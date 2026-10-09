@@ -6,7 +6,8 @@
 //! (`harvest_workflow_executions` + `harvest_events`) over a caller-supplied
 //! time window, grouped by `workflow_name` or by a `search_attrs` JSON key
 //! (e.g. a tenant id). Read-only by construction: no new `WorkflowEvent`
-//! variant, no migration, no replay-determinism impact.
+//! variant, no migration, no replay-determinism impact. The `llm_*` metrics
+//! also read `harvest_llm_ledger`, the agent cost ledger (issue #1996).
 //!
 //! ## Metric semantics
 //!
@@ -65,6 +66,12 @@
 //!   timestamps of their own. Retry backoff wall time between earlier
 //!   attempts is excluded by construction (only the final attempt's span is
 //!   summed).
+//! - `llm_calls`, `llm_input_tokens`, `llm_output_tokens`,
+//!   `llm_cost_usd_micros`, `llm_unpriced_calls` and `llm_latency_ms`: sums
+//!   over the `harvest_llm_ledger` rows whose `recorded_at` falls in the
+//!   window (issue #1996). Cost is in millionths of a US dollar. A row with
+//!   no cost counts in `llm_unpriced_calls`. The sealed `MIGRATED` source of
+//!   a moved run is skipped, so the target reports each call once.
 //!
 //! Local activities (no `ActivityStarted`/worker compute) and
 //! externally-completed activities (`ActivityAwaitingExternal` and
@@ -239,6 +246,18 @@ struct UsageSqlRow {
     activity_executions_failed: i64,
     #[diesel(sql_type = Double)]
     activity_compute_seconds: f64,
+    #[diesel(sql_type = BigInt)]
+    llm_calls: i64,
+    #[diesel(sql_type = BigInt)]
+    llm_input_tokens: i64,
+    #[diesel(sql_type = BigInt)]
+    llm_output_tokens: i64,
+    #[diesel(sql_type = BigInt)]
+    llm_cost_usd_micros: i64,
+    #[diesel(sql_type = BigInt)]
+    llm_unpriced_calls: i64,
+    #[diesel(sql_type = BigInt)]
+    llm_latency_ms: i64,
 }
 
 // Shared group-key expression: `workflow_name` when `$2` (the search_attr
@@ -355,9 +374,28 @@ activity_metrics AS (
           AND e2.timestamp <= ae.timestamp
     ) s ON true
     GROUP BY 1
+),
+llm_metrics AS (
+    -- Issue #1996: the agent cost ledger, windowed by `recorded_at`. A shard
+    -- move leaves a sealed `MIGRATED` copy of the run on the source, so the
+    -- ledger skips it and the target reports each call once.
+    SELECT
+        {group_key_expr} AS grp,
+        COUNT(*)::BIGINT AS llm_calls,
+        COALESCE(SUM(l.input_tokens), 0)::BIGINT AS llm_input_tokens,
+        COALESCE(SUM(l.output_tokens), 0)::BIGINT AS llm_output_tokens,
+        COALESCE(SUM(l.cost_usd_micros), 0)::BIGINT AS llm_cost_usd_micros,
+        COUNT(*) FILTER (WHERE l.cost_usd_micros IS NULL)::BIGINT AS llm_unpriced_calls,
+        COALESCE(SUM(l.latency_ms), 0)::BIGINT AS llm_latency_ms
+    FROM harvest_llm_ledger l
+    INNER JOIN harvest_workflow_executions w ON w.id = l.workflow_exec_id
+    WHERE w.shard_id = $1::INT4
+      AND w.state <> 'MIGRATED'
+      AND l.recorded_at BETWEEN $3 AND $4
+    GROUP BY 1
 )
 SELECT
-    COALESCE(es.grp, tc.grp, am.grp)::TEXT AS grp,
+    COALESCE(es.grp, tc.grp, am.grp, lm.grp)::TEXT AS grp,
     COALESCE(es.workflow_starts, 0)::BIGINT AS workflow_starts,
     COALESCE(tc.completed, 0)::BIGINT AS completed,
     COALESCE(tc.failed, 0)::BIGINT AS failed,
@@ -365,10 +403,17 @@ SELECT
     COALESCE(tc.timed_out, 0)::BIGINT AS timed_out,
     COALESCE(am.activity_executions, 0)::BIGINT AS activity_executions,
     COALESCE(am.activity_executions_failed, 0)::BIGINT AS activity_executions_failed,
-    COALESCE(am.activity_compute_seconds, 0)::DOUBLE PRECISION AS activity_compute_seconds
+    COALESCE(am.activity_compute_seconds, 0)::DOUBLE PRECISION AS activity_compute_seconds,
+    COALESCE(lm.llm_calls, 0)::BIGINT AS llm_calls,
+    COALESCE(lm.llm_input_tokens, 0)::BIGINT AS llm_input_tokens,
+    COALESCE(lm.llm_output_tokens, 0)::BIGINT AS llm_output_tokens,
+    COALESCE(lm.llm_cost_usd_micros, 0)::BIGINT AS llm_cost_usd_micros,
+    COALESCE(lm.llm_unpriced_calls, 0)::BIGINT AS llm_unpriced_calls,
+    COALESCE(lm.llm_latency_ms, 0)::BIGINT AS llm_latency_ms
 FROM execution_starts es
 FULL OUTER JOIN terminal_counts tc ON tc.grp = es.grp
 FULL OUTER JOIN activity_metrics am ON am.grp = COALESCE(es.grp, tc.grp)
+FULL OUTER JOIN llm_metrics lm ON lm.grp = COALESCE(es.grp, tc.grp, am.grp)
 ORDER BY 1
 LIMIT $5
 "
@@ -416,12 +461,12 @@ pub async fn load_usage_grouped(
             activity_executions: row.activity_executions,
             activity_executions_failed: row.activity_executions_failed,
             activity_compute_seconds: row.activity_compute_seconds,
-            llm_calls: 0,
-            llm_input_tokens: 0,
-            llm_output_tokens: 0,
-            llm_cost_usd_micros: 0,
-            llm_unpriced_calls: 0,
-            llm_latency_ms: 0,
+            llm_calls: row.llm_calls,
+            llm_input_tokens: row.llm_input_tokens,
+            llm_output_tokens: row.llm_output_tokens,
+            llm_cost_usd_micros: row.llm_cost_usd_micros,
+            llm_unpriced_calls: row.llm_unpriced_calls,
+            llm_latency_ms: row.llm_latency_ms,
         })
         .collect())
 }
@@ -583,6 +628,24 @@ mod tests {
             sql.contains("s.last_started_at IS NOT NULL"),
             "activity_executions_failed must require a matching ActivityStarted, \
              excluding external activities whose ActivityTimedOut has none"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn usage_sql_sums_the_llm_ledger_and_skips_a_sealed_source() {
+        let sql = usage_sql();
+        assert!(
+            sql.contains("FROM harvest_llm_ledger l"),
+            "the report reads the agent cost ledger (issue #1996)"
+        );
+        assert!(
+            sql.contains("l.recorded_at BETWEEN $3 AND $4"),
+            "the ledger is windowed by recorded_at"
+        );
+        assert!(
+            sql.contains("w.state <> 'MIGRATED'"),
+            "a moved run reports its calls once, on the target"
         );
     }
 

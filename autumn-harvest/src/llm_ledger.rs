@@ -95,7 +95,25 @@ impl LlmCall {
     ///
     /// Returns [`LlmCallError`] for an empty or long model id, or for a value
     /// above `i64::MAX`.
-    pub const fn validate(&self) -> Result<(), LlmCallError> {
+    pub fn validate(&self) -> Result<(), LlmCallError> {
+        if self.model.trim().is_empty() {
+            return Err(LlmCallError::EmptyModel);
+        }
+        if self.model.len() > MAX_MODEL_ID_BYTES {
+            return Err(LlmCallError::ModelTooLong {
+                len: self.model.len(),
+                max: MAX_MODEL_ID_BYTES,
+            });
+        }
+        for (field, value) in [
+            ("input_tokens", Some(self.input_tokens)),
+            ("output_tokens", Some(self.output_tokens)),
+            ("cost_usd_micros", self.cost_usd_micros),
+        ] {
+            if value.is_some_and(|v| i64::try_from(v).is_err()) {
+                return Err(LlmCallError::OutOfRange { field });
+            }
+        }
         Ok(())
     }
 }
@@ -136,8 +154,8 @@ impl From<LlmCallError> for String {
 
 /// The latency in whole milliseconds, saturated to `i64::MAX`.
 #[must_use]
-pub const fn latency_ms(_latency: Duration) -> i64 {
-    0
+pub fn latency_ms(latency: Duration) -> i64 {
+    i64::try_from(latency.as_millis()).unwrap_or(i64::MAX)
 }
 
 /// The per-attempt store behind `ActivityContext::record_llm_call`.
@@ -154,6 +172,105 @@ impl LlmCallSlot {
             calls: std::sync::Mutex::new(Vec::new()),
         }
     }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<LlmCall>> {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Check the call, then keep it.
+    pub(crate) fn record(&self, call: LlmCall) -> Result<(), LlmCallError> {
+        call.validate()?;
+        let mut calls = self.lock();
+        if calls.len() >= MAX_LLM_CALLS_PER_ATTEMPT {
+            return Err(LlmCallError::TooManyCalls {
+                max: MAX_LLM_CALLS_PER_ATTEMPT,
+            });
+        }
+        calls.push(call);
+        Ok(())
+    }
+
+    /// A copy of the calls kept so far.
+    pub(crate) fn snapshot(&self) -> Vec<LlmCall> {
+        self.lock().clone()
+    }
+
+    /// Take the calls. An unset latency becomes the time since the slot was
+    /// made, which is the run time of the attempt.
+    pub(crate) fn take(&self) -> Vec<LlmCall> {
+        let elapsed = self.started.elapsed();
+        let mut calls = std::mem::take(&mut *self.lock());
+        for call in &mut calls {
+            call.latency.get_or_insert(elapsed);
+        }
+        calls
+    }
+}
+
+/// One `harvest_llm_ledger` row to insert.
+#[cfg(feature = "db")]
+#[derive(diesel::Insertable)]
+#[diesel(table_name = crate::schema::harvest_llm_ledger)]
+struct NewLedgerRow<'a> {
+    workflow_exec_id: uuid::Uuid,
+    event_id: i32,
+    call_index: i32,
+    activity_name: &'a str,
+    model: &'a str,
+    input_tokens: i64,
+    output_tokens: i64,
+    cost_usd_micros: Option<i64>,
+    latency_ms: i64,
+}
+
+/// Write one ledger row per call, keyed by the completion event.
+///
+/// Call it in the transaction that appends the completion event, after the
+/// append. The rows then commit with the event or not at all. An empty slice
+/// writes nothing.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if the insert fails, or
+/// [`crate::error::HarvestError::Config`] for a call that fails its check.
+#[cfg(feature = "db")]
+pub(crate) async fn insert_ledger_rows(
+    conn: &mut diesel_async::AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+    event_id: i32,
+    activity_name: &str,
+    calls: &[LlmCall],
+) -> crate::error::HarvestResult<()> {
+    use diesel_async::RunQueryDsl as _;
+
+    if calls.is_empty() {
+        return Ok(());
+    }
+    let mut rows = Vec::with_capacity(calls.len());
+    for (index, call) in calls.iter().enumerate() {
+        call.validate()
+            .map_err(|err| crate::error::HarvestError::Config(err.to_string()))?;
+        let as_bigint = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+        rows.push(NewLedgerRow {
+            workflow_exec_id: exec_id.as_uuid(),
+            event_id,
+            call_index: i32::try_from(index).unwrap_or(i32::MAX),
+            activity_name,
+            model: &call.model,
+            input_tokens: as_bigint(call.input_tokens),
+            output_tokens: as_bigint(call.output_tokens),
+            cost_usd_micros: call.cost_usd_micros.map(as_bigint),
+            latency_ms: call.latency.map_or(0, latency_ms),
+        });
+    }
+    diesel::insert_into(crate::schema::harvest_llm_ledger::table)
+        .values(&rows)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(())
 }
 
 #[cfg(test)]

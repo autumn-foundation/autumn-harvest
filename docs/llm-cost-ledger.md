@@ -112,7 +112,7 @@ and unpriced. See [the agent adapter](agent-adapter.md).
 
 - A failed attempt writes no row. A retried call that cost tokens before it
   failed is not counted.
-- The SQLite and Redis backends do not write the ledger. Their contexts
-  accept a call and drop it.
+- The SQLite backend does not write the ledger. Its context accepts a
+  call and drops it.
 - The report has no per-model dimension. Query the table for that.
 - Quota checks do not read the ledger.

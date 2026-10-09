@@ -50,7 +50,8 @@ use crate::shard_fanout::{self, FanoutStatus, ShardObservation};
 /// place, alongside `workflow_count`'s and `workflow_reachability`'s reports.
 pub type UsageReportStatus = FanoutStatus;
 
-/// One merged usage record — exactly the fields named in issue #596's AC.
+/// One merged usage record: the fields of issue #596's AC, plus the agent
+/// cost ledger sums (issue #1996).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct UsageGroupRecord {
     pub group: String,
@@ -66,6 +67,18 @@ pub struct UsageGroupRecord {
     pub activity_executions: i64,
     pub activity_executions_failed: i64,
     pub activity_compute_seconds: f64,
+    /// Agent cost ledger rows in the window (issue #1996).
+    pub llm_calls: i64,
+    /// Sum of ledger input tokens.
+    pub llm_input_tokens: i64,
+    /// Sum of ledger output tokens.
+    pub llm_output_tokens: i64,
+    /// Sum of priced ledger costs, in millionths of a US dollar.
+    pub llm_cost_usd_micros: i64,
+    /// Ledger rows with no cost.
+    pub llm_unpriced_calls: i64,
+    /// Sum of ledger latencies, in milliseconds.
+    pub llm_latency_ms: i64,
 }
 
 /// The full `GET /admin/usage` response (issue #596).
@@ -225,6 +238,12 @@ pub fn build_usage_response(
                     activity_executions: 0,
                     activity_executions_failed: 0,
                     activity_compute_seconds: 0.0,
+                    llm_calls: 0,
+                    llm_input_tokens: 0,
+                    llm_output_tokens: 0,
+                    llm_cost_usd_micros: 0,
+                    llm_unpriced_calls: 0,
+                    llm_latency_ms: 0,
                 });
             entry.workflow_starts += row.workflow_starts;
             entry.completed += row.completed;
@@ -234,6 +253,12 @@ pub fn build_usage_response(
             entry.activity_executions += row.activity_executions;
             entry.activity_executions_failed += row.activity_executions_failed;
             entry.activity_compute_seconds += row.activity_compute_seconds;
+            entry.llm_calls += row.llm_calls;
+            entry.llm_input_tokens += row.llm_input_tokens;
+            entry.llm_output_tokens += row.llm_output_tokens;
+            entry.llm_cost_usd_micros += row.llm_cost_usd_micros;
+            entry.llm_unpriced_calls += row.llm_unpriced_calls;
+            entry.llm_latency_ms += row.llm_latency_ms;
         }
     }
 
@@ -786,6 +811,12 @@ mod tests {
             activity_executions: 2,
             activity_executions_failed: 0,
             activity_compute_seconds: 3.5,
+            llm_calls: 1,
+            llm_input_tokens: 10,
+            llm_output_tokens: 2,
+            llm_cost_usd_micros: 30,
+            llm_unpriced_calls: 0,
+            llm_latency_ms: 400,
         };
         let value = serde_json::to_value(&record).unwrap();
         let obj = value.as_object().unwrap();

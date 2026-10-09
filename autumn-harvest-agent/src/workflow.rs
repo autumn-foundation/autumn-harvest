@@ -326,6 +326,10 @@ fn harness(ctx: &ActivityContext) -> Result<&AgentHarness, String> {
 /// A rate limit, a transport fault, an outage or a timeout retries with
 /// backoff. Any other failure fails the call at once.
 ///
+/// A completed turn records one call in the agent cost ledger (issue #1996).
+/// `AgentModel::model_id` names the model, and `AgentModel::cost_usd_micros`
+/// prices the call.
+///
 /// # Errors
 ///
 /// Returns the provider failure as an activity error payload.
@@ -337,7 +341,10 @@ pub async fn agent_model_turn(
     ctx: &ActivityContext,
     request: ModelTurnRequest,
 ) -> Result<ModelTurn, String> {
-    harness(ctx)?.model_turn(request).await
+    let harness = harness(ctx)?;
+    let (turn, latency) = harness.model_turn_timed(request).await?;
+    harness.record_turn(ctx, &turn.usage, latency);
+    Ok(turn)
 }
 
 /// One tool call, as an activity.

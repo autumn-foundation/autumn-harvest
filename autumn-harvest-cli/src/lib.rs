@@ -8787,6 +8787,10 @@ fn format_usage_table(value: &Value) -> String {
         "ACT_EXEC",
         "ACT_FAILED",
         "COMPUTE_S",
+        "LLM_CALLS",
+        "LLM_IN",
+        "LLM_OUT",
+        "LLM_COST_USD",
     ]
     .iter()
     .map(ToString::to_string)
@@ -8804,6 +8808,10 @@ fn format_usage_table(value: &Value) -> String {
             cell_number(group.get("activity_executions")),
             cell_number(group.get("activity_executions_failed")),
             format_f64(group.get("activity_compute_seconds")),
+            cell_number(group.get("llm_calls")),
+            cell_number(group.get("llm_input_tokens")),
+            cell_number(group.get("llm_output_tokens")),
+            format_usd_micros(group.get("llm_cost_usd_micros")),
         ]);
     }
 
@@ -8960,6 +8968,17 @@ fn format_rate_limit_table(value: &Value) -> String {
     }
 
     render_table(&rows)
+}
+
+/// Millionths of a US dollar as dollars with six decimals (issue #1996).
+///
+/// An absent field, as from an older server, stays blank.
+fn format_usd_micros(value: Option<&Value>) -> String {
+    value.and_then(Value::as_i64).map_or_else(String::new, |micros| {
+        let sign = if micros < 0 { "-" } else { "" };
+        let abs = micros.unsigned_abs();
+        format!("{sign}{}.{:06}", abs / 1_000_000, abs % 1_000_000)
+    })
 }
 
 fn format_f64(value: Option<&Value>) -> String {

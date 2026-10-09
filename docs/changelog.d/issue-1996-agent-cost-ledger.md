@@ -35,8 +35,8 @@ defaults, so existing models still compile.
 the run on a shard move. The usage report skips the sealed source of a
 moved run. A reset fork does not copy them.
 
-**Known limits.** A failed attempt writes no row. The SQLite and Redis
-backends do not write the ledger. The report has no per-model dimension.
+**Known limits.** A failed attempt writes no row. The SQLite
+backend does not write the ledger. The report has no per-model dimension.
 Quota checks do not read the ledger.
 
 **Migration.** `20261009050156_harvest_llm_ledger` adds the table and one

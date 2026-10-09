@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::AgentError;
-use crate::message::RunId;
+use crate::message::{RunId, TokenUsage};
 use crate::model::{AgentModel, ChatRequest};
 use crate::policy::{AllowAll, RunInfo, ToolDecision, ToolPolicy};
 use crate::tool::{Tool, ToolContext};
@@ -158,12 +158,21 @@ impl AgentHarness {
     /// retryable: a rate limit, a transport fault, a provider outage, or the
     /// time budget. Every other failure is not.
     pub async fn model_turn(&self, request: ModelTurnRequest) -> Result<ModelTurn, String> {
+        self.model_turn_timed(request).await.map(|(turn, _)| turn)
+    }
+
+    /// [`Self::model_turn`], plus the latency of the model call alone.
+    pub(crate) async fn model_turn_timed(
+        &self,
+        request: ModelTurnRequest,
+    ) -> Result<(ModelTurn, Duration), String> {
         let chat = ChatRequest {
             messages: request.messages,
             tools: self.tools.iter().map(|tool| tool.definition()).collect(),
             max_tokens: request.max_output_tokens,
             temperature: self.temperature,
         };
+        let started = std::time::Instant::now();
         let response = match tokio::time::timeout(self.model_timeout, self.client.chat(&chat)).await
         {
             Ok(response) => response.map_err(|err| model_failure(&err))?,
@@ -175,6 +184,7 @@ impl AgentHarness {
                 .into_error_payload());
             }
         };
+        let latency = started.elapsed();
         let mut turn = ModelTurn {
             content: response.content,
             stop: response.stop_reason,
@@ -202,7 +212,31 @@ impl AgentHarness {
                 });
             turn.decisions.push(decision);
         }
-        Ok(turn)
+        Ok((turn, latency))
+    }
+
+    /// Record one model turn in the agent cost ledger (issue #1996).
+    ///
+    /// A ledger refusal, such as a model id over the limit, does not fail
+    /// the turn. It logs a warning, because the reply is already paid for.
+    pub(crate) fn record_turn(
+        &self,
+        ctx: &autumn_harvest::context::ActivityContext,
+        usage: &TokenUsage,
+        latency: Duration,
+    ) {
+        let mut call = autumn_harvest::llm_ledger::LlmCall::new(
+            self.client.model_id(),
+            u64::from(usage.input_tokens),
+            u64::from(usage.output_tokens),
+        )
+        .with_latency(latency);
+        if let Some(cost) = self.client.cost_usd_micros(usage) {
+            call = call.with_cost_usd_micros(cost);
+        }
+        if let Err(err) = ctx.record_llm_call(call) {
+            tracing::warn!(error = %err, "the agent cost ledger refused a model turn");
+        }
     }
 
     /// Run one tool call.

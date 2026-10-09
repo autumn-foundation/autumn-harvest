@@ -15061,14 +15061,13 @@ impl ActivityContext {
         &self,
         call: crate::llm_ledger::LlmCall,
     ) -> Result<(), crate::llm_ledger::LlmCallError> {
-        let _ = call;
-        Ok(())
+        self.llm_calls.record(call)
     }
 
     /// The LLM calls this attempt recorded so far (issue #1996).
     #[must_use]
     pub fn llm_calls(&self) -> Vec<crate::llm_ledger::LlmCall> {
-        Vec::new()
+        self.llm_calls.snapshot()
     }
 
     /// Take the recorded calls, with each unset latency filled in.
@@ -15076,7 +15075,7 @@ impl ActivityContext {
     /// The engine calls this once, when it writes the completion.
     #[cfg_attr(not(feature = "db"), allow(dead_code))]
     pub(crate) fn take_llm_calls(&self) -> Vec<crate::llm_ledger::LlmCall> {
-        Vec::new()
+        self.llm_calls.take()
     }
 
     /// The stable idempotency key for this logical activity invocation.
@@ -16054,6 +16053,16 @@ impl ActivityContext {
                     &[completion_event],
                     history.next_event_id,
                     &codecs,
+                )
+                .await?;
+
+                // Issue #1996: the recorded LLM calls commit with the event.
+                crate::llm_ledger::insert_ledger_rows(
+                    conn,
+                    exec_id,
+                    history.next_event_id,
+                    &self.identity.activity_type,
+                    &self.take_llm_calls(),
                 )
                 .await?;
 
