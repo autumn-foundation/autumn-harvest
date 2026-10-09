@@ -722,13 +722,16 @@ fn encoded(codecs: &PayloadCodecs, events: &[WorkflowEvent]) -> EncodedHistory {
 struct MemStore(std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>);
 
 impl PayloadStore for MemStore {
-    fn store_id(&self) -> &str {
+    fn store_id(&self) -> &'static str {
         "mem"
     }
     fn put(&self, bytes: &[u8]) -> PayloadStoreFuture<'_, String> {
-        let mut blobs = self.0.lock().expect("lock");
-        let key = format!("k{}", blobs.len());
-        blobs.insert(key.clone(), bytes.to_vec());
+        let key = {
+            let mut blobs = self.0.lock().expect("lock");
+            let key = format!("k{}", blobs.len());
+            blobs.insert(key.clone(), bytes.to_vec());
+            key
+        };
         Box::pin(async move { Ok(key) })
     }
     fn get(&self, key: &str) -> PayloadStoreFuture<'_, Vec<u8>> {
