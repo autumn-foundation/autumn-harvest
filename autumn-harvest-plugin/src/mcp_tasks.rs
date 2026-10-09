@@ -224,6 +224,123 @@ fn decode_header_value(raw: &str) -> Option<String> {
         )
 }
 
+/// The browser origins that may call the route, from the app config.
+///
+/// This mirrors the guard of autumn-web's own `/mcp`. A same-origin request
+/// passes only on a trusted host, because DNS rebinding makes `Origin` and
+/// `Host` agree on a hostile name. Any other origin must be in the CORS
+/// allowlist.
+#[derive(Debug, Clone)]
+pub struct OriginPolicy {
+    trusted_hosts: Vec<String>,
+    allowed_origins: Vec<String>,
+}
+
+impl OriginPolicy {
+    /// The policy of an app config: `security.trusted_hosts`, plus the
+    /// loopback names outside `prod`, and `cors.allowed_origins`.
+    #[must_use]
+    pub fn from_config(config: &autumn_web::config::AutumnConfig) -> Self {
+        let mut trusted_hosts: Vec<String> = config
+            .security
+            .trusted_hosts
+            .hosts
+            .iter()
+            .map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
+        if !matches!(config.profile.as_deref(), Some("prod" | "production")) {
+            trusted_hosts.extend(["localhost", "127.0.0.1", "::1"].map(String::from));
+        }
+        Self {
+            trusted_hosts,
+            allowed_origins: config.cors.allowed_origins.clone(),
+        }
+    }
+
+    fn trusts_host(&self, host: &str) -> bool {
+        self.trusted_hosts.iter().any(|rule| {
+            rule == "*"
+                || rule.strip_prefix('.').map_or_else(
+                    || host == rule,
+                    |suffix| {
+                        host == suffix
+                            || host
+                                .strip_suffix(suffix)
+                                .is_some_and(|prefix| prefix.ends_with('.'))
+                    },
+                )
+        })
+    }
+
+    /// `true` when a request with this `Origin` may call the route.
+    ///
+    /// `host` is the request authority, and `scheme` is its scheme when known.
+    #[must_use]
+    pub fn allows(&self, origin: &str, host: Option<&str>, scheme: Option<&str>) -> bool {
+        if let Some(host) = host
+            && same_origin(origin, host, scheme)
+        {
+            let (name, _) = split_host_port(host);
+            let name = name
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            if self.trusts_host(&name) {
+                return true;
+            }
+        }
+        self.allowed_origins
+            .iter()
+            .any(|allowed| allowed == "*" || allowed == origin)
+    }
+}
+
+/// `true` when `origin` names the same scheme, host and port as the request.
+fn same_origin(origin: &str, host: &str, scheme: Option<&str>) -> bool {
+    let Some((origin_scheme, origin_authority)) = origin.split_once("://") else {
+        return false;
+    };
+    if scheme.is_some_and(|s| !s.eq_ignore_ascii_case(origin_scheme)) {
+        return false;
+    }
+    let (origin_host, origin_port) = split_host_port(origin_authority);
+    let (request_host, request_port) = split_host_port(host);
+    let request_scheme = scheme.unwrap_or(origin_scheme);
+    origin_host.eq_ignore_ascii_case(request_host)
+        && origin_port.or_else(|| default_port(origin_scheme))
+            == request_port.or_else(|| default_port(request_scheme))
+}
+
+/// Split an authority into its host and optional port. An IPv6 literal keeps
+/// its brackets.
+fn split_host_port(authority: &str) -> (&str, Option<&str>) {
+    if authority.starts_with('[') {
+        return authority.find(']').map_or((authority, None), |close| {
+            let port = authority[close + 1..]
+                .strip_prefix(':')
+                .filter(|p| !p.is_empty());
+            (&authority[..=close], port)
+        });
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|c| c.is_ascii_digit()) => {
+            (host, Some(port))
+        }
+        _ => (authority, None),
+    }
+}
+
+/// The default port of a URL scheme.
+fn default_port(scheme: &str) -> Option<&'static str> {
+    match scheme.to_ascii_lowercase().as_str() {
+        "https" => Some("443"),
+        "http" => Some("80"),
+        _ => None,
+    }
+}
+
 /// The body value that the `Mcp-Name` header mirrors for `method`.
 fn mirrored_name<'a>(method: &str, params: &'a Value) -> Option<&'a str> {
     let field = match method {
@@ -287,6 +404,17 @@ pub fn check_request_headers(
                 body_version.unwrap_or_default()
             )));
         }
+    }
+    // A version declared only in `_meta` must be one this route serves too.
+    if let Some(body) = body_version
+        && method != "initialize"
+        && !PROTOCOL_VERSIONS.contains(&body)
+    {
+        return Err((
+            UNSUPPORTED_PROTOCOL_VERSION,
+            format!("Unsupported protocol version: {body}"),
+            Some(json!({"supported": PROTOCOL_VERSIONS, "requested": body})),
+        ));
     }
     let modern = version.as_deref() == Some(LATEST_PROTOCOL_VERSION)
         || body_version == Some(LATEST_PROTOCOL_VERSION);
@@ -679,7 +807,10 @@ pub fn build_mcp_task_route(
     let catalog = Arc::new(TaskCatalog::new(descriptors));
     let state = api_state.clone();
     let handler = axum::routing::post(
-        move |headers: HeaderMap,
+        move |axum::extract::State(app): axum::extract::State<autumn_web::AppState>,
+              identity: Option<Extension<autumn_web::security::ResolvedClientIdentity>>,
+              uri: axum::http::Uri,
+              headers: HeaderMap,
               session: Option<Extension<Session>>,
               body: Result<Json<Value>, JsonRejection>| {
             let api_state = state.clone();
@@ -688,8 +819,41 @@ pub fn build_mcp_task_route(
                 headers,
                 session: session.map(|Extension(session)| session),
             };
+            // The Streamable HTTP transport must refuse a browser `Origin` it
+            // does not trust, with 403. This stops DNS rebinding.
+            let origin_refused =
+                caller
+                    .headers
+                    .get(axum::http::header::ORIGIN)
+                    .is_some_and(|origin| {
+                        let identity = identity.as_ref().map(|Extension(id)| id);
+                        let host = identity
+                            .and_then(|id| id.host.as_deref())
+                            .or_else(|| uri.authority().map(axum::http::uri::Authority::as_str))
+                            .or_else(|| {
+                                caller
+                                    .headers
+                                    .get(axum::http::header::HOST)
+                                    .and_then(|h| h.to_str().ok())
+                            });
+                        let scheme = identity.and_then(|id| id.scheme.as_deref());
+                        !OriginPolicy::from_config(&app.config_arc()).allows(
+                            origin.to_str().unwrap_or(""),
+                            host,
+                            scheme,
+                        )
+                    });
             // Boxed: the delegated start future is large (clippy::large_futures).
-            async move { Box::pin(serve(api_state, catalog, caller, body)).await }
+            async move {
+                if origin_refused {
+                    let body = json!({
+                        "jsonrpc": "2.0",
+                        "error": {"code": INVALID_REQUEST, "message": "origin not allowed"},
+                    });
+                    return (StatusCode::FORBIDDEN, Json(body)).into_response();
+                }
+                Box::pin(serve(api_state, catalog, caller, body)).await
+            }
         },
     );
     let handler = crate::mcp_tools::layer_tool_route(
@@ -1686,6 +1850,52 @@ mod tests {
             let err = check_request_headers(&missing, "tools/call", &params).unwrap_err();
             assert_eq!(err.0, HEADER_MISMATCH, "{missing:?}");
         }
+    }
+
+    #[test]
+    fn a_version_in_meta_only_must_be_served() {
+        let params = json!({"_meta": {PROTOCOL_VERSION_META: "2099-01-01"}});
+        let err = check_request_headers(&HeaderMap::new(), "ping", &params).unwrap_err();
+        assert_eq!(err.0, UNSUPPORTED_PROTOCOL_VERSION);
+        assert_eq!(err.2.unwrap()["requested"], "2099-01-01");
+    }
+
+    fn policy(trusted: &[&str], allowed: &[&str]) -> OriginPolicy {
+        OriginPolicy {
+            trusted_hosts: trusted.iter().map(ToString::to_string).collect(),
+            allowed_origins: allowed.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    /// DNS rebinding makes `Origin` and `Host` agree on a hostile name. Only
+    /// a trusted host makes a same-origin request valid.
+    #[test]
+    fn a_rebound_origin_is_refused() {
+        let p = policy(&["localhost", ".example.com"], &[]);
+        assert!(!p.allows("http://evil.test:8080", Some("evil.test:8080"), None));
+        assert!(p.allows("http://localhost:8080", Some("localhost:8080"), None));
+        assert!(p.allows(
+            "https://app.example.com",
+            Some("app.example.com:443"),
+            Some("https")
+        ));
+        // A trusted host does not admit a different origin.
+        assert!(!p.allows("http://evil.test", Some("localhost:8080"), None));
+        // A scheme mismatch is not the same origin.
+        assert!(!p.allows(
+            "http://app.example.com",
+            Some("app.example.com"),
+            Some("https")
+        ));
+    }
+
+    #[test]
+    fn an_allowlisted_origin_passes() {
+        let p = policy(&[], &["https://console.example.com"]);
+        assert!(p.allows("https://console.example.com", Some("api.example.com"), None));
+        assert!(!p.allows("https://other.example.com", Some("api.example.com"), None));
+        assert!(policy(&[], &["*"]).allows("https://any.test", None, None));
+        assert!(policy(&["::1"], &[]).allows("http://[::1]:3000", Some("[::1]:3000"), None));
     }
 
     #[test]

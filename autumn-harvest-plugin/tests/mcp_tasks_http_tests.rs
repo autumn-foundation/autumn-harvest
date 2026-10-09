@@ -523,3 +523,30 @@ async fn a_tool_name_collision_on_mcp_does_not_drop_a_task_tool() {
         .collect();
     assert_eq!(names, ["start_invoice_status", "start_start_invoice"]);
 }
+
+/// A browser `Origin` on an untrusted host gets 403, which stops DNS
+/// rebinding. A trusted same-origin call and a call with no `Origin` pass.
+#[tokio::test]
+async fn an_untrusted_origin_is_refused_with_403() {
+    let ping = call("ping", &json!({}));
+    let (status, _) = post_with_headers(
+        &router(),
+        &ping,
+        &[
+            ("origin", "http://evil.test:8080"),
+            ("host", "evil.test:8080"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, out) = post_with_headers(
+        &router(),
+        &ping,
+        &[
+            ("origin", "http://localhost:8080"),
+            ("host", "localhost:8080"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+}

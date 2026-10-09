@@ -75,6 +75,7 @@ route behind the existing `mcp` cargo feature.
 | R7 | A continue-as-new successor reuses an ordinal. | The key holds the live run id, so a successor has new keys. |
 | R8 | A client that did not declare the extension gets a task it cannot read. | No declaration means a plain `CallToolResult` with the handle, as `start_{wf}` returns today. |
 | R9 | A cross-site form posts to the route with the session cookie. | The route takes `application/json` only. A browser sends that cross-site only after a CORS preflight. |
+| R9a | A hostile page rebinds its DNS name to the server, so `Origin` and `Host` agree. | A same-origin `Origin` passes only on a trusted host, as on autumn-web's `/mcp`. Any other origin must be in the CORS allowlist, or it gets `403`. |
 | R10 | The route skips the tool-route auth layers. | It reuses the layer stack of a mutating tool route. A test proves a read-only principal gets `403`. |
 | R11 | A task outlives retention and `tasks/get` fails with a 500. | A missing row is `-32602` "Task not found", as the spec allows. `ttlMs` reports retention once the run ends. |
 | R12 | `tasks/get` replays history on each poll and loads the database. | The route caches the waits of each run at each history position, so a poll with no new event does not replay. `pollIntervalMs` asks for 5 s. |

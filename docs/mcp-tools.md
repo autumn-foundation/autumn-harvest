@@ -272,7 +272,8 @@ headers, so the route checks them against the body before it acts. A
 `MCP-Protocol-Version`, `Mcp-Method` or `Mcp-Name` header that differs from
 the body gets `400` and `-32020`, and a `=?base64?…?=` name is decoded first.
 A 2026-07-28 request must carry all three. An older request may omit them.
-A version that the route does not serve gets `400` and `-32022`. A
+A version that the route does not serve, in the header or in `_meta`, gets
+`400` and `-32022`. A
 2026-07-28 request must also carry `io.modelcontextprotocol/protocolVersion`
 and `io.modelcontextprotocol/clientCapabilities` in `_meta`, or it gets `400`
 and `-32602`. A 2026-07-28 request for an unknown method gets `404`.
@@ -365,7 +366,11 @@ fail-closed mutation gate (issue #1802) and the tenant refusal (issue #1977).
 Every method on the route counts as a mutation, because the route can start
 and cancel runs. So a read-only principal cannot poll a task either. The
 route takes `application/json` only. A browser cannot send that cross-site
-without a CORS preflight.
+without a CORS preflight. A browser `Origin` must also pass the check of
+autumn-web's own `/mcp`: the same origin on a trusted host
+(`security.trusted_hosts`, plus the loopback names outside `prod`), or an
+origin in `cors.allowed_origins`. Any other origin gets `403`, which stops
+DNS rebinding.
 
 A task is not bound to the caller that created it. Any caller that passes
 these layers can read, answer or cancel a task whose id it knows, as with
