@@ -349,11 +349,22 @@ impl<'c> PgStore<'c> {
                 .expect("finalize");
                 self.completed_events(exec_id).await > before
             }
-            // `complete_task` is the unfenced write. Before issue #1789 the
-            // owner used it too. It appends no event.
-            Fencing::StateOnly => queue::complete_task(self.conn, task_id, payload(tag))
+            // The completion write before issue #1789: no claim predicate.
+            // It appends no event.
+            Fencing::StateOnly => {
+                diesel::sql_query(
+                    "UPDATE harvest_task_queue \
+                     SET state = 'COMPLETED', output = $2, heartbeat_details = NULL, \
+                         error = NULL, completed_at = NOW() \
+                     WHERE id = $1 AND state = 'RUNNING'",
+                )
+                .bind::<diesel::sql_types::Uuid, _>(task_id)
+                .bind::<Jsonb, _>(payload(tag))
+                .execute(self.conn)
                 .await
-                .is_ok(),
+                .expect("pre-fix completion")
+                    > 0
+            }
         };
         write_outcome(applied)
     }
