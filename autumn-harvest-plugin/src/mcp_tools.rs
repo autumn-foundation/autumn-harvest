@@ -929,52 +929,13 @@ fn build_tool_route(
             async move { watch_tool(api_state, workflow, &handle).await }
         }),
     };
-    // Issue #776 (F1): under the read-only operator role, a mutating tool must
-    // 403 a read-only principal. These routes are app-level (outside the
-    // `enforce_read_only_class` layer on the nested management router), so they
-    // carry their own class gate. Applied FIRST (inner) so the auth middleware
-    // below wraps it (outer) and populates the `Session` extension *before*
-    // this gate reads it — exactly the layer order the management router uses
-    // (`enforce_read_only_class` inner, embedder auth outer). One gate on the
-    // route closes both invocation paths: the direct HTTP path AND the `/mcp`
-    // JSON-RPC `tools/call` envelope, which re-dispatches through this same
-    // route with the caller's forwarded credential.
-    let handler = if role_auth_enabled && spec.kind.is_mutation() {
-        handler.layer(axum::middleware::from_fn(
-            crate::api::enforce_read_only_mcp_mutation,
-        ))
-    } else {
-        handler
-    };
-    // Issue #1802: outside `dev`, this gate refuses a mutating tool call with
-    // no credential. A declared boundary, an admin session or the opt-out
-    // admits it. It sits inside the auth middleware below, so it reads the
-    // `Session` that middleware sets.
-    let handler = if spec.kind.is_mutation() {
-        handler.layer(axum::middleware::from_fn_with_state(
-            gate_state,
-            crate::api::require_mutation_auth_by_method,
-        ))
-    } else {
-        handler
-    };
-    // Issue #1977: a tool starts or reads a run with no tenant check, so a
-    // tenant-bound caller never reaches one. This gate sits inside the auth
-    // middleware below, so it sees the `VerifiedTenant` that middleware sets.
-    let handler = handler.layer(axum::middleware::from_fn(
-        crate::tenant::refuse_tenant_bound_mcp_tool,
-    ));
-    // Issue #597 hardening: these routes are registered via
-    // `AppBuilder::routes(...)`, not `nest()`, so they never pass through
-    // the harvest management API's own auth layer (which only wraps the
-    // nested router) or autumn-web's `secure_mcp` (which only gates the
-    // `/mcp` envelope, not a typed route's own HTTP path). Apply the same
-    // layer `HarvestPlugin::api_with_auth` configured directly to this
-    // route's handler so it requires the same credential either way.
-    let handler = match tool_middleware {
-        Some(mw) => mw(handler),
-        None => handler,
-    };
+    let handler = layer_tool_route(
+        handler,
+        &gate_state,
+        spec.kind.is_mutation(),
+        tool_middleware,
+        role_auth_enabled,
+    );
 
     let api_doc = build_tool_api_doc(spec, path, operation_id);
 
@@ -993,6 +954,65 @@ fn build_tool_route(
         // Generated API routes carry no SEO meta (since autumn-web 0.7): EMPTY is
         // what a route attribute without `seo(...)` produces.
         seo: autumn_web::SeoRouteDefaults::EMPTY,
+    }
+}
+
+/// Apply the auth layers of a generated tool route to `handler`.
+///
+/// The MCP Tasks route (issue #2005) takes the same stack as a mutating tool,
+/// so both routes share this function.
+pub(crate) fn layer_tool_route(
+    handler: axum::routing::MethodRouter<autumn_web::AppState>,
+    api_state: &crate::api::HarvestApiState,
+    is_mutation: bool,
+    tool_middleware: Option<&crate::plugin::McpToolMiddlewareFn>,
+    role_auth_enabled: bool,
+) -> axum::routing::MethodRouter<autumn_web::AppState> {
+    // Issue #776 (F1): under the read-only operator role, a mutating tool must
+    // 403 a read-only principal. These routes are app-level (outside the
+    // `enforce_read_only_class` layer on the nested management router), so they
+    // carry their own class gate. Applied FIRST (inner) so the auth middleware
+    // below wraps it (outer) and populates the `Session` extension *before*
+    // this gate reads it — exactly the layer order the management router uses
+    // (`enforce_read_only_class` inner, embedder auth outer). One gate on the
+    // route closes both invocation paths: the direct HTTP path AND the `/mcp`
+    // JSON-RPC `tools/call` envelope, which re-dispatches through this same
+    // route with the caller's forwarded credential.
+    let handler = if role_auth_enabled && is_mutation {
+        handler.layer(axum::middleware::from_fn(
+            crate::api::enforce_read_only_mcp_mutation,
+        ))
+    } else {
+        handler
+    };
+    // Issue #1802: outside `dev`, this gate refuses a mutating tool call with
+    // no credential. A declared boundary, an admin session or the opt-out
+    // admits it. It sits inside the auth middleware below, so it reads the
+    // `Session` that middleware sets.
+    let handler = if is_mutation {
+        handler.layer(axum::middleware::from_fn_with_state(
+            api_state.clone(),
+            crate::api::require_mutation_auth_by_method,
+        ))
+    } else {
+        handler
+    };
+    // Issue #1977: a tool starts or reads a run with no tenant check, so a
+    // tenant-bound caller never reaches one. This gate sits inside the auth
+    // middleware below, so it sees the `VerifiedTenant` that middleware sets.
+    let handler = handler.layer(axum::middleware::from_fn(
+        crate::tenant::refuse_tenant_bound_mcp_tool,
+    ));
+    // Issue #597 hardening: these routes are registered via
+    // `AppBuilder::routes(...)`, not `nest()`, so they never pass through
+    // the harvest management API's own auth layer (which only wraps the
+    // nested router) or autumn-web's `secure_mcp` (which only gates the
+    // `/mcp` envelope, not a typed route's own HTTP path). Apply the same
+    // layer `HarvestPlugin::api_with_auth` configured directly to this
+    // route's handler so it requires the same credential either way.
+    match tool_middleware {
+        Some(mw) => mw(handler),
+        None => handler,
     }
 }
 
@@ -1047,7 +1067,7 @@ async fn load_owned_execution(
 /// pure/in-memory either way) at the cost of two independent sources of
 /// truth for the same schema and a rejected MCP-originated attempt leaving
 /// no audit trail.
-async fn start_tool(
+pub(crate) async fn start_tool(
     api_state: crate::api::HarvestApiState,
     workflow: &'static str,
     headers: axum::http::HeaderMap,
@@ -1169,7 +1189,7 @@ async fn status_tool(
 /// otherwise, avoiding a redundant reload for the common terminal/running
 /// case (`load_owned_execution` already loaded it once).
 #[allow(clippy::result_large_err)]
-async fn resolve_if_chained(
+pub(crate) async fn resolve_if_chained(
     api_state: &crate::api::HarvestApiState,
     execution: autumn_harvest::models::WorkflowExecution,
 ) -> Result<autumn_harvest::models::WorkflowExecution, axum::response::Response> {

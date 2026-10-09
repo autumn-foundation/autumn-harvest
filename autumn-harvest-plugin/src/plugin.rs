@@ -225,6 +225,10 @@ pub struct HarvestPlugin {
     mcp_tools_enabled: bool,
     /// Optional prefix override for the generated MCP tool routes.
     mcp_tools_prefix: Option<String>,
+    /// Serve the MCP Tasks route (issue #2005). Set via [`Self::mcp_tasks`].
+    mcp_tasks_enabled: bool,
+    /// Optional path override for the MCP Tasks route.
+    mcp_tasks_path: Option<String>,
     /// Deployment-level opt-in for operator read-path payload decoding
     /// (issue #608). Set via [`Self::decode_payloads_on_read`]; default off.
     decode_payloads_on_read: bool,
@@ -347,6 +351,8 @@ impl HarvestPlugin {
             mcp_tool_middleware: None,
             mcp_tools_enabled: false,
             mcp_tools_prefix: None,
+            mcp_tasks_enabled: false,
+            mcp_tasks_path: None,
             decode_payloads_on_read: false,
             role_auth_enabled: false,
             api_tokens_enabled: false,
@@ -759,6 +765,28 @@ impl HarvestPlugin {
     pub fn mcp_tools_at(mut self, prefix: impl Into<String>) -> Self {
         self.mcp_tools_enabled = true;
         self.mcp_tools_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Serve each `#[workflow(mcp)]` workflow as an MCP Task (issue #2005).
+    ///
+    /// The route speaks JSON-RPC at `{tools prefix}/tasks`, default
+    /// `/api/harvest/mcp/tasks`. Point an MCP client with the
+    /// `io.modelcontextprotocol/tasks` extension at it. See
+    /// `docs/mcp-tools.md`.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub const fn mcp_tasks(mut self) -> Self {
+        self.mcp_tasks_enabled = true;
+        self
+    }
+
+    /// Like [`Self::mcp_tasks`], with the route at `path`.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn mcp_tasks_at(mut self, path: impl Into<String>) -> Self {
+        self.mcp_tasks_enabled = true;
+        self.mcp_tasks_path = Some(path.into());
         self
     }
 
@@ -1254,6 +1282,8 @@ impl Plugin for HarvestPlugin {
             mcp_tool_middleware,
             mcp_tools_enabled,
             mcp_tools_prefix,
+            mcp_tasks_enabled,
+            mcp_tasks_path,
             decode_payloads_on_read,
             role_auth_enabled,
             api_tokens_enabled,
@@ -1274,7 +1304,13 @@ impl Plugin for HarvestPlugin {
             require_embedded_harvest_mode,
         } = self;
         #[cfg(not(feature = "mcp"))]
-        let _ = (mcp_tool_middleware, mcp_tools_enabled, mcp_tools_prefix);
+        let _ = (
+            mcp_tool_middleware,
+            mcp_tools_enabled,
+            mcp_tools_prefix,
+            mcp_tasks_enabled,
+            mcp_tasks_path,
+        );
         // Issue #1978: an OIDC login brings its own role set. A later
         // `api_with_auth` clears the login, and with it these roles.
         #[cfg(feature = "oidc")]
@@ -1528,7 +1564,7 @@ impl Plugin for HarvestPlugin {
         // `mount_mcp` can project them into the tool catalog; handlers fail
         // closed until `on_startup` installs the runtime.
         #[cfg(feature = "mcp")]
-        let mcp_routes = if mcp_tools_enabled {
+        let mcp_routes = if mcp_tools_enabled || mcp_tasks_enabled {
             // Codex review (PR #908, P1): `HarvestPlugin` cannot detect or
             // intercept `AppBuilder::secure_mcp(...)` -- that's configured on
             // the outer app builder, after this `Plugin::build` call returns
@@ -1559,6 +1595,14 @@ impl Plugin for HarvestPlugin {
                      Configure HarvestPlugin::api_with_auth(path, mw) to protect them."
                 );
             }
+            // Issue #2005: `secure_mcp` never covers the task route either.
+            if mcp_tools_unprotected(mcp_tasks_enabled, mcp_tool_middleware.is_some()) {
+                tracing::warn!(
+                    "HarvestPlugin::mcp_tasks() is enabled with no HarvestPlugin::api_with_auth(..) \
+                     configured. Outside the dev profile the task route answers 401 to a caller \
+                     with no admin session. Configure api_with_auth(path, mw) to protect it."
+                );
+            }
             let prefix =
                 crate::mcp_tools::tools_prefix(api_path.as_deref(), mcp_tools_prefix.as_deref());
             // A unified DAG's shadow `WorkflowInfo` (auto-registered by
@@ -1572,18 +1616,32 @@ impl Plugin for HarvestPlugin {
                 builder.update_handlers(),
                 builder.dag_infos(),
             );
-            crate::mcp_tools::record_schemas(&descriptors);
-            Some(crate::mcp_tools::build_mcp_tool_routes(
-                &prefix,
-                &descriptors,
-                &api_state,
-                mcp_tool_middleware.as_ref(),
-                // Issue #776 (F1): gate mutating MCP tools for read-only
-                // principals. These routes are app-level (outside the
-                // `enforce_read_only_class` layer on the nested management
-                // router), so the read-only class boundary is applied here too.
-                role_auth_enabled,
-            ))
+            let mut routes = Vec::new();
+            if mcp_tools_enabled {
+                crate::mcp_tools::record_schemas(&descriptors);
+                routes = crate::mcp_tools::build_mcp_tool_routes(
+                    &prefix,
+                    &descriptors,
+                    &api_state,
+                    mcp_tool_middleware.as_ref(),
+                    // Issue #776 (F1): gate mutating MCP tools for read-only
+                    // principals. These routes are app-level (outside the
+                    // `enforce_read_only_class` layer on the nested management
+                    // router), so the read-only class boundary is applied here too.
+                    role_auth_enabled,
+                );
+            }
+            if mcp_tasks_enabled {
+                let path = mcp_tasks_path.unwrap_or_else(|| crate::mcp_tasks::tasks_path(&prefix));
+                routes.push(crate::mcp_tasks::build_mcp_task_route(
+                    &path,
+                    &descriptors,
+                    &api_state,
+                    mcp_tool_middleware.as_ref(),
+                    role_auth_enabled,
+                ));
+            }
+            Some(routes)
         } else {
             None
         };

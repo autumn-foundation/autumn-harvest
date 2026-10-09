@@ -102,6 +102,10 @@ pub mod webhook_receiver;
 #[cfg(feature = "mcp")]
 pub mod mcp_tools;
 
+/// MCP Tasks for `#[workflow(mcp)]` workflows (issue #2005).
+#[cfg(feature = "mcp")]
+pub mod mcp_tasks;
+
 /// OpenAPI 3.1 document for the management API (issue #694).
 ///
 /// Derived from `docs/api-contract.json` and served read-only at

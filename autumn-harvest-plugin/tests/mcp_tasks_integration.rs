@@ -1,0 +1,577 @@
+//! MCP Tasks end to end (issue #2005), with testcontainers.
+//!
+//! Each test drives the task route of a full plugin-wired app against a real
+//! Postgres. The tests prove the three acceptance criteria of the issue:
+//!
+//! 1. A task moves through the spec states, and each move is legal.
+//! 2. A retried task-create request starts one execution.
+//! 3. An `input_required` task resumes when the client supplies input.
+//!
+//! Requires Docker. Each test uses a multi-thread runtime, because
+//! `TestApp::plugin` blocks on plugin startup.
+
+#![cfg(feature = "mcp")]
+#![allow(clippy::unused_async, clippy::used_underscore_binding)]
+
+use std::time::Duration;
+
+use autumn_harvest::prelude::*;
+use autumn_harvest_plugin::HarvestPlugin;
+use autumn_harvest_plugin::mcp_tasks::{
+    CLIENT_CAPABILITIES_META, START_KEY_META, TASKS_EXTENSION, TaskStatus,
+};
+use autumn_web::test::{TestApp, TestClient};
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use diesel_async::pooled_connection::deadpool::Pool;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use serde_json::{Value, json};
+use testcontainers::{ContainerAsync, ImageExt};
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+const TASKS: &str = "/api/harvest/mcp/tasks";
+
+// ── Fixtures ──────────────────────────────────────────────────────────────────
+
+/// Waits for one approval, then holds the run open for 1 s.
+#[workflow(mcp, description = "Waits for one approval")]
+async fn task_approval_flow(ctx: &WorkflowContext, request_id: String) -> Result<String, String> {
+    ctx.set_current_details("awaiting approval");
+    let approval = ctx
+        .wait_for_signal("approval")
+        .await
+        .map_err(|e| e.to_string())?;
+    ctx.set_current_details("finalizing");
+    // The timer keeps the run in `working` after the signal, so the test
+    // sees the move from `input_required` back to `working`.
+    ctx.timer("finalize", 1).await.map_err(|e| e.to_string())?;
+    let decision = approval
+        .get("decision")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    Ok(format!("{request_id}:{decision}"))
+}
+
+/// Waits twice on the same signal name and returns both payloads.
+#[workflow(mcp)]
+async fn task_two_step_flow(ctx: &WorkflowContext, _input: String) -> Result<Value, String> {
+    let first = ctx
+        .wait_for_signal("step")
+        .await
+        .map_err(|e| e.to_string())?;
+    let second = ctx
+        .wait_for_signal("step")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(json!([first, second]))
+}
+
+/// Fails at once with a business error.
+#[workflow(mcp)]
+async fn task_failing_flow(_ctx: &WorkflowContext, _input: String) -> Result<String, String> {
+    Err("card declined".to_string())
+}
+
+/// Parks on a signal that never comes.
+#[workflow(mcp)]
+async fn task_parked_flow(ctx: &WorkflowContext, _input: String) -> Result<(), String> {
+    let _ = ctx.wait_for_signal("never").await;
+    Ok(())
+}
+
+/// Not an MCP workflow. Its runs are not tasks.
+#[workflow]
+async fn task_hidden_flow(ctx: &WorkflowContext, _input: String) -> Result<(), String> {
+    let _ = ctx.wait_for_signal("never").await;
+    Ok(())
+}
+
+// ── Harness ───────────────────────────────────────────────────────────────────
+
+fn harvest_plugin() -> HarvestPlugin {
+    HarvestPlugin::new()
+        .workflows(vec![
+            __autumn_workflow_info_task_approval_flow(),
+            __autumn_workflow_info_task_two_step_flow(),
+            __autumn_workflow_info_task_failing_flow(),
+            __autumn_workflow_info_task_parked_flow(),
+            __autumn_workflow_info_task_hidden_flow(),
+        ])
+        .worker(WorkerConfig::default())
+        .api("/api/harvest")
+        .mcp_tasks()
+        // Issue #1802: set the opt-out. These tests exercise tasks, not auth.
+        .allow_unauthenticated_mutations()
+}
+
+async fn build_app(db: &TestPg) -> TestClient {
+    let config = autumn_web::config::AutumnConfig {
+        profile: Some("test".into()),
+        security: autumn_web::security::SecurityConfig {
+            csrf: autumn_web::security::CsrfConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        database: autumn_web::config::DatabaseConfig {
+            url: Some(db.url.clone()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    TestApp::new()
+        .config(config)
+        .plugin(harvest_plugin())
+        .with_db(db.pool.clone())
+        .build()
+}
+
+/// A migrated Postgres 16 container for one test. See
+/// `mcp_tools_integration.rs` for why the schema comes from `test_init_sql`.
+struct TestPg {
+    _container: ContainerAsync<Postgres>,
+    url: String,
+    pool: Pool<AsyncPgConnection>,
+}
+
+async fn setup_db() -> TestPg {
+    let container = Postgres::default()
+        .with_init_sql(autumn_harvest::test_init_sql().into_bytes())
+        .with_tag("16")
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+    let host = container.get_host().await.expect("container host");
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("container port");
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    autumn_web::migrate::run_pending(&url, autumn_web::migrate::FRAMEWORK_MIGRATIONS)
+        .expect("failed to run framework migrations");
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
+    let pool = Pool::builder(manager)
+        .max_size(5)
+        .build()
+        .expect("failed to build pool");
+    TestPg {
+        _container: container,
+        url,
+        pool,
+    }
+}
+
+fn declared() -> Value {
+    json!({CLIENT_CAPABILITIES_META: {"extensions": {TASKS_EXTENSION: {}}}})
+}
+
+async fn rpc_with(client: &TestClient, body: Value, idempotency_key: Option<&str>) -> Value {
+    let mut request = client.post(TASKS);
+    if let Some(key) = idempotency_key {
+        request = request.header("idempotency-key", key);
+    }
+    let resp = request.json(&body).send().await;
+    resp.assert_ok();
+    resp.json::<Value>()
+}
+
+async fn rpc(client: &TestClient, method: &str, params: Value) -> Value {
+    let out = rpc_with(
+        client,
+        json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}),
+        None,
+    )
+    .await;
+    assert!(out.get("error").is_none(), "{method}: {out}");
+    out["result"].clone()
+}
+
+fn tool_call(name: &str, body: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": name, "arguments": {"body": body}, "_meta": declared()}
+    })
+}
+
+/// Create a task and return its `CreateTaskResult`.
+async fn create_task(client: &TestClient, name: &str, body: Value) -> Value {
+    let out = rpc_with(client, tool_call(name, body), None).await;
+    assert!(out.get("error").is_none(), "{out}");
+    out["result"].clone()
+}
+
+async fn get_task(client: &TestClient, task_id: &str) -> Value {
+    rpc(
+        client,
+        "tasks/get",
+        json!({"taskId": task_id, "_meta": declared()}),
+    )
+    .await
+}
+
+fn status_of(task: &Value) -> TaskStatus {
+    match task["status"].as_str() {
+        Some("working") => TaskStatus::Working,
+        Some("input_required") => TaskStatus::InputRequired,
+        Some("completed") => TaskStatus::Completed,
+        Some("failed") => TaskStatus::Failed,
+        Some("cancelled") => TaskStatus::Cancelled,
+        other => panic!("not a task status: {other:?} in {task}"),
+    }
+}
+
+/// Polls `tasks/get` until `pred` holds. Each new status goes to `seen`.
+async fn poll_until(
+    client: &TestClient,
+    task_id: &str,
+    seen: &mut Vec<TaskStatus>,
+    pred: impl Fn(&Value) -> bool,
+) -> Value {
+    let mut last = Value::Null;
+    for _ in 0..300 {
+        let task = get_task(client, task_id).await;
+        let status = status_of(&task);
+        if seen.last() != Some(&status) {
+            seen.push(status);
+        }
+        if pred(&task) {
+            return task;
+        }
+        last = task;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("task condition not reached in 15 s; last task: {last}");
+}
+
+fn only_key(task: &Value) -> String {
+    let requests = task["inputRequests"].as_object().expect("inputRequests");
+    assert_eq!(requests.len(), 1, "{task}");
+    requests.keys().next().unwrap().clone()
+}
+
+async fn answer(client: &TestClient, task_id: &str, key: &str, content: Value) -> Value {
+    rpc(
+        client,
+        "tasks/update",
+        json!({
+            "taskId": task_id,
+            "inputResponses": {key: {"action": "accept", "content": content}},
+            "_meta": declared(),
+        }),
+    )
+    .await
+}
+
+async fn count_runs(db: &TestPg, workflow: &str) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let mut conn = db.pool.get().await.expect("pool connection");
+    diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE workflow_name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(workflow)
+    .get_result::<Count>(&mut conn)
+    .await
+    .expect("count executions")
+    .n
+}
+
+fn assert_legal(seen: &[TaskStatus]) {
+    for pair in seen.windows(2) {
+        assert!(
+            pair[0].can_transition_to(pair[1]),
+            "illegal move {:?} -> {:?} in {seen:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+}
+
+// ── AC 1: spec state transitions ──────────────────────────────────────────────
+
+/// A task moves `working` -> `input_required` -> `working` -> `completed`.
+/// Every observed move is legal under the spec state diagram.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_task_moves_through_the_spec_states() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+
+    let created = create_task(&client, "start_task_approval_flow", json!("r1")).await;
+    assert_eq!(created["resultType"], "task", "{created}");
+    let task_id = created["taskId"].as_str().expect("taskId").to_string();
+    let mut seen = vec![status_of(&created)];
+    assert!(!seen[0].is_terminal(), "{created}");
+    for absent in ["result", "error", "inputRequests"] {
+        assert!(created.get(absent).is_none(), "{absent}: {created}");
+    }
+
+    let waiting = poll_until(&client, &task_id, &mut seen, |t| {
+        t["status"] == "input_required"
+    })
+    .await;
+    assert_eq!(waiting["resultType"], "complete");
+    assert_eq!(waiting["createdAt"], created["createdAt"]);
+    let key = only_key(&waiting);
+    assert!(key.contains(":signal:approval:1"), "{key}");
+    let request = &waiting["inputRequests"][&key];
+    assert_eq!(request["method"], "elicitation/create");
+
+    // The key is stable while the run waits, so a client asks once.
+    let again = get_task(&client, &task_id).await;
+    assert_eq!(only_key(&again), key);
+
+    let ack = answer(&client, &task_id, &key, json!({"decision": "approve"})).await;
+    assert_eq!(ack, json!({"resultType": "complete"}));
+
+    let done = poll_until(&client, &task_id, &mut seen, |t| status_of(t).is_terminal()).await;
+    assert_eq!(done["status"], "completed", "{done}");
+    assert_eq!(done["result"]["isError"], false);
+    assert_eq!(done["result"]["content"][0]["text"], "\"r1:approve\"");
+    assert_eq!(done["createdAt"], created["createdAt"]);
+
+    assert_legal(&seen);
+    let input = seen
+        .iter()
+        .position(|s| *s == TaskStatus::InputRequired)
+        .expect("input_required seen");
+    assert!(
+        seen[input..].contains(&TaskStatus::Working),
+        "the task must go back to working after the input: {seen:?}"
+    );
+    assert_eq!(seen.last(), Some(&TaskStatus::Completed));
+}
+
+/// A workflow error is a tool error. The task is `completed` with
+/// `isError: true`, never `failed`, and Harvest starts no second run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_workflow_error_completes_the_task_as_a_tool_error() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+
+    let created = create_task(&client, "start_task_failing_flow", json!("x")).await;
+    let task_id = created["taskId"].as_str().unwrap().to_string();
+    let mut seen = vec![status_of(&created)];
+    let done = poll_until(&client, &task_id, &mut seen, |t| status_of(t).is_terminal()).await;
+    assert_eq!(done["status"], "completed", "{done}");
+    assert_eq!(done["result"]["isError"], true);
+    assert!(
+        done["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("card declined"),
+        "{done}"
+    );
+    assert!(!seen.contains(&TaskStatus::Failed), "{seen:?}");
+    assert_legal(&seen);
+
+    // A later poll reads the same result, and no retry run exists.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(get_task(&client, &task_id).await["status"], "completed");
+    assert_eq!(count_runs(&db, "task_failing_flow").await, 1);
+}
+
+/// `tasks/cancel` moves a live task to `cancelled`. A second cancel and a
+/// late answer are acknowledged and change nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tasks_cancel_moves_the_task_to_cancelled() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+
+    let created = create_task(&client, "start_task_parked_flow", json!("x")).await;
+    let task_id = created["taskId"].as_str().unwrap().to_string();
+    let mut seen = vec![status_of(&created)];
+    let waiting = poll_until(&client, &task_id, &mut seen, |t| {
+        t["status"] == "input_required"
+    })
+    .await;
+    let key = only_key(&waiting);
+
+    let params = json!({"taskId": task_id, "_meta": declared()});
+    assert_eq!(
+        rpc(&client, "tasks/cancel", params.clone()).await,
+        json!({"resultType": "complete"})
+    );
+    let done = poll_until(&client, &task_id, &mut seen, |t| status_of(t).is_terminal()).await;
+    assert_eq!(done["status"], "cancelled", "{done}");
+    assert!(done.get("result").is_none(), "{done}");
+    assert_legal(&seen);
+
+    assert_eq!(
+        rpc(&client, "tasks/cancel", params).await,
+        json!({"resultType": "complete"})
+    );
+    answer(&client, &task_id, &key, json!({})).await;
+    assert_eq!(get_task(&client, &task_id).await["status"], "cancelled");
+}
+
+// ── AC 2: crash-safe task creation ────────────────────────────────────────────
+
+/// A retried `tools/call` with the same start key returns the same task and
+/// starts one execution. The key can ride the `Idempotency-Key` header or the
+/// request `_meta`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retried_task_create_starts_one_execution() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+    let call = tool_call("start_task_parked_flow", json!("retry"));
+
+    let first = rpc_with(&client, call.clone(), Some("create-1")).await;
+    let retry = rpc_with(&client, call.clone(), Some("create-1")).await;
+    assert_eq!(first["result"]["resultType"], "task", "{first}");
+    assert_eq!(first["result"]["taskId"], retry["result"]["taskId"]);
+    assert_eq!(count_runs(&db, "task_parked_flow").await, 1);
+
+    let mut meta_call = call.clone();
+    meta_call["params"]["_meta"][START_KEY_META] = json!("create-2");
+    let first = rpc_with(&client, meta_call.clone(), None).await;
+    let retry = rpc_with(&client, meta_call, None).await;
+    assert_eq!(first["result"]["taskId"], retry["result"]["taskId"]);
+    assert_eq!(count_runs(&db, "task_parked_flow").await, 2);
+
+    // With no key, each call is a new task.
+    let a = rpc_with(&client, call.clone(), None).await;
+    let b = rpc_with(&client, call, None).await;
+    assert_ne!(a["result"]["taskId"], b["result"]["taskId"]);
+    assert_eq!(count_runs(&db, "task_parked_flow").await, 4);
+}
+
+// ── AC 3: input_required resumes on input ─────────────────────────────────────
+
+/// Two waits on one signal name get two keys. A retried answer to the first
+/// key delivers nothing more, so the run sees each answer once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_wait_gets_its_own_key_and_a_retried_answer_is_ignored() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+
+    let created = create_task(&client, "start_task_two_step_flow", json!("x")).await;
+    let task_id = created["taskId"].as_str().unwrap().to_string();
+    let mut seen = vec![status_of(&created)];
+
+    let first = poll_until(&client, &task_id, &mut seen, |t| {
+        t["status"] == "input_required"
+    })
+    .await;
+    let key1 = only_key(&first);
+    answer(&client, &task_id, &key1, json!({"n": 1})).await;
+    // A retry of the same answer, with a new payload, must not land.
+    answer(&client, &task_id, &key1, json!({"n": 99})).await;
+
+    let second = poll_until(&client, &task_id, &mut seen, |t| {
+        t["status"] == "input_required" && only_key(t) != key1
+    })
+    .await;
+    let key2 = only_key(&second);
+    assert!(key2.ends_with(":signal:step:2"), "{key2}");
+    // A key that is not open now is ignored.
+    answer(&client, &task_id, &key1, json!({"n": 98})).await;
+    answer(&client, &task_id, &key2, json!({"n": 2})).await;
+
+    let done = poll_until(&client, &task_id, &mut seen, |t| status_of(t).is_terminal()).await;
+    assert_eq!(done["status"], "completed", "{done}");
+    assert_eq!(
+        done["result"]["structuredContent"],
+        Value::Null,
+        "an array output has no structured content"
+    );
+    let output: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(output, json!([{"n": 1}, {"n": 2}]));
+    assert_legal(&seen);
+}
+
+/// A task outlives the process that created it: the task is the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_task_survives_a_daemon_restart() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = setup_db().await;
+
+    let task_id = {
+        let client = build_app(&db).await;
+        let created = create_task(&client, "start_task_approval_flow", json!("r2")).await;
+        let task_id = created["taskId"].as_str().unwrap().to_string();
+        let mut seen = Vec::new();
+        poll_until(&client, &task_id, &mut seen, |t| {
+            t["status"] == "input_required"
+        })
+        .await;
+        task_id
+    };
+
+    let client = build_app(&db).await;
+    let mut seen = Vec::new();
+    let waiting = poll_until(&client, &task_id, &mut seen, |t| {
+        t["status"] == "input_required"
+    })
+    .await;
+    let key = only_key(&waiting);
+    answer(&client, &task_id, &key, json!({"decision": "ship"})).await;
+    let done = poll_until(&client, &task_id, &mut seen, |t| status_of(t).is_terminal()).await;
+    assert_eq!(done["result"]["content"][0]["text"], "\"r2:ship\"");
+}
+
+// ── Protocol edges ────────────────────────────────────────────────────────────
+
+/// A run of a workflow outside the task catalog is not a task. It gets the
+/// same error as an unknown id, so the route is no existence oracle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_outside_the_catalog_is_not_a_task() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+
+    let started = client
+        .post("/api/harvest/workflows/task_hidden_flow/start")
+        .json(&json!({"input": "x"}))
+        .send()
+        .await;
+    let started = started.json::<Value>();
+    let hidden = started["execution_id"].as_str().expect("execution_id");
+    let unknown = uuid::Uuid::new_v4().to_string();
+    for task_id in [hidden, unknown.as_str()] {
+        let out = rpc_with(
+            &client,
+            json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tasks/get",
+                "params": {"taskId": task_id, "_meta": declared()}
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(out["error"]["code"], -32602, "{task_id}: {out}");
+        assert_eq!(
+            out["error"]["message"], "Failed to retrieve task: Task not found",
+            "{task_id}"
+        );
+    }
+}
+
+/// A client that does not declare the extension gets a plain tool result
+/// with the run handle, as `start_{wf}` on `/mcp` returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_without_the_extension_gets_a_plain_tool_result() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+
+    let out = rpc(
+        &client,
+        "tools/call",
+        json!({"name": "start_task_parked_flow", "arguments": {"body": "x"}}),
+    )
+    .await;
+    assert_ne!(out["resultType"], "task", "{out}");
+    assert_eq!(out["isError"], false, "{out}");
+    let handle: Value = serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(handle["execution_id"].is_string(), "{handle}");
+}

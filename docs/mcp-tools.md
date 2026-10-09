@@ -234,10 +234,98 @@ An already-terminal run yields the result frame immediately.
   `tracing::warn!` at startup naming this exact gap. `secure_mcp` does not
   gate a generated route's own path.
 
+## MCP Tasks (issue #2005)
+
+A tool call can take longer than the client tool timeout, often 60 s. The
+`io.modelcontextprotocol/tasks` extension (MCP 2026-07-28) fixes this. The
+server answers `tools/call` with a task, and the client polls for the result.
+`mcp_tasks()` serves each `#[workflow(mcp)]` workflow as a task:
+
+```rust
+HarvestPlugin::new()
+    .workflows(vec![__autumn_workflow_info_document_review()])
+    .api_with_auth("/api/harvest", RequireApiToken::new(…))
+    .mcp_tasks()                       // or .mcp_tasks_at("/custom/tasks")
+```
+
+autumn-web's `/mcp` endpoint cannot dispatch the `tasks/*` methods. So
+Harvest serves its own JSON-RPC route at `{tools prefix}/tasks`, default
+`/api/harvest/mcp/tasks`. Point a Tasks-capable MCP client at that URL. The
+route does not need `mcp_tools()` or `mount_mcp`.
+
+| Method | What Harvest does |
+|---|---|
+| `initialize`, `server/discover` | Advertise `capabilities.extensions["io.modelcontextprotocol/tasks"]`. |
+| `tools/list` | One `start_{wf}` tool for each MCP workflow. Its `inputSchema` is the same as on `/mcp`. |
+| `tools/call` | Start the run. A client that declares the extension gets a `CreateTaskResult` (`resultType: "task"`). Any other client gets the plain start handle. |
+| `tasks/get` | Read the run and return the `DetailedTask`. |
+| `tasks/update` | Deliver each `accept` answer as a signal. |
+| `tasks/cancel` | Cancel the live run. |
+
+A `tasks/*` call needs the extension in its own
+`params._meta["io.modelcontextprotocol/clientCapabilities"]`. Without it, the
+call gets error `-32021`.
+
+**The task is the run.** The task id is the execution id. Each read derives
+the task from the execution row, so no task state is stored and a restart
+loses nothing. A retry or continue-as-new chain is followed to the live run.
+
+| Run state | Task status | Payload |
+|---|---|---|
+| `COMPLETED` | `completed` | `result`: a `CallToolResult` with the output, `isError: false` |
+| `FAILED` with no retry left, `TIMED_OUT` | `completed` | `result`: a `CallToolResult` with the error, `isError: true` |
+| `CANCELLED`, `TERMINATED` | `cancelled` | — |
+| Live, parked on `wait_for_signal` | `input_required` | `inputRequests`: one `elicitation/create` for each wait |
+| Live, any other wait | `working` | `statusMessage`: the `current_details` text |
+
+A workflow error is a tool error, as the spec requires. Harvest never reports
+`failed`, so a client does not treat a business error as a protocol fault and
+retry it.
+
+**Crash-safe create.** A client that retries `tools/call` sends the same
+start key. Put it in the `Idempotency-Key` header, or in
+`params._meta["io.autumn-harvest/idempotencyKey"]`. The header wins. The
+start then dedups as in issue #808, and the retry gets the same task. A call
+with no key starts a new run each time.
+
+**Input.** The awaitables replay (issue #615) finds each parked
+`wait_for_signal`. Each wait gets the key `{run id}:signal:{name}:{n}`, where
+`n` counts the waits on that signal name. The key does not change while the
+run waits. An `accept` answer in `tasks/update` sends its `content` object as
+the signal payload. The key is also the signal idempotency key, so a retried
+answer is a no-op. Harvest ignores an answer to a key that is not open, and
+any action other than `accept`.
+
+**TTL.** `ttlMs` is `null` while the run is live. After the run ends, `ttlMs`
+runs from `createdAt` to the time that retention can delete the run. With no
+retention, it stays `null`. After the run is deleted, `tasks/get` answers
+`-32602` "Task not found". `pollIntervalMs` is 5000.
+
+**Limits.**
+
+- A `#[dag(mcp)]` DAG is not served. Its trigger takes no start key, so a
+  retried create could start a second run.
+- A debounced or batched workflow is not served, as on `/mcp`.
+- Only a signal wait is `input_required`. An update wait and an
+  `await_condition` park read as `working` (issue #2035).
+- `requestedSchema` is an open object. The client answer is the signal
+  payload as is.
+- Harvest does not push `notifications/tasks`. Poll `tasks/get`.
+
+**Auth.** The route takes the layers of a mutating tool route:
+`api_with_auth`, the custom-role gate, the read-only role gate, the
+fail-closed mutation gate (issue #1802) and the tenant refusal (issue #1977).
+Every method on the route counts as a mutation, because the route can start
+and cancel runs. The route takes `application/json` only. A browser cannot
+send that cross-site without a CORS preflight.
+
 ## Testing
 
 - No-DB JSON-RPC surface tests: `autumn-harvest-plugin/tests/mcp_tools_http_tests.rs`.
 - Full agent flow + restart survival (Docker/testcontainers):
   `autumn-harvest-plugin/tests/mcp_tools_integration.rs`.
+- No-DB MCP Tasks route tests: `autumn-harvest-plugin/tests/mcp_tasks_http_tests.rs`.
+- MCP Tasks lifecycle (Docker/testcontainers):
+  `autumn-harvest-plugin/tests/mcp_tasks_integration.rs`.
 - Example: `autumn-harvest-plugin/examples/mcp_tools_quickstart.rs`
   (`cargo run -p autumn-harvest-plugin --example mcp_tools_quickstart --features mcp`).
