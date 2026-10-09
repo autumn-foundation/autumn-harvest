@@ -10540,8 +10540,9 @@ fn collect_durable_stream_chunks(commands: &[WorkflowCommand]) -> Vec<store::Dur
 /// A committed cycle therefore holds all of its chunks, so a reader sees no
 /// gap. A cycle with no durable chunk runs no statement.
 ///
-/// The wake is one `pg_notify` per cycle, sent on commit. A reader treats it
-/// as a hint and reads the table, so the wake carries no chunk.
+/// The wake is one note per cycle. The post-commit sender sends it after the
+/// write commits, so a full `NOTIFY` queue cannot fail the write (issue
+/// #1796). A reader treats the wake as a hint and reads the table.
 async fn persist_durable_stream_from_commands(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,

@@ -570,3 +570,76 @@ async fn the_listener_wakes_on_commit_only_and_merges_wakes() {
     }
     assert!(extra <= 1, "wakes must merge, got {extra} extra");
 }
+
+/// SQL that installs a `pg_notify` that always fails (issue #1796 pattern).
+const FAILING_NOTIFY_SQL: &str = "CREATE SCHEMA IF NOT EXISTS notify_fail; \
+    CREATE OR REPLACE FUNCTION notify_fail.pg_notify(text, text) RETURNS void \
+    LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_notify is disabled on this session'; END $$;";
+
+/// The wake is optional. A failed `pg_notify` must not fail the chunk write,
+/// as for the other post-commit wakes (issue #1796).
+#[tokio::test]
+async fn a_failed_wake_never_fails_the_chunk_write() {
+    let (url, _c) = setup_database().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    conn.batch_execute(FAILING_NOTIFY_SQL)
+        .await
+        .expect("failing pg_notify");
+    conn.batch_execute("SET search_path = notify_fail, pg_catalog, public")
+        .await
+        .expect("search_path");
+    let exec_id = ExecutionId::new();
+    insert_execution(&mut conn, exec_id, "failed_wake").await;
+
+    let result = Box::pin(
+        conn.transaction::<(), autumn_harvest::HarvestError, _>(async |c| {
+            store::append_stream_chunks(c, exec_id, &[chunk(0, json!("a"))], 10).await?;
+            autumn_harvest::notify::notify_durable_stream(c, exec_id.as_uuid()).await
+        }),
+    )
+    .await;
+
+    result.expect("the chunk write must commit when the wake fails");
+    let stored = store::load_stream_chunks(&mut conn, exec_id, None, 10)
+        .await
+        .expect("load");
+    assert_eq!(stored.len(), 1);
+}
+
+/// With a registered pool, the post-commit sender sends the wake after the
+/// write commits, outside the write transaction.
+#[tokio::test]
+async fn a_registered_pool_wakes_the_reader_after_commit() {
+    use autumn_harvest::notify::{DurableStreamListener, DurableStreamWait};
+    use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+
+    let (url, _c) = setup_database().await;
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
+    let pool: autumn_harvest::worker::DbPool = deadpool::managed::Pool::builder(manager)
+        .max_size(2)
+        .build()
+        .expect("pool");
+    let sink = autumn_harvest::notify::register_pool(&pool);
+    assert!(
+        sink.wait_ready(Duration::from_secs(10)).await,
+        "sender ready"
+    );
+    let exec_id = ExecutionId::new();
+    let listener = DurableStreamListener::connect(&url, exec_id.as_uuid())
+        .await
+        .expect("listen");
+
+    let mut conn = pool.get().await.expect("conn");
+    Box::pin(
+        conn.transaction::<(), autumn_harvest::HarvestError, _>(async |c| {
+            autumn_harvest::notify::notify_durable_stream(c, exec_id.as_uuid()).await
+        }),
+    )
+    .await
+    .expect("commit");
+
+    assert_eq!(
+        listener.wait_timeout(Duration::from_secs(5)).await,
+        DurableStreamWait::Woken
+    );
+}

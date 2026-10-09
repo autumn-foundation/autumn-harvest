@@ -97,8 +97,12 @@ fails the execution, as for every write in the persist transaction. The cycle
 never commits with a missing chunk. The inline local-activity path writes
 outside the outer transaction. A failure there re-runs the same offsets, which
 dedup.
-After the rows, the worker sends one `pg_notify` on `harvest_stream_<exec_hex>`.
-The payload is a wake only.
+After the rows, the worker stages one wake on `harvest_stream_<exec_hex>`.
+The post-commit sender of `notify.rs` sends it after the commit, as for task
+and history wakes (issue #1796). A full `NOTIFY` queue cannot fail the write,
+and the write takes no database-wide `NOTIFY` lock at commit. The payload is
+a wake only. A lost wake costs latency, because the reader also reads the
+table on each keepalive tick.
 
 Cap: 10,000 chunks for each execution. The store admits rows up to the cap.
 It then stores one marker at offset `i64::MAX` and admits no more rows. The

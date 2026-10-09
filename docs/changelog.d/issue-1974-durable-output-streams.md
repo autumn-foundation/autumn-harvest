@@ -20,6 +20,8 @@ streaming needs a stream that a client can resume at any offset.
   terminal run streams its chunks, then `event: end`, with no `LISTEN`.
 - The `LISTEN` forwarder merges wakes and never blocks, so a slow client
   cannot hold back the shared Postgres NOTIFY queue.
+- The worker sends the wake after the commit, through the post-commit sender
+  (issue #1796). A failed wake never fails the chunk write.
 - Cap: 10,000 chunks per execution, then one terminal marker at offset
   `i64::MAX`. The 7,000-byte chunk cap of the best-effort mode applies.
 - PII erasure deletes the chunks and reports `stream_chunks_deleted`. A shard

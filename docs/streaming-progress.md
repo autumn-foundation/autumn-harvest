@@ -276,6 +276,9 @@ any workflow code.
 - **No gap, no duplicate.** A chunk commits with its decision cycle, or not
   at all. The reader opens `LISTEN` before its first read. Each wake and each
   keepalive tick reads the rows above the reader's cursor.
+- **The wake is a hint.** The worker sends it after the commit, outside the
+  write transaction. A failed or lost wake never fails the write. The reader
+  then finds the chunks at its next keepalive tick.
 - **Resume.** Send `Last-Event-ID: <offset>` (a browser `EventSource` does this
   on reconnect) or `?after=<offset>`. The query parameter wins. The stream
   sends every chunk with a higher offset. With neither, it starts at offset 0.
