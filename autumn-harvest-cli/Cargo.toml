@@ -34,6 +34,9 @@ clap = { version = "4.5", features = ["derive", "env"] }
 # Every crate here is already in the workspace lockfile at these versions via
 # autumn-web's own migration path, so this unifies rather than widening.
 diesel-async = { workspace = true }
+# `harvest dr` takes the pass locks of every shard on a database together
+# (issue #1823). Already in the workspace.
+futures = { workspace = true }
 tokio-postgres = "0.7.18"
 tokio-postgres-rustls = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

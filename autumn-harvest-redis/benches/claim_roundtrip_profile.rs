@@ -2,48 +2,51 @@
 //! -- the poll loop every worker embedding this crate runs continuously
 //! (`TaskQueueAdapter::claim`, the public entry point).
 //!
-//! Wall-clock timing is unreliable on this (shared-vCPU) machine, and this
+//! Wall-clock timing is unreliable on this (shared-vCPU) machine. This
 //! workload is dominated by network round trips to Redis rather than CPU
-//! instructions, so this binary is not measured with `cargo bench` /
-//! criterion timing, nor with `valgrind --tool=callgrind` (which would mostly
-//! count the same TCP-socket syscalls' kernel-entry overhead rather than
-//! anything this crate's own code controls). It is driven directly under
-//! `strace -f -c` instead -- a deterministic count of the socket syscalls
-//! (`writev`/`write`/`recvfrom`) `claim` issues, per this agent's charter's
+//! instructions. So this binary is not measured with `cargo bench` /
+//! criterion timing. It is also not measured with `valgrind
+//! --tool=callgrind`. That tool would mostly count the kernel-entry overhead
+//! of the same TCP-socket syscalls, not anything this crate's own code
+//! controls. It is driven directly under `strace -f -c` instead. That gives
+//! a deterministic count of the socket syscalls
+//! (`writev`/`write`/`recvfrom`) that `claim` issues. This follows the
 //! "strace -c / ltrace -- syscall counts, for I/O and lock-related work"
-//! admissible-evidence category.
+//! admissible-evidence category of this agent's charter.
 //!
 //! `harness = false`, own `main()` -- same shape as
-//! `autumn-harvest/benches/replay_profile.rs` and its siblings -- so the
+//! `autumn-harvest/benches/replay_profile.rs` and its siblings. So the
 //! compiled artifact is a plain executable a profiler can be pointed at
-//! directly, with no criterion wall-clock loop diluting the measured work.
+//! directly. No criterion wall-clock loop dilutes the measured work.
 //!
 //! # Workload
 //!
-//! A single worker polling a single queue in steady state: `CLAIM_PROFILE_N`
-//! tasks (default 300) are enqueued via the public `enqueue` entry point,
-//! then `claim` is called `CLAIM_PROFILE_N` times against that same queue --
-//! the exact call sequence a production worker's poll loop performs once its
-//! backlog is non-empty. A fresh, uniquely-prefixed `RedisTaskQueueConfig`
-//! avoids colliding with any other data already on the target Redis instance,
-//! matching the isolation convention `tests/integration_redis.rs` already
-//! uses for this crate's own integration suite.
+//! A single worker polls a single queue in steady state.
+//! `CLAIM_PROFILE_N` tasks (default 300) are enqueued via the public
+//! `enqueue` entry point. Then `claim` is called `CLAIM_PROFILE_N` times
+//! against that same queue. That is the exact call sequence a production
+//! worker's poll loop performs once its backlog is non-empty. A fresh,
+//! uniquely-prefixed `RedisTaskQueueConfig` avoids colliding with any other
+//! data already on the target Redis instance. This matches the isolation
+//! convention `tests/integration_redis.rs` already uses for this crate's own
+//! integration suite.
 //!
 //! This exercises the real `claim` -> `promote_due` -> `ensure_group` call
-//! chain end-to-end (not a synthetic microbenchmark of a single function
-//! picked in isolation): every `claim` call in this loop pays for whatever
-//! round trips the production code path actually issues, including the
-//! (empty, but still Lua-script-invoking) delayed-task promotion sweep every
-//! real poll cycle performs.
+//! chain end-to-end. It is not a synthetic microbenchmark of a single
+//! function picked in isolation. Every `claim` call in this loop pays for
+//! whatever round trips the production code path actually issues. That
+//! includes the delayed-task promotion sweep every real poll cycle performs.
+//! That sweep is empty here, but it still invokes a Lua script.
 //!
 //! Requires a real, reachable Redis instance -- set `HARVEST_REDIS_TEST_URL`
 //! (the same environment variable `tests/integration_redis.rs` reads) to its
 //! connection URL before running. Unlike that test suite, this harness does
-//! NOT fall back to a `testcontainers`-managed instance: a profiling harness
+//! NOT fall back to a `testcontainers`-managed instance. A profiling harness
 //! needs a specific, known-quiescent instance for its syscall counts to be
-//! reproducible, and spinning up a fresh container on every invocation would
-//! add its own (irrelevant, Docker-daemon-dependent) syscall noise to a trace
-//! meant to isolate this crate's own Redis protocol usage.
+//! reproducible. A fresh container on every invocation would add its own
+//! syscall noise to the trace. That noise is irrelevant and depends on the
+//! Docker daemon. The trace is meant to isolate this crate's own Redis
+//! protocol usage.
 
 use autumn_harvest_redis::{
     EnqueueParams, RedisTaskQueue, RedisTaskQueueConfig, TaskQueueAdapter, TaskType,
@@ -67,9 +70,9 @@ fn env_usize(key: &str, default: usize) -> usize {
 #[tokio::main]
 async fn main() {
     // `harness = false` means `cargo test --benches` / `--all-targets` builds
-    // and *runs* this binary as-is (the `test = false` bench-target setting
+    // and *runs* this binary as-is. The `test = false` bench-target setting
     // in Cargo.toml only stops a bare, target-less `cargo test` from doing
-    // that; an explicit `--benches`/`--all-targets` overrides it) -- so a
+    // that. An explicit `--benches`/`--all-targets` overrides it. So a
     // workspace-wide `cargo test --workspace --all-targets` run on a machine
     // with no Redis configured must not fail here. Skip cleanly (matching
     // `tests/integration_redis.rs::try_start_redis`'s convention for the

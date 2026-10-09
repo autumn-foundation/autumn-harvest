@@ -1,20 +1,21 @@
-//! Integration tests for issue #1213: `GET /workers?shard_id=` (and
+//! Integration tests for issue #1213. `GET /workers?shard_id=` (and
 //! `/workers/drain-preview?shard_id=`) must not return a worker whose
-//! `shard_assignments` is the empty auto/legacy shape unless the requested
-//! shard is the shard that worker's row was actually read from.
+//! `shard_assignments` is the empty auto/legacy shape. The exception is a
+//! request for the shard that worker's row was actually read from.
 //!
 //! `apply_worker_filters`'s `shard_assignments_cover` treats an empty array as
 //! "covers whatever shard the row was read from" (issue #1150). Both
-//! cross-shard read endpoints fan out to every shard's database and, before
-//! this fix, applied that predicate using the *caller's requested* `shard_id`
-//! for every shard's rows -- including shards other than the one each row was
-//! read from. A worker registered with `shard_assignments: []` in shard 0
+//! cross-shard read endpoints fan out to every shard's database. Before this
+//! fix, they applied that predicate using the *caller's requested* `shard_id`
+//! for every shard's rows. That included shards other than the one each row
+//! was read from. A worker registered with `shard_assignments: []` in shard 0
 //! then leaked into `?shard_id=1` (and vice versa).
 //!
-//! Dual-mode: uses a running Postgres from `HARVEST_TEST_DATABASE_URL` (as an
-//! admin URL onto which two fresh shard databases are created) when set — no
-//! Docker required — else boots a fresh testcontainers Postgres, matching the
-//! precedent in `fanout_degradation_integration.rs`.
+//! Dual-mode: when `HARVEST_TEST_DATABASE_URL` is set, the tests use that
+//! running Postgres, with no Docker required. That URL is an admin URL onto
+//! which two fresh shard databases are created. Otherwise the tests boot a
+//! fresh testcontainers Postgres. This matches the precedent in
+//! `fanout_degradation_integration.rs`.
 
 use std::collections::BTreeMap;
 
@@ -178,9 +179,9 @@ async fn shard_id_filter_excludes_an_empty_assignment_worker_from_a_different_sh
 
     let (status, body) = get_json(&app, "/workers?shard_id=1").await;
     assert_eq!(status, StatusCode::OK, "got {body}");
-    // Both shards are reachable, so the fan-out is Complete and /workers
+    // Both shards are reachable, so the fan-out is Complete. So /workers
     // returns a bare array (issue #756, AC3), not a `{"workers": [...]}`
-    // envelope -- that shape is reserved for a degraded (partial) read.
+    // envelope. That envelope shape is reserved for a degraded (partial) read.
     let workers = body.as_array().expect("bare array response");
     let ids = worker_ids(workers);
     assert_eq!(
@@ -211,12 +212,12 @@ async fn shard_id_filter_still_includes_an_empty_assignment_worker_from_its_own_
 
 #[tokio::test]
 async fn shard_id_filter_keeps_a_genuinely_multi_shard_auto_worker_visible_on_each_of_its_shards() {
-    // A worker with no sharded pool per process, deployed with one process per
-    // shard, registers the SAME worker_id with the empty (auto) shape in
-    // EVERY shard's own database -- distinct from the single-shard `auto`
-    // case above. The per-shard source-aware retain runs before
-    // `dedup_workers_by_freshest`, so each shard's own copy of the row must
-    // survive that shard's own request rather than being dropped as a
+    // Take a worker with no sharded pool per process, deployed with one
+    // process per shard. It registers the SAME worker_id with the empty (auto)
+    // shape in EVERY shard's own database. This differs from the single-shard
+    // `auto` case above. The per-shard source-aware retain runs before
+    // `dedup_workers_by_freshest`. So each shard's own copy of the row must
+    // survive that shard's own request. It must not be dropped as a
     // same-worker-id "duplicate" from the wrong source.
     let ((url0, url1), _guard) = setup_two_shards().await;
     seed_worker(&url0, "auto-multi", "[]").await;

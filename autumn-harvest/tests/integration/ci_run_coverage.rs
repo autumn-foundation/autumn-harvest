@@ -424,6 +424,7 @@ fn plugin_required_features(source: &str) -> Vec<String> {
                 "metrics",
                 "unified-dag-execution",
                 "dev-runtime",
+                "oidc",
             ] {
                 let needle = format!("feature = \"{feat}\"");
                 if seg.contains(&needle) {
@@ -895,6 +896,31 @@ fn standalone_runner_test_targets_have_a_running_row() {
                 && r.osclass == "linux"
                 && r.filter == "-"),
             "examples/standalone-runner/tests/{target}.rs needs a `linux standalone-runner {target}` row"
+        );
+    }
+}
+
+/// Issue #1978: the auth suites need no database, so the live-DB sweep skips
+/// them. A missing row, or a row without the `oidc` feature, would then run
+/// zero tests and stay green. This guard pins both rows.
+#[test]
+fn auth_role_and_oidc_suites_have_running_rows() {
+    let rows = parse_manifest();
+    for (stem, required) in [("custom_roles", &[][..]), ("oidc_login", &["oidc"][..])] {
+        let path = plugin_tests_dir().join(format!("{stem}.rs"));
+        let source = read_source(&path);
+        let gated = plugin_required_features(&source);
+        assert_eq!(
+            gated,
+            required
+                .iter()
+                .map(|f| (*f).to_string())
+                .collect::<Vec<_>>(),
+            "{stem}.rs feature gate"
+        );
+        assert!(
+            plugin_covered(&rows, stem, &gated),
+            "autumn-harvest-plugin/tests/{stem}.rs needs a running manifest row with features {required:?}"
         );
     }
 }

@@ -332,6 +332,24 @@ pub(crate) async fn lookup_by_secret(
 
 /// Best-effort `last_used_at` bump. Called off the request critical path.
 pub(crate) async fn touch_last_used(conn: &mut AsyncPgConnection, id: Uuid) -> HarvestResult<()> {
+    use diesel_async::AsyncConnection as _;
+    // The update runs detached from the request, past its fence. With fencing
+    // on, it asserts the fence in its own transaction (issue #1823), as an
+    // audit write does. A process that lost write authority writes nothing.
+    if !autumn_harvest::replication::FenceRegistry::is_enabled() {
+        return write_last_used(conn, id).await;
+    }
+    Box::pin(
+        conn.transaction::<_, autumn_harvest::error::HarvestError, _>(async move |conn| {
+            autumn_harvest::replication::assert_database_fence(conn).await?;
+            write_last_used(conn, id).await
+        }),
+    )
+    .await
+}
+
+/// The update of [`touch_last_used`], with no DR fence check.
+async fn write_last_used(conn: &mut AsyncPgConnection, id: Uuid) -> HarvestResult<()> {
     use harvest_api_tokens::dsl;
     diesel::update(dsl::harvest_api_tokens.filter(dsl::id.eq(id)))
         .set(dsl::last_used_at.eq(Utc::now()))
@@ -359,7 +377,7 @@ fn service_unavailable(msg: &'static str) -> Response {
 /// since the token secret is case-sensitive. A non-`hvst_` credential (any
 /// scheme case) still returns `None` so a non-Harvest bearer passes through to
 /// the embedder untouched.
-fn harvest_bearer(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn harvest_bearer(headers: &HeaderMap) -> Option<String> {
     let raw = headers
         .get(axum::http::header::AUTHORIZATION)?
         .to_str()
@@ -377,6 +395,20 @@ fn harvest_bearer(headers: &HeaderMap) -> Option<String> {
         None
     }
 }
+
+/// Whether a request claims an API token, so the token layer looks it up.
+///
+/// The pre-auth rate limit charges exactly these requests (issue #1827).
+pub(crate) fn claims_harvest_token(headers: &HeaderMap) -> bool {
+    harvest_bearer(headers).is_some()
+}
+
+/// Marks a `403` for a valid token that its scope does not allow.
+///
+/// The pre-auth rate limit reads it from the response and refunds its address
+/// charge (issue #1827). The token is valid, so the charge is not its own.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScopeDeniedToken;
 
 /// Reserve the `token:` audit-actor namespace on a pass-through request.
 ///
@@ -486,11 +518,13 @@ pub async fn enforce_token_scope(
             },
         )
         .await;
-        return if scope == TokenScope::Read {
+        let mut response = if scope == TokenScope::Read {
             read_only_forbidden_response()
         } else {
             admin_scope_required_response()
         };
+        response.extensions_mut().insert(ScopeDeniedToken);
+        return response;
     }
 
     // Issue #1827: give the connection back before the handler runs. The
