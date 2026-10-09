@@ -13,8 +13,8 @@ turn live. Every other effect is recorded or stubbed:
   No tool runs.
 - A memory snapshot is the recorded one, or an empty one.
 - A delivery is a stub. No report leaves the harness.
-- The harness sends again each approval that the source awaited and
-  received in time. It drops every other signal.
+- The harness sends again each approval for a wait that the source opened,
+  when it arrived in time. It drops every other signal.
 - A candidate call that differs from the recorded call gets a new `eval_`
   id, so no recorded approval can release it.
 

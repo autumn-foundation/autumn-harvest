@@ -480,8 +480,10 @@ A recorded outcome answers a call with the same step, tool name and
 arguments. A candidate call that equals the recorded call at the same turn
 and position takes the recorded call id. Approval signal names hold the call
 id, so the recorded approvals stay valid. Any other call gets a new `eval_`
-id, so no recorded approval can release it. The harness sends again only
-the approvals that the source awaited and received before their deadlines.
+id, so no recorded approval can release it. The harness sends again only an
+approval for a wait that the source opened, when it arrived before the
+deadline. An approval sent before its wait opened leaves no deadline timer,
+so the harness drops it, and the candidate times out at that wait.
 
 The report holds one `TurnDiff` per model turn. A turn diverges when the
 calls, the arguments, the policy decisions or the stop reason differ. Two

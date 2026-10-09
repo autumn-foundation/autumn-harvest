@@ -19,9 +19,9 @@
 //! - `agent_deliver` is a stub. No report leaves the harness.
 //! - Any other activity has no mock, so it fails the candidate run.
 //!
-//! The harness sends again each approval that the source awaited and received
-//! before its deadline. It drops every other signal. A late or unsolicited
-//! approval therefore cannot release a call.
+//! The harness sends again each approval for a wait that the source opened,
+//! when it arrived before the deadline. It drops every other signal. A late or
+//! unsolicited approval therefore cannot release a call.
 //!
 //! # The fork rules
 //!
@@ -85,7 +85,6 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::approval::approval_call_id;
 use crate::harness::AgentHarness;
 use crate::message::{ContentPart, StopReason, ToolCall};
 use crate::policy::ToolDecision;
@@ -479,7 +478,7 @@ struct Recording {
     /// The recorded snapshots, and the error of a snapshot that failed for
     /// good.
     snapshots: Vec<Result<String, String>>,
-    /// Approvals that the source awaited and received in time, in order.
+    /// Signals for waits that the source opened, received in time, in order.
     signals: Vec<(String, Value)>,
     end: RunEnd,
 }
@@ -506,6 +505,7 @@ impl Recording {
         let mut run_id = None;
         let mut tools = Vec::new();
         let mut snapshots = Vec::new();
+        let mut opened: HashSet<&str> = HashSet::new();
         let mut timed_out: HashSet<&str> = HashSet::new();
         let mut signals = Vec::new();
         let mut end = None;
@@ -552,8 +552,13 @@ impl Recording {
                     }
                     _ => {}
                 },
+                WorkflowEvent::TimerStarted { timer_id, .. } => {
+                    if let Some(signal) = deadline_signal(timer_id.as_str()) {
+                        opened.insert(signal);
+                    }
+                }
                 WorkflowEvent::TimerFired { timer_id } => {
-                    if let Some(signal) = timed_out_signal(timer_id.as_str()) {
+                    if let Some(signal) = deadline_signal(timer_id.as_str()) {
                         timed_out.insert(signal);
                     }
                 }
@@ -585,11 +590,12 @@ impl Recording {
                 _ => {}
             }
         }
-        // Only an approval that the source awaited is sent again. The source
-        // awaited a call only when its recorded decision asked for approval.
+        // Only a signal for a wait that the source opened is sent again. A
+        // wait opens with its deadline timer. A signal that arrived before
+        // its wait opened leaves no timer, so it is dropped too. The candidate
+        // then times out, which shows as a divergence.
+        signals.retain(|(name, _)| opened.contains(name.as_str()));
         let turns = model_turns(history)?;
-        let gated: HashSet<String> = turns.iter().flat_map(gated_call_ids).collect();
-        signals.retain(|(name, _)| approval_call_id(name).is_some_and(|id| gated.contains(id)));
         Ok(Self {
             task,
             run_id,
@@ -600,16 +606,6 @@ impl Recording {
             end: end.ok_or(EvalError::InFlightSource)?,
         })
     }
-}
-
-/// The ids of the calls of `turn` that the recorded policy gated.
-fn gated_call_ids(turn: &ModelTurn) -> Vec<String> {
-    turn.calls()
-        .into_iter()
-        .zip(&turn.decisions)
-        .filter(|(_, decision)| matches!(decision, ToolDecision::RequireApproval { .. }))
-        .map(|(call, _)| call.id)
-        .collect()
 }
 
 /// The task of an agent run history.
@@ -901,7 +897,7 @@ fn ends_differ(recorded: &RunEnd, candidate: &RunEnd) -> bool {
 }
 
 /// The signal of a signal-wait deadline timer, or `None` for another timer.
-fn timed_out_signal(timer_id: &str) -> Option<&str> {
+fn deadline_signal(timer_id: &str) -> Option<&str> {
     let rest = timer_id.strip_prefix(SIGNAL_TIMEOUT_PREFIX)?;
     let (seq, signal) = rest.split_once(':')?;
     seq.parse::<u64>().ok()?;
@@ -1066,11 +1062,11 @@ mod tests {
     #[test]
     fn a_deadline_timer_names_its_signal() {
         assert_eq!(
-            timed_out_signal("__signal_timeout:3:tool_approval:0:0:w1"),
+            deadline_signal("__signal_timeout:3:tool_approval:0:0:w1"),
             Some("tool_approval:0:0:w1")
         );
-        assert_eq!(timed_out_signal("agent_followup:0"), None);
-        assert_eq!(timed_out_signal("__signal_timeout:x:name"), None);
+        assert_eq!(deadline_signal("agent_followup:0"), None);
+        assert_eq!(deadline_signal("__signal_timeout:x:name"), None);
     }
 
     #[test]

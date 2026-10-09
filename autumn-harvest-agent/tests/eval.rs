@@ -563,6 +563,58 @@ async fn an_approval_the_source_never_awaited_is_not_delivered() {
     assert!(results[0].contains("no approval arrived"), "{results:?}");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approval_for_a_wait_the_source_never_opened_is_not_delivered() {
+    // The source gates `lookup`, but the token budget ends the run before
+    // the approval wait opens. A stray approval for that call follows.
+    let (_dir, db) = fresh_db();
+    let gate = || Arc::new(ToolRules::new().effect(ToolEffect::ReadOnly, Rule::Ask));
+    let source_recorder = Arc::new(Recorder::default());
+    let source_model = ScriptedModel::new(vec![calls(&[("c1", "lookup", json!({"q": "x"}))], 50)]);
+    let harness = AgentHarness::new(source_model)
+        .tool(recorded_tool(
+            "lookup",
+            ToolEffect::ReadOnly,
+            &source_recorder,
+        ))
+        .policy(gate());
+    let mut rt = runtime(&db, harness);
+    let task = AgentTask::new("look")
+        .max_total_tokens(10)
+        .approval_timeout(Duration::from_secs(60));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let source_report = report(rt.run_until_blocked(exec).await.unwrap());
+    assert_eq!(source_report.stop, AgentStop::TokensExhausted);
+    let mut source = rt.load_history(exec).unwrap();
+    let end = source.len() - 1;
+    source.insert(
+        end,
+        WorkflowEvent::SignalReceived {
+            signal_name: "tool_approval:0:0:c1".into(),
+            payload: serde_json::to_value(Approval::Approve).unwrap(),
+        },
+    );
+    // The candidate uses fewer tokens, so it reaches the approval wait.
+    let model = ScriptedModel::new(vec![
+        calls(&[("c1", "lookup", json!({"q": "x"}))], 1),
+        answer("done", 1),
+    ]);
+    let (harness, recorder) = candidate(model);
+
+    let evaluation = evaluate(&source, &Candidate::new(harness.policy(gate())))
+        .await
+        .unwrap();
+
+    assert_eq!(evaluation.replayed_tool_calls, 0, "{evaluation:#?}");
+    assert_eq!(evaluation.stubbed_tool_calls, 0, "{evaluation:#?}");
+    assert_eq!(recorder.runs(), Vec::<Value>::new());
+    let RunEnd::Completed(report) = &evaluation.candidate else {
+        panic!("the candidate completes: {:?}", evaluation.candidate);
+    };
+    let results = tool_results(report);
+    assert!(results[0].contains("no approval arrived"), "{results:?}");
+}
+
 /// Record a source with two gated `pay` calls. The first approval arrives
 /// after its deadline. The second arrives in time.
 ///
