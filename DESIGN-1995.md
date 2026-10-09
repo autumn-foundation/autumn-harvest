@@ -281,6 +281,10 @@ $ my-worker-upgrade-check \
   is declared after the check, never before.
 - With `--baseline-build`, the scan reads only runs on that build or on no
   build. Compat from the candidate covers no other run.
+- A signal or update that reaches an existing run after the check reads is
+  not in the report. A rescan only moves that window. The guide tells the
+  operator to pause the senders, or to rely on candidate schemas at
+  admission.
 - The baseline manifest describes one build. A run with an assigned build
   is compared only when `--baseline-build` names that build. A run with no
   assigned build is trusted to have run the baseline.

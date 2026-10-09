@@ -185,3 +185,8 @@ logs.
 - Nothing ties a manifest to the binary under test. Write both from the
   commits that the two binaries come from.
 - The replay timeout cannot stop candidate code that never yields.
+- The check sees the signals and updates that exist when it reads. One that
+  arrives later, before you declare compat, is not in the report. The
+  build policy stops new starts, not input to existing runs. Pause the
+  senders, or publish candidate schemas so the candidate validates a late
+  payload when it admits it.
