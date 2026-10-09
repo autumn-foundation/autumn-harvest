@@ -206,6 +206,7 @@ A bound is a normal end, not an error. `AgentReport.stop` names it:
 | `steps_exhausted` | The model asked for tools after `max_steps` rounds. |
 | `tokens_exhausted` | The run spent more than `max_total_tokens`. |
 | `transcript_full` | The next request, or the results of one round, could not fit the request cap. The request was not sent. |
+| `budget_exceeded` | A run or tenant LLM budget refused the next model call. The call was not sent. See [LLM budgets](#llm-budgets-issue-1997). |
 
 A turn that ends the run before its tool calls run is left out of
 `AgentReport.messages`. Its text is not the answer either. A round whose
@@ -225,6 +226,41 @@ reads.
 The run fails when a model call fails for good: a non-retryable kind, for
 example a rejected API key, or four failed attempts.
 
+### LLM budgets (issue #1997)
+
+`max_total_tokens` bounds one run inside the workflow. A budget on the
+Postgres engine also bounds a tenant across runs, and it can bound cost.
+
+Each model turn checks the budget before the call. After the call, it
+records one row in `harvest_llm_ledger`: the model id, the tokens, the cost
+and the latency. Implement `AgentModel::model_id` and
+`AgentModel::cost_micros` to fill the model and the cost. The defaults are
+`"unknown"` and zero. A failed ledger write logs a warning and keeps the
+answer, because a retry would pay for the call again.
+
+Declare the caps on `agent_loop`, and set the tenant on each task:
+
+```rust
+use autumn_harvest::quota::QuotaPolicy;
+use autumn_harvest_agent::workflow::{agent_loop_info, activities};
+
+let budget = QuotaPolicy::new("tenant")
+    .with_max_run_llm_tokens(200_000)
+    .with_max_tenant_llm_cost_micros(50_000_000) // 50 currency units a day
+    .with_tenant_llm_window_secs(86_400);
+let built = HarvestBuilder::new()
+    .workflows(vec![agent_loop_info().with_quota(budget)])
+    .activities(activities())
+    .state(harness)
+    .build();
+
+let task = AgentTask::new("Summarise the ticket.").tenant("acme");
+```
+
+A spent cap refuses the next model turn. The call is not sent, and the run
+ends under `budget_exceeded`. The SQLite backend has no quota, so it has no
+budget.
+
 ## 8. History types
 
 The adapter owns the payloads it records: `AgentTask`, `ModelTurnRequest`,
@@ -240,8 +276,9 @@ reads these payloads back, so add a field only with `#[serde(default)]`.
 - **No streaming.** An activity result is a value, not a stream.
 - **Tool definitions are read at call time.** A deploy that changes the tool
   list changes only later turns. Recorded turns replay as they were.
-- **The session entity is separate.** It is a sibling issue. Per-step token
-  cost belongs to the agent cost ledger (#1970).
+- **The session entity is separate.** It is a sibling issue.
+- **The ledger is in clear.** See
+  [`security-posture.md`](security-posture.md#the-llm-ledger-is-in-clear-issue-1997).
 
 ## 10. The daemon example
 

@@ -15214,6 +15214,110 @@ impl ActivityContext {
         self.identity.activity_id
     }
 
+    /// Refuse this LLM step when its run or its tenant has spent a budget
+    /// (issue #1997).
+    ///
+    /// Call it before the model call. The caps come from the
+    /// [`QuotaPolicy`](crate::quota::QuotaPolicy) of the workflow type. With
+    /// no LLM cap, it returns at once and reads no row. A spent cap gives a
+    /// non-retryable failure payload of type
+    /// [`ERROR_TYPE_LLM_BUDGET_EXCEEDED`](crate::llm_budget::ERROR_TYPE_LLM_BUDGET_EXCEEDED).
+    /// A failed read gives a retryable payload.
+    ///
+    /// A context with no database, such as a test context or a local
+    /// activity, always passes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an activity error payload, for use with `?` in the body.
+    // Without `db`, the body has no await: it always passes.
+    #[cfg_attr(
+        not(feature = "db"),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
+    pub async fn check_llm_budget(&self) -> Result<(), String> {
+        #[cfg(feature = "db")]
+        if let Some(state) = self.transactional_state.as_ref()
+            && let Some(policy) = crate::llm_budget::policy_for(self.workflow_type())
+        {
+            use crate::failure::IntoActivityErrorString as _;
+
+            let spend = async {
+                let mut conn = crate::pool::acquire_within_pool_bound(&state.pool).await?;
+                crate::llm_budget::load_llm_spend(
+                    &mut conn,
+                    state.exec_id,
+                    policy.tenant_llm_window_secs,
+                )
+                .await
+            }
+            .await
+            .map_err(|error| {
+                crate::failure::ActivityFailure::retryable(
+                    "LlmBudgetCheckFailed",
+                    format!("could not read the LLM spend: {error}"),
+                )
+                .into_error_payload()
+            })?;
+            if let Some(violation) = crate::llm_budget::check_llm_budget(&spend, &policy) {
+                self.metrics
+                    .record_quota_rejected(self.workflow_type(), violation.resource.as_str());
+                return Err(
+                    crate::llm_budget::LlmBudgetExceeded::from_violation(violation)
+                        .into_failure()
+                        .into_error_payload(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Record the usage of one model call in the LLM ledger (issue #1997).
+    ///
+    /// Call it after the model call, once for each call. A retry that pays
+    /// again records again. Returns `false` when the context has no
+    /// database, so nothing is recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error payload when the write fails. The model call is
+    /// already paid for, so a caller can log the error and keep the answer.
+    // Without `db`, the body has no await: it always passes.
+    #[cfg_attr(
+        not(feature = "db"),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
+    pub async fn record_llm_usage(
+        &self,
+        usage: &crate::llm_budget::LlmUsage,
+    ) -> Result<bool, String> {
+        #[cfg(feature = "db")]
+        if let Some(state) = self.transactional_state.as_ref() {
+            use crate::failure::IntoActivityErrorString as _;
+
+            let site = crate::llm_budget::LlmCallSite {
+                exec_id: state.exec_id,
+                activity_name: self.activity_type(),
+                activity_id: self.activity_id(),
+                attempt: self.attempt(),
+            };
+            return async {
+                let mut conn = crate::pool::acquire_within_pool_bound(&state.pool).await?;
+                crate::llm_budget::record_llm_usage(&mut conn, site, usage).await
+            }
+            .await
+            .map_err(|error| {
+                crate::failure::ActivityFailure::retryable(
+                    "LlmUsageNotRecorded",
+                    format!("could not record the LLM usage: {error}"),
+                )
+                .into_error_payload()
+            });
+        }
+        let _ = usage;
+        Ok(false)
+    }
+
     /// `true` when this activity is running inline as a local activity.
     ///
     /// Local activities run on the workflow worker task and are never enqueued

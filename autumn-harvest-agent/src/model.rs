@@ -50,4 +50,22 @@ pub trait AgentModel: Send + Sync + std::fmt::Debug {
         &'a self,
         request: &'a ChatRequest,
     ) -> BoxFuture<'a, Result<ChatResponse, AgentError>>;
+
+    /// The model id that the LLM ledger records (issue #1997).
+    ///
+    /// The default is `"unknown"`.
+    // An implementation can return a field, so the borrow stays.
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn model_id(&self) -> &str {
+        "unknown"
+    }
+
+    /// The cost of one call, in millionths of a currency unit (issue #1997).
+    ///
+    /// The cost budgets sum this value. The default is zero, so only the
+    /// token budgets apply.
+    fn cost_micros(&self, usage: &TokenUsage) -> u64 {
+        let _ = usage;
+        0
+    }
 }

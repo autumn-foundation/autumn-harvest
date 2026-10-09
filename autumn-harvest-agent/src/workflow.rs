@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use crate::message::{ChatMessage, ChatRole, ContentPart, StopReason, TokenUsage, ToolCall};
 use crate::policy::ToolDecision;
+use autumn_harvest::llm_budget::LlmBudgetExceeded;
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
 
@@ -120,10 +121,17 @@ pub async fn agent_loop(ctx: &WorkflowContext, task: AgentTask) -> Result<AgentR
         if exceeds_bytes(&request, task.request_cap()) {
             return Ok(progress.report(AgentStop::TranscriptFull));
         }
-        let turn: ModelTurn = ctx
+        let turn: ModelTurn = match ctx
             .execute_activity(&agent_model_turn_info(), request)
             .await
-            .map_err(|e| e.to_string())?;
+        {
+            Ok(turn) => turn,
+            // A spent LLM budget is a bound, so the run ends normally.
+            Err(error) if LlmBudgetExceeded::from_error(&error).is_some() => {
+                return Ok(progress.report(AgentStop::BudgetExceeded));
+            }
+            Err(error) => return Err(error.to_string()),
+        };
 
         progress.usage = progress.usage.saturating_add(turn.usage);
         let over_budget = task
@@ -337,7 +345,19 @@ pub async fn agent_model_turn(
     ctx: &ActivityContext,
     request: ModelTurnRequest,
 ) -> Result<ModelTurn, String> {
-    harness(ctx)?.model_turn(request).await
+    let harness = harness(ctx)?;
+    // A spent budget refuses the call before it is paid for (issue #1997).
+    ctx.check_llm_budget().await?;
+    let (turn, latency) = harness.timed_model_turn(request).await?;
+    // The call is paid for. A failed write must not fail the turn, because a
+    // retry would pay again.
+    if let Err(error) = ctx
+        .record_llm_usage(&harness.ledger_usage(&turn.usage, latency))
+        .await
+    {
+        tracing::warn!(error = %error, "could not record the LLM usage of a model turn");
+    }
+    Ok(turn)
 }
 
 /// One tool call, as an activity.

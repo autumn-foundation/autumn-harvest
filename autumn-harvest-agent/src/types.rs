@@ -49,6 +49,10 @@ pub struct AgentTask {
     /// `TranscriptFull` before it sends a request over this size.
     #[serde(default)]
     pub max_request_bytes: Option<u64>,
+    /// The tenant of this run. A `QuotaPolicy` on `agent_loop` with the key
+    /// `"tenant"` reads it for the tenant LLM budgets (issue #1997).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 impl AgentTask {
@@ -65,6 +69,7 @@ impl AgentTask {
             max_output_tokens: None,
             approval_timeout_secs: DEFAULT_APPROVAL_TIMEOUT_SECS,
             max_request_bytes: None,
+            tenant: None,
         }
     }
 
@@ -125,6 +130,13 @@ impl AgentTask {
     #[must_use]
     pub const fn max_request_bytes(mut self, bytes: u64) -> Self {
         self.max_request_bytes = Some(bytes);
+        self
+    }
+
+    /// Set the tenant of this run (issue #1997).
+    #[must_use]
+    pub fn tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = Some(tenant.into());
         self
     }
 
@@ -266,6 +278,9 @@ pub enum AgentStop {
     TokensExhausted,
     /// The next request was too large to record. It was not sent.
     TranscriptFull,
+    /// A run or tenant LLM budget refused the next model call (issue
+    /// #1997). The call was not sent.
+    BudgetExceeded,
 }
 
 /// The workflow output: how the run ended and what it produced.
@@ -352,6 +367,22 @@ mod tests {
     #[test]
     fn stop_names_are_stable_in_history() {
         assert_eq!(json!(AgentStop::TranscriptFull), json!("transcript_full"));
+        assert_eq!(json!(AgentStop::BudgetExceeded), json!("budget_exceeded"));
+    }
+
+    #[test]
+    fn the_tenant_is_in_the_input_only_when_set() {
+        let plain = serde_json::to_value(AgentTask::new("go")).unwrap();
+        assert!(plain.get("tenant").is_none());
+        let task = AgentTask::new("go").tenant("acme");
+        let value = serde_json::to_value(&task).unwrap();
+        assert_eq!(value["tenant"], "acme");
+        assert_eq!(
+            autumn_harvest::quota::resolve_quota_key("tenant", &value).as_deref(),
+            Some("acme")
+        );
+        let back: AgentTask = serde_json::from_value(value).unwrap();
+        assert_eq!(back.tenant.as_deref(), Some("acme"));
     }
 
     #[test]

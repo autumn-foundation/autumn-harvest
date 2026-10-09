@@ -1209,6 +1209,22 @@ with access to `harvest_events` can copy a ciphertext to another field, event
 or execution under the same key, and it decodes. Restrict write access to the
 Harvest database.
 
+### The LLM ledger is in clear (issue #1997)
+
+The codec does not cover `harvest_llm_ledger`. SQL must sum it for the LLM
+budgets, without the codec key. Each row holds these columns in clear:
+
+- `model`: the model id.
+- `input_tokens`, `output_tokens`, `cost_micros` and `latency_ms`.
+- `workflow_name`, `activity_name`, `execution_id`, `activity_id` and
+  `attempt`.
+- `quota_key`: the tenant key, as `harvest_workflow_executions` holds it.
+- `recorded_at`.
+
+Anyone who can read the table can see which model a tenant uses and how
+much it spends. The ledger holds no prompt and no answer. Those stay in the
+encrypted payload. Do not put PII in a model id or a tenant key.
+
 ### Column coverage (issue #1979)
 
 Column encoding is off by default. Turn it on with

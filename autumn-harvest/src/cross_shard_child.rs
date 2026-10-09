@@ -212,10 +212,10 @@ impl QuotaCaps {
     #[must_use]
     pub const fn to_policy(self) -> crate::quota::QuotaPolicy {
         crate::quota::QuotaPolicy {
-            key_expr: "",
             max_active_executions: self.max_active_executions,
             max_history_bytes: self.max_history_bytes,
             max_dead_letters: self.max_dead_letters,
+            ..crate::quota::QuotaPolicy::new("")
         }
     }
 }

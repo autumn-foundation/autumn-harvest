@@ -9,12 +9,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::AgentError;
-use crate::message::RunId;
+use crate::message::{RunId, TokenUsage};
 use crate::model::{AgentModel, ChatRequest};
 use crate::policy::{AllowAll, RunInfo, ToolDecision, ToolPolicy};
 use crate::tool::{Tool, ToolContext};
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
+use autumn_harvest::llm_budget::LlmUsage;
 
 use crate::types::{ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome};
 
@@ -158,12 +159,21 @@ impl AgentHarness {
     /// retryable: a rate limit, a transport fault, a provider outage, or the
     /// time budget. Every other failure is not.
     pub async fn model_turn(&self, request: ModelTurnRequest) -> Result<ModelTurn, String> {
+        self.timed_model_turn(request).await.map(|(turn, _)| turn)
+    }
+
+    /// [`Self::model_turn`], with the time that the model call took.
+    pub(crate) async fn timed_model_turn(
+        &self,
+        request: ModelTurnRequest,
+    ) -> Result<(ModelTurn, Duration), String> {
         let chat = ChatRequest {
             messages: request.messages,
             tools: self.tools.iter().map(|tool| tool.definition()).collect(),
             max_tokens: request.max_output_tokens,
             temperature: self.temperature,
         };
+        let started = std::time::Instant::now();
         let response = match tokio::time::timeout(self.model_timeout, self.client.chat(&chat)).await
         {
             Ok(response) => response.map_err(|err| model_failure(&err))?,
@@ -175,6 +185,7 @@ impl AgentHarness {
                 .into_error_payload());
             }
         };
+        let latency = started.elapsed();
         let mut turn = ModelTurn {
             content: response.content,
             stop: response.stop_reason,
@@ -202,7 +213,7 @@ impl AgentHarness {
                 });
             turn.decisions.push(decision);
         }
-        Ok(turn)
+        Ok((turn, latency))
     }
 
     /// Run one tool call.
@@ -254,6 +265,20 @@ impl AgentHarness {
         let cap = self.max_result_bytes.saturating_sub(OUTCOME_ENVELOPE_BYTES);
         let max = usize::try_from(cap / 12).unwrap_or(usize::MAX);
         ToolOutcome::error(&cut_bytes(message, max))
+    }
+
+    /// The ledger usage of one model call (issue #1997).
+    ///
+    /// `input_tokens` already counts the cached prompt tokens, so the cache
+    /// counts are not added again.
+    pub(crate) fn ledger_usage(&self, usage: &TokenUsage, latency: Duration) -> LlmUsage {
+        LlmUsage::new(
+            self.client.model_id(),
+            u64::from(usage.input_tokens),
+            u64::from(usage.output_tokens),
+        )
+        .with_cost_micros(self.client.cost_micros(usage))
+        .with_latency(latency)
     }
 
     fn find(&self, name: &str) -> Option<&dyn Tool> {
@@ -318,6 +343,64 @@ mod tests {
     use super::*;
     use crate::bounds::json_len;
     use crate::error::ErrorKind;
+
+    /// A model with a fixed id and a price of one micro per token.
+    #[derive(Debug)]
+    struct PricedModel;
+
+    impl AgentModel for PricedModel {
+        fn chat<'a>(
+            &'a self,
+            _request: &'a ChatRequest,
+        ) -> crate::model::BoxFuture<'a, Result<crate::model::ChatResponse, AgentError>> {
+            Box::pin(async { Err(AgentError::new(ErrorKind::Provider, "unused")) })
+        }
+
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn model_id(&self) -> &str {
+            "priced-1"
+        }
+
+        fn cost_micros(&self, usage: &TokenUsage) -> u64 {
+            u64::from(usage.total())
+        }
+    }
+
+    #[test]
+    fn the_ledger_usage_reads_the_model_id_the_cost_and_the_latency() {
+        let harness = AgentHarness::new(Arc::new(PricedModel));
+        let usage = TokenUsage {
+            input_tokens: 30,
+            output_tokens: 12,
+            cache_read_tokens: 20,
+            cache_write_tokens: 0,
+        };
+        let ledger = harness.ledger_usage(&usage, Duration::from_millis(1_500));
+        assert_eq!(ledger.model, "priced-1");
+        // The input count already holds the cached tokens.
+        assert_eq!((ledger.input_tokens, ledger.output_tokens), (30, 12));
+        assert_eq!(ledger.cost_micros, 42);
+        assert_eq!(ledger.latency_ms, 1_500);
+    }
+
+    #[test]
+    fn a_model_with_the_defaults_records_an_unknown_id_and_no_cost() {
+        let model = PricedModelDefaults;
+        assert_eq!(model.model_id(), "unknown");
+        assert_eq!(model.cost_micros(&TokenUsage::new(5, 5)), 0);
+    }
+
+    #[derive(Debug)]
+    struct PricedModelDefaults;
+
+    impl AgentModel for PricedModelDefaults {
+        fn chat<'a>(
+            &'a self,
+            _request: &'a ChatRequest,
+        ) -> crate::model::BoxFuture<'a, Result<crate::model::ChatResponse, AgentError>> {
+            Box::pin(async { Err(AgentError::new(ErrorKind::Provider, "unused")) })
+        }
+    }
 
     #[test]
     fn retryable_kinds_are_marked_retryable() {
