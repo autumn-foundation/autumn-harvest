@@ -468,15 +468,20 @@ impl<'p> StructureBuilder<'p> {
             if !seen.insert((reader.crate_name.clone(), name.clone())) {
                 continue;
             }
+            // An associated constant names two crates, one for its type and
+            // one for its trait, and the impl lives in either. So each
+            // analyzed crate it names is searched, and each match counts.
             let roots = const_roots(&name);
-            let holder = roots.iter().find_map(|root| {
-                program
-                    .docs
-                    .iter()
-                    .find(|d| d.crate_name == *root && d.crate_name != reader.crate_name)
-                    .map(|d| (d, *root))
-            });
-            if let Some((doc, root)) = holder {
+            let mut found = false;
+            let mut outside = false;
+            for root in &roots {
+                if *root == reader.crate_name {
+                    continue;
+                }
+                let Some(doc) = program.docs.iter().find(|d| d.crate_name == *root) else {
+                    outside |= !program.is_trusted_root(root);
+                    continue;
+                };
                 let local = name
                     .strip_prefix(root)
                     .and_then(|rest| rest.strip_prefix("::"))
@@ -487,14 +492,20 @@ impl<'p> StructureBuilder<'p> {
                     .or_insert_with(|| DocIndex::new(doc));
                 let paths = index.const_paths(local);
                 if paths.is_empty() {
-                    external.insert(name);
                     continue;
                 }
+                found = true;
                 let (text, more) = self.closure_text(doc, paths);
                 let _ = write!(out, "\n#crate {}\n", doc.crate_name);
                 out.push_str(&normalize(&text, Some(&doc.alloc_statics)));
                 queue.extend(more.into_iter().map(|n| (doc, n)));
-            } else if !roots.is_empty() && !roots.iter().all(|r| program.is_trusted_root(r)) {
+            }
+            // A crate outside the analysis can hold the item. So can an
+            // analyzed crate that held no match, if none did.
+            let analyzed = roots.iter().any(|r| {
+                *r != reader.crate_name && program.docs.iter().any(|d| d.crate_name == *r)
+            });
+            if outside || (analyzed && !found) {
                 external.insert(name);
             }
         }

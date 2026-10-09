@@ -1472,9 +1472,10 @@ const IN_FLIGHT_SQL: &str = concat!(
      ORDER BY created_at, id LIMIT $3"
 );
 
-/// One run's row, read again in the snapshot that reads its history.
+/// One run's row, read again in the snapshot that reads its history. A run
+/// that left the in-flight states since the scan has no row here.
 #[cfg(feature = "db")]
-const RUN_ROW_SQL: &str = concat!(in_flight_select!(), "WHERE id = $1");
+const RUN_ROW_SQL: &str = concat!(in_flight_select!(), "WHERE id = $1 AND state = ANY($2)");
 
 #[cfg(feature = "db")]
 impl UpgradeCheck {
@@ -1570,6 +1571,7 @@ impl UpgradeCheck {
                 .run(async |conn| {
                     let fresh: Vec<InFlightRow> = diesel::sql_query(RUN_ROW_SQL)
                         .bind::<diesel::sql_types::Uuid, _>(execution_id.as_uuid())
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&states)
                         .load(conn)
                         .await
                         .map_err(crate::error::database_error)?;
@@ -1589,7 +1591,8 @@ impl UpgradeCheck {
                 })
                 .await;
             let (row, mut verdict) = match loaded {
-                // The run left the table after the scan, so it needs no verdict.
+                // The run ended or left the table after the scan, so it needs
+                // no verdict.
                 Ok((None, _, _)) => continue,
                 Ok((Some(fresh), history, pending)) => {
                     let verdict = match self.snapshot_for(&fresh, execution_id, history.events) {

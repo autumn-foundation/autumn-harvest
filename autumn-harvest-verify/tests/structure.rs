@@ -36,23 +36,30 @@ fn manifest(build: &str) -> StructureManifest {
     structure::manifest(&model.version, "rustc test", outcome.structures)
 }
 
-/// The `upgrade_const` workflow, with one build of `limits` analyzed or none.
-fn const_manifest(limits: Option<&str>) -> StructureManifest {
-    let dir = fixture_dir("upgrade_const");
-    let read = |name: &str| {
-        let path = dir.join(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
-    };
-    let mut docs = vec![mir::parse("flow", "flow.mir", &read("flow.mir"))];
-    if let Some(file) = limits {
-        docs.push(mir::parse("limits", file, &read(file)));
-    }
+/// The manifest of a fixture made of several crates, as `(crate, file)`.
+fn crates_manifest(build: &str, crates: &[(&str, &str)]) -> StructureManifest {
+    let dir = fixture_dir(build);
+    let docs = crates
+        .iter()
+        .map(|(name, file)| {
+            let path = dir.join(file);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            mir::parse(name, file, &text)
+        })
+        .collect::<Vec<_>>();
     let entries = entry::discover(&docs);
     let program = Program::build(docs, &SourceRoots { roots: vec![dir] }).expect("build");
     let model = Model::builtin().expect("the embedded model must parse");
     let outcome = analysis::analyze_full(&program, &model, &entries);
     structure::manifest(&model.version, "rustc test", outcome.structures)
+}
+
+/// The `upgrade_const` workflow, with one build of `limits` analyzed or none.
+fn const_manifest(limits: Option<&str>) -> StructureManifest {
+    let mut crates = vec![("flow", "flow.mir")];
+    crates.extend(limits.map(|file| ("limits", file)));
+    crates_manifest("upgrade_const", &crates)
 }
 
 fn workflow<'a>(m: &'a StructureManifest, name: &str) -> &'a WorkflowStructure {
@@ -404,6 +411,44 @@ fn a_const_of_a_crate_outside_the_analysis_is_a_boundary() {
     // `u64::MAX` comes from `core`, so it is not a boundary.
     assert!(
         !w.boundaries.iter().any(|b| b.contains("MAX")),
+        "{:?}",
+        w.boundaries
+    );
+}
+
+#[test]
+fn an_associated_const_is_read_from_each_crate_it_names() {
+    // `types` holds an unrelated `MAX`. The impl is in `limits`.
+    let manifest = |limits: &str| {
+        crates_manifest(
+            "upgrade_assoc",
+            &[
+                ("flow", "flow.mir"),
+                ("types", "types.mir"),
+                ("limits", limits),
+            ],
+        )
+    };
+    let old = manifest("limits_v1.mir");
+    let new = manifest("limits_v2.mir");
+    let old = workflow(&old, "wf_assoc_const");
+    let new = workflow(&new, "wf_assoc_const");
+    assert_ne!(digests(old), digests(new));
+    assert!(old.boundaries.is_empty(), "{:?}", old.boundaries);
+}
+
+#[test]
+fn an_associated_const_of_a_crate_outside_the_analysis_is_a_boundary() {
+    // Only `types` is analyzed. The impl can be in `limits`.
+    let m = crates_manifest(
+        "upgrade_assoc",
+        &[("flow", "flow.mir"), ("types", "types.mir")],
+    );
+    let w = workflow(&m, "wf_assoc_const");
+    assert!(
+        w.boundaries
+            .iter()
+            .any(|b| b == "external-const: <types::Plan as limits::Limits>::MAX"),
         "{:?}",
         w.boundaries
     );

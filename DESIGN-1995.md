@@ -116,7 +116,12 @@ Later review rounds of the merged branch found more gaps:
 13. The scan read each run's row once, and its history later in another
     snapshot. A resume updates `deadline_at` and appends to history in
     one commit, so the replay could pair new history with an old deadline.
-    The row is now read again in the snapshot that reads its history.
+    The row is now read again in the snapshot that reads its history. A
+    run that left the in-flight states by then gets no verdict.
+14. An associated `const`, `<types::Plan as limits::Limits>::MAX`, names
+    two crates. The digest read only the first analyzed one, which can
+    hold an unrelated `MAX`. It now reads each analyzed crate the path
+    names. A crate outside the analysis, or no match, adds the boundary.
 
 ---
 
