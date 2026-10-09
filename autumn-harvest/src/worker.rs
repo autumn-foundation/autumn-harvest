@@ -4230,12 +4230,13 @@ async fn persist_external_signal_inline(
                         // both outcomes record `ExternalSignalDelivered`.
                         let terminal_opt = match &run.target {
                             crate::types::ExternalTarget::ExecutionId(target_id) => {
-                                match signal::send_signal_idempotent(
+                                match signal::send_signal_idempotent_with_codecs(
                                     conn,
                                     *target_id,
                                     &run.signal_name,
                                     run.payload,
                                     run.idempotency_key.as_deref(),
+                                    codecs,
                                 )
                                 .await
                                 {
@@ -4263,13 +4264,14 @@ async fn persist_external_signal_inline(
                                 workflow_name,
                                 workflow_id,
                             } => {
-                                match signal::resolve_and_signal_by_workflow_id(
+                                match signal::resolve_and_signal_by_workflow_id_with_codecs(
                                     conn,
                                     workflow_name,
                                     workflow_id,
                                     &run.signal_name,
                                     run.payload,
                                     run.idempotency_key.as_deref(),
+                                    codecs,
                                 )
                                 .await
                                 {
@@ -4504,8 +4506,8 @@ async fn persist_external_signal_inline(
                         // it later. The value/error is stored INFLATED into the
                         // awaiter's own history (observe-only; never touches the
                         // target).
-                        let terminal_opt = match crate::execution::read_external_await_outcome(
-                            conn, run.target,
+                        let terminal_opt = match crate::execution::read_external_await_outcome_with_codecs(
+                            conn, run.target, codecs,
                         )
                         .await
                         {
@@ -6375,6 +6377,34 @@ async fn workflow_execution_transition_error(
         )
 }
 
+/// The input and memo a workflow retry starts with, decoded (issue #1979).
+///
+/// The start path encodes them again. A value this registry cannot decode
+/// returns `None`, so the run fails without a retry. A missing key must not
+/// roll back the failure write. The codec error text is not logged.
+fn decode_retry_payload(
+    codecs: &crate::payload_codec::PayloadCodecs,
+    execution: &WorkflowExecution,
+) -> Option<(serde_json::Value, Option<serde_json::Value>)> {
+    let decoded = codecs.decode_column(&execution.input).and_then(|input| {
+        codecs
+            .decode_column_opt(execution.memo.as_ref())
+            .map(|memo| (input, memo))
+    });
+    if decoded.is_err() {
+        tracing::warn!(
+            exec_id = %execution.id,
+            "workflow retry skipped: the stored input or memo could not be decoded"
+        );
+    }
+    decoded.ok()
+}
+
+/// Seal the execution row `COMPLETED` with `output`, which is the stored
+/// form. The caller encodes it with [`PayloadCodecs::encode_column`]
+/// (issue #1979).
+///
+/// [`PayloadCodecs::encode_column`]: crate::payload_codec::PayloadCodecs::encode_column
 async fn update_workflow_execution_completed(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -9400,8 +9430,10 @@ pub async fn persist_workflow_completion(
                 codecs,
             )
             .await?;
-            update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
-            queue::complete_task(conn, task_id, output).await?;
+            // The row and the task get the same stored form (issue #1979).
+            let stored_output = codecs.encode_column(&output)?;
+            update_workflow_execution_completed(conn, exec_id, worker_id, &stored_output).await?;
+            queue::complete_task(conn, task_id, stored_output).await?;
             let (mut deferred, closed_children) =
                 apply_parent_close_cascade(conn, exec_id, codecs).await?;
             let mut tx_cancel_metrics = Vec::new();
@@ -9666,11 +9698,12 @@ pub async fn persist_workflow_failure(
             if let (Some(exec_ref), Some((rid, policy, attempt, fire_at, start_delay))) =
                 (exec_ref, retry_fire_info)
                 && attempt < policy.max_attempts
+                && let Some((retry_input, retry_memo)) = decode_retry_payload(codecs, exec_ref)
             {
                 let retry_workflow_id = rid.to_string();
                 let retry_params = crate::execution::StartWorkflowParams {
                     execution_timeout: exec_ref.execution_timeout,
-                    memo: exec_ref.memo.clone(),
+                    memo: retry_memo,
                     search_attrs: exec_ref.search_attrs.clone(),
                     // Workflow-level retry (issue #523) is the same logical run
                     // continuing, so the chain-scoped lifetime cap (issue #617)
@@ -9717,7 +9750,7 @@ pub async fn persist_workflow_failure(
                         &exec_ref.workflow_name,
                         &retry_workflow_id,
                         rid,
-                        exec_ref.input.clone(),
+                        retry_input,
                         &exec_ref.queue_name,
                     )
                 };
@@ -11060,6 +11093,7 @@ fn build_activity_enqueue_plan(
     // After the loop we interleave them with marker/detached-spawn events in full command order.
     let mut activity_events: Vec<WorkflowEvent> = Vec::with_capacity(scheduled_activities.len());
     let mut enqueued = Vec::with_capacity(scheduled_activities.len());
+    let mut decoded_input: Option<serde_json::Value> = None;
     // Dynamic per-key rate-limit buckets (issue #699) to lazily register inside
     // the enqueue transaction: `(bucket_key, refill_rate, burst)`. Deduped so a
     // fan-out of N activities sharing one resolved tenant key ensures the bucket
@@ -11231,7 +11265,13 @@ fn build_activity_enqueue_plan(
             // do NOT `.unwrap_or_default()` here, which would collapse both onto
             // the same `L0:` bucket. Takes priority over the static
             // `rate_limit_key` path entirely.
-            let resolved = crate::concurrency::resolve_concurrency_key(expr, workflow_input);
+            // The input can be a stored envelope (issue #1979). Decode it
+            // once, on first use, so a key resolves against the plaintext.
+            if decoded_input.is_none() {
+                decoded_input = Some(registry.payload_codecs().decode_column(workflow_input)?);
+            }
+            let plain_input = decoded_input.as_ref().unwrap_or(workflow_input);
+            let resolved = crate::concurrency::resolve_concurrency_key(expr, plain_input);
             let bucket_key = queue::dynamic_rate_bucket_key(expr, resolved.as_deref());
             // The bucket is ensured in the same transaction below, so the
             // fail-closed claim/dispatch gate always has a bucket row to read
@@ -12194,7 +12234,8 @@ async fn persist_all_started_child_workflows(
                 parent_exec_id,
                 parent_execution,
                 &parent_exec_id_str,
-            );
+                registry.payload_codecs(),
+            )?;
             let child_started_event = WorkflowEvent::WorkflowStarted {
                 input: child.input.clone(),
                 timestamp: chrono::Utc::now(),
@@ -12205,7 +12246,7 @@ async fn persist_all_started_child_workflows(
             let mut params = queue::EnqueueParams::new(
                 queue_name.clone(),
                 TaskType::Workflow,
-                child.input.clone(),
+                registry.payload_codecs().encode_column(&child.input)?,
             );
             params.workflow_exec_id = Some(child.child_id.as_uuid());
             params.required_build_id = parent_execution.assigned_build_id.clone();
@@ -12305,9 +12346,10 @@ async fn persist_all_started_child_workflows(
                         parent_exec_id,
                         parent_execution,
                         &parent_exec_id_str,
+                        registry.payload_codecs(),
                     )
                 })
-                .collect();
+                .collect::<HarvestResult<_>>()?;
             diesel::insert_into(harvest_workflow_executions::table)
                 .values(&child_rows)
                 .execute(conn)
@@ -12346,7 +12388,7 @@ async fn persist_all_started_child_workflows(
                     let mut params = queue::EnqueueParams::new(
                         queue_name.clone(),
                         TaskType::Workflow,
-                        child.input.clone(),
+                        registry.payload_codecs().encode_column(&child.input)?,
                     );
                     params.workflow_exec_id = Some(child.child_id.as_uuid());
                     params
@@ -12362,9 +12404,9 @@ async fn persist_all_started_child_workflows(
                         .get(&child.child_id.as_uuid())
                         .cloned()
                         .flatten();
-                    params
+                    Ok(params)
                 })
-                .collect();
+                .collect::<HarvestResult<_>>()?;
             queue::enqueue_batch(conn, &enqueue_params).await?;
         }
 
@@ -12657,6 +12699,10 @@ fn cached_retry_policy<'a>(
 /// Shared by both the sequential and the batched-insert paths in
 /// `persist_all_started_child_workflows` (issue #1589). So the two paths
 /// cannot drift on which fields a child row carries.
+///
+/// # Errors
+///
+/// Fails when the codec cannot encode the child input (issue #1979).
 fn build_child_row<'p>(
     plan: &'p LocalChildPlan<'_>,
     shard_id: i32,
@@ -12664,7 +12710,8 @@ fn build_child_row<'p>(
     parent_exec_id: ExecutionId,
     parent_execution: &'p WorkflowExecution,
     parent_exec_id_str: &'p str,
-) -> NewWorkflowExecution<'p> {
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<NewWorkflowExecution<'p>> {
     let child = plan.child;
     // Absolute deadlines are anchored HERE, not read from `plan.defaults`
     // (Codex review, issue #1589). `plan.defaults` is resolved once, up
@@ -12685,7 +12732,7 @@ fn build_child_row<'p>(
         .defaults
         .chain_execution_timeout
         .and_then(|d| now.checked_add_signed(d));
-    NewWorkflowExecution {
+    Ok(NewWorkflowExecution {
         continued_from_exec_id: None,
         first_exec_id: None,
         chain_execution_timeout: plan.defaults.chain_execution_timeout,
@@ -12695,7 +12742,7 @@ fn build_child_row<'p>(
         workflow_id: &plan.child_workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id,
-        input: child.input.clone().into(),
+        input: codecs.encode_column(&child.input)?.into(),
         parent_id: Some(parent_exec_id.as_uuid()),
         queue_name,
         execution_timeout: plan.defaults.execution_timeout,
@@ -12724,7 +12771,7 @@ fn build_child_row<'p>(
         start_source_ref: Some(parent_exec_id_str),
         started_by: None,
         quota_key: plan.child_quota_key.as_deref(),
-    }
+    })
 }
 
 /// Apply `max_workflow_attempts_ceiling` to a detached child's serialized retry
@@ -13057,7 +13104,10 @@ async fn insert_awaited_child_execution(
         workflow_id: &child_workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id,
-        input: child.input.clone().into(),
+        input: registry
+            .payload_codecs()
+            .encode_column(&child.input)?
+            .into(),
         parent_id: Some(parent_exec_id.as_uuid()),
         queue_name: &queue_name,
         execution_timeout: defaults.execution_timeout,
@@ -13093,8 +13143,11 @@ async fn insert_awaited_child_execution(
         last_error: None,
         scheduled_time: None, // child workflows are not scheduler-fired
     };
-    let mut params =
-        queue::EnqueueParams::new(queue_name.clone(), TaskType::Workflow, child.input.clone());
+    let mut params = queue::EnqueueParams::new(
+        queue_name.clone(),
+        TaskType::Workflow,
+        registry.payload_codecs().encode_column(&child.input)?,
+    );
     params.workflow_exec_id = Some(child.child_id.as_uuid());
     params.required_build_id = parent_execution.assigned_build_id.clone();
     (params.concurrency_key, params.max_concurrent) =
@@ -14116,14 +14169,17 @@ pub async fn ingest_due_timers_and_signals(
         .unzip();
     let fired_timer_ids: Vec<TimerId> = timer_entries.iter().map(|(id, _)| id.clone()).collect();
 
+    // The payload column can hold an envelope (issue #1979). The
+    // `SignalReceived` event gets the plaintext, which the event codec then
+    // encodes once.
     let (signal_ids, signal_entries): (Vec<_>, Vec<_>) = pending_signals
         .into_iter()
         .map(|signal| {
-            (
-                signal.id,
-                (signal.signal_name, signal.payload, signal.received_at),
-            )
+            let payload = codecs.decode_column(&signal.payload)?;
+            Ok((signal.id, (signal.signal_name, payload, signal.received_at)))
         })
+        .collect::<HarvestResult<Vec<_>>>()?
+        .into_iter()
         .unzip();
     let signal_names: Vec<String> = signal_entries
         .iter()
@@ -15076,8 +15132,10 @@ pub async fn persist_child_workflow_completion(
             }
             store::append_events_with_codecs(conn, exec_id, &[event], next_event_id, codecs)
                 .await?;
-            update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
-            queue::complete_task(conn, task_id, output.clone()).await?;
+            // The row and the task get the same stored form (issue #1979).
+            let stored_output = codecs.encode_column(&output)?;
+            update_workflow_execution_completed(conn, exec_id, worker_id, &stored_output).await?;
+            queue::complete_task(conn, task_id, stored_output).await?;
             let (mut deferred, closed_children) =
                 apply_parent_close_cascade(conn, exec_id, codecs).await?;
             let mut tx_cancel_metrics = Vec::new();
@@ -15490,7 +15548,7 @@ async fn create_detached_child_executions(
             workflow_id: &child_workflow_id,
             run_id: uuid::Uuid::new_v4(),
             shard_id: parent_execution.shard_id,
-            input: input.clone().into(),
+            input: registry.payload_codecs().encode_column(input)?.into(),
             parent_id: Some(parent_execution.id),
             queue_name: &parent_execution.queue_name,
             execution_timeout: None,
@@ -15576,7 +15634,7 @@ async fn create_detached_child_executions(
         let mut params = queue::EnqueueParams::new(
             parent_execution.queue_name.clone(),
             TaskType::Workflow,
-            input.clone(),
+            registry.payload_codecs().encode_column(input)?,
         );
         params.workflow_exec_id = Some(child_id.as_uuid());
         params.required_build_id = parent_execution.assigned_build_id.clone();
@@ -22982,7 +23040,7 @@ async fn persist_workflow_continue_as_new_with_verdict(
         workflow_id: &execution.workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: execution.shard_id,
-        input: input.clone().into(),
+        input: registry.payload_codecs().encode_column(&input)?.into(),
         parent_id: None,
         queue_name: &execution.queue_name,
         execution_timeout: defaults.execution_timeout,
@@ -23051,8 +23109,11 @@ async fn persist_workflow_continue_as_new_with_verdict(
             |target| resolve_workflow_concurrency(registry, target, &input),
         );
 
-    let mut enqueue =
-        queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);
+    let mut enqueue = queue::EnqueueParams::new(
+        execution.queue_name.clone(),
+        TaskType::Workflow,
+        registry.payload_codecs().encode_column(&input)?,
+    );
     enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
     enqueue.required_build_id = execution.assigned_build_id.clone();
     enqueue.concurrency_key = successor_concurrency_key;
@@ -24381,7 +24442,7 @@ async fn dead_letter_for_history_cap(
                     .optional()
                     .map_err(crate::error::database_error)?
                     .unwrap_or((None, None));
-                dlq::dead_letter(
+                dlq::dead_letter_with_codecs(
                     conn,
                     &NewDeadLetterEntry {
                         original_task_id: task.id,
@@ -24395,6 +24456,7 @@ async fn dead_letter_for_history_cap(
                         owner,
                         severity,
                     },
+                    codecs,
                 )
                 .await?;
                 store::append_events_with_codecs(
@@ -25328,6 +25390,17 @@ async fn process_workflow_task(
                 &exec_context_headers,
             )
         });
+        // The task row may hold the input as an envelope (issue #1979). The
+        // handler gets the plaintext. A missing key fails the run, exactly
+        // like a history that cannot be decoded.
+        let handler_input = fail_execution_on_error(
+            conn,
+            task,
+            worker_id,
+            registry.payload_codecs().decode_column(&task.input),
+            registry.payload_codecs(),
+        )
+        .await?;
         let workflow_drive = async {
             if let Some(resident) = warm_resident.take() {
                 match resident
@@ -25377,7 +25450,7 @@ async fn process_workflow_task(
             crate::executor::drive_workflow_keep(
                 ctx,
                 workflow.handler,
-                task.input.clone(),
+                handler_input,
                 Some(&span_meta),
                 resident_key.clone(),
             )
@@ -34543,6 +34616,7 @@ impl Worker {
                     self.config.worker_heartbeat_interval,
                     crate::quota_reconcile::QUOTA_RECONCILE_DEFAULT_BATCH,
                     *shard,
+                    self.registry.payload_codecs().clone(),
                 )
             })
             .collect();
@@ -38347,7 +38421,7 @@ async fn quarantine_workflow_task_timeout_outcome(
         if let queue::ClaimLock::Lost { .. } = queue::lock_claim_for_update(conn, &claim).await? {
             return Ok(None);
         }
-        dlq::dead_letter(conn, &entry).await?;
+        dlq::dead_letter_with_codecs(conn, &entry, codecs).await?;
         queue::fail_task(conn, task_id, &error_msg).await?;
 
         let (deferred, queue_used, closed_children, pending_cancel_metrics) =

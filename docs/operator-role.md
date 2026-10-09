@@ -156,8 +156,11 @@ gate closes both the direct-HTTP and the envelope invocation paths. When
 
 The nested `/ui` sub-router's paths are not part of `CLASSIFIED_ROUTES`, so under
 fail-closed enforcement a read-only principal receives `403` on `/ui`. Admins
-reach `/ui` unchanged. Classifying the UI routes so read-only principals can view
-(but not act through) the dashboard is a documented follow-up.
+reach `/ui` unchanged.
+
+[Custom roles](./security-posture.md#custom-roles) (issue #1978) close this
+gap. The built-in `harvest-viewer` role reads every Vantage page and gets
+`403` on every Vantage form post.
 
 ## Known limitation: read-capability breadth
 

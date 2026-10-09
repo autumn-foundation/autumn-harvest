@@ -62,7 +62,7 @@ use autumn_harvest::schema::{
     harvest_dead_letters, harvest_events, harvest_external_tasks, harvest_schedules,
     harvest_signals, harvest_task_queue, harvest_timers, harvest_workflow_executions,
 };
-use autumn_harvest::signal::send_signal;
+use autumn_harvest::signal::send_signal_with_codecs;
 use autumn_harvest::start_or_load_workflow_execution_with_metrics_and_codecs;
 use autumn_harvest::store::admit_update_event_with_codecs;
 use autumn_harvest::types::{ExecutionId as HarvestExecutionId, ShardId, UpdateId};
@@ -2528,7 +2528,16 @@ async fn signal_workflow_ui(
                 );
                 (STATUS_FAILED, Some(msg.clone()), url_encode(&msg))
             } else {
-                match send_signal(&mut conn, exec_id, &form.signal_name, payload_json).await {
+                let codecs = api_state.payload_codecs();
+                match send_signal_with_codecs(
+                    &mut conn,
+                    exec_id,
+                    &form.signal_name,
+                    payload_json,
+                    &codecs,
+                )
+                .await
+                {
                     Ok(()) => (
                         STATUS_SUCCEEDED,
                         None,
@@ -2995,7 +3004,7 @@ async fn list_dead_letters_ui(
         // audit row per page render that touched ≥1 envelope.
         let mut outcome = LossyDecodeOutcome::default();
         for row in &mut page_rows {
-            outcome = outcome.merged(codecs.decode_value_lossy(&mut row.dead_letter.input));
+            outcome = outcome.merged(codecs.decode_column_lossy(&mut row.dead_letter.input));
             outcome = outcome.merged(decode_error_field(codecs, &mut row.dead_letter.error));
             for event in &mut row.events {
                 outcome = outcome.merged(codecs.decode_value_lossy(&mut event.event_data));

@@ -377,7 +377,7 @@ fn service_unavailable(msg: &'static str) -> Response {
 /// since the token secret is case-sensitive. A non-`hvst_` credential (any
 /// scheme case) still returns `None` so a non-Harvest bearer passes through to
 /// the embedder untouched.
-fn harvest_bearer(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn harvest_bearer(headers: &HeaderMap) -> Option<String> {
     let raw = headers
         .get(axum::http::header::AUTHORIZATION)?
         .to_str()
@@ -395,6 +395,20 @@ fn harvest_bearer(headers: &HeaderMap) -> Option<String> {
         None
     }
 }
+
+/// Whether a request claims an API token, so the token layer looks it up.
+///
+/// The pre-auth rate limit charges exactly these requests (issue #1827).
+pub(crate) fn claims_harvest_token(headers: &HeaderMap) -> bool {
+    harvest_bearer(headers).is_some()
+}
+
+/// Marks a `403` for a valid token that its scope does not allow.
+///
+/// The pre-auth rate limit reads it from the response and refunds its address
+/// charge (issue #1827). The token is valid, so the charge is not its own.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScopeDeniedToken;
 
 /// Reserve the `token:` audit-actor namespace on a pass-through request.
 ///
@@ -504,11 +518,13 @@ pub async fn enforce_token_scope(
             },
         )
         .await;
-        return if scope == TokenScope::Read {
+        let mut response = if scope == TokenScope::Read {
             read_only_forbidden_response()
         } else {
             admin_scope_required_response()
         };
+        response.extensions_mut().insert(ScopeDeniedToken);
+        return response;
     }
 
     // Issue #1827: give the connection back before the handler runs. The

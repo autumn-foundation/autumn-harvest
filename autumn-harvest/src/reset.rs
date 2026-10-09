@@ -1634,20 +1634,30 @@ async fn enqueue_fork_workflow_task(
     new_exec_id: ExecutionId,
     registry: Option<&HandlerRegistry>,
 ) -> Result<(), WorkflowResetError> {
-    let mut enqueue = EnqueueParams::new(
-        fork.queue_name.clone(),
-        TaskType::Workflow,
-        fork.input.clone(),
-    );
+    // The fork row holds the source's stored input, which may be an envelope
+    // (issue #1979). The concurrency key needs the plaintext. The task stores
+    // the input encoded or not, as the switch says. A process with no codec
+    // registry cannot decode it, so the task keeps the stored bytes, as a
+    // fork did before. The worker decodes them when it runs the task.
+    let codecs = registry.map_or(&*crate::store::DEFAULT_PAYLOAD_CODECS, |reg| {
+        reg.payload_codecs()
+    });
+    let decoded = codecs.decode_column(&fork.input).ok();
+    let task_input = match &decoded {
+        Some(input) => codecs.encode_column(input)?,
+        None => fork.input.clone(),
+    };
+    let mut enqueue = EnqueueParams::new(fork.queue_name.clone(), TaskType::Workflow, task_input);
     enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
     enqueue.required_build_id = fork.assigned_build_id.clone();
     enqueue.fairness_key = crate::queue_fairness::fairness_key_for(None, source_quota_key);
     if let Some(reg) = registry
+        && let Some(input) = &decoded
         && let Some(info) = reg.workflows.get(&fork.workflow_name)
         && let Some(policy) = &info.concurrency
     {
         enqueue.concurrency_key =
-            crate::concurrency::resolve_concurrency_key(policy.key_expr, &fork.input);
+            crate::concurrency::resolve_concurrency_key(policy.key_expr, input);
         enqueue.max_concurrent = Some(policy.limit);
     }
     queue::enqueue(conn, &enqueue).await?;

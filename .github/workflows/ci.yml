@@ -397,6 +397,12 @@ jobs:
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features sqs -- -D warnings
       - name: Clippy autumn-harvest-plugin (aws-kms feature, issue #1825)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features aws-kms -- -D warnings
+      # Issue #1978: the OIDC login module is `cfg`d out of the default build.
+      - name: Clippy autumn-harvest-plugin (oidc feature, issue #1978)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features oidc -- -D warnings
+      # The OIDC gate on the MCP tool routes compiles only with both features.
+      - name: Clippy autumn-harvest-plugin (oidc and mcp features, issue #1978)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features oidc,mcp,unified-dag-execution -- -D warnings
       # Issue #1312: the runtime wiring for the Redis dispatch channel is
       # `cfg`d out of the default build, so only this step compiles it.
       - name: Clippy autumn-harvest-plugin (redis feature)
@@ -411,6 +417,14 @@ jobs:
         run: cargo clippy -p autumn-harvest-cli --all-targets -- -D warnings
       - name: Clippy autumn-harvest-sqlite
         run: cargo clippy -p autumn-harvest-sqlite --all-targets -- -D warnings
+      # Issue #1973. `--no-deps`: the core crate without `db` has dead-code
+      # warnings of its own, which the core's own clippy step owns.
+      - name: Clippy autumn-harvest-agent (issue #1973)
+        run: cargo clippy -p autumn-harvest-agent --all-targets --no-deps -- -D warnings
+      - name: Clippy autumn-harvest-agent (sqlite feature)
+        run: cargo clippy -p autumn-harvest-agent --all-targets --features sqlite --no-deps -- -D warnings
+      - name: Check autumn-harvest-agent depends on no Autumn crate outside the engine
+        run: ./scripts/check-agent-adapter-deps.sh
       # Same issue #962 rule as every other crate on this page: a workspace
       # member gets NO clippy coverage without its own step, and these three
       # standalone example crates (each its own `examples/*/Cargo.toml`
@@ -1037,6 +1051,12 @@ jobs:
       - name: Run plugin lib tests (aws-kms feature, issue #1825)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-plugin --features aws-kms --lib aws_kms
+      # Issue #1978. The OIDC unit tests and the `api_with_oidc` builder test
+      # compile only with the feature. The MCP tool gate test also needs
+      # `mcp`. The round-trip suite runs from the manifest (`oidc_login`).
+      - name: Run plugin lib tests (oidc and mcp features, issue #1978)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo test -p autumn-harvest-plugin --features oidc,mcp,unified-dag-execution --lib oidc
       # No CI step ran the plugin's doctests, so a broken `///` example landed
       # silently (issue #944 review found exactly that). These are compile-only
       # (`no_run`), so they cost seconds and need no database.
@@ -1073,6 +1093,11 @@ jobs:
       - name: Run autumn-harvest-sqlite tests (issue #1068)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-sqlite
+      # Issue #1973. Offline: a scripted model, no API key, no network. The
+      # crash test runs its own binary as a child process.
+      - name: Run autumn-harvest-agent tests (issue #1973)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        run: cargo test -p autumn-harvest-agent --features sqlite
       # The agent-daemon example's suite is offline: a scripted stub model, no
       # API key, and no network. Linux only, because the daemon's control
       # surface is a Unix domain socket.
@@ -1154,6 +1179,9 @@ jobs:
       - name: Run entity_phase_transition example tests (issue #803)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest --no-default-features --features testing --example entity_phase_transition
+      - name: Run agent_session_entity example tests (issue #1975)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        run: cargo test -p autumn-harvest --no-default-features --features testing --example agent_session_entity
       - name: Run mutex_ledger example tests (issue #691)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --no-default-features --features testing --example mutex_ledger
