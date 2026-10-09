@@ -242,24 +242,34 @@ def compose_value(compose: str, key: str) -> str | None:
     return match.group(1) if match else None
 
 
+# The ECR Public mirror of the Docker Official Images. CI pulls an official
+# image from it, because Docker Hub rate-limits anonymous pulls. The mirror
+# serves the same image, so it matches compose.yaml.
+OFFICIAL_IMAGE_MIRROR = "public.ecr.aws/docker/library/"
+
+
 def check_service_matches_compose(compose: str, ci_job: str) -> list[str]:
     """The CI service uses the image, the credentials and the port of compose.yaml."""
     errors: list[str] = []
-    needles = []
+    # Each entry holds the forms that satisfy one value. The first is shown.
+    needles: list[list[str]] = []
     for key in ["image", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"]:
         value = compose_value(compose, key)
         if value is None:
             errors.append(f"{COMPOSE}: no {key}")
             continue
-        needles.append(f"{key}: {value}")
+        forms = [f"{key}: {value}"]
+        if key == "image" and "/" not in value:
+            forms.append(f"{key}: {OFFICIAL_IMAGE_MIRROR}{value}")
+        needles.append(forms)
     port = re.search(r"(\d+):5432", compose)
     if port is None:
         errors.append(f"{COMPOSE}: no published Postgres port")
     else:
-        needles.append(f"{port.group(1)}:5432")
-    for needle in needles:
-        if needle not in ci_job:
-            errors.append(f"{CI}: job {CI_JOB} does not have {needle!r} from {COMPOSE}")
+        needles.append([f"{port.group(1)}:5432"])
+    for forms in needles:
+        if not any(form in ci_job for form in forms):
+            errors.append(f"{CI}: job {CI_JOB} does not have {forms[0]!r} from {COMPOSE}")
     return errors
 
 
@@ -394,6 +404,10 @@ def self_test() -> int:
     job = "image: postgres:16\nPOSTGRES_USER: u\nPOSTGRES_PASSWORD: p\nPOSTGRES_DB: d\n- 5435:5432\n"
     assert check_service_matches_compose(compose, job) == []
     assert len(check_service_matches_compose(compose, job.replace("16", "17"))) == 1
+    mirrored = job.replace("image: ", "image: public.ecr.aws/docker/library/")
+    assert check_service_matches_compose(compose, mirrored) == []
+    other = job.replace("image: ", "image: example.com/")
+    assert len(check_service_matches_compose(compose, other)) == 1
     # A commented-out CI line does not count as wiring.
     assert not wiring_present("# run: cargo test x\n", "run: cargo test x")
     assert wiring_present("  run: cargo test x\n", "run: cargo test x")

@@ -1555,8 +1555,17 @@ jobs:
           if grep -q -- '--test connector_sqs_broker' <<<"$plan"; then
             images="$images softwaremill/elasticmq:1.5.2"
           fi
+          # Docker Hub rate-limits anonymous pulls. An official image (no
+          # slash in its name) comes from the ECR Public mirror of the
+          # Docker Official Images first. The tag then gives it the name that
+          # the suites request.
+          mirror="public.ecr.aws/docker/library"
           for image in $images; do
             for attempt in 1 2 3 4 5; do
+              if [[ "$image" != */* ]] && docker pull "$mirror/$image"; then
+                docker tag "$mirror/$image" "$image"
+                continue 2
+              fi
               if docker pull "$image"; then
                 continue 2
               fi
@@ -1614,7 +1623,9 @@ jobs:
     # connects verbatim, same as `docker compose -f examples/quickstart/compose.yaml up -d`.
     services:
       postgres:
-        image: postgres:16
+        # The ECR Public mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls.
+        image: public.ecr.aws/docker/library/postgres:16
         env:
           POSTGRES_USER: quickstart
           POSTGRES_PASSWORD: quickstart
@@ -1769,7 +1780,9 @@ jobs:
     # DATABASE_URL connects as written.
     services:
       postgres:
-        image: postgres:16
+        # The ECR Public mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls.
+        image: public.ecr.aws/docker/library/postgres:16
         env:
           POSTGRES_USER: harvest
           POSTGRES_PASSWORD: harvest
@@ -1815,7 +1828,9 @@ jobs:
     timeout-minutes: 60
     services:
       postgres:
-        image: postgres:16
+        # The ECR Public mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls.
+        image: public.ecr.aws/docker/library/postgres:16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -1865,7 +1880,9 @@ jobs:
     # Matches examples/quickstart/autumn.toml, same as the `quickstart` job.
     services:
       postgres:
-        image: postgres:16
+        # The ECR Public mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls.
+        image: public.ecr.aws/docker/library/postgres:16
         env:
           POSTGRES_USER: quickstart
           POSTGRES_PASSWORD: quickstart
@@ -1972,7 +1989,9 @@ jobs:
     # config connects verbatim — the truest AC-2/AC-3 test.
     services:
       postgres:
-        image: postgres:16
+        # The ECR Public mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls.
+        image: public.ecr.aws/docker/library/postgres:16
         env:
           POSTGRES_USER: demo_app
           POSTGRES_PASSWORD: demo_app
