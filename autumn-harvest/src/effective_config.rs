@@ -139,6 +139,8 @@ pub struct WorkerConfigView {
     pub max_concurrent_workflows: usize,
     /// Maximum concurrent activity executions.
     pub max_concurrent_activities: usize,
+    /// The most claims this worker runs at once.
+    pub max_concurrent_claims: usize,
     /// Worker poll interval, milliseconds.
     pub poll_interval_ms: u64,
     /// Graceful shutdown timeout, milliseconds.
@@ -408,6 +410,7 @@ impl WorkerConfigView {
             shard_notification_database_urls,
             max_concurrent_workflows,
             max_concurrent_activities,
+            max_concurrent_claims,
             shutdown_timeout,
             workflow_cache_size,
             resident_workflows,
@@ -458,6 +461,7 @@ impl WorkerConfigView {
             queue_weights: queue_weights.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             max_concurrent_workflows: *max_concurrent_workflows,
             max_concurrent_activities: *max_concurrent_activities,
+            max_concurrent_claims: *max_concurrent_claims,
             poll_interval_ms: dur_ms(poll_interval),
             shutdown_timeout_ms: dur_ms(*shutdown_timeout),
             workflow_cache_size: *workflow_cache_size,

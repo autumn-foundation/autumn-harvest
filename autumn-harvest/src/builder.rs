@@ -3845,6 +3845,12 @@ pub struct WorkerConfig {
     pub max_concurrent_workflows: usize,
     /// Maximum concurrent activity executions on this worker.
     pub max_concurrent_activities: usize,
+    /// The most claims this worker runs at once.
+    ///
+    /// Default: [`crate::worker::DEFAULT_MAX_CONCURRENT_CLAIMS`] (2). `1` is
+    /// one serial claim loop. Must be at least 1. See
+    /// [`Self::with_max_concurrent_claims`].
+    pub max_concurrent_claims: usize,
     /// The drain budget on shutdown or on a remote drain without a deadline.
     ///
     /// Default: [`DEFAULT_SHUTDOWN_TIMEOUT`] (25 s). Keep it at least 5 s
@@ -4397,6 +4403,7 @@ impl Default for WorkerConfig {
             shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 20,
             max_concurrent_activities: 50,
+            max_concurrent_claims: crate::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             workflow_cache_size: 1000,
             resident_workflows: true,
@@ -4928,6 +4935,31 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_resident_workflows(mut self, enabled: bool) -> Self {
         self.resident_workflows = enabled;
+        self
+    }
+
+    /// Set the most claims this worker runs at once.
+    ///
+    /// One claim loop runs one claim at a time. Assay #14 found that loop
+    /// busy 94% of the time, so it capped throughput. Extra loops claim only
+    /// after a claim returns work, and stop at the first empty claim. An idle
+    /// worker therefore polls at the rate of one loop.
+    ///
+    /// Each claim in flight holds one pool connection. Size the pool for
+    /// this value plus the running tasks. `1` restores one serial claim
+    /// loop. `0` fails worker validation.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default().with_max_concurrent_claims(4);
+    /// assert_eq!(config.max_concurrent_claims, 4);
+    /// ```
+    #[must_use]
+    pub const fn with_max_concurrent_claims(mut self, n: usize) -> Self {
+        self.max_concurrent_claims = n;
         self
     }
 

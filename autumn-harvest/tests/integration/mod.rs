@@ -81,6 +81,8 @@ mod claim_bench_support;
 #[cfg(feature = "db")]
 mod claim_budget_tests;
 #[cfg(feature = "db")]
+mod claim_concurrency_tests;
+#[cfg(feature = "db")]
 mod claim_continuation_priority_tests;
 #[cfg(feature = "db")]
 mod claim_run_deadline_tests;
