@@ -117,7 +117,8 @@ A finding holds code names and event indexes only. It never holds a payload.
 ### When a changed helper counts as passed
 
 A change to a helper body gives `migrate` only when the history proves that
-the run finished the helper:
+the run finished the helper. Each rule must hold in both manifests that
+have the helper, because the run ran the baseline code:
 
 - The helper is not the workflow body.
 - The helper starts at most once: one call site on each body up to the

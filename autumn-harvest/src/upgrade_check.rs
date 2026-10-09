@@ -859,8 +859,14 @@ impl UpgradeCheck {
                 ));
                 continue;
             }
-            let graph = if new.body(&id).is_some() { new } else { old };
-            if !is_passed(graph, &id, &facts) {
+            // The run ran the baseline code and the candidate takes it over.
+            // So the proof must hold in each graph that has the body. A wait
+            // that only the baseline helper holds is still open for this run.
+            let passed = [old, new]
+                .into_iter()
+                .filter(|graph| graph.body(&id).is_some())
+                .all(|graph| is_passed(graph, &id, &facts));
+            if !passed {
                 findings.push(Finding::new(
                     FindingKind::StepNotPassed,
                     format!("`{id}` changed, and this run may still execute it"),
@@ -889,6 +895,19 @@ fn schema_finding(
             if violations.len() == 1 { "" } else { "s" }
         ),
     ))
+}
+
+/// The shard a run belongs to, among the shard ids that alias its database.
+///
+/// The id encodes the shard the run started on. A rebalanced run keeps that
+/// id but lives elsewhere. So an encoded shard outside the group, or no
+/// encoded shard, gives the group's first shard id.
+fn shard_of(execution_id: ExecutionId, shards: &[ShardId]) -> ShardId {
+    let encoded = execution_id.shard();
+    if !encoded.is_unencoded() && shards.contains(&encoded) {
+        return encoded;
+    }
+    shards.first().copied().unwrap_or(encoded)
 }
 
 /// A payload in `events` or `pending` is a claim-check reference.
@@ -1302,7 +1321,7 @@ impl UpgradeCheck {
             let Some(&shard) = shards.first() else {
                 continue;
             };
-            match self.run_shard(shard, shard_pool, options).await {
+            match self.run_shard(&shards, shard_pool, options).await {
                 Ok((shard_runs, truncated)) => {
                     runs.extend(shard_runs);
                     if truncated {
@@ -1321,9 +1340,11 @@ impl UpgradeCheck {
         report
     }
 
+    /// Check the in-flight runs of one physical database. `shards` are the
+    /// shard ids that alias it, first one first.
     async fn run_shard(
         &self,
-        shard: ShardId,
+        shards: &[ShardId],
         pool: &crate::worker::DbPool,
         options: &UpgradeCheckOptions,
     ) -> crate::error::HarvestResult<(Vec<RunVerdict>, bool)> {
@@ -1393,7 +1414,7 @@ impl UpgradeCheck {
                 }
                 Err(e) => return Err(e),
             };
-            verdict.shard_id = Some(shard);
+            verdict.shard_id = Some(shard_of(execution_id, shards));
             verdicts.push(verdict);
         }
         Ok((verdicts, truncated))
@@ -1684,6 +1705,17 @@ mod tests {
     fn one_manifest_alone_is_a_usage_error() {
         let err = parse(&["--database-url", "x", "--baseline-structure", "old.json"]);
         assert!(matches!(err, Err(UpgradeCheckError::Usage(_))));
+    }
+
+    #[test]
+    fn a_verdict_names_the_aliased_shard_its_run_belongs_to() {
+        let (zero, one) = (ShardId::new(0), ShardId::new(1));
+        let on_one = ExecutionId::new_for_shard(one);
+        assert_eq!(super::shard_of(on_one, &[zero, one]), one);
+        // A rebalanced run keeps its id but lives in this group.
+        assert_eq!(super::shard_of(on_one, &[zero]), zero);
+        let unencoded = ExecutionId::from_uuid(uuid::Uuid::new_v4());
+        assert_eq!(super::shard_of(unencoded, &[one, zero]), one);
     }
 
     #[test]

@@ -584,6 +584,24 @@ async fn a_helper_that_can_park_without_a_command_is_never_passed() {
     assert_eq!(run.verdict, Verdict::Review, "{run:#?}");
 }
 
+/// The baseline `reserve` parks in `await_condition` after its activity. The
+/// candidate drops that wait, so its own graph alone looks passed. The run
+/// can still be parked in the baseline wait.
+#[tokio::test]
+async fn a_wait_that_only_the_baseline_helper_holds_needs_review() {
+    let mut baseline = order_graph(&[]);
+    baseline["bodies"][1]["steps"]
+        .as_array_mut()
+        .expect("steps")
+        .push(json!({ "sink": "await_condition", "kind": "other", "key": null, "in_loop": false }));
+    let candidate = order_graph(&["orders::reserve::{closure#0}"]);
+    let run = check_with(baseline, candidate)
+        .check_snapshot(snapshot(waiting_to_ship()))
+        .await;
+    assert_eq!(run.verdict, Verdict::Review, "{run:#?}");
+    assert_eq!(kinds(&run), [FindingKind::StepNotPassed]);
+}
+
 #[tokio::test]
 async fn an_open_update_with_no_candidate_schema_is_unchecked() {
     let mut events = waiting_to_ship();

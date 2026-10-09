@@ -153,7 +153,8 @@ pin > review > migrate. A run with no finding gets migrate.
 
 A body is **changed** when its digest differs, or when only one manifest
 has it. For a run `R` of workflow `W`, a changed body `b` is passed only
-when all of these hold:
+when all of these hold, in each manifest that has `b`. The run ran the
+baseline code, so a wait that only the baseline `b` holds still counts:
 
 1. `b` is not the root body.
 2. `b` starts at most once per run. Each body on the call chain from the
