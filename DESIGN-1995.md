@@ -88,6 +88,18 @@ verdicts, and each fix has a test:
 6. A future type in generic arguments made a real call look like a resume.
    Only `into_future`, `poll` and the `Pin` constructors resume now.
 
+A later review of the merged branch found three gaps in the candidate setup:
+
+7. The replay had no query handlers. A workflow that branches on
+   `ctx.list_query_names()` took another path than the worker. `queries`
+   now registers them.
+8. The replay used the default payload caps. A run whose next payload is
+   over a lowered candidate cap got `migrate`. `with_payload_caps` now
+   passes the candidate caps.
+9. With an offloader, the replay had no offload threshold. A next payload
+   that the worker offloads failed the cap, and the run got `pin`.
+   `with_offloader` now passes the threshold, but not the offloader.
+
 ---
 
 ## 1. Verdict rules
@@ -209,6 +221,9 @@ passed. Signals, mutexes, `continue_as_new`, random values and
   finding is `payload-unchecked`.
 - The check also validates each recorded workflow input, `SignalReceived`
   and `UpdateAdmitted` payload, when the candidate publishes a schema.
+- The replay applies the candidate payload caps and offload threshold to
+  the commands that a run sends next. A payload over a cap fails the
+  replay, unless the worker offloads it.
 - An offloaded payload is inflated through the candidate offloader. With
   no offloader, the finding is `payload-offloaded`. Replay and the schema
   checks then do not run, because a claim-check stub is not the payload.

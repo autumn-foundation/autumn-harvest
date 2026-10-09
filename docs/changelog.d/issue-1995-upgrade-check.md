@@ -30,6 +30,10 @@ Design decisions:
   names that no other body emits. Each of them must be complete and none
   open, and a decision must run after the last result.
 - Any `unknown` boundary in a workflow graph gives review.
+- The replay runs with the candidate worker's setup: its query handlers
+  (`queries`), its payload caps (`with_payload_caps`) and its offload
+  threshold (`with_offloader`). A run whose next payload is over a
+  candidate cap gets `pin`.
 - A run verdict holds ids, names, finding kinds and event indexes. It holds
   no payload and no error text, because a serde error quotes the value it
   rejects. The `incomplete` list holds shard database errors only.

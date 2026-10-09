@@ -38,7 +38,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::event::WorkflowEvent;
-use crate::info::{SignalHandlerInfo, UpdateHandlerInfo, WorkflowHandlerFn, WorkflowInfo};
+use crate::info::{
+    QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerInfo, WorkflowHandlerFn, WorkflowInfo,
+};
 use crate::payload_codec::PayloadCodecs;
 use crate::testing::{HistorySnapshot, ReplayStatus, WorkflowReplayer};
 use crate::types::{ExecutionId, ShardId};
@@ -493,6 +495,7 @@ pub struct UpgradeCheck {
     signal_schemas: HashMap<(String, String), fn() -> serde_json::Value>,
     update_schemas: HashMap<(String, String), fn() -> serde_json::Value>,
     updates: Vec<UpdateHandlerInfo>,
+    queries: Vec<QueryHandlerInfo>,
     structure: Option<(StructureManifest, StructureManifest)>,
     codecs: Arc<PayloadCodecs>,
     offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
@@ -525,6 +528,7 @@ impl UpgradeCheck {
             signal_schemas: HashMap::new(),
             update_schemas: HashMap::new(),
             updates: Vec::new(),
+            queries: Vec::new(),
             structure: None,
             codecs: Arc::new(PayloadCodecs::default()),
             offloader: None,
@@ -583,6 +587,35 @@ impl UpgradeCheck {
         self
     }
 
+    /// The candidate build's query handlers. The worker registers them before
+    /// workflow code runs, so the replay registers them too. A workflow can
+    /// branch on `ctx.list_query_names()`.
+    #[must_use]
+    pub fn queries(mut self, queries: Vec<QueryHandlerInfo>) -> Self {
+        self.queries.extend(queries);
+        self.replayer = self.replayer.queries(self.queries.clone());
+        self
+    }
+
+    /// The candidate worker's payload caps, in bytes: activity input, signal
+    /// payload and workflow input. `0` means no cap. The replay applies them
+    /// to the commands a run sends next. Pass the values of the candidate
+    /// `HarvestBuilder`.
+    #[must_use]
+    pub fn with_payload_caps(
+        mut self,
+        max_activity_input: u64,
+        max_signal_payload: u64,
+        max_workflow_input: u64,
+    ) -> Self {
+        self.replayer = self.replayer.with_payload_caps(
+            max_activity_input,
+            max_signal_payload,
+            max_workflow_input,
+        );
+        self
+    }
+
     /// Configure the replayer further, for example with shared state or the
     /// candidate build id.
     #[must_use]
@@ -619,6 +652,11 @@ impl UpgradeCheck {
         // The check inflates at its input, before it decodes. The replayer
         // gets no offloader, so it never inflates a payload twice: a value
         // that itself looks like a claim check stays as it is.
+        // The replayer still gets the threshold. The worker offloads a payload
+        // above it, so the payload cap does not reject that payload.
+        self.replayer = self
+            .replayer
+            .with_payload_offload_threshold(Some(offloader.threshold()));
         self.offloader = Some(offloader);
         self
     }

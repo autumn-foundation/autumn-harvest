@@ -12,7 +12,7 @@ use std::sync::Arc;
 use autumn_harvest::WorkflowContext;
 use autumn_harvest::aead_codec::{AeadCodec, DataKey};
 use autumn_harvest::event::WorkflowEvent;
-use autumn_harvest::info::{SignalHandlerInfo, UpdateHandlerInfo};
+use autumn_harvest::info::{QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerInfo};
 use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest::payload_store::{
     PayloadOffloader, PayloadStore, PayloadStoreError, PayloadStoreFuture,
@@ -946,4 +946,99 @@ fn verdicts_order_migrate_review_pin() {
     assert!(Verdict::Review < Verdict::Pin);
     assert_eq!(FindingKind::StepNotPassed.verdict(), Verdict::Review);
     assert_eq!(FindingKind::Nondeterminism.verdict(), Verdict::Pin);
+}
+
+// ── the candidate worker's configuration ────────────────────────────────────
+
+// `QueryHandlerFn` takes the input by value and returns a `Result`.
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn status_handler(_ctx: &WorkflowContext, _input: Value) -> Result<Value, String> {
+    Ok(json!("open"))
+}
+
+/// A candidate query handler.
+fn status_query() -> QueryHandlerInfo {
+    QueryHandlerInfo {
+        name: "status",
+        workflow: ORDER,
+        module: module_path!(),
+        input_type_hint: "()",
+        output_type_hint: "String",
+        handler: status_handler,
+        description: None,
+        arg_schema: None,
+        response_schema: None,
+    }
+}
+
+/// The candidate takes another first step when it has no `status` query.
+pub fn order_by_queries_wf(ctx: &WorkflowContext, input: Value) -> WfFuture<'_> {
+    Box::pin(async move {
+        if !ctx.list_query_names().iter().any(|name| name == "status") {
+            return ctx
+                .execute_activity_raw("legacy", json!({}), "default")
+                .await
+                .map_err(|e| e.to_string());
+        }
+        order_wf(ctx, input).await
+    })
+}
+
+#[tokio::test]
+async fn the_replay_registers_the_candidate_queries() {
+    // The worker registers each query before workflow code runs. A replay
+    // without them takes the other branch.
+    let check = || {
+        UpgradeCheck::new()
+            .register_fn(ORDER, order_by_queries_wf)
+            .with_structure(
+                manifest(vec![order_graph(&[])]),
+                manifest(vec![order_graph(&[])]),
+            )
+    };
+    let blind = check().check_snapshot(snapshot(reserving())).await;
+    assert_eq!(blind.verdict, Verdict::Pin, "{blind:#?}");
+    let run = check()
+        .queries(vec![status_query()])
+        .check_snapshot(snapshot(reserving()))
+        .await;
+    assert_eq!(run.verdict, Verdict::Migrate, "{run:#?}");
+}
+
+#[tokio::test]
+async fn a_next_input_over_the_candidate_cap_is_pinned() {
+    // The run has not dispatched `reserve` yet. Its input `{}` is two bytes,
+    // and the candidate caps an activity input at one.
+    let run = unchanged_check()
+        .with_payload_caps(1, 0, 0)
+        .check_snapshot(snapshot(vec![started()]))
+        .await;
+    assert_eq!(run.verdict, Verdict::Pin, "{run:#?}");
+    assert_eq!(kinds(&run), [FindingKind::ReplayFailed]);
+}
+
+#[tokio::test]
+async fn a_next_input_under_the_candidate_cap_migrates() {
+    let run = unchanged_check()
+        .with_payload_caps(2, 0, 0)
+        .check_snapshot(snapshot(vec![started()]))
+        .await;
+    assert_eq!(run.verdict, Verdict::Migrate, "{run:#?}");
+}
+
+#[tokio::test]
+async fn a_next_input_the_candidate_offloads_migrates() {
+    // The input is over the cap and over the offload threshold. The worker
+    // offloads it, so the cap does not apply.
+    let offloader = Arc::new(PayloadOffloader::new(
+        Arc::new(MemStore::default()),
+        0,
+        Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+    ));
+    let run = unchanged_check()
+        .with_payload_caps(1, 0, 0)
+        .with_offloader(offloader)
+        .check_snapshot(snapshot(vec![started()]))
+        .await;
+    assert_eq!(run.verdict, Verdict::Migrate, "{run:#?}");
 }

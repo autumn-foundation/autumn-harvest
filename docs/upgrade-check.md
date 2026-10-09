@@ -44,7 +44,8 @@ does not change it. See
 The check runs inside the candidate build, because only that build holds its
 workflow types and codec keys. Add a small binary next to the worker binary.
 Enable the `db` and `testing` features of `autumn-harvest` for it. Register
-the same workflows, signals, updates, codecs and offloader as the worker:
+the same workflows, signals, updates, queries, codecs and offloader as the
+worker:
 
 ```rust,ignore
 use std::sync::Arc;
@@ -55,14 +56,27 @@ async fn main() {
     let check = UpgradeCheck::new()
         .register(workflows![place_order])
         .signals(signals![approve])
+        .queries(queries![order_status])
         .with_codecs(Arc::new(my_codecs()));
     std::process::exit(run_command(check, std::env::args().collect()).await);
 }
 ```
 
 The `upgrade_check` example in `autumn-harvest/examples/` is a complete
-binary. Use `with_offloader` when the worker offloads large payloads. Use
-`map_replayer` to give the replay shared state or the candidate build id.
+binary. The replay registers each query, because a workflow can branch on
+`ctx.list_query_names()`.
+
+When the worker sets `max_activity_input_bytes`, `max_signal_payload_bytes`
+or `max_workflow_input_bytes`, pass the same three values to
+`with_payload_caps`. The defaults match the worker defaults. The replay
+applies the caps to the commands that a run sends next. A run whose next
+payload is over a candidate cap gets `pin`, because the candidate worker
+rejects that payload.
+
+Use `with_offloader` when the worker offloads large payloads. The replay
+then takes the offload threshold too, so a payload above it is not held to
+the cap. Use `map_replayer` to give the replay shared state or the
+candidate build id.
 
 ## 3. Run the check
 
