@@ -287,9 +287,8 @@ impl Evaluation {
 ///
 /// # Errors
 ///
-/// Returns an [`EvalError`] when the evaluation cannot start: the history is
-/// not an agent run, it was erased, a payload does not decode, or the runtime
-/// is current-thread. No model call runs in these cases.
+/// Returns an [`EvalError`] when the evaluation cannot start. The variants
+/// name the causes. No model call runs in these cases.
 pub async fn evaluate(
     history: &[WorkflowEvent],
     candidate: &Candidate,

@@ -438,7 +438,53 @@ The guard is not a cost control. A model that changes its arguments, or a
 tool whose result changes, does not trip it. Use `max_steps`,
 `max_total_tokens` and the chain cap for cost.
 
-## 11. The daemon example
+## 11. Evaluate a candidate model or prompt
+
+`eval::evaluate` re-drives a recorded `agent_loop` run with a candidate model
+or prompt (issue #2001). It reports where the decisions diverge. Turn on the
+`eval` feature.
+
+```rust,ignore
+use autumn_harvest_agent::eval::{Candidate, evaluate};
+
+let candidate = Candidate::new(AgentHarness::new(new_model).tools(tools))
+    .system_prompt("Answer in one sentence.");
+let evaluation = evaluate(&history, &candidate).await?;
+if let Some(turn) = evaluation.first_divergence {
+    println!("{:?}", evaluation.turns[turn]);
+}
+```
+
+The harness runs the real loop in the in-memory test engine. It writes
+nothing to a database. The source history is a borrowed slice, so it cannot
+change.
+
+| Activity | In an evaluation |
+|---|---|
+| `agent_model_turn` | The candidate model answers. This is the only live call. |
+| `agent_tool_call` | The recorded outcome of the same call, or an error stub. No tool runs. |
+| `agent_memory_snapshot` | The recorded snapshot, or an empty one. |
+| `agent_deliver` | A stub. No report leaves the harness. |
+
+A recorded outcome answers a call with the same step, tool name and
+arguments. A candidate call that equals the recorded call at the same turn
+and position takes the recorded call id. So the recorded approvals stay
+valid. An approval that arrived after its deadline is dropped.
+
+The report holds one `TurnDiff` per model turn. A turn diverges when the
+calls, the arguments, the policy decisions or the stop reason differ. Two
+final answers in other words are `Reworded`, not a divergence.
+`stubbed_tool_calls` counts the calls with no recorded outcome.
+
+The harness refuses an erased source and a history that is not an agent run.
+A history with payload-store references or encrypted payloads needs decoding
+first. The model call blocks in place, so run the evaluation on a
+multi-thread Tokio runtime.
+
+The evaluation is an in-memory fork at the first event. The database fork of
+issue #2000 is a separate feature.
+
+## 12. The daemon example
 
 `examples/claude-agent-daemon` speaks the Anthropic Messages API and replays
 thinking blocks verbatim, which the provider-neutral `ChatMessage` cannot
