@@ -868,7 +868,8 @@ fn fit_result_cap(turn: ModelTurn, provider_ids: &[String], cap: u64) -> Result<
     for (id, provider_id) in parts.zip(provider_ids) {
         id.clone_from(provider_id);
     }
-    if exceeds_bytes(&as_recorded, cap) {
+    // A worker reads a zero cap as no cap.
+    if cap > 0 && exceeds_bytes(&as_recorded, cap) {
         return Err(ActivityFailure::non_retryable(
             "PayloadTooLarge",
             format!("the model turn is larger than the result cap of {cap} bytes"),
@@ -1195,7 +1196,11 @@ mod tests {
         align_call_ids(&mut turn.content, &[], &HashSet::new(), 0);
         let original = vec!["c1".to_owned()];
         assert!(fit_result_cap(turn.clone(), &original, fits).is_ok());
-        assert!(fit_result_cap(turn, &original, fits - 1).is_err());
+        assert!(fit_result_cap(turn.clone(), &original, fits - 1).is_err());
+        assert!(
+            fit_result_cap(turn, &original, 0).is_ok(),
+            "a zero cap is no cap"
+        );
     }
 
     #[test]
