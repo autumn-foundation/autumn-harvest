@@ -327,6 +327,8 @@ mod telemetry_span_tests;
 mod tenant_cell_isolation_tests;
 mod tenant_isolation_docs;
 #[cfg(feature = "db")]
+mod tenant_propagation_tests;
+#[cfg(feature = "db")]
 mod terminal_task_gc_tests;
 #[cfg(feature = "db")]
 mod terminal_write_ownership_tests;

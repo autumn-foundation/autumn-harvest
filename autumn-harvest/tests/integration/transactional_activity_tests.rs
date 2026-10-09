@@ -323,6 +323,7 @@ async fn transactional_activity_happy_path_atomic_commit() {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                tenant: None,
             },
             None,
         )
@@ -420,6 +421,7 @@ async fn transactional_activity_err_rolls_back_user_writes() {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                tenant: None,
             },
             None,
         )

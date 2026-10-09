@@ -15,23 +15,38 @@ use serde_json::Value;
 
 use crate::approval::Approval;
 use crate::harness::AgentHarness;
+use crate::heartbeat::{HEARTBEAT_WORKFLOW_NAME, HeartbeatTask, agent_heartbeat_info};
 use crate::types::AgentTask;
 use crate::workflow::{
-    WORKFLOW_NAME, agent_loop_info, agent_model_turn_info, agent_tool_call_info,
+    WORKFLOW_NAME, agent_deliver_info, agent_loop_info, agent_memory_snapshot_info,
+    agent_model_turn_info, agent_precheck_info, agent_tool_call_info,
 };
 
-/// Register the agent workflow and its two activities against `harness`.
+/// Register the agent workflows and their activities against `harness`.
 ///
 /// Call it once per runtime, before the first drive. A runtime that reopens a
 /// database must register again before it resumes a run.
 pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     rt.register_workflow(&agent_loop_info());
-    let model = Arc::clone(&harness);
+    rt.register_workflow(&agent_heartbeat_info());
+    let h = Arc::clone(&harness);
     rt.register_activity(&agent_model_turn_info(), move |input| {
-        call(input, |request| model.model_turn(request))
+        call(input, |request| h.model_turn(request))
     });
+    let h = Arc::clone(&harness);
     rt.register_activity(&agent_tool_call_info(), move |input| {
-        call(input, |request| harness.tool_call(request))
+        call(input, |request| h.tool_call(request))
+    });
+    let h = Arc::clone(&harness);
+    rt.register_activity(&agent_memory_snapshot_info(), move |input| {
+        call(input, |scope| h.memory_snapshot(scope))
+    });
+    let h = Arc::clone(&harness);
+    rt.register_activity(&agent_deliver_info(), move |input| {
+        call(input, |report| h.deliver(report))
+    });
+    rt.register_activity(&agent_precheck_info(), move |input| {
+        call(input, |task| harness.precheck_tick(task))
     });
 }
 
@@ -42,6 +57,17 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
 /// Returns an error when the runtime cannot record the start.
 pub fn start(rt: &mut SqliteRuntime, task: &AgentTask) -> SqliteResult<ExecutionId> {
     rt.start_workflow(WORKFLOW_NAME, serde_json::to_value(task)?)
+}
+
+/// Start one heartbeat tick. Returns its execution id.
+///
+/// SQLite has no engine scheduler. Call it from the app on each tick.
+///
+/// # Errors
+///
+/// Returns an error when the runtime cannot record the start.
+pub fn start_heartbeat(rt: &mut SqliteRuntime, task: &HeartbeatTask) -> SqliteResult<ExecutionId> {
+    rt.start_workflow(HEARTBEAT_WORKFLOW_NAME, serde_json::to_value(task)?)
 }
 
 /// Send a reviewer decision to the wait that `signal` names.

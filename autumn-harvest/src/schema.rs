@@ -211,6 +211,13 @@ diesel::table! {
         /// row's marker with a direct match on the vacating migration's own
         /// execution id, with no cross-database write and no retry race.
         staging_vacated_by -> Nullable<Uuid>,
+        /// Verified tenant of the run (issue #1977). A start by a tenant-bound
+        /// caller sets it. Children, retries, continue-as-new, reset and re-run
+        /// copy it from the source run. NULL means the run has no tenant.
+        ///
+        /// The 65th column. The workspace enables diesel's
+        /// `128-column-tables` feature for it.
+        tenant -> Nullable<Text>,
     }
 }
 
@@ -698,6 +705,9 @@ diesel::table! {
         last_used_at -> Nullable<Timestamptz>,
         revoked_at -> Nullable<Timestamptz>,
         created_by -> Text,
+        /// Tenant claim of the token (issue #1977). NULL means not
+        /// tenant-bound.
+        tenant -> Nullable<Text>,
     }
 }
 
@@ -840,6 +850,8 @@ diesel::table! {
         /// #1227, Finding 4). The claim query can then exclude the row until
         /// its backoff elapses, instead of leaving it to dominate every batch.
         next_attempt_at -> Nullable<Timestamptz>,
+        /// Tenant of the source run (issue #1977). The target run gets it.
+        tenant -> Nullable<Text>,
     }
 }
 

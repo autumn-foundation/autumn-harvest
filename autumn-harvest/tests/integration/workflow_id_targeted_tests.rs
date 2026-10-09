@@ -179,6 +179,7 @@ async fn insert_running_row(
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -263,6 +264,7 @@ async fn continue_as_new_atomically(
             start_source: None,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         };
         diesel::insert_into(harvest_workflow_executions::table)
             .values(&row)
@@ -1341,6 +1343,7 @@ fn default_start_params(
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     }
 }
 

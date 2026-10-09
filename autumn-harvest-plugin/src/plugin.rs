@@ -1673,9 +1673,9 @@ impl Plugin for HarvestPlugin {
             let router = harvest_api_router(api_state.clone()).nest("/ui", ui_router);
             // The layer stack and its load-bearing ordering live in
             // `apply_admin_auth_layers`, which the standalone mount path also
-            // calls (issue #1608), so the two cannot drift. Neither layer is
-            // installed unless its opt-in is set, so the default and
-            // api_with_auth paths are byte-for-byte unchanged (AC6, AC7).
+            // calls (issue #1608), so the two cannot drift. Only the tenant
+            // binding layer (issue #1977) is always installed. It passes a
+            // request with no verified tenant unchanged.
             let mut router = crate::api::apply_admin_auth_layers(
                 router,
                 &api_state,
