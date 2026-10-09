@@ -5662,7 +5662,8 @@
           "skipped_count",
           "items",
           "unavailable_shards"
-        ]
+        ],
+        "notes": "Each item has exec_id and outcome: reset | previewed | skipped. A skipped item has skip_reason.type: terminal_source | child_workflow | erased_source | empty_history | continue_as_new | no_matching_activity | invalid_boundary | infrastructure_error. Only infrastructure_error can clear on a plain retry. A run with PII-erased payloads is always skipped with erased_source, in a preview and in a real reset (issue #1999)."
       },
       "error_responses": [
         {

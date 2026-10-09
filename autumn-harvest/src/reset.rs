@@ -2531,4 +2531,50 @@ mod tests {
             assert_eq!(reason, back, "round-trip failed for {json}");
         }
     }
+
+    // ── Erased sources in batch reset (issue #1999, pure / no-DB) ────────────
+
+    #[test]
+    fn erased_source_skip_reason_has_a_typed_wire_tag() {
+        let json = serde_json::to_value(ResetSkipReason::ErasedSource).expect("serialize");
+        assert_eq!(json, serde_json::json!({ "type": "erased_source" }));
+        let back: ResetSkipReason = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, ResetSkipReason::ErasedSource);
+    }
+
+    #[test]
+    fn batch_skip_reason_keeps_an_erasure_typed() {
+        // An erasure can commit between the batch resolve and the fork lock.
+        // The fork then refuses. The item must still say why.
+        let exec_id = crate::types::ExecutionId::new_for_shard(crate::types::ShardId::new(0));
+        let reason = super::batch_skip_reason(&super::WorkflowResetError::ErasedSource { exec_id });
+        assert_eq!(reason, ResetSkipReason::ErasedSource);
+    }
+
+    #[test]
+    fn batch_skip_reason_reports_other_failures_as_infrastructure() {
+        let exec_id = crate::types::ExecutionId::new_for_shard(crate::types::ShardId::new(0));
+        let reason = super::batch_skip_reason(&super::WorkflowResetError::HolderHoldsMutex {
+            exec_id,
+            key: "k".to_string(),
+        });
+        assert!(
+            matches!(
+                &reason,
+                ResetSkipReason::InfrastructureError { message }
+                    if message.starts_with("reset failed: ") && message.contains("mutex")
+            ),
+            "got: {reason:?}"
+        );
+    }
+
+    #[test]
+    fn erased_source_skip_maps_to_the_erased_source_error() {
+        let exec_id = crate::types::ExecutionId::new_for_shard(crate::types::ShardId::new(0));
+        let error = super::skip_reason_to_error(exec_id, ResetSkipReason::ErasedSource);
+        assert!(
+            matches!(error, super::WorkflowResetError::ErasedSource { exec_id: id } if id == exec_id),
+            "got: {error:?}"
+        );
+    }
 }

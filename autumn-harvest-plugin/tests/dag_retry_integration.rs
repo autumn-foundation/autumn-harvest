@@ -730,6 +730,9 @@ async fn retry_erased_run_is_conflict() {
 /// run, which is exactly the state the race leaves behind by the time the fork
 /// takes its lock. The pre-flight guard is bypassed by construction here, so a
 /// refusal can only come from the locked re-check.
+///
+/// The request sets no opt-in (issue #1999). Every fork refuses an erased
+/// source, so a caller cannot forget to ask for the check.
 #[tokio::test]
 async fn reset_refuses_an_erased_source_under_its_own_row_lock() {
     use autumn_harvest::reset::{
@@ -768,7 +771,7 @@ async fn reset_refuses_an_erased_source_under_its_own_row_lock() {
         operator_id: "oncall".to_string(),
         signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::default(),
         allow_terminal_source: true,
-        refuse_erased_source: true,
+        refuse_erased_source: false,
     };
 
     let error = reset_workflow_execution(&mut conn, exec_id, request, None)
@@ -789,13 +792,13 @@ async fn reset_refuses_an_erased_source_under_its_own_row_lock() {
     assert_eq!(forks, 1, "the refused fork must not create a new run");
 }
 
-/// The flag is opt-in: with it off, an erased source resets exactly as before.
-///
-/// This is what keeps the public `POST /workflows/&#123;id&#125;/reset` endpoint — which
-/// cannot set the flag from the wire — byte-for-byte unchanged by the fix.
+/// A dry run must return the rejection the real reset returns (issue #1999).
+/// Otherwise a preview approves a fork that the reset then refuses.
 #[tokio::test]
-async fn reset_without_the_flag_still_forks_an_erased_source() {
-    use autumn_harvest::reset::{WorkflowResetRequest, reset_workflow_execution};
+async fn preview_refuses_an_erased_source() {
+    use autumn_harvest::reset::{
+        WorkflowResetError, WorkflowResetRequest, preview_workflow_reset,
+    };
 
     let (url, _container) = setup_database().await;
     let mut conn = establish(&url).await;
@@ -804,7 +807,7 @@ async fn reset_without_the_flag_still_forks_an_erased_source() {
     let exec_id = seed_run(
         &mut conn,
         "linear_retry_dag",
-        "lin-erased-allowed",
+        "lin-erased-preview",
         events,
         "FAILED",
     )
@@ -814,21 +817,24 @@ async fn reset_without_the_flag_still_forks_an_erased_source() {
         .await
         .expect("erase payloads");
 
-    // Event 4 follows `step_b`, the boundary a `step_c` retry uses. Event 1
-    // has an open `step_a` schedule, so the reset-point check refuses it.
+    // Event 4 is a valid boundary, so only erasure can refuse the preview.
     let request = WorkflowResetRequest {
         reset_to_event_id: Some(4),
         reset_point: None,
-        reason: "plain reset".to_string(),
+        reason: "dry run".to_string(),
         operator_id: "oncall".to_string(),
         signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::default(),
         allow_terminal_source: true,
         refuse_erased_source: false,
     };
 
-    reset_workflow_execution(&mut conn, exec_id, request, None)
+    let error = preview_workflow_reset(&mut conn, exec_id, request)
         .await
-        .expect("with the flag off the reset must behave exactly as it did pre-fix");
+        .expect_err("a preview over an erased source must be refused");
+    assert!(
+        matches!(error, WorkflowResetError::ErasedSource { .. }),
+        "expected ErasedSource, got: {error:?}"
+    );
 }
 
 // ── (f) non-existent node -> 400 with declared list ─────────────────────────

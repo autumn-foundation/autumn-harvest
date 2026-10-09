@@ -679,3 +679,126 @@ async fn reset_strips_stale_nd_diagnostic_search_attrs_from_fork() {
         );
     }
 }
+
+// ── batch reset of a PII-erased source (issue #1999) ────────────────────────
+
+/// Seed a `FAILED` run. Erase its payloads when `erase` is `true`.
+async fn seed_failed_execution(
+    conn: &mut AsyncPgConnection,
+    workflow_id: &str,
+    erase: bool,
+) -> ExecutionId {
+    let (exec_id, _) = seed_execution(conn, workflow_id).await;
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("FAILED"),
+            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+        ))
+        .execute(conn)
+        .await
+        .expect("mark FAILED");
+    if erase {
+        let outcome =
+            autumn_harvest::erase::erase_workflow_payloads(conn, exec_id, "gdpr subject request")
+                .await
+                .expect("erase payloads");
+        assert!(
+            outcome.fields_tombstoned > 0,
+            "the fixture must erase something: {outcome:?}"
+        );
+    }
+    exec_id
+}
+
+/// Find the batch item for `exec_id`.
+fn batch_item(body: &Value, exec_id: ExecutionId) -> Value {
+    body["items"]
+        .as_array()
+        .expect("items array")
+        .iter()
+        .find(|item| item["exec_id"] == json!(exec_id.to_string()))
+        .cloned()
+        .unwrap_or_else(|| panic!("no batch item for {exec_id}: {body}"))
+}
+
+/// Count the reset forks of `exec_id`. A fork names its source in
+/// `start_source_ref` (issue #740).
+async fn fork_count(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64 {
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::start_source.eq(Some("reset")))
+        .filter(harvest_workflow_executions::start_source_ref.eq(Some(exec_id.to_string())))
+        .count()
+        .get_result(conn)
+        .await
+        .expect("count forks")
+}
+
+fn batch_reset_body(preview: bool) -> Value {
+    json!({
+        "filter": { "workflow_name": "resettable", "states": ["FAILED"] },
+        "reset_point": { "type": "event_id", "event_id": 0 },
+        "reason": "replay the failed cohort",
+        "operator_id": "oncall",
+        "preview": preview
+    })
+}
+
+/// A batch reset must not fork a PII-erased run. The fork would resume on
+/// tombstones. The erased run is skipped with a typed reason. The intact run
+/// in the same cohort still resets.
+#[tokio::test]
+async fn batch_reset_skips_an_erased_source_and_resets_the_rest() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+        .await
+        .expect("connect");
+    let erased = seed_failed_execution(&mut conn, "wf-batch-erased", true).await;
+    let intact = seed_failed_execution(&mut conn, "wf-batch-intact", false).await;
+
+    let (status, body) = post_json(&app, "/workflows/batch_reset", batch_reset_body(false)).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["total"], json!(2), "body: {body}");
+    assert_eq!(body["reset_count"], json!(1), "body: {body}");
+    assert_eq!(body["skipped_count"], json!(1), "body: {body}");
+
+    let skipped = batch_item(&body, erased);
+    assert_eq!(skipped["outcome"], json!("skipped"), "item: {skipped}");
+    assert_eq!(
+        skipped["skip_reason"],
+        json!({ "type": "erased_source" }),
+        "the skip must name erasure, not an infrastructure error: {skipped}"
+    );
+    assert!(skipped.get("new_exec_id").is_none(), "item: {skipped}");
+    assert_eq!(fork_count(&mut conn, erased).await, 0, "no fork of the erased run");
+
+    let reset = batch_item(&body, intact);
+    assert_eq!(reset["outcome"], json!("reset"), "item: {reset}");
+    assert_eq!(fork_count(&mut conn, intact).await, 1, "the intact run forks");
+}
+
+/// The dry run must predict the real outcome. It reports the erased run as
+/// skipped with the same typed reason.
+#[tokio::test]
+async fn batch_reset_preview_reports_an_erased_source_as_skipped() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+        .await
+        .expect("connect");
+    let erased = seed_failed_execution(&mut conn, "wf-batch-preview-erased", true).await;
+    let intact = seed_failed_execution(&mut conn, "wf-batch-preview-intact", false).await;
+
+    let (status, body) = post_json(&app, "/workflows/batch_reset", batch_reset_body(true)).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let skipped = batch_item(&body, erased);
+    assert_eq!(skipped["outcome"], json!("skipped"), "item: {skipped}");
+    assert_eq!(skipped["skip_reason"], json!({ "type": "erased_source" }));
+    assert_eq!(batch_item(&body, intact)["outcome"], json!("previewed"));
+    assert_eq!(fork_count(&mut conn, erased).await, 0, "a preview forks nothing");
+    assert_eq!(fork_count(&mut conn, intact).await, 0, "a preview forks nothing");
+}
