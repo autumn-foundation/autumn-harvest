@@ -3707,9 +3707,9 @@ pub trait MetricsRecorder: Send + Sync {
 
     /// A task was dispatched from the given shard (issue #961).
     ///
-    /// Recorded once per dispatched task by the claim loop that claimed it,
-    /// the only place that knows which shard the claim came from (a task row
-    /// carries no `shard_id` column — "which shard" *is* "which pool").
+    /// The claim loop that claimed the task records it once. Only that loop
+    /// knows which shard the claim came from. A task row carries no
+    /// `shard_id` column, so "which shard" *is* "which pool".
     /// Lets operators confirm no assigned shard is being starved (AC5).
     ///
     /// Maps to the counter [`METRIC_SHARD_DISPATCHED`].
