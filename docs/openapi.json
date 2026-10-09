@@ -10990,7 +10990,7 @@
     },
     "/workflows/{id}/fork": {
       "post": {
-        "description": "Non-destructive fork of a workflow execution (issue #2000). Copy a history prefix of the source to a NEW execution with a NEW workflow id. The source is never changed, so a run in any state can be forked, including COMPLETED and TERMINATED. Admin-only. Provenance on the fork is start_source='fork', start_source_ref=<source execution id>; its history holds a WorkflowForked marker that names the source. effects defaults to recorded: a remote activity takes a caller override, or the result that the source recorded for the same name, occurrence and input; with neither it fails non-retryably with error_type ForkEffectUnavailable and never runs. In recorded mode, a local activity, a child workflow, an external activity, an external signal or an external cancel fails the fork run before it runs, and the fork sends no completion callback and fires no completion trigger. effects=live runs effects for real.",
+        "description": "Non-destructive fork of a workflow execution (issue #2000). Copy a history prefix of the source to a NEW execution with a NEW workflow id. The source is never changed, so a run in any state can be forked, including COMPLETED and TERMINATED. Admin-only. Provenance on the fork is start_source='fork', start_source_ref=<source execution id>; its history holds a WorkflowForked marker that names the source. effects defaults to recorded: a remote activity takes a caller override, or the result that the source recorded for the same name, occurrence and input; with neither it fails non-retryably with error_type ForkEffectUnavailable and never runs. In recorded mode, a local activity, a child workflow, an external activity, an external signal, an external cancel, a continue-as-new or a mutex acquire fails the fork run before it runs; a race branch that lost in the source stays pending; and the fork sends no completion callback and fires no completion trigger. A reset of a fork keeps start_source='fork'. Erasure of a source does not reach its forks. effects=live runs effects for real.",
         "operationId": "post_workflows_by_id_fork",
         "parameters": [
           {
@@ -11018,7 +11018,7 @@
                     "description": "Where the fork starts, as a reset_point: {\"type\":\"event_id\",\"event_id\":N}, {\"type\":\"first_activity_run\",\"activity_name\":\"name\"} or {\"type\":\"last_workflow_task\"}. Omitted = event 0 (WorkflowStarted). The point must be a clean decision boundary before any terminal event, and the carried history must hold no MutexGranted."
                   },
                   "input": {
-                    "description": "Replacement input for the fork. Needs fork point 0. A JSON null means no override."
+                    "description": "Replacement input for the fork. Needs fork point 0. It must pass the workflow input schema and byte cap. A JSON null means no override."
                   },
                   "operator_id": {
                     "description": "Identity of the operator."
@@ -11027,7 +11027,7 @@
                     "description": "Reason for the fork, recorded in the marker and the audit log."
                   },
                   "workflow_id": {
-                    "description": "Business key of the fork. Omitted = <source workflow_id>-fork-<uuid>. A key that a live run holds returns 409."
+                    "description": "Business key of the fork. Omitted = <source workflow_id>-fork-<uuid>. A key that another run holds returns 409; a run holds its key unless it continued as new or was terminated."
                   }
                 },
                 "type": "object"
@@ -11056,7 +11056,7 @@
             "description": "Success."
           },
           "400": {
-            "description": "Malformed execution id or body; invalid fork point; continue-as-new history; invalid input or activity override."
+            "description": "Malformed execution id or body; invalid fork point; continue-as-new history; an input override that needs fork point 0 or fails the input schema or byte cap; an invalid activity override."
           },
           "401": {
             "description": "Admin authentication required."
@@ -11065,13 +11065,13 @@
             "description": "Execution not found."
           },
           "409": {
-            "description": "The source payloads were erased (issue #495); recorded mode cannot serve an effect after the fork point (fork with effects=live); the carried history holds a mutex grant; or the workflow id is in use."
+            "description": "The source, or a run in its fork lineage, had its payloads erased (issue #495); recorded mode cannot serve an effect after the fork point (fork with effects=live); the carried history holds a mutex grant; or the workflow id is in use."
           },
           "500": {
             "description": "Database error."
           },
           "503": {
-            "description": "The fork succeeded but the audit record for it could not be written. The new execution exists. Retry is not needed."
+            "description": "The node has not finished start-up, or the fork succeeded but its audit record could not be written. In the second case the message names the new execution. Retry is not needed."
           }
         },
         "summary": "Non-destructive fork of a workflow execution (issue #2000).",

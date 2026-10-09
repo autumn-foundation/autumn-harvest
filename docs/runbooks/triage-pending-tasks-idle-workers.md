@@ -462,7 +462,7 @@ A step whose `outcome` is `pending` (with a `null` `ended_at`) is still open; it
 
 Every workflow execution durably records a bounded `start_source` classifier (issue #740) naming the mechanism that started it, plus optional `start_source_ref` (a correlating id — schedule id, triggering execution id, idempotency key) and `started_by` (an operator/actor). Use these to answer "where did this run come from?" during a spawn storm without grepping logs.
 
-**Bounded source set:** `api`, `schedule`, `backfill`, `signal_with_start`, `update_with_start`, `completion_trigger`, `webhook`, `child`, `batch`, `continue_as_new`, `reset`, `outbox`. A row started before the upgrade (or with no classifier) reports `unknown`.
+**Bounded source set:** `api`, `schedule`, `backfill`, `signal_with_start`, `update_with_start`, `completion_trigger`, `webhook`, `broker`, `child`, `batch`, `continue_as_new`, `reset`, `rerun`, `outbox`, `transactional`, `fork`. A row started before the upgrade (or with no classifier) reports `unknown`.
 
 ### An unexpected run appeared — find what started it
 

@@ -11488,7 +11488,7 @@ async fn persist_scheduled_activities(
                 is_fork,
                 &scheduled_activity_ids(scheduled_activities),
                 &mut race_next_event_id,
-                registry.payload_codecs(),
+                registry,
             )
             .await?;
 
@@ -13897,7 +13897,7 @@ async fn persist_mixed_suspension_batch(
             crate::fork::is_fork(parent_execution),
             &scheduled_activity_ids(&batch.scheduled_activities),
             &mut next_event_id,
-            registry.payload_codecs(),
+            registry,
         )
         .await?;
         let synthesized_broken_session_failure = broken_session_failure || served_from_fork;
@@ -25453,13 +25453,9 @@ async fn process_workflow_task(
 
         // Issue #2000: a recorded fork never runs an effect that it cannot
         // serve from the record. It fails here, before any persist path.
-        if crate::fork::is_fork(&prepared.execution)
-            && crate::fork::fork_marker(&history_events)
-                .is_some_and(|(_, effects)| effects == crate::fork::ForkEffects::Recorded)
-            && let Some(command) = crate::fork::live_effect_refusal(update_result_command_source(
-                &run_outcome,
-                &pending_cmds,
-            ))
+        if crate::fork::history_is_recorded_fork(&prepared.execution, &history_events)
+            && let Some(command) =
+                crate::fork::recorded_outcome_refusal(&run_outcome, &pending_cmds)
         {
             return fail_workflow_execution_clearing_strikes(
                 conn,

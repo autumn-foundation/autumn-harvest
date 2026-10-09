@@ -61,6 +61,7 @@ source stays unchanged. By default, the fork does not run an effect again.
 | R8 | The fork id collides with a running workflow. | A new workflow id. A collision returns `409`. |
 | R9 | An input override diverges from the carried prefix. | An input override needs fork point `0`. |
 | R10 | An override bypasses encryption at rest. | Each override is its own event with a top-level `output`. The codec encodes it. Erasure tombstones it. |
+| R11 | A later run of the fork lineage runs live. | Continue-as-new is refused. A reset keeps fork provenance. A fork row has no retry policy. |
 
 ### 0.4 Six thinking hats
 
@@ -107,17 +108,37 @@ Replay skips both, as it skips `WorkflowResetFork`.
 - `fork::serve_recorded_activities` runs in the scheduling transaction of
   `persist_scheduled_activities` and `persist_mixed_suspension_batch`. It is
   a no-op unless `start_source = 'fork'`. For each scheduled activity, it
-  writes the override, the recorded outcome, or `ForkEffectUnavailable`. It
-  then fails the task row so no worker runs it.
-- `fork::live_effect_refusal` runs after each decision of a recorded fork.
-  It fails the run when the decision holds an effect that recorded mode
-  cannot serve.
+  cancels the task row, so no worker runs it. It then writes the override,
+  the recorded outcome, or `ForkEffectUnavailable`. A source race loser stays
+  pending, so the same branch wins again.
+- `fork::recorded_outcome_refusal` runs after each decision of a recorded
+  fork. It fails the run before a local activity, a child, an external
+  effect, a continue-as-new or a mutex acquire.
+- A fork row with no marker counts as recorded. A reset of a fork keeps
+  `start_source = fork`, so it stays recorded.
 
 ### 1.4 API
 
 `POST /workflows/{id}/fork` returns `201` with the new execution id. Errors:
-`400` invalid point or override, `404` unknown source, `409` erased source,
-unservable effect, carried mutex, or a workflow id in use.
+`400` invalid point, continue-as-new history, or invalid override; `404`
+unknown source; `409` erased source or lineage, unservable effect, carried
+mutex, or a workflow id in use; `422` unknown field; `503` no runtime yet.
+
+### 1.5 Review fixes
+
+A multi-angle review found these gaps. Each one has a fix and a test.
+
+| Gap | Fix |
+|-----|-----|
+| A fork continues as new, and the successor runs live. | Refuse continue-as-new in recorded mode. |
+| A fork of a fork reads the first marker. | The last marker counts. Only its own overrides count. |
+| A reset of a recorded fork runs live. | A reset of a fork keeps `start_source = fork`. |
+| A source race loser is served as a real failure. | Hold the activity pending. Do not serve an abandoned dispatch. |
+| Offloaded payloads never match, and blobs of a deleted source vanish. | Match inflated payloads. Copy the payload references. |
+| A recorded fork takes a production mutex. | Refuse a mutex acquire in recorded mode. |
+| Erasure does not reach a fork. | Refuse a fork whose lineage reaches an erased run. Document per-fork erasure. |
+| An input override skips start checks. | Check the input schema and the byte cap. |
+| A missing runtime writes overrides with no codec. | Return `503`. |
 
 ## 2. Tests
 
@@ -126,4 +147,4 @@ unservable effect, carried mutex, or a workflow id in use.
 | A completed run can be forked; the source is unchanged. | `fork_of_a_completed_run_leaves_the_source_unchanged` |
 | By default, a fork does not run an activity again. | `recorded_fork_does_not_run_a_completed_activity_again` |
 | Live side effects need an explicit flag. | `effects_default_to_recorded`, `live_fork_runs_the_activity` |
-| An erased source is always refused. | `fork_refuses_an_erased_source` |
+| An erased source is always refused. | `fork_refuses_an_erased_source`, `a_fork_of_a_fork_of_an_erased_source_is_refused` |

@@ -1818,11 +1818,23 @@ mod tests {
                 build_id: crate::types::BuildId::new("b-1"),
                 worker_id: WorkerId::new("w-1"),
             },
+            WorkflowEvent::WorkflowForked {
+                forked_from_exec_id: ExecutionId::new(),
+                fork_event_id: 0,
+                effects: ForkEffects::Recorded,
+                reason: "r".into(),
+                operator_id: "o".into(),
+            },
+            WorkflowEvent::ForkActivityResultOverridden {
+                activity_name: "a".into(),
+                occurrence: 1,
+                output: serde_json::Value::Null,
+            },
         ];
 
-        assert_eq!(events.len(), 50);
+        assert_eq!(events.len(), 52);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 50, "duplicate type names detected");
+        assert_eq!(names.len(), 52, "duplicate type names detected");
     }
 
     // ── TimerCancelled tests (issue #768) ─────────────────────────────────────

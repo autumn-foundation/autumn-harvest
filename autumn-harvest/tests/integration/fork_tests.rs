@@ -17,11 +17,12 @@ use std::time::Duration;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::fork::{
     ForkActivityOverride, ForkEffects, WorkflowForkError, WorkflowForkRequest,
-    fork_workflow_execution,
+    fork_workflow_execution, is_recorded_fork,
 };
 use autumn_harvest::models::{NewWorkflowExecution, WorkflowExecution};
 use autumn_harvest::prelude::*;
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
+use autumn_harvest::reset::{ResetPoint, WorkflowResetRequest, reset_workflow_execution};
 use autumn_harvest::schema::{harvest_events, harvest_workflow_executions};
 use autumn_harvest::store;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker};
@@ -302,10 +303,11 @@ async fn fork_of_a_completed_run_leaves_the_source_unchanged() {
 
     let after = snapshot(&url, source).await;
     assert_eq!(before.1, after.1, "the source history is unchanged");
-    assert_eq!(before.0.state, after.0.state);
-    assert_eq!(before.0.output, after.0.output);
-    assert_eq!(before.0.completed_at, after.0.completed_at);
-    assert_eq!(before.0.error, after.0.error);
+    assert_eq!(
+        serde_json::to_value(&before.0).expect("row json"),
+        serde_json::to_value(&after.0).expect("row json"),
+        "the source row is unchanged"
+    );
 
     assert_ne!(
         fork_row.workflow_id, before.0.workflow_id,
@@ -481,6 +483,133 @@ async fn fork_refuses_an_erased_source() {
             "unexpected error: {error}"
         );
     }
+}
+
+/// Erasure does not reach a fork. A fork of that fork is refused, because
+/// its lineage reaches the erased run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_of_a_fork_of_an_erased_source_is_refused() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("lineage");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+    let first = fork(&url, source, request(ForkEffects::Recorded)).await;
+
+    let mut conn = connect(&url).await;
+    autumn_harvest::erase::erase_workflow_payloads(&mut conn, source, "gdpr")
+        .await
+        .expect("erase the source");
+    let error = fork_workflow_execution(&mut conn, first, request(ForkEffects::Live), None)
+        .await
+        .expect_err("the lineage reaches an erased run");
+    assert!(
+        matches!(error, WorkflowForkError::ErasedSource { exec_id } if exec_id == source),
+        "unexpected error: {error}"
+    );
+}
+
+/// A fork at a later point carries the completed charge and takes the
+/// receipt from the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_at_a_later_point_carries_the_prefix() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("later");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+    let source_row = snapshot(&url, source).await.0;
+
+    let mut later = request(ForkEffects::Recorded);
+    later.fork_point = Some(ResetPoint::FirstActivityRun {
+        activity_name: "fork_receipt".to_string(),
+    });
+    let mut conn = connect(&url).await;
+    let result = fork_workflow_execution(&mut conn, source, later, Some(&registry()))
+        .await
+        .expect("fork succeeds");
+    assert!(result.fork_event_id > 0, "the fork starts after the charge");
+    let running = Running::start(&queue, &pool);
+    let row = wait_for_execution_state(&url, result.new_exec_id, "COMPLETED").await;
+    running.stop().await;
+
+    assert_eq!(charges(&queue), 1, "the carried charge does not run again");
+    assert_eq!(row.output, source_row.output);
+    let (_, events) = snapshot(&url, result.new_exec_id).await;
+    let carried = usize::try_from(result.fork_event_id).expect("event id") + 1;
+    assert_eq!(
+        events[carried].1, "WorkflowForked",
+        "the marker follows the prefix"
+    );
+    assert!(
+        events[..carried]
+            .iter()
+            .any(|(_, kind, _)| kind == "ActivityCompleted"),
+        "the prefix carries the charge result"
+    );
+}
+
+/// A reset of a recorded fork stays a recorded fork. It never runs live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reset_of_a_recorded_fork_stays_recorded() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("reset");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+
+    // Event 0 is before the fork marker, so the reset carries no marker.
+    let mut conn = connect(&url).await;
+    let reset = reset_workflow_execution(
+        &mut conn,
+        forked,
+        WorkflowResetRequest {
+            reset_to_event_id: Some(0),
+            reset_point: None,
+            reason: "retry".to_string(),
+            operator_id: "tester".to_string(),
+            signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::Drop,
+            allow_terminal_source: false,
+            refuse_erased_source: false,
+        },
+        Some(&registry()),
+    )
+    .await
+    .expect("reset the fork");
+    let reset_row = snapshot(&url, reset.new_exec_id).await.0;
+    assert_eq!(reset_row.start_source.as_deref(), Some("fork"));
+    assert!(
+        is_recorded_fork(&mut conn, &reset_row)
+            .await
+            .expect("read marker")
+    );
+
+    let running = Running::start(&queue, &pool);
+    wait_for_execution_state(&url, reset.new_exec_id, "FAILED").await;
+    running.stop().await;
+    assert_eq!(charges(&queue), 1, "the reset fork never charges");
+}
+
+/// Only a recorded fork skips completion callbacks and triggers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_a_recorded_fork_suppresses_completion_notifications() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("notify");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let recorded = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let live = fork(&url, source, request(ForkEffects::Live)).await;
+
+    for (exec_id, expected) in [(source, false), (recorded, true), (live, false)] {
+        let row = snapshot(&url, exec_id).await.0;
+        assert_eq!(
+            is_recorded_fork(&mut conn, &row)
+                .await
+                .expect("read marker"),
+            expected,
+            "{exec_id}"
+        );
+    }
+    let recorded_row = snapshot(&url, recorded).await.0;
+    assert_eq!(recorded_row.completion_callbacks, None);
 }
 
 /// A running source stays running, with no new event, after a fork.

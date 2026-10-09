@@ -13,17 +13,25 @@ is never written, so a run in any state can be forked, `COMPLETED` and
   non-retryably with `ForkEffectUnavailable`. The worker resolves it in the
   transaction that schedules it, so no worker runs it.
 - A local activity, a child workflow, an external activity, an external
-  signal or an external cancel fails the fork run before it runs.
+  signal, an external cancel, a continue-as-new or a mutex acquire fails the
+  fork run before it runs. A successor run would hold no fork marker.
+- A race branch that lost in the source stays pending, so the same branch
+  wins again.
 - The fork sends no completion callback and fires no completion trigger.
+- A reset of a fork keeps `start_source = fork`, so it stays recorded. A fork
+  of a fork uses its own, last, marker.
 
 `"effects": "live"` runs effects for real. An override applies in both modes.
 
-**Overrides.** `input` replaces the workflow input at fork point `0`.
+**Overrides.** `input` replaces the workflow input at fork point `0`. It
+passes the input schema (issue #373) and the byte cap (issue #252).
 `activity_overrides` sets the result of one activity occurrence after the
 fork point.
 
 **Refusals.** An erased source (issue #495) is always refused, under a
-`FOR SHARE` lock on the source row. A fork point at or after a terminal
+`FOR SHARE` lock on the source row. So is a fork whose fork lineage reaches
+an erased run. Erasure does not reach a fork, which is a new root, so erase
+each fork on its own. A fork point at or after a terminal
 event, a carried `MutexGranted` and a continue-as-new history are refused.
 In recorded mode, a source suffix with an effect that the mode cannot serve
 is refused with `409`.
@@ -31,6 +39,10 @@ is refused with `409`.
 **Lineage.** The fork row has `start_source = fork` and
 `start_source_ref = <source id>`. Its history holds a `WorkflowForked`
 marker. A fork is a new root, not a child of the source.
+
+**Payloads.** The fork copies the payload references of the source, so
+retention of the source keeps the shared blobs. Matching inflates offloaded
+payloads first.
 
 **Invariants.** Two new `WorkflowEvent` variants: `WorkflowForked` and
 `ForkActivityResultOverridden`. Replay skips both. The override `output` is a
@@ -46,7 +58,11 @@ events. Fork a run only after every worker runs this version.
 history stay byte-identical; a recorded fork does not run a completed
 activity again; a live fork does; a fork with no record fails closed; an
 override replaces a result; a recorded fork fails before a local activity;
-an erased source is refused in both modes; a running source stays running;
-a workflow id in use is refused. Unit tests in `fork.rs` cover occurrence
-matching, input mismatch, erased records, overrides, recorded failures, the
-fork-point checks and the live-effect guard.
+an erased source is refused in both modes; a fork of a fork of an erased run
+is refused; a later fork point carries the prefix; a reset of a recorded
+fork stays recorded; only a recorded fork suppresses completion
+notifications; a running source stays running; a workflow id in use is
+refused. `workflow_fork_integration.rs` covers the HTTP contract. Unit tests in `fork.rs` cover occurrence
+matching, input mismatch, erased records, overrides, recorded failures,
+race losers, the last-marker rule, a missing marker, the fork-point checks
+and the live-effect guard.

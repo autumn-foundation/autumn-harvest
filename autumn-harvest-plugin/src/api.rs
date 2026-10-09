@@ -25445,6 +25445,7 @@ async fn reset_workflow(
 ///
 /// The source stays unchanged. The fork defaults to recorded effects, so it
 /// never runs an effect for real unless the body sets `"effects": "live"`.
+/// Each outcome writes one `workflow.fork` audit row.
 async fn fork_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
@@ -25453,54 +25454,100 @@ async fn fork_workflow(
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let (actor, source, request_id) = audit_context(&headers, &api_state);
-    let route = "POST /workflows/{id}/fork";
+    let context = audit_context(&headers, &api_state);
+    let audit = |target_id: &str, failure: Option<&str>| {
+        audit_fork(
+            &api_state,
+            &context,
+            target_id.to_string(),
+            failure.map(str::to_string),
+        )
+    };
+
     let exec_id = match parse_execution_id(&id) {
         Ok(eid) => eid,
-        Err(e) => return e.into_response(),
+        Err(e) => {
+            let _ = audit(&id, Some("malformed execution id")).await;
+            return e.into_response();
+        }
+    };
+    let exec_id_str = exec_id.to_string();
+    // Fail closed in the boot window. With no runtime there are no payload
+    // codecs, so an override would land in plaintext.
+    let runtime = match api_state.runtime() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            let _ = audit(&exec_id_str, Some(&e.to_string())).await;
+            return map_error(e).into_response();
+        }
     };
     let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
         Ok(conn) => conn,
         Err(e) => return e.into_response(),
     };
-    let exec_id_str = exec_id.to_string();
-    let runtime = api_state.runtime().ok();
-    let registry = runtime.as_ref().map(|r| r.registry().as_ref());
-    let result = fork_workflow_execution(&mut conn, exec_id, request, registry).await;
+    let result = fork_workflow_execution(
+        &mut conn,
+        exec_id,
+        request,
+        Some(runtime.registry().as_ref()),
+    )
+    .await;
+    drop(conn);
 
-    let error_summary = result.as_ref().err().map(ToString::to_string);
-    let ar = NewAuditRecord {
-        actor: &actor,
-        operation: OP_WORKFLOW_FORK,
-        target_type: TARGET_WORKFLOW,
-        target_id: Some(exec_id_str.as_str()),
-        route_or_command: route,
-        request_id: request_id.as_deref(),
-        idempotency_key: None,
-        status: if result.is_ok() {
-            STATUS_SUCCEEDED
-        } else {
-            STATUS_FAILED
-        },
-        error_summary: error_summary.as_deref(),
-        shard_id: None,
-        source: &source,
-    };
-    let audit_result = audit::insert_audit(&mut conn, &ar).await;
     match result {
         Ok(result) => {
             // A committed fork must have its audit row, as a reset must.
-            if let Err(audit_err) = audit_result {
+            if let Err(audit_err) = audit(&exec_id_str, None).await {
                 tracing::error!(error = %audit_err, new_exec_id = %result.new_exec_id, "audit insert failed for workflow.fork");
                 return AutumnError::service_unavailable_msg(format!(
-                    "audit insert failed: {audit_err}"
+                    "the fork {} exists, but its audit insert failed: {audit_err}",
+                    result.new_exec_id
                 ))
                 .into_response();
             }
             (axum::http::StatusCode::CREATED, Json(result)).into_response()
         }
-        Err(error) => fork_error_response(error),
+        Err(error) => {
+            let _ = audit(&exec_id_str, Some(&error.to_string())).await;
+            fork_error_response(error)
+        }
     }
+}
+
+/// Write one `workflow.fork` audit row on its own connection.
+///
+/// `failure` is the error summary of a refused fork, or `None` on success.
+async fn audit_fork(
+    api_state: &HarvestApiState,
+    (actor, source, request_id): &(String, String, Option<String>),
+    target_id: String,
+    failure: Option<String>,
+) -> Result<(), String> {
+    let pool = api_state.storage_pool().map_err(|e| e.to_string())?;
+    let mut conn = acquire_conn(pool.default_pool())
+        .await
+        .map_err(|e| e.to_string())?;
+    let ar = NewAuditRecord {
+        actor,
+        operation: OP_WORKFLOW_FORK,
+        target_type: TARGET_WORKFLOW,
+        target_id: Some(&target_id),
+        route_or_command: "POST /workflows/{id}/fork",
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status: if failure.is_some() {
+            STATUS_FAILED
+        } else {
+            STATUS_SUCCEEDED
+        },
+        error_summary: failure.as_deref(),
+        shard_id: None,
+        source,
+    };
+    audit::insert_audit(&mut conn, &ar)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 fn fork_error_response(error: WorkflowForkError) -> axum::response::Response {

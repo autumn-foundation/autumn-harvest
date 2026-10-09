@@ -1204,6 +1204,11 @@ and `workflow.erase_payloads`. A legal hold exempts a single execution's history
 from the retention janitor and from PII erasure until released — see
 [`docs/archival.md`](archival.md) for the retention/erasure lifecycle.
 
+A fork (`POST /workflows/{id}/fork`, issue #2000) is admin-gated and audited
+under `workflow.fork`. It copies the source payloads to a new root run.
+Erasure of a source does not reach its forks, so erase each fork on its own.
+A fork of an erased run, or of a fork whose lineage reaches one, is refused.
+
 ### Tamper-evident audit rows (issue #1838)
 
 Audit export ships each row off-box. The optional audit hash chain also makes

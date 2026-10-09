@@ -43,7 +43,11 @@ use crate::worker::HandlerRegistry;
 pub const ERROR_TYPE_FORK_EFFECT_UNAVAILABLE: &str = "ForkEffectUnavailable";
 
 /// Request body of `POST /workflows/{id}/fork`.
+///
+/// An unknown field is an error, so a typo such as `"effect"` cannot pass
+/// silently.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowForkRequest {
     /// Where the fork starts. `None` means event `0` (`WorkflowStarted`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,6 +96,7 @@ fn non_empty_or(value: &str, fallback: &str) -> String {
 
 /// One activity result that the caller sets for a fork.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ForkActivityOverride {
     /// Name of the activity.
     pub activity_name: String,
@@ -227,6 +232,14 @@ async fn fork_in_transaction(
     if crate::erase::execution_input_is_erased(&source.input) {
         return Err(WorkflowForkError::ErasedSource { exec_id: source_id });
     }
+    // Erasure does not reach a fork, which is a new root. So a fork of a fork
+    // of an erased run is refused too.
+    if let Some(erased) = erased_fork_ancestor(conn, &source).await? {
+        return Err(WorkflowForkError::ErasedSource { exec_id: erased });
+    }
+    if let (Some(input), Some(registry)) = (&request.input, registry) {
+        check_input_override(registry, &source.workflow_name, input)?;
+    }
 
     let rows = crate::reset::load_event_rows(conn, source_id).await?;
     let events = decode_rows(&rows, codecs)?;
@@ -271,6 +284,10 @@ async fn fork_in_transaction(
         Err(error) => return Err(error.into()),
     };
 
+    // The fork shares the blobs of the source. Its own references keep them
+    // alive after retention deletes the source.
+    let refs = crate::store::load_payload_refs(conn, source_id).await?;
+    crate::store::insert_payload_refs(conn, new_exec_id, &refs).await?;
     copy_prefix(
         conn,
         new_exec_id,
@@ -297,7 +314,15 @@ async fn fork_in_transaction(
     }));
     let tail_start = i32::try_from(plan.events_carried_over)
         .map_err(|_| HarvestError::Database("fork carried too many events".to_string()))?;
-    crate::store::append_events_with_codecs(conn, new_exec_id, &tail, tail_start, codecs).await?;
+    crate::store::append_events_offloaded_with_codecs(
+        conn,
+        new_exec_id,
+        &tail,
+        tail_start,
+        registry.and_then(HandlerRegistry::payload_offloader),
+        codecs,
+    )
+    .await?;
     crate::reset::enqueue_fork_workflow_task(conn, &fork, new_exec_id, registry).await?;
 
     Ok(ForkResult {
@@ -308,6 +333,90 @@ async fn fork_in_transaction(
         events_carried_over: plan.events_carried_over,
         effects: request.effects,
     })
+}
+
+/// Most fork links that a lineage check follows.
+const MAX_FORK_LINEAGE: usize = 64;
+
+/// The first erased run in the fork lineage above `source`, if any.
+///
+/// It follows `start_source_ref` while the row is a fork. A missing ancestor
+/// ends the walk, because retention may delete it.
+async fn erased_fork_ancestor(
+    conn: &mut AsyncPgConnection,
+    source: &WorkflowExecution,
+) -> HarvestResult<Option<ExecutionId>> {
+    let mut current = (is_fork(source), source.start_source_ref.clone());
+    for _ in 0..MAX_FORK_LINEAGE {
+        let (true, Some(parent)) = current else {
+            return Ok(None);
+        };
+        let Ok(parent) = parent.parse::<Uuid>() else {
+            return Ok(None);
+        };
+        let row: Option<(Value, Option<String>, Option<String>)> =
+            harvest_workflow_executions::table
+                .find(parent)
+                .select((
+                    harvest_workflow_executions::input,
+                    harvest_workflow_executions::start_source,
+                    harvest_workflow_executions::start_source_ref,
+                ))
+                .first(conn)
+                .await
+                .optional()
+                .map_err(database_error)?;
+        let Some((input, start_source, start_source_ref)) = row else {
+            return Ok(None);
+        };
+        if crate::erase::execution_input_is_erased(&input) {
+            return Ok(Some(ExecutionId::from_uuid(parent)));
+        }
+        current = (
+            start_source.as_deref() == Some(StartSource::Fork.as_str()),
+            start_source_ref,
+        );
+    }
+    Ok(None)
+}
+
+/// Apply the start checks of the workflow type to an input override.
+///
+/// It checks the published input schema (issue #373) and the input byte cap
+/// (issue #252), as a start and a rerun do.
+fn check_input_override(
+    registry: &HandlerRegistry,
+    workflow_name: &str,
+    input: &Value,
+) -> Result<(), WorkflowForkError> {
+    let info = registry.workflows.get(workflow_name);
+    if let Some(info) = info
+        && let Err(violations) = info.validate_input(input)
+    {
+        let detail = violations
+            .iter()
+            .map(|violation| match &violation.field_path {
+                Some(path) => format!("{path}: {}", violation.message),
+                None => violation.message.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(WorkflowForkError::InvalidOverride {
+            message: format!("the input fails the workflow input schema: {detail}"),
+        });
+    }
+    let cap = info
+        .and_then(|info| info.max_input_bytes)
+        .map_or(registry.max_workflow_input_bytes, |own| {
+            own.max(registry.max_workflow_input_bytes)
+        });
+    let observed = serde_json::to_vec(input).map_or(0, |bytes| bytes.len() as u64);
+    if cap > 0 && observed > cap {
+        return Err(WorkflowForkError::InvalidOverride {
+            message: format!("the input has {observed} bytes, over the cap of {cap}"),
+        });
+    }
+    Ok(())
 }
 
 fn decode_rows(rows: &[HarvestEvent], codecs: &PayloadCodecs) -> HarvestResult<Vec<WorkflowEvent>> {
@@ -336,11 +445,12 @@ fn skip_reason_to_error(reason: ResetSkipReason) -> WorkflowForkError {
     })
 }
 
-/// Whether a live run of `workflow_name` holds `workflow_id`.
+/// Whether a run of `workflow_name` holds the key `workflow_id`.
 ///
 /// It mirrors the partial unique index
-/// `harvest_we_workflow_name_workflow_id_active_key`. The insert also maps a
-/// unique violation, which covers a concurrent start.
+/// `harvest_we_workflow_name_workflow_id_active_key`. A run holds the key
+/// unless it continued as new, was terminated or is a migration seal. The
+/// insert also maps a unique violation, which covers a concurrent start.
 async fn workflow_id_in_use(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
@@ -350,7 +460,8 @@ async fn workflow_id_in_use(
         harvest_workflow_executions::table
             .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
             .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
-            .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"])),
+            .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
+            .filter(harvest_workflow_executions::migrated_run_terminal_at.is_null()),
     ))
     .get_result(conn)
     .await
@@ -559,6 +670,11 @@ pub fn live_effect_refusal(commands: &[WorkflowCommand]) -> Option<&'static str>
         WorkflowCommand::RequestCancelExternalWorkflow { .. } => {
             Some("RequestCancelExternalWorkflow")
         }
+        // A successor run holds no fork marker, so it would run live.
+        WorkflowCommand::ContinueAsNew { .. } => Some("ContinueAsNew"),
+        // A production mutex key is shared with live runs. A what-if fork
+        // must not block them.
+        WorkflowCommand::AcquireMutex { .. } => Some("AcquireMutex"),
         // A remote activity is served from the record at schedule time.
         WorkflowCommand::ScheduleActivity { .. }
         | WorkflowCommand::WaitForActivity { .. }
@@ -568,7 +684,6 @@ pub fn live_effect_refusal(commands: &[WorkflowCommand]) -> Option<&'static str>
         | WorkflowCommand::WaitForSignal { .. }
         | WorkflowCommand::Complete { .. }
         | WorkflowCommand::Fail { .. }
-        | WorkflowCommand::ContinueAsNew { .. }
         | WorkflowCommand::RecordUpdateResult { .. }
         | WorkflowCommand::UpsertSearchAttributes { .. }
         | WorkflowCommand::SetCurrentDetails { .. }
@@ -578,21 +693,41 @@ pub fn live_effect_refusal(commands: &[WorkflowCommand]) -> Option<&'static str>
         | WorkflowCommand::CancelRaceLosers { .. }
         | WorkflowCommand::ArmTimer { .. }
         | WorkflowCommand::CancelTimer { .. }
-        | WorkflowCommand::AcquireMutex { .. }
         | WorkflowCommand::ReleaseMutex { .. } => None,
     })
 }
 
+/// The effect in one decision `outcome` that recorded mode cannot serve.
+///
+/// A suspended decision carries its commands in `outcome`. Any other outcome
+/// carries them in `pending`. A continue-as-new outcome is itself refused.
+#[must_use]
+pub fn recorded_outcome_refusal(
+    outcome: &crate::executor::WorkflowOutcome,
+    pending: &[WorkflowCommand],
+) -> Option<&'static str> {
+    match outcome {
+        crate::executor::WorkflowOutcome::ContinuedAsNew { .. } => Some("ContinueAsNew"),
+        crate::executor::WorkflowOutcome::Suspended { commands } => live_effect_refusal(commands),
+        _ => live_effect_refusal(pending),
+    }
+}
+
 /// Whether `execution` is a fork of issue #2000. A cheap in-memory check.
+///
+/// A reset of a fork keeps `start_source = fork`, so it stays a fork.
 #[must_use]
 pub fn is_fork(execution: &WorkflowExecution) -> bool {
     execution.start_source.as_deref() == Some(StartSource::Fork.as_str())
 }
 
-/// The source and the effects mode that the fork marker in `events` names.
+/// The source and the effects mode of the fork whose history is `events`.
+///
+/// The *last* marker counts. A fork of a fork carries the marker of its
+/// source in its prefix, and its own marker comes after that one.
 #[must_use]
 pub fn fork_marker(events: &[WorkflowEvent]) -> Option<(ExecutionId, ForkEffects)> {
-    events.iter().find_map(|event| match event {
+    events.iter().rev().find_map(|event| match event {
         WorkflowEvent::WorkflowForked {
             forked_from_exec_id,
             effects,
@@ -600,6 +735,16 @@ pub fn fork_marker(events: &[WorkflowEvent]) -> Option<(ExecutionId, ForkEffects
         } => Some((*forked_from_exec_id, *effects)),
         _ => None,
     })
+}
+
+/// Whether a run with fork provenance runs in recorded mode.
+///
+/// A fork row with no marker fails safe, as recorded. That happens for a
+/// reset of a fork at a point before the marker.
+#[must_use]
+pub fn history_is_recorded_fork(execution: &WorkflowExecution, events: &[WorkflowEvent]) -> bool {
+    is_fork(execution)
+        && fork_marker(events).is_none_or(|(_, effects)| effects == ForkEffects::Recorded)
 }
 
 /// Whether `execution` is a recorded fork. A recorded fork sends no
@@ -620,6 +765,7 @@ pub async fn is_recorded_fork(
     let marker: Option<Value> = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(execution.id))
         .filter(harvest_events::event_type.eq("WorkflowForked"))
+        .order(harvest_events::event_id.desc())
         .select(harvest_events::event_data)
         .first(conn)
         .await
@@ -632,41 +778,70 @@ pub async fn is_recorded_fork(
         .is_none_or(|(_, effects)| effects == ForkEffects::Recorded))
 }
 
-/// The terminal event that the fork appends for its activity `activity_id`.
+/// What a fork does with one activity that it just scheduled.
+#[derive(Debug, Clone)]
+pub enum ForkResolution {
+    /// The activity runs as usual.
+    Run,
+    /// The fork appends this terminal event. No worker runs the activity.
+    Serve(WorkflowEvent),
+    /// The activity stays pending and never runs. The source cancelled it as
+    /// a race loser, so a sibling branch wins again.
+    Hold,
+}
+
+/// Resolve the fork activity `activity_id`. The caller knows the run is a fork.
 ///
 /// The order is: a caller override, then (in recorded mode) the source
 /// record with the same name, occurrence and input, then a non-retryable
-/// [`ERROR_TYPE_FORK_EFFECT_UNAVAILABLE`] failure. `None` means that the
-/// activity runs as usual. That is so when the history is not a fork, when
-/// the fork is live with no override, or when the activity has an outcome.
+/// [`ERROR_TYPE_FORK_EFFECT_UNAVAILABLE`] failure. A live fork runs an
+/// activity with no override. An activity with an outcome runs as usual.
 #[must_use]
-pub fn served_outcome(
+pub fn resolve_activity(
     fork_events: &[WorkflowEvent],
     source_events: &[WorkflowEvent],
     activity_id: ActivityExecId,
-) -> Option<WorkflowEvent> {
-    let (_, effects) = fork_marker(fork_events)?;
+) -> ForkResolution {
     if fork_events
         .iter()
         .any(|event| terminal_activity_id(event) == Some(activity_id))
     {
-        return None;
+        return ForkResolution::Run;
     }
-    let (name, occurrence, input) = scheduled_occurrence(fork_events, |id| id == activity_id)?;
+    let Some((name, occurrence, input)) = scheduled_occurrence(fork_events, |id| id == activity_id)
+    else {
+        return ForkResolution::Run;
+    };
     if let Some(output) = override_for(fork_events, name, occurrence) {
-        return Some(WorkflowEvent::ActivityCompleted {
+        return ForkResolution::Serve(WorkflowEvent::ActivityCompleted {
             activity_id,
             output: output.clone(),
         });
     }
+    let effects = fork_marker(fork_events).map_or(ForkEffects::Recorded, |(_, effects)| effects);
     if effects == ForkEffects::Live {
-        return None;
+        return ForkResolution::Run;
     }
-    Some(
-        recorded_terminal(source_events, name, occurrence, input).map_or_else(
-            || unavailable(activity_id, name, occurrence),
-            |event| rebind(event, activity_id),
-        ),
+    match recorded_terminal(source_events, name, occurrence, input) {
+        Some(event) if is_race_loser(event) => ForkResolution::Hold,
+        Some(event) if !is_synthetic(event) => ForkResolution::Serve(rebind(event, activity_id)),
+        _ => ForkResolution::Serve(unavailable(activity_id, name, occurrence)),
+    }
+}
+
+/// The error text of the terminal that `ctx.race()` writes for a loser.
+const RACE_LOSER_ERROR: &str = "lost race to a sibling branch";
+
+fn is_race_loser(event: &WorkflowEvent) -> bool {
+    matches!(event, WorkflowEvent::ActivityFailed { error, .. } if error == RACE_LOSER_ERROR)
+}
+
+/// A failure that the engine wrote, not one that the activity returned.
+fn is_synthetic(event: &WorkflowEvent) -> bool {
+    matches!(
+        event,
+        WorkflowEvent::ActivityFailed { error, .. }
+            if error == crate::event::ABANDONED_DISPATCH_REASON
     )
 }
 
@@ -693,8 +868,16 @@ fn scheduled_occurrence(
     })
 }
 
+/// The override for occurrence `occurrence` of `name`.
+///
+/// Only an override after the last marker counts. An override that a fork of
+/// a fork carries in its prefix belongs to the earlier fork.
 fn override_for<'a>(events: &'a [WorkflowEvent], name: &str, occurrence: u32) -> Option<&'a Value> {
-    events.iter().find_map(|event| match event {
+    let own = events
+        .iter()
+        .rposition(|event| matches!(event, WorkflowEvent::WorkflowForked { .. }))
+        .map_or(events, |marker| &events[marker..]);
+    own.iter().find_map(|event| match event {
         WorkflowEvent::ForkActivityResultOverridden {
             activity_name,
             occurrence: at,
@@ -800,10 +983,15 @@ fn unavailable(activity_id: ActivityExecId, name: &str, occurrence: u32) -> Work
 
 /// Resolve the activities that a fork just scheduled, in the same transaction.
 ///
-/// For each activity in `scheduled` that [`served_outcome`] resolves, this
-/// cancels its task row and appends the outcome. No worker runs it. The
-/// caller must wake the workflow when this returns `true`, as for a broken
-/// session. A run that is not a fork returns at once with no query.
+/// For each activity in `scheduled` that [`resolve_activity`] serves or
+/// holds, this cancels its task row, so no worker runs it. A served activity
+/// also gets its outcome appended. The caller must wake the workflow when this
+/// returns `true`, as for a broken session. A run that is not a fork returns at
+/// once with no query.
+///
+/// Both histories load inflated, so an offloaded input matches its source.
+/// A source that retention deleted, or that does not decode, has no record.
+/// Recorded mode then fails closed.
 ///
 /// # Errors
 ///
@@ -814,25 +1002,32 @@ pub(crate) async fn serve_recorded_activities(
     is_fork: bool,
     scheduled: &[ActivityExecId],
     next_event_id: &mut i32,
-    codecs: &PayloadCodecs,
+    registry: &HandlerRegistry,
 ) -> HarvestResult<bool> {
     if !is_fork || scheduled.is_empty() {
         return Ok(false);
     }
-    let fork_rows = crate::reset::load_event_rows(conn, exec_id).await?;
-    let fork_events = decode_rows(&fork_rows, codecs)?;
-    let Some((source_id, _)) = fork_marker(&fork_events) else {
-        return Ok(false);
+    let codecs = registry.payload_codecs();
+    let offloader = registry.payload_offloader();
+    let fork_events = crate::store::load_history_inflated(conn, exec_id, codecs, offloader)
+        .await?
+        .events;
+    let source_events = match fork_marker(&fork_events) {
+        Some((source_id, _)) => {
+            crate::store::load_history_inflated(conn, source_id, codecs, offloader)
+                .await
+                .map(|history| history.events)
+                .unwrap_or_default()
+        }
+        None => Vec::new(),
     };
-    // A source that a later retention pass deleted, or that does not decode,
-    // has no record. Recorded mode then fails closed.
-    let source_rows = crate::reset::load_event_rows(conn, source_id).await?;
-    let source_events = decode_rows(&source_rows, codecs).unwrap_or_default();
 
     let mut served = false;
     for activity_id in scheduled {
-        let Some(outcome) = served_outcome(&fork_events, &source_events, *activity_id) else {
-            continue;
+        let outcome = match resolve_activity(&fork_events, &source_events, *activity_id) {
+            ForkResolution::Run => continue,
+            ForkResolution::Hold => None,
+            ForkResolution::Serve(event) => Some(event),
         };
         let cancelled = diesel::update(
             harvest_task_queue::table
@@ -843,18 +1038,25 @@ pub(crate) async fn serve_recorded_activities(
         .set((
             harvest_task_queue::state.eq("CANCELLED"),
             harvest_task_queue::worker_id.eq(None::<String>),
-            harvest_task_queue::error.eq(Some("served by the fork record (issue #2000)")),
+            harvest_task_queue::error.eq(Some("resolved by the fork record (issue #2000)")),
             harvest_task_queue::completed_at.eq(Some(chrono::Utc::now())),
         ))
         .execute(conn)
         .await
         .map_err(database_error)?;
         // No open row means that a real outcome exists or is on its way.
-        if cancelled == 0 {
+        let Some(outcome) = outcome.filter(|_| cancelled > 0) else {
             continue;
-        }
-        crate::store::append_events_with_codecs(conn, exec_id, &[outcome], *next_event_id, codecs)
-            .await?;
+        };
+        crate::store::append_events_offloaded_with_codecs(
+            conn,
+            exec_id,
+            &[outcome],
+            *next_event_id,
+            offloader,
+            codecs,
+        )
+        .await?;
         *next_event_id = next_event_id.saturating_add(1);
         served = true;
     }
@@ -921,11 +1123,19 @@ mod tests {
         (events, first, second)
     }
 
-    fn output_of(event: Option<WorkflowEvent>) -> Value {
-        match event {
-            Some(WorkflowEvent::ActivityCompleted { output, .. }) => output,
+    fn output_of(resolution: ForkResolution) -> Value {
+        match resolution {
+            ForkResolution::Serve(WorkflowEvent::ActivityCompleted { output, .. }) => output,
             other => panic!("expected ActivityCompleted, got {other:?}"),
         }
+    }
+
+    fn is_unavailable(resolution: &ForkResolution) -> bool {
+        matches!(
+            resolution,
+            ForkResolution::Serve(WorkflowEvent::ActivityFailed { error_type, non_retryable: true, .. })
+                if error_type == ERROR_TYPE_FORK_EFFECT_UNAVAILABLE
+        )
     }
 
     #[test]
@@ -953,10 +1163,10 @@ mod tests {
             completed(fork_first, json!("ch-1")),
             scheduled(fork_second, "charge", json!({ "n": 2 })),
         ];
-        let served = served_outcome(&fork, &source, fork_second);
+        let served = resolve_activity(&fork, &source, fork_second);
         assert_eq!(output_of(served.clone()), json!("ch-2"));
         match served {
-            Some(WorkflowEvent::ActivityCompleted { activity_id, .. }) => {
+            ForkResolution::Serve(WorkflowEvent::ActivityCompleted { activity_id, .. }) => {
                 assert_eq!(activity_id, fork_second, "the fork id, not the source id");
             }
             other => panic!("unexpected {other:?}"),
@@ -972,17 +1182,7 @@ mod tests {
             marker(ForkEffects::Recorded),
             scheduled(id, "charge", json!({ "n": 99 })),
         ];
-        match served_outcome(&fork, &source, id) {
-            Some(WorkflowEvent::ActivityFailed {
-                error_type,
-                non_retryable,
-                ..
-            }) => {
-                assert_eq!(error_type, ERROR_TYPE_FORK_EFFECT_UNAVAILABLE);
-                assert!(non_retryable);
-            }
-            other => panic!("expected a ForkEffectUnavailable failure, got {other:?}"),
-        }
+        assert!(is_unavailable(&resolve_activity(&fork, &source, id)));
     }
 
     #[test]
@@ -995,10 +1195,7 @@ mod tests {
             marker(ForkEffects::Recorded),
             scheduled(id, "charge", json!({ "n": 1 })),
         ];
-        assert!(matches!(
-            served_outcome(&fork, &source, id),
-            Some(WorkflowEvent::ActivityFailed { .. })
-        ));
+        assert!(is_unavailable(&resolve_activity(&fork, &source, id)));
     }
 
     #[test]
@@ -1015,7 +1212,10 @@ mod tests {
             },
             scheduled(id, "charge", json!({ "n": 1 })),
         ];
-        assert_eq!(output_of(served_outcome(&fork, &source, id)), json!("stub"));
+        assert_eq!(
+            output_of(resolve_activity(&fork, &source, id)),
+            json!("stub")
+        );
     }
 
     #[test]
@@ -1039,8 +1239,8 @@ mod tests {
             marker(ForkEffects::Recorded),
             scheduled(id, "charge", json!({})),
         ];
-        match served_outcome(&fork, &source, id) {
-            Some(WorkflowEvent::ActivityFailed {
+        match resolve_activity(&fork, &source, id) {
+            ForkResolution::Serve(WorkflowEvent::ActivityFailed {
                 activity_id,
                 error_type,
                 ..
@@ -1061,7 +1261,10 @@ mod tests {
             marker(ForkEffects::Live),
             scheduled(id, "charge", json!({ "n": 1 })),
         ];
-        assert!(served_outcome(&fork, &source, id).is_none());
+        assert!(matches!(
+            resolve_activity(&fork, &source, id),
+            ForkResolution::Run
+        ));
     }
 
     #[test]
@@ -1074,7 +1277,103 @@ mod tests {
             scheduled(id, "charge", json!({ "n": 1 })),
             completed(id, json!("race")),
         ];
-        assert!(served_outcome(&fork, &source, id).is_none());
+        assert!(matches!(
+            resolve_activity(&fork, &source, id),
+            ForkResolution::Run
+        ));
+    }
+
+    #[test]
+    fn a_race_loser_is_held_and_an_abandoned_dispatch_is_unavailable() {
+        let failed = |id, error: &str| WorkflowEvent::ActivityFailed {
+            activity_id: id,
+            error: error.to_string(),
+            attempt: 1,
+            error_type: "Error".to_string(),
+            non_retryable: true,
+            details: None,
+        };
+        for (error, held) in [
+            (RACE_LOSER_ERROR, true),
+            (crate::event::ABANDONED_DISPATCH_REASON, false),
+        ] {
+            let first = ActivityExecId::new();
+            let source = vec![
+                started(json!({})),
+                scheduled(first, "slow", json!({})),
+                failed(first, error),
+            ];
+            let id = ActivityExecId::new();
+            let fork = vec![
+                started(json!({})),
+                marker(ForkEffects::Recorded),
+                scheduled(id, "slow", json!({})),
+            ];
+            let resolution = resolve_activity(&fork, &source, id);
+            if held {
+                assert!(matches!(resolution, ForkResolution::Hold));
+            } else {
+                assert!(is_unavailable(&resolution), "{resolution:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_last_marker_and_its_own_overrides_count() {
+        let (source, _, _) = source();
+        let id = ActivityExecId::new();
+        // A recorded fork of a live fork carries the live marker and an old
+        // override in its prefix.
+        let fork = vec![
+            started(json!({})),
+            marker(ForkEffects::Live),
+            WorkflowEvent::ForkActivityResultOverridden {
+                activity_name: "charge".to_string(),
+                occurrence: 1,
+                output: json!("old"),
+            },
+            marker(ForkEffects::Recorded),
+            scheduled(id, "charge", json!({ "n": 1 })),
+        ];
+        assert_eq!(
+            output_of(resolve_activity(&fork, &source, id)),
+            json!("ch-1")
+        );
+        let mut live_last = fork.clone();
+        live_last.swap(1, 3);
+        assert!(matches!(
+            resolve_activity(&live_last, &source, id),
+            ForkResolution::Run
+        ));
+    }
+
+    #[test]
+    fn a_fork_with_no_marker_fails_closed() {
+        // With no marker there is no source, so the serving path passes none.
+        let id = ActivityExecId::new();
+        let fork = vec![
+            started(json!({})),
+            scheduled(id, "charge", json!({ "n": 1 })),
+        ];
+        assert!(is_unavailable(&resolve_activity(&fork, &[], id)));
+        let mut row = crate::reset::tests::execution_in_state("RUNNING");
+        row.start_source = Some("fork".to_string());
+        assert!(history_is_recorded_fork(&row, &fork));
+        row.start_source = Some("reset".to_string());
+        assert!(!history_is_recorded_fork(&row, &fork));
+    }
+
+    #[test]
+    fn an_unknown_request_field_is_refused() {
+        assert!(
+            serde_json::from_value::<WorkflowForkRequest>(json!({ "effect": "live" })).is_err()
+        );
+        assert!(
+            serde_json::from_value::<ForkActivityOverride>(json!({
+                "activity_name": "a", "occurrence": 1, "output": 1, "extra": 1
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1183,6 +1482,30 @@ mod tests {
     }
 
     #[test]
+    fn a_recorded_fork_refuses_to_continue_as_new() {
+        let next = || WorkflowCommand::ContinueAsNew {
+            input: json!({}),
+            new_workflow_type: None,
+        };
+        assert_eq!(live_effect_refusal(&[next()]), Some("ContinueAsNew"));
+        let outcome = crate::executor::WorkflowOutcome::ContinuedAsNew {
+            input: json!({}),
+            new_workflow_type: None,
+        };
+        assert_eq!(
+            recorded_outcome_refusal(&outcome, &[]),
+            Some("ContinueAsNew")
+        );
+        let suspended = crate::executor::WorkflowOutcome::Suspended {
+            commands: vec![next()],
+        };
+        assert_eq!(
+            recorded_outcome_refusal(&suspended, &[]),
+            Some("ContinueAsNew")
+        );
+    }
+
+    #[test]
     fn a_recorded_fork_refuses_a_live_effect_command() {
         let (tx, _rx) = tokio::sync::oneshot::channel();
         let signal = WorkflowCommand::SignalExternalWorkflow {
@@ -1199,6 +1522,12 @@ mod tests {
             details: json!({}),
         };
         assert_eq!(live_effect_refusal(&[marker]), None);
+        let (lock_tx, _lock_rx) = tokio::sync::oneshot::channel();
+        let acquire = WorkflowCommand::AcquireMutex {
+            key: "acct-1".to_string(),
+            result_tx: lock_tx,
+        };
+        assert_eq!(live_effect_refusal(&[acquire]), Some("AcquireMutex"));
         let marker = WorkflowCommand::RecordMarker {
             name: "m".to_string(),
             details: json!({}),

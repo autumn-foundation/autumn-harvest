@@ -1355,7 +1355,13 @@ async fn insert_fork_execution(
         ForkRow {
             workflow_id: &source.workflow_id,
             input: source.input.clone(),
-            start_source: crate::types::StartSource::Reset,
+            // A reset of a fork stays a fork (issue #2000). With reset
+            // provenance, a recorded fork would run its effects live.
+            start_source: if crate::fork::is_fork(source) {
+                crate::types::StartSource::Fork
+            } else {
+                crate::types::StartSource::Reset
+            },
             completion_callbacks: source.completion_callbacks.clone(),
         },
     )
@@ -1690,7 +1696,7 @@ pub(crate) async fn enqueue_fork_workflow_task(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use chrono::Utc;
     use serde_json::Value;
 
@@ -1702,7 +1708,7 @@ mod tests {
         validate_source_execution,
     };
 
-    fn execution_in_state(state: &str) -> crate::models::WorkflowExecution {
+    pub(crate) fn execution_in_state(state: &str) -> crate::models::WorkflowExecution {
         crate::models::WorkflowExecution {
             migrated_to_shard: None,
             migrated_at: None,

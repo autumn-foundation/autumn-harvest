@@ -80,7 +80,12 @@ fn build_app(pool: &DbPool, admin_boundary: bool) -> axum::Router {
     harvest_api_router(api_state)
 }
 
-async fn post_fork(app: &axum::Router, exec_id: &str, body: Value, admin: bool) -> (StatusCode, Value) {
+async fn post_fork(
+    app: &axum::Router,
+    exec_id: &str,
+    body: Value,
+    admin: bool,
+) -> (StatusCode, Value) {
     let mut request = Request::builder()
         .method("POST")
         .uri(format!("/workflows/{exec_id}/fork"))
@@ -212,7 +217,11 @@ async fn fork_route_creates_a_recorded_fork_and_leaves_the_source() {
     ] {
         assert!(body.get(field).is_some(), "missing {field}: {body}");
     }
-    assert_eq!(body["effects"], json!("recorded"), "recorded is the default");
+    assert_eq!(
+        body["effects"],
+        json!("recorded"),
+        "recorded is the default"
+    );
     assert_eq!(body["forked_from_exec_id"], json!(source_id));
     assert_eq!(body["fork_event_id"], json!(0));
 
@@ -238,6 +247,14 @@ async fn fork_route_is_admin_only() {
 
     let (status, _) = post_fork(&app, &source.to_string(), json!({}), false).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // With the admin boundary on, a caller with no admin header is refused.
+    let guarded = build_app(&pool, true);
+    let (status, _) = post_fork(&guarded, &source.to_string(), json!({}), false).await;
+    assert!(
+        matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+        "status: {status}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -262,11 +279,22 @@ async fn fork_route_maps_refusals() {
     let (status, _) = post_fork(&app, &Uuid::new_v4().to_string(), json!({}), true).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
+    // A typo or a bad mode never falls back to the default silently.
+    for body in [json!({ "effects": "LIVE" }), json!({ "effect": "live" })] {
+        let (status, _) = post_fork(&app, &source, body, true).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
     autumn_harvest::erase::erase_workflow_payloads(&mut conn, source.parse().unwrap(), "gdpr")
         .await
         .expect("erase the source");
     let live = json!({ "effects": "live" });
     let (status, body) = post_fork(&app, &source, live, true).await;
     assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
-    assert!(body["message"].as_str().unwrap_or_default().contains("erased"));
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("erased")
+    );
 }

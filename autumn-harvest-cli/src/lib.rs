@@ -2183,9 +2183,10 @@ enum WorkflowCommand {
         history_bloat_min_events: Option<u64>,
         /// Filter by workflow-start provenance (issue #740): one of api,
         /// schedule, backfill, `signal_with_start`, `update_with_start`,
-        /// `completion_trigger`, webhook, child, batch, `continue_as_new`,
-        /// reset, outbox, or unknown (matches pre-upgrade/NULL rows). The
-        /// server rejects any other value with a 400.
+        /// `completion_trigger`, webhook, broker, child, batch,
+        /// `continue_as_new`, reset, rerun, outbox, transactional, fork, or
+        /// unknown (matches pre-upgrade/NULL rows). The server rejects any
+        /// other value with a 400.
         #[arg(long = "start-source")]
         start_source: Option<String>,
     },
