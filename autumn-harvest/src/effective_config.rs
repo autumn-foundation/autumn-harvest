@@ -135,6 +135,8 @@ pub struct WorkerConfigView {
     pub queues: Vec<String>,
     /// Per-queue dispatch weights (sorted for stable output). Empty = equal share.
     pub queue_weights: BTreeMap<String, u32>,
+    /// Whether claims rotate across fairness keys (issue #1976).
+    pub fairness_keys: bool,
     /// Maximum concurrent workflow executions.
     pub max_concurrent_workflows: usize,
     /// Maximum concurrent activity executions.
@@ -402,6 +404,7 @@ impl WorkerConfigView {
         let WorkerConfig {
             queues,
             queue_weights,
+            fairness_keys,
             // REDACTED — presence only, never the URL (may embed a password).
             notification_database_url,
             // REDACTED — count only, never the URLs.
@@ -456,6 +459,7 @@ impl WorkerConfigView {
         Self {
             queues: queues.clone(),
             queue_weights: queue_weights.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            fairness_keys: *fairness_keys,
             max_concurrent_workflows: *max_concurrent_workflows,
             max_concurrent_activities: *max_concurrent_activities,
             poll_interval_ms: dur_ms(poll_interval),

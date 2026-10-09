@@ -1901,3 +1901,80 @@ async fn batch_start_rejects_oversized_item_before_deferring() {
         "no pending row should exist for the oversized item: {backlog:?}"
     );
 }
+
+/// Issue #1976: a throttled start can defer, and a deferred start takes the
+/// quota key. An explicit `fairness_key` would then apply only to a start
+/// that runs at once, so the route rejects the combination.
+#[tokio::test]
+async fn fairness_key_on_a_throttled_start_is_a_400() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, throttled_info("100/m", 5.0));
+
+    let (status, body) = post_json(
+        &app,
+        "/workflows/sync_tenant/start",
+        json!({
+            "workflow_id": "fair-throttled-1",
+            "input": { "tenant_id": "acme" },
+            "fairness_key": "acme",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("fairness_key cannot be combined")),
+        "{body:?}"
+    );
+    let mut conn = raw_connect(&url).await;
+    assert_eq!(execution_count(&mut conn, "sync_tenant").await, 0);
+}
+
+/// Issue #1976: batch pre-validation checks each item's fairness key, and
+/// rejects a key on a throttled item, before any item starts.
+#[tokio::test]
+async fn batch_items_with_a_bad_or_throttled_fairness_key_are_rejected_up_front() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, throttled_info("100/m", 5.0));
+
+    let (status, body) = post_json(
+        &app,
+        "/workflows/batch_start",
+        json!({
+            "atomic": false,
+            "items": [
+                {
+                    "workflow_name": "sync_tenant",
+                    "workflow_id": "fair-batch-bad",
+                    "input": { "tenant_id": "acme" },
+                    "fairness_key": " padded",
+                },
+                {
+                    "workflow_name": "sync_tenant",
+                    "workflow_id": "fair-batch-throttled",
+                    "input": { "tenant_id": "acme" },
+                    "fairness_key": "acme",
+                }
+            ],
+        }),
+    )
+    .await;
+    assert!(
+        status.is_success() || status == StatusCode::MULTI_STATUS,
+        "{status} {body:?}"
+    );
+    let text = body.to_string();
+    assert!(
+        text.contains("whitespace"),
+        "the bad key is named: {body:?}"
+    );
+    assert!(
+        text.contains("fairness_key cannot be combined with a throttled start"),
+        "{body:?}"
+    );
+    let mut conn = raw_connect(&url).await;
+    assert_eq!(execution_count(&mut conn, "sync_tenant").await, 0);
+}

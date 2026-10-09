@@ -541,6 +541,7 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
                 sharded_pool: None,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
+                fairness_keys: false,
             },
             registry,
         )
@@ -4217,6 +4218,7 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
         sharded_pool: None,
         slot_tuner: None,
         max_concurrent_sessions: 0,
+        fairness_keys: false,
     };
     let worker = Arc::new(Worker::new(config, registry).expect("worker should build"));
     let pool = build_test_pool(&database_url);

@@ -249,6 +249,7 @@ async fn start_root(
         start_source: StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        fairness_key: None,
         tenant: None,
     };
     start_or_load_workflow_execution(conn, params, None)

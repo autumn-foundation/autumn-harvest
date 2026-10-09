@@ -203,6 +203,7 @@ fn make_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 sharded_pool: None,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
+                fairness_keys: false,
             },
             registry,
         )
@@ -397,6 +398,7 @@ async fn manual_start_has_no_carryover() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         },
         None,

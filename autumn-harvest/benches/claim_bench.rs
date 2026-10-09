@@ -100,10 +100,91 @@ async fn run() {
     );
     println!();
 
+    // `HARVEST_CLAIM_BENCH_SECTION=fairness` runs only the fairness-key
+    // section (issue #1976). A full run takes far longer.
+    if std::env::var(SECTION_ENV_VAR).as_deref() == Ok("fairness") {
+        fairness_section(&db).await;
+        return;
+    }
     scaling_sweep(&db).await;
     gate_breakdown(&db).await;
+    fairness_section(&db).await;
     enqueue_section(&db).await;
     explain_section(&db).await;
+}
+
+/// Run one section only. `fairness` is the one value it reads.
+const SECTION_ENV_VAR: &str = "HARVEST_CLAIM_BENCH_SECTION";
+
+/// The cost of fairness keys across backlog depth and key count (issue #1976).
+///
+/// Each row pair runs `baseline`, then `fairness_keys`, at the headline
+/// claimers and queues. `p50 vs` is the fair claim's cost against the unfair
+/// claim at the same depth. The depth sweep spreads rows over 256 keys. The
+/// key sweep holds the headline depth.
+async fn fairness_section(db: &BenchDb) {
+    use std::sync::atomic::Ordering;
+    println!("## Fairness keys: claim cost (issue #1976)");
+    println!();
+    println!(
+        "| backlog | keys | mode | claimers | queues | p50 ms | p99 ms | max ms | p50 vs | claims/s |"
+    );
+    println!("|--:|--:|:--|--:|--:|--:|--:|--:|--:|--:|");
+    let headline = headline_scenario();
+    // (backlog, keys, queues). The headline uses 4 queues, where a fair claim
+    // polls one queue per statement. The 1-queue rows isolate the fair SQL.
+    let q = headline.queues;
+    let mut runs: Vec<(usize, usize, usize)> = BACKLOG_SWEEP.iter().map(|b| (*b, 256, q)).collect();
+    runs.extend([
+        (headline.backlog, 1, q),
+        (headline.backlog, 10_000, q),
+        (1_000, 256, 1),
+        (headline.backlog, 256, 1),
+        (headline.backlog, 10_000, 1),
+    ]);
+    for (backlog, keys, queues) in runs {
+        db::FAIRNESS_KEY_CARDINALITY.store(keys, Ordering::Relaxed);
+        let mut base_p50 = None;
+        for gate in [ClaimGate::Baseline, ClaimGate::FairnessKeys] {
+            let scenario = Scenario {
+                backlog,
+                claimers: headline.claimers,
+                queues,
+                gate,
+            };
+            let report = db::run_claim_scenario(db, scenario).await;
+            let delta = match (gate, base_p50) {
+                (ClaimGate::FairnessKeys, Some(b)) if b > 0.0 && report.stats.count > 0 => {
+                    format!("{:+.0}%", (report.stats.p50_ms / b - 1.0) * 100.0)
+                }
+                (ClaimGate::FairnessKeys, _) => "n/a".to_string(),
+                _ => "—".to_string(),
+            };
+            if gate == ClaimGate::Baseline && report.stats.count > 0 {
+                base_p50 = Some(report.stats.p50_ms);
+            }
+            println!(
+                "| {backlog}{}{} | {keys} | `{}` | {} | {} | {} | {delta} | {:.0} |",
+                truncation_note(report.truncated),
+                thin_sample_note(report.stats),
+                gate.as_str(),
+                report.scenario.claimers,
+                report.scenario.queues,
+                stats_cells(report.stats),
+                report.claims_per_sec(),
+            );
+        }
+    }
+    db::FAIRNESS_KEY_CARDINALITY.store(256, Ordering::Relaxed);
+    println!();
+    println!(
+        "> The fair claim builds one map of the lags of keys in debt per claim \
+         and adds one sort term. \
+         After the rechecks it upserts the claimed key's state row. With \
+         several queues it claims one queue per statement."
+    );
+    println!("{}", marker_legend());
+    println!();
 }
 
 /// Read the server version for the report header.

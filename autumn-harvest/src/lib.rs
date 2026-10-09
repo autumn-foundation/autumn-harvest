@@ -336,6 +336,9 @@ pub mod external_target_location;
 #[cfg(feature = "db")]
 pub mod external_task;
 pub mod failure;
+/// Runtime weight overrides and state upkeep for fairness keys (issue #1976).
+#[cfg(feature = "db")]
+pub mod fairness_keys;
 pub mod fan_out;
 /// Replay fuzz harness (issue #1835). Not a stable API.
 #[cfg(feature = "fuzzing")]

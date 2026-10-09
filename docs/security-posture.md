@@ -936,6 +936,9 @@ for the mechanism. Security-relevant properties:
 - **A workflow can pin a child into a cell.** `ChildPlacement::Shard` and
   `ChildPlacement::ResidencyKey` place a child on any shard. The hook does
   not see that decision. Do not build a child pin from caller input.
+- **A fairness key bounds load, not access.** Any caller that may start a
+  workflow may set any fairness key (issue #1976). The authorizer hook does
+  not see the key. See [Fairness keys](./fairness-keys.md).
 - **The tenant header is not an identity.** The caller declares
   `x-harvest-tenant`. A tenant-bound credential overrides it, and a header
   that names another tenant gets `403`. See

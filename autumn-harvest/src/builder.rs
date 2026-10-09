@@ -3829,6 +3829,17 @@ pub struct WorkerConfig {
     /// unchanged, preserving today's byte-for-byte behaviour for all workers
     /// that do not configure weights.
     pub queue_weights: std::collections::HashMap<String, u32>,
+    /// Rotate claims across the fairness keys of each queue (issue #1976).
+    ///
+    /// When `true`, the claim serves the keys of a queue in weighted round
+    /// robin and charges the key it claims. One tenant's flood then cannot
+    /// hold another tenant's tasks in the same queue. See
+    /// [`crate::queue_fairness::FairClock`].
+    ///
+    /// **Default: `false`.** The claim statement is then the unchanged one.
+    /// Turn it on for every worker of a queue. A worker with it off ignores
+    /// keys and does not charge them.
+    pub fairness_keys: bool,
     /// Optional Postgres URL for LISTEN/NOTIFY wakeups.
     pub notification_database_url: Option<String>,
     /// Optional per-shard LISTEN/NOTIFY database URLs for multi-shard workers
@@ -4393,6 +4404,7 @@ impl Default for WorkerConfig {
         Self {
             queues: vec!["default".to_string()],
             queue_weights: std::collections::HashMap::new(),
+            fairness_keys: false,
             notification_database_url: None,
             shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 20,
@@ -4478,6 +4490,18 @@ impl WorkerConfig {
     ) -> Self {
         self.queue_weights
             .extend(weights.into_iter().map(|(k, v)| (k.into(), v)));
+        self
+    }
+
+    /// Turn fairness keys on or off for this worker (issue #1976).
+    ///
+    /// With fairness keys on, each claim serves the keys of a queue in
+    /// weighted round robin. A key with no override has weight `1`. Set a
+    /// weight at runtime with [`crate::fairness_keys::set_fairness_weight`].
+    /// See [`WorkerConfig::fairness_keys`].
+    #[must_use]
+    pub const fn with_fairness_keys(mut self, on: bool) -> Self {
+        self.fairness_keys = on;
         self
     }
 

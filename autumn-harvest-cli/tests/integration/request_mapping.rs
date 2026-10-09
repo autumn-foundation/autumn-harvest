@@ -3049,6 +3049,136 @@ fn queue_pause_requires_a_reason() {
     );
 }
 
+// ── Fairness key weights (issue #1976) ────────────────────────────────────────
+
+#[test]
+fn queue_fairness_show_maps_to_the_read_route() {
+    let cli = Cli::try_parse_from(["harvest", "queue", "fairness", "show", "email-workers"])
+        .expect("queue fairness show args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/admin/queues/email-workers/fairness");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn queue_fairness_set_maps_to_post_with_weight() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "queue",
+        "fairness",
+        "set",
+        "email-workers",
+        "tenant-a",
+        "--weight",
+        "2.5",
+    ])
+    .expect("queue fairness set args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.path,
+        "/admin/queues/email-workers/fairness/tenant-a"
+    );
+    assert_eq!(request.body, Some(json!({ "weight": 2.5 })));
+}
+
+#[test]
+fn queue_fairness_set_requires_a_weight() {
+    assert!(
+        Cli::try_parse_from([
+            "harvest",
+            "queue",
+            "fairness",
+            "set",
+            "email-workers",
+            "tenant-a",
+        ])
+        .is_err(),
+        "queue fairness set must require --weight"
+    );
+}
+
+#[test]
+fn queue_fairness_clear_maps_to_delete_with_no_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "queue",
+        "fairness",
+        "clear",
+        "email-workers",
+        "tenant-a",
+    ])
+    .expect("queue fairness clear args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Delete);
+    assert_eq!(
+        request.path,
+        "/admin/queues/email-workers/fairness/tenant-a"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn queue_fairness_percent_encodes_the_queue_and_the_key() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "queue",
+        "fairness",
+        "set",
+        "email workers/eu",
+        "tenant a/b",
+        "--weight",
+        "3",
+    ])
+    .expect("queue fairness set args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(
+        request.path, "/admin/queues/email%20workers%2Feu/fairness/tenant%20a%2Fb",
+        "a space or slash must not break out of either path segment"
+    );
+}
+
+#[test]
+fn queue_fairness_rejects_url_dot_segment_names() {
+    // The URL parser removes `.` and `..` segments after the path is built.
+    // So a dot-segment queue or key would reach a different route.
+    for dot in [".", ".."] {
+        let key_err = Cli::try_parse_from([
+            "harvest",
+            "queue",
+            "fairness",
+            "clear",
+            "email-workers",
+            dot,
+        ])
+        .expect("queue fairness clear args should parse")
+        .api_request()
+        .expect_err("a dot-segment fairness key must be rejected");
+        assert!(
+            key_err.to_string().contains("invalid fairness key"),
+            "unexpected error for key {dot:?}: {key_err}"
+        );
+
+        let queue_err = Cli::try_parse_from(["harvest", "queue", "fairness", "show", dot])
+            .expect("queue fairness show args should parse")
+            .api_request()
+            .expect_err("a dot-segment queue name must be rejected");
+        assert!(
+            queue_err.to_string().contains("invalid queue name"),
+            "unexpected error for queue {dot:?}: {queue_err}"
+        );
+    }
+}
+
 // ── Per-activity-type pause/resume (issue #807) ───────────────────────────────
 
 #[test]

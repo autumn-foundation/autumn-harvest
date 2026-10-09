@@ -329,6 +329,7 @@ fn make_worker(
             max_workflow_history_events: None,
             slot_tuner: None,
             max_concurrent_sessions: 0,
+            fairness_keys: false,
         },
         registry,
     )
@@ -404,6 +405,7 @@ async fn start_workflow_on_shard(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         },
         None,
@@ -468,6 +470,7 @@ async fn start_workflow_with_source(
             start_source,
             start_source_ref,
             started_by,
+            fairness_key: None,
             tenant: None,
         },
         None,

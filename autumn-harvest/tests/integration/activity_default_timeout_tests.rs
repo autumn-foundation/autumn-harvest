@@ -246,6 +246,7 @@ fn build_worker(worker_id: &str, queue: &str, registry: Arc<HandlerRegistry>) ->
                 sharded_pool: None,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
+                fairness_keys: false,
             },
             registry,
         )

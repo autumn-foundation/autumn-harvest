@@ -1734,6 +1734,71 @@ fn queue_pause_routes_are_classified_and_audited() {
     );
 }
 
+/// The three fairness key weight routes (issue #1976) must be registered and
+/// classified. The two writes map to their audit operations. The read maps to
+/// `None` and is in `EXCLUDED_ROUTES`.
+#[test]
+fn fairness_weight_routes_are_classified_and_audited() {
+    use autumn_harvest::audit::{
+        ALL_MUTATION_ROUTES, CLASSIFIED_ROUTES, EXCLUDED_ROUTES, OP_FAIRNESS_WEIGHT_CLEAR,
+        OP_FAIRNESS_WEIGHT_SET, RouteClass,
+    };
+
+    for (route, op) in [
+        (
+            "POST /admin/queues/{queue_name}/fairness/{fairness_key}",
+            OP_FAIRNESS_WEIGHT_SET,
+        ),
+        (
+            "DELETE /admin/queues/{queue_name}/fairness/{fairness_key}",
+            OP_FAIRNESS_WEIGHT_CLEAR,
+        ),
+    ] {
+        assert!(
+            management_api_routes()
+                .iter()
+                .any(|(m, p)| format!("{m} {p}") == route),
+            "{route} must be registered in management_api_routes()"
+        );
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, class)| *r == route && *class == RouteClass::Mutating),
+            "{route} must be classified Mutating in CLASSIFIED_ROUTES"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, mapped)| *r == route && *mapped == Some(op)),
+            "{route} must be mapped to {op} in ALL_MUTATION_ROUTES"
+        );
+    }
+
+    let read_route = "GET /admin/queues/{queue_name}/fairness";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == read_route),
+        "{read_route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES
+            .iter()
+            .any(|(r, class)| *r == read_route && matches!(class, RouteClass::ReadOnly)),
+        "{read_route} must be classified ReadOnly in CLASSIFIED_ROUTES"
+    );
+    assert!(
+        ALL_MUTATION_ROUTES
+            .iter()
+            .any(|(r, op)| *r == read_route && op.is_none()),
+        "{read_route} must appear in ALL_MUTATION_ROUTES with no audit operation"
+    );
+    assert!(
+        EXCLUDED_ROUTES.contains(&read_route),
+        "{read_route} is read-only and must be listed in EXCLUDED_ROUTES"
+    );
+}
+
 /// The four per-activity-type pause/resume routes (issue #807) must be
 /// registered in the management route list AND correctly classified in
 /// `autumn_harvest::audit::CLASSIFIED_ROUTES`: the two mutating routes mapped to

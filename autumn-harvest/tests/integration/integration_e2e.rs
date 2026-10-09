@@ -169,6 +169,9 @@ const LEGACY_INIT_SQL: &str = concat!(
     // orders by it and `TaskQueueItem` selects it, so each claim in this suite
     // needs it. Added inline for the same reason as the columns above.
     "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS new_start BOOLEAN NOT NULL DEFAULT FALSE;\n",
+    // issue #1976: the fairness key on harvest_task_queue. Every enqueue
+    // inserts it and `TaskQueueItem` selects it.
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS fairness_key TEXT;\n",
     // issue #946: WorkflowExecution::as_select() (the modern start path's
     // read-back) references the quota_key column even for a fresh (no quota
     // policy configured) execution.
@@ -876,6 +879,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        fairness_key: None,
         tenant: None,
     };
 
@@ -1098,6 +1102,7 @@ pub(crate) fn runtime_config(
         sharded_pool: None,
         slot_tuner: None,
         max_concurrent_sessions: 0,
+        fairness_keys: false,
     }
 }
 
@@ -2073,6 +2078,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        fairness_key: None,
         tenant: None,
     };
     let started = start_or_load_workflow_execution(&mut conn, request, None)
@@ -2146,6 +2152,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
                 sharded_pool: None,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
+                fairness_keys: false,
             },
             registry,
         )
@@ -2288,6 +2295,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        fairness_key: None,
         tenant: None,
     };
     let started = start_or_load_workflow_execution(&mut conn, request, None)
@@ -2383,6 +2391,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
                 sharded_pool: None,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
+                fairness_keys: false,
             },
             registry,
         )
@@ -2554,6 +2563,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 sharded_pool: None,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
+                fairness_keys: false,
             },
             registry,
         )
@@ -2696,6 +2706,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 sharded_pool: None,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
+                fairness_keys: false,
             },
             registry,
         )
@@ -2872,6 +2883,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 sharded_pool: None,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
+                fairness_keys: false,
             },
             registry,
         )
@@ -3113,6 +3125,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 sharded_pool: None,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
+                fairness_keys: false,
             },
             Arc::new(HandlerRegistry::new(
                 vec![],
@@ -3379,6 +3392,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 sharded_pool: None,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
+                fairness_keys: false,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -3575,6 +3589,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 sharded_pool: None,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
+                fairness_keys: false,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -6699,6 +6714,7 @@ mod reuse_policy_helpers {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         }
     }
@@ -8114,6 +8130,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 sharded_pool: None,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
+                fairness_keys: false,
             },
             Arc::clone(&registry),
         )
@@ -8347,6 +8364,7 @@ async fn workflow_schedule_pause_and_resume() {
                 sharded_pool: None,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
+                fairness_keys: false,
             },
             Arc::clone(&registry),
         )
@@ -8573,6 +8591,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         },
         None,
@@ -8758,6 +8777,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         },
         None,

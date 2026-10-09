@@ -171,6 +171,7 @@ fn worker(queue: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 workflow_cache_size: 100,
                 resident_workflows: true,
                 priority_aging_secs: None,
+                fairness_keys: false,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
                 capability_miss_max_redeliveries: 5,

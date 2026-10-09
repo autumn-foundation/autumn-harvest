@@ -320,6 +320,7 @@ fn worker_config(queue: &str, shards: Vec<ShardId>) -> WorkerRuntimeConfig {
         max_workflow_history_events: None,
         slot_tuner: None,
         max_concurrent_sessions: 0,
+        fairness_keys: false,
     }
 }
 
@@ -409,6 +410,7 @@ async fn start_on(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         },
         None,

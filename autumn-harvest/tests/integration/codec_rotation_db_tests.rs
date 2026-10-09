@@ -954,6 +954,7 @@ async fn a_builder_configured_codec_encrypts_the_start_input_and_replay_round_tr
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        fairness_key: None,
         tenant: None,
     };
 

@@ -353,6 +353,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     start_source: autumn_harvest::StartSource::Api,
                     start_source_ref: None,
                     started_by: None,
+                    fairness_key: None,
                     tenant: None,
                 },
                 None,
@@ -401,6 +402,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                         sharded_pool: None,
                         slot_tuner: None,
                         max_concurrent_sessions: 0,
+                        fairness_keys: false,
                     },
                     registry,
                 )

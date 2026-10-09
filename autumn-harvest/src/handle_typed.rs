@@ -228,6 +228,9 @@ pub struct TypedStartOptions {
     pub trace_context: Option<crate::telemetry::TraceContextCarrier>,
     /// Within-queue claim priority.
     pub priority: Option<crate::types::Priority>,
+    /// The fairness key of the run (issue #1976). A worker with fairness keys
+    /// on rotates claims across keys. `None` takes the run's quota key.
+    pub fairness_key: Option<String>,
     /// Queue scheduled start at time.
     pub start_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Queue start delay duration.

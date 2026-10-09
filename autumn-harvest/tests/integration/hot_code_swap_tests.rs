@@ -2175,6 +2175,7 @@ mod one_worker_process {
                     scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                     dr: autumn_harvest::replication::DrConfig::default(),
                     worker_id: "hot-swap-host-1".to_string(),
+                    fairness_keys: false,
                     queues: vec![queue.to_string()],
                     notification_database_url: None,
                     max_concurrent_workflows: 2,

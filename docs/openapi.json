@@ -2631,6 +2631,254 @@
         "x-harvest-route-class": "read_only"
       }
     },
+    "/admin/queues/{queue_name}/fairness": {
+      "get": {
+        "description": "Show the fairness key weights and the claim state of one task queue (issue #1976). Each shard keeps its own weights and state. An unreachable shard makes the response partial. Admin only.",
+        "operationId": "get_admin_queues_by_queue_name_fairness",
+        "parameters": [
+          {
+            "description": "The task queue, matched exactly. A name with leading or trailing whitespace is a 400.",
+            "in": "path",
+            "name": "queue_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "queue_name": {},
+                    "state": {},
+                    "status": {},
+                    "unavailable_shards": {},
+                    "weights": {},
+                    "weights_uniform": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Each weights entry has queue_name, fairness_key, weight, updated_by and updated_at. The list holds one entry for each key, from the lowest shard that has it. weights_uniform is false when the shards do not hold the same weights. Each state entry has shard_id, queue_name, fairness_key, pass, last_start, lag and updated_at. The claim serves keys with a smaller lag first. A key with no override has weight 1."
+          },
+          "400": {
+            "description": "Blank or oversized queue name."
+          },
+          "401": {
+            "description": "Admin access required."
+          },
+          "503": {
+            "description": "Harvest storage pool is not configured."
+          }
+        },
+        "summary": "Show the fairness key weights and the claim state of one task queue (issue #1976).",
+        "tags": [
+          "admin"
+        ],
+        "x-harvest-idempotency": "Read-only; always idempotent.",
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
+      }
+    },
+    "/admin/queues/{queue_name}/fairness/{fairness_key}": {
+      "delete": {
+        "description": "Clear the weight of one fairness key in a task queue (issue #1976). The key goes back to weight 1 at its next claim. The clear goes to every shard. Admin only. Audited as `fairness.weight.clear`, rejected attempts included.",
+        "operationId": "delete_admin_queues_by_queue_name_fairness_by_fairness_key",
+        "parameters": [
+          {
+            "description": "The task queue, matched exactly. A name with leading or trailing whitespace is a 400.",
+            "in": "path",
+            "name": "queue_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The fairness key, matched exactly. An empty key, the key `.` or `..`, a key with outer whitespace or a control character, or a key longer than 256 bytes is a 400.",
+            "in": "path",
+            "name": "fairness_key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "cleared": {},
+                    "fairness_key": {},
+                    "ok": {},
+                    "partial_failures": {},
+                    "queue_name": {},
+                    "status": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "cleared is true when at least one shard held an override. A full clear returns ok: true and status: \"complete\", and omits partial_failures. A clear that reaches only some shards returns 207 with ok: false and status: \"partial\". The override stays on the shards that partial_failures names. Send the request again; it is idempotent."
+          },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "cleared": {},
+                    "fairness_key": {},
+                    "ok": {},
+                    "partial_failures": {
+                      "description": "The shards that the clear did not reach. Present only on this status.",
+                      "type": "string"
+                    },
+                    "queue_name": {},
+                    "status": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The clear reached only some shards. The body is the 200 body plus partial_failures, which names the shards that did not apply it."
+          },
+          "400": {
+            "description": "Blank or oversized queue name, or an invalid fairness key."
+          },
+          "401": {
+            "description": "Admin access required."
+          },
+          "500": {
+            "description": "Every shard failed. The override was not cleared."
+          },
+          "503": {
+            "description": "Harvest storage pool is not configured."
+          }
+        },
+        "summary": "Clear the weight of one fairness key in a task queue (issue #1976).",
+        "tags": [
+          "admin"
+        ],
+        "x-harvest-idempotency": "Clearing a key with no override returns 200 with cleared: false.",
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
+      },
+      "post": {
+        "description": "Set the weight of one fairness key in a task queue (issue #1976). A key with weight w gets w claims for each claim of a key with weight 1, while both have work. The weight applies at the next claim of the key. No worker restart is necessary. The write goes to every shard. Admin only. Audited as `fairness.weight.set`, rejected attempts included.",
+        "operationId": "post_admin_queues_by_queue_name_fairness_by_fairness_key",
+        "parameters": [
+          {
+            "description": "The task queue, matched exactly. A name with leading or trailing whitespace is a 400.",
+            "in": "path",
+            "name": "queue_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The fairness key, matched exactly. An empty key, the key `.` or `..`, a key with outer whitespace or a control character, or a key longer than 256 bytes is a 400.",
+            "in": "path",
+            "name": "fairness_key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "weight": {
+                    "description": "The weight, a finite number from 0.001 to 1000. An unknown field is a 400."
+                  }
+                },
+                "required": [
+                  "weight"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "fairness_key": {},
+                    "ok": {},
+                    "partial_failures": {},
+                    "queue_name": {},
+                    "status": {},
+                    "updated_at": {},
+                    "updated_by": {},
+                    "weight": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The body is the stored override, from the first shard that applied it. updated_by is the authenticated actor. A full write returns ok: true and status: \"complete\", and omits partial_failures. A write that reaches only some shards returns 207 with ok: false and status: \"partial\". Send the request again; it is idempotent. A shard at the override cap makes it a 409. A failure on every shard that is not the cap is a 500."
+          },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "fairness_key": {},
+                    "ok": {},
+                    "partial_failures": {
+                      "description": "The shards that the write did not reach. Present only on this status.",
+                      "type": "string"
+                    },
+                    "queue_name": {},
+                    "status": {},
+                    "updated_at": {},
+                    "updated_by": {},
+                    "weight": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The write reached only some shards. The body is the 200 body plus partial_failures, which names the shards that did not apply it."
+          },
+          "400": {
+            "description": "Blank or oversized queue name, invalid fairness key, weight out of range, or malformed body."
+          },
+          "401": {
+            "description": "Admin access required."
+          },
+          "409": {
+            "description": "At least one shard already holds 1000 overrides for the queue and refused a new key. A retry does not converge. Clear an override on that shard first. When some shards applied the weight, the body is the 207 body. When no shard applied it, the body is a problem response."
+          },
+          "500": {
+            "description": "Every shard failed. No weight is in effect."
+          },
+          "503": {
+            "description": "Harvest storage pool is not configured."
+          }
+        },
+        "summary": "Set the weight of one fairness key in a task queue (issue #1976).",
+        "tags": [
+          "admin"
+        ],
+        "x-harvest-idempotency": "Setting the same weight again returns 200 and writes the same row. updated_by and updated_at change to the latest caller.",
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
+      }
+    },
     "/admin/queues/{queue_name}/pause": {
       "post": {
         "description": "Hold dispatch on a named task queue during a scoped downstream outage (issue #619). While paused, no worker claims NEW tasks from the queue; held tasks stay PENDING and are never failed, retried, or dead-lettered, and an already-RUNNING task finishes naturally. The relative `schedule_to_start` timer is suspended for held tasks; the absolute `schedule_to_close` deadline (issue #378) keeps ticking, so a long hold can still time out work carrying one — a pause is not an SLA extension. Idempotent: re-pausing an already-paused queue is a 200 no-op that preserves the original reason and operator (`newly_paused: false`). The operator `reason` is truncated to 500 characters at the API boundary. A partially-applied fleet-wide hold is reported as 207, not 200 — see the success-response notes. Admin only; audited as `queue.pause`, including rejected attempts.",
@@ -7944,7 +8192,7 @@
                     "description": "true = all-or-nothing; false = best-effort per-item results."
                   },
                   "items": {
-                    "description": "Array of { workflow_name, workflow_id?, input?, search_attributes?, idempotency_key? } objects."
+                    "description": "Array of { workflow_name, workflow_id?, input?, search_attributes?, idempotency_key?, context_headers?, priority?, fairness_key? } objects. An item with an invalid fairness_key, or a fairness_key on a throttled workflow, is rejected before any item starts."
                   }
                 },
                 "required": [
@@ -13105,6 +13353,10 @@
                   },
                   "execution_timeout_secs": {
                     "description": "Overall execution timeout in seconds."
+                  },
+                  "fairness_key": {
+                    "description": "The fairness key of the run (issue #1976). A worker with fairness keys on rotates claims across the keys of a queue in weighted round robin. Omitted takes the run's quota key. Must be non-empty, must not be `.` or `..`, must have no outer whitespace or control character, and must be at most 256 bytes. A key bounds load, not access.",
+                    "type": "string"
                   },
                   "idempotency_key": {
                     "description": "Request-scoped idempotency key (issue #808). Two starts carrying the same key within the retention window (default 24h) converge on exactly one execution: the first creates it, the second returns the same execution_id as a no-op (200, no second WorkflowStarted, no second task). Dedup scope is (workflow_name, idempotency_key), independent of workflow_id, and short-circuits the reuse_policy matrix. A committed keyed replay short-circuits to the 200 no-op before fresh-start-only validations (input-schema #373, completion-callback SSRF #605, delay/start_at) and before the admission gate #377, returning the original execution regardless of the retry's body; a genuinely fresh keyed start (no live claim) still runs every validation and the gate. The `Idempotency-Key` request header takes precedence over this body field; a present-but-empty key returns 400. Mutually exclusive with a throttle/debounce/batch policy (400 if combined). Shard routing: a keyed start with an OMITTED (auto-generated) workflow_id routes by the key so same-key retries co-locate and dedup; a keyed start with an EXPLICIT workflow_id routes by workflow_id (preserving the reuse_policy matrix and the shard-local (workflow_name, workflow_id) uniqueness invariant). For dedup to converge across a delivery's retries, be consistent about supplying vs. omitting workflow_id."

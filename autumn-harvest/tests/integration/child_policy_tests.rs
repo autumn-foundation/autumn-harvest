@@ -106,6 +106,7 @@ fn make_worker_with_redeliveries(registry: Arc<HandlerRegistry>, redeliveries: u
             sharded_pool: None,
             slot_tuner: None,
             max_concurrent_sessions: 0,
+            fairness_keys: false,
         },
         registry,
     )
@@ -162,6 +163,7 @@ async fn start_workflow(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         },
         None,

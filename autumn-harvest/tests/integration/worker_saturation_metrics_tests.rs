@@ -174,6 +174,7 @@ fn cohort_with_freshness(queue: &str, peer_stale_secs: i64) -> String {
         slots: workers::SlotPolicy::of(1, 1, None),
         session_slots: 0,
         priority_aging_secs: None,
+        fairness_keys: false,
         ineligible_activities: &[],
         shard_assignments: &[],
         registered_workflows: &[],
@@ -643,6 +644,7 @@ async fn a_long_cohort_key_still_stores() {
         slots: workers::SlotPolicy::of(1, 1, None),
         session_slots: 0,
         priority_aging_secs: None,
+        fairness_keys: false,
         ineligible_activities: &[],
         shard_assignments: &[],
         registered_workflows: &[],
@@ -1022,6 +1024,7 @@ fn start_params<'a>(
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        fairness_key: None,
         tenant: None,
     }
 }

@@ -1269,6 +1269,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         concurrency_limit,
                         concurrency_on_conflict,
                         priority: opts.priority.unwrap_or_default(),
+                        fairness_key: opts.fairness_key,
                         max_workflow_input_bytes: client.max_workflow_input_bytes(info.max_input_bytes),
                         start_at: opts.start_at,
                         delay: opts.delay,

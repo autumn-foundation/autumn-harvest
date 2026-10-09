@@ -204,6 +204,7 @@ fn runtime_config(worker_id: &str, slot_tuner: Option<SlotTunerConfig>) -> Worke
         sharded_pool: None,
         slot_tuner,
         max_concurrent_sessions: 0,
+        fairness_keys: false,
     }
 }
 
@@ -256,6 +257,7 @@ async fn start_workflow(database_url: &str, workflow_id: &str) -> ExecutionId {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         },
         None,

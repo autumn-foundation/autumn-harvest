@@ -151,6 +151,8 @@ mod executor_span_tests;
 #[cfg(feature = "testing")]
 mod external_completion_tests;
 mod external_outbox_scan_tests;
+mod fairness_key_tests;
+mod fairness_key_worker_tests;
 #[cfg(feature = "db")]
 mod fanout_result_writer_db_tests;
 mod fanout_tests;

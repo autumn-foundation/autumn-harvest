@@ -2260,6 +2260,31 @@ impl RetentionRuntime {
                                     );
                                 }
                             }
+                            // Fairness-key state upkeep (issue #1976). It uses the
+                            // same idle window. A pruned row changes no claim, so
+                            // a failure only delays upkeep to the next tick.
+                            match crate::fairness_keys::prune_fairness_state(
+                                &mut conn,
+                                None,
+                                cutoff,
+                                config.batch_size,
+                                config.dry_run,
+                            )
+                            .await
+                            {
+                                Ok(0) => {}
+                                Ok(pruned) => tracing::info!(
+                                    shard = %shard,
+                                    pruned,
+                                    dry_run = config.dry_run,
+                                    "harvest idle fairness-key state pruned"
+                                ),
+                                Err(err) => tracing::warn!(
+                                    shard = %shard,
+                                    error = %err,
+                                    "harvest fairness-key state prune failed"
+                                ),
+                            }
                         }
                     }
 

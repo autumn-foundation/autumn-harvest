@@ -230,6 +230,12 @@ pub const OP_PAYLOAD_DECODE_READ: &str = "payload.decode_read";
 pub const OP_QUEUE_PAUSE: &str = "queue.pause";
 /// Operation: an operator resumed dispatch on a task queue (issue #619).
 pub const OP_QUEUE_RESUME: &str = "queue.resume";
+/// Operation: an operator set the weight of a fairness key in a queue
+/// (issue #1976).
+pub const OP_FAIRNESS_WEIGHT_SET: &str = "fairness.weight.set";
+/// Operation: an operator cleared the weight of a fairness key in a queue
+/// (issue #1976).
+pub const OP_FAIRNESS_WEIGHT_CLEAR: &str = "fairness.weight.clear";
 
 pub const OP_TOKEN_CREATE: &str = "token.create";
 /// Audit operation: revoked a scoped API token (issue #942).
@@ -802,6 +808,20 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "POST /admin/queues/{queue_name}/resume",
         RouteClass::Mutating,
     ),
+    // Fairness key weights (issue #1976). GET is read-only. The two
+    // mutations are admin-gated.
+    (
+        "GET /admin/queues/{queue_name}/fairness",
+        RouteClass::ReadOnly,
+    ),
+    (
+        "POST /admin/queues/{queue_name}/fairness/{fairness_key}",
+        RouteClass::Mutating,
+    ),
+    (
+        "DELETE /admin/queues/{queue_name}/fairness/{fairness_key}",
+        RouteClass::Mutating,
+    ),
     ("GET /admin/metrics", RouteClass::ReadOnly),
     ("GET /admin/completion-triggers", RouteClass::ReadOnly),
     ("GET /admin/schedules/{id}", RouteClass::ReadOnly),
@@ -968,6 +988,9 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     // Task-queue pause/resume (issue #619)
     OP_QUEUE_PAUSE,
     OP_QUEUE_RESUME,
+    // Fairness key weights (issue #1976)
+    OP_FAIRNESS_WEIGHT_SET,
+    OP_FAIRNESS_WEIGHT_CLEAR,
     OP_TOKEN_CREATE,
     OP_TOKEN_REVOKE,
     // Automatic load shedding (issue #1794). No route entry: the sampler
@@ -1107,6 +1130,8 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/queues/scaling",
     // Paused-queue list is read-only.
     "GET /admin/queues/paused",
+    // Fairness weight and state read is read-only (issue #1976).
+    "GET /admin/queues/{queue_name}/fairness",
     "GET /admin/metrics",
     "GET /admin/completion-triggers",
     "GET /admin/schedules/{id}",
@@ -1439,6 +1464,15 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     (
         "POST /admin/queues/{queue_name}/resume",
         Some(OP_QUEUE_RESUME),
+    ),
+    ("GET /admin/queues/{queue_name}/fairness", None),
+    (
+        "POST /admin/queues/{queue_name}/fairness/{fairness_key}",
+        Some(OP_FAIRNESS_WEIGHT_SET),
+    ),
+    (
+        "DELETE /admin/queues/{queue_name}/fairness/{fairness_key}",
+        Some(OP_FAIRNESS_WEIGHT_CLEAR),
     ),
     ("GET /admin/metrics", None),
     ("GET /admin/completion-triggers", None),

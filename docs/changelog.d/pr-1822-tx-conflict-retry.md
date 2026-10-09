@@ -50,8 +50,8 @@ cited pin test exists.
 
 **Known residuals.** An inline cancel can evaluate completion triggers, and
 the throttle fire batch runs admission. Their counters and logs can repeat
-after a retry. The `cancel_running` and mutex cycle (row 15) and the re-run
-cycle (row 16) still return an error from an API start. Unwired transactions
+after a retry. The `cancel_running` and mutex cycle (row 16) and the re-run
+cycle (row 17) still return an error from an API start. Unwired transactions
 still fail on a conflict. This change adds no `WorkflowEvent` variant and no
 migration.
 
