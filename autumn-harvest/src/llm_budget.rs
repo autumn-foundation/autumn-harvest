@@ -38,7 +38,8 @@
 //! - The check reads the policy in its own process. A worker that does not
 //!   register the workflow type does not enforce the budget. It logs one
 //!   warning for each such type.
-//! - Each check sums every ledger row of the tenant in the window.
+//! - A check with a tenant cap sums every ledger row of the tenant in the
+//!   window. A policy with only run caps skips that sum.
 //! - A ledger row cascades with its run. Keep retention longer than the
 //!   tenant window.
 //! - An activity that does not call the check is not budgeted. The budget
@@ -249,8 +250,9 @@ impl LlmBudgetExceeded {
 
 /// The spend of one run and of its tenant, in one round trip.
 ///
-/// `$1` is the run. `$2` is the tenant window in seconds. The tenant scope is
-/// the `(workflow_name, quota_key)` of the run. A run with no key has no
+/// `$1` is the run. `$2` is the tenant window in seconds. `$3` is false when
+/// the policy declares no tenant cap. The planner then skips the tenant sum.
+/// The tenant scope is the `(workflow_name, quota_key)` of the run. A run with no key has no
 /// tenant spend. Each sum reads one index of `harvest_llm_ledger`.
 ///
 /// The sums are `NUMERIC`, clamped to the `BIGINT` range. A huge recorded
@@ -272,7 +274,8 @@ const LLM_SPEND_SQL: &str = "\
                      9223372036854775807)::BIGINT AS cost_micros \
         FROM harvest_llm_ledger l JOIN run r \
           ON l.workflow_name = r.workflow_name AND l.quota_key = r.quota_key \
-        WHERE l.recorded_at >= NOW() - ($2::BIGINT * INTERVAL '1 second') \
+        WHERE $3::BOOLEAN \
+          AND l.recorded_at >= NOW() - ($2::BIGINT * INTERVAL '1 second') \
     ) \
     SELECT run_spend.tokens AS run_tokens, run_spend.cost_micros AS run_cost_micros, \
            tenant_spend.tokens AS tenant_tokens, tenant_spend.cost_micros AS tenant_cost_micros \
@@ -304,6 +307,9 @@ struct LlmSpendRow {
 
 /// Read the spend of a run and of its tenant.
 ///
+/// With `with_tenant` false, the tenant spend reads as zero and costs no
+/// scan.
+///
 /// # Errors
 ///
 /// Returns a database error when the read fails.
@@ -312,12 +318,14 @@ pub async fn load_llm_spend(
     conn: &mut diesel_async::AsyncPgConnection,
     exec_id: crate::types::ExecutionId,
     window_secs: u32,
+    with_tenant: bool,
 ) -> crate::error::HarvestResult<LlmSpend> {
     use diesel_async::RunQueryDsl as _;
 
     let row: LlmSpendRow = diesel::sql_query(LLM_SPEND_SQL)
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
         .bind::<diesel::sql_types::BigInt, _>(i64::from(window_secs))
+        .bind::<diesel::sql_types::Bool, _>(with_tenant)
         .get_result(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -426,6 +434,24 @@ mod tests {
             .with_max_run_llm_cost_micros(1_000)
             .with_max_tenant_llm_tokens(500)
             .with_max_tenant_llm_cost_micros(5_000)
+    }
+
+    #[test]
+    fn only_a_tenant_cap_needs_the_tenant_sum() {
+        let run_only = QuotaPolicy::new("tenant")
+            .with_max_run_llm_tokens(1)
+            .with_max_run_llm_cost_micros(1);
+        assert!(!run_only.has_tenant_llm_cap());
+        assert!(
+            QuotaPolicy::new("t")
+                .with_max_tenant_llm_tokens(1)
+                .has_tenant_llm_cap()
+        );
+        assert!(
+            QuotaPolicy::new("t")
+                .with_max_tenant_llm_cost_micros(1)
+                .has_tenant_llm_cap()
+        );
     }
 
     #[test]

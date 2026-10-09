@@ -1931,7 +1931,7 @@ async fn the_llm_ledger_moves_with_the_run() {
         .expect("migrate");
 
     let mut target = shards.target().await;
-    let spend = autumn_harvest::llm_budget::load_llm_spend(&mut target, exec_id, 3_600)
+    let spend = autumn_harvest::llm_budget::load_llm_spend(&mut target, exec_id, 3_600, true)
         .await
         .expect("read the spend on the target");
     assert_eq!(

@@ -384,7 +384,7 @@ An agent loop can spend without limit. A budget caps the LLM tokens or the cost 
 - The scope is shard-local, as for quota.
 - Keep retention longer than the window, because the ledger rows go with their run.
 - The check reads the policy in its own process. Register the workflow type on each worker that runs its LLM steps. A worker without it passes the check and logs one warning for each type.
-- Each check sums every ledger row of the tenant in the window. A tenant with many calls a day pays for that on each step.
+- A check with a tenant cap sums every ledger row of the tenant in the window. A tenant with many calls a day pays for that on each step. A policy with only run caps skips that sum.
 - A step that does not call the check is not budgeted. A local activity has no database in its context, so the check always passes there.
 - The SQLite backend rejects a workflow that declares `quota`, so a budget does not build there.
 - A refused step is not parked: parking needs a wake when the window moves.

@@ -1706,6 +1706,14 @@ path = "is_expiring_within"
 receiver = "ActivityContext"
 reason = "Activity-side: context.rs:14711; a live-clock predicate, activity-side."
 [[non_sink]]
+path = "check_llm_budget"
+receiver = "ActivityContext"
+reason = "Activity-side: context.rs:15241; reads the LLM spend of the run and its tenant (issue #1997). A read of `harvest_llm_ledger`, not a `harvest_events` write and not a workflow command."
+[[non_sink]]
+path = "record_llm_usage"
+receiver = "ActivityContext"
+reason = "Activity-side: context.rs:15289; inserts one `harvest_llm_ledger` row (issue #1997). A side table, not a `harvest_events` write and not a workflow command."
+[[non_sink]]
 path = "idempotency_key"
 receiver = "ActivityContext"
 reason = "Activity-side: context.rs:14415; supplied by the caller."

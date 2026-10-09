@@ -15251,6 +15251,7 @@ impl ActivityContext {
                     &mut conn,
                     state.exec_id,
                     policy.tenant_llm_window_secs,
+                    policy.has_tenant_llm_cap(),
                 )
                 .await
             }

@@ -338,6 +338,13 @@ impl QuotaPolicy {
             || self.max_tenant_llm_cost_micros.is_some()
     }
 
+    /// `true` when a tenant LLM cap is declared (issue #1997). Only then
+    /// does the budget check sum the tenant spend.
+    #[must_use]
+    pub const fn has_tenant_llm_cap(&self) -> bool {
+        self.max_tenant_llm_tokens.is_some() || self.max_tenant_llm_cost_micros.is_some()
+    }
+
     /// `true` when at least one admission cap is declared.
     ///
     /// A [`QuotaPolicy`] with every cap `None` resolves a key but enforces
