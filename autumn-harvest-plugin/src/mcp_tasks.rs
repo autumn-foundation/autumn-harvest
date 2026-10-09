@@ -412,10 +412,10 @@ impl TaskCatalog {
 
 /// Build the task route.
 ///
-/// The route takes the same layers as a mutating tool route: the read-only
-/// role gate, the mutation-auth gate (issue #1802), the tenant refusal
-/// (issue #1977) and the embedder auth layer. It can start and cancel runs,
-/// so every JSON-RPC method on it counts as a mutation.
+/// The route takes the layers of a mutating tool route. These are the
+/// read-only role gate, the mutation-auth gate (issue #1802), the tenant
+/// refusal (issue #1977) and the embedder auth layer. The route can start
+/// and cancel runs, so every JSON-RPC method on it counts as a mutation.
 #[must_use]
 pub fn build_mcp_task_route(
     path: &str,
