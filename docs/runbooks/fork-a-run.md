@@ -98,7 +98,7 @@ not show it under the source (see
 |--------|-------|--------|
 | `400` | The fork point is not a clean decision boundary, or it is at or after a terminal event. | Use `nearest_valid_before` from the body, when it is set. |
 | `400` | The history holds a continue-as-new. | Fork the latest run of the chain. |
-| `400` | An input override with a fork point other than `0`, an input that fails the workflow schema or byte cap, or a bad override. | Fix the request. |
+| `400` | An input override with a fork point other than `0`, an input that fails the workflow schema or byte cap, a bad override, or the source workflow id. | Fix the request. |
 | `404` | No such execution. | Check the id. |
 | `409` | The source, or a run in its fork lineage, had its payloads erased (issue #495). | You cannot fork it. Start a new run. |
 | `409` | Recorded mode cannot serve an effect after the fork point. | Fork after that effect, or use `"effects": "live"`. |

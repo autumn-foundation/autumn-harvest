@@ -3507,7 +3507,7 @@
           {
             "name": "workflow_id",
             "required": false,
-            "description": "Business key of the fork. Omitted = <source workflow_id>-fork-<uuid>. A key that another run holds returns 409; a run holds its key unless it continued as new or was terminated."
+            "description": "Business key of the fork. Omitted = <source workflow_id>-fork-<uuid>. The source key is refused with 400. A key that another run holds returns 409; a run holds its key unless it continued as new or was terminated."
           },
           {
             "name": "input",

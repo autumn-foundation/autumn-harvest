@@ -2181,11 +2181,11 @@ enum WorkflowCommand {
         /// live executions or force this sort order.
         #[arg(long = "history-bloat-min-events")]
         history_bloat_min_events: Option<u64>,
-        /// Filter by workflow-start provenance (issue #740): one of api,
+        /// Filter by workflow-start provenance (issue #740). Values: api,
         /// schedule, backfill, `signal_with_start`, `update_with_start`,
         /// `completion_trigger`, webhook, broker, child, batch,
-        /// `continue_as_new`, reset, rerun, outbox, transactional, fork, or
-        /// unknown (matches pre-upgrade/NULL rows). The server rejects any
+        /// `continue_as_new`, reset, rerun, outbox, transactional, fork.
+        /// `unknown` matches pre-upgrade/NULL rows. The server rejects any
         /// other value with a 400.
         #[arg(long = "start-source")]
         start_source: Option<String>,

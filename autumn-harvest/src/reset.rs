@@ -1708,7 +1708,7 @@ pub(crate) mod tests {
         validate_source_execution,
     };
 
-    pub(crate) fn execution_in_state(state: &str) -> crate::models::WorkflowExecution {
+    pub fn execution_in_state(state: &str) -> crate::models::WorkflowExecution {
         crate::models::WorkflowExecution {
             migrated_to_shard: None,
             migrated_at: None,

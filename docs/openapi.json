@@ -11027,7 +11027,7 @@
                     "description": "Reason for the fork, recorded in the marker and the audit log."
                   },
                   "workflow_id": {
-                    "description": "Business key of the fork. Omitted = <source workflow_id>-fork-<uuid>. A key that another run holds returns 409; a run holds its key unless it continued as new or was terminated."
+                    "description": "Business key of the fork. Omitted = <source workflow_id>-fork-<uuid>. The source key is refused with 400. A key that another run holds returns 409; a run holds its key unless it continued as new or was terminated."
                   }
                 },
                 "type": "object"

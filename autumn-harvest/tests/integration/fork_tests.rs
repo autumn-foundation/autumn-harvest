@@ -1,5 +1,6 @@
 #![cfg(feature = "db")]
-#![allow(clippy::too_many_lines)]
+// Activity handlers must be `async`, even with no await.
+#![allow(clippy::too_many_lines, clippy::unused_async)]
 //! Non-destructive fork of a run (issue #2000).
 //!
 //! A fork copies a history prefix to a new workflow id. The source stays
@@ -93,8 +94,10 @@ async fn fork_pay_wf(ctx: &WorkflowContext, input: Value) -> Result<Value, Strin
 async fn fork_charge(_ctx: &ActivityContext, input: Value) -> Result<Value, String> {
     let tag = input["tag"].as_str().unwrap_or_default().to_string();
     let mut map = CHARGES.lock().map_err(|e| e.to_string())?;
-    let count = map.entry(tag).or_insert(0);
-    *count += 1;
+    let entry = map.entry(tag).or_insert(0);
+    *entry += 1;
+    let count = *entry;
+    drop(map);
     Ok(json!({ "charge_id": format!("ch-{count}"), "amount": input["amount"] }))
 }
 
@@ -637,15 +640,28 @@ async fn fork_refuses_a_workflow_id_in_use() {
     let queue = unique("id");
     let mut conn = connect(&url).await;
     let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
-    let taken = snapshot(&url, source).await.0.workflow_id;
+    let other = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 2 })).await;
+    let taken = snapshot(&url, other).await.0.workflow_id;
 
-    let mut same_id = request(ForkEffects::Recorded);
-    same_id.workflow_id = Some(taken);
-    let error = fork_workflow_execution(&mut conn, source, same_id, None)
+    let mut other_id = request(ForkEffects::Recorded);
+    other_id.workflow_id = Some(taken);
+    let error = fork_workflow_execution(&mut conn, source, other_id, None)
         .await
         .expect_err("a workflow id in use is refused");
     assert!(
         matches!(error, WorkflowForkError::WorkflowIdInUse { .. }),
+        "unexpected error: {error}"
+    );
+
+    // The source key routes by-id calls to the real entity, so it is refused
+    // even when the source no longer holds it.
+    let mut own_id = request(ForkEffects::Recorded);
+    own_id.workflow_id = Some(snapshot(&url, source).await.0.workflow_id);
+    let error = fork_workflow_execution(&mut conn, source, own_id, None)
+        .await
+        .expect_err("the source key is refused");
+    assert!(
+        matches!(error, WorkflowForkError::InvalidOverride { .. }),
         "unexpected error: {error}"
     );
 }

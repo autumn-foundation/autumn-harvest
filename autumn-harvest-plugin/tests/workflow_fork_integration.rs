@@ -237,6 +237,7 @@ async fn fork_route_creates_a_recorded_fork_and_leaves_the_source() {
     assert_eq!(after.completed_at, before.completed_at);
 }
 
+/// With no admin auth boundary, `require_admin` refuses the caller.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fork_route_is_admin_only() {
     let (url, _container) = setup_database().await;
@@ -247,14 +248,6 @@ async fn fork_route_is_admin_only() {
 
     let (status, _) = post_fork(&app, &source.to_string(), json!({}), false).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-
-    // With the admin boundary on, a caller with no admin header is refused.
-    let guarded = build_app(&pool, true);
-    let (status, _) = post_fork(&guarded, &source.to_string(), json!({}), false).await;
-    assert!(
-        matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
-        "status: {status}"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

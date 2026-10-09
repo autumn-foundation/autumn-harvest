@@ -46,7 +46,7 @@ pub const ERROR_TYPE_FORK_EFFECT_UNAVAILABLE: &str = "ForkEffectUnavailable";
 ///
 /// An unknown field is an error, so a typo such as `"effect"` cannot pass
 /// silently.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowForkRequest {
     /// Where the fork starts. `None` means event `0` (`WorkflowStarted`).
@@ -95,7 +95,7 @@ fn non_empty_or(value: &str, fallback: &str) -> String {
 }
 
 /// One activity result that the caller sets for a fork.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForkActivityOverride {
     /// Name of the activity.
@@ -251,13 +251,7 @@ async fn fork_in_transaction(
     };
     let plan = validate_fork(&events, fork_event_id, request)?;
 
-    let workflow_id = request
-        .workflow_id
-        .clone()
-        .unwrap_or_else(|| format!("{}-fork-{}", source.workflow_id, Uuid::new_v4().simple()));
-    if workflow_id_in_use(conn, &source.workflow_name, &workflow_id).await? {
-        return Err(WorkflowForkError::WorkflowIdInUse { workflow_id });
-    }
+    let workflow_id = fork_workflow_id(conn, &source, request).await?;
 
     let new_exec_id = ExecutionId::new_for_shard(ShardId::new(source.shard_id));
     let input = match &request.input {
@@ -298,20 +292,7 @@ async fn fork_in_transaction(
         codecs,
     )
     .await?;
-    let mut tail = vec![WorkflowEvent::WorkflowForked {
-        forked_from_exec_id: source_id,
-        fork_event_id,
-        effects: request.effects,
-        reason: request.reason.clone(),
-        operator_id: request.operator_id.clone(),
-    }];
-    tail.extend(request.activity_overrides.iter().map(|o| {
-        WorkflowEvent::ForkActivityResultOverridden {
-            activity_name: o.activity_name.clone(),
-            occurrence: o.occurrence,
-            output: o.output.clone(),
-        }
-    }));
+    let tail = fork_tail(source_id, fork_event_id, request);
     let tail_start = i32::try_from(plan.events_carried_over)
         .map_err(|_| HarvestError::Database("fork carried too many events".to_string()))?;
     crate::store::append_events_offloaded_with_codecs(
@@ -333,6 +314,55 @@ async fn fork_in_transaction(
         events_carried_over: plan.events_carried_over,
         effects: request.effects,
     })
+}
+
+/// The workflow id of the fork: the caller's choice, or a new derived id.
+///
+/// The source key routes by-id signals and updates to the real entity, so a
+/// what-if fork must not take it over. A key that another run holds is
+/// refused too.
+async fn fork_workflow_id(
+    conn: &mut AsyncPgConnection,
+    source: &WorkflowExecution,
+    request: &WorkflowForkRequest,
+) -> Result<String, WorkflowForkError> {
+    let workflow_id = request
+        .workflow_id
+        .clone()
+        .unwrap_or_else(|| format!("{}-fork-{}", source.workflow_id, Uuid::new_v4().simple()));
+    if workflow_id == source.workflow_id {
+        return Err(WorkflowForkError::InvalidOverride {
+            message: "a fork needs a workflow id other than the source id".to_string(),
+        });
+    }
+    if workflow_id_in_use(conn, &source.workflow_name, &workflow_id).await? {
+        return Err(WorkflowForkError::WorkflowIdInUse { workflow_id });
+    }
+    Ok(workflow_id)
+}
+
+/// The marker and the override events that follow the carried prefix.
+fn fork_tail(
+    source_id: ExecutionId,
+    fork_event_id: i64,
+    request: &WorkflowForkRequest,
+) -> Vec<WorkflowEvent> {
+    let marker = WorkflowEvent::WorkflowForked {
+        forked_from_exec_id: source_id,
+        fork_event_id,
+        effects: request.effects,
+        reason: request.reason.clone(),
+        operator_id: request.operator_id.clone(),
+    };
+    std::iter::once(marker)
+        .chain(request.activity_overrides.iter().map(|o| {
+            WorkflowEvent::ForkActivityResultOverridden {
+                activity_name: o.activity_name.clone(),
+                occurrence: o.occurrence,
+                output: o.output.clone(),
+            }
+        }))
+        .collect()
 }
 
 /// Most fork links that a lineage check follows.
@@ -395,9 +425,11 @@ fn check_input_override(
     {
         let detail = violations
             .iter()
-            .map(|violation| match &violation.field_path {
-                Some(path) => format!("{path}: {}", violation.message),
-                None => violation.message.clone(),
+            .map(|violation| {
+                violation.field_path.as_ref().map_or_else(
+                    || violation.message.clone(),
+                    |path| format!("{path}: {}", violation.message),
+                )
             })
             .collect::<Vec<_>>()
             .join("; ");
@@ -1339,7 +1371,7 @@ mod tests {
             output_of(resolve_activity(&fork, &source, id)),
             json!("ch-1")
         );
-        let mut live_last = fork.clone();
+        let mut live_last = fork;
         live_last.swap(1, 3);
         assert!(matches!(
             resolve_activity(&live_last, &source, id),
