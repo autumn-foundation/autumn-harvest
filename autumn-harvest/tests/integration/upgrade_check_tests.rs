@@ -602,7 +602,7 @@ async fn an_open_update_with_no_candidate_schema_is_unchecked() {
 }
 
 #[tokio::test]
-async fn an_offloaded_payload_with_no_offloader_is_not_migrate() {
+async fn an_offloaded_payload_with_no_offloader_needs_review() {
     let mut events = vec![started()];
     events.extend(reserve_done(json!({
         "_harvest_offload_envelope": 1,
@@ -611,12 +611,11 @@ async fn an_offloaded_payload_with_no_offloader_is_not_migrate() {
         "size": 9,
         "sha256": "00"
     })));
+    // The stub breaks the candidate type. Replay over it would give a false
+    // pin, so the check stops at the review-level finding.
     let run = unchanged_check().check_snapshot(snapshot(events)).await;
-    assert_ne!(run.verdict, Verdict::Migrate, "{run:#?}");
-    assert!(
-        kinds(&run).contains(&FindingKind::PayloadOffloaded),
-        "{run:#?}"
-    );
+    assert_eq!(run.verdict, Verdict::Review, "{run:#?}");
+    assert_eq!(kinds(&run), [FindingKind::PayloadOffloaded]);
 }
 
 #[tokio::test]

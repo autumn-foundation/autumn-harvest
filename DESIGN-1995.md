@@ -207,12 +207,15 @@ passed. Signals, mutexes, `continue_as_new`, random values and
 - The check also validates each recorded workflow input, `SignalReceived`
   and `UpdateAdmitted` payload, when the candidate publishes a schema.
 - An offloaded payload is inflated through the candidate offloader. With
-  no offloader, the finding is `payload-offloaded`.
+  no offloader, the finding is `payload-offloaded`. Replay and the schema
+  checks then do not run, because a claim-check stub is not the payload.
 
 ## 5. Trust boundary
 
 The DB driver loads each history and each pending signal with the
-candidate codecs and offloader, inside a read-only transaction. Plaintext
+candidate codecs and offloader. Both reads share one read-only
+`REPEATABLE READ` snapshot, so a signal that a worker ingests between them
+is not lost. Plaintext
 exists only in process memory. A run verdict holds execution ids, workflow
 names, finding kinds, event indexes and code names. It holds no payload
 and no error text. The `incomplete` list of a report holds shard database

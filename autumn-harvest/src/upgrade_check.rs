@@ -630,20 +630,23 @@ impl UpgradeCheck {
         let name = snapshot.workflow_name.clone();
         let execution_id = snapshot.execution_id;
         let mut findings = Vec::new();
-        if self.replayer.is_workflow_registered(&name) {
-            findings.extend(self.replay_findings(&snapshot).await);
-        } else {
+        if !self.replayer.is_workflow_registered(&name) {
             findings.push(Finding::new(
                 FindingKind::WorkflowNotRegistered,
                 format!("the candidate build has no handler for `{name}`"),
             ));
-        }
-        findings.extend(self.payload_findings(&name, &snapshot.events, pending_signals));
-        if self.offloader.is_none() && has_offloaded_payload(&snapshot.events, pending_signals) {
+        } else if self.offloader.is_none()
+            && has_offloaded_payload(&snapshot.events, pending_signals)
+        {
+            // A claim-check stub is not the payload. Replay and schema checks
+            // over it would pin a run that may well fit, so neither runs.
             findings.push(Finding::new(
                 FindingKind::PayloadOffloaded,
                 "the run holds offloaded payloads; pass the offloader to check them",
             ));
+        } else {
+            findings.extend(self.replay_findings(&snapshot).await);
+            findings.extend(self.payload_findings(&name, &snapshot.events, pending_signals));
         }
         findings.extend(self.structure_findings(&name, &snapshot.events));
         RunVerdict::new(execution_id, name, findings)
@@ -1352,8 +1355,12 @@ impl UpgradeCheck {
             let execution_id = ExecutionId::from_uuid(row.id);
             let codecs = Arc::clone(&self.codecs);
             let offloader = self.offloader.clone();
+            // One snapshot for both reads (`REPEATABLE READ`). A worker that
+            // ingests a pending signal between them would otherwise move it out
+            // of `harvest_signals` and into history unseen by either read.
             let loaded = conn
                 .build_transaction()
+                .repeatable_read()
                 .read_only()
                 .run(async |conn| {
                     let history = crate::store::load_history_inflated(
