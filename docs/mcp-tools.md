@@ -277,7 +277,7 @@ A version that the route does not serve gets `400` and `-32022`. A
 
 A `tasks/*` call needs the extension in its own
 `params._meta["io.modelcontextprotocol/clientCapabilities"]`. Without it, the
-call gets error `-32021`.
+call gets HTTP `400` with error `-32021`.
 
 **The task is the run.** The task id is the execution id. Each read derives
 the task from the execution row, so no task state is stored and a restart
@@ -290,6 +290,11 @@ loses nothing. A retry or continue-as-new chain is followed to the live run.
 | `CANCELLED`, `TERMINATED` | `cancelled` | `statusMessage`: the cancel reason |
 | Live, parked on `wait_for_signal` | `input_required` | `inputRequests`: one `elicitation/create` for each wait |
 | Live, any other wait | `working` | `statusMessage`: the `current_details` text |
+
+The `result` holds the stored output. With a payload codec, the output is
+decoded only for a caller that the read-path gate admits: the
+`decode_payloads_on_read` opt-in plus an admin session (issue #608). Any
+other caller sees the stored bytes, as on `{wf}_status`.
 
 A workflow error is a tool error, as the spec requires. Harvest never reports
 `failed`, so a client does not treat a business error as a protocol fault and
@@ -328,10 +333,11 @@ fast poll of a parked run does not replay it again.
 **TTL.** `ttlMs` is `null` while the run is live. After the run ends, `ttlMs`
 runs from `createdAt` to the time that retention can delete the row of the
 task id. With no retention, it stays `null`. Retention guards that row only
-while a live row has the same workflow name and business id. A retry gets a
-new business id, and a continue-as-new to another workflow type gets a new
-name. In both cases `ttlMs` counts from the end of the first row, with its
-own retention, and can be set while the chain still runs. After the run is deleted, `tasks/get` answers
+while a row with the same workflow name and business id lives. A retry gets
+a new business id, and a continue-as-new to another workflow type gets a new
+name. Then `ttlMs` counts from the last end among the rows that share the
+name and business id of the first row, with its retention. It can be set
+while the chain still runs. After the run is deleted, `tasks/get` answers
 `-32602` "Task not found". `pollIntervalMs` is 5000.
 
 **Limits.**

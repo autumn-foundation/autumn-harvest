@@ -166,11 +166,20 @@ async fn tools_list_serves_one_start_tool_per_mcp_workflow() {
     );
 }
 
+/// The schema requires HTTP 400 with `-32021` for a missing capability.
 #[tokio::test]
 async fn task_methods_need_the_client_capability() {
     let app = router();
     for method in ["tasks/get", "tasks/update", "tasks/cancel"] {
-        let out = rpc(&app, call(method, &json!({"taskId": "x"}))).await;
+        let (status, text) = post_raw(
+            &app,
+            "application/json",
+            call(method, &json!({"taskId": "x"})).to_string(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method}: {text}");
+        let out: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(out["error"]["code"], MISSING_CLIENT_CAPABILITY, "{method}");
         assert_eq!(
             out["error"]["data"]["requiredCapabilities"]["extensions"][TASKS_EXTENSION],

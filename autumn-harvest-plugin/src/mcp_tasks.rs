@@ -36,6 +36,9 @@ use axum::response::{IntoResponse as _, Response};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
+use autumn_harvest::payload_codec::PayloadCodecs;
+use autumn_web::session::Session;
+
 use crate::api::HarvestApiState;
 use crate::mcp_tools::McpWorkflowDescriptor;
 
@@ -385,19 +388,16 @@ pub fn ttl_ms(
     u64::try_from((expires_at - created_at).num_milliseconds()).ok()
 }
 
-/// `true` when retention can delete the start row while its chain lives.
+/// `true` when the live run keeps the start row from retention.
 ///
 /// The task id names the start row, so the TTL follows that row. The sweep
 /// keeps a row while another row with the same workflow name and business id
 /// lives. A retry gets a new business id, and a cross-type continue-as-new
-/// gets a new name. In both cases the start row expires on its own clock.
+/// gets a new name. Then the start row expires with the last row of its own
+/// name and business id, even while the live run goes on.
 #[must_use]
-pub fn start_row_unguarded(start_state: &str, start_workflow: &str, live_workflow: &str) -> bool {
-    match start_state {
-        "FAILED" => true,
-        "CONTINUED_AS_NEW" => start_workflow != live_workflow,
-        _ => false,
-    }
+pub fn live_run_guards_start_row(start: (&str, &str), live: (&str, &str)) -> bool {
+    start == live
 }
 
 /// One signal wait that the client can answer.
@@ -662,11 +662,17 @@ pub fn build_mcp_task_route(
     let catalog = Arc::new(TaskCatalog::new(descriptors));
     let state = api_state.clone();
     let handler = axum::routing::post(
-        move |headers: HeaderMap, body: Result<Json<Value>, JsonRejection>| {
+        move |headers: HeaderMap,
+              session: Option<Extension<Session>>,
+              body: Result<Json<Value>, JsonRejection>| {
             let api_state = state.clone();
             let catalog = Arc::clone(&catalog);
+            let caller = Caller {
+                headers,
+                session: session.map(|Extension(session)| session),
+            };
             // Boxed: the delegated start future is large (clippy::large_futures).
-            async move { Box::pin(serve(api_state, catalog, headers, body)).await }
+            async move { Box::pin(serve(api_state, catalog, caller, body)).await }
         },
     );
     let handler = crate::mcp_tools::layer_tool_route(
@@ -756,12 +762,19 @@ fn rpc_response(id: &Value, result: RpcResult) -> Response {
     Json(body).into_response()
 }
 
+/// The request context of one JSON-RPC call.
+struct Caller {
+    headers: HeaderMap,
+    session: Option<Session>,
+}
+
 async fn serve(
     api_state: HarvestApiState,
     catalog: Arc<TaskCatalog>,
-    headers: HeaderMap,
+    caller: Caller,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
+    let headers = &caller.headers;
     let message = match body {
         Ok(Json(message)) => message,
         // The JSON content type is the CSRF guard: a browser sends it
@@ -805,7 +818,7 @@ async fn serve(
         return StatusCode::ACCEPTED.into_response();
     };
     let params = object.get("params").cloned().unwrap_or(Value::Null);
-    if let Err((code, message, data)) = check_request_headers(&headers, method, &params) {
+    if let Err((code, message, data)) = check_request_headers(headers, method, &params) {
         let mut response = rpc_response(
             &id,
             Err(RpcError {
@@ -817,16 +830,24 @@ async fn serve(
         *response.status_mut() = StatusCode::BAD_REQUEST;
         return response;
     }
-    let result = dispatch(&api_state, &catalog, &headers, method, &params).await;
-    // The 2026-07-28 transport answers an unknown method with 404.
-    let unknown = matches!(&result, Err(err) if err.code == METHOD_NOT_FOUND);
+    let result = dispatch(&api_state, &catalog, &caller, method, &params).await;
+    let status = match &result {
+        // The 2026-07-28 transport answers an unknown method with 404.
+        Err(err)
+            if err.code == METHOD_NOT_FOUND
+                && headers
+                    .get("mcp-protocol-version")
+                    .is_some_and(|v| v == LATEST_PROTOCOL_VERSION) =>
+        {
+            Some(StatusCode::NOT_FOUND)
+        }
+        // The schema requires HTTP 400 for a missing client capability.
+        Err(err) if err.code == MISSING_CLIENT_CAPABILITY => Some(StatusCode::BAD_REQUEST),
+        _ => None,
+    };
     let mut response = rpc_response(&id, result);
-    if unknown
-        && headers
-            .get("mcp-protocol-version")
-            .is_some_and(|v| v == LATEST_PROTOCOL_VERSION)
-    {
-        *response.status_mut() = StatusCode::NOT_FOUND;
+    if let Some(status) = status {
+        *response.status_mut() = status;
     }
     response
 }
@@ -834,10 +855,11 @@ async fn serve(
 async fn dispatch(
     api_state: &HarvestApiState,
     catalog: &TaskCatalog,
-    headers: &HeaderMap,
+    caller: &Caller,
     method: &str,
     params: &Value,
 ) -> RpcResult {
+    let headers = &caller.headers;
     match method {
         "initialize" => Ok(initialize_result(params)),
         "server/discover" => Ok(discover_result()),
@@ -853,7 +875,7 @@ async fn dispatch(
                 .and_then(Value::as_str)
                 .ok_or_else(|| RpcError::new(INVALID_PARAMS, "taskId is required"))?;
             match method {
-                "tasks/get" => tasks_get(api_state, catalog, task_id, params).await,
+                "tasks/get" => tasks_get(api_state, catalog, caller, task_id, params).await,
                 "tasks/update" => tasks_update(api_state, catalog, headers, task_id, params).await,
                 _ => tasks_cancel(api_state, catalog, headers, task_id).await,
             }
@@ -1009,7 +1031,7 @@ async fn tools_call(
     // So after a few tries the client gets the plain handle instead.
     for delay_ms in [0, 50, 250] {
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-        match load_task(api_state, catalog, task_id).await {
+        match load_task(api_state, catalog, task_id, None).await {
             Ok((snapshot, _)) => {
                 let mut task = task_object(&snapshot);
                 task["resultType"] = json!("task");
@@ -1033,13 +1055,20 @@ fn plain_start_result(started: &Value) -> Value {
     })
 }
 
+/// Read the task. The stored output and error are decoded only for a caller
+/// that the read-path gate admits: the deployment opt-in plus an admin
+/// session (issue #608). Any other caller sees the stored bytes, as on
+/// `{wf}_status`.
 async fn tasks_get(
     api_state: &HarvestApiState,
     catalog: &TaskCatalog,
+    caller: &Caller,
     task_id: &str,
     params: &Value,
 ) -> RpcResult {
-    let (mut snapshot, _) = load_task(api_state, catalog, task_id).await?;
+    let decoder = crate::api::read_path_decoder(api_state, caller.session.clone()).await;
+    let decode = decoder.as_ref().map(|codecs| (codecs, &caller.headers));
+    let (mut snapshot, _) = load_task(api_state, catalog, task_id, decode).await?;
     if !client_accepts_elicitation(params) {
         snapshot.hide_input_requests();
     }
@@ -1065,7 +1094,7 @@ async fn tasks_update(
         .get("inputResponses")
         .and_then(Value::as_object)
         .ok_or_else(|| RpcError::new(INVALID_PARAMS, "inputResponses is required"))?;
-    let (snapshot, live_served) = load_task(api_state, catalog, task_id).await?;
+    let (snapshot, live_served) = load_task(api_state, catalog, task_id, None).await?;
     let answers: Vec<(&SignalWait, &Value)> = snapshot
         .waits
         .iter()
@@ -1146,7 +1175,7 @@ async fn tasks_cancel(
     headers: &HeaderMap,
     task_id: &str,
 ) -> RpcResult {
-    let (snapshot, live_served) = load_task(api_state, catalog, task_id).await?;
+    let (snapshot, live_served) = load_task(api_state, catalog, task_id, None).await?;
     if snapshot.status().is_terminal() {
         return Ok(json!({"resultType": "complete"}));
     }
@@ -1175,11 +1204,13 @@ async fn tasks_cancel(
 ///
 /// A malformed id, an unknown id and a run outside the catalog all get the
 /// same error, so the route is no existence oracle. The flag is `true` when
-/// the live run is also an MCP workflow.
+/// the live run is also an MCP workflow. With `decode`, the payload fields of
+/// the live run are decoded, and the read is audited (issue #608).
 async fn load_task(
     api_state: &HarvestApiState,
     catalog: &TaskCatalog,
     task_id: &str,
+    decode: Option<(&PayloadCodecs, &HeaderMap)>,
 ) -> Result<(TaskSnapshot, bool), RpcError> {
     let exec_id = crate::api::parse_execution_id(task_id).map_err(|_| RpcError::not_found())?;
     let mut conn = crate::api::db_conn_for_execution(api_state, exec_id)
@@ -1190,29 +1221,62 @@ async fn load_task(
         Err(autumn_harvest::error::HarvestError::NotFound(_)) => return Err(RpcError::not_found()),
         Err(e) => return Err(RpcError::new(INTERNAL_ERROR, e.to_string())),
     };
-    drop(conn);
     if !catalog.serves(&origin.workflow_name) {
         return Err(RpcError::not_found());
     }
+    // The last end in the retention group of the start row: its own name and
+    // business id. Only a chained start row needs it.
+    let group_completed_at = if matches!(origin.state.as_str(), "FAILED" | "CONTINUED_AS_NEW") {
+        use autumn_harvest::schema::harvest_workflow_executions as wfe;
+        use diesel::{ExpressionMethods as _, QueryDsl as _};
+        use diesel_async::RunQueryDsl as _;
+        wfe::table
+            .filter(wfe::workflow_name.eq(&origin.workflow_name))
+            .filter(wfe::workflow_id.eq(&origin.workflow_id))
+            .select(diesel::dsl::max(wfe::completed_at))
+            .first::<Option<DateTime<Utc>>>(&mut conn)
+            .await
+            .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?
+    } else {
+        None
+    };
+    drop(conn);
     let created_at = origin.created_at;
-    let origin_state = origin.state.clone();
     let origin_name = origin.workflow_name.clone();
+    let origin_business_id = origin.workflow_id.clone();
     let origin_completed_at = origin.completed_at;
-    let live = crate::mcp_tools::resolve_if_chained(api_state, origin)
+    let mut live = crate::mcp_tools::resolve_if_chained(api_state, origin)
         .await
         .map_err(|_| RpcError::new(INTERNAL_ERROR, "could not resolve the live run"))?;
     let live_served = catalog.serves(&live.workflow_name);
 
-    let (ttl_completed_at, ttl_workflow) =
-        if start_row_unguarded(&origin_state, &origin_name, &live.workflow_name) {
-            (origin_completed_at, origin_name.as_str())
-        } else {
-            (live.completed_at, live.workflow_name.as_str())
-        };
+    let (ttl_completed_at, ttl_workflow) = if live_run_guards_start_row(
+        (&origin_name, &origin_business_id),
+        (&live.workflow_name, &live.workflow_id),
+    ) {
+        (live.completed_at, live.workflow_name.clone())
+    } else {
+        (group_completed_at.or(origin_completed_at), origin_name)
+    };
+    if let Some((codecs, headers)) = decode {
+        let outcome = crate::api::decode_workflow_execution_fields(&mut live, codecs);
+        crate::api::audit_decoded_read(
+            api_state,
+            None,
+            headers,
+            autumn_harvest::audit::TARGET_WORKFLOW,
+            Some(task_id),
+            "MCP tasks/get",
+            Some(exec_id.shard()),
+            outcome,
+            None,
+        )
+        .await;
+    }
     let retention = api_state
         .runtime()
         .ok()
-        .and_then(|rt| rt.retention_config().effective_max_age(ttl_workflow));
+        .and_then(|rt| rt.retention_config().effective_max_age(&ttl_workflow));
     let terminal = crate::api::is_terminal_state(&live.state);
     let (waits, last_event_at) = if terminal {
         (Vec::new(), None)
@@ -1717,12 +1781,13 @@ mod tests {
     /// Retention guards a start row only through a live row with the same
     /// workflow name and business id.
     #[test]
-    fn the_start_row_expires_on_its_own_clock_when_unguarded() {
-        assert!(start_row_unguarded("FAILED", "a", "a"));
-        assert!(start_row_unguarded("CONTINUED_AS_NEW", "a", "b"));
-        assert!(!start_row_unguarded("CONTINUED_AS_NEW", "a", "a"));
-        assert!(!start_row_unguarded("COMPLETED", "a", "a"));
-        assert!(!start_row_unguarded("RUNNING", "a", "a"));
+    fn only_a_live_run_of_the_same_group_guards_the_start_row() {
+        // A same-type continue-as-new keeps the name and business id.
+        assert!(live_run_guards_start_row(("a", "id"), ("a", "id")));
+        // A retry gets a new business id, also after a continue-as-new.
+        assert!(!live_run_guards_start_row(("a", "id"), ("a", "retry-id")));
+        // A cross-type continue-as-new gets a new name.
+        assert!(!live_run_guards_start_row(("a", "id"), ("b", "id")));
     }
 
     #[test]
