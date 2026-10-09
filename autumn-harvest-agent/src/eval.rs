@@ -95,7 +95,11 @@ const SIGNAL_TIMEOUT_PREFIX: &str = "__signal_timeout:";
 pub struct Candidate {
     harness: Arc<AgentHarness>,
     system: Option<String>,
+    max_turns: Option<usize>,
 }
+
+/// Extra turns allowed past the recorded count.
+pub const DEFAULT_EXTRA_TURNS: usize = 8;
 
 impl Candidate {
     /// A candidate that uses `harness` for every model turn.
@@ -110,6 +114,7 @@ impl Candidate {
         Self {
             harness,
             system: None,
+            max_turns: None,
         }
     }
 
@@ -117,6 +122,13 @@ impl Candidate {
     #[must_use]
     pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.system = Some(prompt.into());
+        self
+    }
+
+    /// Cap the live model turns.
+    #[must_use]
+    pub const fn max_turns(mut self, max_turns: usize) -> Self {
+        self.max_turns = Some(max_turns);
         self
     }
 }
@@ -136,6 +148,9 @@ pub enum EvalError {
     /// references or encrypted payloads needs decoding before evaluation.
     #[error("a recorded payload does not decode: {0}")]
     Undecodable(String),
+    /// The source has not ended.
+    #[error("the source run has not ended")]
+    InFlightSource,
     /// The current runtime cannot block in place.
     #[error("evaluation needs a multi-thread Tokio runtime")]
     MultiThreadRuntimeRequired,
@@ -267,6 +282,10 @@ pub struct Evaluation {
     pub replayed_tool_calls: u32,
     /// Candidate tool calls that got an error stub.
     pub stubbed_tool_calls: u32,
+    /// The run ends differ.
+    pub end_diverged: bool,
+    /// The turn cap stopped the candidate.
+    pub turn_cap_reached: bool,
 }
 
 impl Evaluation {
@@ -378,6 +397,8 @@ pub async fn evaluate(
         candidate: candidate_end,
         replayed_tool_calls: replayed,
         stubbed_tool_calls: stubbed,
+        end_diverged: false,
+        turn_cap_reached: false,
     })
 }
 

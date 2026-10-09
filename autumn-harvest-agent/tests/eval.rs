@@ -12,11 +12,15 @@ use std::time::Duration;
 
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest_agent::eval::{
-    Candidate, Divergence, EvalError, Evaluation, RunEnd, Side, Verdict, evaluate,
+    Candidate, DEFAULT_EXTRA_TURNS, Divergence, EvalError, Evaluation, RunEnd, Side, Verdict,
+    evaluate,
 };
+use autumn_harvest_agent::followup::FOLLOWUP_TOOL;
+use autumn_harvest_agent::memory::{MEMORY_TOOL, MemoryStore};
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentStop, AgentTask, Approval, BoxFuture, ChatRole, ContentPart,
-    Delivery, Report, Rule, ToolDecision, ToolEffect, ToolRules, sqlite,
+    Delivery, FnTool, Followups, InMemoryMemoryStore, MemoryScope, Report, Rule, RunInfo, Tool,
+    ToolCall, ToolDecision, ToolEffect, ToolPolicy, ToolRules, sqlite,
 };
 use autumn_harvest_sqlite::RunState;
 use common::{
@@ -123,11 +127,15 @@ async fn the_recorded_model_reports_no_divergence() {
         panic!("the candidate completes: {:?}", evaluation.candidate);
     };
     assert_eq!(report.stop, AgentStop::Completed);
-    assert!(
-        tool_results(report)[0].contains("echo"),
+    let RunEnd::Completed(recorded) = &evaluation.recorded else {
+        panic!("the source completed: {:?}", evaluation.recorded);
+    };
+    assert_eq!(
+        tool_results(report),
+        tool_results(recorded),
         "the candidate reads the recorded tool output"
     );
-    assert!(matches!(evaluation.recorded, RunEnd::Completed(_)));
+    assert!(!evaluation.end_diverged);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -511,20 +519,373 @@ async fn a_late_approval_is_not_delivered_and_new_ids_take_the_recorded_ids() {
     assert!(results[1].contains("echo"), "{results:?}");
 }
 
+/// The history of a run that the source ended in some other way: drop the
+/// terminal event and append `end`.
+fn with_end(mut history: Vec<WorkflowEvent>, end: Option<WorkflowEvent>) -> Vec<WorkflowEvent> {
+    let last = history.pop();
+    assert!(
+        matches!(last, Some(WorkflowEvent::WorkflowCompleted { .. })),
+        "{last:?}"
+    );
+    history.extend(end);
+    history
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn the_source_history_is_left_unchanged() {
+async fn an_in_flight_source_is_refused() {
+    let source = with_end(one_lookup().await, None);
+    let model = ScriptedModel::new(vec![answer("done", 1)]);
+    let (harness, _) = candidate(model.clone());
+
+    let result = evaluate(&source, &Candidate::new(harness)).await;
+
+    assert!(
+        matches!(result, Err(EvalError::InFlightSource)),
+        "{result:?}"
+    );
+    assert_eq!(model.calls(), 0, "a refused source costs no model call");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_source_reports_its_failure() {
+    let failed = WorkflowEvent::WorkflowFailed {
+        error: "provider down".into(),
+        error_type: None,
+        details: None,
+        non_retryable: None,
+    };
+    let source = with_end(one_lookup().await, Some(failed));
+    let model = ScriptedModel::new(vec![
+        calls(&[("c1", "lookup", json!({"q": "x"}))], 5),
+        answer("done", 5),
+    ]);
+    let (harness, _) = candidate(model);
+
+    let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
+
+    assert_eq!(evaluation.recorded, RunEnd::Failed("provider down".into()));
+    assert!(
+        evaluation.end_diverged,
+        "a failed source and a completed candidate differ"
+    );
+    assert!(evaluation.diverged());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_run_stop_diverges_when_every_turn_agrees() {
+    let source = record(
+        &AgentTask::new("hi").max_total_tokens(100),
+        vec![answer("hello", 5)],
+    )
+    .await;
+    // The same answer, but it uses more tokens than the run allows.
+    let (harness, _) = candidate(ScriptedModel::new(vec![answer("hello", 500)]));
+
+    let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
+
+    assert_eq!(evaluation.turns[0].verdict, Verdict::Same);
+    assert_eq!(evaluation.first_divergence, None);
+    assert!(evaluation.end_diverged, "{evaluation:#?}");
+    assert!(evaluation.diverged());
+    let RunEnd::Completed(report) = &evaluation.candidate else {
+        panic!("the candidate completes: {:?}", evaluation.candidate);
+    };
+    assert_eq!(report.stop, AgentStop::TokensExhausted);
+}
+
+/// A policy that allows every call and keeps the run id it sees.
+#[derive(Debug, Default)]
+struct RunIds(Mutex<Vec<String>>);
+
+impl ToolPolicy for RunIds {
+    fn decide<'a>(
+        &'a self,
+        _call: &'a ToolCall,
+        _tool: Option<&'a dyn Tool>,
+        info: &'a RunInfo,
+    ) -> BoxFuture<'a, ToolDecision> {
+        self.0.lock().unwrap().push(info.run_id.as_str().to_owned());
+        Box::pin(async { ToolDecision::Allow })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_candidate_policy_sees_the_recorded_run_id() {
     let source = one_lookup().await;
-    let before: Vec<Value> = source
+    let recorded_run_id = source
         .iter()
-        .map(|event| serde_json::to_value(event).unwrap())
-        .collect();
-    let (harness, _) = candidate(ScriptedModel::new(vec![answer("short", 1)]));
+        .find_map(|event| match event {
+            WorkflowEvent::ActivityScheduled { name, input, .. } if name == "agent_model_turn" => {
+                Some(input["run_id"].as_str().unwrap().to_owned())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let policy = Arc::new(RunIds::default());
+    let model = ScriptedModel::new(vec![
+        calls(&[("c1", "lookup", json!({"q": "x"}))], 5),
+        answer("done", 5),
+    ]);
+    let (harness, _) = candidate(model);
 
-    evaluate(&source, &Candidate::new(harness)).await.unwrap();
+    evaluate(&source, &Candidate::new(harness.policy(policy.clone())))
+        .await
+        .unwrap();
 
-    let after: Vec<Value> = source
-        .iter()
-        .map(|event| serde_json::to_value(event).unwrap())
+    assert_eq!(*policy.0.lock().unwrap(), vec![recorded_run_id]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recorded_approval_never_releases_another_call_with_a_reused_id() {
+    // The source approves `pay 5` with an edit. The provider reuses ids.
+    let (_dir, db) = fresh_db();
+    let (harness, source_recorder, _) = gated_candidate(vec![
+        calls(&[("call_0", "pay", json!({"amount": 5}))], 1),
+        answer("paid", 1),
+    ]);
+    let mut rt = runtime(&db, harness);
+    let task = AgentTask::new("pay").approval_timeout(Duration::from_secs(60));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let RunState::WaitingSignal(signal) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("expected an approval wait");
+    };
+    let edit = Approval::Edit {
+        arguments: json!({"amount": 1}),
+    };
+    sqlite::decide(&mut rt, exec, &signal, &edit).unwrap();
+    report(rt.run_until_blocked(exec).await.unwrap());
+    let source = rt.load_history(exec).unwrap();
+    assert_eq!(source_recorder.runs(), vec![json!({"amount": 1})]);
+
+    // The candidate asks for another amount under the same provider id.
+    let (harness, candidate_recorder, _) = gated_candidate(vec![
+        calls(&[("call_0", "pay", json!({"amount": 999}))], 1),
+        answer("paid", 1),
+    ]);
+
+    let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
+
+    assert_eq!(
+        first(&evaluation).verdict,
+        Verdict::Diverged(Divergence::Calls)
+    );
+    assert_eq!(evaluation.replayed_tool_calls, 0, "{evaluation:#?}");
+    assert_eq!(candidate_recorder.runs(), Vec::<Value>::new());
+    let RunEnd::Completed(report) = &evaluation.candidate else {
+        panic!("the candidate completes: {:?}", evaluation.candidate);
+    };
+    let results = tool_results(report);
+    assert!(results[0].contains("no approval arrived"), "{results:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_turn_cap_stops_the_candidate_model() {
+    let source = one_lookup().await;
+    let model = ScriptedModel::new(vec![
+        calls(&[("c1", "lookup", json!({"q": "x"}))], 5),
+        answer("done", 5),
+    ]);
+    let (harness, _) = candidate(model.clone());
+
+    let evaluation = evaluate(&source, &Candidate::new(harness).max_turns(1))
+        .await
+        .unwrap();
+
+    assert_eq!(model.calls(), 1);
+    assert!(evaluation.turn_cap_reached);
+    assert!(
+        matches!(evaluation.candidate, RunEnd::Failed(_)),
+        "{:?}",
+        evaluation.candidate
+    );
+    assert_eq!(
+        evaluation.turns[1].verdict,
+        Verdict::Diverged(Divergence::Missing(Side::Candidate))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_default_turn_cap_bounds_a_looping_candidate() {
+    let source = record(
+        &AgentTask::new("look it up").max_steps(100),
+        vec![
+            calls(&[("c1", "lookup", json!({"q": "x"}))], 1),
+            answer("done", 1),
+        ],
+    )
+    .await;
+    let replies = (0..50)
+        .map(|n| calls(&[("c", "lookup", json!({"q": n}))], 1))
         .collect();
-    assert_eq!(before, after);
+    let model = ScriptedModel::new(replies);
+    let (harness, _) = candidate(model.clone());
+
+    let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
+
+    assert_eq!(model.calls(), 2 + DEFAULT_EXTRA_TURNS);
+    assert!(evaluation.turn_cap_reached);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_candidate_with_more_turns_reports_missing_recorded() {
+    let source = one_lookup().await;
+    let model = ScriptedModel::new(vec![
+        calls(&[("c1", "lookup", json!({"q": "x"}))], 5),
+        calls(&[("c2", "lookup", json!({"q": "y"}))], 5),
+        answer("done", 5),
+    ]);
+    let (harness, _) = candidate(model);
+
+    let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
+
+    assert_eq!(evaluation.turns.len(), 3, "{evaluation:#?}");
+    assert_eq!(
+        evaluation.turns[1].verdict,
+        Verdict::Diverged(Divergence::Shape)
+    );
+    assert_eq!(
+        evaluation.turns[2].verdict,
+        Verdict::Diverged(Divergence::Missing(Side::Recorded))
+    );
+    assert!(evaluation.turns[2].recorded.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_recorded_output_answers_one_identical_call() {
+    let source = one_lookup().await;
+    let model = ScriptedModel::new(vec![
+        calls(
+            &[
+                ("c1", "lookup", json!({"q": "x"})),
+                ("c2", "lookup", json!({"q": "x"})),
+            ],
+            5,
+        ),
+        answer("done", 5),
+    ]);
+    let (harness, _) = candidate(model);
+
+    let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
+
+    assert_eq!(evaluation.replayed_tool_calls, 1);
+    assert_eq!(evaluation.stubbed_tool_calls, 1);
+}
+
+/// A read-only tool that answers 1, then 2, and so on.
+fn counter_tool(name: &str) -> Arc<dyn Tool> {
+    let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    FnTool::new(
+        name,
+        "A counter.",
+        json!({"type": "object"}),
+        move |_input: Value| {
+            let count = Arc::clone(&count);
+            async move {
+                let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                Ok(json!({ "count": n }))
+            }
+        },
+    )
+    .effect(ToolEffect::ReadOnly)
+    .shared()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn identical_calls_take_their_outputs_in_recorded_order() {
+    let script = || {
+        vec![
+            calls(&[("c1", "count", json!({})), ("c2", "count", json!({}))], 1),
+            answer("done", 1),
+        ]
+    };
+    let (_dir, db) = fresh_db();
+    let harness = AgentHarness::new(ScriptedModel::new(script())).tool(counter_tool("count"));
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::start(&mut rt, &AgentTask::new("count twice")).unwrap();
+    let source_report = report(rt.run_until_blocked(exec).await.unwrap());
+    let source = rt.load_history(exec).unwrap();
+    let harness = AgentHarness::new(ScriptedModel::new(script())).tool(counter_tool("count"));
+
+    let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
+
+    let RunEnd::Completed(candidate_report) = &evaluation.candidate else {
+        panic!("the candidate completes: {:?}", evaluation.candidate);
+    };
+    assert_eq!(tool_results(candidate_report), tool_results(&source_report));
+    assert_eq!(evaluation.replayed_tool_calls, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_segment_sees_its_recorded_memory_snapshot() {
+    let script = || {
+        vec![
+            calls(
+                &[
+                    (
+                        "m",
+                        MEMORY_TOOL,
+                        json!({"action": "add", "block": "user", "text": "Prefers tea."}),
+                    ),
+                    (
+                        "f",
+                        FOLLOWUP_TOOL,
+                        json!({"prompt": "check", "delay_minutes": 20}),
+                    ),
+                ],
+                1,
+            ),
+            answer("later", 1),
+            calls(&[("c1", "lookup", json!({"q": "x"}))], 1),
+            answer("done", 1),
+        ]
+    };
+    let scope = MemoryScope::new("u");
+    let task = AgentTask::new("go")
+        .system("Be brief.")
+        .memory(scope.clone())
+        .followups(Followups::new(Duration::from_secs(3_600)));
+    let (_dir, db) = fresh_db();
+    let source_model = ScriptedModel::new(script());
+    let source_recorder = Arc::new(Recorder::default());
+    let source_harness = AgentHarness::new(source_model.clone())
+        .memory(Arc::new(InMemoryMemoryStore::new()))
+        .tool(recorded_tool(
+            "lookup",
+            ToolEffect::ReadOnly,
+            &source_recorder,
+        ));
+    let mut rt = runtime(&db, source_harness);
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    let state = rt
+        .run_until_blocked_as_of(exec, later(25 * 60))
+        .await
+        .unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    let source = rt.load_history(exec).unwrap();
+    let source_requests = source_model.requests();
+    assert_eq!(source_requests.len(), 4);
+
+    let model = ScriptedModel::new(script());
+    let store = Arc::new(InMemoryMemoryStore::new());
+    let (harness, recorder) = candidate(model.clone());
+
+    let evaluation = evaluate(&source, &Candidate::new(harness.memory(store.clone())))
+        .await
+        .unwrap();
+
+    assert!(!evaluation.diverged(), "{evaluation:#?}");
+    assert_eq!(evaluation.turns.len(), 4);
+    assert_eq!(evaluation.replayed_tool_calls, 2, "{evaluation:#?}");
+    assert_eq!(evaluation.stubbed_tool_calls, 0);
+    let requests = model.requests();
+    assert_eq!(requests[0].messages[0], source_requests[0].messages[0]);
+    assert_eq!(requests[2].messages[0], source_requests[2].messages[0]);
+    assert!(format!("{:?}", requests[2].messages[0]).contains("Prefers tea."));
+    assert_eq!(recorder.runs(), Vec::<Value>::new());
+    let blocks = store.load(&scope).await.unwrap();
+    assert!(
+        blocks.iter().all(|block| block.entries.is_empty()),
+        "the memory write never runs live"
+    );
 }
