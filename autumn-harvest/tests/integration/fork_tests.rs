@@ -674,6 +674,73 @@ async fn a_reset_of_a_nested_recorded_fork_stays_recorded() {
     assert_eq!(charges(&queue), 1, "the reset never charges");
 }
 
+/// A reset of a live fork keeps its overrides. The stubbed charge never runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reset_of_a_fork_keeps_its_overrides() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("reset-override");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+    // History: WorkflowStarted, WorkflowForked(live), the charge override.
+    let mut live = request(ForkEffects::Live);
+    live.activity_overrides = vec![ForkActivityOverride {
+        activity_name: "fork_charge".to_string(),
+        occurrence: 1,
+        output: json!({ "charge_id": "stub", "amount": 0 }),
+    }];
+    let forked = fork(&url, source, live).await;
+
+    // Event 2 carries the override. The reset appends a new marker after it.
+    let mut conn = connect(&url).await;
+    let reset = reset_workflow_execution(
+        &mut conn,
+        forked,
+        WorkflowResetRequest {
+            reset_to_event_id: Some(2),
+            reset_point: None,
+            reason: "retry".to_string(),
+            operator_id: "tester".to_string(),
+            signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::Drop,
+            allow_terminal_source: false,
+            refuse_erased_source: false,
+        },
+        Some(&registry()),
+    )
+    .await
+    .expect("reset the fork");
+
+    let running = Running::start(&queue, &pool);
+    let row = wait_for_execution_state(&url, reset.new_exec_id, "COMPLETED").await;
+    running.stop().await;
+    assert_eq!(charges(&queue), 1, "the override still stubs the charge");
+    assert_eq!(
+        row.output.expect("output")["charge"]["charge_id"],
+        json!("stub")
+    );
+}
+
+/// A source erased after the fork exists serves no record. The fork fails
+/// closed and never charges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_erased_after_the_fork_serves_no_record() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("erased-later");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+
+    let mut conn = connect(&url).await;
+    autumn_harvest::erase::erase_workflow_payloads(&mut conn, source, "gdpr")
+        .await
+        .expect("erase the source");
+    let running = Running::start(&queue, &pool);
+    let row = wait_for_execution_state(&url, forked, "FAILED").await;
+    running.stop().await;
+    assert_eq!(charges(&queue), 1);
+    let error = row.error.unwrap_or_default();
+    assert!(error.contains("no recorded result"), "{error}");
+}
+
 /// Only a recorded fork skips completion callbacks and triggers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn only_a_recorded_fork_suppresses_completion_notifications() {

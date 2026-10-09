@@ -873,11 +873,30 @@ pub async fn reset_workflow_execution(
             // A reset of a fork keeps the effects mode of that fork (issue
             // #2000). The carried prefix can hold an ancestor marker with
             // another mode, so the reset appends its own last marker.
+            // Its overrides count only after that marker, so the reset copies
+            // them there, byte for byte.
             let fork_mode = crate::fork::is_fork(&source).then(|| {
                 crate::fork::fork_marker(&events)
                     .unwrap_or((exec_id, crate::fork::ForkEffects::Recorded))
             });
-            append_fork_marker(conn, new_exec_id, exec_id, &request, &plan, fork_mode).await?;
+            let override_rows: Vec<&HarvestEvent> = if fork_mode.is_some() {
+                crate::fork::own_override_indices(&events)
+                    .into_iter()
+                    .map(|index| &rows[index])
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            append_fork_marker(
+                conn,
+                new_exec_id,
+                exec_id,
+                &request,
+                &plan,
+                fork_mode,
+                &override_rows,
+            )
+            .await?;
 
             let source_tasks_cancelled = queue::cancel_open_tasks_for_execution(
                 conn,
@@ -1545,6 +1564,8 @@ async fn append_fork_marker(
     plan: &ResetPlan,
     // The record source and effects mode of a fork source (issue #2000).
     fork_mode: Option<(ExecutionId, crate::fork::ForkEffects)>,
+    // The override rows of that fork, copied after its new marker.
+    override_rows: &[&HarvestEvent],
 ) -> Result<(), WorkflowResetError> {
     let marker_event_id = i32::try_from(plan.events_carried_over)
         .map_err(|_| HarvestError::Database("reset carried too many events".to_string()))?;
@@ -1565,6 +1586,27 @@ async fn append_fork_marker(
         });
     }
     crate::store::append_events(conn, new_exec_id, &markers, marker_event_id).await?;
+    if override_rows.is_empty() {
+        return Ok(());
+    }
+    let first_override_id = marker_event_id
+        .checked_add(i32::try_from(markers.len()).unwrap_or(i32::MAX))
+        .ok_or_else(|| HarvestError::Database("reset event id overflow".to_string()))?;
+    let copies = override_rows
+        .iter()
+        .zip(first_override_id..)
+        .map(|(row, event_id)| NewHarvestEventOwned {
+            workflow_exec_id: new_exec_id.as_uuid(),
+            event_id,
+            event_type: row.event_type.clone(),
+            event_data: row.event_data.clone(),
+        })
+        .collect::<Vec<_>>();
+    diesel::insert_into(harvest_events::table)
+        .values(&copies)
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
     Ok(())
 }
 

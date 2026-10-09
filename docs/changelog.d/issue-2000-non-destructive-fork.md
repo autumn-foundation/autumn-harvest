@@ -19,8 +19,10 @@ is never written, so a run in any state can be forked, `COMPLETED` and
   wins again.
 - The fork sends no completion callback and fires no completion trigger.
 - A reset of a fork keeps `start_source = fork` and appends a marker with the
-  mode of that fork, so it keeps that mode. A fork of a fork uses its own,
-  last, marker.
+  mode of that fork, so it keeps that mode. It copies the overrides of that
+  fork after the new marker. A fork of a fork uses its own, last, marker.
+- The worker reads the record source `FOR SHARE` and checks it for erasure
+  before it copies a recorded result.
 
 `"effects": "live"` runs effects for real. An override applies in both modes.
 
@@ -44,8 +46,9 @@ is refused with `409`.
 `start_source_ref = <source id>`. Its history holds a `WorkflowForked`
 marker. A fork is a new root, not a child of the source.
 
-**Payloads.** The fork copies the payload references of the source, so
-retention of the source keeps the shared blobs. Matching inflates offloaded
+**Payloads.** The fork copies the payload references of the source that its
+carried rows or kept input still name, so retention of the source keeps the
+shared blobs. Matching inflates offloaded
 payloads first.
 
 **Invariants.** Two new `WorkflowEvent` variants: `WorkflowForked` and

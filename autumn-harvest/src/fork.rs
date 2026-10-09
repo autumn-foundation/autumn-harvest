@@ -296,7 +296,14 @@ async fn fork_in_transaction(
     // The fork shares the blobs of the source. Its own references keep them
     // alive after retention deletes the source.
     let refs = crate::store::load_payload_refs(conn, source_id).await?;
-    crate::store::insert_payload_refs(conn, new_exec_id, &refs).await?;
+    let reachable = reachable_refs(
+        refs,
+        &rows,
+        fork_event_id,
+        request.input.is_none(),
+        &source.input,
+    );
+    crate::store::insert_payload_refs(conn, new_exec_id, &reachable).await?;
     copy_prefix(
         conn,
         new_exec_id,
@@ -429,6 +436,38 @@ async fn check_shards(
             })
         }
     }
+}
+
+/// The payload references that the fork can still address.
+///
+/// A fork addresses a blob through an envelope in a carried row, or in the
+/// source input that it keeps. An input override rewrites the
+/// `WorkflowStarted` row, so that row and the source input do not count then.
+/// A blob key is a unique string, so a text search of those bytes finds each
+/// one. A reference outside them only delays the collection of a blob that no
+/// fork event names.
+fn reachable_refs(
+    refs: Vec<crate::payload_store::OffloadedRef>,
+    rows: &[HarvestEvent],
+    fork_event_id: i64,
+    keeps_source_input: bool,
+    source_input: &Value,
+) -> Vec<crate::payload_store::OffloadedRef> {
+    if refs.is_empty() {
+        return refs;
+    }
+    let mut text = rows
+        .iter()
+        .take_while(|row| i64::from(row.event_id) <= fork_event_id)
+        .filter(|row| keeps_source_input || row.event_id != 0)
+        .map(|row| row.event_data.to_string())
+        .collect::<String>();
+    if keeps_source_input {
+        text.push_str(&source_input.to_string());
+    }
+    refs.into_iter()
+        .filter(|blob| text.contains(&blob.blob_key))
+        .collect()
 }
 
 /// The marker and the override events that follow the carried prefix.
@@ -1003,23 +1042,41 @@ fn scheduled_occurrence(
     })
 }
 
-/// The override for occurrence `occurrence` of `name`.
+/// The indices of the overrides that belong to the last marker in `events`.
 ///
 /// Only an override after the last marker counts. An override that a fork of
-/// a fork carries in its prefix belongs to the earlier fork.
-fn override_for<'a>(events: &'a [WorkflowEvent], name: &str, occurrence: u32) -> Option<&'a Value> {
-    let own = events
+/// a fork carries in its prefix belongs to the earlier fork. A reset of a
+/// fork copies these overrides after its own marker.
+#[must_use]
+pub fn own_override_indices(events: &[WorkflowEvent]) -> Vec<usize> {
+    let Some(marker) = events
         .iter()
         .rposition(|event| matches!(event, WorkflowEvent::WorkflowForked { .. }))
-        .map_or(events, |marker| &events[marker..]);
-    own.iter().find_map(|event| match event {
-        WorkflowEvent::ForkActivityResultOverridden {
-            activity_name,
-            occurrence: at,
-            output,
-        } if activity_name == name && *at == occurrence => Some(output),
-        _ => None,
-    })
+    else {
+        return Vec::new();
+    };
+    (marker..events.len())
+        .filter(|&index| {
+            matches!(
+                events[index],
+                WorkflowEvent::ForkActivityResultOverridden { .. }
+            )
+        })
+        .collect()
+}
+
+/// The override for occurrence `occurrence` of `name`.
+fn override_for<'a>(events: &'a [WorkflowEvent], name: &str, occurrence: u32) -> Option<&'a Value> {
+    own_override_indices(events)
+        .into_iter()
+        .find_map(|index| match &events[index] {
+            WorkflowEvent::ForkActivityResultOverridden {
+                activity_name,
+                occurrence: at,
+                output,
+            } if activity_name == name && *at == occurrence => Some(output),
+            _ => None,
+        })
 }
 
 const fn terminal_activity_id(event: &WorkflowEvent) -> Option<ActivityExecId> {
@@ -1116,6 +1173,25 @@ fn unavailable(activity_id: ActivityExecId, name: &str, occurrence: u32) -> Work
     }
 }
 
+/// Whether the record source exists and is not erased.
+///
+/// It reads the row `FOR SHARE`, as a fork does. So an erasure of the source
+/// cannot commit between this check and the copy of a recorded result.
+async fn record_source_is_readable(
+    conn: &mut AsyncPgConnection,
+    source_id: ExecutionId,
+) -> HarvestResult<bool> {
+    let input: Option<Value> = harvest_workflow_executions::table
+        .find(source_id.as_uuid())
+        .for_share()
+        .select(harvest_workflow_executions::input)
+        .first(conn)
+        .await
+        .optional()
+        .map_err(database_error)?;
+    Ok(input.is_some_and(|input| !crate::erase::execution_input_is_erased(&input)))
+}
+
 /// Resolve the activities that a fork just scheduled, in the same transaction.
 ///
 /// For each activity in `scheduled` that [`resolve_activity`] serves or
@@ -1148,13 +1224,13 @@ pub(crate) async fn serve_recorded_activities(
         .await?
         .events;
     let source_events = match fork_marker(&fork_events) {
-        Some((source_id, _)) => {
+        Some((source_id, _)) if record_source_is_readable(conn, source_id).await? => {
             crate::store::load_history_inflated(conn, source_id, codecs, offloader)
                 .await
                 .map(|history| history.events)
                 .unwrap_or_default()
         }
-        None => Vec::new(),
+        _ => Vec::new(),
     };
 
     let mut served = false;
@@ -1496,6 +1572,71 @@ mod tests {
         assert!(history_is_recorded_fork(&row, &fork));
         row.start_source = Some("reset".to_string());
         assert!(!history_is_recorded_fork(&row, &fork));
+    }
+
+    fn blob(key: &str) -> crate::payload_store::OffloadedRef {
+        crate::payload_store::OffloadedRef {
+            blob_key: key.to_string(),
+            store_id: "s".to_string(),
+            byte_len: 1,
+        }
+    }
+
+    fn row(event_id: i32, data: Value) -> HarvestEvent {
+        HarvestEvent {
+            id: i64::from(event_id),
+            workflow_exec_id: Uuid::new_v4(),
+            event_id,
+            event_type: "T".to_string(),
+            event_data: data,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn only_reachable_payload_refs_are_copied() {
+        let rows = vec![
+            row(0, json!({ "data": { "input": { "key": "blob-start" } } })),
+            row(
+                1,
+                json!({ "data": { "output": { "key": "blob-carried" } } }),
+            ),
+            row(2, json!({ "data": { "output": { "key": "blob-after" } } })),
+        ];
+        let refs = || vec![blob("blob-start"), blob("blob-carried"), blob("blob-after")];
+        let keys = |kept: Vec<crate::payload_store::OffloadedRef>| {
+            kept.into_iter().map(|r| r.blob_key).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            keys(reachable_refs(refs(), &rows, 1, true, &json!({}))),
+            vec!["blob-start", "blob-carried"]
+        );
+        // An input override drops the replaced start input.
+        assert_eq!(
+            keys(reachable_refs(refs(), &rows, 1, false, &json!({}))),
+            vec!["blob-carried"]
+        );
+    }
+
+    #[test]
+    fn own_overrides_follow_the_last_marker() {
+        let over = |output: &str| WorkflowEvent::ForkActivityResultOverridden {
+            activity_name: "charge".to_string(),
+            occurrence: 1,
+            output: json!(output),
+        };
+        let events = vec![
+            started(json!({})),
+            marker(ForkEffects::Live),
+            over("old"),
+            marker(ForkEffects::Recorded),
+            over("new"),
+        ];
+        assert_eq!(own_override_indices(&events), vec![4]);
+        assert_eq!(
+            own_override_indices(&[started(json!({}))]),
+            Vec::<usize>::new()
+        );
     }
 
     #[test]
