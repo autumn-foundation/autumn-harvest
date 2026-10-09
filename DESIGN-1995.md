@@ -113,6 +113,10 @@ Later review rounds of the merged branch found more gaps:
     stops at its limit, the line names every shard of the group. A run's
     shard comes from its row's `shard_id` column, which follows a
     rebalance. The id encodes only the shard the run started on.
+13. The scan read each run's row once, and its history later in another
+    snapshot. A resume updates `deadline_at` and appends to history in
+    one commit, so the replay could pair new history with an old deadline.
+    The row is now read again in the snapshot that reads its history.
 
 ---
 

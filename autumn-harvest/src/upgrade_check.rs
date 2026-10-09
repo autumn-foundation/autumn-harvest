@@ -1446,6 +1446,16 @@ struct InFlightRow {
     assigned_build_id: Option<String>,
 }
 
+/// The columns of [`InFlightRow`]. Both row queries select them.
+#[cfg(feature = "db")]
+macro_rules! in_flight_select {
+    () => {
+        "SELECT id, shard_id, workflow_name, context_headers, execution_timeout, \
+         deadline_at, parent_id, workflow_id, queue_name, assigned_build_id \
+         FROM harvest_workflow_executions "
+    };
+}
+
 /// The in-flight runs of one shard, oldest first. `$1` is the state list,
 /// `$2` the optional workflow name, `$3` the row limit and `$4` the optional
 /// baseline build.
@@ -1455,12 +1465,16 @@ struct InFlightRow {
 /// runs only. A run on the candidate build, or on an older build, is outside
 /// the deploy decision.
 #[cfg(feature = "db")]
-const IN_FLIGHT_SQL: &str = "SELECT id, shard_id, workflow_name, context_headers, execution_timeout, \
-     deadline_at, parent_id, workflow_id, queue_name, assigned_build_id \
-     FROM harvest_workflow_executions \
-     WHERE state = ANY($1) AND ($2::text IS NULL OR workflow_name = $2) \
+const IN_FLIGHT_SQL: &str = concat!(
+    in_flight_select!(),
+    "WHERE state = ANY($1) AND ($2::text IS NULL OR workflow_name = $2) \
      AND ($4::text IS NULL OR assigned_build_id IS NULL OR assigned_build_id = $4) \
-     ORDER BY created_at, id LIMIT $3";
+     ORDER BY created_at, id LIMIT $3"
+);
+
+/// One run's row, read again in the snapshot that reads its history.
+#[cfg(feature = "db")]
+const RUN_ROW_SQL: &str = concat!(in_flight_select!(), "WHERE id = $1");
 
 #[cfg(feature = "db")]
 impl UpgradeCheck {
@@ -1544,14 +1558,21 @@ impl UpgradeCheck {
             let execution_id = ExecutionId::from_uuid(row.id);
             let codecs = Arc::clone(&self.codecs);
             let offloader = self.offloader.clone();
-            // One snapshot for both reads (`REPEATABLE READ`). A worker that
+            // One snapshot for every read (`REPEATABLE READ`). A worker that
             // ingests a pending signal between them would otherwise move it out
-            // of `harvest_signals` and into history unseen by either read.
+            // of `harvest_signals` and into history unseen by either read. A
+            // resume updates `deadline_at` and appends to history in one
+            // commit, so the row is read again here too.
             let loaded = conn
                 .build_transaction()
                 .repeatable_read()
                 .read_only()
                 .run(async |conn| {
+                    let fresh: Vec<InFlightRow> = diesel::sql_query(RUN_ROW_SQL)
+                        .bind::<diesel::sql_types::Uuid, _>(execution_id.as_uuid())
+                        .load(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
                     let history = crate::store::load_history_inflated(
                         conn,
                         execution_id,
@@ -1560,18 +1581,26 @@ impl UpgradeCheck {
                     )
                     .await?;
                     let pending = load_pending_signals(conn, execution_id, &codecs).await?;
-                    Ok::<_, crate::error::HarvestError>((history, pending))
+                    Ok::<_, crate::error::HarvestError>((
+                        fresh.into_iter().next(),
+                        history,
+                        pending,
+                    ))
                 })
                 .await;
-            let mut verdict = match loaded {
-                Ok((history, pending)) => {
-                    match self.snapshot_for(&row, execution_id, history.events) {
+            let (row, mut verdict) = match loaded {
+                // The run left the table after the scan, so it needs no verdict.
+                Ok((None, _, _)) => continue,
+                Ok((Some(fresh), history, pending)) => {
+                    let verdict = match self.snapshot_for(&fresh, execution_id, history.events) {
                         Some(snapshot) => self.check_snapshot_with(snapshot, &pending).await,
-                        None => undecodable(execution_id, row.workflow_name.clone(), None),
-                    }
+                        None => undecodable(execution_id, fresh.workflow_name.clone(), None),
+                    };
+                    (fresh, verdict)
                 }
                 Err(e) if is_codec_error(&e) => {
-                    undecodable(execution_id, row.workflow_name.clone(), None)
+                    let verdict = undecodable(execution_id, row.workflow_name.clone(), None);
+                    (row, verdict)
                 }
                 Err(e) => return Err(e),
             };
