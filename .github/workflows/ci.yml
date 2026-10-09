@@ -417,6 +417,14 @@ jobs:
         run: cargo clippy -p autumn-harvest-cli --all-targets -- -D warnings
       - name: Clippy autumn-harvest-sqlite
         run: cargo clippy -p autumn-harvest-sqlite --all-targets -- -D warnings
+      # Issue #1973. `--no-deps`: the core crate without `db` has dead-code
+      # warnings of its own, which the core's own clippy step owns.
+      - name: Clippy autumn-harvest-agent (issue #1973)
+        run: cargo clippy -p autumn-harvest-agent --all-targets --no-deps -- -D warnings
+      - name: Clippy autumn-harvest-agent (sqlite feature)
+        run: cargo clippy -p autumn-harvest-agent --all-targets --features sqlite --no-deps -- -D warnings
+      - name: Check autumn-harvest-agent depends on no Autumn crate outside the engine
+        run: ./scripts/check-agent-adapter-deps.sh
       # Same issue #962 rule as every other crate on this page: a workspace
       # member gets NO clippy coverage without its own step, and these three
       # standalone example crates (each its own `examples/*/Cargo.toml`
@@ -1085,6 +1093,11 @@ jobs:
       - name: Run autumn-harvest-sqlite tests (issue #1068)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-sqlite
+      # Issue #1973. Offline: a scripted model, no API key, no network. The
+      # crash test runs its own binary as a child process.
+      - name: Run autumn-harvest-agent tests (issue #1973)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        run: cargo test -p autumn-harvest-agent --features sqlite
       # The agent-daemon example's suite is offline: a scripted stub model, no
       # API key, and no network. Linux only, because the daemon's control
       # surface is a Unix domain socket.
