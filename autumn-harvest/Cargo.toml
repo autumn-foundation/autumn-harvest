@@ -586,3 +586,10 @@ harness = false
 
 [lints]
 workspace = true
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `audit_chain::ChainVerifier` -- the keyed hash-chain check over exported
+# audit rows. See `benches/audit_chain_verify_profile.rs`.
+[[bench]]
+name = "audit_chain_verify_profile"
+harness = false
