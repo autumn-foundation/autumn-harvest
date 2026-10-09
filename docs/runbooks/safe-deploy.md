@@ -611,9 +611,8 @@ behaviour change). Those deploys can use the plain drain runbook above.
 Use this when your replay test suite (e.g. `WorkflowReplayer`) confirms the new
 build handles all in-flight histories safely. The
 [upgrade check](../upgrade-check.md) gives that answer per in-flight run.
-Point the build policy at the new build before you run the check, so no new
-run starts on the old build after the check reads. Declare compat only when
-each run gets `migrate`, or a person accepts each `review` finding.
+Advance the build policy first, then run the check, then declare compat.
+Declared compat lets new workers claim old runs, so it comes last.
 
 **Step 1 — Deploy new workers with the new build id.**
 
@@ -628,26 +627,7 @@ WorkerConfig::default()
 Start the new workers alongside the existing fleet. They register in
 `harvest_workers` with `build_id = "sha-new123"`.
 
-**Step 2 — Declare compat so new workers can resume old executions.**
-
-```rust
-// In your deploy tooling or a one-off migration script:
-use autumn_harvest::build_routing::declare_compat;
-
-declare_compat(&mut conn, "sha-new123", "sha-old456").await?;
-// "workers running sha-new123 may process executions assigned to sha-old456"
-```
-
-> **Sharded deployments:** `harvest_build_compat` lives on every shard.
-> Fan the write out to all shards:
-> ```rust
-> for (_, pool) in sharded_pool.iter_shards() {
->     let mut conn = pool.get().await?;
->     declare_compat(&mut conn, "sha-new123", "sha-old456").await?;
-> }
-> ```
-
-**Step 3 — Advance the build policy so new starts land on the new build.**
+**Step 2 — Advance the build policy so new starts land on the new build.**
 
 ```rust
 use autumn_harvest::build_routing::set_build_policy;
@@ -688,7 +668,37 @@ workers are ineligible to claim them.
 > Start workers with the listed build, or declare compatibility for the
 > build your workers run.
 
-**Step 4 — Drain and retire old-build workers.**
+
+**Step 3 — Run the upgrade check against the old build's runs.**
+
+The policy now sends every new start to the new build. So the runs on the old
+build form a closed set. Run the [upgrade check](../upgrade-check.md) with
+`--baseline-build sha-old456`. It reads only those runs.
+
+Go on only when each run gets `migrate`, or a person accepts each `review`
+finding. A `pin` run keeps the old workers until it ends: skip Step 4 and keep
+the old fleet.
+
+**Step 4 — Declare compat so new workers can resume old executions.**
+
+```rust
+// In your deploy tooling or a one-off migration script:
+use autumn_harvest::build_routing::declare_compat;
+
+declare_compat(&mut conn, "sha-new123", "sha-old456").await?;
+// "workers running sha-new123 may process executions assigned to sha-old456"
+```
+
+> **Sharded deployments:** `harvest_build_compat` lives on every shard.
+> Fan the write out to all shards:
+> ```rust
+> for (_, pool) in sharded_pool.iter_shards() {
+>     let mut conn = pool.get().await?;
+>     declare_compat(&mut conn, "sha-new123", "sha-old456").await?;
+> }
+> ```
+
+**Step 5 — Drain and retire old-build workers.**
 
 Check reachability first:
 

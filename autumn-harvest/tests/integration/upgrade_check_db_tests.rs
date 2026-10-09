@@ -313,44 +313,86 @@ async fn a_pending_signal_in_the_database_is_decoded_and_checked() {
     assert!(!report.to_json().contains(SECRET));
 }
 
-/// A run assigned to an older build ran other code than the baseline
-/// manifest describes, so the structural diff cannot clear it.
+/// Compat from the candidate covers only runs on the baseline build. With a
+/// baseline build named, a run on another build is out of the scan. With
+/// none named, a run with an assigned build needs review.
 #[tokio::test]
-async fn a_run_on_another_build_than_the_baseline_needs_review() {
+async fn the_scan_reads_the_runs_of_the_baseline_build() {
     let (url, _container) = setup_test_database_url_or_env().await;
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     let codecs = aead_codecs();
     let name = unique_name();
-    let run = seed(&mut conn, &name, "RUNNING", &waiting_to_ship(), &codecs).await;
-    diesel::sql_query(
-        "UPDATE harvest_workflow_executions SET assigned_build_id = 'v1' WHERE id = $1",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(run.as_uuid())
-    .execute(&mut conn)
-    .await
-    .expect("assign build");
+    let assign = async |conn: &mut AsyncPgConnection, id: ExecutionId, build: &str| {
+        diesel::sql_query(
+            "UPDATE harvest_workflow_executions SET assigned_build_id = $2 WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(id.as_uuid())
+        .bind::<diesel::sql_types::Text, _>(build)
+        .execute(conn)
+        .await
+        .expect("assign build");
+    };
+    let on_baseline = seed(&mut conn, &name, "RUNNING", &waiting_to_ship(), &codecs).await;
+    assign(&mut conn, on_baseline, "v1").await;
+    let on_candidate = seed(&mut conn, &name, "RUNNING", &waiting_to_ship(), &codecs).await;
+    assign(&mut conn, on_candidate, "v2").await;
 
     let pool = ShardedDbPool::single(build_test_pool(&url));
-    let check = |baseline: &str| {
-        let options = UpgradeCheckOptions {
-            workflow_name: Some(name.clone()),
-            baseline_build_id: Some(baseline.to_string()),
-            ..UpgradeCheckOptions::default()
-        };
-        let check = check_for(&name, &codecs);
-        let pool = &pool;
-        async move { check.run(pool, &options).await }
+    let options = |baseline: Option<&str>| UpgradeCheckOptions {
+        workflow_name: Some(name.clone()),
+        baseline_build_id: baseline.map(str::to_string),
+        ..UpgradeCheckOptions::default()
     };
-    let other = check("v2").await;
-    assert_eq!(other.runs.len(), 1, "{other:#?}");
-    assert_eq!(other.runs[0].verdict, Verdict::Review, "{other:#?}");
-    assert_eq!(other.runs[0].build_id.as_deref(), Some("v1"));
-    assert_eq!(
-        other.runs[0].findings[0].kind,
-        FindingKind::StructureUnavailable
-    );
-    let same = check("v1").await;
-    assert_eq!(same.runs[0].verdict, Verdict::Migrate, "{same:#?}");
+    let named = check_for(&name, &codecs)
+        .run(&pool, &options(Some("v1")))
+        .await;
+    assert_eq!(named.runs.len(), 1, "{named:#?}");
+    assert_eq!(named.runs[0].execution_id, on_baseline);
+    assert_eq!(named.runs[0].verdict, Verdict::Migrate, "{named:#?}");
+    assert_eq!(named.runs[0].build_id.as_deref(), Some("v1"));
+    assert_eq!(named.exit_code(), 0);
+
+    let unnamed = check_for(&name, &codecs).run(&pool, &options(None)).await;
+    assert_eq!(unnamed.runs.len(), 2, "{unnamed:#?}");
+    for run in &unnamed.runs {
+        assert_eq!(run.verdict, Verdict::Review, "{run:#?}");
+        assert_eq!(run.findings[0].kind, FindingKind::StructureUnavailable);
+    }
+}
+
+#[tokio::test]
+async fn a_shard_over_its_own_limit_makes_the_check_incomplete() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let codecs = aead_codecs();
+    let name = unique_name();
+    for _ in 0..3 {
+        seed(&mut conn, &name, "RUNNING", &waiting_to_ship(), &codecs).await;
+    }
+    // Two shard ids alias one database, so the group cap is 4. Every run
+    // belongs to shard 0, which holds 3, over its own cap of 2.
+    let pool = ShardedDbPool::from_dsns(
+        [
+            (ShardId::new(0), url.clone()),
+            (ShardId::new(1), url.clone()),
+        ],
+        ShardId::new(0),
+        2,
+    )
+    .expect("pool");
+    let report = check_for(&name, &codecs)
+        .run(
+            &pool,
+            &UpgradeCheckOptions {
+                workflow_name: Some(name.clone()),
+                limit_per_shard: 2,
+                ..UpgradeCheckOptions::default()
+            },
+        )
+        .await;
+    assert_eq!(report.runs.len(), 2, "{report:#?}");
+    assert_eq!(report.incomplete.len(), 1, "{report:#?}");
+    assert_eq!(report.exit_code(), 2);
 }
 
 #[tokio::test]

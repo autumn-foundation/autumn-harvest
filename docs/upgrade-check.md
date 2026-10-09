@@ -87,10 +87,10 @@ $ my-upgrade-check \
 | `--database-url-env NAME` | One shard, read from the environment variable `NAME`. Repeat it in shard order. |
 | `--database-url URL` | One shard, given on the command line. Other local users can see it in the process list, so prefer `--database-url-env`. With neither flag, the check reads `HARVEST_DATABASE_URL`. |
 | `--baseline-structure FILE` | The manifest of the build that runs now. |
-| `--baseline-build ID` | The build that the baseline manifest describes. A run assigned to another build needs review. With no baseline build, each run with an assigned build needs review. |
+| `--baseline-build ID` | The build that the baseline manifest describes. The check reads only runs assigned to it or to no build: compat from the candidate covers no other run. With no baseline build, each run with an assigned build needs review. |
 | `--candidate-structure FILE` | The manifest of the candidate build. Give both manifests, or neither. With neither, each run gets `review`. |
 | `--workflow-name NAME` | Check the runs of one workflow type only. |
-| `--limit N` | The most runs read from one shard. The default is 10000. More runs make the check incomplete. |
+| `--limit N` | The most runs read from one shard id, aliased shard ids included. The default is 10000. More runs make the check incomplete. |
 | `--format text\|json` | The output format. The default is `text`. |
 
 | Exit code | Meaning |
@@ -153,7 +153,7 @@ has passed then gives `migrate`.
 `declare_compat` works per build, not per run. So:
 
 - **Every run gets `migrate`.** Declare compat from the candidate build to the
-  current build. See
+  current build, after the check and never before it. See
   [Build-id routing, Scenario A](runbooks/safe-deploy.md#scenario-a-backward-compatible-deploy-new-code-can-replay-old-history).
 - **A run gets `pin`.** Do not declare compat. Keep workers on the current
   build until those runs end. `build_reachability` says when the old build is

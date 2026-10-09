@@ -1307,10 +1307,10 @@ pub struct UpgradeCheckOptions {
     /// The most runs read from one shard. More runs make the check
     /// incomplete.
     pub limit_per_shard: usize,
-    /// The build that the baseline manifest describes. A run assigned to
-    /// another build ran other code, so the structural diff does not apply
-    /// to it. With no baseline build, each run with an assigned build needs
-    /// review.
+    /// The build that the baseline manifest describes. The check then reads
+    /// only runs assigned to it, or to no build: compat from the candidate
+    /// covers no other run. With no baseline build, each run with an
+    /// assigned build needs review.
     pub baseline_build_id: Option<String>,
 }
 
@@ -1350,12 +1350,19 @@ struct InFlightRow {
 }
 
 /// The in-flight runs of one shard, oldest first. `$1` is the state list,
-/// `$2` the optional workflow name and `$3` the row limit.
+/// `$2` the optional workflow name, `$3` the row limit and `$4` the optional
+/// baseline build.
+///
+/// Compat from the candidate build covers only runs assigned to the baseline
+/// build, or to no build. With a baseline build named, the scan reads those
+/// runs only. A run on the candidate build, or on an older build, is outside
+/// the deploy decision.
 #[cfg(feature = "db")]
 const IN_FLIGHT_SQL: &str = "SELECT id, workflow_name, context_headers, execution_timeout, \
      deadline_at, parent_id, workflow_id, queue_name, assigned_build_id \
      FROM harvest_workflow_executions \
      WHERE state = ANY($1) AND ($2::text IS NULL OR workflow_name = $2) \
+     AND ($4::text IS NULL OR assigned_build_id IS NULL OR assigned_build_id = $4) \
      ORDER BY created_at, id LIMIT $3";
 
 #[cfg(feature = "db")]
@@ -1419,6 +1426,7 @@ impl UpgradeCheck {
         let group_limit = options.limit_per_shard.saturating_mul(shards.len().max(1));
         let limit = i64::try_from(group_limit.saturating_add(1)).unwrap_or(i64::MAX);
         let workflow_name = options.workflow_name.clone();
+        let baseline_build = options.baseline_build_id.clone();
         let mut rows: Vec<InFlightRow> = conn
             .build_transaction()
             .read_only()
@@ -1429,13 +1437,28 @@ impl UpgradeCheck {
                         workflow_name.as_deref(),
                     )
                     .bind::<diesel::sql_types::BigInt, _>(limit)
+                    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                        baseline_build.as_deref(),
+                    )
                     .load(conn)
                     .await
                     .map_err(crate::error::database_error)
             })
             .await?;
-        let truncated = rows.len() > group_limit;
+        let mut truncated = rows.len() > group_limit;
         rows.truncate(group_limit);
+        // The limit holds for each shard id on its own, not only for the
+        // group. A shard over its limit makes the check incomplete.
+        let mut per_shard: HashMap<ShardId, usize> = HashMap::new();
+        rows.retain(|row| {
+            let count = per_shard
+                .entry(shard_of(ExecutionId::from_uuid(row.id), shards))
+                .or_insert(0);
+            *count = count.saturating_add(1);
+            let keep = *count <= options.limit_per_shard;
+            truncated |= !keep;
+            keep
+        });
 
         let mut verdicts = Vec::with_capacity(rows.len());
         for row in rows {
