@@ -32,8 +32,8 @@ cost per tenant. The `harvest usage` table gains `LLM_CALLS`, `LLM_IN`,
 defaults, so existing models still compile.
 
 **Lifecycle.** The rows cascade with the run on retention and move with
-the run on a shard move. The usage report skips the sealed source of a
-moved run. A reset fork does not copy them.
+the run on a shard move. The usage report skips a shard move's staged
+target copy and sealed source, so one shard reports each call. A reset fork does not copy them.
 
 **Known limits.** A failed attempt writes no row. The SQLite
 backend does not write the ledger. The report has no per-model dimension.

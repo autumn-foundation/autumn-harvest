@@ -1322,7 +1322,7 @@ in clear:
 | `input_tokens`, `output_tokens` | The token counts. |
 | `cost_usd_micros` | The cost in millionths of a US dollar, or `NULL`. |
 | `latency_ms` | The call latency. |
-| `recorded_at` | The commit time of the completion. |
+| `recorded_at` | The completion time, equal to the completion event's `timestamp`. |
 
 The fields are in clear by design. SQL usage reports and quota checks sum
 them without a key, so they never decrypt an event. An operator who reads

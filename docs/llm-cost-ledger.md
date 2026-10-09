@@ -76,7 +76,9 @@ for a call recorded after the commit and drops it.
 | `llm_unpriced_calls` | Rows with no cost. |
 | `llm_latency_ms` | Sum of the latencies, in milliseconds. |
 
-The window applies to `recorded_at`, the commit time of the completion.
+The window applies to `recorded_at`. It is the timestamp of the completion
+transaction, the same value as the completion event's `timestamp`, so a row
+and its event always fall in the same window.
 Use `group_by=workflow_name` for the cost per workflow type. Use
 `group_by=search_attr:tenant_id` for the cost per tenant. See
 [the usage report](sharding.md#historical-per-tenant-usage-report-issue-596).
@@ -103,8 +105,9 @@ and unpriced. See [the agent adapter](agent-adapter.md).
 ## 5. Lifecycle
 
 - **Retention.** The rows cascade with the execution row.
-- **Shard moves.** The rows move with the run. The sealed source keeps a
-  copy, and the usage report skips it.
+- **Shard moves.** The rows move with the run. The usage report skips the
+  staged target copy before the cutover and the sealed source after it, so
+  one shard reports each call.
 - **Reset.** A fork copies events, not ledger rows. The cost counts once.
 - **Erasure.** Erasure keeps the rows. They hold no payload.
 

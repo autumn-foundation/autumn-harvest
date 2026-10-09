@@ -70,8 +70,9 @@
 //!   `llm_cost_usd_micros`, `llm_unpriced_calls` and `llm_latency_ms`: sums
 //!   over the `harvest_llm_ledger` rows whose `recorded_at` falls in the
 //!   window (issue #1996). Cost is in millionths of a US dollar. A row with
-//!   no cost counts in `llm_unpriced_calls`. The sealed `MIGRATED` source of
-//!   a moved run is skipped, so the target reports each call once.
+//!   no cost counts in `llm_unpriced_calls`. A shard move's staged
+//!   `MIGRATING` target copy and sealed `MIGRATED` source are skipped, so one
+//!   shard reports each call.
 //!
 //! Local activities (no `ActivityStarted`/worker compute) and
 //! externally-completed activities (`ActivityAwaitingExternal` and
@@ -377,8 +378,9 @@ activity_metrics AS (
 ),
 llm_metrics AS (
     -- Issue #1996: the agent cost ledger, windowed by `recorded_at`. A shard
-    -- move leaves a sealed `MIGRATED` copy of the run on the source, so the
-    -- ledger skips it and the target reports each call once.
+    -- move puts a staged `MIGRATING` copy on the target before the cutover,
+    -- and leaves a sealed `MIGRATED` copy on the source after it. The ledger
+    -- skips both, so exactly one shard reports each call.
     SELECT
         {group_key_expr} AS grp,
         COUNT(*)::BIGINT AS llm_calls,
@@ -390,7 +392,7 @@ llm_metrics AS (
     FROM harvest_llm_ledger l
     INNER JOIN harvest_workflow_executions w ON w.id = l.workflow_exec_id
     WHERE w.shard_id = $1::INT4
-      AND w.state <> 'MIGRATED'
+      AND w.state NOT IN ('MIGRATING', 'MIGRATED')
       AND l.recorded_at BETWEEN $3 AND $4
     GROUP BY 1
 )
@@ -644,8 +646,8 @@ mod tests {
             "the ledger is windowed by recorded_at"
         );
         assert!(
-            sql.contains("w.state <> 'MIGRATED'"),
-            "a moved run reports its calls once, on the target"
+            sql.contains("w.state NOT IN ('MIGRATING', 'MIGRATED')"),
+            "a run in a shard move reports its calls on one shard only"
         );
     }
 

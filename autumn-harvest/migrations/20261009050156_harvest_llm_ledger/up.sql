@@ -33,6 +33,8 @@ CREATE TABLE harvest_llm_ledger (
     -- Millionths of a US dollar. NULL means unpriced.
     cost_usd_micros  BIGINT      NULL,
     latency_ms       BIGINT      NOT NULL,
+    -- NOW(), as for `harvest_events.timestamp`: the row and its completion
+    -- event carry the same instant, so both fall in the same report window.
     recorded_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (workflow_exec_id, event_id, call_index),
     CONSTRAINT harvest_llm_ledger_counts_check CHECK (

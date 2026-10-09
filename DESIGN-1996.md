@@ -130,7 +130,7 @@ Migration `20261009050156_harvest_llm_ledger`:
 | `input_tokens`, `output_tokens` | `BIGINT` | Not negative. |
 | `cost_usd_micros` | `BIGINT NULL` | Millionths of a US dollar. `NULL` is unpriced. |
 | `latency_ms` | `BIGINT` | Not negative. |
-| `recorded_at` | `TIMESTAMPTZ` | The completion transaction time. |
+| `recorded_at` | `TIMESTAMPTZ` | `NOW()` of the completion transaction, the same value as the event `timestamp`. |
 
 The primary key is `(workflow_exec_id, event_id, call_index)`. An index on
 `recorded_at` serves the report window. The table has no `JSONB` column and
