@@ -32,7 +32,7 @@ impl AgentModel for PricedModel {
         self.0.chat(request)
     }
 
-    fn model_id(&self) -> &str {
+    fn model_id(&self) -> &'static str {
         "test-model-1"
     }
 
@@ -381,7 +381,7 @@ impl AgentModel for BadIdModel {
         self.0.chat(request)
     }
 
-    fn model_id(&self) -> &str {
+    fn model_id(&self) -> &'static str {
         "a model id with spaces"
     }
 }
