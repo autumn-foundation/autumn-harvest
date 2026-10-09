@@ -145,6 +145,7 @@ pub fn tool_result(state: &str, output: Option<&Value>, error: Option<&str>) -> 
         "COMPLETED" => {
             let output = output.cloned().unwrap_or(Value::Null);
             let mut result = json!({
+                "resultType": "complete",
                 "content": [{"type": "text", "text": output.to_string()}],
                 "isError": false,
             });
@@ -167,6 +168,7 @@ pub fn tool_result(state: &str, output: Option<&Value>, error: Option<&str>) -> 
                 ToString::to_string,
             );
             Some(json!({
+                "resultType": "complete",
                 "content": [{"type": "text", "text": text}],
                 "isError": true,
             }))
@@ -1972,6 +1974,8 @@ mod tests {
     fn a_completed_run_is_a_successful_tool_result() {
         let output = json!({"approved": true});
         let result = tool_result("COMPLETED", Some(&output), None).unwrap();
+        // The 2026-07-28 schema requires `resultType` on a `CallToolResult`.
+        assert_eq!(result["resultType"], "complete");
         assert_eq!(result["isError"], false);
         assert_eq!(result["structuredContent"], output);
         let text = result["content"][0]["text"].as_str().unwrap();
@@ -1990,6 +1994,7 @@ mod tests {
     #[test]
     fn a_failed_or_timed_out_run_is_a_tool_error() {
         let failed = tool_result("FAILED", None, Some("card declined")).unwrap();
+        assert_eq!(failed["resultType"], "complete");
         assert_eq!(failed["isError"], true);
         assert_eq!(failed["content"][0]["text"], "card declined");
         let timed_out = tool_result("TIMED_OUT", None, None).unwrap();
