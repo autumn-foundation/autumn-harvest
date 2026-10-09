@@ -550,3 +550,29 @@ async fn an_untrusted_origin_is_refused_with_403() {
     .await;
     assert_eq!(status, StatusCode::OK, "{out}");
 }
+
+/// `tools/list` marks `body` as required, so a call without it starts no
+/// run. An explicit `null` body still reaches the start.
+#[tokio::test]
+async fn a_tool_call_without_a_body_is_invalid_params() {
+    for arguments in [json!({}), json!("d1"), Value::Null] {
+        let out = rpc(
+            &router(),
+            call(
+                "tools/call",
+                &json!({"name": "start_review_flow", "arguments": arguments}),
+            ),
+        )
+        .await;
+        assert_eq!(out["error"]["code"], -32602, "{arguments}: {out}");
+    }
+    let out = rpc(
+        &router(),
+        call(
+            "tools/call",
+            &json!({"name": "start_review_flow", "arguments": {"body": null}}),
+        ),
+    )
+    .await;
+    assert!(out.get("error").is_none(), "{out}");
+}

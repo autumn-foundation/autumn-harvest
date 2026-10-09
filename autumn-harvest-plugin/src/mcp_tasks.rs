@@ -341,6 +341,30 @@ fn default_port(scheme: &str) -> Option<&'static str> {
     }
 }
 
+/// A 2026-07-28 request must carry its version and client capabilities in
+/// `_meta`. A request without them is malformed. The schema makes the client
+/// capabilities an object.
+fn check_modern_meta(params: &Value) -> Result<(), (i64, String, Option<Value>)> {
+    let meta = params.pointer("/_meta");
+    let version_ok = meta
+        .and_then(|meta| meta.get(PROTOCOL_VERSION_META))
+        .is_some_and(Value::is_string);
+    let caps_ok = meta
+        .and_then(|meta| meta.get(CLIENT_CAPABILITIES_META))
+        .is_some_and(Value::is_object);
+    if version_ok && caps_ok {
+        return Ok(());
+    }
+    Err((
+        INVALID_PARAMS,
+        format!(
+            "Invalid params: _meta must carry {PROTOCOL_VERSION_META} and \
+             {CLIENT_CAPABILITIES_META}"
+        ),
+        None,
+    ))
+}
+
 /// The body value that the `Mcp-Name` header mirrors for `method`.
 fn mirrored_name<'a>(method: &str, params: &'a Value) -> Option<&'a str> {
     let field = match method {
@@ -423,21 +447,8 @@ pub fn check_request_headers(
             "Header mismatch: MCP-Protocol-Version header is missing".to_string(),
         ));
     }
-    // A 2026-07-28 request must carry its version and client capabilities
-    // in `_meta`. A request without them is malformed.
     if modern {
-        let meta = params.pointer("/_meta");
-        let has = |key: &str| meta.and_then(|meta| meta.get(key)).is_some();
-        if body_version.is_none() || !has(CLIENT_CAPABILITIES_META) {
-            return Err((
-                INVALID_PARAMS,
-                format!(
-                    "Invalid params: _meta must carry {PROTOCOL_VERSION_META} and \
-                     {CLIENT_CAPABILITIES_META}"
-                ),
-                None,
-            ));
-        }
+        check_modern_meta(params)?;
     }
 
     match header("mcp-method")? {
@@ -1180,10 +1191,14 @@ async fn tools_call(
     let tool = catalog
         .tool(name)
         .ok_or_else(|| RpcError::new(INVALID_PARAMS, format!("unknown tool: {name}")))?;
+    // `tools/list` marks `body` as required, so a call without it starts
+    // nothing. An explicit `null` body is still a body.
     let body = params
-        .pointer("/arguments/body")
+        .get("arguments")
+        .and_then(Value::as_object)
+        .and_then(|arguments| arguments.get("body"))
         .cloned()
-        .unwrap_or(Value::Null);
+        .ok_or_else(|| RpcError::new(INVALID_PARAMS, "arguments.body is required"))?;
     let headers = start_headers(headers, params)?;
     let response = Box::pin(crate::mcp_tools::start_tool(
         api_state.clone(),
@@ -1911,6 +1926,16 @@ mod tests {
         );
         assert_eq!(
             check_request_headers(&ok, "ping", &json!({}))
+                .unwrap_err()
+                .0,
+            INVALID_PARAMS
+        );
+        let null_caps = json!({"_meta": {
+            PROTOCOL_VERSION_META: LATEST_PROTOCOL_VERSION,
+            CLIENT_CAPABILITIES_META: null,
+        }});
+        assert_eq!(
+            check_request_headers(&ok, "ping", &null_caps)
                 .unwrap_err()
                 .0,
             INVALID_PARAMS

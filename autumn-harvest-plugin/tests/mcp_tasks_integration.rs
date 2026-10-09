@@ -413,29 +413,28 @@ async fn a_task_moves_through_the_spec_states() {
     .await;
     assert_eq!(ack, json!({"resultType": "complete"}));
 
-    let done = poll_until(&client, &task_id, &mut seen, |t| status_of(t).is_terminal()).await;
+    // After the ack, the run never asks again. It works on, then completes.
+    let mut after = Vec::new();
+    let done = poll_until(&client, &task_id, &mut after, |t| {
+        status_of(t).is_terminal()
+    })
+    .await;
     assert_eq!(done["status"], "completed", "{done}");
     assert_eq!(done["result"]["isError"], false);
     assert_eq!(done["result"]["content"][0]["text"], "\"r1:approve\"");
     assert_eq!(done["createdAt"], created["createdAt"]);
     assert_settled(&client, &task_id, &done).await;
-
-    // The first status can be `working` or `input_required`, as the run may
-    // park before the create returns.
-    let tail: Vec<TaskStatus> = seen
-        .iter()
-        .copied()
-        .skip_while(|s| *s == TaskStatus::Working)
-        .collect();
     assert_eq!(
-        tail,
-        [
-            TaskStatus::InputRequired,
-            TaskStatus::Working,
-            TaskStatus::Completed
-        ],
-        "{seen:?}"
+        after,
+        [TaskStatus::Working, TaskStatus::Completed],
+        "after the answer: {after:?}"
     );
+
+    // Before the answer, a live status may flip, for example while a replay
+    // degrades. The task must still have asked for input.
+    assert!(seen.contains(&TaskStatus::InputRequired), "{seen:?}");
+    seen.extend(after);
+    seen.dedup();
     assert_legal(&seen);
 }
 
