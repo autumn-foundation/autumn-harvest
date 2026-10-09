@@ -216,6 +216,8 @@ fn item_info() -> autumn_harvest::info::ActivityInfo {
         rate_limit_key: None,
         rate_limit_key_expr: None,
         circuit_breaker: None,
+        input_schema: None,
+        output_schema: None,
         requires: None,
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
     }
