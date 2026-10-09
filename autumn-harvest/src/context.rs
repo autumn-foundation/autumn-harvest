@@ -1914,6 +1914,19 @@ const RESERVED_SEARCH_ATTR_KEYS: &[&str] = &[
 
 const RESERVED_SEARCH_ATTR_PREFIX: &str = "_harvest";
 
+/// Copy the test harness clock for an update handler context (issue #1991).
+///
+/// The handler gets its own counter, so a timer in the handler cannot move
+/// the clock of the workflow body.
+#[cfg(any(test, feature = "testing"))]
+fn snapshot_timer_clock(
+    elapsed: &Arc<std::sync::atomic::AtomicU64>,
+) -> Arc<std::sync::atomic::AtomicU64> {
+    Arc::new(std::sync::atomic::AtomicU64::new(
+        elapsed.load(std::sync::atomic::Ordering::Relaxed),
+    ))
+}
+
 fn validate_search_attr_key(key: &str) -> HarvestResult<()> {
     if key.is_empty() {
         return Err(HarvestError::InvalidSearchAttribute {
@@ -3101,8 +3114,11 @@ pub struct WorkflowContext {
     /// `None` = production behavior (`ctx.now()` always returns `start_time`).
     /// `Some` = test harness advancing-clock mode; incremented each time a
     /// durable timer resolves from history so `ctx.now()` reflects virtual elapsed time.
+    ///
+    /// Shared through an `Arc`, so a declarative update handler can read the
+    /// clock when it runs (issue #1991).
     #[cfg(any(test, feature = "testing"))]
-    timer_clock_elapsed_secs: Option<std::sync::atomic::AtomicU64>,
+    timer_clock_elapsed_secs: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// Metrics recorder for user-emitted custom business metrics (issue #532).
     /// Defaults to [`NoOpMetrics`](crate::telemetry::NoOpMetrics) when the
     /// worker has no telemetry configured.  Workflow metrics are replay-safe:
@@ -3883,7 +3899,7 @@ impl WorkflowContext {
     #[must_use]
     #[allow(clippy::missing_const_for_fn)]
     pub fn with_advancing_timer_clock(mut self) -> Self {
-        self.timer_clock_elapsed_secs = Some(std::sync::atomic::AtomicU64::new(0));
+        self.timer_clock_elapsed_secs = Some(Arc::new(std::sync::atomic::AtomicU64::new(0)));
         self
     }
 
@@ -13437,6 +13453,10 @@ impl WorkflowContext {
         // `new_for_handler` inits it to `None`; without this the update-handler
         // path (unlike the workflow body) would never see the parent.
         let parent_execution_id = self.parent_execution_id;
+        // Issue #1991: the test harness clock. The handler reads it when it
+        // runs, so its `ctx.now()` matches the workflow body.
+        #[cfg(any(test, feature = "testing"))]
+        let timer_clock = self.timer_clock_elapsed_secs.clone();
 
         let boxed_handler: crate::update::BoxUpdateHandler = std::sync::Arc::new(move |input| {
             let mut ctx = Self::new_for_handler(
@@ -13464,6 +13484,10 @@ impl WorkflowContext {
                 inner.current_shard_id = current_shard_id;
                 // Issue #698: inherit the spawning parent's execution id.
                 inner.parent_execution_id = parent_execution_id;
+                #[cfg(any(test, feature = "testing"))]
+                {
+                    inner.timer_clock_elapsed_secs = timer_clock.as_ref().map(snapshot_timer_clock);
+                }
             }
             handler_fn(ctx, input)
         });
@@ -13542,6 +13566,13 @@ impl WorkflowContext {
                 // Issue #698: inherit the spawning parent's execution id so
                 // `ctx.info().parent_execution_id` is visible inside the handler.
                 inner.parent_execution_id = self.parent_execution_id;
+                #[cfg(any(test, feature = "testing"))]
+                {
+                    inner.timer_clock_elapsed_secs = self
+                        .timer_clock_elapsed_secs
+                        .as_ref()
+                        .map(snapshot_timer_clock);
+                }
             }
             h(ctx, input)
         })

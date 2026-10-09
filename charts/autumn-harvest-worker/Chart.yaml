@@ -1,0 +1,17 @@
+# Helm chart for a standalone Harvest worker (issue #1989).
+apiVersion: v2
+name: autumn-harvest-worker
+description: A standalone Harvest worker with probes, drain settings and a migration job.
+type: application
+# The chart version follows the workspace version.
+version: 0.7.0
+appVersion: "0.7.0"
+# The preStop `sleep` action is on by default from Kubernetes 1.30.
+kubeVersion: ">=1.30.0-0"
+home: https://github.com/autumn-foundation/autumn-harvest
+sources:
+  - https://github.com/autumn-foundation/autumn-harvest
+keywords:
+  - workflow
+  - durable-execution
+  - harvest

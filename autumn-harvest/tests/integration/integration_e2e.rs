@@ -191,7 +191,9 @@ const LEGACY_INIT_SQL: &str = concat!(
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_state TEXT NULL;\n",
     // issue #1596 review: WorkflowExecution::as_select() also references
     // this column, for the same reason as the column above.
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_by UUID NULL;\n"
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_by UUID NULL;\n",
+    // Issue #1977: the diesel insert and `as_select()` name this column too.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS tenant TEXT NULL;\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -679,6 +681,7 @@ pub(crate) async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> E
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -739,6 +742,7 @@ pub(crate) async fn insert_workflow_execution_on_shard(
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -797,6 +801,7 @@ pub(crate) async fn insert_workflow_execution_with_id(
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -871,6 +876,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -2066,6 +2072,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     let started = start_or_load_workflow_execution(&mut conn, request, None)
         .await
@@ -2280,6 +2287,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     let started = start_or_load_workflow_execution(&mut conn, request, None)
         .await
@@ -5876,6 +5884,7 @@ async fn insert_named_workflow_execution(
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -6689,6 +6698,7 @@ mod reuse_policy_helpers {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         }
     }
 
@@ -8561,6 +8571,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -8745,6 +8756,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -10190,6 +10202,7 @@ async fn insert_cross_type_scheduled_execution(
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -10247,6 +10260,7 @@ async fn insert_manual_trigger_execution(
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -10900,6 +10914,7 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -11978,6 +11993,7 @@ async fn insert_named_execution(
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)

@@ -575,6 +575,7 @@ async fn insert_execution(conn: &mut AsyncPgConnection, queue: &str) -> Executio
             start_source: None,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         })
         .execute(conn)
         .await

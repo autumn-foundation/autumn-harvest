@@ -28,8 +28,10 @@ pub enum ToolEffect {
 
 /// The facts a tool gets with each call.
 ///
-/// `run_id` and `call_id` together are an idempotency key. A call that was
-/// in flight at a crash runs again, and the key lets the tool see that.
+/// `run_id`, `step` and `call_id` together are an idempotency key. A call
+/// that was in flight at a crash runs again, and the key lets the tool see
+/// that. The step is in the key because a provider can reuse a call id in a
+/// later step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolContext {
     /// The run that made the call.
@@ -38,7 +40,8 @@ pub struct ToolContext {
     pub call_id: String,
     /// The session of the run, if any.
     pub session_id: Option<SessionId>,
-    /// The tool round (0-based) that made the call.
+    /// The tool round (0-based) that made the call, counted across
+    /// follow-up segments.
     pub step: u32,
 }
 

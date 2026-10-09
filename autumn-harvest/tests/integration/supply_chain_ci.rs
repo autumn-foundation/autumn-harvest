@@ -1,14 +1,16 @@
 //! Supply-chain CI guard (issue #1826). No DB, no feature gate.
 //!
-//! Four parts, each checked here:
+//! Five parts, each checked here:
 //!
 //! - A daily `cargo deny check advisories` scan. New RUSTSEC advisories land
 //!   with no code change, so the change-gated CI job does not see them.
 //! - A SHA pin on every `uses:`. `docs/audits/action-sha-pin.py` checks each
 //!   line in the `lint` job. This file checks that the job runs it.
-//! - A Dependabot file for `cargo` and `github-actions`.
+//! - A Dependabot file for `cargo`, `github-actions` and `docker`.
 //! - A release that builds auditable binaries, a `CycloneDX` SBOM, a Sigstore
 //!   signature and GitHub artifact attestations.
+//! - A worker image that the release builds with no write token. A separate
+//!   job pushes, signs and attests it by digest (issue #1989).
 //!
 //! The scan behaviour tests run `.github/ci/advisory-scan.sh` with a stub
 //! `cargo` and a stub `gh` first on `PATH`. The script reads the stub JSON
@@ -100,6 +102,26 @@ fn permission<'a>(node: &'a Value, key: &str) -> Option<&'a str> {
 /// True when `step` uses `action` (any ref).
 fn uses(step: &Value, action: &str) -> bool {
     action_of(step) == Some(action)
+}
+
+/// The joined `run:` text of job `name`.
+fn job_runs(doc: &Value, file: &str, name: &str) -> String {
+    job_steps(doc, file, name)
+        .iter()
+        .filter_map(|s| text(s, "run"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The `needs:` list of job `name`.
+fn job_needs<'a>(doc: &'a Value, file: &str, name: &str) -> Vec<&'a str> {
+    job(doc, file, name)
+        .get("needs")
+        .and_then(Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect()
 }
 
 // ── Daily advisory scan ─────────────────────────────────────────────────────
@@ -965,13 +987,7 @@ fn release_publishes_only_on_a_tag_push() {
         cond.contains("github.event_name == 'push'") && cond.contains("refs/tags/"),
         "release must run on a tag push only: {cond:?}"
     );
-    let needs: Vec<&str> = release
-        .get("needs")
-        .and_then(Value::as_sequence)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
+    let needs = job_needs(&doc, RELEASE_WORKFLOW, "release");
     for need in ["validate", "sign", "client", "sign-client"] {
         assert!(
             needs.contains(&need),
@@ -1152,13 +1168,7 @@ fn release_runs_every_tag_gate_before_signing() {
         "git-cliff needs the full history"
     );
     for name in ["sign", "sign-client"] {
-        let needs: Vec<&str> = job(&doc, RELEASE_WORKFLOW, name)
-            .get("needs")
-            .and_then(Value::as_sequence)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect();
+        let needs = job_needs(&doc, RELEASE_WORKFLOW, name);
         assert!(
             needs.contains(&"validate"),
             "{name} must need validate: {needs:?}"
@@ -1173,4 +1183,169 @@ fn release_runs_every_tag_gate_before_signing() {
         !release_runs.contains("diff -u CHANGELOG.md"),
         "the CHANGELOG gate must not wait until after signing"
     );
+}
+
+// ── Release: worker container image (issue #1989) ───────────────────────────
+
+const IMAGE_CONTRACT_AUDIT: &str = "docs/audits/worker-image-contract.py";
+const CHART: &str = "charts/autumn-harvest-worker";
+
+/// The image build runs third-party `build.rs` code. It must hold no token
+/// that can push, sign or attest. A pull request that changes the
+/// `Dockerfile`, `.dockerignore` or a dependency runs it as a dry run.
+#[test]
+fn release_builds_the_image_without_a_write_token() {
+    let doc = parse_workflow(RELEASE_WORKFLOW);
+    let image = job(&doc, RELEASE_WORKFLOW, "image");
+    // A scalar such as `write-all` would make each key lookup below `None`.
+    let grants = image
+        .get("permissions")
+        .and_then(Value::as_mapping)
+        .expect("image must set a `permissions` mapping");
+    for (key, value) in grants {
+        assert_eq!(
+            value.as_str(),
+            Some("read"),
+            "image: `{key:?}` must be read-only"
+        );
+    }
+    let runs = job_runs(&doc, RELEASE_WORKFLOW, "image");
+    for needle in [
+        "docker build",
+        "docker save",
+        "harvest --version",
+        "harvest-replay --help",
+        "65532:65532",
+        "harvest migrate run",
+        "harvest migrate status --check",
+        "/api/harvest/health/ready",
+        "docker stop",
+    ] {
+        assert!(runs.contains(needle), "image must run `{needle}`:\n{runs}");
+    }
+    let paths: Vec<&str> = doc
+        .get("on")
+        .and_then(|on| on.get("pull_request"))
+        .and_then(|pr| pr.get("paths"))
+        .and_then(Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    for path in ["Dockerfile", ".dockerignore", "Cargo.lock", "**/Cargo.toml"] {
+        assert!(
+            paths.contains(&path),
+            "a change to {path} must run the dry run: {paths:?}"
+        );
+    }
+}
+
+/// Only a tag push publishes the image. The push job runs no repository
+/// code. It signs the pushed digest, not a tag, because a tag can move.
+#[test]
+fn release_publishes_and_signs_the_image_by_digest() {
+    let doc = parse_workflow(RELEASE_WORKFLOW);
+    let publish = job(&doc, RELEASE_WORKFLOW, "publish-image");
+    let cond = text(publish, "if").unwrap_or_default();
+    assert!(
+        cond.contains("github.event_name == 'push'") && cond.contains("refs/tags/"),
+        "publish-image must run on a tag push only: {cond:?}"
+    );
+    let needs = job_needs(&doc, RELEASE_WORKFLOW, "publish-image");
+    for need in ["validate", "image"] {
+        assert!(
+            needs.contains(&need),
+            "publish-image must need `{need}`: {needs:?}"
+        );
+    }
+    for key in ["packages", "id-token", "attestations"] {
+        assert_eq!(
+            permission(publish, key),
+            Some("write"),
+            "publish-image: `{key}`"
+        );
+    }
+    assert_ne!(permission(publish, "contents"), Some("write"));
+    let steps = job_steps(&doc, RELEASE_WORKFLOW, "publish-image");
+    assert!(
+        !steps.iter().any(|s| uses(s, "actions/checkout")),
+        "publish-image must run no repository code"
+    );
+    assert!(steps.iter().any(|s| uses(s, "sigstore/cosign-installer")));
+    let provenance = steps
+        .iter()
+        .find(|s| uses(s, "actions/attest-build-provenance"))
+        .expect("publish-image must attest build provenance");
+    let with = provenance.get("with").expect("attest inputs");
+    assert_eq!(
+        with.get("push-to-registry").and_then(Value::as_bool),
+        Some(true),
+        "the attestation must go to the registry next to the image"
+    );
+    assert!(text(with, "subject-digest").is_some(), "attest the digest");
+    let runs = job_runs(&doc, RELEASE_WORKFLOW, "publish-image");
+    for needle in [
+        "docker load",
+        "docker push",
+        "cosign sign --yes \"${IMAGE}@${DIGEST}\"",
+        "cosign verify",
+        "--certificate-identity",
+        "--certificate-oidc-issuer https://token.actions.githubusercontent.com",
+    ] {
+        assert!(
+            runs.contains(needle),
+            "publish-image must run `{needle}`:\n{runs}"
+        );
+    }
+}
+
+/// The GitHub Release waits for the image. A release then never names an
+/// image that failed to publish.
+#[test]
+fn release_waits_for_the_image() {
+    let doc = parse_workflow(RELEASE_WORKFLOW);
+    let needs = job_needs(&doc, RELEASE_WORKFLOW, "release");
+    assert!(
+        needs.contains(&"publish-image"),
+        "release must need `publish-image`: {needs:?}"
+    );
+}
+
+/// The chart gate runs on every pull request. `helm lint` and the image
+/// contract audit must run in the `lint` job.
+#[test]
+fn lint_job_runs_helm_lint_and_the_image_contract() {
+    let doc = parse_workflow(CI_WORKFLOW);
+    let runs = job_runs(&doc, CI_WORKFLOW, "lint");
+    let lines: Vec<&str> = runs.lines().map(str::trim).collect();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("helm lint --strict") && l.contains(CHART)),
+        "the lint job must run `helm lint --strict` on {CHART}"
+    );
+    for line in [
+        format!("python3 {IMAGE_CONTRACT_AUDIT} --self-test"),
+        format!("python3 {IMAGE_CONTRACT_AUDIT}"),
+    ] {
+        assert!(
+            lines.contains(&line.as_str()),
+            "the lint job must run `{line}`"
+        );
+    }
+}
+
+/// The Dockerfile pins each base image by digest. Dependabot keeps the
+/// digests current.
+#[test]
+fn dependabot_watches_the_image_base() {
+    let doc = parse_workflow(DEPENDABOT);
+    let docker = doc
+        .get("updates")
+        .and_then(Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .find(|u| text(u, "package-ecosystem") == Some("docker"))
+        .unwrap_or_else(|| panic!("{DEPENDABOT} must watch the `docker` ecosystem"));
+    assert_eq!(text(docker, "directory"), Some("/"));
 }
