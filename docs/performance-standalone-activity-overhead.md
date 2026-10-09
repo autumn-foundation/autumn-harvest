@@ -3,7 +3,7 @@
 Harvest has no standalone-activity start path. To run one durable job, a
 user wraps one activity in a one-step workflow. Issue #1987 asks what that
 wrapper costs. This page measures it.
-[ADR 0006](adr/0006-standalone-activity.md) records the decision that
+[ADR 0007](adr/0007-standalone-activity.md) records the decision that
 follows from it.
 
 > **This is a reference measurement, not an SLO.** It comes from one

@@ -197,6 +197,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          sticky_routing_tests
 linux        autumn-harvest         integration                      -                          telemetry_span_tests
 linux        autumn-harvest         integration                      -                          tenant_cell_isolation_tests
+linux        autumn-harvest         integration                      -                          tenant_propagation_tests
 linux        autumn-harvest         integration                      -                          terminal_task_gc_tests
 linux        autumn-harvest         integration                      -                          terminal_write_ownership_tests
 linux        autumn-harvest         integration                      -                          throttle_bucket_prelock_batch_perf
@@ -318,6 +319,7 @@ linux        autumn-harvest-plugin  start_throttle_integration       -          
 linux        autumn-harvest-plugin  status_summary_integration       -                          -
 linux        autumn-harvest-plugin  status_summary_stalled_perf      -                          -
 linux        autumn-harvest-plugin  telemetry_propagation_tests      -                          -
+linux        autumn-harvest-plugin  tenant_binding_integration       -                          -
 linux        autumn-harvest-plugin  terminate_integration            -                          -
 linux        autumn-harvest-plugin  timeline_integration             -                          -
 linux        autumn-harvest-plugin  token_auth_integration           -                          -
