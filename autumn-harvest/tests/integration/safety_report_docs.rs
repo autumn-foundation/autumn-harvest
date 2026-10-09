@@ -131,9 +131,14 @@ fn repo_root() -> PathBuf {
 /// Read a repo file with CRLF folded to LF, so a Windows checkout matches.
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);
-    std::fs::read_to_string(&path)
+    read_lf(&path)
         .unwrap_or_else(|err| panic!("issue #2004: cannot read {}: {err}", path.display()))
-        .replace("\r\n", "\n")
+}
+
+/// Read a file with CRLF folded to LF. A Windows checkout writes CRLF, and
+/// the manifest and module parsers split on `\n`.
+fn read_lf(path: &Path) -> std::io::Result<String> {
+    std::fs::read_to_string(path).map(|text| text.replace("\r\n", "\n"))
 }
 
 #[test]
@@ -683,7 +688,7 @@ fn cargo_test_problems(args: &[&str], root: &Path) -> Vec<String> {
         Err(problem) => return vec![problem],
     };
     let crate_dir = root.join(&command.package);
-    let Ok(manifest) = std::fs::read_to_string(crate_dir.join("Cargo.toml")) else {
+    let Ok(manifest) = read_lf(&crate_dir.join("Cargo.toml")) else {
         return vec![format!("no crate `{}` in the workspace", command.package)];
     };
     let Some(target) = &command.target else {
@@ -807,7 +812,7 @@ fn collect_tests(
     features: &BTreeSet<String>,
     tests: &mut Vec<TestFn>,
 ) {
-    let Ok(source) = std::fs::read_to_string(file) else {
+    let Ok(source) = read_lf(file) else {
         return;
     };
     let inner_cfg_off = source
