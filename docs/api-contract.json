@@ -3452,7 +3452,7 @@
         },
         {
           "status": 409,
-          "description": "The source execution is terminal, or it holds a durable mutex that the reset cannot take."
+          "description": "The source execution is terminal, it holds a durable mutex that the reset cannot take, or its payloads were erased."
         },
         {
           "status": 500,

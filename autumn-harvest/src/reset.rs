@@ -120,10 +120,9 @@ pub enum ResetSkipReason {
     /// The execution's payloads were PII-erased (issue #495). A fork would
     /// resume on tombstones, so no fork path accepts it (issue #1999).
     ErasedSource,
-    /// An infrastructure failure (UUID parse, DB connection, or reset engine
-    /// error) prevented the execution from being processed. This is distinct
-    /// from a domain skip — the execution was not examined and should be
-    /// retried once the underlying issue is resolved.
+    /// A database error, or a fork-time refusal that has no typed skip reason,
+    /// such as a held durable mutex. `message` names the cause. Read it before
+    /// a retry, because a fork-time refusal does not clear by itself.
     InfrastructureError { message: String },
 }
 
@@ -410,8 +409,8 @@ pub enum WorkflowResetError {
     ///
     /// Every fork path raises it, with no opt-out (issue #1999). The reset
     /// raises it under the fork's own `FOR UPDATE` row lock, before it copies
-    /// an event. So an erasure that commits after a pre-flight check cannot
-    /// slip through.
+    /// an event. So the fork never copies events that an erasure tombstoned
+    /// after a pre-flight check.
     #[error(
         "workflow execution {exec_id} had its payloads erased; its recorded outputs are \
          tombstones, so a fork would resume on unreadable state"
@@ -2511,6 +2510,7 @@ mod tests {
             ResetSkipReason::ContinueAsNew,
             ResetSkipReason::EmptyHistory,
             ResetSkipReason::ChildWorkflow,
+            ResetSkipReason::ErasedSource,
             ResetSkipReason::TerminalSource {
                 state: "COMPLETED".to_string(),
             },

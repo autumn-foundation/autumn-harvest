@@ -14,7 +14,7 @@ surfaces and the rules that apply to all of them.
 | `POST /workflows/batch_reset` (issue #538) | `RUNNING`, `PAUSED`, `FAILED`, `CANCELLED`, `TIMED_OUT` | A cohort. Each run gets an outcome. `preview: true` forks nothing. |
 | `POST /dags/{dag_name}/runs/{run_exec_id}/retry` (issue #366) | `FAILED`, `CANCELLED`, `TIMED_OUT` | See [DAG retry](runbooks/dag-retry-from-failed-node.md). |
 
-No surface forks a `COMPLETED` or `TERMINATED` run, or a child run.
+No surface forks a run in any other state, or a child run.
 
 ## A fork never uses a PII-erased source
 
@@ -29,7 +29,7 @@ run returns the same refusal.
 
 | Surface | Result for an erased source |
 |---|---|
-| Single reset | `409`. The state gate usually refuses first, because an erased run is terminal. |
+| Single reset | `409` from the state gate, because erasure applies to terminal runs only. The erasure check is a second defense. |
 | Batch reset | The item is `skipped` with `skip_reason: {"type": "erased_source"}`. The other runs in the cohort still reset. |
 | DAG retry | `409` that tells you to start a fresh DAG run. |
 
@@ -41,22 +41,24 @@ It refuses an erased input otherwise. See [`api-contract.json`](api-contract.jso
 
 Before issue #1999, the refusal was an in-process opt-in,
 `WorkflowResetRequest::refuse_erased_source`. Only DAG retry set it. Batch
-reset left it off, so a batch could fork an erased `FAILED`, `CANCELLED` or
-`TIMED_OUT` run. The recorded reason was scope: issue #780 did not want to
-change a shipped endpoint. That reason does not hold for these causes:
+reset left it off, so a batch forked an erased `FAILED`, `CANCELLED` or
+`TIMED_OUT` run. The recorded reason was scope. The issue #780 work kept the
+batch endpoint unchanged. The plain reset also left the flag off, but its
+state gate already refuses an erased run. Four facts outweigh that reason:
 
 - The fork input is the tombstone. Batch reset has no input override.
 - The carried-over activity results are tombstones too. The fork resumes on
   data that no code can read.
 - A fork makes an erased run live again. Erasure must be final.
-- A batch reported the refusal as `infrastructure_error`. That reason tells
-  the operator to retry, which never helps.
+- Setting the flag in batch was not enough. Batch reported every fork error as
+  `infrastructure_error`. That type tells the operator to retry, and a retry
+  never clears an erasure.
 
 So the engine now refuses an erased source without a flag, and the flag is
-gone. A new fork path, such as the non-destructive fork of issue #2000, gets
-the refusal from the engine. If a new path does not call
-`reset_workflow_execution`, it must call the same check under its own row lock
-and add a row to the tables above.
+gone. A new fork path that calls `reset_workflow_execution`, such as the
+non-destructive fork of issue #2000, gets the refusal from the engine. A new
+path that does not call it must call `erase::execution_input_is_erased` under
+its own row lock. It must also add a row to the tables above.
 
 ## Batch skip reasons
 
@@ -72,4 +74,9 @@ A batch reset never drops a run. Each item has `outcome` set to `reset`,
 | `continue_as_new` | The history holds `WorkflowContinuedAsNew`. | No |
 | `no_matching_activity` | `first_activity_run` found no matching activity. | No |
 | `invalid_boundary` | The resolved event is not a clean boundary. | Use the nearest valid id. |
-| `infrastructure_error` | A database or engine failure stopped the run. | Yes |
+| `infrastructure_error` | A database error, or a fork-time refusal other than erasure, such as a held durable mutex. `message` names the cause. | Sometimes. Read `message` first. |
+
+The batch checks each run twice. A first pass reads the row without a lock and
+skips what it can. The fork then rechecks under its row lock. A skip from the
+fork keeps the `resolved_event_id` of the first pass. A skip from the first
+pass has none.

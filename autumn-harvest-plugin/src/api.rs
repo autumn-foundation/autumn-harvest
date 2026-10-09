@@ -25592,9 +25592,9 @@ fn dag_retry_reset_error_response(error: WorkflowResetError) -> axum::response::
     match error {
         WorkflowResetError::InvalidPoint(invalid) => dag_retry_invalid_point_response(&invalid),
         // Same `409` and the same operator instruction as the DAG-retry
-        // pre-flight guard. A caller cannot tell whether the erasure was
-        // already committed or landed in the race window. It only learns that
-        // the source is unusable and that a fresh run is the answer.
+        // pre-flight guard. A caller cannot tell whether the erasure committed
+        // before the pre-flight check or in the race window. It only learns
+        // that the source is unusable and that a fresh run is the answer.
         WorkflowResetError::ErasedSource { exec_id } => (
             axum::http::StatusCode::CONFLICT,
             Json(ResetErrorResponse {
@@ -25941,8 +25941,8 @@ pub(crate) async fn retry_dag_run_inner(
     // The pre-flight erasure guard above ran on an unlocked read. The
     // connection was then dropped for blob inflation, so `erase-payloads` can
     // commit before this transaction opens. The fork rechecks erasure under its
-    // own row lock (issue #1999). The issue #780 compensated-run guard thus
-    // never decides on evidence that no longer exists.
+    // own row lock (issue #1999). So the fork never acts on an issue #780
+    // guard decision whose evidence an erasure destroyed.
     let augmented_reason = format!(
         "{} | dag_retry: nodes=[{}]",
         reason.trim(),
@@ -52226,6 +52226,47 @@ mod tests {
                 "human_message must be non-empty for {variant:?}"
             );
         }
+    }
+
+    /// Read the `message` of a reset error response.
+    async fn reset_error_message(response: axum::response::Response) -> (StatusCode, String) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body must be readable");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
+        (
+            status,
+            body["message"].as_str().unwrap_or_default().to_string(),
+        )
+    }
+
+    /// Every fork refuses an erased source (issue #1999). The shared reset
+    /// `409` names no DAG. DAG retry keeps its own advice for the race window.
+    #[tokio::test]
+    async fn erased_source_409_is_generic_for_reset_and_specific_for_dag_retry() {
+        use autumn_harvest::reset::WorkflowResetError;
+        use autumn_harvest::types::{ExecutionId, ShardId};
+
+        let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+
+        let (status, message) =
+            reset_error_message(reset_error_response(WorkflowResetError::ErasedSource {
+                exec_id,
+            }))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(message.contains("erased"), "message: {message}");
+        assert!(message.contains("fresh run"), "message: {message}");
+        assert!(!message.contains("DAG"), "message: {message}");
+
+        let (status, message) = reset_error_message(dag_retry_reset_error_response(
+            WorkflowResetError::ErasedSource { exec_id },
+        ))
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(message.contains("erased"), "message: {message}");
+        assert!(message.contains("fresh DAG run"), "message: {message}");
     }
 
     /// The bulk DLQ `min_attempts` guard (issue #613): `>= 1` is accepted, but
