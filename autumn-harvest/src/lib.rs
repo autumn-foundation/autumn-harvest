@@ -511,6 +511,9 @@ pub mod timeline;
 pub mod trace_export;
 pub mod types;
 pub mod update;
+/// Pre-deploy upgrade verdict for each in-flight run (issue #1995).
+#[cfg(any(test, feature = "testing"))]
+pub mod upgrade_check;
 /// Read-only per-tenant/per-workflow usage aggregation (issue #596).
 ///
 /// Pure wire-format types compile without the `db` feature;

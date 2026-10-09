@@ -609,7 +609,10 @@ behaviour change). Those deploys can use the plain drain runbook above.
 ## Scenario A: Backward-compatible deploy (new code can replay old history)
 
 Use this when your replay test suite (e.g. `WorkflowReplayer`) confirms the new
-build handles all in-flight histories safely.
+build handles all in-flight histories safely. The
+[upgrade check](../upgrade-check.md) gives that answer per in-flight run.
+Declare compat only when each run gets `migrate`, or a person accepts each
+`review` finding.
 
 **Step 1 — Deploy new workers with the new build id.**
 
