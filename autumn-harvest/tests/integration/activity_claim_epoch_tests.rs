@@ -473,6 +473,35 @@ async fn stale_claim_cannot_complete_the_row_directly() {
     assert_eq!(row(&mut conn, fx.task_id).await, before);
 }
 
+/// The public `complete_task` refuses a stale claim (issue #1992).
+#[tokio::test]
+async fn stale_owner_cannot_complete_a_reclaimed_row_through_complete_task() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let fx = seed_activity(&mut conn).await;
+    let (a, b) = a_then_b(&mut conn, &fx).await;
+    let before = row(&mut conn, fx.task_id).await;
+
+    let stale = queue::complete_task(&mut conn, a.id, serde_json::json!("from A")).await;
+
+    assert!(
+        matches!(stale, Err(autumn_harvest::HarvestError::NotFound(_))),
+        "a stale claim must not complete the row, got: {stale:?}"
+    );
+    assert_eq!(
+        row(&mut conn, fx.task_id).await,
+        before,
+        "A's stale completion must leave B's claim untouched"
+    );
+
+    queue::complete_task(&mut conn, b.id, serde_json::json!("from B"))
+        .await
+        .expect("B completes");
+    let after = row(&mut conn, fx.task_id).await;
+    assert_eq!(after.state, "COMPLETED");
+    assert_eq!(after.output, Some(serde_json::json!("from B")));
+}
+
 // ---------------------------------------------------------------------------
 // Failure and retry
 // ---------------------------------------------------------------------------
