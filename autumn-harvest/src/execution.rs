@@ -1465,14 +1465,14 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         workflow_id: request.workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: shard_id_value,
-        input: request.input.clone(),
+        input: codecs.encode_shared_column(&request.input)?,
         parent_id: request.parent_id,
         queue_name: request.queue_name,
         execution_timeout: effective_timeout,
         deadline_at,
         sla: effective_sla,
         sla_deadline_at,
-        memo: request.memo.clone(),
+        memo: codecs.encode_column_opt(request.memo.as_ref())?,
         search_attrs: request.search_attrs.clone(),
         assigned_build_id: assigned_build.clone(),
         parent_close_policy: None, // root or awaited child; detached uses worker path
@@ -1505,7 +1505,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     let mut enqueue = EnqueueParams::new(
         request.queue_name.to_owned(),
         TaskType::Workflow,
-        request.input.clone(),
+        row.input.clone(),
     );
     enqueue.workflow_exec_id = Some(exec_id.as_uuid());
     enqueue.required_build_id = assigned_build.clone();
@@ -1841,7 +1841,14 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             // guard — the new row has state RUNNING, not COMPLETED, so it
             // can never match, but the explicit exclusion is defensive.
             let (carryover_result, carryover_error) = if let Some(sched_id) = request.schedule_id {
-                resolve_carryover(conn, sched_id, exec_id.as_uuid(), request.scheduled_for).await?
+                resolve_carryover(
+                    conn,
+                    sched_id,
+                    exec_id.as_uuid(),
+                    request.scheduled_for,
+                    codecs,
+                )
+                .await?
             } else {
                 (None, None)
             };
@@ -3491,7 +3498,14 @@ async fn replace_execution(
     // the rerun (and any continue-as-new fork from it) must see the previous fire's
     // carryover rather than behaving like a first scheduled run.
     let (carryover_result, carryover_error) = if let Some(sched_id) = request.schedule_id {
-        resolve_carryover(conn, sched_id, new_exec_id.as_uuid(), request.scheduled_for).await?
+        resolve_carryover(
+            conn,
+            sched_id,
+            new_exec_id.as_uuid(),
+            request.scheduled_for,
+            codecs,
+        )
+        .await?
     } else {
         (None, None)
     };
@@ -7414,6 +7428,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
                     request.signal_name,
                     request.signal_payload,
                     request.idempotency_key.as_deref(),
+                    codecs,
                 )
                 .await?
             } else {
@@ -7972,11 +7987,18 @@ pub async fn rerun_workflow_execution_with_codecs(
             // polluting `?search_attr=` filtering and misleading compliance
             // tooling into believing the new run had been erased. Drop them.
             // (`context_headers` is NULLed rather than tombstoned by the row
-            // scrub, so it needs no equivalent test.)
-            let source_memo = source
-                .memo
-                .clone()
+            // scrub. So it needs no equivalent test.)
+            //
+            // The start path below encodes memo and input itself, so it needs
+            // the plaintext (issue #1979). A tombstone is not an envelope, so
+            // it decodes to itself and the filter still sees it.
+            let source_memo = codecs
+                .decode_column_opt(source.memo.as_ref())?
                 .filter(|v| !crate::erase::is_erasure_tombstone(v));
+            let source_input = match &request.input_override {
+                Some(input) => input.clone(),
+                None => codecs.decode_column(&source.input)?,
+            };
 
             // Strip the six replay-non-determinism diagnostic keys (issue #603):
             // a re-run has never diverged, so it must not display a phantom
@@ -8026,14 +8048,9 @@ pub async fn rerun_workflow_execution_with_codecs(
                 workflow_id: target_wf_id,
                 // Stay on the source's shard: a re-run is the same logical work.
                 exec_id: ExecutionId::new_for_shard(source_shard),
-                // VERBATIM — never decoded. `source.input` is byte-for-byte what
-                // the original start wrote, so decoding here would corrupt an
-                // encrypting deployment's re-run (and re-encrypt on write).
-                input: request
-                    .input_override
-                    .clone()
-                    .unwrap_or_else(|| source.input.clone())
-                    .into(),
+                // Decoded above. The start path encodes it once more, under
+                // the active key (issue #1979).
+                input: source_input.into(),
                 parent_id: None,
                 queue_name: &source.queue_name,
                 // The row value IS the effective (already ceiling-clamped) timeout.
@@ -8347,11 +8364,12 @@ async fn stage_signal_with_idempotency(
     signal_name: &str,
     payload: serde_json::Value,
     idempotency_key: Option<&str>,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<bool> {
     let row = NewHarvestSignal {
         workflow_exec_id: exec_id.as_uuid(),
         signal_name,
-        payload,
+        payload: codecs.encode_column(&payload)?,
         idempotency_key,
     };
 
@@ -8852,7 +8870,8 @@ pub async fn lookup_idempotent_update_dedupe(
 /// wins rather than an arbitrary older terminated row.
 ///
 /// Returns `(last_completion_result, last_error)` where:
-/// - `last_completion_result` = `output` of the highest earlier-slot COMPLETED fire.
+/// - `last_completion_result` = `output` of the highest earlier-slot COMPLETED fire,
+///   decoded with `codecs` (issue #1979).
 /// - `last_error` = `error` of the highest earlier-slot terminal fire if it was
 ///   `FAILED`/`TIMED_OUT`; `None` if that fire `COMPLETED`/`CANCELLED`/`TERMINATED`.
 async fn resolve_carryover(
@@ -8860,6 +8879,7 @@ async fn resolve_carryover(
     schedule_id: uuid::Uuid,
     current_exec_id: uuid::Uuid,
     current_scheduled_for: Option<chrono::DateTime<chrono::Utc>>,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(Option<serde_json::Value>, Option<String>)> {
     use crate::schema::harvest_workflow_executions::dsl;
     use diesel::prelude::*;
@@ -8889,6 +8909,9 @@ async fn resolve_carryover(
         .optional()
         .map_err(database_error)?
         .flatten();
+    // The new `WorkflowStarted` event encodes the carryover itself, so it
+    // needs the plaintext, not a stored envelope (issue #1979).
+    let last_completion_result = codecs.decode_column_opt(last_completion_result.as_ref())?;
 
     // Highest earlier-slot terminal fire for this schedule, across *all* terminal states
     // (COMPLETED, FAILED, TIMED_OUT, CANCELLED, TERMINATED). Surfacing an error only
@@ -9710,9 +9733,60 @@ pub enum ExternalAwaitReadResult {
 /// is followed through its successor chain (same-shard) to the true terminal.
 ///
 /// **Never mutates the target or creates any linkage** — a pure read.
+///
+/// This form decodes the target's output with the identity registry. An
+/// envelope under another codec reads as still pending. Use
+/// [`read_external_await_outcome_with_codecs`] on a deployment that encodes
+/// columns (issue #1979).
+///
+/// # Errors
+///
+/// As [`read_external_await_outcome_with_codecs`].
 pub async fn read_external_await_outcome(
     conn: &mut AsyncPgConnection,
     target: ExecutionId,
+) -> HarvestResult<ExternalAwaitReadResult> {
+    read_external_await_outcome_with_codecs(conn, target, &store::DEFAULT_PAYLOAD_CODECS).await
+}
+
+/// The target's decoded output for an external await (issue #1979), or
+/// `None` when this registry cannot decode it.
+///
+/// A missing key must not fail the whole outbox tick, so the caller keeps the
+/// await pending. The codec error text is not logged.
+fn decoded_await_output(
+    codecs: &crate::payload_codec::PayloadCodecs,
+    target: ExecutionId,
+    execution: &WorkflowExecution,
+) -> Option<serde_json::Value> {
+    codecs
+        .decode_column_opt(execution.output.as_ref())
+        .map_or_else(
+            |_| {
+                tracing::warn!(
+                    target_exec_id = %target,
+                    "external await: the target output could not be decoded; staying pending"
+                );
+                None
+            },
+            |output| Some(output.unwrap_or(serde_json::Value::Null)),
+        )
+}
+
+/// [`read_external_await_outcome`], decoding the target's output column with
+/// `codecs` (issue #1979).
+///
+/// An output this registry cannot decode reads as
+/// [`ExternalAwaitReadResult::NotYetTerminal`], so the await stays pending
+/// and the outbox retries it.
+///
+/// # Errors
+///
+/// Propagates database failures.
+pub async fn read_external_await_outcome_with_codecs(
+    conn: &mut AsyncPgConnection,
+    target: ExecutionId,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<ExternalAwaitReadResult> {
     let mut current = target;
     for hop in 0..AWAIT_OUTCOME_CHAIN_MAX_HOPS {
@@ -9737,14 +9811,14 @@ pub async fn read_external_await_outcome(
         let state = reported_outcome_state(conn, current, &execution.state).await?;
         let outcome = match state {
             "COMPLETED" => {
-                // The target's `output` row column is read RAW. Core
-                // `append_events`/`load_history` use the identity codec (payload
-                // codecs are a plugin-layer concern), so on a codec-encrypting
-                // deployment this is the ciphertext envelope — the awaiter freezes
-                // it inflated into its own history, mirroring the `FAILED`-path
-                // `details` caveat below. A large output is copied inline without
-                // offloading (a documented future optimization — issue #757).
-                ExternalAwaitOutcome::Completed(execution.output.unwrap_or(serde_json::Value::Null))
+                // The `output` column can hold an envelope (issue #1979). The
+                // awaiter freezes the plaintext into its history, where the
+                // event codec encodes it again. A large output is copied
+                // inline, not offloaded (issue #757).
+                let Some(output) = decoded_await_output(codecs, current, &execution) else {
+                    return Ok(ExternalAwaitReadResult::NotYetTerminal);
+                };
+                ExternalAwaitOutcome::Completed(output)
             }
             "FAILED" => {
                 // The typed failure cause (issue #767) lives in the terminal

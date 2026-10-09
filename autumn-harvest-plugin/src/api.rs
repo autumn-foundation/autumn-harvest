@@ -1258,7 +1258,11 @@ impl HarvestApiState {
             WorkflowHandleClient::new(pool.sharded_pool().clone(), runtime.router().clone(), urls)
                 // Issue #684: wire the engine recorder so the in-process typed-update
                 // path emits harvest.update.admitted.
-                .with_metrics(runtime.registry.telemetry().metrics.clone()),
+                .with_metrics(runtime.registry.telemetry().metrics.clone())
+                // Issue #1979: the route decodes the output itself, through the
+                // gated read-path decoder (issue #608).
+                .with_codecs(self.payload_codecs())
+                .with_stored_result_output(),
         )
     }
 
@@ -6507,6 +6511,13 @@ pub(crate) const fn decode_gate(flag: bool, is_admin: bool) -> bool {
     flag && is_admin
 }
 
+/// The error a route returns when a stored codec column does not decode
+/// (issue #1979). It never carries the codec's own error text, which is
+/// embedder-controlled.
+fn undecodable_stored_payload() -> HarvestError {
+    HarvestError::Config("a stored payload could not be decoded".to_string())
+}
+
 /// Resolve the codec registry for read-path decoding, or `None` when this
 /// request must see today's bytes (issue #608).
 ///
@@ -6821,12 +6832,12 @@ pub(crate) fn decode_workflow_execution_fields(
     execution: &mut WorkflowExecution,
     codecs: &PayloadCodecs,
 ) -> LossyDecodeOutcome {
-    let mut outcome = codecs.decode_value_lossy(&mut execution.input);
+    let mut outcome = codecs.decode_column_lossy(&mut execution.input);
     if let Some(output) = execution.output.as_mut() {
-        outcome = outcome.merged(codecs.decode_value_lossy(output));
+        outcome = outcome.merged(codecs.decode_column_lossy(output));
     }
     if let Some(memo) = execution.memo.as_mut() {
-        outcome = outcome.merged(codecs.decode_value_lossy(memo));
+        outcome = outcome.merged(codecs.decode_column_lossy(memo));
     }
     if let Some(search_attrs) = execution.search_attrs.as_mut() {
         outcome = outcome.merged(codecs.decode_value_lossy(search_attrs));
@@ -11993,7 +12004,7 @@ async fn respond_with_workflow_result(
     if let Some(codecs) = decoder {
         let mut outcome = LossyDecodeOutcome::default();
         if let Some(output) = result.output.as_mut() {
-            outcome = outcome.merged(codecs.decode_value_lossy(output));
+            outcome = outcome.merged(codecs.decode_column_lossy(output));
         }
         if let Some(error) = result.error.as_mut() {
             outcome = outcome.merged(decode_error_field(codecs, error));
@@ -13771,7 +13782,11 @@ pub(crate) async fn build_awaitables_report(
             {
                 ctx.register_declarative_update_handler(h);
             }
-            let input = std::mem::take(&mut execution.input);
+            // The replayed handler gets the plaintext input (issue #1979).
+            let input = api_state
+                .payload_codecs()
+                .decode_column(&std::mem::take(&mut execution.input))
+                .map_err(|_| map_error(undecodable_stored_payload()))?;
             let outcome =
                 drive_query_replay_async(&ctx, workflow.handler, input, api_state.query_timeout())
                     .await;
@@ -16110,7 +16125,7 @@ async fn get_workflow_stack(
                     decode_outcome = decode_outcome.merged(codecs.decode_value_lossy(checkpoint));
                 }
                 let mut input = t.input;
-                decode_outcome = decode_outcome.merged(codecs.decode_value_lossy(&mut input));
+                decode_outcome = decode_outcome.merged(codecs.decode_column_lossy(&mut input));
                 Some(input)
             } else {
                 None
@@ -23775,9 +23790,23 @@ async fn rerun_workflow(
             .into_response();
     }
 
-    let effective_input = input_override
-        .clone()
-        .unwrap_or_else(|| source.input.clone());
+    // The start path encodes the input itself, so it gets the plaintext
+    // (issue #1979).
+    let effective_input = if let Some(input) = input_override.clone() {
+        input
+    } else if let Ok(input) = api_state.payload_codecs().decode_column(&source.input) {
+        input
+    } else {
+        // A rejected re-run is audited like every other rejection.
+        audit_rerun_failure_on(
+            &mut conn,
+            &audit_ctx,
+            Some(&exec_id_str),
+            "stored input could not be decoded",
+        )
+        .await;
+        return map_error(undecodable_stored_payload()).into_response();
+    };
 
     // Deferred-start policies are incompatible with a re-run: they admit the
     // start without creating an execution, so there is no execution_id to
@@ -26195,13 +26224,14 @@ pub(crate) async fn signal_workflow(
             Ok(b) => b,
             Err(e) => return map_error(e).into_response(),
         };
-        signal::send_signal_from_resolved(
+        signal::send_signal_from_resolved_with_codecs(
             bound.as_mut(),
             exec_id,
             target,
             &signal_name,
             payload,
             idempotency_key.as_deref(),
+            &api_state.payload_codecs(),
         )
         .await
     };
@@ -26410,13 +26440,13 @@ async fn hydrate_ctx_for_query(
     // resolve via pre-sent oneshot channels so the entire history replays
     // synchronously; this is read-only and appends no events / performs no
     // writes (issue #612 AC4).
-    let outcome = drive_query_replay_async(
-        &ctx,
-        workflow.handler,
-        execution.input.clone(),
-        api_state.query_timeout(),
-    )
-    .await;
+    // The replayed handler gets the plaintext input (issue #1979).
+    let input = api_state
+        .payload_codecs()
+        .decode_column(&execution.input)
+        .map_err(|_| map_error(undecodable_stored_payload()))?;
+    let outcome =
+        drive_query_replay_async(&ctx, workflow.handler, input, api_state.query_timeout()).await;
 
     if terminal {
         // Drift guard (Codex P2, PR #986 follow-up): if the driven handler
@@ -32509,7 +32539,7 @@ async fn list_dead_letters(
         // only; one audit row per request that touched ≥1 envelope.
         let mut outcome = LossyDecodeOutcome::default();
         for dl in &mut dead_letters {
-            outcome = outcome.merged(codecs.decode_value_lossy(&mut dl.input));
+            outcome = outcome.merged(codecs.decode_column_lossy(&mut dl.input));
             outcome = outcome.merged(decode_error_field(codecs, &mut dl.error));
         }
         // No live connection here: the per-shard DLQ loads are scoped inside

@@ -270,6 +270,31 @@ pub struct WorkflowExecution {
 }
 
 impl WorkflowExecution {
+    /// Decode the codec columns in place: `input`, `output` and `memo`
+    /// (issue #1979).
+    ///
+    /// Call this before the engine reads a column's meaning. A value that is
+    /// not an envelope stays as it is.
+    ///
+    /// # Errors
+    ///
+    /// As [`PayloadCodecs::decode_column`](crate::payload_codec::PayloadCodecs::decode_column).
+    /// On error the row is left unchanged.
+    pub fn decode_columns(
+        &mut self,
+        codecs: &crate::payload_codec::PayloadCodecs,
+    ) -> crate::error::HarvestResult<()> {
+        let input = codecs.decode_column(&self.input)?;
+        let output = codecs.decode_column_opt(self.output.as_ref())?;
+        let memo = codecs.decode_column_opt(self.memo.as_ref())?;
+        self.input = input;
+        self.output = output;
+        self.memo = memo;
+        Ok(())
+    }
+}
+
+impl WorkflowExecution {
     /// The state a reuse-policy decision should judge this row by (fresh
     /// review, P2 follow-up).
     ///

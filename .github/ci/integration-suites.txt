@@ -51,6 +51,7 @@ allos        autumn-harvest         integration                      -          
 allos        autumn-harvest         integration                      -                          lock_order_docs
 allos        autumn-harvest         integration                      -                          otel_semconv_docs
 allos        autumn-harvest         integration                      -                          partitioned_events_docs
+allos        autumn-harvest         integration                      -                          standalone_activity_docs
 allos        autumn-harvest         integration                      -                          tenant_isolation_docs
 allos        autumn-harvest         integration                      fuzzing                    replay_fuzz_seeds
 allos        autumn-harvest         integration                      testing                    -
@@ -73,7 +74,6 @@ allos        autumn-harvest-plugin  standalone_admin_auth            -          
 allos        autumn-harvest-plugin  standalone_mount                 -                          -
 allos        autumn-harvest-plugin  standalone_webhook_mount         webhooks                   -
 compileonly  autumn-harvest-plugin  dev_runtime_managed              dev-runtime-managed        -
-compileonly  autumn-harvest-plugin  mcp_tools_integration            mcp,unified-dag-execution  -
 compileonly  autumn-harvest-plugin  status_summary_localpg           -                          -
 linux        autumn-harvest         integration                      -                          active_workflow_gauge_tests
 linux        autumn-harvest         integration                      -                          activity_claim_epoch_tests
@@ -107,6 +107,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          claim_continuation_priority_tests
 linux        autumn-harvest         integration                      -                          claim_run_deadline_tests
 linux        autumn-harvest         integration                      -                          claim_seek_tests
+linux        autumn-harvest         integration                      -                          codec_column_coverage_tests
 linux        autumn-harvest         integration                      -                          completion_callback_outcome_batch_perf
 linux        autumn-harvest         integration                      -                          completion_callback_tests
 linux        autumn-harvest         integration                      -                          completion_trigger_outbox_queue_perf
@@ -118,6 +119,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          ctx_info_tests
 linux        autumn-harvest         integration                      -                          dag_execution_timeout_tests
 linux        autumn-harvest         integration                      -                          debounce_tests
+linux        autumn-harvest         integration                      -                          deep_backlog_fixture_tests
 linux        autumn-harvest         integration                      -                          delayed_start_tests
 linux        autumn-harvest         integration                      -                          drain_release_tests
 linux        autumn-harvest         integration                      -                          dst_differential_tests
@@ -189,6 +191,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          signal_with_start_tests
 linux        autumn-harvest         integration                      -                          sla_breach_tests
 linux        autumn-harvest         integration                      -                          slot_tuner_tests
+linux        autumn-harvest         integration                      -                          standalone_activity_overhead_perf
 linux        autumn-harvest         integration                      -                          start_idempotency_tests
 linux        autumn-harvest         integration                      -                          start_source_tests
 linux        autumn-harvest         integration                      -                          sticky_default_tests
@@ -279,6 +282,7 @@ linux        autumn-harvest-plugin  interface_schema_integration     -          
 linux        autumn-harvest-plugin  legal_hold_integration           -                          -
 linux        autumn-harvest-plugin  lineage_tree_integration         -                          -
 linux        autumn-harvest-plugin  load_shed_localpg                -                          -
+linux        autumn-harvest-plugin  mcp_tools_integration            mcp,unified-dag-execution  -
 linux        autumn-harvest-plugin  openapi_response_conformance     -                          -
 linux        autumn-harvest-plugin  outbox_integration               -                          -
 linux        autumn-harvest-plugin  pacing_override_integration      -                          -
@@ -322,6 +326,7 @@ linux        autumn-harvest-plugin  triage_integration               -          
 linux        autumn-harvest-plugin  ui_integration                   -                          -
 linux        autumn-harvest-plugin  usage_integration                -                          -
 linux        autumn-harvest-plugin  version_usage_integration        -                          -
+linux        autumn-harvest-plugin  webhook_durable_integration      webhooks                   -
 linux        autumn-harvest-plugin  webhook_receiver_integration     webhooks                   -
 linux        autumn-harvest-plugin  worker_shard_filter_integration  -                          -
 linux        autumn-harvest-plugin  workflow_children_traversal_perf -                          -

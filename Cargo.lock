@@ -413,6 +413,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "autumn-harvest-agent"
+version = "0.7.0"
+dependencies = [
+ "autumn-harvest",
+ "autumn-harvest-sqlite",
+ "chrono",
+ "futures",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "autumn-harvest-cli"
 version = "0.7.0"
 dependencies = [
@@ -1631,6 +1648,7 @@ name = "claude-agent-daemon"
 version = "0.7.0"
 dependencies = [
  "autumn-harvest",
+ "autumn-harvest-agent",
  "autumn-harvest-sqlite",
  "clap",
  "libc",

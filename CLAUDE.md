@@ -141,6 +141,10 @@ mutation of the **task queue** row, not of the event log. The `#2` / `#3`
 numbering above is kept because the issues and their PRs use it, but there are
 two `event_data` writers, not three.
 
+The rotation sweep also rewrites `codec_rotation::CODEC_COLUMNS` (issue
+#1979). Those tables are not append-only, so that pass is not an exception.
+`the_column_sweep_loses_to_an_erasure` proves that it loses to an erasure.
+
 If you add another exception, it belongs in this list, with its own scope
 guarantee and its own proof.
 

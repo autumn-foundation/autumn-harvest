@@ -4,12 +4,10 @@
 //! Requires Docker. In sandboxes without a Docker daemon these tests are
 //! compile-checked with `cargo test --no-run` (repo precedent: #543/#544).
 //!
-//! Mirrors `webhook_durable_integration.rs`'s harness shape
-//! (`TestApp::plugin` + `TestDb::shared()` +
-//! `autumn_web::migrate::run_pending`) rather than the hand-rolled
-//! per-migration `INIT_SQL` pattern some other integration tests use --
-//! that pattern needs the full harvest migration set enumerated by hand
-//! and buys nothing extra here.
+//! The harness is `TestApp::plugin` + `TestDb::shared()` +
+//! `autumn_web::migrate::run_pending`. `TestDb` starts Postgres 11, and a
+//! second `run_pending` call skips six Harvest migrations.
+//! `webhook_durable_integration.rs` shows the fixed shape (issue #1959).
 
 #![cfg(feature = "webhooks")]
 #![allow(
