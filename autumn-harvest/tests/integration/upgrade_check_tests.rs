@@ -658,6 +658,22 @@ async fn an_offloaded_payload_with_no_offloader_needs_review() {
     assert_eq!(kinds(&run), [FindingKind::PayloadOffloaded]);
 }
 
+/// Business data can hold a nested value shaped like a claim check. The
+/// offloader replaces only direct payload fields, so it is not offloaded.
+#[tokio::test]
+async fn a_nested_claim_check_shape_is_business_data() {
+    let mut events = vec![started()];
+    events.extend(reserve_done(json!({
+        "amount": 5,
+        "note": { "_harvest_offload_envelope": 1, "store_id": "s3", "key": "k" }
+    })));
+    let run = unchanged_check().check_snapshot(snapshot(events)).await;
+    assert!(
+        !kinds(&run).contains(&FindingKind::PayloadOffloaded),
+        "{run:#?}"
+    );
+}
+
 #[tokio::test]
 async fn manifests_from_two_toolchains_need_review() {
     let baseline = manifest(vec![order_graph(&[])]);

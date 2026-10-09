@@ -259,7 +259,9 @@ impl<'p> StructureBuilder<'p> {
         for id in &ids {
             self.digest(id);
         }
-        let display = self.display_ids(&ids);
+        let (display, ambiguous) = self.display_ids(&ids);
+        let mut boundaries = boundaries;
+        boundaries.extend(ambiguous);
         let show = |id: &str| {
             display
                 .get(id)
@@ -335,12 +337,14 @@ impl<'p> StructureBuilder<'p> {
         }
     }
 
-    /// Display ids, unique within the workflow.
+    /// Display ids, unique within the workflow, and a boundary per collision.
     ///
     /// Two bodies can normalize to one id, such as two impls of one method in
     /// one file. They get `#2`, `#3` in digest order, which a line shift
-    /// cannot change.
-    fn display_ids(&self, ids: &[&String]) -> BTreeMap<String, String> {
+    /// cannot change. But the suffix follows the content, not the body. Two
+    /// bodies that swap code between builds keep the same pairs. So each
+    /// collision is also a boundary, and the upgrade check asks for review.
+    fn display_ids(&self, ids: &[&String]) -> (BTreeMap<String, String>, Vec<String>) {
         let mut groups: BTreeMap<String, Vec<(&str, &str)>> = BTreeMap::new();
         for id in ids {
             let base = normalize(&self.program.qualified_name(id), None);
@@ -348,7 +352,11 @@ impl<'p> StructureBuilder<'p> {
             groups.entry(base).or_default().push((digest, id.as_str()));
         }
         let mut out = BTreeMap::new();
+        let mut ambiguous = Vec::new();
         for (base, mut members) in groups {
+            if members.len() > 1 {
+                ambiguous.push(format!("ambiguous-body-id: {base}"));
+            }
             members.sort_unstable();
             for (n, (_, id)) in members.into_iter().enumerate() {
                 let shown = if n == 0 {
@@ -359,7 +367,7 @@ impl<'p> StructureBuilder<'p> {
                 out.insert(id.to_string(), shown);
             }
         }
-        out
+        (out, ambiguous)
     }
 
     // ── digest ──────────────────────────────────────────────────────────────

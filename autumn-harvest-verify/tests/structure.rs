@@ -85,7 +85,8 @@ fn the_manifest_names_its_format_and_every_workflow() {
             "wf_param_key",
             "wf_root_changed",
             "wf_signal",
-            "wf_steps"
+            "wf_steps",
+            "wf_twin"
         ]
     );
     for w in &m.workflows {
@@ -300,6 +301,27 @@ fn a_changed_span_like_string_literal_changes_the_digest() {
     assert_ne!(
         body(a, "tagged::{closure#0}").digest,
         body(b, "tagged::{closure#0}").digest
+    );
+}
+
+#[test]
+fn two_bodies_with_one_id_are_a_boundary() {
+    // The suffix follows the digest, not the body, so a swap between builds
+    // would hide. The collision must force a review.
+    let m = manifest("upgrade_baseline");
+    let w = workflow(&m, "wf_twin");
+    assert!(
+        w.boundaries
+            .iter()
+            .any(|b| b.starts_with("ambiguous-body-id: ") && b.contains("::run::")),
+        "{:#?}",
+        w.boundaries
+    );
+    let plain = workflow(&m, "wf_steps");
+    assert!(
+        !plain.boundaries.iter().any(|b| b.starts_with("ambiguous")),
+        "{:#?}",
+        plain.boundaries
     );
 }
 

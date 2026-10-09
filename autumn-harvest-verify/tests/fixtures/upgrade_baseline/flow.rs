@@ -228,3 +228,30 @@ pub fn __autumn_workflow_info_wf_literal() -> u8 {
 pub async fn wf_literal(ctx: &WorkflowContext) -> Result<u64, String> {
     tagged(ctx).await
 }
+
+pub struct Alpha;
+pub struct Beta;
+
+/// Two impls of one method name in one file normalize to one id.
+impl Alpha {
+    pub async fn run(ctx: &WorkflowContext) -> Result<u64, String> {
+        ctx.execute_activity_raw("alpha", 1).await
+    }
+}
+
+impl Beta {
+    pub async fn run(ctx: &WorkflowContext) -> Result<u64, String> {
+        ctx.execute_activity_raw("beta", 2).await
+    }
+}
+
+pub fn __autumn_workflow_info_wf_twin() -> u8 {
+    0
+}
+
+/// Calls both same-name methods.
+pub async fn wf_twin(ctx: &WorkflowContext) -> Result<u64, String> {
+    let a = Alpha::run(ctx).await?;
+    let b = Beta::run(ctx).await?;
+    Ok(a + b)
+}

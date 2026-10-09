@@ -188,7 +188,13 @@ fn finish_verdicts(
     // It is empty unless the run asked for it.
     for (shape, verdict) in structures.iter_mut().zip(workflows.iter()) {
         shape.workflow.clone_from(&verdict.workflow);
-        shape.boundaries = analysis::structure_boundaries(&verdict.boundaries);
+        // Keep the boundaries the structure adds itself, such as an
+        // ambiguous body id.
+        shape
+            .boundaries
+            .extend(analysis::structure_boundaries(&verdict.boundaries));
+        shape.boundaries.sort_unstable();
+        shape.boundaries.dedup();
     }
 }
 

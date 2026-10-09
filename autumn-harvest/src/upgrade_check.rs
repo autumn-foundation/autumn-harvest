@@ -649,9 +649,7 @@ impl UpgradeCheck {
                 FindingKind::WorkflowNotRegistered,
                 format!("the candidate build has no handler for `{name}`"),
             ));
-        } else if self.offloader.is_none()
-            && has_offloaded_payload(&snapshot.events, pending_signals)
-        {
+        } else if self.offloader.is_none() && has_offloaded_payload(&snapshot.events) {
             // A claim-check stub is not the payload. Replay and schema checks
             // over it would pin a run that may well fit, so neither runs.
             findings.push(Finding::new(
@@ -959,23 +957,25 @@ fn shard_of(execution_id: ExecutionId, shards: &[ShardId]) -> ShardId {
     shards.first().copied().unwrap_or(encoded)
 }
 
-/// A payload in `events` or `pending` is a claim-check reference.
-fn has_offloaded_payload(events: &[WorkflowEvent], pending: &[PendingSignal]) -> bool {
-    fn walk(value: &serde_json::Value) -> bool {
-        if crate::payload_store::is_offload_envelope(value) {
-            return true;
-        }
-        match value {
-            serde_json::Value::Array(items) => items.iter().any(walk),
-            serde_json::Value::Object(map) => map.values().any(walk),
-            _ => false,
-        }
-    }
+/// A payload field of `events` is a claim-check reference.
+///
+/// The offloader replaces only the direct payload fields of an event's
+/// `data`, and never a pending signal. So only those fields count. A nested
+/// value with the same shape is business data.
+fn has_offloaded_payload(events: &[WorkflowEvent]) -> bool {
     events
         .iter()
         .filter_map(|e| serde_json::to_value(e).ok())
-        .any(|v| walk(&v))
-        || pending.iter().any(|s| walk(&s.payload))
+        .any(|v| {
+            v.get("data")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|data| {
+                    crate::payload_store::PAYLOAD_FIELD_KEYS
+                        .iter()
+                        .filter_map(|key| data.get(*key))
+                        .any(crate::payload_store::is_offload_envelope)
+                })
+        })
 }
 
 const fn plural_y(n: usize) -> &'static str {

@@ -253,7 +253,9 @@ Each workflow lists every body it can reach:
 | `calls` | Each call site. `in_loop` marks a call in a cycle of the caller's control flow, or a closure that the caller passes to another call. `resume` marks a call that handles an existing future, such as `poll`. |
 | `steps` | Each command the body emits. `kind` comes from the `step` field of the model's `[[sink]]` row, or of a `[[non_sink]]` row that can park the workflow, such as `await_condition`. `key` is the step name, such as the activity name, when the MIR shows it. |
 
-The workflow also lists its `unknown` boundaries. An activity body is not in
+The workflow also lists its `unknown` boundaries. Two bodies whose ids
+normalize to the same text add an `ambiguous-body-id` boundary, because
+their `#2` suffix follows the digest, not the body. An activity body is not in
 the graph: a workflow names an activity through its `X_info()` function and
 never calls the body.
 
