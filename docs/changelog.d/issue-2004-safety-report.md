@@ -18,8 +18,11 @@ wrote the pending signals of the source run in one INSERT. Each new row took
 a default `received_at`, so every row got the same `NOW()`. The random row id
 then set the order in which the new run read them. `reapply_or_drop_signals`
 now copies the source `received_at`, as continue-as-new already does. Rows
-that share one `received_at` have no defined order, as on the source run. No
-migration and no new `WorkflowEvent` variant.
+that share one `received_at` have no defined order, as on the source run. A
+keyed copy now shares its key and time with the source row. So
+`lookup_idempotent_signal_dedupe` breaks a tie by the newer execution, and a
+keyed `signal_with_start` retry finds the fork. No migration and no new
+`WorkflowEvent` variant.
 
 **New tests.** `signal_tests::committed_sends_are_recorded_in_send_order`
 sends eight signals on Postgres and ingests them in two wake cycles. History

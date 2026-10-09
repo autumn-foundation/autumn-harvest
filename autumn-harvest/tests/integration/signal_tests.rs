@@ -532,3 +532,71 @@ async fn reset_buffer_keeps_the_order_of_pending_signals() {
         "the fork must read buffered signals in the order the source received them"
     );
 }
+
+/// A reset with the `Buffer` policy copies a keyed signal onto the fork, with
+/// the source `received_at`. The source row stays, so two rows share the key
+/// and the time. A keyed dedupe lookup must then pick the fork, not the source
+/// that the reset ended (issue #2004).
+#[tokio::test]
+async fn keyed_dedupe_after_a_buffered_reset_finds_the_fork() {
+    use autumn_harvest::execution::{
+        StartWorkflowParams, lookup_idempotent_signal_dedupe, start_or_load_workflow_execution,
+    };
+    use autumn_harvest::reset::{
+        ResetSignalReapplyPolicy, WorkflowResetRequest, reset_workflow_execution,
+    };
+
+    let (mut conn, _container) = setup_test_db().await;
+    let source = ExecutionId::new();
+    let workflow_id = source.to_string();
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams::new(
+            "reset_dedupe",
+            &workflow_id,
+            source,
+            serde_json::json!(null),
+            "default",
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    send_signal_idempotent(
+        &mut conn,
+        source,
+        "approval",
+        serde_json::json!({"ok": true}),
+        Some("evt_7"),
+    )
+    .await
+    .unwrap();
+
+    let result = reset_workflow_execution(
+        &mut conn,
+        source,
+        WorkflowResetRequest {
+            reset_to_event_id: Some(0),
+            reset_point: None,
+            reason: "keyed dedupe".to_string(),
+            operator_id: "op-1".to_string(),
+            signal_reapply: ResetSignalReapplyPolicy::Buffer,
+            allow_terminal_source: false,
+            refuse_erased_source: false,
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.source_signals_buffered, 1);
+
+    let found = lookup_idempotent_signal_dedupe(&mut conn, "reset_dedupe", &workflow_id, "evt_7")
+        .await
+        .unwrap()
+        .expect("the key must match a row");
+    assert_eq!(
+        found.id,
+        result.new_exec_id.as_uuid(),
+        "a keyed dedupe must return the fork, not the source that the reset ended"
+    );
+}
