@@ -3549,6 +3549,11 @@ async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
         diesel::update(harvest_task_queue::table.find(task_id))
             .set((
                 harvest_task_queue::state.eq("RUNNING"),
+                harvest_task_queue::worker_id.eq(Some("race-worker")),
+                harvest_task_queue::attempt.eq(1),
+                // One attempt keeps the terminal timeout, which appends an
+                // event, as the path under test.
+                harvest_task_queue::max_attempts.eq(1),
                 harvest_task_queue::started_at
                     .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(60))),
                 harvest_task_queue::start_to_close.eq(Some(chrono::Duration::seconds(1))),
@@ -3605,7 +3610,8 @@ async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
     )
     .await
     .expect("failed to append competing completion event");
-    autumn_harvest::queue::complete_task(&mut lock_conn, task_id, json!({ "completed": true }))
+    let claim = autumn_harvest::queue::TaskClaim::new(task_id, "race-worker", 1);
+    autumn_harvest::queue::complete_task(&mut lock_conn, &claim, json!({ "completed": true }))
         .await
         .expect("failed to complete competing activity task");
     lock_conn

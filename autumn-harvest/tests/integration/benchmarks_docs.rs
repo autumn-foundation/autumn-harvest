@@ -367,3 +367,82 @@ fn the_results_file_records_the_hardware_it_was_measured_on() {
         );
     }
 }
+
+#[test]
+fn the_headline_table_names_the_published_version() {
+    // Issue #1972: the headline must say which release it measured.
+    let heading = format!("### Headline numbers, v{PUBLISHED_RESULTS_VERSION}");
+    assert!(
+        benchmarks_doc().contains(&heading),
+        "docs/benchmarks.md must head its table with {heading:?}"
+    );
+}
+
+#[test]
+fn every_earlier_release_stays_published() {
+    // Issue #941 AC4 keeps each release's numbers. A new release adds a file.
+    // It does not replace one, so every results file on disk stays linked.
+    let doc = benchmarks_doc();
+    let dir = repo_root().join("docs/benchmarks");
+    let files: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{} must be readable: {e}", dir.display()))
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+        })
+        .filter_map(|path| path.file_name()?.to_str().map(str::to_string))
+        .filter(|name| name.starts_with("results-v"))
+        .collect();
+    assert!(
+        files.contains(&format!("results-v{PUBLISHED_RESULTS_VERSION}.md")),
+        "docs/benchmarks/ must hold the results file for {PUBLISHED_RESULTS_VERSION}"
+    );
+    assert!(files.len() >= 2, "the 0.6.0 results file must stay on disk");
+    for file in files {
+        assert!(
+            doc.contains(&file),
+            "docs/benchmarks.md must keep linking {file}"
+        );
+    }
+}
+
+#[test]
+fn every_headline_number_sits_in_its_own_cell_on_the_index_page() {
+    // The digit check above passes when two cells swap. This one reads the
+    // headline row and the shard column of each published baseline.
+    let doc = benchmarks_doc();
+    for baseline in PUBLISHED_BASELINES {
+        let label = match baseline.metric {
+            "workflows_per_sec" => "workflows/sec",
+            "p50_ms" => "p50 ms",
+            "p99_ms" => "p99 ms",
+            "events_per_sec" => "events/sec",
+            other => panic!("no headline label for metric `{other}`"),
+        };
+        let prefix = format!("| `{}` | {label} |", baseline.scenario.as_str());
+        let row = doc
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("docs/benchmarks.md has no headline row {prefix:?}"));
+        let column = SHARD_COUNTS
+            .iter()
+            .position(|shards| *shards == baseline.shards)
+            .expect("every baseline uses a published shard count");
+        let cell: String = row
+            .trim_matches('|')
+            .split('|')
+            .nth(2 + column)
+            .unwrap_or_default()
+            .chars()
+            .filter(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        assert_eq!(
+            cell,
+            format!("{:.2}", baseline.value),
+            "headline row {prefix:?} at {} shards must read the published baseline",
+            baseline.shards
+        );
+    }
+}

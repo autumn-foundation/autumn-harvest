@@ -1,0 +1,8 @@
+# Assay #14 — harvest arms, tree `7bf3789`, round 1
+
+Postgres: PostgreSQL 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+Durability: fsync = off, synchronous_commit = off.
+Pool: 1 worker, 8 workflow slots, 16 activity slots, 32 connections, 25 ms poll. Input `{"p":"0123456789abcdef0123456789abcdef"}`. Cap 900 s.
+
+cell tree=7bf3789 arm=postgres depth=250 rep=1 wfps=23.697629 elapsed=10.550 completed=250 activities=750 valid=PASS truncated=false residue=none load1=4.87 claim_n=1752 claim_mean_ms=5.582 claim_p99_ms=12.998 persist_n=1000 persist_mean_ms=5.721 persist_p99_ms=14.441 scan_n=179 scan_mean_ms=30.925 scan_p99_ms=50.861 heartbeat_n=0 wait_n=1931 wait_p99_ms=1.290 wait_max_ms=5.753 in_use_mean=4.058 in_use_max=6
+cell tree=7bf3789 arm=postgres depth=2000 rep=1 wfps=22.566708 elapsed=88.626 completed=2000 activities=6000 valid=PASS truncated=false residue=none load1=5.09 claim_n=14002 claim_mean_ms=5.902 claim_p99_ms=11.748 persist_n=8000 persist_mean_ms=5.875 persist_p99_ms=15.825 scan_n=1169 scan_mean_ms=47.891 scan_p99_ms=75.613 heartbeat_n=0 wait_n=15171 wait_p99_ms=2.172 wait_max_ms=7.291 in_use_mean=4.012 in_use_max=8

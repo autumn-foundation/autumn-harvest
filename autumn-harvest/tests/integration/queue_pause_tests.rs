@@ -22,7 +22,7 @@
 //! against it directly; otherwise a fresh testcontainers Postgres is booted with
 //! the full migration bundle.
 
-use autumn_harvest::queue::{self, EnqueueParams, TaskType, claim_task};
+use autumn_harvest::queue::{self, EnqueueParams, TaskClaim, TaskType, claim_task};
 use autumn_harvest::queue_pause::{self, MAX_QUEUE_NAME_LEN};
 use autumn_harvest::timeout::{self, TimeoutReason};
 use diesel_async::AsyncPgConnection;
@@ -513,9 +513,14 @@ async fn pause_does_not_abort_in_flight_tasks() {
         "AC2: in-flight work is untouched by a pause"
     );
     // ... and it can still complete normally.
-    queue::complete_task(&mut conn, task, serde_json::json!({}))
-        .await
-        .expect("complete");
+    // `claim_one` claims as `w1`. A first claim has attempt 1.
+    queue::complete_task(
+        &mut conn,
+        &TaskClaim::new(task, "w1", 1),
+        serde_json::json!({}),
+    )
+    .await
+    .expect("complete");
     assert_eq!(task_state(&mut conn, task).await, "COMPLETED");
 }
 
