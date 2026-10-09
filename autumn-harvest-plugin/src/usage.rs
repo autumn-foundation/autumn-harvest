@@ -253,12 +253,20 @@ pub fn build_usage_response(
             entry.activity_executions += row.activity_executions;
             entry.activity_executions_failed += row.activity_executions_failed;
             entry.activity_compute_seconds += row.activity_compute_seconds;
-            entry.llm_calls += row.llm_calls;
-            entry.llm_input_tokens += row.llm_input_tokens;
-            entry.llm_output_tokens += row.llm_output_tokens;
-            entry.llm_cost_usd_micros += row.llm_cost_usd_micros;
-            entry.llm_unpriced_calls += row.llm_unpriced_calls;
-            entry.llm_latency_ms += row.llm_latency_ms;
+            // Issue #1996: each shard sum saturates in SQL, so the merge
+            // saturates too rather than wrap.
+            entry.llm_calls = entry.llm_calls.saturating_add(row.llm_calls);
+            entry.llm_input_tokens = entry.llm_input_tokens.saturating_add(row.llm_input_tokens);
+            entry.llm_output_tokens = entry
+                .llm_output_tokens
+                .saturating_add(row.llm_output_tokens);
+            entry.llm_cost_usd_micros = entry
+                .llm_cost_usd_micros
+                .saturating_add(row.llm_cost_usd_micros);
+            entry.llm_unpriced_calls = entry
+                .llm_unpriced_calls
+                .saturating_add(row.llm_unpriced_calls);
+            entry.llm_latency_ms = entry.llm_latency_ms.saturating_add(row.llm_latency_ms);
         }
     }
 

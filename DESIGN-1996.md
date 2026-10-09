@@ -59,8 +59,8 @@ change to `harvest_events`. No replay impact. No new route.**
 |---|------------------------|------------|
 | R1 | Write the ledger in its own transaction, so a crash keeps a cost for a step that never completed, or loses it. | Each path inserts the rows in the completion transaction, after the event. Tests read both in one run. |
 | R2 | Count a cost twice when a lost lease drops the completion. | A lost lease returns before the insert. The later attempt records its own calls. |
-| R3 | Put the prompt or PII in the model id, in clear. | The model id is capped at 200 bytes and must not be empty. The security posture page says it is in clear and must not hold PII. |
-| R4 | Let a handler record without bound and flood the table. | At most 256 calls per attempt. The 257th call returns an error. |
+| R3 | Put the prompt or PII in the model id, in clear. | The engine accepts only a token of 1 to 200 bytes: ASCII letters, digits and `._:/@+-`. A prompt does not fit. The engine cannot detect PII, so the security posture page says to keep it out. |
+| R4 | Let a handler record without bound, or store a huge value that breaks a sum. | At most 256 calls per attempt. Tokens, cost and latency have upper bounds. The SQL sums saturate. |
 | R5 | Store a value that breaks a `CHECK` and rolls back the completion. | `record_llm_call` checks every value before it accepts the call. The table checks again. |
 | R6 | Lose the rows on a shard move. | The table joins `COPIED_RELATIONS`, the parity list, the copy and the staged-copy cleanup. Test. |
 | R7 | Keep rows after retention deletes the run. | `ON DELETE CASCADE` from `harvest_workflow_executions`. Test. |
@@ -81,7 +81,7 @@ change to `harvest_events`. No replay impact. No new route.**
 | Black | A non-final failed attempt appends no event, so it gets no ledger row. A retried call that cost tokens is not counted. The SQLite backend does not write the ledger. Model ids and token counts are visible without the codec key. |
 | Yellow | No replay risk by construction. The cost sum is exact integer arithmetic. The figures are queryable with plain SQL. The same API serves the agent loop and any hand-written LLM activity. |
 | Green | A `group_by=model` dimension, quota hooks on cost, and failed-attempt metering are follow-ups. An interceptor can record calls for every LLM activity in one place. |
-| Blue | Red: unit tests for `LlmCall` and the context, a DB test for the three paths, the usage rollup, the shard copy, retention and replay, plugin and CLI tests, and a docs guard. Green: migration, module, context, write paths, usage SQL, plugin, CLI, agent and docs. Refactor: gates, then a multi-angle review. |
+| Blue | Red: failing unit, DB, plugin, CLI, agent and docs tests. Green: the migration, the module, the write paths, the usage SQL, the plugin, the CLI, the agent and the docs. Refactor: the gates, then a multi-angle review. |
 
 ### 0.5 Scope
 
@@ -106,11 +106,12 @@ ctx.record_llm_call(
 
 - `LlmCall::new(model, input_tokens, output_tokens)`. The cost is optional.
   A call with no cost counts as unpriced.
-- When the latency is not set, the engine records the run time of the
-  attempt so far.
-- `record_llm_call` returns `LlmCallError` for an empty or long model id,
-  a value above `i64::MAX`, or more than 256 calls. `LlmCallError`
-  converts to `String`, so `?` works in an activity.
+- When the latency is not set, the context records the time since the
+  previous call, or since the attempt started.
+- `record_llm_call` returns `LlmCallError` for a model id that is not a
+  token of 1 to 200 bytes, a value above its bound, or more than 256 calls.
+- `LlmCallError` converts to a non-retryable activity failure. So `?` fails
+  the attempt and does not call the model again.
 - `ActivityContext::llm_calls()` returns the calls recorded so far. Unit
   tests use it.
 - The engine writes the calls only when the attempt completes. A failed
@@ -126,10 +127,10 @@ Migration `20261009050156_harvest_llm_ledger`:
 | `event_id` | `INT` | The completion event of the step. |
 | `call_index` | `INT` | Order of the call in the step. |
 | `activity_name` | `TEXT` | The step's activity type. |
-| `model` | `TEXT` | The model id. |
-| `input_tokens`, `output_tokens` | `BIGINT` | Not negative. |
-| `cost_usd_micros` | `BIGINT NULL` | Millionths of a US dollar. `NULL` is unpriced. |
-| `latency_ms` | `BIGINT` | Not negative. |
+| `model` | `TEXT` | The model id: a token of ASCII letters, digits and `._:/@+-`. |
+| `input_tokens`, `output_tokens` | `BIGINT` | 0 to 10^12. |
+| `cost_usd_micros` | `BIGINT NULL` | Millionths of a US dollar, 0 to 10^15. `NULL` is unpriced. |
+| `latency_ms` | `BIGINT` | 0 to 10^10. |
 | `recorded_at` | `TIMESTAMPTZ` | `NOW()` of the completion transaction, the same value as the event `timestamp`. |
 
 The primary key is `(workflow_exec_id, event_id, call_index)`. An index on
@@ -150,14 +151,18 @@ Each group of `GET /admin/usage` gains six fields. The window is
 | `llm_unpriced_calls` | Rows with no cost. |
 | `llm_latency_ms` | Sum of latencies. |
 
-The CLI `harvest usage` table adds `LLM_CALLS`, `LLM_IN`, `LLM_OUT` and
-`LLM_COST_USD`.
+The CLI `harvest usage` table adds `LLM_CALLS`, `LLM_IN`, `LLM_OUT`,
+`LLM_COST_USD` and `LLM_UNPRICED`.
+
+A shard move copies the rows. The report counts each moving run on one
+shard: it skips the staged `MIGRATING` target copy, and it counts the sealed
+`MIGRATED` source while its move is `COMMITTED`.
 
 ## 4. Tests
 
 | Test | Where |
 |---|---|
-| `LlmCall` checks, context record and take, error text | `llm_ledger.rs`, `context.rs` unit tests |
+| `LlmCall` checks, context record and take, error payload, SQL parity | `llm_ledger.rs` unit tests |
 | Worker, local and transactional paths write the rows; the output stays ciphertext; a failed attempt writes none | `tests/integration/llm_ledger_tests.rs` |
 | Replay is unchanged by the ledger | same file |
 | Usage rollup per workflow type and per tenant | same file |

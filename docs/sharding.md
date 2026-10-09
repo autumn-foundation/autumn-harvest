@@ -843,6 +843,7 @@ The loop reports as scanner `rebalance_resume` in `scanner_liveness` and in
 | Durable timers | ✅ verbatim, including `fires_at` | none |
 | Signals, including `idempotency_key` | ✅ verbatim | none |
 | Payload refs (`harvest_payload_refs`) | ✅ | none — the blob store is shard-external |
+| Agent cost ledger (`harvest_llm_ledger`, issue #1996) | ✅ verbatim, including `recorded_at` | none — the usage report counts the source until the move is done, then the target |
 | The parked workflow task row | ✅ | none |
 | Terminal task rows (activity history) | ❌ stays on the sealed source | none — the durable record is in `harvest_events` |
 | Workflow logs | ✅ | none — copied for a privacy reason as much as an operational one: they are free text, so a PII sink, and `erase.rs` scrubs them via the execution's own shard. Logs left behind would be out of reach of an erasure issued against the run. |
@@ -1088,7 +1089,7 @@ Executions that lack the requested `search_attrs` key are grouped under the lite
 - `activity_executions_failed`: count of terminal `ActivityFailed`/`ActivityTimedOut` events in the window that have a matching `ActivityStarted` (non-final retry attempts emit no event, so this counts exhausted-retry-or-timeout only). The start-match requirement excludes external activities, whose `ActivityTimedOut` can be appended with no `ActivityStarted` at all.
 - `activity_compute_seconds`: for each activity whose terminal event falls in the window, the wall-clock span from that activity's most recent (final-attempt) start to its terminal event, summed. Retry backoff wall time is excluded by construction.
 - Local activities and externally-completed activities are excluded from the activity counters — they never emit `ActivityStarted`, so they're not worker compute.
-- `llm_calls`, `llm_input_tokens`, `llm_output_tokens`, `llm_cost_usd_micros`, `llm_unpriced_calls` and `llm_latency_ms` (issue #1996): sums over the agent cost ledger rows whose `recorded_at` falls in the window. Cost is in millionths of a US dollar. A row with no cost counts in `llm_unpriced_calls`. A shard move's staged target copy and sealed source are skipped, so one shard reports each call. See [the agent cost ledger](llm-cost-ledger.md).
+- `llm_calls`, `llm_input_tokens`, `llm_output_tokens`, `llm_cost_usd_micros`, `llm_unpriced_calls` and `llm_latency_ms` (issue #1996): sums over the agent cost ledger rows whose `recorded_at` falls in the window. Cost is in millionths of a US dollar. A row with no cost counts in `llm_unpriced_calls`. The report skips a shard move's staged target copy and counts the sealed source until the move is done, so one shard reports each run. See [the agent cost ledger](llm-cost-ledger.md).
 
 **Window ceiling**: a `from`/`to` window wider than a configurable ceiling (default 90 days, `HarvestApiState::set_usage_window_ceiling`) is rejected with `400`, naming the ceiling, so an operator cannot accidentally trigger a full-table scan across every shard.
 

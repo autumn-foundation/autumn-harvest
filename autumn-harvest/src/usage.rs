@@ -6,8 +6,9 @@
 //! (`harvest_workflow_executions` + `harvest_events`) over a caller-supplied
 //! time window, grouped by `workflow_name` or by a `search_attrs` JSON key
 //! (e.g. a tenant id). Read-only by construction: no new `WorkflowEvent`
-//! variant, no migration, no replay-determinism impact. The `llm_*` metrics
-//! also read `harvest_llm_ledger`, the agent cost ledger (issue #1996).
+//! variant and no replay-determinism impact. Issue #596 needed no migration.
+//! The `llm_*` metrics read `harvest_llm_ledger`, the agent cost ledger. Its
+//! table comes from the issue #1996 migration.
 //!
 //! ## Metric semantics
 //!
@@ -70,9 +71,9 @@
 //!   `llm_cost_usd_micros`, `llm_unpriced_calls` and `llm_latency_ms`: sums
 //!   over the `harvest_llm_ledger` rows whose `recorded_at` falls in the
 //!   window (issue #1996). Cost is in millionths of a US dollar. A row with
-//!   no cost counts in `llm_unpriced_calls`. A shard move's staged
-//!   `MIGRATING` target copy and sealed `MIGRATED` source are skipped, so one
-//!   shard reports each call.
+//!   no cost counts in `llm_unpriced_calls`. A run in a shard move counts on
+//!   one shard only. The report skips the staged `MIGRATING` target copy. It
+//!   counts the sealed `MIGRATED` source until the move is `DONE`.
 //!
 //! Local activities (no `ActivityStarted`/worker compute) and
 //! externally-completed activities (`ActivityAwaitingExternal` and
@@ -283,6 +284,7 @@ fn group_key_expr() -> String {
 #[allow(clippy::too_many_lines)]
 pub fn usage_sql() -> String {
     let group_key_expr = group_key_expr();
+    let bigint_max = i64::MAX;
     format!(
         r"
 WITH execution_starts AS (
@@ -378,21 +380,31 @@ activity_metrics AS (
 ),
 llm_metrics AS (
     -- Issue #1996: the agent cost ledger, windowed by `recorded_at`. A shard
-    -- move puts a staged `MIGRATING` copy on the target before the cutover,
-    -- and leaves a sealed `MIGRATED` copy on the source after it. The ledger
-    -- skips both, so exactly one shard reports each call.
+    -- move copies the rows, so the report counts each run on one shard only:
+    -- - a staged `MIGRATING` target copy never counts;
+    -- - a sealed `MIGRATED` source counts while its move is `COMMITTED`, so
+    --   the gap before the target activates still reports the run;
+    -- - after the move is `DONE`, the `RUNNING` target counts instead.
     SELECT
         {group_key_expr} AS grp,
+        -- `SUM(BIGINT)` is NUMERIC. `LEAST` saturates it, so the cast to
+        -- BIGINT cannot fail and blank the whole shard.
         COUNT(*)::BIGINT AS llm_calls,
-        COALESCE(SUM(l.input_tokens), 0)::BIGINT AS llm_input_tokens,
-        COALESCE(SUM(l.output_tokens), 0)::BIGINT AS llm_output_tokens,
-        COALESCE(SUM(l.cost_usd_micros), 0)::BIGINT AS llm_cost_usd_micros,
+        LEAST(COALESCE(SUM(l.input_tokens), 0), {bigint_max})::BIGINT AS llm_input_tokens,
+        LEAST(COALESCE(SUM(l.output_tokens), 0), {bigint_max})::BIGINT AS llm_output_tokens,
+        LEAST(COALESCE(SUM(l.cost_usd_micros), 0), {bigint_max})::BIGINT AS llm_cost_usd_micros,
         COUNT(*) FILTER (WHERE l.cost_usd_micros IS NULL)::BIGINT AS llm_unpriced_calls,
-        COALESCE(SUM(l.latency_ms), 0)::BIGINT AS llm_latency_ms
+        LEAST(COALESCE(SUM(l.latency_ms), 0), {bigint_max})::BIGINT AS llm_latency_ms
     FROM harvest_llm_ledger l
     INNER JOIN harvest_workflow_executions w ON w.id = l.workflow_exec_id
     WHERE w.shard_id = $1::INT4
-      AND w.state NOT IN ('MIGRATING', 'MIGRATED')
+      AND (
+          w.state NOT IN ('MIGRATING', 'MIGRATED')
+          OR (w.state = 'MIGRATED' AND EXISTS (
+              SELECT 1 FROM harvest_shard_migrations m
+              WHERE m.execution_id = w.id AND m.phase = 'COMMITTED'
+          ))
+      )
       AND l.recorded_at BETWEEN $3 AND $4
     GROUP BY 1
 )
@@ -646,7 +658,8 @@ mod tests {
             "the ledger is windowed by recorded_at"
         );
         assert!(
-            sql.contains("w.state NOT IN ('MIGRATING', 'MIGRATED')"),
+            sql.contains("w.state NOT IN ('MIGRATING', 'MIGRATED')")
+                && sql.contains("m.phase = 'COMMITTED'"),
             "a run in a shard move reports its calls on one shard only"
         );
     }

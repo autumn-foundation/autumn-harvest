@@ -12,13 +12,31 @@
 //! reports can sum it without a key. The model id and the counts are in
 //! clear. See `docs/security-posture.md`.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The longest model id the ledger accepts, in bytes.
 pub const MAX_MODEL_ID_BYTES: usize = 200;
 
+/// The characters a model id can hold, besides ASCII letters and digits.
+///
+/// A model id is a token, such as `claude-sonnet-5-5` or
+/// `models/gemini-2.0:latest`. No space or control character can appear, so
+/// a prompt or a sentence does not fit.
+pub const MODEL_ID_PUNCTUATION: &str = "._:/@+-";
+
 /// The most calls one activity attempt can record.
 pub const MAX_LLM_CALLS_PER_ATTEMPT: usize = 256;
+
+/// The most input or output tokens one call can record: 10^12.
+pub const MAX_TOKENS_PER_CALL: u64 = 1_000_000_000_000;
+
+/// The highest cost one call can record: 10^15 millionths of a US dollar.
+pub const MAX_COST_USD_MICROS: u64 = 1_000_000_000_000_000;
+
+/// The longest latency the ledger stores: 10^10 ms, about 115 days.
+///
+/// A longer latency saturates to this value.
+pub const MAX_LATENCY_MS: i64 = 10_000_000_000;
 
 /// One model call, as an activity records it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +70,8 @@ impl LlmCall {
 
     /// Set the latency of the call.
     ///
-    /// When it is not set, the engine records the run time of the attempt.
+    /// When it is not set, the context records the time since the previous
+    /// call of the attempt, or since the attempt started.
     #[must_use]
     pub const fn with_latency(mut self, latency: Duration) -> Self {
         self.latency = Some(latency);
@@ -83,7 +102,7 @@ impl LlmCall {
         self.cost_usd_micros
     }
 
-    /// The latency, or `None` when the engine fills it in.
+    /// The latency, or `None` before the context records the call.
     #[must_use]
     pub const fn latency(&self) -> Option<Duration> {
         self.latency
@@ -93,8 +112,8 @@ impl LlmCall {
     ///
     /// # Errors
     ///
-    /// Returns [`LlmCallError`] for an empty or long model id, or for a value
-    /// above `i64::MAX`.
+    /// Returns [`LlmCallError`] for an empty or long model id, a model id with
+    /// a character outside the token charset, or a count above its limit.
     pub fn validate(&self) -> Result<(), LlmCallError> {
         if self.model.trim().is_empty() {
             return Err(LlmCallError::EmptyModel);
@@ -105,13 +124,26 @@ impl LlmCall {
                 max: MAX_MODEL_ID_BYTES,
             });
         }
-        for (field, value) in [
-            ("input_tokens", Some(self.input_tokens)),
-            ("output_tokens", Some(self.output_tokens)),
-            ("cost_usd_micros", self.cost_usd_micros),
+        // A NUL byte would fail the insert at commit and roll back the
+        // completion. The token charset also keeps prompt text out.
+        if !self
+            .model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || MODEL_ID_PUNCTUATION.contains(c))
+        {
+            return Err(LlmCallError::InvalidModelCharacter);
+        }
+        for (field, value, max) in [
+            ("input_tokens", Some(self.input_tokens), MAX_TOKENS_PER_CALL),
+            (
+                "output_tokens",
+                Some(self.output_tokens),
+                MAX_TOKENS_PER_CALL,
+            ),
+            ("cost_usd_micros", self.cost_usd_micros, MAX_COST_USD_MICROS),
         ] {
-            if value.is_some_and(|v| i64::try_from(v).is_err()) {
-                return Err(LlmCallError::OutOfRange { field });
+            if value.is_some_and(|v| v > max) {
+                return Err(LlmCallError::OutOfRange { field, max });
             }
         }
         Ok(())
@@ -120,8 +152,9 @@ impl LlmCall {
 
 /// Why the ledger refuses a call.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum LlmCallError {
-    /// The model id is empty.
+    /// The model id is empty or blank.
     #[error("the LLM call has an empty model id")]
     EmptyModel,
     /// The model id is longer than [`MAX_MODEL_ID_BYTES`].
@@ -132,80 +165,103 @@ pub enum LlmCallError {
         /// The limit.
         max: usize,
     },
-    /// A count is above `i64::MAX`.
-    #[error("the LLM call field {field} is above the ledger limit")]
+    /// The model id holds a character other than an ASCII letter, a digit
+    /// or one of [`MODEL_ID_PUNCTUATION`].
+    #[error(
+        "the LLM model id holds a character outside A-Z, a-z, 0-9 and {}",
+        MODEL_ID_PUNCTUATION
+    )]
+    InvalidModelCharacter,
+    /// A count is above its limit.
+    #[error("the LLM call field {field} is above its limit of {max}")]
     OutOfRange {
         /// The field name.
         field: &'static str,
+        /// The limit.
+        max: u64,
     },
     /// The attempt already recorded [`MAX_LLM_CALLS_PER_ATTEMPT`] calls.
-    #[error("the activity attempt recorded more than {max} LLM calls")]
+    #[error("the activity attempt already recorded {max} LLM calls")]
     TooManyCalls {
         /// The limit.
         max: usize,
     },
 }
 
+/// A non-retryable activity failure, so `?` in an activity does not retry.
+///
+/// A refusal is deterministic. A retry would call the model and pay again.
 impl From<LlmCallError> for String {
     fn from(err: LlmCallError) -> Self {
-        err.to_string()
+        use crate::failure::IntoActivityErrorString as _;
+        crate::failure::ActivityFailure::non_retryable("LlmLedgerRefused", err.to_string())
+            .into_error_payload()
     }
 }
 
-/// The latency in whole milliseconds, saturated to `i64::MAX`.
-#[must_use]
-pub fn latency_ms(latency: Duration) -> i64 {
-    i64::try_from(latency.as_millis()).unwrap_or(i64::MAX)
+/// The latency in whole milliseconds, saturated to [`MAX_LATENCY_MS`].
+pub(crate) fn latency_ms(latency: Duration) -> i64 {
+    i64::try_from(latency.as_millis()).map_or(MAX_LATENCY_MS, |ms| ms.min(MAX_LATENCY_MS))
+}
+
+/// The calls of one attempt, and the time of the last record.
+#[derive(Debug)]
+struct SlotState {
+    calls: Vec<LlmCall>,
+    last_mark: Instant,
 }
 
 /// The per-attempt store behind `ActivityContext::record_llm_call`.
 #[derive(Debug)]
 pub(crate) struct LlmCallSlot {
-    started: std::time::Instant,
-    calls: std::sync::Mutex<Vec<LlmCall>>,
+    state: std::sync::Mutex<SlotState>,
 }
 
 impl LlmCallSlot {
     pub(crate) fn new() -> Self {
         Self {
-            started: std::time::Instant::now(),
-            calls: std::sync::Mutex::new(Vec::new()),
+            state: std::sync::Mutex::new(SlotState {
+                calls: Vec::new(),
+                last_mark: Instant::now(),
+            }),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<LlmCall>> {
-        self.calls
+    fn lock(&self) -> std::sync::MutexGuard<'_, SlotState> {
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Check the call, then keep it.
-    pub(crate) fn record(&self, call: LlmCall) -> Result<(), LlmCallError> {
+    ///
+    /// An unset latency becomes the time since the last record, or since the
+    /// slot was made. So the filled latencies of an attempt add up to its run
+    /// time.
+    pub(crate) fn record(&self, mut call: LlmCall) -> Result<(), LlmCallError> {
         call.validate()?;
-        let mut calls = self.lock();
-        if calls.len() >= MAX_LLM_CALLS_PER_ATTEMPT {
+        let mut state = self.lock();
+        if state.calls.len() >= MAX_LLM_CALLS_PER_ATTEMPT {
             return Err(LlmCallError::TooManyCalls {
                 max: MAX_LLM_CALLS_PER_ATTEMPT,
             });
         }
-        calls.push(call);
+        let now = Instant::now();
+        let since_last = now.saturating_duration_since(state.last_mark);
+        call.latency.get_or_insert(since_last);
+        state.last_mark = now;
+        state.calls.push(call);
         Ok(())
     }
 
     /// A copy of the calls kept so far.
     pub(crate) fn snapshot(&self) -> Vec<LlmCall> {
-        self.lock().clone()
+        self.lock().calls.clone()
     }
 
-    /// Take the calls. An unset latency becomes the time since the slot was
-    /// made, which is the run time of the attempt.
+    /// Take the calls and empty the slot.
     pub(crate) fn take(&self) -> Vec<LlmCall> {
-        let elapsed = self.started.elapsed();
-        let mut calls = std::mem::take(&mut *self.lock());
-        for call in &mut calls {
-            call.latency.get_or_insert(elapsed);
-        }
-        calls
+        std::mem::take(&mut self.lock().calls)
     }
 }
 
@@ -231,10 +287,13 @@ struct NewLedgerRow<'a> {
 /// append. The rows then commit with the event or not at all. An empty slice
 /// writes nothing.
 ///
+/// `record_llm_call` checks every call, so a call that fails its check here
+/// is a bug. The write skips it and logs a warning, so the completion still
+/// commits.
+///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::Database`] if the insert fails, or
-/// [`crate::error::HarvestError::Config`] for a call that fails its check.
+/// Returns [`crate::error::HarvestError::Database`] if the insert fails.
 #[cfg(feature = "db")]
 pub(crate) async fn insert_ledger_rows(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -245,14 +304,13 @@ pub(crate) async fn insert_ledger_rows(
 ) -> crate::error::HarvestResult<()> {
     use diesel_async::RunQueryDsl as _;
 
-    if calls.is_empty() {
-        return Ok(());
-    }
+    let as_bigint = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
     let mut rows = Vec::with_capacity(calls.len());
     for (index, call) in calls.iter().enumerate() {
-        call.validate()
-            .map_err(|err| crate::error::HarvestError::Config(err.to_string()))?;
-        let as_bigint = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+        if let Err(err) = call.validate() {
+            tracing::warn!(error = %err, activity = activity_name, "skipping an invalid LLM ledger call");
+            continue;
+        }
         rows.push(NewLedgerRow {
             workflow_exec_id: exec_id.as_uuid(),
             event_id,
@@ -264,6 +322,9 @@ pub(crate) async fn insert_ledger_rows(
             cost_usd_micros: call.cost_usd_micros.map(as_bigint),
             latency_ms: call.latency.map_or(0, latency_ms),
         });
+    }
+    if rows.is_empty() {
+        return Ok(());
     }
     diesel::insert_into(crate::schema::harvest_llm_ledger::table)
         .values(&rows)
@@ -317,34 +378,83 @@ mod tests {
     }
 
     #[test]
-    fn a_count_above_the_bigint_range_is_refused() {
-        let big = u64::try_from(i64::MAX).unwrap() + 1;
+    fn a_count_above_its_limit_is_refused() {
+        let tokens = MAX_TOKENS_PER_CALL + 1;
         assert_eq!(
-            LlmCall::new("m", big, 0).validate(),
+            LlmCall::new("m", tokens, 0).validate(),
             Err(LlmCallError::OutOfRange {
-                field: "input_tokens"
+                field: "input_tokens",
+                max: MAX_TOKENS_PER_CALL
             })
         );
         assert_eq!(
-            LlmCall::new("m", 0, big).validate(),
+            LlmCall::new("m", 0, tokens).validate(),
             Err(LlmCallError::OutOfRange {
-                field: "output_tokens"
+                field: "output_tokens",
+                max: MAX_TOKENS_PER_CALL
             })
         );
         assert_eq!(
-            LlmCall::new("m", 0, 0).with_cost_usd_micros(big).validate(),
+            LlmCall::new("m", 0, 0)
+                .with_cost_usd_micros(MAX_COST_USD_MICROS + 1)
+                .validate(),
             Err(LlmCallError::OutOfRange {
-                field: "cost_usd_micros"
+                field: "cost_usd_micros",
+                max: MAX_COST_USD_MICROS
             })
         );
+        let at_limit = LlmCall::new("m", MAX_TOKENS_PER_CALL, MAX_TOKENS_PER_CALL)
+            .with_cost_usd_micros(MAX_COST_USD_MICROS);
+        assert_eq!(at_limit.validate(), Ok(()));
     }
 
     #[test]
-    fn a_huge_latency_saturates_and_passes() {
+    fn a_model_id_outside_the_token_charset_is_refused() {
+        for model in [
+            "model\0x",
+            "model\nx",
+            "\u{7f}model",
+            "summarise the contract",
+            "modèle",
+        ] {
+            assert_eq!(
+                LlmCall::new(model, 1, 1).validate(),
+                Err(LlmCallError::InvalidModelCharacter),
+                "{model:?}"
+            );
+        }
+        for model in [
+            "claude-sonnet-5-5",
+            "models/gemini-2.0:latest",
+            "anthropic.claude-v2:1",
+            "org/llama+lora@v3",
+        ] {
+            assert_eq!(LlmCall::new(model, 1, 1).validate(), Ok(()), "{model}");
+        }
+    }
+
+    #[test]
+    fn a_huge_latency_saturates_to_the_ledger_limit() {
         let call = LlmCall::new("m", 0, 0).with_latency(Duration::MAX);
         assert_eq!(call.validate(), Ok(()));
-        assert_eq!(latency_ms(Duration::MAX), i64::MAX);
+        assert_eq!(latency_ms(Duration::MAX), MAX_LATENCY_MS);
         assert_eq!(latency_ms(Duration::from_micros(1_500)), 1);
+    }
+
+    #[test]
+    fn the_rust_limits_match_the_table_checks() {
+        let up = include_str!("../migrations/20261009050156_harvest_llm_ledger/up.sql");
+        for check in [
+            format!("octet_length(model) BETWEEN 1 AND {MAX_MODEL_ID_BYTES}"),
+            format!("input_tokens BETWEEN 0 AND {MAX_TOKENS_PER_CALL}"),
+            format!("output_tokens BETWEEN 0 AND {MAX_TOKENS_PER_CALL}"),
+            format!("cost_usd_micros BETWEEN 0 AND {MAX_COST_USD_MICROS}"),
+            format!("latency_ms BETWEEN 0 AND {MAX_LATENCY_MS}"),
+            format!("call_index BETWEEN 0 AND {}", MAX_LLM_CALLS_PER_ATTEMPT - 1),
+            format!("model ~ '^[A-Za-z0-9{MODEL_ID_PUNCTUATION}]+$'"),
+        ] {
+            assert!(up.contains(&check), "up.sql must hold `{check}`");
+        }
     }
 
     #[test]
@@ -386,25 +496,43 @@ mod tests {
     }
 
     #[test]
-    fn take_fills_an_unset_latency_and_empties_the_slot() {
+    fn record_fills_an_unset_latency_with_the_time_since_the_last_call() {
         let ctx = crate::context::ActivityContext::new_test();
+        std::thread::sleep(Duration::from_millis(5));
         ctx.record_llm_call(LlmCall::new("timed", 1, 1).with_latency(Duration::from_secs(3)))
             .unwrap();
-        ctx.record_llm_call(LlmCall::new("untimed", 1, 1)).unwrap();
         std::thread::sleep(Duration::from_millis(5));
-        let taken = ctx.take_llm_calls();
-        assert_eq!(taken.len(), 2);
-        assert_eq!(taken[0].latency(), Some(Duration::from_secs(3)));
-        let filled = taken[1].latency().expect("the engine fills the latency");
+        ctx.record_llm_call(LlmCall::new("untimed", 1, 1)).unwrap();
+        let calls = ctx.llm_calls();
+        assert_eq!(calls[0].latency(), Some(Duration::from_secs(3)));
+        let filled = calls[1].latency().expect("the context fills the latency");
         assert!(filled >= Duration::from_millis(5), "{filled:?}");
+        assert!(
+            filled < Duration::from_secs(3),
+            "the fill counts from the last record, not the attempt start: {filled:?}"
+        );
+    }
+
+    #[test]
+    fn take_empties_the_slot() {
+        let ctx = crate::context::ActivityContext::new_test();
+        ctx.record_llm_call(LlmCall::new("m", 1, 1)).unwrap();
+        assert_eq!(ctx.take_llm_calls().len(), 1);
         assert_eq!(ctx.llm_calls(), Vec::new());
         assert_eq!(ctx.take_llm_calls(), Vec::new());
     }
 
     #[test]
-    fn the_error_converts_to_an_activity_error_string() {
+    fn the_error_converts_to_a_non_retryable_activity_failure() {
         let text: String = LlmCallError::EmptyModel.into();
-        assert_eq!(text, "the LLM call has an empty model id");
+        let failure =
+            crate::failure::parse_typed_payload(&text).expect("a typed activity failure payload");
+        assert!(
+            failure.non_retryable,
+            "a refusal must not retry and pay again"
+        );
+        assert_eq!(failure.error_type, "LlmLedgerRefused");
+        assert_eq!(failure.message, "the LLM call has an empty model id");
     }
 
     #[test]
@@ -414,7 +542,11 @@ mod tests {
             .split("### LLM cost ledger (issue #1996)")
             .nth(1)
             .expect("docs/security-posture.md has an LLM cost ledger section");
-        let section = section.split("\n## ").next().unwrap_or(section);
+        let section = section
+            .lines()
+            .take_while(|line| !line.starts_with("## ") && !line.starts_with("### "))
+            .collect::<Vec<_>>()
+            .join("\n");
         for field in [
             "harvest_llm_ledger",
             "model",

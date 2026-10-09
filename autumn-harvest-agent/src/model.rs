@@ -53,7 +53,9 @@ pub trait AgentModel: Send + Sync + std::fmt::Debug {
 
     /// The model id that the agent cost ledger records (issue #1996).
     ///
-    /// The id is stored in clear. Do not put PII in it.
+    /// The ledger stores the id in clear, so do not put PII in it. It must be
+    /// a token of at most 200 bytes: ASCII letters, digits and `._:/@+-`. The
+    /// ledger records any other id as [`UNKNOWN_MODEL_ID`].
     fn model_id(&self) -> &str {
         UNKNOWN_MODEL_ID
     }

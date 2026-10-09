@@ -1324,15 +1324,20 @@ in clear:
 | `latency_ms` | The call latency. |
 | `recorded_at` | The completion time, equal to the completion event's `timestamp`. |
 
-The fields are in clear by design. SQL usage reports and quota checks sum
-them without a key, so they never decrypt an event. An operator who reads
-the database sees which models a tenant uses, how many tokens it spends and
-what it costs. Accept that before your activities record calls.
+The fields are in clear by design. SQL usage reports sum them without a key,
+so a report never decrypts an event. An operator who reads the database
+sees which models a tenant uses, how many tokens it spends and what it
+costs. Accept that before your activities record calls.
 
 The ledger holds no prompt and no answer. Those stay in the encrypted
-`input` and `output` fields. Do not put PII or a prompt in the model id. The
-engine refuses a model id over 200 bytes. Erasure (issue #495) keeps the
-rows, because they hold no payload. Retention deletes them with the run.
+`input` and `output` fields. The model id is the only free-form text. The
+engine accepts only a token of 1 to 200 bytes: ASCII letters, digits and
+`._:/@+-`. A prompt or a sentence does not fit, but the engine cannot detect
+PII. Keep PII out of the model id.
+
+Erasure (issue #495) keeps the rows, because they hold no payload.
+Retention deletes them with the run. The cross-region DR publication copies
+them to the standby. The history archive does not hold them.
 
 ### Key providers
 

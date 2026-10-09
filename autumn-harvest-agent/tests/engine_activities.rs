@@ -368,3 +368,38 @@ async fn a_failed_model_turn_records_no_ledger_call() {
     assert!(result.is_err());
     assert_eq!(ctx.llm_calls(), Vec::new());
 }
+
+/// A model whose id the ledger refuses.
+#[derive(Debug)]
+struct BadIdModel(Arc<ScriptedModel>);
+
+impl AgentModel for BadIdModel {
+    fn chat<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+    ) -> autumn_harvest_agent::model::BoxFuture<'a, Result<ChatResponse, AgentError>> {
+        self.0.chat(request)
+    }
+
+    fn model_id(&self) -> &str {
+        "a model id with spaces"
+    }
+}
+
+#[tokio::test]
+async fn a_refused_model_id_still_records_the_turn_as_unknown() {
+    let model = ScriptedModel::new(vec![calls(&[], 7)]);
+    let ctx = with_harness(AgentHarness::new(Arc::new(BadIdModel(model))));
+
+    let info = agent_model_turn_info();
+    let result = (info.handler)(&ctx, serde_json::to_value(turn_request()).unwrap()).await;
+    assert!(result.is_ok(), "a ledger refusal never fails the turn");
+
+    let ledger = ctx.llm_calls();
+    assert_eq!(ledger.len(), 1, "{ledger:?}");
+    assert_eq!(
+        ledger[0].model(),
+        autumn_harvest_agent::model::UNKNOWN_MODEL_ID
+    );
+    assert_eq!(ledger[0].input_tokens(), 7);
+}

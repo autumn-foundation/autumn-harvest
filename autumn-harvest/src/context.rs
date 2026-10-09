@@ -15048,6 +15048,9 @@ impl ActivityContext {
     /// writes no row. The ledger is outside the event payload, so the codec
     /// does not encrypt it.
     ///
+    /// A call with no latency gets the time since the previous call, or
+    /// since the attempt started.
+    ///
     /// In a [`Self::run_transactional`] activity, record the calls before the
     /// commit. The commit writes the calls that exist at that time.
     ///
@@ -15056,7 +15059,8 @@ impl ActivityContext {
     /// Returns [`crate::llm_ledger::LlmCallError`] when the call fails its
     /// check, or when this attempt already recorded
     /// [`crate::llm_ledger::MAX_LLM_CALLS_PER_ATTEMPT`] calls. The error
-    /// converts to `String`, so `?` works in an activity.
+    /// converts to a non-retryable activity failure, so `?` in an activity
+    /// fails the attempt without a retry.
     pub fn record_llm_call(
         &self,
         call: crate::llm_ledger::LlmCall,
@@ -15070,9 +15074,9 @@ impl ActivityContext {
         self.llm_calls.snapshot()
     }
 
-    /// Take the recorded calls, with each unset latency filled in.
+    /// Take the recorded calls and empty the slot.
     ///
-    /// The engine calls this once, when it writes the completion.
+    /// The engine calls this when it writes the completion.
     #[cfg_attr(not(feature = "db"), allow(dead_code))]
     pub(crate) fn take_llm_calls(&self) -> Vec<crate::llm_ledger::LlmCall> {
         self.llm_calls.take()
@@ -16057,12 +16061,14 @@ impl ActivityContext {
                 .await?;
 
                 // Issue #1996: the recorded LLM calls commit with the event.
+                // A copy, so a rollback keeps them in the slot. The slot is
+                // emptied only after the commit.
                 crate::llm_ledger::insert_ledger_rows(
                     conn,
                     exec_id,
                     history.next_event_id,
                     &self.identity.activity_type,
-                    &self.take_llm_calls(),
+                    &self.llm_calls(),
                 )
                 .await?;
 
@@ -16092,6 +16098,8 @@ impl ActivityContext {
                 // leaves it false so the failure flows through the normal path.
                 self.transactional_commit_occurred
                     .store(true, std::sync::atomic::Ordering::SeqCst);
+                // The commit wrote the recorded LLM calls (issue #1996).
+                drop(self.take_llm_calls());
                 Ok(value)
             }
             Err(e) => Err(match e {

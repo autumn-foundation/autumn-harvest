@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::error::AgentError;
 use crate::message::{RunId, TokenUsage};
-use crate::model::{AgentModel, ChatRequest};
+use crate::model::{AgentModel, ChatRequest, UNKNOWN_MODEL_ID};
 use crate::policy::{AllowAll, RunInfo, ToolDecision, ToolPolicy};
 use crate::tool::{Tool, ToolContext};
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
@@ -217,24 +217,35 @@ impl AgentHarness {
 
     /// Record one model turn in the agent cost ledger (issue #1996).
     ///
-    /// A ledger refusal, such as a model id over the limit, does not fail
-    /// the turn. It logs a warning, because the reply is already paid for.
+    /// A ledger refusal does not fail the turn, because the reply is already
+    /// paid for. A refused model id falls back to [`UNKNOWN_MODEL_ID`], so
+    /// the tokens and the cost still count. The fallback logs a warning.
     pub(crate) fn record_turn(
         &self,
         ctx: &autumn_harvest::context::ActivityContext,
         usage: &TokenUsage,
         latency: Duration,
     ) {
-        let mut call = autumn_harvest::llm_ledger::LlmCall::new(
-            self.client.model_id(),
-            u64::from(usage.input_tokens),
-            u64::from(usage.output_tokens),
-        )
-        .with_latency(latency);
-        if let Some(cost) = self.client.cost_usd_micros(usage) {
-            call = call.with_cost_usd_micros(cost);
-        }
-        if let Err(err) = ctx.record_llm_call(call) {
+        let call = |model: &str| {
+            let call = autumn_harvest::llm_ledger::LlmCall::new(
+                model,
+                u64::from(usage.input_tokens),
+                u64::from(usage.output_tokens),
+            )
+            .with_latency(latency);
+            match self.client.cost_usd_micros(usage) {
+                Some(cost) => call.with_cost_usd_micros(cost),
+                None => call,
+            }
+        };
+        let Err(err) = ctx.record_llm_call(call(self.client.model_id())) else {
+            return;
+        };
+        tracing::warn!(
+            error = %err,
+            "the agent cost ledger refused the model id; recording the turn as {UNKNOWN_MODEL_ID:?}"
+        );
+        if let Err(err) = ctx.record_llm_call(call(UNKNOWN_MODEL_ID)) {
             tracing::warn!(error = %err, "the agent cost ledger refused a model turn");
         }
     }

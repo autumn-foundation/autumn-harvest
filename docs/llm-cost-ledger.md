@@ -1,8 +1,8 @@
 # Agent cost ledger
 
-The agent cost ledger records the model id, the tokens, the cost and the
-latency of each LLM call that an activity makes (issue #1996). The usage
-report sums the ledger per workflow type and per tenant.
+The agent cost ledger records the model id, tokens, cost and latency of
+each LLM call (issue #1996). The usage report sums it per workflow type and
+per tenant.
 
 The ledger is a separate table, `harvest_llm_ledger`. It is not part of the
 workflow history, so replay does not change. The payload codec does not
@@ -35,16 +35,27 @@ async fn summarise(ctx: &ActivityContext, prompt: String) -> Result<String, Stri
 - `LlmCall::new(model, input_tokens, output_tokens)` makes the call.
 - `with_cost_usd_micros` sets the cost in millionths of a US dollar. A call
   with no cost counts as unpriced.
-- `with_latency` sets the latency. When it is not set, the engine records
-  the run time of the attempt.
+- `with_latency` sets the latency. When it is not set, the context records
+  the time since the previous call, or since the attempt started. Set it
+  when an attempt does other slow work between calls.
 - An activity can record up to 256 calls in one attempt.
-- `record_llm_call` refuses an empty model id, a model id over 200 bytes, a
-  value above `i64::MAX` and a call over the limit. The error converts to
-  `String`, so `?` works in an activity.
-- An interceptor gets the same context, so it can record the calls of many
-  activities in one place.
 - `ActivityContext::llm_calls` returns the calls recorded so far. Use it in
   a unit test.
+- An interceptor gets the same context, so it can record the calls of many
+  activities in one place.
+
+`record_llm_call` checks each call:
+
+| Check | Limit |
+|---|---|
+| Model id | 1 to 200 bytes of ASCII letters, digits and `._:/@+-` |
+| Input or output tokens | At most 10^12 |
+| Cost | At most 10^15 millionths of a US dollar |
+| Latency | Saturates at 10^10 ms |
+
+A refused call returns `LlmCallError`. The error converts to a
+non-retryable activity failure. So `?` fails the attempt and does not run
+the model again.
 
 ## 2. When the engine writes the rows
 
@@ -76,23 +87,32 @@ for a call recorded after the commit and drops it.
 | `llm_unpriced_calls` | Rows with no cost. |
 | `llm_latency_ms` | Sum of the latencies, in milliseconds. |
 
-The window applies to `recorded_at`. It is the timestamp of the completion
-transaction, the same value as the completion event's `timestamp`, so a row
-and its event always fall in the same window.
+The window applies to `recorded_at`. `recorded_at` is the time of the
+completion transaction. It equals the completion event's `timestamp`, so a
+row and its event fall in the same window.
+
 Use `group_by=workflow_name` for the cost per workflow type. Use
 `group_by=search_attr:tenant_id` for the cost per tenant. See
 [the usage report](sharding.md#historical-per-tenant-usage-report-issue-596).
 
-`harvest usage` shows `LLM_CALLS`, `LLM_IN`, `LLM_OUT` and `LLM_COST_USD`
-columns. `--json` prints every field.
+`harvest usage` shows `LLM_CALLS`, `LLM_IN`, `LLM_OUT`, `LLM_COST_USD` and
+`LLM_UNPRICED` columns. `LLM_COST_USD` sums the priced calls only, so read it
+with `LLM_UNPRICED`. `--json` prints every field.
 
-The table is plain SQL, so a custom report can read it:
+The table is plain SQL, so a custom report can read it. A shard move leaves
+a copy of the rows on two shards. Filter as the usage report does, so the
+fleet counts each run once:
 
 ```sql
-SELECT model, SUM(input_tokens), SUM(output_tokens), SUM(cost_usd_micros)
-  FROM harvest_llm_ledger
- WHERE recorded_at >= NOW() - INTERVAL '30 days'
- GROUP BY model;
+SELECT l.model, SUM(l.input_tokens), SUM(l.output_tokens), SUM(l.cost_usd_micros)
+  FROM harvest_llm_ledger l
+  JOIN harvest_workflow_executions w ON w.id = l.workflow_exec_id
+ WHERE l.recorded_at >= NOW() - INTERVAL '30 days'
+   AND (w.state NOT IN ('MIGRATING', 'MIGRATED')
+        OR (w.state = 'MIGRATED' AND EXISTS (
+            SELECT 1 FROM harvest_shard_migrations m
+             WHERE m.execution_id = w.id AND m.phase = 'COMMITTED')))
+ GROUP BY l.model;
 ```
 
 ## 4. The agent adapter
@@ -100,22 +120,29 @@ SELECT model, SUM(input_tokens), SUM(output_tokens), SUM(cost_usd_micros)
 The `agent_model_turn` activity of `autumn-harvest-agent` records one call
 per model turn. Implement `AgentModel::model_id` to name the model, and
 `AgentModel::cost_usd_micros` to price a call. The defaults are `"unknown"`
-and unpriced. See [the agent adapter](agent-adapter.md).
+and unpriced. The ledger records a refused model id as `"unknown"`, so the
+tokens still count. See [the agent adapter](agent-adapter.md).
 
 ## 5. Lifecycle
 
-- **Retention.** The rows cascade with the execution row.
-- **Shard moves.** The rows move with the run. The usage report skips the
-  staged target copy before the cutover and the sealed source after it, so
-  one shard reports each call.
+- **Retention.** The rows cascade with the execution row. The history
+  archive does not hold them, so retention deletes the cost data too.
+- **Shard moves.** The rows move with the run. The report skips the staged
+  target copy. It counts the sealed source until the move is done. So one
+  shard reports each run in every phase.
 - **Reset.** A fork copies events, not ledger rows. The cost counts once.
-- **Erasure.** Erasure keeps the rows. They hold no payload.
+- **Erasure.** Erasure keeps the rows. They hold no payload. The model id
+  is the only free-form text, and it must not hold PII.
+- **Cross-region DR.** The `FOR ALL TABLES` publication copies the table to
+  the standby.
 
 ## 6. Limits
 
-- A failed attempt writes no row. A retried call that cost tokens before it
-  failed is not counted.
-- The SQLite backend does not write the ledger. Its context accepts a
-  call and drops it.
+- A failed attempt writes no row. So does an attempt that loses its lease,
+  or that returns a result over the result cap. Tokens that such an attempt
+  spent are not counted.
+- A SQLite activity has no `ActivityContext`, so it cannot record a call.
+  The SQLite agent path writes no ledger rows.
+- The ledger has no columns for cached prompt tokens.
 - The report has no per-model dimension. Query the table for that.
 - Quota checks do not read the ledger.

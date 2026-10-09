@@ -13,10 +13,12 @@
 //! - **AC1** (model, tokens, cost and latency outside the encrypted payload)
 //!   — [`the_worker_path_writes_one_row_per_call_outside_the_ciphertext`],
 //!   [`a_local_activity_writes_its_calls_with_its_completion_event`],
-//!   [`a_transactional_activity_writes_its_calls_in_its_commit`] and
-//!   [`a_failed_attempt_writes_no_row`].
+//!   [`a_transactional_activity_writes_its_calls_in_its_commit`],
+//!   [`a_failed_attempt_writes_no_row`] and the edge cases after them.
 //! - **AC2** (usage rolls up per workflow type and per tenant) —
-//!   [`usage_rolls_the_ledger_up_per_workflow_type_and_per_tenant`].
+//!   [`usage_rolls_the_ledger_up_per_workflow_type_and_per_tenant`],
+//!   [`usage_reports_a_run_that_started_before_the_window`] and
+//!   [`usage_counts_a_moving_run_on_one_shard_in_every_phase`].
 //! - **AC3** (replay is unchanged) —
 //!   [`replay_of_a_history_with_llm_steps_is_unchanged`].
 //! - Retention — [`retention_deletes_the_ledger_rows_with_the_run`].
@@ -383,6 +385,7 @@ fn llm_remote_step(ctx: &ActivityContext, _input: Value) -> BoxFut<'_> {
                 .with_cost_usd_micros(8_700)
                 .with_latency(Duration::from_millis(950)),
         )?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
         ctx.record_llm_call(LlmCall::new("model-remote-b", 50, 7))?;
         Ok(json!({"answer": OUTPUT_SECRET}))
     })
@@ -460,6 +463,110 @@ fn llm_flaky_step(ctx: &ActivityContext, _input: Value) -> BoxFut<'_> {
     })
 }
 
+/// Runs `step` on the workflow queue and turns an activity failure into a
+/// result, so the run completes either way.
+fn run_step<'a>(ctx: &'a WorkflowContext, step: &'static str, input: Value) -> BoxFut<'a> {
+    Box::pin(async move {
+        let queue = ctx.queue_name().to_string();
+        match ctx.execute_activity_raw(step, input, &queue).await {
+            Ok(value) => Ok(value),
+            Err(err) => Ok(json!({"activity_failed": err.to_string()})),
+        }
+    })
+}
+
+fn wf_after_commit(ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
+    run_step(ctx, "llm_after_commit_step", input)
+}
+
+/// Records one call before the commit and one after it.
+fn llm_after_commit_step(ctx: &ActivityContext, _input: Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        ctx.record_llm_call(LlmCall::new("model-before-commit", 5, 1))?;
+        let value = ctx
+            .run_transactional(|_conn| Box::pin(async move { Ok(json!({"ok": true})) }))
+            .await?;
+        ctx.record_llm_call(LlmCall::new("model-after-commit", 5, 1))?;
+        Ok(value)
+    })
+}
+
+fn wf_oversized(ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
+    run_step(ctx, "llm_oversized_step", input)
+}
+
+/// Records a call, then returns a result over the activity's result cap.
+fn llm_oversized_step(ctx: &ActivityContext, _input: Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        ctx.record_llm_call(LlmCall::new("model-oversized", 5, 1))?;
+        Ok(json!({"answer": "x".repeat(4_096)}))
+    })
+}
+
+fn wf_refused(ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
+    run_step(ctx, "llm_refused_step", input)
+}
+
+static REFUSED_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Records a call whose model id the ledger refuses, and propagates with `?`.
+fn llm_refused_step(ctx: &ActivityContext, _input: Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        REFUSED_CALLS.fetch_add(1, Ordering::SeqCst);
+        ctx.record_llm_call(LlmCall::new("not a model id", 5, 1))?;
+        Ok(json!({"unreachable": true}))
+    })
+}
+
+fn wf_local_retry(ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        let retry = RetryPolicy::fixed(2, Duration::from_millis(10));
+        ctx.execute_local_activity_raw("llm_local_flaky_step", input, Some(retry), None)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+static LOCAL_FLAKY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// A local activity that records a call on each attempt and fails the first.
+fn llm_local_flaky_step(ctx: &ActivityContext, _input: Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        let attempt = LOCAL_FLAKY_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+        ctx.record_llm_call(LlmCall::new(format!("model-local-attempt-{attempt}"), 3, 1))?;
+        if attempt == 1 {
+            return Err("transient provider fault".to_string());
+        }
+        Ok(json!({"answer": OUTPUT_SECRET}))
+    })
+}
+
+/// Run one workflow that calls one activity, and return its execution id.
+async fn run_one(
+    url: &str,
+    workflow: (&'static str, autumn_harvest::info::WorkflowHandlerFn),
+    activity: ActivityInfo,
+) -> ExecutionId {
+    let codecs = aead_codecs();
+    let queue = activity
+        .default_queue
+        .expect("the activity names its queue");
+    let registry = registry(
+        vec![wf_info(workflow.0, workflow.1)],
+        vec![activity],
+        &codecs,
+    );
+    run_to_completion(
+        url,
+        &codecs,
+        queue,
+        registry,
+        workflow.0,
+        &[&Uuid::new_v4().to_string()],
+    )
+    .await[0]
+}
+
 // ── AC1: the three completion paths ──────────────────────────────────────────
 
 #[tokio::test]
@@ -513,7 +620,11 @@ async fn the_worker_path_writes_one_row_per_call_outside_the_ciphertext() {
     assert_eq!(rows[1].call_index, 1);
     assert_eq!(rows[1].model, "model-remote-b");
     assert_eq!(rows[1].cost_usd_micros, None, "an unpriced call");
-    assert!(rows[1].latency_ms >= 0);
+    assert!(
+        (20..10_000).contains(&rows[1].latency_ms),
+        "an untimed call gets the time since the previous call: {}",
+        rows[1].latency_ms
+    );
 }
 
 #[tokio::test]
@@ -642,6 +753,107 @@ async fn a_failed_attempt_writes_no_row() {
     );
     assert_eq!(rows.len(), 1, "only the completed attempt writes: {rows:?}");
     assert_eq!(rows[0].model, "model-attempt-2");
+}
+
+#[tokio::test]
+async fn a_call_recorded_after_the_transactional_commit_is_dropped() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = unique_queue("llm-after-commit");
+    let exec_id = run_one(
+        &url,
+        ("llm_after_commit_wf", wf_after_commit),
+        activity_info(
+            "llm_after_commit_step",
+            queue,
+            false,
+            None,
+            llm_after_commit_step,
+        ),
+    )
+    .await;
+
+    let mut conn = connect(&url).await;
+    let rows = ledger_rows(&mut conn, exec_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].model, "model-before-commit");
+    assert_eq!(
+        stored_events(&mut conn, exec_id, "ActivityCompleted")
+            .await
+            .len(),
+        1,
+        "the commit stands"
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_result_writes_no_row() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = unique_queue("llm-oversized");
+    let mut info = activity_info("llm_oversized_step", queue, false, None, llm_oversized_step);
+    info.max_result_bytes = Some(256);
+    let exec_id = run_one(&url, ("llm_oversized_wf", wf_oversized), info).await;
+
+    let mut conn = connect(&url).await;
+    assert_eq!(ledger_rows(&mut conn, exec_id).await, Vec::new());
+    assert_eq!(
+        stored_events(&mut conn, exec_id, "ActivityFailed")
+            .await
+            .len(),
+        1,
+        "the cap fails the activity"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_call_fails_the_attempt_without_a_retry() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = unique_queue("llm-refused");
+    REFUSED_CALLS.store(0, Ordering::SeqCst);
+    let exec_id = run_one(
+        &url,
+        ("llm_refused_wf", wf_refused),
+        activity_info(
+            "llm_refused_step",
+            queue,
+            false,
+            Some(RetryPolicy::fixed(3, Duration::from_millis(10))),
+            llm_refused_step,
+        ),
+    )
+    .await;
+
+    let mut conn = connect(&url).await;
+    assert_eq!(
+        AtomicUsize::load(&REFUSED_CALLS, Ordering::SeqCst),
+        1,
+        "a refusal is not retryable, so the model is not called and paid again"
+    );
+    assert_eq!(ledger_rows(&mut conn, exec_id).await, Vec::new());
+}
+
+#[tokio::test]
+async fn a_local_retry_writes_only_the_completed_attempt() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = unique_queue("llm-local-retry");
+    LOCAL_FLAKY_CALLS.store(0, Ordering::SeqCst);
+    let exec_id = run_one(
+        &url,
+        ("llm_local_retry_wf", wf_local_retry),
+        activity_info(
+            "llm_local_flaky_step",
+            queue,
+            true,
+            None,
+            llm_local_flaky_step,
+        ),
+    )
+    .await;
+
+    let mut conn = connect(&url).await;
+    let rows = ledger_rows(&mut conn, exec_id).await;
+    assert_eq!(AtomicUsize::load(&LOCAL_FLAKY_CALLS, Ordering::SeqCst), 2);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].model, "model-local-attempt-2");
 }
 
 // ── AC3: replay is unchanged ─────────────────────────────────────────────────
@@ -868,6 +1080,96 @@ async fn usage_rolls_the_ledger_up_per_workflow_type_and_per_tenant() {
     assert_eq!(g.llm_input_tokens, 2_000);
     assert_eq!(g.llm_cost_usd_micros, 9_000);
     assert_eq!(g.workflow_starts, 1, "the other metrics are unchanged");
+}
+
+#[tokio::test]
+async fn usage_reports_a_run_that_started_before_the_window() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let name = format!("long-agent-{}", Uuid::new_v4().simple());
+    let exec_id = seed_run(&mut conn, &name, None).await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET started_at = NOW() - INTERVAL '3 days' \
+          WHERE id = $1",
+    )
+    .bind::<SqlUuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("age the run");
+    seed_ledger_row(&mut conn, exec_id, 3, 40, 4, Some(90), 10, 0).await;
+
+    let query = UsageQuery {
+        group_by: UsageGroupBy::WorkflowName,
+        from: Utc::now() - chrono::Duration::hours(1),
+        to: Utc::now() + chrono::Duration::hours(1),
+    };
+    let rows = load_usage_grouped(&mut conn, 0, &query, 10_000)
+        .await
+        .expect("usage");
+    let row = group(&rows, &name);
+    assert_eq!(row.workflow_starts, 0, "the start is outside the window");
+    assert_eq!(row.llm_calls, 1);
+    assert_eq!(row.llm_cost_usd_micros, 90);
+}
+
+/// Put `exec_id` in the state that one phase of a shard move leaves.
+async fn set_move_phase(conn: &mut AsyncPgConnection, exec_id: ExecutionId, phase: &str) {
+    let state = if phase == "STAGED" {
+        "MIGRATING"
+    } else {
+        "MIGRATED"
+    };
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions \
+            SET state = $2, migrated_to_shard = 1, migrated_at = NOW() WHERE id = $1",
+    )
+    .bind::<SqlUuid, _>(exec_id.as_uuid())
+    .bind::<Text, _>(state)
+    .execute(conn)
+    .await
+    .expect("set the move state");
+    if phase != "STAGED" {
+        diesel::sql_query(
+            "INSERT INTO harvest_shard_migrations (execution_id, source_shard, target_shard, phase) \
+             VALUES ($1, 0, 1, $2)",
+        )
+        .bind::<SqlUuid, _>(exec_id.as_uuid())
+        .bind::<Text, _>(phase)
+        .execute(conn)
+        .await
+        .expect("record the move");
+    }
+}
+
+#[tokio::test]
+async fn usage_counts_a_moving_run_on_one_shard_in_every_phase() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let mut expected = Vec::new();
+    for (phase, counts) in [("STAGED", 0), ("COMMITTED", 1), ("DONE", 0)] {
+        let name = format!("move-{phase}-{suffix}");
+        let exec_id = seed_run(&mut conn, &name, None).await;
+        seed_ledger_row(&mut conn, exec_id, 3, 10, 1, Some(5), 5, 0).await;
+        set_move_phase(&mut conn, exec_id, phase).await;
+        expected.push((name, counts));
+    }
+
+    let query = UsageQuery {
+        group_by: UsageGroupBy::WorkflowName,
+        from: Utc::now() - chrono::Duration::hours(1),
+        to: Utc::now() + chrono::Duration::hours(1),
+    };
+    let rows = load_usage_grouped(&mut conn, 0, &query, 10_000)
+        .await
+        .expect("usage");
+    for (name, counts) in expected {
+        let calls = rows
+            .iter()
+            .find(|row| row.group == name)
+            .map_or(0, |row| row.llm_calls);
+        assert_eq!(calls, counts, "{name}");
+    }
 }
 
 // ── retention ────────────────────────────────────────────────────────────────

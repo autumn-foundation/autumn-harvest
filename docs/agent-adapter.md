@@ -150,8 +150,10 @@ model id, the tokens, the cost and the call latency. It is outside the
 encrypted turn output, so the usage report can sum it per tenant. Two
 `AgentModel` methods fill it in:
 
-- `model_id()` — the model id. The default is `"unknown"`. It is stored in
-  clear, so do not put PII in it.
+- `model_id()` — the model id. The default is `"unknown"`. The ledger
+  stores it in clear, so do not put PII in it. It must be a token of ASCII
+  letters, digits and `._:/@+-`. The ledger records any other id as
+  `"unknown"`.
 - `cost_usd_micros(usage)` — the cost of one call, in millionths of a US
   dollar. The default is `None`, which counts the call as unpriced.
 
@@ -254,7 +256,8 @@ reads these payloads back, so add a field only with `#[serde(default)]`.
 - **Tool definitions are read at call time.** A deploy that changes the tool
   list changes only later turns. Recorded turns replay as they were.
 - **The session entity is separate.** It is a sibling issue.
-- **The cost ledger needs Postgres.** On SQLite the ledger call is dropped.
+- **The cost ledger needs Postgres.** The SQLite path calls the model
+  directly, with no activity context, so it writes no ledger rows.
 
 ## 10. The daemon example
 
