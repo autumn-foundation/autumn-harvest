@@ -1950,6 +1950,20 @@ async fn the_llm_ledger_moves_with_the_run() {
         .await,
         1
     );
+
+    // The cutover drops the source rows. Otherwise the tenant spend of the
+    // source shard would still count a run that now lives on the target.
+    let mut source = shards.source().await;
+    assert_eq!(
+        count(
+            &mut source,
+            "SELECT count(*)::BIGINT AS value FROM harvest_llm_ledger WHERE execution_id = $1",
+            exec_id
+        )
+        .await,
+        0,
+        "the source must not keep the spend it handed to the target"
+    );
 }
 
 // ── AC7: crash safety at every kill point ────────────────────────────────────

@@ -2688,6 +2688,11 @@ mod db {
         // always executes to completion whether or not the primary query reads
         // them; only the seal's row count is needed to answer "did the cutover
         // happen?".
+        //
+        // `released` drops the source copy of the LLM ledger (issue #1997). The
+        // target holds the staged copy now. A source copy would count the same
+        // spend for the tenant on two shards. It goes in the seal commit, so an
+        // abort keeps it.
         let sql = format!(
             "WITH sealed AS ( \
                  UPDATE harvest_workflow_executions e \
@@ -2704,6 +2709,10 @@ mod db {
                     AND t.state IN ('PENDING', 'RUNNING') \
                     AND EXISTS (SELECT 1 FROM sealed) \
                  RETURNING t.id \
+             ), released AS ( \
+                 DELETE FROM harvest_llm_ledger g \
+                  WHERE g.execution_id = $1 AND EXISTS (SELECT 1 FROM sealed) \
+                 RETURNING g.id \
              ) \
              SELECT (SELECT count(*) FROM sealed)::BIGINT AS sealed_rows"
         );
