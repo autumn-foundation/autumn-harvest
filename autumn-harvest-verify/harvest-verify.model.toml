@@ -1694,6 +1694,14 @@ path = "run_transactional"
 receiver = "ActivityContext"
 reason = "Activity-side: context.rs:15202; runs the closure inside the activity's transactional state. Activity-side, no workflow command."
 [[non_sink]]
+path = "record_llm_call"
+receiver = "ActivityContext"
+reason = "Activity-side: context.rs:15064; keeps the call in the attempt's ledger slot (issue #1996). The completion transaction writes it to `harvest_llm_ledger`, not to `harvest_events`. No workflow command."
+[[non_sink]]
+path = "llm_calls"
+receiver = "ActivityContext"
+reason = "Activity-side: context.rs:15073; a copy of the calls the attempt recorded so far (issue #1996). No workflow command."
+[[non_sink]]
 path = "deadline"
 receiver = "ActivityContext"
 reason = "Activity-side: the attempt deadline (context.rs:14659) - activity-side, and const."
