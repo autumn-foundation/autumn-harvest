@@ -51,6 +51,7 @@ fn update_with_start_params_is_cloneable_and_debug() {
         workflow_retry_policy: None,
         max_workflow_attempts_ceiling: None,
         reject_fresh_if_debounced: false,
+        tenant: None,
     };
 
     let _cloned = params.clone();
@@ -123,6 +124,7 @@ fn update_with_start_outcome_idempotency_key_roundtrip() {
         workflow_retry_policy: None,
         max_workflow_attempts_ceiling: None,
         reject_fresh_if_debounced: false,
+        tenant: None,
     };
     assert_eq!(
         params.idempotency_key.as_deref(),
@@ -230,6 +232,7 @@ mod db_tests {
             workflow_retry_policy: None,
             max_workflow_attempts_ceiling: None,
             reject_fresh_if_debounced: false,
+            tenant: None,
         }
     }
 
@@ -322,6 +325,7 @@ mod db_tests {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         };
         start_or_load_workflow_execution(&mut conn, first_params, None)
             .await
@@ -403,6 +407,7 @@ mod db_tests {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         };
         start_or_load_workflow_execution(&mut conn, start_params, None)
             .await

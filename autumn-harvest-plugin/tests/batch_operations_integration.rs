@@ -226,6 +226,7 @@ async fn seed_workflows(database_url: &str, workflow_name: &str, count: usize) -
                 start_source_ref: None,
                 started_by: None,
                 fairness_key: None,
+                tenant: None,
             },
             None,
         )

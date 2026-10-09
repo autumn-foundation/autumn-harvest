@@ -239,6 +239,7 @@ fn start_params(exec_id: ExecutionId) -> StartWorkflowParams<'static> {
         start_source_ref: None,
         started_by: None,
         fairness_key: None,
+        tenant: None,
     }
 }
 

@@ -100,6 +100,7 @@ async fn insert_named_running(
             start_source: None,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         })
         .execute(conn)
         .await
@@ -238,6 +239,7 @@ fn default_params(exec_id: ExecutionId, workflow_id: &str) -> StartWorkflowParam
         start_source_ref: None,
         started_by: None,
         fairness_key: None,
+        tenant: None,
     }
 }
 
@@ -873,6 +875,7 @@ async fn signal_with_start_applies_fleet_wide_chain_ceiling() {
             workflow_info: None,
             start_source_override: None,
             start_source_ref_override: None,
+            tenant: None,
         },
         None,
         None,

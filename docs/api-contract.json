@@ -794,6 +794,11 @@
                 "name": "staging_vacated_by",
                 "type": "string",
                 "description": "A UUID."
+              },
+              {
+                "name": "tenant",
+                "type": "string",
+                "description": "Verified tenant of the run (issue #1977). Omitted when the run has none."
               }
             ],
             "description": "The execution row."
@@ -2000,7 +2005,7 @@
       "error_responses": [
         {
           "status": 400,
-          "description": "Invalid request body or workflow name. Also returned when start_at/delay is combined with a debounce policy, when input exceeds the workflow input cap, when idempotency_key is empty, when idempotency_key is combined with a throttle/debounce/batch policy (issue #808), when conflict_policy is an unknown value, when a non-default conflict_policy is combined with a throttle/debounce/batch policy (issue #685), when shard_id and residency_key are both supplied, when shard_id is negative / the reserved routing sentinel / outside readable_shards / drained out of writable_shards, or when residency_key is blank or undeclared (issue #697)."
+          "description": "Invalid request body or workflow name. Also returned when start_at/delay is combined with a debounce policy, when input exceeds the workflow input cap, when idempotency_key is empty, when idempotency_key is combined with a throttle/debounce/batch policy (issue #808), when conflict_policy is an unknown value, when a non-default conflict_policy is combined with a throttle/debounce/batch policy (issue #685), when shard_id and residency_key are both supplied, when shard_id is negative / the reserved routing sentinel / outside readable_shards / drained out of writable_shards, or when residency_key is blank or undeclared (issue #697). Also returned when a tenant-bound caller starts a throttled, debounced or batched workflow (issue #1977)."
         },
         {
           "status": 401,
@@ -2012,7 +2017,7 @@
         },
         {
           "status": 409,
-          "description": "Duplicate workflow_id with conflicting reuse policy, or conflict_policy=fail over an ACTIVE (RUNNING/PAUSED) prior (issue #685)."
+          "description": "Duplicate workflow_id with conflicting reuse policy, or conflict_policy=fail over an ACTIVE (RUNNING/PAUSED) prior (issue #685). Also returned to a tenant-bound caller when the start resolves to a run of another tenant. That body names no execution (issue #1977)."
         },
         {
           "status": 413,
@@ -9933,7 +9938,7 @@
       "path": "/admin/tokens",
       "category": "api_tokens",
       "read_only": true,
-      "description": "List all scoped API tokens as metadata only (issue #942). The plaintext secret and its hash are never returned — only id, name, scope, created_at, expires_at, last_used_at, revoked_at.",
+      "description": "List all scoped API tokens as metadata only (issue #942). The plaintext secret and its hash are never returned — only id, name, scope, created_at, expires_at, last_used_at, revoked_at and tenant (issue #1977).",
       "idempotency": "Read-only; always idempotent.",
       "params": [],
       "request_body": null,
@@ -9982,6 +9987,11 @@
             "name": "expires_at",
             "required": false,
             "description": "RFC 3339 timestamp after which the token is rejected 401."
+          },
+          {
+            "name": "tenant",
+            "required": false,
+            "description": "Tenant claim (issue #1977). 1 to 128 bytes of visible ASCII, with no spaces. A tenant-bound token reaches only the runs of its tenant, through the tenant-scoped routes. Omit it for an operator token."
           }
         ]
       },
@@ -9995,13 +10005,14 @@
           "expires_at",
           "last_used_at",
           "revoked_at",
+          "tenant",
           "secret"
         ]
       },
       "error_responses": [
         {
           "status": 400,
-          "description": "Unknown scope (expected 'read', 'mutate' or 'admin')."
+          "description": "Unknown scope (expected 'read', 'mutate' or 'admin'), or an invalid tenant."
         },
         {
           "status": 401,

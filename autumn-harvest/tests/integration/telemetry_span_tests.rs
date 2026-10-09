@@ -354,6 +354,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     start_source_ref: None,
                     started_by: None,
                     fairness_key: None,
+                    tenant: None,
                 },
                 None,
             )

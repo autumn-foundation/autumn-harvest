@@ -78,6 +78,8 @@ pub mod status_summary;
 /// pair list (issue #1151, extracted from the issue #774 `queue-coverage`
 /// fix).
 pub mod strict_query;
+/// Tenant binding for the management API (issue #1977).
+pub mod tenant;
 pub mod ui;
 pub mod usage;
 pub mod version_gate_retirement;

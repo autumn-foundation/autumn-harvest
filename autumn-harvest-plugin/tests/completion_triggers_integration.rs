@@ -484,6 +484,7 @@ async fn test_trigger_evaluations_same_shard() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -614,6 +615,7 @@ async fn test_terminate_fires_terminated_trigger_not_cancelled() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -739,6 +741,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -831,6 +834,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -954,6 +958,7 @@ async fn test_outcome_mapping_delivers_failure_cause_to_target() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -1121,6 +1126,7 @@ async fn test_outcome_mapping_delivers_output_on_completed_source() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -1242,6 +1248,7 @@ async fn test_trigger_state_matching_and_deduplication() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -1433,6 +1440,7 @@ async fn test_trigger_cross_shard() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -1552,6 +1560,7 @@ async fn test_completion_trigger_via_worker_run() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -1685,6 +1694,7 @@ async fn test_trigger_with_custom_queue() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -1887,6 +1897,7 @@ async fn test_trigger_outbox_retry_and_sweep() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -2139,6 +2150,7 @@ async fn test_trigger_cross_shard_queue_preservation() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -2643,6 +2655,7 @@ async fn test_trigger_evaluations_schema_validation() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -2730,6 +2743,7 @@ async fn test_trigger_evaluations_schema_validation() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -2859,6 +2873,7 @@ async fn test_trigger_emits_fire_metric_outcomes() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -2994,6 +3009,7 @@ async fn start_and_complete_source(
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )

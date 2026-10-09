@@ -250,6 +250,7 @@ async fn start_root(
         start_source_ref: None,
         started_by: None,
         fairness_key: None,
+        tenant: None,
     };
     start_or_load_workflow_execution(conn, params, None)
         .await
@@ -301,6 +302,7 @@ async fn signal_with_start(
         workflow_info: None,
         start_source_override: None,
         start_source_ref_override: None,
+        tenant: None,
     };
     signal_with_start_workflow_execution(conn, params)
         .await

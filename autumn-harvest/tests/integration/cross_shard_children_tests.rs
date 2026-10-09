@@ -439,6 +439,7 @@ fn parent_start_params<'a>(
         start_source_ref: None,
         started_by: None,
         fairness_key: None,
+        tenant: None,
     }
 }
 
@@ -579,6 +580,7 @@ async fn a_cross_shard_childs_chain_deadline_is_anchored_at_its_own_creation() {
         max_concurrent: None,
         trace_context: None,
         fairness_key: None,
+        tenant: None,
     };
 
     {
@@ -689,6 +691,7 @@ async fn a_cross_shard_child_cancelled_before_creation_is_born_cancelled() {
         max_concurrent: None,
         trace_context: None,
         fairness_key: None,
+        tenant: None,
     };
 
     {
@@ -800,6 +803,7 @@ async fn a_cross_shard_child_cancelled_before_creation_bypasses_an_exceeded_quot
         max_concurrent: None,
         trace_context: None,
         fairness_key: None,
+        tenant: None,
     };
 
     let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
@@ -919,6 +923,7 @@ async fn erasing_a_parent_reaches_a_terminal_cross_shard_childs_payloads() {
             max_concurrent: None,
             trace_context: None,
             fairness_key: None,
+            tenant: None,
         };
         autumn_harvest::cross_shard_child::record_cross_shard_child(
             &mut parent_conn,
@@ -1048,6 +1053,7 @@ async fn erasing_a_parent_scrubs_the_outbox_child_specs_input() {
             max_concurrent: None,
             trace_context: None,
             fairness_key: None,
+            tenant: None,
         };
         autumn_harvest::cross_shard_child::record_cross_shard_child(
             &mut parent_conn,
@@ -1179,6 +1185,7 @@ async fn erasing_a_parent_preserves_a_still_running_started_childs_outbox_spec()
             max_concurrent: None,
             trace_context: None,
             fairness_key: None,
+            tenant: None,
         };
         autumn_harvest::cross_shard_child::record_cross_shard_child(
             &mut parent_conn,
@@ -1296,6 +1303,7 @@ async fn erasing_a_parent_with_a_pending_start_child_reports_it_as_skipped() {
         max_concurrent: None,
         trace_context: None,
         fairness_key: None,
+        tenant: None,
     };
     autumn_harvest::cross_shard_child::record_cross_shard_child(
         &mut parent_conn,
@@ -1404,6 +1412,7 @@ async fn erasing_a_parent_scrubs_a_started_childs_spec_after_target_side_retenti
         max_concurrent: None,
         trace_context: None,
         fairness_key: None,
+        tenant: None,
     };
     autumn_harvest::cross_shard_child::record_cross_shard_child(
         &mut parent_conn,
@@ -2346,6 +2355,7 @@ async fn a_fenced_child_sweep_abandons_its_pass_on_a_busy_target_pool() {
         concurrency_key: None,
         max_concurrent: None,
         trace_context: None,
+        tenant: None,
     };
     let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
     autumn_harvest::cross_shard_child::record_cross_shard_child(

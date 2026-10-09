@@ -245,6 +245,7 @@ fn start_params<'a>(name: &'a str, wf_id: &'a str, exec: ExecutionId) -> StartWo
         start_source_ref: None,
         started_by: None,
         fairness_key: None,
+        tenant: None,
     }
 }
 

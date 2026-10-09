@@ -215,6 +215,7 @@ async fn seed_execution(
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )

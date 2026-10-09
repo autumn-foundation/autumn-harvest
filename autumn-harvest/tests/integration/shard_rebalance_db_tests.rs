@@ -293,6 +293,7 @@ async fn insert_execution_with_id(
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -4719,6 +4720,7 @@ fn signal_with_start_allow_duplicate<'a>(
         workflow_info: None,
         start_source_override: None,
         start_source_ref_override: None,
+        tenant: None,
     }
 }
 
@@ -5064,6 +5066,7 @@ fn terminate_existing_start<'a>(
         start_source_ref: None,
         started_by: None,
         fairness_key: None,
+        tenant: None,
     }
 }
 

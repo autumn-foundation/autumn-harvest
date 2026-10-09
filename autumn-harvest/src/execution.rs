@@ -204,6 +204,50 @@ pub struct StartWorkflowParams<'a> {
     /// Optional human/operator attribution for the start (issue #740). `None`
     /// when absent.
     pub started_by: Option<&'a str>,
+    /// Verified tenant of the new run (issue #1977). `None` means no tenant.
+    ///
+    /// Set it only from a verified source: a tenant-bound credential, or
+    /// trusted in-process code. Never set it from caller input. The retention
+    /// janitor and the management API tenant check trust this value.
+    /// [`crate::tenant::validate_tenant`] must accept it, or the start fails.
+    pub tenant: Option<&'a str>,
+}
+
+/// Refuse a tenant-bound start whose prior run has another tenant (issue
+/// #1977).
+///
+/// A start with no tenant is trusted code, so it passes. A prior run with no
+/// tenant counts as another tenant.
+fn refuse_other_tenant(
+    request: &StartWorkflowParams<'_>,
+    existing: &WorkflowExecution,
+) -> HarvestResult<()> {
+    match request.tenant {
+        Some(tenant) if existing.tenant.as_deref() != Some(tenant) => {
+            Err(HarvestError::TenantConflict {
+                workflow_name: request.workflow_name.to_string(),
+                workflow_id: request.workflow_id.to_string(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Refuse a tenant-bound start whose idempotency claim names a run of another
+/// tenant (issue #1977).
+///
+/// Idempotency keys are shared across tenants. A duplicate must not hand one
+/// tenant the run of another.
+pub(crate) async fn refuse_other_tenant_claim(
+    conn: &mut AsyncPgConnection,
+    request: &StartWorkflowParams<'_>,
+    claimed: ExecutionId,
+) -> HarvestResult<()> {
+    if request.tenant.is_none() {
+        return Ok(());
+    }
+    let existing = load_execution(conn, claimed).await?;
+    refuse_other_tenant(request, &existing)
 }
 
 /// Origin marker for a normal scheduler-tick fire (issue #534).
@@ -301,6 +345,7 @@ impl<'a> StartWorkflowParams<'a> {
             start_source: StartSource::default(),
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         }
     }
 
@@ -584,6 +629,7 @@ mod start_params_new_tests {
             start_source,
             start_source_ref,
             started_by,
+            tenant,
         } = StartWorkflowParams::new("wf", "wf-1", exec_id, input.clone(), "default");
 
         assert_eq!(workflow_name, "wf");
@@ -628,6 +674,7 @@ mod start_params_new_tests {
         assert_eq!(start_source, StartSource::Unknown);
         assert!(start_source_ref.is_none());
         assert!(started_by.is_none());
+        assert!(tenant.is_none());
     }
 
     /// Struct-update syntax overrides only the named fields.
@@ -1171,6 +1218,12 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     if request.workflow_id.is_empty() {
         return Err(HarvestError::EmptyWorkflowId);
     }
+    // Every start path funnels through here, so one check covers them all.
+    if let Some(tenant) = request.tenant
+        && let Err(e) = crate::tenant::validate_tenant(tenant)
+    {
+        return Err(HarvestError::Config(format!("invalid tenant: {e}")));
+    }
 
     // Validate delayed start parameters (issue #322)
     if request.start_at.is_some() && request.delay.is_some() {
@@ -1358,6 +1411,13 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         && terminate_via_pre_check
         && !reject_fresh_if_debounced
     {
+        // A tenant conflict outranks a closed gate (issue #1977).
+        if request.tenant.is_some()
+            && let Some(prior) =
+                try_load_by_key(conn, request.workflow_name, request.workflow_id).await?
+        {
+            refuse_other_tenant(&request, &prior)?;
+        }
         admit_fresh_start(
             mode,
             metrics,
@@ -1398,6 +1458,8 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             try_load_by_key(conn, request.workflow_name, request.workflow_id).await?
         && matches!(existing.state.as_str(), "RUNNING" | "PAUSED")
     {
+        // Never cancel a run of another tenant (issue #1977).
+        refuse_other_tenant(&request, &existing)?;
         let existing_exec_id = ExecutionId::from_uuid(existing.id);
         // Ignore Config errors: the execution may have transitioned to a terminal
         // state between the pre-check and the cancel lock. In that race the prior
@@ -1514,6 +1576,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         start_source_ref: request.start_source_ref,
         started_by: request.started_by,
         quota_key: quota_key.as_deref(),
+        tenant: request.tenant,
     };
     let mut enqueue = EnqueueParams::new(
         request.queue_name.to_owned(),
@@ -1655,6 +1718,9 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                     .optional()
                     .map_err(database_error)?;
                 if let Some(seal) = reconciled_seal {
+                    // A seal of another tenant is still that tenant's run
+                    // (issue #1977). Do not report, attach to or replace it.
+                    refuse_other_tenant(&request, &seal)?;
                     if request.reuse_policy == WorkflowIdReusePolicy::RejectDuplicate {
                         // Report the effective terminal state, not the
                         // seal's own `MIGRATED` marker (issue #1596 review,
@@ -1731,6 +1797,10 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                 request.workflow_id,
             )
             .await?;
+            // A tenant conflict outranks a closed gate (issue #1977).
+            if let Some(prior) = prior.as_ref() {
+                refuse_other_tenant(&request, prior)?;
+            }
             if start_will_create_new_execution(
                 prior.as_ref().map(|e| e.state.as_str()),
                 request.reuse_policy,
@@ -1992,6 +2062,11 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         // attached to a dead seal permanently. `migrated_run_terminal_at`
         // is the reconciler's record that the live copy has finished;
         // treat that exactly like any other terminal prior below.
+        // Issue #1977: a tenant-bound start must not attach to, cancel,
+        // replace or seal a run of another tenant. The row lock is held, so
+        // the check and every branch below see the same row.
+        refuse_other_tenant(&request, &existing)?;
+
         let seal_observed_terminal =
             existing.state == "MIGRATED" && existing.migrated_run_terminal_at.is_some();
 
@@ -2531,16 +2606,19 @@ pub async fn start_or_load_workflow_execution_idempotent_with_codecs(
                     exec_id,
                     workflow_id,
                     state,
-                } => Ok((
-                    IdempotentStartOutcome::Deduplicated {
-                        exec_id,
-                        workflow_id,
-                        state,
-                    },
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                )),
+                } => {
+                    refuse_other_tenant_claim(conn, &request, exec_id).await?;
+                    Ok((
+                        IdempotentStartOutcome::Deduplicated {
+                            exec_id,
+                            workflow_id,
+                            state,
+                        },
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ))
+                }
                 crate::start_idempotency::StartIdempotencyReservation::Reserved => {
                     let workflow_name = request.workflow_name;
                     let (started, ds, dc, cm) =
@@ -6860,6 +6938,7 @@ macro_rules! with_start_params {
             start_source: $source,
             start_source_ref: $source_ref,
             started_by: None,
+            tenant: $request.tenant,
         }
     };
 }
@@ -7143,6 +7222,9 @@ pub struct SignalWithStartParams<'a> {
     /// coordinates, and the documented provenance query would return a
     /// different string for the two binding kinds.
     pub start_source_ref_override: Option<String>,
+    /// Tenant of a fresh run (issue #1977). An attach ignores it. See
+    /// [`StartWorkflowParams::tenant`].
+    pub tenant: Option<&'a str>,
 }
 
 /// Result of a [`signal_with_start_workflow_execution`] call.
@@ -8122,6 +8204,8 @@ pub async fn rerun_workflow_execution_with_codecs(
                 start_source: StartSource::Rerun,
                 start_source_ref: Some(source_exec_id_str.as_str()),
                 started_by: request.started_by,
+                // A re-run belongs to the tenant of its source (issue #1977).
+                tenant: source.tenant.as_deref(),
             };
 
             let (started, deferred_starts, deferred_checks, cancel_metrics) =
@@ -8528,6 +8612,9 @@ pub struct UpdateWithStartParams<'a> {
     /// so an attach/idempotent call is preserved while a fresh start is rejected
     /// — decided atomically under this call's lock (issue #499).
     pub reject_fresh_if_debounced: bool,
+    /// Tenant of a fresh run (issue #1977). An attach ignores it. See
+    /// [`StartWorkflowParams::tenant`].
+    pub tenant: Option<&'a str>,
 }
 
 /// Result of an [`update_with_start_workflow_execution`] call.
@@ -10640,6 +10727,7 @@ mod with_start_shared_unit_tests {
             workflow_retry_policy: Some(serde_json::json!({"max_attempts": 3})),
             max_workflow_attempts_ceiling: Some(4),
             reject_fresh_if_debounced: false,
+            tenant: None,
         }
     }
 

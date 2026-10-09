@@ -90,6 +90,8 @@ const INIT_SQL: &str = concat!(
     // issue #1596 review: WorkflowExecution::as_select() also references
     // this column, for the same reason as the column above.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_by UUID NULL;\n",
+    // Issue #1977: the diesel insert and `as_select()` name this column too.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS tenant TEXT NULL;\n",
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260619000000_harvest_task_queue_created_at/up.sql"
@@ -363,6 +365,7 @@ async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> Execut
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )

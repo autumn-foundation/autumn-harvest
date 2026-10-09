@@ -179,6 +179,7 @@ async fn test_delayed_start_validation() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -243,6 +244,7 @@ async fn test_delayed_start_validation() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -376,6 +378,7 @@ async fn test_delayed_start_no_premature_dispatch() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -471,6 +474,7 @@ async fn test_delayed_start_cancel_before_firing() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -573,6 +577,7 @@ async fn test_delayed_start_workflow_started_event_timestamp() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -643,6 +648,7 @@ async fn test_immediate_start_skew_tolerance() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )

@@ -239,6 +239,7 @@ async fn seed_workflow_with_history_size(
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )

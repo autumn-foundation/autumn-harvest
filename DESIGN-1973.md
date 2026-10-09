@@ -113,3 +113,53 @@ flowchart LR
 | `the_engine_registration_builds`, `the_model_turn_handler_…` | The Postgres path: registration and the `#[activity]` handlers. |
 | proptest `approval_signal_round_trips` | A signal name gives back its call id, for any id. |
 | `scripts/check-agent-adapter-deps.sh` | The adapter depends on no Autumn crate outside the engine. |
+
+---
+
+## 4. Always-on primitives (follow-up)
+
+`autumn-plugin-agent` has always-on primitives: heartbeats, follow-ups,
+delivery, memory and a loop guard. This section maps them onto engine
+primitives. The SQLite backend supports activities, signals and fire-once
+timers, but not `continue_as_new`, child workflows or schedules. Every
+primitive below therefore uses only those three.
+
+### 4.1 Brainstorm
+
+| # | Idea | Verdict |
+|---|------|---------|
+| A1 | Heartbeat as a workflow that loops forever on a timer. | Rejected. History grows without bound, and SQLite has no `continue_as_new`. |
+| A2 | Heartbeat as a one-tick workflow `agent_heartbeat`. An engine schedule starts it on Postgres. The app starts it on SQLite. | **Adopted.** One tick is one bounded run. |
+| A3 | Follow-up as a child workflow with a start delay. | Rejected. SQLite has no child workflows. |
+| A4 | Follow-up as a durable timer in the same run, then a new segment with the follow-up prompt. A chain cap bounds it. | **Adopted.** The session stays one workflow. |
+| A5 | Delivery inside the tool or model activity. | Rejected. A retried activity could deliver twice. |
+| A6 | Delivery as its own activity, `agent_deliver`. | **Adopted.** It is recorded once. |
+| A7 | Memory read by the workflow on each turn. | Rejected. It changes the prompt mid-run and breaks the cache. |
+| A8 | Memory read once per segment by an activity, `agent_memory_snapshot`. | **Adopted.** It is a frozen snapshot, recorded in history. |
+| A9 | Loop guard with `DefaultHasher`. | Rejected. Its output can change between Rust versions, so replay could differ. |
+| A10 | Loop guard with FNV-1a over recorded data. | **Adopted.** It is stable across builds. |
+
+### 4.2 Reverse brainstorm
+
+| # | How to make it harmful | Mitigation |
+|---|------------------------|------------|
+| H1 | Deliver a report twice after a crash. | Delivery is an activity. Replay reads its record. |
+| H2 | Let a heartbeat act on the world with nobody watching. | A heartbeat run is read-only unless the task sets `allow_actions`. The rules apply on top of the app policy. |
+| H3 | Let an agent wake itself forever. | Follow-ups have a chain cap and a maximum delay. |
+| H4 | Reuse an approval name across follow-up segments. | The step number is global across segments. |
+| H5 | Spam the user with "nothing to report". | `HEARTBEAT_OK` answers are not delivered. |
+| H6 | Change the memory prompt between replay and the first run. | The snapshot is an activity result. |
+
+### 4.3 Six thinking hats
+
+- **White.** The SQLite backend has timers but no schedules or
+  `continue_as_new`. Postgres has both.
+- **Red.** Always-on is the feature people want to show off. It must feel
+  like one call per primitive.
+- **Black.** History grows with each follow-up segment. The chain cap bounds
+  it.
+- **Yellow.** Each primitive becomes durable for free: a crash never loses a
+  scheduled follow-up or delivers twice.
+- **Green.** The follow-up tool is handled in the workflow, not by an
+  activity, because it only schedules a timer.
+- **Blue.** RED tests per primitive, then the code, then the guide.

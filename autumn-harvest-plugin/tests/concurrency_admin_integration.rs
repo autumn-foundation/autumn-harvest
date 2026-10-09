@@ -193,6 +193,7 @@ async fn seed_run(pool: &DbPool, wf: &str, wf_id: &str, key: &str, limit: u32) {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )

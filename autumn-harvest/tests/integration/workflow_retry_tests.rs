@@ -406,6 +406,7 @@ async fn start_workflow_on_shard(
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -470,6 +471,7 @@ async fn start_workflow_with_source(
             start_source_ref,
             started_by,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )

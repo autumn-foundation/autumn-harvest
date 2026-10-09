@@ -399,6 +399,7 @@ async fn manual_start_has_no_carryover() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )

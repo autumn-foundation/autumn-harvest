@@ -368,6 +368,7 @@ async fn start_run(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )

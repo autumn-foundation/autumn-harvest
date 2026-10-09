@@ -1945,6 +1945,10 @@ enum TokenCommand {
         /// Optional RFC 3339 expiry after which the token is rejected 401.
         #[arg(long)]
         expires_at: Option<String>,
+        /// Optional tenant claim (issue #1977). A tenant-bound token reaches
+        /// only the runs of its tenant, through the tenant-scoped routes.
+        #[arg(long)]
+        tenant: Option<String>,
     },
     /// List all tokens as metadata (never the secret/hash).
     #[command(alias = "ls")]
@@ -1967,6 +1971,11 @@ enum TokenCommand {
         /// Optional RFC 3339 expiry for the replacement token.
         #[arg(long)]
         expires_at: Option<String>,
+        /// Tenant claim of the replacement token (issue #1977). Rotation does
+        /// not copy the old tenant. Pass it again, as `harvest token list`
+        /// shows it, or the replacement is not tenant-bound.
+        #[arg(long)]
+        tenant: Option<String>,
     },
     /// Seed the FIRST token offline (issue #942). Prints a fresh secret ONCE
     /// and the exact `INSERT INTO harvest_api_tokens ...` SQL for you to run
@@ -1993,6 +2002,11 @@ enum TokenCommand {
         /// Audit provenance recorded as `created_by`.
         #[arg(long, default_value = "bootstrap")]
         created_by: String,
+        /// Optional tenant claim (issue #1977). A tenant-bound seed token
+        /// cannot mint further tokens, so seed the first admin token without
+        /// one.
+        #[arg(long)]
+        tenant: Option<String>,
     },
 }
 
@@ -3977,10 +3991,17 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
                 scope,
                 expires_at,
                 created_by,
+                tenant,
             },
     } = &cli.command
     {
-        return run_token_bootstrap(name, scope, expires_at.as_deref(), created_by);
+        return run_token_bootstrap(
+            name,
+            scope,
+            expires_at.as_deref(),
+            created_by,
+            tenant.as_deref(),
+        );
     }
 
     if matches!(cli.command, Commands::Tui) {
@@ -13010,6 +13031,7 @@ fn token_request(command: &TokenCommand) -> ApiRequest {
             name,
             scope,
             expires_at,
+            tenant,
         } => {
             let mut body = serde_json::json!({
                 "name": name,
@@ -13017,6 +13039,9 @@ fn token_request(command: &TokenCommand) -> ApiRequest {
             });
             if let Some(exp) = expires_at {
                 body["expires_at"] = serde_json::json!(exp);
+            }
+            if let Some(tenant) = tenant {
+                body["tenant"] = serde_json::json!(tenant);
             }
             ApiRequest::post("/admin/tokens", Some(body))
         }
@@ -13026,6 +13051,7 @@ fn token_request(command: &TokenCommand) -> ApiRequest {
             old_id,
             scope,
             expires_at,
+            tenant,
         } => {
             let mut body = serde_json::json!({
                 "name": format!("rotation-of-{old_id}"),
@@ -13033,6 +13059,9 @@ fn token_request(command: &TokenCommand) -> ApiRequest {
             });
             if let Some(exp) = expires_at {
                 body["expires_at"] = serde_json::json!(exp);
+            }
+            if let Some(tenant) = tenant {
+                body["tenant"] = serde_json::json!(tenant);
             }
             ApiRequest::post("/admin/tokens", Some(body))
         }
@@ -13087,6 +13116,26 @@ pub fn build_bootstrap_token(
     expires_at: Option<&str>,
     created_by: &str,
 ) -> Result<BootstrapToken, CliError> {
+    build_bootstrap_token_for_tenant(name, scope, expires_at, created_by, None)
+}
+
+/// [`build_bootstrap_token`] with an optional tenant claim (issue #1977).
+///
+/// # Errors
+///
+/// As [`build_bootstrap_token`]. Also an invalid `tenant`.
+pub fn build_bootstrap_token_for_tenant(
+    name: &str,
+    scope: &str,
+    expires_at: Option<&str>,
+    created_by: &str,
+    tenant: Option<&str>,
+) -> Result<BootstrapToken, CliError> {
+    if let Some(t) = tenant {
+        autumn_harvest::tenant::validate_tenant(t).map_err(|e| {
+            CliError::InvalidInput(format!("token bootstrap: --tenant '{t}' is not valid: {e}"))
+        })?;
+    }
     // Single source of truth: the mint route hashes with these exact helpers.
     let secret = autumn_harvest::api_token::mint_secret();
     let hash = autumn_harvest::api_token::hash_secret(&secret);
@@ -13117,6 +13166,11 @@ pub fn build_bootstrap_token(
         columns.push_str(", expires_at");
         let _ = write!(values, ", {}::timestamptz", sql_quote(e));
     }
+    if let Some(t) = tenant {
+        use std::fmt::Write as _;
+        columns.push_str(", tenant");
+        let _ = write!(values, ", {}", sql_quote(t));
+    }
     let insert_sql = format!("INSERT INTO harvest_api_tokens ({columns})\nVALUES ({values});");
 
     Ok(BootstrapToken {
@@ -13139,8 +13193,9 @@ fn run_token_bootstrap(
     scope: &str,
     expires_at: Option<&str>,
     created_by: &str,
+    tenant: Option<&str>,
 ) -> Result<(), CliError> {
-    let token = build_bootstrap_token(name, scope, expires_at, created_by)?;
+    let token = build_bootstrap_token_for_tenant(name, scope, expires_at, created_by, tenant)?;
 
     println!("Harvest API token — offline bootstrap seed");
     println!();
@@ -17542,12 +17597,14 @@ mod token_bootstrap_tests {
                         scope,
                         expires_at,
                         created_by,
+                        tenant,
                     },
             } => {
                 assert_eq!(scope, "admin", "default scope must be admin");
                 assert_eq!(name, "bootstrap");
                 assert_eq!(created_by, "bootstrap");
                 assert_eq!(expires_at, None);
+                assert_eq!(tenant, None, "a seed token has no tenant by default");
             }
             other => panic!("expected token bootstrap, got {other:?}"),
         }
@@ -17584,6 +17641,7 @@ mod token_bootstrap_tests {
                     scope,
                     expires_at,
                     created_by,
+                    tenant: _,
                 },
         } = cli.command
         else {
@@ -17595,6 +17653,85 @@ mod token_bootstrap_tests {
         assert!(token.insert_sql.contains("'dashboard'"));
         assert!(token.insert_sql.contains("'release-eng'"));
         assert!(!token.insert_sql.contains(&token.secret));
+    }
+
+    /// `--tenant` binds the seed token to a tenant (issue #1977).
+    #[test]
+    fn bootstrap_tenant_flows_through_to_sql() {
+        let cli = Cli::try_parse_from([
+            "harvest",
+            "token",
+            "bootstrap",
+            "--scope",
+            "read",
+            "--tenant",
+            "acme",
+        ])
+        .expect("parses");
+        let Commands::Token {
+            command: TokenCommand::Bootstrap { tenant, .. },
+        } = cli.command
+        else {
+            panic!("expected token bootstrap");
+        };
+        assert_eq!(tenant.as_deref(), Some("acme"));
+        let token = build_bootstrap_token_for_tenant("t", "read", None, "op", Some("acme"))
+            .expect("builds");
+        assert!(token.insert_sql.contains("tenant)"), "{}", token.insert_sql);
+        assert!(
+            token.insert_sql.contains("'acme');"),
+            "{}",
+            token.insert_sql
+        );
+
+        let untenanted = build_bootstrap_token("t", "read", None, "op").expect("builds");
+        assert!(!untenanted.insert_sql.contains("tenant"));
+
+        // A quote is visible ASCII, so it is a valid key. The SQL escapes it.
+        let quoted = build_bootstrap_token_for_tenant("t", "read", None, "op", Some("o'neil"))
+            .expect("builds");
+        assert!(
+            quoted.insert_sql.contains("'o''neil'"),
+            "{}",
+            quoted.insert_sql
+        );
+
+        for bad in ["", "a b", "tab\t"] {
+            assert!(
+                build_bootstrap_token_for_tenant("t", "read", None, "op", Some(bad)).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// `token rotate --tenant` keeps the replacement tenant-bound (issue
+    /// #1977). Without the flag the body carries no tenant.
+    #[test]
+    fn token_rotate_sends_the_tenant() {
+        let body = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).expect("parses");
+            let Commands::Token { command } = cli.command else {
+                panic!("expected token rotate");
+            };
+            token_request(&command).body.expect("a mint body")
+        };
+        let bound = body(&["harvest", "token", "rotate", "old", "--tenant", "acme"]);
+        assert_eq!(bound["tenant"], "acme");
+        let unbound = body(&["harvest", "token", "rotate", "old"]);
+        assert!(unbound.get("tenant").is_none(), "{unbound}");
+    }
+
+    /// `token create --tenant` sends the tenant in the mint body (issue #1977).
+    #[test]
+    fn token_create_sends_the_tenant() {
+        let cli = Cli::try_parse_from(["harvest", "token", "create", "ci", "--tenant", "acme"])
+            .expect("parses");
+        let Commands::Token { command } = cli.command else {
+            panic!("expected token create");
+        };
+        let request = token_request(&command);
+        let body = request.body.expect("a mint body");
+        assert_eq!(body["tenant"], "acme");
     }
 
     /// A valid `--expires-at` is embedded as a `timestamptz` literal.

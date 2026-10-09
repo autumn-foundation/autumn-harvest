@@ -271,6 +271,7 @@ async fn start_source_completed_on(
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -2161,6 +2162,7 @@ async fn immediate_outbox_relay_counts_the_bypass_exactly_once() {
         retry_policy: None,
         max_workflow_attempts_ceiling: None,
         codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
+        tenant: None,
     };
     deferred.spawn();
 
@@ -2377,6 +2379,7 @@ async fn immediate_outbox_relay_blocks_on_real_queue_gate() {
         retry_policy: None,
         max_workflow_attempts_ceiling: None,
         codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
+        tenant: None,
     };
     deferred.spawn();
 
@@ -2710,6 +2713,7 @@ async fn scanner_delivers_a_stale_row_whose_target_already_exists() {
                 start_source_ref: None,
                 started_by: None,
                 fairness_key: None,
+                tenant: None,
             },
             None,
         )
@@ -2944,6 +2948,7 @@ async fn run_stale_sealed_delivered_case(
                 start_source_ref: None,
                 started_by: None,
                 fairness_key: None,
+                tenant: None,
             },
             None,
         )
@@ -3214,6 +3219,7 @@ async fn start_webhook_delivery(conn: &mut AsyncPgConnection, workflow_id: &str)
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -3267,6 +3273,7 @@ fn webhook_replacement_params(workflow_id: &'static str) -> StartWorkflowParams<
         start_source_ref: None,
         started_by: None,
         fairness_key: None,
+        tenant: None,
     }
 }
 
@@ -3482,6 +3489,7 @@ fn ag_target_params(
         start_source_ref: None,
         started_by: None,
         fairness_key: None,
+        tenant: None,
     }
 }
 
@@ -3986,6 +3994,7 @@ fn signal_with_start_fresh_params(workflow_id: &'static str) -> SignalWithStartP
         workflow_info: None,
         start_source_override: None,
         start_source_ref_override: None,
+        tenant: None,
     }
 }
 
@@ -4022,6 +4031,7 @@ fn update_with_start_fresh_params(workflow_id: &'static str) -> UpdateWithStartP
         workflow_retry_policy: None,
         max_workflow_attempts_ceiling: None,
         reject_fresh_if_debounced: false,
+        tenant: None,
     }
 }
 
@@ -4251,4 +4261,133 @@ async fn gate_blocks_fresh_update_with_start_create() {
         0,
         "a blocked fresh update-with-start must roll back with NO execution row"
     );
+}
+
+/// Issue #1977: the relay gives the target run the tenant stored on the
+/// outbox row. Retention may have removed the source run before the relay
+/// runs, so the row, not the source, must carry the tenant.
+#[tokio::test]
+async fn outbox_relay_keeps_the_tenant_after_the_source_is_gone() {
+    #[derive(diesel::QueryableByName)]
+    struct TenantRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        tenant: Option<String>,
+    }
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+    set_global_admission_gate_cache(None);
+
+    let trigger_id = Uuid::new_v4();
+    insert_trigger(&mut conn, trigger_id).await;
+    // The source id names no row: retention already removed the source run.
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_trigger_outbox
+            (source_exec_id, trigger_id, target_shard, target_workflow_name,
+             target_workflow_id, target_input, queue_name, priority,
+             max_workflow_input_bytes, tenant)
+         VALUES ($1, $2, 0, 'ag_target_wf', 'ct-outbox-tenant', '{}'::jsonb, 'default',
+                 '0'::jsonb, 1048576, 'acme')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(ExecutionId::new_for_shard(ShardId::new(0)).as_uuid())
+    .bind::<diesel::sql_types::Uuid, _>(trigger_id)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let metrics = CapturingMetrics::default();
+    let relayed = autumn_harvest::completion_trigger::enforce_completion_triggers_outbox(
+        &mut conn,
+        &metrics,
+        &Some(ShardedDbPool::single(pool.clone())),
+        &[ShardId::new(0)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(relayed, 1);
+
+    let rows: Vec<TenantRow> = diesel::sql_query(
+        "SELECT tenant FROM harvest_workflow_executions WHERE workflow_id = 'ct-outbox-tenant'",
+    )
+    .load(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1, "the relay starts the target");
+    assert_eq!(rows[0].tenant.as_deref(), Some("acme"));
+}
+
+/// Issue #1977: a tenant start that meets a live run of another tenant is a
+/// tenant conflict, not an admission. A closed gate must not answer it with
+/// `AdmissionBlocked`, for the pre-check path and for the locked path.
+#[tokio::test]
+async fn a_closed_gate_still_reports_a_tenant_conflict() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+
+    for (reuse, conflict) in [
+        (
+            autumn_harvest::WorkflowIdReusePolicy::TerminateIfRunning,
+            autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+        ),
+        (
+            autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            autumn_harvest::types::WorkflowIdConflictPolicy::TerminateExisting,
+        ),
+    ] {
+        let workflow_id = format!("tenant-gate-{}", Uuid::new_v4());
+        let globex = autumn_harvest::StartWorkflowParams {
+            tenant: Some("globex"),
+            ..autumn_harvest::StartWorkflowParams::new(
+                "ag_target_wf",
+                &workflow_id,
+                ExecutionId::new_for_shard(ShardId::new(0)),
+                serde_json::json!({}),
+                "default",
+            )
+        };
+        autumn_harvest::start_or_load_workflow_execution(&mut conn, globex, None)
+            .await
+            .expect("start the globex run");
+
+        set_global_admission_gate_cache(Some(fleet_cache("tenant-gate-incident")));
+        let acme = autumn_harvest::StartWorkflowParams {
+            tenant: Some("acme"),
+            reuse_policy: reuse,
+            conflict_policy: conflict,
+            ..autumn_harvest::StartWorkflowParams::new(
+                "ag_target_wf",
+                &workflow_id,
+                ExecutionId::new_for_shard(ShardId::new(0)),
+                serde_json::json!({}),
+                "default",
+            )
+        };
+        let outcome = autumn_harvest::start_or_load_workflow_execution_with_metrics(
+            &mut conn,
+            acme,
+            None,
+            Some(autumn_harvest::admission_gate::GateMode::Check),
+        )
+        .await;
+        set_global_admission_gate_cache(None);
+
+        assert!(
+            matches!(
+                outcome,
+                Err(autumn_harvest::HarvestError::TenantConflict { .. })
+            ),
+            "{reuse:?}/{conflict:?}: {outcome:?}"
+        );
+    }
 }

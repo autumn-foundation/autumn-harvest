@@ -135,6 +135,7 @@ async fn seed_stalled_workflow(
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )

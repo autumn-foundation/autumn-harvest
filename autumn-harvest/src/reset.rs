@@ -1447,6 +1447,8 @@ async fn insert_fork_execution(
         // filters `WHERE quota_key IS NOT NULL`, so a reset fork neither
         // consumes headroom nor is blocked by one.
         quota_key: None,
+        // A reset fork belongs to the tenant of its source (issue #1977).
+        tenant: source.tenant.as_deref(),
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -1743,6 +1745,7 @@ mod tests {
             migrated_run_terminal_state: None,
             staging_vacated_state: None,
             staging_vacated_by: None,
+            tenant: None,
         }
     }
 

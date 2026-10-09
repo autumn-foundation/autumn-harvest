@@ -258,6 +258,7 @@ async fn start_workflow(database_url: &str, workflow_id: &str) -> ExecutionId {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )

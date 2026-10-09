@@ -192,6 +192,7 @@ async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> Execut
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -512,6 +513,7 @@ async fn seed_child(
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )

@@ -733,6 +733,7 @@ mod db_tests {
                 start_source: None,
                 start_source_ref: None,
                 started_by: None,
+                tenant: None,
             })
             .execute(conn)
             .await
@@ -1039,6 +1040,7 @@ mod db_tests {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         }
     }
 

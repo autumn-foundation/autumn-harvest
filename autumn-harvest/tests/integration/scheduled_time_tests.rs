@@ -337,6 +337,7 @@ async fn manual_start_has_no_scheduled_time() {
             start_source_ref: None,
             started_by: None,
             fairness_key: None,
+            tenant: None,
         },
         None,
     )

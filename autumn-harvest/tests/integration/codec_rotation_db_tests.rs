@@ -259,6 +259,7 @@ async fn insert_execution(conn: &mut AsyncPgConnection, name: &str) -> Execution
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -954,6 +955,7 @@ async fn a_builder_configured_codec_encrypts_the_start_input_and_replay_round_tr
         start_source_ref: None,
         started_by: None,
         fairness_key: None,
+        tenant: None,
     };
 
     autumn_harvest::execution::start_or_load_workflow_execution_collect_with_codecs(
