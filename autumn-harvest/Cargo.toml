@@ -150,7 +150,7 @@ wasmtime = { version = "48.0.4", optional = true }
 wat = { version = "1", optional = true }
 # Publisher signatures on WASM modules (issue #1838). The lockfile already
 # holds this version through `jsonwebtoken`, so it adds no new crate.
-ed25519-dalek = { version = "2.2", optional = true }
+ed25519-dalek = { version = "3.0", optional = true }
 
 [[test]]
 name = "integration"
