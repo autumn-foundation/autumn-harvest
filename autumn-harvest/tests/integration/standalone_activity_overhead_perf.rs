@@ -580,6 +580,7 @@ async fn start_one(conn: &mut AsyncPgConnection, workflow_name: &'static str, n:
             start_source: StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )

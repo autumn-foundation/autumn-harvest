@@ -1,6 +1,6 @@
 ## Perf — Standalone durable activity: measured, decided (issue #1987)
 
-**Decision.** [ADR 0006](../adr/0006-standalone-activity.md) records it:
+**Decision.** [ADR 0007](../adr/0007-standalone-activity.md) records it:
 document the one-step-workflow pattern, and do not build a
 standalone-activity start path now. The activities guide shows the pattern
 and its local-activity fast path.

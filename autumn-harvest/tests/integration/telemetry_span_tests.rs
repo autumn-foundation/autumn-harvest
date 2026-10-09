@@ -359,6 +359,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     start_source: autumn_harvest::StartSource::Api,
                     start_source_ref: None,
                     started_by: None,
+                    tenant: None,
                 },
                 None,
             )

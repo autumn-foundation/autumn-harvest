@@ -361,6 +361,7 @@ async fn seed_execution(conn: &mut AsyncPgConnection, workflow_name: &str) -> Ex
             start_source: None,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         })
         .execute(conn)
         .await

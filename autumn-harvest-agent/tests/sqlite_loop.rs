@@ -289,7 +289,7 @@ async fn a_tool_result_over_the_result_cap_is_cut_and_the_run_goes_on() {
         .tool_output_limit(usize::MAX);
     let mut rt = runtime(&db, harness);
 
-    let exec = sqlite::start(&mut rt, &AgentTask::new("fetch")).unwrap();
+    let exec = sqlite::start(&mut rt, &AgentTask::new("fetch").loop_guard(no_guard())).unwrap();
     let report = report(rt.run_until_blocked(exec).await.unwrap());
 
     assert_eq!(report.stop, AgentStop::Completed);
@@ -303,6 +303,12 @@ async fn a_tool_result_over_the_result_cap_is_cut_and_the_run_goes_on() {
     assert!(result.ends_with("…[truncated]"));
 }
 
+/// The cap tests repeat one call on purpose. The loop guard would stop them
+/// first.
+const fn no_guard() -> autumn_harvest_agent::loop_guard::LoopGuard {
+    autumn_harvest_agent::loop_guard::LoopGuard::disabled()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_round_whose_results_pass_the_cap_ends_the_run_mid_batch() {
     let (_dir, db) = fresh_db();
@@ -312,7 +318,7 @@ async fn a_round_whose_results_pass_the_cap_ends_the_run_mid_batch() {
         .tool_output_limit(usize::MAX);
     let mut rt = runtime(&db, harness);
 
-    let exec = sqlite::start(&mut rt, &AgentTask::new("fetch")).unwrap();
+    let exec = sqlite::start(&mut rt, &AgentTask::new("fetch").loop_guard(no_guard())).unwrap();
     let report = report(rt.run_until_blocked(exec).await.unwrap());
 
     assert_eq!(report.stop, AgentStop::TranscriptFull);
@@ -350,7 +356,7 @@ async fn a_transcript_too_large_to_record_ends_the_run_before_the_next_model_cal
         .tool_output_limit(usize::MAX);
     let mut rt = runtime(&db, harness);
 
-    let exec = sqlite::start(&mut rt, &AgentTask::new("fill")).unwrap();
+    let exec = sqlite::start(&mut rt, &AgentTask::new("fill").loop_guard(no_guard())).unwrap();
     let report = report(rt.run_until_blocked(exec).await.unwrap());
 
     assert_eq!(report.stop, AgentStop::TranscriptFull);

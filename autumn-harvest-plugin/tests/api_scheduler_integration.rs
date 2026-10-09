@@ -500,6 +500,7 @@ async fn insert_workflow_on_url(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -597,6 +598,7 @@ async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> Exec
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -777,6 +779,7 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
             start_source: None,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         })
         .execute(&mut conn)
         .await
@@ -1122,6 +1125,7 @@ async fn seed_scheduled_activity_task_from_url(
             start_source: None,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         })
         .execute(&mut conn)
         .await
@@ -8178,6 +8182,7 @@ async fn insert_running_execution_for(database_url: &str, wf_name: &str) {
             start_source: None,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         })
         .execute(&mut conn)
         .await

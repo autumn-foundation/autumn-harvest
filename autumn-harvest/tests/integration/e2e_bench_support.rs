@@ -3555,6 +3555,7 @@ pub mod db {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         }
     }
 

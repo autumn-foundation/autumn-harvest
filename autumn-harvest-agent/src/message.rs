@@ -5,9 +5,11 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Identifies one agent run. The loop uses the workflow id.
+/// Identifies one agent run. The loop uses the execution id, which no other
+/// run shares.
 ///
-/// Tools receive it with the call id. The pair is an idempotency key.
+/// Tools receive it with the step and the call id. Together they are an
+/// idempotency key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RunId(String);

@@ -185,6 +185,7 @@ async fn start(conn: &mut AsyncPgConnection, name: &str, id: &str) -> ExecutionI
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
