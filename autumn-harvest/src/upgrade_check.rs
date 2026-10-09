@@ -327,11 +327,21 @@ pub struct RunVerdict {
     /// The shard the run lives on, when the check read it from a database.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_id: Option<ShardId>,
+    /// The build the run is assigned to, when the check read it from a
+    /// database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
     pub verdict: Verdict,
     pub findings: Vec<Finding>,
 }
 
 impl RunVerdict {
+    /// Add a finding, and raise the verdict to match it.
+    fn push(&mut self, finding: Finding) {
+        self.verdict = self.verdict.max(finding.kind.verdict());
+        self.findings.push(finding);
+    }
+
     fn new(execution_id: ExecutionId, workflow_name: String, findings: Vec<Finding>) -> Self {
         let verdict = findings
             .iter()
@@ -342,6 +352,7 @@ impl RunVerdict {
             execution_id,
             workflow_name,
             shard_id: None,
+            build_id: None,
             verdict,
             findings,
         }
@@ -604,7 +615,9 @@ impl UpgradeCheck {
         mut self,
         offloader: Arc<crate::payload_store::PayloadOffloader>,
     ) -> Self {
-        self.replayer = self.replayer.with_payload_offloader(Arc::clone(&offloader));
+        // The check inflates at its input, before it decodes. The replayer
+        // gets no offloader, so it never inflates a payload twice: a value
+        // that itself looks like a claim check stays as it is.
         self.offloader = Some(offloader);
         self
     }
@@ -895,6 +908,26 @@ fn schema_finding(
             if violations.len() == 1 { "" } else { "s" }
         ),
     ))
+}
+
+/// A finding when the baseline manifest may not describe the code the run ran.
+///
+/// A run with no assigned build ran whatever the fleet ran, so the operator
+/// vouches for it. A run assigned to another build than the baseline ran
+/// other code. With no baseline build named, the check cannot tell.
+fn build_finding(run_build: Option<&str>, baseline_build: Option<&str>) -> Option<Finding> {
+    let run_build = run_build?;
+    match baseline_build {
+        Some(baseline) if baseline == run_build => None,
+        Some(baseline) => Some(Finding::new(
+            FindingKind::StructureUnavailable,
+            format!("the run is assigned to build `{run_build}`, not the baseline `{baseline}`"),
+        )),
+        None => Some(Finding::new(
+            FindingKind::StructureUnavailable,
+            format!("the run is assigned to build `{run_build}`; name the baseline build"),
+        )),
+    }
 }
 
 /// The shard a run belongs to, among the shard ids that alias its database.
@@ -1258,6 +1291,11 @@ pub struct UpgradeCheckOptions {
     /// The most runs read from one shard. More runs make the check
     /// incomplete.
     pub limit_per_shard: usize,
+    /// The build that the baseline manifest describes. A run assigned to
+    /// another build ran other code, so the structural diff does not apply
+    /// to it. With no baseline build, each run with an assigned build needs
+    /// review.
+    pub baseline_build_id: Option<String>,
 }
 
 #[cfg(feature = "db")]
@@ -1266,6 +1304,7 @@ impl Default for UpgradeCheckOptions {
         Self {
             workflow_name: None,
             limit_per_shard: DEFAULT_LIMIT_PER_SHARD,
+            baseline_build_id: None,
         }
     }
 }
@@ -1290,13 +1329,15 @@ struct InFlightRow {
     workflow_id: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     queue_name: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    assigned_build_id: Option<String>,
 }
 
 /// The in-flight runs of one shard, oldest first. `$1` is the state list,
 /// `$2` the optional workflow name and `$3` the row limit.
 #[cfg(feature = "db")]
 const IN_FLIGHT_SQL: &str = "SELECT id, workflow_name, context_headers, execution_timeout, \
-     deadline_at, parent_id, workflow_id, queue_name \
+     deadline_at, parent_id, workflow_id, queue_name, assigned_build_id \
      FROM harvest_workflow_executions \
      WHERE state = ANY($1) AND ($2::text IS NULL OR workflow_name = $2) \
      ORDER BY created_at, id LIMIT $3";
@@ -1358,7 +1399,9 @@ impl UpgradeCheck {
             .iter()
             .map(|s| (*s).to_string())
             .collect();
-        let limit = i64::try_from(options.limit_per_shard.saturating_add(1)).unwrap_or(i64::MAX);
+        // Aliased shards share this database, so each one adds its own limit.
+        let group_limit = options.limit_per_shard.saturating_mul(shards.len().max(1));
+        let limit = i64::try_from(group_limit.saturating_add(1)).unwrap_or(i64::MAX);
         let workflow_name = options.workflow_name.clone();
         let mut rows: Vec<InFlightRow> = conn
             .build_transaction()
@@ -1375,8 +1418,8 @@ impl UpgradeCheck {
                     .map_err(crate::error::database_error)
             })
             .await?;
-        let truncated = rows.len() > options.limit_per_shard;
-        rows.truncate(options.limit_per_shard);
+        let truncated = rows.len() > group_limit;
+        rows.truncate(group_limit);
 
         let mut verdicts = Vec::with_capacity(rows.len());
         for row in rows {
@@ -1415,6 +1458,15 @@ impl UpgradeCheck {
                 Err(e) => return Err(e),
             };
             verdict.shard_id = Some(shard_of(execution_id, shards));
+            if self.structure.is_some()
+                && let Some(finding) = build_finding(
+                    row.assigned_build_id.as_deref(),
+                    options.baseline_build_id.as_deref(),
+                )
+            {
+                verdict.push(finding);
+            }
+            verdict.build_id = row.assigned_build_id;
             verdicts.push(verdict);
         }
         Ok((verdicts, truncated))
@@ -1501,6 +1553,7 @@ const fn is_codec_error(e: &crate::error::HarvestError) -> bool {
 struct CommandArgs {
     database_urls: Vec<String>,
     baseline: Option<std::path::PathBuf>,
+    baseline_build: Option<String>,
     candidate: Option<std::path::PathBuf>,
     workflow_name: Option<String>,
     limit: Option<usize>,
@@ -1511,7 +1564,7 @@ struct CommandArgs {
 #[cfg(feature = "db")]
 pub const USAGE: &str = "\
 usage: <binary> [--database-url-env NAME]... [--database-url URL]... \
-[--baseline-structure FILE] [--candidate-structure FILE] [--workflow-name NAME] \
+[--baseline-structure FILE] [--candidate-structure FILE] [--baseline-build ID] [--workflow-name NAME] \
 [--limit N] [--format text|json]
 
 Gives each in-flight run a verdict against this build: migrate, review or pin.
@@ -1552,6 +1605,7 @@ impl CommandArgs {
                 "--baseline-structure" => out.baseline = Some(value()?.into()),
                 "--candidate-structure" => out.candidate = Some(value()?.into()),
                 "--workflow-name" => out.workflow_name = Some(value()?),
+                "--baseline-build" => out.baseline_build = Some(value()?),
                 "--limit" => {
                     let raw = value()?;
                     out.limit = Some(raw.parse().map_err(|_| {
@@ -1652,6 +1706,7 @@ pub async fn run_command_with_output(
     let options = UpgradeCheckOptions {
         workflow_name: args.workflow_name.clone(),
         limit_per_shard: args.limit.unwrap_or(DEFAULT_LIMIT_PER_SHARD),
+        baseline_build_id: args.baseline_build.clone(),
     };
     let report = check.run(&pool, &options).await;
     let rendered = if args.json {
@@ -1716,6 +1771,15 @@ mod tests {
         assert_eq!(super::shard_of(on_one, &[zero]), zero);
         let unencoded = ExecutionId::from_uuid(uuid::Uuid::new_v4());
         assert_eq!(super::shard_of(unencoded, &[one, zero]), one);
+    }
+
+    #[test]
+    fn a_run_on_another_build_than_the_baseline_needs_review() {
+        assert!(super::build_finding(None, None).is_none());
+        assert!(super::build_finding(Some("v2"), Some("v2")).is_none());
+        let other = super::build_finding(Some("v1"), Some("v2")).expect("finding");
+        assert_eq!(other.kind, FindingKind::StructureUnavailable);
+        assert!(super::build_finding(Some("v1"), None).is_some());
     }
 
     #[test]

@@ -105,7 +105,7 @@ pin > review > migrate. A run with no finding gets migrate.
 | `replay-timed-out` | review |
 | `payload-unchecked` — a pending signal or an open update has no candidate schema | review |
 | `payload-offloaded` — the run holds offloaded payloads, and the check has no offloader | review |
-| `structure-unavailable` — a manifest is missing, the two manifests come from different toolchains or models, or two workflows share the name | review |
+| `structure-unavailable` — a manifest is missing, the two manifests come from different toolchains or models, two workflows share the name, or the run is assigned to another build than the baseline | review |
 | `unknown-boundary` — the workflow graph has an `unknown` boundary, or the workflow has declarative update handlers | review |
 | `root-changed` — the workflow body itself changed | review |
 | `step-not-passed` — a changed helper may still run for this run | review |
@@ -272,3 +272,6 @@ $ my-worker-upgrade-check \
 - The replay timeout cannot stop candidate code that never yields.
 - Nothing ties the candidate manifest to the binary under test. Build both
   from the same commit.
+- The baseline manifest describes one build. A run with an assigned build
+  is compared only when `--baseline-build` names that build. A run with no
+  assigned build is trusted to have run the baseline.

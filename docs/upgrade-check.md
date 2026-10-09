@@ -70,6 +70,7 @@ binary. Use `with_offloader` when the worker offloads large payloads. Use
 $ my-upgrade-check \
     --database-url-env SHARD0_URL --database-url-env SHARD1_URL \
     --baseline-structure old.structure.json \
+    --baseline-build sha-old456 \
     --candidate-structure new.structure.json
 ```
 
@@ -78,6 +79,7 @@ $ my-upgrade-check \
 | `--database-url-env NAME` | One shard, read from the environment variable `NAME`. Repeat it in shard order. |
 | `--database-url URL` | One shard, given on the command line. Other local users can see it in the process list, so prefer `--database-url-env`. With neither flag, the check reads `HARVEST_DATABASE_URL`. |
 | `--baseline-structure FILE` | The manifest of the build that runs now. |
+| `--baseline-build ID` | The build that the baseline manifest describes. A run assigned to another build needs review. With no baseline build, each run with an assigned build needs review. |
 | `--candidate-structure FILE` | The manifest of the candidate build. Give both manifests, or neither. With neither, each run gets `review`. |
 | `--workflow-name NAME` | Check the runs of one workflow type only. |
 | `--limit N` | The most runs read from one shard. The default is 10000. More runs make the check incomplete. |
@@ -107,7 +109,7 @@ transactions and writes nothing.
 | `replay-timed-out` | `review` | The replay ran longer than the replay timeout, 30 seconds by default. |
 | `payload-unchecked` | `review` | A pending signal or an open update has no candidate schema. Publish one to remove this finding. |
 | `payload-offloaded` | `review` | The run holds offloaded payloads, and the check has no offloader. Pass one with `with_offloader`. |
-| `structure-unavailable` | `review` | A manifest is missing, the two manifests come from different toolchains or models, or two workflows share the name. |
+| `structure-unavailable` | `review` | A manifest is missing, the two manifests come from different toolchains or models, two workflows share the name, or the run is assigned to another build than the baseline. |
 | `unknown-boundary` | `review` | `harvest-verify` cannot see part of the workflow graph. A declarative update handler is such a part. |
 | `root-changed` | `review` | The workflow body itself changed. |
 | `step-not-passed` | `review` | A changed helper may still run for this run. |

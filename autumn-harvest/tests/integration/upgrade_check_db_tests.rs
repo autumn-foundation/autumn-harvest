@@ -19,7 +19,7 @@ use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::store;
 use autumn_harvest::upgrade_check::{
-    UpgradeCheck, UpgradeCheckOptions, Verdict, run_command_with_output,
+    FindingKind, UpgradeCheck, UpgradeCheckOptions, Verdict, run_command_with_output,
 };
 use autumn_harvest::{ExecutionId, ShardId};
 
@@ -311,6 +311,46 @@ async fn a_pending_signal_in_the_database_is_decoded_and_checked() {
     assert_eq!(verdict_of(bad), Some(Verdict::Pin), "{report:#?}");
     assert_eq!(verdict_of(good), Some(Verdict::Migrate), "{report:#?}");
     assert!(!report.to_json().contains(SECRET));
+}
+
+/// A run assigned to an older build ran other code than the baseline
+/// manifest describes, so the structural diff cannot clear it.
+#[tokio::test]
+async fn a_run_on_another_build_than_the_baseline_needs_review() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let codecs = aead_codecs();
+    let name = unique_name();
+    let run = seed(&mut conn, &name, "RUNNING", &waiting_to_ship(), &codecs).await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET assigned_build_id = 'v1' WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(run.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("assign build");
+
+    let pool = ShardedDbPool::single(build_test_pool(&url));
+    let check = |baseline: &str| {
+        let options = UpgradeCheckOptions {
+            workflow_name: Some(name.clone()),
+            baseline_build_id: Some(baseline.to_string()),
+            ..UpgradeCheckOptions::default()
+        };
+        let check = check_for(&name, &codecs);
+        let pool = &pool;
+        async move { check.run(pool, &options).await }
+    };
+    let other = check("v2").await;
+    assert_eq!(other.runs.len(), 1, "{other:#?}");
+    assert_eq!(other.runs[0].verdict, Verdict::Review, "{other:#?}");
+    assert_eq!(other.runs[0].build_id.as_deref(), Some("v1"));
+    assert_eq!(
+        other.runs[0].findings[0].kind,
+        FindingKind::StructureUnavailable
+    );
+    let same = check("v1").await;
+    assert_eq!(same.runs[0].verdict, Verdict::Migrate, "{same:#?}");
 }
 
 #[tokio::test]
