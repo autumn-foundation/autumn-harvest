@@ -19,8 +19,8 @@ use autumn_harvest_agent::followup::FOLLOWUP_TOOL;
 use autumn_harvest_agent::memory::{MEMORY_TOOL, MemoryStore};
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentStop, AgentTask, Approval, BoxFuture, ChatRole, ContentPart,
-    Delivery, FnTool, Followups, InMemoryMemoryStore, MemoryScope, Report, Rule, RunInfo, Tool,
-    ToolCall, ToolDecision, ToolEffect, ToolPolicy, ToolRules, sqlite,
+    Delivery, ErrorKind, FnTool, Followups, InMemoryMemoryStore, MemoryScope, Report, Rule,
+    RunInfo, Tool, ToolCall, ToolDecision, ToolEffect, ToolPolicy, ToolRules, sqlite,
 };
 use autumn_harvest_sqlite::RunState;
 use common::{
@@ -427,6 +427,23 @@ async fn a_failed_candidate_model_is_reported_not_raised() {
         Verdict::Diverged(Divergence::Missing(Side::Candidate))
     );
     assert_eq!(recorder.runs(), Vec::<Value>::new(), "no tool runs live");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rate_limited_model_turn_retries_as_in_production() {
+    let source = one_lookup().await;
+    let model = ScriptedModel::new(vec![
+        Err(AgentError::new(ErrorKind::RateLimited, "slow down")),
+        calls(&[("c1", "lookup", json!({"q": "x"}))], 5),
+        answer("done", 5),
+    ]);
+    let (harness, _) = candidate(model.clone());
+
+    let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
+
+    assert!(!evaluation.diverged(), "{evaluation:#?}");
+    assert_eq!(model.calls(), 3, "the rate-limited call runs again");
+    assert!(!evaluation.turn_cap_reached);
 }
 
 /// Record a source with two gated `pay` calls. The first approval arrives

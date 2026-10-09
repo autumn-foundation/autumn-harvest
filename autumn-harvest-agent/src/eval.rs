@@ -9,7 +9,8 @@
 //! It writes nothing to a database. Each activity resolves as follows:
 //!
 //! - `agent_model_turn` asks the candidate model, then the candidate policy.
-//!   These are the only live calls.
+//!   These are the only live calls. A retryable failure retries under the
+//!   retry policy of the activity, as on a worker.
 //! - `agent_tool_call` returns the recorded outcome of the same call. A call
 //!   with no recorded outcome gets an error stub. No tool runs.
 //! - `agent_memory_snapshot` returns the recorded snapshot, or an empty one.
@@ -69,9 +70,12 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use autumn_harvest::erase::is_erasure_tombstone;
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::failure::parse_typed_payload;
+use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::testing::WorkflowTestEnv;
 use autumn_harvest::types::ActivityExecId;
 use serde::de::DeserializeOwned;
@@ -377,6 +381,9 @@ pub async fn evaluate(
         let session = Arc::clone(&session);
         let harness = Arc::clone(&candidate.harness);
         let run_id = recording.run_id.clone();
+        let retry = agent_model_turn_info()
+            .default_retry_policy
+            .unwrap_or_default();
         move |input: Value| -> Result<Value, String> {
             let mut request: ModelTurnRequest = decode(input)?;
             // The test engine has its own ids. The policy sees the recorded
@@ -385,12 +392,7 @@ pub async fn evaluate(
                 request.run_id.clone_from(run_id);
             }
             let (index, recorded) = lock(&session).next_turn()?;
-            // The ids change before the policy runs, so the policy sees the
-            // ids that the transcript records.
-            let align = |content: &mut Vec<ContentPart>| align_call_ids(content, &recorded, index);
-            let turn = tokio::task::block_in_place(|| {
-                handle.block_on(harness.model_turn_with(request, align))
-            })?;
+            let turn = live_turn(&handle, &harness, &request, &recorded, index, &retry)?;
             encode(&turn)
         }
     };
@@ -652,6 +654,54 @@ fn align_call_ids(content: &mut [ContentPart], recorded: &[ToolCall], index: usi
     }
 }
 
+/// Ask the candidate for turn `index`. The call ids change before the policy
+/// runs, so the policy sees the ids that the transcript records.
+///
+/// The test engine does not retry an activity. So this function applies the
+/// retry policy of the model activity, as a worker does.
+///
+/// # Errors
+///
+/// Returns the final failure payload of the model turn.
+fn live_turn(
+    handle: &tokio::runtime::Handle,
+    harness: &AgentHarness,
+    request: &ModelTurnRequest,
+    recorded: &[ToolCall],
+    index: usize,
+    retry: &RetryPolicy,
+) -> Result<ModelTurn, String> {
+    let mut attempt = 1;
+    loop {
+        let align = |content: &mut Vec<ContentPart>| align_call_ids(content, recorded, index);
+        let result = tokio::task::block_in_place(|| {
+            handle.block_on(harness.model_turn_with(request.clone(), align))
+        });
+        let payload = match result {
+            Ok(turn) => return Ok(turn),
+            Err(payload) => payload,
+        };
+        let delay = retry_delay(&payload, retry, attempt).ok_or(payload)?;
+        tokio::task::block_in_place(|| handle.block_on(tokio::time::sleep(delay)));
+        attempt += 1;
+    }
+}
+
+/// The wait before attempt `attempt + 1` of a failed model turn, or `None`
+/// when the failure is final.
+fn retry_delay(payload: &str, policy: &RetryPolicy, attempt: u32) -> Option<Duration> {
+    let typed = parse_typed_payload(payload);
+    let final_failure = typed.as_ref().is_some_and(|failure| failure.non_retryable)
+        || policy.is_non_retryable(
+            typed.as_ref().map(|failure| failure.error_type.as_str()),
+            payload,
+        );
+    if final_failure {
+        return None;
+    }
+    policy.next_delay(attempt)
+}
+
 /// The completed model turns of a history, in order.
 fn model_turns(history: &[WorkflowEvent]) -> Result<Vec<ModelTurn>, EvalError> {
     let model_name = agent_model_turn_info().name;
@@ -887,6 +937,20 @@ mod tests {
             decision.calls[0].decision,
             ToolDecision::Deny { .. }
         ));
+    }
+
+    #[test]
+    fn only_a_retryable_failure_waits_for_another_attempt() {
+        use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
+        let policy = RetryPolicy::exponential(3, Duration::from_millis(10));
+        let retryable = ActivityFailure::retryable("RateLimited", "slow").into_error_payload();
+        let fatal = ActivityFailure::non_retryable("Config", "bad key").into_error_payload();
+        assert!(retry_delay(&retryable, &policy, 1).is_some());
+        assert!(
+            retry_delay(&retryable, &policy, 3).is_none(),
+            "the attempts run out"
+        );
+        assert!(retry_delay(&fatal, &policy, 1).is_none());
     }
 
     #[test]
