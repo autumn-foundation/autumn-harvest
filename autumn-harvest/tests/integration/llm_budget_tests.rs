@@ -522,7 +522,10 @@ async fn spend_outside_the_window_does_not_count() {
 #[tokio::test]
 async fn the_ledger_row_holds_the_usage_in_clear_columns() {
     let _serial = TEST_SERIAL.lock().await;
-    let policy = QuotaPolicy::new("tenant").with_max_run_llm_tokens(1_000);
+    // A tenant cap makes the run use its key, so the row copies it.
+    let policy = QuotaPolicy::new("tenant")
+        .with_max_run_llm_tokens(1_000)
+        .with_max_tenant_llm_tokens(1_000_000);
     let harness = Harness::new("llm_ledger_row", Some(policy)).await;
     let step = json!({ "input_tokens": 7, "output_tokens": 5, "cost_micros": 1_234 });
     let (exec_id, output) = harness.run(Some("acme"), 1, step).await;
@@ -599,6 +602,20 @@ async fn a_retry_that_pays_again_records_again_and_counts() {
     .expect("ledger attempts");
     let attempts: Vec<i32> = attempts.into_iter().map(|row| row.attempt).collect();
     assert_eq!(attempts, vec![1, 2]);
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn a_run_only_budget_ignores_an_over_long_key() {
+    let _serial = TEST_SERIAL.lock().await;
+    // Only run caps: the tenant key is not used, so its length must not
+    // refuse the start. The LLM caps do not change admission.
+    let policy = QuotaPolicy::new("tenant").with_max_run_llm_tokens(250);
+    let harness = Harness::new("llm_run_only_key", Some(policy)).await;
+    let long_tenant = "t".repeat(300);
+    let (_, output) = harness.run(Some(&long_tenant), 10, hundred_tokens()).await;
+    assert_eq!(output["ran"], 3, "{output}");
+    assert_eq!(refused(&output), Some("run_llm_tokens"));
     harness.stop().await;
 }
 

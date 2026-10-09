@@ -12148,6 +12148,7 @@ async fn persist_all_started_child_workflows(
             // start path runs in `execution.rs`, applied per child here.
             let child_quota_key: Option<String> = defaults
                 .quota
+                .filter(crate::quota::QuotaPolicy::uses_key)
                 .and_then(|p| crate::quota::resolve_quota_key(p.key_expr, &child.input));
             if let Some(key) = child_quota_key.as_deref()
                 && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
@@ -12799,6 +12800,7 @@ fn cross_shard_child_spec(
     let defaults = resolve_child_workflow_defaults(registry, workflow_name);
     let quota_key: Option<String> = defaults
         .quota
+        .filter(crate::quota::QuotaPolicy::uses_key)
         .and_then(|p| crate::quota::resolve_quota_key(p.key_expr, input));
     if let Some(key) = quota_key.as_deref()
         && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
@@ -13028,6 +13030,7 @@ async fn insert_awaited_child_execution(
     // continue-as-new/reset/workflow-level-retry.
     let child_quota_key: Option<String> = defaults
         .quota
+        .filter(crate::quota::QuotaPolicy::uses_key)
         .and_then(|p| crate::quota::resolve_quota_key(p.key_expr, &child.input));
     if let Some(key) = child_quota_key.as_deref()
         && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)

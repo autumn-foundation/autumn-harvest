@@ -1257,12 +1257,16 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     // an array as its input. This fix must not do that. Only
     // `event_batch.rs`'s own known-shape aggregate is ever unwrapped this
     // way.
-    let quota_key: Option<String> = quota_policy.and_then(|p| {
-        crate::quota::resolve_quota_key(
-            p.key_expr,
-            quota_key_input_override.unwrap_or(&request.input),
-        )
-    });
+    // A run-only LLM policy does not use the key (issue #1997), so the key
+    // is neither resolved nor checked.
+    let quota_key: Option<String> = quota_policy
+        .filter(crate::quota::QuotaPolicy::uses_key)
+        .and_then(|p| {
+            crate::quota::resolve_quota_key(
+                p.key_expr,
+                quota_key_input_override.unwrap_or(&request.input),
+            )
+        });
     // A resolved key is stamped onto the row for EVERY admission that has
     // one -- including a retry-exempt admission below, which still tags its
     // row for future usage accounting -- so this bound must be checked

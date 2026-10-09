@@ -338,6 +338,16 @@ impl QuotaPolicy {
             || self.max_tenant_llm_cost_micros.is_some()
     }
 
+    /// `true` when a start must resolve and stamp the key (issue #1997).
+    ///
+    /// Only a policy whose sole caps are run LLM caps does not use the key.
+    /// A start then skips the key, so the key cannot refuse it. The LLM caps
+    /// do not change admission.
+    #[must_use]
+    pub const fn uses_key(&self) -> bool {
+        self.has_any_cap() || self.has_tenant_llm_cap() || !self.has_llm_budget()
+    }
+
     /// `true` when a tenant LLM cap is declared (issue #1997). Only then
     /// does the budget check sum the tenant spend.
     #[must_use]
@@ -917,6 +927,29 @@ mod tests {
             assert_eq!(resource.as_str(), name);
             assert_eq!(serde_json::to_value(resource).unwrap(), name);
         }
+    }
+
+    #[test]
+    fn only_a_run_only_llm_policy_skips_the_key() {
+        assert!(QuotaPolicy::new("t").uses_key());
+        assert!(QuotaPolicy::new("t").with_max_dead_letters(1).uses_key());
+        assert!(
+            QuotaPolicy::new("t")
+                .with_max_tenant_llm_tokens(1)
+                .uses_key()
+        );
+        assert!(
+            QuotaPolicy::new("t")
+                .with_max_run_llm_tokens(1)
+                .with_max_active_executions(1)
+                .uses_key()
+        );
+        assert!(
+            !QuotaPolicy::new("t")
+                .with_max_run_llm_tokens(1)
+                .with_max_run_llm_cost_micros(1)
+                .uses_key()
+        );
     }
 
     #[test]
