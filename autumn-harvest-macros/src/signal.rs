@@ -141,12 +141,13 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#params),*
         ) -> ::autumn_harvest::HarvestResult<()> {
             #cap_check
-            ::autumn_harvest::signal::send_signal_to_live_attempt(
+            ::autumn_harvest::signal::send_signal_to_live_attempt_with_codecs(
                 conn,
                 handle.exec_id(),
                 #fn_name_str,
                 payload,
                 None,
+                handle.client().payload_codecs(),
             )
             .await
             .map(|_| ())
@@ -167,12 +168,13 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         ) -> ::autumn_harvest::HarvestResult<bool> {
             #cap_check
             let __idem_key = __autumn_idempotency_key.into();
-            ::autumn_harvest::signal::send_signal_to_live_attempt(
+            ::autumn_harvest::signal::send_signal_to_live_attempt_with_codecs(
                 conn,
                 handle.exec_id(),
                 #fn_name_str,
                 payload,
                 __idem_key.as_deref(),
+                handle.client().payload_codecs(),
             )
             .await
             .map(|__d| __d.delivered)

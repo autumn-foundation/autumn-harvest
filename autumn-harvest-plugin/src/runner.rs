@@ -1402,6 +1402,7 @@ impl HarvestRunner {
                 BatchExecutorConfig {
                     concurrency: config.batch.concurrency,
                     metrics: Arc::clone(&registry.telemetry().metrics),
+                    payload_codecs: registry.payload_codecs().clone(),
                 },
                 std::time::Duration::from_millis(config.batch.tick_interval_ms),
             ))

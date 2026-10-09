@@ -417,20 +417,13 @@ impl<'a> CodecEnvelopeParts<'a> {
 /// the two sanctioned exceptions in `CLAUDE.md`. The legacy flat shapes
 /// above carry the identical, pre-existing residual for the same reason.
 ///
-/// **Third residual: columns [`PayloadCodecs::encode_payload`] never
-/// touches at all.** `harvest_workflow_executions.input`/`output` and
-/// similar denormalized queue and dead-letter columns are populated
-/// directly from caller-supplied values. They never go through
-/// `encode_payload`. So [`PayloadCodecs::decode_value_lossy`] can misread
-/// a coincidental collision there, for the same reason it can on
-/// `harvest_events`.
-///
-/// This predates issue #1253. It applied to the legacy flat shapes too,
-/// so it is not new. An escape guard on `encode_payload` cannot close it,
-/// because these columns never reach `encode_payload` to escape through.
-/// Out of scope for this fix — see issue #1253's PR discussion. Those
-/// columns stay directly queryable by design, which a codec envelope
-/// would break.
+/// **Third residual: the codec columns (issue #1979).** The engine decodes
+/// `harvest_workflow_executions.input`/`output`/`memo` and similar columns
+/// with [`PayloadCodecs::decode_column`]. A row written in clear, before
+/// column encoding was on, never went through the escape guard. So a
+/// coincidental collision there is read as an envelope, for the same reason
+/// as on `harvest_events`. Rows written with column encoding on go through
+/// [`PayloadCodecs::encode_payload`] and get the escape guard.
 fn codec_envelope_parts(payload: &Value) -> Option<CodecEnvelopeParts<'_>> {
     let obj = payload.as_object()?;
     let marker = obj.get(CODEC_ENVELOPE_KEY)?;
@@ -575,6 +568,25 @@ fn payload_or_a_descendant_is_a_codec_envelope(payload: &Value) -> bool {
     }
 }
 
+/// Wrap `value` in an identity envelope when it, or anything nested in it,
+/// is shaped like a codec envelope (issue #1979). Returns `None` otherwise.
+///
+/// This is the [`PayloadCodecs::encode_payload`] escape case, for a write
+/// that does not encode. The identity codec is always registered, so the
+/// wrapper always decodes back to `value`.
+fn escape_envelope_shape(value: &Value) -> HarvestResult<Option<Value>> {
+    if !payload_or_a_descendant_is_a_codec_envelope(value) {
+        return Ok(None);
+    }
+    let raw = serde_json::to_vec(value)?;
+    Ok(Some(PayloadCodecs::envelope(
+        "identity",
+        CODEC_LEGACY_KEY_ID,
+        &raw,
+        true,
+    )))
+}
+
 /// A trait for intercepting and transforming raw payload bytes.
 ///
 /// Implementations of this trait are used by the [`PayloadCodecs`] registry
@@ -704,6 +716,12 @@ pub struct PayloadCodecs {
     /// atomic instead of taking the `RwLock` keeps that case free. Written only
     /// under the write lock, so it can never claim keys exist when they do not.
     any_keys: Arc<AtomicBool>,
+    /// Whether writes encode the codec columns (issue #1979).
+    ///
+    /// Shared across clones, like `keyed`, so one switch reaches the worker,
+    /// the client and the management API. See
+    /// [`PayloadCodecs::set_column_encoding`].
+    columns: Arc<AtomicBool>,
 }
 
 /// When the key set or the active key last changed (issue #1815).
@@ -776,6 +794,7 @@ impl Default for PayloadCodecs {
                 epoch: KeyEpoch::default(),
             })),
             any_keys: Arc::new(AtomicBool::new(false)),
+            columns: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -790,6 +809,7 @@ impl std::fmt::Debug for PayloadCodecs {
             .field("codec_ids", &self.codecs.keys().collect::<Vec<_>>())
             .field("key_ids", &keyed.keys.keys().collect::<Vec<_>>())
             .field("active_key_id", &keyed.active)
+            .field("column_encoding", &self.column_encoding())
             // `finish_non_exhaustive`: the `keyed` field itself is deliberately
             // not printed as a field — only the identifiers read out of it —
             // because it holds live codec handles that may close over key
@@ -1649,6 +1669,100 @@ impl PayloadCodecs {
         Ok(serde_json::from_slice(&decoded)?)
     }
 
+    /// Turn encoding of the codec columns on or off (issue #1979).
+    ///
+    /// The codec columns are `harvest_workflow_executions.input`, `.output`
+    /// and `.memo`, `harvest_signals.payload`, `harvest_dead_letters.input`,
+    /// and the workflow task's `harvest_task_queue.input` and `.output`. The
+    /// default is off.
+    ///
+    /// Readers always decode these columns, whatever this switch says. So
+    /// turn it on only after every process in the fleet runs a release that
+    /// reads them. An older reader takes an envelope for literal data.
+    ///
+    /// Every clone shares the switch, so a change reaches every holder at
+    /// once.
+    pub fn set_column_encoding(&self, on: bool) {
+        self.columns.store(on, Ordering::Release);
+    }
+
+    /// Whether writes encode the codec columns (issue #1979).
+    #[must_use]
+    pub fn column_encoding(&self) -> bool {
+        self.columns.load(Ordering::Acquire)
+    }
+
+    /// Encode one codec-column value for a write (issue #1979).
+    ///
+    /// With column encoding on, it encodes like
+    /// [`PayloadCodecs::encode_payload`], under the active key. With it off,
+    /// it returns `value` unchanged, except in one case. A value shaped like
+    /// a codec envelope, at any depth, is wrapped in an identity envelope, as
+    /// `encode_payload` does (issue #1253). Engine reads always decode, so
+    /// without this a caller could store an envelope-shaped value that a
+    /// later read unwraps.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError`] when serialization or the codec's `encode` fails.
+    pub fn encode_column(&self, value: &Value) -> HarvestResult<Value> {
+        if self.column_encoding() {
+            return self.encode_payload(value);
+        }
+        Ok(escape_envelope_shape(value)?.unwrap_or_else(|| value.clone()))
+    }
+
+    /// [`PayloadCodecs::encode_column`] for a shared value.
+    ///
+    /// While column encoding is off, this usually returns a second handle to
+    /// the same allocation. So a large input is not copied.
+    ///
+    /// # Errors
+    ///
+    /// As [`PayloadCodecs::encode_column`].
+    pub fn encode_shared_column(
+        &self,
+        value: &crate::shared_json::SharedJson,
+    ) -> HarvestResult<crate::shared_json::SharedJson> {
+        if self.column_encoding() {
+            return Ok(self.encode_payload(value)?.into());
+        }
+        Ok(escape_envelope_shape(value)?.map_or_else(|| value.clone(), Into::into))
+    }
+
+    /// [`PayloadCodecs::encode_column`] for an optional column.
+    ///
+    /// # Errors
+    ///
+    /// As [`PayloadCodecs::encode_column`].
+    pub fn encode_column_opt(&self, value: Option<&Value>) -> HarvestResult<Option<Value>> {
+        value.map(|v| self.encode_column(v)).transpose()
+    }
+
+    /// Decode one codec-column value for an engine read (issue #1979).
+    ///
+    /// A value that is not an envelope comes back unchanged. That covers
+    /// plaintext written while column encoding was off, and an erasure
+    /// tombstone. This read is strict: a missing key or bad ciphertext is an
+    /// error, never a guess. Operator views use
+    /// [`PayloadCodecs::decode_value_lossy`] instead.
+    ///
+    /// # Errors
+    ///
+    /// As [`PayloadCodecs::decode_payload`].
+    pub fn decode_column(&self, value: &Value) -> HarvestResult<Value> {
+        self.decode_payload(value)
+    }
+
+    /// [`PayloadCodecs::decode_column`] for an optional column.
+    ///
+    /// # Errors
+    ///
+    /// As [`PayloadCodecs::decode_column`].
+    pub fn decode_column_opt(&self, value: Option<&Value>) -> HarvestResult<Option<Value>> {
+        value.map(|v| self.decode_column(v)).transpose()
+    }
+
     /// [`PayloadCodecs::decode_payload`], taking `payload` by value.
     ///
     /// [`PayloadCodecs::transform_event_data`] already owns the whole event
@@ -1798,6 +1912,29 @@ impl PayloadCodecs {
         let mut outcome = LossyDecodeOutcome::default();
         self.decode_value_lossy_inner(value, &mut outcome);
         outcome
+    }
+
+    /// [`PayloadCodecs::decode_value_lossy`] for one codec-column value
+    /// (issue #1979).
+    ///
+    /// A column write can wrap the whole value in one envelope: the column
+    /// codec, or the identity escape while the switch is off. This removes
+    /// that layer first, then decodes the result as
+    /// `decode_value_lossy` does. So a read shows the same value whether the
+    /// switch is off or on, and the same value as a row written before
+    /// issue #1979. A layer that fails to decode becomes a marker, as in
+    /// `decode_value_lossy`.
+    ///
+    /// For the operator read path only. Never write the result back.
+    pub fn decode_column_lossy(&self, value: &mut Value) -> LossyDecodeOutcome {
+        if codec_envelope_parts(value).is_none() {
+            return self.decode_value_lossy(value);
+        }
+        let layer = self.decode_value_lossy(value);
+        if layer.failed > 0 {
+            return layer;
+        }
+        layer.merged(self.decode_value_lossy(value))
     }
 
     fn decode_value_lossy_inner(&self, value: &mut Value, outcome: &mut LossyDecodeOutcome) {

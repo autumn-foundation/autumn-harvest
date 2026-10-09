@@ -6,7 +6,8 @@
 //! cannot share a database. With `HARVEST_TEST_DATABASE_URL` set, such a
 //! suite creates its own database on that server. [`ThrowawayDb`] drops it
 //! again, after a pass and during an unwind. The DSN can be a URL or a libpq
-//! keyword/value string.
+//! keyword/value string. [`ThrowawayDb::create_on`] takes any admin URL, for
+//! a harness that starts its own server.
 
 /// The DSN `url` with its database set to `database`.
 ///
@@ -111,12 +112,32 @@ impl ThrowawayDb {
     /// the `HARVEST_TEST_DATABASE_URL` server. Returns `None` when the
     /// variable is unset.
     pub async fn create(prefix: &str) -> Option<Self> {
-        use diesel_async::{AsyncConnection, AsyncPgConnection, SimpleAsyncConnection};
         let admin_url = std::env::var("HARVEST_TEST_DATABASE_URL").ok()?;
+        Some(Self::create_on(&admin_url, prefix).await)
+    }
+
+    /// Create and migrate a database named `prefix` plus a unique suffix on
+    /// the server of `admin_url`. A caller that starts its own server uses
+    /// this form.
+    ///
+    /// # Panics
+    /// Panics when the server is unreachable or the migration fails.
+    pub async fn create_on(admin_url: &str, prefix: &str) -> Self {
+        use diesel_async::{AsyncConnection, AsyncPgConnection, SimpleAsyncConnection};
+        // The name goes into SQL text, and Postgres cuts a name at 63 bytes.
+        // A short `[a-z0-9_]` prefix keeps it safe and whole.
+        assert!(
+            (1..=30).contains(&prefix.len())
+                && prefix
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+            "a throwaway prefix must match [a-z0-9_]{{1,30}}: {prefix:?}"
+        );
+        let admin_url = admin_url.to_string();
         let name = format!("{prefix}_{}", uuid::Uuid::new_v4().simple());
         let mut admin = AsyncPgConnection::establish(&admin_url)
             .await
-            .expect("HARVEST_TEST_DATABASE_URL must be reachable");
+            .expect("the admin server must be reachable");
         admin
             .batch_execute(&format!("CREATE DATABASE \"{name}\""))
             .await
@@ -128,7 +149,13 @@ impl ThrowawayDb {
         conn.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("migrate the throwaway database");
-        Some(db)
+        db
+    }
+
+    /// The name of the throwaway database.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// The connection URL of the throwaway database.

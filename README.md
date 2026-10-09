@@ -339,6 +339,7 @@ for a compile-checked polling loop that works with and without the `db` feature.
 | [`autumn-harvest-cli`](autumn-harvest-cli/) | `harvest` CLI: thin operator client for the management API |
 | [`autumn-harvest-redis`](autumn-harvest-redis/) | Optional Redis Streams dispatch channel — carries references to claimable rows; Postgres stays the source of truth |
 | [`autumn-harvest-sqlite`](autumn-harvest-sqlite/) | Optional SQLite storage backend for single-process and embedded deployments |
+| [`autumn-harvest-agent`](autumn-harvest-agent/) | Optional durable agent loop: model and tool calls as activities, approvals as durable waits ([guide](docs/agent-adapter.md)) |
 
 Use `autumn-harvest-plugin` if you're building an Autumn app. For a non-web
 context — a worker or CLI process with no HTTP surface at all — use the bare
@@ -1489,4 +1490,8 @@ With no `telemetry(...)` call (the default), all `info_span!` sites compile to b
 
 ## License
 
-Dual-licensed under MIT or Apache 2.0 at your option.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Each published crate ships both license files.
+
+To contribute, read [`CONTRIBUTING.md`](CONTRIBUTING.md).
+To report a vulnerability, follow [`SECURITY.md`](SECURITY.md).
