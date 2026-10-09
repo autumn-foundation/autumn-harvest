@@ -205,7 +205,7 @@ an interceptor `Err`/panic is contained exactly like a handler failure. See
 ## Run one durable job
 
 Harvest has no standalone-activity start path.
-[ADR 0006](../adr/0006-standalone-activity.md) records why. A one-step
+[ADR 0007](../adr/0007-standalone-activity.md) records why. A one-step
 workflow with a local activity costs less than twice what a standalone job
 would. Wrap the job in a one-step workflow:
 

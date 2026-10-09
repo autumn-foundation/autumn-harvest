@@ -343,7 +343,7 @@ fn the_guide_shows_the_pattern_and_links_the_decision() {
         "the guide section must name the local-activity fast path"
     );
     assert!(
-        body.contains("(../adr/0006-standalone-activity.md)"),
+        body.contains("(../adr/0007-standalone-activity.md)"),
         "the guide section must link the ADR"
     );
 }
