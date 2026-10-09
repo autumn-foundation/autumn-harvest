@@ -1163,10 +1163,11 @@ async fn load_source_execution(
     }
 }
 
-async fn load_event_rows(
+/// Load the stored event rows of `exec_id` in `event_id` order.
+pub(crate) async fn load_event_rows(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-) -> Result<Vec<HarvestEvent>, WorkflowResetError> {
+) -> Result<Vec<HarvestEvent>, HarvestError> {
     harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
         .order(harvest_events::event_id.asc())
@@ -1174,7 +1175,6 @@ async fn load_event_rows(
         .load(conn)
         .await
         .map_err(database_error)
-        .map_err(WorkflowResetError::from)
 }
 
 fn decode_events(rows: &[HarvestEvent]) -> Result<Vec<WorkflowEvent>, WorkflowResetError> {
@@ -1348,6 +1348,41 @@ async fn insert_fork_execution(
     source: &WorkflowExecution,
     new_exec_id: ExecutionId,
 ) -> Result<WorkflowExecution, WorkflowResetError> {
+    insert_fork_row(
+        conn,
+        source,
+        new_exec_id,
+        ForkRow {
+            workflow_id: &source.workflow_id,
+            input: source.input.clone(),
+            start_source: crate::types::StartSource::Reset,
+            completion_callbacks: source.completion_callbacks.clone(),
+        },
+    )
+    .await
+    .map_err(database_error)
+    .map_err(WorkflowResetError::from)
+}
+
+/// The fields in which a reset fork and a non-destructive fork differ.
+pub(crate) struct ForkRow<'a> {
+    /// A reset keeps the source id. A fork of issue #2000 takes a new id.
+    pub(crate) workflow_id: &'a str,
+    /// The stored input. A fork can replace it.
+    pub(crate) input: Value,
+    /// Provenance. `start_source_ref` is always the source id.
+    pub(crate) start_source: crate::types::StartSource,
+    /// A recorded fork drops the targets, so that it sends no notification.
+    pub(crate) completion_callbacks: Option<Value>,
+}
+
+/// Insert the execution row of a fork of `source`.
+pub(crate) async fn insert_fork_row(
+    conn: &mut AsyncPgConnection,
+    source: &WorkflowExecution,
+    new_exec_id: ExecutionId,
+    spec: ForkRow<'_>,
+) -> Result<WorkflowExecution, diesel::result::Error> {
     // Re-compute deadline_at from the source execution's timeout so the fork
     // gets a fresh deadline anchored to its own start time (issue #243).
     let deadline_at = source.execution_timeout.map(|d| chrono::Utc::now() + d);
@@ -1390,10 +1425,10 @@ async fn insert_fork_execution(
         chain_deadline_at,
         id: new_exec_id.as_uuid(),
         workflow_name: &source.workflow_name,
-        workflow_id: &source.workflow_id,
+        workflow_id: spec.workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: source.shard_id,
-        input: source.input.clone().into(),
+        input: spec.input.into(),
         parent_id: None,
         queue_name: &source.queue_name,
         execution_timeout: source.execution_timeout,
@@ -1418,14 +1453,14 @@ async fn insert_fork_execution(
         retry_of_exec_id: None,
         // Reset fork is an operator intervention, not a schedule fire (issue #534).
         origin: None,
-        // Inherit the source's completion-callback targets (issue #605): the
-        // fork continues the same logical run, so its terminal notification
-        // targets should too.
-        completion_callbacks: source.completion_callbacks.clone(),
+        // A reset fork inherits the completion-callback targets (issue #605).
+        // It continues the same logical run, so its terminal notification
+        // targets do too. A recorded fork of issue #2000 drops them.
+        completion_callbacks: spec.completion_callbacks,
         // A reset fork has its OWN provenance (issue #740 AC3) — it is an
         // operator intervention, never re-attributed to the source's source.
         // Ref is the source execution id.
-        start_source: Some(crate::types::StartSource::Reset.as_str()),
+        start_source: Some(spec.start_source.as_str()),
         start_source_ref: Some(source_exec_id_str.as_str()),
         started_by: None,
         // A reset fork is an operator intervention that bypasses every other
@@ -1449,8 +1484,6 @@ async fn insert_fork_execution(
         .returning(WorkflowExecution::as_returning())
         .get_result(conn)
         .await
-        .map_err(database_error)
-        .map_err(WorkflowResetError::from)
 }
 
 #[derive(Insertable)]
@@ -1620,7 +1653,7 @@ async fn reapply_or_drop_signals(
     Ok(signals.len())
 }
 
-async fn enqueue_fork_workflow_task(
+pub(crate) async fn enqueue_fork_workflow_task(
     conn: &mut AsyncPgConnection,
     fork: &WorkflowExecution,
     new_exec_id: ExecutionId,

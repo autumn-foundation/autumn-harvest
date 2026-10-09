@@ -1282,7 +1282,8 @@ these free-form strings in `harvest_events.event_data`:
   `UpdateFailed`.
 - `last_error` in `WorkflowStarted`.
 - `reason` in `WorkflowCancelled`, `WorkflowResetFork`,
-  `WorkflowResetTerminated`, `WorkflowExecutionPaused` and `WorkflowRedriven`.
+  `WorkflowResetTerminated`, `WorkflowForked`, `WorkflowExecutionPaused` and
+  `WorkflowRedriven`.
 - `message` in `ExternalAwaitFailed`.
 - `error_type` and `reason_code`, which name a failure class.
 

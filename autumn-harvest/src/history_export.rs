@@ -572,6 +572,8 @@ impl MermaidExporter {
                 | WorkflowEvent::WorkflowContinuedAsNew { .. }
                 | WorkflowEvent::WorkflowResetFork { .. }
                 | WorkflowEvent::WorkflowResetTerminated { .. }
+                | WorkflowEvent::WorkflowForked { .. }
+                | WorkflowEvent::ForkActivityResultOverridden { .. }
                 | WorkflowEvent::WorkflowExecutionTimedOut { .. }
                 | WorkflowEvent::WorkflowExecutionPaused { .. }
                 | WorkflowEvent::WorkflowExecutionResumed { .. }
@@ -689,6 +691,32 @@ impl MermaidExporter {
                 writeln!(
                     self.out,
                     "    Note over WF: Reset Terminated (fork: {reset_to_exec_id}): {safe_reason}"
+                )?;
+            }
+            WorkflowEvent::WorkflowForked {
+                forked_from_exec_id,
+                fork_event_id,
+                effects,
+                reason,
+                ..
+            } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Forked from {forked_from_exec_id} at event {fork_event_id} \
+                     ({} effects): {}",
+                    effects.as_str(),
+                    mermaid_text(reason),
+                )?;
+            }
+            WorkflowEvent::ForkActivityResultOverridden {
+                activity_name,
+                occurrence,
+                ..
+            } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Fork override: {} #{occurrence}",
+                    mermaid_text(activity_name),
                 )?;
             }
             WorkflowEvent::WorkflowExecutionTimedOut { deadline, .. } => {

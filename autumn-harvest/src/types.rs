@@ -1035,6 +1035,9 @@ pub enum StartSource {
     /// (issue #763), so the run commits or rolls back together with the
     /// caller's own domain write.
     Transactional,
+    /// A non-destructive fork of another run (issue #2000). The source stays
+    /// unchanged. `start_source_ref` holds the source execution id.
+    Fork,
     /// Provenance is unknown (a NULL / pre-upgrade column, or an unrecognized
     /// stored value). This is the default.
     #[default]
@@ -1064,6 +1067,7 @@ impl StartSource {
             Self::Rerun => "rerun",
             Self::Outbox => "outbox",
             Self::Transactional => "transactional",
+            Self::Fork => "fork",
             Self::Unknown => "unknown",
         }
     }
@@ -1091,6 +1095,7 @@ impl StartSource {
             "rerun" => Self::Rerun,
             "outbox" => Self::Outbox,
             "transactional" => Self::Transactional,
+            "fork" => Self::Fork,
             _ => Self::Unknown,
         }
     }
@@ -1819,6 +1824,7 @@ mod tests {
             StartSource::Rerun,
             StartSource::Outbox,
             StartSource::Transactional,
+            StartSource::Fork,
             StartSource::Unknown,
         ];
         for src in all {
