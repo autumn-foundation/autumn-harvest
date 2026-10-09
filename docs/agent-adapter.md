@@ -142,6 +142,19 @@ A worker with a payload cap other than the default must say so. Set
 A tool error is cut to fit the result cap too, so a huge error message
 cannot fail the run.
 
+### The cost ledger
+
+On Postgres, each model turn writes one row to the
+[agent cost ledger](llm-cost-ledger.md) (issue #1996). The row holds the
+model id, the tokens, the cost and the call latency. It is outside the
+encrypted turn output, so the usage report can sum it per tenant. Two
+`AgentModel` methods fill it in:
+
+- `model_id()` — the model id. The default is `"unknown"`. It is stored in
+  clear, so do not put PII in it.
+- `cost_usd_micros(usage)` — the cost of one call, in millionths of a US
+  dollar. The default is `None`, which counts the call as unpriced.
+
 `AgentTask` sets the run: `input`, `system`, `history`, `session`,
 `max_steps` (default 8), `max_total_tokens`, `max_output_tokens`,
 `approval_timeout` (default one hour, rounded up to whole seconds), and
@@ -240,8 +253,8 @@ reads these payloads back, so add a field only with `#[serde(default)]`.
 - **No streaming.** An activity result is a value, not a stream.
 - **Tool definitions are read at call time.** A deploy that changes the tool
   list changes only later turns. Recorded turns replay as they were.
-- **The session entity is separate.** It is a sibling issue. Per-step token
-  cost belongs to the agent cost ledger (#1970).
+- **The session entity is separate.** It is a sibling issue.
+- **The cost ledger needs Postgres.** On SQLite the ledger call is dropped.
 
 ## 10. The daemon example
 
