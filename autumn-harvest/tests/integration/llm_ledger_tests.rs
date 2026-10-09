@@ -716,7 +716,7 @@ async fn replay_of_a_history_with_llm_steps_is_unchanged() {
 
     let mut conn = connect(&url).await;
     assert_eq!(ledger_rows(&mut conn, with_ledger).await.len(), 2);
-    assert!(ledger_rows(&mut conn, without_ledger).await.is_empty());
+    assert_eq!(ledger_rows(&mut conn, without_ledger).await, Vec::new());
 
     let ledger_history =
         autumn_harvest::store::load_history_with_codecs(&mut conn, with_ledger, &codecs)

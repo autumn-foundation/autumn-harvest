@@ -366,5 +366,5 @@ async fn a_failed_model_turn_records_no_ledger_call() {
     let info = agent_model_turn_info();
     let result = (info.handler)(&ctx, serde_json::to_value(turn_request()).unwrap()).await;
     assert!(result.is_err());
-    assert!(ctx.llm_calls().is_empty());
+    assert_eq!(ctx.llm_calls(), Vec::new());
 }

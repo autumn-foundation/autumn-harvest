@@ -367,7 +367,7 @@ mod tests {
             ctx.record_llm_call(LlmCall::new("", 1, 1)),
             Err(LlmCallError::EmptyModel)
         );
-        assert!(ctx.llm_calls().is_empty());
+        assert_eq!(ctx.llm_calls(), Vec::new());
     }
 
     #[test]
@@ -397,8 +397,8 @@ mod tests {
         assert_eq!(taken[0].latency(), Some(Duration::from_secs(3)));
         let filled = taken[1].latency().expect("the engine fills the latency");
         assert!(filled >= Duration::from_millis(5), "{filled:?}");
-        assert!(ctx.llm_calls().is_empty());
-        assert!(ctx.take_llm_calls().is_empty());
+        assert_eq!(ctx.llm_calls(), Vec::new());
+        assert_eq!(ctx.take_llm_calls(), Vec::new());
     }
 
     #[test]
