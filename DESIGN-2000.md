@@ -115,7 +115,8 @@ Replay skips both, as it skips `WorkflowResetFork`.
   fork. It fails the run before a local activity, a child, an external
   effect, a continue-as-new or a mutex acquire.
 - A fork row with no marker counts as recorded. A reset of a fork keeps
-  `start_source = fork`, so it stays recorded.
+  `start_source = fork` and appends a marker with the mode of that fork. A
+  carried ancestor marker with another mode then cannot decide the mode.
 
 ### 1.4 API
 

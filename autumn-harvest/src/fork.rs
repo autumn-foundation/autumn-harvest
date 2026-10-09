@@ -353,20 +353,24 @@ async fn fork_workflow_id(
     if workflow_id_in_use(conn, &source.workflow_name, &workflow_id).await? {
         return Err(WorkflowForkError::WorkflowIdInUse { workflow_id });
     }
-    check_shards(conn, source, &workflow_id).await?;
+    check_shards(conn, source, &workflow_id, request.workflow_id.is_some()).await?;
     Ok(workflow_id)
 }
 
 /// Apply the shard checks of a rerun (issue #777) to the fork.
 ///
 /// The fork lands on the source shard, so that shard must accept new work.
-/// The business-key index is shard-local. So a key that routes to another
-/// shard is checked there too, and a shard that cannot be read fails closed.
-/// With no process router, both checks pass, as for a rerun.
+/// The business-key index is shard-local. So a caller-chosen key is checked
+/// on every readable shard, whatever shard it hashes to. Explicit placement
+/// or a change of the writable set can leave a holder on another shard. A
+/// shard that cannot be read fails closed. A derived key holds a new UUID, so
+/// it needs no fan-out. With no process router, both checks pass, as for a
+/// rerun.
 async fn check_shards(
     conn: &mut AsyncPgConnection,
     source: &WorkflowExecution,
     workflow_id: &str,
+    caller_chose_key: bool,
 ) -> Result<(), WorkflowForkError> {
     use crate::external_target_location::CrossShardOccupancy;
 
@@ -389,7 +393,7 @@ async fn check_shards(
     else {
         return Ok(());
     };
-    if expected == source_shard {
+    if !caller_chose_key {
         return Ok(());
     }
     let occupancy = crate::execution::rerun_cross_shard_occupancy(
@@ -404,6 +408,13 @@ async fn check_shards(
         CrossShardOccupancy::Occupied { .. } => Err(WorkflowForkError::WorkflowIdInUse {
             workflow_id: workflow_id.to_string(),
         }),
+        // No sharded pool is configured, so the source shard is the only
+        // reachable one. Its own index check above covers it.
+        CrossShardOccupancy::Indeterminate { uninspected }
+            if uninspected.is_empty() && expected == source_shard =>
+        {
+            Ok(())
+        }
         CrossShardOccupancy::Indeterminate { uninspected } => {
             let shards = uninspected
                 .iter()

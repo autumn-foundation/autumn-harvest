@@ -589,7 +589,7 @@ async fn a_reset_of_a_recorded_fork_stays_recorded() {
     let source = completed_source(&url, &pool, &queue, &queue).await;
     let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
 
-    // Event 0 is before the fork marker, so the reset carries no marker.
+    // Event 0 is before the fork marker. The reset appends its own marker.
     let mut conn = connect(&url).await;
     let reset = reset_workflow_execution(
         &mut conn,
@@ -615,10 +615,63 @@ async fn a_reset_of_a_recorded_fork_stays_recorded() {
             .expect("read marker")
     );
 
+    // The reset takes the record of the original source, so it completes
+    // with no new charge.
+    let running = Running::start(&queue, &pool);
+    wait_for_execution_state(&url, reset.new_exec_id, "COMPLETED").await;
+    running.stop().await;
+    assert_eq!(charges(&queue), 1, "the reset fork never charges");
+}
+
+/// A reset between the markers of a recorded fork of a live fork stays
+/// recorded. The carried prefix holds only the live ancestor marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reset_of_a_nested_recorded_fork_stays_recorded() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("nested");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+    // History of the live fork: WorkflowStarted, WorkflowForked(live).
+    let live = fork(&url, source, request(ForkEffects::Live)).await;
+    let mut recorded_request = request(ForkEffects::Recorded);
+    recorded_request.fork_point = Some(ResetPoint::EventId { event_id: 1 });
+    let recorded = fork(&url, live, recorded_request).await;
+
+    // The live fork must not run in this test, so its task never starts.
+    let mut conn = connect(&url).await;
+    queue::cancel_open_tasks_for_execution(&mut conn, live, "test keeps it idle")
+        .await
+        .expect("cancel the live fork task");
+
+    // Event 1 is the live marker, before the recorded marker.
+    let reset = reset_workflow_execution(
+        &mut conn,
+        recorded,
+        WorkflowResetRequest {
+            reset_to_event_id: Some(1),
+            reset_point: None,
+            reason: "retry".to_string(),
+            operator_id: "tester".to_string(),
+            signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::Drop,
+            allow_terminal_source: false,
+            refuse_erased_source: false,
+        },
+        Some(&registry()),
+    )
+    .await
+    .expect("reset the nested fork");
+    let reset_row = snapshot(&url, reset.new_exec_id).await.0;
+    assert!(
+        is_recorded_fork(&mut conn, &reset_row)
+            .await
+            .expect("read marker")
+    );
+
+    // The live fork never ran, so it holds no record. The reset fails closed.
     let running = Running::start(&queue, &pool);
     wait_for_execution_state(&url, reset.new_exec_id, "FAILED").await;
     running.stop().await;
-    assert_eq!(charges(&queue), 1, "the reset fork never charges");
+    assert_eq!(charges(&queue), 1, "the reset never charges");
 }
 
 /// Only a recorded fork skips completion callbacks and triggers.

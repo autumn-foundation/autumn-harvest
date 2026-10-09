@@ -18,8 +18,9 @@ is never written, so a run in any state can be forked, `COMPLETED` and
 - A race branch that lost in the source stays pending, so the same branch
   wins again.
 - The fork sends no completion callback and fires no completion trigger.
-- A reset of a fork keeps `start_source = fork`, so it stays recorded. A fork
-  of a fork uses its own, last, marker.
+- A reset of a fork keeps `start_source = fork` and appends a marker with the
+  mode of that fork, so it keeps that mode. A fork of a fork uses its own,
+  last, marker.
 
 `"effects": "live"` runs effects for real. An override applies in both modes.
 

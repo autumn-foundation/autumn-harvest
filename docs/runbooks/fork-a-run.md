@@ -72,9 +72,8 @@ closed.
 
 ## 4. Know what stays recorded
 
-- A reset of a recorded fork stays recorded. It keeps `start_source = fork`.
-  A reset before the fork marker carries no record, so its activities fail
-  closed.
+- A reset of a fork keeps its mode. It keeps `start_source = fork` and
+  appends a marker with the mode and record source of that fork.
 - A rerun (`POST /workflows/{id}/rerun`) of a fork starts a new live run.
 - Erasure of a source does not erase its forks. A fork is a new root. Find
   the forks with `GET /workflows?start_source=fork` and the source id in

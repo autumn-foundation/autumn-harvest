@@ -870,7 +870,14 @@ pub async fn reset_workflow_execution(
             .await?;
             let fork = insert_fork_execution(conn, &source, new_exec_id).await?;
             copy_carried_events(conn, new_exec_id, &rows, reset_event_id).await?;
-            append_fork_marker(conn, new_exec_id, exec_id, &request, &plan).await?;
+            // A reset of a fork keeps the effects mode of that fork (issue
+            // #2000). The carried prefix can hold an ancestor marker with
+            // another mode, so the reset appends its own last marker.
+            let fork_mode = crate::fork::is_fork(&source).then(|| {
+                crate::fork::fork_marker(&events)
+                    .unwrap_or((exec_id, crate::fork::ForkEffects::Recorded))
+            });
+            append_fork_marker(conn, new_exec_id, exec_id, &request, &plan, fork_mode).await?;
 
             let source_tasks_cancelled = queue::cancel_open_tasks_for_execution(
                 conn,
@@ -1536,21 +1543,28 @@ async fn append_fork_marker(
     source_exec_id: ExecutionId,
     request: &WorkflowResetRequest,
     plan: &ResetPlan,
+    // The record source and effects mode of a fork source (issue #2000).
+    fork_mode: Option<(ExecutionId, crate::fork::ForkEffects)>,
 ) -> Result<(), WorkflowResetError> {
     let marker_event_id = i32::try_from(plan.events_carried_over)
         .map_err(|_| HarvestError::Database("reset carried too many events".to_string()))?;
-    crate::store::append_events(
-        conn,
-        new_exec_id,
-        &[WorkflowEvent::WorkflowResetFork {
-            reset_from_exec_id: source_exec_id,
-            reset_to_event_id: request.reset_to_event_id.unwrap_or(0),
+    let reset_to_event_id = request.reset_to_event_id.unwrap_or(0);
+    let mut markers = vec![WorkflowEvent::WorkflowResetFork {
+        reset_from_exec_id: source_exec_id,
+        reset_to_event_id,
+        reason: request.reason.clone(),
+        operator_id: request.operator_id.clone(),
+    }];
+    if let Some((forked_from_exec_id, effects)) = fork_mode {
+        markers.push(WorkflowEvent::WorkflowForked {
+            forked_from_exec_id,
+            fork_event_id: reset_to_event_id,
+            effects,
             reason: request.reason.clone(),
             operator_id: request.operator_id.clone(),
-        }],
-        marker_event_id,
-    )
-    .await?;
+        });
+    }
+    crate::store::append_events(conn, new_exec_id, &markers, marker_event_id).await?;
     Ok(())
 }
 
