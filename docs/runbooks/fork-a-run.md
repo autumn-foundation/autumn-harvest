@@ -103,7 +103,9 @@ not show it under the source (see
 | `409` | The source, or a run in its fork lineage, had its payloads erased (issue #495). | You cannot fork it. Start a new run. |
 | `409` | Recorded mode cannot serve an effect after the fork point. | Fork after that effect, or use `"effects": "live"`. |
 | `409` | The carried history holds a mutex grant. | Fork before the grant. |
-| `409` | The workflow id is in use. A run holds its key unless it continued as new or was terminated. | Choose another `workflow_id`. |
+| `409` | The workflow id is in use on any shard. A run holds its key unless it continued as new or was terminated. | Choose another `workflow_id`. |
+| `409` | The source shard is draining, or a shard that the key routes to cannot be checked. | Retry after the drain or the outage. |
+| `409` | The fork lineage is deeper than 64 links. | Fork a run nearer the root. |
 | `422` | An unknown field or a bad `effects` value. | Fix the body. |
 | `503` | The node has not finished start-up, or the fork exists but its audit row failed. | Retry in the first case. In the second, the message names the fork. Do not retry. |
 

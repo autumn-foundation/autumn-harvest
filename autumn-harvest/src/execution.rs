@@ -7634,7 +7634,7 @@ pub struct RerunOutcome {
 /// matches the fail-closed posture the pre-#1308 hash rejection took for
 /// every divergent override. So an embedder that never wires one up sees no
 /// behavior change.
-async fn rerun_cross_shard_occupancy(
+pub(crate) async fn rerun_cross_shard_occupancy(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     target_wf_id: &str,

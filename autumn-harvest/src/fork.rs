@@ -171,6 +171,21 @@ pub enum WorkflowForkError {
         /// The workflow id.
         workflow_id: String,
     },
+    /// The fork lineage is deeper than the erased-lineage scan.
+    #[error(
+        "the fork lineage is deeper than {depth} links, so no erased ancestor can be ruled out"
+    )]
+    LineageTooDeep {
+        /// The scan bound.
+        depth: usize,
+    },
+    /// The source shard cannot take the fork, or the business key cannot be
+    /// checked on every shard.
+    #[error("{message}")]
+    ShardRefused {
+        /// What blocks the fork.
+        message: String,
+    },
     /// A storage or database error.
     #[error(transparent)]
     Harvest(#[from] HarvestError),
@@ -338,7 +353,71 @@ async fn fork_workflow_id(
     if workflow_id_in_use(conn, &source.workflow_name, &workflow_id).await? {
         return Err(WorkflowForkError::WorkflowIdInUse { workflow_id });
     }
+    check_shards(conn, source, &workflow_id).await?;
     Ok(workflow_id)
+}
+
+/// Apply the shard checks of a rerun (issue #777) to the fork.
+///
+/// The fork lands on the source shard, so that shard must accept new work.
+/// The business-key index is shard-local. So a key that routes to another
+/// shard is checked there too, and a shard that cannot be read fails closed.
+/// With no process router, both checks pass, as for a rerun.
+async fn check_shards(
+    conn: &mut AsyncPgConnection,
+    source: &WorkflowExecution,
+    workflow_id: &str,
+) -> Result<(), WorkflowForkError> {
+    use crate::external_target_location::CrossShardOccupancy;
+
+    let source_shard = ShardId::new(source.shard_id);
+    let router = crate::shard::GLOBAL_SHARD_ROUTER
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().cloned());
+    if let Some(router) = &router
+        && !router.is_writable(source_shard)
+    {
+        return Err(WorkflowForkError::ShardRefused {
+            message: format!(
+                "the source lives on shard {source_shard}, which is draining and takes no new run"
+            ),
+        });
+    }
+    let Some(expected) =
+        router.map(|router| router.pick_for_new_workflow(&source.workflow_name, workflow_id))
+    else {
+        return Ok(());
+    };
+    if expected == source_shard {
+        return Ok(());
+    }
+    let occupancy = crate::execution::rerun_cross_shard_occupancy(
+        conn,
+        &source.workflow_name,
+        workflow_id,
+        source_shard,
+    )
+    .await;
+    match occupancy {
+        CrossShardOccupancy::Free => Ok(()),
+        CrossShardOccupancy::Occupied { .. } => Err(WorkflowForkError::WorkflowIdInUse {
+            workflow_id: workflow_id.to_string(),
+        }),
+        CrossShardOccupancy::Indeterminate { uninspected } => {
+            let shards = uninspected
+                .iter()
+                .map(|u| format!("shard {} ({})", u.shard, u.reason))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(WorkflowForkError::ShardRefused {
+                message: format!(
+                    "workflow id '{workflow_id}' routes to shard {expected}, but these shards \
+                     could not be checked for a run of the key: {shards}"
+                ),
+            })
+        }
+    }
 }
 
 /// The marker and the override events that follow the carried prefix.
@@ -371,11 +450,18 @@ const MAX_FORK_LINEAGE: usize = 64;
 /// The first erased run in the fork lineage above `source`, if any.
 ///
 /// It follows `start_source_ref` while the row is a fork. A missing ancestor
-/// ends the walk, because retention may delete it.
+/// ends the walk, because retention may delete it. Each ancestor row is read
+/// `FOR SHARE`, as the source is. So an erasure of an ancestor cannot commit
+/// between this check and the fork.
+///
+/// # Errors
+///
+/// Returns [`WorkflowForkError::LineageTooDeep`] past
+/// [`MAX_FORK_LINEAGE`] links. The walk fails closed there.
 async fn erased_fork_ancestor(
     conn: &mut AsyncPgConnection,
     source: &WorkflowExecution,
-) -> HarvestResult<Option<ExecutionId>> {
+) -> Result<Option<ExecutionId>, WorkflowForkError> {
     let mut current = (is_fork(source), source.start_source_ref.clone());
     for _ in 0..MAX_FORK_LINEAGE {
         let (true, Some(parent)) = current else {
@@ -387,6 +473,7 @@ async fn erased_fork_ancestor(
         let row: Option<(Value, Option<String>, Option<String>)> =
             harvest_workflow_executions::table
                 .find(parent)
+                .for_share()
                 .select((
                     harvest_workflow_executions::input,
                     harvest_workflow_executions::start_source,
@@ -407,7 +494,12 @@ async fn erased_fork_ancestor(
             start_source_ref,
         );
     }
-    Ok(None)
+    match current {
+        (true, Some(_)) => Err(WorkflowForkError::LineageTooDeep {
+            depth: MAX_FORK_LINEAGE,
+        }),
+        _ => Ok(None),
+    }
 }
 
 /// Apply the start checks of the workflow type to an input override.

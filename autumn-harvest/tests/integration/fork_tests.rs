@@ -511,6 +511,36 @@ async fn a_fork_of_a_fork_of_an_erased_source_is_refused() {
     );
 }
 
+/// A fork lineage deeper than the scan bound is refused. The walk cannot
+/// prove that no erased run lies above it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_lineage_past_the_scan_bound_is_refused() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("deep");
+    let mut conn = connect(&url).await;
+    // Link 66 rows as forks, each of the previous one, with fork provenance.
+    let mut parent = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    for _ in 0..66 {
+        let child = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+        diesel::update(harvest_workflow_executions::table.find(child.as_uuid()))
+            .set((
+                harvest_workflow_executions::start_source.eq(Some("fork")),
+                harvest_workflow_executions::start_source_ref.eq(Some(parent.to_string())),
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("link the chain");
+        parent = child;
+    }
+    let error = fork_workflow_execution(&mut conn, parent, request(ForkEffects::Recorded), None)
+        .await
+        .expect_err("a lineage past the bound is refused");
+    assert!(
+        matches!(error, WorkflowForkError::LineageTooDeep { .. }),
+        "unexpected error: {error}"
+    );
+}
+
 /// A fork at a later point carries the completed charge and takes the
 /// receipt from the record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

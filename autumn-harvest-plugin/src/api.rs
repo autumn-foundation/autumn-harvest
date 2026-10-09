@@ -25562,7 +25562,9 @@ fn fork_error_response(error: WorkflowForkError) -> axum::response::Response {
         WorkflowForkError::ErasedSource { .. }
         | WorkflowForkError::UnservableEffect { .. }
         | WorkflowForkError::CarriedMutex { .. }
-        | WorkflowForkError::WorkflowIdInUse { .. } => axum::http::StatusCode::CONFLICT,
+        | WorkflowForkError::WorkflowIdInUse { .. }
+        | WorkflowForkError::LineageTooDeep { .. }
+        | WorkflowForkError::ShardRefused { .. } => axum::http::StatusCode::CONFLICT,
     };
     (
         status,

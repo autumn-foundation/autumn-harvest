@@ -33,6 +33,9 @@ fork point.
 an erased run. Erasure does not reach a fork, which is a new root, so erase
 each fork on its own. A fork point at or after a terminal
 event, a carried `MutexGranted` and a continue-as-new history are refused.
+As for a rerun, a draining source shard and a business key held on any
+shard are refused. The erased-lineage walk locks each ancestor and fails
+closed past 64 links.
 In recorded mode, a source suffix with an effect that the mode cannot serve
 is refused with `409`.
 
