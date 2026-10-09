@@ -1154,6 +1154,9 @@ jobs:
       - name: Run entity_phase_transition example tests (issue #803)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest --no-default-features --features testing --example entity_phase_transition
+      - name: Run agent_session_entity example tests (issue #1975)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        run: cargo test -p autumn-harvest --no-default-features --features testing --example agent_session_entity
       - name: Run mutex_ledger example tests (issue #691)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --no-default-features --features testing --example mutex_ledger
