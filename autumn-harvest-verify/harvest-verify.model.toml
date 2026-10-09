@@ -1702,6 +1702,10 @@ path = "run_transactional"
 receiver = "ActivityContext"
 reason = "Activity-side: context.rs:15202; runs the closure inside the activity's transactional state. Activity-side, no workflow command."
 [[non_sink]]
+path = "run_tenant"
+receiver = "ActivityContext"
+reason = "Activity-side: context.rs:15389; reads the run's verified tenant column (issue #1998). A read, no workflow command, and history does not record it."
+[[non_sink]]
 path = "deadline"
 receiver = "ActivityContext"
 reason = "Activity-side: the attempt deadline (context.rs:14659) - activity-side, and const."

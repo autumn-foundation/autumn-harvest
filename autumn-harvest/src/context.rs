@@ -15795,6 +15795,59 @@ impl ActivityContext {
         self.state.get(&TypeId::of::<T>())?.downcast_ref::<T>()
     }
 
+    /// Read the verified tenant of the run that owns this activity (issue
+    /// #1998).
+    ///
+    /// The value comes from `harvest_workflow_executions.tenant` (issue #1977).
+    /// Each call runs one query. History does not record the value, so replay
+    /// never depends on it.
+    ///
+    /// Returns `Ok(None)` for a run with no tenant. It also returns `Ok(None)`
+    /// for a test context and for a build without the `db` feature.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::Config`] for a local activity. It has no pool, so it
+    ///   cannot read the row.
+    /// - A [`HarvestError`] when the pool or the read fails, or when the row is
+    ///   not on this shard, for example during a rebalance.
+    // Without `db` the body has no `.await`, so both no-await lints fire.
+    #[cfg_attr(
+        not(feature = "db"),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
+    pub async fn run_tenant(&self) -> HarvestResult<Option<String>> {
+        // A local activity runs inside a tenant run, so `None` would be false.
+        if self.is_local {
+            return Err(HarvestError::Config(
+                "a local activity cannot read the run tenant".to_owned(),
+            ));
+        }
+        #[cfg(feature = "db")]
+        if let Some(txn) = &self.transactional_state {
+            use crate::schema::harvest_workflow_executions::dsl::{
+                harvest_workflow_executions, tenant,
+            };
+            use diesel::{QueryDsl as _, prelude::OptionalExtension as _};
+            use diesel_async::RunQueryDsl as _;
+
+            let mut conn = crate::replication::fenced_checkout(&txn.pool).await?;
+            let found: Option<Option<String>> = harvest_workflow_executions
+                .find(txn.exec_id.as_uuid())
+                .select(tenant)
+                .first(&mut *conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            // A missing row is not "no tenant". The run can be on another
+            // shard, so the caller must not guess.
+            return found.ok_or_else(|| {
+                HarvestError::Database(format!("execution {} is not on this shard", txn.exec_id))
+            });
+        }
+        Ok(None)
+    }
+
     /// Return the heartbeat payload durably persisted by the previous attempt.
     ///
     /// This is a snapshot captured before the current attempt starts. Heartbeats
@@ -30499,6 +30552,25 @@ mod activity_info_tests {
         );
         assert!(local.is_local());
         assert!(local.info().is_local);
+    }
+
+    /// Issue #1998: a test context has no run, and a local activity cannot
+    /// read its run.
+    #[tokio::test]
+    async fn run_tenant_is_none_for_a_test_context_and_refused_for_a_local_one() {
+        assert_eq!(
+            ActivityContext::new_test().run_tenant().await.unwrap(),
+            None
+        );
+        let local = ActivityContext::new_local_activity(
+            crate::context::empty_shared_state(),
+            tokio_util::sync::CancellationToken::new(),
+            ActivityIdentity::for_test(),
+        );
+        assert!(matches!(
+            local.run_tenant().await,
+            Err(crate::error::HarvestError::Config(_))
+        ));
     }
 
     /// AC2: no `start_to_close` configured -> unbounded.

@@ -9,7 +9,8 @@
 //! The crate owns its agent primitives: [`AgentModel`], [`Tool`],
 //! [`ToolPolicy`], [`Approval`] and the message types. It also has the
 //! always-on primitives: [`heartbeat`], [`followup`], [`delivery`],
-//! [`memory`] and [`loop_guard`]. It depends on the core
+//! [`memory`] and [`loop_guard`]. [`ResponseCache`] serves an identical
+//! model call across runs. The crate depends on the core
 //! engine only, with no default features. It has no Autumn plugin dependency.
 //! An app implements [`AgentModel`] for its provider, or bridges a framework
 //! it already uses.
@@ -67,6 +68,7 @@ pub mod memory;
 pub mod message;
 pub mod model;
 pub mod policy;
+pub mod response_cache;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod tool;
@@ -90,6 +92,9 @@ pub use message::{
 };
 pub use model::{AgentModel, BoxFuture, ChatRequest, ChatResponse};
 pub use policy::{AllowAll, Rule, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
+pub use response_cache::{
+    CacheIndex, CacheKey, CacheScope, InMemoryCacheIndex, KeyTenant, ResponseCache,
+};
 pub use tool::{FnTool, Tool, ToolContext, ToolEffect};
 pub use types::{
     AgentReport, AgentStop, AgentTask, ModelTurn, ModelTurnRequest, RunIdSource, ToolCallRequest,

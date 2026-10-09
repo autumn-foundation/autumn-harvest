@@ -26,7 +26,7 @@ use crate::approval::{Approval, Decision, approval_signal, await_decision};
 use crate::bounds::{exceeds_bytes, json_len};
 use crate::delivery::{Report, ReportSource, report_text};
 use crate::followup::{self, FOLLOWUP_TOOL, Planned};
-use crate::harness::AgentHarness;
+use crate::harness::{AgentHarness, CacheTenant};
 use crate::heartbeat::{HeartbeatTask, agent_heartbeat_info};
 use crate::loop_guard::{LoopTracker, LoopVerdict, warning_note};
 use crate::memory::MemoryScope;
@@ -270,6 +270,7 @@ async fn run_segment(
             read_only: task.read_only,
             memory_scope: task.memory_tool_scope(),
             extra_tools: extra_tools.clone(),
+            tenant: task.tenant.clone(),
         };
         // A request the engine would refuse is not sent. The refusal is not
         // retryable, so it would fail the run after earlier work was paid for.
@@ -577,7 +578,73 @@ pub async fn agent_model_turn(
     ctx: &ActivityContext,
     request: ModelTurnRequest,
 ) -> Result<ModelTurn, String> {
-    harness(ctx)?.model_turn(request).await
+    let harness = harness(ctx)?;
+    let tenant = cache_tenant(ctx, harness, &request).await;
+    harness.model_turn_in(request, tenant).await
+}
+
+/// The tenant that scopes the response cache for one turn (issue #1998).
+///
+/// The activity reads the verified tenant of the run only when the harness
+/// has a cache.
+async fn cache_tenant(
+    ctx: &ActivityContext,
+    harness: &AgentHarness,
+    request: &ModelTurnRequest,
+) -> CacheTenant {
+    if !harness.cache_active() {
+        return CacheTenant::None;
+    }
+    let info = ctx.info();
+    if shares_run_id(
+        &request.run_id,
+        &info.workflow_id,
+        &info.execution_id.to_string(),
+    ) {
+        return CacheTenant::Skip;
+    }
+    // A local activity has no pool, so its read fails. The turn then skips
+    // the cache.
+    let read = tokio::time::timeout(harness.cache_budget(), ctx.run_tenant())
+        .await
+        .map_err(|_| "the read timed out".to_owned())
+        .and_then(|read| read.map_err(|err| err.to_string()));
+    resolve_tenant(read, request.tenant.as_deref())
+}
+
+/// Whether the run id of a turn is the workflow id, which a later run can
+/// reuse.
+///
+/// A hit repeats the tool-call ids of the stored answer. Tools take the run
+/// id, the step and the call id as an idempotency key. With a shared run
+/// id, a hit could give a tool a key that an earlier run used, so the turn
+/// skips the cache.
+fn shares_run_id(run_id: &str, workflow_id: &str, execution_id: &str) -> bool {
+    run_id == workflow_id && run_id != execution_id
+}
+
+/// Pick the cache tenant from the verified read and the task field.
+///
+/// The verified tenant wins over the task field. A caller bound to one
+/// tenant writes the task, so the activity does not trust the field alone.
+/// With no verified tenant, the task field applies as a declared tenant. A
+/// failed read gives an unknown tenant, so the turn skips the cache.
+fn resolve_tenant(read: Result<Option<String>, String>, task: Option<&str>) -> CacheTenant {
+    match read {
+        Ok(Some(verified)) => {
+            if task.is_some_and(|task| task != verified) {
+                tracing::warn!(
+                    "AgentTask::tenant differs from the verified tenant; the cache uses the verified tenant"
+                );
+            }
+            CacheTenant::Verified(verified)
+        }
+        Ok(None) => CacheTenant::declared(task),
+        Err(err) => {
+            tracing::warn!(error = %err, "the run tenant read failed; the turn skips the cache");
+            CacheTenant::Skip
+        }
+    }
 }
 
 /// One tool call, as an activity.
@@ -652,4 +719,45 @@ pub fn activities() -> Vec<ActivityInfo> {
         agent_deliver_info(),
         agent_precheck_info(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_verified_tenant_wins_over_the_task_field() {
+        let verified = || Ok(Some("acme".to_owned()));
+        assert_eq!(
+            resolve_tenant(verified(), Some("evil")),
+            CacheTenant::Verified("acme".into())
+        );
+        assert_eq!(
+            resolve_tenant(verified(), None),
+            CacheTenant::Verified("acme".into())
+        );
+    }
+
+    #[test]
+    fn with_no_verified_tenant_the_task_field_is_declared() {
+        assert_eq!(
+            resolve_tenant(Ok(None), Some("a")),
+            CacheTenant::Declared("a".into())
+        );
+        assert_eq!(resolve_tenant(Ok(None), None), CacheTenant::None);
+    }
+
+    #[test]
+    fn a_run_id_from_the_workflow_id_skips_the_cache() {
+        assert!(shares_run_id("daily", "daily", "0e3c"));
+        assert!(!shares_run_id("0e3c", "daily", "0e3c"));
+        // A test context has neither id.
+        assert!(!shares_run_id("run-1", "", "00000000"));
+    }
+
+    #[test]
+    fn a_failed_read_skips_the_cache() {
+        let failed = Err("the pool is down".to_owned());
+        assert_eq!(resolve_tenant(failed, Some("a")), CacheTenant::Skip);
+    }
 }
