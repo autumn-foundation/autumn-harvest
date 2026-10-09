@@ -224,11 +224,38 @@ pub fn update_input_schema_component(workflow: &str, update: &str) -> String {
 /// schema derivation always read the exact `WorkflowInfo` the runtime will
 /// execute.
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn collect_descriptors(
     workflows: &[WorkflowInfo],
     updates: &[UpdateHandlerInfo],
     dags: &[DagInfo],
+) -> Vec<McpWorkflowDescriptor> {
+    collect_descriptors_by(workflows, updates, dags, tool_operation_ids)
+}
+
+/// Like [`collect_descriptors`], for the MCP Tasks route (issue #2005).
+///
+/// That route exposes only `start_{wf}`. A collision among the other tool
+/// names of `/mcp` must not drop a workflow from it, so only the start
+/// names are checked here.
+#[must_use]
+pub fn collect_task_descriptors(
+    workflows: &[WorkflowInfo],
+    updates: &[UpdateHandlerInfo],
+    dags: &[DagInfo],
+) -> Vec<McpWorkflowDescriptor> {
+    collect_descriptors_by(workflows, updates, dags, |d| {
+        vec![format!("start_{}", d.name)]
+    })
+}
+
+/// The body of [`collect_descriptors`]. `operation_ids` names the tools
+/// that one descriptor registers, for the collision check.
+#[allow(clippy::too_many_lines)]
+fn collect_descriptors_by(
+    workflows: &[WorkflowInfo],
+    updates: &[UpdateHandlerInfo],
+    dags: &[DagInfo],
+    operation_ids: fn(&McpWorkflowDescriptor) -> Vec<String>,
 ) -> Vec<McpWorkflowDescriptor> {
     let dag_names: HashSet<&str> = dags
         .iter()
@@ -387,7 +414,7 @@ pub fn collect_descriptors(
         // Exclude the colliding workflow entirely (first-seen wins, matching
         // the duplicate-registration precedent above) rather than ship a
         // partial tool set.
-        if let Some(colliding_id) = tool_operation_ids(&candidate)
+        if let Some(colliding_id) = operation_ids(&candidate)
             .into_iter()
             .find(|id| seen_operation_ids.contains(id))
         {
@@ -400,7 +427,7 @@ pub fn collect_descriptors(
             );
             continue;
         }
-        seen_operation_ids.extend(tool_operation_ids(&candidate));
+        seen_operation_ids.extend(operation_ids(&candidate));
         descriptors.push(candidate);
     }
     descriptors.sort_by(|a, b| a.name.cmp(&b.name));

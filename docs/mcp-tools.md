@@ -273,7 +273,9 @@ headers, so the route checks them against the body before it acts. A
 the body gets `400` and `-32020`, and a `=?base64?…?=` name is decoded first.
 A 2026-07-28 request must carry all three. An older request may omit them.
 A version that the route does not serve gets `400` and `-32022`. A
-2026-07-28 request for an unknown method gets `404`.
+2026-07-28 request must also carry `io.modelcontextprotocol/protocolVersion`
+and `io.modelcontextprotocol/clientCapabilities` in `_meta`, or it gets `400`
+and `-32602`. A 2026-07-28 request for an unknown method gets `404`.
 
 A `tasks/*` call needs the extension in its own
 `params._meta["io.modelcontextprotocol/clientCapabilities"]`. Without it, the
@@ -344,7 +346,9 @@ while the chain still runs. After the run is deleted, `tasks/get` answers
 
 - A `#[dag(mcp)]` DAG is not served. Its trigger takes no start key, so a
   retried create could start a second run.
-- A debounced or batched workflow is not served, as on `/mcp`.
+- A debounced or batched workflow is not served, as on `/mcp`. A tool-name
+  collision among the other `/mcp` tools does not drop a workflow here,
+  because this route exposes only `start_{wf}`.
 - Only a signal wait is `input_required`. An update wait and an
   `await_condition` park read as `working` (issue #2035).
 - Harvest does not push `notifications/tasks`. Poll `tasks/get`.

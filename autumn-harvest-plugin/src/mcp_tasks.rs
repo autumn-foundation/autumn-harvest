@@ -246,7 +246,8 @@ fn mirrored_name<'a>(method: &str, params: &'a Value) -> Option<&'a str> {
 ///
 /// Returns [`HEADER_MISMATCH`] for a missing, malformed or mismatched
 /// header, and [`UNSUPPORTED_PROTOCOL_VERSION`] for a version this route
-/// does not serve.
+/// does not serve. A 2026-07-28 request without its version or client
+/// capabilities in `_meta` gets `-32602`.
 pub fn check_request_headers(
     headers: &HeaderMap,
     method: &str,
@@ -293,6 +294,22 @@ pub fn check_request_headers(
         return Err(mismatch(
             "Header mismatch: MCP-Protocol-Version header is missing".to_string(),
         ));
+    }
+    // A 2026-07-28 request must carry its version and client capabilities
+    // in `_meta`. A request without them is malformed.
+    if modern {
+        let meta = params.pointer("/_meta");
+        let has = |key: &str| meta.and_then(|meta| meta.get(key)).is_some();
+        if body_version.is_none() || !has(CLIENT_CAPABILITIES_META) {
+            return Err((
+                INVALID_PARAMS,
+                format!(
+                    "Invalid params: _meta must carry {PROTOCOL_VERSION_META} and \
+                     {CLIENT_CAPABILITIES_META}"
+                ),
+                None,
+            ));
+        }
     }
 
     match header("mcp-method")? {
@@ -1213,7 +1230,8 @@ async fn load_task(
     decode: Option<(&PayloadCodecs, &HeaderMap)>,
 ) -> Result<(TaskSnapshot, bool), RpcError> {
     let exec_id = crate::api::parse_execution_id(task_id).map_err(|_| RpcError::not_found())?;
-    let mut conn = crate::api::db_conn_for_execution(api_state, exec_id)
+    // The shard that hosts the run now, which a rebalance can change.
+    let (mut conn, shard) = crate::api::db_conn_for_execution_with_shard(api_state, exec_id)
         .await
         .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?;
     let origin = match crate::api::load_execution(&mut conn, exec_id).await {
@@ -1267,7 +1285,7 @@ async fn load_task(
             autumn_harvest::audit::TARGET_WORKFLOW,
             Some(task_id),
             "MCP tasks/get",
-            Some(exec_id.shard()),
+            Some(shard),
             outcome,
             None,
         )
@@ -1606,7 +1624,10 @@ mod tests {
 
     fn modern_params(extra: Value) -> Value {
         let mut params = extra;
-        params["_meta"] = json!({PROTOCOL_VERSION_META: LATEST_PROTOCOL_VERSION});
+        params["_meta"] = json!({
+            PROTOCOL_VERSION_META: LATEST_PROTOCOL_VERSION,
+            CLIENT_CAPABILITIES_META: {},
+        });
         params
     }
 
@@ -1665,6 +1686,26 @@ mod tests {
             let err = check_request_headers(&missing, "tools/call", &params).unwrap_err();
             assert_eq!(err.0, HEADER_MISMATCH, "{missing:?}");
         }
+    }
+
+    #[test]
+    fn a_modern_request_must_carry_its_meta_fields() {
+        let ok = headers(&[
+            ("mcp-protocol-version", LATEST_PROTOCOL_VERSION),
+            ("mcp-method", "ping"),
+        ]);
+        let no_caps = json!({"_meta": {PROTOCOL_VERSION_META: LATEST_PROTOCOL_VERSION}});
+        assert_eq!(
+            check_request_headers(&ok, "ping", &no_caps).unwrap_err().0,
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            check_request_headers(&ok, "ping", &json!({}))
+                .unwrap_err()
+                .0,
+            INVALID_PARAMS
+        );
+        assert!(check_request_headers(&ok, "ping", &modern_params(json!({}))).is_ok());
     }
 
     #[test]

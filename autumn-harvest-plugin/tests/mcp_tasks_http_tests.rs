@@ -36,6 +36,16 @@ async fn private_flow(_ctx: &WorkflowContext) -> Result<(), String> {
     Ok(())
 }
 
+#[workflow(mcp)]
+async fn invoice_status(_ctx: &WorkflowContext, _id: String) -> Result<(), String> {
+    Ok(())
+}
+
+#[workflow(mcp)]
+async fn start_invoice(_ctx: &WorkflowContext, _id: String) -> Result<(), String> {
+    Ok(())
+}
+
 fn review_input_schema() -> Value {
     json!({"type": "string", "description": "document id"})
 }
@@ -447,7 +457,10 @@ async fn an_unsupported_version_header_is_refused_with_400() {
 /// method gets 404, as the transport requires.
 #[tokio::test]
 async fn a_modern_request_with_matching_headers_is_served() {
-    let meta = json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28"});
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        CLIENT_CAPABILITIES_META: {},
+    });
     let modern = [
         ("mcp-protocol-version", "2026-07-28"),
         ("mcp-method", "ping"),
@@ -467,4 +480,46 @@ async fn a_modern_request_with_matching_headers_is_served() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(out["error"]["code"], -32601, "{out}");
+}
+
+/// A 2026-07-28 request without its client capabilities in `_meta` is
+/// malformed: HTTP 400 with `-32602`.
+#[tokio::test]
+async fn a_modern_request_without_meta_fields_is_refused() {
+    let meta = json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28"});
+    let modern = [
+        ("mcp-protocol-version", "2026-07-28"),
+        ("mcp-method", "ping"),
+    ];
+    let (status, out) =
+        post_with_headers(&router(), &call("ping", &json!({"_meta": meta})), &modern).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(out["error"]["code"], -32602, "{out}");
+}
+
+/// The task route exposes only `start_{wf}`. A collision on another `/mcp`
+/// tool name must not drop a workflow from it.
+#[tokio::test]
+async fn a_tool_name_collision_on_mcp_does_not_drop_a_task_tool() {
+    let workflows = vec![
+        __autumn_workflow_info_invoice_status(),
+        __autumn_workflow_info_start_invoice(),
+    ];
+    // On `/mcp`, `start_invoice_status` is both the start tool of
+    // `invoice_status` and the status tool of `start_invoice`.
+    assert_eq!(collect_descriptors(&workflows, &[], &[]).len(), 1);
+    let descriptors =
+        autumn_harvest_plugin::mcp_tools::collect_task_descriptors(&workflows, &[], &[]);
+    let route = build_mcp_task_route(TASKS, &descriptors, &open_state(), None, false);
+    let app = Router::<AppState>::new()
+        .route(route.path, route.handler)
+        .with_state(AppState::for_test());
+    let out = rpc(&app, call("tools/list", &json!({}))).await;
+    let names: Vec<&str> = out["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert_eq!(names, ["start_invoice_status", "start_start_invoice"]);
 }

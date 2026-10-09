@@ -1634,9 +1634,16 @@ impl Plugin for HarvestPlugin {
             };
             if mcp_tasks_enabled {
                 let path = mcp_tasks_path.unwrap_or_else(|| crate::mcp_tasks::tasks_path(&prefix));
+                // The task route exposes only `start_{wf}`, so a collision
+                // among the other `/mcp` tool names must not drop a workflow.
+                let task_descriptors = crate::mcp_tools::collect_task_descriptors(
+                    builder.workflow_infos(),
+                    builder.update_handlers(),
+                    builder.dag_infos(),
+                );
                 routes.push(crate::mcp_tasks::build_mcp_task_route(
                     &path,
-                    &descriptors,
+                    &task_descriptors,
                     &api_state,
                     mcp_tool_middleware.as_ref(),
                     role_auth_enabled,
