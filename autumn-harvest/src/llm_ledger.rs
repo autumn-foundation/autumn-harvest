@@ -200,6 +200,7 @@ impl From<LlmCallError> for String {
 }
 
 /// The latency in whole milliseconds, saturated to [`MAX_LATENCY_MS`].
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
 pub(crate) fn latency_ms(latency: Duration) -> i64 {
     i64::try_from(latency.as_millis()).map_or(MAX_LATENCY_MS, |ms| ms.min(MAX_LATENCY_MS))
 }
