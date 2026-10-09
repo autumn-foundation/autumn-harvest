@@ -49,7 +49,7 @@ dependencies = [
  "aes",
  "cipher 0.4.4",
  "ctr",
- "ghash",
+ "ghash 0.5.1",
  "subtle",
  "zeroize",
 ]
@@ -372,7 +372,7 @@ dependencies = [
  "diesel_migrations",
  "ed25519-dalek",
  "futures",
- "ghash",
+ "ghash 0.6.0",
  "hmac 0.13.0",
  "loom",
  "lru",
@@ -3152,6 +3152,15 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval 0.6.2",
+]
+
+[[package]]
+name = "ghash"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2eecf2d5dc9b66b732b97707a0210906b1d30523eb773193ab777c0c84b3e8d5"
+dependencies = [
+ "polyval 0.7.3",
  "zeroize",
 ]
 
