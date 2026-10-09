@@ -255,6 +255,21 @@ pub fn ttl_ms(
     u64::try_from((expires_at - created_at).num_milliseconds()).ok()
 }
 
+/// `true` when retention can delete the start row while its chain lives.
+///
+/// The task id names the start row, so the TTL follows that row. The sweep
+/// keeps a row while another row with the same workflow name and business id
+/// lives. A retry gets a new business id, and a cross-type continue-as-new
+/// gets a new name. In both cases the start row expires on its own clock.
+#[must_use]
+pub fn start_row_unguarded(start_state: &str, start_workflow: &str, live_workflow: &str) -> bool {
+    match start_state {
+        "FAILED" => true,
+        "CONTINUED_AS_NEW" => start_workflow != live_workflow,
+        _ => false,
+    }
+}
+
 /// One signal wait that the client can answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignalWait {
@@ -590,7 +605,16 @@ type RpcResult = Result<Value, RpcError>;
 
 fn rpc_response(id: &Value, result: RpcResult) -> Response {
     let body = match result {
-        Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        Ok(mut result) => {
+            // The 2026-07-28 revision requires `resultType` on each result.
+            // An older client ignores the extra field.
+            if let Some(fields) = result.as_object_mut() {
+                fields
+                    .entry("resultType")
+                    .or_insert_with(|| json!("complete"));
+            }
+            json!({"jsonrpc": "2.0", "id": id, "result": result})
+        }
         Err(err) => {
             let mut error = json!({"code": err.code, "message": err.message});
             if let Some(data) = err.data {
@@ -712,12 +736,25 @@ fn initialize_result(params: &Value) -> Value {
     })
 }
 
+/// How long a client may cache the discovery and tool-list results.
+const CATALOG_TTL_MS: u64 = 60_000;
+
+/// The cache fields of a `CacheableResult`.
+///
+/// The route sits behind auth, so a shared cache must not serve the result
+/// across callers.
+fn cacheable(mut result: Value) -> Value {
+    result["ttlMs"] = json!(CATALOG_TTL_MS);
+    result["cacheScope"] = json!("private");
+    result
+}
+
 fn discover_result() -> Value {
-    json!({
+    cacheable(json!({
         "supportedVersions": PROTOCOL_VERSIONS,
         "capabilities": capabilities(),
-        "serverInfo": server_info(),
-    })
+        "_meta": {"io.modelcontextprotocol/serverInfo": server_info()},
+    }))
 }
 
 fn tools_list(catalog: &TaskCatalog) -> Value {
@@ -733,7 +770,7 @@ fn tools_list(catalog: &TaskCatalog) -> Value {
             })
         })
         .collect();
-    json!({"tools": tools})
+    cacheable(json!({"tools": tools}))
 }
 
 /// Read a delegated handler response as status plus JSON body.
@@ -812,43 +849,39 @@ async fn tools_call(
     let task_id = started.get("execution_id").and_then(Value::as_str);
     let (true, Some(task_id)) = (client_declares_tasks(params), task_id) else {
         // A start with no run id yet, such as a deferred one, is no task.
-        return Ok(json!({
-            "resultType": "complete",
-            "content": [{"type": "text", "text": started.to_string()}],
-            "structuredContent": started,
-            "isError": false,
-        }));
+        return Ok(plain_start_result(started));
     };
-    // The start has committed, so this read resolves, as the spec requires
-    // before a `CreateTaskResult`. A failed read must not hide the run: a
-    // client that saw an error could retry and start a second run.
-    let snapshot = match load_task(api_state, catalog, task_id).await {
-        Ok((snapshot, _)) => snapshot,
-        Err(err) => {
-            tracing::warn!(task_id, error = %err.message, "mcp tasks: read after start failed");
-            seed_snapshot(task_id)
+    // `started` moves into the fallback result below, so own the id.
+    let owned_id = task_id.to_string();
+    let task_id = owned_id.as_str();
+    // The spec sends a `CreateTaskResult` only once `tasks/get` resolves, so
+    // the read must succeed first. A failed read must not hide the run
+    // either: a client that saw an error could retry and start a second run.
+    // So after a few tries the client gets the plain handle instead.
+    for delay_ms in [0, 50, 250] {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        match load_task(api_state, catalog, task_id).await {
+            Ok((snapshot, _)) => {
+                let mut task = task_object(&snapshot);
+                task["resultType"] = json!("task");
+                return Ok(task);
+            }
+            Err(err) => {
+                tracing::warn!(task_id, error = %err.message, "mcp tasks: read after start failed");
+            }
         }
-    };
-    let mut task = task_object(&snapshot);
-    task["resultType"] = json!("task");
-    Ok(task)
+    }
+    Ok(plain_start_result(started))
 }
 
-/// A `working` task with the time of now, for a run that cannot be read yet.
-fn seed_snapshot(task_id: &str) -> TaskSnapshot {
-    let now = Utc::now();
-    TaskSnapshot {
-        task_id: task_id.to_string(),
-        run_id: uuid::Uuid::nil(),
-        created_at: now,
-        last_updated_at: now,
-        state: "RUNNING".to_string(),
-        current_details: None,
-        output: None,
-        error: None,
-        waits: Vec::new(),
-        ttl_ms: None,
-    }
+/// The plain `CallToolResult` of a start: the run handle, with no task.
+fn plain_start_result(started: Value) -> Value {
+    json!({
+        "resultType": "complete",
+        "content": [{"type": "text", "text": started.to_string()}],
+        "structuredContent": started,
+        "isError": false,
+    })
 }
 
 async fn tasks_get(
@@ -1013,23 +1046,24 @@ async fn load_task(
         return Err(RpcError::not_found());
     }
     let created_at = origin.created_at;
-    // Retention keys a retry chain on the business id, which each attempt
-    // changes. So the sweep can delete the `FAILED` start row while a retry
-    // runs, and the TTL counts from that row.
-    let row_completed_at = if origin.state == "FAILED" {
-        origin.completed_at
-    } else {
-        None
-    };
+    let origin_state = origin.state.clone();
+    let origin_name = origin.workflow_name.clone();
+    let origin_completed_at = origin.completed_at;
     let live = crate::mcp_tools::resolve_if_chained(api_state, origin)
         .await
         .map_err(|_| RpcError::new(INTERNAL_ERROR, "could not resolve the live run"))?;
     let live_served = catalog.serves(&live.workflow_name);
 
+    let (ttl_completed_at, ttl_workflow) =
+        if start_row_unguarded(&origin_state, &origin_name, &live.workflow_name) {
+            (origin_completed_at, origin_name.as_str())
+        } else {
+            (live.completed_at, live.workflow_name.as_str())
+        };
     let retention = api_state
         .runtime()
         .ok()
-        .and_then(|rt| rt.retention_config().effective_max_age(&live.workflow_name));
+        .and_then(|rt| rt.retention_config().effective_max_age(ttl_workflow));
     let terminal = crate::api::is_terminal_state(&live.state);
     let (waits, last_event_at) = if terminal {
         (Vec::new(), None)
@@ -1045,11 +1079,7 @@ async fn load_task(
         run_id: live.id,
         created_at,
         last_updated_at,
-        ttl_ms: ttl_ms(
-            created_at,
-            row_completed_at.or(live.completed_at),
-            retention,
-        ),
+        ttl_ms: ttl_ms(created_at, ttl_completed_at, retention),
         state: live.state,
         current_details: live.current_details,
         output: live.output,
@@ -1432,6 +1462,17 @@ mod tests {
     fn the_task_route_sits_under_the_tool_prefix() {
         assert_eq!(tasks_path("/api/harvest/mcp"), "/api/harvest/mcp/tasks");
         assert_eq!(tasks_path("/custom/"), "/custom/tasks");
+    }
+
+    /// Retention guards a start row only through a live row with the same
+    /// workflow name and business id.
+    #[test]
+    fn the_start_row_expires_on_its_own_clock_when_unguarded() {
+        assert!(start_row_unguarded("FAILED", "a", "a"));
+        assert!(start_row_unguarded("CONTINUED_AS_NEW", "a", "b"));
+        assert!(!start_row_unguarded("CONTINUED_AS_NEW", "a", "a"));
+        assert!(!start_row_unguarded("COMPLETED", "a", "a"));
+        assert!(!start_row_unguarded("RUNNING", "a", "a"));
     }
 
     #[test]

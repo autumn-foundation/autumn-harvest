@@ -79,7 +79,8 @@ route behind the existing `mcp` cargo feature.
 | R11 | A task outlives retention and `tasks/get` fails with a 500. | A missing row is `-32602` "Task not found", as the spec allows. `ttlMs` reports retention once the run ends. |
 | R12 | `tasks/get` replays history on each poll and loads the database. | The route caches the waits of each run at each history position, so a poll with no new event does not replay. `pollIntervalMs` asks for 5 s. |
 | R13 | A cross-type continue-as-new moves the live run to a workflow outside the catalog. | `tasks/update` and `tasks/cancel` refuse such a run. |
-| R14 | The read after a start fails, so the client sees an error and retries. | The create then returns a `working` seed task. The run is never hidden. |
+| R14 | The read after a start fails, so the client sees an error and retries. | The create retries the read. If it still fails, the client gets the plain run handle, not a task, because the spec sends a task only once `tasks/get` resolves. The run is never hidden. |
+| R15 | A cross-type continue-as-new leaves the start row unguarded, so it expires before the TTL says. | The TTL follows the start row: its own completion and retention when no live row with the same name and business id guards it. |
 
 ### 0.4 Six thinking hats
 

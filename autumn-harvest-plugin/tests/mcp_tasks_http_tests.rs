@@ -115,15 +115,35 @@ async fn initialize_advertises_the_tasks_extension() {
 #[tokio::test]
 async fn server_discover_advertises_the_tasks_extension() {
     let out = rpc(&router(), call("server/discover", &json!({}))).await;
+    let result = &out["result"];
     assert_eq!(
-        out["result"]["capabilities"]["extensions"][TASKS_EXTENSION],
+        result["capabilities"]["extensions"][TASKS_EXTENSION],
         json!({})
     );
+    // The 2026-07-28 `DiscoverResult` shape: a `CacheableResult` with the
+    // server identity under `_meta`.
+    assert_eq!(result["resultType"], "complete");
+    assert!(
+        result["supportedVersions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("2026-07-28"))
+    );
+    assert!(
+        result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"].is_string(),
+        "{result}"
+    );
+    assert!(result.get("serverInfo").is_none(), "{result}");
+    assert!(result["ttlMs"].is_u64(), "{result}");
+    assert_eq!(result["cacheScope"], "private");
 }
 
 #[tokio::test]
 async fn tools_list_serves_one_start_tool_per_mcp_workflow() {
     let out = rpc(&router(), call("tools/list", &json!({}))).await;
+    assert_eq!(out["result"]["resultType"], "complete");
+    assert!(out["result"]["ttlMs"].is_u64(), "{out}");
+    assert_eq!(out["result"]["cacheScope"], "private");
     let tools = out["result"]["tools"].as_array().expect("tools array");
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert_eq!(names, ["start_review_flow"]);
@@ -259,9 +279,9 @@ async fn an_unknown_method_is_method_not_found() {
 }
 
 #[tokio::test]
-async fn ping_answers_an_empty_result() {
+async fn ping_answers_an_empty_complete_result() {
     let out = rpc(&router(), call("ping", &json!({}))).await;
-    assert_eq!(out["result"], json!({}));
+    assert_eq!(out["result"], json!({"resultType": "complete"}));
 }
 
 #[tokio::test]

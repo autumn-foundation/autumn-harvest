@@ -256,12 +256,16 @@ route does not need `mcp_tools()` or `mount_mcp`.
 | Method | What Harvest does |
 |---|---|
 | `initialize`, `server/discover` | Advertise `capabilities.extensions["io.modelcontextprotocol/tasks"]`. |
-| `ping` | Answer `{}`. |
+| `ping` | Answer an empty result. |
 | `tools/list` | One `start_{wf}` tool for each MCP workflow. Its `inputSchema` is the same as on `/mcp`. |
 | `tools/call` | Start the run. A client that declares the extension gets a `CreateTaskResult` (`resultType: "task"`). Any other client gets the plain start handle. |
 | `tasks/get` | Read the run and return the `DetailedTask`. |
 | `tasks/update` | Deliver each `accept` answer as a signal. |
 | `tasks/cancel` | Cancel the live run. |
+
+Each result carries `resultType`, as the 2026-07-28 revision requires. The
+`server/discover` and `tools/list` results are cacheable: `ttlMs` is 60000,
+`cacheScope` is `private`, and `_meta` holds the server identity on discovery.
 
 A `tasks/*` call needs the extension in its own
 `params._meta["io.modelcontextprotocol/clientCapabilities"]`. Without it, the
@@ -315,10 +319,11 @@ fast poll of a parked run does not replay it again.
 
 **TTL.** `ttlMs` is `null` while the run is live. After the run ends, `ttlMs`
 runs from `createdAt` to the time that retention can delete the row of the
-task id. With no retention, it stays `null`. Retention keys a retry chain on
-the business id, which each attempt changes. So for a retried run, `ttlMs`
-counts from the failure of the first attempt, and can be set while a retry
-still runs. After the run is deleted, `tasks/get` answers
+task id. With no retention, it stays `null`. Retention guards that row only
+while a live row has the same workflow name and business id. A retry gets a
+new business id, and a continue-as-new to another workflow type gets a new
+name. In both cases `ttlMs` counts from the end of the first row, with its
+own retention, and can be set while the chain still runs. After the run is deleted, `tasks/get` answers
 `-32602` "Task not found". `pollIntervalMs` is 5000.
 
 **Limits.**
