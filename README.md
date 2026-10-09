@@ -1490,4 +1490,8 @@ With no `telemetry(...)` call (the default), all `info_span!` sites compile to b
 
 ## License
 
-Dual-licensed under MIT or Apache 2.0 at your option.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Each published crate ships both license files.
+
+To contribute, read [`CONTRIBUTING.md`](CONTRIBUTING.md).
+To report a vulnerability, follow [`SECURITY.md`](SECURITY.md).
