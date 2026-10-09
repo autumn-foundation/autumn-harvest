@@ -1165,15 +1165,78 @@ fn schema_check_flags_an_incompatible_side_effect_value_change() {
     let (_d, b, c) = tree(BASELINE_1994, &current);
     let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, false, None)
         .expect_err("a side-effect value break must fail the gate");
-    assert_eq!(err.exit_code(), 1);
+    assert!(
+        matches!(
+            err,
+            autumn_harvest_cli::CliError::SchemaContractBreaking { breaking: 1 }
+        ),
+        "exactly the one side-effect break is reported: {err:?}"
+    );
 
     let base = autumn_harvest::WorkflowSchemaContract::parse(BASELINE_1994).unwrap();
     let cur = autumn_harvest::WorkflowSchemaContract::parse(&current).unwrap();
     let text = format_schema_diff_text(&autumn_harvest::diff_schema_contracts(&base, &cur));
     assert!(
-        text.contains("checkout/side_effect:pick.value"),
-        "the text report names the side effect: {text}"
+        text.contains("checkout/side_effect:pick.value: (root) — breaking"),
+        "the text report names the side effect and the verdict: {text}"
     );
+
+    let json: serde_json::Value = serde_json::from_str(
+        &schema_diff_json(&autumn_harvest::diff_schema_contracts(&base, &cur)).unwrap(),
+    )
+    .unwrap();
+    let d = &json["deltas"][0];
+    assert_eq!(d["subject"], "side_effect", "{d}");
+    assert_eq!(d["workflow"], "checkout", "{d}");
+    assert_eq!(d["side_effect"], "pick", "{d}");
+    assert_eq!(d["role"], "value", "{d}");
+    assert_eq!(d["change"], "enum_value_removed", "{d}");
+    assert_eq!(d["verdict"], "breaking", "{d}");
+}
+
+/// A generated contract that drops the last side effect is not refused as a
+/// broken producer. The removal is a breaking delta, so `--acknowledge` can
+/// record it.
+#[test]
+fn removing_the_last_side_effect_can_be_acknowledged() {
+    let current = CURRENT_1994_ACTIVITY_COMPATIBLE.replace(
+        r#""side_effects": [
+    { "workflow": "checkout", "id": "pick",
+      "value_schema": {"type": "string", "enum": ["a", "b"]} }
+  ]"#,
+        r#""side_effects": []"#,
+    );
+    assert!(
+        !current.contains("pick"),
+        "the fixture drops the side effect"
+    );
+    let (_d, b, c) = tree(BASELINE_1994, &current);
+    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, false, None)
+        .expect_err("removing a side-effect declaration is breaking");
+    assert!(
+        matches!(
+            err,
+            autumn_harvest_cli::CliError::SchemaContractBreaking { breaking: 1 }
+        ),
+        "{err:?}"
+    );
+    run_schema_update(&b, &c, Some("call site removed; runs drained"), None)
+        .expect("the removal can be acknowledged");
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&b).unwrap()).unwrap();
+    let ack = &written["acknowledged_breaking_changes"][0];
+    assert_eq!(ack["change"], "side_effect_removed", "{ack}");
+    assert_eq!(ack["side_effect"], "pick", "{ack}");
+}
+
+/// A version 1 baseline upgrades to version 2 through `schema update`.
+#[test]
+fn schema_update_writes_contract_version_2_over_a_version_1_baseline() {
+    let (_d, b, c) = tree(BASELINE, CURRENT_COMPATIBLE);
+    run_schema_update(&b, &c, None, None).expect("a compatible update succeeds");
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&b).unwrap()).unwrap();
+    assert_eq!(written["contract_version"], "2");
 }
 
 /// A bare `GET /workflows/registered` array has no activity section. It must
@@ -1250,6 +1313,13 @@ fn the_escape_hatch_needs_an_ack_with_the_right_subject() {
         Some(&head),
     )
     .expect_err("a workflow ack must not cover an activity break");
+    assert!(
+        matches!(
+            err,
+            autumn_harvest_cli::CliError::SchemaContractUnacknowledged { missing: 1, .. }
+        ),
+        "{err:?}"
+    );
     assert!(
         format!("{err}").contains("activity:charge"),
         "the unrecorded break is named by its subject label: {err}"

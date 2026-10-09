@@ -33,6 +33,8 @@
 //!
 //! The generator also publishes the `send_welcome_email` activity schemas and
 //! the `pick_variant` side-effect value schema. The CI gate checks them too.
+//! Under the `schema` feature, they derive from the Rust types. So a change to
+//! `EmailReceipt` changes the generated contract.
 
 #![allow(
     clippy::unused_async,
@@ -96,7 +98,7 @@ pub async fn onboarding(
     ctx: &WorkflowContext,
     _input: OnboardInput,
 ) -> Result<OnboardOutput, String> {
-    // Replay reads this value back, so `registered_side_effects` publishes its
+    // Replay reads this value back, so `declared_side_effects` publishes its
     // schema (issue #1994).
     let _variant: String = ctx
         .side_effect("pick_variant", || "control".to_string())
@@ -155,10 +157,12 @@ fn onboard_error_schema() -> serde_json::Value {
     serde_json::json!({"type": "string"})
 }
 
+#[cfg(not(feature = "schema"))]
 fn email_address_schema() -> serde_json::Value {
     serde_json::json!({"type": "string"})
 }
 
+#[cfg(not(feature = "schema"))]
 fn email_receipt_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -167,6 +171,7 @@ fn email_receipt_schema() -> serde_json::Value {
     })
 }
 
+#[cfg(not(feature = "schema"))]
 fn variant_schema() -> serde_json::Value {
     serde_json::json!({"type": "string"})
 }
@@ -190,21 +195,31 @@ fn registered_workflows() -> Vec<WorkflowInfo> {
 
 /// Every activity this "app" registers, with its published schemas attached
 /// (issue #1994).
+///
+/// The `schema` feature derives the schemas from the payload types. Without
+/// it, the hand-written schemas apply.
 fn registered_activities() -> Vec<ActivityInfo> {
-    vec![
-        send_welcome_email_info()
-            .with_input_schema_fn(email_address_schema)
-            .with_output_schema_fn(email_receipt_schema),
-    ]
+    let info = send_welcome_email_info();
+    #[cfg(feature = "schema")]
+    let info = info.with_schemas::<String, EmailReceipt>();
+    #[cfg(not(feature = "schema"))]
+    let info = info
+        .with_input_schema_fn(email_address_schema)
+        .with_output_schema_fn(email_receipt_schema);
+    vec![info]
 }
 
-/// Every side effect whose value schema this "app" publishes (issue #1994).
-fn registered_side_effects() -> Vec<SideEffectInfo> {
-    vec![
-        onboarding_info()
-            .side_effect("pick_variant")
-            .with_value_schema_fn(variant_schema),
-    ]
+/// Every side effect whose value schema this "app" declares (issue #1994).
+///
+/// A declaration is not registered with the runtime. Only the contract reads
+/// it, so copy the id from the `ctx.side_effect` call site.
+fn declared_side_effects() -> Vec<SideEffectInfo> {
+    let info = onboarding_info().side_effect("pick_variant");
+    #[cfg(feature = "schema")]
+    let info = info.with_schemas::<String>();
+    #[cfg(not(feature = "schema"))]
+    let info = info.with_value_schema_fn(variant_schema);
+    vec![info]
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -219,7 +234,7 @@ fn main() {
             &registered_workflows(),
         )
         .with_activities(&registered_activities())
-        .with_side_effects(&registered_side_effects());
+        .with_side_effects(&declared_side_effects());
         print!("{}", contract.to_json_pretty().expect("serialize contract"));
         return;
     }

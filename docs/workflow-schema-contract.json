@@ -19,7 +19,8 @@
       "Withdrawing a previously published schema (coverage regression)",
       "Any change to a constraint keyword outside the analysed set (fail closed)",
       "A cardinality bound (minLength/maxLength/minItems/maxItems) that is present but is not a non-negative integer on either side: the engine's validator reads them with as_u64 and IGNORES anything else, so such a value is not a smaller bound but an absent one (fail closed)",
-      "Removing a side-effect declaration. It is not registered with the runtime, so its call site can still read recorded values (issue #1994)"
+      "Removing an activity type: in-flight runs still decode its recorded results (issue #1994)",
+      "Removing a side-effect declaration while its workflow stays. The declaration is not registered with the runtime, so its call site can still read recorded values (issue #1994)"
     ],
     "non_breaking_changes": [
       "Adding an optional property (Option<T> or #[serde(default)])",
@@ -31,7 +32,7 @@
       "Relaxing additionalProperties or a bound",
       "Adding a workflow type, or publishing a schema for the first time",
       "Removing a workflow type (gated more accurately by `harvest workflow-types reachability`, issue #520)",
-      "Adding an activity type or a side effect, or removing an activity type (issue #1994)",
+      "Adding an activity type or a side effect, or removing a side effect together with its workflow (issue #1994)",
       "Editing any annotation (title, description, examples, …)"
     ],
     "analysed_keywords": [

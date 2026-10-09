@@ -1585,9 +1585,11 @@ impl SideEffectInfo {
     }
 
     /// Derive the value schema from `T`. Enabled with the `schema` feature.
+    ///
+    /// Named like [`SignalHandlerInfo::with_schemas`], which also takes one type.
     #[cfg(feature = "schema")]
     #[must_use]
-    pub fn with_schema<T: schemars::JsonSchema>(self) -> Self {
+    pub fn with_schemas<T: schemars::JsonSchema>(self) -> Self {
         self.with_value_schema_fn(schema_for::<T>)
     }
 }
@@ -3401,8 +3403,41 @@ mod schema_feature_tests {
     /// Issue #1994: a side effect derives its value schema from `T`.
     #[test]
     fn side_effect_with_schema_populates_the_value_schema() {
-        let info = SideEffectInfo::new("wf", "pick").with_schema::<SomeResp>();
+        let info = SideEffectInfo::new("wf", "pick").with_schemas::<SomeResp>();
         let value = (info.value_schema.expect("value schema"))();
         assert!(value["properties"].get("ok").is_some(), "{value}");
+    }
+
+    #[derive(schemars::JsonSchema)]
+    #[allow(dead_code)]
+    struct ReceiptV1 {
+        id: String,
+        amount: i64,
+    }
+
+    #[derive(schemars::JsonSchema)]
+    #[allow(dead_code)]
+    struct ReceiptV2 {
+        id: String,
+    }
+
+    /// Issue #1994, end to end: a derived activity output type loses a field,
+    /// and the gate reports it as a breaking activity delta.
+    #[test]
+    fn a_derived_activity_output_change_is_breaking() {
+        use crate::schema_contract::{
+            ChangeKind, SchemaSubject, WorkflowSchemaContract, diff_schema_contracts,
+        };
+        let contract = |info: ActivityInfo| {
+            WorkflowSchemaContract::from_entries("0.0.0-test", Vec::new()).with_activities(&[info])
+        };
+        let base = contract(activity_info().with_schemas::<SomeArg, ReceiptV1>());
+        let cur = contract(activity_info().with_schemas::<SomeArg, ReceiptV2>());
+        let diff = diff_schema_contracts(&base, &cur);
+        let breaking: Vec<_> = diff.breaking().collect();
+        assert_eq!(breaking.len(), 1, "{diff:#?}");
+        assert_eq!(breaking[0].subject, SchemaSubject::Activity);
+        assert_eq!(breaking[0].field_path, "/amount");
+        assert_eq!(breaking[0].change, ChangeKind::PropertyRemoved);
     }
 }

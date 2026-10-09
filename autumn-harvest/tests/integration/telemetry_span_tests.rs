@@ -150,6 +150,8 @@ fn telem_child_wf<'a>(
     Box::pin(async move { Ok(Value::Null) })
 }
 
+// Two full `ActivityInfo` literals make this long. Splitting it adds nothing.
+#[allow(clippy::too_many_lines)]
 fn build_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![

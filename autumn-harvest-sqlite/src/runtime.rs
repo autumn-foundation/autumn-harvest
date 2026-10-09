@@ -2492,7 +2492,8 @@ const fn unsupported_workflow_feature(info: &WorkflowInfo) -> Option<(&'static s
 ///   is a command-layer non-goal), and a raised `max_input_bytes` /
 ///   `max_result_bytes` (#252).
 /// - **ACCEPTED, inert**: `name`, `module`, and a lone `concurrency_key` (groups a
-///   cap that is not set).
+///   cap that is not set). Also `input_schema` and `output_schema`: only the
+///   schema contract reads them (issue #1994).
 ///
 /// The chain is EXHAUSTIVE by intent: adding an execution-affecting field to core
 /// `ActivityInfo` should extend this audit rather than silently pass through.

@@ -7,6 +7,10 @@
 //!
 //! No database, no network: the gate is pure `serde_json` analysis.
 
+// The fixtures are trivial handlers. `#[workflow]` reads every input binding,
+// so an unused `_input` still trips the underscore lint.
+#![allow(clippy::used_underscore_binding, clippy::unused_async)]
+
 use autumn_harvest::prelude::*;
 use autumn_harvest::schema_contract::{
     AcknowledgedBreakingChange, ActivitySchemaEntry, ChangeKind, SCHEMA_CONTRACT_VERSION,
@@ -174,12 +178,24 @@ fn the_contract_round_trips_with_the_new_sections() {
     assert_eq!(SCHEMA_CONTRACT_VERSION, "2");
 }
 
+/// A version 1 binary would skip the new sections in silence, so a version 1
+/// label on version 2 content is refused.
+#[test]
+fn a_version_1_label_on_version_2_content_is_refused() {
+    let c = activity_contract(receipt_schema());
+    let mut v: Value = serde_json::from_str(&c.to_json_pretty().unwrap()).unwrap();
+    v["contract_version"] = json!("1");
+    let err = WorkflowSchemaContract::parse(&v.to_string())
+        .expect_err("a v1 label must not carry activities");
+    assert!(err.to_string().contains("contract_version"), "{err}");
+}
+
 #[test]
 fn a_version_1_contract_still_parses() {
     let v1 = r#"{"version":"0.6.0","contract_version":"1","workflows":[{"name":"w"}]}"#;
     let c = WorkflowSchemaContract::parse(v1).expect("a v1 baseline must still parse");
-    assert!(c.activities.is_empty());
-    assert!(c.side_effects.is_empty());
+    assert_eq!(c.activities, []);
+    assert_eq!(c.side_effects, []);
 }
 
 #[test]
@@ -292,18 +308,25 @@ fn withdrawing_an_activity_schema_is_breaking() {
 }
 
 #[test]
-fn adding_or_removing_an_activity_is_compatible() {
+fn adding_an_activity_is_compatible() {
     let empty = WorkflowSchemaContract::from_entries("0.0.0-test", Vec::new());
-    let with = activity_contract(receipt_schema());
-
-    let added = diff_schema_contracts(&empty, &with);
+    let added = diff_schema_contracts(&empty, &activity_contract(receipt_schema()));
     assert!(!added.has_breaking());
     assert_eq!(added.deltas[0].change, ChangeKind::ActivityAdded);
     assert_eq!(added.deltas[0].subject, SchemaSubject::Activity);
+}
 
-    let removed = diff_schema_contracts(&with, &empty);
-    assert!(!removed.has_breaking());
-    assert_eq!(removed.deltas[0].change, ChangeKind::ActivityRemoved);
+/// The generator list is not tied to the runtime registry. A silent removal
+/// would let a later re-add change the output type with no check at all.
+#[test]
+fn removing_an_activity_is_breaking() {
+    let empty = WorkflowSchemaContract::from_entries("0.0.0-test", Vec::new());
+    let removed = diff_schema_contracts(&activity_contract(receipt_schema()), &empty);
+    let d = &removed.deltas[0];
+    assert_eq!(d.change, ChangeKind::ActivityRemoved);
+    assert_eq!(d.subject, SchemaSubject::Activity);
+    assert_eq!(d.workflow, "charge");
+    assert_eq!(d.verdict, Verdict::Breaking);
 }
 
 #[test]
@@ -362,7 +385,9 @@ fn side_effects_are_keyed_by_workflow_and_id() {
     let diff = diff_schema_contracts(&base, &reparse(&cur));
     let breaking = only_breaking(&diff);
     assert_eq!(breaking.len(), 1, "{diff:#?}");
+    assert_eq!(breaking[0].subject, SchemaSubject::SideEffect);
     assert_eq!(breaking[0].workflow, "refund");
+    assert_eq!(breaking[0].side_effect.as_deref(), Some("pick"));
 }
 
 #[test]
@@ -382,8 +407,29 @@ fn removing_a_side_effect_declaration_is_breaking() {
     let empty = WorkflowSchemaContract::from_entries("0.0.0-test", Vec::new());
     let with = side_effect_contract("checkout", variant_schema());
     let removed = diff_schema_contracts(&with, &empty);
-    assert_eq!(removed.deltas[0].change, ChangeKind::SideEffectRemoved);
-    assert_eq!(removed.deltas[0].verdict, Verdict::Breaking);
+    let d = &removed.deltas[0];
+    assert_eq!(d.change, ChangeKind::SideEffectRemoved);
+    assert_eq!(d.subject, SchemaSubject::SideEffect);
+    assert_eq!(d.side_effect.as_deref(), Some("pick"));
+    assert_eq!(d.verdict, Verdict::Breaking);
+}
+
+/// A workflow removal is compatible (issue #520 gates it). Its side effects go
+/// with it, so they must not each need an acknowledgement.
+#[test]
+fn removing_a_side_effect_with_its_workflow_is_compatible() {
+    let mut with = side_effect_contract("checkout", variant_schema());
+    with.workflows = WorkflowSchemaContract::from_infos("0.0.0-test", &[checkout_info()]).workflows;
+    let with = reparse(&with);
+    let empty = WorkflowSchemaContract::from_entries("0.0.0-test", Vec::new());
+    let diff = diff_schema_contracts(&with, &empty);
+    assert!(!diff.has_breaking(), "{diff:#?}");
+    assert!(
+        diff.deltas
+            .iter()
+            .any(|d| d.change == ChangeKind::SideEffectRemoved),
+        "{diff:#?}"
+    );
 }
 
 // ── identity, acknowledgement and output ─────────────────────────────────────
@@ -406,7 +452,7 @@ fn a_workflow_ack_does_not_cover_an_activity_of_the_same_name() {
     let base = activity_contract(receipt_schema());
     let cur = activity_contract(json!({"type": "object", "properties": {}}));
     let diff = diff_schema_contracts(&base, &cur);
-    let mut head = cur.clone();
+    let mut head = cur;
     head.acknowledged_breaking_changes = diff.breaking().map(workflow_ack_for).collect();
     let missing = unacknowledged_breaking(&diff, &base, &head);
     assert_eq!(missing.len(), 1, "the subject is part of the identity");
@@ -423,7 +469,45 @@ fn acknowledged_update_records_the_subject_and_the_side_effect_id() {
     assert_eq!(ack.subject, SchemaSubject::SideEffect);
     assert_eq!(ack.side_effect.as_deref(), Some("pick"));
     let diff = diff_schema_contracts(&base, &cur);
-    assert!(unacknowledged_breaking(&diff, &base, &next).is_empty());
+    assert_eq!(
+        unacknowledged_breaking(&diff, &base, &next),
+        Vec::<&SchemaDelta>::new()
+    );
+}
+
+/// The side-effect id is part of the ack identity: an ack for `pick` does not
+/// cover a break in `roll` of the same workflow.
+#[test]
+fn an_ack_for_one_side_effect_does_not_cover_another() {
+    let mut base = side_effect_contract("checkout", variant_schema());
+    base.side_effects.push(SideEffectSchemaEntry {
+        workflow: "checkout".to_string(),
+        id: "roll".to_string(),
+        value_schema: Some(variant_schema()),
+    });
+    let base = reparse(&base);
+    let mut cur = base.clone();
+    let roll = cur
+        .side_effects
+        .iter_mut()
+        .find(|s| s.id == "roll")
+        .unwrap();
+    roll.value_schema = Some(json!({"type": "string", "enum": ["a"]}));
+    let cur = reparse(&cur);
+    let diff = diff_schema_contracts(&base, &cur);
+    let d = only_breaking(&diff)[0];
+    assert_eq!(d.side_effect.as_deref(), Some("roll"));
+
+    let mut ack = workflow_ack_for(d);
+    ack.subject = SchemaSubject::SideEffect;
+    ack.side_effect = Some("pick".to_string());
+    let mut head = cur;
+    head.acknowledged_breaking_changes = vec![ack];
+    assert_eq!(unacknowledged_breaking(&diff, &base, &head).len(), 1);
+
+    let mut retargeted = head.clone();
+    retargeted.acknowledged_breaking_changes[0].side_effect = Some("roll".to_string());
+    assert_eq!(dropped_acknowledgements(&head, &retargeted).len(), 1);
 }
 
 #[test]
@@ -468,6 +552,27 @@ fn a_workflow_delta_serialises_without_the_new_keys() {
     );
     let v = serde_json::to_value(&diff.deltas[0]).unwrap();
     assert_eq!(v["subject"], "activity", "{v}");
+    assert!(v.get("side_effect").is_none(), "{v}");
+
+    let diff = diff_schema_contracts(
+        &side_effect_contract("checkout", variant_schema()),
+        &side_effect_contract("checkout", json!({"type": "string", "enum": ["a"]})),
+    );
+    let v = serde_json::to_value(&diff.deltas[0]).unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "subject": "side_effect",
+            "workflow": "checkout",
+            "side_effect": "pick",
+            "role": "value",
+            "field_path": "",
+            "change": "enum_value_removed",
+            "verdict": "breaking",
+            "reason": v["reason"],
+        }),
+        "the side-effect wire format is pinned"
+    );
 }
 
 #[test]

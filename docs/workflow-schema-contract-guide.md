@@ -1,8 +1,8 @@
 # Workflow Schema Contract — Replay-Compatibility Gate
 
-This guide is for anyone who changes a `#[workflow]` function's **input, output,
-or error type**, an `#[activity]` input or output type, or the type of a
-`ctx.side_effect` value. It explains what `docs/workflow-schema-contract.json` is, how
+This guide is for anyone who changes a payload type. That is the **input,
+output or error type** of a `#[workflow]`, the input or output type of an
+`#[activity]`, or the value type of a `ctx.side_effect`. It explains what `docs/workflow-schema-contract.json` is, how
 `harvest schema check` classifies a change, and how to acknowledge a deliberate
 migration.
 
@@ -126,7 +126,7 @@ Publish their schemas the same way a workflow does:
 let activities = vec![charge_info().with_schemas::<ChargeInput, Receipt>()];
 
 // A side effect is keyed by its workflow and its id.
-let side_effects = vec![checkout_info().side_effect("pick").with_schema::<Variant>()];
+let side_effects = vec![checkout_info().side_effect("pick").with_schemas::<Variant>()];
 
 let contract = WorkflowSchemaContract::from_infos(env!("CARGO_PKG_VERSION"), &workflows)
     .with_activities(&activities)
@@ -138,36 +138,47 @@ or `with_value_schema_fn` with a hand-written schema.
 
 For an activity with more than one input parameter, the input is the tuple of
 the parameter types, for example `with_schemas::<(String, u32), Receipt>()`.
+A tuple schema fixes its length, so a new trailing parameter reads as a
+breaking arity change. At run time, a missing trailing element decodes as
+`null`. Acknowledge the delta if the new parameter is an `Option`.
 
 Pass the same `ActivityInfo` values that you register with the runtime. An
 activity with no schema is still listed, so `coverage` shows it.
 
 A side-effect declaration is not registered with the runtime. Only the
-contract reads it. A side effect with an id built at run time cannot publish
-a schema.
+contract reads it. Nothing checks that its id matches a `ctx.side_effect`
+call, so copy the id from the call site. A side effect with an id built at
+run time cannot publish a schema.
 
-The full ruleset applies to these payloads. Three rules are new:
+The full ruleset applies to these payloads. Four rules are new:
 
 | Change | Verdict | Why |
 |---|---|---|
 | Add an activity or a side effect | Compatible | No history exists for it |
-| Remove an activity | Compatible | The same as a removed workflow. The handler is gone too |
+| Remove an activity | **Breaking** | The contract list is not tied to the runtime registry. In-flight runs still decode its recorded results. Acknowledge it after those runs end and its queued tasks drain |
 | Remove a side-effect declaration | **Breaking** | The call site can stay after the declaration goes. A removal must not stop the check in silence. Acknowledge it when the call site is gone too |
+| Remove a side effect together with its workflow | Compatible | The workflow removal is compatible, and issue #520 gates it |
 
-The contract gets two sections, `activities` and `side_effects`. Each is left
-out of the file when it is empty. The artifact format is `contract_version`
-`2`. This build still reads a version `1` baseline. A version `1` binary
-refuses a version `2` file, so it cannot skip the new sections in silence.
+The contract gets two sections, `activities` and `side_effects`. The file
+omits each one when it is empty. The artifact format is `contract_version`
+`2`. This build still reads a version `1` baseline, and refuses a version `1`
+label on a file with the new sections. A version `1` binary refuses a version
+`2` file, so it cannot skip the new sections in silence.
 
 A bare `GET /workflows/registered` body has no activity or side-effect
 section. `schema check` and `schema update` refuse such a `--current` when the
-baseline has either section. Without that rule, every activity would read as
-removed, and that verdict is compatible.
+baseline has either section.
+
+**Limits.** The gate checks the type that the activity or the side effect
+declares. A workflow can decode the recorded value into another type at its
+call site, and the gate does not see that type. The gate does not check an
+activity error payload.
 
 ### Alternative: a running server
 
 `--current` also accepts a raw `GET /workflows/registered` response body, so a
-staging deployment works with no post-processing:
+staging deployment works with no post-processing. That body has no activity or
+side-effect section, so the CLI refuses it when the baseline has either:
 
 ```console
 $ curl -s "$HARVEST_URL/workflows/registered" > /tmp/current.json
@@ -511,10 +522,10 @@ breaking that fit*.
 `--format text` (default) prints one line per delta:
 
 ```
-<subject>.<role>: <field_path> — <verdict> — <reason>
+<label>.<role>: <field_path> — <verdict> — <reason>
 ```
 
-followed by a summary line. The subject is a workflow name, `activity:<name>`
+followed by a summary line. The label is a workflow name, `activity:<name>`
 or `<workflow>/side_effect:<id>`. The role of a side effect is `value`. `--format json` emits the machine-readable diff:
 
 ```json
@@ -539,7 +550,8 @@ or `<workflow>/side_effect:<id>`. The role of a side effect is `value`. `--forma
 A delta about an activity or a side effect also has a `subject` key
 (`activity` or `side_effect`). For an activity, `workflow` holds the activity
 name. A side-effect delta also has a `side_effect` key that holds the id. A
-workflow delta has neither key, so its JSON is unchanged.
+workflow delta has neither key, so its JSON is unchanged. A JSON consumer must
+read `subject` before it reads `workflow` as a workflow name.
 
 `field_path` is an RFC 6901 JSON Pointer **for ordinary object properties**,
 matching the violation format `POST /workflows/{name}/start` already returns —
@@ -660,7 +672,7 @@ against a baseline that knows the variant existed, which is breaking and needs
 an acknowledgement.
 
 The flag also checks the artifact's **regenerated metadata**, which the differ
-never looks at — it reads only `workflows`. `compatibility` is the
+never looks at — it reads only `workflows`, `activities` and `side_effects`. `compatibility` is the
 machine-readable claim about which rules this gate implements, and `description`
 is the same claim in prose; a hand-edited `analysed_keywords` would otherwise
 sail through and tell a reviewer this build enforces something it does not. Both
@@ -670,8 +682,8 @@ Two siblings are deliberately *not* compared. `version` records which **build**
 produced the artifact rather than what the gate checks, so comparing it would
 force a regeneration on every crate version bump for no change in meaning.
 `contract_version` needs no comparison at all — parsing already hard-refuses a
-value this build does not implement, and rebuilds `workflows` and `coverage`
-from the entries.
+value this build does not implement, and rebuilds `workflows`, `activities`,
+`side_effects` and `coverage` from the entries.
 
 The fix is always the same: run `harvest schema update`, and commit the
 regenerated artifact alongside the change.
@@ -754,7 +766,7 @@ file against its revision at the PR base with `--acknowledged-in` — proving th
 artifact is current, that its own change was recorded, and that the documented
 recipe runs.
 
-### When you change a workflow payload type
+### When you change a payload type
 
 1. Change the type.
 2. Regenerate `--current` (see above).

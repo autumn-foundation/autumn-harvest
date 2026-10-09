@@ -88,8 +88,9 @@ pub enum SchemaRole {
     /// The input payload. A workflow reads it from `WorkflowStarted`. A
     /// retried activity reads its stored input.
     Input,
-    /// The output payload. A workflow reads its own from `WorkflowCompleted`,
-    /// and an activity result from `ActivityCompleted`.
+    /// The output payload. `WorkflowCompleted` records a workflow output.
+    /// `ActivityCompleted` records an activity result, and the workflow decodes
+    /// it on replay.
     Output,
     /// The workflow's error payload — read from `WorkflowFailed`.
     Error,
@@ -131,6 +132,7 @@ impl SchemaRole {
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SchemaSubject {
     /// A registered workflow type.
     #[default]
@@ -503,20 +505,26 @@ pub struct SchemaCoverage {
     /// How many publish an error schema.
     pub with_error_schema: usize,
     /// Registered activity types in this contract (issue #1994).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub activities_total: usize,
     /// How many activities publish an input schema.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub with_activity_input_schema: usize,
     /// How many activities publish an output schema.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub with_activity_output_schema: usize,
     /// Declared side effects in this contract (issue #1994).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub side_effects_total: usize,
     /// How many side effects publish a value schema.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub with_side_effect_value_schema: usize,
+}
+
+/// `true` for zero. Used to omit an unused coverage counter from the JSON.
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
+const fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// The published schemas for one registered workflow type.
@@ -700,8 +708,11 @@ impl CompatibilityRules {
                  is not a non-negative integer on either side: the engine's validator reads them \
                  with as_u64 and IGNORES anything else, so such a value is not a smaller bound \
                  but an absent one (fail closed)",
-                "Removing a side-effect declaration. It is not registered with the runtime, so \
-                 its call site can still read recorded values (issue #1994)",
+                "Removing an activity type: in-flight runs still decode its recorded results \
+                 (issue #1994)",
+                "Removing a side-effect declaration while its workflow stays. The declaration is \
+                 not registered with the runtime, so its call site can still read recorded \
+                 values (issue #1994)",
             ]
             .into_iter()
             .map(ToString::to_string)
@@ -717,8 +728,8 @@ impl CompatibilityRules {
                 "Adding a workflow type, or publishing a schema for the first time",
                 "Removing a workflow type (gated more accurately by \
                  `harvest workflow-types reachability`, issue #520)",
-                "Adding an activity type or a side effect, or removing an activity type \
-                 (issue #1994)",
+                "Adding an activity type or a side effect, or removing a side effect together \
+                 with its workflow (issue #1994)",
                 "Editing any annotation (title, description, examples, …)",
             ]
             .into_iter()
@@ -1001,6 +1012,24 @@ impl WorkflowSchemaContract {
                  the `harvest` CLI to match the checked-in baseline, or regenerate the baseline \
                  with this build",
                 parsed.contract_version, SCHEMA_CONTRACT_VERSION
+            )));
+        }
+        // A version 1 file has no activity or side-effect content. A file that
+        // claims version 1 and carries some would make a version 1 binary skip
+        // that content in silence, so refuse it.
+        if parsed.contract_version != SCHEMA_CONTRACT_VERSION
+            && (!parsed.activities.is_empty()
+                || !parsed.side_effects.is_empty()
+                || parsed
+                    .acknowledged_breaking_changes
+                    .iter()
+                    .any(|a| !a.subject.is_workflow()))
+        {
+            return Err(SchemaContractError::Parse(format!(
+                "contract_version `{}` has no activities or side effects, but this file has \
+                 some. Set contract_version to `{SCHEMA_CONTRACT_VERSION}`, or regenerate the \
+                 baseline with `harvest schema update`",
+                parsed.contract_version
             )));
         }
         // Re-derive the invariants a hand-edited file may have broken:
@@ -1795,8 +1824,10 @@ pub fn diff_schema_contracts(
 
 /// Diff the activity sections (issue #1994).
 ///
-/// The rules match the workflow walk. An added or removed activity is
-/// compatible, the same as an added or removed workflow.
+/// The schema rules match the workflow walk. An added activity is compatible.
+/// A removed one is breaking. The generator list is not tied to the runtime
+/// registry. A workflow decodes a recorded result whether or not a handler
+/// exists. A silent removal would let a later re-add change the type unchecked.
 fn diff_activities(
     baseline: &WorkflowSchemaContract,
     current: &WorkflowSchemaContract,
@@ -1822,17 +1853,15 @@ fn diff_activities(
         ));
     }
     for name in base.difference(&cur) {
-        diff.push(
-            subject(name).delta(
-                None,
-                ChangeKind::ActivityRemoved,
-                Verdict::Compatible,
-                "activity type is no longer registered. Payload compatibility is not the question \
-             here. A queued task of this type has no handler, so drain the queue before you \
-             remove it"
-                    .to_string(),
-            ),
-        );
+        diff.push(subject(name).delta(
+            None,
+            ChangeKind::ActivityRemoved,
+            Verdict::Breaking,
+            "the current contract no longer lists this activity, so its payloads are no longer \
+             checked. In-flight runs still decode its recorded results on replay. Acknowledge \
+             the removal after those runs end and its queued tasks drain"
+                .to_string(),
+        ));
     }
     for name in base.intersection(&cur) {
         let (Some(b), Some(c)) = (baseline.activity(name), current.activity(name)) else {
@@ -1855,6 +1884,9 @@ fn diff_activities(
 /// An added side effect is compatible. A removed one is breaking: the
 /// declaration is not registered with the runtime, so its call site can
 /// outlive it. A silent removal would stop the check with the value still read.
+///
+/// One exception: the owning workflow left the contract too. That removal is
+/// compatible and is gated elsewhere (issue #520), so its side effects follow it.
 fn diff_side_effects(
     baseline: &WorkflowSchemaContract,
     current: &WorkflowSchemaContract,
@@ -1878,7 +1910,26 @@ fn diff_side_effects(
             ),
         );
     }
+    let base_workflows: BTreeSet<&str> =
+        baseline.workflows.iter().map(|w| w.name.as_str()).collect();
+    let cur_workflows: BTreeSet<&str> = current.workflows.iter().map(|w| w.name.as_str()).collect();
     for (workflow, id) in base.difference(&cur) {
+        let owner_removed = base_workflows.contains(workflow.as_str())
+            && !cur_workflows.contains(workflow.as_str());
+        let (verdict, reason) = if owner_removed {
+            (
+                Verdict::Compatible,
+                "the owning workflow is no longer registered, so its side effects go with it. \
+                 `harvest workflow-types reachability` (issue #520) gates that removal",
+            )
+        } else {
+            (
+                Verdict::Breaking,
+                "the current contract no longer declares this side effect. The declaration is \
+                 not registered with the runtime, so the call site can still read recorded \
+                 values. Acknowledge the removal if the call site is gone too",
+            )
+        };
         diff.push(
             Subject {
                 kind: SchemaSubject::SideEffect,
@@ -1888,11 +1939,8 @@ fn diff_side_effects(
             .delta(
                 None,
                 ChangeKind::SideEffectRemoved,
-                Verdict::Breaking,
-                "the side-effect declaration was removed. The declaration is not registered \
-                 with the runtime, so the call site can still read recorded values. \
-                 Acknowledge the removal if the call site is gone too"
-                    .to_string(),
+                verdict,
+                reason.to_string(),
             ),
         );
     }
