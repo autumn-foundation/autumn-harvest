@@ -267,6 +267,14 @@ Each result carries `resultType`, as the 2026-07-28 revision requires. The
 `server/discover` and `tools/list` results are cacheable: `ttlMs` is 60000,
 `cacheScope` is `private`, and `_meta` holds the server identity on discovery.
 
+**Headers.** A gateway can route or authorize on the Streamable HTTP
+headers, so the route checks them against the body before it acts. A
+`MCP-Protocol-Version`, `Mcp-Method` or `Mcp-Name` header that differs from
+the body gets `400` and `-32020`, and a `=?base64?…?=` name is decoded first.
+A 2026-07-28 request must carry all three. An older request may omit them.
+A version that the route does not serve gets `400` and `-32022`. A
+2026-07-28 request for an unknown method gets `404`.
+
 A `tasks/*` call needs the extension in its own
 `params._meta["io.modelcontextprotocol/clientCapabilities"]`. Without it, the
 call gets error `-32021`.
@@ -310,8 +318,8 @@ idempotency key, so a retried answer is a no-op.
   Use `tasks/cancel` to stop the task.
 - A payload that the signal refuses, for example by its schema or size cap,
   gets `-32602` with the reason in `data`.
-- A client must declare `elicitation` in its client capabilities to get
-  `inputRequests`. Without it, the task reads as `working`, and
+- A client must declare form-mode `elicitation` (an empty object, or one
+  with `form`) in its client capabilities to get `inputRequests`. Without it, the task reads as `working`, and
   `statusMessage` names each signal. Such a client can use `signal_{wf}`.
 
 The route caches the replay result for each run and history position. So a

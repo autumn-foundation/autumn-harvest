@@ -80,6 +80,7 @@ route behind the existing `mcp` cargo feature.
 | R12 | `tasks/get` replays history on each poll and loads the database. | The route caches the waits of each run at each history position, so a poll with no new event does not replay. `pollIntervalMs` asks for 5 s. |
 | R13 | A cross-type continue-as-new moves the live run to a workflow outside the catalog. | `tasks/update` and `tasks/cancel` refuse such a run. |
 | R14 | The read after a start fails, so the client sees an error and retries. | The create retries the read. If it still fails, the client gets the plain run handle, not a task, because the spec sends a task only once `tasks/get` resolves. The run is never hidden. |
+| R16 | A gateway authorizes on `Mcp-Method: ping`, and the body runs `tools/call`. | The route compares `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` with the body and refuses a mismatch with `400` and `-32020`. |
 | R15 | A cross-type continue-as-new leaves the start row unguarded, so it expires before the TTL says. | The TTL follows the start row: its own completion and retention when no live row with the same name and business id guards it. |
 
 ### 0.4 Six thinking hats

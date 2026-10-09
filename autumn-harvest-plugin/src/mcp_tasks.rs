@@ -183,21 +183,151 @@ pub fn input_request_key(run: uuid::Uuid, signal: &str, position: i32) -> String
     format!("{run}:signal:{signal}:{position}")
 }
 
-/// `true` when the request declares the client capability `name`.
-fn client_declares(params: &Value, name: &str) -> bool {
+/// `true` when the request declares form-mode elicitation.
+///
+/// A server must not send an elicitation in a mode the client did not
+/// declare. An empty `elicitation` object declares form mode. Otherwise the
+/// object must name `form`.
+#[must_use]
+pub fn client_accepts_elicitation(params: &Value) -> bool {
     params
         .pointer("/_meta")
         .and_then(|meta| meta.get(CLIENT_CAPABILITIES_META))
-        .and_then(|caps| caps.get(name))
-        .is_some_and(Value::is_object)
+        .and_then(|caps| caps.get("elicitation"))
+        .and_then(Value::as_object)
+        .is_some_and(|modes| modes.is_empty() || modes.get("form").is_some_and(Value::is_object))
 }
 
-/// `true` when the request declares the elicitation capability.
+/// The `_meta` key that carries the protocol version of one request.
+const PROTOCOL_VERSION_META: &str = "io.modelcontextprotocol/protocolVersion";
+/// JSON-RPC error code for headers that do not match the body.
+pub const HEADER_MISMATCH: i64 = -32020;
+/// JSON-RPC error code for a protocol version the server does not serve.
+pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+
+/// Decode a header value that may use the `=?base64?…?=` sentinel.
+fn decode_header_value(raw: &str) -> Option<String> {
+    use base64::Engine as _;
+    raw.strip_prefix("=?base64?")
+        .and_then(|rest| rest.strip_suffix("?="))
+        .map_or_else(
+            || Some(raw.to_string()),
+            |encoded| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+            },
+        )
+}
+
+/// The body value that the `Mcp-Name` header mirrors for `method`.
+fn mirrored_name<'a>(method: &str, params: &'a Value) -> Option<&'a str> {
+    let field = match method {
+        "tools/call" => "name",
+        "tasks/get" | "tasks/update" | "tasks/cancel" => "taskId",
+        _ => return None,
+    };
+    params.get(field).and_then(Value::as_str)
+}
+
+/// Check the Streamable HTTP headers of one request against its body.
 ///
-/// A server must not send an elicitation to a client without it.
-#[must_use]
-pub fn client_accepts_elicitation(params: &Value) -> bool {
-    client_declares(params, "elicitation")
+/// The body is the source of truth, but a gateway can route or authorize
+/// on the headers. A mismatch could then pass a policy for one method and
+/// run another, so the request is refused. A 2026-07-28 request must carry
+/// the headers. An older request may omit them, but a header it sends must
+/// still match. The error is a code, a message and optional data.
+///
+/// # Errors
+///
+/// Returns [`HEADER_MISMATCH`] for a missing, malformed or mismatched
+/// header, and [`UNSUPPORTED_PROTOCOL_VERSION`] for a version this route
+/// does not serve.
+pub fn check_request_headers(
+    headers: &HeaderMap,
+    method: &str,
+    params: &Value,
+) -> Result<(), (i64, String, Option<Value>)> {
+    let mismatch = |message: String| (HEADER_MISMATCH, message, None);
+    let header = |name: &str| -> Result<Option<String>, (i64, String, Option<Value>)> {
+        headers
+            .get(name)
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(ToString::to_string)
+                    .map_err(|_| mismatch(format!("Header mismatch: {name} is not visible ASCII")))
+            })
+            .transpose()
+    };
+
+    let version = header("mcp-protocol-version")?;
+    let body_version = params
+        .pointer("/_meta")
+        .and_then(|meta| meta.get(PROTOCOL_VERSION_META))
+        .and_then(Value::as_str);
+    if let Some(version) = version.as_deref() {
+        // `initialize` negotiates the version in its body.
+        if method != "initialize" && !PROTOCOL_VERSIONS.contains(&version) {
+            return Err((
+                UNSUPPORTED_PROTOCOL_VERSION,
+                format!("Unsupported protocol version: {version}"),
+                Some(json!({"supported": PROTOCOL_VERSIONS, "requested": version})),
+            ));
+        }
+        if body_version.is_some_and(|body| body != version) {
+            return Err(mismatch(format!(
+                "Header mismatch: MCP-Protocol-Version header value '{version}' does not \
+                 match body value '{}'",
+                body_version.unwrap_or_default()
+            )));
+        }
+    }
+    let modern = version.as_deref() == Some(LATEST_PROTOCOL_VERSION)
+        || body_version == Some(LATEST_PROTOCOL_VERSION);
+    if modern && version.is_none() {
+        return Err(mismatch(
+            "Header mismatch: MCP-Protocol-Version header is missing".to_string(),
+        ));
+    }
+
+    match header("mcp-method")? {
+        Some(value) if value != method => {
+            return Err(mismatch(format!(
+                "Header mismatch: Mcp-Method header value '{value}' does not match body \
+                 value '{method}'"
+            )));
+        }
+        None if modern => {
+            return Err(mismatch(
+                "Header mismatch: Mcp-Method header is missing".to_string(),
+            ));
+        }
+        _ => {}
+    }
+
+    let expected = mirrored_name(method, params);
+    match (header("mcp-name")?, expected) {
+        (Some(raw), Some(expected)) => {
+            let value = decode_header_value(&raw).ok_or_else(|| {
+                mismatch("Header mismatch: Mcp-Name header is malformed".to_string())
+            })?;
+            if value != expected {
+                return Err(mismatch(format!(
+                    "Header mismatch: Mcp-Name header value '{value}' does not match body \
+                     value '{expected}'"
+                )));
+            }
+        }
+        (None, Some(_)) if modern => {
+            return Err(mismatch(
+                "Header mismatch: Mcp-Name header is missing".to_string(),
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// The signal payload in the `content` of an `accept` answer.
@@ -675,8 +805,30 @@ async fn serve(
         return StatusCode::ACCEPTED.into_response();
     };
     let params = object.get("params").cloned().unwrap_or(Value::Null);
+    if let Err((code, message, data)) = check_request_headers(&headers, method, &params) {
+        let mut response = rpc_response(
+            &id,
+            Err(RpcError {
+                code,
+                message,
+                data,
+            }),
+        );
+        *response.status_mut() = StatusCode::BAD_REQUEST;
+        return response;
+    }
     let result = dispatch(&api_state, &catalog, &headers, method, &params).await;
-    rpc_response(&id, result)
+    // The 2026-07-28 transport answers an unknown method with 404.
+    let unknown = matches!(&result, Err(err) if err.code == METHOD_NOT_FOUND);
+    let mut response = rpc_response(&id, result);
+    if unknown
+        && headers
+            .get("mcp-protocol-version")
+            .is_some_and(|v| v == LATEST_PROTOCOL_VERSION)
+    {
+        *response.status_mut() = StatusCode::NOT_FOUND;
+    }
+    response
 }
 
 async fn dispatch(
@@ -1378,6 +1530,107 @@ mod tests {
             first,
             input_request_key(uuid::Uuid::from_u128(8), "approval", 4)
         );
+    }
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, HeaderValue::from_str(value).unwrap());
+        }
+        map
+    }
+
+    fn modern_params(extra: Value) -> Value {
+        let mut params = extra;
+        params["_meta"] = json!({PROTOCOL_VERSION_META: LATEST_PROTOCOL_VERSION});
+        params
+    }
+
+    #[test]
+    fn matching_headers_pass() {
+        let params = modern_params(json!({"name": "start_review"}));
+        let ok = headers(&[
+            ("mcp-protocol-version", LATEST_PROTOCOL_VERSION),
+            ("mcp-method", "tools/call"),
+            ("mcp-name", "start_review"),
+        ]);
+        assert!(check_request_headers(&ok, "tools/call", &params).is_ok());
+        // An older request may omit every header.
+        assert!(check_request_headers(&HeaderMap::new(), "tools/call", &json!({})).is_ok());
+    }
+
+    #[test]
+    fn a_method_header_that_differs_from_the_body_is_refused() {
+        // A gateway that allows `ping` must not let a `tools/call` through.
+        let sneaky = headers(&[("mcp-method", "ping")]);
+        let err = check_request_headers(&sneaky, "tools/call", &json!({"name": "x"})).unwrap_err();
+        assert_eq!(err.0, HEADER_MISMATCH);
+    }
+
+    #[test]
+    fn a_name_header_is_compared_after_base64_decoding() {
+        let params = json!({"taskId": "étape"});
+        let encoded = headers(&[("mcp-name", "=?base64?w6l0YXBl?=")]);
+        assert!(check_request_headers(&encoded, "tasks/get", &params).is_ok());
+        let other = headers(&[("mcp-name", "etape")]);
+        let err = check_request_headers(&other, "tasks/get", &params).unwrap_err();
+        assert_eq!(err.0, HEADER_MISMATCH);
+        let broken = headers(&[("mcp-name", "=?base64?***?=")]);
+        assert_eq!(
+            check_request_headers(&broken, "tasks/get", &params)
+                .unwrap_err()
+                .0,
+            HEADER_MISMATCH
+        );
+    }
+
+    #[test]
+    fn a_modern_request_must_carry_the_headers() {
+        let params = modern_params(json!({"name": "start_review"}));
+        for missing in [
+            headers(&[("mcp-method", "tools/call"), ("mcp-name", "start_review")]),
+            headers(&[
+                ("mcp-protocol-version", LATEST_PROTOCOL_VERSION),
+                ("mcp-name", "start_review"),
+            ]),
+            headers(&[
+                ("mcp-protocol-version", LATEST_PROTOCOL_VERSION),
+                ("mcp-method", "tools/call"),
+            ]),
+        ] {
+            let err = check_request_headers(&missing, "tools/call", &params).unwrap_err();
+            assert_eq!(err.0, HEADER_MISMATCH, "{missing:?}");
+        }
+    }
+
+    #[test]
+    fn a_version_header_must_match_the_body_and_be_served() {
+        let params = json!({"_meta": {PROTOCOL_VERSION_META: "2025-11-25"}});
+        let differs = headers(&[("mcp-protocol-version", LATEST_PROTOCOL_VERSION)]);
+        assert_eq!(
+            check_request_headers(&differs, "ping", &params)
+                .unwrap_err()
+                .0,
+            HEADER_MISMATCH
+        );
+        let unknown = headers(&[("mcp-protocol-version", "2099-01-01")]);
+        let err = check_request_headers(&unknown, "ping", &json!({})).unwrap_err();
+        assert_eq!(err.0, UNSUPPORTED_PROTOCOL_VERSION);
+        assert_eq!(err.2.unwrap()["requested"], "2099-01-01");
+        // `initialize` negotiates in its body, so its header is not checked.
+        assert!(check_request_headers(&unknown, "initialize", &json!({})).is_ok());
+    }
+
+    #[test]
+    fn only_form_mode_elicitation_gets_input_requests() {
+        let caps = |elicitation: Value| json!({"_meta": {CLIENT_CAPABILITIES_META: {"elicitation": elicitation}}});
+        assert!(client_accepts_elicitation(&caps(json!({}))));
+        assert!(client_accepts_elicitation(&caps(json!({"form": {}}))));
+        assert!(client_accepts_elicitation(&caps(
+            json!({"form": {}, "url": {}})
+        )));
+        assert!(!client_accepts_elicitation(&caps(json!({"url": {}}))));
+        assert!(!client_accepts_elicitation(&caps(json!(true))));
     }
 
     #[test]

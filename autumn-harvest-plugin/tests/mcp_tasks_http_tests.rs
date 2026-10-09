@@ -382,3 +382,80 @@ async fn a_tenant_bound_caller_is_refused() {
     let resp = router().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
+
+async fn post_with_headers(
+    app: &Router,
+    body: &Value,
+    pairs: &[(&str, &str)],
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(TASKS)
+        .header("content-type", "application/json");
+    for (name, value) in pairs {
+        builder = builder.header(*name, *value);
+    }
+    let resp = app
+        .clone()
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// A gateway can authorize on `Mcp-Method`. A header that differs from the
+/// body method is refused, so it cannot pass a `ping` policy and start a run.
+#[tokio::test]
+async fn a_mismatched_method_header_is_refused_with_400() {
+    let body = call(
+        "tools/call",
+        &json!({"name": "start_review_flow", "arguments": {"body": "d1"}}),
+    );
+    let (status, out) = post_with_headers(&router(), &body, &[("mcp-method", "ping")]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(out["error"]["code"], -32020, "{out}");
+}
+
+#[tokio::test]
+async fn an_unsupported_version_header_is_refused_with_400() {
+    let (status, out) = post_with_headers(
+        &router(),
+        &call("ping", &json!({})),
+        &[("mcp-protocol-version", "2099-01-01")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(out["error"]["code"], -32022, "{out}");
+    assert_eq!(out["error"]["data"]["requested"], "2099-01-01");
+}
+
+/// A 2026-07-28 request with matching headers is served. Its unknown
+/// method gets 404, as the transport requires.
+#[tokio::test]
+async fn a_modern_request_with_matching_headers_is_served() {
+    let meta = json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28"});
+    let modern = [
+        ("mcp-protocol-version", "2026-07-28"),
+        ("mcp-method", "ping"),
+    ];
+    let (status, out) =
+        post_with_headers(&router(), &call("ping", &json!({"_meta": meta})), &modern).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let unknown = [
+        ("mcp-protocol-version", "2026-07-28"),
+        ("mcp-method", "nope/x"),
+    ];
+    let (status, out) = post_with_headers(
+        &router(),
+        &call("nope/x", &json!({"_meta": meta})),
+        &unknown,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(out["error"]["code"], -32601, "{out}");
+}
