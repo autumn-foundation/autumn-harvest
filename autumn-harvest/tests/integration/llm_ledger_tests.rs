@@ -789,9 +789,32 @@ async fn a_call_recorded_after_the_transactional_commit_is_dropped() {
 async fn an_oversized_result_writes_no_row() {
     let (url, _c) = setup_test_database_url_or_env().await;
     let queue = unique_queue("llm-oversized");
-    let mut info = activity_info("llm_oversized_step", queue, false, None, llm_oversized_step);
-    info.max_result_bytes = Some(256);
-    let exec_id = run_one(&url, ("llm_oversized_wf", wf_oversized), info).await;
+    let codecs = aead_codecs();
+    // A per-activity cap only raises the registry cap, so lower the registry
+    // cap itself.
+    let mut registry = HandlerRegistry::with_state_and_telemetry(
+        vec![wf_info("llm_oversized_wf", wf_oversized)],
+        vec![activity_info(
+            "llm_oversized_step",
+            queue,
+            false,
+            None,
+            llm_oversized_step,
+        )],
+        autumn_harvest::context::empty_shared_state(),
+        Arc::new(TelemetryConfig::default()),
+    )
+    .with_payload_codecs(codecs.clone());
+    registry.max_activity_result_bytes = 256;
+    let exec_id = run_to_completion(
+        &url,
+        &codecs,
+        queue,
+        Arc::new(registry),
+        "llm_oversized_wf",
+        &[&Uuid::new_v4().to_string()],
+    )
+    .await[0];
 
     let mut conn = connect(&url).await;
     assert_eq!(ledger_rows(&mut conn, exec_id).await, Vec::new());

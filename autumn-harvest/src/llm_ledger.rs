@@ -251,6 +251,7 @@ impl LlmCallSlot {
         call.latency.get_or_insert(since_last);
         state.last_mark = now;
         state.calls.push(call);
+        drop(state);
         Ok(())
     }
 
