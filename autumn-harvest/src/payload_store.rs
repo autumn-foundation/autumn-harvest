@@ -441,7 +441,7 @@ fn build_offload_envelope(store_id: &str, key: &str, len: u64, checksum: &str) -
     })
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
+pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(64);

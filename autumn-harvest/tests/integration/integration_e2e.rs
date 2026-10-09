@@ -11978,7 +11978,7 @@ fn windowed_fanout_e2e_registry() -> Arc<HandlerRegistry> {
 }
 
 /// Insert a RUNNING execution row for `(workflow_name, workflow_id)`.
-async fn insert_named_execution(
+pub(crate) async fn insert_named_execution(
     conn: &mut AsyncPgConnection,
     workflow_name: &'static str,
     workflow_id: &'static str,
