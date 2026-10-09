@@ -82,7 +82,7 @@ fn tp_child(_ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
 }
 
 /// Returns the verified tenant that the activity reads (issue #1998).
-#[activity(start_to_close = "30s")]
+#[activity(start_to_close = "30s", queue = "tp_reader")]
 async fn tp_read_tenant(ctx: &ActivityContext, input: Value) -> Result<Value, String> {
     let _ = input;
     let tenant = ctx.run_tenant().await.map_err(|e| e.to_string())?;
@@ -155,13 +155,18 @@ fn info(
 }
 
 fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
+    make_worker_on(registry, "default")
+}
+
+/// A worker that polls only `queue`.
+fn make_worker_on(registry: Arc<HandlerRegistry>, queue: &str) -> Worker {
     Worker::new(
         WorkerRuntimeConfig {
             codec_rotation_batch_size: 0,
             scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
             dr: autumn_harvest::replication::DrConfig::default(),
             worker_id: uuid::Uuid::new_v4().to_string(),
-            queues: vec!["default".to_string()],
+            queues: vec![queue.to_string()],
             notification_database_url: None,
             max_concurrent_workflows: 10,
             max_concurrent_activities: 20,
@@ -581,15 +586,29 @@ async fn an_activity_reads_the_verified_tenant() {
     let suffix = uuid::Uuid::new_v4();
     let tenanted = format!("reader-acme-{suffix}");
     let untenanted = format!("reader-none-{suffix}");
-    let reader = "tp_tenant_reader";
-    start(&mut conn, reader, &tenanted, json!({}), Some("acme"), None).await;
-    start(&mut conn, reader, &untenanted, json!({}), None, None).await;
+    // A queue of its own keeps the workers of the other tests off these
+    // runs.
+    for (workflow_id, tenant) in [(&tenanted, Some("acme")), (&untenanted, None)] {
+        let params = StartWorkflowParams {
+            tenant,
+            ..StartWorkflowParams::new(
+                "tp_tenant_reader",
+                workflow_id,
+                ExecutionId::new_for_shard(ShardId::new(0)),
+                json!({}),
+                "tp_reader",
+            )
+        };
+        start_or_load_workflow_execution(&mut conn, params, None)
+            .await
+            .expect("start");
+    }
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![info("tp_tenant_reader", tp_tenant_reader, None)],
         vec![tp_read_tenant_info()],
     ));
-    let worker = Arc::new(make_worker(registry));
+    let worker = Arc::new(make_worker_on(registry, "tp_reader"));
     let pool = build_pool(&url);
     let runner = worker.clone();
     let handle = tokio::spawn(async move {

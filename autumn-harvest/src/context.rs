@@ -30084,7 +30084,7 @@ mod activity_info_tests {
         );
         assert!(matches!(
             local.run_tenant().await,
-            Err(HarvestError::Config(_))
+            Err(crate::error::HarvestError::Config(_))
         ));
     }
 
