@@ -76,6 +76,11 @@ A batch reset never drops a run. Each item has `outcome` set to `reset`,
 | `invalid_boundary` | The resolved event is not a clean boundary. | Use the nearest valid id. |
 | `infrastructure_error` | A database error, or a fork-time refusal other than erasure, such as a held durable mutex. `message` names the cause. | Sometimes. Read `message` first. |
 
+The checks run in this order: state, child, erasure. The first failed check
+names the reason. So an erased child reports `child_workflow`, and an erased
+`COMPLETED` or `TERMINATED` run reports `terminal_source`. Each of these
+reasons is permanent, and no batch forks an erased run.
+
 The batch checks each run twice. A first pass reads the row without a lock and
 skips what it can. The fork then rechecks under its row lock. A skip from the
 fork keeps the `resolved_event_id` of the first pass. A skip from the first

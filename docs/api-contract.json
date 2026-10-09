@@ -5663,7 +5663,7 @@
           "items",
           "unavailable_shards"
         ],
-        "notes": "Each item has exec_id and outcome: reset | previewed | skipped. A skipped item has skip_reason.type: terminal_source | child_workflow | erased_source | empty_history | continue_as_new | no_matching_activity | invalid_boundary | infrastructure_error. Only infrastructure_error can clear on a plain retry. A run with PII-erased payloads is always skipped with erased_source, in a preview and in a real reset (issue #1999)."
+        "notes": "Each item has exec_id and outcome: reset | previewed | skipped. A skipped item has skip_reason.type: terminal_source | child_workflow | erased_source | empty_history | continue_as_new | no_matching_activity | invalid_boundary | infrastructure_error. Only infrastructure_error can clear on a plain retry. No run with PII-erased payloads is forked (issue #1999). The checks run in this order: state, child, erasure. So an erased child reports child_workflow, an erased COMPLETED or TERMINATED run reports terminal_source, and any other erased run reports erased_source, in a preview and in a real reset."
       },
       "error_responses": [
         {
