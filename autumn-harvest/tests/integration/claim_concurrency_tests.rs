@@ -1,14 +1,14 @@
 #![cfg(feature = "db")]
 //! Claim concurrency: one worker runs more than one claim at once.
 //!
-//! Assay #14 found one claim in flight per worker. The claim loop was busy
-//! 94% of the time, so it capped throughput. These tests pin the fix and its
+//! Assay #14 measured claim-loop occupancy at 0.94, which fits one claim in
+//! flight. That loop capped throughput. These tests pin the fix and its
 //! safety rules. See `DESIGN-claim-concurrency.md`.
 //!
 //! A test trigger makes each claim of one queue sleep, so claims of one
 //! worker overlap only if the worker runs them at once. The trigger records
-//! each claim interval in a probe table. Each test uses its own queue, probe
-//! table and trigger, and drops them at the end.
+//! each claim interval in a probe table. Each probe test uses its own queue,
+//! probe table and trigger, and drops them at the end.
 //!
 //! Set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run against it.
 //! Otherwise a testcontainers Postgres 16 starts.
@@ -340,7 +340,7 @@ fn build_worker(
     metrics: Arc<dyn MetricsRecorder>,
 ) -> Arc<Worker> {
     let mut config: WorkerRuntimeConfig = autumn_harvest::builder::WorkerConfig::default().into();
-    config.worker_id = worker_id.to_owned();
+    worker_id.clone_into(&mut config.worker_id);
     config.queues = vec![queue.to_owned()];
     config.max_concurrent_workflows = knobs.workflows;
     config.max_concurrent_activities = knobs.activities;
@@ -468,6 +468,11 @@ async fn db_now_ms(url: &str) -> i64 {
         .v
 }
 
+/// `n` as a database count.
+fn as_count(n: usize) -> i64 {
+    i64::try_from(n).expect("a test count fits in i64")
+}
+
 /// How many workflows on `queue` completed.
 async fn completed(url: &str, queue: &str) -> i64 {
     count(
@@ -525,7 +530,7 @@ async fn drain_overlap(claims: usize, n: usize) -> i64 {
     let worker = build_worker(&queue, &queue, &knobs, Arc::new(NoOpMetrics));
     let handle = spawn_worker(&worker, &pool);
 
-    let drained = wait_completed(&url, &queue, n as i64, Duration::from_secs(60)).await;
+    let drained = wait_completed(&url, &queue, as_count(n), Duration::from_secs(60)).await;
     worker.shutdown();
     handle.await.expect("worker joins");
     let overlap = probe.max_overlap().await;
@@ -533,7 +538,7 @@ async fn drain_overlap(claims: usize, n: usize) -> i64 {
     probe.remove().await;
     assert!(drained, "every workflow completes");
     assert!(
-        seen >= n as i64,
+        seen >= as_count(n),
         "the probe sees every claim: {seen} of {n}"
     );
     overlap
@@ -585,7 +590,7 @@ async fn a_multi_shard_worker_overlaps_claims_up_to_its_cap() {
     );
     let handle = spawn_worker(&worker, &pool);
 
-    let drained = wait_completed(&url, &queue, n as i64, Duration::from_secs(60)).await;
+    let drained = wait_completed(&url, &queue, as_count(n), Duration::from_secs(60)).await;
     worker.shutdown();
     handle.await.expect("worker joins");
     let overlap = probe.max_overlap().await;
@@ -633,7 +638,7 @@ async fn most_rows_held(kind: &str, permits: usize, n: usize) -> (i64, i64) {
     );
     let mut most = 0;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while completed(&url, &queue).await < n as i64 && tokio::time::Instant::now() < deadline {
+    while completed(&url, &queue).await < as_count(n) && tokio::time::Instant::now() < deadline {
         most = most.max(count(&url, &held_sql, &queue).await);
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -643,7 +648,7 @@ async fn most_rows_held(kind: &str, permits: usize, n: usize) -> (i64, i64) {
     probe.remove().await;
     assert_eq!(
         completed(&url, &queue).await,
-        n as i64,
+        as_count(n),
         "every workflow completes"
     );
     (most, overlap)
@@ -692,7 +697,7 @@ async fn every_task_runs_once_under_concurrent_claims() {
     let ha = spawn_worker(&a, &pool);
     let hb = spawn_worker(&b, &pool);
 
-    let drained = wait_completed(&url, &queue, n as i64, Duration::from_secs(60)).await;
+    let drained = wait_completed(&url, &queue, as_count(n), Duration::from_secs(60)).await;
     a.shutdown();
     b.shutdown();
     ha.await.expect("worker a joins");

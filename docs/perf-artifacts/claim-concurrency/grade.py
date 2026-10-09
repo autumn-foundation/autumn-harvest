@@ -8,7 +8,8 @@ Prints one Markdown table per measure:
 - workflows/sec per cell (mean over valid runs, with each run);
 - Temporal over harvest per depth and claim cap;
 - claims in flight: claim count x mean claim time / elapsed time;
-- the mean claim time.
+- the mean claim time;
+- the mean pool connections in use.
 """
 
 import re

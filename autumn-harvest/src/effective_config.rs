@@ -1062,7 +1062,7 @@ mod tests {
         );
         assert_eq!(
             default_view.max_concurrent_claims,
-            crate::worker::DEFAULT_MAX_CONCURRENT_CLAIMS
+            crate::builder::DEFAULT_MAX_CONCURRENT_CLAIMS
         );
         let view = WorkerConfigView::from_worker_config(
             &WorkerConfig::default().with_max_concurrent_claims(4),

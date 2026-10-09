@@ -82,12 +82,7 @@ pub type DbPool = deadpool::managed::Pool<
 /// `GLOBAL_DEFAULT_WORKFLOW_QUEUE` and so must not run on a read-only path.
 pub const DEFAULT_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Default cap on the claims one worker runs at once.
-///
-/// Assay #14 measured one claim in flight per worker. The claim loop was busy
-/// 94% of the time, so it capped throughput. See
-/// [`WorkerRuntimeConfig::max_concurrent_claims`].
-pub const DEFAULT_MAX_CONCURRENT_CLAIMS: usize = 2;
+pub use crate::builder::DEFAULT_MAX_CONCURRENT_CLAIMS;
 
 /// Ceiling for the overdue-schedule gauge's adaptive sampling interval (issue
 /// #696).
@@ -30185,7 +30180,7 @@ static POLLERS_BY_RECORDER: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<usize, RecorderPollers>>,
 > = std::sync::LazyLock::new(std::sync::Mutex::default);
 
-/// Counts one running poll loop and keeps `harvest.worker.pollers` current
+/// Counts one running claim loop and keeps `harvest.worker.pollers` current
 /// (issue #1815).
 ///
 /// The guard sets the gauge when its loop starts and again when the loop
@@ -34204,26 +34199,14 @@ impl Worker {
         // coverage.
         let dispatch_allowed = self.dispatch_span_allowed();
 
-        let more_work = tokio::sync::Notify::new();
-        let claim_targets = [ClaimTarget {
-            shard: poll_shard,
+        self.run_single_pool_claim_loops(
             pool,
-            registration_pending: &registration_pending,
-            acquire_bound: shard_acquire_bound(false, self.config.poll_interval),
-            global_dispatch: dispatch_allowed,
-        }];
-        self.warn_if_claim_loops_fill_pools(&claim_targets);
-        tokio::join!(
-            self.run_poll_loop(
-                pool,
-                poll_shard,
-                listener,
-                &registration_pending,
-                dispatch_allowed,
-                &more_work,
-            ),
-            self.run_claim_followers(&claim_targets, &more_work),
-        );
+            poll_shard,
+            listener,
+            &registration_pending,
+            dispatch_allowed,
+        )
+        .await;
 
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received");
 
@@ -36859,6 +36842,37 @@ impl Worker {
         exclusions
     }
 
+    /// Run the single-pool leader loop and its followers until shutdown.
+    async fn run_single_pool_claim_loops(
+        &self,
+        pool: &DbPool,
+        shard: Option<crate::types::ShardId>,
+        listener: Option<crate::notify::QueueListener>,
+        registration_pending: &AtomicBool,
+        dispatch_allowed: bool,
+    ) {
+        let more_work = tokio::sync::Notify::new();
+        let claim_targets = [ClaimTarget {
+            shard,
+            pool,
+            registration_pending,
+            acquire_bound: shard_acquire_bound(false, self.config.poll_interval),
+            global_dispatch: dispatch_allowed,
+        }];
+        self.warn_if_claim_loops_fill_pools(&claim_targets);
+        tokio::join!(
+            self.run_poll_loop(
+                pool,
+                shard,
+                listener,
+                registration_pending,
+                dispatch_allowed,
+                &more_work,
+            ),
+            self.run_claim_followers(&claim_targets, &more_work),
+        );
+    }
+
     /// Warn when the claim loops alone can hold every connection of a claim
     /// pool. See [`claim_loops_fill_pool`].
     fn warn_if_claim_loops_fill_pools(&self, targets: &[ClaimTarget<'_>]) {
@@ -36872,7 +36886,7 @@ impl Worker {
                     max_concurrent_claims = claim_loops,
                     pool_max_size = max_size,
                     "the claim loops can hold every pool connection; tasks, heartbeats and \
-                     persists then wait behind them. Raise the pool size or lower \
+                     persists then wait behind them. Use a larger pool or lower \
                      max_concurrent_claims"
                 );
             }
@@ -36881,8 +36895,8 @@ impl Worker {
 
     /// Run `max_concurrent_claims - 1` follower claim loops beside the leader.
     ///
-    /// Assay #14 found one claim in flight per worker, and that loop capped
-    /// throughput. A follower adds a claim in flight only while claims return
+    /// Assay #14 measured claim-loop occupancy at 0.94, which fits one claim
+    /// in flight. That loop capped throughput. A follower adds a claim in flight only while claims return
     /// work. The leader alone still guarantees progress, so a follower needs
     /// no timer and no listener. See `DESIGN-claim-concurrency.md`.
     ///
@@ -36920,9 +36934,9 @@ impl Worker {
             while !self.shutdown.is_cancelled() && self.follower_claim(targets, &mut start).await {
                 more_work.notify_one();
             }
-            // This run ended on an empty claim. A wake stored during the run
-            // would only cost one more empty claim. The next success wakes
-            // a follower again.
+            // This run ended on an empty claim or on shutdown. A wake stored
+            // during the run would only cost one more empty claim. The next
+            // success wakes a follower again.
             let _ = futures::FutureExt::now_or_never(more_work.notified());
         }
     }
@@ -36981,9 +36995,6 @@ impl Worker {
     /// exhausted pool on one shard cannot park the loop and strand its peers.
     /// See `shard_acquire_bound`. A timeout increments
     /// `harvest.db.pool_acquire_timeout{site="claim"}`.
-    // significant_drop_tightening: `permits` holds `OwnedSemaphorePermit`s
-    // across the claim on purpose (issue #1787). An earlier drop would let a
-    // slot tuner shrink take the permit of a row this poll then claims.
     async fn poll_once(
         &self,
         pool: &DbPool,
@@ -36999,6 +37010,9 @@ impl Worker {
     /// Only the leader runs the throttle check after an empty claim. A
     /// follower ends each run with an empty claim, so its check would repeat
     /// the leader's and count each throttled key once more.
+    // significant_drop_tightening: `permits` holds `OwnedSemaphorePermit`s
+    // across the claim on purpose (issue #1787). An earlier drop would let a
+    // slot tuner shrink take the permit of a row this poll then claims.
     #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
     async fn poll_once_as(
         &self,

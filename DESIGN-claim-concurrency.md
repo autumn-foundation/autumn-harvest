@@ -41,20 +41,20 @@ once. **No SQL change. No migration. No new `WorkflowEvent` variant.**
 
 | # | How to make it harmful | Mitigation |
 |---|------------------------|------------|
-| R1 | Loops claim more tasks than the local permits allow. | Each loop takes its own `PollPermits` before it claims. Test: `concurrent_claims_never_exceed_the_local_permits`. |
+| R1 | Loops claim more tasks than the local permits allow. | Each loop takes its own `PollPermits` before it claims. Tests: `concurrent_claims_never_exceed_the_activity_permits` and `concurrent_claims_never_exceed_the_workflow_permits`. |
 | R2 | Two loops claim one row. | The claim SQL is unchanged. `FOR UPDATE SKIP LOCKED` decides. Test: every task of a backlog runs exactly once. |
 | R3 | Idle claim load grows with the loop count. | A follower has no timer and no listener. Test: `an_idle_worker_claims_at_the_single_loop_rate`. |
-| R4 | A follower claims after shutdown starts, so a task misses the drain. | The followers run in the same future as the leader. The drain starts only after every loop returns. Test: no row stays `RUNNING` under the worker after `run` returns. |
+| R4 | A follower claims after shutdown starts, so a task misses the drain. | The followers run in the same future as the leader. The drain starts only after every loop returns. Test: `no_claim_starts_after_a_concurrent_worker_stops`. |
 | R5 | A burst of NOTIFY wakes every loop at once. | A follower wakes on a sibling success only, one wake per success. |
 | R6 | A wake is lost and work waits. | `Notify::notify_one` stores one wake. The leader polls on its own timer in any case. |
 | R7 | Followers use the Redis dispatch channel, or a shard with an unverified registration. | A follower polls Postgres only where the leader would. It skips a shard with a channel or with a pending registration. Test: `a_follower_polls_postgres_only_where_the_leader_does`. Known limit: in degraded dispatch mode the leader drains Postgres alone (§4). |
 | R8 | Followers take every pool connection. | Each loop holds one connection for one claim. The default cap is small. The worker warns at startup when the claim loops can fill a pool. The upgrade guide and the pool runbook say to size the pool for it. |
-| R9 | Tests that need a strict claim order become flaky. | Existing worker tests keep the default, so they run followers. The 64 affected suites pass CI-style. A test that needs a strict order can set `max_concurrent_claims = 1`. |
+| R9 | Tests that need a strict claim order become flaky. | Existing worker tests keep the default, so they run followers. The affected suites pass. A test that needs a strict order can set `max_concurrent_claims = 1`. |
 | R10 | `harvest.worker.pollers` changes meaning. | It counts running claim loops, as before. Followers are claim loops. The docs say so. |
 | R11 | Claim order changes. | Two loops can take rows slightly out of order, as two workers can today. `docs/performance.md` already documents this. |
-| R12 | Each follower run ends on an empty claim. That claim also runs the throttle check, and a stored wake adds one more empty claim. | Found in review. A follower skips the throttle check, so the leader alone emits `harvest.rate_limit.throttled`. A follower drops a stored wake when its run ends. Test: `an_idle_worker_claims_at_the_single_loop_rate` counts claims after a burst. |
-| R13 | A worker's own loops contend for one hot concurrency key or one rate-limit bucket. | Found in review. The loser of `pg_try_advisory_xact_lock` gets an empty claim, as with two workers. The upgrade guide advises 1 claim loop for such a queue. |
-| R14 | The outlier cohort mixes workers with other claim caps. | Found in review. `ExecutionPolicy` keys the cohort on `claim_loops`. |
+| R12 | Each follower run ends on an empty claim. That claim also runs the throttle check, and a stored wake adds one more empty claim. | A follower skips the throttle check, so the leader alone emits `harvest.rate_limit.throttled`. A follower drops a stored wake when its run ends. Test: `an_idle_worker_claims_at_the_single_loop_rate` counts claims after a burst. |
+| R13 | A worker's own loops contend for one hot concurrency key or one rate-limit bucket. | The loser of `pg_try_advisory_xact_lock` gets an empty claim, as with two workers. The upgrade guide advises 1 claim loop for such a queue. |
+| R14 | The outlier cohort mixes workers with other claim caps. | `ExecutionPolicy` keys the cohort on `claim_loops`. |
 
 ### 0.4 Six thinking hats — B2
 
@@ -111,12 +111,12 @@ re-charter item 1.
 | Phase | Test | Expected in red | Expected in green |
 |---|---|---|---|
 | Red | `a_worker_overlaps_claims_up_to_its_cap` | Fail: the largest overlap is 1. | Pass. |
-| Red | `concurrent_claims_never_exceed_the_local_permits` | Fail: the largest overlap is 1. | Pass. Split in review into an activity and a workflow case. |
-| Red | `no_task_stays_running_after_a_concurrent_worker_stops` | Fail: the largest overlap is 1. | Pass. Renamed in review to `no_claim_starts_after_a_concurrent_worker_stops`. |
+| Red | `concurrent_claims_never_exceed_the_activity_permits` | Fail: the largest overlap is 1. | Pass. |
+| Red | `no_claim_starts_after_a_concurrent_worker_stops` | Fail: the largest overlap is 1. | Pass. |
 | Red | `max_concurrent_claims_of_one_keeps_claims_serial` | Pass. | Pass. |
 | Red | `every_task_runs_once_under_concurrent_claims` | Pass. | Pass. |
 | Red | `an_idle_worker_claims_at_the_single_loop_rate` | Pass. | Pass. |
-| Green | `a_multi_shard_worker_overlaps_claims_up_to_its_cap` | — | Pass. |
+| Green | `a_multi_shard_worker_overlaps_claims_up_to_its_cap`, `concurrent_claims_never_exceed_the_workflow_permits` | — | Pass. |
 | Green | Unit tests: validation, builder default, effective config, follower predicate, pool check, cohort key | — | Pass. |
 | Both | Existing claim and worker suites | Pass. | Pass. |
 

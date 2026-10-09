@@ -1479,7 +1479,7 @@ impl Default for ExecutionPolicy {
             poison_pill_threshold: 3,
             cancellation_grace_period: std::time::Duration::from_secs(5),
             dr_fencing: false,
-            claim_loops: crate::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+            claim_loops: crate::builder::DEFAULT_MAX_CONCURRENT_CLAIMS,
         }
     }
 }
