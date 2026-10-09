@@ -175,16 +175,29 @@ const ABSENT: u32 = u32::MAX;
 /// `docs/audit-export.md`.
 #[must_use]
 pub fn canonical_record(record: &AuditExportRecord) -> Vec<u8> {
-    let shard = record.shard.to_string();
-    let seq = record.seq.to_string();
-    let id = record.id.hyphenated().to_string();
-    let shard_id = record.shard_id.map(|id| id.to_string());
+    let mut out = Vec::with_capacity(256);
+    for_each_canonical_chunk(record, |chunk| out.extend_from_slice(chunk));
+    out
+}
+
+/// Feed the bytes of [`canonical_record`] to `sink`, in order, in pieces.
+///
+/// The pieces concatenate to exactly the bytes [`canonical_record`] returns.
+/// The MAC path uses this to skip the buffer that holds the whole record.
+fn for_each_canonical_chunk(record: &AuditExportRecord, mut sink: impl FnMut(&[u8])) {
+    let mut shard = DecimalBuf::default();
+    let mut seq = DecimalBuf::default();
+    let mut shard_id = DecimalBuf::default();
+    if let Some(value) = record.shard_id {
+        shard_id.write(value);
+    }
+    let mut id = uuid::Uuid::encode_buffer();
     let occurred_at = canonical_time(record.occurred_at);
     let fields: [Option<&str>; 15] = [
-        Some(&shard),
-        Some(&seq),
-        Some(&id),
-        shard_id.as_deref(),
+        Some(shard.write(record.shard)),
+        Some(seq.write(record.seq)),
+        Some(record.id.hyphenated().encode_lower(&mut id)),
+        record.shard_id.map(|_| shard_id.as_str()),
         Some(&occurred_at),
         Some(&record.actor),
         Some(&record.operation),
@@ -197,11 +210,35 @@ pub fn canonical_record(record: &AuditExportRecord) -> Vec<u8> {
         record.error_summary.as_deref(),
         Some(&record.source),
     ];
-    let mut out = Vec::with_capacity(256);
     for field in fields {
-        push_field(&mut out, field);
+        push_field(&mut sink, field);
     }
-    out
+}
+
+/// A stack buffer that holds the decimal text of one integer.
+#[derive(Default)]
+struct DecimalBuf {
+    bytes: [u8; 20],
+    len: usize,
+}
+
+impl DecimalBuf {
+    /// Write `value` in decimal and return the text.
+    fn write(&mut self, value: impl std::fmt::Display) -> &str {
+        use std::io::Write as _;
+
+        let mut cursor = &mut self.bytes[..];
+        // An `i64` has at most 20 characters, so the write cannot fail.
+        let _ = write!(cursor, "{value}");
+        let left = cursor.len();
+        self.len = self.bytes.len() - left;
+        self.as_str()
+    }
+
+    /// The text written last.
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).unwrap_or_default()
+    }
 }
 
 /// Compute the link for `record` after `prev`.
@@ -219,15 +256,31 @@ pub fn link(
     newest_before: Option<DateTime<Utc>>,
     record: &AuditExportRecord,
 ) -> ChainHash {
+    link_with(&keyed_mac(key), prev, newest_before, record)
+}
+
+/// The HMAC state after the key setup.
+///
+/// Clone it per link. The clone skips the two key-block compressions that
+/// `Hmac::new_from_slice` runs on every call.
+fn keyed_mac(key: &CallbackSecret) -> Hmac<Sha256> {
     #[expect(clippy::expect_used, reason = "HMAC accepts a key of any length")]
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
+    Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length")
+}
+
+/// [`link`] with a key that [`keyed_mac`] already set up.
+fn link_with(
+    keyed: &Hmac<Sha256>,
+    prev: &ChainHash,
+    newest_before: Option<DateTime<Utc>>,
+    record: &AuditExportRecord,
+) -> ChainHash {
+    let mut mac = keyed.clone();
     mac.update(CHAIN_DOMAIN);
     mac.update(prev);
-    let mut newest = Vec::with_capacity(32);
-    push_field(&mut newest, newest_before.map(canonical_time).as_deref());
-    mac.update(&newest);
-    mac.update(&canonical_record(record));
+    let newest = newest_before.map(canonical_time);
+    push_field(&mut |chunk| mac.update(chunk), newest.as_deref());
+    for_each_canonical_chunk(record, |chunk| mac.update(chunk));
     mac.finalize().into_bytes().into()
 }
 
@@ -237,15 +290,15 @@ fn canonical_time(at: DateTime<Utc>) -> String {
 }
 
 /// Append one length-prefixed field, or the absent marker.
-fn push_field(out: &mut Vec<u8>, field: Option<&str>) {
+fn push_field(sink: &mut impl FnMut(&[u8]), field: Option<&str>) {
     match field {
         Some(text) => {
             // An audit field longer than 4 GiB cannot reach the table.
             let len = u32::try_from(text.len()).unwrap_or(ABSENT - 1);
-            out.extend_from_slice(&len.to_be_bytes());
-            out.extend_from_slice(text.as_bytes());
+            sink(&len.to_be_bytes());
+            sink(text.as_bytes());
         }
-        None => out.extend_from_slice(&ABSENT.to_be_bytes()),
+        None => sink(&ABSENT.to_be_bytes()),
     }
 }
 
@@ -440,7 +493,9 @@ impl ChainReport {
 
 /// An incremental verifier. Push rows in `export_seq` order.
 pub struct ChainVerifier<'k> {
-    keys: &'k [CallbackSecret],
+    /// The keyed HMAC state of each accepted key.
+    macs: Vec<Hmac<Sha256>>,
+    keys: std::marker::PhantomData<&'k [CallbackSecret]>,
     retention_cutoff: Option<DateTime<Utc>>,
     report: ChainReport,
     /// The previous row, once the chain starts. See [`Previous`].
@@ -475,7 +530,8 @@ impl<'k> ChainVerifier<'k> {
     #[must_use]
     pub fn with_keys(keys: &'k [CallbackSecret]) -> Self {
         Self {
-            keys,
+            keys: std::marker::PhantomData,
+            macs: keys.iter().map(keyed_mac).collect(),
             retention_cutoff: None,
             report: ChainReport::default(),
             previous: None,
@@ -628,9 +684,9 @@ impl<'k> ChainVerifier<'k> {
     /// `true` when the row's stored hash is its link under some key.
     fn own_hash_matches(&self, row: &ChainRow) -> bool {
         row.prev.is_some_and(|prev| {
-            self.keys
-                .iter()
-                .any(|key| row.hash == Some(link(key, &prev, row.newest_before, &row.record)))
+            self.macs.iter().any(|keyed| {
+                row.hash == Some(link_with(keyed, &prev, row.newest_before, &row.record))
+            })
         })
     }
 
@@ -1308,6 +1364,31 @@ mod tests {
         a.chain_prev = Some("00".into());
         a.chain_hash = Some("ff".into());
         assert_eq!(canonical_record(&a), canonical_record(&rec(1)));
+    }
+
+    /// The integer fields use a stack buffer. The widest values must still
+    /// match the text that `to_string` gives.
+    #[test]
+    fn the_widest_integers_encode_as_decimal_text() {
+        let mut wide = rec(1);
+        wide.shard = i32::MIN;
+        wide.seq = i64::MIN;
+        wide.shard_id = Some(i32::MAX);
+        let bytes = canonical_record(&wide);
+        let mut expected = Vec::new();
+        for text in [i32::MIN.to_string(), i64::MIN.to_string()] {
+            expected
+                .extend_from_slice(&u32::try_from(text.len()).unwrap_or_default().to_be_bytes());
+            expected.extend_from_slice(text.as_bytes());
+        }
+        assert!(bytes.starts_with(&expected));
+        let shard_id = i32::MAX.to_string();
+        let mut tail = u32::try_from(shard_id.len())
+            .unwrap_or_default()
+            .to_be_bytes()
+            .to_vec();
+        tail.extend_from_slice(shard_id.as_bytes());
+        assert!(bytes.windows(tail.len()).any(|w| w == tail));
     }
 
     /// A fixed vector. A change here breaks every stored chain and every SIEM

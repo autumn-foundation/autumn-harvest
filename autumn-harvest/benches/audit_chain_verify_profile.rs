@@ -102,5 +102,5 @@ fn main() {
     }
     let report = verifier.finish(None);
     assert_eq!(report.checked, n as u64);
-    assert!(report.findings.is_empty());
+    assert_eq!(report.findings.len(), 0);
 }
