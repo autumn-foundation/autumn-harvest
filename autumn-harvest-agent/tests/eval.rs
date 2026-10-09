@@ -510,6 +510,59 @@ async fn a_recorded_tool_failure_fails_the_candidate_at_the_same_call() {
     assert_eq!(recorder.runs(), Vec::<Value>::new());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_source_is_refused() {
+    let cancelled = WorkflowEvent::WorkflowCancelled {
+        reason: "operator".into(),
+    };
+    let source = with_end(one_lookup().await, Some(cancelled));
+    let model = ScriptedModel::new(vec![answer("done", 1)]);
+    let (harness, _) = candidate(model.clone());
+
+    let result = evaluate(&source, &Candidate::new(harness)).await;
+
+    assert!(
+        matches!(result, Err(EvalError::InterruptedSource(_))),
+        "{result:?}"
+    );
+    assert_eq!(model.calls(), 0, "a refused source costs no model call");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approval_the_source_never_awaited_is_not_delivered() {
+    // The source never gated `lookup`, but its history holds a stray
+    // approval for that call.
+    let mut source = one_lookup().await;
+    let started = source.len() - 1;
+    source.insert(
+        started,
+        WorkflowEvent::SignalReceived {
+            signal_name: "tool_approval:0:0:c1".into(),
+            payload: serde_json::to_value(Approval::Approve).unwrap(),
+        },
+    );
+    // The candidate policy gates every read.
+    let model = ScriptedModel::new(vec![
+        calls(&[("c1", "lookup", json!({"q": "x"}))], 5),
+        answer("done", 5),
+    ]);
+    let (harness, recorder) = candidate(model);
+    let gate = ToolRules::new().effect(ToolEffect::ReadOnly, Rule::Ask);
+
+    let evaluation = evaluate(&source, &Candidate::new(harness.policy(Arc::new(gate))))
+        .await
+        .unwrap();
+
+    assert_eq!(evaluation.first_divergence, Some(0));
+    assert_eq!(evaluation.replayed_tool_calls, 0, "{evaluation:#?}");
+    assert_eq!(recorder.runs(), Vec::<Value>::new());
+    let RunEnd::Completed(report) = &evaluation.candidate else {
+        panic!("the candidate completes: {:?}", evaluation.candidate);
+    };
+    let results = tool_results(report);
+    assert!(results[0].contains("no approval arrived"), "{results:?}");
+}
+
 /// Record a source with two gated `pay` calls. The first approval arrives
 /// after its deadline. The second arrives in time.
 ///

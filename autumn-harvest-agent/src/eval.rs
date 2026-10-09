@@ -19,9 +19,9 @@
 //! - `agent_deliver` is a stub. No report leaves the harness.
 //! - Any other activity has no mock, so it fails the candidate run.
 //!
-//! The harness sends again each signal that the source received before its
-//! deadline. Approvals are such signals. A signal that arrived after its
-//! deadline is dropped, so a late approval cannot release a call.
+//! The harness sends again each approval that the source awaited and received
+//! before its deadline. It drops every other signal. A late or unsolicited
+//! approval therefore cannot release a call.
 //!
 //! # The fork rules
 //!
@@ -34,8 +34,9 @@
 //!   effects.
 //! - The harness always refuses an erased source.
 //!
-//! The harness also refuses a source that has not ended. Such a source has no
-//! recorded frontier to compare against.
+//! The harness also refuses a source that has not ended, and a source that
+//! was cancelled or timed out. Such a source has no recorded end to compare
+//! against.
 //!
 //! # Matching
 //!
@@ -84,6 +85,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::approval::approval_call_id;
 use crate::harness::AgentHarness;
 use crate::message::{ContentPart, StopReason, ToolCall};
 use crate::policy::ToolDecision;
@@ -178,6 +180,10 @@ pub enum EvalError {
     /// The source history has no terminal event.
     #[error("the source run has not ended, so it has no recorded frontier")]
     InFlightSource,
+    /// The source was cancelled or timed out. An outside event cut it, so its
+    /// last turn is not a recorded end. The text says what ended it.
+    #[error("the source run was interrupted ({0}), so it has no recorded end")]
+    InterruptedSource(String),
     /// A recorded or candidate payload does not decode.
     #[error("a payload does not decode: {0}")]
     Undecodable(String),
@@ -297,8 +303,7 @@ pub struct TurnDiff {
 pub enum RunEnd {
     /// The run completed with this report.
     Completed(AgentReport),
-    /// The run failed, or the engine cancelled it or timed it out. The text
-    /// says why.
+    /// The run failed. The text says why.
     Failed(String),
 }
 
@@ -474,7 +479,7 @@ struct Recording {
     /// The recorded snapshots, and the error of a snapshot that failed for
     /// good.
     snapshots: Vec<Result<String, String>>,
-    /// Signals that the source received in time, in order.
+    /// Approvals that the source awaited and received in time, in order.
     signals: Vec<(String, Value)>,
     end: RunEnd,
 }
@@ -580,16 +585,31 @@ impl Recording {
                 _ => {}
             }
         }
+        // Only an approval that the source awaited is sent again. The source
+        // awaited a call only when its recorded decision asked for approval.
+        let turns = model_turns(history)?;
+        let gated: HashSet<String> = turns.iter().flat_map(gated_call_ids).collect();
+        signals.retain(|(name, _)| approval_call_id(name).is_some_and(|id| gated.contains(id)));
         Ok(Self {
             task,
             run_id,
-            turns: model_turns(history)?,
+            turns,
             tools,
             snapshots,
             signals,
             end: end.ok_or(EvalError::InFlightSource)?,
         })
     }
+}
+
+/// The ids of the calls of `turn` that the recorded policy gated.
+fn gated_call_ids(turn: &ModelTurn) -> Vec<String> {
+    turn.calls()
+        .into_iter()
+        .zip(&turn.decisions)
+        .filter(|(_, decision)| matches!(decision, ToolDecision::RequireApproval { .. }))
+        .map(|(call, _)| call.id)
+        .collect()
 }
 
 /// The task of an agent run history.
@@ -629,17 +649,22 @@ fn recorded_tool(
 }
 
 /// How a terminal event ends a run, or `None` for another event.
+///
+/// # Errors
+///
+/// Returns [`EvalError::InterruptedSource`] for a cancel or a timeout.
 fn run_end(event: &WorkflowEvent) -> Result<Option<RunEnd>, EvalError> {
     Ok(match event {
         WorkflowEvent::WorkflowCompleted { output } => Some(RunEnd::Completed(
             decode(output.clone()).map_err(EvalError::Undecodable)?,
         )),
         WorkflowEvent::WorkflowFailed { error, .. } => Some(RunEnd::Failed(error.clone())),
+        // An outside event cut the run, so its last turn is not an end.
         WorkflowEvent::WorkflowCancelled { reason } => {
-            Some(RunEnd::Failed(format!("cancelled: {reason}")))
+            return Err(EvalError::InterruptedSource(format!("cancelled: {reason}")));
         }
         WorkflowEvent::WorkflowExecutionTimedOut { .. } => {
-            Some(RunEnd::Failed("timed out".to_owned()))
+            return Err(EvalError::InterruptedSource("timed out".to_owned()));
         }
         _ => None,
     })

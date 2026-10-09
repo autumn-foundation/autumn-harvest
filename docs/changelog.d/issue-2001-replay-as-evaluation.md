@@ -13,8 +13,8 @@ turn live. Every other effect is recorded or stubbed:
   No tool runs.
 - A memory snapshot is the recorded one, or an empty one.
 - A delivery is a stub. No report leaves the harness.
-- The harness sends again each signal that the source received in time. It
-  drops a signal that arrived after its deadline.
+- The harness sends again each approval that the source awaited and
+  received in time. It drops every other signal.
 - A candidate call that differs from the recorded call gets a new `eval_`
   id, so no recorded approval can release it.
 
@@ -30,7 +30,8 @@ is the recorded turn count plus `DEFAULT_EXTRA_TURNS`.
 **Fork rules.** An evaluation is an in-memory fork at the first event. The
 harness leaves the source unchanged, accepts a completed source, records or
 stubs each effect, and refuses an erased source. It also refuses a source
-that has not ended. The database fork of issue #2000 is separate.
+that has not ended, or that was cancelled or timed out. The database fork of
+issue #2000 is separate.
 
 **Invariants.** No new `WorkflowEvent` variant. No migration. No route
 change. No database access. The `eval` feature turns on the engine's

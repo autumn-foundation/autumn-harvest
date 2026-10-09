@@ -480,8 +480,8 @@ A recorded outcome answers a call with the same step, tool name and
 arguments. A candidate call that equals the recorded call at the same turn
 and position takes the recorded call id. Approval signal names hold the call
 id, so the recorded approvals stay valid. Any other call gets a new `eval_`
-id, so no recorded approval can release it. The harness drops a signal that
-arrived after its deadline.
+id, so no recorded approval can release it. The harness sends again only
+the approvals that the source awaited and received before their deadlines.
 
 The report holds one `TurnDiff` per model turn. A turn diverges when the
 calls, the arguments, the policy decisions or the stop reason differ. Two
@@ -494,8 +494,8 @@ Each candidate turn is a live model call. `Candidate::max_turns` caps them.
 The default cap is the recorded turn count plus `DEFAULT_EXTRA_TURNS`. The
 report sets `turn_cap_reached` when the cap stops the candidate.
 
-The harness refuses an erased source, a source that has not ended, and a
-history that is not an agent run. A history with payload-store references or
+The harness refuses an erased source, a source that has not ended, a source
+that was cancelled or timed out, and a history that is not an agent run. A history with payload-store references or
 encrypted payloads needs decoding first. The model call blocks in place, so
 run the evaluation on a multi-thread Tokio runtime.
 
