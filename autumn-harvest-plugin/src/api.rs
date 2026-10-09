@@ -21497,11 +21497,6 @@ async fn batch_reset_workflows(
                         operator_id: request.operator_id.clone(),
                         signal_reapply: request.signal_reapply,
                         allow_terminal_source: true,
-                        // Left `false` deliberately: this is the batch-reset
-                        // endpoint, not the issue #780 DAG retry, and refusing
-                        // an erased source here would be an unrelated behavior
-                        // change to an already-shipped surface.
-                        refuse_erased_source: false,
                     };
                     match reset_workflow_execution(
                         conn,
@@ -21523,6 +21518,8 @@ async fn batch_reset_workflows(
                             });
                             reset_count += 1;
                         }
+                        // The fork refuses an erased source under its row lock
+                        // (issue #1999). `batch_skip_reason` keeps that skip typed.
                         Err(reset_err) => {
                             items.push(BatchResetItem {
                                 exec_id: exec_id_str,
@@ -25443,18 +25440,14 @@ fn reset_error_response(error: WorkflowResetError) -> axum::response::Response {
             }),
         )
             .into_response(),
-        // Same `409` and the same operator instruction as the DAG-retry
-        // pre-flight guard, so a caller cannot tell whether the erasure was
-        // already committed or landed in the race window — only that the
-        // source is unusable and a fresh run is the answer.
+        // Every fork refuses an erased source (issue #1999). DAG retry maps
+        // this case to its own message in `dag_retry_reset_error_response`.
         WorkflowResetError::ErasedSource { exec_id } => (
             axum::http::StatusCode::CONFLICT,
             Json(ResetErrorResponse {
                 message: format!(
-                    "workflow execution {exec_id} had its payloads erased (issue #495), so its \
-                     carried-over node outputs are tombstones and whether it already compensated \
-                     cannot be determined; retrying would resume on unreadable state — start a \
-                     fresh DAG run instead"
+                    "workflow execution {exec_id} had its payloads erased (issue #495); a fork \
+                     would resume on tombstones, so start a fresh run instead"
                 ),
             }),
         )
@@ -25594,8 +25587,26 @@ fn dag_retry_invalid_point_response(invalid: &ResetInvalidPoint) -> axum::respon
 /// contract: the invalid-boundary case is a `409` (not the `400` the standalone
 /// reset uses), everything else mirrors the standalone reset mapping.
 fn dag_retry_reset_error_response(error: WorkflowResetError) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
     match error {
         WorkflowResetError::InvalidPoint(invalid) => dag_retry_invalid_point_response(&invalid),
+        // Same `409` and the same operator instruction as the DAG-retry
+        // pre-flight guard. A caller cannot tell whether the erasure was
+        // already committed or landed in the race window. It only learns that
+        // the source is unusable and that a fresh run is the answer.
+        WorkflowResetError::ErasedSource { exec_id } => (
+            axum::http::StatusCode::CONFLICT,
+            Json(ResetErrorResponse {
+                message: format!(
+                    "workflow execution {exec_id} had its payloads erased (issue #495), so its \
+                     carried-over node outputs are tombstones and whether it already compensated \
+                     cannot be determined; retrying would resume on unreadable state — start a \
+                     fresh DAG run instead"
+                ),
+            }),
+        )
+            .into_response(),
         other => reset_error_response(other),
     }
 }
@@ -25926,6 +25937,12 @@ pub(crate) async fn retry_dag_run_inner(
 
     // Compose the reset request: the reason carries the DAG-retry annotation so
     // the audit trail (#158) and the WorkflowResetFork event read cleanly.
+    //
+    // The pre-flight erasure guard above ran on an unlocked read. The
+    // connection was then dropped for blob inflation, so `erase-payloads` can
+    // commit before this transaction opens. The fork rechecks erasure under its
+    // own row lock (issue #1999). The issue #780 compensated-run guard thus
+    // never decides on evidence that no longer exists.
     let augmented_reason = format!(
         "{} | dag_retry: nodes=[{}]",
         reason.trim(),
@@ -25938,13 +25955,6 @@ pub(crate) async fn retry_dag_run_inner(
         operator_id: operator_id.trim().to_string(),
         signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::default(),
         allow_terminal_source: true,
-        // Recheck erasure under the fork's own row lock. The pre-flight guard
-        // above ran on an unlocked read, and the connection was dropped for blob
-        // inflation before this transaction opens — so `erase-payloads` can
-        // commit in that window. Without this, the fork would carry tombstoned
-        // outputs and the issue #780 compensated-run guard would have been
-        // decided on evidence that no longer exists.
-        refuse_erased_source: true,
     };
 
     // Dry-run: validate the boundary and return the plan without writing.

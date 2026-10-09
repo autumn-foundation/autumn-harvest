@@ -771,7 +771,6 @@ async fn reset_refuses_an_erased_source_under_its_own_row_lock() {
         operator_id: "oncall".to_string(),
         signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::default(),
         allow_terminal_source: true,
-        refuse_erased_source: false,
     };
 
     let error = reset_workflow_execution(&mut conn, exec_id, request, None)
@@ -823,7 +822,6 @@ async fn preview_refuses_an_erased_source() {
         operator_id: "oncall".to_string(),
         signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::default(),
         allow_terminal_source: true,
-        refuse_erased_source: false,
     };
 
     let error = preview_workflow_reset(&mut conn, exec_id, request)
