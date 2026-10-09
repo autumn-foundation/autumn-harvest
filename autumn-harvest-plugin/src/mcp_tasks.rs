@@ -710,6 +710,8 @@ pub fn detailed_task(snapshot: &TaskSnapshot) -> Value {
 /// The tool schema nests the workflow schema under `$defs`. A ref such as
 /// `#/$defs/Inner` in the workflow schema names its own root, so it must
 /// gain the path of that new place, `root`. A remote ref stays as it is.
+/// An anchor ref such as `#inner` is not a path and stays valid in the whole
+/// document, so it stays as it is too.
 #[must_use]
 pub fn rebase_refs(schema: Value, root: &str) -> Value {
     match schema {
@@ -718,7 +720,9 @@ pub fn rebase_refs(schema: Value, root: &str) -> Value {
                 .into_iter()
                 .map(|(key, value)| {
                     let value = match (key.as_str(), value) {
-                        ("$ref", Value::String(target)) if target.starts_with('#') => {
+                        ("$ref", Value::String(target))
+                            if target == "#" || target.starts_with("#/") =>
+                        {
                             Value::String(format!("{root}{}", &target[1..]))
                         }
                         (_, value) => rebase_refs(value, root),
@@ -1540,9 +1544,8 @@ async fn load_task(
     let origin_name = origin.workflow_name.clone();
     let origin_business_id = origin.workflow_id.clone();
     let origin_completed_at = origin.completed_at;
-    let mut live = crate::mcp_tools::resolve_if_chained(api_state, origin)
-        .await
-        .map_err(|_| RpcError::new(INTERNAL_ERROR, "could not resolve the live run"))?;
+    let origin_id = origin.id;
+    let mut live = resolve_live(api_state, origin).await?;
     let live_served = catalog.serves(&live.workflow_name);
 
     let (ttl_completed_at, ttl_workflow) = if live_run_guards_start_row(
@@ -1554,6 +1557,17 @@ async fn load_task(
         (group_completed_at.or(origin_completed_at), origin_name)
     };
     if let Some((codecs, headers)) = decode {
+        // The audit row goes to the shard of the row that is decoded. A
+        // successor can live on another shard than the start row.
+        let shard = if live.id == origin_id {
+            shard
+        } else {
+            let live_id = autumn_harvest::ExecutionId::from_uuid(live.id);
+            crate::api::db_conn_for_execution_with_shard(api_state, live_id)
+                .await
+                .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?
+                .1
+        };
         let outcome = crate::api::decode_workflow_execution_fields(&mut live, codecs);
         crate::api::audit_decoded_read(
             api_state,
@@ -1595,6 +1609,71 @@ async fn load_task(
         waits,
     };
     Ok((snapshot, live_served))
+}
+
+/// The live run of a task: the end of its retry and continue-as-new chain.
+async fn resolve_live(
+    api_state: &HarvestApiState,
+    origin: autumn_harvest::models::WorkflowExecution,
+) -> Result<autumn_harvest::models::WorkflowExecution, RpcError> {
+    let mut live = crate::mcp_tools::resolve_if_chained(api_state, origin)
+        .await
+        .map_err(|_| RpcError::new(INTERNAL_ERROR, "could not resolve the live run"))?;
+    // A chain walk ends on a `CONTINUED_AS_NEW` row only when no successor
+    // follows, as after a rerun seal. That run ended, so the task keeps the
+    // state that the seal hid and never reads `working` again.
+    if live.state == "CONTINUED_AS_NEW"
+        && let Some(state) = last_event_type(api_state, live.id)
+            .await?
+            .as_deref()
+            .and_then(state_before_rerun_seal)
+    {
+        live.state = state.to_string();
+    }
+    Ok(live)
+}
+
+/// The state that a rerun seal hid, from the last history event of the run.
+///
+/// An operator rerun that reuses the business id seals the ended run as
+/// `CONTINUED_AS_NEW`, with no successor event. Its last event still names
+/// how it ended. Terminate writes `WorkflowCancelled` too, so both read as
+/// cancelled. Any other last event gives `None`.
+#[must_use]
+pub fn state_before_rerun_seal(last_event_type: &str) -> Option<&'static str> {
+    match last_event_type {
+        "WorkflowCompleted" => Some("COMPLETED"),
+        "WorkflowFailed" => Some("FAILED"),
+        "WorkflowExecutionTimedOut" => Some("TIMED_OUT"),
+        "WorkflowCancelled" | "WorkflowResetTerminated" => Some("CANCELLED"),
+        _ => None,
+    }
+}
+
+/// The `type` of the last history event of a run.
+async fn last_event_type(
+    api_state: &HarvestApiState,
+    run: uuid::Uuid,
+) -> Result<Option<String>, RpcError> {
+    use autumn_harvest::schema::harvest_events;
+    use diesel::{ExpressionMethods as _, OptionalExtension as _, QueryDsl as _};
+    use diesel_async::RunQueryDsl as _;
+
+    let exec_id = autumn_harvest::ExecutionId::from_uuid(run);
+    let mut conn = crate::api::db_conn_for_execution(api_state, exec_id)
+        .await
+        .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?;
+    let found: Option<Option<String>> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(run))
+        .order(harvest_events::event_id.desc())
+        .select(diesel::dsl::sql::<
+            diesel::sql_types::Nullable<diesel::sql_types::Text>,
+        >("event_data->>'type'"))
+        .first(&mut conn)
+        .await
+        .optional()
+        .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?;
+    Ok(found.flatten())
 }
 
 /// The id and the time of the last history event of a run.
@@ -2185,7 +2264,8 @@ mod tests {
                 "inner": {"$ref": "#/$defs/Inner"},
                 "old": {"$ref": "#/definitions/Old"},
                 "list": {"items": [{"$ref": "#"}]},
-                "remote": {"$ref": "https://example.com/s.json"}
+                "remote": {"$ref": "https://example.com/s.json"},
+                "anchored": {"$ref": "#inner"}
             },
             "$defs": {"Inner": {"type": "string"}},
             "definitions": {"Old": {"type": "integer"}}
@@ -2205,7 +2285,42 @@ mod tests {
             "#/$defs/HarvestMcpInput_wf"
         );
         assert_eq!(props["remote"]["$ref"], "https://example.com/s.json");
+        assert_eq!(props["anchored"]["$ref"], "#inner");
         assert_eq!(moved["$defs"]["Inner"], json!({"type": "string"}));
+    }
+
+    /// A rerun seal keeps the end that the run had. A terminate reads as
+    /// cancelled, and a live or chained run gives no state.
+    #[test]
+    fn a_rerun_seal_keeps_the_end_of_the_run() {
+        assert_eq!(
+            state_before_rerun_seal("WorkflowCompleted"),
+            Some("COMPLETED")
+        );
+        assert_eq!(state_before_rerun_seal("WorkflowFailed"), Some("FAILED"));
+        assert_eq!(
+            state_before_rerun_seal("WorkflowExecutionTimedOut"),
+            Some("TIMED_OUT")
+        );
+        assert_eq!(
+            state_before_rerun_seal("WorkflowCancelled"),
+            Some("CANCELLED")
+        );
+        assert_eq!(
+            state_before_rerun_seal("WorkflowResetTerminated"),
+            Some("CANCELLED")
+        );
+        for other in ["WorkflowContinuedAsNew", "SignalReceived", ""] {
+            assert_eq!(state_before_rerun_seal(other), None, "{other}");
+        }
+        for (event, status) in [
+            ("WorkflowCompleted", TaskStatus::Completed),
+            ("WorkflowFailed", TaskStatus::Completed),
+            ("WorkflowCancelled", TaskStatus::Cancelled),
+        ] {
+            let state = state_before_rerun_seal(event).unwrap();
+            assert_eq!(status_for_state(state, false), status, "{event}");
+        }
     }
 
     #[test]

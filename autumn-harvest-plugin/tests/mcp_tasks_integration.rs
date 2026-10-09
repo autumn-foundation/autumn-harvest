@@ -562,6 +562,51 @@ async fn a_workflow_error_completes_the_task_as_a_tool_error() {
     assert_eq!(count_runs(&db, "task_failing_flow").await, 1);
 }
 
+/// An operator rerun seals the ended run as `CONTINUED_AS_NEW`, with no
+/// successor event. The task keeps its terminal status and its result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rerun_leaves_an_ended_task_settled() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+
+    let created = create_task(&client, "start_task_failing_flow", json!("x")).await;
+    let task_id = created["taskId"].as_str().unwrap().to_string();
+    let mut seen = vec![status_of(&created)];
+    let done = poll_until(&client, &task_id, &mut seen, |t| status_of(t).is_terminal()).await;
+    assert_eq!(done["status"], "completed", "{done}");
+
+    let mut conn = db.pool.get().await.expect("pool connection");
+    let source = autumn_harvest::ExecutionId::from_uuid(task_id.parse().unwrap());
+    let outcome = autumn_harvest::execution::rerun_workflow_execution(
+        &mut conn,
+        source,
+        autumn_harvest::execution::RerunRequest {
+            input_override: None,
+            workflow_id_override: None,
+            started_by: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+            max_workflow_input_bytes: 0,
+            max_execution_timeout_ceiling: None,
+            max_workflow_chain_timeout_ceiling: None,
+            max_workflow_attempts_ceiling: None,
+            trace_context: None,
+        },
+        None,
+    )
+    .await
+    .expect("rerun");
+    drop(conn);
+    assert_eq!(outcome.source_prior_state, "FAILED");
+
+    let after = get_task(&client, &task_id).await;
+    assert_eq!(after["status"], "completed", "{after}");
+    assert_eq!(after["result"], done["result"], "{after}");
+    assert_settled(&client, &task_id, &done).await;
+}
+
 /// `tasks/cancel` moves a live task to `cancelled`. A second cancel and a
 /// late answer are acknowledged and change nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

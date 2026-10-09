@@ -362,6 +362,9 @@ while the chain still runs. After the run is deleted, `tasks/get` answers
 - An operator reset of an ended run seals that run as `TERMINATED`. The task
   then reads `cancelled`, even after `completed`, and does not follow the
   fork.
+- An operator rerun that reuses the business id seals the ended run as
+  `CONTINUED_AS_NEW`. The task keeps the status and result that the run had,
+  from its last history event, and does not follow the new run.
 
 **Auth.** The route takes the layers of a mutating tool route:
 `api_with_auth`, the custom-role gate, the read-only role gate, the
