@@ -576,3 +576,25 @@ async fn a_tool_call_without_a_body_is_invalid_params() {
     .await;
     assert!(out.get("error").is_none(), "{out}");
 }
+
+/// A malformed 2026-07-28 request gets HTTP 400, also when dispatch finds
+/// the fault: here a `tasks/get` without its `taskId`.
+#[tokio::test]
+async fn a_modern_invalid_params_error_is_http_400() {
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        CLIENT_CAPABILITIES_META: {"extensions": {TASKS_EXTENSION: {}}},
+    });
+    let modern = [
+        ("mcp-protocol-version", "2026-07-28"),
+        ("mcp-method", "tasks/get"),
+    ];
+    let (status, out) = post_with_headers(
+        &router(),
+        &call("tasks/get", &json!({"_meta": meta})),
+        &modern,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{out}");
+    assert_eq!(out["error"]["code"], -32602, "{out}");
+}

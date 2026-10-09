@@ -563,6 +563,8 @@ pub struct SignalWait {
     pub key: String,
     /// The signal name.
     pub signal_name: String,
+    /// The id of the last history event when the run parked.
+    pub position: i32,
 }
 
 /// The state of one task at one read.
@@ -698,6 +700,38 @@ pub fn detailed_task(snapshot: &TaskSnapshot) -> Value {
     task
 }
 
+/// Point the local `$ref`s of `schema` at its new place in a larger document.
+///
+/// The tool schema nests the workflow schema under `$defs`. A ref such as
+/// `#/$defs/Inner` in the workflow schema names its own root, so it must
+/// gain the path of that new place, `root`. A remote ref stays as it is.
+#[must_use]
+pub fn rebase_refs(schema: Value, root: &str) -> Value {
+    match schema {
+        Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .map(|(key, value)| {
+                    let value = match (key.as_str(), value) {
+                        ("$ref", Value::String(target)) if target.starts_with('#') => {
+                            Value::String(format!("{root}{}", &target[1..]))
+                        }
+                        (_, value) => rebase_refs(value, root),
+                    };
+                    (key, value)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| rebase_refs(item, root))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 /// The workflows the task route serves.
 ///
 /// A DAG is left out. Its trigger takes no start key, so a retried create
@@ -755,12 +789,15 @@ impl TaskCatalog {
                          task at once. Poll tasks/get for the result.",
                         d.name
                     ),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {"body": {"$ref": format!("#/$defs/{component}")}},
-                        "required": ["body"],
-                        "$defs": {component: body_schema},
-                    }),
+                    input_schema: {
+                        let root = format!("#/$defs/{component}");
+                        json!({
+                            "type": "object",
+                            "properties": {"body": {"$ref": root}},
+                            "required": ["body"],
+                            "$defs": {component: rebase_refs(body_schema, &root)},
+                        })
+                    },
                 }
             })
             .collect();
@@ -1023,15 +1060,15 @@ async fn serve(
         return response;
     }
     let result = dispatch(&api_state, &catalog, &caller, method, &params).await;
+    let modern = headers
+        .get("mcp-protocol-version")
+        .is_some_and(|v| v == LATEST_PROTOCOL_VERSION);
     let status = match &result {
         // The 2026-07-28 transport answers an unknown method with 404.
-        Err(err)
-            if err.code == METHOD_NOT_FOUND
-                && headers
-                    .get("mcp-protocol-version")
-                    .is_some_and(|v| v == LATEST_PROTOCOL_VERSION) =>
-        {
-            Some(StatusCode::NOT_FOUND)
+        Err(err) if modern && err.code == METHOD_NOT_FOUND => Some(StatusCode::NOT_FOUND),
+        // The 2026-07-28 revision answers a malformed request with 400.
+        Err(err) if modern && matches!(err.code, INVALID_PARAMS | INVALID_REQUEST) => {
+            Some(StatusCode::BAD_REQUEST)
         }
         // The schema requires HTTP 400 for a missing client capability.
         Err(err) if err.code == MISSING_CLIENT_CAPABILITY => Some(StatusCode::BAD_REQUEST),
@@ -1317,6 +1354,13 @@ async fn tasks_update(
         ));
     }
     for (wait, answer) in answers {
+        // The wait can end between the read and this delivery, by a timeout
+        // or another signal. A late answer would then reach a later wait, so
+        // the wait is checked again just before the signal goes in. The
+        // engine has no guarded signal, so a small window stays.
+        if !wait_still_open(api_state, snapshot.run_id, wait).await? {
+            continue;
+        }
         // The input key is the delivery key. A header key wins over the
         // query key, so the header from the request must not ride along.
         let mut headers = headers.clone();
@@ -1348,6 +1392,36 @@ async fn tasks_update(
         }
     }
     Ok(json!({"resultType": "complete"}))
+}
+
+/// `true` when the run is still parked on `wait`: no new history event, and
+/// no signal of that name queued for it.
+async fn wait_still_open(
+    api_state: &HarvestApiState,
+    run: uuid::Uuid,
+    wait: &SignalWait,
+) -> Result<bool, RpcError> {
+    use autumn_harvest::schema::harvest_signals;
+    use diesel::{ExpressionMethods as _, QueryDsl as _};
+    use diesel_async::RunQueryDsl as _;
+
+    let head = history_head(api_state, run).await?;
+    if head.map(|(position, _)| position) != Some(wait.position) {
+        return Ok(false);
+    }
+    let mut conn =
+        crate::api::db_conn_for_execution(api_state, autumn_harvest::ExecutionId::from_uuid(run))
+            .await
+            .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?;
+    let queued: i64 = harvest_signals::table
+        .filter(harvest_signals::workflow_exec_id.eq(run))
+        .filter(harvest_signals::signal_name.eq(&wait.signal_name))
+        .filter(harvest_signals::consumed.eq(false))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?;
+    Ok(queued == 0)
 }
 
 /// The error for a task whose live run left the catalog.
@@ -1596,6 +1670,7 @@ async fn open_signal_waits(
             waits.push(SignalWait {
                 key: input_request_key(live.id, &name, position),
                 signal_name: name,
+                position,
             });
         }
     }
@@ -2023,6 +2098,7 @@ mod tests {
         snap.waits = vec![SignalWait {
             key: "k1".into(),
             signal_name: "approval".into(),
+            position: 1,
         }];
         snap.hide_input_requests();
         let task = detailed_task(&snap);
@@ -2066,6 +2142,39 @@ mod tests {
         assert!(!live_run_guards_start_row(("a", "id"), ("b", "id")));
     }
 
+    /// A nested workflow schema keeps working refs once it moves under
+    /// `$defs` in the tool schema.
+    #[test]
+    fn local_refs_follow_the_schema_to_its_new_place() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "inner": {"$ref": "#/$defs/Inner"},
+                "old": {"$ref": "#/definitions/Old"},
+                "list": {"items": [{"$ref": "#"}]},
+                "remote": {"$ref": "https://example.com/s.json"}
+            },
+            "$defs": {"Inner": {"type": "string"}},
+            "definitions": {"Old": {"type": "integer"}}
+        });
+        let moved = rebase_refs(schema, "#/$defs/HarvestMcpInput_wf");
+        let props = &moved["properties"];
+        assert_eq!(
+            props["inner"]["$ref"],
+            "#/$defs/HarvestMcpInput_wf/$defs/Inner"
+        );
+        assert_eq!(
+            props["old"]["$ref"],
+            "#/$defs/HarvestMcpInput_wf/definitions/Old"
+        );
+        assert_eq!(
+            props["list"]["items"][0]["$ref"],
+            "#/$defs/HarvestMcpInput_wf"
+        );
+        assert_eq!(props["remote"]["$ref"], "https://example.com/s.json");
+        assert_eq!(moved["$defs"]["Inner"], json!({"type": "string"}));
+    }
+
     #[test]
     fn ttl_is_open_while_the_run_lives() {
         let day = std::time::Duration::from_secs(86_400);
@@ -2100,6 +2209,7 @@ mod tests {
         snap.waits = vec![SignalWait {
             key: "k1".into(),
             signal_name: "approval".into(),
+            position: 1,
         }];
         assert_eq!(snap.status(), TaskStatus::InputRequired);
         let task = detailed_task(&snap);
