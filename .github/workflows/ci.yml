@@ -619,6 +619,15 @@ jobs:
       - name: "Online-migration lock-safety lint (issue #1810)"
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration migration_lock_safety::"
 
+      # Issue #1987: the standalone-activity decision lives under `docs/`.
+      # A PR that edits only the perf page, the ADR or the capture skips the
+      # `test` matrix, so these guards run here.
+      #
+      # Guarded by `standalone_activity_docs::guards_run_on_docs_only_changes`.
+      # Quoted for the trailing-`::` YAML reason above.
+      - name: Run standalone-activity decision guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration standalone_activity_docs::"
+
       # Folio corpus harness: internal link check across all of docs/ (see
       # docs/audits/corpus-link-check.py). Same reasoning as the docs-only
       # guards above — a broken link is exactly the change class a docs-only
