@@ -22,7 +22,11 @@ is never written, so a run in any state can be forked, `COMPLETED` and
   mode of that fork, so it keeps that mode. It copies the overrides of that
   fork after the new marker. A fork of a fork uses its own, last, marker.
 - The worker reads the record source `FOR SHARE` and checks it for erasure
-  before it copies a recorded result.
+  before it copies a recorded result. A failed read of the source rolls the
+  decision back, so it retries.
+- The record settles an activity before the broken-session check. A member
+  of a session that the source closed gets its recorded result, not
+  `SessionBroken`.
 
 `"effects": "live"` runs effects for real. An override applies in both modes.
 
@@ -66,6 +70,7 @@ events. Fork a run only after every worker runs this version.
 history stay byte-identical; a recorded fork does not run a completed
 activity again; a live fork does; a fork with no record fails closed; an
 override replaces a result; a recorded fork fails before a local activity;
+a recorded fork serves a member of a closed session;
 an erased source is refused in both modes; a fork of a fork of an erased run
 is refused; a later fork point carries the prefix; a reset of a recorded
 fork stays recorded; only a recorded fork suppresses completion

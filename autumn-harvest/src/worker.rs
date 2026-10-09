@@ -10977,11 +10977,15 @@ async fn persist_activity_wait_park(
 ///
 /// Extracted from [`persist_scheduled_activities`] (issue #950) so the
 /// generalized mixed-batch path enforces the identical guarantee.
+///
+/// The check skips each activity in `settled`. A fork record settled it, so
+/// no host runs it (issue #2000).
 async fn fail_activities_for_broken_sessions(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     scheduled_activities: &[ScheduledActivityCommand],
     activity_task_ids: &[uuid::Uuid],
+    settled: &std::collections::HashSet<ActivityExecId>,
     next_event_id: &mut i32,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<bool> {
@@ -11016,6 +11020,9 @@ async fn fail_activities_for_broken_sessions(
 
     let mut synthesized = false;
     for (scheduled, activity_task_id) in scheduled_activities.iter().zip(activity_task_ids.iter()) {
+        if settled.contains(&scheduled.activity_id) {
+            continue;
+        }
         let Some(session_uuid) = scheduled.session_id.map(|id| id.as_uuid()) else {
             continue;
         };
@@ -11550,6 +11557,18 @@ async fn persist_scheduled_activities(
             )
             .await?;
 
+            // Issue #2000: a fork resolves each activity from its record
+            // here. It runs before the session check, which skips each
+            // settled activity.
+            let fork = crate::fork::serve_recorded_activities(
+                conn,
+                exec_id,
+                is_fork,
+                &scheduled_activity_ids(scheduled_activities),
+                &mut race_next_event_id,
+                registry,
+            )
+            .await?;
             // Worker sessions (issue #606): fail any member activity whose
             // session already left ACTIVE, so the workflow observes
             // SessionBroken on its next decision cycle instead of hanging on a
@@ -11559,21 +11578,12 @@ async fn persist_scheduled_activities(
                 exec_id,
                 scheduled_activities,
                 &activity_task_ids,
+                &fork.settled,
                 &mut race_next_event_id,
                 registry.payload_codecs(),
             )
             .await?;
-            // Issue #2000: a recorded fork resolves each activity here. It
-            // runs after the session check, which skips a settled activity.
-            let served_from_fork = crate::fork::serve_recorded_activities(
-                conn,
-                exec_id,
-                is_fork,
-                &scheduled_activity_ids(scheduled_activities),
-                &mut race_next_event_id,
-                registry,
-            )
-            .await?;
+            let served_from_fork = fork.served;
 
             let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
             Ok((
@@ -13960,21 +13970,9 @@ async fn persist_mixed_suspension_batch(
             .await?;
         }
 
-        // Worker sessions (issue #606): fail any member activity whose session
-        // already left ACTIVE so the workflow observes SessionBroken on its next
-        // decision cycle instead of hanging on a task pinned to a dead host.
-        let broken_session_failure = fail_activities_for_broken_sessions(
-            conn,
-            exec_id,
-            &batch.scheduled_activities,
-            &activity_task_ids,
-            &mut next_event_id,
-            registry.payload_codecs(),
-        )
-        .await?;
-        // Issue #2000: a recorded fork resolves each activity here, after the
-        // session check, exactly as on the plain path.
-        let served_from_fork = crate::fork::serve_recorded_activities(
+        // Issue #2000: a fork resolves each activity from its record here,
+        // before the session check, exactly as on the plain path.
+        let fork = crate::fork::serve_recorded_activities(
             conn,
             exec_id,
             crate::fork::is_fork(parent_execution),
@@ -13983,7 +13981,20 @@ async fn persist_mixed_suspension_batch(
             registry,
         )
         .await?;
-        let synthesized_broken_session_failure = broken_session_failure || served_from_fork;
+        // Worker sessions (issue #606): fail any member activity whose session
+        // already left ACTIVE so the workflow observes SessionBroken on its next
+        // decision cycle instead of hanging on a task pinned to a dead host.
+        let broken_session_failure = fail_activities_for_broken_sessions(
+            conn,
+            exec_id,
+            &batch.scheduled_activities,
+            &activity_task_ids,
+            &fork.settled,
+            &mut next_event_id,
+            registry.payload_codecs(),
+        )
+        .await?;
+        let synthesized_broken_session_failure = broken_session_failure || fork.served;
 
         // ── park ────────────────────────────────────────────────────────────
         let deadline = timer_fire_instants

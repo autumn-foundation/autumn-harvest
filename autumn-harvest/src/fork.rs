@@ -1200,8 +1200,14 @@ async fn record_source_is_readable(
 /// once with no query.
 ///
 /// Both histories load inflated, so an offloaded input matches its source.
-/// A source that retention deleted, or that does not decode, has no record.
-/// Recorded mode then fails closed.
+/// A source that retention deleted or erased has no record. Recorded mode
+/// then fails closed. A failed load of the source returns an error, so the
+/// decision rolls back and retries. A transient store fault never becomes a
+/// permanent `ForkEffectUnavailable`.
+///
+/// The caller runs this before the broken-session check and skips each
+/// settled activity there. A recorded fork often carries a session that the
+/// source closed. The record serves its members, not a `SessionBroken`.
 ///
 /// # Errors
 ///
@@ -1213,9 +1219,10 @@ pub(crate) async fn serve_recorded_activities(
     scheduled: &[ActivityExecId],
     next_event_id: &mut i32,
     registry: &HandlerRegistry,
-) -> HarvestResult<bool> {
+) -> HarvestResult<ForkSettlement> {
+    let mut settlement = ForkSettlement::default();
     if !is_fork || scheduled.is_empty() {
-        return Ok(false);
+        return Ok(settlement);
     }
     let codecs = registry.payload_codecs();
     let offloader = registry.payload_offloader();
@@ -1225,14 +1232,12 @@ pub(crate) async fn serve_recorded_activities(
     let source_events = match fork_marker(&fork_events) {
         Some((source_id, _)) if record_source_is_readable(conn, source_id).await? => {
             crate::store::load_history_inflated(conn, source_id, codecs, offloader)
-                .await
-                .map(|history| history.events)
-                .unwrap_or_default()
+                .await?
+                .events
         }
         _ => Vec::new(),
     };
 
-    let mut served = false;
     for activity_id in scheduled {
         let outcome = match resolve_activity(&fork_events, &source_events, *activity_id) {
             ForkResolution::Run => continue,
@@ -1254,6 +1259,9 @@ pub(crate) async fn serve_recorded_activities(
         .execute(conn)
         .await
         .map_err(database_error)?;
+        if cancelled > 0 {
+            settlement.settled.insert(*activity_id);
+        }
         // No open row means that a real outcome exists or is on its way.
         let Some(outcome) = outcome.filter(|_| cancelled > 0) else {
             continue;
@@ -1268,9 +1276,18 @@ pub(crate) async fn serve_recorded_activities(
         )
         .await?;
         *next_event_id = next_event_id.saturating_add(1);
-        served = true;
+        settlement.served = true;
     }
-    Ok(served)
+    Ok(settlement)
+}
+
+/// The activities that the fork record settles in one decision.
+#[derive(Debug, Default)]
+pub(crate) struct ForkSettlement {
+    /// The activities whose task row the record cancelled.
+    pub(crate) settled: std::collections::HashSet<ActivityExecId>,
+    /// True when an outcome was appended. The workflow then needs a wake.
+    pub(crate) served: bool,
 }
 
 #[cfg(test)]

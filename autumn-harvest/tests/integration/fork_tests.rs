@@ -69,7 +69,8 @@ fn lookups(tag: &str) -> u32 {
 }
 
 /// Charges `amount`, then writes a receipt for the charge. With
-/// `"local": true`, it first runs the local activity `fork_lookup`.
+/// `"local": true`, it first runs the local activity `fork_lookup`. With
+/// `"session": true`, it charges in a worker session.
 #[workflow]
 async fn fork_pay_wf(ctx: &WorkflowContext, input: Value) -> Result<Value, String> {
     let queue = ctx.queue_name().to_string();
@@ -78,10 +79,22 @@ async fn fork_pay_wf(ctx: &WorkflowContext, input: Value) -> Result<Value, Strin
             .await
             .map_err(|e| e.to_string())?;
     }
-    let charge = ctx
-        .execute_activity_raw("fork_charge", input.clone(), &queue)
-        .await
-        .map_err(|e| e.to_string())?;
+    let charge = if input["session"] == json!(true) {
+        let session = ctx
+            .create_session(autumn_harvest::context::SessionOptions::new(&queue))
+            .await
+            .map_err(|e| e.to_string())?;
+        let charge = session
+            .execute_activity_raw("fork_charge", input.clone(), &queue)
+            .await
+            .map_err(|e| e.to_string())?;
+        session.complete().await.map_err(|e| e.to_string())?;
+        charge
+    } else {
+        ctx.execute_activity_raw("fork_charge", input.clone(), &queue)
+            .await
+            .map_err(|e| e.to_string())?
+    };
     let receipt = ctx
         .execute_activity_raw("fork_receipt", json!({ "charge": charge }), &queue)
         .await
@@ -138,6 +151,7 @@ impl Running {
     fn start(queue: &str, pool: &DbPool) -> Self {
         let mut config = runtime_config(&format!("w-{queue}"), 2, 2, Duration::from_secs(10));
         config.queues = vec![queue.to_string()];
+        config.max_concurrent_sessions = 2;
         let worker = Arc::new(Worker::new(config, registry()).expect("worker builds"));
         let handle = spawn_test_worker(Arc::clone(&worker), pool.clone());
         Self { worker, handle }
@@ -591,6 +605,38 @@ async fn a_fork_at_a_later_point_carries_the_prefix() {
             .any(|(_, kind, _)| kind == "ActivityCompleted"),
         "the prefix carries the charge result"
     );
+}
+
+/// A recorded fork serves a member of a session that the source closed. The
+/// record settles the member before the broken-session check, so the fork
+/// gets the recorded charge and not `SessionBroken`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recorded_fork_serves_a_member_of_a_closed_session() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("session");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 5, "session": true });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    let running = Running::start(&queue, &pool);
+    let source_row = wait_for_execution_state(&url, source, "COMPLETED").await;
+    running.stop().await;
+    assert_eq!(charges(&queue), 1, "the source charges once");
+
+    let mut at_member = request(ForkEffects::Recorded);
+    at_member.fork_point = Some(ResetPoint::FirstActivityRun {
+        activity_name: "fork_charge".to_string(),
+    });
+    let result = fork_workflow_execution(&mut conn, source, at_member, Some(&registry()))
+        .await
+        .expect("fork succeeds");
+    assert!(result.fork_event_id > 0, "the fork carries the session");
+    let running = Running::start(&queue, &pool);
+    let row = wait_for_execution_state(&url, result.new_exec_id, "COMPLETED").await;
+    running.stop().await;
+
+    assert_eq!(charges(&queue), 1, "the fork never charges");
+    assert_eq!(row.output, source_row.output);
 }
 
 /// A reset of a recorded fork stays a recorded fork. It never runs live.
