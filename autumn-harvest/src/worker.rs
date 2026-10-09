@@ -379,12 +379,19 @@ impl WorkerRuntimeConfig {
         }
         // A fair worker's queues must be names that the weight API accepts
         // (issue #1976). Otherwise no operator could set a weight for their
-        // keys.
+        // keys. The weight routes put the queue in a URL path segment. URL
+        // parsing removes `.` and `..` there, so those names are refused too.
         if self.fairness_keys {
             for queue in &self.queues {
                 crate::queue_pause::validate_queue_name(queue).map_err(|e| {
                     HarvestError::Config(format!("fairness_keys: queue {queue:?}: {e}"))
                 })?;
+                if queue == "." || queue == ".." {
+                    return Err(HarvestError::Config(format!(
+                        "fairness_keys: queue {queue:?} is a URL dot segment, \
+                         which the weight API cannot address"
+                    )));
+                }
             }
         }
         // A degenerate band (min_slots > max_slots, or a configured value
@@ -40802,6 +40809,12 @@ mod tests {
         cfg.fairness_keys = true;
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("fairness_keys"), "{err}");
+        // A URL drops a dot segment, so the weight routes cannot name it.
+        for dots in [".", ".."] {
+            cfg.queues = vec![dots.to_owned()];
+            let err = cfg.validate().unwrap_err();
+            assert!(err.to_string().contains("dot segment"), "{err}");
+        }
         cfg.queues = vec!["shared".to_owned()];
         assert!(cfg.validate().is_ok());
     }

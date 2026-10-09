@@ -129,6 +129,10 @@ mod debugger_tests;
 mod decision_boundary_db_tests;
 #[cfg(feature = "testing")]
 mod decision_boundary_replay_tests;
+#[cfg(feature = "db")]
+mod deep_backlog_fixture_tests;
+#[cfg(feature = "db")]
+mod deep_backlog_support;
 mod delayed_start_tests;
 mod det_check_tests;
 mod determinism_static_analysis_docs;
@@ -215,6 +219,8 @@ mod payload_offload_db_tests;
 mod payload_offload_replay_tests;
 mod performance_docs;
 #[cfg(feature = "db")]
+mod pg_stats_snapshot;
+#[cfg(feature = "db")]
 mod pg_timeouts_tests;
 #[cfg(feature = "db")]
 mod poison_pill_reclaim_perf;
@@ -248,6 +254,7 @@ mod replay_canary_tests;
 mod replay_drift_tests;
 #[cfg(feature = "fuzzing")]
 mod replay_fuzz_seeds;
+mod replay_positioning_docs;
 mod replay_tests;
 #[cfg(feature = "testing")]
 mod replay_verifier_tests;
@@ -304,6 +311,10 @@ mod sla_breach_tests;
 mod slo_pack_docs;
 mod slot_tuner_tests;
 mod sqlite_feasibility_docs;
+mod standalone_activity_docs;
+#[cfg(feature = "db")]
+mod standalone_activity_overhead_perf;
+mod standalone_activity_support;
 #[cfg(feature = "db")]
 mod start_idempotency_tests;
 #[cfg(feature = "db")]

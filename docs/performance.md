@@ -2221,6 +2221,9 @@ from the benchmark are directly comparable.
 * [`docs/performance-task-queue-hygiene.md`](performance-task-queue-hygiene.md) —
   claim latency after 1M terminal task rows, before and after the
   terminal-task janitor and table tuning (issue #1811).
+* [`docs/performance-deep-backlog.md`](performance-deep-backlog.md) — the claim
+  path on a seeded, skewed 1M-row backlog with 10% dead tuples (issue #1956).
+  It measures the depth scaling that issue #1340 left open.
 
 ### Other profiling notes
 
@@ -2428,3 +2431,8 @@ standalone note rather than part of the claim-path attribution table above:
   `derive_timeline` behind `GET /workflows/{id}/timeline` (PR #1894);
   replaced by a manual impl that writes one 128-bit value (instructions
   -8.3%, callgrind).
+* [`docs/performance-standalone-activity-overhead.md`](performance-standalone-activity-overhead.md)
+  — the cost of a one-step workflow against a bare activity (issue #1987).
+  It writes 17 rows per job with a regular activity and 10 with a local
+  activity. A bare task row writes 3, and a modelled standalone job 6.
+  [ADR 0006](adr/0006-standalone-activity.md) records the decision.

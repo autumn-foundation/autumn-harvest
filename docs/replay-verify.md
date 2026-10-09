@@ -1,8 +1,11 @@
 # Gating deploys with replay-verify
 
-`harvest replay-verify` is the CI gate that ensures code changes to `#[workflow]` functions
-do not break in-flight production executions. It batch-replays exported history fixtures
-against the current codebase and exits non-zero on any regression, blocking the merge.
+Replay-verify is the CI gate that ensures code changes to `#[workflow]` functions
+do not break in-flight production executions. You run it from your own binary or test,
+which calls `ReplayVerifier` (see [Quick start](#quick-start-rust-api)). The `harvest` CLI
+has no `replay-verify` subcommand. The `harvest-replay` binary replays one history file
+only. The verifier batch-replays exported history fixtures against the current codebase
+and exits non-zero on any regression, blocking the merge.
 
 ## What it catches — and what it does not
 
@@ -117,7 +120,7 @@ async fn main() {
 
 ## Report formats
 
-Pass `--report <format>` on the CLI or `ReportFormat::<Variant>` in the API:
+Pass `ReportFormat::<Variant>` in the API. A binary that you write can map a `--report <format>` flag to it (see the [GitHub Actions snippet](#complete-github-actions-snippet)):
 
 | Format | Description |
 |--------|-------------|
@@ -136,6 +139,10 @@ Pass `--report <format>` on the CLI or `ReportFormat::<Variant>` in the API:
 | `1` | One or more replay failures (configurable via `--fail-on rate=0.95`) |
 | `2` | One or more harness errors (invalid fixture JSON or unregistered workflow) — dominates over exit 1 |
 
+`CiReport::exit_code` returns `0` for an empty fixture directory. The binary in the
+[GitHub Actions snippet](#complete-github-actions-snippet) exits `2` instead, so an empty
+run cannot pass the gate.
+
 ---
 
 ## `--fail-on` threshold mode
@@ -149,7 +156,7 @@ let ci = report.into_ci_report_with_threshold(0.95); // fail only if < 95% pass
 ```
 
 ```bash
-# CLI (harvest-replay binary or downstream app)
+# The binary from the GitHub Actions snippet below
 my-app replay-verify --fixtures-dir ./fixtures --fail-on rate=0.95
 ```
 
@@ -173,6 +180,60 @@ ReplayVerifier::new()
 ---
 
 ## Complete GitHub Actions snippet
+
+`replay-verify` below is the Quick start binary with three flags added. Replace its
+`main` with this one. It also fails when the directory holds no fixtures, because an
+empty run proves nothing.
+
+```rust
+#[tokio::main]
+async fn main() {
+    let mut fixtures = String::from("./fixtures/replay");
+    let mut format = ReportFormat::Text;
+    let mut min_pass_rate: Option<f64> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(flag) = args.next() {
+        let value = args.next().expect("each flag takes a value");
+        match flag.as_str() {
+            "--fixtures-dir" => fixtures = value,
+            "--report" => {
+                format = match value.as_str() {
+                    "junit" => ReportFormat::JUnit,
+                    "json" => ReportFormat::Json,
+                    "github" => ReportFormat::GitHub,
+                    _ => ReportFormat::Text,
+                }
+            }
+            "--fail-on" => {
+                let rate = value.strip_prefix("rate=").expect("use --fail-on rate=<0..1>");
+                let rate: f64 = rate.parse().expect("rate must be a number");
+                assert!((0.0..=1.0).contains(&rate), "rate must be in 0..=1");
+                min_pass_rate = Some(rate);
+            }
+            other => panic!("unknown flag {other}"),
+        }
+    }
+
+    let report = ReplayVerifier::new()
+        .register(workflows![/* your workflows */])
+        .fixtures_dir(&fixtures)
+        .verify_all()
+        .await;
+    if report.fixtures_total == 0 {
+        eprintln!("no fixtures in {fixtures}");
+        std::process::exit(2);
+    }
+    let ci = match min_pass_rate {
+        Some(rate) => report.into_ci_report_with_threshold(rate),
+        None => report.into_ci_report(),
+    };
+    println!("{}", ci.format_report(format));
+    std::process::exit(ci.exit_code());
+}
+```
+
+The verifier reads one `HistorySnapshot` per file, so the export step splits the batch
+envelope into one file per run.
 
 ```yaml
 # .github/workflows/replay-verify.yml
@@ -198,7 +259,15 @@ jobs:
       #       history export-batch \
       #       --state-group terminal \
       #       --limit 200 \
-      #       --output-file ./fixtures/replay/batch.json
+      #       --payload-policy full \
+      #       --output-file ./batch.json
+      #     # A partial or empty export proves nothing, so fail the gate on it.
+      #     jq -e '.status == "complete" and (.failures | length == 0) and (.exports | length > 0)' ./batch.json
+      #     mkdir -p ./fixtures/replay
+      #     jq -c '.exports[]' ./batch.json | while read -r doc; do
+      #       id=$(jq -r '.execution_id' <<<"$doc")
+      #       printf '%s\n' "$doc" > "./fixtures/replay/$id.json"
+      #     done
 
       - name: Run replay-verify
         run: |
@@ -249,6 +318,9 @@ cargo bench -p autumn-harvest \
   No new key-management surface is introduced by the verifier.
 - **DAG runs:** The verifier covers `#[workflow]`-annotated event histories only. A DAG-level
   verifier is a planned follow-up.
-- **Fixture lifecycle:** The verifier consumes a fixture directory produced by
-  `harvest history export --batch` (issue #169). Fixture rotation, pruning, and
+- **Fixture lifecycle:** The verifier reads a directory of `HistorySnapshot` files.
+  `harvest history export` writes one such file per run (issue #169).
+  `harvest history export-batch` writes one envelope file, so split its `exports`
+  array into one file per run first. A `partial` envelope omits histories, so treat
+  it as a failed export. Fixture rotation, pruning, and
   auto-export-on-merge are deployment concerns outside the verifier's scope.

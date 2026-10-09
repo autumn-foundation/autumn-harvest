@@ -1858,8 +1858,13 @@ async fn upsert_schedule(
             calendar_name: None,
             skip_policy: crate::policy::SkipPolicy::Skip.as_str(),
         };
-        diesel::insert_into(harvest_schedules::table)
+        // A manual trigger and the scheduler can register the same DAG at the
+        // same time. Both find no row, and both insert. The second insert
+        // uses the committed row and does not fail on the unique key (#1959).
+        let inserted_rows = diesel::insert_into(harvest_schedules::table)
             .values(&row)
+            .on_conflict(dsl::dag_name)
+            .do_nothing()
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
@@ -1870,6 +1875,11 @@ async fn upsert_schedule(
             .first(conn)
             .await
             .map_err(crate::error::database_error)?;
+        if inserted_rows == 0 {
+            // The other writer owns this row and sets its `next_run_at`.
+            // A later registration tick reconciles the row.
+            return Ok(inserted);
+        }
         let initial_next_run = next_run_after(dag.schedule.as_ref(), now);
         diesel::update(dsl::harvest_schedules.find(inserted.id))
             .set(dsl::next_run_at.eq(initial_next_run))
