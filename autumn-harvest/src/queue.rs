@@ -3854,7 +3854,7 @@ pub async fn complete_claimed_task(
     claim: &TaskClaim,
     output: serde_json::Value,
 ) -> HarvestResult<ClaimWrite> {
-    complete_task_inner(conn, claim.task_id, Some(claim), output)
+    complete_task_inner(conn, claim, output)
         .await
         .map(claim_write)
 }
@@ -4255,7 +4255,7 @@ pub async fn complete_task(
     claim: &TaskClaim,
     output: serde_json::Value,
 ) -> HarvestResult<()> {
-    if !complete_task_inner(conn, claim.task_id, Some(claim), output).await? {
+    if !complete_task_inner(conn, claim, output).await? {
         return Err(crate::error::HarvestError::NotFound(format!(
             "task queue item {} is not running under this claim",
             claim.task_id
@@ -4265,28 +4265,25 @@ pub async fn complete_task(
     Ok(())
 }
 
+/// The one task completion write. It always takes a claim, so no
+/// completion is unfenced.
 async fn complete_task_inner(
     conn: &mut AsyncPgConnection,
-    task_id: Uuid,
-    claim: Option<&TaskClaim>,
+    claim: &TaskClaim,
     output: serde_json::Value,
 ) -> HarvestResult<bool> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let update = diesel::update(
-        dsl::harvest_task_queue
-            .find(task_id)
-            .filter(dsl::state.eq("RUNNING")),
-    )
-    .set((
-        dsl::state.eq("COMPLETED"),
-        dsl::output.eq(Some(output)),
-        dsl::heartbeat_details.eq(None::<serde_json::Value>),
-        dsl::error.eq(None::<String>),
-        dsl::completed_at.eq(Some(Utc::now())),
-    ))
-    .into_boxed();
-    let updated = fence(update, claim)
+    let update = diesel::update(dsl::harvest_task_queue.find(claim.task_id))
+        .set((
+            dsl::state.eq("COMPLETED"),
+            dsl::output.eq(Some(output)),
+            dsl::heartbeat_details.eq(None::<serde_json::Value>),
+            dsl::error.eq(None::<String>),
+            dsl::completed_at.eq(Some(Utc::now())),
+        ))
+        .into_boxed();
+    let updated = fence(update, Some(claim))
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
