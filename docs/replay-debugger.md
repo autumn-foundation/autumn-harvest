@@ -104,6 +104,12 @@ events: 9
 
 Nine events, three activities, one timer. Now find the interesting one.
 
+A history from a worker with [decision boundaries](decision-boundaries.md)
+(issue #1833) also has `DecisionCommitted` rows. The detail column of each one
+names the build and the worker of that decision, for example
+`decision: build 2026.10.1, worker worker-eu-1`. `replay --step` shows the
+same values under `decision`. Replay skips these rows.
+
 ### 3. Run to a breakpoint
 
 Break on the activity you suspect:
@@ -295,6 +301,9 @@ first divergence at step 3
   right (after.json) event ActivityScheduled [not_replayed]
       open_awaitables: activity fraud_check (opened at 3)
 ```
+
+The diff ignores the build and the worker of a `DecisionCommitted` row. Those
+values change from build to build by design. The event type still compares.
 
 It exits `1` when a divergence is found, mirroring `diff(1)`'s "differences
 found", so it drops straight into a CI pipeline. Both sides render the **value**

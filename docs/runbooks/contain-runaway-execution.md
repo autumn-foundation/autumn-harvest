@@ -251,7 +251,7 @@ Per-execution pause is the **narrowest** containment lever. Reach for it when
 | One specific execution is misbehaving | **This runbook** — `POST /workflows/{id}/pause` |
 | A schedule keeps firing new runs you don't want | Schedule pause (#229): `POST /admin/schedules/{id}/pause` — stops future firings; already-running executions are untouched |
 | New *starts* of a workflow type / queue must stop (deploy freeze, incident) | Admission gates (#377) — reject or defer new starts at the API boundary; in-flight runs are untouched |
-| One activity's downstream dependency is down, fleet-wide — or a paused run's own activity retries are still hammering it | Circuit breaker (#369): `POST /admin/circuits/{activity}/force-open` — fast-fails that activity's dispatch everywhere, immediately. Pause does **not** stop activity claiming or retries (see above), so for immediate downstream relief pair the two. |
+| One activity's downstream dependency is down, fleet-wide — or a paused run's own activity retries are still hammering it | Circuit breaker (#369): `POST /admin/circuits/{activity}/force-open` — stops that activity's dispatch on that process at once (deferred by default, failed in fail-fast mode, #1809). Pause does **not** stop activity claiming or retries (see above), so for immediate downstream relief pair the two. |
 | The run is wedged and must die | Terminate (#504): `POST /workflows/{id}/terminate` |
 
 These compose: during a serious incident it is normal to pause the schedule

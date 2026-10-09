@@ -93,6 +93,8 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_scanner_tick_total",
     "harvest_scanner_pass_total",
     "harvest_db_pool_acquire_timeout_total",
+    "harvest_db_transaction_retry_total",
+    "harvest_db_transaction_retry_exhausted_total",
     "harvest_heartbeat_flush_failed_total",
     "harvest_saga_compensated_total",
     "harvest_saga_compensation_failed_total",
@@ -108,9 +110,11 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_activity_attempts_total",
     "harvest_activity_retries_total",
     "harvest_retry_budget_exhausted_total",
+    "harvest_activity_concurrency_deferred_total",
     "harvest_activity_pause_actions_total",
     "harvest_activity_circuit_tripped_total",
     "harvest_activity_circuit_closed_total",
+    "harvest_activity_circuit_deferred_total",
     "harvest_activity_panic_total",
     "harvest_workflow_panic_total",
     "harvest_timer_started_total",
@@ -137,6 +141,10 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_quota_rejected_total",
     // Automatic load shedding (issue #1794).
     "harvest_load_shed_rejected_total",
+    // Build ramp guard (issue #1814).
+    "harvest_build_ramp_aborted_total",
+    // API rate limiting (issue #1827).
+    "harvest_api_rate_limited_total",
     "harvest_codec_reencrypted_total",
     "harvest_rate_limit_throttled_total",
     "harvest_webhook_received_total",
@@ -204,6 +212,17 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     // series per process).
     "harvest_notify_send_failures",
     "harvest_notify_queue_usage",
+    // Issue #1815 — DB pool, DB op latency, pollers and the outlier signal.
+    "harvest_db_pool_in_use",
+    "harvest_db_pool_idle",
+    "harvest_db_pool_wait_duration_bucket",
+    "harvest_db_pool_wait_duration_count",
+    "harvest_db_pool_wait_duration_sum",
+    "harvest_db_query_duration_bucket",
+    "harvest_db_query_duration_count",
+    "harvest_db_query_duration_sum",
+    "harvest_worker_pollers",
+    "harvest_worker_outlier",
     // Issue #954 — cross-region DR. Four gauges (bare) and one counter.
     "harvest_replication_lag_seconds",
     "harvest_replication_lag_bytes",
@@ -227,6 +246,9 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_rate_limit_tokens_available",
     "harvest_rate_limit_refill_rate",
     "harvest_retry_budget_available",
+    "harvest_activity_concurrency_limit",
+    "harvest_activity_concurrency_in_flight",
+    "harvest_activity_latency_baseline_seconds",
     "harvest_concurrency_in_flight",
     "harvest_concurrency_deferred",
     "harvest_mutex_contention_depth",
@@ -256,11 +278,11 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ),
     (
         "harvest_workflow_duration",
-        &["workflow", "queue", "status"],
+        &["workflow", "queue", "status", "build_id"],
     ),
     (
         "harvest_workflow_terminal",
-        &["workflow", "queue", "outcome"],
+        &["workflow", "queue", "outcome", "build_id"],
     ),
     ("harvest_workflow_history_size", &["workflow_type"]),
     ("harvest_workflow_continue_as_new", &["workflow_type"]),
@@ -270,7 +292,7 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ),
     (
         "harvest_workflow_nondeterministic_block",
-        &["workflow", "queue"],
+        &["workflow", "queue", "build_id"],
     ),
     ("harvest_workflow_cache_hit", &["workflow", "queue"]),
     ("harvest_workflow_cache_miss", &["workflow", "queue"]),
@@ -322,13 +344,18 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     // Scanner election role per tick (issue #1795). Bounded labels.
     ("harvest_scanner_pass", &["scanner", "shard", "role"]),
     ("harvest_db_pool_acquire_timeout", &["site"]),
+    ("harvest_db_transaction_retry", &["site", "reason"]),
+    (
+        "harvest_db_transaction_retry_exhausted",
+        &["site", "reason"],
+    ),
     ("harvest_heartbeat_flush_failed", &["reason"]),
     ("harvest_mutex_wait_duration", &["workflow"]),
     ("harvest_mutex_held_duration", &["workflow"]),
     ("harvest_mutex_contention_depth", &["workflow"]),
     (
         "harvest_activity_duration",
-        &["activity", "queue", "status", "error_type"],
+        &["activity", "queue", "status", "error_type", "build_id"],
     ),
     (
         "harvest_activity_failed",
@@ -336,14 +363,19 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ),
     (
         "harvest_activity_attempts",
-        &["activity", "queue", "outcome"],
+        &["activity", "queue", "outcome", "build_id"],
     ),
     ("harvest_activity_retries", &["activity", "queue"]),
     ("harvest_retry_budget_available", &["activity"]),
     ("harvest_retry_budget_exhausted", &["activity"]),
+    ("harvest_activity_concurrency_limit", &["activity"]),
+    ("harvest_activity_concurrency_in_flight", &["activity"]),
+    ("harvest_activity_latency_baseline_seconds", &["activity"]),
+    ("harvest_activity_concurrency_deferred", &["activity"]),
     ("harvest_activity_pause_actions", &["activity", "action"]),
     ("harvest_activity_circuit_tripped", &["activity_name"]),
     ("harvest_activity_circuit_closed", &["activity_name"]),
+    ("harvest_activity_circuit_deferred", &["activity_name"]),
     ("harvest_activity_panic", &["activity", "queue"]),
     ("harvest_workflow_panic", &["workflow", "queue"]),
     ("harvest_timer_started", &[]),
@@ -357,6 +389,14 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_dispatch_dropped_hints", &[]),
     ("harvest_notify_send_failures", &[]),
     ("harvest_notify_queue_usage", &[]),
+    // Issue #1815. Each label is bounded: shard ids, the `DbOp` and
+    // `OutlierDimension` enums, and configured queue names.
+    ("harvest_db_pool_in_use", &["shard"]),
+    ("harvest_db_pool_idle", &["shard"]),
+    ("harvest_db_pool_wait_duration", &["shard"]),
+    ("harvest_db_query_duration", &["op"]),
+    ("harvest_worker_pollers", &["queue"]),
+    ("harvest_worker_outlier", &["dimension"]),
     // Issue #954 — cross-region DR. All `{shard}`-only: a standby's
     // `application_name` is operator-chosen and unbounded (ADR-0001 §7).
     ("harvest_replication_lag_seconds", &["shard"]),
@@ -410,6 +450,8 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_quota_rejected", &["workflow", "resource"]),
     ("harvest_load_shed_active", &["queue"]),
     ("harvest_load_shed_rejected", &["queue"]),
+    ("harvest_build_ramp_aborted", &["queue", "reason"]),
+    ("harvest_api_rate_limited", &["route_class", "client_kind"]),
     ("harvest_codec_reencrypted", &["shard"]),
     (
         "harvest_payload_bytes",

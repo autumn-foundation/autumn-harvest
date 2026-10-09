@@ -50,7 +50,9 @@ where to look next.
       "active": 4,
       "draining": 0,
       "unhealthy": 0,
-      "total": 4
+      "total": 4,
+      "outliers": [],
+      "outliers_total": 0
     },
     {
       "name": "shards",
@@ -89,6 +91,13 @@ where to look next.
 }
 ```
 
+The `workers` block lists gray failures under `outliers` (issue #1815). Each
+entry names a live worker that fails or slows far more than its peers on the
+same queues, queue weights, build, labels and slots per task kind. It shows the worker's stats and the peer medians. The list holds
+the worst 20, and `outliers_total` gives the full count. Any outlier degrades
+the block with the `worker_outlier` reason code. See
+[harvest_worker_gray_failure](#harvest_worker_gray_failure).
+
 Each subsystem block carries its verdict, its `reason_codes`, its headline
 numbers (flattened into the block), and a `drill_down` path — which is
 populated **only when the subsystem is not `healthy`** and is `null`
@@ -99,7 +108,7 @@ otherwise. The `drill_down` paths are relative to the management-API mount
 
 | Subsystem | Headline metrics | `drill_down` when non-`healthy` |
 |---|---|---|
-| `workers` | `active` / `draining` / `unhealthy` / `total` | `/workers/health` |
+| `workers` | `active` / `draining` / `unhealthy` / `total` / `outliers` / `outliers_total` | `/workers/health` |
 | `shards` | `ready` / `degraded` / `unavailable` | `/admin/shards/health` |
 | `dead_letters` | `total` / `newest_entry_age_secs` | `/dead-letters/aggregate` |
 | `queues` | `max_backlog` / `max_backlog_queue` | `/admin/shards/health` |
@@ -690,6 +699,14 @@ The response distinguishes `matched` (total filtered), `redriven`,
   as `skipped` — never a duplicate side-effect.
 - **Shard-aware.** A filtered redrive fans out across all shards; each row is
   re-enqueued on the shard that owns its `workflow_exec_id`.
+- **Spread, not a burst (issue #1832).** Redrive and bulk replay spread the
+  new tasks' `scheduled_at` over a window. Each task gets a jittered slot. So
+  1000 tasks do not hit the dependency that sent them to the DLQ at one
+  instant. The default window is 60 s for 1000 rows, scaled down for fewer
+  rows (100 rows: 6 s). `--spread-secs N` sets it, up to 3600. `--spread-secs 0`
+  makes every task due at once. The base instant is the database clock.
+  On a sharded cluster, every shard uses the window of the whole call. A
+  completion-callback entry gets its next delivery attempt in the window.
 
 The endpoint backing this is `POST /api/harvest/dlq/redrive` (admin auth,
 audit op `dlq.redrive`).
@@ -1244,8 +1261,9 @@ self-resolves within one evaluation window is expected.
 
 1. If a downstream outage is confirmed, force-open the failing activity's
    circuit breaker (`POST /api/harvest/admin/circuits/{activity}/force-open`)
-   so new sagas fail fast at the first step instead of committing work they
-   will immediately unwind.
+   so new sagas stop at the first step instead of committing work they will
+   immediately unwind. In defer mode they wait in `PENDING`. In fail-fast mode
+   they fail at once.
 2. Pause the schedules or gate the admissions that feed the affected workflow
    type until the downstream recovers.
 3. Let in-flight unwinds run — compensations are idempotent by contract and
@@ -1549,23 +1567,24 @@ stalled (their `stack` shows no forward progress across successive checks).
 
 **What to do when a still-running workflow's history is approaching the hard
 cap:** the `harvest.workflow.history_bloat` counter (issue #704) is an operator
-**early-warning**, distinct from the terminal outcome it precedes. Harvest can
-optionally enforce a hard cap on the number of recorded `harvest_events` an
-in-flight execution may accumulate (`WorkflowHistoryPolicy::event_hard_cap`,
-set once via `HarvestBuilder::history_event_hard_cap` at worker-registry
-construction time — **registry-wide, not per-workflow-type**: `HandlerRegistry`
+**early-warning**, distinct from the terminal outcome it precedes. Harvest
+enforces a hard cap on the number of recorded `harvest_events` an
+in-flight execution may accumulate. The default is 50,000 events (issue
+#1804). Set it with `HarvestBuilder::history_event_hard_cap`
+(`WorkflowHistoryPolicy::event_hard_cap`) at worker-registry
+construction time. The cap is **registry-wide, not per-workflow-type**: `HandlerRegistry`
 stores a single `WorkflowHistoryPolicy`, consulted with no workflow-name
 parameter, so every workflow type registered on that worker shares the
 identical cap and warn fraction; there is no per-type override, and raising or
 lowering either value affects every workflow type that worker serves. Distinct
 from the unrelated fleet-wide `HarvestBuilder::max_workflow_history_events`
 ceiling from issue #493, which is sampled by a separate periodic scanner and
-reported via the `harvest.workflow.history_oversized` gauge). When a hard cap
-is configured,
+reported via the `harvest.workflow.history_oversized` gauge). Unless the cap
+is unlimited,
 the same still-`RUNNING` execution that would eventually hit it is instead
 warned once — the first time its recorded history crosses a configurable
-fraction of that cap (`history_bloat_warn_fraction`, default **75%**,
-`0` disables the signal entirely). The counter increments once per crossing
+fraction of that cap (`history_bloat_warn_fraction`, default **20.48%**, so
+10,240 events under the default cap; `0` disables the signal entirely). The counter increments once per crossing
 per execution (delivery is at-least-once — see the last triage step below);
 the run itself is completely unaffected and keeps executing normally. A
 single decision cycle can also grow history from below the soft threshold
@@ -1587,7 +1606,7 @@ window to act *before* that happens.
    `history_event_count`:
    `harvest workflow list --history-bloat-min-events <threshold>` (or
    `GET /api/harvest/workflows?history_bloat_min_events=<threshold>`). Start
-   with a threshold near the configured hard cap's 75% soft mark and lower it
+   with a threshold near the configured hard cap's 20.48% soft mark and lower it
    if you need to see the full ranked population; every returned row is
    guaranteed non-terminal (`RUNNING`/`PAUSED`), sorted by history size
    descending. This is a DIFFERENT query parameter from the unrelated,
@@ -1637,9 +1656,10 @@ A single crossing for a workflow type known to run long and record many
 events by design (e.g. a long-lived entity workflow deliberately operating
 close to its configured cap) is expected, not an incident — the alert fires
 once per execution and does not repeat unless the execution keeps growing
-past the point already investigated. A worker whose `HandlerRegistry` has no
-`event_hard_cap` configured will show a permanently flat, never-incrementing
-series; that is the disabled/no-op state, not a health signal to chase.
+past the point already investigated. A worker with an unlimited event cap
+(`history_event_hard_cap_unlimited()`) or a warn fraction of `0`
+(`history_bloat_warn_fraction(0.0)`) shows a flat series. That is the
+disabled state, not a health signal.
 
 ### Safe actions
 
@@ -1881,6 +1901,7 @@ own work counters and its `tracing::error!`, not this heartbeat.
 | `schedule` | `Scheduler::spawn_sharded` | Every cron/interval schedule firing |
 | `pause_auto_resume` | `spawn_pause_auto_resumer` | Bounded-pause auto-resume (#383) |
 | `audit_export` | `spawn_audit_export_checker_for_shard` | Audit-record export to the configured SIEM sink (#1269) |
+| `rebalance_resume` | `spawn_rebalance_resume_scanner` | Settles a shard migration that stalled after its cutover (#1839) |
 
 ### Triage steps
 
@@ -1937,7 +1958,8 @@ own work counters and its `tracing::error!`, not this heartbeat.
   API-only pod.
 - **A loop polling slower than the alert window.** The loops do *not* share a
   cadence: `timeout`/`sla`/`external_outbox` poll every 500 ms, `schedule`
-  every 1 s, `poison_pill`/`pause_auto_resume` every 5 s — but `retention`
+  every 1 s, `poison_pill`/`pause_auto_resume`/`rebalance_resume` every 5 s —
+  but `retention`
   polls **hourly** by default. That is why the shipped rule carries two
   expressions with different windows; a single 5-minute window would page
   continuously on a perfectly healthy retention janitor. Retune both if you
@@ -2033,7 +2055,8 @@ own work counters and its `tracing::error!`, not this heartbeat.
   `scanner_liveness` check, which needs no gate because it knows what is
   registered.
 - **Not a false positive: one wedged shard.** A multi-shard worker spawns a
-  `timeout`, `poison_pill`, and `pause_auto_resume` loop **per assigned shard**,
+  `timeout`, `poison_pill`, `pause_auto_resume` and `rebalance_resume` loop
+  **per assigned shard**,
   all under one `scanner` label. Both surfaces handle this, and both have to:
   the counter carries a bounded **`shard`** label (the shard id, or `none` for
   the process-wide `retention`/`schedule` loops and single-shard deployments),
@@ -2818,8 +2841,9 @@ the count never decays on its own.
 
 ### Safe actions
 
-- Restart the fenced workers against the region that currently holds authority,
-  with `dr_fencing` still enabled. They pin the current epoch at startup.
+- Restart the fenced workers against the region that currently holds authority.
+  The default `Auto` fencing mode finds the generation row, so they fence
+  again and pin the current epoch at startup.
 - If the fence was a mistake, the recovery is still to **restart the fleet**.
   Generations only go up; there is no un-bump, and bumping again does not undo
   anything — it fences the fleet a second time.
@@ -2884,9 +2908,10 @@ mutually exclusive and neither can fire on a stale reading.
 
 - A single tick during a role change or a failover, where the connection is
   re-established as a different role. The `for: 10m` window covers that.
-- A deployment that has not enabled DR at all but did enable `dr_fencing`: the
-  sampler runs and finds nothing to read. Silence this shard explicitly rather
-  than letting it become background noise.
+- A deployment that has not configured DR at all but set
+  `with_dr_fencing(true)`: the sampler runs and finds nothing to read.
+  Silence this shard explicitly rather than letting it become background
+  noise.
 
 ### Safe actions
 
@@ -3368,6 +3393,215 @@ Escalate when the queue usage keeps rising after the long transactions
 end, or when it reaches `1` and `harvest.notify.send_failures` climbs.
 Escalate to the database owner first, because the queue is a
 database-wide resource that other applications can also fill.
+
+## harvest_worker_gray_failure
+
+**What to do when one worker is alive but sick:** the gauge
+`harvest.worker.outlier{dimension}` reads `1` on a worker that fails a far
+higher share of tasks than its peers. It also reads `1` on a worker with a
+far higher p99 task latency (issue #1815). The worker still heartbeats, so
+`/workers/health` shows it as healthy. Huang et al. (HotOS'17) call this a
+gray failure.
+
+Each worker keeps a window of its own task outcomes. The window holds the
+last 5 minutes and at most 1024 tasks. A busy worker therefore covers less
+than 5 minutes. A worker whose heartbeat interval is longer than 150 seconds
+keeps two heartbeat intervals instead, so every outcome reaches a snapshot. The liveness heartbeat writes a snapshot to
+`harvest_worker_task_stats` on every shard. Each heartbeat then compares
+the worker with its peers. It merges the peers from all the worker's
+shards, so every heartbeat sees the same peers. If one shard fails, a
+healthy shard keeps the verdict live. When two workers in one process share a metrics recorder,
+the gauge reads `1` when either worker is an outlier.
+
+The peers are the live, `Active` workers that poll the same queues with the
+same `queue_weights`, on the same build with the same labels, and with the
+same `max_concurrent_workflows` and `max_concurrent_activities`. The build id is the
+only code identity in the key. Workers without one share a cohort across code
+versions that register the same names, so set `build_id` for a rolling
+deployment. A worker with
+a slot tuner is keyed on the tuner's band, its initial target per kind and
+the tuner's `policy()` instead, because the tuner sizes its slots from there. Session capacity counts
+too, because session member activities are pinned to the session's host. So do
+`priority_aging_secs` and the activities the worker's labels make it
+ineligible for, because the claim query orders and filters tasks by them. So
+do the shards and the registered handlers, because a task without a handler is
+released and never counts. So do the circuit-breaker policies, because an
+activity with a breaker skips the claim-time rate-limit gate. The open state
+of a breaker is left out, because it is the worker's own health. So does the
+dispatch route on each shard, because a dispatch channel ignores
+`queue_weights` and the Postgres claim applies them. So do the retry-budget policies, because a
+tighter budget defers more retries. So do the adaptive-limit policies, because a
+saturated activity type is left out of the claim. So do the outcome window and the peer
+freshness limit, which both follow `worker_heartbeat_interval`. Workers with
+two intervals would compare two time ranges. So do the workflow cache
+settings (`sticky_timeout`, `workflow_cache_size`, `resident_workflows`), the
+task budgets (`workflow_task_timeout`, `max_local_activity_start_to_close`)
+and the quarantine limits (`workflow_panic_max_attempts`,
+`poison_pill_threshold`). So does `cancellation_grace_period`: a timed-out
+activity that ignores its cancellation runs that long before the timeout is
+recorded. So does `dr_fencing`: a fenced worker checks its shard generation
+in each claim query and before each history persist. So do the payload caps, the history policy, the
+payload offloader, the registered payload codecs and default codec, the
+registered and active codec keys, the activity interceptor chain
+and each activity's own caps, rate and concurrency limits and WASM binding.
+So do the defaults a local activity runs with, because it has no task row,
+the hot-code-swap module host's policy, each workflow's input cap, DAG
+classification and quota, the declarative query and update handlers, and the workflow
+log policy. Each heartbeat reads the codec keys afresh, because a reload can
+register, retire or activate one. A
+worker with the cache off replays full histories, a shorter budget times out
+tasks that its peers finish, and a smaller result cap fails results that its
+peers return. Those
+decide which tasks a worker can claim, and in
+which mix under load. So workers of two sizes are two cohorts. A worker on a
+slow queue is not compared with workers on a fast queue. A worker that favours
+a bulk queue is not compared with one that favours an interactive queue.
+During a rolling deployment, each build is its own cohort. A GPU worker that
+takes capability-routed tasks is not compared with a CPU worker. Each
+heartbeat reads only its own cohort. `GET /admin/status` runs the same
+comparison over every shard. It keeps each cohort's rows for that cohort's
+own freshness limit, as the cohort's heartbeat does. It lists the worst 20 outliers under
+`workers.outliers`, and `workers.outliers_total` gives the full count.
+
+The rule flags a failure ratio at least 20 points above the peer median. That
+ratio must also be at least twice the median. The rule flags a p99 latency
+at least 3 times the peer median. That p99 must also be at least 100 ms above
+the median. A worker needs 20 tasks in its window, and 2 such peers, before
+it is judged.
+
+### Triage steps
+
+1. Read `workers.outliers` from `GET /api/harvest/admin/status`. Each entry
+   names the worker, the dimensions, its own stats and the peer medians.
+2. Match the alert `instance` label to that worker id and host. One process
+   can run more than one worker, so check every worker on that instance.
+3. On the dashboard, open **Database pool, queries & pollers → Worker
+   outliers**. Compare the worker with its peers over the last hour.
+4. Read the worker's logs for `task execution failed` and for activity
+   errors. Check its host for CPU steal, memory pressure, disk errors and
+   network faults.
+
+### Likely causes
+
+- The host is degraded: noisy neighbor, failing disk, low memory or a bad
+  network path to a downstream service.
+- The worker runs a different build or configuration from its peers.
+- A local resource is broken, such as an expired credential, a full temp
+  directory or an exhausted file-descriptor limit.
+
+### False positives
+
+Workers that poll the same queues can still get different work. For
+example, one tenant's slow tasks can land on one worker for a while. A short
+burst on a lightly loaded worker can also flag it for a few minutes. The
+`for: 10m` clause covers most of these. A draining worker reads `0`.
+
+### Safe actions
+
+- Drain the worker with `POST /api/harvest/workers/{id}/drain`. Its peers
+  take over the queue, and in-flight tasks finish or retry.
+- Replace the host or restart the worker after the drain.
+- Do not restart the whole fleet. A healthy fleet does not need it, and a
+  fleet-wide fault does not fire this rule.
+
+### Escalation criteria
+
+Escalate when the outlier stays after a drain and a restart on a fresh host.
+Also escalate when more workers become outliers one after another. A spread
+like that points to a rollout or a shared dependency, not to one host.
+
+## harvest_db_pool_wait_high
+
+**What to do when callers wait for a database connection:** the histogram
+`harvest.db.pool.wait_duration{shard}` times each `pool.get()` on the claim
+path, the timeout scanner and the activity heartbeat flush (issue #1815). A
+high p99 means the worker pool is too small for the load. It can also mean
+that slow queries hold connections too long.
+
+### Triage steps
+
+1. On the dashboard, open **Database pool, queries & pollers**. Read **DB
+   pool connections in use / idle** for the same shard. Series C shows the
+   fewest idle connections on one replica. A value near `0` confirms that a
+   pool is exhausted.
+2. Read **DB operation latency p99 by op**. A slow op holds its connection
+   longer, so slow queries and pool waits often rise together.
+3. Count connections on the database:
+   `SELECT state, count(*) FROM pg_stat_activity GROUP BY state;`.
+4. Compare the pool size with the worker's slot counts. Each in-flight task
+   can hold a connection.
+
+### Likely causes
+
+- The worker pool size, `HarvestPoolConfig::worker_pool_size` per shard, is
+  smaller than the worker's concurrency needs.
+- Slow queries or lock waits hold connections for longer than usual.
+- A connection leak in an activity that calls `run_transactional` and does
+  not finish.
+- The database limits connections, so the pool cannot grow.
+
+### False positives
+
+A short spike during a worker start, while the pool opens its first
+connections. The `for: 10m` clause covers it.
+
+### Safe actions
+
+- Raise the worker pool size within the database `max_connections` budget.
+- Lower `max_concurrent_activities` on the worker so it asks for fewer
+  connections at once.
+- Fix the slow query first when **DB operation latency** is also high.
+
+### Escalation criteria
+
+Escalate to the database owner when the database is at `max_connections`.
+Also escalate when the wait stays high after the pool grows and the queries
+are fast.
+
+## harvest_db_query_latency_high
+
+**What to do when hot-path database operations are slow:** the histogram
+`harvest.db.query.duration{op, shard}` times four ops (issue #1815). They
+are one claim, one workflow-task persist transaction, one timeout-scanner
+pass and one activity heartbeat write. Each op is a unit of work, not one SQL
+statement. The rule watches `claim` and `persist`, because they set
+throughput. It keeps the `instance` and `shard` labels, so one slow replica,
+or one slow shard of a multi-shard worker, fires it alone.
+
+### Triage steps
+
+1. Find the slow op on **DB operation latency p99 by op**. When only one
+   instance fires, check that replica's network path and its pool first.
+2. List long-running statements:
+   `SELECT pid, wait_event_type, wait_event, now() - query_start AS age, query FROM pg_stat_activity WHERE state <> 'idle' ORDER BY age DESC LIMIT 20;`.
+3. Look for lock waits on `harvest_task_queue` and
+   `harvest_workflow_executions`.
+4. Check the database host for CPU, IO and replication load.
+
+### Likely causes
+
+- The database is saturated on CPU or IO.
+- A long transaction or a migration holds locks on a hot table.
+- Table bloat or a missing index after a large backlog.
+- A large history makes each persist transaction write more rows.
+
+### False positives
+
+A scan pass is long by design and is not part of this rule. A claim can be
+slow for a few minutes after a large backlog lands. The `for: 10m` clause
+covers it.
+
+### Safe actions
+
+- End the transaction that blocks a hot table. Prefer a graceful restart of
+  its owner over `pg_terminate_backend`.
+- Run `VACUUM (ANALYZE)` on a bloated queue table.
+- Lower worker concurrency to cut database load while the cause is fixed.
+
+### Escalation criteria
+
+Escalate to the database owner when the latency stays high with no blocking
+transaction. Also escalate when the database host is saturated.
 
 ## harvest_slo_workflow_task
 

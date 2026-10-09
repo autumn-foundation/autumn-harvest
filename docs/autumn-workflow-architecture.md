@@ -5,7 +5,7 @@
 *Version 0.1 — Draft*
 *March 2026*
 
-**Release status note (0.6.0):** DAG scheduling, signals, queries, the
+**Release status note (0.7.0):** DAG scheduling, signals, queries, the
 management API, dead-letter list/replay endpoints, durable workflow
 cancellation, pause/resume controls, DLQ aggregation, DAG retry from failed
 nodes, timezone-aware cron schedules, scaling signals, and metrics endpoints
@@ -1029,7 +1029,7 @@ Autumn Harvest uses Postgres as the task queue. No external broker (Redis, Rabbi
 
 **When Postgres is not enough:** the optional `autumn-harvest-redis` crate supplies a Redis Streams **dispatch channel**, wired into the worker by issue #1312. Postgres stays the source of truth. Every `harvest_task_queue` row, every claim gate, and the whole history write path are unchanged. The channel carries only a small reference to a claimable row: task id, queue, and due time. A worker reads a reference, claims the named row in Postgres with the full existing claim predicate, and then acks the reference. The claim commit is the only Postgres write the reference exists to trigger, so the ack follows that commit immediately. A reconcile sweep republishes due `PENDING` rows on a fixed interval. That sweep is the durability floor: a lost reference, a dropped hint, and a Redis restart all converge through it. When Redis is unreachable the worker falls back to the Postgres claim path for that iteration, so availability equals the Postgres-only path. That fallback covers the running state, not boot: a configured URL that cannot connect fails startup in every mode, with an error naming the endpoint. Turn the channel on with `[harvest.redis] url` and the `redis` cargo feature of `autumn-harvest-plugin`. Leave the URL unset and nothing changes. See [`docs/operations/redis-dispatch.md`](operations/redis-dispatch.md).
 
-**v1 limits.** Single-shard runtimes only: `HarvestRunner::start` rejects a configured URL before it installs the channel when the runtime resolves more than one shard pool, and `Worker::new` repeats the check. Config validation cannot enforce this, because it does not see the resolved pool. One Redis instance only: the keys carry no Cluster hash tags. This release carries no TLS transport: a `rediss://` URL is rejected at startup (issue #1429 tracks TLS), and a plain `redis://` URL sends the password in cleartext. Priority order and sticky affinity degrade to best effort, because a stream delivers in publish order and only the reconcile sweep publishes in priority order.
+**v1 limits.** Single-shard runtimes only: `HarvestRunner::start` rejects a configured URL before it installs the channel when the runtime resolves more than one shard pool, and `Worker::new` repeats the check. Config validation cannot enforce this, because it does not see the resolved pool. One Redis instance only: the keys carry no Cluster hash tags. A `rediss://` URL connects over TLS and verifies the server (issue #1834). A plain `redis://` URL sends the password in cleartext. Priority order and sticky affinity degrade to best effort, because a stream delivers in publish order and only the reconcile sweep publishes in priority order.
 
 **Numbers, and what they do not yet say.** The *standalone* adapter throughput is measured in [`docs/assays/0001-redis-adapter-throughput-ceiling.md`](assays/0001-redis-adapter-throughput-ceiling.md): draining a 1,000-entry backlog with 8 claim-only workers averaged 12,004 claims/sec across three runs. That number is *not* a matched comparison against the Postgres figure above — two attempts at matching the workload shape (queue topology, drain fraction, backlog depth held roughly constant) both turned out to miss how `docs/performance.md`'s own harness actually works, so no multiplier is reported. A narrower, artificially-constrained sub-question that assay separately posed — an always-near-empty queue at exactly 8 concurrent workers — did miss 10,000/sec (~8,760 mean); see the report for why that is not the same finding. Neither figure measures the wired path, which also pays a Postgres claim per reference. The deployment-shaped number is now measured in [`docs/assays/0008-redis-dispatch-integrated-throughput.md`](assays/0008-redis-dispatch-integrated-throughput.md): the integrated path sustained a mean **173.04 completed tasks/sec** draining a 10,000-workflow backlog on the four-core reference machine, where the same worker pool on the Postgres claim path completed **zero** task rows in the same window. That assay is a **kill** on the founding line. Redis dispatch delivers a large measured multiplier over the Postgres path at a deep backlog, not 10,000 tasks/sec, and its dispatch-latency p99 at that pace (426.96 ms) misses the assay's 250 ms line as well.
 
@@ -1137,9 +1137,14 @@ Four distinct timeouts, matching Temporal's model:
 | Timeout | What it measures | Default | Effect on failure |
 |---------|-----------------|---------|-------------------|
 | **Schedule-to-Start** | Time from task enqueued to worker claiming it | None (unlimited) | Task marked `TIMED_OUT`, NOT retried (requeuing to same queue would repeat the problem) |
-| **Start-to-Close** | Time from worker claiming task to completion | 5 minutes | Task marked `TIMED_OUT`, retried per policy |
-| **Heartbeat** | Time between consecutive heartbeats from the activity | None (disabled unless set) | Task marked `TIMED_OUT`, retried per policy |
+| **Start-to-Close** | Time from worker claiming task to completion | 10 minutes (`DEFAULT_ACTIVITY_START_TO_CLOSE`) | Attempt ends and retries per policy (row back to `PENDING`). The last attempt appends `ActivityTimedOut`, and the row becomes `FAILED` |
+| **Heartbeat** | Time between consecutive heartbeats from the activity | None (disabled unless set) | Same as start-to-close |
 | **Schedule-to-Close** | Total time from enqueue to final completion (across all retries) | None (unlimited) | Task and all retries cancelled |
+
+[ADR 0005](adr/0005-activity-timeout-retry-and-open-circuit.md) records the
+retry rule and how the code applies it (issue #1809). A retried timeout appends
+no event. Only the last attempt appends `ActivityTimedOut`. A timeout feeds the
+circuit breaker only when the attempt's handler started.
 
 The scheduler enforces timeouts by running a periodic check (every 10 seconds):
 
@@ -1737,6 +1742,6 @@ Harvest's value proposition is operational simplicity: one Rust binary, one Post
 
 1. **Workflow versioning.** When a workflow's code changes while executions are in-flight, replay will fail due to non-determinism. Temporal solves this with versioning APIs (`workflow.GetVersion()`). Harvest needs an equivalent — likely a `ctx.version("change-id", min_version, max_version)` call that records version markers in the event history.
 
-2. **Multi-tenancy.** Should Harvest support namespace isolation (like Temporal namespaces) for multi-tenant deployments? Initial answer: no, keep it simple. Namespaces can be added later by prefixing all table queries with a `namespace` column.
+2. **Multi-tenancy.** Should Harvest support namespace isolation (like Temporal namespaces) for multi-tenant deployments? Initial answer: no, keep it simple. Namespaces can be added later by prefixing all table queries with a `namespace` column. Resolved by [ADR 0004](adr/0004-tenant-isolation-cells.md) (issue #1837): no namespaces; isolate a tenant in a cell instead.
 
 3. **Exactly-once semantics.** Activity execution is at-least-once by design (retries after failure). For operations that must not be duplicated (e.g., charging a credit card), users must implement idempotency keys in their activity code. Should Harvest provide built-in idempotency key management? Initial answer: provide a `ctx.idempotency_key()` helper that generates a deterministic key from the workflow ID + activity ID + attempt number, but leave enforcement to the activity implementation.

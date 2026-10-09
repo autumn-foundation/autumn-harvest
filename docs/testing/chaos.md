@@ -293,7 +293,8 @@ restart therefore does not change any URL. These tests ignore
 shared database.
 
 Workers use a 500 ms heartbeat, so the lease TTL (the stale threshold) is 1 s.
-The latency test is the exception, see the known bugs below.
+The latency test also raises the workflow-task budget to 60 s, because a
+decision cycle takes more than 10 s at that latency.
 
 | Scenario | Test | Fault | Proof the fault landed |
 |---|---|---|---|
@@ -336,31 +337,40 @@ event, an `ActivityCompleted`.
 
 **Known bugs.** The tests found four bugs:
 
-- #1871: the worker does not retry the activity result write after a DB
-  error. The result is lost, and only `start_to_close` recovers the task.
-- #1870: a `StartToClose` timeout ignores the retry policy and fails the
-  workflow.
+- #1871: the worker did not retry the activity result write after a DB
+  error. The result was lost, and only `start_to_close` recovered the task.
+  #1788 fixed #1871 for a session that the server ends. The worker now
+  writes the result again, up to 10 times, and gets a new connection after
+  a lost one.
+- #1870: a `StartToClose` timeout ignored the retry policy and failed the
+  workflow. #1809 and #1870 fixed it. A timeout with attempts left now starts
+  a new attempt.
 - #1876: Postgres keeps the open transaction of a partitioned worker until
   TCP keepalive ends the session. That transaction keeps its row locks.
-  Orphan reclaim blocks on such a lock, so no orphan is reclaimed.
-- #1879: the heartbeat period is the interval plus the tick latency. When a
-  tick takes longer than one interval, a live worker looks dead. False
-  reclaims then count crash strikes and quarantine healthy work.
+  Orphan reclaim blocked on such a lock, so no orphan was reclaimed. The
+  #1876 fix makes reclaim skip a locked row and reclaim the other rows.
+- #1879: the heartbeat period was the interval plus the tick latency. When a
+  tick took longer than one interval, a live worker looked dead. False
+  reclaims then counted crash strikes and quarantined healthy work. The fix
+  makes the heartbeat fixed-rate. The reclaimer also holds the last strike
+  until it confirms the death of the worker.
 
 Each test works around a bug only where the bug applies:
 
-- #1871 and #1870 turn a lost result write into `FAILED` after one
-  `StartToClose` timeout. The rolled-back append test requires that outcome,
-  so a fix for the bugs makes the test fail on purpose. The restart test
-  accepts it, but only for workflows with an activity that the old Postgres
-  instance claimed. Each accepted `FAILED` must have the exact history: one
-  activity terminal event, a `StartToClose` timeout, and one terminal event,
-  a `WorkflowFailed` for the timeout.
-- For #1876, the partition test sets `idle_in_transaction_session_timeout =
-  5s` on the server to end the session.
-- For #1879, the latency test uses a 2 s heartbeat. A decision cycle also
-  takes more than 10 s at that latency, so it keeps the default 60 s
-  workflow-task budget.
+- Both append tests require `COMPLETED`, with one attempt of the activity.
+  The rolled-back test pins the #1871 fix: the worker writes the result
+  again, and the handler does not run again. With the repeat turned off, the
+  worker gives the claim back and a second attempt runs. Only the attempt
+  check fails. In the ack-lost test, the commit landed, so the repeat must
+  change nothing.
+- A result write reaches the `StartToClose` timeout when its repeats and
+  the claim give-back all fail. A crash restart can cause that. The retry
+  policy then starts a new attempt (#1870), so the restart test requires
+  `COMPLETED` for every workflow.
+- The partition test sets `idle_in_transaction_session_timeout = 5s` on the
+  server. This setting is no longer a #1876 workaround. A row that the
+  cut-off session locks stays locked until the session ends. The 5 s limit
+  ends that session within the test budget, so the setting stays.
 
 When a fix for a bug merges, remove its workaround.
 

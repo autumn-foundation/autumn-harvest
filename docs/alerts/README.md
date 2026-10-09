@@ -57,9 +57,20 @@ Harvest metric names that are expected after Prometheus normalization:
 | `harvest.workflow.task_timeout` | `harvest_workflow_task_timeout_total` |
 | `harvest.canary.success` | `harvest_canary_success_total` |
 | `harvest.canary.failure` | `harvest_canary_failure_total` |
+| `harvest.db.pool.in_use` / `harvest.db.pool.idle` | `harvest_db_pool_in_use`, `harvest_db_pool_idle` |
+| `harvest.db.pool.wait_duration` | `harvest_db_pool_wait_duration_count`, `harvest_db_pool_wait_duration_sum`, `harvest_db_pool_wait_duration_bucket` |
+| `harvest.db.query.duration` | `harvest_db_query_duration_count`, `harvest_db_query_duration_sum`, `harvest_db_query_duration_bucket` |
+| `harvest.worker.pollers` | `harvest_worker_pollers` |
+| `harvest.worker.outlier` | `harvest_worker_outlier` |
+
+A `_bucket` series exists only with the metrics-rs Prometheus exporter and
+configured bucket boundaries. The built-in scrape endpoint renders `_count`
+and `_sum` only. Each #1815 latency rule therefore ships a bucket-less
+average fallback expression.
 
 Use only bounded labels from ADR-0001/#138: `workflow`, `activity`, `queue`,
-`status`, `shard`, `kind`, `name`, and `reason`. Never use `execution.id`,
+`status`, `shard`, `kind`, `name`, and `reason`. Issue #1815 adds `op` and
+`dimension`, both bounded by an enum. Never use `execution.id`,
 `harvest.execution.id`, raw workflow IDs, task IDs, payload values, tenant IDs,
 or user IDs as metric labels. Those belong in traces, logs, or API payloads.
 

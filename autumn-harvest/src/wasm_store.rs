@@ -107,6 +107,11 @@ pub struct WasmActivityRegistration {
     pub capabilities: WasmCapabilities,
     /// Per-invocation resource budget.
     pub limits: WasmLimits,
+    /// Hex Ed25519 publisher signature over this module (issue #1838).
+    ///
+    /// Required when the builder has a trusted publisher key. See
+    /// [`crate::wasm_signing`].
+    pub signature: Option<String>,
 }
 
 impl WasmActivityRegistration {
@@ -124,7 +129,16 @@ impl WasmActivityRegistration {
             schedule_to_close: None,
             capabilities: WasmCapabilities::default(),
             limits: WasmLimits::default(),
+            signature: None,
         }
+    }
+
+    /// Attach the publisher signature from
+    /// [`crate::wasm_signing::sign_wasm_module`].
+    #[must_use]
+    pub fn with_signature(mut self, signature: impl Into<String>) -> Self {
+        self.signature = Some(signature.into());
+        self
     }
 
     /// Route this activity's tasks to `queue`.
@@ -413,6 +427,28 @@ pub async fn publish_wasm_module(
     activity_name: &str,
     bytes: &[u8],
 ) -> HarvestResult<String> {
+    publish_signed_wasm_module(conn, activity_name, bytes, None, None).await
+}
+
+/// Publish like [`publish_wasm_module`], and store a publisher `signature`
+/// (issue #1838).
+///
+/// With a `policy`, the signature must verify before anything is written, and
+/// it then replaces a stored one. Without a `policy`, a signature only fills a
+/// row that has none. So an unverified signature never replaces a valid one.
+/// A republish without a signature keeps the stored one.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Config`] for an oversized blob or a
+/// refused signature, or `HarvestError::Database` on any transaction failure.
+pub async fn publish_signed_wasm_module(
+    conn: &mut diesel_async::AsyncPgConnection,
+    activity_name: &str,
+    bytes: &[u8],
+    signature: Option<&str>,
+    policy: Option<&crate::wasm_signing::WasmTrustPolicy>,
+) -> HarvestResult<String> {
     use diesel_async::{AsyncConnection, RunQueryDsl};
 
     if bytes.len() > MAX_WASM_MODULE_BYTES {
@@ -424,6 +460,15 @@ pub async fn publish_wasm_module(
     }
 
     let hash = WasmModuleStore::compute_hash(bytes);
+    if let Some(policy) = policy {
+        policy
+            .verify(activity_name, &hash, signature)
+            .map_err(|e| {
+                crate::error::HarvestError::Config(format!(
+                    "wasm module for activity '{activity_name}' was refused: {e}"
+                ))
+            })?;
+    }
     let hash_for_txn = hash.clone();
     let name = activity_name.to_owned();
 
@@ -456,12 +501,21 @@ pub async fn publish_wasm_module(
                 activity_name: &name,
                 wasm_bytes: bytes,
                 active: true,
+                signature,
             };
             diesel::insert_into(m::harvest_wasm_modules)
                 .values(&new_row)
                 .on_conflict((m::hash, m::activity_name))
                 .do_update()
-                .set((m::active.eq(true), m::published_at.eq(diesel::dsl::now)))
+                .set((
+                    m::active.eq(true),
+                    m::published_at.eq(diesel::dsl::now),
+                    m::signature.eq(diesel::dsl::sql::<
+                        diesel::sql_types::Nullable<diesel::sql_types::Text>,
+                    >(signature_upsert_sql(
+                        policy.is_some(),
+                    ))),
+                ))
                 .execute(conn)
                 .await
                 .map_err(database_error)?;
@@ -504,6 +558,26 @@ pub async fn seed_wasm_module(
     activity_name: &str,
     bytes: &[u8],
 ) -> HarvestResult<String> {
+    seed_signed_wasm_module(conn, activity_name, bytes, None, None).await
+}
+
+/// Seed like [`seed_wasm_module`], and store a publisher `signature`
+/// (issue #1838).
+///
+/// A signature that `policy` verifies replaces a stored one. So a module
+/// re-signed after a key rotation runs again. Any other signature only fills
+/// a row that has none.
+///
+/// # Errors
+///
+/// As [`seed_wasm_module`].
+pub async fn seed_signed_wasm_module(
+    conn: &mut diesel_async::AsyncPgConnection,
+    activity_name: &str,
+    bytes: &[u8],
+    signature: Option<&str>,
+    policy: Option<&crate::wasm_signing::WasmTrustPolicy>,
+) -> HarvestResult<String> {
     use diesel_async::{AsyncConnection, RunQueryDsl};
 
     if bytes.len() > MAX_WASM_MODULE_BYTES {
@@ -515,6 +589,8 @@ pub async fn seed_wasm_module(
     }
 
     let hash = WasmModuleStore::compute_hash(bytes);
+    let verified = signature.is_some()
+        && policy.is_some_and(|policy| policy.verify(activity_name, &hash, signature).is_ok());
     let hash_for_txn = hash.clone();
     let name = activity_name.to_owned();
 
@@ -539,6 +615,7 @@ pub async fn seed_wasm_module(
                 activity_name: &name,
                 wasm_bytes: bytes,
                 active: false,
+                signature,
             };
             diesel::insert_into(m::harvest_wasm_modules)
                 .values(&new_row)
@@ -547,6 +624,24 @@ pub async fn seed_wasm_module(
                 .execute(conn)
                 .await
                 .map_err(database_error)?;
+            if let Some(signature) = signature {
+                let row = m::harvest_wasm_modules
+                    .filter(m::hash.eq(&hash_for_txn))
+                    .filter(m::activity_name.eq(&name));
+                if verified {
+                    diesel::update(row)
+                        .set(m::signature.eq(signature))
+                        .execute(conn)
+                        .await
+                        .map_err(database_error)?;
+                } else {
+                    diesel::update(row.filter(m::signature.is_null()))
+                        .set(m::signature.eq(signature))
+                        .execute(conn)
+                        .await
+                        .map_err(database_error)?;
+                }
+            }
 
             // 2. Activate the seeded version ONLY when no active version exists
             //    for this name. Under the advisory lock the `NOT EXISTS` guard
@@ -587,12 +682,25 @@ pub async fn seed_wasm_module(
 /// Returns the first seed failure (oversized blob or database error).
 pub async fn seed_registered_wasm_modules(
     conn: &mut diesel_async::AsyncPgConnection,
-    registrations: &[(String, Vec<u8>)],
+    registrations: &[(String, Vec<u8>, Option<String>)],
+    policy: Option<&crate::wasm_signing::WasmTrustPolicy>,
 ) -> HarvestResult<()> {
-    for (name, bytes) in registrations {
-        seed_wasm_module(conn, name, bytes).await?;
+    for (name, bytes, signature) in registrations {
+        seed_signed_wasm_module(conn, name, bytes, signature.as_deref(), policy).await?;
     }
     Ok(())
+}
+
+/// The SQL for the stored signature on an upsert conflict (issue #1838).
+///
+/// A verified signature replaces the stored one. An unverified one only fills
+/// an empty column.
+const fn signature_upsert_sql(verified: bool) -> &'static str {
+    if verified {
+        "COALESCE(excluded.signature, harvest_wasm_modules.signature)"
+    } else {
+        "COALESCE(harvest_wasm_modules.signature, excluded.signature)"
+    }
 }
 
 /// Resolve the active module **hash** for `activity_name`, if any (issue #965).
@@ -617,6 +725,33 @@ pub async fn resolve_active_wasm_hash(
         .order(m::published_at.desc())
         .select(m::hash)
         .first::<String>(conn)
+        .await
+        .optional()
+        .map_err(database_error)
+}
+
+/// Resolve the active module hash and its publisher signature for
+/// `activity_name`, if any (issue #1838).
+///
+/// Never selects the bytes.
+///
+/// # Errors
+///
+/// Returns `HarvestError::Database` on failure.
+pub async fn resolve_active_wasm_version(
+    conn: &mut diesel_async::AsyncPgConnection,
+    activity_name: &str,
+) -> HarvestResult<Option<(String, Option<String>)>> {
+    use diesel::OptionalExtension as _;
+    use diesel_async::RunQueryDsl;
+
+    use crate::schema::harvest_wasm_modules::dsl as m;
+    m::harvest_wasm_modules
+        .filter(m::activity_name.eq(activity_name))
+        .filter(m::active.eq(true))
+        .order(m::published_at.desc())
+        .select((m::hash, m::signature))
+        .first::<(String, Option<String>)>(conn)
         .await
         .optional()
         .map_err(database_error)
@@ -745,8 +880,8 @@ pub async fn resolve_wasm_dispatch(
     // guest's deadline, not just compile.
     dispatch_start: Instant,
 ) -> WasmDispatch {
-    let hash = match resolve_active_wasm_hash(conn, name).await {
-        Ok(Some(hash)) => hash,
+    let (hash, signature) = match resolve_active_wasm_version(conn, name).await {
+        Ok(Some(version)) => version,
         Ok(None) => {
             return WasmDispatch::Fail(
                 ActivityFailure::wasm_module_unavailable(format!(
@@ -764,6 +899,21 @@ pub async fn resolve_wasm_dispatch(
             );
         }
     };
+
+    // Check the publisher signature on every dispatch, before the cache
+    // probe (issue #1838). A cached module stays refused once its stored
+    // signature changes or a key leaves the trust policy.
+    if let Some(policy) = store.trust_policy()
+        && let Err(e) = policy.verify(name, &hash, signature.as_deref())
+    {
+        return WasmDispatch::Fail(
+            ActivityFailure::wasm_module_invalid(format!(
+                "wasm module {hash} for activity '{name}' failed the publisher signature \
+                 check: {e}"
+            ))
+            .into_error_payload(),
+        );
+    }
 
     // Cache hit: serve the compiled module without touching the bytes. Cache
     // miss: fetch the bytes (async) but defer the compile to `invoke` on the

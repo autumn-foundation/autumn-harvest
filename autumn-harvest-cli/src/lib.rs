@@ -26,6 +26,26 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 const DEFAULT_BASE_URL: &str = "http://localhost:3000/api/harvest";
+/// Default for `--http-timeout-secs` (issue #1832).
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
+/// Upper bound on the TCP and TLS connect phase (issue #1832).
+const MAX_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Minimum idle limit between two SSE reads (issue #1832).
+///
+/// The server sends a keepalive every 15 s by default. So 60 s is four
+/// missed keepalives, and a dead stream fails instead of hanging. A larger
+/// `--http-timeout-secs` raises the limit.
+const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Server-side wait of `workflow update --wait completed` when the command
+/// sets no `--timeout-secs`.
+const UPDATE_WAIT_DEFAULT_SECS: u64 = 30;
+/// Time added to a server-side wait, so the server answers first.
+const SERVER_WAIT_SLACK_SECS: u64 = 10;
+/// Minimum timeout for a bulk DLQ command that writes (issue #1832).
+///
+/// One call acts on up to 1000 rows across all shards. A client timeout
+/// does not stop the server. It only hides the result and the row counts.
+const BULK_DLQ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 /// Characters percent-encoded when a caller-supplied value becomes one URL path
 /// segment.
 ///
@@ -85,6 +105,19 @@ pub struct Cli {
     /// Output format for successful API responses.
     #[arg(long, global = true, value_enum, default_value = "pretty-json")]
     output: OutputFormat,
+
+    /// Seconds an HTTP request to the management API may take (issue #1832).
+    ///
+    /// A request that gets no full response in this time fails. For
+    /// `events tail`, it bounds the wait for the response headers only.
+    #[arg(
+        long,
+        global = true,
+        env = "HARVEST_HTTP_TIMEOUT_SECS",
+        default_value_t = DEFAULT_HTTP_TIMEOUT_SECS,
+        value_parser = clap::value_parser!(u64).range(1..=3600)
+    )]
+    http_timeout_secs: u64,
 
     #[command(subcommand)]
     command: Commands,
@@ -327,6 +360,16 @@ pub enum PartitionCommand {
         #[arg(long = "i-understand-the-lock-window")]
         confirm: bool,
 
+        /// The DR generation that holds write authority (issue #1823).
+        ///
+        /// Required on a shard database that carries a DR marker. Read it
+        /// from `harvest dr status` against the promoted primary. `N` applies
+        /// to every shard. `<ID>=<N>` applies to one shard and overrides `N`.
+        /// Repeat it once per shard. The command refuses a shard at any other
+        /// generation, so a stale DSN to a demoted primary writes nothing.
+        #[arg(long = "expect-generation", value_name = "[ID=]N", value_parser = parse_expect_generation)]
+        expect_generation: Vec<ExpectGeneration>,
+
         /// Convert even when a logical-replication publication covers
         /// `harvest_events` without `publish_via_partition_root`.
         ///
@@ -361,6 +404,16 @@ pub enum PartitionCommand {
         #[arg(long, value_name = "N", default_value_t = 32)]
         max_drops: usize,
 
+        /// The DR generation that holds write authority (issue #1823).
+        ///
+        /// Required on a shard database that carries a DR marker. Read it
+        /// from `harvest dr status` against the promoted primary. `N` applies
+        /// to every shard. `<ID>=<N>` applies to one shard and overrides `N`.
+        /// Repeat it once per shard. The command refuses a shard at any other
+        /// generation, so a stale DSN to a demoted primary writes nothing.
+        #[arg(long = "expect-generation", value_name = "[ID=]N", value_parser = parse_expect_generation)]
+        expect_generation: Vec<ExpectGeneration>,
+
         /// Output format.
         #[arg(long, short = 'o', value_enum, default_value = "text")]
         format: DrFormat,
@@ -379,6 +432,16 @@ pub enum PartitionCommand {
         /// Acknowledge that this rewrites `harvest_events` in full.
         #[arg(long = "i-understand-this-rewrites-the-table")]
         confirm: bool,
+
+        /// The DR generation that holds write authority (issue #1823).
+        ///
+        /// Required on a shard database that carries a DR marker. Read it
+        /// from `harvest dr status` against the promoted primary. `N` applies
+        /// to every shard. `<ID>=<N>` applies to one shard and overrides `N`.
+        /// Repeat it once per shard. The command refuses a shard at any other
+        /// generation, so a stale DSN to a demoted primary writes nothing.
+        #[arg(long = "expect-generation", value_name = "[ID=]N", value_parser = parse_expect_generation)]
+        expect_generation: Vec<ExpectGeneration>,
 
         /// Output format.
         #[arg(long, short = 'o', value_enum, default_value = "text")]
@@ -658,6 +721,23 @@ pub enum CliError {
     /// HTTP transport failed.
     #[error("request failed: {0}")]
     Request(#[from] reqwest::Error),
+
+    /// The management API did not answer in time (issue #1832).
+    #[error(
+        "request timed out after {seconds} s; raise --http-timeout-secs \
+         (HARVEST_HTTP_TIMEOUT_SECS) for a slow link"
+    )]
+    Timeout {
+        /// The timeout that expired, in seconds.
+        seconds: u64,
+    },
+
+    /// No connection to the management API in time (issue #1832).
+    #[error("could not connect within {seconds} s; check --base-url and the network")]
+    ConnectTimeout {
+        /// The connect timeout that expired, in seconds.
+        seconds: u64,
+    },
 
     /// The Harvest API returned a non-success status.
     #[error("harvest API returned {status}: {body}")]
@@ -1854,6 +1934,10 @@ enum TokenCommand {
         /// Optional RFC 3339 expiry after which the token is rejected 401.
         #[arg(long)]
         expires_at: Option<String>,
+        /// Optional tenant claim (issue #1977). A tenant-bound token reaches
+        /// only the runs of its tenant, through the tenant-scoped routes.
+        #[arg(long)]
+        tenant: Option<String>,
     },
     /// List all tokens as metadata (never the secret/hash).
     #[command(alias = "ls")]
@@ -1876,6 +1960,11 @@ enum TokenCommand {
         /// Optional RFC 3339 expiry for the replacement token.
         #[arg(long)]
         expires_at: Option<String>,
+        /// Tenant claim of the replacement token (issue #1977). Rotation does
+        /// not copy the old tenant. Pass it again, as `harvest token list`
+        /// shows it, or the replacement is not tenant-bound.
+        #[arg(long)]
+        tenant: Option<String>,
     },
     /// Seed the FIRST token offline (issue #942). Prints a fresh secret ONCE
     /// and the exact `INSERT INTO harvest_api_tokens ...` SQL for you to run
@@ -1902,6 +1991,11 @@ enum TokenCommand {
         /// Audit provenance recorded as `created_by`.
         #[arg(long, default_value = "bootstrap")]
         created_by: String,
+        /// Optional tenant claim (issue #1977). A tenant-bound seed token
+        /// cannot mint further tokens, so seed the first admin token without
+        /// one.
+        #[arg(long)]
+        tenant: Option<String>,
     },
 }
 
@@ -1944,6 +2038,15 @@ enum ShardCommand {
         /// See `--after-created-at`; both must be supplied together.
         #[arg(long, requires = "after_created_at")]
         after_execution_id: Option<autumn_harvest::uuid::Uuid>,
+        /// The DR generation that holds write authority (issue #1823).
+        ///
+        /// Required on a shard database that carries a DR marker. Read it
+        /// from `harvest dr status` against the promoted primary. `N` applies
+        /// to every shard. `<ID>=<N>` applies to one shard and overrides `N`.
+        /// Repeat it once per shard. The command refuses a shard at any other
+        /// generation, so a stale DSN to a demoted primary writes nothing.
+        #[arg(long = "expect-generation", value_name = "[ID=]N", value_parser = parse_expect_generation)]
+        expect_generation: Vec<ExpectGeneration>,
         /// Print the raw JSON report instead of a human table.
         #[arg(long)]
         json: bool,
@@ -1964,6 +2067,15 @@ enum ShardCommand {
         /// Maximum records to advance in this run.
         #[arg(long, default_value_t = 100)]
         limit: i64,
+        /// The DR generation that holds write authority (issue #1823).
+        ///
+        /// Required on a shard database that carries a DR marker. Read it
+        /// from `harvest dr status` against the promoted primary. `N` applies
+        /// to every shard. `<ID>=<N>` applies to one shard and overrides `N`.
+        /// Repeat it once per shard. The command refuses a shard at any other
+        /// generation, so a stale DSN to a demoted primary writes nothing.
+        #[arg(long = "expect-generation", value_name = "[ID=]N", value_parser = parse_expect_generation)]
+        expect_generation: Vec<ExpectGeneration>,
         /// Print the raw JSON report instead of a human table.
         #[arg(long)]
         json: bool,
@@ -1998,6 +2110,15 @@ enum ShardCommand {
         /// See `--after-migrated-at`; both must be supplied together.
         #[arg(long, requires = "after_migrated_at")]
         after_execution_id: Option<autumn_harvest::uuid::Uuid>,
+        /// The DR generation that holds write authority (issue #1823).
+        ///
+        /// Required on a shard database that carries a DR marker. Read it
+        /// from `harvest dr status` against the promoted primary. `N` applies
+        /// to every shard. `<ID>=<N>` applies to one shard and overrides `N`.
+        /// Repeat it once per shard. The command refuses a shard at any other
+        /// generation, so a stale DSN to a demoted primary writes nothing.
+        #[arg(long = "expect-generation", value_name = "[ID=]N", value_parser = parse_expect_generation)]
+        expect_generation: Vec<ExpectGeneration>,
         /// Print the raw JSON count instead of a human summary.
         #[arg(long)]
         json: bool,
@@ -3181,7 +3302,8 @@ enum DeadLetterCommand {
         #[arg(long)]
         error_class: Option<String>,
         /// Filter by derived DLQ reason class (exact, `snake_case`; e.g.
-        /// `poison_pill`, `workflow_task_timeout`, `retry_exhaustion`). Exact-equality.
+        /// `poison_pill`, `workflow_task_timeout`, `history_cap_exceeded`,
+        /// `history_bytes_cap_exceeded`, `retry_exhaustion`). Exact-equality.
         #[arg(long)]
         dlq_reason: Option<String>,
         /// Filter by derived failure signature (exact match on the normalized
@@ -3194,6 +3316,11 @@ enum DeadLetterCommand {
         /// Preview matching rows without performing any writes.
         #[arg(long)]
         dry_run: bool,
+        /// Spread the replayed tasks over this many seconds (issue #1832).
+        /// 0 makes every task due at once. Default: 60 s for 1000 rows,
+        /// scaled down for fewer rows. Maximum: 3600.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(0..=3600))]
+        spread_secs: Option<u64>,
     },
     /// Aggregate dead-lettered tasks by dimension for fast root-cause triage.
     ///
@@ -3267,7 +3394,8 @@ enum DeadLetterCommand {
         #[arg(long)]
         error_class: Option<String>,
         /// Filter by derived DLQ reason class (exact, `snake_case`; e.g.
-        /// `poison_pill`, `workflow_task_timeout`, `retry_exhaustion`). Exact-equality.
+        /// `poison_pill`, `workflow_task_timeout`, `history_cap_exceeded`,
+        /// `history_bytes_cap_exceeded`, `retry_exhaustion`). Exact-equality.
         #[arg(long)]
         dlq_reason: Option<String>,
         /// Filter by derived failure signature (exact match on the normalized
@@ -3316,6 +3444,11 @@ enum DeadLetterCommand {
         /// Preview matching rows without re-enqueuing.
         #[arg(long)]
         dry_run: bool,
+        /// Spread the redriven tasks over this many seconds (issue #1832).
+        /// 0 makes every task due at once. Default: 60 s for 1000 rows,
+        /// scaled down for fewer rows. Maximum: 3600.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(0..=3600))]
+        spread_secs: Option<u64>,
     },
 }
 
@@ -3434,6 +3567,42 @@ enum EventsCommand {
 }
 
 impl Cli {
+    /// The `--http-timeout-secs` value (issue #1832).
+    #[must_use]
+    pub const fn http_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.http_timeout_secs)
+    }
+
+    /// The timeout for this command's API request (issue #1832).
+    ///
+    /// It is [`Self::http_timeout`], raised for a command that is slow by
+    /// design. `workflow update --wait completed` waits on the server for its
+    /// `--timeout-secs`. A bulk DLQ command that writes gets at least
+    /// [`BULK_DLQ_TIMEOUT`].
+    #[must_use]
+    pub fn request_timeout(&self) -> std::time::Duration {
+        let floor = match &self.command {
+            Commands::Workflow {
+                command:
+                    WorkflowCommand::Update {
+                        wait, timeout_secs, ..
+                    },
+            } if wait != "admitted" => std::time::Duration::from_secs(
+                timeout_secs
+                    .unwrap_or(UPDATE_WAIT_DEFAULT_SECS)
+                    .saturating_add(SERVER_WAIT_SLACK_SECS),
+            ),
+            Commands::Dlq {
+                command:
+                    DeadLetterCommand::Redrive { dry_run: false, .. }
+                    | DeadLetterCommand::BulkReplay { dry_run: false, .. }
+                    | DeadLetterCommand::BulkDiscard { dry_run: false, .. },
+            } => BULK_DLQ_TIMEOUT,
+            _ => std::time::Duration::ZERO,
+        };
+        self.http_timeout().max(floor)
+    }
+
     /// Build the management API request represented by these CLI arguments.
     ///
     /// # Errors
@@ -3777,10 +3946,17 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
                 scope,
                 expires_at,
                 created_by,
+                tenant,
             },
     } = &cli.command
     {
-        return run_token_bootstrap(name, scope, expires_at.as_deref(), created_by);
+        return run_token_bootstrap(
+            name,
+            scope,
+            expires_at.as_deref(),
+            created_by,
+            tenant.as_deref(),
+        );
     }
 
     if matches!(cli.command, Commands::Tui) {
@@ -5948,6 +6124,321 @@ async fn dr_connect_read_only(
 
 // ── `harvest partition` (issue #958) ───────────────────────────────────────
 
+/// One `--expect-generation` value: `N` for every shard, or `<ID>=<N>` for
+/// one shard (issue #1823).
+///
+/// Generations are per shard. After a partial or independent fence, the two
+/// shards of a rebalance can hold different valid generations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpectGeneration {
+    /// The shard this value covers, or `None` for every shard.
+    pub shard: Option<i32>,
+    /// The generation that holds write authority there.
+    pub generation: i64,
+}
+
+/// Parse one `--expect-generation` value.
+fn parse_expect_generation(raw: &str) -> Result<ExpectGeneration, String> {
+    let number = |text: &str, what: &str| {
+        text.trim()
+            .parse::<i64>()
+            .map_err(|_| format!("--expect-generation: `{text}` is not a valid {what}"))
+    };
+    match raw.split_once('=') {
+        Some((shard, generation)) => {
+            Ok(ExpectGeneration {
+                shard: Some(i32::try_from(number(shard, "shard id")?).map_err(|_| {
+                    format!("--expect-generation: shard id `{shard}` is out of range")
+                })?),
+                generation: number(generation, "generation")?,
+            })
+        }
+        None => Ok(ExpectGeneration {
+            shard: None,
+            generation: number(raw, "generation")?,
+        }),
+    }
+}
+
+/// The generation stated for `shard`. A per-shard value overrides `N`.
+///
+/// # Errors
+///
+/// [`CliError::InvalidInput`] when the values name the same scope twice.
+fn expected_generation_for(
+    values: &[ExpectGeneration],
+    shard: i32,
+) -> Result<Option<i64>, CliError> {
+    let pick = |scope: Option<i32>| -> Result<Option<i64>, CliError> {
+        let mut found = values.iter().filter(|v| v.shard == scope);
+        let first = found.next().map(|v| v.generation);
+        if found.next().is_some() {
+            return Err(CliError::InvalidInput(format!(
+                "--expect-generation names {} more than once",
+                scope.map_or_else(|| "every shard".to_string(), |s| format!("shard {s}"))
+            )));
+        }
+        Ok(first)
+    };
+    let all = pick(None)?;
+    Ok(pick(Some(shard))?.or(all))
+}
+
+#[cfg(test)]
+mod expect_generation_tests {
+    use super::{ExpectGeneration, expected_generation_for, parse_expect_generation};
+
+    #[test]
+    fn a_per_shard_value_overrides_the_value_for_every_shard() {
+        let values = [
+            parse_expect_generation("5").unwrap(),
+            parse_expect_generation("1=7").unwrap(),
+        ];
+        assert_eq!(expected_generation_for(&values, 1).unwrap(), Some(7));
+        assert_eq!(expected_generation_for(&values, 0).unwrap(), Some(5));
+        assert_eq!(expected_generation_for(&[], 0).unwrap(), None);
+    }
+
+    #[test]
+    fn a_scope_named_twice_is_rejected() {
+        let twice = [
+            ExpectGeneration {
+                shard: Some(1),
+                generation: 2,
+            },
+            ExpectGeneration {
+                shard: Some(1),
+                generation: 3,
+            },
+        ];
+        assert!(expected_generation_for(&twice, 1).is_err());
+        let bare_twice = [
+            parse_expect_generation("2").unwrap(),
+            parse_expect_generation("3").unwrap(),
+        ];
+        assert!(expected_generation_for(&bare_twice, 0).is_err());
+    }
+
+    #[test]
+    fn malformed_values_are_rejected() {
+        assert!(parse_expect_generation("x").is_err());
+        assert!(parse_expect_generation("1=x").is_err());
+        assert!(parse_expect_generation("99999999999=1").is_err());
+    }
+}
+
+/// Refuse a direct-database write on a shard without write authority
+/// (issue #1823).
+///
+/// `harvest partition` and `harvest shard rebalance` connect to shard
+/// databases directly, so the management API fence never sees them. The
+/// operator states the generation that holds authority. A demoted primary is
+/// still at an older one.
+async fn direct_write_authority(
+    conn: &mut autumn_harvest::diesel_async::AsyncPgConnection,
+    shard_id: i32,
+    expect_generation: &[ExpectGeneration],
+    kind: autumn_harvest::replication::AdminWrite,
+) -> Result<(), String> {
+    let expected =
+        expected_generation_for(expect_generation, shard_id).map_err(|e| e.to_string())?;
+    autumn_harvest::replication::assert_admin_write_authority(
+        conn,
+        autumn_harvest::types::ShardId::new(shard_id),
+        expected.map(autumn_harvest::replication::ShardGeneration::new),
+        autumn_harvest::replication::DEFAULT_DR_SLOT_PREFIX,
+        kind,
+    )
+    .await
+    .map_err(|error| match error {
+        autumn_harvest::HarvestError::Config(_) => format!(
+            "{error} Pass --expect-generation <N> (or <ID>=<N> per shard), where N is the \
+             generation `harvest dr status` reports on the promoted primary."
+        ),
+        other => other.to_string(),
+    })
+}
+
+/// Open the fence barriers for one direct-database command on one database
+/// (issue #1823), at the epochs the operator stated.
+///
+/// The command changes tables that every logical shard on the database
+/// shares. So it holds a barrier for the named shard and for every other
+/// shard whose generation row is on that database. A bump of any of them
+/// then waits for the command. A named shard with no stated epoch has no DR
+/// marker, so it needs no barrier. A colocated shard with no stated epoch is
+/// refused: the command cannot hold its barrier.
+///
+/// A last guard then freezes the set of rows, so a shard provisioned during
+/// the command cannot appear without a barrier. See
+/// `autumn_harvest::replication::freeze_generation_rows_on`.
+///
+/// Each barrier takes its own connection. A bump cannot commit while the
+/// caller holds them, so the command's DDL and row moves keep their
+/// authority.
+async fn database_fence(
+    dsn: &str,
+    shard_id: i32,
+    expect_generation: &[ExpectGeneration],
+) -> Result<Vec<autumn_harvest::replication::FencePassGuard>, String> {
+    lock_database_fence(plan_database_fence(dsn, shard_id, expect_generation).await?).await
+}
+
+/// The connections of a [`database_fence`], open but holding no lock yet.
+struct PlannedFence {
+    /// One connection per guarded shard, with the epoch it must hold.
+    passes: Vec<(
+        autumn_harvest::types::ShardId,
+        i64,
+        autumn_harvest::diesel_async::AsyncPgConnection,
+    )>,
+    /// The connection of the row freeze.
+    freeze: autumn_harvest::diesel_async::AsyncPgConnection,
+}
+
+/// The first half of [`database_fence`]: probe the database and open every
+/// connection, with no lock taken (issue #1823). A command over several
+/// databases plans them all before it locks any. A slow connection then
+/// holds no barrier.
+async fn plan_database_fence(
+    dsn: &str,
+    shard_id: i32,
+    expect_generation: &[ExpectGeneration],
+) -> Result<PlannedFence, String> {
+    use autumn_harvest::types::ShardId;
+    let rows = {
+        let mut probe = dr_connect(dsn).await.map_err(|e| e.to_string())?;
+        autumn_harvest::replication::probe_dr_markers(
+            &mut probe,
+            autumn_harvest::replication::DEFAULT_DR_SLOT_PREFIX,
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .generation_shards
+    };
+    let mut shards = vec![shard_id];
+    for row in &rows {
+        if !shards.contains(&row.as_i32()) {
+            shards.push(row.as_i32());
+        }
+    }
+    let mut plan = Vec::with_capacity(shards.len());
+    for shard in shards {
+        let Some(expected) =
+            expected_generation_for(expect_generation, shard).map_err(|e| e.to_string())?
+        else {
+            if shard == shard_id {
+                continue;
+            }
+            return Err(format!(
+                "this database also holds the generation row of shard {shard}. The command \
+                 changes tables that shard shares, so it must hold its barrier too. Pass \
+                 --expect-generation <N> for every shard, or {shard}=<N>."
+            ));
+        };
+        plan.push((ShardId::new(shard), expected));
+    }
+    // Issue #1823: every connection opens here, before any lock.
+    let conns = futures::future::try_join_all(plan.iter().map(|_| dr_connect(dsn)))
+        .await
+        .map_err(|e| e.to_string())?;
+    let freeze = dr_connect(dsn).await.map_err(|e| e.to_string())?;
+    Ok(PlannedFence {
+        passes: plan
+            .into_iter()
+            .zip(conns)
+            .map(|((shard, expected), conn)| (shard, expected, conn))
+            .collect(),
+        freeze,
+    })
+}
+
+/// The second half of [`database_fence`]: take every pass lock together,
+/// then freeze the rows (issue #1823). Each lock waits a bounded time. A
+/// bump that holds one lock then fails the command fast. Its other guards
+/// drop before a bump on another shard times out.
+async fn lock_database_fence(
+    planned: PlannedFence,
+) -> Result<Vec<autumn_harvest::replication::FencePassGuard>, String> {
+    let guarded: Vec<autumn_harvest::types::ShardId> =
+        planned.passes.iter().map(|(shard, ..)| *shard).collect();
+    let mut guards =
+        futures::future::try_join_all(planned.passes.into_iter().map(|(shard, expected, conn)| {
+            autumn_harvest::replication::begin_fenced_pass_on(
+                conn,
+                shard,
+                autumn_harvest::replication::ShardGeneration::new(expected),
+            )
+        }))
+        .await
+        .map_err(|e| e.to_string())?;
+    // Frozen even when the table is empty: the first row must not appear
+    // mid-command either.
+    guards.push(
+        autumn_harvest::replication::freeze_generation_rows_on(planned.freeze, &guarded)
+            .await
+            .map_err(|e| e.to_string())?,
+    );
+    Ok(guards)
+}
+
+/// [`direct_write_authority`] for every shard of a rebalance pool, before any
+/// write. A rebalance moves history between two shards, so both must hold
+/// authority. The returned guards hold each stated epoch until the caller
+/// drops them, so a bump cannot commit while the rebalance writes.
+///
+/// The rebalance scans tables that every logical shard on a database
+/// shares. So each database gets [`database_fence`], which guards every
+/// shard with a row there, not only the configured ones.
+async fn shard_pool_write_authority(
+    pool: &autumn_harvest::shard::ShardedDbPool,
+    targets: &[autumn_harvest::backup_verify::ShardTarget],
+    expect_generation: &[ExpectGeneration],
+) -> Result<Vec<autumn_harvest::replication::FencePassGuard>, CliError> {
+    let mut guards = Vec::new();
+    for (shard, shard_pool) in pool.iter_shards() {
+        let mut conn = shard_pool
+            .get()
+            .await
+            .map_err(|e| CliError::InvalidInput(format!("cannot connect to shard {shard}: {e}")))?;
+        direct_write_authority(
+            &mut conn,
+            shard.as_i32(),
+            expect_generation,
+            autumn_harvest::replication::AdminWrite::Data,
+        )
+        .await
+        .map_err(|e| CliError::InvalidInput(format!("shard {shard}: {e}")))?;
+    }
+    // Hold the barriers for the whole command, so a bump cannot commit while
+    // the rebalance writes (issue #1823). One set for each database. Every
+    // database's connections open first. Then the locks on all of them are
+    // taken together, so a slow database holds no other's barrier.
+    let mut fenced: Vec<&autumn_harvest::backup_verify::ShardTarget> = Vec::new();
+    for target in targets {
+        if fenced.iter().any(|seen| seen.dsn == target.dsn) {
+            continue;
+        }
+        fenced.push(target);
+    }
+    let planned = futures::future::try_join_all(fenced.iter().map(|target| async move {
+        plan_database_fence(&target.dsn, target.shard_id, expect_generation)
+            .await
+            .map_err(|e| CliError::InvalidInput(format!("shard {}: {e}", target.shard_id)))
+    }))
+    .await?;
+    let locked = futures::future::try_join_all(planned.into_iter().zip(&fenced).map(
+        |(plan, target)| async move {
+            lock_database_fence(plan)
+                .await
+                .map_err(|e| CliError::InvalidInput(format!("shard {}: {e}", target.shard_id)))
+        },
+    ))
+    .await?;
+    guards.extend(locked.into_iter().flatten());
+    Ok(guards)
+}
+
 /// What `harvest partition disable` did on one shard.
 ///
 /// A named enum rather than `Option<Option<_>>`: "already unpartitioned" is a
@@ -6115,6 +6606,7 @@ pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
             lookahead_cohorts,
             lock_timeout_secs,
             confirm,
+            expect_generation,
             allow_incompatible_publications,
             format,
         } => {
@@ -6136,17 +6628,28 @@ pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
             };
             opts.validate()
                 .map_err(|e| CliError::InvalidInput(e.to_string()))?;
-            run_partition_enable(shards, &opts, *format).await
+            run_partition_enable(shards, &opts, expect_generation, *format).await
         }
         PartitionCommand::Maintain {
             shards,
             lookahead_cohorts,
             max_drops,
+            expect_generation,
             format,
-        } => run_partition_maintain(shards, *lookahead_cohorts, *max_drops, *format).await,
+        } => {
+            run_partition_maintain(
+                shards,
+                *lookahead_cohorts,
+                *max_drops,
+                expect_generation,
+                *format,
+            )
+            .await
+        }
         PartitionCommand::Disable {
             shards,
             confirm,
+            expect_generation,
             format,
         } => {
             if !confirm {
@@ -6157,7 +6660,7 @@ pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
                         .to_string(),
                 ));
             }
-            run_partition_disable(shards, *format).await
+            run_partition_disable(shards, expect_generation, *format).await
         }
     }
 }
@@ -6217,6 +6720,7 @@ async fn run_partition_status(shards: &[String], format: DrFormat) -> Result<(),
 async fn run_partition_enable(
     shards: &[String],
     opts: &autumn_harvest::partition::EnableOptions,
+    expect_generation: &[ExpectGeneration],
     format: DrFormat,
 ) -> Result<(), CliError> {
     let targets = parse_shard_targets(shards)?;
@@ -6235,11 +6739,42 @@ async fn run_partition_enable(
             }
         };
         let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
+        if let Err(error) = direct_write_authority(
+            &mut conn,
+            target.shard_id,
+            expect_generation,
+            autumn_harvest::replication::AdminWrite::SchemaOnly,
+        )
+        .await
+        {
+            row.error = Some(error);
+            out.push(row);
+            continue;
+        }
+        // Held until this shard's mutation ends (issue #1823).
+        let fence = match database_fence(&target.dsn, target.shard_id, expect_generation).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                row.error = Some(error);
+                out.push(row);
+                continue;
+            }
+        };
         // Per-shard independence is deliberate: a shard is a database, and a
         // half-converted cluster is a supported state (each shard's layout is
         // detected at runtime), so one shard's lock timeout must not abort the
         // conversion of the rest.
-        match autumn_harvest::partition::enable_partitioning(&mut conn, opts).await {
+        // A lost fence session stops the mutation. See `run_fenced_pass`.
+        let enabled = autumn_harvest::replication::run_fenced_pass(&fence, async {
+            // Issue #1823: the connection predates the pass, so it joins it.
+            // A lost guard then ends its backend.
+            let _member =
+                autumn_harvest::replication::join_fenced_pass_direct(&target.dsn, &mut conn).await;
+            autumn_harvest::partition::enable_partitioning(&mut conn, opts).await
+        })
+        .await
+        .and_then(|done| done);
+        match enabled {
             Ok(report) => row.enable = Some(report),
             Err(e) => row.error = Some(e.to_string()),
         }
@@ -6252,6 +6787,7 @@ async fn run_partition_maintain(
     shards: &[String],
     lookahead_cohorts: u32,
     max_drops: usize,
+    expect_generation: &[ExpectGeneration],
     format: DrFormat,
 ) -> Result<(), CliError> {
     let targets = parse_shard_targets(shards)?;
@@ -6274,16 +6810,46 @@ async fn run_partition_maintain(
             }
         };
         let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
-        match autumn_harvest::partition::maintain(
+        if let Err(error) = direct_write_authority(
             &mut conn,
-            autumn_harvest::chrono::Utc::now(),
-            lookahead_cohorts,
-            &sweep,
-            None,
-            None,
+            target.shard_id,
+            expect_generation,
+            autumn_harvest::replication::AdminWrite::SchemaOnly,
         )
         .await
         {
+            row.error = Some(error);
+            out.push(row);
+            continue;
+        }
+        // Held until this shard's mutation ends (issue #1823).
+        let fence = match database_fence(&target.dsn, target.shard_id, expect_generation).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                row.error = Some(error);
+                out.push(row);
+                continue;
+            }
+        };
+        // A lost fence session stops the pass. See `run_fenced_pass`.
+        let maintained = autumn_harvest::replication::run_fenced_pass(&fence, async {
+            // Issue #1823: the connection predates the pass, so it joins it.
+            // A lost guard then ends its backend.
+            let _member =
+                autumn_harvest::replication::join_fenced_pass_direct(&target.dsn, &mut conn).await;
+            autumn_harvest::partition::maintain(
+                &mut conn,
+                autumn_harvest::chrono::Utc::now(),
+                lookahead_cohorts,
+                &sweep,
+                None,
+                None,
+            )
+            .await
+        })
+        .await
+        .and_then(|done| done);
+        match maintained {
             Ok(outcome) => {
                 // A pass that ran but did not COMPLETE — a `drain_default` that
                 // lost its bounded lock attempt, say — comes back as `Ok` with
@@ -6303,7 +6869,11 @@ async fn run_partition_maintain(
     emit_partition_report(&out, format, "maintain")
 }
 
-async fn run_partition_disable(shards: &[String], format: DrFormat) -> Result<(), CliError> {
+async fn run_partition_disable(
+    shards: &[String],
+    expect_generation: &[ExpectGeneration],
+    format: DrFormat,
+) -> Result<(), CliError> {
     let targets = parse_shard_targets(shards)?;
     let mut out = Vec::with_capacity(targets.len());
     for target in &targets {
@@ -6320,7 +6890,38 @@ async fn run_partition_disable(shards: &[String], format: DrFormat) -> Result<()
             }
         };
         let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
-        match autumn_harvest::partition::disable_partitioning(&mut conn).await {
+        if let Err(error) = direct_write_authority(
+            &mut conn,
+            target.shard_id,
+            expect_generation,
+            autumn_harvest::replication::AdminWrite::SchemaOnly,
+        )
+        .await
+        {
+            row.error = Some(error);
+            out.push(row);
+            continue;
+        }
+        // Held until this shard's mutation ends (issue #1823).
+        let fence = match database_fence(&target.dsn, target.shard_id, expect_generation).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                row.error = Some(error);
+                out.push(row);
+                continue;
+            }
+        };
+        // A lost fence session stops the mutation. See `run_fenced_pass`.
+        let disabled = autumn_harvest::replication::run_fenced_pass(&fence, async {
+            // Issue #1823: the connection predates the pass, so it joins it.
+            // A lost guard then ends its backend.
+            let _member =
+                autumn_harvest::replication::join_fenced_pass_direct(&target.dsn, &mut conn).await;
+            autumn_harvest::partition::disable_partitioning(&mut conn).await
+        })
+        .await
+        .and_then(|done| done);
+        match disabled {
             Ok(report) => {
                 row.layout = Some(autumn_harvest::partition::EventLayout::Unpartitioned);
                 // `None` = already unpartitioned. That is a successful no-op,
@@ -7633,7 +8234,8 @@ fn print_new_next_steps(names: &ScaffoldNames, target: &Path) {
 /// API returns a non-success status, or the response body is not valid JSON.
 pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
     let request = cli.api_request()?;
-    let client = reqwest::Client::new();
+    let timeout = cli.request_timeout();
+    let client = http_client(timeout)?;
     let url = format!("{}{}", cli.base_url.trim_end_matches('/'), request.path);
     let builder = match request.method {
         ApiMethod::Get => client.get(url),
@@ -7673,9 +8275,15 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
         builder
     };
 
-    let response = builder.send().await?;
+    let response = builder
+        .send()
+        .await
+        .map_err(|e| transport_error(e, timeout))?;
     let status = response.status();
-    let body = response.text().await?;
+    let body = response
+        .text()
+        .await
+        .map_err(|e| transport_error(e, timeout))?;
     if !status.is_success() {
         return Err(CliError::Http { status, body });
     }
@@ -7684,6 +8292,72 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
     }
 
     serde_json::from_str(&body).map_err(CliError::ParseResponse)
+}
+
+/// An HTTP client whose every request ends within `timeout` (issue #1832).
+///
+/// # Errors
+///
+/// Returns [`CliError::Request`] if the TLS backend fails to start.
+pub(crate) fn http_client(timeout: std::time::Duration) -> Result<reqwest::Client, CliError> {
+    Ok(reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(timeout.min(MAX_CONNECT_TIMEOUT))
+        .build()?)
+}
+
+/// An HTTP client for an SSE stream (issue #1832).
+///
+/// A total timeout would cut a live stream. So this client bounds only the
+/// connect phase and the silence between two reads.
+fn sse_client(timeout: std::time::Duration) -> Result<reqwest::Client, CliError> {
+    Ok(reqwest::Client::builder()
+        .connect_timeout(timeout.min(MAX_CONNECT_TIMEOUT))
+        .read_timeout(timeout.max(SSE_IDLE_TIMEOUT))
+        .build()?)
+}
+
+/// Map a transport error. A timeout names the limit that expired.
+fn transport_error(error: reqwest::Error, timeout: std::time::Duration) -> CliError {
+    if !error.is_timeout() {
+        CliError::Request(error)
+    } else if error.is_connect() {
+        CliError::ConnectTimeout {
+            seconds: timeout.min(MAX_CONNECT_TIMEOUT).as_secs(),
+        }
+    } else {
+        CliError::Timeout {
+            seconds: timeout.as_secs(),
+        }
+    }
+}
+
+/// Send `request` and wait at most `timeout` for the response headers.
+///
+/// A non-2xx response becomes [`CliError::Http`]. Its body must arrive in the
+/// same `timeout` as the headers. Only a 2xx stream has no total limit, so a
+/// live stream can run for as long as it needs.
+async fn send_for_stream(
+    request: reqwest::RequestBuilder,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Response, CliError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let timed_out = |_| CliError::Timeout {
+        seconds: timeout.as_secs(),
+    };
+    let response = tokio::time::timeout_at(deadline, request.send())
+        .await
+        .map_err(timed_out)?
+        .map_err(|e| transport_error(e, timeout))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = tokio::time::timeout_at(deadline, response.text())
+            .await
+            .map_err(timed_out)?
+            .map_err(|e| transport_error(e, timeout))?;
+        return Err(CliError::Http { status, body });
+    }
+    Ok(response)
 }
 
 /// Open the SSE stream for `execution_id` and print events to stdout.
@@ -7703,7 +8377,8 @@ async fn run_events_tail(
         path
     );
 
-    let client = reqwest::Client::new();
+    let timeout = cli.http_timeout();
+    let client = sse_client(timeout)?;
     let mut builder = client
         .get(&url)
         .header("Accept", "text/event-stream")
@@ -7716,14 +8391,7 @@ async fn run_events_tail(
         builder = builder.header("Last-Event-ID", id.to_string());
     }
 
-    let response = builder.send().await?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await?;
-        return Err(CliError::Http { status, body });
-    }
-
-    let mut response = response;
+    let mut response = send_for_stream(builder, timeout).await?;
     let mut buf: Vec<u8> = Vec::new();
     // SSE fields for the current event block.
     let mut ev_id = String::new();
@@ -7731,7 +8399,10 @@ async fn run_events_tail(
     let mut ev_data = String::new();
 
     loop {
-        let chunk = response.chunk().await?;
+        let chunk = response
+            .chunk()
+            .await
+            .map_err(|e| transport_error(e, timeout.max(SSE_IDLE_TIMEOUT)))?;
         let Some(bytes) = chunk else {
             // Server closed the connection.
             break;
@@ -7825,6 +8496,7 @@ async fn run_worker_drain_wait(
             actor: cli.actor.clone(),
             request_id: cli.request_id.clone(),
             output: cli.output,
+            http_timeout_secs: cli.http_timeout_secs,
             command: Commands::Worker {
                 command: WorkerCommand::Get {
                     worker_id: worker_id.to_string(),
@@ -10124,6 +10796,7 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             dry_run,
             after_created_at,
             after_execution_id,
+            expect_generation,
             json,
         } => {
             let targets = parse_shard_targets(shards)?;
@@ -10135,20 +10808,31 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
                 ));
             }
             let pool = build_pool(&targets)?;
+            // Held until the command ends. See `shard_pool_write_authority`.
+            let fence = if *dry_run {
+                Vec::new()
+            } else {
+                shard_pool_write_authority(&pool, &targets, expect_generation).await?
+            };
             let after = after_created_at
                 .zip(*after_execution_id)
                 .map(|(at, id)| (at, autumn_harvest::types::ExecutionId::from_uuid(id)));
-            let report = autumn_harvest::shard_rebalance::migrate_quiescent_executions_after(
-                &pool,
-                ShardId::new(*from),
-                ShardId::new(*to),
-                *limit,
-                *dry_run,
-                actor.unwrap_or("anonymous"),
-                &PayloadCodecs::default(),
-                after,
+            // A lost fence session stops the command. See `run_fenced_pass`.
+            let report = autumn_harvest::replication::run_fenced_pass(
+                &fence,
+                autumn_harvest::shard_rebalance::migrate_quiescent_executions_after(
+                    &pool,
+                    ShardId::new(*from),
+                    ShardId::new(*to),
+                    *limit,
+                    *dry_run,
+                    actor.unwrap_or("anonymous"),
+                    &PayloadCodecs::default(),
+                    after,
+                ),
             )
             .await
+            .and_then(|done| done)
             .map_err(|e| CliError::InvalidInput(e.to_string()))?;
 
             if *json {
@@ -10166,19 +10850,26 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             shards,
             from,
             limit,
+            expect_generation,
             json,
         } => {
             let targets = parse_shard_targets(shards)?;
             require_shard(&targets, *from, "from")?;
             let pool = build_pool(&targets)?;
-            let outcomes = autumn_harvest::shard_rebalance::resume_incomplete_migrations(
-                &pool,
-                ShardId::new(*from),
-                *limit,
-                actor.unwrap_or("anonymous"),
-                &PayloadCodecs::default(),
+            let fence = shard_pool_write_authority(&pool, &targets, expect_generation).await?;
+            // A lost fence session stops the command. See `run_fenced_pass`.
+            let outcomes = autumn_harvest::replication::run_fenced_pass(
+                &fence,
+                autumn_harvest::shard_rebalance::resume_incomplete_migrations(
+                    &pool,
+                    ShardId::new(*from),
+                    *limit,
+                    actor.unwrap_or("anonymous"),
+                    &PayloadCodecs::default(),
+                ),
             )
             .await
+            .and_then(|done| done)
             .map_err(|e| CliError::InvalidInput(e.to_string()))?;
 
             if *json {
@@ -10202,23 +10893,29 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             limit,
             after_migrated_at,
             after_execution_id,
+            expect_generation,
             json,
         } => {
             let targets = parse_shard_targets(shards)?;
             require_shard(&targets, *from, "from")?;
             let pool = build_pool(&targets)?;
+            let fence = shard_pool_write_authority(&pool, &targets, expect_generation).await?;
             let after = after_migrated_at
                 .zip(*after_execution_id)
                 .map(|(at, id)| (at, autumn_harvest::types::ExecutionId::from_uuid(id)));
-            let (reconciled, failures, next_cursor) =
+            // A lost fence session stops the command. See `run_fenced_pass`.
+            let (reconciled, failures, next_cursor) = autumn_harvest::replication::run_fenced_pass(
+                &fence,
                 autumn_harvest::shard_rebalance::reconcile_migrated_seals_after(
                     &pool,
                     ShardId::new(*from),
                     *limit,
                     after,
-                )
-                .await
-                .map_err(|e| CliError::InvalidInput(e.to_string()))?;
+                ),
+            )
+            .await
+            .and_then(|done| done)
+            .map_err(|e| CliError::InvalidInput(e.to_string()))?;
 
             if *json {
                 println!(
@@ -11979,9 +12676,9 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
             failure_signature,
             limit,
             dry_run,
-        } => ApiRequest::post(
-            "/dead-letters/replay",
-            Some(build_bulk_dlq_body(
+            spread_secs,
+        } => {
+            let mut body = build_bulk_dlq_body(
                 activity_name.as_deref(),
                 workflow_name.as_deref(),
                 queue_name.as_deref(),
@@ -11993,8 +12690,10 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
                 failure_signature.as_deref(),
                 *limit,
                 *dry_run,
-            )),
-        ),
+            );
+            insert_spread_secs(&mut body, *spread_secs);
+            ApiRequest::post("/dead-letters/replay", Some(body))
+        }
         DeadLetterCommand::BulkDiscard {
             activity_name,
             workflow_name,
@@ -12082,9 +12781,9 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
             max,
             reason,
             dry_run,
-        } => ApiRequest::post(
-            "/dlq/redrive",
-            Some(build_redrive_dlq_body(
+            spread_secs,
+        } => {
+            let mut body = build_redrive_dlq_body(
                 queue.as_deref(),
                 workflow_name.as_deref(),
                 dead_lettered_after.as_deref(),
@@ -12094,8 +12793,10 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
                 *max,
                 reason.as_deref(),
                 *dry_run,
-            )),
-        ),
+            );
+            insert_spread_secs(&mut body, *spread_secs);
+            ApiRequest::post("/dlq/redrive", Some(body))
+        }
     }
 }
 
@@ -12165,6 +12866,13 @@ fn build_bulk_dlq_body(
     Value::Object(body)
 }
 
+/// Add `--spread-secs` to a redrive or bulk-replay body (issue #1832).
+fn insert_spread_secs(body: &mut Value, spread_secs: Option<u64>) {
+    if let (Value::Object(map), Some(secs)) = (body, spread_secs) {
+        map.insert("spread_secs".to_string(), json!(secs));
+    }
+}
+
 fn gate_request(command: &GateCommand) -> Result<ApiRequest, CliError> {
     match command {
         GateCommand::List => Ok(ApiRequest::get("/admin/gates")),
@@ -12225,6 +12933,7 @@ fn token_request(command: &TokenCommand) -> ApiRequest {
             name,
             scope,
             expires_at,
+            tenant,
         } => {
             let mut body = serde_json::json!({
                 "name": name,
@@ -12232,6 +12941,9 @@ fn token_request(command: &TokenCommand) -> ApiRequest {
             });
             if let Some(exp) = expires_at {
                 body["expires_at"] = serde_json::json!(exp);
+            }
+            if let Some(tenant) = tenant {
+                body["tenant"] = serde_json::json!(tenant);
             }
             ApiRequest::post("/admin/tokens", Some(body))
         }
@@ -12241,6 +12953,7 @@ fn token_request(command: &TokenCommand) -> ApiRequest {
             old_id,
             scope,
             expires_at,
+            tenant,
         } => {
             let mut body = serde_json::json!({
                 "name": format!("rotation-of-{old_id}"),
@@ -12248,6 +12961,9 @@ fn token_request(command: &TokenCommand) -> ApiRequest {
             });
             if let Some(exp) = expires_at {
                 body["expires_at"] = serde_json::json!(exp);
+            }
+            if let Some(tenant) = tenant {
+                body["tenant"] = serde_json::json!(tenant);
             }
             ApiRequest::post("/admin/tokens", Some(body))
         }
@@ -12302,6 +13018,26 @@ pub fn build_bootstrap_token(
     expires_at: Option<&str>,
     created_by: &str,
 ) -> Result<BootstrapToken, CliError> {
+    build_bootstrap_token_for_tenant(name, scope, expires_at, created_by, None)
+}
+
+/// [`build_bootstrap_token`] with an optional tenant claim (issue #1977).
+///
+/// # Errors
+///
+/// As [`build_bootstrap_token`]. Also an invalid `tenant`.
+pub fn build_bootstrap_token_for_tenant(
+    name: &str,
+    scope: &str,
+    expires_at: Option<&str>,
+    created_by: &str,
+    tenant: Option<&str>,
+) -> Result<BootstrapToken, CliError> {
+    if let Some(t) = tenant {
+        autumn_harvest::tenant::validate_tenant(t).map_err(|e| {
+            CliError::InvalidInput(format!("token bootstrap: --tenant '{t}' is not valid: {e}"))
+        })?;
+    }
     // Single source of truth: the mint route hashes with these exact helpers.
     let secret = autumn_harvest::api_token::mint_secret();
     let hash = autumn_harvest::api_token::hash_secret(&secret);
@@ -12332,6 +13068,11 @@ pub fn build_bootstrap_token(
         columns.push_str(", expires_at");
         let _ = write!(values, ", {}::timestamptz", sql_quote(e));
     }
+    if let Some(t) = tenant {
+        use std::fmt::Write as _;
+        columns.push_str(", tenant");
+        let _ = write!(values, ", {}", sql_quote(t));
+    }
     let insert_sql = format!("INSERT INTO harvest_api_tokens ({columns})\nVALUES ({values});");
 
     Ok(BootstrapToken {
@@ -12354,8 +13095,9 @@ fn run_token_bootstrap(
     scope: &str,
     expires_at: Option<&str>,
     created_by: &str,
+    tenant: Option<&str>,
 ) -> Result<(), CliError> {
-    let token = build_bootstrap_token(name, scope, expires_at, created_by)?;
+    let token = build_bootstrap_token_for_tenant(name, scope, expires_at, created_by, tenant)?;
 
     println!("Harvest API token — offline bootstrap seed");
     println!();
@@ -16708,12 +17450,14 @@ mod token_bootstrap_tests {
                         scope,
                         expires_at,
                         created_by,
+                        tenant,
                     },
             } => {
                 assert_eq!(scope, "admin", "default scope must be admin");
                 assert_eq!(name, "bootstrap");
                 assert_eq!(created_by, "bootstrap");
                 assert_eq!(expires_at, None);
+                assert_eq!(tenant, None, "a seed token has no tenant by default");
             }
             other => panic!("expected token bootstrap, got {other:?}"),
         }
@@ -16750,6 +17494,7 @@ mod token_bootstrap_tests {
                     scope,
                     expires_at,
                     created_by,
+                    tenant: _,
                 },
         } = cli.command
         else {
@@ -16761,6 +17506,85 @@ mod token_bootstrap_tests {
         assert!(token.insert_sql.contains("'dashboard'"));
         assert!(token.insert_sql.contains("'release-eng'"));
         assert!(!token.insert_sql.contains(&token.secret));
+    }
+
+    /// `--tenant` binds the seed token to a tenant (issue #1977).
+    #[test]
+    fn bootstrap_tenant_flows_through_to_sql() {
+        let cli = Cli::try_parse_from([
+            "harvest",
+            "token",
+            "bootstrap",
+            "--scope",
+            "read",
+            "--tenant",
+            "acme",
+        ])
+        .expect("parses");
+        let Commands::Token {
+            command: TokenCommand::Bootstrap { tenant, .. },
+        } = cli.command
+        else {
+            panic!("expected token bootstrap");
+        };
+        assert_eq!(tenant.as_deref(), Some("acme"));
+        let token = build_bootstrap_token_for_tenant("t", "read", None, "op", Some("acme"))
+            .expect("builds");
+        assert!(token.insert_sql.contains("tenant)"), "{}", token.insert_sql);
+        assert!(
+            token.insert_sql.contains("'acme');"),
+            "{}",
+            token.insert_sql
+        );
+
+        let untenanted = build_bootstrap_token("t", "read", None, "op").expect("builds");
+        assert!(!untenanted.insert_sql.contains("tenant"));
+
+        // A quote is visible ASCII, so it is a valid key. The SQL escapes it.
+        let quoted = build_bootstrap_token_for_tenant("t", "read", None, "op", Some("o'neil"))
+            .expect("builds");
+        assert!(
+            quoted.insert_sql.contains("'o''neil'"),
+            "{}",
+            quoted.insert_sql
+        );
+
+        for bad in ["", "a b", "tab\t"] {
+            assert!(
+                build_bootstrap_token_for_tenant("t", "read", None, "op", Some(bad)).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// `token rotate --tenant` keeps the replacement tenant-bound (issue
+    /// #1977). Without the flag the body carries no tenant.
+    #[test]
+    fn token_rotate_sends_the_tenant() {
+        let body = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).expect("parses");
+            let Commands::Token { command } = cli.command else {
+                panic!("expected token rotate");
+            };
+            token_request(&command).body.expect("a mint body")
+        };
+        let bound = body(&["harvest", "token", "rotate", "old", "--tenant", "acme"]);
+        assert_eq!(bound["tenant"], "acme");
+        let unbound = body(&["harvest", "token", "rotate", "old"]);
+        assert!(unbound.get("tenant").is_none(), "{unbound}");
+    }
+
+    /// `token create --tenant` sends the tenant in the mint body (issue #1977).
+    #[test]
+    fn token_create_sends_the_tenant() {
+        let cli = Cli::try_parse_from(["harvest", "token", "create", "ci", "--tenant", "acme"])
+            .expect("parses");
+        let Commands::Token { command } = cli.command else {
+            panic!("expected token create");
+        };
+        let request = token_request(&command);
+        let body = request.body.expect("a mint body");
+        assert_eq!(body["tenant"], "acme");
     }
 
     /// A valid `--expires-at` is embedded as a `timestamptz` literal.

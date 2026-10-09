@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Folio corpus harness: internal link check + orphan scan for docs/.
+r"""Folio corpus harness: internal link check + orphan scan for docs/.
 
 Deterministic, reproducible on any checkout — no network access required.
 Two Tier-1 audits (see docs/audits/README.md):

@@ -44,7 +44,8 @@ use autumn_harvest::audit::{
 };
 use autumn_harvest::build_routing::{
     BuildCompatEntry, BuildPolicy, BuildReachability, all_build_reachability, declare_compat,
-    list_build_compat, list_build_policies, merge_reachability, revoke_compat, set_build_policy,
+    list_build_compat, list_build_policies, merge_reachability, revoke_compat,
+    set_build_policy_with_ramp_id,
 };
 use autumn_harvest::error::{HarvestResult, database_error};
 use autumn_harvest::execution::StartWorkflowParams;
@@ -61,7 +62,7 @@ use autumn_harvest::schema::{
     harvest_dead_letters, harvest_events, harvest_external_tasks, harvest_schedules,
     harvest_signals, harvest_task_queue, harvest_timers, harvest_workflow_executions,
 };
-use autumn_harvest::signal::send_signal;
+use autumn_harvest::signal::send_signal_with_codecs;
 use autumn_harvest::start_or_load_workflow_execution_with_metrics_and_codecs;
 use autumn_harvest::store::admit_update_event_with_codecs;
 use autumn_harvest::types::{ExecutionId as HarvestExecutionId, ShardId, UpdateId};
@@ -459,6 +460,10 @@ pub(crate) struct BuildRoutingListParams {
     set_policy_build_id: Option<String>,
     #[serde(default)]
     set_policy_deployment_name: Option<String>,
+    /// The operation id of a failed "Set Build Policy" submission, so a
+    /// retry reuses its ramp id (issue #1814).
+    #[serde(default)]
+    set_policy_operation_id: Option<String>,
     /// Error text for the "Declare Compatibility" form, if its last submission failed.
     #[serde(default)]
     compat_error: Option<String>,
@@ -477,6 +482,7 @@ struct BuildRoutingActionEcho {
     set_policy_queue_name: Option<String>,
     set_policy_build_id: Option<String>,
     set_policy_deployment_name: Option<String>,
+    set_policy_operation_id: Option<String>,
     compat_error: Option<String>,
     compat_build_id: Option<String>,
     compat_compatible_with: Option<String>,
@@ -489,6 +495,7 @@ impl From<&BuildRoutingListParams> for BuildRoutingActionEcho {
             set_policy_queue_name: params.set_policy_queue_name.clone(),
             set_policy_build_id: params.set_policy_build_id.clone(),
             set_policy_deployment_name: params.set_policy_deployment_name.clone(),
+            set_policy_operation_id: params.set_policy_operation_id.clone(),
             compat_error: params.compat_error.clone(),
             compat_build_id: params.compat_build_id.clone(),
             compat_compatible_with: params.compat_compatible_with.clone(),
@@ -502,6 +509,60 @@ struct BuildRoutingSetPolicyForm {
     build_id: String,
     #[serde(default)]
     deployment_name: Option<String>,
+    /// The operation id that the form carries (issue #1814).
+    #[serde(default)]
+    operation_id: Option<String>,
+}
+
+/// The operation id of one "Set Build Policy" submission (issue #1814).
+///
+/// The form carries the id in a hidden field. A failed submission echoes it
+/// back, so a retry of the same form reuses it. The handler passes it to
+/// every shard as the caller ramp id, so a partial fan-out and its retry
+/// give a retained ramp one identity. A missing or malformed id gets a new
+/// one.
+fn set_policy_operation_id(raw: Option<&str>) -> uuid::Uuid {
+    raw.and_then(|id| uuid::Uuid::parse_str(id.trim()).ok())
+        .unwrap_or_else(uuid::Uuid::new_v4)
+}
+
+/// The caller `ramp_id` of one "Set Build Policy" submission (issue #1814).
+///
+/// It derives from the operation id and the request. A retry of the same
+/// form gets the same id. A changed request under the same operation id
+/// gets a new id, so every shard rewrites the ramp under that new id.
+fn set_policy_ramp_id(
+    operation_id: uuid::Uuid,
+    queue_name: &str,
+    build_id: &str,
+    deployment_name: Option<&str>,
+) -> uuid::Uuid {
+    let operation = operation_id.to_string();
+    crate::api::derived_ramp_id(&[
+        Some("ui-policy"),
+        Some(operation.as_str()),
+        Some(queue_name),
+        Some(build_id),
+        deployment_name,
+    ])
+}
+
+/// The redirect after a failed "Set Build Policy" submission. It echoes the
+/// entered values, the error and the operation id back into the form.
+fn set_policy_failure_redirect(
+    error: &str,
+    queue_name: &str,
+    build_id: &str,
+    deployment_name: &str,
+    operation_id: uuid::Uuid,
+) -> String {
+    format!(
+        "../build-routing?set_policy_error={}&set_policy_queue_name={}&set_policy_build_id={}&set_policy_deployment_name={}&set_policy_operation_id={operation_id}",
+        url_encode(error),
+        url_encode(queue_name),
+        url_encode(build_id),
+        url_encode(deployment_name),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -2467,7 +2528,16 @@ async fn signal_workflow_ui(
                 );
                 (STATUS_FAILED, Some(msg.clone()), url_encode(&msg))
             } else {
-                match send_signal(&mut conn, exec_id, &form.signal_name, payload_json).await {
+                let codecs = api_state.payload_codecs();
+                match send_signal_with_codecs(
+                    &mut conn,
+                    exec_id,
+                    &form.signal_name,
+                    payload_json,
+                    &codecs,
+                )
+                .await
+                {
                     Ok(()) => (
                         STATUS_SUCCEEDED,
                         None,
@@ -2934,7 +3004,7 @@ async fn list_dead_letters_ui(
         // audit row per page render that touched ≥1 envelope.
         let mut outcome = LossyDecodeOutcome::default();
         for row in &mut page_rows {
-            outcome = outcome.merged(codecs.decode_value_lossy(&mut row.dead_letter.input));
+            outcome = outcome.merged(codecs.decode_column_lossy(&mut row.dead_letter.input));
             outcome = outcome.merged(decode_error_field(codecs, &mut row.dead_letter.error));
             for event in &mut row.events {
                 outcome = outcome.merged(codecs.decode_value_lossy(&mut event.event_data));
@@ -3350,14 +3420,14 @@ async fn list_workers_ui(
     Query(params): Query<WorkerListParams>,
 ) -> Result<Markup, AutumnError> {
     // Issue: an unrecognized status/stale value used to `?`-abort the whole
-    // page (bare 400, no HTML) before the filter form was ever rendered,
-    // discarding the build_id/shard filters the operator had already
+    // page (bare 400, no HTML) before the filter form was ever rendered.
+    // That discarded the build_id/shard filters the operator had already
     // entered. `parse_worker_status_filter`/`parse_worker_stale_filter`
-    // instead degrade to "filter not applied" and hand back an error to
-    // redisplay inline, so a bad value costs one field, not the page — same
-    // fix as `parse_started_bound` on the Workflows page (#1333). The raw
-    // text is carried alongside the parsed value so pagination and form
-    // resubmission don't silently drop it (Codex review, #1378 P2).
+    // instead degrade to "filter not applied". They hand back an error to
+    // redisplay inline. So a bad value costs one field, not the page. This is
+    // the same fix as `parse_started_bound` on the Workflows page (#1333).
+    // The raw text is carried alongside the parsed value so pagination and
+    // form resubmission do not silently drop it (#1378).
     let (status_filter, status_raw, status_error) =
         parse_worker_status_filter(params.status.as_deref());
     let (stale_only, stale_raw, stale_error) = parse_worker_stale_filter(params.stale.as_deref());
@@ -3493,18 +3563,18 @@ async fn list_workers_ui(
 }
 
 /// Parses the Workers page's `status` filter from a raw query-string value.
-/// Returns `(parsed, raw_display, error)`: on success `error` is `None`; on
-/// an unrecognized value `parsed` is `None` (the filter is not applied)
-/// while `error` carries a message to render next to the field — so a bad
+/// Returns `(parsed, raw_display, error)`. On success `error` is `None`. On
+/// an unrecognized value `parsed` is `None`, so the filter is not applied.
+/// `error` then carries a message to render next to the field. So a bad
 /// value drops one filter instead of the whole page (see `list_workers_ui`).
-/// `raw_display` echoes the operator's exact trimmed input in both cases (a
-/// no-op on success, since the only valid inputs are the canonical labels
-/// modulo case) so the caller can carry it through pagination and
-/// resubmission — Codex review on #1378 P2: without this, a bad value's
-/// error vanished on the next Next/Previous click or Apply resubmit,
-/// because the `<select>` and the pagination query string were both built
-/// from the already-`None`d parsed value, silently discarding the operator's
-/// input rather than persisting the error "until resolved" as intended.
+/// `raw_display` echoes the operator's exact trimmed input in both cases.
+/// On success this is a no-op, since the only valid inputs are the canonical
+/// labels modulo case. The caller carries it through pagination and
+/// resubmission (#1378). Without it, a bad value's error vanished on the
+/// next Next/Previous click or Apply resubmit. The `<select>` and the
+/// pagination query string were both built from the already-`None`d parsed
+/// value. That silently discarded the operator's input. The intent is to
+/// persist the error "until resolved".
 fn parse_worker_status_filter(raw: Option<&str>) -> (Option<&'static str>, String, Option<String>) {
     let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
         return (None, String::new(), None);
@@ -5107,10 +5177,10 @@ fn render_worker_filters(
                         option value=(s) selected[status_filter == Some(s)] { (s) }
                     }
                     // An unrecognized value is rendered as its own option so
-                    // the select echoes it back (rather than silently
-                    // reverting to "All") until the operator picks a valid
-                    // one — the `<select>` equivalent of a text input's
-                    // `value=` (Codex review, #1378 P2).
+                    // the select echoes it back until the operator picks a
+                    // valid one. It does not silently revert to "All". This
+                    // is the `<select>` equivalent of a text input's
+                    // `value=` (#1378).
                     @if status_error.is_some() {
                         option value=(status_raw) selected { (status_raw) }
                     }
@@ -5228,9 +5298,9 @@ fn build_worker_query_string(
         let _ = write!(out, "&limit={limit}");
     }
     // Carry the raw text (not the parsed value) so an invalid value's inline
-    // error persists across pagination instead of being silently dropped —
-    // same reasoning as `build_query_string`'s started_after/started_before
-    // handling on the Workflows page (Codex review, #1378 P2).
+    // error persists across pagination instead of being silently dropped.
+    // The reasoning is the same as for `build_query_string`'s
+    // started_after/started_before handling on the Workflows page (#1378).
     if !status_raw.is_empty() {
         let _ = write!(out, "&status={}", url_encode(status_raw));
     }
@@ -5682,6 +5752,13 @@ fn event_human_label(event_type: &str, event_data: &Value, execution_state: &str
         "ActivityCompletedExternally" => "Activity completed externally".to_string(),
         "ActivityFailedExternally" => "Activity failed externally".to_string(),
         "ActivityExternalDeadlineExtended" => "External activity deadline extended".to_string(),
+        "DecisionCommitted" => {
+            let build = event_data_field(event_data, "build_id")
+                .filter(|build| !build.is_empty())
+                .unwrap_or("<none>");
+            let worker = event_data_field(event_data, "worker_id").unwrap_or("?");
+            format!("Decision committed: build {build}, worker {worker}")
+        }
         "TimerStarted" => "Timer started".to_string(),
         "TimerFired" => "Timer fired".to_string(),
         "TimerCancelled" => "Timer cancelled".to_string(),
@@ -8212,18 +8289,22 @@ async fn build_routing_set_policy_ui(
     let queue_name = form.queue_name.trim().to_string();
     let build_id = form.build_id.trim().to_string();
     let deployment_name_raw = form.deployment_name.clone().unwrap_or_default();
+    // A retry of the same form reuses the operation id (issue #1814).
+    let operation_id = set_policy_operation_id(form.operation_id.as_deref());
     if queue_name.is_empty() || build_id.is_empty() {
-        let error = url_encode("queue_name and build_id must not be empty");
-        let redirect_url = format!(
-            "../build-routing?set_policy_error={error}&set_policy_queue_name={}&set_policy_build_id={}&set_policy_deployment_name={}",
-            url_encode(&queue_name),
-            url_encode(&build_id),
-            url_encode(&deployment_name_raw),
+        let redirect_url = set_policy_failure_redirect(
+            "queue_name and build_id must not be empty",
+            &queue_name,
+            &build_id,
+            &deployment_name_raw,
+            operation_id,
         );
         return Ok(axum::response::Redirect::to(&redirect_url).into_response());
     }
     let pool = api_state.storage_pool().map_err(map_error)?;
     let deployment_name = form.deployment_name.as_deref().filter(|s| !s.is_empty());
+    // One ramp id for every shard, so a retained ramp keeps one identity.
+    let ramp_id = set_policy_ramp_id(operation_id, &queue_name, &build_id, deployment_name);
     // Fan out to all shards so every shard's get_build_policy() sees the new policy
     // when evaluating assigned_build_id at workflow start time.
     let mut last_policy = None;
@@ -8231,9 +8312,15 @@ async fn build_routing_set_policy_ui(
     for (shard_id, shard_pool) in pool.iter_shards() {
         match acquire_conn(shard_pool).await {
             Ok(mut conn) => {
-                match set_build_policy(&mut conn, &queue_name, &build_id, deployment_name)
-                    .await
-                    .map_err(map_error)
+                match set_build_policy_with_ramp_id(
+                    &mut conn,
+                    &queue_name,
+                    &build_id,
+                    deployment_name,
+                    ramp_id,
+                )
+                .await
+                .map_err(map_error)
                 {
                     Ok(p) => last_policy = Some(p),
                     Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
@@ -8284,15 +8371,15 @@ async fn build_routing_set_policy_ui(
                 .into_response(),
         );
     }
-    let error = url_encode(&format!(
-        "Partial failure setting build policy: {}",
-        shard_errors.join("; ")
-    ));
-    let redirect_url = format!(
-        "../build-routing?set_policy_error={error}&set_policy_queue_name={}&set_policy_build_id={}&set_policy_deployment_name={}",
-        url_encode(&queue_name),
-        url_encode(&build_id),
-        url_encode(&deployment_name_raw),
+    let redirect_url = set_policy_failure_redirect(
+        &format!(
+            "Partial failure setting build policy: {}",
+            shard_errors.join("; ")
+        ),
+        &queue_name,
+        &build_id,
+        &deployment_name_raw,
+        operation_id,
     );
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
@@ -8634,6 +8721,7 @@ fn render_build_routing_action_forms(echo: &BuildRoutingActionEcho) -> Markup {
         .set_policy_deployment_name
         .as_deref()
         .unwrap_or_default();
+    let operation_id = set_policy_operation_id(echo.set_policy_operation_id.as_deref());
     let compat_build_id = echo.compat_build_id.as_deref().unwrap_or_default();
     let compat_compatible_with = echo.compat_compatible_with.as_deref().unwrap_or_default();
     html! {
@@ -8649,6 +8737,7 @@ fn render_build_routing_action_forms(echo: &BuildRoutingActionEcho) -> Markup {
                 }
                 form method="post" action="build-routing/set-policy"
                       style="display:flex;flex-direction:column;gap:10px" {
+                    input type="hidden" name="operation_id" value=(operation_id);
                     label style=(label_style) { "Queue name"
                         input type="text" name="queue_name" required placeholder="e.g. default" style=(input_style) value=(set_policy_queue_name);
                     }
@@ -13484,6 +13573,26 @@ mod tests {
     }
 
     #[test]
+    fn event_label_shows_build_and_worker_per_decision() {
+        let data = serde_json::json!({
+            "type": "DecisionCommitted",
+            "data": {"build_id": "build-7", "worker_id": "worker-eu-1"},
+        });
+        assert_eq!(
+            event_human_label("DecisionCommitted", &data, "RUNNING"),
+            "Decision committed: build build-7, worker worker-eu-1"
+        );
+        let legacy = serde_json::json!({
+            "type": "DecisionCommitted",
+            "data": {"build_id": "", "worker_id": "w"},
+        });
+        assert_eq!(
+            event_human_label("DecisionCommitted", &legacy, "RUNNING"),
+            "Decision committed: build <none>, worker w"
+        );
+    }
+
+    #[test]
     fn layout_escapes_title_but_keeps_body_markup() {
         let body = html! { p { "hello" } };
         let html = layout("<evil>", &body, "", None).into_string();
@@ -14273,10 +14382,10 @@ mod tests {
         assert!(q.contains("stale=true"));
     }
 
-    /// GREEN — the fix under test: an invalid raw value (which a caller would
-    /// otherwise have parsed to `None`/`false` and lost) is carried through
-    /// verbatim, so a Next/Previous click doesn't drop the still-unresolved
-    /// filter and its inline error (Codex review, #1378 P2).
+    /// GREEN — the fix under test: an invalid raw value is carried through
+    /// verbatim. A caller would otherwise have parsed it to `None`/`false`
+    /// and lost it. So a Next/Previous click does not drop the
+    /// still-unresolved filter and its inline error (#1378).
     #[test]
     fn build_worker_query_string_carries_invalid_raw_values() {
         let q = build_worker_query_string(DEFAULT_PAGE_SIZE, "", "zombie", "north", "True", None);
@@ -14989,6 +15098,9 @@ mod tests {
             capability_miss_workers: Vec::new(),
             capability_miss_handler: None,
             timer_fires_at: None,
+            handler_started_attempt: None,
+            timed_out_claims: None,
+            handler_started_at: None,
             new_start: false,
         }
     }
@@ -15112,6 +15224,7 @@ mod tests {
             migrated_run_terminal_state: None,
             staging_vacated_state: None,
             staging_vacated_by: None,
+            tenant: None,
         }
     }
 
@@ -15733,6 +15846,89 @@ mod tests {
     /// now carry the entered values and an inline error back through the
     /// redirect's query params, which `list_build_routing_ui` turns into a
     /// `BuildRoutingActionEcho`.
+    /// A failed submission echoes its operation id into a hidden field, so a
+    /// retry of the form reuses its ramp id (issue #1814).
+    #[test]
+    fn render_build_routing_page_set_policy_keeps_the_operation_id() {
+        let id = uuid::Uuid::new_v4();
+        let echo = BuildRoutingActionEcho {
+            set_policy_operation_id: Some(id.to_string()),
+            ..BuildRoutingActionEcho::default()
+        };
+        let html =
+            render_build_routing_page(&[], &[], &[], &[], &[], &[], false, None, None, &echo)
+                .into_string();
+        assert!(
+            html.contains(&format!(
+                r#"type="hidden" name="operation_id" value="{id}""#
+            )),
+            "the form must carry the echoed operation id: {html}"
+        );
+    }
+
+    /// A fresh page gives the form a new, valid operation id.
+    #[test]
+    fn render_build_routing_page_set_policy_has_a_fresh_operation_id() {
+        let html = render_build_routing_page(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            None,
+            None,
+            &BuildRoutingActionEcho::default(),
+        )
+        .into_string();
+        let marker = r#"type="hidden" name="operation_id" value=""#;
+        let start = html.find(marker).expect("hidden operation_id field") + marker.len();
+        let value = &html[start..start + 36];
+        assert!(uuid::Uuid::parse_str(value).is_ok(), "{value}");
+    }
+
+    /// A valid echoed id is kept. A missing or malformed one gets a new id.
+    #[test]
+    fn set_policy_operation_id_reuses_only_a_valid_id() {
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(set_policy_operation_id(Some(&id.to_string())), id);
+        assert_ne!(set_policy_operation_id(None), set_policy_operation_id(None));
+        assert_ne!(
+            set_policy_operation_id(Some("not-a-uuid")),
+            set_policy_operation_id(Some("not-a-uuid"))
+        );
+    }
+
+    /// A retry of the same form keeps its ramp id. A changed request under
+    /// the same operation id gets a new one.
+    #[test]
+    fn set_policy_ramp_id_depends_on_the_request() {
+        let op = uuid::Uuid::new_v4();
+        let id = |build: &str, deployment: Option<&str>| {
+            set_policy_ramp_id(op, "default", build, deployment)
+        };
+        assert_eq!(id("sha-1", Some("prod")), id("sha-1", Some("prod")));
+        assert_ne!(id("sha-1", Some("prod")), id("sha-1", Some("prod-v2")));
+        assert_ne!(id("sha-1", None), id("sha-2", None));
+        assert_ne!(
+            id("sha-1", None),
+            set_policy_ramp_id(uuid::Uuid::new_v4(), "default", "sha-1", None)
+        );
+    }
+
+    /// The failure redirect carries the operation id back to the form.
+    #[test]
+    fn set_policy_failure_redirect_echoes_the_operation_id() {
+        let id = uuid::Uuid::new_v4();
+        let url = set_policy_failure_redirect("shard 1: down", "default", "sha-1", "", id);
+        assert!(
+            url.contains(&format!("&set_policy_operation_id={id}")),
+            "{url}"
+        );
+        assert!(url.contains("set_policy_queue_name=default"), "{url}");
+    }
+
     #[test]
     fn render_build_routing_page_set_policy_error_echoes_entered_values() {
         let echo = BuildRoutingActionEcho {
@@ -15875,10 +16071,10 @@ mod tests {
     }
 
     /// GREEN — the fix under test: the invalid raw value is echoed back as
-    /// the `<select>`'s selected option (not silently reverted to "All"), so
-    /// resubmitting the form unchanged resends the same bad value and the
-    /// operator sees the same error again rather than it vanishing (Codex
-    /// review, #1378 P2).
+    /// the `<select>`'s selected option. It is not silently reverted to
+    /// "All". So resubmitting the form unchanged resends the same bad value.
+    /// The operator sees the same error again rather than it vanishing
+    /// (#1378).
     #[test]
     fn render_worker_filters_echoes_invalid_raw_value_as_selected_option() {
         let html = render_worker_filters(
@@ -15981,13 +16177,13 @@ mod tests {
 
     /// GREEN — the fix under test: an unrecognized status no longer aborts
     /// `list_workers_ui`. It degrades to "filter not applied" (parsed is
-    /// `None`) while carrying the raw text and a recovery message, so the
-    /// page can redisplay the form inline instead of discarding it — same
-    /// contract as `parse_started_bound` on the Workflows page (#1333).
+    /// `None`). It carries the raw text and a recovery message, so the page
+    /// can redisplay the form inline instead of discarding it. This is the
+    /// same contract as `parse_started_bound` on the Workflows page (#1333).
     /// Before this change, `parse_worker_ui_filters` `?`-propagated a bare
-    /// `AutumnError::bad_request_msg` here, which aborted the whole
-    /// `/workers` response before the filter form (or the `build_id`/`shard`
-    /// filters the operator had already typed) was ever rendered — see the
+    /// `AutumnError::bad_request_msg` here. That aborted the whole
+    /// `/workers` response before the filter form, or the `build_id`/`shard`
+    /// filters the operator had already typed, was ever rendered. See the
     /// RED baseline in
     /// `tests/ui_integration.rs::ui_workers_unknown_status_value_redisplays_form_instead_of_aborting_page`.
     #[test]
@@ -16029,10 +16225,10 @@ mod tests {
         );
     }
 
-    /// Same fix, applied to the `stale` field: an unrecognized value (e.g.
-    /// the very plausible `True`, since matching is case-sensitive by
-    /// design — see the field's existing semantics) no longer `?`-aborts the
-    /// page.
+    /// Same fix, applied to the `stale` field: an unrecognized value no
+    /// longer `?`-aborts the page. An example is the very plausible `True`,
+    /// since matching is case-sensitive by design (see the field's existing
+    /// semantics).
     #[test]
     fn parse_worker_stale_filter_rejects_unknown_value_without_erroring() {
         let (parsed, raw, error) = parse_worker_stale_filter(Some("True"));

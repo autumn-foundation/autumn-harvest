@@ -238,6 +238,7 @@ async fn insert_workflow(database_url: &str, workflow_id: &str) -> ExecutionId {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )

@@ -65,6 +65,11 @@ fn build_pool(url: &str) -> DbPool {
 }
 
 fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
+    make_worker_with_redeliveries(registry, 5)
+}
+
+/// Builds a worker with `redeliveries` as its capability-miss budget.
+fn make_worker_with_redeliveries(registry: Arc<HandlerRegistry>, redeliveries: u32) -> Worker {
     Worker::new(
         WorkerRuntimeConfig {
             codec_rotation_batch_size: 0,
@@ -89,7 +94,7 @@ fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
             priority_aging_secs: None,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
-            capability_miss_max_redeliveries: 5,
+            capability_miss_max_redeliveries: redeliveries,
             workflow_task_timeout: std::time::Duration::from_secs(10),
             workflow_panic_max_attempts: 3,
             max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
@@ -157,6 +162,7 @@ async fn start_workflow(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -389,6 +395,7 @@ async fn insert_detached_child_execution(
             start_source: None,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         })
         .execute(conn)
         .await
@@ -992,6 +999,7 @@ async fn detached_child_execution_timeout_does_not_wake_parent() {
             start_source: None,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         })
         .execute(&mut conn)
         .await
@@ -1066,7 +1074,10 @@ async fn terminal_detached_spawn_setup_error_fails_workflow() {
     )
     .await;
 
-    let worker = Arc::new(make_worker(registry));
+    // A missing handler is a capability miss (issue #804). With the default
+    // budget, the backoff releases the task for more than 30 seconds before it
+    // fails. A budget of 0 fails the workflow on the first miss.
+    let worker = Arc::new(make_worker_with_redeliveries(registry, 0));
     let worker_pool = pool.clone();
     let worker_ref = worker.clone();
     let worker_handle = tokio::spawn(async move {

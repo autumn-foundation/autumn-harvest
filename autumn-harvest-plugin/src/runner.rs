@@ -691,6 +691,7 @@ fn prepare_audit_export_config(
             batch_size: audit_config.effective_batch_size(),
             backoff: audit_config.backoff.clone(),
             lease: audit_config.effective_lease(),
+            chain_key: autumn_harvest::audit_export::runtime_chain_key(audit_config),
         })
     })
 }
@@ -750,8 +751,18 @@ impl PreparedHarvestRuntime {
     fn build(
         built: BuiltHarvest,
         resources: HarvestRunnerResources,
+        worker_enabled: bool,
     ) -> autumn_web::AutumnResult<Self> {
         let shard_router = resources.shard_router.clone().unwrap_or_default();
+        // An auto pool covers every pool shard, cell shards included. It
+        // would drain a tenant cell and void its isolation (issue #1837).
+        // This pure check runs first, before any step publishes global state.
+        refuse_auto_pool_over_cells(
+            &shard_router,
+            &built.worker_config().shard_assignments,
+            worker_enabled,
+        )
+        .map_err(AutumnError::service_unavailable_msg)?;
         let retention_config = built.retention().clone();
         let history_archiver = built.history_archiver().cloned();
         install_completion_callback_config(&built);
@@ -1099,7 +1110,7 @@ impl HarvestRunner {
         }
 
         let completion_triggers = built.completion_triggers().to_vec();
-        let mut prepared = PreparedHarvestRuntime::build(built, resources)?;
+        let mut prepared = PreparedHarvestRuntime::build(built, resources, config.worker_enabled)?;
         let registry = Arc::clone(&prepared.registry);
         let dag_catalog = Arc::clone(&prepared.dag_catalog);
         let workflow_schedules = Arc::clone(&prepared.workflow_schedules);
@@ -1120,18 +1131,66 @@ impl HarvestRunner {
             );
         }
 
+        // Issue #1823: pin the DR fence before this process writes anything.
+        // An API-only node owns no worker, so it must pin here. The management
+        // API checks these pins before every admin write. An in-process worker
+        // pins the same generations again, which is idempotent.
+        autumn_harvest::replication::pin_process_fence(
+            prepared.worker_runtime_config.dr.fencing,
+            &prepared.worker_runtime_config.dr.slot_prefix,
+            autumn_harvest::worker::dr_fence_targets(
+                &prepared.worker_runtime_config,
+                &harvest_pool,
+            ),
+            &harvest_pool,
+        )
+        .await
+        .map_err(|error| {
+            AutumnError::service_unavailable_msg(format!(
+                "refusing to start: cross-region DR fencing could not be resolved: {error}"
+            ))
+        })?;
+
         // Sync static triggers before starting workers (issue #517)
+        let single_pool = prepared.storage_pool.sharded_pool().len() == 1;
         for (shard_id, shard_pool) in prepared.storage_pool.iter_shards() {
+            // Issue #1823: a bump cannot commit while the sync writes. A single
+            // pool names its shard through the default pin.
+            let fence_key = if single_pool {
+                autumn_harvest::types::ShardId::UNENCODED
+            } else {
+                shard_id
+            };
+            // The connection comes first, so a sync that waits for one holds
+            // no fence barrier and cannot block a bump.
             let mut conn = shard_pool.get().await.map_err(|e| {
                 AutumnError::service_unavailable_msg(format!(
                     "Failed to get DB connection to sync completion triggers for shard {shard_id}: {e}"
                 ))
             })?;
-            autumn_harvest::completion_trigger::sync_completion_triggers(
-                &mut conn,
-                &completion_triggers,
-            )
+            // The sync rewrites a database-wide table, so it guards every
+            // pinned shard colocated on this database too.
+            let fence = autumn_harvest::replication::begin_fenced_group(shard_pool, fence_key)
+                .await
+                .map_err(|error| {
+                    AutumnError::service_unavailable_msg(format!(
+                        "refusing to start: shard {shard_id} is fenced: {error}"
+                    ))
+                })?;
+            // A lost fence session stops the sync. See `run_fenced_pass`.
+            autumn_harvest::replication::run_fenced_pass(&fence, async {
+                // The older connection joins the pass. A lost guard then
+                // ends its backend.
+                let _member =
+                    autumn_harvest::replication::join_fenced_pass(shard_pool, &mut conn).await;
+                autumn_harvest::completion_trigger::sync_completion_triggers(
+                    &mut conn,
+                    &completion_triggers,
+                )
+                .await
+            })
             .await
+            .and_then(|done| done)
             .map_err(|e| {
                 AutumnError::service_unavailable_msg(format!(
                     "Failed to sync completion triggers on startup for shard {shard_id}: {e:?}"
@@ -1343,6 +1402,7 @@ impl HarvestRunner {
                 BatchExecutorConfig {
                     concurrency: config.batch.concurrency,
                     metrics: Arc::clone(&registry.telemetry().metrics),
+                    payload_codecs: registry.payload_codecs().clone(),
                 },
                 std::time::Duration::from_millis(config.batch.tick_interval_ms),
             ))
@@ -2290,6 +2350,50 @@ fn warn_uncovered_writable_shards(router: &ShardRouter, assignments: &[ShardId])
     }
 }
 
+/// Refuse a worker pool that would drain a tenant cell (issue #1837).
+///
+/// An API-only process (`worker_enabled == false`) claims nothing, so it
+/// passes. Otherwise see [`reserved_shards_under_auto_assignment`].
+fn refuse_auto_pool_over_cells(
+    router: &ShardRouter,
+    assignments: &[ShardId],
+    worker_enabled: bool,
+) -> Result<(), String> {
+    if !worker_enabled {
+        return Ok(());
+    }
+    let cells = reserved_shards_under_auto_assignment(router, assignments);
+    if cells.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "ShardRouter reserves shards {cells:?} for tenant cells, but this worker has no \
+         explicit shard assignments and would drain them; call \
+         WorkerConfig::with_shard_assignments with the shards this pool serves, or disable \
+         the worker on an API-only replica (see docs/sharding.md#tenant-cells-issue-1837)"
+    ))
+}
+
+/// Reserved shards that an auto-assigned worker would drain (issue #1837).
+///
+/// An empty `assignments` list means auto: the worker covers every pool
+/// shard. When the router reserves shards for tenant cells, such a worker
+/// also claims cell work. An explicit list is a deliberate choice. Startup
+/// accepts it, even when it names a cell shard.
+fn reserved_shards_under_auto_assignment(
+    router: &ShardRouter,
+    assignments: &[ShardId],
+) -> Vec<i32> {
+    if !assignments.is_empty() {
+        return Vec::new();
+    }
+    router
+        .reserved_shards()
+        .iter()
+        .map(|shard| shard.as_i32())
+        .collect()
+}
+
 fn missing_router_shards(router: &ShardRouter, pool: &ShardedDbPool) -> Vec<ShardId> {
     let mut missing: Vec<ShardId> = router
         .readable_shards()
@@ -2331,8 +2435,32 @@ pub(crate) fn injected_runtime_state(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_plugin_audit_export_config_keeps_the_chain_key() {
+        struct Nowhere;
+        impl autumn_harvest::audit_export::AuditSink for Nowhere {
+            fn deliver<'a>(
+                &'a self,
+                _batch: &'a autumn_harvest::audit_export::AuditBatch<'a>,
+            ) -> autumn_harvest::audit_export::SinkFuture<'a> {
+                Box::pin(async { autumn_harvest::audit_export::SinkAttempt::success(200) })
+            }
+        }
+        let built = autumn_harvest::HarvestBuilder::new()
+            .audit_export_sink(Nowhere)
+            .audit_export_chain_key(vec![2_u8; 32])
+            .try_build()
+            .expect("builds");
+        let config = super::prepare_audit_export_config(&built).expect("a sink is set");
+        assert_eq!(
+            config.chain_key.as_ref().map(|key| key.secret().as_bytes()),
+            Some(&[2_u8; 32][..])
+        );
+    }
     use super::{
-        DeferredAuditExportInstall, HarvestRunnerResources, registered_workflow_type_names,
+        DeferredAuditExportInstall, HarvestRunnerResources, refuse_auto_pool_over_cells,
+        registered_workflow_type_names, reserved_shards_under_auto_assignment,
         resolve_runtime_storage_pool, select_runtime_gate_shards, select_runtime_shard0_pool,
         uncovered_writable_shards,
     };
@@ -2369,6 +2497,7 @@ mod tests {
                 batch_size,
                 backoff: autumn_harvest::audit_export::ExportBackoff::default(),
                 lease: std::time::Duration::from_secs(30),
+                chain_key: None,
             })
         }
 
@@ -2565,6 +2694,102 @@ mod tests {
         assert!(
             uncovered_writable_shards(&router, &[ShardId::new(0), ShardId::new(1)]).is_empty(),
             "a drained readable-only shard is not an uncovered *writable* shard",
+        );
+    }
+
+    // Issue #1837: a shared auto-assigned pool must not drain a cell shard.
+
+    fn cell_router() -> ShardRouter {
+        three_shard_router().with_reserved_shards([ShardId::new(1)])
+    }
+
+    #[test]
+    fn auto_assignment_is_refused_when_the_router_reserves_shards() {
+        assert_eq!(
+            reserved_shards_under_auto_assignment(&cell_router(), &[]),
+            vec![1],
+            "an auto pool would drain the reserved shard",
+        );
+    }
+
+    #[test]
+    fn explicit_assignment_is_accepted_with_reserved_shards() {
+        let router = cell_router();
+        let none = Vec::<i32>::new();
+        assert_eq!(
+            reserved_shards_under_auto_assignment(&router, &[ShardId::new(0)]),
+            none
+        );
+        assert_eq!(
+            reserved_shards_under_auto_assignment(&router, &[ShardId::new(1)]),
+            none
+        );
+    }
+
+    #[test]
+    fn auto_assignment_is_accepted_without_reserved_shards() {
+        assert_eq!(
+            reserved_shards_under_auto_assignment(&three_shard_router(), &[]),
+            Vec::<i32>::new()
+        );
+    }
+
+    #[test]
+    fn startup_refuses_an_auto_pool_over_a_cell() {
+        let error = refuse_auto_pool_over_cells(&cell_router(), &[], true)
+            .expect_err("an auto pool would drain the cell");
+        assert!(error.contains("[1]"), "the error names the cell: {error}");
+        assert!(error.contains("with_shard_assignments"), "{error}");
+    }
+
+    #[test]
+    fn startup_accepts_an_api_only_process_with_cells() {
+        assert_eq!(
+            refuse_auto_pool_over_cells(&cell_router(), &[], false),
+            Ok(())
+        );
+    }
+
+    /// A refused cell startup must publish no global state. The callback
+    /// config is the first thing `build` publishes, so the check runs before
+    /// it.
+    #[test]
+    fn a_refused_cell_startup_publishes_no_callback_config() {
+        const MARKER: u32 = 1837;
+        let built = autumn_harvest::HarvestBuilder::new()
+            .completion_callback_retry_policy(autumn_harvest::RetryPolicy {
+                max_attempts: MARKER,
+                ..autumn_harvest::RetryPolicy::default()
+            })
+            .build();
+        let pool = tagged_pool(1);
+        let mut pools = std::collections::BTreeMap::new();
+        pools.insert(ShardId::new(0), pool.clone());
+        pools.insert(ShardId::new(1), tagged_pool(2));
+        pools.insert(ShardId::new(2), tagged_pool(3));
+        let resources = HarvestRunnerResources::new(pool)
+            .with_sharded_pool(ShardedDbPool::from_map(pools, ShardId::new(0)))
+            .with_shard_router(cell_router());
+
+        let refused = super::PreparedHarvestRuntime::build(built, resources, true);
+        assert!(refused.is_err(), "an auto pool over a cell must be refused");
+        let published = autumn_harvest::completion_callback::GLOBAL_CALLBACK_CONFIG
+            .read()
+            .expect("lock")
+            .clone()
+            .map(|config| config.retry_policy.max_attempts);
+        assert_ne!(
+            published,
+            Some(MARKER),
+            "the refused startup published its callback config"
+        );
+    }
+
+    #[test]
+    fn startup_accepts_an_explicit_pool_with_cells() {
+        assert_eq!(
+            refuse_auto_pool_over_cells(&cell_router(), &[ShardId::new(0)], true),
+            Ok(())
         );
     }
 
@@ -3217,17 +3442,17 @@ mod tests {
     /// then replace a still-active multi-shard runner with no intervening
     /// `stop()`. If that connect failed, the multi-shard runner lost every
     /// dispatch channel it owned, and fell back to Postgres for no reason
-    /// of its own. This drives a connect failure with a `rediss://` URL.
-    /// `RedisDispatch::connect` rejects it before any network I/O, since
-    /// this release carries no TLS transport — deterministic and fast on
-    /// every platform, unlike a black-holed address. A sandboxed CI
+    /// of its own. This drives a connect failure with a URL whose scheme is
+    /// not Redis. `RedisDispatch::connect` rejects it while it parses the
+    /// URL, before any network I/O — deterministic and fast on every
+    /// platform, unlike a black-holed address. A sandboxed CI
     /// runner's network policy is not guaranteed to reproduce that
     /// connect-timeout failure. Checks that a per-shard channel installed
     /// before the call is still there after it fails.
     ///
     /// Gated on the `redis` feature. The no-feature stub of
     /// `install_dispatch_channel` never inspects `config.redis.url` at
-    /// all, so it would return `Ok` here regardless of the `rediss://`
+    /// all, so it would return `Ok` here regardless of the URL
     /// scheme. This test's own `is_err()` assertion would then fail for a
     /// reason that has nothing to do with the connect-failure behavior it
     /// means to pin.
@@ -3249,7 +3474,7 @@ mod tests {
 
         let config = crate::config::HarvestRuntimeConfig {
             redis: super::HarvestRedisConfig {
-                url: Some("rediss://127.0.0.1:6379".to_string()),
+                url: Some("http://127.0.0.1:6379".to_string()),
                 ..super::HarvestRedisConfig::default()
             },
             ..crate::config::HarvestRuntimeConfig::default()
@@ -3258,7 +3483,7 @@ mod tests {
         let result = block_on(super::install_dispatch_channel(&config, None));
         assert!(
             result.is_err(),
-            "a rediss:// URL must fail the call before any connection attempt"
+            "a non-Redis URL must fail the call before any connection attempt"
         );
         assert!(
             autumn_harvest::dispatch::installed_for_shard(active_shard).is_some(),
@@ -3631,10 +3856,10 @@ mod tests {
     /// all. The old topology was already cleared, and the new one never
     /// finished installing. The fix connects every shard into a local list
     /// first, and only clears and installs once every shard has succeeded.
-    /// This test drives a connect failure with a `rediss://` URL.
-    /// `RedisDispatch::connect` rejects it before any network I/O, since
-    /// this release carries no TLS transport — deterministic and fast on
-    /// every platform, unlike a black-holed address. A sandboxed CI
+    /// This test drives a connect failure with a URL whose scheme
+    /// is not Redis. `RedisDispatch::connect` rejects it while it parses
+    /// the URL, before any network I/O — deterministic and fast on every
+    /// platform, unlike a black-holed address. A sandboxed CI
     /// runner's network policy is not guaranteed to reproduce that
     /// connect-timeout failure. It checks that a channel installed before
     /// the call is still there after it fails.
@@ -3665,7 +3890,7 @@ mod tests {
 
         let config = crate::config::HarvestRuntimeConfig {
             redis: super::HarvestRedisConfig {
-                url: Some("rediss://127.0.0.1:6379".to_string()),
+                url: Some("http://127.0.0.1:6379".to_string()),
                 ..super::HarvestRedisConfig::default()
             },
             ..crate::config::HarvestRuntimeConfig::default()
@@ -3677,7 +3902,7 @@ mod tests {
         ));
         assert!(
             result.is_err(),
-            "a rediss:// URL must fail the call before any connection attempt"
+            "a non-Redis URL must fail the call before any connection attempt"
         );
         assert!(
             autumn_harvest::dispatch::installed().is_some(),

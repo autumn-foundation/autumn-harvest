@@ -328,6 +328,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 max_workflow_attempts_ceiling: client.max_workflow_attempts(),
                 // Typed stubs already reject debounced workflows up front.
                 reject_fresh_if_debounced: false,
+                tenant: opts.tenant.as_deref(),
             };
             let _ = client;
             ::autumn_harvest::update_with_start_workflow_execution(conn, params).await
@@ -581,10 +582,10 @@ mod same_module_vs_nested_module_parity_tests {
 
 // ── Characterization tests: signature-validation error paths ────────────────
 //
-// Sibling of `query.rs`'s test of the same name -- pins `update_macro`'s
+// Sibling of `query.rs`'s test of the same name. Pins `update_macro`'s
 // current rejection messages for `first_param_is_ctx`/`returns_result`/the
-// async check before those checks route through the already-shared
-// `attr_util` helpers.
+// async check. A later change routes those checks through the
+// already-shared `attr_util` helpers.
 #[cfg(test)]
 mod signature_validation_characterization_tests {
     use super::update_macro;

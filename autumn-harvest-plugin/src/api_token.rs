@@ -133,12 +133,15 @@ impl TokenScope {
 /// [`enforce_token_scope`]. Its presence is what lets [`crate::api::require_harvest_admin`]
 /// admit a token-authenticated request without a session/embedder boundary
 /// (issue #942, AC6/AC7).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct TokenPrincipal {
-    // The authorizer hook (issue #1803) reads both fields.
+    // The authorizer hook (issue #1803) reads `id` and `scope`.
     // `require_harvest_admin` needs only the extension's presence.
     pub id: Uuid,
     pub scope: TokenScope,
+    /// The tenant claim of the token (issue #1977). The tenant binding layer
+    /// reads it.
+    pub tenant: Option<String>,
 }
 
 /// Metadata-only response DTO for `GET /admin/tokens` (issue #942, AC2).
@@ -156,6 +159,9 @@ pub struct TokenView {
     pub expires_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// Tenant claim of the token (issue #1977). `null` means not
+    /// tenant-bound.
+    pub tenant: Option<String>,
 }
 
 impl TokenView {
@@ -173,6 +179,7 @@ impl TokenView {
             last_used_at,
             revoked_at,
             created_by: _,
+            tenant,
         } = t;
         Self {
             id: *id,
@@ -182,6 +189,7 @@ impl TokenView {
             expires_at: *expires_at,
             last_used_at: *last_used_at,
             revoked_at: *revoked_at,
+            tenant: tenant.clone(),
         }
     }
 }
@@ -255,12 +263,16 @@ fn admin_scope_required_response() -> Response {
 // ── DB CRUD (default/control shard) ───────────────────────────────────────────
 
 /// Mint and persist a new token; returns the one-time [`MintResult`].
+///
+/// `tenant` binds the token to one tenant (issue #1977). The caller has
+/// already checked it with [`autumn_harvest::tenant::validate_tenant`].
 pub(crate) async fn create_token(
     conn: &mut AsyncPgConnection,
     name: &str,
     scope: TokenScope,
     expires_at: Option<DateTime<Utc>>,
     created_by: &str,
+    tenant: Option<&str>,
 ) -> HarvestResult<MintResult> {
     let secret = mint_secret();
     let hash = hash_secret(&secret);
@@ -270,6 +282,7 @@ pub(crate) async fn create_token(
         scope: scope.as_str(),
         expires_at,
         created_by,
+        tenant,
     };
     let row: ApiToken = diesel::insert_into(harvest_api_tokens::table)
         .values(&new)
@@ -332,6 +345,24 @@ pub(crate) async fn lookup_by_secret(
 
 /// Best-effort `last_used_at` bump. Called off the request critical path.
 pub(crate) async fn touch_last_used(conn: &mut AsyncPgConnection, id: Uuid) -> HarvestResult<()> {
+    use diesel_async::AsyncConnection as _;
+    // The update runs detached from the request, past its fence. With fencing
+    // on, it asserts the fence in its own transaction (issue #1823), as an
+    // audit write does. A process that lost write authority writes nothing.
+    if !autumn_harvest::replication::FenceRegistry::is_enabled() {
+        return write_last_used(conn, id).await;
+    }
+    Box::pin(
+        conn.transaction::<_, autumn_harvest::error::HarvestError, _>(async move |conn| {
+            autumn_harvest::replication::assert_database_fence(conn).await?;
+            write_last_used(conn, id).await
+        }),
+    )
+    .await
+}
+
+/// The update of [`touch_last_used`], with no DR fence check.
+async fn write_last_used(conn: &mut AsyncPgConnection, id: Uuid) -> HarvestResult<()> {
     use harvest_api_tokens::dsl;
     diesel::update(dsl::harvest_api_tokens.filter(dsl::id.eq(id)))
         .set(dsl::last_used_at.eq(Utc::now()))
@@ -359,7 +390,7 @@ fn service_unavailable(msg: &'static str) -> Response {
 /// since the token secret is case-sensitive. A non-`hvst_` credential (any
 /// scheme case) still returns `None` so a non-Harvest bearer passes through to
 /// the embedder untouched.
-fn harvest_bearer(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn harvest_bearer(headers: &HeaderMap) -> Option<String> {
     let raw = headers
         .get(axum::http::header::AUTHORIZATION)?
         .to_str()
@@ -377,6 +408,20 @@ fn harvest_bearer(headers: &HeaderMap) -> Option<String> {
         None
     }
 }
+
+/// Whether a request claims an API token, so the token layer looks it up.
+///
+/// The pre-auth rate limit charges exactly these requests (issue #1827).
+pub(crate) fn claims_harvest_token(headers: &HeaderMap) -> bool {
+    harvest_bearer(headers).is_some()
+}
+
+/// Marks a `403` for a valid token that its scope does not allow.
+///
+/// The pre-auth rate limit reads it from the response and refunds its address
+/// charge (issue #1827). The token is valid, so the charge is not its own.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScopeDeniedToken;
 
 /// Reserve the `token:` audit-actor namespace on a pass-through request.
 ///
@@ -486,17 +531,25 @@ pub async fn enforce_token_scope(
             },
         )
         .await;
-        return if scope == TokenScope::Read {
+        let mut response = if scope == TokenScope::Read {
             read_only_forbidden_response()
         } else {
             admin_scope_required_response()
         };
+        response.extensions_mut().insert(ScopeDeniedToken);
+        return response;
     }
+
+    // Issue #1827: give the connection back before the handler runs. The
+    // handler takes its own, so a held one would double each request's pool
+    // use. A rate-limited request would also hold one for nothing.
+    drop(conn);
 
     // AC6/D3: mark the verified principal so `require_admin` admits it.
     request.extensions_mut().insert(TokenPrincipal {
         id: token.id,
         scope,
+        tenant: token.tenant.clone(),
     });
 
     // AC6: authoritative actor. Strip any spoofed inbound value, set token:{id}.
@@ -594,6 +647,31 @@ pub async fn enforce_token_scope_mcp_mutation(
     if is_expired(token.expires_at, Utc::now()) {
         return unauthorized("api token expired");
     }
+    // A generated tool starts or changes a run with no tenant check, so a
+    // tenant-bound token never reaches one (issue #1977).
+    if token.tenant.is_some() {
+        tracing::warn!(
+            method = %request.method(),
+            path = %request.uri().path(),
+            "harvest: tenant-bound api token denied MCP tool (403)"
+        );
+        let (_, source, request_id) = audit_context(request.headers(), &api_state);
+        let actor = format!("{TOKEN_ACTOR_PREFIX}{}", token.id);
+        crate::authz::audit_deny(
+            &mut conn,
+            &crate::authz::DenyAudit {
+                actor: &actor,
+                method: request.method(),
+                path: request.uri().path(),
+                request_id: request_id.as_deref(),
+                source: &source,
+                shard: None,
+                summary: "route is not tenant-scoped",
+            },
+        )
+        .await;
+        return crate::tenant::forbidden();
+    }
     // Every generated route carrying this layer is a mutation, so a read token
     // is always denied here. An unknown scope is `Read`, as in the main layer.
     let scope = TokenScope::from_db(&token.scope).unwrap_or(TokenScope::Read);
@@ -664,6 +742,7 @@ mod tests {
             expires_at: None,
             last_used_at: None,
             revoked_at: None,
+            tenant: None,
         };
         let secret = "hvst_super_secret_value".to_string();
         let mr = MintResult {
@@ -692,6 +771,7 @@ mod tests {
             last_used_at: None,
             revoked_at: None,
             created_by: "op".to_string(),
+            tenant: None,
         };
         let view = TokenView::from_row(&row);
         let body = serde_json::to_string(&view).unwrap();

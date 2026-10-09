@@ -22,7 +22,8 @@ use rusqlite::Connection;
 use serde_json::Value;
 
 use crate::error::{SqliteError, SqliteResult};
-use crate::{queue, schema, store, worker};
+use crate::lock::WriterLock;
+use crate::{lock, queue, schema, store, worker};
 
 /// The activity body a workflow's `execute_activity_raw(name, ...)` resolves to.
 ///
@@ -165,6 +166,10 @@ pub struct StartOutcome {
     pub created: bool,
 }
 
+/// The `error_type` of the `WorkflowFailed` event that seals an execution
+/// which reached an unsupported feature (issue #1834).
+pub const UNSUPPORTED_FEATURE_ERROR_TYPE: &str = "UnsupportedFeature";
+
 /// Maximum driver iterations before declaring a runaway (safety bound only — the
 /// supported scenarios converge in a handful of cycles).
 const MAX_ITERATIONS: usize = 10_000;
@@ -206,6 +211,17 @@ pub struct SqliteRuntime {
     /// drivers bypass it entirely (they take a caller-fixed timestamp — the
     /// deterministic-simulation seam).
     now_fn: NowFn,
+    /// The single-writer lock (issue #1834). It is released when the runtime
+    /// drops.
+    writer_lock: Option<WriterLock>,
+}
+
+impl Drop for SqliteRuntime {
+    fn drop(&mut self) {
+        if let Some(lock) = &self.writer_lock {
+            lock.release(&self.conn);
+        }
+    }
 }
 
 /// A wall-clock source for the public drivers — see [`SqliteRuntime::set_clock`].
@@ -221,13 +237,20 @@ impl SqliteRuntime {
     /// schema idempotently and reclaiming any orphaned `RUNNING` task from a
     /// previous process (crash recovery; makes activities at-least-once).
     ///
+    /// The open first takes the single-writer lock, `<path>.lock` (issue
+    /// #1834). It fails fast when another runtime holds that lock. It fails
+    /// before any pragma, schema step or reclaim, so it changes nothing.
+    ///
     /// # Errors
     ///
-    /// Returns [`SqliteError::Sqlite`] if the file cannot be opened, the schema
-    /// cannot be applied, or the orphan reclaim fails.
+    /// Returns [`SqliteError::DatabaseLocked`] if another process or runtime
+    /// has the file open. Returns [`SqliteError::Io`] if the lock file cannot
+    /// be opened. Returns [`SqliteError::Sqlite`] if the file cannot be
+    /// opened, the schema cannot be applied, or the orphan reclaim fails.
     pub fn open(path: impl AsRef<Path>) -> SqliteResult<Self> {
-        let conn = Connection::open(path)?;
-        Self::from_connection(conn)
+        let conn = Connection::open(path.as_ref())?;
+        let writer_lock = lock::acquire(&conn, path.as_ref())?;
+        Self::from_connection(conn, writer_lock)
     }
 
     /// Open a private, in-memory database (each call is a fresh, empty database —
@@ -240,10 +263,12 @@ impl SqliteRuntime {
     /// created or the schema cannot be applied.
     pub fn open_in_memory() -> SqliteResult<Self> {
         let conn = Connection::open_in_memory()?;
-        Self::from_connection(conn)
+        let writer_lock = lock::acquire(&conn, Path::new(":memory:"))?;
+        Self::from_connection(conn, writer_lock)
     }
 
-    fn from_connection(conn: Connection) -> SqliteResult<Self> {
+    /// Apply the pragmas and the schema, and reclaim orphaned tasks.
+    fn prepare(conn: &Connection) -> SqliteResult<()> {
         // Durability & concurrency posture (issue #1068). This backend makes a
         // deliberate, conservative durability claim (a committed transaction
         // survives a crash/power-loss — the crash-then-reopen tests depend on it),
@@ -269,17 +294,30 @@ impl SqliteRuntime {
         // ORIGINAL columns, so this additive, idempotent step adds any column
         // introduced since the file was created (e.g. `harvest_tasks`'s freeze
         // columns) before any read/insert touches them. A no-op on a fresh file.
-        schema::migrate(&conn)?;
+        schema::migrate(conn)?;
         // Single-server crash recovery: any task left `RUNNING` was claimed by a
         // process that exited without finalizing — flip it back to `PENDING` so
         // its body re-runs (at-least-once).
-        queue::reclaim_orphaned_running(&conn)?;
+        queue::reclaim_orphaned_running(conn)?;
+        Ok(())
+    }
+
+    fn from_connection(conn: Connection, writer_lock: Option<WriterLock>) -> SqliteResult<Self> {
+        // A failed setup builds no runtime, so `Drop` never runs. Release the
+        // lock here, or an in-memory owner row would outlive the failed open.
+        if let Err(err) = Self::prepare(&conn) {
+            if let Some(lock) = &writer_lock {
+                lock.release(&conn);
+            }
+            return Err(err);
+        }
         Ok(Self {
             conn,
             workflows: HashMap::new(),
             activities: HashMap::new(),
             workflow_panic_strikes: HashMap::new(),
             now_fn: std::sync::Arc::new(Utc::now),
+            writer_lock,
         })
     }
 
@@ -912,7 +950,8 @@ impl SqliteRuntime {
     /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns
     /// [`SqliteError::Stuck`] if the run makes no progress and cannot be
     /// classified. Returns [`SqliteError::Unsupported`] for an unsupported
-    /// command and [`SqliteError::UnknownWorkflow`] for an unregistered workflow.
+    /// command, after it seals the run `FAILED` (issue #1834). Returns
+    /// [`SqliteError::UnknownWorkflow`] for an unregistered workflow.
     /// Returns [`SqliteError::UnregisteredActivity`] for an unregistered activity.
     /// Returns [`SqliteError::NonDeterministic`] on replay divergence and
     /// [`SqliteError::WorkflowPanicked`] for a contained panic. Returns
@@ -1139,6 +1178,65 @@ impl SqliteRuntime {
         Err(first_error.unwrap_or(SqliteError::Runaway))
     }
 
+    /// Run one decision cycle, and seal the run `FAILED` when the cycle meets an
+    /// unsupported feature (issue #1834).
+    ///
+    /// The cycle's own transaction has already rolled back at that point. The
+    /// seal is a new transaction, so no half-written cycle survives. The error
+    /// still returns to the caller, so the drive that seals the run reports why.
+    /// Every other error leaves the run `RUNNING`, because a fix in the same
+    /// runtime can still resume it.
+    async fn drive_one_cycle(
+        &mut self,
+        exec: ExecutionId,
+        now: i64,
+        failure_now: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> SqliteResult<RunState> {
+        let result = self.drive_one_cycle_inner(exec, now, failure_now).await;
+        if let Err(SqliteError::Unsupported(message)) = &result
+            && let Err(seal_error) = self.seal_unsupported(exec, message)
+        {
+            // Keep the reason the caller needs. The run stays `RUNNING`, so
+            // the next drive meets the feature again and retries the seal.
+            tracing::warn!(%exec, error = %seal_error, "could not seal an unsupported run FAILED");
+        }
+        result
+    }
+
+    /// Seal `exec` `FAILED` with the typed unsupported-feature reason, and
+    /// remove its pending tasks, unfired timers and staged signals.
+    ///
+    /// The `WorkflowFailed` event carries [`UNSUPPORTED_FEATURE_ERROR_TYPE`]
+    /// and `non_retryable = true`. A retry would meet the same feature again.
+    /// `details.feature` is a stable token, such as `StartChildWorkflow` or
+    /// `ScheduleActivity.session_id`. `details.message` holds the full text.
+    fn seal_unsupported(&mut self, exec: ExecutionId, unsupported: &str) -> SqliteResult<()> {
+        let feature = unsupported
+            .split(" — ")
+            .next()
+            .unwrap_or(unsupported)
+            .trim();
+        let message = SqliteError::Unsupported(unsupported.to_string()).to_string();
+        let event = WorkflowEvent::WorkflowFailed {
+            error: message.clone(),
+            error_type: Some(UNSUPPORTED_FEATURE_ERROR_TYPE.to_string()),
+            details: Some(serde_json::json!({ "feature": feature, "message": unsupported })),
+            non_retryable: Some(true),
+        };
+        let tx = self.conn.transaction()?;
+        store::append_event(&tx, exec, &event)?;
+        store::set_failed(&tx, exec, &message)?;
+        // The cycle's own cleanup, such as a race's loser cancellation, rolled
+        // back with the cycle. This backend has no retention pass, so remove
+        // the work no one can use any more, as the `TerminateIfRunning` seal does.
+        queue::delete_pending_tasks_for_execution(&tx, exec)?;
+        queue::delete_unfired_timers_for_execution(&tx, exec)?;
+        queue::delete_undelivered_signals_for_execution(&tx, exec)?;
+        tx.commit()?;
+        self.workflow_panic_strikes.remove(&exec);
+        Ok(())
+    }
+
     /// Run exactly one decision cycle at logical time `now` (epoch milliseconds):
     /// replay/execute the workflow once, persist the resulting side effects, and
     /// run one worker pass.
@@ -1150,7 +1248,7 @@ impl SqliteRuntime {
     /// `_as_of` drivers pass one that returns the caller-fixed epoch, so simulation
     /// stays deterministic (`failure_now() == now`).
     #[allow(clippy::too_many_lines)] // one arm per `WorkflowOutcome` variant
-    async fn drive_one_cycle(
+    async fn drive_one_cycle_inner(
         &mut self,
         exec: ExecutionId,
         now: i64,
@@ -1686,8 +1784,9 @@ impl SqliteRuntime {
 ///   cap, immediate requeue, no policy non-retryable list).
 /// - `start_to_close_override` — honored: persisted (milliseconds) so the worker
 ///   enforces it as a post-execution outcome (a body exceeding its budget records a
-///   terminal `ActivityTimedOut { StartToClose }`, byte-equivalent to the Postgres
-///   timeout scanner). `None` = no budget (unbounded).
+///   terminal `ActivityTimedOut { StartToClose }`). `None` = no budget (unbounded).
+///   Postgres differs here: it retries a start-to-close timeout per the retry
+///   policy (issue #1809, ADR 0005). This backend does not.
 /// - `schedule_to_close` (the `ActivityInfo::default_schedule_to_close`, issue #378)
 ///   and the other three resolved defaults — FROZEN onto the row here when the
 ///   activity is already registered (issue #1068). It is not a command field, so it
@@ -1873,11 +1972,11 @@ const SEALED_STATE: &str = "CONTINUED_AS_NEW";
 /// already-terminal prior (`COMPLETED`/`FAILED`) is sealed WITHOUT a cancellation
 /// event and has no PENDING tasks or unfired timers left to clean up. Every prior
 /// being sealed — RUNNING or already-terminal — also has its undelivered staged
-/// signals deleted: a signal can be staged while the prior is RUNNING and then
-/// outlive it even if the prior reaches COMPLETED/FAILED on its own (the workflow
-/// never awaited that signal name), so the row is just as unreachable — and,
-/// absent any retention/GC pass on this backend, would otherwise survive forever —
-/// regardless of which state sealed it. Then seal to [`SEALED_STATE`] so the prior
+/// signals deleted. A signal can be staged while the prior is RUNNING. It can then
+/// outlive the prior even if the prior reaches COMPLETED/FAILED on its own (the
+/// workflow never awaited that signal name). The row is then just as unreachable,
+/// regardless of which state sealed it. This backend has no retention/GC pass, so
+/// the row would otherwise survive forever. Then seal to [`SEALED_STATE`] so the prior
 /// leaves the active set. Byte-identical
 /// to the pre-#1080 single-prior inline path — extracted so the `TerminateIfRunning`
 /// arm can loop it over EVERY active row for the key

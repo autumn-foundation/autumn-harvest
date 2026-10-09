@@ -314,6 +314,7 @@ async fn insert_workflow_on_url(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -1474,20 +1475,20 @@ async fn ui_workers_filter_stale_true() {
 }
 
 /// RED (was): `?status=zombie` used to `?`-abort `list_workers_ui` with a
-/// bare 400 before the filter form was ever rendered, discarding the
-/// `build_id` filter the operator had already typed alongside it — the same
-/// discard-the-page-on-bad-filter pattern fixed for the Workflows page's
-/// `started_after`/`started_before` in #1333 (that PR's commit message
-/// names this exact test, `ui_workers_unknown_status_value_returns_400`, as
-/// evidence the pattern was systemic, not a one-off).
+/// bare 400 before the filter form was ever rendered. That discarded the
+/// `build_id` filter the operator had already typed alongside it. It is the
+/// same discard-the-page-on-bad-filter pattern fixed for the Workflows page's
+/// `started_after`/`started_before` in #1333. That PR's commit message names
+/// this exact test, `ui_workers_unknown_status_value_returns_400`, as
+/// evidence the pattern was systemic, not a one-off.
 ///
-/// GREEN (this commit): the request still renders the Workers page (`200`),
-/// preserves the other filter (`build_id=abc123`, still in its input's
-/// `value=`), and surfaces a `role="alert"` message naming the bad value and
-/// the valid options next to the Status field — the same four error-path
-/// booleans (adjacent to cause, persists until resolved, says how to
-/// recover, entered data preserved) the Workflows-page fix established now
-/// hold here too.
+/// GREEN (this commit): the request still renders the Workers page (`200`).
+/// It preserves the other filter (`build_id=abc123`, still in its input's
+/// `value=`). It surfaces a `role="alert"` message next to the Status field.
+/// That message names the bad value and the valid options. The Workflows-page
+/// fix established four error-path booleans: adjacent to cause, persists
+/// until resolved, says how to recover, entered data preserved. The same
+/// four now hold here too.
 #[tokio::test]
 async fn ui_workers_unknown_status_value_redisplays_form_instead_of_aborting_page() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -1633,14 +1634,13 @@ async fn ui_workers_invalid_page_redisplays_list_instead_of_aborting_page() {
     );
 }
 
-/// Codex review on #1378 (P2): the first version of this fix parsed the
-/// invalid value down to `None` before it ever reached
-/// `render_workers_page`, so the pagination links and a plain form
-/// resubmission were built without it — a Next click (or clicking Apply
-/// with nothing changed) silently dropped the still-unresolved `status`
-/// filter and its error, one click after the operator saw it. Fixed by
-/// carrying the raw text alongside the parsed value all the way to
-/// `build_worker_query_string`.
+/// #1378: the first version of this fix parsed the invalid value down to
+/// `None` before it ever reached `render_workers_page`. So the pagination
+/// links and a plain form resubmission were built without it. A Next click,
+/// or a click on Apply with nothing changed, silently dropped the
+/// still-unresolved `status` filter and its error. That happened one click
+/// after the operator saw it. The fix carries the raw text alongside the
+/// parsed value all the way to `build_worker_query_string`.
 #[tokio::test]
 async fn ui_workers_invalid_status_value_persists_across_pagination() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -1662,12 +1662,13 @@ async fn ui_workers_invalid_status_value_persists_across_pagination() {
     );
 }
 
-/// Same fix, `stale` side — a distinct code path in `list_workers_ui`, and
-/// the one most likely to be hit organically rather than only by hand-edited
-/// URLs: matching is case-sensitive by design (only the literal `true`
-/// applies the filter), so a capitalized `True` — plausible from a
-/// runbook example, a shell variable, or a JSON boolean serialized
-/// upstream — used to `?`-abort the page the same way `status=zombie` did.
+/// Same fix, `stale` side. This is a distinct code path in
+/// `list_workers_ui`. It is also the one most likely to be hit organically
+/// rather than only by hand-edited URLs. Matching is case-sensitive by
+/// design: only the literal `true` applies the filter. So a capitalized
+/// `True` used to `?`-abort the page the same way `status=zombie` did. That
+/// value is plausible from a runbook example, a shell variable, or a JSON
+/// boolean serialized upstream.
 #[tokio::test]
 async fn ui_workers_unknown_stale_value_redisplays_form_instead_of_aborting_page() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -4709,6 +4710,7 @@ async fn insert_child_workflow_on_url(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -6364,6 +6366,7 @@ async fn workflow_detail_ui_renders_decoded_input() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -6446,6 +6449,14 @@ async fn workflow_detail_ui_renders_decoded_input() {
         .expect("seed pending signal");
     }
 
+    // The engine may wrap the input in a column envelope (issue #1979).
+    let stored_before: Value = autumn_harvest::schema::harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(autumn_harvest::schema::harvest_workflow_executions::input)
+        .first(&mut conn)
+        .await
+        .expect("load stored input before the render");
+
     let app = build_decode_enabled_api_with_ui_app(&database_url);
 
     let (status, html) = fetch_html(&app, &format!("/ui/workflows/{exec_id}")).await;
@@ -6493,7 +6504,11 @@ async fn workflow_detail_ui_renders_decoded_input() {
         .await
         .expect("load stored input");
     assert_eq!(
-        stored_input, input_envelope,
+        stored_input, stored_before,
+        "the decoded render must not write the stored input back"
+    );
+    assert!(
+        !stored_input.to_string().contains("pii-detail-input"),
         "stored input must remain ciphertext after the decoded render"
     );
 }
@@ -6556,6 +6571,7 @@ async fn rejected_signal_render_attributes_decode_audit_to_the_post_route() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -6646,6 +6662,7 @@ async fn workflow_detail_ui_writes_no_audit_row_when_only_hidden_fields_carry_en
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -6943,6 +6960,7 @@ async fn dag957_seed_run(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -7806,7 +7824,8 @@ async fn ui_timeline_renders_activity_timer_pause_ndblock() {
         .with_timezone(&chrono::Utc);
 
     // Activity retried twice (attempt 1 and 2 fail, then attempt 3 completes),
-    // so `derive_timeline` reports attempt = 2 → a "×2" badge. Plus a durable timer.
+    // so `derive_timeline` counts the 3 starts (issue #1809) → a "×3" badge.
+    // Plus a durable timer.
     let a = autumn_harvest::ActivityExecId::new();
     let t_id = "wait_gate";
     let events = vec![
@@ -7841,7 +7860,7 @@ async fn ui_timeline_renders_activity_timer_pause_ndblock() {
     assert_eq!(status, StatusCode::OK, "timeline renders: {html}");
     assert!(html.contains("<svg"), "inline svg present");
     assert!(html.contains("charge_card"), "activity span present");
-    assert!(html.contains("×2"), "retry attempt badge visible: {html}");
+    assert!(html.contains("×3"), "retry attempt badge visible: {html}");
     assert!(html.contains("wait_gate"), "timer span present");
     assert!(html.contains("Timer"), "timer lane label present");
     // Pause band + reason/actor.

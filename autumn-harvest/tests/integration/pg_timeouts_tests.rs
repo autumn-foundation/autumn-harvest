@@ -1004,6 +1004,7 @@ async fn seed_execution(conn: &mut AsyncPgConnection, queue: &str) -> ExecutionI
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -1324,6 +1325,7 @@ async fn a_retried_heartbeat_keeps_its_receipt_time() {
         autumn_harvest::heartbeat::HeartbeatFlushOptions {
             acquire_timeout: Duration::from_millis(200),
             metrics: Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+            shards: Arc::from([0]),
         },
     );
     let sent_at = Utc::now();
@@ -1401,6 +1403,7 @@ async fn a_heartbeat_keeps_its_send_time_on_a_busy_runtime() {
         autumn_harvest::heartbeat::HeartbeatFlushOptions {
             acquire_timeout: Duration::from_secs(5),
             metrics: Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+            shards: Arc::from([0]),
         },
     );
     let sent_at = Utc::now();
@@ -1645,9 +1648,10 @@ async fn a_stale_result_write_does_not_reach_a_newer_claim() {
         let (exec_id, _activity_id, mut stale) = seed_claimed_activity(&mut conn, "q-sr").await;
         let task_id = stale.id;
         if case == "deadline" {
-            // The 1 s retry delay crosses this deadline, so the write takes
-            // the schedule-to-close timeout branch.
-            let deadline = Utc::now() + chrono::Duration::milliseconds(500);
+            // Any retry delay crosses a deadline in the past, so the write
+            // takes the schedule-to-close timeout branch. The retry delay is
+            // jittered, so a future deadline could miss it.
+            let deadline = Utc::now() - chrono::Duration::seconds(1);
             stale.schedule_to_close_at = Some(deadline);
             diesel::sql_query(
                 "UPDATE harvest_task_queue SET schedule_to_close_at = $2 WHERE id = $1",
@@ -1669,7 +1673,7 @@ async fn a_stale_result_write_does_not_reach_a_newer_claim() {
         .expect("model the newer claim");
 
         let policy = autumn_harvest::policy::RetryPolicy::fixed(3, Duration::from_secs(1));
-        let _ = autumn_harvest::worker::write_activity_result_for_task(
+        let write = autumn_harvest::worker::write_activity_result_for_task(
             &mut conn,
             &stale,
             "w-1",
@@ -1678,6 +1682,12 @@ async fn a_stale_result_write_does_not_reach_a_newer_claim() {
             &autumn_harvest::payload_codec::PayloadCodecs::default(),
         )
         .await;
+        // Issue #1815: the outcome window skips a lost lease, so the stale
+        // write must report one on every branch.
+        assert!(
+            matches!(write, Ok(autumn_harvest::queue::ClaimWrite::LeaseLost)),
+            "{case}: the stale write must report a lost lease, got {write:?}"
+        );
 
         let claim =
             diesel::sql_query("SELECT state, worker_id FROM harvest_task_queue WHERE id = $1")
@@ -1898,6 +1908,7 @@ async fn a_heartbeat_sent_during_a_blocked_flush_keeps_its_time() {
         autumn_harvest::heartbeat::HeartbeatFlushOptions {
             acquire_timeout: Duration::from_secs(3),
             metrics: Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+            shards: Arc::from([0]),
         },
     );
     assert!(tx.send(serde_json::json!({"progress": 1})));
@@ -1976,6 +1987,7 @@ async fn a_newer_heartbeat_follows_a_blocked_flush_at_once() {
         autumn_harvest::heartbeat::HeartbeatFlushOptions {
             acquire_timeout: Duration::from_secs(10),
             metrics: Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+            shards: Arc::from([0]),
         },
     );
     assert!(tx.send(serde_json::json!({"progress": 1})));
@@ -2065,6 +2077,7 @@ async fn a_scanner_behind_a_blocked_flush_sees_the_newer_heartbeat() {
         autumn_harvest::heartbeat::HeartbeatFlushOptions {
             acquire_timeout: Duration::from_secs(10),
             metrics: Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+            shards: Arc::from([0]),
         },
     );
     assert!(tx.send(serde_json::json!({"progress": 1})));
@@ -2402,6 +2415,7 @@ async fn a_scanner_behind_a_timed_out_heartbeat_sees_the_newer_one() {
         autumn_harvest::heartbeat::HeartbeatFlushOptions {
             acquire_timeout: Duration::from_secs(10),
             metrics: Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+            shards: Arc::from([0]),
         },
     );
     assert!(tx.send(serde_json::json!({"progress": 1})));

@@ -997,29 +997,43 @@ fn job_block_stops_at_the_next_job() {
     assert_eq!(job_block(yaml, "b"), "  b:\n    steps:\n      - run: two\n");
 }
 
-/// Issue #1616: the release job builds the client before it creates the
-/// release, and attaches the tarball.
+/// Issue #1616: the `client` job builds the client before the release job
+/// creates the release, and the release attaches the tarball. Issue #1826
+/// moved the build out of the job that holds `contents: write`.
 #[test]
 fn the_release_pipeline_builds_and_attaches_the_client() {
     let release = repo_file(".github/workflows/release.yml");
+    let client = without_comments(job_block(&release, "client"));
+    assert!(
+        client.contains("scripts/build-typescript-client.sh"),
+        "the client job must run scripts/build-typescript-client.sh"
+    );
+    assert!(
+        client.contains("autumn-harvest-client-${version}.tgz"),
+        "the client job must check the tarball name against the version"
+    );
     let job = without_comments(job_block(&release, "release"));
-    let build = job
-        .find("scripts/build-typescript-client.sh")
-        .expect("the release job must run scripts/build-typescript-client.sh");
+    // Read the list, so a new release gate does not break this test.
+    let needs: Vec<&str> = job
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("needs: ["))
+        .and_then(|rest| rest.strip_suffix(']'))
+        .expect("the release job must list its needs")
+        .split(',')
+        .map(str::trim)
+        .collect();
+    for need in ["validate", "sign", "client", "sign-client"] {
+        assert!(
+            needs.contains(&need),
+            "the release must wait for the client build: no `{need}` in {needs:?}"
+        );
+    }
     let create = job
         .find("softprops/action-gh-release")
         .expect("the release job must create the GitHub release");
     assert!(
-        build < create,
-        "the client must build before the release exists"
-    );
-    assert!(
-        job[create..].contains("files: ${{ steps.client.outputs.tarball }}"),
+        job[create..].contains("dist/${{ needs.client.outputs.tarball }}"),
         "the release step must attach the client tarball"
-    );
-    assert!(
-        job[..create].contains("autumn-harvest-client-${version}.tgz"),
-        "the release job must check the tarball name against the version"
     );
 }
 

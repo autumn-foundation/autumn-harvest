@@ -34,8 +34,10 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use autumn_harvest::replication::{
-    FenceRegistry, ReplicationStatus, ShardGeneration, WatermarkReading, assert_fence,
-    bump_generation, current_generation, ensure_generation_row, query_replication_status,
+    AdminWrite, DrFencing, DrMarkers, FenceRegistry, ReplicationStatus, ShardGeneration,
+    WatermarkReading, assert_admin_write_authority, assert_fence, bump_generation,
+    current_generation, ensure_generation_row, pin_process_fence, pin_worker_fence,
+    probe_dr_markers, query_replication_status, resolve_held,
 };
 use autumn_harvest::types::{ExecutionId, ShardId};
 use futures::FutureExt as _;
@@ -88,8 +90,34 @@ impl autumn_harvest::payload_codec::PayloadCodec for DrXorCodec {
 struct NoOpMetrics;
 impl autumn_harvest::telemetry::MetricsRecorder for NoOpMetrics {}
 
-async fn registry_guard() -> tokio::sync::MutexGuard<'static, ()> {
-    REGISTRY_SERIAL.lock().await
+/// Holds [`REGISTRY_SERIAL`]. On drop it clears the registry and the DR
+/// config, so a test that panics leaves no pin behind (issue #1823).
+pub struct RegistryGuard {
+    _serial: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for RegistryGuard {
+    fn drop(&mut self) {
+        FenceRegistry::clear();
+        autumn_harvest::replication::set_dr_config(autumn_harvest::replication::DrConfig::default());
+    }
+}
+
+/// Serializes every test in this crate that pins the process-global
+/// `FenceRegistry`. `shard_rebalance_db_tests` takes it too (issue #1839).
+pub async fn registry_guard() -> RegistryGuard {
+    RegistryGuard {
+        _serial: REGISTRY_SERIAL.lock().await,
+    }
+}
+
+/// A slot prefix no other test uses, for a "plain database" assertion.
+///
+/// A physical slot covers the whole cluster. A slot that another test leaks
+/// with the default prefix would mark every database as DR. A unique prefix
+/// keeps the plain-database tests independent of that.
+fn unique_prefix(db: &str) -> String {
+    format!("{DR_PREFIX}_{db}")
 }
 
 /// The shared Postgres these tests create their per-test databases on.
@@ -1012,6 +1040,129 @@ async fn a_fenced_worker_cannot_claim_tasks() {
     FenceRegistry::clear();
 }
 
+/// The batched claim applies the same fence as the single-row claim (issue
+/// #1823). Issue #1340 intends to make it the default claim path.
+#[tokio::test]
+async fn a_fenced_worker_cannot_claim_through_claim_task_batched() {
+    use autumn_harvest::queue::{BatchedClaimConfig, claim_task_batched};
+
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("claimbatched");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    let params = autumn_harvest::queue::EnqueueParams::new(
+        "q-dr-batched",
+        autumn_harvest::queue::TaskType::Activity,
+        serde_json::json!({}),
+    );
+    autumn_harvest::queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue");
+
+    FenceRegistry::clear();
+    FenceRegistry::publish(
+        &[(ShardId::new(0), ShardGeneration::new(0))],
+        ShardId::new(0),
+    )
+    .expect("no conflicting pin in this test");
+
+    let queues = ["q-dr-batched".to_string()];
+    let claimed = claim_task_batched(
+        &mut conn,
+        &queues,
+        "w-dr",
+        "",
+        None,
+        &[],
+        &[],
+        BatchedClaimConfig::default(),
+    )
+    .await
+    .expect("claim");
+    assert!(claimed.is_some(), "the current epoch claims normally");
+
+    diesel::sql_query("UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
+        .await
+        .unwrap();
+
+    let after = claim_task_batched(
+        &mut conn,
+        &queues,
+        "w-dr",
+        "",
+        None,
+        &[],
+        &[],
+        BatchedClaimConfig::default(),
+    )
+    .await
+    .expect("the claim query itself still succeeds");
+    let after_on_shard = autumn_harvest::queue::claim_task_batched_on_shard(
+        &mut conn,
+        &queues,
+        "w-dr",
+        "",
+        None,
+        &[],
+        &[],
+        BatchedClaimConfig::default(),
+        Some(ShardId::new(0)),
+    )
+    .await
+    .expect("the claim query itself still succeeds");
+    FenceRegistry::clear();
+    assert!(
+        after.is_none(),
+        "a worker pinned to a superseded generation must claim nothing"
+    );
+    assert!(
+        after_on_shard.is_none(),
+        "the explicit-shard entry point is fenced too"
+    );
+
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        attempt: i32,
+    }
+    let rows: Vec<Row> = diesel::sql_query("SELECT state, attempt FROM harvest_task_queue")
+        .load(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].state, "PENDING");
+    assert_eq!(rows[0].attempt, 1, "a fenced claim must not burn a retry");
+
+    // Positive control: the row is claimable at the current epoch, so the
+    // `None` above comes from the fence, not from leftover row state.
+    FenceRegistry::publish(
+        &[(ShardId::new(0), ShardGeneration::new(1))],
+        ShardId::new(0),
+    )
+    .expect("pin the current epoch");
+    let current = claim_task_batched(
+        &mut conn,
+        &queues,
+        "w-dr",
+        "",
+        None,
+        &[],
+        &[],
+        BatchedClaimConfig::default(),
+    )
+    .await
+    .expect("claim");
+    FenceRegistry::clear();
+    assert!(current.is_some(), "the current epoch claims the row");
+}
+
 /// The fence bump is a **commit-order barrier**, not a racy read.
 ///
 /// This is the property the whole mechanism rests on: a persist that passes the
@@ -1869,7 +2020,7 @@ async fn a_dr_enabled_worker_pins_at_startup_and_stops_when_fenced() {
     let shard = ShardId::new(3);
     FenceRegistry::clear();
     autumn_harvest::replication::set_dr_config(autumn_harvest::replication::DrConfig {
-        fencing: true,
+        fencing: DrFencing::Enabled,
         sample_interval: std::time::Duration::from_millis(300),
         watermark_retain: std::time::Duration::from_secs(3600),
         slot_prefix: DR_PREFIX.to_string(),
@@ -1942,6 +2093,3286 @@ async fn a_dr_enabled_worker_pins_at_startup_and_stops_when_fenced() {
 
     FenceRegistry::clear();
     autumn_harvest::replication::set_dr_config(autumn_harvest::replication::DrConfig::default());
+}
+
+/// A worker's shutdown writes check the live fence (issue #1823). The
+/// sampler stops with the worker, so a bump during shutdown never sets the
+/// fenced-out flag. The fleet row must still not change after the bump.
+#[tokio::test]
+async fn a_shutdown_after_a_bump_leaves_the_fleet_row_alone() {
+    #[derive(diesel::QueryableByName)]
+    struct Status {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        status: String,
+    }
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("shutdownfence");
+    let shard = ShardId::new(3);
+    let hour = std::time::Duration::from_secs(3600);
+    FenceRegistry::clear();
+    autumn_harvest::replication::set_dr_config(autumn_harvest::replication::DrConfig {
+        fencing: DrFencing::Enabled,
+        sample_interval: hour,
+        watermark_retain: hour,
+        slot_prefix: DR_PREFIX.to_string(),
+    });
+    // Neither the sampler nor the heartbeat may see the bump first.
+    let mut config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default()
+            .with_dr_fencing(true)
+            .with_replication_sample_interval(hour),
+    );
+    config.shard_assignments = vec![shard];
+    config.worker_heartbeat_interval = hour;
+    let worker_id = config.worker_id.clone();
+    let registry = std::sync::Arc::new(autumn_harvest::worker::HandlerRegistry::new(
+        Vec::new(),
+        Vec::new(),
+    ));
+    let worker = std::sync::Arc::new(
+        autumn_harvest::worker::Worker::new(config, registry).expect("worker builds"),
+    );
+    let pool = dr_pool(&url);
+    let runner = std::sync::Arc::clone(&worker);
+    let run = tokio::spawn(async move { runner.run(&pool).await });
+    let status = |url: String, worker_id: String| async move {
+        let mut conn = connect(&url).await;
+        let rows: Vec<Status> =
+            diesel::sql_query("SELECT status FROM harvest_workers WHERE worker_id = $1")
+                .bind::<diesel::sql_types::Text, _>(worker_id)
+                .load(&mut conn)
+                .await
+                .unwrap_or_default();
+        <[Status]>::first(&rows).map(|row| row.status.clone())
+    };
+    eventually(
+        "the worker to register",
+        std::time::Duration::from_secs(30),
+        || {
+            let (url, worker_id) = (url.clone(), worker_id.clone());
+            async move { status(url, worker_id).await.as_deref() == Some("Active") }
+        },
+    )
+    .await;
+
+    {
+        let mut conn = connect(&url).await;
+        bump_generation(&mut conn, shard, "failover", "test")
+            .await
+            .expect("bump");
+    }
+    worker.shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(60), run)
+        .await
+        .expect("the worker stops")
+        .expect("the worker task must not panic");
+
+    assert_eq!(
+        status(url.clone(), worker_id.clone()).await.as_deref(),
+        Some("Active"),
+        "a worker that lost write authority must not write its fleet status"
+    );
+}
+
+/// A detached completion-trigger relay holds its own fence (issue #1823).
+/// It runs after the caller returns, so the caller's fence no longer covers
+/// it. A source shard whose pin is superseded keeps its outbox row.
+#[tokio::test]
+async fn a_detached_trigger_relay_writes_nothing_on_a_fenced_source() {
+    #[derive(diesel::QueryableByName)]
+    struct Rows {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        rows: i64,
+    }
+    let _serial = registry_guard().await;
+    let (source_url, _source_db) = require_db!("relaysrc");
+    let (target_url, _target_db) = require_db!("relaytgt");
+    let (source, target) = (ShardId::new(0), ShardId::new(1));
+    let source_pool = dr_pool(&source_url);
+    let pools: std::collections::BTreeMap<_, _> = [
+        (source, source_pool.clone()),
+        (target, dr_pool(&target_url)),
+    ]
+    .into_iter()
+    .collect();
+    let sharded = autumn_harvest::shard::ShardedDbPool::from_map(pools, source);
+
+    let outbox_id = uuid::Uuid::new_v4();
+    let source_exec_id = ExecutionId::new_for_shard(source).as_uuid();
+    let mut conn = connect(&source_url).await;
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_trigger_outbox \
+            (id, source_exec_id, trigger_id, target_shard, target_workflow_name, \
+             target_workflow_id, target_input, queue_name, priority, max_workflow_input_bytes) \
+         VALUES ($1, $2, $3, 1, 'dr_relay_target', 'dr-relay', '{}'::jsonb, \
+                 'default', '0'::jsonb, 1048576)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(outbox_id)
+    .bind::<diesel::sql_types::Uuid, _>(source_exec_id)
+    .bind::<diesel::sql_types::Uuid, _>(uuid::Uuid::new_v4())
+    .execute(&mut conn)
+    .await
+    .expect("insert the outbox row");
+    // The source pin is superseded: another region owns the source shard.
+    let pinned = ensure_generation_row(&mut conn, source).await.unwrap();
+    FenceRegistry::publish(&[(source, pinned)], source).expect("pin");
+    bump_generation(&mut conn, source, "failover", "test")
+        .await
+        .expect("bump");
+
+    autumn_harvest::completion_trigger::DeferredTriggerStart {
+        outbox_id,
+        source_exec_id,
+        trigger_id: uuid::Uuid::new_v4(),
+        source_shard: source,
+        target_shard: target,
+        target_workflow_name: "dr_relay_target".to_string(),
+        target_workflow_id: "dr-relay".to_string(),
+        target_input: serde_json::json!({}),
+        queue_name: Some("default".to_string()),
+        concurrency_key: None,
+        concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+        priority: autumn_harvest::types::Priority::default(),
+        max_workflow_input_bytes: 1_048_576,
+        trigger_name: "dr_relay".to_string(),
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        sla: None,
+        retry_policy: None,
+        max_workflow_attempts_ceiling: None,
+        codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
+        tenant: None,
+    }
+    .spawn();
+    // The relay is fire-and-forget. Give it time to run.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let remaining: Vec<Rows> =
+        diesel::sql_query("SELECT count(*) AS rows FROM harvest_completion_trigger_outbox")
+            .load(&mut conn)
+            .await
+            .expect("count the outbox");
+    let _ = autumn_harvest::shard::ShardedDbPool::single(source_pool);
+    drop(sharded);
+
+    assert_eq!(
+        <[Rows]>::first(&remaining).map(|row| row.rows),
+        Some(1),
+        "a relay must not write a source shard whose pin is superseded"
+    );
+}
+
+/// An audit write checks the fence in its own transaction (issue #1823). A
+/// read route such as the event stream writes audit rows but takes no fence
+/// barrier. A process whose pin is superseded must write none.
+#[tokio::test]
+async fn a_superseded_pin_writes_no_audit_row() {
+    #[derive(diesel::QueryableByName)]
+    struct Rows {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        rows: i64,
+    }
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("auditfence");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    FenceRegistry::publish(&[(ShardId::new(0), pinned)], ShardId::new(0)).expect("pin");
+    bump_generation(&mut conn, ShardId::new(0), "failover", "test")
+        .await
+        .expect("bump");
+    let record = autumn_harvest::models::NewAuditRecord {
+        actor: "reader",
+        operation: "execution.stream.open",
+        target_type: "execution",
+        target_id: None,
+        route_or_command: "GET /executions/{exec_id}/events/stream",
+        request_id: None,
+        idempotency_key: None,
+        status: autumn_harvest::audit::STATUS_SUCCEEDED,
+        error_summary: None,
+        shard_id: Some(0),
+        source: "api",
+    };
+
+    let single = autumn_harvest::audit::insert_audit(&mut conn, &record).await;
+    let batch =
+        autumn_harvest::audit::insert_audit_batch(&mut conn, std::slice::from_ref(&record)).await;
+    let rows: Vec<Rows> = diesel::sql_query("SELECT count(*) AS rows FROM harvest_audit_log")
+        .load(&mut conn)
+        .await
+        .expect("count the audit rows");
+
+    assert!(
+        matches!(
+            single,
+            Err(autumn_harvest::error::HarvestError::ShardFenced { .. })
+        ),
+        "a superseded pin must not write an audit row: {single:?}"
+    );
+    assert!(
+        matches!(
+            batch,
+            Err(autumn_harvest::error::HarvestError::ShardFenced { .. })
+        ),
+        "a superseded pin must not write an audit batch: {batch:?}"
+    );
+    assert_eq!(<[Rows]>::first(&rows).map(|row| row.rows), Some(0));
+}
+
+// ── Fence on by default where DR is configured (issue #1823) ───────────────
+
+#[tokio::test]
+async fn the_probe_finds_no_dr_marker_on_a_plain_database() {
+    let (url, db) = require_db!("probeplain");
+    let mut conn = connect(&url).await;
+    let markers = probe_dr_markers(&mut conn, &unique_prefix(&db))
+        .await
+        .expect("probe");
+    assert_eq!(markers, DrMarkers::default(), "{markers:?}");
+    assert!(!markers.is_dr());
+}
+
+#[tokio::test]
+async fn the_probe_finds_a_generation_row() {
+    let (url, _db) = require_db!("proberow");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(5))
+        .await
+        .expect("provision");
+    let markers = probe_dr_markers(&mut conn, DR_PREFIX).await.expect("probe");
+    assert_eq!(markers.generation_shards, vec![ShardId::new(5)]);
+    assert!(markers.is_dr());
+}
+
+/// A DR slot on THIS database marks it. A slot with another prefix does not.
+#[tokio::test]
+async fn the_probe_finds_a_logical_dr_slot_on_this_database_only() {
+    let (url, db) = require_db!("probeslot");
+    if !wal_level_is_logical(&url).await {
+        eprintln!("SKIPPED probeslot: wal_level is not logical");
+        return;
+    }
+    let mut conn = connect(&url).await;
+    let dr_slot = format!("{DR_PREFIX}_{db}");
+    let cdc_slot = format!("cdc_{db}");
+    for slot in [&dr_slot, &cdc_slot] {
+        diesel::sql_query("SELECT pg_create_logical_replication_slot($1, 'pgoutput')")
+            .bind::<diesel::sql_types::Text, _>(slot.clone())
+            .execute(&mut conn)
+            .await
+            .expect("create slot");
+    }
+    let markers = probe_dr_markers(&mut conn, DR_PREFIX).await;
+    let other = probe_dr_markers(&mut conn, "no_such_prefix").await;
+    // The same slot, seen from another database, must not count there.
+    let elsewhere = match fresh_db("probeslotother").await {
+        Some((other_url, _)) => {
+            let mut other_conn = connect(&other_url).await;
+            Some(probe_dr_markers(&mut other_conn, &dr_slot).await)
+        }
+        None => None,
+    };
+    for slot in [&dr_slot, &cdc_slot] {
+        let _ = diesel::sql_query("SELECT pg_drop_replication_slot($1)")
+            .bind::<diesel::sql_types::Text, _>(slot.clone())
+            .execute(&mut conn)
+            .await;
+    }
+    let markers = markers.expect("probe");
+    assert_eq!(markers.dr_slots, 1, "{markers:?}");
+    assert!(markers.is_dr());
+    assert!(!other.expect("probe").is_dr(), "only the DR prefix counts");
+    if let Some(elsewhere) = elsewhere {
+        assert_eq!(
+            elsewhere.expect("probe").dr_slots,
+            0,
+            "a logical slot marks its own database only"
+        );
+    }
+}
+
+#[tokio::test]
+async fn auto_mode_leaves_a_plain_database_unfenced() {
+    let _serial = registry_guard().await;
+    let (url, db) = require_db!("autoplain");
+    let pool = dr_pool(&url);
+    FenceRegistry::clear();
+    let targets = Some((vec![(ShardId::new(2), pool.clone())], ShardId::new(2)));
+    let resolved = pin_process_fence(DrFencing::Auto, &unique_prefix(&db), targets, &pool)
+        .await
+        .expect("a plain database starts");
+    let enabled = FenceRegistry::is_enabled();
+    let mut conn = connect(&url).await;
+    let row = current_generation(&mut conn, ShardId::new(2))
+        .await
+        .unwrap();
+    FenceRegistry::clear();
+    assert!(resolved.is_none(), "no marker means no fence");
+    assert!(!enabled, "nothing is pinned");
+    assert_eq!(row, None, "Auto never provisions a plain database");
+}
+
+#[tokio::test]
+async fn auto_mode_pins_a_dr_database() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("autodr");
+    let pool = dr_pool(&url);
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(2))
+        .await
+        .unwrap();
+    bump_generation(&mut conn, ShardId::new(2), "earlier failover", "test")
+        .await
+        .unwrap();
+    FenceRegistry::clear();
+    let targets = Some((vec![(ShardId::new(2), pool.clone())], ShardId::new(2)));
+    let resolved = pin_process_fence(DrFencing::Auto, DR_PREFIX, targets, &pool)
+        .await
+        .expect("a DR database starts fenced");
+    let pinned = FenceRegistry::expected(ShardId::new(2));
+    FenceRegistry::clear();
+    assert_eq!(
+        resolved.map(|targets| targets.len()),
+        Some(1),
+        "the fence is on"
+    );
+    assert_eq!(
+        pinned,
+        Some(ShardGeneration::new(1)),
+        "pins the current epoch"
+    );
+}
+
+/// With no shard identity, Auto reads the shard from the single row.
+#[tokio::test]
+async fn auto_mode_reads_the_shard_from_a_single_generation_row() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("autoinfer");
+    let pool = dr_pool(&url);
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(7))
+        .await
+        .unwrap();
+    FenceRegistry::clear();
+    let resolved = pin_process_fence(DrFencing::Auto, DR_PREFIX, None, &pool)
+        .await
+        .expect("one row names the shard");
+    let pinned = FenceRegistry::expected(ShardId::new(7));
+    let unencoded = FenceRegistry::expected(ShardId::UNENCODED);
+    FenceRegistry::clear();
+    assert_eq!(
+        resolved.map(|targets| targets.iter().map(|(s, _)| *s).collect::<Vec<_>>()),
+        Some(vec![ShardId::new(7)])
+    );
+    assert_eq!(pinned, Some(ShardGeneration::INITIAL));
+    assert_eq!(
+        unencoded,
+        Some(ShardGeneration::INITIAL),
+        "default shard is 7"
+    );
+}
+
+/// A DR database with no row and no shard identity cannot be fenced. The
+/// process refuses to start rather than invent shard 0.
+#[tokio::test]
+async fn auto_mode_refuses_a_dr_database_it_cannot_name() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("autononame");
+    let pool = dr_pool(&url);
+    let mut conn = connect(&url).await;
+    for shard in [1, 2] {
+        ensure_generation_row(&mut conn, ShardId::new(shard))
+            .await
+            .unwrap();
+    }
+    FenceRegistry::clear();
+    let refused = pin_process_fence(DrFencing::Auto, DR_PREFIX, None, &pool).await;
+    let enabled = FenceRegistry::is_enabled();
+    FenceRegistry::clear();
+    let Err(error) = refused else {
+        panic!("two rows name no single shard");
+    };
+    assert!(error.to_string().contains("shard"), "{error}");
+    assert!(!enabled, "a refused start pins nothing");
+}
+
+#[tokio::test]
+async fn disabled_mode_refuses_a_dr_database() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("disableddr");
+    let pool = dr_pool(&url);
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(2))
+        .await
+        .unwrap();
+    FenceRegistry::clear();
+    let targets = Some((vec![(ShardId::new(2), pool.clone())], ShardId::new(2)));
+    let refused = pin_process_fence(DrFencing::Disabled, DR_PREFIX, targets.clone(), &pool).await;
+    let enabled = FenceRegistry::is_enabled();
+    FenceRegistry::clear();
+    let Err(error) = refused else {
+        panic!("Disabled on a DR database must refuse to start");
+    };
+    assert!(
+        matches!(error, autumn_harvest::error::HarvestError::Config(_)),
+        "{error:?}"
+    );
+    assert!(!enabled);
+
+    // A plain database runs unfenced under Disabled, as before.
+    let (plain_url, plain_db) = require_db!("disabledplain");
+    let plain = dr_pool(&plain_url);
+    let plain_targets = Some((vec![(ShardId::new(2), plain.clone())], ShardId::new(2)));
+    let prefix = unique_prefix(&plain_db);
+    let resolved = pin_process_fence(DrFencing::Disabled, &prefix, plain_targets, &plain)
+        .await
+        .expect("a plain database starts");
+    assert!(resolved.is_none());
+}
+
+/// A worker configured `Disabled` does not start on a DR database: it never
+/// registers in the fleet and never claims.
+#[tokio::test]
+async fn a_worker_configured_disabled_refuses_to_start_on_a_dr_database() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("workerdisabled");
+    let shard = ShardId::new(3);
+    {
+        let mut conn = connect(&url).await;
+        ensure_generation_row(&mut conn, shard).await.unwrap();
+    }
+    FenceRegistry::clear();
+    let mut config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default().with_dr_fencing(false),
+    );
+    config.shard_assignments = vec![shard];
+    let registry = std::sync::Arc::new(autumn_harvest::worker::HandlerRegistry::new(
+        Vec::new(),
+        Vec::new(),
+    ));
+    let worker = autumn_harvest::worker::Worker::new(config, registry).expect("worker builds");
+    let pool = dr_pool(&url);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), worker.run(&pool)).await;
+    let enabled = FenceRegistry::is_enabled();
+    FenceRegistry::clear();
+    autumn_harvest::replication::set_dr_config(autumn_harvest::replication::DrConfig::default());
+    outcome.expect("a disagreeing worker must stop at once, not run");
+    assert!(!enabled, "a refused worker pins nothing");
+    assert_eq!(
+        count_on(&url, "SELECT COUNT(*) AS n FROM harvest_workers").await,
+        0,
+        "a refused worker never registers in the fleet"
+    );
+}
+
+/// The default worker config fences a DR database with no extra setting.
+#[tokio::test]
+async fn a_default_worker_fences_a_dr_database() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("workerauto");
+    let shard = ShardId::new(4);
+    {
+        let mut conn = connect(&url).await;
+        ensure_generation_row(&mut conn, shard).await.unwrap();
+    }
+    FenceRegistry::clear();
+    let config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default()
+            .with_replication_sample_interval(std::time::Duration::from_millis(300)),
+    );
+    let registry = std::sync::Arc::new(autumn_harvest::worker::HandlerRegistry::new(
+        Vec::new(),
+        Vec::new(),
+    ));
+    let worker = autumn_harvest::worker::Worker::new(config, registry).expect("worker builds");
+    let pool = dr_pool(&url);
+    let run = tokio::spawn(async move { worker.run(&pool).await });
+    eventually(
+        "the default worker to pin its generation",
+        std::time::Duration::from_secs(30),
+        || async move { FenceRegistry::expected(shard).is_some() },
+    )
+    .await;
+    {
+        let mut conn = connect(&url).await;
+        bump_generation(&mut conn, shard, "failover", "test")
+            .await
+            .unwrap();
+    }
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(60), run).await;
+    FenceRegistry::clear();
+    autumn_harvest::replication::set_dr_config(autumn_harvest::replication::DrConfig::default());
+    stopped
+        .expect("a fenced default worker must stop")
+        .expect("worker task must not panic");
+}
+
+/// A DR subscription marks a logical standby. No process may start there,
+/// and nothing is provisioned: a local row would collide with the row that
+/// replication later delivers.
+#[tokio::test]
+async fn a_logical_standby_refuses_to_start_and_provisions_nothing() {
+    let _serial = registry_guard().await;
+    let (url, db) = require_db!("standbysub");
+    let mut conn = connect(&url).await;
+    let sub = format!("{DR_PREFIX}_sub_{db}");
+    diesel::sql_query(format!(
+        "CREATE SUBSCRIPTION {sub} CONNECTION 'dbname=unused' PUBLICATION harvest_dr \
+         WITH (connect = false)"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("create a disconnected subscription");
+
+    let markers = probe_dr_markers(&mut conn, DR_PREFIX).await;
+    let pool = dr_pool(&url);
+    let targets = Some((vec![(ShardId::new(0), pool.clone())], ShardId::new(0)));
+    let refused = pin_process_fence(DrFencing::Auto, DR_PREFIX, targets, &pool).await;
+    let row = current_generation(&mut conn, ShardId::new(0)).await;
+    let _ = diesel::sql_query(format!("ALTER SUBSCRIPTION {sub} SET (slot_name = NONE)"))
+        .execute(&mut conn)
+        .await;
+    let _ = diesel::sql_query(format!("DROP SUBSCRIPTION {sub}"))
+        .execute(&mut conn)
+        .await;
+
+    let markers = markers.expect("probe");
+    assert_eq!(markers.dr_subscriptions, 1, "{markers:?}");
+    assert!(markers.is_dr() && markers.is_standby());
+    let Err(error) = refused else {
+        panic!("a standby must refuse to start");
+    };
+    assert!(error.to_string().contains("standby"), "{error}");
+    assert_eq!(
+        row.expect("read"),
+        None,
+        "nothing is provisioned on a standby"
+    );
+    assert!(!FenceRegistry::is_enabled());
+}
+
+/// A subscription may have any local name. Its slot name carries the DR
+/// prefix, so the slot name marks the standby too.
+#[tokio::test]
+async fn a_standby_whose_subscription_slot_has_the_dr_prefix_refuses_to_start() {
+    let _serial = registry_guard().await;
+    let (url, db) = require_db!("standbyslotname");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .expect("the replicated row");
+    let sub = format!("regional_replica_{db}");
+    diesel::sql_query(format!(
+        "CREATE SUBSCRIPTION {sub} CONNECTION 'dbname=unused' PUBLICATION harvest_dr \
+         WITH (connect = false, slot_name = '{DR_PREFIX}_{db}')"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("create a disconnected subscription");
+
+    let pool = dr_pool(&url);
+    let targets = Some((vec![(ShardId::new(0), pool.clone())], ShardId::new(0)));
+    let refused = pin_process_fence(DrFencing::Auto, DR_PREFIX, targets, &pool).await;
+    let enabled = FenceRegistry::is_enabled();
+    let _ = diesel::sql_query(format!("ALTER SUBSCRIPTION {sub} SET (slot_name = NONE)"))
+        .execute(&mut conn)
+        .await;
+    let _ = diesel::sql_query(format!("DROP SUBSCRIPTION {sub}"))
+        .execute(&mut conn)
+        .await;
+
+    let Err(error) = refused else {
+        panic!("a standby must refuse to start, whatever its subscription is named");
+    };
+    assert!(error.to_string().contains("standby"), "{error}");
+    assert!(!enabled, "a refused start pins nothing");
+}
+
+/// A worker that cannot probe a shard at boot holds it instead of refusing
+/// to start (issues #961, #1823). A held shard claims nothing until the
+/// resolver releases it.
+#[tokio::test]
+async fn a_worker_holds_a_shard_it_cannot_probe_and_claims_nothing_there() {
+    let _serial = registry_guard().await;
+    let (url, db) = require_db!("holdshard");
+    let unreachable = dr_pool("postgres://postgres:postgres@127.0.0.1:1/unreachable");
+    let targets = Some((
+        vec![(ShardId::new(0), unreachable.clone())],
+        ShardId::new(0),
+    ));
+    let Ok((fenced, mut held)) =
+        pin_worker_fence(DrFencing::Auto, DR_PREFIX, targets, &unreachable, &[]).await
+    else {
+        panic!("an unreachable shard is held, not refused");
+    };
+    assert!(fenced.is_none());
+    assert_eq!(held.len(), 1);
+    assert!(FenceRegistry::is_held(ShardId::new(0)));
+
+    // The held shard claims nothing, even on a database that has work.
+    let mut conn = connect(&url).await;
+    let params = autumn_harvest::queue::EnqueueParams::new(
+        "q-held",
+        autumn_harvest::queue::TaskType::Activity,
+        serde_json::json!({}),
+    );
+    autumn_harvest::queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue");
+    async fn claim(
+        conn: &mut AsyncPgConnection,
+    ) -> autumn_harvest::error::HarvestResult<Option<autumn_harvest::models::TaskQueueItem>> {
+        autumn_harvest::queue::claim_task_on_shard(
+            conn,
+            &["q-held".to_string()],
+            "w-held",
+            "",
+            None,
+            &[],
+            &[],
+            Some(ShardId::new(0)),
+        )
+        .await
+    }
+    let while_held = claim(&mut conn).await.expect("claim query runs");
+
+    // The shard comes back with no DR marker: the resolver releases it.
+    let plain = dr_pool(&url);
+    held[0].1 = plain;
+    resolve_held(&mut held, &unique_prefix(&db))
+        .await
+        .expect("a plain shard is released");
+    let after_release = claim(&mut conn).await.expect("claim query runs");
+
+    assert!(while_held.is_none(), "a held shard must claim nothing");
+    assert!(held.is_empty(), "the released shard leaves the held list");
+    assert!(!FenceRegistry::is_held(ShardId::new(0)));
+    assert!(after_release.is_some(), "a released shard claims normally");
+}
+
+/// A shard this process already pinned keeps that pin when a later worker
+/// cannot probe it (issue #1823). The runner pins before its worker starts.
+/// A brief outage at that moment must not hold, refuse or stop the worker.
+/// The worker must probe through the pool that took the pin. Another pool
+/// can reach another database, such as a logical standby.
+#[tokio::test]
+async fn an_unprobeable_shard_reuses_the_process_pin() {
+    let _serial = registry_guard().await;
+    let (url, db) = require_db!("pinreuse");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    drop(conn);
+    let pool = dr_pool(&url);
+    let runner_targets = Some((vec![(ShardId::new(0), pool.clone())], ShardId::new(0)));
+    pin_process_fence(DrFencing::Auto, DR_PREFIX, runner_targets, &pool)
+        .await
+        .expect("the runner pins first");
+    // The outage: the pinned database goes away.
+    let admin = admin_url().await.expect("admin url");
+    let mut admin_conn = connect(&admin).await;
+    diesel::sql_query(format!("DROP DATABASE \"{db}\" WITH (FORCE)"))
+        .execute(&mut admin_conn)
+        .await
+        .expect("drop the pinned database");
+
+    let targets = Some((vec![(ShardId::new(0), pool.clone())], ShardId::new(0)));
+    let Ok((fenced, held)) =
+        pin_worker_fence(DrFencing::Auto, DR_PREFIX, targets, &pool, &[]).await
+    else {
+        panic!("a pinned shard needs no probe to start");
+    };
+    let fenced: Vec<ShardId> = fenced
+        .expect("the pinned shard stays fenced")
+        .into_iter()
+        .map(|(shard, _)| shard)
+        .collect();
+    assert_eq!(fenced, vec![ShardId::new(0)]);
+    assert!(held.is_empty(), "a pinned shard is never held");
+    assert_eq!(
+        FenceRegistry::expected(ShardId::new(0)),
+        Some(pinned),
+        "the process pin is kept"
+    );
+
+    // A worker with no shard identity resolves through the default shard.
+    let Ok((fenced, held)) = pin_worker_fence(DrFencing::Auto, DR_PREFIX, None, &pool, &[]).await
+    else {
+        panic!("the default shard pin covers a worker with no shard identity");
+    };
+    assert!(fenced.is_some() && held.is_empty());
+
+    // Another pool proves nothing about the pinned database.
+    let other = dr_pool("postgres://postgres:postgres@127.0.0.1:1/unreachable");
+    let targets = Some((vec![(ShardId::new(0), other.clone())], ShardId::new(0)));
+    let refused = pin_worker_fence(DrFencing::Auto, DR_PREFIX, targets, &other, &[]).await;
+    assert!(
+        refused.is_err(),
+        "an unprobed pool that did not take the pin must not reuse it"
+    );
+}
+
+/// A peer row that a pin discovered reuses that pin too (issue #1823). The
+/// pin was taken through this pool, so a later worker that targets the peer
+/// and cannot probe it starts on the existing pin.
+#[tokio::test]
+async fn an_unprobeable_peer_reuses_the_discovered_pin() {
+    let _serial = registry_guard().await;
+    let (url, db) = require_db!("peerreuse");
+    let (own, peer) = (ShardId::new(0), ShardId::new(5));
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, own).await.unwrap();
+    let peer_generation = ensure_generation_row(&mut conn, peer).await.unwrap();
+    drop(conn);
+    let pool = dr_pool(&url);
+    let runner_targets = Some((vec![(own, pool.clone())], own));
+    pin_process_fence(DrFencing::Auto, DR_PREFIX, runner_targets, &pool)
+        .await
+        .expect("the runner pins its shard and discovers the peer");
+    assert_eq!(FenceRegistry::expected(peer), Some(peer_generation));
+    // The outage: the database goes away.
+    let admin = admin_url().await.expect("admin url");
+    let mut admin_conn = connect(&admin).await;
+    diesel::sql_query(format!("DROP DATABASE \"{db}\" WITH (FORCE)"))
+        .execute(&mut admin_conn)
+        .await
+        .expect("drop the database");
+
+    // The process keeps its default shard. Only the target is the peer.
+    let targets = Some((vec![(peer, pool.clone())], own));
+    let started = pin_worker_fence(DrFencing::Auto, DR_PREFIX, targets, &pool, &[]).await;
+
+    let fenced: Vec<ShardId> = started
+        .expect("the peer pin was taken through this pool")
+        .0
+        .expect("the peer stays fenced")
+        .into_iter()
+        .map(|(shard, _)| shard)
+        .collect();
+    assert_eq!(fenced, vec![peer]);
+}
+
+/// A loop that skips a held shard still proves it is alive (issue #1823). A
+/// held shard is a supported state, so its scanners must not read as stale.
+#[tokio::test]
+async fn a_held_shard_keeps_its_scanners_live() {
+    #[derive(Default)]
+    struct Ticks(std::sync::Mutex<Vec<String>>);
+    impl autumn_harvest::telemetry::MetricsRecorder for Ticks {
+        fn record_scanner_tick(&self, scanner: &str, _shard: &str) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(scanner.to_owned());
+        }
+    }
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("heldlive");
+    let shard = ShardId::new(0);
+    FenceRegistry::hold(&[shard], shard).expect("hold");
+    let ticks = std::sync::Arc::new(Ticks::default());
+    let telemetry = std::sync::Arc::new(autumn_harvest::telemetry::TelemetryConfig {
+        metrics: ticks.clone(),
+        ..Default::default()
+    });
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let interval = std::time::Duration::from_millis(50);
+    let poison = autumn_harvest::poison_pill::spawn_poison_pill_reclaimer_for_shard(
+        dr_pool(&url),
+        cancel.clone(),
+        interval,
+        3,
+        60,
+        None,
+        std::sync::Arc::clone(&telemetry),
+        Some(shard),
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
+    );
+    let export = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        dr_pool(&url),
+        cancel.clone(),
+        interval,
+        telemetry,
+        Some(shard),
+        None,
+        None,
+    );
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    cancel.cancel();
+    let _ = poison.await;
+    let _ = export.await;
+
+    let seen = ticks
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    for scanner in ["poison_pill", "audit_export"] {
+        assert!(
+            seen.iter().filter(|tick| *tick == scanner).count() >= 2,
+            "{scanner} must keep ticking while its shard is held; saw {seen:?}"
+        );
+    }
+}
+
+/// A retention lease release checks the fence (issue #1823). A dropped tick
+/// releases its leases from a detached task, after the tick's own fence is
+/// gone. A process whose pin is superseded must leave the leases alone.
+#[tokio::test]
+async fn a_superseded_pin_releases_no_retention_lease() {
+    #[derive(diesel::QueryableByName)]
+    struct Lease {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        sticky_worker_id: Option<String>,
+    }
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("leasefence");
+    let shard = ShardId::new(0);
+    let mut conn = connect(&url).await;
+    let exec_id = ExecutionId::new_for_shard(shard).as_uuid();
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+            (id, workflow_name, workflow_id, shard_id, state, input, sticky_worker_id) \
+         VALUES ($1, 'wf', 'lease-fence', 0, 'COMPLETED', '{}'::jsonb, 'retention-lease-x')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .execute(&mut conn)
+    .await
+    .expect("insert a leased execution");
+    let pinned = ensure_generation_row(&mut conn, shard).await.unwrap();
+    FenceRegistry::publish(&[(shard, pinned)], shard).expect("pin");
+    bump_generation(&mut conn, shard, "failover", "test")
+        .await
+        .expect("bump");
+
+    autumn_harvest::retention::release_retention_leases(
+        dr_pool(&url),
+        shard,
+        "retention-lease-x".to_string(),
+        vec![exec_id],
+    )
+    .await;
+
+    let rows: Vec<Lease> =
+        diesel::sql_query("SELECT sticky_worker_id FROM harvest_workflow_executions WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(exec_id)
+            .load(&mut conn)
+            .await
+            .expect("read the lease");
+    assert_eq!(
+        <[Lease]>::first(&rows).and_then(|row| row.sticky_worker_id.clone()),
+        Some("retention-lease-x".to_string()),
+        "a process that lost write authority must not release a lease"
+    );
+}
+
+/// A loop that waits for a pooled connection holds no fence barrier (issue
+/// #1823). An exhausted pool must not block a bump.
+#[tokio::test]
+async fn a_loop_waiting_for_a_connection_does_not_block_a_bump() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("poolwait");
+    let shard = ShardId::new(0);
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, shard).await.unwrap();
+    FenceRegistry::publish(&[(shard, pinned)], shard).expect("pin");
+
+    let manager =
+        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            &url,
+        );
+    let pool = deadpool::managed::Pool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("pool build");
+    // The only connection stays checked out, so the loop waits for it.
+    let busy = pool.get().await.expect("check out the only connection");
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let reclaimer = autumn_harvest::poison_pill::spawn_poison_pill_reclaimer_for_shard(
+        pool.clone(),
+        cancel.clone(),
+        std::time::Duration::from_millis(50),
+        3,
+        60,
+        None,
+        std::sync::Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
+        Some(shard),
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let bumped = bump_generation(&mut conn, shard, "failover", "test").await;
+    cancel.cancel();
+    drop(busy);
+    let _ = reclaimer.await;
+    assert!(
+        bumped.is_ok(),
+        "a loop parked on the pool must not hold the bump off: {bumped:?}"
+    );
+}
+
+/// An activity heartbeat asserts the fence in its own transaction (issue
+/// #1823). A process whose pin is superseded must not refresh a claim, even
+/// before the sampler cancels the activity.
+#[tokio::test]
+async fn a_superseded_pin_writes_no_activity_heartbeat() {
+    #[derive(diesel::QueryableByName)]
+    struct Beat {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+        heartbeat_details: Option<serde_json::Value>,
+    }
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("beatfence");
+    let shard = ShardId::new(0);
+    let mut conn = connect(&url).await;
+    let task_id = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+            (id, queue_name, task_type, input, state, worker_id, attempt) \
+         VALUES ($1, 'q', 'activity', '{}'::jsonb, 'RUNNING', 'w-1', 1)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("insert a claimed task");
+    let pinned = ensure_generation_row(&mut conn, shard).await.unwrap();
+    FenceRegistry::publish(&[(shard, pinned)], shard).expect("pin");
+    bump_generation(&mut conn, shard, "failover", "test")
+        .await
+        .expect("bump");
+
+    let claim = autumn_harvest::queue::TaskClaim::new(task_id, "w-1", 1);
+    let written = autumn_harvest::queue::record_heartbeat(
+        &mut conn,
+        &claim,
+        serde_json::json!({"progress": 1}),
+    )
+    .await;
+
+    let rows: Vec<Beat> =
+        diesel::sql_query("SELECT heartbeat_details FROM harvest_task_queue WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(task_id)
+            .load(&mut conn)
+            .await
+            .expect("read the beat");
+    assert_eq!(
+        <[Beat]>::first(&rows).and_then(|row| row.heartbeat_details.clone()),
+        None,
+        "a process that lost write authority must not write a heartbeat: {written:?}"
+    );
+    assert!(
+        matches!(
+            written,
+            Err(autumn_harvest::error::HarvestError::ShardFenced { .. })
+        ),
+        "the beat must fail as fenced: {written:?}"
+    );
+}
+
+/// A batch pass that cannot check out a connection drops its fence barriers
+/// (issue #1823). An exhausted pool must not block a bump.
+#[tokio::test]
+async fn a_batch_pass_waiting_for_a_connection_does_not_block_a_bump() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("batchwait");
+    let shard = ShardId::new(0);
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, shard).await.unwrap();
+    FenceRegistry::publish(&[(shard, pinned)], shard).expect("pin");
+
+    let manager =
+        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            &url,
+        );
+    let pool = deadpool::managed::Pool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("pool build");
+    // The only connection stays checked out, so the pass waits for it.
+    let busy = pool.get().await.expect("check out the only connection");
+    let pools = autumn_harvest::shard::ShardedDbPool::single(pool.clone());
+    let pass = tokio::spawn(async move {
+        autumn_harvest::batch::run_executor_once(
+            &pools,
+            &autumn_harvest::batch::BatchExecutorConfig::default(),
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let bumped = bump_generation(&mut conn, shard, "failover", "test").await;
+    drop(busy);
+    pass.abort();
+    let _ = pass.await;
+    assert!(
+        bumped.is_ok(),
+        "a batch pass parked on the pool must not hold the bump off: {bumped:?}"
+    );
+}
+
+/// A retention tick that cannot check out a connection drops its fence
+/// barriers (issue #1823). An exhausted pool must not block a bump.
+#[tokio::test]
+async fn a_retention_tick_waiting_for_a_connection_does_not_block_a_bump() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("retentionwait");
+    let shard = ShardId::new(0);
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, shard).await.unwrap();
+    FenceRegistry::publish(&[(shard, pinned)], shard).expect("pin");
+
+    let manager =
+        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            &url,
+        );
+    let pool = deadpool::managed::Pool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("pool build");
+    let runtime = autumn_harvest::retention::RetentionRuntime::spawn(
+        autumn_harvest::shard::ShardedDbPool::single(pool.clone()),
+        autumn_harvest::retention::RetentionConfig::with_max_age(std::time::Duration::from_secs(
+            86_400,
+        )),
+        std::sync::Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+        None,
+        None,
+    )
+    .expect("retention runs with a max age");
+    // The startup pass needs the connection. Let it finish first.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    // The only connection stays checked out, so the tick waits for it.
+    let busy = pool.get().await.expect("check out the only connection");
+    runtime.run_now();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let bumped = bump_generation(&mut conn, shard, "failover", "test").await;
+    drop(busy);
+    runtime.shutdown();
+    assert!(
+        bumped.is_ok(),
+        "a retention tick parked on the pool must not hold the bump off: {bumped:?}"
+    );
+}
+
+/// The database-wide fence fails closed on a missing generation row (issue
+/// #1823). A restored or edited database may lose the row of a pinned shard.
+/// A write then cannot prove its authority.
+#[tokio::test]
+async fn a_missing_generation_row_stops_a_database_wide_write() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("rowgone");
+    let mut conn = connect(&url).await;
+    let task_id = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+            (id, queue_name, task_type, input, state, worker_id, attempt) \
+         VALUES ($1, 'q', 'activity', '{}'::jsonb, 'RUNNING', 'w-1', 1)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("insert a claimed task");
+    let (zero, five) = (ShardId::new(0), ShardId::new(5));
+    let g0 = ensure_generation_row(&mut conn, zero).await.unwrap();
+    let g5 = ensure_generation_row(&mut conn, five).await.unwrap();
+    FenceRegistry::publish(&[(zero, g0), (five, g5)], zero).expect("pin");
+    FenceRegistry::colocate(&[zero, five]);
+    let claim = autumn_harvest::queue::TaskClaim::new(task_id, "w-1", 1);
+
+    // One colocated row is gone: the set is incomplete.
+    diesel::sql_query("DELETE FROM harvest_shard_generation WHERE shard_id = 5")
+        .execute(&mut conn)
+        .await
+        .expect("drop one row");
+    let incomplete =
+        autumn_harvest::queue::record_heartbeat(&mut conn, &claim, serde_json::json!({"n": 1}))
+            .await;
+    assert!(
+        incomplete.is_err(),
+        "a database missing a pinned row must refuse the write: {incomplete:?}"
+    );
+
+    // Every row is gone.
+    diesel::sql_query("DELETE FROM harvest_shard_generation")
+        .execute(&mut conn)
+        .await
+        .expect("drop every row");
+    let empty =
+        autumn_harvest::queue::record_heartbeat(&mut conn, &claim, serde_json::json!({"n": 2}))
+            .await;
+    assert!(
+        empty.is_err(),
+        "a database with no generation row must refuse the write: {empty:?}"
+    );
+}
+
+/// A fenced timeout scanner leaves its lease alone on shutdown (issue
+/// #1823). The promoted region may hold the lease under the same worker id.
+/// A stale release would expire it.
+#[tokio::test]
+async fn a_fenced_timeout_scanner_does_not_release_its_lease_on_shutdown() {
+    #[derive(diesel::QueryableByName)]
+    struct Live {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    async fn live_leases(conn: &mut AsyncPgConnection) -> i64 {
+        let rows: Vec<Live> = diesel::sql_query(
+            "SELECT count(*) AS n FROM harvest_scanner_leases \
+             WHERE holder = 'dr-holder' AND lease_until > NOW()",
+        )
+        .load(conn)
+        .await
+        .expect("read the lease");
+        <[Live]>::first(&rows).map_or(0, |row| row.n)
+    }
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("leaseshut");
+    let shard = ShardId::new(0);
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, shard).await.unwrap();
+    FenceRegistry::publish(&[(shard, pinned)], shard).expect("pin");
+
+    // Open a connection now. The checker's checkout is bounded by its 50 ms
+    // tick, which may be too short to open one.
+    let pool = dr_pool(&url);
+    drop(pool.get().await.expect("connection"));
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let checker = autumn_harvest::timeout::spawn_coordinated_timeout_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(50),
+        std::sync::Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
+        std::time::Duration::from_secs(5),
+        None,
+        vec![shard],
+        std::sync::Arc::new(autumn_harvest::circuit_breaker::CircuitBreakerRegistry::default()),
+        None,
+        60,
+        Some(shard),
+        Some(shard),
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
+        autumn_harvest::scanner_lease::ScannerCoordination::elected("dr-holder"),
+        100,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while live_leases(&mut conn).await == 0 {
+        if std::time::Instant::now() >= deadline {
+            #[derive(diesel::QueryableByName, Debug)]
+            struct Row {
+                #[diesel(sql_type = diesel::sql_types::Text)]
+                row: String,
+            }
+            let rows: Vec<Row> = diesel::sql_query(
+                "SELECT concat_ws(' ', shard_id, scanner, holder, lease_until > NOW()) AS row \
+                 FROM harvest_scanner_leases",
+            )
+            .load(&mut conn)
+            .await
+            .unwrap_or_default();
+            panic!("the scanner must take its lease: {rows:?}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    bump_generation(&mut conn, shard, "failover", "test")
+        .await
+        .expect("bump");
+    cancel.cancel();
+    let _ = checker.await;
+
+    assert_eq!(
+        live_leases(&mut conn).await,
+        1,
+        "a fenced scanner must not expire the lease on shutdown"
+    );
+}
+
+/// A held-only process still writes to a plain database (issue #1823). A
+/// shard held for an unreachable probe pins no generation. A healthy plain
+/// database has no generation row, and that is no lost authority.
+#[tokio::test]
+async fn a_held_only_process_still_beats_on_a_plain_database() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("heldplain");
+    let mut conn = connect(&url).await;
+    let task_id = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+            (id, queue_name, task_type, input, state, worker_id, attempt) \
+         VALUES ($1, 'q', 'activity', '{}'::jsonb, 'RUNNING', 'w-1', 1)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("insert a claimed task");
+    // Another shard is held. This database has no generation row.
+    FenceRegistry::hold(&[ShardId::new(3)], ShardId::new(0)).expect("hold");
+    assert!(!FenceRegistry::has_real_pin(), "precondition: held only");
+
+    let claim = autumn_harvest::queue::TaskClaim::new(task_id, "w-1", 1);
+    let beat =
+        autumn_harvest::queue::record_heartbeat(&mut conn, &claim, serde_json::json!({"n": 1}))
+            .await;
+    assert!(
+        beat.is_ok(),
+        "a held-only process must still beat on a plain database: {beat:?}"
+    );
+}
+
+/// A multi-database pass that meets a bump on one database drops its guards
+/// on the others (issue #1823). It must not hold a bump off elsewhere.
+#[tokio::test]
+async fn a_pass_waiting_on_one_database_does_not_block_a_bump_on_another() {
+    use diesel_async::SimpleAsyncConnection as _;
+    let _serial = registry_guard().await;
+    let (url_a, _db_a) = require_db!("lockwait_a");
+    let (url_b, _db_b) = require_db!("lockwait_b");
+    let (zero, one) = (ShardId::new(0), ShardId::new(1));
+    let mut conn_a = connect(&url_a).await;
+    let mut conn_b = connect(&url_b).await;
+    let g0 = ensure_generation_row(&mut conn_a, zero).await.unwrap();
+    let g1 = ensure_generation_row(&mut conn_b, one).await.unwrap();
+    FenceRegistry::publish(&[(zero, g0), (one, g1)], zero).expect("pin");
+
+    // A bump on database B holds its exclusive pass lock.
+    let mut bump_b = connect(&url_b).await;
+    bump_b
+        .batch_execute(&format!(
+            "BEGIN; SELECT pg_advisory_xact_lock({})",
+            (1823_i64 << 32) | 1
+        ))
+        .await
+        .expect("hold B's pass lock");
+
+    let (pool_a, pool_b) = (dr_pool(&url_a), dr_pool(&url_b));
+    let pass = tokio::spawn(async move {
+        autumn_harvest::replication::begin_fenced_groups(&[(&pool_a, zero), (&pool_b, one)])
+            .await
+            .map(|guards| guards.len())
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let bumped = bump_generation(&mut conn_a, zero, "failover", "test").await;
+    bump_b.batch_execute("ROLLBACK").await.expect("release");
+    let _ = pass.await;
+    assert!(
+        bumped.is_ok(),
+        "a pass waiting on database B must not hold a bump off on A: {bumped:?}"
+    );
+}
+
+/// A ramp-guard write asserts the fence in its own transaction (issue
+/// #1823). The guard runs in an API process with its own token, outside any
+/// tick fence. After a bump, it must change no build policy.
+#[tokio::test]
+async fn a_superseded_pin_refuses_a_ramp_guard_write() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("rampfence");
+    let shard = ShardId::new(0);
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, shard).await.unwrap();
+    FenceRegistry::publish(&[(shard, pinned)], shard).expect("pin");
+    bump_generation(&mut conn, shard, "failover", "test")
+        .await
+        .expect("bump");
+
+    let written = autumn_harvest::ramp_guard::mark_abort_reported(
+        &mut conn,
+        "q",
+        uuid::Uuid::new_v4(),
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        matches!(
+            written,
+            Err(autumn_harvest::error::HarvestError::ShardFenced { .. })
+        ),
+        "a ramp-guard write after a bump must fail as fenced: {written:?}"
+    );
+}
+
+/// A worker writes nothing to a held shard (issue #1823). The shard may be
+/// an unpromoted logical standby. Fleet rows and rate-limit buckets wait for
+/// the release, and the heartbeat then registers the worker.
+#[tokio::test]
+async fn a_worker_defers_its_startup_writes_on_a_held_shard() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("holdwrites");
+    FenceRegistry::hold(&[ShardId::new(0)], ShardId::new(0)).expect("hold");
+
+    let mut config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default().with_shard_assignments([ShardId::new(0)]),
+    );
+    config.worker_heartbeat_interval = std::time::Duration::from_millis(200);
+    let worker_id = config.worker_id.clone();
+    let registry = std::sync::Arc::new(autumn_harvest::worker::HandlerRegistry::new(
+        Vec::new(),
+        Vec::new(),
+    ));
+    let worker = std::sync::Arc::new(
+        autumn_harvest::worker::Worker::new(config, registry).expect("worker builds"),
+    );
+    let runner = std::sync::Arc::clone(&worker);
+    let pool = dr_pool(&url);
+    let run = tokio::spawn(async move { runner.run(&pool).await });
+
+    let registered = |url: String, worker_id: String| async move {
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+        let mut conn = connect(&url).await;
+        diesel::sql_query("SELECT count(*) AS n FROM harvest_workers WHERE worker_id = $1")
+            .bind::<diesel::sql_types::Text, _>(worker_id)
+            .get_result::<Count>(&mut conn)
+            .await
+            .expect("count workers")
+            .n
+            == 1
+    };
+    // Several heartbeat intervals pass while the shard is held.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let while_held = registered(url.clone(), worker_id.clone()).await;
+
+    FenceRegistry::release_held(ShardId::new(0));
+    eventually(
+        "the worker to register after the release",
+        std::time::Duration::from_secs(20),
+        || registered(url.clone(), worker_id.clone()),
+    )
+    .await;
+    worker.shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(30), run)
+        .await
+        .expect("worker stops")
+        .expect("worker task joins");
+
+    assert!(!while_held, "a held shard must not get a fleet row");
+}
+
+/// A fenced worker holds an unassigned shard it cannot probe (issue #1823).
+/// It serves its assigned shard, and cross-shard writes to the held shard
+/// fail closed. Only an assigned shard it cannot probe refuses the start.
+#[tokio::test]
+async fn a_fenced_worker_holds_an_unassigned_shard_it_cannot_probe() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("holdunassigned");
+    {
+        let mut conn = connect(&url).await;
+        ensure_generation_row(&mut conn, ShardId::new(0))
+            .await
+            .unwrap();
+    }
+    let healthy = dr_pool(&url);
+    let unreachable = dr_pool("postgres://postgres:postgres@127.0.0.1:1/unreachable");
+    let targets = || {
+        Some((
+            vec![
+                (ShardId::new(0), healthy.clone()),
+                (ShardId::new(1), unreachable.clone()),
+            ],
+            ShardId::new(0),
+        ))
+    };
+
+    let refused = pin_worker_fence(
+        DrFencing::Auto,
+        DR_PREFIX,
+        targets(),
+        &healthy,
+        &[ShardId::new(1)],
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "an assigned shard that cannot be pinned refuses"
+    );
+    FenceRegistry::clear();
+
+    let Ok((fenced, held)) = pin_worker_fence(
+        DrFencing::Auto,
+        DR_PREFIX,
+        targets(),
+        &healthy,
+        &[ShardId::new(0)],
+    )
+    .await
+    else {
+        panic!("an unassigned shard must not refuse the worker");
+    };
+    let fenced: Vec<ShardId> = fenced
+        .expect("the assigned shard is fenced")
+        .into_iter()
+        .map(|(shard, _)| shard)
+        .collect();
+    let held: Vec<ShardId> = held.into_iter().map(|(shard, _)| shard).collect();
+    assert_eq!(fenced, vec![ShardId::new(0)]);
+    assert_eq!(held, vec![ShardId::new(1)]);
+    assert!(FenceRegistry::is_held(ShardId::new(1)));
+    assert_eq!(
+        FenceRegistry::expected(ShardId::new(0)),
+        Some(ShardGeneration::INITIAL)
+    );
+}
+
+/// A worker issues no write statement on a held shard (issue #1823). A
+/// statement trigger on every Harvest table records each write attempt.
+#[tokio::test]
+async fn a_held_shard_gets_no_worker_write_statement() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("holdnowrite");
+    {
+        let mut conn = connect(&url).await;
+        conn.batch_execute(
+            "CREATE TABLE test_write_log (tbl text NOT NULL, op text NOT NULL);
+             CREATE FUNCTION test_note_write() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+               INSERT INTO test_write_log VALUES (TG_TABLE_NAME, TG_OP);
+               RETURN NULL;
+             END $$;
+             DO $$
+             DECLARE t text;
+             BEGIN
+               FOR t IN
+                 SELECT c.relname FROM pg_class c
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+                   AND c.relname LIKE 'harvest\\_%' AND NOT c.relispartition
+               LOOP
+                 EXECUTE format(
+                   'CREATE TRIGGER test_note_write AFTER INSERT OR UPDATE OR DELETE ON %I \
+                    FOR EACH STATEMENT EXECUTE FUNCTION test_note_write()', t);
+               END LOOP;
+             END $$;",
+        )
+        .await
+        .expect("install the write log");
+    }
+    FenceRegistry::hold(&[ShardId::new(0)], ShardId::new(0)).expect("hold");
+
+    let mut config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default().with_shard_assignments([ShardId::new(0)]),
+    );
+    config.worker_heartbeat_interval = std::time::Duration::from_millis(200);
+    config.poll_interval = std::time::Duration::from_millis(100);
+    let registry = std::sync::Arc::new(autumn_harvest::worker::HandlerRegistry::new(
+        Vec::new(),
+        Vec::new(),
+    ));
+    let worker = std::sync::Arc::new(
+        autumn_harvest::worker::Worker::new(config, registry).expect("worker builds"),
+    );
+    let runner = std::sync::Arc::clone(&worker);
+    let pool = dr_pool(&url);
+    let run = tokio::spawn(async move { runner.run(&pool).await });
+
+    let writes = |url: String| async move {
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            tbl: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            op: String,
+        }
+        let mut conn = connect(&url).await;
+        diesel::sql_query("SELECT tbl, op FROM test_write_log ORDER BY tbl, op")
+            .load::<Row>(&mut conn)
+            .await
+            .expect("read the write log")
+            .into_iter()
+            .map(|row| format!("{} {}", row.op, row.tbl))
+            .collect::<Vec<_>>()
+    };
+    // Many poll, heartbeat and monitor ticks pass while the shard is held.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let while_held = writes(url.clone()).await;
+
+    FenceRegistry::release_held(ShardId::new(0));
+    eventually(
+        "a write after the release",
+        std::time::Duration::from_secs(20),
+        || {
+            let url = url.clone();
+            async move { !writes(url).await.is_empty() }
+        },
+    )
+    .await;
+    worker.shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(30), run)
+        .await
+        .expect("worker stops")
+        .expect("worker task joins");
+
+    assert!(
+        while_held.is_empty(),
+        "a held shard must get no write statement: {while_held:?}"
+    );
+}
+
+/// A worker whose logical shards share one database pins every one of them
+/// (issue #1823). Fencing shard 1 must stop its shard-1 claims too.
+#[tokio::test]
+async fn a_worker_pins_every_colocated_shard() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("colocated");
+    {
+        let mut conn = connect(&url).await;
+        ensure_generation_row(&mut conn, ShardId::new(0))
+            .await
+            .unwrap();
+    }
+    let assigned = [ShardId::new(0), ShardId::new(1)];
+    let config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default().with_shard_assignments(assigned),
+    );
+    let pool = dr_pool(&url);
+    let targets = autumn_harvest::worker::dr_fence_targets(&config, &pool);
+    let Ok((fenced, held)) =
+        pin_worker_fence(DrFencing::Auto, DR_PREFIX, targets, &pool, &assigned).await
+    else {
+        panic!("colocated shards on one database must start");
+    };
+    assert!(held.is_empty());
+    assert_eq!(fenced.map(|targets| targets.len()), Some(2));
+    assert_eq!(
+        FenceRegistry::expected(ShardId::new(0)),
+        Some(ShardGeneration::INITIAL)
+    );
+    assert_eq!(
+        FenceRegistry::expected(ShardId::new(1)),
+        Some(ShardGeneration::INITIAL),
+        "every colocated shard is pinned"
+    );
+}
+
+/// A fenced scheduler writes nothing (issue #1823). Its schedule-table writes
+/// do not pass the persist assert, so each shard pass checks the fence first.
+#[tokio::test]
+async fn a_fenced_scheduler_writes_nothing() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("fencedsched");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    FenceRegistry::publish(&[(ShardId::new(0), pinned)], ShardId::new(0)).expect("pin");
+    bump_generation(&mut conn, ShardId::new(0), "failover", "test")
+        .await
+        .unwrap();
+    conn.batch_execute(
+        "INSERT INTO harvest_schedules (id, workflow_name, schedule_expr, timezone, catchup, \
+           max_active_runs, is_paused, next_run_at, jitter_secs, overlap_policy, \
+           buffered_runs, buffer_all_max, skip_policy) \
+         VALUES (gen_random_uuid(), 'dr_fenced_wf', 'interval:60', 'UTC', false, 10, false, \
+           now() - interval '5 seconds', 0, 'skip', '[]', 100, 'skip');
+         CREATE TABLE test_write_log (tbl text NOT NULL, op text NOT NULL);
+         CREATE FUNCTION test_note_write() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           INSERT INTO test_write_log VALUES (TG_TABLE_NAME, TG_OP);
+           RETURN NULL;
+         END $$;
+         CREATE TRIGGER test_note_write AFTER INSERT OR UPDATE OR DELETE ON harvest_schedules
+           FOR EACH STATEMENT EXECUTE FUNCTION test_note_write();
+         CREATE TRIGGER test_note_write AFTER INSERT OR UPDATE OR DELETE
+           ON harvest_workflow_executions
+           FOR EACH STATEMENT EXECUTE FUNCTION test_note_write();",
+    )
+    .await
+    .expect("seed a due schedule and the write log");
+
+    let registry = std::sync::Arc::new(autumn_harvest::worker::HandlerRegistry::new(
+        Vec::new(),
+        Vec::new(),
+    ));
+    let _ = autumn_harvest::tick_once(
+        dr_pool(&url),
+        registry,
+        std::sync::Arc::new(autumn_harvest::DagCatalog::default()),
+        std::sync::Arc::new(Vec::new()),
+        autumn_harvest::SchedulerMonitor::offline(),
+    )
+    .await;
+
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let writes = diesel::sql_query("SELECT count(*) AS n FROM test_write_log")
+        .get_result::<Count>(&mut conn)
+        .await
+        .expect("read the write log")
+        .n;
+    assert_eq!(writes, 0, "a fenced scheduler must not write");
+}
+
+/// Workers may split the logical shards of one database (issue #1823). A
+/// second worker finds the first worker's row there and still starts.
+#[tokio::test]
+async fn split_workers_on_one_database_both_start() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("splitworkers");
+    {
+        let mut conn = connect(&url).await;
+        ensure_generation_row(&mut conn, ShardId::new(0))
+            .await
+            .unwrap();
+    }
+    let assigned = [ShardId::new(1)];
+    let config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default().with_shard_assignments(assigned),
+    );
+    let pool = dr_pool(&url);
+    let targets = autumn_harvest::worker::dr_fence_targets(&config, &pool);
+    let started = pin_worker_fence(DrFencing::Auto, DR_PREFIX, targets, &pool, &assigned).await;
+    let Ok((fenced, held)) = started else {
+        panic!("a worker for another logical shard on this database must start");
+    };
+    assert!(held.is_empty());
+    assert!(fenced.is_some());
+    assert_eq!(
+        FenceRegistry::expected(ShardId::new(1)),
+        Some(ShardGeneration::INITIAL)
+    );
+}
+
+/// A fenced pass outlives an idle-in-transaction timeout (issue #1823). The
+/// guard runs no query while the pass works. A server timeout must not end
+/// its transaction and free the lock mid-pass.
+#[tokio::test]
+async fn a_fenced_pass_outlives_an_idle_transaction_timeout() {
+    let _serial = registry_guard().await;
+    let (url, db) = require_db!("passidle");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    diesel::sql_query(format!(
+        "ALTER DATABASE \"{db}\" SET idle_in_transaction_session_timeout = '300ms'"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("set the idle timeout");
+    FenceRegistry::publish(&[(ShardId::new(0), pinned)], ShardId::new(0)).expect("pin");
+    let pool = dr_pool(&url);
+    let guard = autumn_harvest::replication::begin_fenced_pass(&pool, ShardId::new(0))
+        .await
+        .expect("open the pass")
+        .expect("a pinned shard gets a guard");
+    // Well past the timeout, as a long pass would be.
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+
+    let bump_url = url.clone();
+    let bump = tokio::spawn(async move {
+        let mut conn = connect(&bump_url).await;
+        bump_generation(&mut conn, ShardId::new(0), "failover", "test").await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let waited = !bump.is_finished();
+    drop(guard);
+    let _ = bump.await;
+
+    assert!(waited, "the idle timeout must not free the pass lock");
+}
+
+/// A runner given one plain pool wraps it as shard 0 (issue #1823). Its
+/// configured logical shard must still be the one it pins.
+#[tokio::test]
+async fn a_single_pool_wrapper_pins_the_configured_shard() {
+    let (url, _db) = require_db!("singlewrap");
+    let pool = dr_pool(&url);
+    let mut config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default().with_shard_assignments([ShardId::new(1)]),
+    );
+    config.sharded_pool = Some(autumn_harvest::shard::ShardedDbPool::single(pool.clone()));
+    let (targets, default_shard) = autumn_harvest::worker::dr_fence_targets(&config, &pool)
+        .expect("a configured shard gives targets");
+    let shards: Vec<ShardId> = targets.into_iter().map(|(shard, _)| shard).collect();
+    assert_eq!(shards, vec![ShardId::new(1)]);
+    assert_eq!(default_shard, ShardId::new(1));
+}
+
+/// A fence guard notices when its session ends (issue #1823). The server
+/// then frees the pass lock, so the pass must stop writing.
+#[tokio::test]
+async fn a_fence_guard_reports_a_lost_session() {
+    let _serial = registry_guard().await;
+    let (url, db) = require_db!("guardlost");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    FenceRegistry::publish(&[(ShardId::new(0), pinned)], ShardId::new(0)).expect("pin");
+    let pool = dr_pool(&url);
+    let guard = autumn_harvest::replication::begin_fenced_pass(&pool, ShardId::new(0))
+        .await
+        .expect("open the pass")
+        .expect("a pinned shard gets a guard");
+    assert!(!guard.is_lost(), "a fresh guard holds its lock");
+
+    diesel::sql_query(format!(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE datname = '{db}' AND application_name = 'harvest_dr_fence_pass'"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("terminate the guard backend");
+    eventually(
+        "the guard to report its lost session",
+        std::time::Duration::from_secs(10),
+        || async { guard.is_lost() },
+    )
+    .await;
+}
+
+/// A pass stops when its fence guard loses its session (issue #1823). The
+/// server then frees the pass lock, so a bump can commit mid-pass.
+#[tokio::test]
+async fn a_pass_stops_when_its_fence_guard_is_lost() {
+    let (url, db) = require_db!("passlost");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    let pool = dr_pool(&url);
+    let guard = autumn_harvest::replication::begin_fenced_pass_at(&pool, ShardId::new(0), pinned)
+        .await
+        .expect("open the pass");
+    let pass = autumn_harvest::replication::run_fenced_pass(
+        Some(&guard),
+        tokio::time::sleep(std::time::Duration::from_secs(60)),
+    );
+    let terminate = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        diesel::sql_query(format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = '{db}' AND application_name = 'harvest_dr_fence_pass'"
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("terminate the guard backend");
+    };
+    let (stopped, ()) = tokio::join!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), pass),
+        terminate
+    );
+
+    let Ok(outcome) = stopped else {
+        panic!("a pass must stop when its guard is lost");
+    };
+    assert!(outcome.is_err(), "a stopped pass reports an error");
+}
+
+/// A bump waits out a write that a lost pass already sent (issue #1823).
+/// The pass sees the loss within one keepalive interval and stops. A short
+/// statement it sent before then must commit before the bump.
+#[tokio::test]
+async fn a_bump_waits_out_a_write_a_lost_pass_already_sent() {
+    let (url, db) = require_db!("passstraggler");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    diesel::sql_query("CREATE TABLE dr_straggler (id int PRIMARY KEY, written bool NOT NULL)")
+        .execute(&mut conn)
+        .await
+        .expect("create the probe table");
+    diesel::sql_query("INSERT INTO dr_straggler VALUES (1, false)")
+        .execute(&mut conn)
+        .await
+        .expect("seed the probe row");
+    #[derive(diesel::QueryableByName)]
+    struct Probe {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        written: bool,
+    }
+    let pool = dr_pool(&url);
+    let guard = autumn_harvest::replication::begin_fenced_pass_at(&pool, ShardId::new(0), pinned)
+        .await
+        .expect("open the pass");
+    // The pass sends a write. The server still runs it when the guard ends.
+    let writer_url = url.clone();
+    let write = tokio::spawn(async move {
+        let mut writer = connect(&writer_url).await;
+        diesel::sql_query("UPDATE dr_straggler SET written = true WHERE pg_sleep(0.8) IS NOT NULL")
+            .execute(&mut writer)
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    diesel::sql_query(format!(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE datname = '{db}' AND application_name = 'harvest_dr_fence_pass'"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("terminate the guard backend");
+
+    bump_generation(&mut conn, ShardId::new(0), "failover", "test")
+        .await
+        .expect("bump");
+    let written: Vec<Probe> = diesel::sql_query("SELECT written FROM dr_straggler")
+        .load(&mut conn)
+        .await
+        .expect("read the probe row");
+    write.await.expect("join").expect("the write commits");
+    drop(guard);
+
+    assert!(
+        <[Probe]>::first(&written).is_some_and(|row| row.written),
+        "a write sent before the loss must commit before the bump"
+    );
+}
+
+/// A lost pass ends the statement it still runs (issue #1823). A dropped
+/// future does not cancel a statement on the server. A write that waits on
+/// a row lock would otherwise commit after the bump, once the lock clears.
+#[tokio::test]
+async fn a_lost_pass_ends_a_write_that_waits_on_a_row_lock() {
+    use diesel_async::SimpleAsyncConnection as _;
+
+    let (url, db) = require_db!("passblocked");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    diesel::sql_query("CREATE TABLE dr_blocked (id int PRIMARY KEY)")
+        .execute(&mut conn)
+        .await
+        .expect("create the probe table");
+    diesel::sql_query("INSERT INTO dr_blocked VALUES (1)")
+        .execute(&mut conn)
+        .await
+        .expect("seed the probe row");
+    // Another session holds the row, so the pass's DELETE waits on it.
+    let mut blocker = connect(&url).await;
+    blocker
+        .batch_execute("BEGIN; SELECT id FROM dr_blocked WHERE id = 1 FOR UPDATE")
+        .await
+        .expect("lock the probe row");
+    let pool = dr_pool(&url);
+    let guard = autumn_harvest::replication::begin_fenced_pass_at(&pool, ShardId::new(0), pinned)
+        .await
+        .expect("open the pass");
+    let pass = autumn_harvest::replication::run_fenced_pass(Some(&guard), async {
+        let mut writer = autumn_harvest::replication::fenced_checkout(&pool)
+            .await
+            .expect("check out");
+        diesel::sql_query("DELETE FROM dr_blocked WHERE id = 1")
+            .execute(&mut *writer)
+            .await
+    });
+    let terminate = async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        diesel::sql_query(format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = '{db}' AND application_name = 'harvest_dr_fence_pass'"
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("terminate the guard backend");
+    };
+    let (stopped, ()) = tokio::join!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), pass),
+        terminate
+    );
+    assert!(
+        stopped.is_ok_and(|outcome| outcome.is_err()),
+        "the pass must stop when its guard is lost"
+    );
+
+    bump_generation(&mut conn, ShardId::new(0), "failover", "test")
+        .await
+        .expect("bump");
+    blocker.batch_execute("COMMIT").await.expect("free the row");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    #[derive(diesel::QueryableByName)]
+    struct Rows {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let rows: Vec<Rows> = diesel::sql_query("SELECT count(*) AS n FROM dr_blocked")
+        .load(&mut conn)
+        .await
+        .expect("count the probe rows");
+    drop(guard);
+
+    assert_eq!(
+        <[Rows]>::first(&rows).map(|row| row.n),
+        Some(1),
+        "a write the lost pass sent must not commit after the bump"
+    );
+}
+
+/// A lost pass ends its backends when it holds the whole pool (issue
+/// #1823). The terminator must not wait for a pooled connection that the
+/// stopped pass itself holds.
+#[tokio::test]
+async fn a_lost_pass_ends_a_write_that_holds_the_whole_pool() {
+    use diesel_async::SimpleAsyncConnection as _;
+
+    let (url, db) = require_db!("passfullpool");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    conn.batch_execute(
+        "CREATE TABLE dr_full_pool (id int PRIMARY KEY); INSERT INTO dr_full_pool VALUES (1)",
+    )
+    .await
+    .expect("seed the probe row");
+    let mut blocker = connect(&url).await;
+    blocker
+        .batch_execute("BEGIN; SELECT id FROM dr_full_pool WHERE id = 1 FOR UPDATE")
+        .await
+        .expect("lock the probe row");
+    let manager =
+        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            url.as_str(),
+        );
+    let pool: autumn_harvest::worker::DbPool = deadpool::managed::Pool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("pool build");
+    let guard = autumn_harvest::replication::begin_fenced_pass_at(&pool, ShardId::new(0), pinned)
+        .await
+        .expect("open the pass");
+    let pass = autumn_harvest::replication::run_fenced_pass(Some(&guard), async {
+        let mut writer = autumn_harvest::replication::fenced_checkout(&pool)
+            .await
+            .expect("check out");
+        diesel::sql_query("DELETE FROM dr_full_pool WHERE id = 1")
+            .execute(&mut *writer)
+            .await
+    });
+    let terminate = async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        diesel::sql_query(format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = '{db}' AND application_name = 'harvest_dr_fence_pass'"
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("terminate the guard backend");
+    };
+    let (stopped, ()) = tokio::join!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), pass),
+        terminate
+    );
+    assert!(
+        stopped.is_ok_and(|outcome| outcome.is_err()),
+        "the pass must stop when its guard is lost"
+    );
+
+    bump_generation(&mut conn, ShardId::new(0), "failover", "test")
+        .await
+        .expect("bump");
+    blocker.batch_execute("COMMIT").await.expect("free the row");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let rows = count_rows(&mut conn, "dr_full_pool").await;
+    drop(guard);
+
+    assert_eq!(
+        rows, 1,
+        "a write the lost pass sent must not commit after the bump"
+    );
+}
+
+/// A guard notices a network path that goes silent (issue #1823). A path
+/// that drops packets gives no socket error. A late ping must count as a
+/// lost session. The server must also end the silent session, so that a
+/// bump can commit.
+#[tokio::test]
+async fn a_guard_behind_a_silent_network_reports_its_loss() {
+    let (url, _db) = require_db!("guardsilent");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    let (proxied, frozen) = silent_proxy(&url).await;
+    let pool = dr_pool(&proxied);
+    let guard = autumn_harvest::replication::begin_fenced_pass_at(&pool, ShardId::new(0), pinned)
+        .await
+        .expect("open the pass through the proxy");
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert!(!guard.is_lost(), "a guard on a live path keeps its session");
+
+    frozen.store(true, std::sync::atomic::Ordering::SeqCst);
+    eventually(
+        "the guard to report a silent path",
+        std::time::Duration::from_secs(10),
+        || async { guard.is_lost() },
+    )
+    .await;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match bump_generation(&mut conn, ShardId::new(0), "failover", "test").await {
+            Ok(_) => break,
+            Err(error) => assert!(
+                std::time::Instant::now() < deadline,
+                "the server must end the silent guard session: {error}"
+            ),
+        }
+    }
+    drop(guard);
+}
+
+/// A connection checked out before its pass starts can join the pass
+/// (issue #1823). A lost guard then ends its backend too.
+#[tokio::test]
+async fn a_connection_that_joins_a_lost_pass_has_its_write_ended() {
+    use diesel_async::SimpleAsyncConnection as _;
+
+    let (url, db) = require_db!("passjoined");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    conn.batch_execute(
+        "CREATE TABLE dr_joined (id int PRIMARY KEY); INSERT INTO dr_joined VALUES (1)",
+    )
+    .await
+    .expect("seed the probe row");
+    let mut blocker = connect(&url).await;
+    blocker
+        .batch_execute("BEGIN; SELECT id FROM dr_joined WHERE id = 1 FOR UPDATE")
+        .await
+        .expect("lock the probe row");
+    let pool = dr_pool(&url);
+    let mut writer = autumn_harvest::replication::fenced_checkout(&pool)
+        .await
+        .expect("check out before the pass");
+    let guard = autumn_harvest::replication::begin_fenced_pass_at(&pool, ShardId::new(0), pinned)
+        .await
+        .expect("open the pass");
+    let pass = autumn_harvest::replication::run_fenced_pass(Some(&guard), async {
+        writer.join_pass().await.expect("join the pass");
+        diesel::sql_query("DELETE FROM dr_joined WHERE id = 1")
+            .execute(&mut *writer)
+            .await
+    });
+    let terminate = async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        diesel::sql_query(format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = '{db}' AND application_name = 'harvest_dr_fence_pass'"
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("terminate the guard backend");
+    };
+    let (stopped, ()) = tokio::join!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), pass),
+        terminate
+    );
+    assert!(
+        stopped.is_ok_and(|outcome| outcome.is_err()),
+        "the pass must stop when its guard is lost"
+    );
+
+    bump_generation(&mut conn, ShardId::new(0), "failover", "test")
+        .await
+        .expect("bump");
+    blocker.batch_execute("COMMIT").await.expect("free the row");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let rows = count_rows(&mut conn, "dr_joined").await;
+    drop(guard);
+
+    assert_eq!(
+        rows, 1,
+        "a write on a joined connection must not commit after the bump"
+    );
+}
+
+/// A connection opened from a DSN, outside any pool, can join its pass
+/// (issue #1823). A lost guard then ends its backend too. The partition CLI
+/// writes on such a connection.
+#[tokio::test]
+async fn a_direct_connection_that_joins_a_lost_pass_has_its_write_ended() {
+    use diesel_async::SimpleAsyncConnection as _;
+
+    let (url, db) = require_db!("passdirect");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    conn.batch_execute(
+        "CREATE TABLE dr_direct (id int PRIMARY KEY); INSERT INTO dr_direct VALUES (1)",
+    )
+    .await
+    .expect("seed the probe row");
+    let mut blocker = connect(&url).await;
+    blocker
+        .batch_execute("BEGIN; SELECT id FROM dr_direct WHERE id = 1 FOR UPDATE")
+        .await
+        .expect("lock the probe row");
+    let pool = dr_pool(&url);
+    let mut writer = connect(&url).await;
+    let guard = autumn_harvest::replication::begin_fenced_pass_at(&pool, ShardId::new(0), pinned)
+        .await
+        .expect("open the pass");
+    let pass = autumn_harvest::replication::run_fenced_pass(Some(&guard), async {
+        let _member = autumn_harvest::replication::join_fenced_pass_direct(&url, &mut writer).await;
+        diesel::sql_query("DELETE FROM dr_direct WHERE id = 1")
+            .execute(&mut writer)
+            .await
+    });
+    let terminate = async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        diesel::sql_query(format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = '{db}' AND application_name = 'harvest_dr_fence_pass'"
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("terminate the guard backend");
+    };
+    let (stopped, ()) = tokio::join!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), pass),
+        terminate
+    );
+    assert!(
+        stopped.is_ok_and(|outcome| outcome.is_err()),
+        "the pass must stop when its guard is lost"
+    );
+
+    bump_generation(&mut conn, ShardId::new(0), "failover", "test")
+        .await
+        .expect("bump");
+    blocker.batch_execute("COMMIT").await.expect("free the row");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let rows = count_rows(&mut conn, "dr_direct").await;
+    drop(guard);
+
+    assert_eq!(
+        rows, 1,
+        "a write on a joined direct connection must not commit after the bump"
+    );
+}
+
+/// A fence stops an activity heartbeat flusher (issue #1823). The flusher
+/// outlives a drain, so the worker token does not reach it. Without this,
+/// it keeps writing `last_heartbeat_at` after another region owns the row.
+#[tokio::test]
+async fn a_fence_stops_an_activity_heartbeat_flusher() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("hbfence");
+    FenceRegistry::publish(
+        &[(ShardId::new(0), ShardGeneration::INITIAL)],
+        ShardId::new(0),
+    )
+    .expect("pin");
+    let stop = tokio_util::sync::CancellationToken::new();
+    let _slot = autumn_harvest::heartbeat::spawn_heartbeat_flusher_with(
+        autumn_harvest::queue::TaskClaim::new(uuid::Uuid::new_v4(), "w-1", 1),
+        dr_pool(&url),
+        stop.clone(),
+        autumn_harvest::heartbeat::HeartbeatFlushOptions {
+            acquire_timeout: std::time::Duration::from_secs(1),
+            metrics: std::sync::Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+            shards: std::sync::Arc::from([0]),
+        },
+    );
+
+    FenceRegistry::mark_fenced_out();
+
+    assert!(
+        stop.is_cancelled(),
+        "a fence must stop the heartbeat flusher"
+    );
+}
+
+/// A replication heartbeat checks the fence in its own transaction (issue
+/// #1823). A process whose pin is superseded writes no beat, also when the
+/// bump lands after the sampler's own fence check.
+#[tokio::test]
+async fn a_superseded_pin_writes_no_replication_heartbeat() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("beatfence");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    FenceRegistry::publish(&[(ShardId::new(0), pinned)], ShardId::new(0)).expect("pin");
+    bump_generation(&mut conn, ShardId::new(0), "failover", "test")
+        .await
+        .expect("bump");
+
+    let beat = autumn_harvest::replication::record_replication_heartbeat(
+        &mut conn,
+        ShardId::new(0),
+        std::time::Duration::from_secs(3600),
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    #[derive(diesel::QueryableByName)]
+    struct Beats {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        beats: i64,
+    }
+    let rows: Vec<Beats> =
+        diesel::sql_query("SELECT count(*) AS beats FROM harvest_replication_heartbeat")
+            .load(&mut conn)
+            .await
+            .expect("count the beats");
+
+    assert!(
+        matches!(
+            beat,
+            Err(autumn_harvest::error::HarvestError::ShardFenced { .. })
+        ),
+        "a superseded pin must not write a beat: {beat:?}"
+    );
+    assert_eq!(<[Beats]>::first(&rows).map(|row| row.beats), Some(0));
+}
+
+/// A pass on one shard does not block a bump of another shard on the same
+/// database (issue #1823). Generations are per shard, so the barrier is too.
+#[tokio::test]
+async fn a_fenced_pass_does_not_block_another_shards_bump() {
+    let (url, _db) = require_db!("passscope");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(1))
+        .await
+        .unwrap();
+    let other = ensure_generation_row(&mut conn, ShardId::new(2))
+        .await
+        .unwrap();
+    let pool = dr_pool(&url);
+    let guard = autumn_harvest::replication::begin_fenced_pass_at(&pool, ShardId::new(2), other)
+        .await
+        .expect("open the pass on shard 2");
+
+    // Above the bump's 6-second writer grace. A blocked bump fails on its
+    // 5-second lock timeout before the grace starts.
+    let bump = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        bump_generation(&mut conn, ShardId::new(1), "failover", "test"),
+    )
+    .await;
+    drop(guard);
+
+    assert!(
+        matches!(bump, Ok(Ok(_))),
+        "a pass on shard 2 must not block a bump of shard 1: {bump:?}"
+    );
+}
+
+/// A background tick holds a barrier on each pinned shard, and a fenced
+/// process gets no tick (issue #1823). Retention and the batch executor use
+/// this.
+#[tokio::test]
+async fn a_background_tick_holds_the_fence_and_refuses_when_fenced() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("tickfence");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    let pools = autumn_harvest::shard::ShardedDbPool::single(dr_pool(&url));
+    let unpinned = autumn_harvest::replication::begin_fenced_tick(&pools)
+        .await
+        .expect("an unpinned process ticks");
+    assert!(unpinned.is_empty(), "no pin, no barrier");
+
+    FenceRegistry::publish(&[(ShardId::new(0), pinned)], ShardId::new(0)).expect("pin");
+    let guards = autumn_harvest::replication::begin_fenced_tick(&pools)
+        .await
+        .expect("a pinned process ticks");
+    assert_eq!(guards.len(), 1, "one barrier per pinned shard");
+    let bump_url = url.clone();
+    let bump = tokio::spawn(async move {
+        let mut conn = connect(&bump_url).await;
+        bump_generation(&mut conn, ShardId::new(0), "failover", "test").await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let waited = !bump.is_finished();
+    drop(guards);
+    bump.await
+        .expect("bump task")
+        .expect("the bump commits after the tick");
+    assert!(waited, "a bump waits for the tick");
+
+    let refused = autumn_harvest::replication::begin_fenced_tick(&pools).await;
+    assert!(
+        matches!(
+            refused,
+            Err(autumn_harvest::error::HarvestError::ShardFenced { .. })
+        ),
+        "a fenced process gets no tick"
+    );
+}
+
+/// A worker on a plain database refuses to start in a process that already
+/// pins DR shards (issue #1823). The registry is process-wide, so the worker
+/// would check its writes against another database's pins.
+#[tokio::test]
+async fn an_unfenced_worker_refuses_to_join_a_pinned_process() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("mixedworker");
+    FenceRegistry::publish(
+        &[(ShardId::new(5), ShardGeneration::new(2))],
+        ShardId::new(5),
+    )
+    .expect("another worker pins first");
+    let pool = dr_pool(&url);
+    let targets = Some((vec![(ShardId::new(0), pool.clone())], ShardId::new(0)));
+    let refused = pin_worker_fence(DrFencing::Auto, DR_PREFIX, targets, &pool, &[]).await;
+    assert!(
+        refused.is_err(),
+        "an unfenced worker must not share a pinned process"
+    );
+}
+
+/// A claim on a database shared by several logical shards checks every one
+/// of their pins (issue #1823). The claim scan is not filtered by shard, so
+/// a bump of any colocated shard must stop it.
+#[tokio::test]
+async fn a_colocated_claim_stops_when_any_colocated_shard_is_bumped() {
+    use autumn_harvest::queue::claim_task_on_shard;
+
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("colocclaim");
+    let pool = dr_pool(&url);
+    let config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default()
+            .with_shard_assignments([ShardId::new(0), ShardId::new(1)]),
+    );
+    let targets = autumn_harvest::worker::dr_fence_targets(&config, &pool);
+    let assigned = [ShardId::new(0), ShardId::new(1)];
+    pin_worker_fence(DrFencing::Enabled, DR_PREFIX, targets, &pool, &assigned)
+        .await
+        .expect("both colocated shards pin");
+    let mut conn = connect(&url).await;
+    let params = autumn_harvest::queue::EnqueueParams::new(
+        "q-dr-coloc",
+        autumn_harvest::queue::TaskType::Activity,
+        serde_json::json!({}),
+    );
+    autumn_harvest::queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue");
+
+    bump_generation(&mut conn, ShardId::new(1), "promote", "oncall")
+        .await
+        .unwrap();
+    let queues = ["q-dr-coloc".to_string()];
+    let claimed = claim_task_on_shard(
+        &mut conn,
+        &queues,
+        "w-dr",
+        "",
+        None,
+        &[],
+        &[],
+        Some(ShardId::new(0)),
+    )
+    .await
+    .expect("the claim query itself still succeeds");
+    assert!(
+        claimed.is_none(),
+        "a bump of a colocated shard must stop the claim"
+    );
+}
+
+/// A failed publish releases the holds that the same startup added (issue
+/// #1823). Otherwise the sentinel stays in the process-wide registry, and
+/// other workers treat the shard as unwritable forever.
+#[tokio::test]
+async fn a_failed_publish_releases_its_holds() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("holdleak");
+    let mut conn = connect(&url).await;
+    let current = ensure_generation_row(&mut conn, ShardId::new(1))
+        .await
+        .unwrap();
+    FenceRegistry::publish(
+        &[(ShardId::new(1), ShardGeneration::new(current.as_i64() + 5))],
+        ShardId::new(1),
+    )
+    .expect("an older worker pinned shard 1 at another generation");
+    let unreachable = dr_pool("postgres://postgres:postgres@127.0.0.1:1/unreachable");
+    let reachable = dr_pool(&url);
+    let targets = Some((
+        vec![
+            (ShardId::new(0), unreachable),
+            (ShardId::new(1), reachable.clone()),
+        ],
+        ShardId::new(1),
+    ));
+    let refused = pin_worker_fence(
+        DrFencing::Auto,
+        DR_PREFIX,
+        targets,
+        &reachable,
+        &[ShardId::new(1)],
+    )
+    .await;
+
+    assert!(refused.is_err(), "a pin conflict refuses the worker");
+    assert!(
+        !FenceRegistry::is_held(ShardId::new(0)),
+        "a refused startup must not leave its hold behind"
+    );
+}
+
+/// A background tick on a database that several logical shards share holds
+/// a barrier for each of them (issue #1823). The tick's work is not filtered
+/// by shard, so a bump of any of them must wait for it.
+#[tokio::test]
+async fn a_background_tick_guards_every_colocated_shard() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("tickcoloc");
+    let pool = dr_pool(&url);
+    let config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default()
+            .with_shard_assignments([ShardId::new(0), ShardId::new(1)]),
+    );
+    let targets = autumn_harvest::worker::dr_fence_targets(&config, &pool);
+    let assigned = [ShardId::new(0), ShardId::new(1)];
+    pin_worker_fence(DrFencing::Enabled, DR_PREFIX, targets, &pool, &assigned)
+        .await
+        .expect("both colocated shards pin");
+
+    let pools = autumn_harvest::shard::ShardedDbPool::single(pool.clone());
+    let guards = autumn_harvest::replication::begin_fenced_tick(&pools)
+        .await
+        .expect("a pinned process ticks");
+    let bump_url = url.clone();
+    let bump = tokio::spawn(async move {
+        let mut conn = connect(&bump_url).await;
+        bump_generation(&mut conn, ShardId::new(1), "failover", "test").await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let waited = !bump.is_finished();
+    let count = guards.len();
+    drop(guards);
+    let _ = bump.await;
+
+    assert_eq!(count, 1, "one guard holds both colocated shards");
+    assert!(waited, "a bump of a colocated shard waits for the tick");
+
+    // A scheduler pass on that database takes the same group.
+    let group = autumn_harvest::replication::begin_fenced_group(&pool, ShardId::UNENCODED).await;
+    assert!(
+        matches!(
+            group,
+            Err(autumn_harvest::error::HarvestError::ShardFenced { .. })
+        ),
+        "the bumped colocated shard fences the scheduler pass too"
+    );
+}
+
+/// A process that shares its database with another process's logical shard
+/// stops claiming when that shard is fenced (issue #1823). Its claim scan
+/// is not filtered by shard, so it reaches the other shard's rows too.
+#[tokio::test]
+async fn a_split_database_claim_stops_when_the_peer_shard_is_bumped() {
+    use autumn_harvest::queue::claim_task_on_shard;
+
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("splitpeer");
+    let mut conn = connect(&url).await;
+    // Another process serves logical shard 1 on this database.
+    ensure_generation_row(&mut conn, ShardId::new(1))
+        .await
+        .unwrap();
+    let pool = dr_pool(&url);
+    let config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default().with_shard_assignments([ShardId::new(0)]),
+    );
+    let targets = autumn_harvest::worker::dr_fence_targets(&config, &pool);
+    pin_worker_fence(
+        DrFencing::Auto,
+        DR_PREFIX,
+        targets,
+        &pool,
+        &[ShardId::new(0)],
+    )
+    .await
+    .expect("a split database is supported");
+    let params = autumn_harvest::queue::EnqueueParams::new(
+        "q-dr-split",
+        autumn_harvest::queue::TaskType::Activity,
+        serde_json::json!({}),
+    );
+    autumn_harvest::queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue");
+
+    bump_generation(&mut conn, ShardId::new(1), "promote", "oncall")
+        .await
+        .unwrap();
+    let queues = ["q-dr-split".to_string()];
+    let claimed = claim_task_on_shard(
+        &mut conn,
+        &queues,
+        "w-dr",
+        "",
+        None,
+        &[],
+        &[],
+        Some(ShardId::new(0)),
+    )
+    .await
+    .expect("the claim query itself still succeeds");
+    assert!(
+        claimed.is_none(),
+        "a bump of the peer shard on this database must stop the claim"
+    );
+}
+
+/// A generation row that appears after startup stops this process's claims
+/// and background ticks (issue #1823). The process did not pin it, so it
+/// cannot tell whether that shard was fenced. A restart pins it.
+#[tokio::test]
+async fn a_late_peer_row_fails_claims_and_ticks_closed() {
+    use autumn_harvest::queue::claim_task_on_shard;
+
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("latepeer");
+    let pool = dr_pool(&url);
+    let config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default().with_shard_assignments([ShardId::new(0)]),
+    );
+    let targets = autumn_harvest::worker::dr_fence_targets(&config, &pool);
+    pin_worker_fence(
+        DrFencing::Enabled,
+        DR_PREFIX,
+        targets,
+        &pool,
+        &[ShardId::new(0)],
+    )
+    .await
+    .expect("shard 0 pins");
+    let mut conn = connect(&url).await;
+    let params = autumn_harvest::queue::EnqueueParams::new(
+        "q-dr-late",
+        autumn_harvest::queue::TaskType::Activity,
+        serde_json::json!({}),
+    );
+    autumn_harvest::queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue");
+
+    // Another process for shard 1 starts later on the same database.
+    ensure_generation_row(&mut conn, ShardId::new(1))
+        .await
+        .unwrap();
+    let queues = ["q-dr-late".to_string()];
+    let claimed = claim_task_on_shard(
+        &mut conn,
+        &queues,
+        "w-dr",
+        "",
+        None,
+        &[],
+        &[],
+        Some(ShardId::new(0)),
+    )
+    .await
+    .expect("the claim query itself still succeeds");
+    let tick = autumn_harvest::replication::begin_fenced_group(&pool, ShardId::new(0)).await;
+
+    assert!(claimed.is_none(), "an unpinned row must stop the claim");
+    assert!(tick.is_err(), "an unpinned row must stop a background tick");
+}
+
+/// A fenced worker refuses to join a process that already runs an unfenced
+/// worker (issue #1823). Its pins are process-wide, so the unfenced worker
+/// would check its writes against another database's generation.
+#[tokio::test]
+async fn a_fenced_worker_refuses_to_join_an_unfenced_process() {
+    let _serial = registry_guard().await;
+    let (plain_url, _plain) = require_db!("unfencedfirst");
+    let plain = dr_pool(&plain_url);
+    let plain_targets = Some((vec![(ShardId::new(0), plain.clone())], ShardId::new(0)));
+    let (fenced, _) = pin_worker_fence(DrFencing::Auto, DR_PREFIX, plain_targets, &plain, &[])
+        .await
+        .expect("a plain database runs unfenced");
+    assert!(fenced.is_none());
+
+    let (dr_url, _dr) = require_db!("fencedsecond");
+    let dr = dr_pool(&dr_url);
+    let dr_targets = Some((vec![(ShardId::new(0), dr.clone())], ShardId::new(0)));
+    let refused = pin_worker_fence(DrFencing::Enabled, DR_PREFIX, dr_targets, &dr, &[]).await;
+    assert!(
+        refused.is_err(),
+        "a fenced worker must not pin shards an unfenced worker already uses"
+    );
+    assert!(!FenceRegistry::is_enabled(), "nothing is published");
+}
+
+/// Two DSN aliases of one database are one database to the fence (issue
+/// #1823). `from_dsns` builds a pool per alias, but groups them as one
+/// physical pool. The worker must start twice, and a bump of either shard
+/// must stop a claim on the other.
+#[tokio::test]
+async fn dsn_aliases_of_one_database_are_colocated() {
+    use autumn_harvest::queue::claim_task_on_shard;
+
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("dsnalias");
+    let sharded = autumn_harvest::shard::ShardedDbPool::from_dsns(
+        [
+            (ShardId::new(0), url.clone()),
+            (ShardId::new(1), url.clone()),
+        ],
+        ShardId::new(0),
+        4,
+    )
+    .expect("two aliases of one database");
+    let mut config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default(),
+    );
+    config.sharded_pool = Some(sharded);
+    let fallback = dr_pool(&url);
+    for start in 0..2 {
+        FenceRegistry::clear();
+        let targets = autumn_harvest::worker::dr_fence_targets(&config, &fallback);
+        let pinned = pin_worker_fence(DrFencing::Enabled, DR_PREFIX, targets, &fallback, &[]).await;
+        assert!(pinned.is_ok(), "start {start} must pin: {:?}", pinned.err());
+    }
+
+    let mut conn = connect(&url).await;
+    let params = autumn_harvest::queue::EnqueueParams::new(
+        "q-dr-alias",
+        autumn_harvest::queue::TaskType::Activity,
+        serde_json::json!({}),
+    );
+    autumn_harvest::queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue");
+    let queues = ["q-dr-alias".to_string()];
+    let before = claim_task_on_shard(
+        &mut conn,
+        &queues,
+        "w-dr",
+        "",
+        None,
+        &[],
+        &[],
+        Some(ShardId::new(0)),
+    )
+    .await
+    .expect("claim");
+    assert!(before.is_some(), "the current epoch claims normally");
+    diesel::sql_query("UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    bump_generation(&mut conn, ShardId::new(1), "promote", "oncall")
+        .await
+        .unwrap();
+    let claimed = claim_task_on_shard(
+        &mut conn,
+        &queues,
+        "w-dr",
+        "",
+        None,
+        &[],
+        &[],
+        Some(ShardId::new(0)),
+    )
+    .await
+    .expect("the claim query itself still succeeds");
+    assert!(
+        claimed.is_none(),
+        "a bump of an aliased shard must stop the claim"
+    );
+}
+
+/// A direct-database command freezes the set of generation rows while it
+/// runs (issue #1823). A shard provisioned mid-command would otherwise have
+/// no barrier.
+#[tokio::test]
+async fn a_row_freeze_blocks_new_rows_and_refuses_unguarded_ones() {
+    use autumn_harvest::replication::freeze_generation_rows_on;
+
+    let (url, _db) = require_db!("rowfreeze");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    // An empty table is frozen too: the first row must wait.
+    let (empty_url, _empty) = require_db!("rowfreezeempty");
+    let mut empty_conn = connect(&empty_url).await;
+    let freeze = freeze_generation_rows_on(connect(&empty_url).await, &[])
+        .await
+        .expect("an empty table freezes");
+    let first = tokio::time::timeout(
+        std::time::Duration::from_millis(700),
+        ensure_generation_row(&mut empty_conn, ShardId::new(0)),
+    )
+    .await;
+    assert!(first.is_err(), "the first row waits for the freeze");
+    drop(freeze);
+
+    let freeze = freeze_generation_rows_on(connect(&url).await, &[ShardId::new(0)])
+        .await
+        .expect("every row is guarded");
+    let provision = tokio::time::timeout(
+        std::time::Duration::from_millis(700),
+        ensure_generation_row(&mut conn, ShardId::new(1)),
+    )
+    .await;
+    assert!(provision.is_err(), "a new row waits for the freeze");
+    drop(freeze);
+    drop(conn);
+
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(1))
+        .await
+        .expect("the row lands once the freeze drops");
+    let refused = freeze_generation_rows_on(connect(&url).await, &[ShardId::new(0)]).await;
+    assert!(
+        matches!(refused, Err(autumn_harvest::error::HarvestError::Config(_))),
+        "an unguarded row is refused"
+    );
+}
+
+/// A new shard row waits for every fenced pass already running on its
+/// database (issue #1823). The running pass guards only the rows it saw, so
+/// a row provisioned mid-pass would have no barrier.
+#[tokio::test]
+async fn provisioning_a_row_waits_for_a_running_pass() {
+    let (url, _db) = require_db!("provisionwait");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    let pool = dr_pool(&url);
+    let guard = autumn_harvest::replication::begin_fenced_pass_at(&pool, ShardId::new(0), pinned)
+        .await
+        .expect("open the pass");
+    let provision = tokio::time::timeout(
+        std::time::Duration::from_millis(700),
+        ensure_generation_row(&mut conn, ShardId::new(1)),
+    )
+    .await;
+    assert!(provision.is_err(), "a new row waits for the running pass");
+    drop(guard);
+    drop(conn);
+
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(1))
+        .await
+        .expect("the row lands once the pass ends");
+    // An existing row never waits: a restart re-provisions every time.
+    let guard = autumn_harvest::replication::begin_fenced_pass_at(&pool, ShardId::new(0), pinned)
+        .await
+        .expect("open the pass");
+    let again = tokio::time::timeout(
+        std::time::Duration::from_millis(700),
+        ensure_generation_row(&mut conn, ShardId::new(1)),
+    )
+    .await;
+    drop(guard);
+    assert!(matches!(again, Ok(Ok(_))), "an existing row does not wait");
+}
+
+/// A group larger than the guard cap still gets a guard (issue #1823). One
+/// connection holds the barrier of every shard in the group, so the group
+/// takes one slot, not one per shard.
+#[tokio::test]
+async fn a_group_larger_than_the_guard_cap_gets_a_guard() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("biggroup");
+    let pool = dr_pool(&url);
+    let assigned: Vec<ShardId> = (0..70).map(ShardId::new).collect();
+    let config = autumn_harvest::worker::WorkerRuntimeConfig::from(
+        autumn_harvest::builder::WorkerConfig::default().with_shard_assignments(assigned.clone()),
+    );
+    let targets = autumn_harvest::worker::dr_fence_targets(&config, &pool);
+    pin_worker_fence(DrFencing::Enabled, DR_PREFIX, targets, &pool, &assigned)
+        .await
+        .expect("70 colocated shards pin");
+
+    let group = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        autumn_harvest::replication::begin_fenced_group(&pool, ShardId::UNENCODED),
+    )
+    .await
+    .expect("the group must not wait for 70 slots")
+    .expect("the group gets a guard");
+    assert_eq!(group.len(), 1, "one guard for the whole group");
+    let pools = autumn_harvest::shard::ShardedDbPool::single(pool.clone());
+    let tick = autumn_harvest::replication::begin_fenced_tick(&pools)
+        .await
+        .expect("a tick over 70 shards gets a guard");
+    assert_eq!(tick.len(), 1);
+}
+
+/// A tick takes one guard slot per database, all at once (issue #1823). A
+/// guard opens its own connection, so a slot per guard bounds connections.
+/// Taking them all at once means no tick holds some slots while it waits.
+#[tokio::test]
+async fn a_tick_takes_a_guard_slot_per_database_at_once() {
+    let _serial = registry_guard().await;
+    let (first_url, _first) = require_db!("slotone");
+    let (second_url, _second) = require_db!("slottwo");
+    let (first, second) = (ShardId::new(0), ShardId::new(1));
+    let first_pool = dr_pool(&first_url);
+    let second_pool = dr_pool(&second_url);
+    let mut pins = Vec::new();
+    for (shard, url) in [(first, &first_url), (second, &second_url)] {
+        let mut conn = connect(url).await;
+        pins.push((
+            shard,
+            ensure_generation_row(&mut conn, shard).await.unwrap(),
+        ));
+    }
+    FenceRegistry::publish(&pins, first).expect("pin");
+    // Every slot but one is busy.
+    let mut busy = Vec::new();
+    for _ in 1..autumn_harvest::replication::FENCE_GUARD_LIMIT {
+        busy.push(
+            autumn_harvest::replication::begin_fenced_group(&first_pool, first)
+                .await
+                .expect("hold a slot"),
+        );
+    }
+    let pools = autumn_harvest::shard::ShardedDbPool::from_map(
+        [(first, first_pool.clone()), (second, second_pool.clone())]
+            .into_iter()
+            .collect(),
+        first,
+    );
+    let groups = [(first_pool.clone(), first), (second_pool.clone(), second)];
+
+    let tick = tokio::spawn(async move {
+        guard_count(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                autumn_harvest::replication::begin_fenced_tick(&pools),
+            )
+            .await,
+        )
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let waited = !tick.is_finished();
+    // One more free slot lets the tick take both of its slots.
+    busy.pop();
+    let tick = tick.await.expect("the tick task");
+    // A cross-shard relay fences its source and its target the same way.
+    let relay = guard_count(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            autumn_harvest::replication::begin_fenced_groups(&[
+                (&groups[0].0, groups[0].1),
+                (&groups[1].0, groups[1].1),
+            ]),
+        )
+        .await,
+    );
+    drop(busy);
+
+    assert!(
+        waited,
+        "a tick over two databases must wait for two free slots"
+    );
+    assert_eq!(tick, Ok(2), "the tick gets a guard on each database");
+    assert_eq!(relay, Ok(2), "a relay gets a guard on each database");
+}
+
+/// An operation that guards more databases than the cap takes every slot
+/// and runs alone (issue #1823). It must not wait for slots that cannot
+/// exist.
+#[tokio::test]
+async fn a_tick_over_more_databases_than_the_cap_runs_alone() {
+    let _serial = registry_guard().await;
+    let (base_url, base_db) = require_db!("slotwide");
+    let count = autumn_harvest::replication::FENCE_GUARD_LIMIT + 1;
+    // One database per shard, cloned from a migrated one.
+    let admin = admin_url().await.expect("admin url");
+    let mut admin_conn = connect(&admin).await;
+    let mut urls = vec![base_url];
+    for index in 1..count {
+        let db = format!("{base_db}_{index}");
+        diesel::sql_query(format!("CREATE DATABASE {db} TEMPLATE {base_db}"))
+            .execute(&mut admin_conn)
+            .await
+            .expect("clone the database");
+        urls.push(with_db_name(&admin, &db));
+    }
+    drop(admin_conn);
+    let mut pins = Vec::new();
+    let mut pools = std::collections::BTreeMap::new();
+    for (index, url) in urls.iter().enumerate() {
+        let shard = ShardId::new(i32::try_from(index).unwrap());
+        let mut conn = connect(url).await;
+        pins.push((
+            shard,
+            ensure_generation_row(&mut conn, shard).await.unwrap(),
+        ));
+        pools.insert(shard, dr_pool(url));
+    }
+    FenceRegistry::publish(&pins, ShardId::new(0)).expect("pin");
+    let pools = autumn_harvest::shard::ShardedDbPool::from_map(pools, ShardId::new(0));
+
+    let tick = guard_count(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            autumn_harvest::replication::begin_fenced_tick(&pools),
+        )
+        .await,
+    );
+
+    assert_eq!(tick, Ok(count), "the tick takes every slot and runs");
+}
+
+/// How many guards an attempt opened, or why it opened none. The guards drop
+/// here, so the next attempt can take their slot.
+fn guard_count(
+    attempt: Result<
+        autumn_harvest::error::HarvestResult<Vec<autumn_harvest::replication::FencePassGuard>>,
+        tokio::time::error::Elapsed,
+    >,
+) -> Result<usize, String> {
+    match attempt {
+        Ok(Ok(guards)) => Ok(guards.len()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("timed out waiting for a guard slot".to_string()),
+    }
+}
+
+/// A held shard that turns out to carry a DR marker stops the worker. A pin
+/// is fixed for the life of a process, so it restarts and pins at startup.
+#[tokio::test]
+async fn a_held_shard_with_a_dr_marker_stops_the_worker() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("holddr");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    FenceRegistry::hold(&[ShardId::new(0)], ShardId::new(0)).expect("hold");
+    let mut held = vec![(ShardId::new(0), dr_pool(&url))];
+    let Err(error) = resolve_held(&mut held, DR_PREFIX).await else {
+        panic!("a DR shard found after startup must stop the worker");
+    };
+    assert!(error.to_string().contains("Restart"), "{error}");
+    assert!(
+        FenceRegistry::is_held(ShardId::new(0)),
+        "the shard stays held until the process stops"
+    );
+}
+
+/// A database without the fence table probes as plain. Before issue #1823 an
+/// unfenced process issued no DR query, so it must not fail now.
+#[tokio::test]
+async fn the_probe_tolerates_a_database_without_the_fence_table() {
+    let (url, db) = require_db!("probenotable");
+    let mut conn = connect(&url).await;
+    diesel::sql_query("DROP TABLE harvest_shard_generation CASCADE")
+        .execute(&mut conn)
+        .await
+        .expect("drop the fence table");
+    let markers = probe_dr_markers(&mut conn, &unique_prefix(&db))
+        .await
+        .expect("a missing table is not an error");
+    assert_eq!(markers.generation_shards, Vec::<ShardId>::new());
+    assert!(!markers.is_dr());
+}
+
+/// A DR slot with no row yet still turns the fence on, and Auto provisions
+/// the row for the shard the process serves.
+#[tokio::test]
+async fn auto_mode_provisions_the_row_on_a_slot_only_dr_database() {
+    let _serial = registry_guard().await;
+    let (url, db) = require_db!("autoslot");
+    if !wal_level_is_logical(&url).await {
+        eprintln!("SKIPPED autoslot: wal_level is not logical");
+        return;
+    }
+    let prefix = unique_prefix(&db);
+    let slot = format!("{prefix}_slot");
+    let mut conn = connect(&url).await;
+    diesel::sql_query("SELECT pg_create_logical_replication_slot($1, 'pgoutput')")
+        .bind::<diesel::sql_types::Text, _>(slot.clone())
+        .execute(&mut conn)
+        .await
+        .expect("create slot");
+    let pool = dr_pool(&url);
+    let targets = Some((vec![(ShardId::new(6), pool.clone())], ShardId::new(6)));
+    let resolved = pin_process_fence(DrFencing::Auto, &prefix, targets, &pool).await;
+    let pinned = FenceRegistry::expected(ShardId::new(6));
+    let row = current_generation(&mut conn, ShardId::new(6)).await;
+    let _ = diesel::sql_query("SELECT pg_drop_replication_slot($1)")
+        .bind::<diesel::sql_types::Text, _>(slot)
+        .execute(&mut conn)
+        .await;
+    let Ok(resolved) = resolved else {
+        panic!("a slot-only DR database starts fenced");
+    };
+    assert!(resolved.is_some(), "the slot turns the fence on");
+    assert_eq!(pinned, Some(ShardGeneration::INITIAL));
+    assert_eq!(row.expect("read"), Some(ShardGeneration::INITIAL));
+}
+
+/// In a sharded pool, a database whose row names another shard is
+/// misconfigured: two DSNs are swapped. Pinning would add a second row that
+/// `harvest dr fence` never bumps.
+#[tokio::test]
+async fn a_process_that_names_the_wrong_shard_refuses_to_start() {
+    let _serial = registry_guard().await;
+    let (url_a, _db_a) = require_db!("wrongshard_a");
+    let (url_b, _db_b) = require_db!("wrongshard_b");
+    let mut conn_b = connect(&url_b).await;
+    ensure_generation_row(&mut conn_b, ShardId::new(7))
+        .await
+        .unwrap();
+    let pool_a = dr_pool(&url_a);
+    let pool_b = dr_pool(&url_b);
+    let targets = Some((
+        vec![(ShardId::new(0), pool_a.clone()), (ShardId::new(1), pool_b)],
+        ShardId::new(0),
+    ));
+    let refused = pin_process_fence(DrFencing::Auto, DR_PREFIX, targets, &pool_a).await;
+    let row = current_generation(&mut conn_b, ShardId::new(1)).await;
+    let Err(error) = refused else {
+        panic!("a shard mismatch must refuse to start");
+    };
+    assert!(error.to_string().contains("names shard"), "{error}");
+    assert_eq!(row.expect("read"), None, "no second row is provisioned");
+    assert!(!FenceRegistry::is_enabled());
+}
+
+/// Runners may split the logical shards of one database (issue #1823). A
+/// second runner finds the first runner's row there and still pins.
+#[tokio::test]
+async fn split_runners_on_one_database_both_pin() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("splitrunners");
+    {
+        let mut conn = connect(&url).await;
+        ensure_generation_row(&mut conn, ShardId::new(0))
+            .await
+            .unwrap();
+    }
+    let pool = dr_pool(&url);
+    let targets = Some((vec![(ShardId::new(1), pool.clone())], ShardId::new(1)));
+    let pinned = pin_process_fence(DrFencing::Auto, DR_PREFIX, targets, &pool).await;
+    if let Err(error) = pinned {
+        panic!("a runner for another logical shard on this database must pin: {error}");
+    }
+    assert_eq!(
+        FenceRegistry::expected(ShardId::new(1)),
+        Some(ShardGeneration::INITIAL)
+    );
+}
+
+/// A fenced pass is a commit-order barrier (issue #1823). A bump waits for
+/// the open pass, and a pass that starts after the bump is refused.
+#[tokio::test]
+async fn a_bump_waits_for_an_open_fenced_pass() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("passbarrier");
+    let mut conn = connect(&url).await;
+    let pinned = ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    FenceRegistry::publish(&[(ShardId::new(0), pinned)], ShardId::new(0)).expect("pin");
+    let pool = dr_pool(&url);
+    let guard = autumn_harvest::replication::begin_fenced_pass(&pool, ShardId::new(0))
+        .await
+        .expect("an unfenced shard opens a pass")
+        .expect("a pinned shard gets a guard");
+
+    let bump_url = url.clone();
+    let bump = tokio::spawn(async move {
+        let mut conn = connect(&bump_url).await;
+        bump_generation(&mut conn, ShardId::new(0), "failover", "test").await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let waited = !bump.is_finished();
+    // The pass keeps writing while the bump waits. Its own fence checks
+    // must not queue behind the bump, or the pass and the bump deadlock.
+    let mut pass_conn = connect(&url).await;
+    let pass_check = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        autumn_harvest::replication::assert_fence(&mut pass_conn, ShardId::new(0)),
+    )
+    .await;
+    drop(guard);
+    let bumped = bump.await.expect("bump task").expect("bump commits");
+    let after = autumn_harvest::replication::begin_fenced_pass(&pool, ShardId::new(0)).await;
+
+    assert!(waited, "a bump must wait for the open pass");
+    assert!(
+        matches!(pass_check, Ok(Ok(()))),
+        "the pass's own fence check must not wait behind the bump"
+    );
+    assert!(bumped > pinned);
+    assert!(
+        matches!(
+            after,
+            Err(autumn_harvest::error::HarvestError::ShardFenced { .. })
+        ),
+        "a pass after the bump is refused"
+    );
+}
+
+/// `Enabled` with no shard identity reads the shard from a single row, and
+/// refuses when the database names none.
+#[tokio::test]
+async fn enabled_mode_without_shard_identity_needs_exactly_one_row() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("enablednoid");
+    let pool = dr_pool(&url);
+    let refused = pin_process_fence(DrFencing::Enabled, DR_PREFIX, None, &pool).await;
+    assert!(refused.is_err(), "no row and no identity: nothing to pin");
+    assert!(!FenceRegistry::is_enabled());
+
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(9))
+        .await
+        .unwrap();
+    let Ok(resolved) = pin_process_fence(DrFencing::Enabled, DR_PREFIX, None, &pool).await else {
+        panic!("one row names the shard");
+    };
+    assert!(resolved.is_some());
+    assert_eq!(
+        FenceRegistry::expected(ShardId::new(9)),
+        Some(ShardGeneration::INITIAL)
+    );
+}
+
+// ── Direct-database admin writes (issue #1823) ─────────────────────────────
+
+/// An admin write against a demoted primary is rejected. The operator states
+/// the epoch that holds authority; the old primary still has the older one.
+#[tokio::test]
+async fn an_admin_write_against_a_demoted_shard_is_rejected() {
+    let (url, _db) = require_db!("admindemoted");
+    let mut conn = connect(&url).await;
+    let shard = ShardId::new(0);
+    ensure_generation_row(&mut conn, shard).await.unwrap();
+
+    // The promoted primary is at generation 1. This database never saw it.
+    let error = assert_admin_write_authority(
+        &mut conn,
+        shard,
+        Some(ShardGeneration::new(1)),
+        DR_PREFIX,
+        AdminWrite::Data,
+    )
+    .await
+    .expect_err("a demoted shard must refuse the write");
+    match error {
+        autumn_harvest::error::HarvestError::ShardFenced {
+            shard_id,
+            pinned,
+            current,
+        } => {
+            assert_eq!((shard_id, pinned, current), (0, 1, Some(0)));
+        }
+        other => panic!("expected ShardFenced, got {other:?}"),
+    }
+
+    assert_admin_write_authority(
+        &mut conn,
+        shard,
+        Some(ShardGeneration::INITIAL),
+        DR_PREFIX,
+        AdminWrite::Data,
+    )
+    .await
+    .expect("the stated epoch matches, so the write may run");
+}
+
+/// On a DR database, an admin write with no stated epoch is refused.
+#[tokio::test]
+async fn an_admin_write_on_a_dr_database_must_state_the_epoch() {
+    let (url, db) = require_db!("adminepoch");
+    let mut conn = connect(&url).await;
+    assert_admin_write_authority(
+        &mut conn,
+        ShardId::new(0),
+        None,
+        &unique_prefix(&db),
+        AdminWrite::Data,
+    )
+    .await
+    .expect("a plain database needs no epoch");
+
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    let error = assert_admin_write_authority(
+        &mut conn,
+        ShardId::new(0),
+        None,
+        DR_PREFIX,
+        AdminWrite::Data,
+    )
+    .await
+    .expect_err("a DR database needs a stated epoch");
+    assert!(
+        matches!(error, autumn_harvest::error::HarvestError::Config(_)),
+        "{error:?}"
+    );
+}
+
+/// A data write on a logical standby is refused even when the stated epoch
+/// matches: the standby carries the replicated row at the same generation.
+/// The subscription's name does not matter.
+/// A schema-only write (partition DDL) is allowed there, because logical
+/// replication carries no DDL and the docs require it on both sides.
+#[tokio::test]
+async fn an_admin_data_write_on_a_logical_standby_is_refused() {
+    let (url, db) = require_db!("adminstandby");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+    // A custom name: deployments may set their own slot prefix, and the CLI
+    // cannot know it. The standby check must not depend on the name.
+    let sub = format!("custom_sub_{db}");
+    diesel::sql_query(format!(
+        "CREATE SUBSCRIPTION {sub} CONNECTION 'dbname=unused' PUBLICATION harvest_dr \
+         WITH (connect = false)"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("create a disconnected subscription");
+
+    let data = assert_admin_write_authority(
+        &mut conn,
+        ShardId::new(0),
+        Some(ShardGeneration::INITIAL),
+        DR_PREFIX,
+        AdminWrite::Data,
+    )
+    .await;
+    let schema = assert_admin_write_authority(
+        &mut conn,
+        ShardId::new(0),
+        Some(ShardGeneration::INITIAL),
+        DR_PREFIX,
+        AdminWrite::SchemaOnly,
+    )
+    .await;
+    let _ = diesel::sql_query(format!("ALTER SUBSCRIPTION {sub} SET (slot_name = NONE)"))
+        .execute(&mut conn)
+        .await;
+    let _ = diesel::sql_query(format!("DROP SUBSCRIPTION {sub}"))
+        .execute(&mut conn)
+        .await;
+
+    let error = data.expect_err("a data write on a standby must be refused");
+    assert!(error.to_string().contains("standby"), "{error}");
+    schema.expect("partition DDL runs on both sides of logical replication");
 }
 
 /// Counts `harvest.shard.fenced`; every other metric is the default no-op.
@@ -2655,4 +6086,78 @@ async fn promotion_body(regions: &Regions) -> Result<(), String> {
         return Err(format!("history forked: {forks} duplicated event ids"));
     }
     Ok(())
+}
+
+/// The number of rows in `table`.
+async fn count_rows(conn: &mut AsyncPgConnection, table: &str) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Rows {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let rows: Vec<Rows> = diesel::sql_query(format!("SELECT count(*) AS n FROM {table}"))
+        .load(conn)
+        .await
+        .expect("count the rows");
+    <[Rows]>::first(&rows).map_or(0, |row| row.n)
+}
+
+/// A TCP proxy in front of the database of `url`, and its switch. When the
+/// switch is on, the proxy stops forwarding bytes but keeps every socket
+/// open, as a path that drops packets does. Returns `url` through the proxy.
+async fn silent_proxy(url: &str) -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    async fn pipe(
+        mut from: tokio::net::tcp::OwnedReadHalf,
+        mut to: tokio::net::tcp::OwnedWriteHalf,
+        frozen: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let mut buf = vec![0_u8; 8192];
+        loop {
+            let Ok(n) = from.read(&mut buf).await else {
+                return;
+            };
+            if n == 0 {
+                return;
+            }
+            if std::sync::atomic::AtomicBool::load(&frozen, std::sync::atomic::Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if to.write_all(&buf[..n]).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    let at = url.find('@').expect("the url names a user") + 1;
+    let end = at + url[at..].find('/').expect("the url names a database");
+    let upstream = url[at..end].replace("localhost", "127.0.0.1");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the proxy");
+    let port = listener.local_addr().expect("proxy address").port();
+    let frozen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let switch = std::sync::Arc::clone(&frozen);
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let Ok(server) = tokio::net::TcpStream::connect(&upstream).await else {
+                continue;
+            };
+            let (client_read, client_write) = client.into_split();
+            let (server_read, server_write) = server.into_split();
+            tokio::spawn(pipe(
+                client_read,
+                server_write,
+                std::sync::Arc::clone(&switch),
+            ));
+            tokio::spawn(pipe(
+                server_read,
+                client_write,
+                std::sync::Arc::clone(&switch),
+            ));
+        }
+    });
+    let proxied = format!("{}127.0.0.1:{port}{}", &url[..at], &url[end..]);
+    (proxied, frozen)
 }

@@ -211,6 +211,13 @@ diesel::table! {
         /// row's marker with a direct match on the vacating migration's own
         /// execution id, with no cross-database write and no retry race.
         staging_vacated_by -> Nullable<Uuid>,
+        /// Verified tenant of the run (issue #1977). A start by a tenant-bound
+        /// caller sets it. Children, retries, continue-as-new, reset and re-run
+        /// copy it from the source run. NULL means the run has no tenant.
+        ///
+        /// The 65th column. The workspace enables diesel's
+        /// `128-column-tables` feature for it.
+        tenant -> Nullable<Text>,
     }
 }
 
@@ -319,6 +326,15 @@ diesel::table! {
         /// `NULL` when no timer owns this row, or once a different wake
         /// reason repends it.
         timer_fires_at -> Nullable<Timestamptz>,
+        /// The `attempt` whose activity handler started (issue #1809).
+        /// Written with `ActivityStarted`. Equal to `attempt` only after
+        /// the current claim started its handler. `NULL` when no attempt
+        /// started.
+        handler_started_attempt -> Nullable<Int4>,
+        timed_out_claims -> Nullable<Array<Nullable<Text>>>,
+        /// When the handler of `handler_started_attempt` started (issue
+        /// #1809).
+        handler_started_at -> Nullable<Timestamptz>,
         /// `TRUE` on the first workflow task of a freshly admitted run
         /// (issue #1824). Set only by the workflow start path. The claim
         /// order reads it while `attempt = 0`.
@@ -551,6 +567,13 @@ diesel::table! {
         updated_at -> Timestamptz,
         target_build_id -> Nullable<Text>,
         ramp_percent -> Nullable<Integer>,
+        /// One operator ramp's identity, the same on every shard pool (issue
+        /// #1814). NULL = no ramp, or a ramp set before the column existed.
+        ramp_id -> Nullable<Uuid>,
+        /// The ramp guard's abort markers on this pool, newest first (issue
+        /// #1814). Each is `{"id": ramp_id, "base": build_id}`. A later guard
+        /// uses them to finish a partial abort.
+        ramp_aborted -> Jsonb,
     }
 }
 
@@ -610,6 +633,14 @@ diesel::table! {
         /// (issue #953). `NULL` until assigned; stays `NULL` forever when no
         /// audit sink is configured.
         export_seq -> Nullable<Int8>,
+        /// Audit-chain link of the previous `export_seq` (issue #1838).
+        chain_prev -> Nullable<Bytea>,
+        /// Newest `occurred_at` chained before this row (issue #1838).
+        chain_newest_before -> Nullable<Timestamptz>,
+        /// Audit-chain link of this row (issue #1838).
+        chain_hash -> Nullable<Bytea>,
+        /// The shard whose exporter made the links (issue #1838).
+        chain_shard -> Nullable<Int4>,
     }
 }
 
@@ -633,6 +664,16 @@ diesel::table! {
         last_delivered_at -> Nullable<Timestamptz>,
         updated_at -> Timestamptz,
         retired_at -> Nullable<Timestamptz>,
+        /// Newest audit-chain link on this shard (issue #1838).
+        chain_head -> Nullable<Bytea>,
+        /// First chained `export_seq` on this shard (issue #1838).
+        chain_start_seq -> Nullable<Int8>,
+        /// `export_seq` of the newest chained row (issue #1838).
+        chain_head_seq -> Nullable<Int8>,
+        /// Newest `occurred_at` of the chain, through the head (issue #1838).
+        chain_newest_at -> Nullable<Timestamptz>,
+        /// Keyed MAC over the checkpoint columns (issue #1838).
+        chain_mac -> Nullable<Bytea>,
     }
 }
 
@@ -664,6 +705,9 @@ diesel::table! {
         last_used_at -> Nullable<Timestamptz>,
         revoked_at -> Nullable<Timestamptz>,
         created_by -> Text,
+        /// Tenant claim of the token (issue #1977). NULL means not
+        /// tenant-bound.
+        tenant -> Nullable<Text>,
     }
 }
 
@@ -803,9 +847,11 @@ diesel::table! {
         created_at -> Timestamptz,
         /// NULL = never quota-blocked; eligible immediately. Set to
         /// `now() + backoff` when a relay attempt hits `QuotaExceeded` (issue
-        /// #1227, Finding 4) so the claim query can exclude the row until its
-        /// backoff elapses instead of leaving it to dominate every batch.
+        /// #1227, Finding 4). The claim query can then exclude the row until
+        /// its backoff elapses, instead of leaving it to dominate every batch.
         next_attempt_at -> Nullable<Timestamptz>,
+        /// Tenant of the source run (issue #1977). The target run gets it.
+        tenant -> Nullable<Text>,
     }
 }
 
@@ -1100,6 +1146,8 @@ diesel::table! {
         wasm_bytes    -> Bytea,
         active        -> Bool,
         published_at  -> Timestamptz,
+        /// Hex Ed25519 publisher signature (issue #1838). `NULL` = unsigned.
+        signature     -> Nullable<Text>,
     }
 }
 

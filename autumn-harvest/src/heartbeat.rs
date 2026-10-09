@@ -236,6 +236,10 @@ pub struct HeartbeatFlushOptions {
     /// Receives `harvest.heartbeat.flush_failed` and
     /// `harvest.db.pool_acquire_timeout{site="heartbeat_flush"}`.
     pub metrics: Arc<dyn MetricsRecorder>,
+    /// The `shard` labels of the pool (issue #1815). Each flush records its
+    /// pool wait and its write latency under each of them. A pool that serves
+    /// several shards carries each shard's label, as its gauges do.
+    pub shards: Arc<[u16]>,
 }
 
 /// A heartbeat flusher for payloads that their sender stamps (issue #1788).
@@ -244,7 +248,7 @@ pub struct HeartbeatFlushOptions {
 ///
 /// A failed flush keeps its payload. The next tick sends it again, unless a
 /// newer payload replaces it. A lost claim cancels `cancel` and stops the
-/// flusher.
+/// flusher. So does a DR fence on this process.
 ///
 /// Each payload carries the time its sender stamped. The flush writes the
 /// database clock minus the age of that time. A payload that waits in the
@@ -257,6 +261,11 @@ pub fn spawn_heartbeat_flusher_with(
     cancel: CancellationToken,
     options: HeartbeatFlushOptions,
 ) -> HeartbeatSlot {
+    // A fence stops this flusher too (issue #1823). The flusher outlives a
+    // drain, so the worker token does not reach it.
+    if crate::replication::FenceRegistry::is_enabled() {
+        crate::replication::FenceRegistry::register_worker_shutdown(&cancel);
+    }
     let latest = LatestHeartbeat::default();
     tokio::spawn(stamped_heartbeat_loop(
         claim,
@@ -404,9 +413,12 @@ pub async fn flush_heartbeat(
         claim,
         &mut pending,
         &Latest::default(),
-        acquire_timeout,
+        &HeartbeatFlushOptions {
+            acquire_timeout,
+            metrics: Arc::new(crate::telemetry::NoOpMetrics),
+            shards: Arc::from([0]),
+        },
         Duration::MAX,
-        &crate::telemetry::NoOpMetrics,
     )
     .await
     .map_err(|failure| *failure.error)
@@ -438,8 +450,10 @@ struct Pending {
 /// send time. A quick write keeps the rate of one write per interval.
 ///
 /// A blocked write that fails on a session timeout is followed too. The
-/// timeout keeps the session, so the connection still works. `metrics`
-/// counts that failure, because the caller sees only the last write.
+/// timeout keeps the session, so the connection still works. The `metrics`
+/// of `options` count that failure, because the caller sees only the last
+/// write. They also get the pool wait and the write latency of each flush,
+/// under the `shard` of `options` (issue #1815).
 ///
 /// `beat` holds the last heartbeat written or tried.
 #[cfg(feature = "db")]
@@ -448,25 +462,31 @@ async fn flush(
     claim: &TaskClaim,
     beat: &mut Pending,
     latest: &Latest,
-    acquire_timeout: Duration,
+    options: &HeartbeatFlushOptions,
     interval: Duration,
-    metrics: &dyn MetricsRecorder,
 ) -> Result<ClaimWrite, FlushFailure> {
+    let metrics = options.metrics.as_ref();
+    let shards = &options.shards;
     let mut started = tokio::time::Instant::now();
-    let mut conn = crate::pool::acquire(pool, acquire_timeout)
-        .await
-        .map_err(|error| FlushFailure {
-            reason: if error.is_pool_acquire_timeout() {
-                "acquire_timeout"
-            } else {
-                "acquire_error"
-            },
-            error: Box::new(error),
-        })?;
+    let wait_started = std::time::Instant::now();
+    let acquired = crate::pool::acquire(pool, options.acquire_timeout).await;
+    let waited = wait_started.elapsed().as_secs_f64();
+    for shard in shards.iter() {
+        metrics.record_db_pool_wait(*shard, waited);
+    }
+    let mut conn = acquired.map_err(|error| FlushFailure {
+        reason: if error.is_pool_acquire_timeout() {
+            "acquire_timeout"
+        } else {
+            "acquire_error"
+        },
+        error: Box::new(error),
+    })?;
     loop {
         if let Some(newer) = latest.take() {
             *beat = newer;
         }
+        let write_started = std::time::Instant::now();
         let written = crate::queue::record_heartbeat_sent_ago(
             &mut conn,
             claim,
@@ -474,6 +494,10 @@ async fn flush(
             beat.sent_order.elapsed(),
         )
         .await;
+        let latency = write_started.elapsed().as_secs_f64();
+        for shard in shards.iter() {
+            metrics.record_db_query_duration(crate::telemetry::DbOp::Heartbeat, *shard, latency);
+        }
         let connection_works = match &written {
             Ok(write) => *write == ClaimWrite::Applied,
             Err(error) => crate::pool::is_session_timeout(error),
@@ -537,16 +561,7 @@ async fn stamped_heartbeat_loop(
         // If we got at least one heartbeat, flush to DB.
         if let Some(mut beat) = pending.take() {
             let started = tokio::time::Instant::now();
-            let outcome = flush(
-                &pool,
-                &claim,
-                &mut beat,
-                &latest,
-                options.acquire_timeout,
-                flush_interval,
-                options.metrics.as_ref(),
-            )
-            .await;
+            let outcome = flush(&pool, &claim, &mut beat, &latest, &options, flush_interval).await;
             // A write that blocked leaves the row with an old send time,
             // whether it then succeeds or fails. A newer heartbeat then goes
             // at once, so a timeout scanner does not see a live activity as
@@ -939,6 +954,7 @@ mod tests {
                 HeartbeatFlushOptions {
                     acquire_timeout: bound,
                     metrics: Arc::clone(&failures) as Arc<dyn crate::telemetry::MetricsRecorder>,
+                    shards: Arc::from([0]),
                 },
             );
             assert!(tx.send(serde_json::json!({"p": 1})));
@@ -977,6 +993,7 @@ mod tests {
                 HeartbeatFlushOptions {
                     acquire_timeout: Duration::from_millis(100),
                     metrics: Arc::clone(&failures) as Arc<dyn crate::telemetry::MetricsRecorder>,
+                    shards: Arc::from([0]),
                 },
             );
             assert!(tx.send(serde_json::json!({"p": 1})));
@@ -992,6 +1009,48 @@ mod tests {
                     break;
                 }
                 assert!(Instant::now() < deadline, "flush failures seen: {seen:?}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            cancel.cancel();
+        }
+
+        /// Records each pool wait with its shard label.
+        #[derive(Default)]
+        struct PoolWaits(Mutex<Vec<u16>>);
+
+        impl crate::telemetry::MetricsRecorder for PoolWaits {
+            fn record_db_pool_wait(&self, shard: u16, _seconds: f64) {
+                self.0.lock().expect("lock").push(shard);
+            }
+        }
+
+        /// The flusher records its pool wait under its own shard, even when the
+        /// acquire times out (issue #1815).
+        #[tokio::test]
+        async fn a_flush_records_its_pool_wait_under_its_shard() {
+            let (_listener, pool) = silent_pool().await;
+            let waits = Arc::new(PoolWaits::default());
+            let cancel = CancellationToken::new();
+            let tx = spawn_heartbeat_flusher_with(
+                TaskClaim::new(uuid::Uuid::new_v4(), "w-1", 1),
+                pool,
+                cancel.clone(),
+                HeartbeatFlushOptions {
+                    acquire_timeout: Duration::from_millis(100),
+                    metrics: Arc::clone(&waits) as Arc<dyn crate::telemetry::MetricsRecorder>,
+                    shards: Arc::from([3]),
+                },
+            );
+            assert!(tx.send(serde_json::json!({"p": 1})));
+
+            let deadline = Instant::now() + Duration::from_secs(6);
+            loop {
+                let seen = waits.0.lock().expect("lock").clone();
+                if !seen.is_empty() {
+                    assert!(seen.iter().all(|shard| *shard == 3), "{seen:?}");
+                    break;
+                }
+                assert!(Instant::now() < deadline, "no pool wait recorded");
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             cancel.cancel();

@@ -62,6 +62,17 @@ impl std::fmt::Display for TimeoutReason {
 }
 
 impl TimeoutReason {
+    /// Whether this timeout retries per the retry policy (issue #1809).
+    ///
+    /// ADR 0005 records the rule. A start-to-close or heartbeat timeout ends
+    /// one attempt, and the next attempt can succeed. A schedule-to-start
+    /// retry goes back to the same starved queue. Schedule-to-close is the
+    /// deadline for all attempts.
+    #[must_use]
+    pub const fn retries_per_policy(&self) -> bool {
+        matches!(self, Self::Heartbeat | Self::StartToClose)
+    }
+
     const fn timeout_type(&self) -> TimeoutType {
         match self {
             Self::Heartbeat => TimeoutType::Heartbeat,
@@ -1334,26 +1345,127 @@ pub(crate) async fn task_state_for_update(
         .map_err(crate::error::database_error)
 }
 
-/// Locked (`FOR UPDATE`) read of a task row's current state **and**
-/// row-current `schedule_to_close_at`. [`enforce_activity_timeout`] needs the
-/// deadline in addition to the state so the frozen-row half of the PAUSED
-/// re-check ([`pause_suppresses_timeout_enforcement`]) can be evaluated
-/// against the row's current value under the execution row lock, not the
-/// scan-time snapshot.
-async fn task_state_and_deadline_for_update(
-    conn: &mut AsyncPgConnection,
-    task_id: uuid::Uuid,
-) -> HarvestResult<Option<(String, Option<chrono::DateTime<Utc>>)>> {
-    use crate::schema::harvest_task_queue::dsl;
+/// A task row read under its `FOR UPDATE` lock by [`enforce_activity_timeout`].
+struct LockedTask {
+    state: String,
+    /// The row-current deadline. The frozen-row half of the PAUSED re-check
+    /// ([`pause_suppresses_timeout_enforcement`]) and the retry deadline
+    /// check (issue #1809) read it, not the scan-time snapshot.
+    schedule_to_close_at: Option<chrono::DateTime<Utc>>,
+    /// The row-current poison-pill count. A timeout retry keeps it.
+    crash_strikes: i32,
+    /// The row is `RUNNING` under the claim that the scan saw (issue #1809).
+    scanned_claim: bool,
+    /// The handler of the scanned claim started (issue #1809).
+    handler_started: bool,
+    /// The `started_at` of the `RUNNING` claim that holds the row now, when
+    /// its handler started (issue #1809). A schedule-to-close timeout ends
+    /// this claim, which can be later than the scanned one.
+    current_started_claim: Option<chrono::DateTime<Utc>>,
+    /// How long the handler of the claim that holds the row now has run, when
+    /// it started (issue #1809). The database clock measures it, because that
+    /// clock also wrote the start.
+    current_handler_elapsed_secs: Option<f64>,
+    /// The row-current `attempt`. With `current_started_claim`, it names the
+    /// claim that holds the row now.
+    attempt: i32,
+    /// The heartbeat deadline has passed on the row-current values.
+    heartbeat_expired: bool,
+}
 
-    dsl::harvest_task_queue
-        .find(task_id)
-        .for_update()
-        .select((dsl::state, dsl::schedule_to_close_at))
-        .first(conn)
+/// SQL for [`lock_task_for_timeout`].
+///
+/// `clock_timestamp()`, not `NOW()`: this transaction can wait on row locks,
+/// and `NOW()` is frozen at its start.
+const LOCK_TASK_FOR_TIMEOUT_SQL: &str = "SELECT state, schedule_to_close_at, crash_strikes, \
+         worker_id, attempt, started_at, handler_started_attempt, \
+         EXTRACT(EPOCH FROM clock_timestamp() - handler_started_at)::float8 \
+             AS handler_elapsed_secs, \
+         COALESCE(heartbeat_timeout IS NOT NULL \
+             AND COALESCE(last_heartbeat_at, started_at) + heartbeat_timeout \
+                 < clock_timestamp(), false) AS heartbeat_expired \
+     FROM harvest_task_queue WHERE id = $1 FOR UPDATE";
+
+#[derive(diesel::QueryableByName)]
+struct LockedTaskRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    state: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    schedule_to_close_at: Option<chrono::DateTime<Utc>>,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    crash_strikes: i32,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    worker_id: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    attempt: i32,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    started_at: Option<chrono::DateTime<Utc>>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+    handler_started_attempt: Option<i32>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    handler_elapsed_secs: Option<f64>,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    heartbeat_expired: bool,
+}
+
+/// Locked (`FOR UPDATE`) read of a task row for [`enforce_activity_timeout`].
+///
+/// A claim is the pair `(worker_id, attempt)`, but a self-release before the
+/// handler lets a later claim reuse the pair. `started_at` tells the two
+/// claims apart, so `scanned_claim` compares all three with the scan
+/// snapshot `task`.
+async fn lock_task_for_timeout(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+) -> HarvestResult<Option<LockedTask>> {
+    let row = diesel::sql_query(LOCK_TASK_FOR_TIMEOUT_SQL)
+        .bind::<diesel::sql_types::Uuid, _>(task.id)
+        .get_result::<LockedTaskRow>(conn)
         .await
         .optional()
-        .map_err(crate::error::database_error)
+        .map_err(crate::error::database_error)?;
+    Ok(row.map(|row| {
+        let running = row.state == "RUNNING";
+        let scanned_claim = running
+            && row.worker_id == task.worker_id
+            && row.attempt == task.attempt
+            && row.started_at == task.started_at;
+        let current_handler_started = running && row.handler_started_attempt == Some(row.attempt);
+        LockedTask {
+            handler_started: scanned_claim && current_handler_started,
+            scanned_claim,
+            current_started_claim: row.started_at.filter(|_| current_handler_started),
+            current_handler_elapsed_secs: row
+                .handler_elapsed_secs
+                .filter(|_| current_handler_started),
+            attempt: row.attempt,
+            heartbeat_expired: row.heartbeat_expired,
+            crash_strikes: row.crash_strikes,
+            state: row.state,
+            schedule_to_close_at: row.schedule_to_close_at,
+        }
+    }))
+}
+
+/// The result of [`enforce_activity_timeout`]'s transaction. `None` means
+/// the task moved on and the transaction changed nothing.
+type TimeoutEnforcement = Option<ActivityTimeoutOutcome>;
+
+/// What [`enforce_activity_timeout`] did to a timed-out activity task.
+#[derive(Debug, Clone, Copy)]
+struct ActivityTimeoutOutcome {
+    /// The task went back to `PENDING` for a retry (issue #1809).
+    retried: bool,
+    /// The handler of the timed-out attempt started (issue #1809).
+    handler_started: bool,
+    /// The timed-out claim is the one the scan saw (issue #1809).
+    scanned_claim: bool,
+    /// The `started_at` of the timed-out claim, when its handler started.
+    /// The enforcer then counts that attempt as a failed one.
+    started_attempt: Option<chrono::DateTime<Utc>>,
+    /// How long the handler of the timed-out attempt ran. The attempt
+    /// duration counts from its start, as on the worker path.
+    handler_elapsed_secs: Option<f64>,
 }
 
 /// SQL for [`schedule_to_start_still_expired`], exposed for shape tests.
@@ -1574,27 +1686,30 @@ fn external_task_timeout_still_due(
     state == "PENDING" && schedule_to_close_at < now
 }
 
-/// What a workflow task timeout may do to its owning execution.
+/// What a task timeout may do to its owning execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkflowTaskTimeoutDisposition {
-    /// The run is open. Seal it `TIMED_OUT`.
-    Seal,
+enum TaskTimeoutDisposition {
+    /// The run is open. Enforce the timeout: a workflow task seals the run
+    /// `TIMED_OUT`, and an activity task retries or records the timeout.
+    Enforce,
     /// The run is already sealed. Fail the orphan task and nothing else.
     FailTaskOnly,
     /// The row is a staged shard copy. Do not touch it.
     Skip,
 }
 
-/// Classify the locked execution state for a workflow task timeout.
+/// Classify the locked execution state for a task timeout.
 ///
-/// `PAUSED` seals, as the quarantine and poison-pill paths do (issue #383).
-/// A terminal state never changes, so a late timeout cannot rewrite the
-/// recorded outcome of a run.
-fn workflow_task_timeout_disposition(state: &str) -> WorkflowTaskTimeoutDisposition {
+/// `PAUSED` is open, as on the quarantine and poison-pill paths (issue
+/// #383). A terminal state never changes, so a late timeout cannot rewrite
+/// the recorded outcome of a run. That holds for an activity task too: its
+/// timeout appends no event to a sealed history and starts no new attempt
+/// (issue #1870).
+fn task_timeout_disposition(state: &str) -> TaskTimeoutDisposition {
     match state {
-        "RUNNING" | "PAUSED" => WorkflowTaskTimeoutDisposition::Seal,
-        s if crate::erase::is_terminal_state(s) => WorkflowTaskTimeoutDisposition::FailTaskOnly,
-        _ => WorkflowTaskTimeoutDisposition::Skip,
+        "RUNNING" | "PAUSED" => TaskTimeoutDisposition::Enforce,
+        s if crate::erase::is_terminal_state(s) => TaskTimeoutDisposition::FailTaskOnly,
+        _ => TaskTimeoutDisposition::Skip,
     }
 }
 
@@ -1834,8 +1949,8 @@ async fn enforce_activity_timeout(
     };
     let error = timeout_error(activity_name, reason);
 
-    // Did we actually append a timeout (vs. a no-op because the task already
-    // moved on)? Only a real enforcement should count toward the breaker.
+    // Did the task time out (vs. a no-op because the task already moved on)?
+    // Only a real enforcement can count toward the breaker.
     //
     // Pinned `READ COMMITTED`, not the session default (issue #619 round-24
     // review). The queue advisory lock taken below is a `SELECT`, so it fixes
@@ -1849,6 +1964,26 @@ async fn enforce_activity_timeout(
     // `default_transaction_isolation = repeatable read` on the database or the
     // role disable the guarantee from outside this code.
     let mut tx = conn.build_transaction().read_committed();
+    // Mark the claim before the transaction can requeue it (issue #1809).
+    // The handler can return as soon as the requeue commits. A result that
+    // arrives while the mark is provisional is held. The code after the
+    // transaction confirms the mark, which drops the held result, or rolls
+    // it back, which applies the held result.
+    let claim_key = crate::circuit_breaker::ClaimKey {
+        task_id: task.id,
+        attempt: task.attempt,
+        started_at: task.started_at,
+    };
+    // The guard rolls the mark back on every exit that does not confirm it,
+    // including a dropped future. A mark left provisional would hold a late
+    // result, and with it a probe slot, for good.
+    let mut provisional =
+        ProvisionalTimeoutMark::new(circuit_breakers, activity_name, claim_key, metrics);
+    // A schedule-to-close timeout can end a later claim than the scanned
+    // one. The transaction marks that claim under its row lock, so the
+    // owner cannot see its loss before the mark. This guard rolls the mark
+    // back on every exit that does not confirm it.
+    let current_mark = std::sync::Mutex::new(None::<ProvisionalTimeoutMark<'_>>);
     // `wake_workflow_task` below raises a dispatch hint (issue #1429). The
     // scope ties its publish to this transaction's commit.
     //
@@ -1860,7 +1995,7 @@ async fn enforce_activity_timeout(
     // background publisher instead, the same fix already applied to the
     // outbox sweeps in this file.
     let enforced = crate::dispatch::buffered_settled_in_background(Box::pin(
-        tx.run::<bool, HarvestError, _>(async |conn| {
+        tx.run::<TimeoutEnforcement, HarvestError, _>(async |conn| {
             let error = error.clone();
 
             // Authoritative QUEUE-pause re-check (issue #619). The scan predicate
@@ -1906,7 +2041,7 @@ async fn enforce_activity_timeout(
                     reason,
                     crate::queue_pause::is_queue_paused(conn, &task.queue_name).await?,
                 ) {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 // Authoritative ACTIVITY-pause re-check (issue #807), the
                 // per-activity-type sibling of the queue re-check above. Same
@@ -1943,7 +2078,7 @@ async fn enforce_activity_timeout(
                         crate::activity_pause::is_activity_paused(conn, activity_name).await?,
                     )
                 {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 // A *completed* pause/resume cycle leaves nothing for either check
                 // above to suppress on, but resume has already credited the held
@@ -1959,32 +2094,39 @@ async fn enforce_activity_timeout(
                 // execution lock and history load for the common held-task case;
                 // the authoritative locked re-read runs after the row locks below.
                 if !schedule_to_start_still_expired_unlocked(conn, task.id).await? {
-                    return Ok(false);
+                    return Ok(None);
                 }
             }
 
             let (execution, history) =
                 lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
-            let Some((state, row_schedule_to_close_at)) =
-                task_state_and_deadline_for_update(conn, task.id).await?
-            else {
-                return Ok(false);
+            let Some(locked) = lock_task_for_timeout(conn, task).await? else {
+                return Ok(None);
             };
-            if !expected_task_states_for_timeout(reason).contains(&state.as_str()) {
-                return Ok(false);
+            if !expected_task_states_for_timeout(reason).contains(&locked.state.as_str()) {
+                return Ok(None);
             }
-            // Authoritative `schedule_to_start` deadline re-read (round-18 review),
-            // now placed here — after the execution row lock above and while this
-            // transaction already holds the task row from
-            // `task_state_and_deadline_for_update` — so it preserves the
-            // execution-row -> task-row order (round-22 review). The unlocked
+            // A start-to-close or heartbeat timeout judges one claim (issue
+            // #1809). When a later claim holds the row, the scan snapshot is
+            // stale and the new attempt has its own clock. A heartbeat that
+            // landed after the scan also cancels the timeout.
+            if reason.retries_per_policy()
+                && (!locked.scanned_claim
+                    || (matches!(reason, TimeoutReason::Heartbeat) && !locked.heartbeat_expired))
+            {
+                return Ok(None);
+            }
+            // Authoritative `schedule_to_start` deadline re-read. It runs here,
+            // after the execution row lock above. The transaction already holds
+            // the task row from `lock_task_for_timeout`. So the read keeps the
+            // execution-row -> task-row lock order. The unlocked
             // fast-path check near the top of this transaction is advisory; this is
             // the one that must be trusted, because only a lock held across the
             // resume's own `scheduled_at` shift can serialize against it.
             if matches!(reason, TimeoutReason::ScheduleToStart)
                 && !schedule_to_start_still_expired(conn, task.id).await?
             {
-                return Ok(false);
+                return Ok(None);
             }
             // Authoritative ACTIVITY-pause re-check, AFTER the blocking row
             // acquisitions above (issue #807, round-17 review, P1).
@@ -2020,7 +2162,7 @@ async fn enforce_activity_timeout(
                     crate::activity_pause::is_activity_paused(conn, activity_name).await?,
                 )
             {
-                return Ok(false);
+                return Ok(None);
             }
             // Authoritative PAUSED re-check under the execution row lock
             // (issue #609 post-review hardening, second bot-review round):
@@ -2034,23 +2176,93 @@ async fn enforce_activity_timeout(
             if pause_suppresses_timeout_enforcement(
                 reason,
                 &execution.state,
-                row_schedule_to_close_at,
+                locked.schedule_to_close_at,
                 Utc::now(),
             ) {
-                return Ok(false);
+                return Ok(None);
+            }
+            // A late timeout must not change a sealed run (issue #1870). A
+            // workflow can end while its activity still runs. The timeout then
+            // fails the orphan task only. It appends no event and wakes nothing,
+            // as for a workflow task. A retry would run the handler again.
+            match task_timeout_disposition(&execution.state) {
+                TaskTimeoutDisposition::Enforce => {}
+                TaskTimeoutDisposition::FailTaskOnly => {
+                    queue::fail_task(conn, task.id, &error).await?;
+                    return Ok(None);
+                }
+                TaskTimeoutDisposition::Skip => return Ok(None),
             }
             // (The queue-pause re-check runs at the TOP of this transaction, before
             // the row locks above — see the lock-ordering note there.)
             let activity_id =
                 match pending_activity_id_for_task(&history.events, task, activity_name) {
                     Ok(Some(activity_id)) => activity_id,
-                    Ok(None) => return Ok(false),
+                    Ok(None) => return Ok(None),
                     Err(missing_error) => {
                         let fallback = missing_error.to_string();
                         queue::fail_task(conn, task.id, &fallback).await?;
-                        return Ok(false);
+                        return Ok(None);
                     }
                 };
+            let outcome = |retried, started_attempt| {
+                Some(ActivityTimeoutOutcome {
+                    retried,
+                    handler_started: locked.handler_started,
+                    scanned_claim: locked.scanned_claim,
+                    started_attempt,
+                    handler_elapsed_secs: locked.current_handler_elapsed_secs,
+                })
+            };
+            // Timeout retry (issue #1809, ADR 0005). A start-to-close or
+            // heartbeat timeout retries per the retry policy, as a handler
+            // failure does. The check above confirmed the scanned claim, and
+            // the requeue is fenced by it too. It appends no event: the
+            // workflow sees only the final outcome. It keeps `crash_strikes`,
+            // because a timeout does not prove that the attempt ended without
+            // a crash.
+            //
+            // No retry starts after `schedule_to_close`. A paused execution
+            // is the exception, because a pause stops that clock. Resume then
+            // shifts the deadline, as on the worker retry path.
+            if reason.retries_per_policy()
+                && let Some(delay) = crate::worker::timeout_retry_delay(task, &error)
+                && let Some(claim) = queue::TaskClaim::of(task)
+            {
+                let past_deadline = execution.state != "PAUSED"
+                    && crate::worker::deadline_would_be_exceeded(
+                        locked.schedule_to_close_at,
+                        queue::db_clock_now(conn).await?,
+                        delay,
+                    );
+                if !past_deadline {
+                    return Ok(
+                        match queue::requeue_claimed_task_after_timeout(
+                            conn,
+                            &claim,
+                            delay,
+                            &error,
+                            locked.crash_strikes,
+                        )
+                        .await?
+                        {
+                            queue::ClaimWrite::Applied => {
+                                let started_attempt =
+                                    task.started_at.filter(|_| locked.handler_started);
+                                record_timed_out_claim(
+                                    conn,
+                                    task.id,
+                                    task.attempt,
+                                    started_attempt,
+                                )
+                                .await?;
+                                outcome(true, started_attempt)
+                            }
+                            queue::ClaimWrite::LeaseLost => None,
+                        },
+                    );
+                }
+            }
             let timeout_event = WorkflowEvent::ActivityTimedOut {
                 activity_id,
                 timeout_type: reason.timeout_type(),
@@ -2063,39 +2275,228 @@ async fn enforce_activity_timeout(
                 codecs,
             )
             .await?;
+            // A schedule-to-close timeout ends the claim that holds the row
+            // now, which can be later than the scanned one. Mark and record
+            // that claim. The row lock holds until commit, so its owner sees
+            // the loss only after the mark.
+            if !locked.scanned_claim
+                && let Some(started_at) = locked.current_started_claim
+            {
+                let current = crate::circuit_breaker::ClaimKey {
+                    task_id: task.id,
+                    attempt: locked.attempt,
+                    started_at: Some(started_at),
+                };
+                *current_mark
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+                    ProvisionalTimeoutMark::new(circuit_breakers, activity_name, current, metrics),
+                );
+            }
             queue::fail_task(conn, task.id, &error).await?;
+            record_timed_out_claim(conn, task.id, locked.attempt, locked.current_started_claim)
+                .await?;
             queue::wake_workflow_task(conn, exec_id).await?;
-            Ok(true)
+            Ok(outcome(false, locked.current_started_claim))
         }),
     ))
-    .await?;
-
-    // Circuit breaker (issue #369): a start-to-close / heartbeat timeout against
-    // a protected downstream is a retryable, downstream-style failure that the
-    // handler-result path never sees (the worker may be gone). Record it
-    // out-of-band so a hanging downstream trips the breaker just like an
-    // explicit error would.
+    .await;
+    // No timeout after all: the guard rolls the mark back as it drops, and a
+    // result held meanwhile counts now.
+    let Some(enforced) = enforced? else {
+        return Ok(());
+    };
+    // Circuit breaker (issues #369, #1809). A timeout against a protected
+    // downstream is a retryable, downstream-style failure. The handler-result
+    // path never sees it, because the worker may be gone. The confirm counts
+    // it out of band, so a hanging downstream trips the breaker as an
+    // explicit error does.
     //
-    // ScheduleToClose on a PENDING task means the activity sat in the queue
-    // until its total deadline elapsed without any handler being dispatched.
-    // No downstream call was made, so the breaker must NOT be fed — a backlog
-    // spike would otherwise incorrectly open the circuit.
-    // ScheduleToStart: task sat in the queue until the schedule-to-start window
-    // expired without ever being dispatched — no downstream call was made.
-    // ScheduleToClose on a PENDING task: total deadline expired before dispatch.
-    // Neither case represents a downstream failure; suppress the breaker so a
-    // queue backlog does not incorrectly open the circuit.
-    let downstream_call_made = matches!(reason, TimeoutReason::ScheduleToStart)
-        || (matches!(reason, TimeoutReason::ScheduleToClose) && task.state == "PENDING");
-    if enforced
-        && !downstream_call_made
-        && let Some(breakers) = circuit_breakers
-        && breakers.on_external_failure(activity_name, std::time::Instant::now())
-            == Some(crate::circuit_breaker::CircuitTransition::Tripped)
-    {
-        metrics.record_circuit_tripped(activity_name);
+    // Only an attempt whose handler started can say anything about the
+    // downstream. A task that waited after its claim made no call, and
+    // neither did a `PENDING` task that timed out in the queue. Counting
+    // them would let a backlog open the circuit and turn overload into
+    // failure (#1785). The confirm also fences a late result of this attempt.
+    //
+    // A schedule-to-close timeout can end a later claim than the scanned
+    // one. The scanned mark then rolls back, and the mark on the later claim
+    // counts its timeout here. An owner in this process waits for that
+    // confirm. An owner elsewhere counts the timeout from its record.
+    if enforced.scanned_claim {
+        provisional.confirm(enforced.handler_started);
+    } else {
+        drop(provisional);
+        if let Some(mut current) = current_mark
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            current.confirm(true);
+        }
     }
+    if enforced.retried {
+        metrics.record_activity_retried(activity_name, &task.queue_name);
+    }
+    // The timed-out attempt is a failed attempt (issue #1809). Its handler
+    // started, so it belongs in the success-rate denominator. A worker that
+    // later reports this attempt finds its record and does not count it.
+    //
+    // The duration counts from the handler start, as on the worker path. The
+    // wait between the claim and the handler start is local setup. The
+    // database clock wrote the start, so the same clock measures the run. A
+    // marker written without a start time falls back to the claim time.
+    if let Some(started_at) = enforced.started_attempt {
+        let (error_type, non_retryable, _) = crate::failure::parse_error_payload(&error);
+        let duration_secs = enforced.handler_elapsed_secs.map_or_else(
+            || {
+                (Utc::now() - started_at)
+                    .to_std()
+                    .unwrap_or_default()
+                    .as_secs_f64()
+            },
+            |elapsed| elapsed.max(0.0),
+        );
+        metrics.record_activity_completed_with_error_type(
+            activity_name,
+            &task.queue_name,
+            duration_secs,
+            crate::telemetry::ActivityStatus::Failed,
+            Some(&error_type),
+        );
+        metrics.record_activity_attempt(
+            activity_name,
+            &task.queue_name,
+            crate::telemetry::ActivityStatus::Failed,
+        );
+        metrics.record_activity_failed(activity_name, "", &error_type, non_retryable);
+    }
+
     Ok(())
+}
+
+/// Record the timed-out claim on its row (issue #1809). The worker that held
+/// it can then tell this timeout from any other loss of its claim.
+///
+/// The caller passes `started_at` only for a claim whose handler started.
+/// Any other timeout feeds no breaker, so its owner must not count it
+/// either. A `PENDING` task holds no claim and records nothing.
+async fn record_timed_out_claim(
+    conn: &mut AsyncPgConnection,
+    task_id: uuid::Uuid,
+    attempt: i32,
+    started_at: Option<chrono::DateTime<Utc>>,
+) -> HarvestResult<()> {
+    match started_at {
+        Some(started_at) => queue::record_timed_out_claim(conn, task_id, attempt, started_at).await,
+        None => Ok(()),
+    }
+}
+
+/// A provisional timeout mark on one claim (issue #1809).
+///
+/// [`confirm`](Self::confirm) settles it as a timeout. Any other exit,
+/// including a dropped enforcement future, rolls it back. A held result then
+/// counts as usual. Each settle records the breaker transition it causes.
+struct ProvisionalTimeoutMark<'a> {
+    breakers: Option<&'a crate::circuit_breaker::CircuitBreakerRegistry>,
+    activity_name: &'a str,
+    claim: crate::circuit_breaker::ClaimKey,
+    metrics: &'a (dyn MetricsRecorder + Send + Sync),
+}
+
+impl<'a> ProvisionalTimeoutMark<'a> {
+    fn new(
+        breakers: Option<&'a crate::circuit_breaker::CircuitBreakerRegistry>,
+        activity_name: &'a str,
+        claim: crate::circuit_breaker::ClaimKey,
+        metrics: &'a (dyn MetricsRecorder + Send + Sync),
+    ) -> Self {
+        if let Some(breakers) = breakers {
+            breakers.mark_claim_timed_out(activity_name, claim);
+        }
+        Self {
+            breakers,
+            activity_name,
+            claim,
+            metrics,
+        }
+    }
+
+    /// The enforcer timed the claim out. A timed-out probe re-opens the
+    /// breaker here, which releases its slot. The trip is recorded only when
+    /// the handler started, since `on_external_failure` skips a breaker that
+    /// is already open. An unstarted probe made no downstream call, so its
+    /// timeout is local congestion, not a failed probe.
+    fn confirm(&mut self, handler_started: bool) {
+        if let Some(breakers) = self.breakers.take() {
+            // Only a started handler counts against the downstream.
+            let transition = breakers.confirm_claim_timed_out(
+                self.activity_name,
+                self.claim,
+                handler_started,
+                std::time::Instant::now(),
+            );
+            if handler_started {
+                self.record(transition);
+            }
+        }
+    }
+
+    fn record(&self, transition: Option<crate::circuit_breaker::CircuitTransition>) {
+        match transition {
+            Some(crate::circuit_breaker::CircuitTransition::Tripped) => {
+                self.metrics.record_circuit_tripped(self.activity_name);
+            }
+            Some(crate::circuit_breaker::CircuitTransition::Closed) => {
+                self.metrics.record_circuit_closed(self.activity_name);
+            }
+            None => {}
+        }
+    }
+}
+
+impl Drop for ProvisionalTimeoutMark<'_> {
+    fn drop(&mut self) {
+        if let Some(breakers) = self.breakers.take() {
+            let transition = breakers.unmark_claim_timed_out(
+                self.activity_name,
+                self.claim,
+                std::time::Instant::now(),
+            );
+            self.record(transition);
+        }
+    }
+}
+
+/// Test seam for the activity timeout enforcer (issue #1809).
+///
+/// [`enforce_timeouts_once`] scans and enforces in one call, so a test cannot
+/// hand it a stale scan snapshot. This enforces `reason` for `task` as the
+/// scanner would.
+///
+/// # Errors
+///
+/// Returns the error of the enforcement transaction.
+#[doc(hidden)]
+pub async fn enforce_activity_timeout_for_test(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    reason: &TimeoutReason,
+    circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<()> {
+    let exec_uuid = task.workflow_exec_id.ok_or_else(|| {
+        HarvestError::NotFound(format!("task queue item {} has no execution", task.id))
+    })?;
+    enforce_activity_timeout(
+        conn,
+        task,
+        ExecutionId::from_uuid(exec_uuid),
+        reason,
+        circuit_breakers,
+        &crate::telemetry::NoOpMetrics,
+        codecs,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2198,11 +2599,11 @@ fn classify_force_fail_target(
 ///   [`enforce_activity_timeout`] and the worker's `finalize_activity_*`
 ///   paths use, so a concurrent late worker result serializes with this call
 ///   rather than racing it).
-/// - **Late results are ignored**: after this commits, a late `Ok` hits
-///   `complete_task`'s `state = 'RUNNING'` filter (no-op error), a late
-///   retryable `Err` hits `requeue_for_retry`'s `state = 'RUNNING'` filter
-///   (cannot resurrect the FAILED row), and a late non-retryable `Err` no-ops
-///   in `finalize_activity_failure`'s terminal-history/row-state guards.
+/// - **Late results are ignored.** After this commits, the row is `FAILED`
+///   and the activity is not pending. A late `Ok` writes nothing, because its
+///   claim is lost (issue #1789). A late retryable `Err` cannot requeue the
+///   `FAILED` row. A late non-retryable `Err` no-ops in the terminal-history
+///   and row-state guards of `finalize_activity_failure`.
 /// - **Idempotent**: re-issuing the call on an already-forced task returns
 ///   `Ok` with `already_forced: true` and performs zero writes — including
 ///   after the owning run has since sealed (the woken workflow consuming the
@@ -2536,15 +2937,15 @@ async fn enforce_workflow_timeout(
             // The task scan filters on task state only. So the owning execution
             // can already be sealed, or can be a staged shard copy. A workflow
             // task timeout seals only an open run: `RUNNING` or `PAUSED`.
-            match workflow_task_timeout_disposition(&execution.state) {
-                WorkflowTaskTimeoutDisposition::Seal => {}
-                WorkflowTaskTimeoutDisposition::FailTaskOnly => {
+            match task_timeout_disposition(&execution.state) {
+                TaskTimeoutDisposition::Enforce => {}
+                TaskTimeoutDisposition::FailTaskOnly => {
                     // The run is already sealed. Close the orphan task so the
                     // scan stops finding it, and keep the recorded outcome.
                     queue::fail_task(conn, task.id, &error).await?;
                     return Ok(None);
                 }
-                WorkflowTaskTimeoutDisposition::Skip => return Ok(None),
+                TaskTimeoutDisposition::Skip => return Ok(None),
             }
             // The engine-reserved type keeps the timeout readable after a
             // start-replace seals this row `CONTINUED_AS_NEW`.
@@ -3669,6 +4070,8 @@ struct SignalDeliveryRequest<'a> {
     /// Whether the cross-shard resolution saw a **live** run on the shard this
     /// attempt is running against — see [`DeliveryRoute::CrossShard`].
     expected_live: bool,
+    /// The registry that encodes the stored payload (issue #1979).
+    codecs: &'a crate::payload_codec::PayloadCodecs,
 }
 
 async fn attempt_signal_delivery(
@@ -3683,15 +4086,17 @@ async fn attempt_signal_delivery(
         payload,
         idempotency_key,
         expected_live,
+        codecs,
     } = request;
     match target {
         ExternalTarget::ExecutionId(target_id) => {
-            match crate::signal::send_signal_idempotent(
+            match crate::signal::send_signal_idempotent_with_codecs(
                 conn,
                 *target_id,
                 signal_name,
                 payload,
                 idempotency_key,
+                codecs,
             )
             .await
             {
@@ -3714,13 +4119,14 @@ async fn attempt_signal_delivery(
         ExternalTarget::WorkflowId {
             workflow_name,
             workflow_id,
-        } => match crate::signal::resolve_and_signal_by_workflow_id(
+        } => match crate::signal::resolve_and_signal_by_workflow_id_with_codecs(
             conn,
             workflow_name,
             workflow_id,
             signal_name,
             payload,
             idempotency_key,
+            codecs,
         )
         .await
         {
@@ -3989,6 +4395,7 @@ pub async fn enforce_external_signals_outbox(
                                 payload: payload.clone(),
                                 idempotency_key: idempotency_key.as_deref(),
                                 expected_live,
+                                codecs: &codecs,
                             },
                             not_found_terminal,
                         )
@@ -4029,9 +4436,9 @@ pub async fn enforce_external_signals_outbox(
                         // and holding a cold connect to 250 ms would fail it
                         // forever rather than slowly. See
                         // `external_target_location::peer_acquire_bound`.
-                        let mut target_conn = match tokio::time::timeout(
+                        let mut target_conn = match crate::replication::fenced_get_within(
+                            pool,
                             crate::external_target_location::peer_acquire_bound(pool),
-                            pool.get(),
                         )
                         .await
                         {
@@ -4058,6 +4465,7 @@ pub async fn enforce_external_signals_outbox(
                                 payload: payload.clone(),
                                 idempotency_key: idempotency_key.as_deref(),
                                 expected_live,
+                                codecs: &codecs,
                             },
                             not_found_terminal,
                         )
@@ -4582,9 +4990,9 @@ pub async fn enforce_external_cancels_outbox(
 
                     // Bounded for the same reason as the signal outbox above
                     // (issue #1146, Codex round 1 P1).
-                    let mut target_conn = match tokio::time::timeout(
+                    let mut target_conn = match crate::replication::fenced_get_within(
+                        pool,
                         crate::external_target_location::peer_acquire_bound(pool),
-                        pool.get(),
                     )
                     .await
                     {
@@ -4943,9 +5351,9 @@ pub async fn enforce_external_cancels_outbox(
                         // This check is best-effort already: it logs its own
                         // errors instead of propagating them. It logs a
                         // timed-out acquisition and skips it the same way.
-                        match tokio::time::timeout(
+                        match crate::replication::fenced_get_within(
+                            pool,
                             crate::external_target_location::peer_acquire_bound(pool),
-                            pool.get(),
                         )
                         .await
                         {
@@ -5204,7 +5612,7 @@ pub async fn enforce_external_awaits_outbox(
                 // the row pending so the sweep continues and retries next
                 // tick (issue #757 review, P2-b).
                 let read_result = if same_pool {
-                    match crate::execution::read_external_await_outcome(conn, target).await {
+                    match crate::execution::read_external_await_outcome_with_codecs(conn, target, &codecs).await {
                         Ok(r) => r,
                         Err(HarvestError::Database(e)) => {
                             tracing::error!(error = %e, "await outbox sweep: db error reading target; leaving pending");
@@ -5229,9 +5637,9 @@ pub async fn enforce_external_awaits_outbox(
                     // another pool in the same process. One timeout checker
                     // runs per assigned shard. See
                     // `external_target_location::peer_acquire_bound`.
-                    let mut target_conn = match tokio::time::timeout(
+                    let mut target_conn = match crate::replication::fenced_get_within(
+                        pool,
                         crate::external_target_location::peer_acquire_bound(pool),
-                        pool.get(),
                     )
                     .await
                     {
@@ -5248,7 +5656,7 @@ pub async fn enforce_external_awaits_outbox(
                             return Ok(Some((false, Some(row.id))));
                         }
                     };
-                    match crate::execution::read_external_await_outcome(&mut target_conn, target)
+                    match crate::execution::read_external_await_outcome_with_codecs(&mut target_conn, target, &codecs)
                         .await
                     {
                         Ok(r) => r,
@@ -5346,9 +5754,12 @@ pub async fn enforce_timeouts_once(
     payload_codecs: &crate::payload_codec::PayloadCodecs,
     codec_rotation_batch_size: i64,
 ) -> HarvestResult<usize> {
+    // Issue #1815: `conn` names no shard, so the scan carries each assigned
+    // shard, as the background checker on the single pool does.
     enforce_timeouts_once_on_conn_shard(
         conn,
         None,
+        &scan_metric_shards(None, None, shard_assignments),
         TaskScan::All,
         metrics,
         unknown_target_grace_window,
@@ -5369,10 +5780,74 @@ pub async fn enforce_timeouts_once(
 /// per-shard scanners in this pass then reuse `conn` for that shard instead
 /// of checking out a second connection. See
 /// [`crate::shard::connect_or_reuse`].
+///
+/// `metric_shards` are the `shard` labels of the pass's `scan` sample (issue
+/// #1815). They stay separate from `conn_shard`, because a checker without a
+/// pool shard still labels its samples with its assigned shards. See
+/// [`scan_metric_shards`].
 // `&Option` because the body forwards `sharded_pool` to many public
 // scanners that take `&Option<ShardedDbPool>`.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::ref_option)]
+#[allow(clippy::too_many_arguments, clippy::ref_option)]
 pub(crate) async fn enforce_timeouts_once_on_conn_shard(
+    conn: &mut AsyncPgConnection,
+    conn_shard: Option<crate::types::ShardId>,
+    metric_shards: &[u16],
+    task_scan: TaskScan<'_>,
+    metrics: &(dyn MetricsRecorder + Send + Sync),
+    unknown_target_grace_window: Duration,
+    sharded_pool: &Option<crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+    circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
+    max_workflow_history_events: Option<u64>,
+    session_worker_stale_secs: i64,
+    payload_codecs: &crate::payload_codec::PayloadCodecs,
+    codec_rotation_batch_size: i64,
+) -> HarvestResult<usize> {
+    // Issue #1815: one pass is one `scan` op, whether it succeeds or fails.
+    let started = std::time::Instant::now();
+    let result = Box::pin(enforce_timeouts_pass(
+        conn,
+        conn_shard,
+        task_scan,
+        metrics,
+        unknown_target_grace_window,
+        sharded_pool,
+        shard_assignments,
+        circuit_breakers,
+        max_workflow_history_events,
+        session_worker_stale_secs,
+        payload_codecs,
+        codec_rotation_batch_size,
+    ))
+    .await;
+    let elapsed = started.elapsed().as_secs_f64();
+    for label in metric_shards {
+        metrics.record_db_query_duration(crate::telemetry::DbOp::Scan, *label, elapsed);
+    }
+    result
+}
+
+/// The `shard` labels of a timeout checker's pool waits and scans (issue
+/// #1815).
+///
+/// A checker on a shard pool uses that shard. A checker on the single pool
+/// scans the database that serves every assigned shard. It then uses each
+/// assigned shard, as the claim path and the pool gauges do. A worker with
+/// no assignment uses shard 0.
+fn scan_metric_shards(
+    pool_shard: Option<crate::types::ShardId>,
+    shard: Option<crate::types::ShardId>,
+    assignments: &[crate::types::ShardId],
+) -> Vec<u16> {
+    pool_shard.or(shard).map_or_else(
+        || crate::worker::single_pool_shard_labels(assignments),
+        |shard| vec![crate::worker::shard_metric_label(shard)],
+    )
+}
+
+/// The body of one [`enforce_timeouts_once_on_conn_shard`] pass.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::ref_option)]
+async fn enforce_timeouts_pass(
     conn: &mut AsyncPgConnection,
     conn_shard: Option<crate::types::ShardId>,
     task_scan: TaskScan<'_>,
@@ -5926,6 +6401,8 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
         )
     })
     .collect();
+    // Issue #1815: the `shard` labels of this loop's pool waits and scans.
+    let metric_shards = scan_metric_shards(pool_shard, shard, &shard_assignments);
     // The tick series and the pass series carry the same shard label.
     let shard_label = owners[0].shard_label();
     // Keep the worker dispatch binding for hints (issue #1431).
@@ -5947,6 +6424,16 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                 }
                 () = tokio::time::sleep(sleep) => {}
             }
+            // Issue #1823: a held shard skips the tick before it takes a connection.
+            // It can be an unreachable standby, so a checkout could wait on it.
+            if crate::replication::shard_writes_held(pool_shard) {
+                skip_tick(&mut ran_last_tick, &mut leader_failures);
+                // The loop is still alive, so a skipped tick still counts.
+                for owner in &owners {
+                    crate::scanner_health::record_scanner_tick(&*telemetry.metrics, *owner);
+                }
+                continue;
+            }
 
             // Bounded to `interval`. Unbounded pool contention here would
             // silently stretch this loop's actual period past `interval`,
@@ -5963,12 +6450,34 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
             // bound above only limits a merely-slow acquisition. Without this
             // select, a shutdown request during that wait would still queue
             // behind the full `interval` before this loop noticed it.
+            let wait_started = std::time::Instant::now();
             let get_result = tokio::select! {
                 () = cancel.cancelled() => {
                     tracing::debug!("timeout checker cancelled while acquiring a connection");
                     break;
                 }
                 result = tokio::time::timeout(interval, pool.get()) => result,
+            };
+            // Issue #1815: a wait that ends in an error or a timeout counts too.
+            // A single-pool checker has no `pool_shard`, so it records under each
+            // assigned shard. That matches the claim path and the pool gauges.
+            // The scan sample of the pass uses the same labels.
+            let waited = wait_started.elapsed().as_secs_f64();
+            for label in &metric_shards {
+                telemetry.metrics.record_db_pool_wait(*label, waited);
+            }
+            // The fence opens only after the checkout. A tick that waits for a
+            // connection holds no barrier, so pool pressure cannot block a bump. The
+            // tick runs under the barrier of this shard and each pinned shard
+            // colocated with it. A fenced shard skips the tick, and a lost barrier
+            // stops it.
+            let Some(fence) = crate::replication::begin_shard_tick(&pool, pool_shard).await else {
+                skip_tick(&mut ran_last_tick, &mut leader_failures);
+                // The loop is still alive, so a skipped tick still counts.
+                for owner in &owners {
+                    crate::scanner_health::record_scanner_tick(&*telemetry.metrics, *owner);
+                }
+                continue;
             };
             match get_result {
                 Ok(Ok(mut conn)) => {
@@ -6008,24 +6517,39 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                     }
                     ran_last_tick = role.runs_pass();
                     if role.runs_pass() {
-                        let failed = match enforce_timeouts_once_on_conn_shard(
-                            &mut conn,
-                            pool_shard,
-                            TaskScan::Batch {
-                                cursor: &mut cursor,
-                                limit: task_batch_size,
-                            },
-                            &*telemetry.metrics,
-                            unknown_target_grace_window,
-                            &sharded_pool,
-                            &shard_assignments,
-                            Some(&circuit_breakers),
-                            max_workflow_history_events,
-                            session_worker_stale_secs,
-                            &payload_codecs,
-                            codec_rotation_batch_size,
+                        // Issue #1823: the pass runs under the tick's fence
+                        // barrier. A lost barrier stops it before its next
+                        // write.
+                        let failed = match crate::replication::run_fenced_pass(
+                            &fence,
+                            Box::pin(async {
+                                // Issue #1823: the older connection joins the pass.
+                                // A lost guard then ends its backend.
+                                let _member =
+                                    crate::replication::join_fenced_pass(&pool, &mut conn).await;
+                                enforce_timeouts_once_on_conn_shard(
+                                    &mut conn,
+                                    pool_shard,
+                                    &metric_shards,
+                                    TaskScan::Batch {
+                                        cursor: &mut cursor,
+                                        limit: task_batch_size,
+                                    },
+                                    &*telemetry.metrics,
+                                    unknown_target_grace_window,
+                                    &sharded_pool,
+                                    &shard_assignments,
+                                    Some(&circuit_breakers),
+                                    max_workflow_history_events,
+                                    session_worker_stale_secs,
+                                    &payload_codecs,
+                                    codec_rotation_batch_size,
+                                )
+                                .await
+                            }),
                         )
                         .await
+                        .and_then(|done| done)
                         {
                             Ok(enforced_count) => {
                                 if enforced_count > 0 {
@@ -6122,10 +6646,24 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
         //
         // The bound is fixed, not the scan interval. Worker shutdown awaits
         // each checker in turn, so a long interval would add up per shard.
+        //
+        // Issue #1823: the tick's fence is gone by now, so the release takes a
+        // fresh one. A held or fenced shard skips it, and the lease expires
+        // after its TTL. A stale release could expire a lease that the
+        // promoted region holds under the same worker id.
         if let Some(lease) = &lease {
             let release = async {
-                let mut conn = pool.get().await.map_err(|e| e.to_string())?;
-                lease.release(&mut conn).await.map_err(|e| e.to_string())
+                let fence = crate::replication::begin_shard_tick(&pool, pool_shard)
+                    .await
+                    .ok_or_else(|| "the shard is held or fenced".to_string())?;
+                crate::replication::run_fenced_pass(&fence, async {
+                    let mut conn = crate::replication::fenced_checkout(&pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    lease.release(&mut conn).await.map_err(|e| e.to_string())
+                })
+                .await
+                .map_err(|e| e.to_string())?
             };
             match tokio::time::timeout(crate::scanner_lease::LEASE_RELEASE_BOUND, release).await {
                 Ok(Ok(())) => {}
@@ -6420,35 +6958,165 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
 
 #[cfg(test)]
 mod tests {
-    // ── workflow task timeout against the locked execution state ─────────
+
+    /// Issue #1815: a single-pool checker labels its pool waits and scans
+    /// with each assigned shard, as the claim path and the pool gauges do. It
+    /// never reports under a shard the worker does not serve.
+    #[test]
+    fn a_single_pool_checker_labels_its_assigned_shards() {
+        use super::scan_metric_shards;
+        use crate::types::ShardId;
+        let shard = ShardId::new;
+        assert_eq!(scan_metric_shards(None, None, &[shard(7)]), vec![7]);
+        assert_eq!(
+            scan_metric_shards(None, None, &[shard(7), shard(3)]),
+            vec![3, 7]
+        );
+        assert_eq!(scan_metric_shards(None, None, &[]), vec![0]);
+        assert_eq!(
+            scan_metric_shards(Some(shard(5)), Some(shard(5)), &[shard(5)]),
+            vec![5]
+        );
+    }
+    // ── Timeout retry rule (issue #1809, ADR 0005) ───────────────────────
+
+    /// A confirmed timeout releases a probe slot either way. Only a probe whose
+    /// handler started records the trip (issue #1809). An unstarted probe
+    /// made no downstream call.
+    #[test]
+    fn only_a_started_probe_timeout_records_a_trip() {
+        use crate::circuit_breaker::{
+            AttemptOutcome, CircuitBreakerRegistry, ClaimKey, DispatchDecision,
+        };
+        use crate::policy::CircuitBreakerPolicy;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        #[derive(Default)]
+        struct Trips(AtomicUsize);
+        impl crate::telemetry::MetricsRecorder for Trips {
+            fn record_circuit_tripped(&self, _activity_name: &str) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for handler_started in [false, true] {
+            let mut policies = std::collections::HashMap::new();
+            policies.insert(
+                "send".to_string(),
+                CircuitBreakerPolicy::new(1, Duration::from_secs(30), Duration::from_secs(60)),
+            );
+            let reg = CircuitBreakerRegistry::new(policies);
+            let t0 = Instant::now();
+            let DispatchDecision::Allow { token } = reg.on_dispatch("send", t0) else {
+                panic!("a closed breaker admits");
+            };
+            let _ = reg.on_result("send", AttemptOutcome::RetryableFailure, token, t0);
+            let t1 = t0 + Duration::from_secs(61);
+            let DispatchDecision::Allow { token: probe } = reg.on_dispatch("send", t1) else {
+                panic!("the cooldown admits a probe");
+            };
+            let claim = ClaimKey {
+                task_id: uuid::Uuid::from_u128(1809),
+                attempt: 1,
+                started_at: None,
+            };
+            reg.begin_claim("send", claim, probe);
+            let trips = Trips::default();
+            let mut mark = super::ProvisionalTimeoutMark::new(Some(&reg), "send", claim, &trips);
+            mark.confirm(handler_started);
+            let state = reg.snapshot("send", t1).expect("tracked").state;
+            assert_eq!(state, "open", "the probe slot is released");
+            assert_eq!(
+                AtomicUsize::load(&trips.0, Ordering::SeqCst),
+                usize::from(handler_started),
+                "handler started: {handler_started}"
+            );
+        }
+    }
+
+    /// A dropped enforcement rolls its provisional mark back (issue #1809). A
+    /// result held meanwhile then counts, so a successful probe closes the
+    /// breaker instead of holding its slot for good.
+    #[test]
+    fn a_dropped_enforcement_rolls_its_mark_back() {
+        use crate::circuit_breaker::{
+            AttemptOutcome, CircuitBreakerRegistry, ClaimKey, DispatchDecision,
+        };
+        use crate::policy::CircuitBreakerPolicy;
+        use std::time::{Duration, Instant};
+
+        let mut policies = std::collections::HashMap::new();
+        policies.insert(
+            "send".to_string(),
+            CircuitBreakerPolicy::new(1, Duration::from_secs(30), Duration::from_secs(60)),
+        );
+        let reg = CircuitBreakerRegistry::new(policies);
+        let t0 = Instant::now();
+        let DispatchDecision::Allow { token } = reg.on_dispatch("send", t0) else {
+            panic!("a closed breaker admits");
+        };
+        let _ = reg.on_result("send", AttemptOutcome::RetryableFailure, token, t0);
+        let t1 = t0 + Duration::from_secs(61);
+        let DispatchDecision::Allow { token: probe } = reg.on_dispatch("send", t1) else {
+            panic!("the cooldown admits a probe");
+        };
+        let claim = ClaimKey {
+            task_id: uuid::Uuid::from_u128(1809),
+            attempt: 1,
+            started_at: None,
+        };
+        reg.begin_claim("send", claim, probe);
+        let metrics = crate::telemetry::NoOpMetrics;
+        let mark = super::ProvisionalTimeoutMark::new(Some(&reg), "send", claim, &metrics);
+        let held = reg.on_claim_result("send", AttemptOutcome::Success, probe, claim, t1);
+        assert_eq!(held, None, "the result waits for the enforcer");
+        drop(mark);
+        assert_eq!(
+            reg.snapshot("send", t1).expect("tracked").state,
+            "closed",
+            "the rollback applies the held probe success"
+        );
+    }
 
     #[test]
-    fn a_workflow_task_timeout_seals_only_an_open_run() {
+    fn only_start_to_close_and_heartbeat_timeouts_retry() {
+        use super::TimeoutReason;
+        assert!(TimeoutReason::StartToClose.retries_per_policy());
+        assert!(TimeoutReason::Heartbeat.retries_per_policy());
+        assert!(!TimeoutReason::ScheduleToStart.retries_per_policy());
+        assert!(!TimeoutReason::ScheduleToClose.retries_per_policy());
+    }
+
+    // ── task timeout against the locked execution state ─────────────────
+
+    #[test]
+    fn a_task_timeout_is_enforced_only_in_an_open_run() {
         for state in ["RUNNING", "PAUSED"] {
             assert_eq!(
-                workflow_task_timeout_disposition(state),
-                WorkflowTaskTimeoutDisposition::Seal,
+                task_timeout_disposition(state),
+                TaskTimeoutDisposition::Enforce,
                 "{state}"
             );
         }
     }
 
     #[test]
-    fn a_workflow_task_timeout_never_rewrites_a_sealed_run() {
+    fn a_task_timeout_never_rewrites_a_sealed_run() {
         for state in crate::erase::TERMINAL_STATES {
             assert_eq!(
-                workflow_task_timeout_disposition(state),
-                WorkflowTaskTimeoutDisposition::FailTaskOnly,
+                task_timeout_disposition(state),
+                TaskTimeoutDisposition::FailTaskOnly,
                 "{state}"
             );
         }
     }
 
     #[test]
-    fn a_workflow_task_timeout_leaves_a_staged_copy_alone() {
+    fn a_task_timeout_leaves_a_staged_copy_alone() {
         assert_eq!(
-            workflow_task_timeout_disposition("MIGRATING"),
-            WorkflowTaskTimeoutDisposition::Skip
+            task_timeout_disposition("MIGRATING"),
+            TaskTimeoutDisposition::Skip
         );
     }
 

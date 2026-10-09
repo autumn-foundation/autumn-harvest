@@ -404,6 +404,7 @@ async fn start_workflow_on_shard(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -467,6 +468,7 @@ async fn start_workflow_with_source(
             start_source,
             start_source_ref,
             started_by,
+            tenant: None,
         },
         None,
     )

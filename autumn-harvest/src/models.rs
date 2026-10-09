@@ -267,6 +267,34 @@ pub struct WorkflowExecution {
     /// cross-database write and no retry race.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub staging_vacated_by: Option<Uuid>,
+    /// Verified tenant of the run (issue #1977). `None` means no tenant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+}
+
+impl WorkflowExecution {
+    /// Decode the codec columns in place: `input`, `output` and `memo`
+    /// (issue #1979).
+    ///
+    /// Call this before the engine reads a column's meaning. A value that is
+    /// not an envelope stays as it is.
+    ///
+    /// # Errors
+    ///
+    /// As [`PayloadCodecs::decode_column`](crate::payload_codec::PayloadCodecs::decode_column).
+    /// On error the row is left unchanged.
+    pub fn decode_columns(
+        &mut self,
+        codecs: &crate::payload_codec::PayloadCodecs,
+    ) -> crate::error::HarvestResult<()> {
+        let input = codecs.decode_column(&self.input)?;
+        let output = codecs.decode_column_opt(self.output.as_ref())?;
+        let memo = codecs.decode_column_opt(self.memo.as_ref())?;
+        self.input = input;
+        self.output = output;
+        self.memo = memo;
+        Ok(())
+    }
 }
 
 impl WorkflowExecution {
@@ -379,6 +407,10 @@ pub struct NewWorkflowExecution<'a> {
     /// required for the quota-usage aggregate queries in `quota.rs` to find
     /// this execution's active-executions/history-bytes contribution.
     pub quota_key: Option<&'a str>,
+    /// Verified tenant of the run (issue #1977). `None` means no tenant.
+    /// The start path sets it from [`crate::StartWorkflowParams::tenant`].
+    /// Every path that derives a run from another run copies it.
+    pub tenant: Option<&'a str>,
 }
 
 // ── HarvestEvent ──────────────────────────────────────────────────────────────
@@ -578,6 +610,22 @@ pub struct TaskQueueItem {
     /// owns this row, or once a different wake reason repends it.
     #[serde(default)]
     pub timer_fires_at: Option<DateTime<Utc>>,
+    /// The `attempt` whose activity handler started (issue #1809). Written
+    /// with `ActivityStarted`. Equal to `attempt` only after the current
+    /// claim started its handler. `NULL` when no attempt started.
+    #[serde(default)]
+    pub handler_started_attempt: Option<i32>,
+    /// One entry per claim that the timeout enforcer timed out after its
+    /// handler started, newest last (issue #1809). An entry names the claim
+    /// by `attempt` and `started_at` (see `queue::timed_out_claim_key`). The
+    /// worker that held a claim takes its own entry out of here. `NULL`
+    /// until a claim times out.
+    #[serde(default)]
+    pub timed_out_claims: Option<Vec<Option<String>>>,
+    /// When the handler of `handler_started_attempt` started (issue #1809).
+    /// A timeout enforcer measures the attempt duration from it.
+    #[serde(default)]
+    pub handler_started_at: Option<DateTime<Utc>>,
     /// `true` on the first workflow task of a freshly admitted run (issue
     /// #1824). See [`crate::queue::CLAIM_ORDER_DUE_SQL`].
     #[serde(default)]
@@ -1104,6 +1152,14 @@ pub struct AuditExportRow {
     pub shard_id: Option<i32>,
     pub source: String,
     pub export_seq: Option<i64>,
+    /// Audit-chain link of the previous row (issue #1838).
+    pub chain_prev: Option<Vec<u8>>,
+    /// Newest `occurred_at` chained before this row (issue #1838).
+    pub chain_newest_before: Option<DateTime<Utc>>,
+    /// Audit-chain link of this row (issue #1838).
+    pub chain_hash: Option<Vec<u8>>,
+    /// The shard whose exporter made the links (issue #1838).
+    pub chain_shard: Option<i32>,
 }
 
 /// The per-shard audit-export delivery cursor (issue #953).
@@ -1128,6 +1184,16 @@ pub struct AuditExportCursor {
     /// themselves; a retired cursor is inert — retention ignores it and a
     /// redrive refuses it.
     pub retired_at: Option<DateTime<Utc>>,
+    /// Newest audit-chain link on this shard (issue #1838).
+    pub chain_head: Option<Vec<u8>>,
+    /// First chained `export_seq` on this shard (issue #1838).
+    pub chain_start_seq: Option<i64>,
+    /// `export_seq` of the newest chained row (issue #1838).
+    pub chain_head_seq: Option<i64>,
+    /// Newest `occurred_at` of the chain, through the head (issue #1838).
+    pub chain_newest_at: Option<DateTime<Utc>>,
+    /// Keyed MAC over the checkpoint columns (issue #1838).
+    pub chain_mac: Option<Vec<u8>>,
 }
 
 // ── ApiToken ──────────────────────────────────────────────────────────────────
@@ -1152,6 +1218,9 @@ pub struct ApiToken {
     pub last_used_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
     pub created_by: String,
+    /// Tenant claim of the token (issue #1977). `None` means not
+    /// tenant-bound.
+    pub tenant: Option<String>,
 }
 
 /// Insert struct for minting a new API token (issue #942).
@@ -1166,6 +1235,9 @@ pub struct NewApiToken<'a> {
     pub scope: &'a str,
     pub expires_at: Option<DateTime<Utc>>,
     pub created_by: &'a str,
+    /// Tenant claim of the token (issue #1977). `None` means not
+    /// tenant-bound.
+    pub tenant: Option<&'a str>,
 }
 
 impl std::fmt::Debug for NewApiToken<'_> {
@@ -1176,6 +1248,7 @@ impl std::fmt::Debug for NewApiToken<'_> {
             .field("scope", &self.scope)
             .field("expires_at", &self.expires_at)
             .field("created_by", &self.created_by)
+            .field("tenant", &self.tenant)
             .finish()
     }
 }
@@ -1199,6 +1272,12 @@ pub struct HarvestBuildPolicy {
     pub target_build_id: Option<String>,
     /// Ramp percentage 0..=100 (issue #604). `None` = no ramp configured.
     pub ramp_percent: Option<i32>,
+    /// One operator ramp's identity, the same on every shard pool (issue
+    /// #1814). `None` = no ramp, or a ramp set before the column existed.
+    pub ramp_id: Option<Uuid>,
+    /// The ramp guard's abort markers on this pool, newest first (issue
+    /// #1814). Each is `{"id": ramp_id, "base": build_id}`.
+    pub ramp_aborted: serde_json::Value,
 }
 
 /// Insert struct for a new build policy.
@@ -1409,6 +1488,8 @@ pub struct CompletionTriggerOutboxDb {
     pub max_workflow_input_bytes: i64,
     pub created_at: DateTime<Utc>,
     pub next_attempt_at: Option<DateTime<Utc>>,
+    /// Tenant of the source run (issue #1977). The target run gets it.
+    pub tenant: Option<String>,
 }
 
 /// Insertable model for registering a deferred completion trigger outbox task.
@@ -1426,6 +1507,8 @@ pub struct NewCompletionTriggerOutboxDb {
     pub concurrency_limit: Option<i32>,
     pub priority: serde_json::Value,
     pub max_workflow_input_bytes: i64,
+    /// Tenant of the source run (issue #1977). The target run gets it.
+    pub tenant: Option<String>,
 }
 
 // ── Cross-shard child workflows (issue #956) ─────────────────────────────────
@@ -1762,6 +1845,8 @@ pub struct NewHarvestWasmModule<'a> {
     pub activity_name: &'a str,
     pub wasm_bytes: &'a [u8],
     pub active: bool,
+    /// Hex Ed25519 publisher signature (issue #1838). `None` = unsigned.
+    pub signature: Option<&'a str>,
 }
 
 // ── Durable mutex locks (issue #691) ────────────────────────────────────────
@@ -1927,6 +2012,7 @@ mod effective_terminal_state_tests {
             migrated_run_terminal_state: None,
             staging_vacated_state: None,
             staging_vacated_by: None,
+            tenant: None,
         }
     }
 

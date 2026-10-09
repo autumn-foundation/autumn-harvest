@@ -1,0 +1,62 @@
+# Dependabot version updates (issue #1826).
+#
+# Every pull request targets trunk-dev. trunk is the release branch.
+#
+# github-actions: each `uses:` is pinned to a commit SHA with a `# <tag>`
+# comment. Dependabot updates the SHA and the comment together.
+# docs/audits/action-sha-pin.py rejects a pin with no SHA.
+#
+# cargo: `/` is the workspace. The CI `msrv` job catches an update that needs
+# a newer rustc. `/fuzz` is not listed. It has no lockfile, so Dependabot
+# could open only major bumps there, and no CI job builds it by default.
+#
+# Security updates are a repository setting, not part of this file.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    target-branch: trunk-dev
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:23"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    groups:
+      # One pull request for the compatible updates. A major update gets its
+      # own pull request, because it can break the build.
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    target-branch: trunk-dev
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:23"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-and-patch:
+        update-types: [minor, patch]
+
+  # Issue #1989. The Dockerfile pins each base image by digest. Dependabot
+  # moves a digest within its tag. Dependabot does not move the `rust` tag to
+  # a new minor or major release. That is a toolchain bump in
+  # rust-toolchain.toml. A patch tag bump fails the image contract audit
+  # until rust-toolchain.toml moves with it.
+  - package-ecosystem: docker
+    directory: "/"
+    target-branch: trunk-dev
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:23"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 2
+    ignore:
+      - dependency-name: rust
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor

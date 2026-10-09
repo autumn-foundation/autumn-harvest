@@ -1,0 +1,24 @@
+{
+  "codec": "identity",
+  "stored": false,
+  "offload_threshold": 1048576,
+  "program": [
+    {
+      "op": "random_float",
+      "value": null
+    },
+    {
+      "op": "complete",
+      "output": null
+    }
+  ],
+  "history": [
+    {
+      "type": "WorkflowStarted",
+      "data": {
+        "input": null,
+        "timestamp": "2026-09-01T12:00:00Z"
+      }
+    }
+  ]
+}

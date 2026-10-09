@@ -1417,7 +1417,7 @@
               }
             }
           ],
-          "description": "Alert: harvest_workflow_history_bloat (docs/runbooks/harvest-alerts.md#harvest_workflow_history_bloat) At-least-once early warning: fires when an execution's recorded harvest_events count first crosses history_bloat_warn_fraction * event_hard_cap (issue #704, default 75%) -- either (1) while still RUNNING, observation-only, the run keeps executing normally, or (2) in the SAME decision that also reaches the event-count hard cap and terminally fails the execution. Emitted once per crossing per run outside a rare crash-window duplicate (deliberately biased toward a duplicate over a lost-forever signal). Requires event_hard_cap to be configured for the workflow type via WorkflowHistoryPolicy; otherwise this stays flat at zero (disabled), not an outage. Discover and rank offending executions with GET /api/harvest/workflows?history_bloat_min_events=<N> or harvest workflow list --history-bloat-min-events <N>."
+          "description": "Alert: harvest_workflow_history_bloat (docs/runbooks/harvest-alerts.md#harvest_workflow_history_bloat) At-least-once early warning: fires when an execution's recorded harvest_events count first crosses history_bloat_warn_fraction * event_hard_cap (issue #704, default 20.48%, so 10,240 events under the default 50,000-event cap) -- either (1) while still RUNNING, observation-only, the run keeps executing normally, or (2) in the SAME decision that also reaches the event-count hard cap and terminally fails the execution. Emitted once per crossing per run outside a rare crash-window duplicate (deliberately biased toward a duplicate over a lost-forever signal). Stays flat at zero only when the signal is disabled (an unlimited event cap or a warn fraction of 0), not an outage. Discover and rank offending executions with GET /api/harvest/workflows?history_bloat_min_events=<N> or harvest workflow list --history-bloat-min-events <N>."
         }
       ]
     },
@@ -1971,6 +1971,104 @@
             }
           ],
           "description": "New starts refused by automatic load shedding (issue #1794). See docs/operations/load-shedding.md."
+        },
+        {
+          "id": 182701,
+          "type": "timeseries",
+          "title": "API rate-limit rejections",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 86
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (route_class, client_kind) (rate(harvest_api_rate_limited_total[$__rate_interval]))",
+              "legendFormat": "{{route_class}} / {{client_kind}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Management API requests the optional per-client rate limiter refused with 429 (issue #1827). See docs/security-posture.md#api-rate-limiting."
+        },
+        {
+          "id": 230251,
+          "type": "timeseries",
+          "title": "Build ramp auto-aborts",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 94
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (queue, reason) (increase(harvest_build_ramp_aborted_total{queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{queue}} {{reason}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Build ramps that the ramp guard aborted, by queue and reason (issue #1814). See docs/operations/build-ramp-guard.md."
         }
       ]
     },
@@ -2295,7 +2393,7 @@
     {
       "id": 39,
       "type": "row",
-      "title": "Circuit breakers and retry budget",
+      "title": "Circuit breakers, retry budget and adaptive limit",
       "collapsed": true,
       "gridPos": {
         "h": 1,
@@ -2349,9 +2447,18 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (activity_name) (increase(harvest_activity_circuit_deferred_total[1h]))",
+              "legendFormat": "{{activity_name}} deferred",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
             }
           ],
-          "description": "Per-activity circuit breakers opened in the last hour (issue #369)."
+          "description": "Per-activity circuit breakers opened in the last hour (issue #369), and dispatches that an open breaker deferred (issue #1809)."
         },
         {
           "id": 41,
@@ -2499,6 +2606,202 @@
             }
           ],
           "description": "Retries that the retry budget deferred in the last hour, per activity type. A deferred retry is not lost. It runs later (issue #1793)."
+        },
+        {
+          "id": 185257,
+          "type": "timeseries",
+          "title": "Adaptive concurrency limit",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 58
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "min by (activity) (harvest_activity_concurrency_limit)",
+              "legendFormat": "{{activity}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Lowest adaptive cap on in-flight attempts per activity type across workers. It falls when latency inflates or retryable failures occur (issue #1836)."
+        },
+        {
+          "id": 185258,
+          "type": "timeseries",
+          "title": "Adaptive limit slots in flight",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 58
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (activity) (harvest_activity_concurrency_in_flight)",
+              "legendFormat": "{{activity}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "In-flight attempts that hold an adaptive limit slot, per activity type, summed across workers. At the cap, a worker claims no more tasks of that type (issue #1836)."
+        },
+        {
+          "id": 185259,
+          "type": "timeseries",
+          "title": "Adaptive limit latency baseline",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 66
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "max by (activity) (harvest_activity_latency_baseline_seconds)",
+              "legendFormat": "{{activity}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "No-load handler latency estimate of the adaptive limit, per activity type, highest across workers. Above tolerance times this value, the cap grows more slowly and then settles (issue #1836)."
+        },
+        {
+          "id": 185260,
+          "type": "timeseries",
+          "title": "Claims deferred by the adaptive limit",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 66
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (activity) (increase(harvest_activity_concurrency_deferred_total[1h]))",
+              "legendFormat": "{{activity}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Claimed attempts that the adaptive limit deferred in the last hour, per activity type. The claim skips a type at its cap, so a steady rate means claims race past the cap (issue #1836)."
         }
       ]
     },
@@ -6161,7 +6464,7 @@
               }
             }
           ],
-          "description": "Iterations completed per loop over 3h (issue #797) -- the low-frequency companion to the rate panel, and the panel to judge `retention` on. The window is deliberately LONGER than the slowest loop's cadence: the janitor polls hourly by default, so any window under an hour legitimately contains zero increments for much of every healthy hour and the \"zero means wedged\" reading would be false exactly where it is supposed to be authoritative. At 3h a healthy janitor floors at ~3. A series that stops incrementing is the wedge signal -- note that on the log axis a zero reads as a BREAK in the line rather than a dip to the baseline. The axis is log because a sub-second loop contributes ~21,600 ticks over the same window against the janitor's ~3, and a linear scale would pin retention indistinguishably to zero -- the exact illegibility this panel exists to fix. Retune alongside the alert's 3h window if you have changed the retention tick interval. Per-instance so one replica's wedged loop is not hidden by its healthy peers. A multi-shard worker runs one timeout/poison_pill/pause_auto_resume loop PER SHARD under one label, and the metric carries no shard label -- to catch a single-shard wedge use the scanner_liveness check in GET /admin/preflight, which names the wedged instance's shard."
+          "description": "Iterations completed per loop over 3h (issue #797) -- the low-frequency companion to the rate panel, and the panel to judge `retention` on. The window is deliberately LONGER than the slowest loop's cadence: the janitor polls hourly by default, so any window under an hour legitimately contains zero increments for much of every healthy hour and the \"zero means wedged\" reading would be false exactly where it is supposed to be authoritative. At 3h a healthy janitor floors at ~3. A series that stops incrementing is the wedge signal -- note that on the log axis a zero reads as a BREAK in the line rather than a dip to the baseline. The axis is log because a sub-second loop contributes ~21,600 ticks over the same window against the janitor's ~3, and a linear scale would pin retention indistinguishably to zero -- the exact illegibility this panel exists to fix. Retune alongside the alert's 3h window if you have changed the retention tick interval. Per-instance so one replica's wedged loop is not hidden by its healthy peers. A multi-shard worker runs one timeout/poison_pill/pause_auto_resume/rebalance_resume loop PER SHARD under one label, and the metric carries no shard label -- to catch a single-shard wedge use the scanner_liveness check in GET /admin/preflight, which names the wedged instance's shard."
         },
         {
           "id": 934,
@@ -7183,6 +7486,359 @@
         }
       ],
       "description": "Rate of activity heartbeat flushes that failed, per reason. The flusher keeps the payload and tries again on the next tick. A run of failures longer than heartbeat_timeout fails a healthy activity. See docs/operations/postgres-timeouts.md."
+    },
+    {
+      "id": 182200,
+      "type": "timeseries",
+      "title": "Transaction conflict retries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 216
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (site, reason) (rate(harvest_db_transaction_retry_total[$__rate_interval]))",
+          "legendFormat": "retry {{site}} {{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (site, reason) (rate(harvest_db_transaction_retry_exhausted_total[$__rate_interval]))",
+          "legendFormat": "exhausted {{site}} {{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Rate of transaction retries after a Postgres abort (retry), and of conflicts that remained after the last retry (exhausted). Per site (persist, workflow_task, claim or scanner) and reason (deadlock or serialization_failure). A steady deadlock rate points to a lock-order defect. Any exhausted rate reaches callers. See docs/operations/postgres-timeouts.md."
+    },
+    {
+      "id": 461861,
+      "type": "row",
+      "title": "Database pool, queries & pollers (issue #1815)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 224
+      },
+      "collapsed": true,
+      "panels": [
+        {
+          "id": 482935,
+          "type": "timeseries",
+          "title": "DB pool connections in use / idle",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 225
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (shard) (harvest_db_pool_in_use{shard=~\"$shard\"})",
+              "legendFormat": "in use shard {{shard}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (shard) (harvest_db_pool_idle{shard=~\"$shard\"})",
+              "legendFormat": "idle shard {{shard}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "C",
+              "expr": "min by (shard) (harvest_db_pool_idle{shard=~\"$shard\"})",
+              "legendFormat": "fewest idle on one replica, shard {{shard}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Connections each shard pool lends out and holds idle, summed over worker replicas (issue #1815). Each replica owns its pool, so sum is valid. A sum can hide one starved replica, so series C shows the fewest idle connections on any one replica. Idle near 0 with rising acquire wait means the pool is too small. Colocated shards that share one pool show the same values."
+        },
+        {
+          "id": 376911,
+          "type": "timeseries",
+          "title": "DB pool acquire wait p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 225
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.99, sum by (le, instance, shard) (rate(harvest_db_pool_wait_duration_bucket{shard=~\"$shard\"}[$__rate_interval])))",
+              "legendFormat": "p99 shard {{shard}} @ {{instance}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (instance, shard) (rate(harvest_db_pool_wait_duration_sum{shard=~\"$shard\"}[$__rate_interval])) / sum by (instance, shard) (rate(harvest_db_pool_wait_duration_count{shard=~\"$shard\"}[$__rate_interval]))",
+              "legendFormat": "avg shard {{shard}} @ {{instance}} (bucket-less fallback)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Seconds a caller waits for a pooled connection on the claim path, the timeout scanner and the activity heartbeat flush (issue #1815). Alert: harvest_db_pool_wait_high (docs/runbooks/harvest-alerts.md#harvest_db_pool_wait_high). p99 needs set_buckets_for_metric; the avg fallback works on any install. Charted per replica, as the alert is, so one starved replica cannot hide behind healthy ones."
+        },
+        {
+          "id": 716897,
+          "type": "timeseries",
+          "title": "DB operation latency p99 by op",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 233
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.99, sum by (le, instance, op, shard) (rate(harvest_db_query_duration_bucket[$__rate_interval])))",
+              "legendFormat": "p99 {{op}} shard {{shard}} @ {{instance}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (instance, op, shard) (rate(harvest_db_query_duration_sum[$__rate_interval])) / sum by (instance, op, shard) (rate(harvest_db_query_duration_count[$__rate_interval]))",
+              "legendFormat": "avg {{op}} shard {{shard}} @ {{instance}} (bucket-less fallback)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Seconds one database operation takes, by op: claim, persist, scan, heartbeat (issue #1815). Each op is one unit of work, not one SQL statement. Alert: harvest_db_query_latency_high (docs/runbooks/harvest-alerts.md#harvest_db_query_latency_high). Not the same as harvest_query_duration, which times workflow query handlers. Charted per replica, as the alert is."
+        },
+        {
+          "id": 270529,
+          "type": "timeseries",
+          "title": "Pollers by queue",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 233
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (queue) (harvest_worker_pollers{queue=~\"$queue\"}) or max by (queue) (harvest_queue_depth{queue=~\"$queue\"}) * 0",
+              "legendFormat": "{{queue}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Poll loops that claim from each queue, summed over worker replicas (issue #1815). One worker runs one poll loop over all its queues. A drained worker reports 0. When the last poller of a queue exits, its series ends; the queue-depth fallback then draws that queue at 0, and its backlog grows."
+        },
+        {
+          "id": 872151,
+          "type": "timeseries",
+          "title": "Worker outliers (gray failure)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 241
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "max by (instance, dimension) (harvest_worker_outlier)",
+              "legendFormat": "{{instance}} {{dimension}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "1 when a worker fails a far higher share of tasks, or has a far higher p99 task latency, than the median of its live peers on the same queues (issue #1815). The worker is alive and passes the heartbeat check, so worker health alone misses it. GET /admin/status lists the same workers under workers.outliers. Alert: harvest_worker_gray_failure (docs/runbooks/harvest-alerts.md#harvest_worker_gray_failure)."
+        }
+      ]
     }
   ]
 }

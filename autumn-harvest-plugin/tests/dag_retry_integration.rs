@@ -296,6 +296,7 @@ async fn seed_run(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -758,8 +759,10 @@ async fn reset_refuses_an_erased_source_under_its_own_row_lock() {
         "fixture must actually erase something: {outcome:?}"
     );
 
+    // Event 4 follows `step_b`, the boundary a `step_c` retry uses. Event 1
+    // has an open `step_a` schedule, so the reset-point check refuses it.
     let request = WorkflowResetRequest {
-        reset_to_event_id: Some(1),
+        reset_to_event_id: Some(4),
         reset_point: None,
         reason: "dag_retry: nodes=[step_c]".to_string(),
         operator_id: "oncall".to_string(),
@@ -811,8 +814,10 @@ async fn reset_without_the_flag_still_forks_an_erased_source() {
         .await
         .expect("erase payloads");
 
+    // Event 4 follows `step_b`, the boundary a `step_c` retry uses. Event 1
+    // has an open `step_a` schedule, so the reset-point check refuses it.
     let request = WorkflowResetRequest {
-        reset_to_event_id: Some(1),
+        reset_to_event_id: Some(4),
         reset_point: None,
         reason: "plain reset".to_string(),
         operator_id: "oncall".to_string(),

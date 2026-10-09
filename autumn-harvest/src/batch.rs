@@ -519,6 +519,9 @@ mod db {
         /// than 10% p99 regression on unrelated workflows.
         pub concurrency: u32,
         pub metrics: Arc<dyn MetricsRecorder>,
+        /// The registry a signal action encodes its payload with (issue
+        /// #1979). The default is the identity registry.
+        pub payload_codecs: crate::payload_codec::PayloadCodecs,
     }
 
     impl std::fmt::Debug for BatchExecutorConfig {
@@ -534,6 +537,7 @@ mod db {
             Self {
                 concurrency: DEFAULT_BATCH_CONCURRENCY,
                 metrics: Arc::new(NoOpMetrics),
+                payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             }
         }
     }
@@ -697,6 +701,7 @@ mod db {
         signal_payload: Option<&Value>,
         target: ExecutionId,
         metrics: &dyn MetricsRecorder,
+        codecs: &crate::payload_codec::PayloadCodecs,
     ) -> Result<(), String> {
         match action {
             BatchAction::Cancel => {
@@ -719,7 +724,7 @@ mod db {
                     "Signal action missing signal_name on batch job row".to_string()
                 })?;
                 let payload = signal_payload.cloned().unwrap_or(Value::Null);
-                signal::send_signal(conn, target, name, payload)
+                signal::send_signal_with_codecs(conn, target, name, payload, codecs)
                     .await
                     .map_err(|e| e.to_string())
             }
@@ -752,6 +757,25 @@ mod db {
             })
     }
 
+    /// Check out a connection inside the executor pass (issue #1823).
+    ///
+    /// The pass holds a fence barrier on every pinned shard. With fencing on,
+    /// this checkout waits at most
+    /// [`crate::replication::FENCED_CHECKOUT_BOUND`]. A pass that gets
+    /// no connection then fails, its guards drop, and the next tick tries
+    /// again. With fencing off, the checkout waits as before. The pass
+    /// records the backend, so a lost guard ends it.
+    async fn executor_conn(pool: &DbPool) -> HarvestResult<crate::replication::FencedConn> {
+        if crate::replication::FenceRegistry::is_enabled() {
+            return crate::replication::fenced_acquire(
+                pool,
+                crate::replication::FENCED_CHECKOUT_BOUND,
+            )
+            .await;
+        }
+        crate::replication::fenced_checkout(pool).await
+    }
+
     /// Drive every open batch job to terminal status across all shards.
     ///
     /// One tick is sufficient for a 1k-target batch on a laptop-class
@@ -759,6 +783,21 @@ mod db {
     /// on each scheduler interval so longer batches drain over multiple
     /// ticks without holding open transactions.
     pub async fn run_executor_once(
+        pool: &ShardedDbPool,
+        config: &BatchExecutorConfig,
+    ) -> HarvestResult<()> {
+        // Issue #1823: the tick holds a fence barrier on each pinned shard,
+        // so a bump cannot commit while it claims or updates a job. A lost
+        // barrier stops the tick before its next write. A checkout before a
+        // write is bounded, see `executor_conn`. So is a progress or
+        // completion checkout. A timeout there ends the pass like a failed
+        // `record_progress`: the next tick dispatches the chunk again.
+        let fence = crate::replication::begin_fenced_tick(pool).await?;
+        crate::replication::run_fenced_pass(&fence, Box::pin(executor_pass(pool, config))).await?
+    }
+
+    /// One executor pass over every shard. See [`run_executor_once`].
+    async fn executor_pass(
         pool: &ShardedDbPool,
         config: &BatchExecutorConfig,
     ) -> HarvestResult<()> {
@@ -773,10 +812,7 @@ mod db {
             // pool. A small shard pool self-deadlocks otherwise, waiting for
             // a connection this loop still holds (issue #1360).
             let jobs = {
-                let mut conn = shard_pool
-                    .get()
-                    .await
-                    .map_err(|e| HarvestError::Database(e.to_string()))?;
+                let mut conn = executor_conn(shard_pool).await?;
                 open_jobs(&mut conn).await?
             };
             for job in jobs {
@@ -799,10 +835,7 @@ mod db {
             Ok(a) => a,
             Err(reason) => {
                 tracing::warn!(job_id = %job.id, reason, "batch job has unknown action; failing");
-                let mut conn = owning_shard_pool
-                    .get()
-                    .await
-                    .map_err(|e| HarvestError::Database(e.to_string()))?;
+                let mut conn = executor_conn(owning_shard_pool).await?;
                 let _ = mark_failed(&mut conn, job.id, &reason).await;
                 return Ok(());
             }
@@ -811,10 +844,7 @@ mod db {
             Ok(f) => f,
             Err(error) => {
                 tracing::warn!(job_id = %job.id, %error, "batch job filter is malformed");
-                let mut conn = owning_shard_pool
-                    .get()
-                    .await
-                    .map_err(|e| HarvestError::Database(e.to_string()))?;
+                let mut conn = executor_conn(owning_shard_pool).await?;
                 let _ = mark_failed(&mut conn, job.id, &error.to_string()).await;
                 return Ok(());
             }
@@ -827,10 +857,7 @@ mod db {
         // when concatenating results from 256 default shards.
         let mut all_targets: Vec<ExecutionId> = Vec::with_capacity(pool.iter_shards().count() * 10);
         for (_, shard_pool) in pool.iter_shards() {
-            let mut conn = shard_pool
-                .get()
-                .await
-                .map_err(|e| HarvestError::Database(e.to_string()))?;
+            let mut conn = executor_conn(shard_pool).await?;
             let mut targets = resolve_targets_on_shard(&mut conn, action, &filter).await?;
             all_targets.append(&mut targets);
         }
@@ -849,10 +876,7 @@ mod db {
         // (issue #1360).
         let total = i64::try_from(all_targets.len()).unwrap_or(i64::MAX);
         let claimed = {
-            let mut owning_conn = owning_shard_pool
-                .get()
-                .await
-                .map_err(|e| HarvestError::Database(e.to_string()))?;
+            let mut owning_conn = executor_conn(owning_shard_pool).await?;
             try_claim_job(&mut owning_conn, job.id, total).await?
         };
         if !claimed {
@@ -885,6 +909,7 @@ mod db {
         let signal_payload = job.signal_payload.clone();
         let concurrency = usize::try_from(config.concurrency.max(1)).unwrap_or(1);
         let metrics = Arc::clone(&config.metrics);
+        let codecs = &config.payload_codecs;
 
         // Dispatch in chunks of `concurrency` to bound in-flight ops.
         for chunk in targets_to_dispatch.chunks(concurrency) {
@@ -896,11 +921,15 @@ mod db {
                 tasks.push(async move {
                     let pool_for_target = match dispatch_pool_for(pool, target).await {
                         Ok(p) => p,
-                        Err(e) => return (target, Err(e.to_string())),
+                        Err(e) => return (target, Ok(Err(e.to_string()))),
                     };
-                    let mut conn = match pool_for_target.get().await {
+                    // A checkout that times out under the fence defers the
+                    // target, so the pass can drop its guards. The target is
+                    // not recorded, and the next tick dispatches it.
+                    let mut conn = match executor_conn(&pool_for_target).await {
                         Ok(c) => c,
-                        Err(e) => return (target, Err(e.to_string())),
+                        Err(e) if e.is_pool_acquire_timeout() => return (target, Err(e)),
+                        Err(e) => return (target, Ok(Err(e.to_string()))),
                     };
                     let result = dispatch_target(
                         &mut conn,
@@ -909,16 +938,25 @@ mod db {
                         signal_payload.as_ref(),
                         target,
                         metrics.as_ref(),
+                        codecs,
                     )
                     .await;
-                    (target, result)
+                    (target, Ok(result))
                 });
             }
             let mut completed_delta = 0i64;
             let mut failed_delta = 0i64;
             let mut new_errors: Vec<BatchTargetError> = Vec::with_capacity(chunk.len());
             let mut dispatched_ids: Vec<Uuid> = Vec::with_capacity(chunk.len());
+            let mut deferred: Option<HarvestError> = None;
             while let Some((target, outcome)) = tasks.next().await {
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        deferred.get_or_insert(error);
+                        continue;
+                    }
+                };
                 dispatched_ids.push(target.as_uuid());
                 match outcome {
                     Ok(()) => completed_delta += 1,
@@ -934,10 +972,7 @@ mod db {
             // This block acquires a fresh connection for this write and
             // drops it at the end of the chunk. The next chunk's dispatch
             // loop never finds it held (issue #1360).
-            let mut owning_conn = owning_shard_pool
-                .get()
-                .await
-                .map_err(|e| HarvestError::Database(e.to_string()))?;
+            let mut owning_conn = executor_conn(owning_shard_pool).await?;
             record_progress(
                 &mut owning_conn,
                 job.id,
@@ -947,12 +982,12 @@ mod db {
                 &dispatched_ids,
             )
             .await?;
+            if let Some(error) = deferred {
+                return Err(error);
+            }
         }
 
-        let mut owning_conn = owning_shard_pool
-            .get()
-            .await
-            .map_err(|e| HarvestError::Database(e.to_string()))?;
+        let mut owning_conn = executor_conn(owning_shard_pool).await?;
         mark_completed(&mut owning_conn, job.id).await?;
         Ok(())
     }

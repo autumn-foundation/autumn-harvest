@@ -112,6 +112,9 @@ pub struct CrossShardChildSpec {
     /// Ambient context headers inherited from the parent (issue #481).
     #[serde(default)]
     pub context_headers: Option<serde_json::Value>,
+    /// Tenant inherited from the parent (issue #1977). `None` means no tenant.
+    #[serde(default)]
+    pub tenant: Option<String>,
     #[serde(default)]
     pub owner: Option<String>,
     #[serde(default)]
@@ -1396,7 +1399,7 @@ async fn start_child_on_target(
                     // column would make every shard-filtered scanner query (timeouts,
                     // outboxes, the SLA sweep) skip it.
                     shard_id: row.target_shard,
-                    input: spec.input.clone().into(),
+                    input: codecs.encode_column(&spec.input)?.into(),
                     parent_id: Some(parent_exec_id.as_uuid()),
                     queue_name: &spec.queue_name,
                     execution_timeout: spec.execution_timeout_secs.map(chrono::Duration::seconds),
@@ -1422,6 +1425,7 @@ async fn start_child_on_target(
                     start_source_ref: Some(parent_exec_id_str.as_str()),
                     started_by: None,
                     quota_key: spec.quota_key.as_deref(),
+                    tenant: spec.tenant.as_deref(),
                 };
                 let inserted = diesel::insert_into(harvest_workflow_executions::table)
                     .values(&child_row)
@@ -1542,12 +1546,13 @@ async fn start_child_on_target(
                     // are returned rather than emitted inline.
                     let mut pending_cancel_metrics = Vec::new();
                     for start in
-                        crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+                        crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
                             conn,
                             child_exec_id,
                             crate::completion_trigger::TerminalState::Cancelled,
                             Some(metrics),
                             &mut pending_cancel_metrics,
+                            codecs,
                         )
                         .await?
                     {
@@ -1588,7 +1593,7 @@ async fn start_child_on_target(
                 let mut params = queue::EnqueueParams::new(
                     spec.queue_name.clone(),
                     TaskType::Workflow,
-                    spec.input.clone(),
+                    codecs.encode_column(&spec.input)?,
                 );
                 params.workflow_exec_id = Some(child_exec_id.as_uuid());
                 params.required_build_id = spec.assigned_build_id.clone();
@@ -1760,7 +1765,12 @@ async fn deliver_terminal(
     let child_exec_id = ExecutionId::from_uuid(row.child_exec_id);
     let parent_exec_id = ExecutionId::from_uuid(row.parent_exec_id);
     let state = child.state.clone();
-    let output = child.output.clone();
+    // The output column can hold an envelope (issue #1979). The parent's
+    // history gets the plaintext. A failure here takes the caller's retry
+    // path, so the child stays pending. The codec error text is not kept.
+    let output = codecs
+        .decode_column_opt(child.output.as_ref())
+        .map_err(|_| HarvestError::Config("the child output could not be decoded".to_string()))?;
     let error = child.error.clone();
     let typed_failure = child.typed_failure.clone();
 
@@ -1833,7 +1843,7 @@ async fn target_conn(
     pool: &ShardedDbPool,
     row: &CrossShardChildRow,
     acquire_bound: Option<std::time::Duration>,
-) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
+) -> HarvestResult<crate::replication::FencedConn> {
     let shard_pool = pool
         .exact_pool_for(ShardId::new(row.target_shard))
         .ok_or_else(|| HarvestError::ShardUnavailable {
@@ -1854,26 +1864,49 @@ async fn target_conn(
 /// pools with no timeout on either side. Bounding the acquisition converts that
 /// from a permanent hang into "skip this shard, retry next sweep", which is
 /// exactly what `shard_acquire_bound` (issue #961) exists for.
+///
+/// The sweep can run inside a fenced pass of the parent's shard (issue
+/// #1823). The checkout is then fence-aware. It waits at most
+/// [`crate::replication::FENCED_CHECKOUT_BOUND`], and a timeout abandons the
+/// pass, so a busy target pool cannot hold a bump off. The pass also records
+/// the target backend, so a lost guard ends it.
 async fn acquire_bounded(
     shard_pool: &crate::worker::DbPool,
     shard: i32,
     bound: Option<std::time::Duration>,
-) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
-    let unavailable = |reason: String| HarvestError::ShardUnavailable {
-        shard_id: shard,
-        reason,
+) -> HarvestResult<crate::replication::FencedConn> {
+    let checkout = match bound {
+        None => crate::replication::fenced_checkout(shard_pool).await,
+        Some(bound) => crate::replication::fenced_acquire(shard_pool, bound).await,
     };
-    match bound {
-        None => shard_pool
-            .get()
-            .await
-            .map_err(|e| unavailable(format!("pool checkout failed: {e}"))),
-        Some(bound) => match tokio::time::timeout(bound, shard_pool.get()).await {
-            Ok(Ok(conn)) => Ok(conn),
-            Ok(Err(e)) => Err(unavailable(format!("pool checkout failed: {e}"))),
-            Err(_) => Err(unavailable(format!(
-                "pool checkout did not complete within {bound:?}"
-            ))),
+    checkout.map_err(|error| HarvestError::ShardUnavailable {
+        shard_id: shard,
+        reason: match error {
+            HarvestError::PoolAcquireTimeout { waited } => {
+                format!("pool checkout did not complete within {waited:?}")
+            }
+            error => format!("pool checkout failed: {error}"),
         },
+    })
+}
+
+#[cfg(test)]
+mod tenant_spec_tests {
+    use super::CrossShardChildSpec;
+
+    /// A stored spec carries the parent's tenant to the target shard (issue
+    /// #1977). A spec that an older release wrote has no tenant field. It
+    /// still reads, with no tenant.
+    #[test]
+    fn spec_carries_the_tenant_and_reads_old_rows() {
+        let old = serde_json::json!({ "input": {}, "queue_name": "default" });
+        let spec: CrossShardChildSpec = serde_json::from_value(old).expect("old spec reads");
+        assert_eq!(spec.tenant, None);
+
+        let new = serde_json::json!({ "input": {}, "queue_name": "default", "tenant": "acme" });
+        let spec: CrossShardChildSpec = serde_json::from_value(new).expect("new spec reads");
+        assert_eq!(spec.tenant.as_deref(), Some("acme"));
+        let round_trip = serde_json::to_value(&spec).expect("spec writes");
+        assert_eq!(round_trip["tenant"], "acme");
     }
 }

@@ -1115,10 +1115,11 @@ fn validate_node(
     }
 
     // required fields
-    if let (Some(required), Some(obj)) = (
-        schema_obj.get("required").and_then(|v| v.as_array()),
-        value.as_object(),
-    ) {
+    // Keyword lookups are gated on the value's kind: a map lookup against a
+    // non-matching value is wasted work on the leaf-heavy common case.
+    if let Some(obj) = value.as_object()
+        && let Some(required) = schema_obj.get("required").and_then(|v| v.as_array())
+    {
         for req in required {
             if let Some(field) = req.as_str()
                 && !obj.contains_key(field)
@@ -1136,10 +1137,9 @@ fn validate_node(
     }
 
     // properties — recurse
-    if let (Some(properties), Some(obj)) = (
-        schema_obj.get("properties").and_then(|v| v.as_object()),
-        value.as_object(),
-    ) {
+    if let Some(obj) = value.as_object()
+        && let Some(properties) = schema_obj.get("properties").and_then(|v| v.as_object())
+    {
         for (prop_name, prop_schema) in properties {
             if let Some(prop_value) = obj.get(prop_name) {
                 let child_path = JsonPointerPath::Prop {
@@ -1162,7 +1162,9 @@ fn validate_node(
     }
 
     // array items — recurse into each element
-    if let (Some(items_schema), Some(arr)) = (schema_obj.get("items"), value.as_array()) {
+    if let Some(arr) = value.as_array()
+        && let Some(items_schema) = schema_obj.get("items")
+    {
         for (i, elem) in arr.iter().enumerate() {
             let child_path = JsonPointerPath::Index {
                 parent: path,
@@ -1222,8 +1224,8 @@ fn validate_node(
     }
 
     // additionalProperties — reject unknown keys (false) or validate them against a sub-schema
-    if let (Some(add_props), Some(obj)) =
-        (schema_obj.get("additionalProperties"), value.as_object())
+    if let Some(obj) = value.as_object()
+        && let Some(add_props) = schema_obj.get("additionalProperties")
     {
         // Known-property membership is checked directly against the schema's
         // own `properties` map (already a `BTreeMap`) rather than collecting
@@ -1450,8 +1452,10 @@ pub struct ActivityInfo {
     /// `rate_limit(...)` form at compile time.
     pub rate_limit_key_expr: Option<&'static str>,
     /// Optional circuit-breaker policy (issue #369). When set, the worker
-    /// fast-fails dispatches of this activity with a non-retryable
-    /// `"CircuitOpen"` failure while the breaker is open. `None` retains
+    /// short-circuits dispatches of this activity while the breaker is open.
+    /// The policy's `open_mode` decides how (issue #1809). `Defer` (default)
+    /// puts the task back to `PENDING`. `FailFast` fails it with a
+    /// non-retryable `"CircuitOpen"` failure. `None` retains
     /// today's behaviour (no breaker; the full retry policy applies). Declared
     /// via `#[activity(circuit_breaker = CircuitBreakerPolicy::new(...))]`.
     pub circuit_breaker: Option<crate::policy::CircuitBreakerPolicy>,

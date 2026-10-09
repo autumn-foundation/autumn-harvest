@@ -4,6 +4,9 @@ Harvest migrations run against a live database. A migration that locks a hot
 table stops the engine for as long as it holds the lock, or waits for it. A
 waiting lock is as bad as a held one: every later write queues behind it.
 
+A migration must also keep the previous release working. See the
+[rolling-deploy contract](README.md#schema-changes-expand-then-contract).
+
 The CI lint `migration_lock_safety` (issue #1810) checks every migration after
 `20260914165542`. It runs in the `lint` job. Run it locally before you push:
 

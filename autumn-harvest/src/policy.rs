@@ -36,6 +36,7 @@ pub fn compute_retry_delay(
 /// The default is [`Full`](Self::Full), so tasks that fail together do not
 /// retry together (issue #1792). Use [`None`](Self::None) for exact timing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub enum JitterPolicy {
     /// Exact backoff, with no jitter.
     None,
@@ -151,12 +152,14 @@ pub fn compute_retry_delay_with_seed(
 /// assert_eq!(policy.max_attempts, 3);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct RetryPolicy {
     /// Maximum number of attempts (including the first). 1 = no retries.
     pub max_attempts: u32,
     /// Delay before the first retry.
     pub initial_interval: Duration,
     /// Multiplier applied after each retry (`1.0` = fixed delay).
+    #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::finite_f64))]
     pub backoff_coefficient: f64,
     /// Upper bound on delay between retries.
     pub max_interval: Duration,
@@ -332,27 +335,37 @@ pub fn resolve_retry_after_hint(
 /// When attached to an activity (via the `#[activity(circuit_breaker = ...)]`
 /// attribute or builder registration), the worker tracks consecutive failures
 /// of that activity within a rolling window. Once `failure_threshold` failures
-/// accumulate inside `window`, the breaker **trips open** and subsequent
-/// dispatches fast-fail with a non-retryable
-/// [`ActivityFailure`](crate::failure::ActivityFailure) of error type
-/// `"CircuitOpen"` instead of being retried against a downstream that is known
-/// to be down. After `cooldown` elapses the breaker moves to half-open and
+/// accumulate inside `window`, the breaker **trips open**. `open_mode` then
+/// decides what happens to each later dispatch:
+///
+/// - [`CircuitOpenMode::Defer`] (default): the task goes back to `PENDING`
+///   until the next probe. It uses no attempt and appends no event.
+/// - [`CircuitOpenMode::FailFast`]: the attempt fails with a non-retryable
+///   [`ActivityFailure`](crate::failure::ActivityFailure) of error type
+///   `"CircuitOpen"`.
+///
+/// After `cooldown` elapses the breaker moves to half-open and
 /// admits a single probe; success re-closes it, failure re-opens it.
 ///
 /// Circuit state is tracked in-process and per-shard — it never touches the
 /// workflow event log, so the append-only contract is unchanged and replay is
-/// unaffected (a short-circuited attempt records an ordinary `ActivityFailed`
-/// event).
+/// unaffected. A deferral appends no event. A fail-fast short circuit
+/// records an ordinary `ActivityFailed` event.
 ///
 /// ## Examples
 ///
 /// ```rust
 /// use std::time::Duration;
-/// use autumn_harvest::policy::CircuitBreakerPolicy;
+/// use autumn_harvest::policy::{CircuitBreakerPolicy, CircuitOpenMode};
 ///
 /// // Trip after 10 failures within 30s; re-probe after 60s.
 /// let policy = CircuitBreakerPolicy::new(10, Duration::from_secs(30), Duration::from_secs(60));
 /// assert_eq!(policy.failure_threshold, 10);
+/// assert_eq!(policy.open_mode, CircuitOpenMode::Defer);
+///
+/// // A Saga that compensates on `CircuitOpen` needs the fast failure.
+/// let fail_fast = policy.with_open_mode(CircuitOpenMode::FailFast);
+/// assert_eq!(fail_fast.open_mode, CircuitOpenMode::FailFast);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CircuitBreakerPolicy {
@@ -364,6 +377,27 @@ pub struct CircuitBreakerPolicy {
     /// Cooldown after the breaker opens before a single half-open probe is
     /// admitted.
     pub cooldown: Duration,
+    /// What a dispatch does while the breaker is open (issue #1809).
+    /// A policy serialized before this field existed reads as the default.
+    #[serde(default)]
+    pub open_mode: CircuitOpenMode,
+}
+
+/// What a dispatch does while its circuit breaker is open (issue #1809).
+///
+/// `docs/adr/0005-activity-timeout-retry-and-open-circuit.md` records why
+/// [`Defer`](Self::Defer) is the default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CircuitOpenMode {
+    /// Put the claimed task back to `PENDING` until the next probe. The
+    /// deferral uses no attempt and appends no event.
+    #[default]
+    Defer,
+    /// Fail the attempt with a non-retryable `CircuitOpen` failure. Use it
+    /// when a workflow must react to the outage at once, for example with a
+    /// Saga compensation.
+    FailFast,
 }
 
 impl CircuitBreakerPolicy {
@@ -378,7 +412,15 @@ impl CircuitBreakerPolicy {
             failure_threshold: failure_threshold.max(1),
             window,
             cooldown,
+            open_mode: CircuitOpenMode::Defer,
         }
+    }
+
+    /// Set what a dispatch does while the breaker is open (issue #1809).
+    #[must_use]
+    pub const fn with_open_mode(mut self, open_mode: CircuitOpenMode) -> Self {
+        self.open_mode = open_mode;
+        self
     }
 }
 
@@ -448,6 +490,121 @@ impl Default for RetryBudgetPolicy {
             Self::DEFAULT_MAX_TOKENS,
             Self::DEFAULT_MIN_RETRIES_PER_SEC,
         )
+    }
+}
+
+/// Adaptive concurrency limit for one activity type (issue #1836).
+///
+/// The worker caps the in-flight attempts of the type. The cap follows the
+/// handler latency and the retryable failures. See [`crate::adaptive_limit`]
+/// for the rules.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::policy::AdaptiveLimitPolicy;
+///
+/// // Let the cap move between 2 and 64 in-flight attempts.
+/// let policy = AdaptiveLimitPolicy::new(2, 64);
+/// assert_eq!(policy.max_limit, 64);
+/// assert_eq!(AdaptiveLimitPolicy::default().min_limit, 1);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AdaptiveLimitPolicy {
+    /// Lowest cap. At least 1.
+    pub min_limit: u32,
+    /// Highest cap. At least `min_limit`.
+    pub max_limit: u32,
+    /// Latency inflation over the no-load baseline that the limit accepts.
+    /// At 1.25, the gradient stays at 1 until latency is 25 % above the
+    /// baseline. Above that, the cap grows more slowly and settles. At
+    /// least 1.
+    pub tolerance: f64,
+    /// Factor that an overloaded window applies to the cap. It is in the
+    /// range from 0.5 to 1.
+    pub backoff_ratio: f64,
+    /// Share of retryable failures above which a window is overloaded. It
+    /// is in the range from 0 to 1. At 0, one failure cuts the cap. A higher
+    /// value keeps rare failures from throttling a healthy dependency.
+    pub error_threshold: f64,
+    /// Samples between two baseline probes. At least
+    /// [`AdaptiveLimitPolicy::MIN_PROBE_INTERVAL`].
+    pub probe_interval: u32,
+}
+
+impl AdaptiveLimitPolicy {
+    /// Default lowest cap.
+    pub const DEFAULT_MIN_LIMIT: u32 = 1;
+    /// Default highest cap.
+    pub const DEFAULT_MAX_LIMIT: u32 = 200;
+    /// Default latency tolerance.
+    pub const DEFAULT_TOLERANCE: f64 = 1.25;
+    /// Default backoff factor for an overloaded window.
+    pub const DEFAULT_BACKOFF_RATIO: f64 = 0.9;
+    /// Default failure share above which a window is overloaded.
+    pub const DEFAULT_ERROR_THRESHOLD: f64 = 0.05;
+    /// Default samples between two baseline probes.
+    pub const DEFAULT_PROBE_INTERVAL: u32 = 1_000;
+    /// Fewest samples between two baseline probes.
+    pub const MIN_PROBE_INTERVAL: u32 = 10;
+
+    /// Construct a policy with the given cap range and default tuning.
+    #[must_use]
+    pub fn new(min_limit: u32, max_limit: u32) -> Self {
+        Self {
+            min_limit,
+            max_limit,
+            ..Self::default()
+        }
+        .sanitized()
+    }
+
+    /// Apply the field rules. The fields are public, so a caller can set a
+    /// NaN or an inverted range directly.
+    ///
+    /// `min_limit` becomes at least 1, and `max_limit` at least `min_limit`.
+    /// A non-finite or low `tolerance` becomes 1. A `backoff_ratio` outside
+    /// the range from 0.5 to 1 is clamped, and NaN becomes the default.
+    /// `error_threshold` follows the same rule in the range from 0 to 1.
+    #[must_use]
+    pub fn sanitized(self) -> Self {
+        let min_limit = self.min_limit.max(1);
+        let tolerance = if self.tolerance.is_finite() {
+            self.tolerance.max(1.0)
+        } else {
+            1.0
+        };
+        let backoff_ratio = if self.backoff_ratio.is_nan() {
+            Self::DEFAULT_BACKOFF_RATIO
+        } else {
+            self.backoff_ratio.clamp(0.5, 1.0)
+        };
+        let error_threshold = if self.error_threshold.is_nan() {
+            Self::DEFAULT_ERROR_THRESHOLD
+        } else {
+            self.error_threshold.clamp(0.0, 1.0)
+        };
+        Self {
+            min_limit,
+            max_limit: self.max_limit.max(min_limit),
+            tolerance,
+            backoff_ratio,
+            error_threshold,
+            probe_interval: self.probe_interval.max(Self::MIN_PROBE_INTERVAL),
+        }
+    }
+}
+
+impl Default for AdaptiveLimitPolicy {
+    fn default() -> Self {
+        Self {
+            min_limit: Self::DEFAULT_MIN_LIMIT,
+            max_limit: Self::DEFAULT_MAX_LIMIT,
+            tolerance: Self::DEFAULT_TOLERANCE,
+            backoff_ratio: Self::DEFAULT_BACKOFF_RATIO,
+            error_threshold: Self::DEFAULT_ERROR_THRESHOLD,
+            probe_interval: Self::DEFAULT_PROBE_INTERVAL,
+        }
     }
 }
 
@@ -579,6 +736,8 @@ pub enum Schedule {
     /// UTC on upgrade.
     Cron(String),
     /// Fixed interval from the end of the previous run.
+    ///
+    /// The period must be a whole number of seconds greater than zero.
     Interval(Duration),
     /// Only runs when triggered manually via API.
     Manual,
@@ -1409,13 +1568,14 @@ impl WorkflowSchedule {
 /// Validate a [`Schedule`] value, returning an error string if it is invalid.
 ///
 /// For [`Schedule::Cron`] expressions this parses the expression using
-/// `croner` (5-field or 6-field with seconds). For other variants the schedule
-/// is always valid.
+/// `croner` (5-field or 6-field with seconds). A [`Schedule::Interval`] period
+/// must be a whole number of seconds greater than zero.
 ///
 /// # Errors
 ///
 /// Returns a human-readable error string if the cron expression is
-/// syntactically invalid.
+/// syntactically invalid. Also returns one if the interval is zero or has a
+/// fractional second.
 pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
     match schedule {
         Schedule::Cron(expr) => Cron::new(expr)
@@ -1443,6 +1603,12 @@ pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
         Schedule::Interval(period) if period.is_zero() => {
             Err("interval schedule period must be greater than zero".to_string())
         }
+        // `schedule_expr` drops a fraction on write. A sub-second period reads
+        // back as zero (issue #1967). The scheduler ticks once a second, so it
+        // cannot keep a shorter cadence.
+        Schedule::Interval(period) if period.subsec_nanos() != 0 => Err(format!(
+            "interval schedule period must be a whole number of seconds, got {period:?}"
+        )),
         Schedule::Interval(_) | Schedule::Manual => Ok(()),
     }
 }
@@ -1584,6 +1750,47 @@ pub(crate) fn resolve_effective_start_to_close(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    // ── Circuit open mode (issue #1809) ────────────────────────────────────
+
+    #[test]
+    fn circuit_breaker_policy_defers_by_default() {
+        let policy = CircuitBreakerPolicy::new(3, Duration::from_secs(30), Duration::from_secs(60));
+        assert_eq!(policy.open_mode, CircuitOpenMode::Defer);
+        assert_eq!(CircuitOpenMode::default(), CircuitOpenMode::Defer);
+    }
+
+    #[test]
+    fn circuit_breaker_policy_with_open_mode_sets_fail_fast() {
+        let policy = CircuitBreakerPolicy::new(3, Duration::from_secs(30), Duration::from_secs(60))
+            .with_open_mode(CircuitOpenMode::FailFast);
+        assert_eq!(policy.open_mode, CircuitOpenMode::FailFast);
+    }
+
+    #[test]
+    fn circuit_breaker_policy_without_open_mode_deserializes_to_defer() {
+        let mut json = serde_json::to_value(CircuitBreakerPolicy::new(
+            3,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        ))
+        .unwrap();
+        json.as_object_mut().unwrap().remove("open_mode");
+        let policy: CircuitBreakerPolicy = serde_json::from_value(json).unwrap();
+        assert_eq!(policy.open_mode, CircuitOpenMode::Defer);
+    }
+
+    #[test]
+    fn circuit_open_mode_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_value(CircuitOpenMode::FailFast).unwrap(),
+            serde_json::json!("fail_fast")
+        );
+        assert_eq!(
+            serde_json::to_value(CircuitOpenMode::Defer).unwrap(),
+            serde_json::json!("defer")
+        );
+    }
 
     // ── Retry-After hint clamp/resolve (issue #744) ────────────────────────────
     //
@@ -2386,6 +2593,23 @@ mod tests {
         );
         // A positive interval remains valid.
         assert!(validate_schedule(&Schedule::Interval(Duration::from_secs(1))).is_ok());
+    }
+
+    #[test]
+    fn subsecond_interval_schedule_rejected() {
+        // The stored form holds whole seconds only (issue #1967).
+        for interval in [
+            Duration::from_nanos(1),
+            Duration::from_millis(500),
+            Duration::from_millis(1_500),
+        ] {
+            let err = validate_schedule(&Schedule::Interval(interval)).unwrap_err();
+            assert!(
+                err.contains("whole number of seconds"),
+                "{interval:?} must be rejected: {err}"
+            );
+        }
+        assert!(validate_schedule(&Schedule::Interval(Duration::from_secs(u64::MAX))).is_ok());
     }
 
     #[test]

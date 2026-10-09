@@ -444,6 +444,15 @@ async fn handle_webhook(
     };
     let metrics = runtime.registry().telemetry().metrics.clone();
 
+    // These routes skip `admit_mutation`, so they run the DR fence check
+    // here (issue #1823). The refusal is a `503`. A `5xx` releases the replay
+    // key, so the provider retries later against a node with authority.
+    // The guards are held until this handler returns.
+    let fence = match crate::api::enforce_dr_fence(&api_state).await {
+        Ok(guards) => guards,
+        Err(refusal) => return refusal.into_response(),
+    };
+
     let payload: serde_json::Value = match serde_json::from_slice(hook.raw_body()) {
         Ok(v) => v,
         Err(e) => {
@@ -517,17 +526,22 @@ async fn handle_webhook(
             // header-name constant the handler reads so the two can't drift.
             let mut start_headers = headers.clone();
             start_headers.remove(HEADER_IDEMPOTENCY_KEY);
-            Box::pin(crate::api::start_workflow(
-                Extension(api_state.clone()),
-                axum::extract::Path(workflow.to_string()),
-                None,
-                start_headers,
-                Ok(Json(StartWorkflowRequest::from_webhook(
-                    workflow_id.as_str().to_string(),
-                    payload,
-                    queue.map(str::to_string),
-                ))),
-            ))
+            // A lost fence session stops the dispatch with a `503`.
+            crate::api::run_dr_fenced(
+                &fence,
+                Box::pin(crate::api::start_workflow(
+                    Extension(api_state.clone()),
+                    axum::extract::Path(workflow.to_string()),
+                    None,
+                    None,
+                    start_headers,
+                    Ok(Json(StartWorkflowRequest::from_webhook(
+                        workflow_id.as_str().to_string(),
+                        payload,
+                        queue.map(str::to_string),
+                    ))),
+                )),
+            )
             .await
         }
         WebhookTarget::SignalsWithStart {
@@ -563,19 +577,23 @@ async fn handle_webhook(
                 .delivery_id
                 .as_deref()
                 .map(|delivery_id| format!("{path}:{signal_name}:{delivery_id}"));
-            Box::pin(crate::api::signal_with_start_workflow(
-                Extension(api_state.clone()),
-                axum::extract::Path(workflow.to_string()),
-                None,
-                headers.clone(),
-                Json(SignalWithStartRequest::from_webhook(
-                    workflow_id.as_str().to_string(),
-                    payload,
-                    signal_name.to_string(),
-                    namespaced_idempotency_key,
-                    queue.map(str::to_string),
+            // A lost fence session stops the dispatch with a `503`.
+            crate::api::run_dr_fenced(
+                &fence,
+                Box::pin(crate::api::signal_with_start_workflow(
+                    Extension(api_state.clone()),
+                    axum::extract::Path(workflow.to_string()),
+                    None,
+                    headers.clone(),
+                    Json(SignalWithStartRequest::from_webhook(
+                        workflow_id.as_str().to_string(),
+                        payload,
+                        signal_name.to_string(),
+                        namespaced_idempotency_key,
+                        queue.map(str::to_string),
+                    )),
                 )),
-            ))
+            )
             .await
         }
     };
@@ -588,7 +606,13 @@ async fn handle_webhook(
         workflow_id: workflow_id.as_str(),
         delivery_id: ctx.delivery_id.as_deref(),
     };
-    reshape_dispatch_response(metrics.as_ref(), path, dispatch_response, audit_ctx).await
+    // The reshape writes an audit row, so it runs under the same guards. A
+    // lost fence session skips it and answers `503`.
+    crate::api::run_dr_fenced(
+        &fence,
+        reshape_dispatch_response(metrics.as_ref(), path, dispatch_response, audit_ctx),
+    )
+    .await
 }
 
 /// Context needed to write the `webhook.trigger` audit row for one dispatch

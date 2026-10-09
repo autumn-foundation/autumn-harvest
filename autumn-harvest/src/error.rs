@@ -74,6 +74,7 @@ impl std::fmt::Display for PayloadKind {
 /// assert_eq!(timeout.to_string(), "StartToClose");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub enum TimeoutType {
     /// Worker claimed the task but didn't finish in time.
     StartToClose,
@@ -535,6 +536,20 @@ pub enum HarvestError {
         existing_state: String,
     },
 
+    /// A start with a tenant met a prior run of another tenant (issue #1977).
+    ///
+    /// The start changes nothing: it does not attach to, cancel, replace or
+    /// seal the prior run. A run with no tenant counts as another tenant. The
+    /// error names no execution, so a caller learns only that the id is in
+    /// use.
+    #[error("workflow id {workflow_name}/{workflow_id} is in use by a run of another tenant")]
+    TenantConflict {
+        /// The workflow type of the start.
+        workflow_name: String,
+        /// The business key of the start.
+        workflow_id: String,
+    },
+
     /// An update request was rejected by the handler's validator before being
     /// admitted to the workflow's event history.
     ///
@@ -746,7 +761,7 @@ pub enum HarvestError {
     /// absent entirely. That also fences: a pinned worker with nothing to
     /// check against fails closed rather than assuming it still has authority.
     #[error(
-        "shard {shard_id} is fenced: this worker is pinned to generation {pinned} but the \
+        "shard {shard_id} is fenced: this process expects generation {pinned} but the \
          database is at {current:?} — another region holds write authority"
     )]
     ShardFenced {

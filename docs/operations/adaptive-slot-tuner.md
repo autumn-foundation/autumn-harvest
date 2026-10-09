@@ -209,6 +209,13 @@ moment — none of them is aware of, or adjusts, the others:
   enforced at claim/dispatch time. The slot tuner never grants extra tokens
   or bypasses a rate limit — a rate-limited activity can still be
   throttled even when the tuner has grown the semaphore to `max_slots`.
+- **Adaptive limit per activity type (issue #1836,
+  `WorkerConfig::with_adaptive_limit`)** caps the in-flight attempts of one
+  activity type. The cap follows the handler latency and the retryable
+  failures, not the permit wait. Use it when a dependency is the
+  bottleneck. The tuner grows on waits, and more calls then only add
+  latency. See [design decision 12](../architecture.md#key-design-decisions)
+  and [the adaptive-limit runbook](../runbooks/activity-concurrency-limit.md).
 
 ## Scope and cadence
 

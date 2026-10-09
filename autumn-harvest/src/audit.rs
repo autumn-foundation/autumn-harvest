@@ -195,6 +195,10 @@ pub const OP_BATCH_RESET: &str = "batch.reset";
 pub const OP_BUILD_RAMP_SET: &str = "build_routing.ramp.set";
 /// Audit operation: Cleared a queue's percentage build ramp (issue #604).
 pub const OP_BUILD_RAMP_CLEAR: &str = "build_routing.ramp.clear";
+/// Audit operation: The ramp guard aborted a queue's build ramp (issue #1814).
+///
+/// The actor is `system`. The row's summary holds the reason and both rates.
+pub const OP_BUILD_RAMP_AUTO_ABORT: &str = "build_routing.ramp.auto_abort";
 /// Audit operation: Manually redrove a dead-lettered completion-callback
 /// delivery (issue #605).
 pub const OP_CALLBACK_REDRIVE: &str = "completion_callback.redrive";
@@ -237,12 +241,30 @@ pub const OP_TOKEN_REVOKE: &str = "token.revoke";
 pub const OP_LOAD_SHED_TRIP: &str = "load_shed.trip";
 /// Audit operation: a queue stopped shedding new starts (issue #1794).
 pub const OP_LOAD_SHED_CLEAR: &str = "load_shed.clear";
+/// Audit operation: an operator's `harvest shard rebalance` or
+/// `rebalance-resume` stepped a shard migration (issue #964).
+///
+/// The CLI writes it, not a route. So no `ALL_MUTATION_ROUTES` entry exists
+/// for it.
+pub const OP_SHARD_REBALANCE_MIGRATE: &str = "shard.rebalance.migrate";
+/// Audit operation: the rebalance-resume scanner settled a shard migration
+/// that stalled after its cutover (issue #1839).
+///
+/// The scanner writes it, not a route. So no `ALL_MUTATION_ROUTES` entry
+/// exists for it.
+pub const OP_SHARD_REBALANCE_AUTO_RESUME: &str = "shard.rebalance.auto_resume";
 /// Audit operation: a token scope or the authorizer hook denied a request
 /// (issue #1803).
 ///
 /// The row has status `failed`, so the SIEM export marks it `ERROR`. The deny
 /// reason goes in `error_summary` and never into the response.
 pub const OP_AUTHZ_DENY: &str = "authz.deny";
+/// Audit operation: one API rate-limit bucket reached the sustained-rejection
+/// threshold in one window (issue #1827).
+///
+/// The row has status `failed`. The limiter writes it, not a route, so no
+/// `ALL_MUTATION_ROUTES` entry exists for it.
+pub const OP_API_RATE_LIMIT_SUSTAINED: &str = "api.rate_limit_sustained";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
@@ -952,6 +974,15 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     // writes these rows.
     OP_LOAD_SHED_TRIP,
     OP_LOAD_SHED_CLEAR,
+    // Build ramp guard (issue #1814). No route entry: the guard writes these
+    // rows.
+    OP_BUILD_RAMP_AUTO_ABORT,
+    // Shard rebalancing (issues #964 and #1839). No route entry: the CLI and
+    // the rebalance-resume scanner write these rows.
+    OP_SHARD_REBALANCE_MIGRATE,
+    OP_SHARD_REBALANCE_AUTO_RESUME,
+    // API rate limiting (issue #1827). No route entry: the limiter writes it.
+    OP_API_RATE_LIMIT_SUSTAINED,
 ];
 
 /// Routes explicitly excluded from audit.
@@ -1520,10 +1551,33 @@ impl Default for AuditFilters {
 /// the HTTP client — the audit record must be durable before the response is
 /// sent.
 ///
+/// A read route writes audit rows too, with no fence barrier. So when the
+/// DR fence is on, the insert checks the fence in its own transaction
+/// (issue #1823). See [`crate::replication::assert_database_fence`].
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] if the insert fails.
+/// Returns the fence's error when this process lost write authority.
 pub async fn insert_audit(
+    conn: &mut AsyncPgConnection,
+    record: &NewAuditRecord<'_>,
+) -> HarvestResult<Uuid> {
+    use diesel_async::AsyncConnection as _;
+    if !crate::replication::FenceRegistry::is_enabled() {
+        return insert_audit_row(conn, record).await;
+    }
+    Box::pin(
+        conn.transaction::<_, crate::error::HarvestError, _>(async move |conn| {
+            crate::replication::assert_database_fence(conn).await?;
+            insert_audit_row(conn, record).await
+        }),
+    )
+    .await
+}
+
+/// The insert of [`insert_audit`], with no fence check.
+async fn insert_audit_row(
     conn: &mut AsyncPgConnection,
     record: &NewAuditRecord<'_>,
 ) -> HarvestResult<Uuid> {
@@ -1553,7 +1607,8 @@ const MAX_AUDIT_BATCH_ROWS: usize = 4999;
 /// the connection.
 ///
 /// Same durability contract as [`insert_audit`]: the caller must ensure this
-/// returns `Ok` before reporting success for every mutation it covers.
+/// returns `Ok` before reporting success for every mutation it covers. Same
+/// DR fence check too (issue #1823).
 ///
 /// # Errors
 ///
@@ -1562,6 +1617,24 @@ const MAX_AUDIT_BATCH_ROWS: usize = 4999;
 /// chunk is its own statement, matching the per-row loop this replaces,
 /// which offered no cross-row atomicity either.
 pub async fn insert_audit_batch(
+    conn: &mut AsyncPgConnection,
+    records: &[NewAuditRecord<'_>],
+) -> HarvestResult<Vec<Uuid>> {
+    use diesel_async::AsyncConnection as _;
+    if records.is_empty() || !crate::replication::FenceRegistry::is_enabled() {
+        return insert_audit_rows(conn, records).await;
+    }
+    Box::pin(
+        conn.transaction::<_, crate::error::HarvestError, _>(async move |conn| {
+            crate::replication::assert_database_fence(conn).await?;
+            insert_audit_rows(conn, records).await
+        }),
+    )
+    .await
+}
+
+/// The inserts of [`insert_audit_batch`], with no fence check.
+async fn insert_audit_rows(
     conn: &mut AsyncPgConnection,
     records: &[NewAuditRecord<'_>],
 ) -> HarvestResult<Vec<Uuid>> {

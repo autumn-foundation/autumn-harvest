@@ -157,6 +157,9 @@ pub struct HarvestBuilder {
     /// Automatic per-queue load shedding (issue #1794). An empty config turns
     /// it off.
     load_shed: crate::load_shed::LoadShedConfig,
+    /// Metric-gated automatic build-ramp abort (issue #1814). The default
+    /// config is disabled.
+    ramp_guard: crate::ramp_guard::RampGuardConfig,
     /// Declarative completion triggers (issue #517).
     completion_triggers: Vec<crate::completion_trigger::CompletionTrigger>,
     /// Server-side ceiling on `workflow_attempt` (issue #523).
@@ -186,10 +189,13 @@ pub struct HarvestBuilder {
     /// `wasm_activity(...)` call (issue #965). `None` = no WASM activities.
     #[cfg(feature = "wasm-activities")]
     wasm_store: Option<Arc<crate::wasm_activities::WasmModuleStore>>,
-    /// `(activity_name, module_bytes)` pairs published to each worker's shard DB
-    /// at startup (issue #965).
+    /// `(activity_name, module_bytes, signature)` entries published to each
+    /// worker's shard DB at startup (issue #965, issue #1838).
     #[cfg(feature = "wasm-activities")]
-    wasm_module_registrations: Vec<(String, Vec<u8>)>,
+    wasm_module_registrations: Vec<(String, Vec<u8>, Option<String>)>,
+    /// Raw Ed25519 public keys of trusted WASM publishers (issue #1838).
+    #[cfg(feature = "wasm-activities")]
+    wasm_trusted_keys: Vec<[u8; 32]>,
 }
 
 impl Default for HarvestBuilder {
@@ -226,6 +232,7 @@ impl Default for HarvestBuilder {
             unknown_target_grace_window: None,
             batch_start_config: BatchStartConfig::default(),
             load_shed: crate::load_shed::LoadShedConfig::new(),
+            ramp_guard: crate::ramp_guard::RampGuardConfig::default(),
             completion_triggers: Vec::new(),
             max_workflow_attempts: None,
             usage_window_ceiling: None,
@@ -240,6 +247,8 @@ impl Default for HarvestBuilder {
             wasm_store: None,
             #[cfg(feature = "wasm-activities")]
             wasm_module_registrations: Vec::new(),
+            #[cfg(feature = "wasm-activities")]
+            wasm_trusted_keys: Vec::new(),
         }
     }
 }
@@ -287,6 +296,7 @@ impl std::fmt::Debug for HarvestBuilder {
             )
             .field("batch_start_config", &self.batch_start_config)
             .field("load_shed", &self.load_shed)
+            .field("ramp_guard", &self.ramp_guard)
             .field("max_workflow_attempts", &self.max_workflow_attempts)
             .field("usage_window_ceiling", &self.usage_window_ceiling)
             .field("usage_max_groups", &self.usage_max_groups)
@@ -300,6 +310,49 @@ impl std::fmt::Debug for HarvestBuilder {
             )
             .finish_non_exhaustive()
     }
+}
+
+/// Log a warning when a history cap undercuts the soft `continue_as_new`
+/// threshold (issue #1804).
+///
+/// A cap at or below the threshold fails runs before `should_continue_as_new`
+/// turns true. A warning point at or below the threshold pages healthy runs.
+/// These are warnings, not errors: a small cap is a valid choice in tests.
+fn warn_if_history_cap_preempts_continue_as_new(policy: WorkflowHistoryPolicy) {
+    if history_cap_preempts_continue_as_new(policy) {
+        tracing::warn!(
+            event_hard_cap = ?policy.event_hard_cap(),
+            continue_as_new_threshold = policy.continue_as_new_threshold(),
+            "history_event_hard_cap is at or below history_continue_as_new_threshold; \
+             runs fail at the cap before should_continue_as_new turns true"
+        );
+    } else if history_warning_precedes_continue_as_new(policy) {
+        tracing::warn!(
+            history_bloat_warn_threshold = ?policy.history_bloat_warn_threshold(),
+            continue_as_new_threshold = policy.continue_as_new_threshold(),
+            "the history-bloat warning fires at or below history_continue_as_new_threshold; \
+             healthy runs warn before should_continue_as_new turns true"
+        );
+    }
+}
+
+/// `true` when the history-bloat warning fires at or below the soft threshold
+/// (issue #1804).
+///
+/// A tie counts. `should_continue_as_new` turns true only past the threshold,
+/// so a warning at the threshold pages a run that has not yet been told to
+/// rotate. Under the defaults the warning sits at 10,240, above 10,000.
+fn history_warning_precedes_continue_as_new(policy: WorkflowHistoryPolicy) -> bool {
+    policy
+        .history_bloat_warn_threshold()
+        .is_some_and(|threshold| threshold <= policy.continue_as_new_threshold())
+}
+
+/// `true` when the event hard cap fires before the soft threshold can.
+fn history_cap_preempts_continue_as_new(policy: WorkflowHistoryPolicy) -> bool {
+    policy
+        .event_hard_cap()
+        .is_some_and(|cap| cap <= policy.continue_as_new_threshold())
 }
 
 /// Built harvest registration set produced by [`HarvestBuilder::build`].
@@ -359,6 +412,9 @@ pub struct BuiltHarvest {
     /// Automatic per-queue load shedding (issue #1794). An empty config turns
     /// it off.
     pub load_shed: crate::load_shed::LoadShedConfig,
+    /// Metric-gated automatic build-ramp abort (issue #1814). The default
+    /// config is disabled.
+    pub ramp_guard: crate::ramp_guard::RampGuardConfig,
     /// Declarative completion triggers (issue #517).
     completion_triggers: Vec<crate::completion_trigger::CompletionTrigger>,
     /// Server-side ceiling on workflow retry attempts (issue #523). `None` = no ceiling.
@@ -402,7 +458,7 @@ pub struct BuiltHarvest {
     /// `(activity_name, module_bytes)` pairs published to each worker's shard DB
     /// at startup (issue #965).
     #[cfg(feature = "wasm-activities")]
-    wasm_module_registrations: Vec<(String, Vec<u8>)>,
+    wasm_module_registrations: Vec<(String, Vec<u8>, Option<String>)>,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -446,6 +502,7 @@ impl std::fmt::Debug for BuiltHarvest {
             )
             .field("batch_start_config", &self.batch_start_config)
             .field("load_shed", &self.load_shed)
+            .field("ramp_guard", &self.ramp_guard)
             .field("max_workflow_attempts", &self.max_workflow_attempts)
             .field("usage_window_ceiling", &self.usage_window_ceiling)
             .field("usage_max_groups", &self.usage_max_groups)
@@ -988,6 +1045,16 @@ pub enum HarvestBuilderError {
     )]
     AuditSinkSecretMissing,
 
+    /// An audit-chain key or accepted key is shorter than
+    /// [`crate::audit_chain::MIN_CHAIN_KEY_BYTES`] (issue #1838).
+    #[error("an audit chain key is {len} bytes; the chain needs at least {min} bytes")]
+    AuditChainKeyTooShort {
+        /// The configured key length.
+        len: usize,
+        /// The minimum key length.
+        min: usize,
+    },
+
     /// A native `#[activity]` registration shares its name with a WASM activity
     /// binding (issue #965 review). The native registration would win in the
     /// handler registry while the WASM binding lingered, so the worker's WASM
@@ -1003,6 +1070,26 @@ pub enum HarvestBuilderError {
         /// The name registered as both native and WASM.
         activity: String,
     },
+
+    /// A trusted WASM publisher key is not a valid Ed25519 public key
+    /// (issue #1838).
+    #[cfg(feature = "wasm-activities")]
+    #[error("trusted wasm publisher key {index} is not a valid ed25519 public key")]
+    WasmTrustedKeyInvalid {
+        /// Position of the key, in the order the builder received it.
+        index: usize,
+    },
+
+    /// A trusted publisher key is set, and a registered WASM module has no
+    /// valid signature from it (issue #1838).
+    #[cfg(feature = "wasm-activities")]
+    #[error("wasm activity '{activity}' has no trusted publisher signature: {reason}")]
+    WasmModuleSignatureRejected {
+        /// The activity whose module was refused.
+        activity: String,
+        /// Why the signature was refused.
+        reason: String,
+    },
 }
 
 impl BuiltHarvest {
@@ -1017,12 +1104,21 @@ impl BuiltHarvest {
         &self.payload_codecs
     }
 
-    /// The `(activity_name, module_bytes)` WASM module registrations to publish
-    /// at worker startup (issue #965). Empty when no WASM activity is registered.
+    /// The `(activity_name, module_bytes, signature)` WASM module registrations
+    /// to publish at worker startup (issue #965). Empty when no WASM activity is
+    /// registered.
     #[cfg(feature = "wasm-activities")]
     #[must_use]
-    pub fn wasm_module_registrations(&self) -> &[(String, Vec<u8>)] {
+    pub fn wasm_module_registrations(&self) -> &[(String, Vec<u8>, Option<String>)] {
         &self.wasm_module_registrations
+    }
+
+    /// The shared WASM module store, if a WASM activity is registered
+    /// (issue #965).
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub const fn wasm_store(&self) -> Option<&Arc<crate::wasm_activities::WasmModuleStore>> {
+        self.wasm_store.as_ref()
     }
 
     /// The configured large-payload offloader, if a [`PayloadStore`] is
@@ -1330,7 +1426,8 @@ impl BuiltHarvest {
             self.worker_config.default_activity_start_to_close,
         )
         .with_retry_after_ceiling(self.worker_config.retry_after_ceiling)
-        .with_retry_budget(self.worker_config.retry_budget.clone());
+        .with_retry_budget(self.worker_config.retry_budget.clone())
+        .with_adaptive_limit(self.worker_config.adaptive_limit.clone());
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -1431,7 +1528,8 @@ impl BuiltHarvest {
             self.worker_config.default_activity_start_to_close,
         )
         .with_retry_after_ceiling(self.worker_config.retry_after_ceiling)
-        .with_retry_budget(self.worker_config.retry_budget.clone());
+        .with_retry_budget(self.worker_config.retry_budget.clone())
+        .with_adaptive_limit(self.worker_config.adaptive_limit.clone());
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -1814,6 +1912,23 @@ impl HarvestBuilder {
         self
     }
 
+    /// Encode the codec columns as well as the event payloads (issue #1979).
+    ///
+    /// The codec columns are `harvest_workflow_executions.input`, `.output`
+    /// and `.memo`, `harvest_signals.payload`, `harvest_dead_letters.input`,
+    /// and the workflow task's `harvest_task_queue.input` and `.output`. The
+    /// default is off.
+    ///
+    /// This release always decodes those columns. Turn the switch on only
+    /// after every worker and every API process runs this release or later.
+    /// An older reader takes an envelope for literal data. See
+    /// [`PayloadCodecs::set_column_encoding`].
+    #[must_use]
+    pub fn encode_payload_columns(self) -> Self {
+        self.payload_codecs.set_column_encoding(true);
+        self
+    }
+
     /// Register an external [`PayloadStore`](crate::payload_store::PayloadStore)
     /// for large-payload offloading via claim-check (issue #524).
     ///
@@ -1931,13 +2046,36 @@ impl HarvestBuilder {
         if let Some(existing) = self
             .wasm_module_registrations
             .iter_mut()
-            .find(|(existing_name, _)| *existing_name == registration.name)
+            .find(|(existing_name, _, _)| *existing_name == registration.name)
         {
             existing.1 = registration.wasm_bytes;
+            existing.2 = registration.signature;
         } else {
-            self.wasm_module_registrations
-                .push((registration.name, registration.wasm_bytes));
+            self.wasm_module_registrations.push((
+                registration.name,
+                registration.wasm_bytes,
+                registration.signature,
+            ));
         }
+        self
+    }
+
+    /// Trust WASM modules signed by this Ed25519 public key (issue #1838).
+    ///
+    /// Call it once per key. With one or more keys, every registered WASM
+    /// module needs a signature from a trusted key, or
+    /// [`try_build`](Self::try_build) fails. The worker also checks the
+    /// signature of each module before it runs it. See
+    /// [`crate::wasm_signing`].
+    ///
+    /// The policy covers WASM activity modules on the store this builder
+    /// creates. A `HandlerRegistry` built by hand needs
+    /// `WasmModuleStore::set_trust_policy` instead. Hot-swap workflow modules
+    /// keep their own HMAC check.
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn wasm_trusted_publisher_key(mut self, public_key: [u8; 32]) -> Self {
+        self.wasm_trusted_keys.push(public_key);
         self
     }
 
@@ -2092,6 +2230,33 @@ impl HarvestBuilder {
         self
     }
 
+    /// Turn on the keyed audit hash chain (issue #1838).
+    ///
+    /// The exporter stamps each row it sequences with an HMAC-SHA256 link to
+    /// the row before it. Keep the key outside the database. A key shorter than
+    /// [`crate::audit_chain::MIN_CHAIN_KEY_BYTES`] fails
+    /// [`try_build`](Self::try_build). See `docs/audit-export.md`.
+    #[must_use]
+    pub fn audit_export_chain_key(mut self, key: impl Into<Vec<u8>>) -> Self {
+        self.audit_export_config.chain_key =
+            Some(crate::completion_callback::CallbackSecret::new(key));
+        self
+    }
+
+    /// Accept `key` on a stored audit chain checkpoint (issue #1838).
+    ///
+    /// The exporter extends only a checkpoint that a known key signed. Add the
+    /// old key here during a key rotation. The exporter never signs with it.
+    /// A short key fails [`try_build`](Self::try_build). See
+    /// `docs/audit-export.md`.
+    #[must_use]
+    pub fn audit_export_chain_accept_key(mut self, key: impl Into<Vec<u8>>) -> Self {
+        self.audit_export_config
+            .chain_accept_keys
+            .push(crate::completion_callback::CallbackSecret::new(key));
+        self
+    }
+
     /// Records per exported batch. Clamped to
     /// `[1, crate::audit_export::MAX_EXPORT_BATCH_SIZE]`; defaults to
     /// [`crate::audit_export::DEFAULT_EXPORT_BATCH_SIZE`].
@@ -2154,10 +2319,45 @@ impl HarvestBuilder {
         self
     }
 
-    /// Configure an opt-in hard cap for workflow history event counts.
+    /// Override the hard cap on durable history events per run.
+    ///
+    /// Defaults to
+    /// [`DEFAULT_HISTORY_EVENT_HARD_CAP`](crate::context::DEFAULT_HISTORY_EVENT_HARD_CAP)
+    /// (50,000) since issue #1804. A run that reaches the cap fails and moves
+    /// to the DLQ with `HistoryCapExceeded`.
     #[must_use]
     pub const fn history_event_hard_cap(mut self, cap: u64) -> Self {
         self.history_policy = self.history_policy.with_event_hard_cap(cap);
+        self
+    }
+
+    /// Remove the history event hard cap (issue #1804).
+    ///
+    /// This also turns off the history-bloat warning, because the warning
+    /// is a fraction of the cap.
+    #[must_use]
+    pub const fn history_event_hard_cap_unlimited(mut self) -> Self {
+        self.history_policy = self.history_policy.without_event_hard_cap();
+        self
+    }
+
+    /// Override the hard cap on stored history bytes per run (issue #1804).
+    ///
+    /// Defaults to
+    /// [`DEFAULT_HISTORY_BYTE_HARD_CAP`](crate::context::DEFAULT_HISTORY_BYTE_HARD_CAP)
+    /// (50 MiB). The worker sums `pg_column_size(event_data)` once per
+    /// decision. A run that reaches the cap fails and moves to the DLQ with
+    /// `HistoryBytesCapExceeded`.
+    #[must_use]
+    pub const fn history_byte_hard_cap(mut self, cap: u64) -> Self {
+        self.history_policy = self.history_policy.with_byte_hard_cap(cap);
+        self
+    }
+
+    /// Remove the stored-history byte cap (issue #1804).
+    #[must_use]
+    pub const fn history_byte_hard_cap_unlimited(mut self) -> Self {
+        self.history_policy = self.history_policy.without_byte_hard_cap();
         self
     }
 
@@ -2165,17 +2365,28 @@ impl HarvestBuilder {
     /// at which the operator early-warning soft threshold fires (issue #704).
     /// Clamped into `[0.0, 1.0]`; `0.0` disables the signal entirely (AC4).
     ///
-    /// Has no effect unless a hard cap is also configured -- with no hard
-    /// cap there is nothing to warn about approaching.
+    /// The signal is off when the event cap is unlimited. With no cap there
+    /// is nothing to warn about approaching.
     ///
     /// Defaults to
     /// [`DEFAULT_HISTORY_BLOAT_WARN_FRACTION`](crate::context::DEFAULT_HISTORY_BLOAT_WARN_FRACTION)
-    /// (`0.75`).
+    /// (`0.2048`, so 10,240 events under the default cap).
     #[must_use]
     pub const fn history_bloat_warn_fraction(mut self, fraction: f64) -> Self {
         self.history_policy = self
             .history_policy
             .with_history_bloat_warn_fraction(fraction);
+        self
+    }
+
+    /// Record a `DecisionCommitted` boundary after each decision (issue #1833).
+    ///
+    /// Off by default. A worker older than this release fails an execution
+    /// whose history holds a boundary. Pass `true` only when no older
+    /// process runs. See `docs/decision-boundaries.md`.
+    #[must_use]
+    pub const fn record_decision_boundaries(mut self, enabled: bool) -> Self {
+        self.history_policy = self.history_policy.with_decision_boundaries(enabled);
         self
     }
 
@@ -2427,6 +2638,19 @@ impl HarvestBuilder {
         self
     }
 
+    /// Turn on the build ramp guard (issue #1814).
+    ///
+    /// The guard aborts a build ramp when the target build fails or ND-blocks
+    /// more runs than the base build. See
+    /// `docs/operations/build-ramp-guard.md`. The default config is disabled.
+    /// The plugin boot spawns the guard loop. A bare builder only stores the
+    /// config, so call `ramp_guard::run_ramp_guard` without the plugin.
+    #[must_use]
+    pub const fn ramp_guard(mut self, config: crate::ramp_guard::RampGuardConfig) -> Self {
+        self.ramp_guard = config;
+        self
+    }
+
     /// Number of registered workflows (used in tests and diagnostics).
     #[must_use]
     pub const fn workflow_count(&self) -> usize {
@@ -2527,6 +2751,12 @@ impl HarvestBuilder {
         validate_activity_rate_limits(&self.activities)?;
         #[cfg(feature = "wasm-activities")]
         validate_wasm_activity_name_collisions(&self.wasm_bindings, &self.activities)?;
+        #[cfg(feature = "wasm-activities")]
+        install_wasm_trust_policy(
+            &self.wasm_trusted_keys,
+            &self.wasm_module_registrations,
+            self.wasm_store.as_deref(),
+        )?;
         if let Err((url, rejection)) = self.completion_callback_config.validate_default_targets() {
             return Err(HarvestBuilderError::CallbackTargetRejected { url, rejection });
         }
@@ -2536,6 +2766,20 @@ impl HarvestBuilder {
         if self.audit_export_config.webhook_is_missing_a_secret() {
             return Err(HarvestBuilderError::AuditSinkSecretMissing);
         }
+        if let Some(key) = self
+            .audit_export_config
+            .chain_key
+            .iter()
+            .chain(&self.audit_export_config.chain_accept_keys)
+            .find(|key| key.as_bytes().len() < crate::audit_chain::MIN_CHAIN_KEY_BYTES)
+        {
+            return Err(HarvestBuilderError::AuditChainKeyTooShort {
+                len: key.as_bytes().len(),
+                min: crate::audit_chain::MIN_CHAIN_KEY_BYTES,
+            });
+        }
+
+        warn_if_history_cap_preempts_continue_as_new(self.history_policy);
 
         if let Some(ceiling) = self.max_workflow_history_events {
             let threshold = self.history_policy.continue_as_new_threshold();
@@ -2617,6 +2861,7 @@ impl HarvestBuilder {
             unknown_target_grace_window,
             batch_start_config: self.batch_start_config,
             load_shed: self.load_shed,
+            ramp_guard: self.ramp_guard,
             completion_triggers: self.completion_triggers,
             max_workflow_attempts: self.max_workflow_attempts,
             usage_window_ceiling,
@@ -2994,29 +3239,20 @@ fn validate_workflow_schedules(
                 workflow_name: schedule.workflow_name.clone(),
             });
         }
-        // Reject zero-length intervals (would cause infinite loops in due_run_plan
-        // with catchup=true) and invalid cron expressions (would silently never fire).
-        if let crate::policy::Schedule::Interval(dur) = &schedule.schedule {
-            if dur.is_zero() {
-                return Err(HarvestBuilderError::InvalidWorkflowSchedule {
-                    workflow_name: schedule.workflow_name.clone(),
-                    reason: "interval must be at least 1 second".to_string(),
-                });
-            }
-        } else {
-            // Validate timezone names early so operators get a typed error rather
-            // than a silent bad-timezone panic at first scheduler tick.
-            if let crate::policy::Schedule::CronInTimezone { tz, .. } = &schedule.schedule
-                && tz.parse::<chrono_tz::Tz>().is_err()
-            {
-                return Err(HarvestBuilderError::UnknownTimezone { name: tz.clone() });
-            }
-            if let Err(reason) = crate::policy::validate_schedule(&schedule.schedule) {
-                return Err(HarvestBuilderError::InvalidWorkflowSchedule {
-                    workflow_name: schedule.workflow_name.clone(),
-                    reason,
-                });
-            }
+        // Validate timezone names early so operators get a typed error rather
+        // than a silent bad-timezone panic at first scheduler tick.
+        if let crate::policy::Schedule::CronInTimezone { tz, .. } = &schedule.schedule
+            && tz.parse::<chrono_tz::Tz>().is_err()
+        {
+            return Err(HarvestBuilderError::UnknownTimezone { name: tz.clone() });
+        }
+        // Reject a bad cron expression, a zero interval and a fractional interval
+        // (issue #1967).
+        if let Err(reason) = crate::policy::validate_schedule(&schedule.schedule) {
+            return Err(HarvestBuilderError::InvalidWorkflowSchedule {
+                workflow_name: schedule.workflow_name.clone(),
+                reason,
+            });
         }
         if let Err(reason) = crate::policy::validate_jitter(&schedule.schedule, schedule.jitter) {
             return Err(HarvestBuilderError::InvalidWorkflowSchedule {
@@ -3386,6 +3622,34 @@ fn validate_wasm_activity_name_collisions(
     Ok(())
 }
 
+/// Build the WASM trust policy, check every registered module against it,
+/// and install it on the shared store (issue #1838).
+#[cfg(feature = "wasm-activities")]
+fn install_wasm_trust_policy(
+    keys: &[[u8; 32]],
+    registrations: &[(String, Vec<u8>, Option<String>)],
+    store: Option<&crate::wasm_activities::WasmModuleStore>,
+) -> Result<(), HarvestBuilderError> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let policy = crate::wasm_signing::WasmTrustPolicy::from_public_keys(keys)
+        .map_err(|e| HarvestBuilderError::WasmTrustedKeyInvalid { index: e.index })?;
+    for (name, bytes, signature) in registrations {
+        let hash = crate::wasm_activities::WasmModuleStore::compute_hash(bytes);
+        policy
+            .verify(name, &hash, signature.as_deref())
+            .map_err(|e| HarvestBuilderError::WasmModuleSignatureRejected {
+                activity: name.clone(),
+                reason: e.to_string(),
+            })?;
+    }
+    if let Some(store) = store {
+        store.set_trust_policy(Some(policy));
+    }
+    Ok(())
+}
+
 /// Reject local activities whose `default_start_to_close` exceeds the worker
 /// cap. Failing early gives operators a clear error instead of a runtime surprise.
 fn validate_local_activity_timeouts(
@@ -3702,14 +3966,20 @@ pub struct WorkerConfig {
     /// A value of `0` is normalized to `None` (no aging). `None` is the
     /// default — existing deployments are unaffected.
     pub priority_aging_secs: Option<u32>,
-    /// Enable cross-region DR write-authority fencing for this worker
-    /// (issue #954).
+    /// How this worker decides whether to fence its writes for cross-region
+    /// DR (issues #954, #1823).
     ///
-    /// **Off by default, and off costs nothing**: with it off the claim query
-    /// is the byte-for-byte pre-#954 statement, the persist path issues no
-    /// extra statement, and no replication sampler is spawned.
+    /// **[`DrFencing::Auto`] by default.** At startup the worker probes each
+    /// shard database for a DR marker: a `harvest_shard_generation` row, a DR
+    /// replication slot or a DR subscription. With a marker it fences. With
+    /// none it runs the byte-for-byte pre-#954 claim and persist paths, and
+    /// spawns no replication sampler. [`DrFencing::Disabled`] on a database
+    /// with a marker refuses to start.
     ///
-    /// When on, at startup the worker provisions and *pins* each assigned
+    /// [`DrFencing::Auto`]: crate::replication::DrFencing::Auto
+    /// [`DrFencing::Disabled`]: crate::replication::DrFencing::Disabled
+    ///
+    /// When fenced, at startup the worker provisions and *pins* each assigned
     /// shard's `harvest_shard_generation` epoch. From then on it can only claim
     /// tasks and append events while the database still reports that epoch. If
     /// an operator bumps it — the failover fence — this worker stops with
@@ -3720,22 +3990,23 @@ pub struct WorkerConfig {
     /// it, never by adopting the new epoch: adopting is precisely the
     /// split-brain the epoch exists to prevent. See
     /// `docs/runbooks/cross-region-failover.md`.
-    pub dr_fencing: bool,
+    pub dr_fencing: crate::replication::DrFencing,
     /// How often the DR sampler writes a replication watermark, reads the
     /// replication views, and re-checks this worker's fence (issue #954).
     ///
     /// Also the **resolution floor of the reported RPO** — a healthy
     /// deployment reports somewhere between zero and one interval — and the
     /// bound on how long a fenced worker keeps running before it notices. Only
-    /// used when [`Self::dr_fencing`] is set. Default: 15 seconds.
+    /// used when the worker is fenced; see [`Self::dr_fencing`]. Default: 15
+    /// seconds.
     pub replication_sample_interval: Duration,
     /// How much trailing watermark history the DR sampler keeps
     /// (issue #954).
     ///
     /// The ceiling on the lag that can be *measured*: a standby further behind
     /// than the oldest retained watermark reports an unknown RPO rather than a
-    /// floor value that would understate the loss. Only used when
-    /// [`Self::dr_fencing`] is set. Default: 1 hour.
+    /// floor value that would understate the loss. Only used when the worker is
+    /// fenced; see [`Self::dr_fencing`]. Default: 1 hour.
     pub replication_watermark_retain: Duration,
     /// Slot-name prefix identifying this shard's DR replication (issue #954).
     ///
@@ -3744,7 +4015,7 @@ pub struct WorkerConfig {
     /// the shard's database counts as a DR standby — including an unrelated
     /// logical-decoding consumer such as a CDC pipeline — and a shard whose
     /// real cross-region subscriber had disconnected would report itself
-    /// protected. Only used when [`Self::dr_fencing`] is set.
+    /// protected. The startup DR-marker probe uses it too (issue #1823).
     pub replication_slot_prefix: String,
     /// Maximum allowed start delay for a workflow (issue #322).
     /// Default: 365 days.
@@ -3759,6 +4030,12 @@ pub struct WorkerConfig {
     /// increments the task's `crash_strikes`. Once `crash_strikes` reaches this
     /// threshold the task is moved to the DLQ and its owning workflow is failed
     /// terminally, rather than being re-dispatched to crash another worker.
+    ///
+    /// The last strike waits until the reclaimer confirms the death of the
+    /// worker (issue #1879). Two sweeps in a row must see the orphan, and the
+    /// worker must write no heartbeat for two stale windows. Until then the
+    /// task stays `RUNNING`. A late worker that heartbeats again keeps its
+    /// task.
     ///
     /// Defaults to **3**. Set to `0` to disable quarantine entirely (reclaimed
     /// poison pills are re-queued indefinitely — the legacy retry-loop
@@ -3997,6 +4274,16 @@ pub struct WorkerConfig {
     /// The Postgres worker enforces the budget. Local activities and the
     /// `autumn-harvest-sqlite` backend do not use it.
     pub retry_budget: crate::retry_budget::RetryBudgetConfig,
+    /// Per-activity-type adaptive concurrency limits (issue #1836).
+    ///
+    /// **Off by default.** A limited type has a cap on its in-flight
+    /// attempts on this worker. The cap follows the handler latency and the
+    /// retryable failures. At the cap, the worker claims no more tasks of
+    /// that type. Set via `with_adaptive_limit`.
+    ///
+    /// The Postgres worker enforces the limit. Local activities and the
+    /// `autumn-harvest-sqlite` backend do not use it.
+    pub adaptive_limit: crate::adaptive_limit::AdaptiveLimitConfig,
 }
 
 /// Drop duplicate shard ids, preserving first-occurrence order (issue #797).
@@ -4125,7 +4412,7 @@ impl Default for WorkerConfig {
             deployment_name: None,
             query_timeout: Duration::from_secs(5),
             priority_aging_secs: None,
-            dr_fencing: false,
+            dr_fencing: crate::replication::DrFencing::Auto,
             replication_sample_interval: Duration::from_secs(15),
             replication_watermark_retain: Duration::from_secs(3600),
             replication_slot_prefix: crate::replication::DEFAULT_DR_SLOT_PREFIX.to_string(),
@@ -4147,6 +4434,7 @@ impl Default for WorkerConfig {
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
             scanner: crate::scanner_lease::ScannerConfig::default(),
             retry_budget: crate::retry_budget::RetryBudgetConfig::default(),
+            adaptive_limit: crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
         }
     }
 }
@@ -4228,6 +4516,9 @@ impl WorkerConfig {
     ///
     /// It also sets the drain's join window. A drain never aborts the
     /// handler. See [`WorkerConfig::shutdown_timeout`].
+    ///
+    /// A worker rejects a grace above
+    /// [`crate::worker::MAX_CANCELLATION_GRACE_PERIOD`] (24 h) at startup.
     #[must_use]
     pub const fn with_cancellation_grace_period(mut self, grace_period: Duration) -> Self {
         self.cancellation_grace_period = grace_period;
@@ -4288,23 +4579,53 @@ impl WorkerConfig {
         self.query_timeout = timeout;
         self
     }
-    /// Enable cross-region DR write-authority fencing (issue #954).
+    /// Force cross-region DR write-authority fencing on or off (issue #954).
     ///
-    /// See [`WorkerConfig::dr_fencing`]. Turning this on is what makes a
-    /// failover fence bite; leaving it off is byte-for-byte the pre-#954
-    /// runtime.
+    /// `true` sets [`DrFencing::Enabled`]. `false` sets [`DrFencing::Disabled`],
+    /// which refuses to start on a database that carries a DR marker. Leave
+    /// the default [`DrFencing::Auto`] unless you need one of those. See
+    /// [`WorkerConfig::dr_fencing`].
+    ///
+    /// [`DrFencing::Enabled`]: crate::replication::DrFencing::Enabled
+    /// [`DrFencing::Disabled`]: crate::replication::DrFencing::Disabled
+    /// [`DrFencing::Auto`]: crate::replication::DrFencing::Auto
     ///
     /// ## Examples
     ///
     /// ```rust
     /// use autumn_harvest::builder::WorkerConfig;
+    /// use autumn_harvest::replication::DrFencing;
     ///
     /// let config = WorkerConfig::default().with_dr_fencing(true);
-    /// assert!(config.dr_fencing);
+    /// assert_eq!(config.dr_fencing, DrFencing::Enabled);
     /// ```
     #[must_use]
     pub const fn with_dr_fencing(mut self, enabled: bool) -> Self {
-        self.dr_fencing = enabled;
+        self.dr_fencing = if enabled {
+            crate::replication::DrFencing::Enabled
+        } else {
+            crate::replication::DrFencing::Disabled
+        };
+        self
+    }
+
+    /// Set the cross-region DR fencing mode (issue #1823).
+    ///
+    /// See [`WorkerConfig::dr_fencing`].
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    /// use autumn_harvest::replication::DrFencing;
+    ///
+    /// assert_eq!(WorkerConfig::default().dr_fencing, DrFencing::Auto);
+    /// let config = WorkerConfig::default().with_dr_fencing_mode(DrFencing::Disabled);
+    /// assert_eq!(config.dr_fencing, DrFencing::Disabled);
+    /// ```
+    #[must_use]
+    pub const fn with_dr_fencing_mode(mut self, mode: crate::replication::DrFencing) -> Self {
+        self.dr_fencing = mode;
         self
     }
 
@@ -4770,6 +5091,17 @@ impl WorkerConfig {
     #[must_use]
     pub fn with_retry_budget(mut self, config: crate::retry_budget::RetryBudgetConfig) -> Self {
         self.retry_budget = config;
+        self
+    }
+
+    /// Set the per-activity-type adaptive concurrency limits (issue #1836).
+    /// See [`WorkerConfig::adaptive_limit`].
+    #[must_use]
+    pub fn with_adaptive_limit(
+        mut self,
+        config: crate::adaptive_limit::AdaptiveLimitConfig,
+    ) -> Self {
+        self.adaptive_limit = config;
         self
     }
 }
@@ -5362,6 +5694,27 @@ mod tests {
     }
 
     #[test]
+    fn harvest_builder_rejects_subsecond_workflow_schedule() {
+        // Issue #1967: the stored form would drop the fraction.
+        let err = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .workflow_schedule(WorkflowSchedule::new(
+                "test",
+                Schedule::Interval(Duration::from_millis(500)),
+            ))
+            .try_build()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::InvalidWorkflowSchedule { ref workflow_name, ref reason }
+                    if workflow_name == "test" && reason.contains("whole number of seconds")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
     fn harvest_builder_build_registers_shared_state() {
         let built = HarvestBuilder::new().state(String::from("hello")).build();
 
@@ -5385,7 +5738,61 @@ mod tests {
         let policy = built.history_policy();
 
         assert_eq!(policy.continue_as_new_threshold(), 10_000);
+        // Issue #1804: both hard caps are on by default.
+        assert_eq!(policy.event_hard_cap(), Some(50_000));
+        assert_eq!(policy.byte_hard_cap(), Some(50 * 1024 * 1024));
+    }
+
+    #[test]
+    fn harvest_builder_history_caps_accept_explicit_unlimited() {
+        // Issue #1804: an explicit "unlimited" turns each default cap off.
+        let built = HarvestBuilder::new()
+            .history_event_hard_cap_unlimited()
+            .history_byte_hard_cap_unlimited()
+            .build();
+        let policy = built.history_policy();
         assert_eq!(policy.event_hard_cap(), None);
+        assert_eq!(policy.byte_hard_cap(), None);
+    }
+
+    #[test]
+    fn history_cap_preempts_continue_as_new_only_at_or_below_the_threshold() {
+        let policy = WorkflowHistoryPolicy::default();
+        assert!(!history_cap_preempts_continue_as_new(policy));
+        assert!(history_cap_preempts_continue_as_new(
+            policy.with_continue_as_new_threshold(50_000)
+        ));
+        assert!(!history_cap_preempts_continue_as_new(
+            policy
+                .with_continue_as_new_threshold(60_000)
+                .without_event_hard_cap()
+        ));
+    }
+
+    #[test]
+    fn history_warning_precedes_continue_as_new_at_or_below_the_threshold() {
+        let policy = WorkflowHistoryPolicy::default();
+        // Defaults: the warning at 10,240 sits above the 10,000 threshold.
+        assert!(!history_warning_precedes_continue_as_new(policy));
+        // A tie precedes. The advisory turns true only past the threshold.
+        assert!(history_warning_precedes_continue_as_new(
+            policy.with_history_bloat_warn_fraction(0.2)
+        ));
+        // Cap 20,000 warns at 4,096, below the 10,000 threshold.
+        assert!(history_warning_precedes_continue_as_new(
+            policy.with_event_hard_cap(20_000)
+        ));
+        assert!(!history_warning_precedes_continue_as_new(
+            policy
+                .with_event_hard_cap(20_000)
+                .with_history_bloat_warn_fraction(0.75)
+        ));
+    }
+
+    #[test]
+    fn harvest_builder_accepts_history_byte_hard_cap_override() {
+        let built = HarvestBuilder::new().history_byte_hard_cap(4_096).build();
+        assert_eq!(built.history_policy().byte_hard_cap(), Some(4_096));
     }
 
     #[test]
@@ -5650,6 +6057,42 @@ mod tests {
         let (registry, _dags, _schedules, _worker_config) =
             built.into_worker_parts_with_extra_state(crate::context::SharedStateMap::new());
         assert_eq!(registry.retry_budgets().config(), &config);
+    }
+
+    /// The worker registry enforces the configured adaptive limit (issue
+    /// #1836).
+    #[cfg(feature = "db")]
+    #[test]
+    fn harvest_builder_wires_adaptive_limit_into_worker_registry() {
+        use crate::adaptive_limit::AdaptiveLimitConfig;
+        use crate::policy::AdaptiveLimitPolicy;
+
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let config = AdaptiveLimitConfig::disabled()
+            .with_activity("charge_card", Some(AdaptiveLimitPolicy::new(2, 32)));
+        let built = HarvestBuilder::new()
+            .worker(WorkerConfig::default().with_adaptive_limit(config.clone()))
+            .build();
+        let (registry, _dags, _schedules, _worker_config) = built.into_worker_parts();
+        assert_eq!(registry.adaptive_limits().config(), &config);
+
+        let built = HarvestBuilder::new()
+            .worker(WorkerConfig::default().with_adaptive_limit(config.clone()))
+            .build();
+        let (registry, _dags, _schedules, _worker_config) =
+            built.into_worker_parts_with_extra_state(crate::context::SharedStateMap::new());
+        assert_eq!(registry.adaptive_limits().config(), &config);
+    }
+
+    /// The adaptive limit is off by default (issue #1836).
+    #[test]
+    fn worker_config_adaptive_limit_is_off_by_default() {
+        let config = WorkerConfig::default();
+        assert_eq!(config.adaptive_limit.default_policy(), None);
+        assert!(config.adaptive_limit.overrides().is_empty());
     }
 
     /// The retry budget is on by default (issue #1793).
@@ -8046,6 +8489,51 @@ mod tests {
     }
 
     #[test]
+    fn builder_rejects_a_short_audit_chain_key() {
+        let result = HarvestBuilder::new()
+            .audit_export_chain_key(vec![1_u8; crate::audit_chain::MIN_CHAIN_KEY_BYTES - 1])
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::AuditChainKeyTooShort { len: 31, min: 32 })
+            ),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_a_short_audit_chain_accept_key() {
+        let result = HarvestBuilder::new()
+            .audit_export_chain_key(vec![1_u8; crate::audit_chain::MIN_CHAIN_KEY_BYTES])
+            .audit_export_chain_accept_key(vec![2_u8; 8])
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::AuditChainKeyTooShort { len: 8, min: 32 })
+            ),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_keeps_a_full_length_audit_chain_key() {
+        let built = HarvestBuilder::new()
+            .audit_export_chain_key(vec![1_u8; crate::audit_chain::MIN_CHAIN_KEY_BYTES])
+            .try_build()
+            .expect("a full-length chain key builds");
+        assert_eq!(
+            built
+                .audit_export_config()
+                .chain_key
+                .as_ref()
+                .map(|k| k.as_bytes().len()),
+            Some(crate::audit_chain::MIN_CHAIN_KEY_BYTES)
+        );
+    }
+
+    #[test]
     fn builder_accepts_an_allowlisted_audit_export_webhook() {
         let built = HarvestBuilder::new()
             .audit_export_allowlist(
@@ -8310,12 +8798,135 @@ mod tests {
             );
 
         // Exactly one registration entry for the name, carrying the LATER bytes.
-        let regs: Vec<&(String, Vec<u8>)> = builder
+        let regs: Vec<&(String, Vec<u8>, Option<String>)> = builder
             .wasm_module_registrations
             .iter()
-            .filter(|(n, _)| n == "checksum")
+            .filter(|(n, _, _)| n == "checksum")
             .collect();
         assert_eq!(regs.len(), 1, "duplicate name must not keep both blobs");
         assert_eq!(regs[0].1, vec![2, 2, 2], "must retain the later bytes");
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    fn wasm_publisher() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[9; 32])
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn a_trusted_key_rejects_an_unsigned_wasm_registration() {
+        use crate::wasm_store::WasmActivityRegistration;
+
+        let result = HarvestBuilder::new()
+            .wasm_trusted_publisher_key(wasm_publisher().verifying_key().to_bytes())
+            .wasm_activity(WasmActivityRegistration::new("checksum", vec![1, 2, 3]))
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::WasmModuleSignatureRejected { ref activity, .. })
+                    if activity == "checksum"
+            ),
+            "got {result:?}"
+        );
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn a_trusted_key_rejects_an_invalid_public_key() {
+        let bad = (0_u8..=255)
+            .map(|b| [b; 32])
+            .find(|k| ed25519_dalek::VerifyingKey::from_bytes(k).is_err())
+            .expect("an invalid point");
+        let result = HarvestBuilder::new()
+            .wasm_trusted_publisher_key(wasm_publisher().verifying_key().to_bytes())
+            .wasm_trusted_publisher_key(bad)
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::WasmTrustedKeyInvalid { index: 1 })
+            ),
+            "got {result:?}"
+        );
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn a_signed_wasm_registration_builds_and_installs_the_policy() {
+        use crate::wasm_store::WasmActivityRegistration;
+
+        let bytes = vec![1, 2, 3];
+        let signature =
+            crate::wasm_signing::sign_wasm_module(&wasm_publisher(), "checksum", &bytes);
+        let built = HarvestBuilder::new()
+            .wasm_trusted_publisher_key(wasm_publisher().verifying_key().to_bytes())
+            .wasm_activity(
+                WasmActivityRegistration::new("checksum", bytes).with_signature(signature),
+            )
+            .try_build()
+            .expect("a signed module builds");
+        let policy = built
+            .wasm_store()
+            .and_then(|store| store.trust_policy())
+            .expect("the store carries the trust policy");
+        assert_eq!(policy.len(), 1);
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn a_trusted_key_set_after_the_registration_still_applies() {
+        use crate::wasm_store::WasmActivityRegistration;
+
+        let result = HarvestBuilder::new()
+            .wasm_activity(WasmActivityRegistration::new("checksum", vec![1, 2, 3]))
+            .wasm_trusted_publisher_key(wasm_publisher().verifying_key().to_bytes())
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::WasmModuleSignatureRejected { .. })
+            ),
+            "got {result:?}"
+        );
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn a_re_registration_keeps_the_later_signature() {
+        use crate::wasm_store::WasmActivityRegistration;
+
+        let later = vec![4, 5, 6];
+        let signature =
+            crate::wasm_signing::sign_wasm_module(&wasm_publisher(), "checksum", &later);
+        let built = HarvestBuilder::new()
+            .wasm_trusted_publisher_key(wasm_publisher().verifying_key().to_bytes())
+            .wasm_activity(WasmActivityRegistration::new("checksum", vec![1, 2, 3]))
+            .wasm_activity(
+                WasmActivityRegistration::new("checksum", later).with_signature(signature.clone()),
+            )
+            .try_build()
+            .expect("the later, signed registration builds");
+        assert_eq!(
+            built.wasm_module_registrations()[0].2.as_deref(),
+            Some(signature.as_str())
+        );
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn without_a_trusted_key_no_policy_is_installed() {
+        use crate::wasm_store::WasmActivityRegistration;
+
+        let built = HarvestBuilder::new()
+            .wasm_activity(WasmActivityRegistration::new("checksum", vec![1, 2, 3]))
+            .try_build()
+            .expect("an unsigned module builds without a policy");
+        assert!(
+            built
+                .wasm_store()
+                .and_then(|store| store.trust_policy())
+                .is_none()
+        );
     }
 }

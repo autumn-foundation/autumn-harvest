@@ -343,6 +343,16 @@ pub struct RetentionConfig {
     /// type is never deleted. Uses [`BTreeMap`] for deterministic ordering and
     /// serialization. Issue #737.
     pub overrides: BTreeMap<String, u64>,
+    /// Per-tenant retention overrides keyed by tenant, each a max-age in
+    /// seconds (issue #1977).
+    ///
+    /// The janitor matches the key against `harvest_workflow_executions.tenant`.
+    /// Precedence is strict: a tenant override wins over a type override,
+    /// which wins over the global `max_age_secs`. A run with no tenant, or a
+    /// tenant with no override, falls back to the type and global ages. A
+    /// legal hold still exempts a run.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tenant_overrides: BTreeMap<String, u64>,
     /// How often the background retention job wakes up to scan for expired data.
     pub tick_interval_secs: u64,
     /// The maximum number of records to process in a single transaction/batch.
@@ -509,6 +519,7 @@ impl Default for RetentionConfig {
         Self {
             max_age_secs: None,
             overrides: BTreeMap::new(),
+            tenant_overrides: BTreeMap::new(),
             tick_interval_secs: DEFAULT_TICK_INTERVAL.as_secs(),
             batch_size: DEFAULT_BATCH_SIZE,
             dry_run: false,
@@ -558,6 +569,32 @@ impl RetentionConfig {
     ) -> Self {
         for (name, max_age) in iter {
             self.overrides.insert(name.into(), max_age.as_secs());
+        }
+        self
+    }
+
+    /// Register a per-tenant retention override (issue #1977).
+    ///
+    /// Every run whose stored tenant is `tenant` is kept for `max_age`. That
+    /// age wins over a type override and over the global `max_age`.
+    /// [`Self::validate`] applies the same bounds as a type override, and
+    /// checks the key with [`crate::tenant::validate_tenant`].
+    #[must_use]
+    pub fn with_tenant_override(mut self, tenant: impl Into<String>, max_age: Duration) -> Self {
+        self.tenant_overrides
+            .insert(tenant.into(), max_age.as_secs());
+        self
+    }
+
+    /// Register many per-tenant retention overrides (issue #1977).
+    #[must_use]
+    pub fn with_tenant_overrides<S: Into<String>>(
+        mut self,
+        iter: impl IntoIterator<Item = (S, Duration)>,
+    ) -> Self {
+        for (tenant, max_age) in iter {
+            self.tenant_overrides
+                .insert(tenant.into(), max_age.as_secs());
         }
         self
     }
@@ -761,6 +798,24 @@ impl RetentionConfig {
             .or_else(|| self.max_age())
     }
 
+    /// Resolves the effective history max-age for one run (issue #1977).
+    ///
+    /// The order is: the override for `tenant`, then the override for
+    /// `workflow_name`, then the global `max_age`. Returns `None` when none of
+    /// them is set. The run is then never deleted.
+    #[must_use]
+    pub fn effective_max_age_for(
+        &self,
+        workflow_name: &str,
+        tenant: Option<&str>,
+    ) -> Option<Duration> {
+        tenant
+            .and_then(|t| self.tenant_overrides.get(t))
+            .copied()
+            .map(Duration::from_secs)
+            .or_else(|| self.effective_max_age(workflow_name))
+    }
+
     /// The smallest effective retention age across the global `max_age` and all
     /// per-type overrides (issue #737).
     ///
@@ -771,18 +826,24 @@ impl RetentionConfig {
     /// then applies the exact per-type age to each candidate in Rust.
     ///
     /// Returns `None` iff the global `max_age` is unset *and* there are no
-    /// overrides.
+    /// type or tenant overrides.
     #[must_use]
     pub fn loosest_cutoff_age(&self) -> Option<Duration> {
         self.max_age()
             .into_iter()
             .chain(self.overrides.values().copied().map(Duration::from_secs))
+            .chain(
+                self.tenant_overrides
+                    .values()
+                    .copied()
+                    .map(Duration::from_secs),
+            )
             .min()
     }
 
-    /// Returns `true` if workflow-history retention should run this tick, i.e.
-    /// either the global `max_age` or at least one per-type override is set
-    /// (issue #737).
+    /// Returns `true` if workflow-history retention should run this tick.
+    /// That is so when the global `max_age`, a per-type override (issue #737)
+    /// or a per-tenant override (issue #1977) is set.
     #[must_use]
     pub fn history_retention_active(&self) -> bool {
         self.loosest_cutoff_age().is_some()
@@ -792,6 +853,13 @@ impl RetentionConfig {
     #[must_use]
     pub const fn workflow_overrides(&self) -> &BTreeMap<String, u64> {
         &self.overrides
+    }
+
+    /// Read access to the per-tenant retention overrides, in seconds (issue
+    /// #1977).
+    #[must_use]
+    pub const fn tenant_overrides(&self) -> &BTreeMap<String, u64> {
+        &self.tenant_overrides
     }
 
     /// Translates the raw numeric tick value into a standard [`Duration`] for the scheduler loop.
@@ -837,6 +905,21 @@ impl RetentionConfig {
             if !(MIN_MAX_AGE..=MAX_MAX_AGE).contains(&age) {
                 return Err(format!(
                     "retention override for '{name}' must be between {}s and {}s",
+                    MIN_MAX_AGE.as_secs(),
+                    MAX_MAX_AGE.as_secs()
+                ));
+            }
+        }
+        // A tenant override has the type-override bounds (issue #1977). Its
+        // key must be a valid tenant key, or no run can ever match it.
+        for (tenant, secs) in &self.tenant_overrides {
+            if let Err(e) = crate::tenant::validate_tenant(tenant) {
+                return Err(format!("retention tenant override {tenant:?}: {e}"));
+            }
+            let age = Duration::from_secs(*secs);
+            if !(MIN_MAX_AGE..=MAX_MAX_AGE).contains(&age) {
+                return Err(format!(
+                    "retention override for tenant {tenant:?} must be between {}s and {}s",
                     MIN_MAX_AGE.as_secs(),
                     MAX_MAX_AGE.as_secs()
                 ));
@@ -905,11 +988,13 @@ impl RetentionConfig {
     ///
     /// Per-workflow-type overrides count as enabling workflow-history retention
     /// even when the global `max_age` is unset (issue #737), so an
-    /// overrides-only configuration still spawns the janitor.
+    /// overrides-only configuration still spawns the janitor. Per-tenant
+    /// overrides count the same way (issue #1977).
     #[must_use]
     pub fn enabled(&self) -> bool {
         self.max_age_secs.is_some()
             || !self.overrides.is_empty()
+            || !self.tenant_overrides.is_empty()
             || self.audit_retention_days > 0
             || self.schedule_decision_retention_days > 0
             // A bounded summary policy spawns the janitor so its GC pass runs
@@ -1359,7 +1444,7 @@ async fn run_terminal_task_pass(
         // yet, so returning here abandons nothing.
         let checkout = tokio::select! {
             () = shutdown.cancelled() => return,
-            result = pool.get() => result,
+            result = crate::replication::fenced_checkout(pool) => result,
         };
         let result = match checkout {
             Ok(mut conn) => crate::queue::sweep_terminal_tasks_into(
@@ -1405,6 +1490,50 @@ async fn run_terminal_task_pass(
     }
 }
 
+/// Open the fence for one partition-maintenance pass, or `None` to skip the
+/// shard (issue #1823).
+///
+/// A fenced process must not create or drop partitions on a shard another
+/// region owns. The guard holds a commit-order barrier for the whole pass,
+/// across its several transactions. With no pin, it opens no connection. A
+/// fenced shard is reported as failed.
+#[cfg(feature = "db")]
+async fn partition_pass_fence(
+    pools: &ShardedDbPool,
+    shard: crate::types::ShardId,
+    monitor_task: &RetentionMonitor,
+    tick_fenced: bool,
+) -> Option<Vec<crate::replication::FencePassGuard>> {
+    // Inside a retention tick, the tick's barrier covers this pass. A second
+    // guard here could queue behind a waiting bump and stall it.
+    if tick_fenced {
+        return Some(Vec::new());
+    }
+    // The pass changes tables that every logical shard on this database
+    // shares, so it guards every pin colocated here too. A single pool names
+    // its shard through the default pin, as `begin_fenced_tick` does.
+    let fence_key = if pools.len() == 1 {
+        crate::types::ShardId::UNENCODED
+    } else {
+        shard
+    };
+    match crate::replication::begin_fenced_group(pools.pool_for(shard), fence_key).await {
+        Ok(guards) => Some(guards),
+        Err(error) => {
+            tracing::warn!(
+                shard = %shard,
+                error = %error,
+                "harvest event-partition maintenance skipped: this process is fenced"
+            );
+            monitor_task.update_partitions(
+                shard,
+                crate::partition::MaintenanceOutcome::failed(error.to_string()),
+            );
+            None
+        }
+    }
+}
+
 /// One pass of engine-automated partition maintenance (issue #958, AC8):
 /// `ensure_partitions`, the reclamation sweep, and the DEFAULT-partition
 /// drain, for every shard.
@@ -1424,6 +1553,8 @@ async fn run_terminal_task_pass(
 /// candidate loop there. A cohort only becomes droppable once that loop
 /// has archived, summarized and deleted its executions.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 async fn run_partition_maintenance_pass(
     pools: &ShardedDbPool,
     config: &RetentionConfig,
@@ -1432,6 +1563,7 @@ async fn run_partition_maintenance_pass(
     metrics: &dyn MetricsRecorder,
     owner: crate::scanner_health::ScannerOwner,
     shutdown: &CancellationToken,
+    tick_fenced: bool,
 ) {
     if !config.partitions.enabled {
         return;
@@ -1475,7 +1607,7 @@ async fn run_partition_maintenance_pass(
         // here can never abandon one mid-flight.
         let mut conn = tokio::select! {
             () = shutdown.cancelled() => return,
-            result = pool.get() => match result {
+            result = crate::replication::fenced_checkout(pool) => match result {
                 Ok(conn) => conn,
                 Err(error) => {
                     // Never silent: a shard that cannot be reached gets no
@@ -1494,6 +1626,12 @@ async fn run_partition_maintenance_pass(
                     continue;
                 }
             },
+        };
+        // Held until this shard's pass ends, so a bump cannot commit while
+        // the pass writes. See `crate::replication::FencePassGuard`.
+        let Some(fence) = partition_pass_fence(pools, shard, monitor_task, tick_fenced).await
+        else {
+            continue;
         };
         // Review finding: a standalone probe used to run here, before
         // calling `maintain` below. That told an unpartitioned shard
@@ -1545,17 +1683,31 @@ async fn run_partition_maintenance_pass(
         // until the next tick. Read the clock fresh, right before this
         // shard's own call.
         let now = Utc::now();
-        match crate::partition::maintain_with_progress(
-            &mut conn,
-            now,
-            config.partitions.lookahead_cohorts,
-            &sweep_opts,
-            cursor.resume_after,
-            cursor.catch_up_target,
-            &mut tick_partition,
-        )
-        .await
-        {
+        // A lost fence session stops the pass. See
+        // `crate::replication::run_fenced_pass`.
+        let maintained = crate::replication::run_fenced_pass(&fence, async {
+            // Issue #1823: the connection predates the pass, so it joins it.
+            // A lost guard then ends its backend.
+            let _member = crate::replication::join_fenced_pass(pool, &mut conn).await;
+            crate::partition::maintain_with_progress(
+                &mut conn,
+                now,
+                config.partitions.lookahead_cohorts,
+                &sweep_opts,
+                cursor.resume_after,
+                cursor.catch_up_target,
+                &mut tick_partition,
+            )
+            .await
+        })
+        .await;
+        // A stopped pass can leave a transaction open. Closing the
+        // connection makes the server roll it back.
+        let maintained = maintained.unwrap_or_else(|lost| {
+            drop(deadpool::managed::Object::take(conn.into_pooled()));
+            Err(lost)
+        });
+        match maintained {
             Ok(outcome) if outcome.partitioned == Some(false) => {
                 // `outcome.partitioned` comes from `maintain`'s own
                 // probe, the same one that gated its (empty) pass below
@@ -1750,6 +1902,7 @@ impl RetentionRuntime {
                 metrics.as_ref(),
                 owner,
                 &shutdown_task,
+                false,
             )
             .await;
             if shutdown_task.is_cancelled() {
@@ -1773,324 +1926,361 @@ impl RetentionRuntime {
                     }
                 }
 
-                // Workflow-history retention: runs when the global max_age OR
-                // any per-workflow-type override is configured (issue #737).
-                // Resolve the loosest cutoff age up front. `None` here means
-                // either no retention age is configured (the common case) OR —
-                // fail-safe — the configured loosest age is unrepresentable as a
-                // `chrono::Duration` (unreachable for validated ages, which are
-                // bounded by MAX_MAX_AGE ≪ chrono's ~292M-year range). In the
-                // latter case we skip the workflow-history retention phase this
-                // tick and retain everything, rather than falling back to a zero
-                // cutoff that would make `loose_cutoff == now` and over-select
-                // nearly every completed row. The audit/schedule purges below
-                // still run.
-                if config
-                    .loosest_cutoff_age()
-                    .and_then(|age| chrono::Duration::from_std(age).ok())
-                    .is_some()
-                {
-                    // Phase-active gate (issue #737): the `and_then(from_std)`
-                    // above is the fail-safe guard from commit 34ddb62 — if the
-                    // loosest configured age is unrepresentable as a
-                    // `chrono::Duration` (unreachable for validated ages) we skip
-                    // the whole workflow-history phase this tick rather than
-                    // over-selecting. Compute `now` once so every shard's SQL
-                    // predicate and per-candidate resolution use one consistent
-                    // clock. The exact per-type cutoffs are pushed into the SELECT
-                    // inside `run_shard_tick` (PR #990 review) — there is no
-                    // single "loose cutoff" SQL bind any more.
-                    let now = Utc::now();
-                    let tick_futures = pools.iter_shards().map(|(shard, pool)| {
-                        let pool = pool.clone();
-                        let config = config.clone();
-                        let metrics = Arc::clone(&metrics);
-                        let archiver = archiver.clone();
-                        let offloader = offloader.clone();
-                        let cursor = scan_cursors.get(&shard).copied().flatten();
-                        async move {
-                            let started = Instant::now();
-                            let tick = run_shard_tick(
-                                pool,
-                                shard,
-                                now,
-                                &config,
-                                archiver,
-                                cursor,
-                                Arc::clone(&metrics),
-                                offloader,
-                            )
-                            .await;
-                            (shard, started, tick)
-                        }
-                    });
-
-                    for (shard, started, tick) in join_all(tick_futures).await {
-                        let mut result = RetentionTickResult {
-                            shard: u16::try_from(shard.as_i32()).unwrap_or(0),
-                            ran_at: Some(Utc::now()),
-                            duration_ms: started.elapsed().as_millis(),
-                            ..RetentionTickResult::default()
-                        };
-                        match tick {
-                            Ok(ok) => {
-                                scan_cursors.insert(shard, ok.next_cursor);
-                                result.candidate_count = ok.candidate_count;
-                                result.deleted_count = ok.deleted_count;
-                                result.oldest_age_secs_skipped = ok.oldest_age_secs_skipped;
-                                result.deleted_by_workflow = ok.deleted_by_workflow.clone();
-                                result.summarized_count = ok.summarized_count;
-                                tracing::info!(
-                                    shard = %shard,
-                                    candidates = ok.candidate_count,
-                                    deleted = ok.deleted_count,
-                                    oldest_age_secs_skipped = ok.oldest_age_secs_skipped,
-                                    duration_ms = result.duration_ms,
-                                    dry_run = config.dry_run,
-                                    "harvest retention tick completed"
-                                );
-                                #[allow(clippy::cast_precision_loss)]
-                                metrics.record_retention_tick(
-                                    u16::try_from(shard.as_i32()).unwrap_or(0),
-                                    ok.candidate_count as u64,
-                                    ok.deleted_count as u64,
-                                    result.duration_ms as f64 / 1000.0,
-                                );
-                                // Per-workflow-type deletion counter (issue
-                                // #737, AC8). Real deletes only — the metric
-                                // confirms ACTUAL deletion (it reads 0 for a
-                                // long-retained type until its own age), so a
-                                // dry-run's would-delete counts are excluded.
-                                if !config.dry_run {
-                                    for (name, count) in &ok.deleted_by_workflow {
-                                        metrics.record_retention_deleted(name, *count);
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                result.last_error = Some(error.to_string());
-                                scan_cursors.insert(shard, None);
-                                tracing::warn!(shard = %shard, error = %error, "harvest retention tick failed");
-                            }
-                        }
-                        monitor_task.update(shard, result);
+                // Issue #1823: every pass of the tick deletes or updates
+                // rows, so the tick holds a fence barrier on each pinned
+                // shard. A fenced process skips the tick. A lost barrier
+                // stops the tick before its next write.
+                let tick_fence = match crate::replication::begin_fenced_tick(&pools).await {
+                    Ok(guards) => guards,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "harvest retention tick skipped: this process is fenced"
+                        );
+                        crate::scanner_health::record_scanner_tick(metrics.as_ref(), owner);
+                        continue;
                     }
-                }
-
-                // Engine-automated partition maintenance (issue #958, AC8).
-                // See `run_partition_maintenance_pass` — the startup call
-                // above this loop runs the identical pass immediately,
-                // outside the loop's own schedule entirely.
-                //
-                // Deliberately OUTSIDE the history-retention phase gate above:
-                // a partitioned deployment must keep its write window covered
-                // even with no history-retention age configured, or an append
-                // would eventually reach an uncovered cohort.
-                //
-                // Deliberately AFTER the candidate loop: a cohort only becomes
-                // droppable once the loop has archived (#345), summarized
-                // (#752) and deleted its executions. Running it here reclaims
-                // in the SAME tick that frees the cohort rather than the next
-                // one.
-                run_partition_maintenance_pass(
-                    &pools,
-                    &config,
-                    &monitor_task,
-                    &mut partition_resume_cursors,
-                    metrics.as_ref(),
-                    owner,
-                    &shutdown_task,
-                )
-                .await;
-
-                // Purge old audit records once per tick, best-effort.
-                // Audit rows may live on any shard (workflow starts use shard-aware
-                // inserts), so iterate every shard to honour the retention window.
-                if config.audit_retention_days > 0 && !config.dry_run {
-                    purge_audit_records_across_shards(&pools, &config).await;
-                }
-
-                // Purge old schedule decisions once per tick, best-effort.
-                if config.schedule_decision_retention_days > 0 && !config.dry_run {
-                    for (_, pool) in pools.iter_shards() {
-                        if let Ok(mut conn) = pool.get().await
-                            && let Err(err) =
-                                crate::schedule_decision::purge_old_schedule_decisions(
-                                    &mut conn,
-                                    config.schedule_decision_retention_days,
+                };
+                let tick = async {
+                    // Workflow-history retention: runs when the global max_age OR
+                    // any per-workflow-type override is configured (issue #737).
+                    // Resolve the loosest cutoff age up front. `None` here means
+                    // either no retention age is configured (the common case) OR —
+                    // fail-safe — the configured loosest age is unrepresentable as a
+                    // `chrono::Duration` (unreachable for validated ages, which are
+                    // bounded by MAX_MAX_AGE ≪ chrono's ~292M-year range). In the
+                    // latter case we skip the workflow-history retention phase this
+                    // tick and retain everything, rather than falling back to a zero
+                    // cutoff that would make `loose_cutoff == now` and over-select
+                    // nearly every completed row. The audit/schedule purges below
+                    // still run.
+                    if config
+                        .loosest_cutoff_age()
+                        .and_then(|age| chrono::Duration::from_std(age).ok())
+                        .is_some()
+                    {
+                        // Phase-active gate (issue #737): the `and_then(from_std)`
+                        // above is the fail-safe guard from commit 34ddb62 — if the
+                        // loosest configured age is unrepresentable as a
+                        // `chrono::Duration` (unreachable for validated ages) we skip
+                        // the whole workflow-history phase this tick rather than
+                        // over-selecting. Compute `now` once so every shard's SQL
+                        // predicate and per-candidate resolution use one consistent
+                        // clock. The exact per-type cutoffs are pushed into the SELECT
+                        // inside `run_shard_tick` (PR #990 review) — there is no
+                        // single "loose cutoff" SQL bind any more.
+                        let now = Utc::now();
+                        // A single pool names its shard through the default pin,
+                        // as `begin_fenced_tick` does (issue #1823).
+                        let single_pool = pools.len() == 1;
+                        let tick_futures = pools.iter_shards().map(|(shard, pool)| {
+                            let pool = pool.clone();
+                            let config = config.clone();
+                            let metrics = Arc::clone(&metrics);
+                            let archiver = archiver.clone();
+                            let offloader = offloader.clone();
+                            let cursor = scan_cursors.get(&shard).copied().flatten();
+                            async move {
+                                let started = Instant::now();
+                                let fence_key = if single_pool {
+                                    ShardId::UNENCODED
+                                } else {
+                                    shard
+                                };
+                                let tick = run_shard_tick(
+                                    pool,
+                                    shard,
+                                    fence_key,
+                                    now,
+                                    &config,
+                                    archiver,
+                                    cursor,
+                                    Arc::clone(&metrics),
+                                    offloader,
                                 )
-                                .await
-                        {
-                            tracing::warn!(error = %err, "harvest schedule decisions purge failed");
-                        }
-                    }
-                }
+                                .await;
+                                (shard, started, tick)
+                            }
+                        });
 
-                // Summary GC pass (issue #752): garbage-collect execution
-                // summaries older than the summary horizon, once per tick,
-                // best-effort. Only runs for a bounded (`For(_)`) horizon —
-                // `Unbounded` keeps summaries forever. Shard-local (summaries
-                // live on the demoted execution's own shard). The
-                // `harvest.retention.summary_deleted` counter is emitted for
-                // real GC deletes only.
-                if config.summary_gc_active()
-                    && !config.dry_run
-                    && let Some(summary_age) = config.summary_age()
-                {
-                    let now = Utc::now();
-                    for (shard, pool) in pools.iter_shards() {
-                        if let Ok(mut conn) = pool.get().await {
-                            match purge_expired_summaries(
-                                &mut conn,
-                                u16::try_from(shard.as_i32()).unwrap_or(0),
-                                summary_age,
-                                config.batch_size,
-                                false,
-                                now,
-                            )
-                            .await
-                            {
-                                Ok(counts) => {
-                                    for (name, count) in counts {
-                                        if count > 0 {
-                                            metrics.record_summary_deleted(&name, count);
+                        for (shard, started, tick) in join_all(tick_futures).await {
+                            let mut result = RetentionTickResult {
+                                shard: u16::try_from(shard.as_i32()).unwrap_or(0),
+                                ran_at: Some(Utc::now()),
+                                duration_ms: started.elapsed().as_millis(),
+                                ..RetentionTickResult::default()
+                            };
+                            match tick {
+                                Ok(ok) => {
+                                    scan_cursors.insert(shard, ok.next_cursor);
+                                    result.candidate_count = ok.candidate_count;
+                                    result.deleted_count = ok.deleted_count;
+                                    result.oldest_age_secs_skipped = ok.oldest_age_secs_skipped;
+                                    result.deleted_by_workflow = ok.deleted_by_workflow.clone();
+                                    result.summarized_count = ok.summarized_count;
+                                    tracing::info!(
+                                        shard = %shard,
+                                        candidates = ok.candidate_count,
+                                        deleted = ok.deleted_count,
+                                        oldest_age_secs_skipped = ok.oldest_age_secs_skipped,
+                                        duration_ms = result.duration_ms,
+                                        dry_run = config.dry_run,
+                                        "harvest retention tick completed"
+                                    );
+                                    #[allow(clippy::cast_precision_loss)]
+                                    metrics.record_retention_tick(
+                                        u16::try_from(shard.as_i32()).unwrap_or(0),
+                                        ok.candidate_count as u64,
+                                        ok.deleted_count as u64,
+                                        result.duration_ms as f64 / 1000.0,
+                                    );
+                                    // Per-workflow-type deletion counter (issue
+                                    // #737, AC8). Real deletes only — the metric
+                                    // confirms ACTUAL deletion (it reads 0 for a
+                                    // long-retained type until its own age), so a
+                                    // dry-run's would-delete counts are excluded.
+                                    if !config.dry_run {
+                                        for (name, count) in &ok.deleted_by_workflow {
+                                            metrics.record_retention_deleted(name, *count);
                                         }
                                     }
                                 }
-                                Err(err) => {
-                                    tracing::warn!(shard = %shard, error = %err, "harvest execution-summary GC failed");
+                                Err(error) => {
+                                    result.last_error = Some(error.to_string());
+                                    scan_cursors.insert(shard, None);
+                                    tracing::warn!(shard = %shard, error = %error, "harvest retention tick failed");
                                 }
                             }
-                            // Fires expire with their target's summary
-                            // (issue #1676).
-                            match purge_expired_trigger_fires(
+                            monitor_task.update(shard, result);
+                        }
+                    }
+
+                    // Engine-automated partition maintenance (issue #958, AC8).
+                    // See `run_partition_maintenance_pass` — the startup call
+                    // above this loop runs the identical pass immediately,
+                    // outside the loop's own schedule entirely.
+                    //
+                    // Deliberately OUTSIDE the history-retention phase gate above:
+                    // a partitioned deployment must keep its write window covered
+                    // even with no history-retention age configured, or an append
+                    // would eventually reach an uncovered cohort.
+                    //
+                    // Deliberately AFTER the candidate loop: a cohort only becomes
+                    // droppable once the loop has archived (#345), summarized
+                    // (#752) and deleted its executions. Running it here reclaims
+                    // in the SAME tick that frees the cohort rather than the next
+                    // one.
+                    run_partition_maintenance_pass(
+                        &pools,
+                        &config,
+                        &monitor_task,
+                        &mut partition_resume_cursors,
+                        metrics.as_ref(),
+                        owner,
+                        &shutdown_task,
+                        true,
+                    )
+                    .await;
+
+                    // Purge old audit records once per tick, best-effort.
+                    // Audit rows may live on any shard (workflow starts use shard-aware
+                    // inserts), so iterate every shard to honour the retention window.
+                    if config.audit_retention_days > 0 && !config.dry_run {
+                        purge_audit_records_across_shards(&pools, &config).await;
+                    }
+
+                    // Purge old schedule decisions once per tick, best-effort.
+                    if config.schedule_decision_retention_days > 0 && !config.dry_run {
+                        for (_, pool) in pools.iter_shards() {
+                            if let Ok(mut conn) = crate::replication::fenced_checkout(pool).await
+                                && let Err(err) =
+                                    crate::schedule_decision::purge_old_schedule_decisions(
+                                        &mut conn,
+                                        config.schedule_decision_retention_days,
+                                    )
+                                    .await
+                            {
+                                tracing::warn!(error = %err, "harvest schedule decisions purge failed");
+                            }
+                        }
+                    }
+
+                    // Summary GC pass (issue #752): garbage-collect execution
+                    // summaries older than the summary horizon, once per tick,
+                    // best-effort. Only runs for a bounded (`For(_)`) horizon —
+                    // `Unbounded` keeps summaries forever. Shard-local (summaries
+                    // live on the demoted execution's own shard). The
+                    // `harvest.retention.summary_deleted` counter is emitted for
+                    // real GC deletes only.
+                    if config.summary_gc_active()
+                        && !config.dry_run
+                        && let Some(summary_age) = config.summary_age()
+                    {
+                        let now = Utc::now();
+                        for (shard, pool) in pools.iter_shards() {
+                            if let Ok(mut conn) = crate::replication::fenced_checkout(pool).await {
+                                match purge_expired_summaries(
+                                    &mut conn,
+                                    u16::try_from(shard.as_i32()).unwrap_or(0),
+                                    summary_age,
+                                    config.batch_size,
+                                    false,
+                                    now,
+                                )
+                                .await
+                                {
+                                    Ok(counts) => {
+                                        for (name, count) in counts {
+                                            if count > 0 {
+                                                metrics.record_summary_deleted(&name, count);
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(shard = %shard, error = %err, "harvest execution-summary GC failed");
+                                    }
+                                }
+                                // Fires expire with their target's summary
+                                // (issue #1676).
+                                match purge_expired_trigger_fires(
+                                    &mut conn,
+                                    summary_age,
+                                    config.batch_size,
+                                    now,
+                                )
+                                .await
+                                {
+                                    Ok(0) => {}
+                                    Ok(n) => {
+                                        tracing::debug!(shard = %shard, deleted = n, "harvest completion-trigger fire GC");
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(shard = %shard, error = %err, "harvest completion-trigger fire GC failed");
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Idle rate-limit bucket GC (issue #1127): collect inert
+                    // per-tenant token buckets so `harvest_rate_limit_buckets`
+                    // stops growing one row per caller-supplied key forever.
+                    //
+                    // Deliberately OUTSIDE the history-retention phase gate: bucket
+                    // growth is driven by *dispatch* traffic, not by how long
+                    // finished histories are kept, so a deployment that retains
+                    // history forever still has to collect buckets.
+                    //
+                    // Shard-local and best-effort, exactly like the audit/schedule/
+                    // summary purges above: a shard that fails is reported and
+                    // retried next tick rather than failing the whole tick, because
+                    // reclamation here is independent of everything else the
+                    // janitor just did. Reported, not merely logged — otherwise
+                    // `GET /admin/retention` would keep serving the last successful
+                    // tick's count and a permanently-failing shard would look
+                    // exactly like an idle one.
+                    //
+                    // Under `dry_run` the pass still runs, as a read-only PREVIEW:
+                    // it deletes nothing and reports what it *would* collect (the
+                    // same affordance `purge_expired_summaries` offers). A
+                    // collector that is on by default is precisely the kind an
+                    // operator wants to preview first.
+                    if config.rate_limit_bucket_gc_active()
+                        && let Some(window) = config.rate_limit_bucket_retention()
+                        && let Ok(window) = chrono::Duration::from_std(window)
+                    {
+                        let cutoff = Utc::now() - window;
+                        for (shard, pool) in pools.iter_shards() {
+                            let mut conn = match crate::replication::fenced_checkout(pool).await {
+                                Ok(conn) => conn,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        shard = %shard,
+                                        error = %error,
+                                        "harvest rate-limit bucket GC could not acquire a connection"
+                                    );
+                                    monitor_task.update_rate_limit_buckets(
+                                        shard,
+                                        RateLimitBucketGcOutcome::failed(
+                                            error.to_string(),
+                                            config.dry_run,
+                                        ),
+                                    );
+                                    continue;
+                                }
+                            };
+                            match crate::queue::sweep_idle_rate_limit_buckets(
                                 &mut conn,
-                                summary_age,
+                                cutoff,
                                 config.batch_size,
-                                now,
+                                config.dry_run,
                             )
                             .await
                             {
-                                Ok(0) => {}
-                                Ok(n) => {
-                                    tracing::debug!(shard = %shard, deleted = n, "harvest completion-trigger fire GC");
-                                }
-                                Err(err) => {
-                                    tracing::warn!(shard = %shard, error = %err, "harvest completion-trigger fire GC failed");
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Idle rate-limit bucket GC (issue #1127): collect inert
-                // per-tenant token buckets so `harvest_rate_limit_buckets`
-                // stops growing one row per caller-supplied key forever.
-                //
-                // Deliberately OUTSIDE the history-retention phase gate: bucket
-                // growth is driven by *dispatch* traffic, not by how long
-                // finished histories are kept, so a deployment that retains
-                // history forever still has to collect buckets.
-                //
-                // Shard-local and best-effort, exactly like the audit/schedule/
-                // summary purges above: a shard that fails is reported and
-                // retried next tick rather than failing the whole tick, because
-                // reclamation here is independent of everything else the
-                // janitor just did. Reported, not merely logged — otherwise
-                // `GET /admin/retention` would keep serving the last successful
-                // tick's count and a permanently-failing shard would look
-                // exactly like an idle one.
-                //
-                // Under `dry_run` the pass still runs, as a read-only PREVIEW:
-                // it deletes nothing and reports what it *would* collect (the
-                // same affordance `purge_expired_summaries` offers). A
-                // collector that is on by default is precisely the kind an
-                // operator wants to preview first.
-                if config.rate_limit_bucket_gc_active()
-                    && let Some(window) = config.rate_limit_bucket_retention()
-                    && let Ok(window) = chrono::Duration::from_std(window)
-                {
-                    let cutoff = Utc::now() - window;
-                    for (shard, pool) in pools.iter_shards() {
-                        let mut conn = match pool.get().await {
-                            Ok(conn) => conn,
-                            Err(error) => {
-                                tracing::warn!(
-                                    shard = %shard,
-                                    error = %error,
-                                    "harvest rate-limit bucket GC could not acquire a connection"
-                                );
-                                monitor_task.update_rate_limit_buckets(
-                                    shard,
-                                    RateLimitBucketGcOutcome::failed(
-                                        error.to_string(),
-                                        config.dry_run,
-                                    ),
-                                );
-                                continue;
-                            }
-                        };
-                        match crate::queue::sweep_idle_rate_limit_buckets(
-                            &mut conn,
-                            cutoff,
-                            config.batch_size,
-                            config.dry_run,
-                        )
-                        .await
-                        {
-                            Ok(by_family) => {
-                                let total: u64 = by_family.values().sum();
-                                // Real deletes only: a preview's would-collect
-                                // counts must never move a counter an operator
-                                // reads as work actually done.
-                                if !config.dry_run {
-                                    for (family, count) in &by_family {
-                                        metrics.record_rate_limit_buckets_deleted(family, *count);
+                                Ok(by_family) => {
+                                    let total: u64 = by_family.values().sum();
+                                    // Real deletes only: a preview's would-collect
+                                    // counts must never move a counter an operator
+                                    // reads as work actually done.
+                                    if !config.dry_run {
+                                        for (family, count) in &by_family {
+                                            metrics
+                                                .record_rate_limit_buckets_deleted(family, *count);
+                                        }
                                     }
-                                }
-                                if total > 0 {
-                                    tracing::info!(
-                                        shard = %shard,
-                                        deleted = total,
-                                        dry_run = config.dry_run,
-                                        window_secs = window.num_seconds(),
-                                        "harvest idle rate-limit buckets collected"
+                                    if total > 0 {
+                                        tracing::info!(
+                                            shard = %shard,
+                                            deleted = total,
+                                            dry_run = config.dry_run,
+                                            window_secs = window.num_seconds(),
+                                            "harvest idle rate-limit buckets collected"
+                                        );
+                                    }
+                                    monitor_task.update_rate_limit_buckets(
+                                        shard,
+                                        RateLimitBucketGcOutcome::collected(
+                                            by_family,
+                                            config.dry_run,
+                                        ),
                                     );
                                 }
-                                monitor_task.update_rate_limit_buckets(
-                                    shard,
-                                    RateLimitBucketGcOutcome::collected(by_family, config.dry_run),
-                                );
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    shard = %shard,
-                                    error = %err,
-                                    "harvest idle rate-limit bucket GC failed"
-                                );
-                                monitor_task.update_rate_limit_buckets(
-                                    shard,
-                                    RateLimitBucketGcOutcome::failed(
-                                        err.to_string(),
-                                        config.dry_run,
-                                    ),
-                                );
+                                Err(err) => {
+                                    tracing::warn!(
+                                        shard = %shard,
+                                        error = %err,
+                                        "harvest idle rate-limit bucket GC failed"
+                                    );
+                                    monitor_task.update_rate_limit_buckets(
+                                        shard,
+                                        RateLimitBucketGcOutcome::failed(
+                                            err.to_string(),
+                                            config.dry_run,
+                                        ),
+                                    );
+                                }
                             }
                         }
                     }
-                }
 
-                // Terminal-task janitor (issue #1811). It is outside the
-                // history-retention gate: task rows grow with traffic, and
-                // history retention is off by default.
-                run_terminal_task_pass(
-                    &pools,
-                    &config,
-                    &monitor_task,
-                    metrics.as_ref(),
-                    &shutdown_task,
-                )
-                .await;
+                    // Terminal-task janitor (issue #1811). It is outside the
+                    // history-retention gate: task rows grow with traffic, and
+                    // history retention is off by default.
+                    run_terminal_task_pass(
+                        &pools,
+                        &config,
+                        &monitor_task,
+                        metrics.as_ref(),
+                        &shutdown_task,
+                    )
+                    .await;
+                };
+                if let Err(error) =
+                    crate::replication::run_fenced_pass(&tick_fence, Box::pin(tick)).await
+                {
+                    tracing::warn!(error = %error, "harvest retention tick stopped");
+                }
+                drop(tick_fence);
 
                 // Issue #797: unconditional end-of-iteration liveness tick. A
                 // tick that deleted nothing still proves the janitor is alive —
@@ -2209,6 +2399,9 @@ struct CandidateExecution {
     /// in no `WorkflowEvent` and the archive is its last surviving copy.
     #[diesel(sql_type = Text)]
     queue_name: String,
+    /// Stored tenant (issue #1977). It selects a per-tenant retention override.
+    #[diesel(sql_type = Nullable<Text>)]
+    tenant: Option<String>,
 }
 
 #[cfg(feature = "db")]
@@ -2221,6 +2414,8 @@ struct RetentionScanCursor {
 #[cfg(feature = "db")]
 struct RetentionLeaseGuard {
     pool: crate::worker::DbPool,
+    /// The shard the tick fenced. The release fences it again (issue #1823).
+    fence_key: ShardId,
     lease_id: String,
     active_ids: Arc<Mutex<Vec<uuid::Uuid>>>,
     active: bool,
@@ -2245,27 +2440,54 @@ impl Drop for RetentionLeaseGuard {
                 return;
             };
             if !ids.is_empty() {
-                runtime.spawn(async move {
-                    if let Ok(mut conn) = pool.get().await {
-                        let _ = diesel::update(
-                            harvest_workflow_executions::table
-                                .filter(harvest_workflow_executions::id.eq_any(ids))
-                                .filter(
-                                    harvest_workflow_executions::sticky_worker_id
-                                        .eq(Some(lease_id)),
-                                ),
-                        )
-                        .set(
-                            harvest_workflow_executions::sticky_worker_id
-                                .eq::<Option<String>>(None),
-                        )
-                        .execute(&mut conn)
-                        .await;
-                    }
-                });
+                let fence_key = self.fence_key;
+                runtime.spawn(release_retention_leases(pool, fence_key, lease_id, ids));
             }
         }
     }
+}
+
+/// Clear the retention lease `lease_id` from the executions `ids`.
+///
+/// A dropped retention tick calls it from a detached task. Best effort: a
+/// row that keeps its lease is recovered as after a process crash.
+///
+/// The tick's own fence is gone by then, so the release takes a new one on
+/// `fence_key` (issue #1823). A fenced or held shard keeps its leases, and
+/// a lost guard stops the write.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub async fn release_retention_leases(
+    pool: crate::worker::DbPool,
+    fence_key: ShardId,
+    lease_id: String,
+    ids: Vec<uuid::Uuid>,
+) {
+    let fence = match crate::replication::begin_fenced_group(&pool, fence_key).await {
+        Ok(fence) => fence,
+        Err(error) => {
+            tracing::warn!(
+                shard_id = fence_key.as_i32(),
+                %error,
+                "retention lease release skipped: this process is fenced; the leases are \
+                 recovered as after a crash"
+            );
+            return;
+        }
+    };
+    let release = async {
+        if let Ok(mut conn) = crate::replication::fenced_checkout(&pool).await {
+            let _ = diesel::update(
+                harvest_workflow_executions::table
+                    .filter(harvest_workflow_executions::id.eq_any(ids))
+                    .filter(harvest_workflow_executions::sticky_worker_id.eq(Some(lease_id))),
+            )
+            .set(harvest_workflow_executions::sticky_worker_id.eq::<Option<String>>(None))
+            .execute(&mut conn)
+            .await;
+        }
+    };
+    let _ = crate::replication::run_fenced_pass(&fence, Box::pin(release)).await;
 }
 
 /// Compute each pool group's combined `protect_unexported_audit` decision
@@ -2346,7 +2568,7 @@ async fn purge_audit_records_across_shards(pools: &ShardedDbPool, config: &Reten
     for (pool, protect_unexported_audit, colocated_shards, exempted_shards) in
         group_shards_by_pool(pools, config)
     {
-        if let Ok(mut conn) = pool.get().await {
+        if let Ok(mut conn) = crate::replication::fenced_checkout(pool).await {
             let colocated_shard_ids: Vec<i32> =
                 colocated_shards.iter().map(|s| s.as_i32()).collect();
             let exempted_shard_ids: Vec<i32> = exempted_shards.iter().map(|s| s.as_i32()).collect();
@@ -2371,6 +2593,7 @@ async fn purge_audit_records_across_shards(pools: &ShardedDbPool, config: &Reten
 async fn run_shard_tick(
     pool: crate::worker::DbPool,
     shard: ShardId,
+    fence_key: ShardId,
     now: DateTime<Utc>,
     config: &RetentionConfig,
     archiver: Option<Arc<dyn HistoryArchiver>>,
@@ -2413,6 +2636,16 @@ async fn run_shard_tick(
             override_cuts.push(now - delta);
         }
     }
+    // Per-tenant cutoffs (issue #1977), built the same way. The SQL tries the
+    // tenant arm before the type arm, so a tenant override wins.
+    let mut tenant_cut_names: Vec<String> = Vec::new();
+    let mut tenant_cuts: Vec<DateTime<Utc>> = Vec::new();
+    for (tenant, secs) in config.tenant_overrides() {
+        if let Ok(delta) = chrono::Duration::from_std(Duration::from_secs(*secs)) {
+            tenant_cut_names.push(tenant.clone());
+            tenant_cuts.push(now - delta);
+        }
+    }
     // The global fallback cutoff for un-overridden types. `None` means "no global
     // age" (or an unrepresentable one — same fail-safe): the SQL uses an
     // `'-infinity'` literal so those types are never selected.
@@ -2428,6 +2661,7 @@ async fn run_shard_tick(
     let lease_id = format!("retention-lease-{}", uuid::Uuid::new_v4());
     let guard = RetentionLeaseGuard {
         pool: pool.clone(),
+        fence_key,
         lease_id: lease_id.clone(),
         active_ids: Arc::new(Mutex::new(Vec::new())),
         active: true,
@@ -2446,37 +2680,44 @@ async fn run_shard_tick(
     // delete's existing "not finished yet" rule for PENDING/INFLIGHT/FAILED
     // rows. Runs once per shard tick (not per candidate) since it is a
     // table-wide reclaim, not scoped to this tick's candidate batch.
+    //
+    // Issue #1823: a table-wide delete can run long. It asserts the fence in
+    // its own transaction, so a bump waits for it even when the tick's guard
+    // session ends first. See `replication::assert_fence_group`.
     {
-        let mut conn = pool
-            .get()
+        let mut conn = crate::replication::fenced_checkout(&pool).await?;
+        let reclaimed = Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            crate::replication::assert_fence_group(conn, fence_key).await?;
+            diesel::sql_query(
+                "DELETE FROM harvest_completion_deliveries
+                 WHERE state = 'DELIVERED'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM harvest_workflow_executions
+                       WHERE harvest_workflow_executions.id = harvest_completion_deliveries.workflow_exec_id
+                   )",
+            )
+            .execute(conn)
             .await
-            .map_err(|error| HarvestError::Database(error.to_string()))?;
-        let reclaimed = diesel::sql_query(
-            "DELETE FROM harvest_completion_deliveries
-             WHERE state = 'DELIVERED'
-               AND NOT EXISTS (
-                   SELECT 1 FROM harvest_workflow_executions
-                   WHERE harvest_workflow_executions.id = harvest_completion_deliveries.workflow_exec_id
-               )",
-        )
-        .execute(&mut conn)
-        .await
-        .map_err(database_error)?;
+            .map_err(database_error)
+        }))
+        .await?;
         outcome.deleted_count += reclaimed;
     }
 
     while remaining > 0 {
         // Check out a short-lived connection just to load and claim this batch of candidates in a single transaction
-        let mut conn = pool
-            .get()
-            .await
-            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        let mut conn = crate::replication::fenced_checkout(&pool).await?;
 
         let lease_id_inner = lease_id.clone();
         let names_inner = override_cut_names.clone();
         let cuts_inner = override_cuts.clone();
+        let tenant_names_inner = tenant_cut_names.clone();
+        let tenant_cuts_inner = tenant_cuts.clone();
         let candidates = Box::pin(
             conn.transaction::<Vec<CandidateExecution>, HarvestError, _>(async |conn| {
+                // The claim asserts the fence in its own transaction (issue
+                // #1823). See the reclaim above.
+                crate::replication::assert_fence_group(conn, fence_key).await?;
                 // Push each row's exact per-type effective cutoff into the
                 // predicate (issue #737, PR #990 review): the correlated
                 // `unnest` subquery resolves the override cutoff for this row's
@@ -2494,7 +2735,8 @@ async fn run_shard_tick(
                 let sql = candidate_scan_sql(global_fallback.is_some());
                 // Bind order maps to $1..$N regardless of textual position. The
                 // override arrays ($1/$2) are always bound; $3 is the global
-                // fallback only in the global-age variant.
+                // fallback only in the global-age variant. The tenant arrays
+                // are always bound last (issue #1977).
                 let query = diesel::sql_query(sql)
                     .bind::<Array<Text>, _>(names_inner)
                     .bind::<Array<Timestamptz>, _>(cuts_inner);
@@ -2504,6 +2746,8 @@ async fn run_shard_tick(
                         .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
                         .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
                         .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
+                        .bind::<Array<Text>, _>(tenant_names_inner)
+                        .bind::<Array<Timestamptz>, _>(tenant_cuts_inner)
                         .load::<CandidateExecution>(conn)
                         .await
                 } else {
@@ -2511,6 +2755,8 @@ async fn run_shard_tick(
                         .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
                         .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
                         .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
+                        .bind::<Array<Text>, _>(tenant_names_inner)
+                        .bind::<Array<Timestamptz>, _>(tenant_cuts_inner)
                         .load::<CandidateExecution>(conn)
                         .await
                 }
@@ -2568,10 +2814,7 @@ async fn run_shard_tick(
             remaining = remaining.saturating_sub(1);
 
             // Checkout a connection to run candidate dependency validations
-            let mut conn = pool
-                .get()
-                .await
-                .map_err(|error| HarvestError::Database(error.to_string()))?;
+            let mut conn = crate::replication::fenced_checkout(&pool).await?;
 
             // --- Per-candidate retention decision (issue #737) ------------
             // This is the single seam where a candidate's fate is decided.
@@ -2606,7 +2849,10 @@ async fn run_shard_tick(
             // row is ever selected. They are kept as cheap defense-in-depth. The
             // `should_skip_candidate` chain-link check below still needs the
             // RESOLVED per-type cutoff, which is derived here.
-            let Some(age) = config.effective_max_age(&candidate.workflow_name) else {
+            // Issue #1977: a tenant override wins over the type override.
+            let Some(age) =
+                config.effective_max_age_for(&candidate.workflow_name, candidate.tenant.as_deref())
+            else {
                 // Neither an override nor a global max-age applies to this
                 // type: never delete it. Routine skip.
                 routine_skip_candidate(
@@ -2871,10 +3117,7 @@ async fn run_shard_tick(
             }
 
             // Check out a short-lived connection exclusively to execute the candidate deletion transaction
-            let mut conn = pool
-                .get()
-                .await
-                .map_err(|error| HarvestError::Database(error.to_string()))?;
+            let mut conn = crate::replication::fenced_checkout(&pool).await?;
 
             // Collect the candidate's offloaded blob references BEFORE deletion
             // (the rows cascade-delete with the execution). Issue #524.
@@ -2893,8 +3136,14 @@ async fn run_shard_tick(
                 Vec::new()
             };
 
-            match delete_candidate_execution(&mut conn, candidate.id, now, config.summary.as_ref())
-                .await
+            match delete_candidate_execution(
+                &mut conn,
+                candidate.id,
+                now,
+                config.summary.as_ref(),
+                fence_key,
+            )
+            .await
             {
                 Err(err) => {
                     has_failed = true;
@@ -3037,13 +3286,19 @@ enum CandidateDeleteOutcome {
 const RETENTION_CANDIDATE_STATES: &[&str] = crate::erase::TERMINAL_STATES_WITHOUT_MIGRATED;
 
 /// Candidate-scan template when a global age fallback is bound as `$3`.
+///
+/// The tenant override arrays are bound last, as `$7` and `$8` (issue #1977).
+/// The tenant arm comes first in the `COALESCE`, so a tenant override wins.
 #[cfg(feature = "db")]
-const CANDIDATE_SCAN_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name
+const CANDIDATE_SCAN_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name, tenant
                  FROM harvest_workflow_executions
                  WHERE state IN ({states})
                    AND completed_at IS NOT NULL
                    AND (sticky_worker_id IS NULL OR sticky_worker_id NOT LIKE 'retention-lease-%')
                    AND completed_at < COALESCE(
+                       (SELECT tv.cut
+                          FROM unnest($7::text[], $8::timestamptz[]) AS tv(nm, cut)
+                         WHERE tv.nm = harvest_workflow_executions.tenant),
                        (SELECT ov.cut
                           FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
                          WHERE ov.nm = harvest_workflow_executions.workflow_name),
@@ -3058,13 +3313,18 @@ const CANDIDATE_SCAN_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflo
                  FOR UPDATE SKIP LOCKED";
 
 /// Candidate-scan template when no global age is set; the fallback is `-infinity`.
+///
+/// The tenant override arrays are bound last, as `$6` and `$7` (issue #1977).
 #[cfg(feature = "db")]
-const CANDIDATE_SCAN_NO_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name
+const CANDIDATE_SCAN_NO_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name, tenant
                  FROM harvest_workflow_executions
                  WHERE state IN ({states})
                    AND completed_at IS NOT NULL
                    AND (sticky_worker_id IS NULL OR sticky_worker_id NOT LIKE 'retention-lease-%')
                    AND completed_at < COALESCE(
+                       (SELECT tv.cut
+                          FROM unnest($6::text[], $7::timestamptz[]) AS tv(nm, cut)
+                         WHERE tv.nm = harvest_workflow_executions.tenant),
                        (SELECT ov.cut
                           FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
                          WHERE ov.nm = harvest_workflow_executions.workflow_name),
@@ -3174,10 +3434,15 @@ async fn delete_candidate_execution(
     candidate_id: uuid::Uuid,
     now: DateTime<Utc>,
     summary: Option<&SummaryPolicy>,
+    fence_key: ShardId,
 ) -> HarvestResult<CandidateDeleteOutcome> {
     // Copy the policy into the transaction closure (it is `Copy`).
     let summary = summary.copied();
     Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+        // Issue #1823: the delete asserts the fence in its own transaction.
+        // A bump then waits for it, even when the tick's guard session ends
+        // first. The legal-hold read below is still in this transaction.
+        crate::replication::assert_fence_group(conn, fence_key).await?;
         let mut summarized = false;
         // Set alongside `summarized` when this candidate hits the forced
         // migration-target tombstone below. It is set even on the `ON
@@ -4600,6 +4865,105 @@ mod tests {
         );
     }
 
+    // --- Issue #1977: per-tenant history retention overrides ---
+
+    #[test]
+    fn tenant_override_wins_over_type_and_global() {
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("slow_wf", Duration::from_secs(7200))
+            .with_tenant_override("acme", Duration::from_secs(600));
+        assert_eq!(
+            config.effective_max_age_for("slow_wf", Some("acme")),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(
+            config.effective_max_age_for("other_wf", Some("acme")),
+            Some(Duration::from_secs(600))
+        );
+        // Another tenant, or no tenant, falls back to the type, then the global.
+        assert_eq!(
+            config.effective_max_age_for("slow_wf", Some("globex")),
+            Some(Duration::from_secs(7200))
+        );
+        assert_eq!(
+            config.effective_max_age_for("other_wf", None),
+            Some(Duration::from_secs(3600))
+        );
+        // The type-only resolver is unchanged.
+        assert_eq!(
+            config.effective_max_age("slow_wf"),
+            Some(Duration::from_secs(7200))
+        );
+    }
+
+    #[test]
+    fn tenant_override_alone_enables_history_retention() {
+        let config =
+            RetentionConfig::default().with_tenant_override("acme", Duration::from_secs(900));
+        assert!(config.enabled());
+        assert!(config.history_retention_active());
+        assert_eq!(config.loosest_cutoff_age(), Some(Duration::from_secs(900)));
+        assert_eq!(config.effective_max_age_for("wf", None), None);
+        assert_eq!(config.effective_max_age_for("wf", Some("globex")), None);
+        assert_eq!(
+            config.tenant_overrides().get("acme").copied(),
+            Some(900),
+            "the override is stored in seconds"
+        );
+    }
+
+    #[test]
+    fn loosest_cutoff_age_counts_tenant_overrides() {
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("wf", Duration::from_secs(1800))
+            .with_tenant_overrides([("acme", Duration::from_secs(120))]);
+        assert_eq!(config.loosest_cutoff_age(), Some(Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn validate_rejects_bad_tenant_overrides() {
+        let base = RetentionConfig::with_max_age(Duration::from_secs(3600));
+        assert!(
+            base.clone()
+                .with_tenant_override("acme", Duration::from_secs(0))
+                .validate()
+                .is_err(),
+            "below MIN_MAX_AGE"
+        );
+        assert!(
+            base.clone()
+                .with_tenant_override("acme", MAX_MAX_AGE + Duration::from_secs(1))
+                .validate()
+                .is_err(),
+            "above MAX_MAX_AGE"
+        );
+        assert!(
+            base.clone()
+                .with_tenant_override("", Duration::from_secs(60))
+                .validate()
+                .is_err(),
+            "an empty tenant key"
+        );
+        assert!(
+            base.clone()
+                .with_tenant_override("t".repeat(129), Duration::from_secs(60))
+                .validate()
+                .is_err(),
+            "a tenant key longer than 128 bytes"
+        );
+        assert!(
+            base.clone()
+                .with_tenant_override("t".repeat(128), MIN_MAX_AGE)
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            base.with_tenant_override("acme", MAX_MAX_AGE)
+                .validate()
+                .is_ok()
+        );
+    }
+
     // --- Issue #737: per-workflow-type history retention overrides ---
 
     #[test]
@@ -5182,6 +5546,7 @@ mod tests {
             deadline_at: None,
             parent_id: None,
             queue_name: "default".to_string(),
+            tenant: None,
         };
         let candidate_skip = CandidateExecution {
             id: uuid::Uuid::new_v4(),
@@ -5196,6 +5561,7 @@ mod tests {
             deadline_at: None,
             parent_id: None,
             queue_name: "default".to_string(),
+            tenant: None,
         };
 
         // When evaluating outcome next_cursor logic, if the first candidate completes,
@@ -5330,6 +5696,7 @@ mod tests {
     fn active_guard(active_ids: Arc<Mutex<Vec<uuid::Uuid>>>) -> RetentionLeaseGuard {
         RetentionLeaseGuard {
             pool: unconnected_pool(),
+            fence_key: ShardId::UNENCODED,
             lease_id: "retention-lease-test".to_owned(),
             active_ids,
             active: true,

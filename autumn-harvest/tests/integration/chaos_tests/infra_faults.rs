@@ -9,8 +9,7 @@
 //! worker URL. The test reads state through a second proxy that has no
 //! toxics. Each test then checks the sweep oracle, [`assert_converged`]:
 //! every workflow `COMPLETED`, no stranded task, and one terminal event per
-//! execution. Two tests expect or accept one known `FAILED` outcome, see
-//! [`Accept`].
+//! execution.
 //!
 //! Each test also asserts proof that its fault landed. A fault that does not
 //! land fails the test, so a healthy run cannot pass in its place.
@@ -39,7 +38,7 @@ use testcontainers_modules::postgres::Postgres;
 
 use super::{
     CountRow, DB_BODY_SERIAL, assert_converged, base_params, chaos_noop_info, connect, event_count,
-    exec_state, terminal_event_count,
+    exec_state,
 };
 
 /// The worker heartbeat interval. The stale threshold, the "lease TTL", is
@@ -65,12 +64,13 @@ const FAST: Tuning = Tuning {
 
 /// The tuning of the latency test.
 ///
-/// A heartbeat tick must take less than one interval. At [`HEARTBEAT`], the
-/// latency toxic breaks that rule, and bug #1879 then quarantines healthy
-/// work. A decision cycle also takes more than 10 s at this latency. So the
-/// test keeps the default 60 s cap, which gives a 60 s budget.
+/// The test uses [`HEARTBEAT`]. At this latency a heartbeat tick can take
+/// longer than one interval. A false requeue can then occur, but the held
+/// last strike stops a false quarantine (#1879). The test is a smoke test for
+/// that fix. A decision cycle also takes more than 10 s at this latency. So
+/// the test keeps the default 60 s cap, which gives a 60 s budget.
 const SLOW_NETWORK: Tuning = Tuning {
-    heartbeat: Duration::from_secs(2),
+    heartbeat: HEARTBEAT,
     local_activity_cap: Duration::from_secs(60),
 };
 
@@ -121,9 +121,10 @@ fn count(counter: &AtomicUsize) -> usize {
 /// With `input.hold_attempts`, attempt 1 waits for [`RELEASE_FIRST_ATTEMPTS`],
 /// and attempt 2 waits for [`RELEASE_SECOND_ATTEMPTS`].
 ///
-/// A lost result write recovers only through `start_to_close`. The retry
-/// policy must then start a new attempt, but bug #1870 fails the workflow.
-/// The timeout is long, so a pause or a partition does not reach it.
+/// A result write that fails after its repeats gives the claim back, so the
+/// activity runs again. When the give-back also fails, only `start_to_close`
+/// recovers the task. The retry policy then starts a new attempt (issue
+/// #1870). The timeout is long, so a pause or a partition does not reach it.
 #[activity(
     start_to_close = "30s",
     retry = autumn_harvest::policy::RetryPolicy::fixed(5, Duration::from_millis(200))
@@ -597,37 +598,12 @@ async fn start_workload(
     execs
 }
 
-/// The outcomes that [`converge`] accepts.
-///
-/// The known failure is `FAILED` after one activity `StartToClose` timeout.
-/// Bug #1871: the worker does not retry a lost result write. Bug #1870: the
-/// timeout ignores the retry policy. When both bugs are fixed, the known
-/// failure becomes `COMPLETED`. Then remove the two known-failure variants.
-#[derive(Clone, Copy, Debug)]
-enum Accept<'a> {
-    /// Every workflow is `COMPLETED`.
-    Completed,
-    /// Every workflow ends in the known failure. A `COMPLETED` workflow fails
-    /// the check, so a fix for the bugs makes this test fail on purpose.
-    KnownFailure,
-    /// The listed workflows are `COMPLETED` or end in the known failure. All
-    /// other workflows are `COMPLETED`.
-    CompletedOrKnownFailure(&'a [ExecutionId]),
-}
-
 /// Wait until every execution is terminal, then check the outcomes.
 ///
-/// A `COMPLETED` workflow must pass the sweep oracle. An activity workflow
-/// must also record exactly one activity terminal event, an
-/// `ActivityCompleted`. A `FAILED` workflow passes only where [`Accept`]
-/// allows the known failure, and only with its exact history.
-async fn converge(
-    admin_url: &str,
-    execs: &[ExecutionId],
-    activity_wf: bool,
-    accept: Accept<'_>,
-    diag: &str,
-) {
+/// Every workflow must be `COMPLETED` and pass the sweep oracle. An activity
+/// workflow must also record exactly one activity terminal event, an
+/// `ActivityCompleted`.
+async fn converge(admin_url: &str, execs: &[ExecutionId], activity_wf: bool, diag: &str) {
     // The admin proxy never gets a toxic, so one connection serves all polls.
     let deadline = Instant::now() + CONVERGE_DEADLINE;
     let mut conn = connect(admin_url).await;
@@ -651,22 +627,11 @@ async fn converge(
 
     let mut completed = Vec::new();
     for (exec_id, state) in states {
-        let accepted = match (state.as_str(), accept) {
-            ("COMPLETED", Accept::KnownFailure) => false,
-            ("COMPLETED", _) => {
-                completed.push(exec_id);
-                true
-            }
-            ("FAILED", Accept::KnownFailure) => known_failure(&mut conn, exec_id).await,
-            ("FAILED", Accept::CompletedOrKnownFailure(allowed)) => {
-                allowed.contains(&exec_id) && known_failure(&mut conn, exec_id).await
-            }
-            _ => false,
-        };
-        if !accepted {
+        if state != "COMPLETED" {
             let history = history_dump(&mut conn, execs).await;
-            panic!("{diag}: workflow {exec_id:?} ended {state}, not accepted\n{history}");
+            panic!("{diag}: workflow {exec_id:?} ended {state}, not COMPLETED\n{history}");
         }
+        completed.push(exec_id);
     }
     let history = history_dump(&mut conn, execs).await;
     assert_converged(admin_url, diag, &completed, &history).await;
@@ -696,25 +661,20 @@ async fn one_activity_result(conn: &mut AsyncPgConnection, exec_id: ExecutionId)
     .ok
 }
 
-/// Return true when `exec_id` shows the known failure of [`Accept`]. Its one
-/// activity terminal event is a `StartToClose` timeout. Its one terminal
-/// event is a `WorkflowFailed` for that timeout.
-async fn known_failure(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> bool {
-    let shape = diesel::sql_query(
-        "SELECT COUNT(*) FILTER (WHERE event_type IN ('ActivityCompleted', 'ActivityFailed', \
-                'ActivityTimedOut', 'ActivityCompletedExternally', 'ActivityFailedExternally')) = 1 \
-            AND COUNT(*) FILTER (WHERE event_type = 'ActivityTimedOut' \
-                AND event_data->'data'->>'timeout_type' = 'StartToClose') = 1 \
-            AND COUNT(*) FILTER (WHERE event_type = 'WorkflowFailed' \
-                AND event_data->'data'->>'error' LIKE 'timeout: StartToClose %') = 1 AS ok \
-         FROM harvest_events WHERE workflow_exec_id = $1",
+/// Return true when the activity of `exec_id` ran once. It has one activity
+/// task at attempt 1 and one `ActivityStarted` event.
+async fn one_activity_attempt(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> bool {
+    diesel::sql_query(
+        "SELECT (SELECT COUNT(*) = 1 AND MAX(attempt) = 1 FROM harvest_task_queue \
+                 WHERE workflow_exec_id = $1 AND task_type = 'activity') \
+            AND (SELECT COUNT(*) = 1 FROM harvest_events \
+                 WHERE workflow_exec_id = $1 AND event_type = 'ActivityStarted') AS ok",
     )
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
     .get_result::<BoolRow>(conn)
     .await
-    .expect("read the failure shape")
-    .ok;
-    shape && terminal_event_count(conn, exec_id).await == 1
+    .expect("count activity attempts")
+    .ok
 }
 
 /// Render the events and tasks of `execs` for a failure message.
@@ -793,28 +753,6 @@ async fn running_activity_execs(
         .collect()
 }
 
-/// The executions with an activity task that the old Postgres instance
-/// claimed. A claim sets `started_at` from the server clock, so a claim
-/// before the restart is older than `pg_postmaster_start_time()`. This set
-/// has no timing window, unlike a snapshot taken before or after the crash.
-async fn activities_claimed_before_restart(conn: &mut AsyncPgConnection) -> Vec<ExecutionId> {
-    #[derive(diesel::QueryableByName)]
-    struct ExecRow {
-        #[diesel(sql_type = diesel::sql_types::Uuid)]
-        workflow_exec_id: uuid::Uuid,
-    }
-    let rows: Vec<ExecRow> = diesel::sql_query(
-        "SELECT DISTINCT workflow_exec_id FROM harvest_task_queue \
-         WHERE task_type = 'activity' AND started_at < pg_postmaster_start_time()",
-    )
-    .load(conn)
-    .await
-    .expect("list activities claimed before the restart");
-    rows.into_iter()
-        .map(|r| ExecutionId::from_uuid(r.workflow_exec_id))
-        .collect()
-}
-
 /// Wait until `counter` reaches `target`.
 async fn wait_for_count(counter: &AtomicUsize, target: usize, what: &str) {
     let deadline = Instant::now() + RENDEZVOUS_DEADLINE;
@@ -882,13 +820,22 @@ async fn terminate_backend_in_commit(site: CommitSite, fate: CommitFate) {
         }
     }
 
-    // A rolled-back result write always ends in the known failure.
-    let accept = match (site, fate) {
-        (CommitSite::Append, CommitFate::RolledBack) => Accept::KnownFailure,
-        _ => Accept::Completed,
-    };
     let diag = format!("{site:?} {fate:?}");
-    converge(&db.admin_url, &execs, activity_wf, accept, &diag).await;
+    converge(&db.admin_url, &execs, activity_wf, &diag).await;
+
+    // After a dropped connection, the worker writes the result again on a new
+    // connection (#1871). The handler must not run a second time. Only the
+    // rolled-back test needs the repeat. In the ack-lost test, the commit
+    // landed, so the repeat must change nothing.
+    if matches!(site, CommitSite::Append) {
+        let mut conn = connect(&db.admin_url).await;
+        for exec_id in &execs {
+            if !one_activity_attempt(&mut conn, *exec_id).await {
+                let history = history_dump(&mut conn, &execs).await;
+                panic!("{diag}: workflow {exec_id:?} ran its activity more than once\n{history}");
+            }
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -933,12 +880,9 @@ async fn postgres_crash_restart_mid_workload() {
 
     db.crash_restart_postgres().await;
 
-    // The crash can drop a write of an activity in flight, so the known
-    // failure applies to those workflows only.
-    let mut conn = connect(&db.admin_url).await;
-    let in_flight = activities_claimed_before_restart(&mut conn).await;
-    let accept = Accept::CompletedOrKnownFailure(&in_flight);
-    converge(&db.admin_url, &execs, true, accept, "crash restart").await;
+    // The crash can drop every write of an activity in flight. Then only
+    // `start_to_close` recovers the task, and the retry policy runs it again.
+    converge(&db.admin_url, &execs, true, "crash restart").await;
 }
 
 /// Pause Postgres for longer than the lease TTL while two workers hold
@@ -958,7 +902,7 @@ async fn postgres_pause_longer_than_lease_ttl() {
     tokio::time::sleep(PAST_LEASE_TTL).await;
     db.unpause_postgres().await;
 
-    converge(&db.admin_url, &execs, true, Accept::Completed, "pause").await;
+    converge(&db.admin_url, &execs, true, "pause").await;
 }
 
 // ── Scenario 3: toxiproxy latency and partition ─────────────────────────────
@@ -988,7 +932,7 @@ async fn toxiproxy_latency_between_worker_and_db() {
     let _a = RunningWorker::spawn_tuned("infra-latency-a", &db.worker_url, SLOW_NETWORK);
     let _b = RunningWorker::spawn_tuned("infra-latency-b", &db.worker_url, SLOW_NETWORK);
 
-    converge(&db.admin_url, &execs, true, Accept::Completed, "latency").await;
+    converge(&db.admin_url, &execs, true, "latency").await;
 }
 
 /// Blackhole worker A for longer than the lease TTL while it holds three
@@ -1008,8 +952,9 @@ async fn toxiproxy_partition_longer_than_lease_ttl() {
     LATE_RETURNS.store(0, Ordering::SeqCst);
     let db = FaultDb::start().await;
     // Postgres keeps the open transaction of a partitioned worker. That
-    // transaction keeps its row locks, and orphan reclaim stalls behind them
-    // (bug #1876). This server timeout ends such a session.
+    // transaction keeps its row locks. Orphan reclaim skips a locked row
+    // (issue #1876), but it cannot reclaim the row until the session ends.
+    // This server timeout ends such a session within the test budget.
     db.limit_idle_in_transaction(5).await;
     let input = serde_json::json!({ "sleep_ms": 0, "hold_attempts": true });
     let execs = start_workload(
@@ -1073,7 +1018,7 @@ async fn toxiproxy_partition_longer_than_lease_ttl() {
     }
 
     RELEASE_SECOND_ATTEMPTS.store(true, Ordering::SeqCst);
-    converge(&db.admin_url, &execs, true, Accept::Completed, "partition").await;
+    converge(&db.admin_url, &execs, true, "partition").await;
 }
 
 // ── Scenario 4: SIGKILL of a worker process ─────────────────────────────────
@@ -1114,7 +1059,7 @@ async fn sigkill_child_worker_mid_activity() {
     );
 
     let _worker = RunningWorker::spawn("infra-sigkill-recover", &db.worker_url);
-    converge(&db.admin_url, &execs, true, Accept::Completed, "sigkill").await;
+    converge(&db.admin_url, &execs, true, "sigkill").await;
     let reclaimed = reclaimed_tasks(&db.admin_url, &execs).await;
     assert!(reclaimed >= 1, "the killed worker's task must be reclaimed");
 }

@@ -22,6 +22,12 @@
 //!
 //! This backend assumes **one writer process** against **one** `SQLite` file:
 //!
+//! - **The contract is enforced (issue #1834).** [`SqliteRuntime::open`] takes an
+//!   exclusive OS lock on `<database>.lock`. A second runtime on the same file
+//!   fails fast with [`SqliteError::DatabaseLocked`], before it changes the file.
+//!   The lock dies with its process, so a crash leaves no stale lock. A read-only
+//!   inspector connection still works. Do not delete the lock file while a
+//!   runtime runs.
 //! - **`BEGIN IMMEDIATE` replaces `SELECT … FOR UPDATE SKIP LOCKED`.** A task
 //!   claim takes `SQLite`'s database-level write lock up front, selects the oldest
 //!   ready task, and flips it to `RUNNING`. Under the single-writer assumption
@@ -247,8 +253,14 @@
 //! other out-of-subset primitive a workflow can reach surfaces as
 //! [`SqliteError::Unsupported`] whose message NAMES the specific
 //! `WorkflowCommand` (never an opaque `"Unknown"`, Codex #1069 P2) — a workflow
-//! author gets an actionable failure, not a silent gap. The full v0.1 non-goal set,
-//! and the command each emits:
+//! author gets an actionable failure, not a silent gap.
+//!
+//! The run then ends `FAILED` (issue #1834). The drive rolls back the cycle and
+//! seals the run with a typed `WorkflowFailed` event. Its `error_type` is
+//! [`UNSUPPORTED_FEATURE_ERROR_TYPE`], `details.feature` names the command, and
+//! `non_retryable` is `true`. A later drive returns [`RunState::Failed`] and does
+//! not run the handler again. The full v0.1 non-goal set, and the command each
+//! emits:
 //!
 //! - **Child workflows** — `ctx.spawn_child_workflow(...)` (`StartChildWorkflow`),
 //!   `ctx.spawn_child_workflow_detached(...)` (`SpawnDetachedChildWorkflow`).
@@ -364,7 +376,9 @@
 //!     attempt cap; the WHOLE policy also reaches the worker per-dispatch via the
 //!     command's `retry_policy_override` (backoff timing + non-retryable classification).
 //!   - `default_start_to_close` — honored via the command's `start_to_close_override`
-//!     (a per-attempt post-execution `ActivityTimedOut { StartToClose }`).
+//!     (a per-attempt post-execution `ActivityTimedOut { StartToClose }`). The
+//!     timeout is terminal here. Postgres retries it per the retry policy (issue
+//!     #1809, ADR 0005).
 //!   - `default_queue` — recorded on the task row (single-writer routing is a no-op).
 //! - **REJECTED (a dispatch-admission / cross-worker semantic with no single-writer
 //!   analog, or a cap raiser that would otherwise silently apply the STRICTER global
@@ -522,6 +536,7 @@
 //! here always replays byte-identically on the core `WorkflowReplayer`.
 
 mod error;
+mod lock;
 mod queue;
 mod runtime;
 mod schema;
@@ -533,5 +548,6 @@ pub use autumn_harvest::{ExecutionId, WorkflowEvent};
 pub use crate::error::{SqliteError, SqliteResult};
 pub use crate::runtime::{
     ActivityBody, ActivitySpec, ExecutionOutcome, RunState, SqliteRuntime, StartOutcome,
+    UNSUPPORTED_FEATURE_ERROR_TYPE,
 };
 pub use crate::store::ActivityAttempt;

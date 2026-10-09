@@ -1,0 +1,56 @@
+[package]
+name = "autumn-harvest-agent"
+description = "Durable agent loop for autumn-harvest: model and tool calls as activities, approvals as durable waits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/autumn-foundation/autumn-harvest"
+readme = "README.md"
+keywords = ["workflow", "durable", "agent", "llm", "autumn"]
+categories = ["asynchronous"]
+
+[features]
+default = []
+# Register the agent loop on the embedded SQLite backend.
+sqlite = ["dep:autumn-harvest-sqlite"]
+
+[dependencies]
+# The backend-neutral core only: no Diesel, no Postgres, no autumn-web.
+autumn-harvest = { version = "0.7.0", path = "../autumn-harvest", default-features = false }
+autumn-harvest-sqlite = { version = "0.7.0", path = "../autumn-harvest-sqlite", optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# `testing` adds `ActivityContext::new_test_with_state` for the engine path.
+autumn-harvest = { version = "0.7.0", path = "../autumn-harvest", default-features = false, features = ["testing"] }
+chrono = { workspace = true }
+autumn-harvest-sqlite = { version = "0.7.0", path = "../autumn-harvest-sqlite" }
+futures = { workspace = true }
+proptest = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true }
+
+[[test]]
+name = "sqlite_loop"
+required-features = ["sqlite"]
+
+[[test]]
+name = "crash_resume"
+required-features = ["sqlite"]
+
+[[test]]
+name = "always_on"
+required-features = ["sqlite"]
+
+[lints]
+workspace = true
+
+[[example]]
+name = "sqlite_agent"
+required-features = ["sqlite"]

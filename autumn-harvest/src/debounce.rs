@@ -524,8 +524,8 @@ struct FireDueRow {
     #[diesel(sql_type = diesel::sql_types::Integer)]
     shard_id: i32,
     /// Needed to compute [`redefer_target`] if this row's fire is blocked by
-    /// a quota (issue #1227, Finding 3) — fetched here, under the same
-    /// `FOR UPDATE` claim, rather than a second round trip.
+    /// a quota (issue #1227, Finding 3). It is fetched here, under the same
+    /// `FOR UPDATE` claim, rather than in a second round trip.
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
     max_fire_at: DateTime<Utc>,
 }
@@ -588,7 +588,7 @@ type FiredDebounce = (
 #[cfg(feature = "db")]
 async fn fire_due_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
-    _metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<Vec<FiredDebounce>> {
     use diesel_async::{AsyncConnection, RunQueryDsl};
@@ -616,10 +616,20 @@ async fn fire_due_on_conn(
     // `FOR UPDATE SKIP LOCKED` locks are held until each row is deleted.
     // Deferred trigger-starts are collected and spawned *after* the transaction
     // commits so a rollback can't leave orphaned completion-trigger workflows.
-    let fired: Vec<FiredDebounce> = Box::pin(
-        conn.transaction::<Vec<FiredDebounce>, crate::error::HarvestError, _>(async |conn| {
-            let now = Utc::now();
-            let due_sql = "
+    //
+    // Issue #1822: a deadlock or serialization abort runs the batch again.
+    // The rollback releases every claimed row, so the next run claims afresh.
+    let fired: Vec<FiredDebounce> = Box::pin(crate::tx_retry::run_with_conflict_retry(
+        conn,
+        crate::tx_retry::SITE_SCANNER,
+        metrics.unwrap_or(&crate::telemetry::NoOpMetrics),
+        crate::tx_retry::TxRetryPolicy::DEFAULT,
+        async |conn| {
+            Box::pin(
+                conn.transaction::<Vec<FiredDebounce>, crate::error::HarvestError, _>(
+                    async |conn| {
+                        let now = Utc::now();
+                        let due_sql = "
                 SELECT id, workflow_name, debounce_key, workflow_id, queue_name,
                        last_input, start_options, shard_id, max_fire_at
                 FROM harvest_debounce
@@ -629,26 +639,33 @@ async fn fire_due_on_conn(
                 FOR UPDATE SKIP LOCKED
             ";
 
-            let due_rows: Vec<FireDueRow> = diesel::sql_query(due_sql)
-                .bind::<diesel::sql_types::Timestamptz, _>(now)
-                .bind::<diesel::sql_types::BigInt, _>(DEBOUNCE_FIRE_BATCH_SIZE)
-                .load(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+                        let due_rows: Vec<FireDueRow> = diesel::sql_query(due_sql)
+                            .bind::<diesel::sql_types::Timestamptz, _>(now)
+                            .bind::<diesel::sql_types::BigInt, _>(DEBOUNCE_FIRE_BATCH_SIZE)
+                            .load(conn)
+                            .await
+                            .map_err(crate::error::database_error)?;
 
-            let due_rows =
-                crate::quota_lock_order::order_due_rows_for_deadlock_free_firing(conn, due_rows)
-                    .await?;
+                        let due_rows =
+                            crate::quota_lock_order::order_due_rows_for_deadlock_free_firing(
+                                conn, due_rows,
+                            )
+                            .await?;
 
-            let mut results = Vec::with_capacity(due_rows.len());
-            for row in due_rows {
-                if let Some(item) = fire_claimed_debounce_row(conn, row, codecs).await? {
-                    results.push(item);
-                }
-            }
-            Ok(results)
-        }),
-    )
+                        let mut results = Vec::with_capacity(due_rows.len());
+                        for row in due_rows {
+                            if let Some(item) = fire_claimed_debounce_row(conn, row, codecs).await?
+                            {
+                                results.push(item);
+                            }
+                        }
+                        Ok(results)
+                    },
+                ),
+            )
+            .await
+        },
+    ))
     .await?;
 
     Ok(fired)
@@ -825,24 +842,24 @@ const QUOTA_REDEFER_BACKOFF: Duration = Duration::from_secs(5);
 /// Clamps `proposed` to the row's own `max_fire_at`, preserving the
 /// pre-existing `max_wait` contract, **unless `max_fire_at` has already
 /// passed**. Once the deadline itself is in the past, `LEAST(proposed,
-/// max_fire_at)` would always evaluate to that past `max_fire_at` — writing
-/// an already-expired `effective_fire_at` back to the row, which
-/// re-qualifies it as due on the very next scanner tick and defeats the
-/// backoff entirely for exactly the case where it matters most (a row stuck
-/// past its deadline on a persistently exhausted quota). Past that point the
-/// row instead gets the bounded backoff **unclamped**: the `max_wait` cap
-/// has already been blown by the quota block, so there is no deadline left
-/// to honor, and the alternative — dropping the row — would silently
-/// discard a debounced start the caller is still waiting on.
+/// max_fire_at)` would always evaluate to that past `max_fire_at`. That
+/// writes an already-expired `effective_fire_at` back to the row. The row
+/// then re-qualifies as due on the very next scanner tick. That defeats the
+/// backoff entirely for exactly the case where it matters most: a row stuck
+/// past its deadline on a persistently exhausted quota. Past that point the
+/// row instead gets the bounded backoff **unclamped**. The quota block has
+/// already blown the `max_wait` cap, so there is no deadline left to honor.
+/// The alternative is to drop the row. That would silently discard a
+/// debounced start the caller is still waiting on.
 ///
 /// Deliberately NOT gated behind `#[cfg(feature = "db")]` like its caller
-/// (`redefer_debounce_row`): this function is pure `DateTime` arithmetic with
-/// no database dependency, and the ungated unit tests below need to call it
+/// (`redefer_debounce_row`). This function is pure `DateTime` arithmetic with
+/// no database dependency. The ungated unit tests below need to call it
 /// regardless of which features are enabled. Its only PRODUCTION caller is
-/// still `db`-gated, though, so it would be flagged dead code by a
-/// downstream crate's non-test build with `db` off (as `autumn-harvest-sqlite`
-/// does) -- the standard `#[cfg_attr(not(feature = "db"), allow(dead_code))]`
-/// used throughout this crate for exactly that shape.
+/// still `db`-gated, though. So a downstream crate's non-test build with `db`
+/// off would flag it as dead code (as `autumn-harvest-sqlite` does). Hence the
+/// standard `#[cfg_attr(not(feature = "db"), allow(dead_code))]`, used
+/// throughout this crate for exactly that shape.
 #[cfg_attr(not(feature = "db"), allow(dead_code))]
 fn redefer_target(
     now: DateTime<Utc>,

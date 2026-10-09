@@ -256,15 +256,33 @@ default threshold is `10_000` events.
 let harvest = HarvestBuilder::new()
     .workflows(workflows![polling_loop])
     .history_continue_as_new_threshold(5_000)
-    .history_event_hard_cap(20_000)
+    .history_event_hard_cap(40_000)
     .try_build()?;
 ```
 
-The optional hard cap is a last-resort guardrail. If an execution reaches
-`history_event_hard_cap` and the workflow does not issue `continue_as_new`, the
-worker fails the execution and moves it to the DLQ with a typed
-`HistoryCapExceeded { count, cap, workflow_type }` reason. No new workflow event
-variant is used for this guardrail.
+Two hard caps are on by default (issue #1804). They are last-resort
+guardrails against a runaway loop:
+
+| Cap | Default | Builder override | Typed DLQ reason |
+|---|---|---|---|
+| Durable events per run | `50_000` | `history_event_hard_cap(n)` | `HistoryCapExceeded { count, cap, workflow_type }` |
+| Stored history bytes per run | 50 MiB | `history_byte_hard_cap(n)` | `HistoryBytesCapExceeded { bytes, cap, workflow_type }` |
+
+A run that reaches a cap fails unless it calls `continue_as_new`. The worker
+moves it to the DLQ with the typed reason. The guardrail adds no workflow
+event variant. The byte measure is `pg_column_size(event_data)`, the
+same measure as the tenant `max_history_bytes` quota. The Postgres worker
+enforces both caps. The SQLite backend does not.
+
+`harvest.workflow.history_bloat` fires once per run at 20.48% of the event
+cap, so at `10_240` events by default. The worker also logs a warning. Set
+`history_bloat_warn_fraction(..)` to move the threshold. Keep the warning
+point above `history_continue_as_new_threshold`, or healthy runs warn before
+the advisory turns true. `try_build` logs a warning when they do.
+
+To remove a cap, call `history_event_hard_cap_unlimited()` or
+`history_byte_hard_cap_unlimited()`. With no event cap there is no
+history-bloat warning either.
 
 Harvest emits `harvest.workflow.history_size` for terminal executions and
 `harvest.workflow.continue_as_new` when a workflow rotates. Both metrics use
@@ -321,6 +339,7 @@ for a compile-checked polling loop that works with and without the `db` feature.
 | [`autumn-harvest-cli`](autumn-harvest-cli/) | `harvest` CLI: thin operator client for the management API |
 | [`autumn-harvest-redis`](autumn-harvest-redis/) | Optional Redis Streams dispatch channel — carries references to claimable rows; Postgres stays the source of truth |
 | [`autumn-harvest-sqlite`](autumn-harvest-sqlite/) | Optional SQLite storage backend for single-process and embedded deployments |
+| [`autumn-harvest-agent`](autumn-harvest-agent/) | Optional durable agent loop: model and tool calls as activities, approvals as durable waits ([guide](docs/agent-adapter.md)) |
 
 Use `autumn-harvest-plugin` if you're building an Autumn app. For a non-web
 context — a worker or CLI process with no HTTP surface at all — use the bare
@@ -378,6 +397,16 @@ a bearer token. Successful responses are printed as pretty JSON by default; use
 `--output json` for compact script-friendly output. JSON request payloads accept
 inline `--*-json` values or `--*-file PATH`; use `-` as the file path to read
 from stdin.
+
+Every API request has a timeout (issue #1832). Set it with
+`--http-timeout-secs` or `HARVEST_HTTP_TIMEOUT_SECS` (default 30, range
+1–3600). A request to an endpoint that never answers fails with
+`request timed out`. Two kinds of command get more time. `workflow update
+--wait completed` gets its `--timeout-secs` plus 10 s. A bulk DLQ command
+that writes gets at least 300 s. `events tail` applies the timeout to the
+response headers only. After that, it fails only when no data arrives for
+60 s or the timeout, whichever is longer. Server keepalives every 15 s keep
+a live stream open.
 
 The CLI sends `Accept: application/json` on every JSON request (issue
 #1579). Send the same header from `curl` or any other direct client of
@@ -1070,7 +1099,8 @@ The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest
   installs it on the first `cargo` call. CI uses the same pin, so a new
   stable release changes CI only when that file changes.
 - Postgres 12+ — except for `cargo dev`, whose `dev-runtime-managed` tier
-  downloads one for you
+  downloads one for you. CI runs Harvest's own DB suites on Postgres 16 and
+  does not test 12 to 15.
 - The `db` feature is enabled by default and pulls Diesel + diesel-async; build
   with `--no-default-features` for pure compile-checks on systems without
   libpq.
@@ -1193,11 +1223,11 @@ cannot connect **fails startup**, in every mode, with an error naming the
 endpoint. A process that came up without its channel would look healthy and
 publish nothing, so the failure is loud instead.
 
-The connection is plaintext, and `redis://` sends the password in cleartext.
-This release carries no TLS transport: a `rediss://` URL is rejected at
-startup, and issue #1429 tracks TLS support. Keep Redis on a private network
-or behind a TLS tunnel that terminates on the host. v1 targets a single Redis
-instance and a single-shard runtime; Redis Cluster is not supported.
+A `redis://` URL is plaintext and sends the password in cleartext. Use
+`rediss://` for TLS (issue #1834). The client verifies the server against the
+platform trust store. `SSL_CERT_FILE` or `SSL_CERT_DIR` replaces that store
+with a private CA bundle. v1 targets a single Redis instance and a
+single-shard runtime. Redis Cluster is not supported.
 
 See [`docs/operations/redis-dispatch.md`](docs/operations/redis-dispatch.md)
 for the key layout, the crash matrix, the failure modes and the v1 limits.
@@ -1460,4 +1490,8 @@ With no `telemetry(...)` call (the default), all `info_span!` sites compile to b
 
 ## License
 
-Dual-licensed under MIT or Apache 2.0 at your option.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Each published crate ships both license files.
+
+To contribute, read [`CONTRIBUTING.md`](CONTRIBUTING.md).
+To report a vulnerability, follow [`SECURITY.md`](SECURITY.md).

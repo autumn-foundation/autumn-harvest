@@ -256,6 +256,11 @@ pub struct ShardRouter {
     /// shard and silently resolve to the wrong run — the one failure mode a
     /// decommission must never produce.
     shard_forwards: BTreeMap<ShardId, ShardId>,
+    /// Shards reserved for pinned work, one per tenant cell (issue #1837).
+    ///
+    /// Sorted and free of duplicates. Empty by default. Populated via
+    /// [`ShardRouter::with_reserved_shards`].
+    reserved_shards: Vec<ShardId>,
 }
 
 /// Every placement-affecting field of a [`ShardRouter`], borrowed together.
@@ -275,6 +280,8 @@ pub struct ShardRouterParts<'a> {
     pub residency_map: &'a BTreeMap<String, ShardId>,
     /// The declared retired-shard → successor mapping (issue #964).
     pub shard_forwards: &'a BTreeMap<ShardId, ShardId>,
+    /// The shards reserved for pinned work (issue #1837).
+    pub reserved_shards: &'a [ShardId],
 }
 
 impl ShardRouter {
@@ -309,6 +316,7 @@ impl ShardRouter {
             default_shard,
             residency_map: BTreeMap::new(),
             shard_forwards: BTreeMap::new(),
+            reserved_shards: Vec::new(),
         }
     }
 
@@ -491,6 +499,105 @@ impl ShardRouter {
         &self.shard_forwards
     }
 
+    /// Reserve shards for pinned work only (issue #1837).
+    ///
+    /// A reserved shard is a tenant cell. Unpinned placement never picks it:
+    /// [`ShardPlacement::Auto`], idempotency-key routing, DAG pinning and
+    /// `ChildPlacement::Distributed` all skip it. A pin still reaches it,
+    /// through [`ShardPlacement::Shard`] or a residency key from
+    /// [`ShardRouter::with_residency_map`]. The shard stays readable and
+    /// writable.
+    ///
+    /// Only keys that hashed to a reserved shard move. They re-hash among
+    /// the other writable shards, which is the same redirect a drained shard
+    /// gets. All other keys keep their shard.
+    ///
+    /// Reserve a shard before it takes unpinned traffic. A business key that
+    /// already lives on it hashes elsewhere after the reservation, like a key
+    /// on a drained shard. See `docs/adr/0004-tenant-isolation-cells.md`.
+    ///
+    /// Calling this twice replaces the previous set.
+    ///
+    /// ```rust
+    /// # use autumn_harvest::shard::ShardRouter;
+    /// # use autumn_harvest::types::ShardId;
+    /// let all = vec![ShardId::new(0), ShardId::new(1)];
+    /// let router = ShardRouter::new(all.clone(), all, ShardId::new(0))
+    ///     .with_residency_map([("cell-a".to_string(), ShardId::new(1))])
+    ///     .with_reserved_shards([ShardId::new(1)]);
+    /// assert_eq!(router.pick_for_new_workflow("wf", "any"), ShardId::new(0));
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if a reserved shard is not in `readable_shards`. Panics if the
+    /// default shard is reserved: workflow schedules and unencoded ids resolve
+    /// to it without a pin. Panics if the reservation leaves no writable
+    /// shard for unpinned starts, or no readable one. All fail at boot, like
+    /// the other router builders.
+    #[must_use]
+    pub fn with_reserved_shards(mut self, shards: impl IntoIterator<Item = ShardId>) -> Self {
+        let mut reserved: Vec<ShardId> = shards.into_iter().collect();
+        reserved.sort_unstable();
+        reserved.dedup();
+        for shard in &reserved {
+            assert!(
+                self.readable_shards.contains(shard),
+                "reserved shard {shard} is not in the readable set"
+            );
+            assert_ne!(
+                *shard, self.default_shard,
+                "reserved shard {shard} is the default shard; unpinned schedules and \
+                 unencoded ids land there, so keep the default shard shared"
+            );
+        }
+        let shared_writable = self
+            .writable_shards
+            .iter()
+            .any(|shard| !reserved.contains(shard));
+        assert!(
+            shared_writable || self.writable_shards.is_empty(),
+            "reserving {reserved:?} leaves no writable shard for unpinned starts; \
+             keep at least one writable shard unreserved"
+        );
+        // A fully drained router places DAGs over the readable set, so one
+        // readable shard must also stay unreserved.
+        let shared_readable = self
+            .readable_shards
+            .iter()
+            .any(|shard| !reserved.contains(shard));
+        assert!(
+            shared_readable,
+            "reserving {reserved:?} leaves no readable shard for unpinned work; \
+             keep at least one readable shard unreserved"
+        );
+        self.reserved_shards = reserved;
+        self
+    }
+
+    /// The shards reserved for pinned work (issue #1837).
+    ///
+    /// Sorted. Empty unless [`ShardRouter::with_reserved_shards`] was used.
+    #[must_use]
+    pub fn reserved_shards(&self) -> &[ShardId] {
+        &self.reserved_shards
+    }
+
+    /// Is `shard` reserved for pinned work (issue #1837)?
+    #[must_use]
+    pub fn is_reserved(&self, shard: ShardId) -> bool {
+        self.reserved_shards.binary_search(&shard).is_ok()
+    }
+
+    /// Can unpinned placement pick `shard` (issue #1837)?
+    ///
+    /// True when the shard is writable and not reserved. A pin may still
+    /// target a shard for which this is false, if the shard is writable.
+    #[must_use]
+    pub fn accepts_unpinned(&self, shard: ShardId) -> bool {
+        self.is_writable(shard) && !self.is_reserved(shard)
+    }
+
     /// Borrow every placement-affecting field at once, for exhaustive
     /// destructuring by a projection that must not silently miss one.
     ///
@@ -518,6 +625,7 @@ impl ShardRouter {
             default_shard,
             residency_map,
             shard_forwards,
+            reserved_shards,
         } = self;
         ShardRouterParts {
             readable_shards,
@@ -525,6 +633,7 @@ impl ShardRouter {
             default_shard: *default_shard,
             residency_map,
             shard_forwards,
+            reserved_shards,
         }
     }
 
@@ -699,15 +808,32 @@ impl ShardRouter {
     /// The initial pick is taken over the full readable set (so the hash is
     /// stable while the writable set is widened/narrowed) and, when it lands
     /// outside the writable subset, re-hashed among the writable shards.
+    ///
+    /// A reserved shard (issue #1837) counts as outside the subset. The
+    /// re-hash then runs over the unreserved writable shards only.
     fn pick_writable(&self, primary: &str, secondary: &str) -> ShardId {
         let initial = rendezvous_pick(&self.readable_shards, primary, secondary);
-        if self.writable_shards.contains(&initial) {
+        if self.accepts_unpinned(initial) {
             return initial;
         }
         if self.writable_shards.is_empty() {
             return self.default_shard;
         }
-        rendezvous_pick(&self.writable_shards, primary, secondary)
+        if self.reserved_shards.is_empty() {
+            return rendezvous_pick(&self.writable_shards, primary, secondary);
+        }
+        // Never empty: `with_reserved_shards` keeps one writable shard free.
+        let candidates = self.without_reserved(&self.writable_shards);
+        rendezvous_pick(&candidates, primary, secondary)
+    }
+
+    /// `shards` minus the reserved ones, in the same order (issue #1837).
+    fn without_reserved(&self, shards: &[ShardId]) -> Vec<ShardId> {
+        shards
+            .iter()
+            .copied()
+            .filter(|shard| !self.is_reserved(*shard))
+            .collect()
     }
 
     /// Pick a shard for a brand new workflow using rendezvous hashing.
@@ -789,6 +915,9 @@ impl ShardRouter {
     /// DAG must be pinned to a single shard that owns it.
     /// The same name always maps to the same shard because rendezvous hashing
     /// is stable.
+    ///
+    /// A DAG is unpinned work, so it never lands on a reserved shard
+    /// (issue #1837).
     #[must_use]
     pub fn pick_for_dag(&self, dag_name: &str) -> ShardId {
         let primary = if self.writable_shards.is_empty() {
@@ -796,7 +925,17 @@ impl ShardRouter {
         } else {
             &self.writable_shards
         };
-        rendezvous_pick(primary, dag_name, "")
+        if self.reserved_shards.is_empty() {
+            return rendezvous_pick(primary, dag_name, "");
+        }
+        let candidates = self.without_reserved(primary);
+        // `with_reserved_shards` keeps one readable and one writable shard
+        // free, so this is not empty. The default shard is never reserved,
+        // so it is the safe fallback.
+        if candidates.is_empty() {
+            return self.default_shard;
+        }
+        rendezvous_pick(&candidates, dag_name, "")
     }
 }
 
@@ -1881,9 +2020,7 @@ pub(crate) enum ShardConnectError {
 
 /// A pooled connection to one shard, as returned by [`connect_to_shard`].
 #[cfg(feature = "db")]
-pub(crate) type ShardConn = deadpool::managed::Object<
-    diesel_async::pooled_connection::AsyncDieselConnectionManager<AsyncPgConnection>,
->;
+pub(crate) type ShardConn = crate::replication::FencedConn;
 
 /// Get `shard`'s own connection from `sharded_pool`.
 ///
@@ -1920,7 +2057,9 @@ pub(crate) async fn connect_to_shard(
     let Some(pool) = sharded_pool.exact_pool_for(shard).cloned() else {
         return Ok(None);
     };
-    match pool.get().await {
+    // Issue #1823: inside a fenced pass, a busy pool must not hold a bump
+    // off, and a lost guard must end this backend.
+    match crate::replication::fenced_checkout(&pool).await {
         Ok(conn) => Ok(Some(conn)),
         Err(e) => match on_connect_error {
             ShardConnectError::LogAndSkip => {

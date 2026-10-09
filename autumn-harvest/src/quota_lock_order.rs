@@ -7,12 +7,16 @@
 //! Two scanner transactions can claim disjoint batches that need the same
 //! two quota locks in opposite order. That is an ABBA wait-for cycle.
 //! Postgres aborts one transaction with a raw `deadlock_detected` error.
-//! No arm in a scanner fire path catches that error. It aborts every other
-//! duty in the same tick.
+//! Before issue #1822, no arm in a scanner fire path caught that error. It
+//! aborted every other duty in the same tick.
 //!
 //! [`order_due_rows_for_deadlock_free_firing`] closes the cycle. It sorts
 //! the batch by the advisory-lock id each row will take. Every transaction
 //! then visits shared locks in the same order.
+//!
+//! The fire batch also runs under [`crate::tx_retry`]. The retry is a
+//! backstop for a cycle this sort does not cover. It does not replace the
+//! sort. See the lock-order table in `docs/architecture.md`.
 
 use std::collections::{BTreeSet, HashMap};
 

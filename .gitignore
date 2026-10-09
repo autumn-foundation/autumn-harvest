@@ -4,6 +4,9 @@ Cargo.lock
 .claude/
 __pycache__/
 
+# Crash dumps that rustc writes on an internal compiler error.
+rustc-ice-*.txt
+
 # Nested cargo target dirs (e.g. per-agent --target-dir runs inside member crates)
 **/target/
 
@@ -33,3 +36,11 @@ clients/typescript/*.tgz
 # TLC trace dumps from a manual run in formal/tla (issue #1819).
 formal/tla/*_TTrace_*
 formal/tla/states/
+
+# Patch leftovers (issue #1831). CI fails on a tracked one
+# (docs/audits/tracked-artifacts.py).
+*.orig
+*.rej
+
+# An interrupted Ledger capture can leave its stage (issue #1956).
+docs/perf-artifacts/**/.staging-*/

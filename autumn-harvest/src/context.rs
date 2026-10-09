@@ -48,6 +48,19 @@ pub fn empty_shared_state() -> SharedState {
 /// Default soft history-size threshold for recommending `continue_as_new`.
 pub const DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD: u64 = 10_000;
 
+/// Default hard cap on durable history events per run (issue #1804).
+///
+/// A run that reaches this count fails and moves to the DLQ with
+/// `HistoryCapExceeded`. Temporal terminates at 51,200 events.
+pub const DEFAULT_HISTORY_EVENT_HARD_CAP: u64 = 50_000;
+
+/// Default hard cap on stored history bytes per run (issue #1804): 50 MiB.
+///
+/// The worker measures `pg_column_size(event_data)`, the same measure as the
+/// tenant `max_history_bytes` quota. A run that reaches the cap fails and moves
+/// to the DLQ with `HistoryBytesCapExceeded`.
+pub const DEFAULT_HISTORY_BYTE_HARD_CAP: u64 = 50 * 1024 * 1024;
+
 /// Default deadline-fraction trigger for [`WorkflowContext::should_continue_as_new`]
 /// (issue #772).
 ///
@@ -60,11 +73,16 @@ pub const DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION: f64 = 0.8;
 /// Default fraction of [`WorkflowHistoryPolicy::event_hard_cap`] at which the
 /// operator early-warning soft threshold fires (issue #704).
 ///
-/// `0.75` means a still-running execution is warned once it has accumulated
-/// 75% of the configured hard-cap event count -- giving an operator a window
-/// to intervene (e.g. trigger a manual `continue_as_new`, or investigate a
-/// runaway loop) before the hard cap terminally fails the workflow.
-pub const DEFAULT_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.75;
+/// `0.2048` warns a still-running execution at 20.48% of the hard cap. Under
+/// the default cap that is 10,240 events, the same as Temporal's warning
+/// point (issue #1804). The gap gives an operator time to act before the cap
+/// fails the run.
+///
+/// The warning sits above the default `continue_as_new` threshold of 10,000.
+/// [`WorkflowContext::should_continue_as_new`] turns true only past that
+/// threshold. A warning at exactly 10,000 would page every run that rotates
+/// on the advisory. The 240-event margin covers the rotating decision.
+pub const DEFAULT_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.2048;
 
 /// Upper clamp for [`WorkflowContext::with_history_bloat_warn_fraction`]
 /// (issue #704, PR #1139 review, P2).
@@ -86,16 +104,44 @@ pub const DEFAULT_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.75;
 /// `ceil(100 * 0.999) = ceil(99.9) = 100 == cap`), which -- absent a further
 /// fix -- would collapse the promised "warn before the hard cap" window into
 /// "warn on the same decision cycle as the hard cap" for small caps (PR
-/// #1139 review, a later round). The actual below-`cap` guarantee is
-/// enforced in `worker.rs`'s `history_bloat_threshold_crossed`, which clamps
-/// its computed threshold to `cap - 1` unconditionally of what `fraction`
-/// resolves to -- that clamp is what keeps the signal functional for every
-/// `(cap, fraction)` combination the public builder API can produce. This
+/// #1139 review, a later round). [`history_bloat_warn_threshold`] holds the
+/// real below-`cap` guarantee. It clamps the threshold to `cap - 1` for any
+/// `fraction`. That clamp keeps the signal working for every
+/// `(cap, fraction)` pair the public builder API can build. This
 /// constant's `< 1.0` ceiling remains as an independent, secondary safety
 /// margin (and a reasonable API choice on its own: a fraction of exactly
 /// `1.0` is a confusing "wait until literally the entire cap" configuration
 /// regardless of the below-cap clamp).
 pub const MAX_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.999;
+
+/// The event count at which the history-bloat warning fires (issue #704).
+///
+/// Returns `None` when `fraction <= 0.0`, the disabled sentinel. Otherwise
+/// the threshold is `ceil(cap * fraction)`, clamped to `cap - 1`.
+///
+/// The ceiling rounds up, not down. For cap 10 and fraction 0.75 the product
+/// is 7.5. A truncating cast warns at 7 events, which is 70% of the cap. The
+/// warning must fire at or past the configured fraction, so it fires at 8.
+///
+/// The clamp keeps at least one event of warning room below the hard cap.
+/// [`MAX_HISTORY_BLOAT_WARN_FRACTION`] limits `fraction` alone and cannot see
+/// `cap`. For cap 100, `ceil(100 * 0.999)` is 100, which equals the cap. The
+/// warning would then fire in the same decision as the hard cap, with no time
+/// to act. Only a clamp that sees both values prevents that, for every
+/// `(cap, fraction)` pair the public API can build.
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+pub fn history_bloat_warn_threshold(cap: u64, fraction: f64) -> Option<u64> {
+    if fraction <= 0.0 {
+        return None;
+    }
+    let raw_threshold = (cap as f64 * fraction).ceil() as u64;
+    Some(raw_threshold.min(cap.saturating_sub(1)))
+}
 
 /// Default maximum byte length for the `current_details` string (issue #473).
 /// Values longer than this cap are truncated to this length on the byte boundary.
@@ -169,6 +215,8 @@ const fn encode_progress_seq(epoch: u64, local_index: u64) -> u64 {
 pub struct WorkflowHistoryPolicy {
     continue_as_new_threshold: u64,
     event_hard_cap: Option<u64>,
+    /// Hard cap on stored history bytes (issue #1804). `None` is unlimited.
+    byte_hard_cap: Option<u64>,
     /// Fraction of `execution_timeout` consumed at which
     /// [`WorkflowContext::should_continue_as_new`] additionally recommends a
     /// checkpoint (issue #772). Clamped into `[0.0, 1.0]`.
@@ -181,15 +229,20 @@ pub struct WorkflowHistoryPolicy {
     /// via [`Self::with_history_bloat_warn_fraction`], the sole (guarded)
     /// entry point, since this field is private.
     history_bloat_warn_fraction: f64,
+    /// Whether each decision appends a `DecisionCommitted` boundary
+    /// (issue #1833). Defaults to `false`.
+    decision_boundaries: bool,
 }
 
 impl Default for WorkflowHistoryPolicy {
     fn default() -> Self {
         Self {
             continue_as_new_threshold: DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
-            event_hard_cap: None,
+            event_hard_cap: Some(DEFAULT_HISTORY_EVENT_HARD_CAP),
+            byte_hard_cap: Some(DEFAULT_HISTORY_BYTE_HARD_CAP),
             continue_as_new_deadline_fraction: DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION,
             history_bloat_warn_fraction: DEFAULT_HISTORY_BLOAT_WARN_FRACTION,
+            decision_boundaries: false,
         }
     }
 }
@@ -201,7 +254,8 @@ impl WorkflowHistoryPolicy {
         self.continue_as_new_threshold
     }
 
-    /// Optional hard cap that moves an execution to the DLQ when exceeded.
+    /// Hard cap that moves an execution to the DLQ when reached. Defaults to
+    /// [`DEFAULT_HISTORY_EVENT_HARD_CAP`]; `None` is unlimited.
     #[must_use]
     pub const fn event_hard_cap(self) -> Option<u64> {
         self.event_hard_cap
@@ -223,10 +277,39 @@ impl WorkflowHistoryPolicy {
         self
     }
 
-    /// Override the optional hard cap.
+    /// Override the event hard cap.
     #[must_use]
     pub const fn with_event_hard_cap(mut self, cap: u64) -> Self {
         self.event_hard_cap = Some(cap);
+        self
+    }
+
+    /// Remove the event hard cap (issue #1804). This also turns off the
+    /// history-bloat warning, because the warning is a fraction of the cap.
+    #[must_use]
+    pub const fn without_event_hard_cap(mut self) -> Self {
+        self.event_hard_cap = None;
+        self
+    }
+
+    /// Hard cap on stored history bytes (issue #1804). Defaults to
+    /// [`DEFAULT_HISTORY_BYTE_HARD_CAP`]; `None` is unlimited.
+    #[must_use]
+    pub const fn byte_hard_cap(self) -> Option<u64> {
+        self.byte_hard_cap
+    }
+
+    /// Override the stored-history byte cap (issue #1804).
+    #[must_use]
+    pub const fn with_byte_hard_cap(mut self, cap: u64) -> Self {
+        self.byte_hard_cap = Some(cap);
+        self
+    }
+
+    /// Remove the stored-history byte cap (issue #1804).
+    #[must_use]
+    pub const fn without_byte_hard_cap(mut self) -> Self {
+        self.byte_hard_cap = None;
         self
     }
 
@@ -246,6 +329,35 @@ impl WorkflowHistoryPolicy {
     #[must_use]
     pub const fn history_bloat_warn_fraction(self) -> f64 {
         self.history_bloat_warn_fraction
+    }
+
+    /// Whether each decision appends a
+    /// [`DecisionCommitted`](crate::event::WorkflowEvent::DecisionCommitted)
+    /// boundary (issue #1833). Defaults to `false`.
+    #[must_use]
+    pub const fn decision_boundaries(self) -> bool {
+        self.decision_boundaries
+    }
+
+    /// Turn decision boundaries on or off (issue #1833).
+    ///
+    /// A process older than this release cannot decode a boundary. An old
+    /// worker fails the execution that holds one. So boundaries are off by
+    /// default, as the rolling-deploy contract requires. Turn them on when
+    /// no older process runs.
+    #[must_use]
+    pub const fn with_decision_boundaries(mut self, enabled: bool) -> Self {
+        self.decision_boundaries = enabled;
+        self
+    }
+
+    /// The event count at which the history-bloat warning fires (issue
+    /// #1804). `None` when the event cap is unlimited or the fraction is
+    /// `0.0`. See [`history_bloat_warn_threshold`].
+    #[must_use]
+    pub fn history_bloat_warn_threshold(self) -> Option<u64> {
+        self.event_hard_cap
+            .and_then(|cap| history_bloat_warn_threshold(cap, self.history_bloat_warn_fraction))
     }
 
     /// Override the history-bloat soft-warning fraction (issue #704). The
@@ -1802,6 +1914,19 @@ const RESERVED_SEARCH_ATTR_KEYS: &[&str] = &[
 
 const RESERVED_SEARCH_ATTR_PREFIX: &str = "_harvest";
 
+/// Copy the test harness clock for an update handler context (issue #1991).
+///
+/// The handler gets its own counter, so a timer in the handler cannot move
+/// the clock of the workflow body.
+#[cfg(any(test, feature = "testing"))]
+fn snapshot_timer_clock(
+    elapsed: &Arc<std::sync::atomic::AtomicU64>,
+) -> Arc<std::sync::atomic::AtomicU64> {
+    Arc::new(std::sync::atomic::AtomicU64::new(
+        elapsed.load(std::sync::atomic::Ordering::Relaxed),
+    ))
+}
+
 fn validate_search_attr_key(key: &str) -> HarvestResult<()> {
     if key.is_empty() {
         return Err(HarvestError::InvalidSearchAttribute {
@@ -2989,8 +3114,11 @@ pub struct WorkflowContext {
     /// `None` = production behavior (`ctx.now()` always returns `start_time`).
     /// `Some` = test harness advancing-clock mode; incremented each time a
     /// durable timer resolves from history so `ctx.now()` reflects virtual elapsed time.
+    ///
+    /// Shared through an `Arc`, so a declarative update handler can read the
+    /// clock when it runs (issue #1991).
     #[cfg(any(test, feature = "testing"))]
-    timer_clock_elapsed_secs: Option<std::sync::atomic::AtomicU64>,
+    timer_clock_elapsed_secs: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// Metrics recorder for user-emitted custom business metrics (issue #532).
     /// Defaults to [`NoOpMetrics`](crate::telemetry::NoOpMetrics) when the
     /// worker has no telemetry configured.  Workflow metrics are replay-safe:
@@ -3757,7 +3885,7 @@ impl WorkflowContext {
     #[must_use]
     #[allow(clippy::missing_const_for_fn)]
     pub fn with_advancing_timer_clock(mut self) -> Self {
-        self.timer_clock_elapsed_secs = Some(std::sync::atomic::AtomicU64::new(0));
+        self.timer_clock_elapsed_secs = Some(Arc::new(std::sync::atomic::AtomicU64::new(0)));
         self
     }
 
@@ -3866,6 +3994,37 @@ impl WorkflowContext {
     /// inline, and therefore must NOT be rejected by the #252 size cap.
     const fn offload_will_apply(&self, observed: u64) -> bool {
         matches!(self.payload_offload_threshold, Some(t) if observed > t)
+    }
+
+    /// The history policy this run runs under.
+    pub(crate) const fn history_policy(&self) -> WorkflowHistoryPolicy {
+        self.history_policy
+    }
+
+    /// Serialized bytes of the history loaded for this task.
+    ///
+    /// It reads only the loaded events, so the result is the same on each
+    /// call within one task (issue #1975).
+    pub(crate) fn loaded_history_bytes(&self) -> u64 {
+        self.match_history(|matcher| matcher.loaded_bytes())
+    }
+
+    /// The largest same-type continue-as-new input this run can write.
+    ///
+    /// Returns `None` when every size is accepted. That is true when the cap
+    /// is `0`. It is also true when the offload threshold is at or below the
+    /// cap, because each input above the cap is then offloaded. A higher
+    /// threshold leaves a size band that is rejected, so the cap applies.
+    /// The entity loop uses it to size a checkpoint (issue #1975).
+    pub(crate) const fn continue_as_new_input_budget(&self) -> Option<u64> {
+        let cap = self.payload_max_workflow_input;
+        if cap == 0 {
+            return None;
+        }
+        match self.payload_offload_threshold {
+            Some(threshold) if threshold <= cap => None,
+            _ => Some(cap),
+        }
     }
 
     /// Add or replace a per-activity input cap override.
@@ -13024,6 +13183,10 @@ impl WorkflowContext {
         // `new_for_handler` inits it to `None`; without this the update-handler
         // path (unlike the workflow body) would never see the parent.
         let parent_execution_id = self.parent_execution_id;
+        // Issue #1991: the test harness clock. The handler reads it when it
+        // runs, so its `ctx.now()` matches the workflow body.
+        #[cfg(any(test, feature = "testing"))]
+        let timer_clock = self.timer_clock_elapsed_secs.clone();
 
         let boxed_handler: crate::update::BoxUpdateHandler = std::sync::Arc::new(move |input| {
             let mut ctx = Self::new_for_handler(
@@ -13051,6 +13214,10 @@ impl WorkflowContext {
                 inner.current_shard_id = current_shard_id;
                 // Issue #698: inherit the spawning parent's execution id.
                 inner.parent_execution_id = parent_execution_id;
+                #[cfg(any(test, feature = "testing"))]
+                {
+                    inner.timer_clock_elapsed_secs = timer_clock.as_ref().map(snapshot_timer_clock);
+                }
             }
             handler_fn(ctx, input)
         });
@@ -13129,6 +13296,13 @@ impl WorkflowContext {
                 // Issue #698: inherit the spawning parent's execution id so
                 // `ctx.info().parent_execution_id` is visible inside the handler.
                 inner.parent_execution_id = self.parent_execution_id;
+                #[cfg(any(test, feature = "testing"))]
+                {
+                    inner.timer_clock_elapsed_secs = self
+                        .timer_clock_elapsed_secs
+                        .as_ref()
+                        .map(snapshot_timer_clock);
+                }
             }
             h(ctx, input)
         })
@@ -15573,9 +15747,7 @@ impl ActivityContext {
             return Ok(());
         }
 
-        let mut conn = check
-            .pool
-            .get()
+        let mut conn = crate::replication::fenced_checkout(&check.pool)
             .await
             .map_err(crate::error::database_error)?;
         let task_id = check.claim.task_id;
@@ -15743,10 +15915,9 @@ impl ActivityContext {
         let codecs = self.payload_codecs.clone();
         let max_result_bytes = txn.max_result_bytes;
 
-        let mut conn =
-            txn.pool.get().await.map_err(|e| {
-                format!("transactional activity failed to acquire DB connection: {e}")
-            })?;
+        let mut conn = crate::replication::fenced_checkout(&txn.pool)
+            .await
+            .map_err(|e| format!("transactional activity failed to acquire DB connection: {e}"))?;
 
         // Issue #1429 (Codex review): `wake_workflow_task` below raises a
         // dispatch hint. `buffered_checkpoint` ties its publish to this
@@ -16012,6 +16183,30 @@ impl ActivityContext {
             identity,
         )
         .with_idempotency_key(key)
+        .with_attempt(1)
+        .with_max_attempts(1)
+    }
+
+    /// Like [`new_test`](Self::new_test) but with registered state, so a test
+    /// can run an activity that reads [`state`](Self::state) (issue #1973).
+    ///
+    /// Build `state` the way `HarvestBuilder::state` does: one boxed value per
+    /// type, keyed by its `TypeId`.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn new_test_with_state(state: SharedState) -> Self {
+        let id = ActivityExecId::new();
+        let identity = ActivityIdentity {
+            activity_id: id,
+            ..ActivityIdentity::for_test()
+        };
+        Self::new(
+            state,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            identity,
+        )
+        .with_idempotency_key(IdempotencyKey::from_activity_exec_id(id))
         .with_attempt(1)
         .with_max_attempts(1)
     }
@@ -17371,6 +17566,52 @@ mod tests {
         assert!(under.continue_as_new_deadline_fraction().abs() < f64::EPSILON);
         let mid = WorkflowHistoryPolicy::default().with_continue_as_new_deadline_fraction(0.6);
         assert!((mid.continue_as_new_deadline_fraction() - 0.6).abs() < f64::EPSILON);
+    }
+
+    // ── Default history caps (issue #1804) ──────────────────────────────────
+
+    #[test]
+    fn workflow_history_policy_ships_default_hard_caps() {
+        let policy = WorkflowHistoryPolicy::default();
+        assert_eq!(DEFAULT_HISTORY_EVENT_HARD_CAP, 50_000);
+        assert_eq!(DEFAULT_HISTORY_BYTE_HARD_CAP, 50 * 1024 * 1024);
+        assert_eq!(
+            policy.event_hard_cap(),
+            Some(DEFAULT_HISTORY_EVENT_HARD_CAP)
+        );
+        assert_eq!(policy.byte_hard_cap(), Some(DEFAULT_HISTORY_BYTE_HARD_CAP));
+    }
+
+    #[test]
+    fn workflow_history_policy_default_warning_lands_at_10240_events() {
+        // 50,000 * 0.2048 = 10,240: the default soft threshold.
+        let policy = WorkflowHistoryPolicy::default();
+        assert_eq!(policy.history_bloat_warn_threshold(), Some(10_240));
+        assert_eq!(
+            policy
+                .without_event_hard_cap()
+                .history_bloat_warn_threshold(),
+            None
+        );
+        assert_eq!(
+            policy
+                .with_history_bloat_warn_fraction(0.0)
+                .history_bloat_warn_threshold(),
+            None
+        );
+    }
+
+    #[test]
+    fn workflow_history_policy_caps_accept_unlimited() {
+        let policy = WorkflowHistoryPolicy::default()
+            .without_event_hard_cap()
+            .without_byte_hard_cap();
+        assert_eq!(policy.event_hard_cap(), None);
+        assert_eq!(policy.byte_hard_cap(), None);
+
+        let capped = policy.with_event_hard_cap(7).with_byte_hard_cap(9);
+        assert_eq!(capped.event_hard_cap(), Some(7));
+        assert_eq!(capped.byte_hard_cap(), Some(9));
     }
 
     // ── Operator early-warning for history bloat (issue #704) ────────────────
@@ -20919,7 +21160,9 @@ mod tests {
     async fn freeze_completes_well_under_a_decision_budget_at_max_n() {
         // R10: a decision cycle must stay cheap. The scan is bounded and uses
         // BTreeSet lookups, so even MAX_BUSINESS_DAYS is cheap.
+        // Every tenth day stays open, so no run is longer than 30 days (issue #1968).
         let holidays: Vec<chrono::NaiveDate> = (0..400)
+            .filter(|i| i % 10 != 0)
             .filter_map(|i| {
                 chrono::NaiveDate::from_ymd_opt(2026, 1, 1)?.checked_add_days(chrono::Days::new(i))
             })
@@ -20932,7 +21175,7 @@ mod tests {
         // Assert the outcome, not just the timing: discarding the Result would
         // let the scan bail out immediately with an error and still "pass".
         // With no declared coverage horizon the resolution must SUCCEED, and it
-        // must land past the 400 blocked days.
+        // must land past the 400-day holiday span.
         let deadline = out.expect("MAX_BUSINESS_DAYS must resolve, not reject");
         assert!(
             deadline > bd_utc("2027-02-05T00:00:00Z"),
@@ -29826,6 +30069,17 @@ mod activity_info_tests {
         assert_eq!(info.attempt, 1);
         assert_eq!(info.max_attempts, 1);
         assert_eq!(info.task_id, None);
+    }
+
+    /// `new_test_with_state()` exposes the state it was given, and nothing else.
+    #[test]
+    fn new_test_with_state_exposes_its_state() {
+        let mut map: crate::context::SharedStateMap = std::collections::HashMap::new();
+        map.insert(std::any::TypeId::of::<u32>(), Box::new(7_u32));
+        let ctx = ActivityContext::new_test_with_state(std::sync::Arc::new(map));
+        assert_eq!(ctx.state::<u32>(), Some(&7));
+        assert_eq!(ctx.state::<String>(), None);
+        assert_eq!(ctx.info().attempt, 1);
     }
 
     #[test]

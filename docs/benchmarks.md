@@ -34,47 +34,43 @@ Four scenarios, each run at **1 shard**, **2 shards** and **4 shards**.
 | `signal_roundtrip` | signal round-trip p50/p99 | an HTTP signal request leaving the client → the workflow's own code resuming past `wait_for_signal` |
 | `replay_throughput` | replay events/sec | the issue #135 history (10 001 events), in memory |
 
-### Headline numbers, v0.6.0
+### Headline numbers, v0.7.0
 
-Four logical CPUs, Postgres 16.13, durability off, one worker per shard. The
+Four logical CPUs, Postgres 16.15, durability off, one worker per shard. The
 full environment, the per-cell notes and the verbatim run output are in
-[`benchmarks/results-v0.6.0.md`](benchmarks/results-v0.6.0.md).
+[`benchmarks/results-v0.7.0.md`](benchmarks/results-v0.7.0.md).
 
 | scenario | metric | 1 shard | 2 shards | 4 shards |
 |:--|:--|--:|--:|--:|
-| `throughput` | workflows/sec | 23.73 | 35.70 | 33.58 |
-| `dispatch_latency` | p50 ms | 40.98 | 47.22 | 58.02 |
-| `dispatch_latency` | p99 ms | 58.63 | 65.49 | 111.75 |
-| `signal_roundtrip` | p50 ms | 53.59 | 44.74 | 54.23 |
-| `signal_roundtrip` | p99 ms | 65.96 | 71.16 | 92.90 |
-| `replay_throughput` | events/sec | 9 204 142.19 | 9 282 928.36 | 9 240 557.56 |
+| `throughput` | workflows/sec | 15.46 | 18.84 | 19.50 |
+| `dispatch_latency` | p50 ms | 16.12 | 26.17 | 69.98 |
+| `dispatch_latency` | p99 ms | 90.86 | 107.79 | 183.13 |
+| `signal_roundtrip` | p50 ms | 47.53 | 51.10 | 62.27 |
+| `signal_roundtrip` | p99 ms | 92.99 | 95.52 | 118.00 |
+| `replay_throughput` | events/sec | 9 750 423.86 | 9 063 901.37 | 8 981 387.93 |
 
-Four things a reader should take from that table before anything else:
+Read these four points with the table:
 
-* **The box was idle, and that is a precondition rather than a formality.** The
-  replay control — in-memory, so it cannot legitimately move with shard count —
-  spread **0.8%** across this sweep. An earlier sweep of the same code on the
-  same machine, taken while the machine was also compiling, read **8.7%** and
-  deformed its latency cells badly enough to invert the dispatch p50 ordering;
-  another read 602 ms in a cell that reads 58 ms here. On four cores a
-  concurrent build is enough to move a published latency by more than 10x, so
-  check your own run's noise-control section before comparing anything.
-* **Sharding bought 1.50x at two shards and then gave some back.** Four shards
-  is slower than two *on this machine*, which runs four Postgres clusters, four
-  workers and the harness on four cores. This reproduces on every sweep taken
-  here. See
+* **This is a different host from 0.6.0, and most of the drop is the host.**
+  A same-box control, linked from the results file, runs the 0.6.0 suite on
+  this host. There,
+  0.6.0 reads 17.91 workflows/sec at one shard, against 23.73 on its own
+  host. On the same host, 0.7.0 is 14% below 0.6.0 at one shard, 11% below at
+  two and level at four. It dispatches faster: a 1-shard p50 of 16.12 ms
+  against 45.31.
+* **The box was quiet, but less quiet than for 0.6.0.** The replay control
+  spread **7.9%** against 0.8% for 0.6.0. That is inside the 10% bar. On four
+  cores, a concurrent build once moved a published latency by more than 10x.
+  Check your own run's noise-control section before you compare anything.
+* **Sharding bought 1.22x at two shards and 1.26x at four.** Four shards
+  share four cores with four Postgres clusters and the harness. See
   [what the shard sweep can and cannot show](#what-the-shard-sweep-can-and-cannot-show).
-* **The tail degrades about twice as fast as the median.** Dispatch p50 rises
-  42% across the sweep while its p99 rises 91%.
-* **One row is genuinely non-monotonic.** Signal p50 dips at two shards (44.74)
-  below one shard (53.59) and recovers at four. On a sweep whose control read
-  0.8% that is not noise — but this suite has no instrumentation to attribute
-  it, so the results file records it as an observation and declines to guess at
-  a mechanism.
+* **The dispatch tail is wide.** At one shard the dispatch p99 is 5.6x its
+  p50. The p50 rises fastest with shard count: 16.12 to 69.98 ms.
 
 ### Reading this next to another engine
 
-Before putting `23.73 workflows/sec` next to a number from another
+Before putting `15.46 workflows/sec` next to a number from another
 durable-execution engine's own page, two things make that comparison
 misleading on their own — independent of which engine comes out ahead.
 
@@ -101,8 +97,8 @@ and four logical CPUs shared with Postgres and the load generator — see
 [the configuration these numbers were taken at](#the-configuration-these-numbers-were-taken-at).
 `replay_throughput` is exempt: it runs entirely in memory as this page's
 noise control, so none of that configuration bounds it. Little's law on the
-`throughput` scenario's 1-shard cell — 32 workflows in flight ÷ 23.73/sec ≈
-1.35 s
+`throughput` scenario's 1-shard cell — 32 workflows in flight ÷ 15.46/sec ≈
+2.07 s
 end to end per workflow — bounds how long a workflow spends in the system.
 It says nothing about how that time splits between dispatch waiting,
 database work, and worker execution; this suite does not instrument that
@@ -110,8 +106,8 @@ split for the throughput scenario itself. Adding workers, or giving Postgres
 its own cores, moves the number, and neither is an architectural change. The
 poll interval is not as direct a lever as it looks: with LISTEN/NOTIFY wired,
 as it is here, a successful notification wakes a worker in 50 to 75 ms
-regardless of the configured interval (a fixed 50 ms when these numbers were
-taken; issue #1796 added the jitter), and a worker claiming tasks back to
+regardless of the configured interval (a fixed 50 ms before issue #1796 added
+the jitter; 0.7.0 has it), and a worker claiming tasks back to
 back under load never waits at all. The interval mainly bounds a *missed*
 notification, per
 [the configuration these numbers were taken at](#the-configuration-these-numbers-were-taken-at).
@@ -122,29 +118,35 @@ would carry accuracy and staleness this project cannot vouch for. A comparison
 worth trusting re-runs both engines on the same hardware, which is why this
 suite ships in the repo — see [Reproducing](#reproducing).
 
-**One such comparison has now been run on this page's own workflow, and
-Harvest lost it.** It is reported in the assay ledger rather than here, and
-the engine is deliberately not named on this page: issue #1309's acceptance
+**Such comparisons have now been run on this page's own workflow, and
+Harvest lost them.** They are reported in the assay ledger rather than here.
+The engine is deliberately not named on this page: issue #1309's acceptance
 criterion is that no competitor figure appears on it, and
-`benchmarks_docs.rs` enforces that. See
-[the assay ledger](assays/README.md), entries 10 and 11, for the measured
-numbers, the pre-registration that fixed in advance what they may not be read
-to mean, and the depth diagnostic that separates a known claim-path defect
-from an architectural gap.
+`benchmarks_docs.rs` enforces that. See [the assay ledger](assays/README.md):
+entries 11 and 14 are the cross-engine runs, and entry 10 compares harvest's
+own modes. Entry 14, the 0.7.0 rerun, is the current one. The ledger links
+its report without this page naming the engine. Each entry
+carries its pre-registration, which fixed in advance what its numbers may not
+be read to mean.
 
-Two things about that result belong here, because they bear on this page's
-own numbers rather than on any other engine. The first is that the margin
-widened sharply with backlog depth, which is the `#786`/`#1177` claim path
-this page already cross-references: the Postgres arm fell 4.2x between a
-500-row and a 2,000-row backlog. The second is that the Redis dispatch
-channel did not fall at all over the same range, which is what an operator
-choosing between the two modes actually needs to know.
+Two things from entry 14 bear on this page's own numbers:
+
+* **Backlog depth decides the default mode's throughput on 0.7.0.** The
+  Postgres claim path fell from 13.90 to 4.00 workflows/sec between a
+  250-row and a 2,000-row backlog. The claim-path fix (#1971) holds it at
+  21.1 to 22.1 at every depth. This page's closed loop keeps the backlog
+  shallow on purpose, so it does not show the collapse.
+* **The claim loop looks like the ceiling.** In every harvest run of entry
+  14, the worker spent 91% to 99% of its wall time inside a claim. That fits
+  one claim in flight at a time, with throughput set by the claim latency.
+  This reading is post hoc, not a registered line.
 
 ### Results by release
 
 Each release's numbers are kept, not overwritten:
 
 * **0.6.0** — [`benchmarks/results-v0.6.0.md`](benchmarks/results-v0.6.0.md)
+* **0.7.0** — [`benchmarks/results-v0.7.0.md`](benchmarks/results-v0.7.0.md)
 
 ## The configuration these numbers were taken at
 
@@ -202,6 +204,7 @@ HARVEST_BENCH_SCENARIOS=signal_roundtrip HARVEST_BENCH_SHARDS=1 ./benchmarks/run
 | `HARVEST_BENCH_CHECK` | also print the reproduction verdict |
 | `HARVEST_BENCH_KEEP` | leave the containers running afterwards |
 | `HARVEST_BENCH_OUT` | write the report somewhere other than `benchmarks/results/` |
+| `HARVEST_BENCH_STATS_DIR` | write each shard's `pg_stat_user_tables` and `pg_stat_statements` to this absolute path before teardown drops the shard database. The statements file needs `pg_stat_statements` in `shared_preload_libraries`; the compose shards do not set it |
 
 The two latency scenarios have no size knob; their populations are fixed so the
 published percentiles always rest on the same sample count.
@@ -237,8 +240,9 @@ Two honest caveats about that band:
   Postgres with durability enabled, expect to be outside it — that is the
   measurement working, not failing.
 * The published numbers were taken on **native Postgres clusters**, provisioned
-  with the same settings as the compose services but not through Docker (the
-  machine they were measured on had no Docker daemon). The compose path adds
+  with the same settings as the compose services but not through Docker. The
+  0.6.0 box had no Docker daemon; the 0.7.0 sweep used native clusters too, so
+  the two releases share one method. The compose path adds
   container networking and a container filesystem; **that delta has not been
   measured**, and this page does not claim to know its sign. Treat the ±15% band
   as applying to the native path, and treat a compose run's difference from it

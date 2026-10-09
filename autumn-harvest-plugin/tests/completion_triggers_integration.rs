@@ -483,6 +483,7 @@ async fn test_trigger_evaluations_same_shard() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -612,6 +613,7 @@ async fn test_terminate_fires_terminated_trigger_not_cancelled() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -736,6 +738,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -827,6 +830,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -949,6 +953,7 @@ async fn test_outcome_mapping_delivers_failure_cause_to_target() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -1115,6 +1120,7 @@ async fn test_outcome_mapping_delivers_output_on_completed_source() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -1235,6 +1241,7 @@ async fn test_trigger_state_matching_and_deduplication() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -1425,6 +1432,7 @@ async fn test_trigger_cross_shard() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -1543,6 +1551,7 @@ async fn test_completion_trigger_via_worker_run() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -1675,6 +1684,7 @@ async fn test_trigger_with_custom_queue() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -1876,6 +1886,7 @@ async fn test_trigger_outbox_retry_and_sweep() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -1936,15 +1947,15 @@ async fn test_trigger_outbox_retry_and_sweep() {
         .is_some();
     assert!(outbox_still_exists);
 
-    // Issue #1227 Finding 4 (Codex round-4 P1 on PR #1386): a missing target-shard
-    // pool now stamps `next_attempt_at` with a backoff (`OUTBOX_RELAY_FAILURE_BACKOFF`)
-    // so a durably-unreachable shard can't dominate every claim batch forever. The
-    // row above just got stamped by the failed sweep, so the very next sweep call
-    // (with no time elapsed) would not yet reclaim it -- back the timestamp into the
-    // past to simulate the backoff having elapsed, i.e. this test is exercising
-    // "the connection issue clears and a LATER scan retries successfully", not
-    // "retried on the very next tick with zero delay" (the hot-spin issue #1227
-    // itself fixed).
+    // Issue #1227 Finding 4 (PR #1386): a missing target-shard pool now stamps
+    // `next_attempt_at` with a backoff (`OUTBOX_RELAY_FAILURE_BACKOFF`). So a
+    // durably-unreachable shard cannot dominate every claim batch forever. The
+    // failed sweep just stamped the row above. So the very next sweep call, with
+    // no time elapsed, would not yet reclaim it. Back the timestamp into the past
+    // to simulate that the backoff has elapsed. This test exercises "the
+    // connection issue clears and a LATER scan retries successfully". It does not
+    // exercise "retried on the very next tick with zero delay". That zero-delay
+    // retry is the hot-spin that issue #1227 itself fixed.
     diesel::update(
         outbox_dsl::harvest_completion_trigger_outbox
             .filter(outbox_dsl::source_exec_id.eq(source_exec_id.as_uuid())),
@@ -2127,6 +2138,7 @@ async fn test_trigger_cross_shard_queue_preservation() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -2547,12 +2559,16 @@ async fn test_runner_startup_fails_on_sync_failure() {
     )
     .await;
 
-    // Verify it failed to start
+    // Verify it failed to start. Since issue #1823 the DR fence probe runs
+    // first, before any write, so an unreachable database now refuses there.
+    // Trigger sync never runs against a database the runner cannot probe.
     assert!(result.is_err());
     let err_str = result.err().unwrap().to_string();
     assert!(
         err_str.contains("Failed to get DB connection")
             || err_str.contains("sync completion triggers")
+            || err_str.contains("cross-region DR fencing could not be resolved"),
+        "{err_str}"
     );
 }
 
@@ -2626,6 +2642,7 @@ async fn test_trigger_evaluations_schema_validation() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -2712,6 +2729,7 @@ async fn test_trigger_evaluations_schema_validation() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -2840,6 +2858,7 @@ async fn test_trigger_emits_fire_metric_outcomes() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -2974,6 +2993,7 @@ async fn start_and_complete_source(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )

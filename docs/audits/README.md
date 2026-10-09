@@ -18,9 +18,14 @@ to wire into CI as a gate.
 | `cli-flag-coverage.py` | The inverse of `config-cli-drift.py`: real `harvest` CLI `--flags`, extracted the same way, that no page in the corpus mentions at all — a coverage-matrix report for manual triage, not a gate (see the script's own docstring for why) | No — report-only; run manually as Folio triage input |
 | `comment-hygiene.py` | Comment defects across every `*.rs`: commented-out code, unreferenced TODOs, narrative asides, blank block edges (all gated at zero), plus review-round archaeology, contractions and over-long sentences (ratcheted against the merge base, so a change may not add one to a file it touches) | Yes — `.github/workflows/ci.yml`, `lint` job |
 | `audit-catalog-coverage.py` | Every `*.py` script in `docs/audits/` has a row in this table | Yes — `.github/workflows/ci.yml`, `lint` job |
+| `tracked-artifacts.py` | No tracked file is binary or a patch leftover (`.orig`, `.rej`). The binary rule is git's: a NUL byte in the first 8000 bytes. The script lists each binary that the repository needs, with a reason (issue #1831). `--self-test` runs the fixtures | Yes — `.github/workflows/ci.yml`, `lint` job |
+| `doc-claim-drift.py` | Each doc claim matches the shipped code. The `event.rs` row in `docs/architecture.md` states no `WorkflowEvent` variant count, because a hard-coded count drifts. No two rows of one table in `docs/architecture.md` share a first cell. The newest version in `RELEASE_NOTES.md`, if any, is the workspace version. Each `STALE_CLAIMS` pin, the exact wording that a shipped change made false, stays absent from its file. No rule judges free prose (issue #1831). `--self-test` runs the fixtures | Yes — `.github/workflows/ci.yml`, `lint` job |
 | `shard-weight-drift.py` | `test-db-linux` per-shard test-count weight, computed the way `run-suites.sh`'s own `row_ordinal % SEMAPHORE_SHARD_COUNT` actually assigns rows to shards; flags any shard carrying 2+ heavy suites | Yes — `.github/workflows/ci.yml`, `lint` job, **report-only** (always exits 0; see the script's own docstring for why it does not yet gate) |
 | `workflow-yaml-parse.py` | Every `.github/workflows/*.yml` parses as YAML with no repeated mapping key and has a non-empty `jobs` mapping. GitHub runs an unparsable workflow as a zero-job failed run and never fires its triggers | Yes — `.github/workflows/ci.yml`, `lint` job |
+| `action-sha-pin.py` | Every `uses:` in `.github/workflows/` and `.github/actions/` pins a 40-hex commit SHA with a `# <tag>` comment, or names a local `./` action or a `docker://` image by digest. A tag or branch can move to new code, and a SHA cannot (issue #1826). It finds each `uses` key in the parsed YAML tree, then reads the raw line for the comment, which a parser drops. A key in any other form is a finding. Needs PyYAML. `--self-test` runs the fixtures | Yes — `.github/workflows/ci.yml`, `lint` job |
 | `standalone-chapter-sync.py` | `docs/getting-started/standalone-axum.md` shows the files of `examples/standalone-quickstart` byte for byte and holds the Chapter 2 workflow verbatim. Every shell block in it has a parseable `chapter-run` marker for `scripts/run-standalone-chapter.sh`, and the CI Postgres service matches its `compose.yaml`. Every Rust fence in `docs/embedding.md` is one that rustdoc compiles, and the CI steps that run these guards exist (issue #1614). `--self-test` runs the fixtures | Yes — `.github/workflows/ci.yml`, `lint` job |
+| `mixed-version-contract.py` | `docs/upgrading/README.md` has each section of the rolling-deploy contract and names the smoke script and the `mixed-version-smoke` CI job. The job runs `scripts/run-mixed-version-smoke.sh`, the script is executable, and the smoke crate declares its own `[workspace]` (issue #1828). `--self-test` runs the fixtures | Yes — `.github/workflows/ci.yml`, `lint` job |
+| `worker-image-contract.py` | The worker image and its Helm chart match [ADR 0006](../adr/0006-worker-container-image.md). The `Dockerfile` pins each base by digest and builds with the `rust-toolchain.toml` toolchain and `cargo auditable`. Its final stage runs as a non-root user and holds each binary. The chart `appVersion` is the workspace version, and its image is the release image. The rendered chart has the probe paths, the `preStop` sleep, a grace period that covers the drain, and a pre-install and pre-upgrade migration Job. It refuses to render with no database Secret (issue #1989). Needs PyYAML and `helm`. `--self-test` runs the fixtures | Yes — `.github/workflows/ci.yml`, `lint` job |
 
 ## Comment hygiene: the two tiers
 
@@ -57,6 +62,15 @@ clone — Tier B reports but never fails. Gating the whole corpus at the
 moment the tool cannot tell what changed is the worst option available.
 (This is why the `lint` checkout uses `fetch-depth: 0`: without real
 history there is no merge base, and the step would silently stop gating.)
+
+A PR ratchets against its merge base, or against the commit that added
+the gate if the merge base predates it. Only the release PR from
+`trunk-dev` into `trunk` hits the second case, and only while `trunk` is
+older than the gate. Its merge base is then the last release, so the
+legacy population from before the gate would count as new. The gate
+commit still checks the whole release cumulatively. A push run on
+`trunk-dev` can be cancelled, and two clean PRs can merge into a new
+finding, so the release PR is the last place to catch either.
 
 **It reads every comment, via a lexer.** Leading and trailing `//`,
 `///`, `//!` and `/* */` (nested and doc forms included) all count — a

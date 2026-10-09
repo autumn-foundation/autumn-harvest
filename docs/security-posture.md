@@ -4,12 +4,15 @@ This document defines the supported security postures for the Harvest management
 API, explains how to mount it safely in an Autumn application, and provides a
 production-readiness checklist.
 
-Harvest does not ship its own identity provider, session system, or RBAC engine.
-Authentication and authorization are **delegated to the host Autumn application**,
+Harvest does not ship its own identity provider or session store. By default,
+authentication and authorization are **delegated to the host Autumn application**,
 exactly as Oban Web and Sidekiq Web are mounted behind Plug/Rack authentication
-in their respective ecosystems. The responsibility of this document is to make
-the API surface explicit so embedders can make informed decisions and verify
-their posture before deployment.
+in their respective ecosystems. Built-in opt-in layers include
+[OIDC login with custom roles](#sso-and-custom-roles-issue-1978) and
+[scoped API tokens](#scoped-api-tokens-built-in-opt-in--issue-942). The
+responsibility of this document is to make the API surface explicit so
+embedders can make informed decisions and verify their posture before
+deployment.
 
 ---
 
@@ -366,10 +369,13 @@ identically to a route-minted one (shared core hashing helper).
 
 ### Operational caveats
 
-- **Standalone-token mode should sit behind a rate-limiting proxy.** With
+- **Standalone-token mode needs a rate limit on token lookups.** With
   `enable_api_tokens()` as the only auth, any `hvst_` bearer triggers one indexed
-  lookup before authentication (inherent to any bearer scheme). Front the API
-  with a per-source rate-limiting proxy to bound unauthenticated lookup floods.
+  lookup before authentication (inherent to any bearer scheme). Turn on the
+  built-in [API rate limiter](#api-rate-limiting). It charges each claimed token
+  to its client address before the lookup, so a flood of made-up tokens gets
+  `429` and takes no pool connection. Without the limiter, front the API with a
+  per-source rate-limiting proxy.
 - **Rotation needs `admin`.** `harvest token rotate` mints through
   `POST /admin/tokens`, so only an `admin` token can rotate.
 - **A compromised `admin` token can mint replacement tokens.** Give `admin` to
@@ -417,7 +423,8 @@ needs I/O implements `HarvestAuthorizer` directly and returns a boxed future.
 |---|---|
 | `principal` | `Token { id, scope }` for a verified `hvst_` token. `Embedder` for every other caller; read its claims from `extensions`. |
 | `route_class` | `CLASSIFIED_ROUTES`. An unclassified path is `Mutating`. |
-| `tenant_key` | The `x-harvest-tenant` header, trimmed. A repeated header, a blank value, a non-ASCII byte or more than 128 bytes gets `400`. |
+| `tenant_key` | The verified tenant, when the credential carries one (issue #1977). Otherwise the `x-harvest-tenant` header, trimmed. A repeated header, a blank value, a non-ASCII byte or more than 128 bytes gets `400`. |
+| `tenant_verified` | `true` when `tenant_key` is the verified tenant. `false` when it is the header. Do not grant access on an unverified tenant. |
 | `shard` | Only a source the route's handler uses. See the table below. |
 | `method`, `path`, `extensions` | The request. |
 
@@ -450,9 +457,10 @@ shard by hash. To confine a caller to some shards, deny `None` too.
 - **A deny is a generic `403`.** The body is
   `{"error":"forbidden by authorization policy"}`. The reason goes only to the
   audit row, so the policy is not an oracle.
-- **The tenant key is caller-declared.** Harvest does not bind it to stored
-  executions. The hook decides if the principal may act for that tenant. To
-  confine a caller to its own executions, also check the target in `path`.
+- **An unverified tenant key is caller-declared.** With `tenant_verified =
+  false`, the key is the header. Do not grant access on it. A tenant-bound
+  caller gets its verified tenant instead, and Harvest checks the run's
+  tenant itself. See [Tenant binding](#tenant-binding-issue-1977).
 - **An execution id gives every shard its handler can reach.** That is the
   entry shard and the live shard after a rebalance. Some routes act on the
   live attempt: `/result`, `cancel`, `terminate`, `pause`, `resume`, `signal`,
@@ -508,6 +516,379 @@ no audit write. Keep the rate-limiting proxy advice above.
 
 ---
 
+## SSO and custom roles (issue #1978)
+
+**Decision: SSO lives in Harvest, as a thin opt-in layer.** The record is
+[ADR 0006](./adr/0006-oidc-sso-and-custom-roles.md). Harvest owns the login
+routes, the claim-to-role map and the session boundary. autumn-web owns the
+OIDC protocol and the crypto. mTLS stays in autumn-web.
+
+### Custom roles
+
+A role has a base scope and a list of extra routes. The scope is `read`,
+`mutate` or `admin`, as for a [token](#scopes-read--mutate--admin). An extra
+route is one `CLASSIFIED_ROUTES` entry.
+
+```rust
+use autumn_harvest_plugin::api_token::TokenScope;
+use autumn_harvest_plugin::roles::{HarvestRole, HarvestRoles};
+
+let roles = HarvestRoles::builder()
+    .builtin_roles() // harvest-viewer, harvest-operator, harvest-admin
+    .role(
+        HarvestRole::new("dlq-operator")
+            .with_scope(TokenScope::Read)
+            .allow_route("POST /dead-letters/replay"),
+    )
+    .build()?;
+```
+
+`build` refuses a bad name, a duplicate name, a role with no scope and no
+route, and a route that is not in `CLASSIFIED_ROUTES`. A name is 1 to 64 of
+`a-z`, `0-9`, `-` and `_`.
+
+| Built-in role | Scope |
+|---|---|
+| `harvest-viewer` | `read` |
+| `harvest-operator` | `mutate` |
+| `harvest-admin` | `admin` |
+
+Turn the role layer on with `HarvestPlugin::with_roles(roles)` or
+`StandaloneAdminAuth::with_roles(roles)`. The OIDC login turns it on for you.
+
+**Where roles come from.** The layer reads role names from one of two places:
+
+1. A `RoleGrant` request extension. Host middleware sets it. The OIDC
+   boundary sets it from the session of a verified login.
+2. Else, the session key `harvest_roles`, a comma-separated list. Host
+   middleware sets it. The OIDC login never writes it: it keeps its roles
+   under `harvest_oidc_roles`, bound to the login.
+
+A client cannot set either one. No header grants a role.
+
+**The decision.**
+
+- A `PublicSafe` route needs no role.
+- A role allows a route when its scope allows the route, or when the role
+  names the route.
+- A Vantage (`/ui`) `GET`, `HEAD` or `OPTIONS` is a read. Any other Vantage
+  method is a mutation. An extra route does not cover Vantage.
+- An unclassified API path is a mutation, so a `read` role cannot reach it.
+- An unknown role name grants nothing.
+- A verified `hvst_` token skips the role check. Its scope applies.
+- A deny is `403` with `{"error":"role does not allow this route"}`. It
+  writes one `authz.deny` audit row. A caller with no role names no
+  principal, so its deny writes no row.
+- The layer strips an inbound `oidc:` actor. Only the OIDC boundary sets one.
+
+An allowed request carries a `RolePrincipal` extension. The admin gate and
+the #1802 mutation gate admit it, as they admit a token. The
+[authorizer hook](#authorizer-hook-issue-1803) can read it from
+`extensions`. The hook runs after the role layer, so it can only narrow.
+
+**Admin checks inside handlers.** Some handlers check for admin access a
+second time. Examples are payload decode on read, `terminate_if_running`,
+batch start and reset, the SSE event stream and the Vantage logs panel.
+Under the role layer, only a role with the `admin` scope passes those
+checks. A declared auth boundary does not widen a narrower role.
+
+**MCP tool routes.** A generated tool route has no route class. With roles
+on, a `GET` tool needs a `read` scope or wider. Any other tool needs `mutate`
+or wider. Extra routes do not apply. A deny writes one `authz.deny` row.
+
+### OIDC login
+
+Turn on the `oidc` feature of `autumn-harvest-plugin`. It turns on the
+autumn-web OIDC client and adds no other crate.
+
+```rust
+use autumn_harvest_plugin::oidc::{OidcLogin, discover_provider};
+use autumn_harvest_plugin::roles::{ClaimRoleMap, ClaimRule};
+
+let provider = discover_provider(
+    "https://login.example.com",
+    std::env::var("OIDC_CLIENT_ID")?,
+    std::env::var("OIDC_CLIENT_SECRET")?,
+    "https://harvest.example.com/api/harvest/auth/oidc/callback",
+)
+.await?;
+let claims = ClaimRoleMap::new()
+    .rule(ClaimRule::new("groups", "harvest-admins", "harvest-admin"))
+    .rule(ClaimRule::new("groups", "support", "harvest-viewer"))
+    .rule(ClaimRule::new("realm_access.roles", "dlq", "dlq-operator"));
+let login = OidcLogin::new(provider, roles, claims)?;
+
+let plugin = HarvestPlugin::new().api_with_oidc("/api/harvest", login);
+```
+
+A standalone mount uses `StandaloneAdminAuth::with_oidc(login)`. It needs an
+autumn-web session layer outside the mounted router.
+
+**Routes.** They are under the API mount. They sit outside the boundary.
+
+| Route | Effect |
+|---|---|
+| `GET /auth/oidc/login` | `303` to the identity provider, with PKCE, `state` and `nonce`. |
+| `GET /auth/oidc/callback` | Check the code, the ID token and the claims. Then `303` to Vantage. |
+| `POST /auth/oidc/logout` | Remove the Harvest keys from the session and rotate its id. Host keys stay. A cross-site post gets `403`. |
+
+Register the callback URL with the identity provider as the redirect URI.
+
+**The callback.** autumn-web checks `state`, then trades the code with the
+PKCE verifier. It checks the ID-token signature against the JWKS, with the
+algorithm the key allows. It checks `iss`, `aud`, `exp`, `nbf` and `nonce`.
+A failed check is `401`. A callback with no `code` or `state` is `400`. A
+failed callback does not change the session, so a stray link cannot log a
+user out. Then Harvest maps the claims to roles:
+
+- `ClaimRule::new(claim, value, role)` matches when the claim equals `value`,
+  or when an array claim holds `value`. `claim` is a top-level claim name,
+  or else a dot-separated path. A whole name wins, so a URL claim name such
+  as `https://acme.example.com/roles` works.
+- `ClaimRoleMap::default_role` gives a role to every identity that logs in.
+- An identity with no role gets `403` and no session.
+- `OidcLogin::new` refuses a rule for an undefined role.
+
+**The session boundary.**
+
+- A session user reaches the role layer. The audit actor is
+  `oidc:{subject}@{issuer}`. The boundary strips an inbound `oidc:` actor from every
+  other request.
+- A `PublicSafe` route needs no session.
+- An `hvst_` bearer passes when API tokens are on. The token layer verifies
+  it.
+- A request with a host `RoleGrant` passes. The role layer reads the grant.
+- Any other Vantage `GET` gets `303` to the login route.
+- Any other request gets `401`.
+
+**Configuration checks.** `OidcLogin::new` needs `client_id`,
+`authorize_url`, `token_url`, `redirect_uri`, `issuer` and `jwks_url`. Each
+URL, `redirect_uri` included, must use `https`, unless its host is
+loopback. The scope must include `openid`.
+
+- `userinfo_url` must be unset. The autumn-web userinfo path checks no
+  signature, no audience and no nonce, so Harvest requires a signed ID
+  token. `discover_provider` leaves `userinfo_url` unset.
+- A Microsoft multi-tenant issuer (`/common/`, `/organizations/`,
+  `/consumers/`) is refused. autumn-web would accept the issuer of any
+  tenant. Use the issuer of your own tenant.
+- `discover_provider` refuses a document that names another issuer. It
+  follows no redirect and reads at most 1 MiB.
+- `Debug` output of an `OidcLogin` never shows the client secret.
+
+**Limits.**
+
+- Roles are fixed at login. After `max_session_age` (default 12 hours) the
+  user must log in again. Set it with `OidcLogin::with_max_session_age`. An
+  age under one second becomes one second.
+- The claim map reads the signed ID token only.
+- Logout does not end the session at the identity provider.
+- `api_with_oidc` and `api_with_auth` replace each other. The last call
+  wins, and the roles of a replaced login go with it. `api_with_oidc` also
+  turns off the read-only layer of an earlier `api_with_role_auth`.
+  `StandaloneAdminAuth::with_oidc` turns off `with_read_only_role` too.
+- Two mounts can share one session. The session binds its principal to the
+  login that made it: the client, the issuer, and a digest of the redirect
+  URI, the roles and the claim map. A login time more than 60 seconds in the
+  future is refused, so clock skew cannot extend a session. A principal of one login is not a
+  principal on a mount with another login or another policy. The roles of a login
+  replace any set by `with_roles`.
+
+### mTLS on the management API
+
+autumn-web owns the listener, so it verifies client certificates. Require a
+certificate on the management API:
+
+```toml
+[server.tls.client_auth]
+mode = "optional"
+ca_bundle_path = "/etc/harvest/client-ca.pem"
+required_paths = ["/api/harvest"]
+```
+
+A request to `/api/harvest` with no verified certificate gets `403`. Map the
+certificate to a role in host middleware. This needs the autumn-web `tls`
+feature:
+
+```rust
+use autumn_harvest_plugin::roles::RoleGrant;
+use autumn_web::tls::client_auth::OptionalClientCert;
+
+async fn cert_roles(cert: OptionalClientCert, mut req: Request, next: Next) -> Response {
+    let role = match cert.0.as_deref().and_then(|id| id.common_name()) {
+        Some("ci-deployer") => Some("harvest-operator"),
+        Some(_) => Some("harvest-viewer"),
+        None => None,
+    };
+    if let Some(role) = role {
+        req.extensions_mut().insert(RoleGrant::new([role]));
+    }
+    next.run(req).await
+}
+
+let plugin = HarvestPlugin::new()
+    .with_roles(roles)
+    .api_with_auth("/api/harvest", axum::middleware::from_fn(cert_roles));
+```
+
+Keep `mode = "optional"` when browsers also use the listener. Use `required`
+when every client presents a certificate.
+
+---
+
+## API rate limiting
+
+Issue #1827. One client or one leaked token can flood the start, signal and
+query routes (OWASP API4, Unrestricted Resource Consumption). Harvest has an
+optional in-process rate limiter for the management API. It is off by default.
+**Turn it on in production.**
+
+### Enabling it
+
+```rust
+use autumn_harvest_plugin::api_rate_limit::{ApiRateLimit, BucketRate};
+
+// Plugin mount.
+let plugin = HarvestPlugin::new(/* … */)
+    .api("/api/harvest")
+    .enable_api_tokens()
+    .with_api_rate_limit(ApiRateLimit::default());
+
+// Standalone mount.
+let auth = StandaloneAdminAuth::new()
+    .with_api_tokens()
+    .with_rate_limit(ApiRateLimit::new(
+        BucketRate::per_second(10).with_burst(20), // mutating routes
+        BucketRate::per_second(50).with_burst(100), // read routes
+    ));
+```
+
+`ApiRateLimit::default()` allows 20 mutating requests a second (burst 40) and
+100 read requests a second (burst 200) for each client. Set each rate above
+the peak of your busiest real client, such as a CI job or a batch starter.
+After you turn it on, watch `harvest_api_rate_limited_total`.
+
+### How it counts
+
+- **Client.** A verified API token is the client. Without a token, the
+  client IP address is the client. An IPv6 address counts by its /64 prefix.
+  An IPv4-mapped address counts as IPv4.
+- **Buckets.** Each client has one token bucket for mutating routes and one
+  for read routes. Reads do not decrease the budget for writes.
+- **Route class.** The class comes from `CLASSIFIED_ROUTES`. A route with no
+  class, such as a Vantage page, counts by its method. `GET` and `HEAD` are
+  reads.
+- **Exempt.** `PublicSafe` routes, such as the health probes and
+  `/openapi.json`, and `OPTIONS` requests are never limited.
+- **Answer.** A client over its limit gets `429 Too Many Requests` with a
+  `Retry-After` header in whole seconds. The value is never zero. With a rate
+  of one or more a second, it is always 1. The body is
+  `{"error": "rate limited", "route_class", "retry_after_secs"}`.
+
+### Layer order
+
+The limiter runs directly inside the token layer. It keys a bucket on the
+verified token id, so a random `hvst_` bearer cannot open a new bucket. It
+runs before the tenant binding, read-only, authorizer and `require_admin`
+layers, so a refused request reaches no handler. The request order is:
+embedder auth -> pre-auth charge -> token layer -> rate limiter -> tenant
+binding -> read-only layer -> authorizer -> `require_admin` -> handler. A
+standalone token-only mount also puts `require_token_for_non_public` first. It
+refuses a request with no token before any lookup.
+
+With API tokens on, the same limiter also runs outside the token layer. This
+pre-auth charge takes one request from the client address bucket of each
+request that carries an `hvst_` bearer. A client over its address limit gets
+`429` before the token lookup, so a flood of made-up tokens takes no pool
+connection. When the token verifies, the limiter gives the address charge back
+and charges the token bucket instead. A valid token that its scope refuses
+also gets the charge back. Valid tokens that share one address do not share
+its budget. A request with no `hvst_` bearer skips the pre-auth charge,
+because the token layer does no lookup for it. An `OPTIONS` request also
+skips it. An exempt route, such as a health probe, does not: the token layer
+looks up a claimed token there too. That request pays from the read bucket.
+
+### Client address
+
+The limiter reads the autumn-web `ClientAddr`. That value applies your
+`[security.trusted_proxies]` settings. Without it, the limiter reads the
+socket peer address. A request with no address at all shares one `unknown`
+bucket.
+
+Behind a proxy, configure trusted proxies with `ranges` or `trusted_hops`.
+Without them, all callers without a token share the bucket of the proxy
+address. Do not trust forwarded headers from every peer. A client can then
+send a new `X-Forwarded-For` value on each request and get a new bucket.
+
+Session users behind one office NAT share one address bucket. Give each
+automated client its own API token.
+
+### Memory bound
+
+The limiter keeps at most 10,000 address buckets, plus two overflow buckets.
+One client uses up to two buckets. Change the cap with `with_max_buckets`.
+Token buckets have no cap, because only an admin can mint a token.
+
+At the cap, the limiter drops idle buckets, at most once a second. A bucket is
+idle when it is full and counts no rejections in a live window. If no bucket
+is idle, each new address shares one overflow bucket per route class. A token
+never goes to the overflow bucket.
+
+### Metric and audit
+
+- Each `429` increments `harvest.api.rate_limited`, with the labels
+  `route_class` and `client_kind` (`token`, `ip`, `unknown` or `overflow`).
+  The token id and the address are never labels. See
+  [telemetry](./telemetry.md).
+- Sustained rejections write an `api.rate_limit_sustained` audit row. The
+  default is 100 rejections of one bucket in 60 seconds. Change it with
+  `with_sustained_audit`. A window starts at the first rejection. The limiter
+  writes at most one row per bucket per window, and at most 100 rows a minute
+  in total. The write runs off the request path, so a `429` never waits on
+  the database.
+
+| Column | Value |
+|---|---|
+| `operation` | `api.rate_limit_sustained` |
+| `status` | `failed` |
+| `actor` | `token:{id}` for a token, else `anonymous` |
+| `route_or_command` | `METHOD path` of the request that crossed the threshold |
+| `error_summary` | `rate limit sustained: N rejections in Ws on <class> routes from <client>`. N is the threshold. The client is `token <id>`, `ip <address>`, `ip <prefix>/64`, `a client with no address` or `the overflow bucket`. |
+
+The summary can hold a client IP address. That is personal data. Include it
+in your audit retention and erasure policy.
+
+### Limits
+
+- **Per replica.** Each replica keeps its own buckets. With N replicas, a
+  client can send N times the limit. For one fleet-wide limit, also turn on
+  the autumn-web `[security.rate_limit]` layer with its Redis backend.
+- **Token lookup.** The pre-auth charge bounds token lookups per client
+  address. A refused request from a valid token still costs one lookup,
+  because its token bucket is known only after the lookup. A made-up token
+  costs its address one request, which the limiter never gives back.
+- **Shared addresses.** A flood of made-up tokens empties the bucket of its
+  address. Valid tokens from that address then get `429` until it refills.
+  Behind a proxy, configure `[security.trusted_proxies]`, so each caller has
+  its own address bucket. A valid token holds an address charge only while its
+  lookup runs. A burst larger than the address burst can thus see a `429`.
+- **Scope denies.** The token layer refuses a route outside the token scope
+  with `403` and writes an `authz.deny` row. This also happens before the
+  token bucket is charged. The address charge comes back, so a scope deny is
+  not counted.
+- **Streams.** The limiter counts a request when it opens an SSE stream. It
+  does not limit how many streams stay open.
+- **Other surfaces.** The limiter covers the management API and Vantage. It
+  does not cover the MCP tool routes or webhook receivers.
+
+### Upgrading
+
+The `harvest` CLI and the TypeScript client do not retry a `429`. A script
+that sends bursts can now fail. Make it wait `Retry-After` seconds and send
+the request again, or give it a higher rate.
+
+---
+
 ## Data residency and shard placement (issue #697)
 
 `POST /workflows/{name}/start` accepts an optional `shard_id` or `residency_key`
@@ -535,6 +916,139 @@ for the mechanism. Security-relevant properties:
 - **A pin failing closed is a `503`, not a silent redirect.** A shard the router
   accepts but has no pool for is refused rather than written to the default
   database, so a residency obligation cannot be violated by a configuration gap.
+
+---
+
+## Multi-tenant deployment (issue #1837)
+
+[ADR 0004](./adr/0004-tenant-isolation-cells.md) records the decision.
+
+- **Harvest supports cooperative multi-tenancy.** Many tenants of one
+  operator can share a deployment. Quotas, throttles and concurrency caps bound a
+  tenant on a shared shard. A **cell** gives a tenant its own shard and its
+  own worker pool. See [Tenant cells](./sharding.md#tenant-cells-issue-1837).
+- **A cell is not a security boundary between tenants.** It bounds load,
+  not access. Any caller that may start a workflow may also pin it into any
+  cell. To confine a caller to its tenant, install an
+  [authorizer hook](#authorizer-hook-issue-1803). On a pinned start, check
+  the shard. On a route where the hook sees no shard, check the target in
+  `path`, or deny it.
+- **A workflow can pin a child into a cell.** `ChildPlacement::Shard` and
+  `ChildPlacement::ResidencyKey` place a child on any shard. The hook does
+  not see that decision. Do not build a child pin from caller input.
+- **The tenant header is not an identity.** The caller declares
+  `x-harvest-tenant`. A tenant-bound credential overrides it, and a header
+  that names another tenant gets `403`. See
+  [Tenant binding](#tenant-binding-issue-1977).
+- **Name cells, not tenants.** A cell residency key appears in requests,
+  CLI calls and audit rows. Use `cell-a`, not a customer name. Keep the
+  tenant-to-cell map in the application.
+- **Harvest has no namespaces.** All tenants on one shard share its
+  tables. Harvest has no per-tenant filter on list routes. A tenant-bound
+  caller cannot use list routes at all.
+
+---
+
+## Tenant binding (issue #1977)
+
+[ADR 0004](./adr/0004-tenant-isolation-cells.md#amendment-tenant-binding-issue-1977)
+records the decision. A credential can carry a tenant. A caller with such a
+credential is *tenant-bound*. Harvest then confines it without an authorizer.
+
+### Bind a credential
+
+- **A Harvest token.** Mint it with `tenant`:
+  `POST /admin/tokens {"name": "acme-ci", "scope": "mutate", "tenant": "acme"}`,
+  `harvest token create acme-ci --scope mutate --tenant acme`, or
+  `harvest token bootstrap --tenant acme`. `harvest token rotate` does not
+  copy the old tenant, so pass `--tenant` again. A tenant key is 1 to 128 bytes of
+  visible ASCII, with no spaces.
+- **The embedder's own principal.** In the auth middleware that wraps the
+  Harvest router, insert
+  `autumn_harvest_plugin::tenant::VerifiedTenant::new(tenant)?` as a request
+  extension.
+
+A request with a token tenant and an embedder tenant that differ gets `403`.
+
+### What a tenant-bound caller can do
+
+It can use only the routes in `TENANT_SCOPED_ROUTES`:
+
+- `POST /workflows/{name}/start`. The new run is stamped with the tenant.
+- `GET /workflows/{id}`, `/history` and `/result`.
+- `POST /workflows/{id}/cancel` and `/terminate`.
+- `POST /workflows/{id}/signal/{name}`.
+- `GET` and `POST /workflows/{id}/query/{name}`, and `GET /workflows/{id}/queries`.
+- `POST /workflows/{id}/update/{name}` and `GET /workflows/{id}/update/{update_id}/result`.
+
+Public routes such as `/health` also answer. The token scope still applies,
+so a `read` tenant token cannot cancel.
+
+### What Harvest refuses
+
+| Request | Answer |
+|---|---|
+| An `x-harvest-tenant` header that names another tenant | `403` |
+| Any route not in the list: list routes, admin routes, token mint and revoke, Vantage, signal-with-start, update-with-start, reset, erase, legal hold | `403` |
+| A run of another tenant, or a run with no tenant | `404`, the same as an unknown id |
+| A start whose workflow id is in use by a run of another tenant, with any reuse or conflict policy | `409`. The engine refuses before it attaches, cancels, replaces or seals the run. |
+| A start that resolves to a run of another tenant through an idempotency key | `409`, or the body error for a malformed body. The committed-replay check and the engine both refuse to return the run. |
+| A start of a throttled, debounced or batched workflow | `400`. A deferred start cannot carry the tenant. |
+
+Every `409` of a bound start has the body `{"error": "workflow id is in
+use"}`. It names no run and no state. Each `403`, each refused run and each
+`409` writes one `authz.deny` audit row. The answer body names no tenant and
+no reason. The rate limiter runs before the binding layer, so it also bounds
+refused requests.
+
+After a start succeeds, the binding layer reads the owner of the run that the
+answer names. A different owner turns the answer into the `409`. If that read
+fails, a fresh start keeps its answer, because the engine checked and stamped
+the tenant. A retry of it would start a second run. A replayed answer gets
+`503` instead, because a retry of a replay starts no run.
+
+### Where the tenant goes
+
+- The start route writes the tenant to `harvest_workflow_executions.tenant`.
+  The start body has no tenant field. A start by an unbound caller writes
+  no tenant, even with the header.
+- Children, cross-shard children, retries, continue-as-new successors,
+  reset forks and re-runs copy the tenant of their source run. A rebalance
+  moves it with the row. PII erasure does not touch it.
+- Completion-trigger targets copy the tenant of their source run. A
+  cross-shard trigger keeps it on its outbox row, so it survives retention
+  of the source run.
+- In-process code sets `StartWorkflowParams::tenant`,
+  `SignalWithStartParams::tenant`, `UpdateWithStartParams::tenant`, or the
+  `tenant` field of the typed start options. Set it only from a verified
+  source. With a tenant, the engine refuses to touch a prior run of another
+  tenant with `HarvestError::TenantConflict`. It also refuses to return one
+  as an idempotency duplicate.
+- These start paths carry no tenant: transactional starts, the outbox,
+  debounce, throttle, event batches, schedules, webhooks, broker connectors
+  and the MCP tools. Their runs have no tenant.
+- The retention janitor reads it for
+  [per-tenant overrides](./archival.md#per-tenant-retention-overrides-issue-1977).
+
+### Limits
+
+- **Workflow ids are shared.** Two tenants that start the same
+  `(workflow_name, workflow_id)` collide. The second gets `409`, so it learns
+  that the id is in use. It cannot change the other run. Prefix workflow ids
+  with the tenant. Idempotency keys are shared the same way.
+- **Workflow code is trusted.** A workflow can signal or cancel any run
+  by id or business key, and can pin a child into any cell. The binding
+  covers the management API only.
+- **MCP tool routes refuse a bound caller.** Each generated tool route
+  answers `403` when the embedder middleware sets `VerifiedTenant`. The token
+  layer does not run on these routes. If you install
+  `enforce_token_scope_mcp_mutation` on them, it refuses a tenant token on
+  the mutating tools. It does not cover the read tools.
+- **Concurrency supersede is not tenant-aware.** A `cancel_running`
+  concurrency policy can cancel another tenant's run that resolves to the
+  same concurrency key. Put the tenant in the concurrency key expression.
+- **A cell still bounds load, not access.** The binding is the access
+  boundary. Use cells to bound load.
 
 ---
 
@@ -587,6 +1101,46 @@ by its stable `(workflow_name, workflow_id)` business key instead of its
   `workflow_name`/`workflow_id` from attacker-influenced data is unchanged and
   is now the only gate, since placement no longer accidentally hides a pinned
   workflow.
+
+---
+
+## Keyed entities (issue #1975)
+
+[ADR 0006](./adr/0006-keyed-entity.md) records the design. An entity adds no
+route and no table.
+
+- **Any signal route sends an operation.** Signal-with-start, the signal
+  routes by execution id and by business id, and batch signal jobs all reach
+  the entity. Each route keeps its own authentication. A caller who may use
+  one of them for an entity type may create an entity under any key. That
+  caller may also send any operation to it, a delete included. Cancel,
+  terminate and reset end or rewind an entity like any workflow.
+- **The start input is trusted.** Signal-with-start passes `start_input` to a
+  new run as its checkpoint. A caller can set the first state and pending
+  operations that way. Validate state in the handler if callers are not
+  trusted.
+- **Reads are not admin-gated.** The by-id query route
+  `GET /workflows/by-id/{name}/{key}/query/harvest.entity.state` returns the
+  full state. It is a read route like `GET /workflows/{id}`, and it is not
+  audited. Outside the `dev` profile, mount the API behind your own auth, for
+  example `api_with_auth`. A key is guessable.
+- **The authorizer hook sees the path, not the body.** It can check the key
+  on the by-id query and signal routes. On signal-with-start the key is in
+  the body, so the hook cannot see it. To confine a caller to its own keys,
+  deny signal-with-start in the hook and send ops through the by-id signal
+  route. Or check the body in your own middleware.
+- **The key is a business id, not a secret.** A key appears in requests,
+  audit rows and logs. Do not put a secret or a customer name in it.
+- **State is stored in clear unless you encrypt it.** Each operation is a
+  `SignalReceived` payload. Each checkpoint writes the full state to the
+  continue-as-new event and to the `input` column of the next run. The
+  payload codec covers event payloads. Encrypt sensitive state in the
+  handler if a column must not hold it in clear.
+- **Erasure is per run.** Erasure acts on one terminal run. It does not walk
+  the continue-as-new chain, and it cannot act on a live entity. A delete
+  operation erases nothing.
+- **`harvest.entity.stats` shows `last_error`.** A decode error can quote
+  part of the bad payload.
 
 ---
 
@@ -650,6 +1204,44 @@ and `workflow.erase_payloads`. A legal hold exempts a single execution's history
 from the retention janitor and from PII erasure until released — see
 [`docs/archival.md`](archival.md) for the retention/erasure lifecycle.
 
+### Tamper-evident audit rows (issue #1838)
+
+Audit export ships each row off-box. The optional audit hash chain also makes
+the rows in the database tamper-evident. Set
+`HarvestBuilder::audit_export_chain_key` with a key kept outside the database.
+`audit_chain::verify_shard_chain` then reports changed, missing and unlinked
+rows. See [The audit hash chain](audit-export.md#the-audit-hash-chain) and
+[ADR 0004](adr/0004-security-extras.md).
+
+---
+
+## Signed WASM modules (issue #1838)
+
+No HTTP route publishes a WASM module. A future route under `/modules` or
+`/admin/modules` needs the `admin` scope. As defence in depth, a worker can
+also require a publisher signature on every WASM activity module. Hot-swap
+workflow modules keep their own HMAC check.
+
+- Sign offline with `wasm_signing::sign_wasm_module` and a key that workers
+  never hold.
+- Give workers the public key with
+  `HarvestBuilder::wasm_trusted_publisher_key`.
+- Publish with `wasm_store::publish_signed_wasm_module`, or attach the
+  signature to a registration with `WasmActivityRegistration::with_signature`.
+
+The signing helper needs the `wasm-activities` feature. A publisher tool that
+uses it therefore compiles `wasmtime`.
+
+The worker checks the signature before each run. A module written by direct
+SQL, or published without a signature, fails with the non-retryable
+`WasmModuleInvalid` error.
+
+A signature covers the activity name and the module hash. It has no version
+and no expiry. So anyone who can write the module table can reactivate any
+version a trusted key ever signed, including an old, vulnerable one. To
+revoke a version, remove its key from the trusted set and re-sign the
+versions you keep with a new key. See [ADR 0004](adr/0004-security-extras.md).
+
 ---
 
 ## Payload encryption at rest (issue #1825)
@@ -674,15 +1266,13 @@ JSON. A workflow that carries PII or secrets must encrypt them. Use
 
 ### What the codec does not cover
 
-The codec encrypts the payload fields of `harvest_events.event_data` only:
+A registered codec always encrypts the payload fields of
+`harvest_events.event_data`:
 `input`, `output`, `payload`, `details`, `value` and
-`last_completion_result`. ADR-0003 and the current schema keep these columns
-in clear, so that operators can query them:
-
-- `harvest_workflow_executions.input`, `.output`, `.memo` and `.search_attrs`;
-- `harvest_task_queue.input`, `.output` and `.heartbeat_details`;
-- `harvest_signals.payload` and `harvest_dead_letters.input`;
-- other denormalized copies, for example schedule inputs and outbox rows.
+`last_completion_result`. With column encoding on, it also encrypts the codec
+columns (issue #1979). The [column coverage](#column-coverage-issue-1979)
+table lists every `JSONB` column and says which ones the codec covers. Each
+clear column has a reason.
 
 Failure text also stays in clear (issue #1920). The codec does not encrypt
 these free-form strings in `harvest_events.event_data`:
@@ -714,15 +1304,114 @@ the codec encrypts. Set it with `WorkflowFailure::with_details` or
 `ActivityFailure::with_details`. A plain `Err(String)` sets no `details`. The
 other variants have no encrypted field for failure data.
 
-Event types, ids, timestamps and workflow names also stay in clear. Do not put
-PII in a memo, a search attribute, a workflow id or a workflow name. If these
-columns must not hold PII, encrypt the value in workflow code before Harvest
-sees it. Also use Postgres disk encryption.
+Event types, ids, timestamps and workflow names also stay in clear. So do the
+build id and the worker id in `DecisionCommitted` (issue #1833). A worker id
+often holds a host name or a pod name. The redacted export keeps both. Do not put
+PII in a search attribute, a workflow id or a workflow name. A memo is covered
+only while column encoding is on. If a clear column must not hold PII, encrypt
+the value in workflow code before Harvest sees it. Also use Postgres disk
+encryption.
 
 The associated data binds the version and the key id, not the row. A writer
 with access to `harvest_events` can copy a ciphertext to another field, event
 or execution under the same key, and it decodes. Restrict write access to the
 Harvest database.
+
+### Column coverage (issue #1979)
+
+Column encoding is off by default. Turn it on with
+`HarvestBuilder::encode_payload_columns()`, or with
+`PayloadCodecs::set_column_encoding(true)`.
+
+**Upgrade order.** This release always decodes the codec columns. An older
+release reads an envelope as literal data. So upgrade every worker and every
+API process first. Then turn column encoding on. Existing rows keep the form
+they were written in. The rotation sweep converts envelopes from key to key.
+It never encrypts a value written in clear.
+
+**Read surfaces.** The engine decodes a codec column before it uses the
+value. This covers the workflow handler, the client handle, signal ingest and
+queries. It also covers retries, reruns, forks and DLQ replay. So do
+completion triggers and callbacks, cross-shard children, external awaits and
+the quota reconciler.
+
+The management API and the Vantage UI follow the read-path decode rules
+(issue #608). An admin sees plaintext when `decode_payloads_on_read` is on.
+Any other caller sees the stored envelope. The list surfaces and the MCP
+status and watch tools always show the stored envelope. See
+[`docs/operations/read-path-decode.md`](operations/read-path-decode.md).
+
+**Behavior change for API clients.** Before column encoding, the output
+column was always plaintext, so every caller of `GET /workflows/{id}/result`
+got plaintext. With column encoding on, only an admin with
+`decode_payloads_on_read` on gets plaintext. Turn on `decode_payloads_on_read`,
+and give result readers admin access, before you turn on column encoding. The
+Rust `WorkflowHandle` decodes with its own registry, so it is not affected.
+
+**Residual risk.** With the switch on or off, a new write escapes a value
+shaped like a codec envelope, as the event codec does (issue #1253). A row
+written before this release had no escape. If such a row holds an
+envelope-shaped value, an engine read now decodes it. A missing key fails a
+strict read. It never guesses.
+
+The sweep and the census cover each column marked Covered. The list is
+`codec_rotation::CODEC_COLUMNS`. A unit test parses `schema.rs` and fails when
+a `JSONB` column has no row here. Gaps marked #2043 are follow-up work.
+
+| Column | Codec | Reason |
+|---|---|---|
+| `harvest_events.event_data` | Covered (payload fields) | The six payload fields above. Failure text stays in clear (issue #1920). |
+| `harvest_workflow_executions.input` | Covered | The workflow input. |
+| `harvest_workflow_executions.output` | Covered | The workflow result. |
+| `harvest_workflow_executions.memo` | Covered | Operator notes can hold PII. No query reads into them. |
+| `harvest_workflow_executions.search_attrs` | Clear | Visibility queries filter on it. Do not put PII in it. |
+| `harvest_workflow_executions.context_headers` | Clear | The engine copies the headers to every task. The API never returns them. Follow-up #2043. |
+| `harvest_workflow_executions.workflow_retry_policy` | Clear | Engine configuration, not payload. |
+| `harvest_workflow_executions.completion_callbacks` | Clear | Callback targets, not payload. |
+| `harvest_workflow_executions.migrated_from_shards` | Clear | Shard bookkeeping, not payload. |
+| `harvest_task_queue.input` | Covered (workflow tasks) | A workflow task row lives as long as its run. An activity task row stays in clear. It is short-lived, and its `ActivityScheduled` event holds an encrypted copy. Follow-up #2043. |
+| `harvest_task_queue.output` | Covered (workflow tasks) | The workflow task stores the same form as `harvest_workflow_executions.output`. An activity result stays in clear for the reason above. |
+| `harvest_task_queue.heartbeat_details` | Clear | A short-lived activity checkpoint. Follow-up #2043. |
+| `harvest_task_queue.retry_policy` | Clear | Engine configuration, not payload. |
+| `harvest_task_queue.trace_context` | Clear | Trace ids, not payload. |
+| `harvest_task_queue.required_capabilities` | Clear | Routing labels, not payload. |
+| `harvest_task_queue.context_headers` | Clear | As for the execution row. Follow-up #2043. |
+| `harvest_schedules.workflow_input` | Clear | An operator template that the schedule API lists and edits. Follow-up #2043. |
+| `harvest_schedules.buffered_runs` | Clear | Fire times only. |
+| `harvest_schedules.retry_policy` | Clear | Engine configuration, not payload. |
+| `harvest_signals.payload` | Covered | The signal payload. Signal ingest decodes it before it records `SignalReceived`. |
+| `harvest_dead_letters.input` | Covered | The failed task input. A completion-callback entry copies the clear webhook body, so it stays in clear. Follow-up #2043. |
+| `harvest_workers.queues` | Clear | Worker registration, not payload. |
+| `harvest_workers.shard_assignments` | Clear | Worker registration, not payload. |
+| `harvest_workers.labels` | Clear | Worker capabilities, not payload. |
+| `harvest_build_policies.ramp_aborted` | Clear | Rollout state, not payload. |
+| `harvest_batch_jobs.filter` | Clear | An operator filter, not payload. |
+| `harvest_batch_jobs.signal_payload` | Clear | The operator-supplied batch payload. Each delivered signal row is covered. Follow-up #2043. |
+| `harvest_batch_jobs.errors` | Clear | Failure text (issue #1920). |
+| `harvest_batch_jobs.processed_ids` | Clear | Ids only. |
+| `harvest_schedule_decisions.detail` | Clear | A scheduler decision record, not payload. |
+| `harvest_completion_triggers.terminal_states` | Clear | Trigger configuration, not payload. |
+| `harvest_completion_triggers.input_mapping` | Clear | Trigger configuration, not payload. |
+| `harvest_completion_triggers.condition` | Clear | Trigger configuration, not payload. |
+| `harvest_completion_trigger_outbox.target_input` | Clear | A short-lived outbox row. The target start encodes the input it writes. Follow-up #2043. |
+| `harvest_completion_trigger_outbox.priority` | Clear | Scheduling, not payload. |
+| `harvest_cross_shard_children.child_spec` | Clear | A short-lived relay row that holds the child input. The target start encodes it. Follow-up #2043. |
+| `harvest_debounce.last_input` | Clear | A short-lived start buffer. Follow-up #2043. |
+| `harvest_debounce.start_options` | Clear | Start configuration, not payload. |
+| `harvest_start_throttle.input` | Clear | A short-lived start buffer. Follow-up #2043. |
+| `harvest_start_throttle.start_options` | Clear | Start configuration, not payload. |
+| `harvest_event_batches.buffered_payloads` | Clear | A short-lived start buffer. Follow-up #2043. |
+| `harvest_event_batches.start_options` | Clear | Start configuration, not payload. |
+| `harvest_completion_deliveries.event_filter` | Clear | Callback configuration, not payload. |
+| `harvest_completion_deliveries.payload` | Clear | The webhook body. It holds the decoded result. Follow-up #2043. |
+| `harvest_completion_deliveries.retry_policy` | Clear | Callback configuration, not payload. |
+| `harvest_execution_summaries.search_attrs` | Clear | As for the execution row. |
+| `harvest_execution_summaries.result` | Covered | A verbatim copy of `harvest_workflow_executions.output`, so it holds the same envelope. |
+| `harvest_execution_summaries.migrated_from_shards` | Clear | Shard bookkeeping, not payload. |
+| `harvest_shard_migrations.staged_task` | Clear | A verbatim task-row snapshot during a shard move. It can hold an envelope that the sweep does not reach. Do not retire a key during a shard move. |
+
+The SQLite and Redis backends do not use the codec. The connector dead-letter
+table, `harvest_connector_dead_letters`, stores raw message bytes in clear.
 
 ### Key providers
 
@@ -734,9 +1423,23 @@ Load each data key once, at startup, through a `KeyProvider`:
 | `FileKeyProvider` | `<dir>/<key_id>.key` that holds base64, for example a secret volume. |
 | `KmsKeyProvider` | A wrapped data key that a KMS unwraps (envelope encryption). |
 
-The `autumn-harvest-plugin` `aws-kms` feature adds `aws_kms::AwsKms`, which
-implements `KmsDecrypt` for AWS KMS. The core crate has no cloud dependency. To
-make a wrapped key, call `GenerateDataKey` with the codec key id as the
+`KmsKeyProvider` calls a KMS through the one-method `KmsDecrypt` trait. The
+core crate has no cloud dependency. `autumn-harvest-plugin` features supply
+the supported KMS bindings:
+
+| KMS | Plugin feature | Binding | Context binding |
+|-----|----------------|---------|-----------------|
+| AWS KMS | `aws-kms` | `aws_kms::AwsKms` | Encryption context |
+| HashiCorp Vault Transit | `vault-transit` | `vault_transit::VaultTransit` | Key derivation context |
+
+Each binding passes one shared test suite (`kms_conformance`, issue #1981).
+Vault Transit runs on any cloud and on premises. Harvest has no GCP Cloud KMS
+or Azure Key Vault binding yet. For another KMS, implement `KmsDecrypt` and
+send the context to the KMS as authenticated data.
+
+#### AWS KMS
+
+To make a wrapped key, call `GenerateDataKey` with the codec key id as the
 encryption context:
 
 ```sh
@@ -769,6 +1472,83 @@ let harvest = HarvestBuilder::new()
     .aead_payload_codec_key(AeadCodec::load(&keys, "2026-10").await?)
     .try_build()?;
 ```
+
+#### HashiCorp Vault Transit
+
+The `vault-transit` feature uses the `reqwest` client that the plugin already
+has. It adds no crate to the lockfile. Make a Transit key with key derivation. Vault uses
+the context only for a derived key, so the binding refuses any other key.
+
+```sh
+vault secrets enable transit
+vault write transit/keys/harvest derived=true
+vault write -field=ciphertext transit/datakey/wrapped/harvest bits=256 \
+  context="$(printf '{"harvest_codec_key_id":"2026-10"}' | base64 | tr -d '\n')" \
+  > 2026-10.wrapped
+```
+
+The context is the base64 of the compact JSON object above. Use the codec key
+id as the value, and add no spaces. The `datakey/wrapped` endpoint returns the
+ciphertext only, so the plaintext key never leaves Vault. Vault refuses to unwrap the key under
+another key id or another Transit key.
+
+Give the Harvest token this policy. The binding reads the key to check that
+derivation is on. With another mount or a namespace, change the paths to match.
+
+```hcl
+path "transit/keys/harvest"    { capabilities = ["read"] }
+path "transit/decrypt/harvest" { capabilities = ["update"] }
+```
+
+```toml
+[dependencies]
+autumn-harvest-plugin = { version = "0.7", features = ["vault-transit"] }
+```
+
+```rust,ignore
+use autumn_harvest::aead_codec::{AeadCodec, KmsKeyProvider};
+use autumn_harvest_plugin::vault_transit::VaultTransit;
+
+let vault = VaultTransit::new(std::env::var("VAULT_ADDR")?, std::env::var("VAULT_TOKEN")?);
+let wrapped = std::fs::read_to_string("2026-10.wrapped")?;
+let keys = KmsKeyProvider::new(vault, "harvest")
+    .with_wrapped_key("2026-10", wrapped.trim().as_bytes().to_vec());
+let harvest = HarvestBuilder::new()
+    .aead_payload_codec_key(AeadCodec::load(&keys, "2026-10").await?)
+    .try_build()?;
+```
+
+The wrapped key is the `vault:v1:` text. Load it with `with_wrapped_key`, not
+`with_wrapped_key_base64`.
+
+- `with_mount` sets another Transit mount. Each mount segment uses letters,
+  digits, `_`, `-` and `.` only.
+- `with_namespace` sets a Vault Enterprise namespace.
+- The address must use `https`. Plain `http` is allowed for a loopback host,
+  for example a Vault Agent sidecar. `allow_plain_http` allows it for other
+  hosts, for development only.
+- The default client follows no redirect, so the token goes to the configured
+  address only. It sends plain `http` direct, never through a proxy. It trusts the bundled public CA roots, not the OS store, and
+  it ignores `VAULT_CACERT`.
+- Each request times out after 30 seconds, also with `with_client`.
+- `VaultTransit::new` takes the token once. The binding does not renew it. The
+  token must be valid when the process loads its keys.
+
+For a private CA, pass your own client to `with_client`. Turn off redirects on
+it. The module re-exports `reqwest`.
+
+```rust,ignore
+use autumn_harvest_plugin::vault_transit::reqwest;
+
+let ca = reqwest::Certificate::from_pem(&std::fs::read("vault-ca.pem")?)?;
+let client = reqwest::Client::builder()
+    .add_root_certificate(ca)
+    .redirect(reqwest::redirect::Policy::none())
+    .build()?;
+let vault = VaultTransit::new(vault_addr, vault_token).with_client(client);
+```
+
+### Codec rollout
 
 Use `aead_payload_codec_key`, not `payload_codec`, from the first deployment.
 It writes the key id into each envelope, so a later rotation needs no
@@ -832,6 +1612,78 @@ does not authorise" in
 byte-identical across a sweep with this codec.
 
 ---
+
+## Supply chain (issue #1826)
+
+The plan is in
+[`plans/2026-10-06-supply-chain.md`](plans/2026-10-06-supply-chain.md).
+
+### Daily advisory scan
+
+`.github/workflows/advisory-scan.yml` runs `cargo deny check advisories` every
+day at 05:37 UTC. The CI `dependency-audit` job runs on code changes only, and
+a new RUSTSEC advisory needs no code change. Both jobs install the same
+`cargo-deny` version.
+
+A failed scheduled scan opens the issue "Advisory scan: cargo deny check
+advisories failed", or comments on it. The body lists each RUSTSEC id and
+quotes the scan output. To close the issue, fix each finding or add a reasoned
+`ignore` entry to `deny.toml`. The next clean scan closes the issue.
+
+### Pinned actions and Dependabot
+
+Each `uses:` pins a commit SHA, with a `# <tag>` comment. A tag can move to new
+code, and a SHA cannot. `docs/audits/action-sha-pin.py` fails the `lint` job on
+any other form.
+
+`.github/dependabot.yml` opens weekly update pull requests against `trunk-dev`,
+for `cargo` and `github-actions`. Dependabot changes the SHA and the comment
+together.
+
+### Verifying a release
+
+Each release archive ships with a CycloneDX SBOM (`.cdx.json`) and a Sigstore
+bundle (`.sigstore.json`) for each file. The TypeScript client tarball
+(`.tgz`) ships the same way. The binaries are built with `cargo auditable`, so
+each binary holds its own dependency list.
+
+The bundles are the trust anchor. `SHA256SUMS` is not signed. Use it only to
+check a download for damage.
+
+Verify the signature. Replace the version in each name:
+
+```sh
+cosign verify-blob \
+  --bundle harvest-0.8.0-x86_64-unknown-linux-gnu.tar.gz.sigstore.json \
+  --certificate-identity https://github.com/autumn-foundation/autumn-harvest/.github/workflows/release.yml@refs/tags/v0.8.0 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  harvest-0.8.0-x86_64-unknown-linux-gnu.tar.gz
+```
+
+Verify the build provenance and the SBOM attestation. Always pass the tag
+and the workflow. `--repo` alone accepts an attestation from any workflow
+run of this repository.
+
+```sh
+gh attestation verify harvest-0.8.0-x86_64-unknown-linux-gnu.tar.gz \
+  --repo autumn-foundation/autumn-harvest \
+  --source-ref refs/tags/v0.8.0 \
+  --signer-workflow autumn-foundation/autumn-harvest/.github/workflows/release.yml
+gh attestation verify harvest-0.8.0-x86_64-unknown-linux-gnu.tar.gz \
+  --repo autumn-foundation/autumn-harvest \
+  --source-ref refs/tags/v0.8.0 \
+  --signer-workflow autumn-foundation/autumn-harvest/.github/workflows/release.yml \
+  --predicate-type https://cyclonedx.org/bom
+```
+
+Scan an extracted binary for advisories with `cargo audit bin <path>`.
+
+A manual run of the Release workflow is a dry run. So is a pull request that
+changes `release.yml`. A dry run builds, writes the SBOM and signs, but
+writes no attestation and publishes nothing. Its files are in the
+`signed-<target>` workflow artifacts. A fork or Dependabot pull request gets
+no OIDC token, so its dry run does not sign. It keeps the `unsigned-<target>`
+artifacts only.
 
 ## Production-readiness checklist
 
@@ -917,7 +1769,25 @@ Authentication middleware applies uniformly across all shards because it wraps
 the router layer, not individual handlers. No extra configuration is needed for
 multi-shard deployments.
 
-### 6. Payloads that carry PII are encrypted
+A deployment with tenant cells needs one more check. The authorizer hook
+must refuse a pin into a cell the caller does not own. See
+[Multi-tenant deployment](#multi-tenant-deployment-issue-1837).
+
+### 6. The API rate limiter is on
+
+Turn on the [API rate limiter](#api-rate-limiting) with
+`with_api_rate_limit` or `StandaloneAdminAuth::with_rate_limit`. Configure
+`[security.trusted_proxies]` when a proxy fronts the API. Send a burst from
+one client, then check for `429` with `Retry-After`. Watch
+`harvest_api_rate_limited_total` for refusals of real clients.
+
+### 7. SSO users have the least role they need
+
+With [OIDC login](#oidc-login), map each group to the narrowest role. Log in
+as a viewer and check that a mutation gets `403`. Give `harvest-admin` to as
+few groups as you can, because it can mint API tokens.
+
+### 8. Payloads that carry PII are encrypted
 
 If a workflow carries PII or secrets, register an `AeadCodec` with
 `aead_payload_codec_key`. Load the key from a `KeyProvider`, never from

@@ -409,6 +409,7 @@ async fn start_on(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -1773,4 +1774,89 @@ async fn a_replacement_install_does_not_redirect_a_running_workers_hints() {
             task.id
         );
     }
+}
+
+/// Answers in 50 ms.
+fn slow_echo_activity(
+    _ctx: &autumn_harvest::ActivityContext,
+    input: serde_json::Value,
+) -> BoxFut<'_> {
+    Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        Ok(input)
+    })
+}
+
+/// One call to the capped activity.
+fn capped_workflow(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        let queue = ctx.queue_name().to_string();
+        ctx.execute_activity_raw("capped_echo", input, &queue)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// A reference to a type at its adaptive limit comes back when a slot is
+/// likely free, not after the gate backoff (issue #1836). With a 10 s backoff
+/// cap and a 10 s reconcile, the generic backoff would hold the free slots
+/// idle for seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_saturated_reference_returns_when_a_slot_frees() {
+    use autumn_harvest::adaptive_limit::AdaptiveLimitConfig;
+    use autumn_harvest::policy::AdaptiveLimitPolicy;
+
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let channel = Arc::new(MemoryDispatch::new());
+    let _guard = install_with(
+        &channel,
+        DispatchSettings {
+            poll_interval: Duration::from_millis(20),
+            reconcile_interval: Duration::from_secs(10),
+            reconcile_batch: 100,
+            release_backoff_cap: Duration::from_secs(10),
+        },
+    );
+
+    let mut conn = connect(&url).await;
+    let mut execs = Vec::new();
+    for _ in 0..10 {
+        execs.push(start(&mut conn, "dispatch_capped").await);
+    }
+
+    let telemetry = Arc::new(TelemetryConfig::builder().build());
+    let registry = HandlerRegistry::with_state_and_telemetry(
+        vec![wf_info("dispatch_capped", capped_workflow)],
+        vec![act_info("capped_echo", slow_echo_activity, None)],
+        empty_shared_state(),
+        telemetry,
+    )
+    .with_adaptive_limit(
+        AdaptiveLimitConfig::disabled()
+            .with_activity("capped_echo", Some(AdaptiveLimitPolicy::new(1, 1))),
+    );
+    let worker = Arc::new(
+        Worker::new(
+            worker_config("default", vec![ShardId::new(0)]),
+            Arc::new(registry),
+        )
+        .expect("worker should build"),
+    );
+
+    let pool = build_pool(&url);
+    let mut check = connect(&url).await;
+    let started = std::time::Instant::now();
+    with_worker(worker, pool, async {
+        for exec in &execs {
+            wait_for_state(&mut check, *exec, &["COMPLETED"], Duration::from_secs(50)).await;
+        }
+    })
+    .await;
+    let elapsed = started.elapsed();
+    // Ten serial 50 ms calls. The gate backoff would add seconds.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "ten capped runs took {elapsed:?}"
+    );
 }
