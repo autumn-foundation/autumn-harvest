@@ -21762,6 +21762,21 @@ pub(crate) async fn signal_with_start_workflow(
     let start_input = request.start_input.unwrap_or(Value::Null);
     let signal_payload = request.signal_payload.unwrap_or(Value::Null);
 
+    // Issue #1985: apply the promise settlement rules before the replay probe
+    // below. A mismatched key can match an unrelated row and report a false
+    // replay. A promise belongs to one run, but the probe looks across runs.
+    // So a promise signal skips the probe, as the engine does.
+    if let Err(e) = autumn_harvest::durable_promise::settlement_idempotency_key(
+        &request.signal_name,
+        &signal_payload,
+        request.idempotency_key.as_deref(),
+    ) {
+        return map_error(e).into_response();
+    }
+    let promise_signal = request
+        .signal_name
+        .starts_with(autumn_harvest::durable_promise::PROMISE_SIGNAL_PREFIX);
+
     // INVARIANT (this PR): keyed committed-replay short-circuit. A retry of an
     // already-committed keyed signal-with-start must replay to its documented
     // `200 signal_delivered: false` no-op BEFORE any fresh-start-only validation
@@ -21775,7 +21790,8 @@ pub(crate) async fn signal_with_start_workflow(
     // concurrent-first-delivery race — this probe is an additive fast path for
     // COMMITTED replays only, never a replacement. Mirrors #808 (plain start)
     // and #1092 (plain signal route).
-    if let Some(key) = request.idempotency_key.as_deref()
+    if !promise_signal
+        && let Some(key) = request.idempotency_key.as_deref()
         && let Some(resp) = probe_committed_sws_replay(
             &api_state,
             &workflow_name,
@@ -26064,6 +26080,18 @@ pub(crate) async fn signal_workflow(
     {
         return resp;
     }
+
+    // Issue #1985: apply the promise settlement rules before the keyed dedupe
+    // probe below. A mismatched key can match an unrelated row. The probe then
+    // reports success, and the promise stays unsettled.
+    let idempotency_key = match autumn_harvest::durable_promise::settlement_idempotency_key(
+        &signal_name,
+        &payload,
+        idempotency_key.as_deref(),
+    ) {
+        Ok(key) => key.map(str::to_owned),
+        Err(e) => return map_error(e).into_response(),
+    };
 
     let exec_id = match parse_execution_id(&id) {
         Ok(eid) => eid,

@@ -341,6 +341,8 @@ impl<'a> DurablePromise<'a> {
 ///
 /// Every signal path calls this through `signal::send_signal_idempotent`:
 /// the Rust API, the HTTP route, the CLI and the cross-workflow outbox.
+/// The HTTP route also calls it before its keyed dedupe probe. Otherwise a
+/// mismatched key that matches an unrelated row reports a false success.
 ///
 /// - A `harvest.promise:` signal always uses its own name as the
 ///   idempotency key. A missing key gets that value. A different key is an
@@ -356,7 +358,7 @@ impl<'a> DurablePromise<'a> {
 ///
 /// Returns [`crate::HarvestError::Config`] when a rule fails.
 #[cfg(feature = "db")]
-pub(crate) fn settlement_idempotency_key<'a>(
+pub fn settlement_idempotency_key<'a>(
     signal_name: &'a str,
     payload: &Value,
     idempotency_key: Option<&'a str>,
