@@ -5444,6 +5444,9 @@ pub struct StandaloneAdminAuth {
     deployment_profile: Option<String>,
     admin_auth_session_key: Option<String>,
     rate_limit: Option<crate::api_rate_limit::ApiRateLimit>,
+    roles: Option<crate::roles::HarvestRoles>,
+    #[cfg(feature = "oidc")]
+    oidc: Option<crate::oidc::OidcLogin>,
 }
 
 impl StandaloneAdminAuth {
@@ -5500,6 +5503,36 @@ impl StandaloneAdminAuth {
         rate_limit: crate::api_rate_limit::ApiRateLimit,
     ) -> Self {
         self.rate_limit = Some(rate_limit);
+        self
+    }
+
+    /// Install the custom-role layer (issue #1978).
+    ///
+    /// Each request needs a role that allows its route. Roles come from a
+    /// [`crate::roles::RoleGrant`] extension or the session key
+    /// [`crate::roles::SESSION_ROLES_KEY`]. A verified token skips the check.
+    /// See [`crate::roles`].
+    #[must_use]
+    pub fn with_roles(mut self, roles: crate::roles::HarvestRoles) -> Self {
+        self.roles = Some(roles);
+        self
+    }
+
+    /// Install OIDC login and its session boundary (issue #1978).
+    ///
+    /// This also installs the role layer with the roles of `login`, and
+    /// declares the auth boundary. The roles of `login` replace any set by
+    /// [`Self::with_roles`]. It turns off [`Self::with_read_only_role`]. The login routes sit outside the boundary.
+    /// The host must apply an autumn-web session layer outside the mounted
+    /// router. See [`crate::oidc`].
+    #[cfg(feature = "oidc")]
+    #[must_use]
+    pub fn with_oidc(mut self, login: crate::oidc::OidcLogin) -> Self {
+        self.admin_auth_boundary = true;
+        // The read-only role reads host session keys. The login replaces that
+        // host auth, so the custom roles decide alone.
+        self.read_only_role = false;
+        self.oidc = Some(login);
         self
     }
 
@@ -5580,6 +5613,14 @@ impl StandaloneAdminAuth {
         if let Some(session_key) = &self.admin_auth_session_key {
             api_state.set_admin_auth_session_key(session_key.clone());
         }
+        #[cfg(feature = "oidc")]
+        let roles = self
+            .oidc
+            .as_ref()
+            .map(|login| login.roles().clone())
+            .or_else(|| self.roles.clone());
+        #[cfg(not(feature = "oidc"))]
+        let roles = self.roles.clone();
         let router = apply_admin_auth_layers(
             router,
             api_state,
@@ -5588,8 +5629,13 @@ impl StandaloneAdminAuth {
                 read_only_role: self.read_only_role,
                 authorizer: self.authorizer.clone(),
                 rate_limit: self.rate_limit.clone(),
+                roles,
             },
         );
+        #[cfg(feature = "oidc")]
+        if let Some(login) = &self.oidc {
+            return crate::oidc::apply_oidc(router, login, self.api_tokens);
+        }
         if self.api_tokens && !self.admin_auth_boundary {
             router.layer(middleware::from_fn(
                 crate::api_token::require_token_for_non_public,
@@ -5610,6 +5656,8 @@ pub(crate) struct AdminAuthLayers {
     pub authorizer: Option<crate::authz::SharedAuthorizer>,
     /// The per-client rate limiter (issue #1827).
     pub rate_limit: Option<crate::api_rate_limit::ApiRateLimit>,
+    /// The custom-role layer (issue #1978).
+    pub roles: Option<crate::roles::HarvestRoles>,
 }
 
 /// Wrap a composed Harvest router in the admin-auth layer stack.
@@ -5635,6 +5683,11 @@ pub(crate) struct AdminAuthLayers {
 /// layer. It runs after both built-in gates, so it can only deny. It sees the
 /// `TokenPrincipal` the token layer sets.
 ///
+/// Issue #1978: the custom-role layer sits INSIDE the read-only-class layer
+/// and OUTSIDE the authorizer. A verified token skips it. An allowed request
+/// carries a `RolePrincipal`, which the admin gate and the #1802 gate admit.
+/// The authorizer can then only narrow what a role allows.
+///
 /// Issue #1827: the rate-limit layer sits directly INSIDE the token layer. It
 /// keys a bucket on the verified `TokenPrincipal`, so an unverified bearer
 /// cannot open a new bucket. It runs before the read-only and authorizer
@@ -5657,6 +5710,12 @@ pub(crate) fn apply_admin_auth_layers(
         router = router.layer(middleware::from_fn_with_state(
             (api_state.clone(), authorizer.clone()),
             crate::authz::enforce_authorizer,
+        ));
+    }
+    if let Some(roles) = &layers.roles {
+        router = router.layer(middleware::from_fn_with_state(
+            (api_state.clone(), roles.clone()),
+            crate::roles::enforce_custom_roles,
         ));
     }
     if layers.read_only_role {
@@ -5706,6 +5765,14 @@ pub(crate) async fn require_harvest_admin(
     if request
         .extensions()
         .get::<crate::api_token::TokenPrincipal>()
+        .is_some()
+    {
+        return next.run(request).await;
+    }
+    // Issue #1978: the role layer already allowed this route for this caller.
+    if request
+        .extensions()
+        .get::<crate::roles::RolePrincipal>()
         .is_some()
     {
         return next.run(request).await;
@@ -5764,10 +5831,15 @@ async fn admit_mutation(
     request: axum::extract::Request,
     next: Next,
 ) -> axum::response::Response {
+    // Issue #1978: a role principal counts as a credential, as a token does.
     let has_token = request
         .extensions()
         .get::<crate::api_token::TokenPrincipal>()
-        .is_some();
+        .is_some()
+        || request
+            .extensions()
+            .get::<crate::roles::RolePrincipal>()
+            .is_some();
     let session = request.extensions().get::<Session>().cloned();
     if !mutation_admitted(api_state, has_token, session).await {
         return AutumnError::unauthorized_msg("authentication required").into_response();
@@ -5902,6 +5974,11 @@ pub(crate) async fn has_harvest_admin_access(
     api_state: &HarvestApiState,
     session: Option<Session>,
 ) -> bool {
+    // Issue #1978: under the role layer, only an `admin`-scope role passes.
+    // A declared boundary must not widen a narrower role.
+    if let Some(admin) = crate::roles::role_admin_access() {
+        return admin;
+    }
     if api_state.admin_auth_boundary() {
         return true;
     }

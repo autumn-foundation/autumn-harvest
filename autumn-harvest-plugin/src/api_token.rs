@@ -377,7 +377,7 @@ fn service_unavailable(msg: &'static str) -> Response {
 /// since the token secret is case-sensitive. A non-`hvst_` credential (any
 /// scheme case) still returns `None` so a non-Harvest bearer passes through to
 /// the embedder untouched.
-fn harvest_bearer(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn harvest_bearer(headers: &HeaderMap) -> Option<String> {
     let raw = headers
         .get(axum::http::header::AUTHORIZATION)?
         .to_str()
