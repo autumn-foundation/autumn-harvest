@@ -1,0 +1,35 @@
+Hash Left Join  (cost=72.13..125.31 rows=1132 width=127) (actual time=0.991..2.520 rows=1396 loops=1)
+  Output: s.id, s.workflow_exec_id, s.host_worker_id, s.queue_name, s.state, s.created_at, s.expires_at, s.broken_at, s.broken_reason, s.completed_at
+  Inner Unique: true
+  Hash Cond: (s.workflow_exec_id = e.id)
+  Filter: ((w.worker_id IS NULL) OR (w.last_heartbeat_at <= (now() - '00:02:00'::interval)) OR (w.status = ANY ('{Draining,Stopped}'::text[])) OR (s.expires_at < now()) OR (e.state = ANY ('{COMPLETED,FAILED,CANCELLED,TIMED_OUT,TERMINATED,CONTINUED_AS_NEW}'::text[])))
+  Rows Removed by Filter: 204
+  Buffers: shared hit=60
+  ->  Hash Left Join  (cost=1.14..50.08 rows=1600 width=154) (actual time=0.059..0.994 rows=1600 loops=1)
+        Output: s.id, s.workflow_exec_id, s.host_worker_id, s.queue_name, s.state, s.created_at, s.expires_at, s.broken_at, s.broken_reason, s.completed_at, w.worker_id, w.last_heartbeat_at, w.status
+        Inner Unique: true
+        Hash Cond: (s.host_worker_id = w.worker_id)
+        Buffers: shared hit=25
+        ->  Seq Scan on public.harvest_sessions s  (cost=0.00..44.00 rows=1600 width=127) (actual time=0.007..0.368 rows=1600 loops=1)
+              Output: s.id, s.workflow_exec_id, s.host_worker_id, s.queue_name, s.state, s.created_at, s.expires_at, s.broken_at, s.broken_reason, s.completed_at
+              Filter: (s.state = 'ACTIVE'::text)
+              Buffers: shared hit=24
+        ->  Hash  (cost=1.06..1.06 rows=6 width=27) (actual time=0.030..0.031 rows=6 loops=1)
+              Output: w.worker_id, w.last_heartbeat_at, w.status
+              Buckets: 1024  Batches: 1  Memory Usage: 9kB
+              Buffers: shared hit=1
+              ->  Seq Scan on public.harvest_workers w  (cost=0.00..1.06 rows=6 width=27) (actual time=0.002..0.015 rows=6 loops=1)
+                    Output: w.worker_id, w.last_heartbeat_at, w.status
+                    Buffers: shared hit=1
+  ->  Hash  (cost=51.00..51.00 rows=1600 width=23) (actual time=0.913..0.914 rows=1600 loops=1)
+        Output: e.state, e.id
+        Buckets: 2048  Batches: 1  Memory Usage: 104kB
+        Buffers: shared hit=35
+        ->  Seq Scan on public.harvest_workflow_executions e  (cost=0.00..51.00 rows=1600 width=23) (actual time=0.004..0.400 rows=1600 loops=1)
+              Output: e.state, e.id
+              Buffers: shared hit=35
+Query Identifier: 7538190495178263721
+Planning:
+  Buffers: shared hit=65
+Planning Time: 0.577 ms
+Execution Time: 2.650 ms
