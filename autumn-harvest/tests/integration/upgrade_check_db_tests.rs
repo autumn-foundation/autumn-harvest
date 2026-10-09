@@ -66,6 +66,7 @@ async fn seed(
     let workflow_id = format!("wf-{}", exec_id.as_uuid());
     let row = NewWorkflowExecution {
         quota_key: None,
+        tenant: None,
         id: exec_id.as_uuid(),
         workflow_name: name,
         workflow_id: &workflow_id,
