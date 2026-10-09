@@ -14,13 +14,18 @@
 # - `client` builds the TypeScript client and its CycloneDX SBOM with
 #   read-only permissions, because `npm` runs third-party install scripts.
 #   `sign-client` signs and attests the tarball as `sign` does an archive.
+# - `image` builds the worker image of issue #1989 with read-only
+#   permissions, then runs it against Postgres.
+# - `publish-image` runs on a tag push only, after both sign jobs. It pushes
+#   the image, signs its digest, and pushes a provenance attestation to the
+#   registry. It runs no repository code.
 # - `release` runs on a tag push only. It publishes the signed files.
 #
-# A manual run or a pull request that changes this file is a dry run. It runs
-# `binaries` and `sign`, and keeps the result as a workflow artifact. A dry run
-# writes no attestation. `gh attestation verify --repo` accepts any workflow
-# run of this repository, so a dry-run attestation would verify like a
-# release.
+# A manual run is a dry run. So is a pull request that changes a file in
+# `pull_request.paths` below. A dry run runs `binaries`, `sign` and `image`,
+# and keeps the result as a workflow artifact. It writes no attestation.
+# `gh attestation verify --repo` accepts any workflow run of this
+# repository, so a dry-run attestation would verify like a release.
 name: Release
 
 on:
@@ -34,6 +39,15 @@ on:
     branches: [trunk, trunk-dev]
     paths:
       - .github/workflows/release.yml
+      # The image inputs. A dependency change can add a shared library that
+      # the distroless runtime lacks. CI runs the runner acceptance suite on
+      # each source change.
+      - Dockerfile
+      - .dockerignore
+      - rust-toolchain.toml
+      - Cargo.lock
+      - "**/Cargo.toml"
+      - autumn-harvest-plugin/migrations/harvest/**
 
 # Read-only by default. Each job that needs more asks for it.
 permissions:
@@ -45,6 +59,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Issue #1989. `publish-image` pushes here, and the release notes name it.
+  IMAGE: ghcr.io/autumn-foundation/autumn-harvest
 
 jobs:
   # Every check that can reject a tag runs here. Both sign jobs wait for this
@@ -166,9 +182,11 @@ jobs:
           ext=""
           if [ "$RUNNER_OS" = Windows ]; then ext=".exe"; fi
           mkdir -p "dist/${NAME}"
+          # The archive ships both license texts (issue #1990). `cp` fails
+          # the step if a license file is missing.
           cp "target/${TARGET}/release/harvest${ext}" \
             "target/${TARGET}/release/harvest-replay${ext}" \
-            README.md "dist/${NAME}/"
+            README.md LICENSE-MIT LICENSE-APACHE "dist/${NAME}/"
           tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
           rm -rf "dist/${NAME:?}"
       # The SBOM describes the package, features and target of the build.
@@ -369,11 +387,194 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  # Issue #1989. The build runs third-party `build.rs` code, so this job
+  # holds no write token. The smoke test runs the image as a cluster does.
+  image:
+    name: Build the worker image
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: harvest
+          POSTGRES_PASSWORD: harvest
+          POSTGRES_DB: harvest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U harvest"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      LOCAL: autumn-harvest:${{ needs.meta.outputs.version }}
+      DATABASE_URL: postgres://harvest:harvest@127.0.0.1:5432/harvest?sslmode=disable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No build cache, as in `binaries`.
+      - name: Build the image
+        run: |
+          set -euo pipefail
+          docker build --pull --no-cache \
+            --build-arg "VERSION=${VERSION}" \
+            --build-arg "REVISION=${GITHUB_SHA}" \
+            --tag "$LOCAL" .
+      # The runtime image has no shell. A missing library, a missing file or
+      # a root user fails here, not in a cluster.
+      - name: Smoke test the binaries
+        run: |
+          set -euo pipefail
+          docker run --rm "$LOCAL" harvest --version
+          docker run --rm "$LOCAL" harvest-replay --help > /dev/null
+          user="$(docker image inspect --format '{{.Config.User}}' "$LOCAL")"
+          if [ "$user" != "65532:65532" ]; then
+            echo "::error::the image runs as '${user}', not 65532:65532"
+            exit 1
+          fi
+      # The chart runs these three commands. Migrate, gate, start the runner,
+      # wait for readiness, then stop it as the kubelet does.
+      - name: Smoke test the worker against Postgres
+        run: |
+          set -euo pipefail
+          dirs=(--include-dir /usr/share/autumn-harvest/migrations/harvest)
+          docker run --rm --network host -e "HARVEST_DATABASE_URL=${DATABASE_URL}" \
+            "$LOCAL" harvest migrate run "${dirs[@]}"
+          docker run --rm --network host -e "HARVEST_DATABASE_URL=${DATABASE_URL}" \
+            "$LOCAL" harvest migrate status --check "${dirs[@]}"
+          docker run -d --name worker --network host \
+            -e "DATABASE_URL=${DATABASE_URL}" -e AUTUMN_PROFILE=prod "$LOCAL"
+          ready=""
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8082/api/harvest/health/ready; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$ready" ]; then
+            docker logs worker
+            echo "::error::the worker did not become ready"
+            exit 1
+          fi
+          curl -fsS http://127.0.0.1:8082/api/harvest/health/live
+          docker stop --timeout 60 worker
+          code="$(docker inspect --format '{{.State.ExitCode}}' worker)"
+          docker logs worker 2>&1 | tail -n 20
+          if [ "$code" != 0 ]; then
+            echo "::error::the worker exited with ${code} after SIGTERM"
+            exit 1
+          fi
+      - name: Save the image
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          docker save --output dist/worker-image.tar "$LOCAL"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: worker-image
+          path: dist/worker-image.tar
+          if-no-files-found: error
+          retention-days: 7
+
+  # Issue #1989. A tag push only. It waits for `validate` and both sign jobs,
+  # so the push is the last irreversible step before `release`. It runs no
+  # repository code: no checkout, only `docker` and `cosign`. It signs the
+  # digest, because a tag can move.
+  publish-image:
+    name: Publish and sign the worker image
+    needs: [meta, validate, image, sign, sign-client]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      LOCAL: autumn-harvest:${{ needs.meta.outputs.version }}
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: worker-image
+          path: dist
+      # Install cosign before the registry credential is on disk.
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      # Read the digest back from the registry. It is the digest that a
+      # user pulls. The hash of the raw manifest bytes is that digest on
+      # every buildx release, so no format template is needed. `cosign` and
+      # the attestation read the login.
+      - name: Push the image
+        id: push
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          docker load --input dist/worker-image.tar
+          echo "$TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker tag "$LOCAL" "${IMAGE}:${VERSION}"
+          docker push "${IMAGE}:${VERSION}"
+          digest="sha256:$(docker buildx imagetools inspect --raw "${IMAGE}:${VERSION}" \
+            | sha256sum | cut -d ' ' -f 1)"
+          if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::no digest for ${IMAGE}:${VERSION}: '${digest}'"
+            exit 1
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+      # Keyless, as in `sign`. The signature goes to the registry and the
+      # entry goes to the public Rekor log.
+      - name: Sign the image digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+      - name: Verify the image signature
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          identity="${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}"
+          cosign verify --certificate-identity "$identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${IMAGE}@${DIGEST}" > /dev/null
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+          # A storage record needs `artifact-metadata: write`. The registry
+          # copy is the one that users verify.
+          create-storage-record: false
+      # GHCR makes a new package private. The chart default then cannot pull
+      # it. ADR 0006 has the one-time fix. The check only warns: each failed
+      # request, the token request too, takes the warning path.
+      - name: Check that the image is public
+        run: |
+          set -uo pipefail
+          repo="${IMAGE#ghcr.io/}"
+          accept="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json"
+          if token="$(curl -fsS "https://ghcr.io/token?scope=repository:${repo}:pull" | jq -er .token)" \
+            && curl -fsS -o /dev/null -H "Authorization: Bearer ${token}" -H "Accept: ${accept}" \
+              "https://ghcr.io/v2/${repo}/manifests/${VERSION}"; then
+            echo "${IMAGE}:${VERSION} is public."
+          else
+            echo "::warning::${IMAGE}:${VERSION} is not public. See docs/adr/0006-worker-container-image.md."
+          fi
+
   # The only job with `contents: write`. It runs no npm and no build, and its
   # checkout keeps no credentials on disk.
   release:
     name: Create GitHub Release
-    needs: [meta, validate, sign, client, sign-client]
+    needs: [meta, validate, sign, client, sign-client, publish-image]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -388,11 +589,15 @@ jobs:
         uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
         with:
           tool: git-cliff
+      # The notes name the image by digest, the form to pin.
       - name: Generate release notes
         id: release-notes
+        env:
+          IMAGE_REF: ${{ env.IMAGE }}@${{ needs.publish-image.outputs.digest }}
         run: |
           git-cliff --config cliff.toml --latest --strip header > RELEASE_NOTES.md
           perl -0pi -e 's/\n+\z/\n/' RELEASE_NOTES.md
+          printf '\nWorker image: `%s`\n' "$IMAGE_REF" >> RELEASE_NOTES.md
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: signed-*
