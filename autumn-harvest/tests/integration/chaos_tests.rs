@@ -26,6 +26,9 @@
 mod infra_faults;
 
 mod drain_hold;
+mod tla_trace;
+mod trace_activity;
+mod trace_red;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -149,6 +152,7 @@ async fn chaos_db() -> (
             .await
             .expect("connect to HARVEST_TEST_DATABASE_URL");
         scrub(&mut conn).await;
+        tla_trace::install(&mut conn).await;
         (body, url, None)
     } else {
         use testcontainers::ImageExt;
@@ -165,6 +169,7 @@ async fn chaos_db() -> (
         conn.batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("migration");
+        tla_trace::install(&mut conn).await;
         (body, url, Some(container))
     }
 }
@@ -514,6 +519,7 @@ async fn chaos_repro_601_lost_wake_is_recovered_via_wake_requested() {
         "re-pended task must have no worker_id; {}",
         guard.diagnostics()
     );
+    tla_trace::export(&url, "repro-601").await;
 }
 
 // ── Reproducer 2 — issue #367 poison-pill orphan reclaim ─────────────────────
@@ -623,6 +629,7 @@ async fn chaos_repro_367_crash_orphan_is_reclaimed() {
         worker.is_none(),
         "recovered task must have no worker_id; {diag}"
     );
+    tla_trace::export(&url, "repro-367").await;
 }
 
 // ── Reproducer 2b — issue #1348 terminal metrics lost to post-commit cancel ──
@@ -781,6 +788,7 @@ async fn chaos_repro_1348_terminal_metrics_survive_post_commit_cancellation() {
         "harvest.workflow.terminal must be recorded once the outcome is durable, even though \
          the cycle was cancelled immediately after commit; {diag}"
     );
+    tla_trace::export(&url, "repro-1348").await;
 }
 
 // ── Reproducer 3 — issue #492 outbox vs inline external-signal persist ───────
@@ -949,6 +957,7 @@ async fn chaos_repro_492_outbox_cannot_double_deliver_inline_external_signal() {
         0,
         "no ExternalSignalRequested without a terminal; {diag}"
     );
+    tla_trace::export(&url, "repro-492").await;
 }
 
 // ── Reproducer 4 — issue #350 schedule fire claim expiring mid-fire ──────────
@@ -1085,6 +1094,7 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
         1,
         "the crashed slot must be re-fired by a peer exactly once after the claim expires; {diag}"
     );
+    tla_trace::export(&url, "repro-350-pre-start").await;
 }
 
 // ── Reproducer 4b — issue #350 post-start crash (SCHED_AFTER_START_BEFORE_ADVANCE) ──
@@ -1227,6 +1237,7 @@ async fn chaos_repro_350_post_start_crash_dedupes_to_exactly_one() {
         1,
         "a post-start crash must yield exactly one execution through recovery (no double-fire); {diag}"
     );
+    tla_trace::export(&url, "repro-350-post-start").await;
 }
 
 // ── AC1(d) — expire a lease/heartbeat early ──────────────────────────────────
@@ -1367,6 +1378,7 @@ async fn chaos_ac1d_session_lease_expiry_marks_broken() {
         Some("session lease expired"),
         "the break must be attributed to the expired lease, not a dead/draining host",
     );
+    tla_trace::export(&url, "session-lease").await;
 }
 
 #[derive(diesel::QueryableByName)]
@@ -1632,6 +1644,7 @@ async fn chaos_seeded_convergence_sweep() {
 
         // Convergence invariant.
         assert_converged(&url, &format!("seed {seed}"), &execs, &diag).await;
+        tla_trace::export(&url, &format!("sweep-seed-{seed}")).await;
     }
 }
 
@@ -1721,6 +1734,17 @@ async fn oracle_flags_a_duplicate_terminal_event() {
         message.contains("exactly one terminal event"),
         "the oracle panicked for another reason: {message}"
     );
+
+    // The forged event is an injected violation (issue #2003). It closes no
+    // claim, so each guard setting of the spec must reject its trace.
+    if tla_trace::trace_dir().is_some() {
+        let traces = tla_trace::take(&mut conn).await;
+        tla_trace::write(
+            "oracle-duplicate-terminal",
+            &traces,
+            |_| serde_json::json!({ "fixed": "reject", "pre-fix": "reject" }),
+        );
+    }
 }
 
 /// Count the workflow-level terminal events of one execution (issue #1801).

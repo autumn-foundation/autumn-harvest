@@ -144,6 +144,22 @@ CapMissRelease(c) ==
     /\ inflight' = inflight \ {c}
     /\ UNCHANGED <<run, events, claims>>
 
+\* release_unstarted_claim (issue #1813): a draining worker gives back a
+\* claim that never started. Its fence is claim_held, with no strikes term.
+\* It subtracts 1 from attempt and keeps crash_strikes. Issue #2003 found
+\* this action, because a chaos trace had no other match.
+UnstartedRelease(c) ==
+    /\ c \in inflight
+    /\ IF /\ row.state = "RUNNING"
+          /\ row.worker = c.w
+          /\ (ChecksAttempt => row.attempt = c.a)
+       THEN /\ Wrote(c)
+            /\ row' = [row EXCEPT !.state = "PENDING", !.worker = NoWorker,
+                                  !.seq = 0, !.attempt = @ - 1]
+       ELSE UNCHANGED <<row, writes>>
+    /\ inflight' = inflight \ {c}
+    /\ UNCHANGED <<run, events, claims>>
+
 \* The terminal persist: lock the run, check the guard, append the terminal
 \* event and close the run and the task in one transaction.
 PersistTerminal(c) ==
@@ -164,6 +180,7 @@ Next ==
     \/ \E c \in inflight :
         \/ SuspendRelease(c)
         \/ CapMissRelease(c)
+        \/ UnstartedRelease(c)
         \/ PersistTerminal(c)
 
 Spec == Init /\ [][Next]_vars

@@ -1,0 +1,6 @@
+{"spec":"ActivityClaim","case":"injected: a second terminal event after the task finished","checks":{"fixed":"reject","pre-fix":"reject"}}
+{"op":"init","state":"PENDING","worker":null,"attempt":0,"strikes":0,"terminal":0,"actor":null}
+{"op":"write","state":"RUNNING","worker":"w1","attempt":1,"strikes":0,"terminal":0,"actor":null}
+{"op":"start","state":"RUNNING","worker":"w1","attempt":1,"strikes":0,"terminal":0,"actor":null}
+{"op":"write","state":"COMPLETED","worker":"w1","attempt":1,"strikes":0,"terminal":1,"actor":null}
+{"op":"write","state":"FAILED","worker":"w1","attempt":1,"strikes":0,"terminal":2,"actor":null}
