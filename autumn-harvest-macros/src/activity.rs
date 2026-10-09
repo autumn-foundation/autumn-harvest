@@ -573,6 +573,8 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #dispatch
                     })
                 },
+                input_schema: None,
+                output_schema: None,
             }
         }
 

@@ -230,6 +230,8 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 circuit_breaker: None,
                 requires: None,
                 handler: telem_activity,
+                input_schema: None,
+                output_schema: None,
             },
             ActivityInfo {
                 name: "telem_act_b",
@@ -252,6 +254,8 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 circuit_breaker: None,
                 requires: None,
                 handler: telem_activity,
+                input_schema: None,
+                output_schema: None,
             },
         ],
     ))

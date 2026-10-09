@@ -898,6 +898,8 @@ fn e2e_registry() -> std::sync::Arc<autumn_harvest::worker::HandlerRegistry> {
         max_result_bytes: None,
         requires: None,
         handler: e2e_activity,
+        input_schema: None,
+        output_schema: None,
     };
     std::sync::Arc::new(
         autumn_harvest::worker::HandlerRegistry::with_state_and_telemetry(

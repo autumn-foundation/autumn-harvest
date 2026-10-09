@@ -938,6 +938,8 @@ fn activity_info() -> ActivityInfo {
         max_result_bytes: None,
         requires: None,
         handler: failing_activity,
+        input_schema: None,
+        output_schema: None,
     }
 }
 

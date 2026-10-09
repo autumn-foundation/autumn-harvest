@@ -819,6 +819,8 @@ mod db_tests {
                 max_result_bytes: None,
                 requires: None,
                 handler: pipeline_step_activity,
+                input_schema: None,
+                output_schema: None,
             }],
         ));
 

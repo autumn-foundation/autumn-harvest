@@ -1328,6 +1328,8 @@ async fn retry_path_requeues_when_a_concurrent_resume_shifted_the_deadline() {
             max_result_bytes: None,
             requires: None,
             handler: deadline_shifting_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ));
     let worker = Arc::new(make_worker(registry));
@@ -1586,6 +1588,8 @@ async fn retry_path_requeues_when_a_concurrent_pause_committed_after_the_gate() 
             max_result_bytes: None,
             requires: None,
             handler: self_pausing_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ));
     let worker = Arc::new(make_worker(registry));

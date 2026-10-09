@@ -202,6 +202,8 @@ fn slow_activity_info() -> ActivityInfo {
         max_result_bytes: None,
         requires: None,
         handler: slow_activity,
+        input_schema: None,
+        output_schema: None,
     }
 }
 

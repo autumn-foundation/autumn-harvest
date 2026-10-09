@@ -11,8 +11,8 @@
 use autumn_harvest::info::validate_against_schema;
 use autumn_harvest::schema_contract::{
     AcknowledgedBreakingChange, ChangeKind, MAX_DELTAS, SCHEMA_CONTRACT_VERSION,
-    SchemaContractDiff, SchemaRole, Verdict, WorkflowSchemaContract, WorkflowSchemaEntry,
-    canonicalize_schema, dropped_acknowledgements, unacknowledged_breaking,
+    SchemaContractDiff, SchemaRole, SchemaSubject, Verdict, WorkflowSchemaContract,
+    WorkflowSchemaEntry, canonicalize_schema, dropped_acknowledgements, unacknowledged_breaking,
 };
 use serde_json::{Value, json};
 
@@ -1116,6 +1116,8 @@ fn an_acknowledgement_without_a_reason_is_reported_as_breaking() {
     let mut c = input_contract(json!({"type":"object"}));
     c.acknowledged_breaking_changes
         .push(AcknowledgedBreakingChange {
+            subject: SchemaSubject::Workflow,
+            side_effect: None,
             workflow: "wf".to_string(),
             role: Some(SchemaRole::Input),
             field_path: "/email".to_string(),
@@ -2705,6 +2707,8 @@ fn a_pre_existing_acknowledgement_does_not_cover_a_fresh_break() {
         .iter()
         .filter(|d| d.verdict == Verdict::Breaking)
         .map(|d| AcknowledgedBreakingChange {
+            subject: d.subject,
+            side_effect: d.side_effect.clone(),
             workflow: d.workflow.clone(),
             role: d.role,
             field_path: d.field_path.clone(),
@@ -2852,6 +2856,8 @@ fn a_blank_reason_record_cannot_cover_a_breaking_change() {
         .iter()
         .filter(|d| d.verdict == Verdict::Breaking)
         .map(|d| AcknowledgedBreakingChange {
+            subject: d.subject,
+            side_effect: d.side_effect.clone(),
             workflow: d.workflow.clone(),
             role: d.role,
             field_path: d.field_path.clone(),
@@ -2988,6 +2994,8 @@ fn a_rewritten_acknowledgement_record_is_detected() {
 
     // Base carries a record for an unrelated, earlier break.
     let stale = AcknowledgedBreakingChange {
+        subject: SchemaSubject::Workflow,
+        side_effect: None,
         workflow: "some_other_workflow".to_string(),
         role: Some(SchemaRole::Output),
         field_path: "/legacy".to_string(),
@@ -3005,6 +3013,8 @@ fn a_rewritten_acknowledgement_record_is_detected() {
         .iter()
         .filter(|d| d.verdict == Verdict::Breaking)
         .map(|d| AcknowledgedBreakingChange {
+            subject: d.subject,
+            side_effect: d.side_effect.clone(),
             workflow: d.workflow.clone(),
             role: d.role,
             field_path: d.field_path.clone(),
@@ -3029,6 +3039,8 @@ fn a_legitimate_acknowledged_update_drops_nothing() {
     base_artifact
         .acknowledged_breaking_changes
         .push(AcknowledgedBreakingChange {
+            subject: SchemaSubject::Workflow,
+            side_effect: None,
             workflow: "some_other_workflow".to_string(),
             role: Some(SchemaRole::Output),
             field_path: "/legacy".to_string(),

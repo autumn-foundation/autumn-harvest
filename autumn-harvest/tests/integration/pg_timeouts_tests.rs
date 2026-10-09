@@ -470,6 +470,8 @@ async fn a_rate_limit_bucket_registers_after_a_startup_timeout() {
         circuit_breaker: None,
         requires: None,
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        input_schema: None,
+        output_schema: None,
     };
     let worker_id = format!("pg-timeouts-{}", Uuid::new_v4());
     let worker = build_worker_with(

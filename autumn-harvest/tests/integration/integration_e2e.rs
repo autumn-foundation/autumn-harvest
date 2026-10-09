@@ -2824,6 +2824,8 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             max_result_bytes: None,
             requires: None,
             handler: send_email_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ));
     let worker = Arc::new(
@@ -3001,6 +3003,8 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             max_result_bytes: None,
             requires: None,
             handler: checkpointed_import_activity,
+            input_schema: None,
+            output_schema: None,
         }],
         heartbeat_resume_state(Arc::clone(&stats)),
     ));
@@ -3128,6 +3132,8 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                     max_result_bytes: None,
                     requires: None,
                     handler: send_email_activity,
+                    input_schema: None,
+                    output_schema: None,
                 }],
             )),
         )
@@ -3425,6 +3431,8 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     max_result_bytes: None,
                     requires: None,
                     handler: slow_activity,
+                    input_schema: None,
+                    output_schema: None,
                 }],
             )),
         )
@@ -5088,6 +5096,8 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             max_result_bytes: None,
             requires: None,
             handler: stateful_activity,
+            input_schema: None,
+            output_schema: None,
         }])
         .state(String::from("haunted"))
         .worker(WorkerConfig::default())
@@ -5745,6 +5755,8 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             max_result_bytes: None,
             requires: None,
             handler: send_email_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ));
     let worker = build_runtime_worker("worker-e2e-early-signal", 1, 1, registry);
@@ -9293,6 +9305,8 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
             max_result_bytes: None,
             requires: None,
             handler: always_non_retryable_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ));
 
@@ -9462,6 +9476,8 @@ async fn circuit_breaker_short_circuits_after_tripping() {
             max_result_bytes: None,
             requires: None,
             handler: always_retryable_failure_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ));
 
@@ -9596,6 +9612,8 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
             max_result_bytes: None,
             requires: None,
             handler: always_legacy_string_failure_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ));
 
@@ -11394,6 +11412,8 @@ async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
             max_result_bytes: None,
             requires: None,
             handler: retry_context_activity,
+            input_schema: None,
+            output_schema: None,
         }],
         shared_state,
     ));
@@ -11677,6 +11697,8 @@ fn saga_activity_info(
         max_result_bytes: None,
         requires: None,
         handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -11930,6 +11952,8 @@ fn windowed_fanout_e2e_registry() -> Arc<HandlerRegistry> {
             max_result_bytes: None,
             requires: None,
             handler: slow_double_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ))
 }

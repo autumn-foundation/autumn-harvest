@@ -289,6 +289,8 @@ fn side_effect_activity() -> ActivityInfo {
         max_result_bytes: None,
         requires: None,
         handler: side_effect,
+        input_schema: None,
+        output_schema: None,
     }
 }
 

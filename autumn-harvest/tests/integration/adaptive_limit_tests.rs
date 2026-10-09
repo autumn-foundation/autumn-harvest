@@ -353,6 +353,8 @@ fn act_info(name: &'static str, handler: autumn_harvest::info::ActivityHandlerFn
         max_result_bytes: None,
         requires: None,
         handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 

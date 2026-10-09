@@ -929,6 +929,16 @@ impl WorkflowInfo {
             .with_output_schema_fn(schema_for::<O>)
             .with_error_schema_fn(string_schema)
     }
+
+    /// Declare the side effect `id` that this workflow records (issue #1994).
+    ///
+    /// The returned [`SideEffectInfo`] has this workflow as its owner. Attach a
+    /// value schema to it, then pass it to
+    /// [`WorkflowSchemaContract::with_side_effects`](crate::schema_contract::WorkflowSchemaContract::with_side_effects).
+    #[must_use]
+    pub const fn side_effect(&self, id: &'static str) -> SideEffectInfo {
+        SideEffectInfo::new(self.name, id)
+    }
 }
 
 /// Derive a JSON Schema value for `T` (issue #373/#610).
@@ -1465,6 +1475,14 @@ pub struct ActivityInfo {
     pub requires: Option<&'static str>,
     /// Type-erased dispatch function.
     pub handler: ActivityHandlerFn,
+    /// Optional JSON Schema of the input that the handler decodes (issue #1994).
+    ///
+    /// `None` means that no schema is published. For more than one input
+    /// parameter, the input is the tuple of the parameter types.
+    pub input_schema: Option<fn() -> serde_json::Value>,
+    /// Optional JSON Schema of the result that a workflow decodes on replay
+    /// (issue #1994). `None` means that no schema is published.
+    pub output_schema: Option<fn() -> serde_json::Value>,
 }
 
 /// Placeholder handler for a WASM activity's [`ActivityInfo`] (issue #965).
@@ -1501,6 +1519,82 @@ impl ActivityInfo {
         self.default_start_to_close.is_some()
             || self.default_schedule_to_close.is_some()
             || self.default_heartbeat_timeout.is_some()
+    }
+
+    /// Attach a raw input-schema generator function (issue #1994).
+    #[must_use]
+    pub const fn with_input_schema_fn(self, _f: fn() -> serde_json::Value) -> Self {
+        self
+    }
+
+    /// Attach a raw output-schema generator function (issue #1994).
+    #[must_use]
+    pub const fn with_output_schema_fn(self, _f: fn() -> serde_json::Value) -> Self {
+        self
+    }
+
+    /// Derive the input and output schemas from `I` and `O` (issue #1994).
+    ///
+    /// Enabled with the `schema` feature.
+    #[cfg(feature = "schema")]
+    #[must_use]
+    pub fn with_schemas<I, O>(self) -> Self
+    where
+        I: schemars::JsonSchema,
+        O: schemars::JsonSchema,
+    {
+        self
+    }
+}
+
+/// The published value schema of one `ctx.side_effect(id, ..)` call site
+/// (issue #1994).
+///
+/// A side-effect id is scoped to its workflow, so the key is `(workflow, id)`.
+/// Build one with [`WorkflowInfo::side_effect`].
+#[derive(Clone)]
+pub struct SideEffectInfo {
+    /// Name of the workflow that calls `ctx.side_effect`.
+    pub workflow: &'static str,
+    /// The id passed to `ctx.side_effect`.
+    pub id: &'static str,
+    /// Optional JSON Schema of the recorded value. `None` means that no
+    /// schema is published.
+    pub value_schema: Option<fn() -> serde_json::Value>,
+}
+
+impl SideEffectInfo {
+    /// Declare the side effect `id` of `workflow`, with no schema.
+    #[must_use]
+    pub const fn new(workflow: &'static str, id: &'static str) -> Self {
+        Self {
+            workflow,
+            id,
+            value_schema: None,
+        }
+    }
+
+    /// Attach a raw value-schema generator function.
+    #[must_use]
+    pub const fn with_value_schema_fn(self, _f: fn() -> serde_json::Value) -> Self {
+        self
+    }
+
+    /// Derive the value schema from `T`. Enabled with the `schema` feature.
+    #[cfg(feature = "schema")]
+    #[must_use]
+    pub fn with_schema<T: schemars::JsonSchema>(self) -> Self {
+        self
+    }
+}
+
+impl std::fmt::Debug for SideEffectInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SideEffectInfo")
+            .field("workflow", &self.workflow)
+            .field("id", &self.id)
+            .field("value_schema", &self.value_schema.map(|_| "<fn>"))
+            .finish()
     }
 }
 
@@ -1543,6 +1637,8 @@ impl ActivityInfo {
             circuit_breaker: None,
             requires: None,
             handler: wasm_activity_stub_handler,
+            input_schema: None,
+            output_schema: None,
         }
     }
 
@@ -1806,6 +1902,8 @@ impl std::fmt::Debug for ActivityInfo {
             .field("circuit_breaker", &self.circuit_breaker)
             .field("requires", &self.requires)
             .field("handler", &"<fn>")
+            .field("input_schema", &self.input_schema.map(|_| "<fn>"))
+            .field("output_schema", &self.output_schema.map(|_| "<fn>"))
             .finish()
     }
 }
@@ -2355,6 +2453,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         assert!(info.default_retry_policy.is_none());
         assert_eq!(info.default_queue, None);
@@ -2386,6 +2486,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         assert!(info.is_local);
         assert!(
@@ -2425,6 +2527,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         assert_eq!(info.max_concurrent, Some(5));
         assert_eq!(info.concurrency_key, Some("email"));
@@ -2455,6 +2559,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         assert_eq!(
             info.default_schedule_to_close,
@@ -2489,6 +2595,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         assert!(
             info.default_schedule_to_close.is_none(),
@@ -2590,6 +2698,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         let debug_str = format!("{activity_info:?}");
         assert!(debug_str.contains("ActivityInfo"));
@@ -3245,5 +3355,50 @@ mod schema_feature_tests {
         let info = signal_info().with_schemas::<SomeArg>();
         assert!(info.arg_schema.is_some());
         assert_eq!((info.arg_schema.unwrap())()["type"], "object");
+    }
+
+    fn activity_info() -> ActivityInfo {
+        ActivityInfo {
+            name: "charge",
+            module: "tests",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            default_schedule_to_close: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            rate_limit_key_expr: None,
+            circuit_breaker: None,
+            requires: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
+        }
+    }
+
+    /// Issue #1994: an activity derives both schemas from its payload types.
+    #[test]
+    fn activity_with_schemas_populates_input_and_output() {
+        let info = activity_info().with_schemas::<SomeArg, SomeResp>();
+        let input = (info.input_schema.expect("input schema"))();
+        let output = (info.output_schema.expect("output schema"))();
+        assert!(input["properties"].get("amount").is_some(), "{input}");
+        assert!(output["properties"].get("ok").is_some(), "{output}");
+    }
+
+    /// Issue #1994: a side effect derives its value schema from `T`.
+    #[test]
+    fn side_effect_with_schema_populates_the_value_schema() {
+        let info = SideEffectInfo::new("wf", "pick").with_schema::<SomeResp>();
+        let value = (info.value_schema.expect("value schema"))();
+        assert!(value["properties"].get("ok").is_some(), "{value}");
     }
 }

@@ -1055,6 +1055,8 @@ fn act_info(name: &'static str, handler: ActivityHandlerFn) -> ActivityInfo {
         max_result_bytes: None,
         requires: None,
         handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
