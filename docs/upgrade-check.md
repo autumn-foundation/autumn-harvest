@@ -107,7 +107,7 @@ transactions and writes nothing.
 | `payload-schema-violation` | `pin` | A recorded or pending payload breaks a candidate schema. |
 | `history-undecodable` | `pin` | The candidate codecs cannot decode the history, a pending signal or the context headers. A codec key is missing, or a payload does not decrypt. |
 | `replay-timed-out` | `review` | The replay ran longer than the replay timeout, 30 seconds by default. |
-| `payload-unchecked` | `review` | A pending signal or an open update has no candidate schema. Publish one to remove this finding. |
+| `payload-unchecked` | `review` | A signal, recorded or pending, or an open update has no candidate schema. Replay can pass a buffered signal with no decode. Publish a schema to remove this finding. |
 | `payload-offloaded` | `review` | The run holds offloaded payloads, and the check has no offloader. Pass one with `with_offloader`. |
 | `structure-unavailable` | `review` | A manifest is missing, the two manifests come from different toolchains or models, two workflows share the name, or the run is assigned to another build than the baseline. |
 | `unknown-boundary` | `review` | `harvest-verify` cannot see part of the workflow graph. A declarative update handler is such a part. |

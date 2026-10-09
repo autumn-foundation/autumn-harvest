@@ -103,7 +103,7 @@ pin > review > migrate. A run with no finding gets migrate.
 | `payload-schema-violation` — a recorded or pending payload breaks a candidate schema | pin |
 | `history-undecodable` — the candidate codecs cannot decode the history, a pending signal or the context headers | pin |
 | `replay-timed-out` | review |
-| `payload-unchecked` — a pending signal or an open update has no candidate schema | review |
+| `payload-unchecked` — a signal, recorded or pending, or an open update has no candidate schema | review |
 | `payload-offloaded` — the run holds offloaded payloads, and the check has no offloader | review |
 | `structure-unavailable` — a manifest is missing, the two manifests come from different toolchains or models, two workflows share the name, or the run is assigned to another build than the baseline | review |
 | `unknown-boundary` — the workflow graph has an `unknown` boundary, or the workflow has declarative update handlers | review |
@@ -202,9 +202,11 @@ passed. Signals, mutexes, `continue_as_new`, random values and
   canary flags one that the code does not consume. A signal that waits in
   `harvest_signals` is not in history yet, so no replay reads it. The
   canary also excuses an open update.
-- So the check validates each pending signal and each open update against
-  the candidate schema for its name. With no schema, the finding is
-  `payload-unchecked`.
+- A recorded signal can also wait in the workflow's buffer while the run
+  waits on another step. Replay then passes it with no decode.
+- So the check validates each signal, recorded or pending, and each open
+  update against the candidate schema for its name. With no schema, the
+  finding is `payload-unchecked`.
 - The check also validates each recorded workflow input, `SignalReceived`
   and `UpdateAdmitted` payload, when the candidate publishes a schema.
 - An offloaded payload is inflated through the candidate offloader. With

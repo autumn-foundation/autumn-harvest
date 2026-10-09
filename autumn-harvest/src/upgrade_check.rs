@@ -237,7 +237,7 @@ pub enum FindingKind {
     HistoryUndecodable,
     /// The replay did not finish in time.
     ReplayTimedOut,
-    /// A pending signal or an open update has no candidate schema.
+    /// A signal or an open update has no candidate schema.
     PayloadUnchecked,
     /// A payload is offloaded, and the check has no offloader to read it.
     PayloadOffloaded,
@@ -746,10 +746,10 @@ impl UpgradeCheck {
 
     /// Schema findings for recorded and pending payloads.
     ///
-    /// The replay consumes each recorded payload, except an open update. A
-    /// candidate schema, when there is one, still checks it. A pending signal
-    /// is not in history yet, so no replay reads it. An open update and a
-    /// pending signal each need a schema.
+    /// The replay consumes each recorded payload, except an open update and a
+    /// buffered signal. A candidate schema, when there is one, still checks
+    /// it. A pending signal is not in history yet, so no replay reads it. So
+    /// each signal, recorded or pending, and each open update need a schema.
     fn payload_findings(
         &self,
         workflow: &str,
@@ -774,10 +774,23 @@ impl UpgradeCheck {
                 WorkflowEvent::SignalReceived {
                     signal_name,
                     payload,
-                } => self
-                    .signal_schemas
-                    .get(&(workflow.to_string(), signal_name.clone()))
-                    .and_then(|schema| schema_finding("signal", signal_name, *schema, payload)),
+                } => {
+                    // A recorded signal can wait in the workflow's buffer while
+                    // the run waits on another step. Replay then passes it with
+                    // no decode, so only a schema can check it.
+                    let key = (workflow.to_string(), signal_name.clone());
+                    self.signal_schemas.get(&key).map_or_else(
+                        || {
+                            Some(Finding::new(
+                                FindingKind::PayloadUnchecked,
+                                format!(
+                                    "recorded signal `{signal_name}` has no schema in the candidate build"
+                                ),
+                            ))
+                        },
+                        |schema| schema_finding("signal", signal_name, *schema, payload),
+                    )
+                }
                 WorkflowEvent::UpdateAdmitted {
                     update_id,
                     name,

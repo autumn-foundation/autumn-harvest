@@ -14,8 +14,8 @@ One check per failure mode:
 - **Rehydration.** The replay decodes each recorded payload into the
   candidate types. Candidate schemas also check the workflow input, signal
   and update payloads, and each signal that waits in `harvest_signals`. A
-  failure pins the run. A pending signal or an open update with no
-  candidate schema needs review.
+  failure pins the run. A signal, recorded or pending, or an open update
+  with no candidate schema needs review.
 - **Structural drift.** `cargo harvest-verify --emit-structure FILE` writes the
   resolved call graph of each workflow: each body with a span-free digest of
   its raw MIR text, its call sites and the commands it emits. The check

@@ -602,6 +602,25 @@ async fn a_wait_that_only_the_baseline_helper_holds_needs_review() {
     assert_eq!(kinds(&run), [FindingKind::StepNotPassed]);
 }
 
+/// A signal the worker wrote into history while the run waits on its timer.
+/// The workflow has not read it yet, so replay never decodes it.
+#[tokio::test]
+async fn a_recorded_signal_with_no_candidate_schema_is_unchecked() {
+    let mut events = waiting_to_ship();
+    events.push(WorkflowEvent::SignalReceived {
+        signal_name: "approve".into(),
+        payload: json!({ "by": 7 }),
+    });
+    let run = unchanged_check().check_snapshot(snapshot(events)).await;
+    assert_ne!(run.verdict, Verdict::Migrate, "{run:#?}");
+    let unchecked = run
+        .findings
+        .iter()
+        .find(|f| f.kind == FindingKind::PayloadUnchecked)
+        .expect("an unchecked finding");
+    assert_eq!(unchecked.event_index, Some(4));
+}
+
 #[tokio::test]
 async fn an_open_update_with_no_candidate_schema_is_unchecked() {
     let mut events = waiting_to_ship();
