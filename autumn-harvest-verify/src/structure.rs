@@ -221,6 +221,8 @@ pub struct StructureBuilder<'p> {
     cyclic: HashMap<String, BTreeSet<String>>,
     /// Per doc path: lookup tables over its bodies.
     doc_index: HashMap<String, DocIndex>,
+    /// Per body id: the `const` items it reads that no analyzed crate holds.
+    external_consts: HashMap<String, BTreeSet<String>>,
     /// The names `X` that have an activity or workflow marker body.
     markers: Option<BTreeSet<String>>,
 }
@@ -233,6 +235,7 @@ impl<'p> StructureBuilder<'p> {
             digests: HashMap::new(),
             cyclic: HashMap::new(),
             doc_index: HashMap::new(),
+            external_consts: HashMap::new(),
             markers: None,
         }
     }
@@ -262,6 +265,16 @@ impl<'p> StructureBuilder<'p> {
         let (display, ambiguous) = self.display_ids(&ids);
         let mut boundaries = boundaries;
         boundaries.extend(ambiguous);
+        let external: BTreeSet<&String> = ids
+            .iter()
+            .filter_map(|id| self.external_consts.get(id.as_str()))
+            .flatten()
+            .collect();
+        boundaries.extend(
+            external
+                .into_iter()
+                .map(|name| format!("external-const: {name}")),
+        );
         let show = |id: &str| {
             display
                 .get(id)
@@ -372,11 +385,12 @@ impl<'p> StructureBuilder<'p> {
 
     // ── digest ──────────────────────────────────────────────────────────────
 
-    /// Hex SHA-256 of the body `id` and of everything it holds or reads, from
-    /// its own doc: nested items, `const` items and `allocN` footers.
+    /// Hex SHA-256 of the body `id` and of everything it holds or reads:
+    /// nested items, `const` items and `allocN` footers.
     ///
     /// A digest of the parsed form would miss text the parser drops, such as
-    /// the case values of a `switchInt`. So the raw text is hashed.
+    /// the case values of a `switchInt`. So the raw text is hashed. A `const`
+    /// item of another analyzed crate is hashed from that crate's doc.
     fn digest(&mut self, id: &str) -> String {
         if let Some(known) = self.digests.get(id) {
             return known.clone();
@@ -384,8 +398,12 @@ impl<'p> StructureBuilder<'p> {
         let program = self.program;
         let value = match (program.body(id), program.doc_of(id)) {
             (Some(body), Some(doc)) => {
-                let text = self.closure_text(doc, body);
-                let normalized = normalize(&text, Some(&doc.alloc_statics));
+                let (text, foreign) = self.closure_text(doc, vec![body.path.clone()]);
+                let mut normalized = normalize(&text, Some(&doc.alloc_statics));
+                let external = self.fold_foreign_consts(doc, foreign, &mut normalized);
+                if !external.is_empty() {
+                    self.external_consts.insert(id.to_string(), external);
+                }
                 hex(&Sha256::digest(normalized.as_bytes()))
             }
             _ => hex(&Sha256::digest(format!("<missing body {id}>").as_bytes())),
@@ -394,16 +412,18 @@ impl<'p> StructureBuilder<'p> {
         value
     }
 
-    /// The text of `body` and of the items nested under it. Then the text of
-    /// the `const` items they read, and the footers of the allocs they name.
-    fn closure_text(&mut self, doc: &MirDoc, body: &Body) -> String {
+    /// The text of the items at `start` and of the items nested under them.
+    /// Then the text of the `const` items they read, and the footers of the
+    /// allocs they name. Also the `const` names that `doc` does not hold.
+    fn closure_text(&mut self, doc: &MirDoc, start: Vec<String>) -> (String, Vec<String>) {
         let index = self
             .doc_index
             .entry(doc.path.clone())
             .or_insert_with(|| DocIndex::new(doc));
         let mut seen: BTreeSet<String> = BTreeSet::new();
-        let mut queue: Vec<String> = vec![body.path.clone()];
+        let mut queue: Vec<String> = start;
         let mut text = String::new();
+        let mut foreign: Vec<String> = Vec::new();
         while let Some(path) = queue.pop() {
             if !seen.insert(path.clone()) {
                 continue;
@@ -411,7 +431,9 @@ impl<'p> StructureBuilder<'p> {
             for &at in index.by_path.get(&path).into_iter().flatten() {
                 if let Some(item) = doc.bodies.get(at) {
                     let _ = write!(text, "\n#item {path}\n{}", item.text);
-                    queue.extend(index.const_refs(&item.text));
+                    let (found, missing) = index.const_refs(&item.text);
+                    queue.extend(found);
+                    foreign.extend(missing);
                 }
             }
             if let Some(line) = doc.inline_consts.get(&path) {
@@ -420,7 +442,63 @@ impl<'p> StructureBuilder<'p> {
             queue.extend(index.children(&path));
         }
         append_allocs(doc, &mut text);
-        text
+        (text, foreign)
+    }
+
+    /// Append the text of each `const` item in `names` that another analyzed
+    /// crate holds. Return the names that no analyzed crate holds.
+    ///
+    /// MIR prints a `const` read from another crate with its crate root, as
+    /// `const dep::LIMIT`. Its value is not in the reader's MIR. So the
+    /// digest reads the item from the doc of that crate. A std or trusted
+    /// crate does not change between two builds on one toolchain, so it is
+    /// skipped. Any other crate is outside the analysis, so its name returns
+    /// and becomes a boundary.
+    fn fold_foreign_consts(
+        &mut self,
+        from: &MirDoc,
+        names: Vec<String>,
+        out: &mut String,
+    ) -> BTreeSet<String> {
+        let program = self.program;
+        let mut external = BTreeSet::new();
+        let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut queue: Vec<(&MirDoc, String)> = names.into_iter().map(|n| (from, n)).collect();
+        while let Some((reader, name)) = queue.pop() {
+            if !seen.insert((reader.crate_name.clone(), name.clone())) {
+                continue;
+            }
+            let roots = const_roots(&name);
+            let holder = roots.iter().find_map(|root| {
+                program
+                    .docs
+                    .iter()
+                    .find(|d| d.crate_name == *root && d.crate_name != reader.crate_name)
+                    .map(|d| (d, *root))
+            });
+            if let Some((doc, root)) = holder {
+                let local = name
+                    .strip_prefix(root)
+                    .and_then(|rest| rest.strip_prefix("::"))
+                    .unwrap_or(&name);
+                let index = self
+                    .doc_index
+                    .entry(doc.path.clone())
+                    .or_insert_with(|| DocIndex::new(doc));
+                let paths = index.const_paths(local);
+                if paths.is_empty() {
+                    external.insert(name);
+                    continue;
+                }
+                let (text, more) = self.closure_text(doc, paths);
+                let _ = write!(out, "\n#crate {}\n", doc.crate_name);
+                out.push_str(&normalize(&text, Some(&doc.alloc_statics)));
+                queue.extend(more.into_iter().map(|n| (doc, n)));
+            } else if !roots.is_empty() && !roots.iter().all(|r| program.is_trusted_root(r)) {
+                external.insert(name);
+            }
+        }
+        external
     }
 
     // ── loops ───────────────────────────────────────────────────────────────
@@ -532,41 +610,80 @@ impl DocIndex {
             .collect()
     }
 
-    /// The raw paths of the `const` items that `text` reads.
+    /// The raw paths of the `const` items that `text` reads, and the names
+    /// it reads that this doc does not hold.
     ///
     /// MIR prints a read of a `const` item by name, as `const NAME`. A
     /// promoted constant is nested under its body, so the walk finds it as a
     /// child.
-    fn const_refs(&self, text: &str) -> Vec<String> {
-        let mut out = Vec::new();
+    fn const_refs(&self, text: &str) -> (Vec<String>, Vec<String>) {
+        let mut found = Vec::new();
+        let mut missing = Vec::new();
         let mut rest = text;
         while let Some(at) = rest.find("const ") {
             let tail = rest.get(at.saturating_add(6)..).unwrap_or_default();
             let name = const_name(tail);
-            let last = name.rsplit("::").next().unwrap_or(name);
-            if let Some(paths) = self.consts.get(last) {
-                // An associated constant, `<X as T>::NAME`, names its impl
-                // by type. The impl body has another path. So every `const`
-                // item with that last segment counts: a false match only
-                // costs a review.
-                let qualified = name.starts_with('<');
-                let suffix = format!("::{name}");
-                out.extend(
-                    paths
-                        .iter()
-                        .filter(|p| {
-                            qualified
-                                || p.as_str() == name
-                                || p.ends_with(&suffix)
-                                || name.ends_with(&format!("::{p}"))
-                        })
-                        .cloned(),
-                );
+            let paths = self.const_paths(name);
+            if paths.is_empty() {
+                missing.push(name.to_string());
             }
+            found.extend(paths);
             rest = tail;
         }
-        out
+        (found, missing)
     }
+
+    /// The raw paths of the `const` items in this doc that `name` can mean.
+    fn const_paths(&self, name: &str) -> Vec<String> {
+        let last = name.rsplit("::").next().unwrap_or(name);
+        let Some(paths) = self.consts.get(last) else {
+            return Vec::new();
+        };
+        // An associated constant, `<X as T>::NAME`, names its impl by type.
+        // The impl body has another path. So every `const` item with that
+        // last segment counts: a false match only costs a review.
+        let qualified = name.starts_with('<');
+        let suffix = format!("::{name}");
+        paths
+            .iter()
+            .filter(|p| {
+                qualified
+                    || p.as_str() == name
+                    || p.ends_with(&suffix)
+                    || name.ends_with(&format!("::{p}"))
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+/// The crate roots that a `const` name can come from.
+///
+/// `dep::LIMIT` has the root `dep`. `<dep::Plan as dep::Limits>::MAX` has
+/// the roots of its self type and its trait. A name with no `::`, such as a
+/// literal or a local item, has none.
+fn const_roots(name: &str) -> Vec<&str> {
+    name.strip_prefix('<').map_or_else(
+        || first_segment(name).into_iter().collect(),
+        |inner| {
+            let inner = inner.split_once(">::").map_or(inner, |(head, _)| head);
+            let (ty, tr) = inner.split_once(" as ").unwrap_or((inner, ""));
+            [first_segment(ty), first_segment(tr)]
+                .into_iter()
+                .flatten()
+                .collect()
+        },
+    )
+}
+
+/// The first segment of `path`, past a leading `&`, `mut` or `dyn`.
+fn first_segment(path: &str) -> Option<&str> {
+    let path = path
+        .trim()
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
+        .trim_start_matches("dyn ");
+    path.split_once("::").map(|(root, _)| root)
 }
 
 /// The path after `const `, such as `m::LIMIT` or `<X as T>::LIMIT`.

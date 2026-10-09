@@ -255,7 +255,14 @@ Each workflow lists every body it can reach:
 
 The workflow also lists its `unknown` boundaries. Two bodies whose ids
 normalize to the same text add an `ambiguous-body-id` boundary, because
-their `#2` suffix follows the digest, not the body. An activity body is not in
+their `#2` suffix follows the digest, not the body.
+
+MIR prints a `const` read from another crate by path, such as
+`const limits::ATTEMPTS`, and not by value. When that crate is in the
+analyzed set, the digest includes the item from its MIR. A std, core or
+trusted crate is skipped. Any other crate adds an `external-const` boundary,
+because a change to its value does not change the reader's MIR. An activity
+body is not in
 the graph: a workflow names an activity through its `X_info()` function and
 never calls the body.
 

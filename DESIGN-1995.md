@@ -99,6 +99,11 @@ A later review of the merged branch found three gaps in the candidate setup:
 9. With an offloader, the replay had no offload threshold. A next payload
    that the worker offloads failed the cap, and the run got `pin`.
    `with_offloader` now passes the threshold, but not the offloader.
+10. The digest read `const` items only from the reader's own crate. MIR
+    prints `const dep::LIMIT` for a read from another crate, so a change
+    there left the digest the same. The digest now reads the item from the
+    analyzed crate that holds it. A crate outside the analysis adds an
+    `external-const` boundary.
 
 ---
 
@@ -151,7 +156,10 @@ pin > review > migrate. A run with no finding gets migrate.
 - `id` is the body path with each span removed.
 - `digest` hashes the raw MIR text of the body. It also hashes the items
   nested under the body, the `const` items it reads and the `allocN`
-  footers they name. It drops spans and `allocN` numbers.
+  footers they name. It drops spans and `allocN` numbers. A `const` item
+  of another analyzed crate is read from that crate's MIR. A `const` item
+  of a crate outside the analysis, other than std, core or a trusted crate,
+  adds an `external-const` boundary.
 - `calls` holds one entry per call site. `in_loop` is true when the call
   sits in a cycle of the caller's control flow, or runs a closure that the
   caller passes to another call. `resume` is true when the call handles a

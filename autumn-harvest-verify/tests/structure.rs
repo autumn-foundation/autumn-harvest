@@ -36,6 +36,25 @@ fn manifest(build: &str) -> StructureManifest {
     structure::manifest(&model.version, "rustc test", outcome.structures)
 }
 
+/// The `upgrade_const` workflow, with one build of `limits` analyzed or none.
+fn const_manifest(limits: Option<&str>) -> StructureManifest {
+    let dir = fixture_dir("upgrade_const");
+    let read = |name: &str| {
+        let path = dir.join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+    };
+    let mut docs = vec![mir::parse("flow", "flow.mir", &read("flow.mir"))];
+    if let Some(file) = limits {
+        docs.push(mir::parse("limits", file, &read(file)));
+    }
+    let entries = entry::discover(&docs);
+    let program = Program::build(docs, &SourceRoots { roots: vec![dir] }).expect("build");
+    let model = Model::builtin().expect("the embedded model must parse");
+    let outcome = analysis::analyze_full(&program, &model, &entries);
+    structure::manifest(&model.version, "rustc test", outcome.structures)
+}
+
 fn workflow<'a>(m: &'a StructureManifest, name: &str) -> &'a WorkflowStructure {
     m.workflows
         .iter()
@@ -352,6 +371,42 @@ fn a_condition_wait_is_a_step_with_no_key() {
     assert_eq!(wait.steps[0].sink, "await_condition");
     assert_eq!(wait.steps[0].kind, "other");
     assert_eq!(wait.steps[0].key, None);
+}
+
+#[test]
+fn a_changed_const_of_an_analyzed_crate_changes_the_digest_of_its_reader() {
+    // The workflow's own MIR is the same against both builds of `limits`.
+    let old = const_manifest(Some("limits_v1.mir"));
+    let new = const_manifest(Some("limits_v2.mir"));
+    let old = workflow(&old, "wf_dep_const");
+    let new = workflow(&new, "wf_dep_const");
+    assert_ne!(digests(old), digests(new));
+    assert!(
+        !old.boundaries
+            .iter()
+            .any(|b| b.starts_with("external-const")),
+        "{:?}",
+        old.boundaries
+    );
+}
+
+#[test]
+fn a_const_of_a_crate_outside_the_analysis_is_a_boundary() {
+    let m = const_manifest(None);
+    let w = workflow(&m, "wf_dep_const");
+    assert!(
+        w.boundaries
+            .iter()
+            .any(|b| b == "external-const: limits::ATTEMPTS"),
+        "{:?}",
+        w.boundaries
+    );
+    // `u64::MAX` comes from `core`, so it is not a boundary.
+    assert!(
+        !w.boundaries.iter().any(|b| b.contains("MAX")),
+        "{:?}",
+        w.boundaries
+    );
 }
 
 // ── end to end with the core check ─────────────────────────────────────────

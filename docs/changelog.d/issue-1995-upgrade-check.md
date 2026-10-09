@@ -29,7 +29,9 @@ Design decisions:
   The helper must start at most once. It must emit only commands with known
   names that no other body emits. Each of them must be complete and none
   open, and a decision must run after the last result.
-- Any `unknown` boundary in a workflow graph gives review.
+- Any `unknown` boundary in a workflow graph gives review. A `const` read
+  from a crate outside the analysis adds an `external-const` boundary,
+  because its value is not in the reader's MIR.
 - The replay runs with the candidate worker's setup: its query handlers
   (`queries`), its payload caps (`with_payload_caps`) and its offload
   threshold (`with_offloader`). A run whose next payload is over a
