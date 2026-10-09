@@ -279,6 +279,10 @@ pub struct PromiseRejected {
 pub struct DurablePromise<'a> {
     context: &'a WorkflowContext,
     id: PromiseId,
+    /// The settlement, after the first wait takes it. A promise has one
+    /// settlement, so a later wait reads it here. Another signal wait would
+    /// park forever.
+    settlement: tokio::sync::OnceCell<Value>,
 }
 
 impl fmt::Debug for DurablePromise<'_> {
@@ -291,7 +295,11 @@ impl fmt::Debug for DurablePromise<'_> {
 
 impl<'a> DurablePromise<'a> {
     pub(crate) const fn new(context: &'a WorkflowContext, id: PromiseId) -> Self {
-        Self { context, id }
+        Self {
+            context,
+            id,
+            settlement: tokio::sync::OnceCell::const_new(),
+        }
     }
 
     /// The address of this promise. Its string form is the token.
@@ -303,7 +311,8 @@ impl<'a> DurablePromise<'a> {
     /// Waits until a caller settles the promise.
     ///
     /// The outer error is an engine error, for example a replay drift. The
-    /// inner error is a rejection.
+    /// inner error is a rejection. Every wait on this handle returns the same
+    /// settlement, also when waits run at the same time.
     ///
     /// # Errors
     ///
@@ -311,8 +320,13 @@ impl<'a> DurablePromise<'a> {
     /// its value does not decode. Propagates all errors from
     /// [`WorkflowContext::wait_for_signal`].
     pub async fn wait<T: DeserializeOwned>(&self) -> HarvestResult<Result<T, PromiseRejected>> {
-        let raw = self.context.wait_for_signal(&self.id.signal_name()).await?;
-        PromiseSettlement::decode(raw)
+        let raw = self
+            .settlement
+            .get_or_try_init(|| async {
+                self.context.wait_for_signal(&self.id.signal_name()).await
+            })
+            .await?;
+        PromiseSettlement::decode(raw.clone())
     }
 
     /// Waits until a caller settles the promise, or until `timeout` passes.
@@ -328,11 +342,26 @@ impl<'a> DurablePromise<'a> {
         &self,
         timeout: Duration,
     ) -> HarvestResult<Option<Result<T, PromiseRejected>>> {
-        self.context
-            .wait_for_signal_timeout(&self.id.signal_name(), timeout)
-            .await?
-            .map(PromiseSettlement::decode)
-            .transpose()
+        // `Err(None)` is a timeout. It leaves the cell empty for a later wait.
+        let raw = self
+            .settlement
+            .get_or_try_init(|| async {
+                match self
+                    .context
+                    .wait_for_signal_timeout(&self.id.signal_name(), timeout)
+                    .await
+                {
+                    Ok(Some(raw)) => Ok(raw),
+                    Ok(None) => Err(None),
+                    Err(e) => Err(Some(e)),
+                }
+            })
+            .await;
+        match raw {
+            Ok(raw) => PromiseSettlement::decode(raw.clone()).map(Some),
+            Err(None) => Ok(None),
+            Err(Some(e)) => Err(e),
+        }
     }
 }
 

@@ -279,6 +279,57 @@ async fn test_durable_promise_wait_timeout_returns_the_settlement() {
     assert_eq!(outcome.result, Ok(json!({ "resolved": true })));
 }
 
+/// Waits on one `approval` handle twice in sequence, then twice at once.
+fn approval_repeated_wait_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+    Box::pin(async move {
+        let promise = ctx.promise("approval").map_err(|e| e.to_string())?;
+        let first = promise.wait::<Value>().await.map_err(|e| e.to_string())?;
+        let second = promise.wait::<Value>().await.map_err(|e| e.to_string())?;
+        let (third, fourth) = tokio::join!(promise.wait::<Value>(), promise.wait::<Value>());
+        let all = [
+            first,
+            second,
+            third.map_err(|e| e.to_string())?,
+            fourth.map_err(|e| e.to_string())?,
+        ];
+        Ok(json!(all.into_iter().map(Result::ok).collect::<Vec<_>>()))
+    })
+}
+
+/// Waits on one `approval` handle at once with and without a timeout.
+fn approval_joined_wait_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+    Box::pin(async move {
+        let promise = ctx.promise("approval").map_err(|e| e.to_string())?;
+        let (timed, plain) = tokio::join!(
+            promise.wait_timeout::<Value>(std::time::Duration::from_secs(60)),
+            promise.wait::<Value>(),
+        );
+        let timed = timed.map_err(|e| e.to_string())?.map(Result::ok);
+        let plain = plain.map_err(|e| e.to_string())?.ok();
+        Ok(json!([timed, plain]))
+    })
+}
+
+/// A promise has one settlement. Every wait on one handle returns it, so a
+/// second wait never parks for a settlement that cannot come.
+#[tokio::test]
+async fn test_durable_promise_handle_returns_its_settlement_to_every_wait() {
+    let settlement = PromiseSettlement::resolved(json!("ops"));
+    let outcome = WorkflowTestEnv::new()
+        .queue_signal(approval_signal_name(), settlement.to_value())
+        .run(approval_repeated_wait_workflow, Value::Null)
+        .await;
+    assert_eq!(outcome.result, Ok(json!(["ops", "ops", "ops", "ops"])));
+    assert_succeeded(&outcome.replay_check(approval_repeated_wait_workflow).await);
+
+    let outcome = WorkflowTestEnv::new()
+        .queue_signal(approval_signal_name(), settlement.to_value())
+        .run(approval_joined_wait_workflow, Value::Null)
+        .await;
+    assert_eq!(outcome.result, Ok(json!(["ops", "ops"])));
+    assert_succeeded(&outcome.replay_check(approval_joined_wait_workflow).await);
+}
+
 #[tokio::test]
 async fn test_durable_promise_new_promise_token_names_this_run() {
     let outcome = WorkflowTestEnv::new()

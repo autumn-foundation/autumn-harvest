@@ -33,6 +33,9 @@ async fn approve(ctx: &WorkflowContext, request: String) -> HarvestResult<String
 | `promise.wait::<T>()` | `HarvestResult<Result<T, PromiseRejected>>`. The outer error is an engine error. The inner error is a rejection. |
 | `promise.wait_timeout::<T>(d)` | `Ok(None)` when the durable timer fires first. |
 
+Every wait on one handle returns the same settlement, also when two waits
+run at the same time.
+
 The token is `<execution-id>/<key>`. A key holds only `A-Z`, `a-z`, `0-9`,
 `.`, `_`, `:` and `-`, and is 128 bytes or fewer.
 
@@ -107,6 +110,8 @@ A rejection body is `{"outcome":"rejected","error":"budget exceeded"}`.
   point. That token names the source run. To settle the promise in the fork,
   use `PromiseId::new(fork_execution_id, id.key())`, or send the HTTP signal
   to the fork.
+- Make one handle for each key in a run. A second handle for the same key
+  waits for a second settlement, and none comes.
 - Do not register a push signal handler for a `harvest.promise:` name.
 
 ## Why signals, not external task tokens
