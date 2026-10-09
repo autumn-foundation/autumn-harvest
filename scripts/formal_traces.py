@@ -44,6 +44,11 @@ GUARDS = {
 
 OPS = ("init", "write", "start", "heartbeat")
 STATE_RE = re.compile(r"^[A-Z_]+$")
+# "reject@N" also names the file line that no behavior may match.
+EXPECT_RE = re.compile(r"^(accept|reject|reject@[1-9][0-9]*)$")
+STATES_RE = re.compile(r"(\d+) distinct states? found")
+# A trace check takes seconds. The bound stops a hung JVM.
+TLC_TIMEOUT_SECS = 900
 DEPTH_RE = re.compile(r"The depth of the complete state graph search is (\d+)\.")
 
 
@@ -51,12 +56,58 @@ class TraceError(Exception):
     """A trace file that the script cannot check."""
 
 
+# TLC integers are 32-bit.
+MAX_INT = 2**31 - 1
+
+
+def is_count(value, low=0):
+    """True for an int in [low, MAX_INT]. A bool is not an int here."""
+    return type(value) is int and low <= value <= MAX_INT
+
+
+def is_name(value):
+    """True for a worker name: a string or null."""
+    return value is None or isinstance(value, str)
+
+
+def check_line(where, index, line):
+    """Raise TraceError when one step line is malformed.
+
+    Every field that reaches the TLA+ text is checked here, so a trace
+    cannot inject TLA+ code.
+    """
+    if not isinstance(line, dict):
+        raise TraceError(f"{where}: a line must be a JSON object")
+    if line.get("op") not in OPS or (line["op"] == "init") != (index == 0):
+        raise TraceError(f"{where}: bad op {line.get('op')!r}")
+    if not isinstance(line.get("state"), str) or not STATE_RE.match(line["state"]):
+        raise TraceError(f"{where}: bad state {line.get('state')!r}")
+    for key in ("attempt", "strikes", "terminal"):
+        if not is_count(line.get(key)):
+            raise TraceError(f"{where}: bad {key} {line.get(key)!r}")
+    for key in ("worker", "by"):
+        if not is_name(line.get(key)):
+            raise TraceError(f"{where}: bad {key} {line.get(key)!r}")
+    actor = line.get("actor")
+    if actor is not None and not (
+        isinstance(actor, dict)
+        and isinstance(actor.get("worker"), str)
+        and is_count(actor.get("attempt"), low=1)
+    ):
+        raise TraceError(f"{where}: bad actor {actor!r}")
+
+
 def load(path):
-    """Return the header and the step lines of one trace file."""
+    """Return the header and the step lines of one trace file.
+
+    Only the last line may be blank, so a reported line number is the
+    line number in the file.
+    """
     rows = []
-    for number, text in enumerate(path.read_text().splitlines(), start=1):
+    texts = path.read_text().splitlines()
+    for number, text in enumerate(texts, start=1):
         if not text.strip():
-            continue
+            raise TraceError(f"{path}:{number}: blank line")
         try:
             rows.append(json.loads(text))
         except json.JSONDecodeError as err:
@@ -64,23 +115,18 @@ def load(path):
     if len(rows) < 2:
         raise TraceError(f"{path}: want a header and at least one line")
     header, lines = rows[0], rows[1:]
+    if not isinstance(header, dict):
+        raise TraceError(f"{path}:1: the header must be a JSON object")
     if header.get("spec") not in SPECS:
         raise TraceError(f"{path}: unknown spec {header.get('spec')!r}")
     checks = header.get("checks")
     if not isinstance(checks, dict) or not checks:
         raise TraceError(f"{path}: the header has no checks")
     for guard, expect in checks.items():
-        if guard not in GUARDS[header["spec"]] or expect not in ("accept", "reject"):
+        if guard not in GUARDS[header["spec"]] or not EXPECT_RE.match(str(expect)):
             raise TraceError(f"{path}: bad check {guard!r}: {expect!r}")
     for index, line in enumerate(lines):
-        where = f"{path}:{index + 2}"
-        if line.get("op") not in OPS or (line["op"] == "init") != (index == 0):
-            raise TraceError(f"{where}: bad op {line.get('op')!r}")
-        if not STATE_RE.match(str(line.get("state", ""))):
-            raise TraceError(f"{where}: bad state {line.get('state')!r}")
-        for key in ("attempt", "strikes", "terminal"):
-            if not isinstance(line.get(key), int) or line[key] < 0:
-                raise TraceError(f"{where}: bad {key} {line.get(key)!r}")
+        check_line(f"{path}:{index + 2}", index, line)
     return header, lines
 
 
@@ -163,36 +209,60 @@ def run_tlc(jar, run_dir):
     # sometimes fail to parse a module.
     tmp = run_dir / "tmp"
     tmp.mkdir()
-    proc = subprocess.run(
-        [
-            "java",
-            "-XX:+UseParallelGC",
-            f"-Djava.io.tmpdir={tmp}",
-            "-cp",
-            str(jar),
-            "tlc2.TLC",
-            "-config",
-            "TraceRun.cfg",
-            "-metadir",
-            str(run_dir / "meta"),
-            "-workers",
-            "1",
-            "-cleanup",
-            "TraceRun.tla",
-        ],
-        cwd=run_dir,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            [
+                "java",
+                "-XX:+UseParallelGC",
+                f"-Djava.io.tmpdir={tmp}",
+                "-cp",
+                str(jar),
+                "tlc2.TLC",
+                "-config",
+                "TraceRun.cfg",
+                "-metadir",
+                str(run_dir / "meta"),
+                "-workers",
+                "1",
+                "-cleanup",
+                "TraceRun.tla",
+            ],
+            cwd=run_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=TLC_TIMEOUT_SECS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as err:
+        return "error", f"TLC did not run: {err}"
     log = proc.stdout + proc.stderr
     if proc.returncode == 12 and "Invariant LogNotConsumed is violated" in log:
         return "accept", None
     if proc.returncode == 0 and "No error has been found" in log:
-        match = DEPTH_RE.search(log)
-        depth = int(match.group(1)) if match else 0
-        return "reject", depth
+        # No initial state means that the init line does not match Init.
+        states = STATES_RE.search(log)
+        if states and int(states.group(1)) == 0:
+            return "reject", 0
+        depth = DEPTH_RE.search(log)
+        if depth:
+            return "reject", int(depth.group(1))
     return "error", log
+
+
+def reject_line(depth):
+    """The file line that TLC could not match, from the search depth.
+
+    TraceInit matches line 2 at depth 1. Depth d leaves cursor = d + 1, so
+    line d + 2 is the first line that no behavior matches.
+    """
+    return depth + 2
+
+
+def meets(expect, verdict):
+    """True when a verdict such as "reject@7" meets an expectation."""
+    if expect == "reject":
+        return verdict.startswith("reject")
+    return verdict == expect
 
 
 def describe_reject(depth, steps):
@@ -234,6 +304,8 @@ def main():
     parser.add_argument("--work", required=True, type=pathlib.Path)
     parser.add_argument("dirs", nargs="+")
     args = parser.parse_args()
+    # TLC runs in a temp dir, so a relative jar path must be made absolute.
+    args.jar = pathlib.Path(args.jar).resolve()
 
     try:
         groups = collect(args.dirs)
@@ -257,12 +329,16 @@ def main():
     failures = 0
     files = 0
     for ((spec, steps, guard), (_, uses)), (verdict, detail) in zip(runs, results):
-        note = f" ({describe_reject(detail, steps)})" if verdict == "reject" else ""
+        note = ""
+        if verdict == "reject":
+            note = f" ({describe_reject(detail, steps)})"
+            verdict = f"reject@{reject_line(detail)}"
         for path, expect in uses:
             files += 1
-            mark = "" if verdict == expect else "  <-- FAIL"
+            ok = meets(expect, verdict)
+            mark = "" if ok else "  <-- FAIL"
             print(f"{path} [{spec}, {guard}]: want {expect}, got {verdict}{note}{mark}")
-            if verdict != expect:
+            if not ok:
                 failures += 1
                 if verdict == "error":
                     print(detail)

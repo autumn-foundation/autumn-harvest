@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 
+use autumn_harvest::error::HarvestError;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
@@ -34,11 +35,6 @@ use super::{base_params, chaos_db, chaos_noop_info, connect, exec_state};
 
 /// The activity name of the activity fixture.
 const ACTIVITY: &str = "trace_red_activity";
-
-/// The checks of an injected stale write. Only the fence rejects it.
-fn red() -> Value {
-    json!({ "fixed": "reject", "pre-fix": "accept" })
-}
 
 /// The next free event id of `exec_id`.
 async fn next_event_id(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i32 {
@@ -132,7 +128,17 @@ async fn trace_check_red_stale_workflow_persist() {
     // The real stale cycle. The fence stops its terminal write.
     let registry = Arc::new(HandlerRegistry::new(vec![chaos_noop_info()], vec![]));
     let stale_url = tla_trace::actor_url(&url, stale.id, worker, stale.attempt);
-    let _ = chaos_drive_one_workflow_task(&stale_url, registry, stale.clone(), worker.into()).await;
+    let outcome =
+        chaos_drive_one_workflow_task(&stale_url, registry, stale.clone(), worker.into()).await;
+    // The fence finds that the row holds a later claim, so the cycle gives
+    // up its terminal write.
+    assert!(
+        matches!(
+            outcome,
+            Ok(Err(HarvestError::TerminalWriteClaimAmbiguous { task_id })) if task_id == stale.id
+        ),
+        "the fence must stop the stale cycle: {outcome:?}"
+    );
     assert_eq!(
         exec_state(&mut conn, exec_id).await,
         "RUNNING",
@@ -175,7 +181,7 @@ async fn trace_check_red_stale_workflow_persist() {
     assert_stale_last_line(trace, worker, stale.attempt, held.attempt);
     tla_trace::write("red-stale-workflow-persist", &traces, |t| {
         if t.task_id == stale.id {
-            red()
+            tla_trace::reject_last(t, "accept")
         } else {
             tla_trace::accept()
         }
@@ -325,7 +331,7 @@ async fn trace_check_red_stale_activity_finish() {
     assert_stale_last_line(trace, worker, stale.attempt, held.attempt);
     tla_trace::write("red-stale-activity-finish", &traces, |t| {
         if t.task_id == task_id {
-            red()
+            tla_trace::reject_last(t, "accept")
         } else {
             tla_trace::accept()
         }

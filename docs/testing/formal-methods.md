@@ -180,7 +180,8 @@ This model found the #1917 gap before any test did.
 **The unstarted release (issue #1813).** A draining worker gives back a
 claim that never started, through `queue::release_unstarted_claim`.
 `UnstartedRelease` models it. Its fence is `claim_held`, with no strikes
-term. It subtracts 1 from `attempt` and keeps `crash_strikes`. The trace
+term. The release came after #1806, so its guard checks `attempt` in every
+config, the pre-fix config included. It subtracts 1 from `attempt` and keeps `crash_strikes`. The trace
 check of issue #2003 found this gap: the chaos trace of
 `chaos_repro_1813_drain_releases_a_claim_that_never_started` matched no
 action. Every config gives the same result with the new action.
@@ -246,8 +247,8 @@ The chaos suite records when `HARVEST_TLA_TRACE_DIR` is set. Two triggers
 copy each committed write to `harvest_task_queue`, and each activity or
 terminal event in `harvest_events`, into the `harvest_tla_trace` table. A
 trigger row rolls back with its transaction, so the log holds committed
-steps only. The recorder is in
-`autumn-harvest/tests/integration/chaos_tests/tla_trace.rs`.
+steps only. The recorder is in `autumn-harvest/tests/integration/tla_trace.rs`.
+Its unit tests run in every build, so each PR checks the exporter.
 
 At the end of each case, the suite writes one NDJSON file for each task row:
 
@@ -263,7 +264,10 @@ A line has one of three ops:
 |---|---|
 | `write` | It changes a logged column or adds a terminal event. |
 | `start` | It appends `ActivityStarted`. `by` names the event's worker. |
-| `heartbeat` | It changes only `last_heartbeat_at` of a running activity. |
+| `heartbeat` | It changes only `last_heartbeat_at` of an activity row. |
+
+A heartbeat line in any state must match an accepted heartbeat. A beat on a
+row that no claim holds therefore fails the check.
 
 The exporter maps the engine onto the spec in three places:
 
@@ -271,8 +275,9 @@ The exporter maps the engine onto the spec in three places:
   it, so the trace logs it as `PENDING`.
 - `ActivityCompleted` and `ActivityCompletedExternally` are always
   terminal. `ActivityFailed`, `ActivityTimedOut` and
-  `ActivityFailedExternally` are terminal only when the row becomes
-  terminal in the same transaction. Otherwise a retry follows.
+  `ActivityFailedExternally` are terminal unless the same transaction
+  requeues the row for a retry. A stale result with no requeue therefore
+  counts as a second terminal event, and the check fails.
 - Transactions are in the order of their last log id. Row locks serialize
   the writes of one task row, so this order is the commit order.
 
@@ -282,6 +287,12 @@ trigger copies it. A line that names a claim of its own row must be a new
 claim, or an owner action of the named claim. A system action, such as an
 orphan reclaim, cannot explain it. A line with no name can be explained by
 any action. Production code does not set the name.
+
+The chaos suite names the writer of each decision cycle that it drives. Each
+`chaos_drive_one_workflow_task` call gets its own connection, so the suite
+passes an `actor_url` for the claim that it drives. A stale write by such a
+cycle fails the check. The traces of a real `Worker` have no names, because
+its pooled connections serve many claims.
 
 ### Check a trace
 
@@ -320,10 +331,14 @@ The runner fails in these cases:
 A red trace holds an injected protocol violation. There are two kinds:
 
 - A **fence** red trace is a stale owner write. Its header expects
-  `"fixed": "reject"` and `"pre-fix": "accept"`. The second check proves
+  `"fixed": "reject@N"` and `"pre-fix": "accept"`. The second check proves
   that the fence causes the rejection, not a malformed trace.
 - A **forged** red trace breaks the protocol under each guard, for example
-  with a second terminal event. Its header expects `reject` from both.
+  with a second terminal event. Its header expects `reject@N` from both.
+
+`reject@N` names the file line that no behavior may match, usually the
+injected line. A rejection at another line fails the check. A plain
+`reject` accepts any line.
 
 The sources are:
 
@@ -371,8 +386,13 @@ scripts/check-formal-traces.sh "$HARVEST_TLA_TRACE_DIR"
 
 ### Limits
 
-- Only a test can name the writer. A real `Worker` does not
-  name its claims, so its lines can be explained by any claim.
+- Only a test can name the writer. A real `Worker` does not name its
+  claims, so any claim can explain its lines. A stale write of a real
+  worker can therefore pass. The red tests and the driven cycles cover the
+  fences of #1789 and #1806.
+- The models have no workflow failure, no cancellation and no quarantine.
+  A trace that reaches `FAILED` on a workflow row, or `CANCELLED`, is
+  rejected. Extend the model before a chaos case reaches such a path.
 - An unobserved action changes no logged column. `TraceNext` omits it. Such
   an action only drops a claim, so a match never needs it.
 - A recording run leaves the triggers on its database. A shared
@@ -381,6 +401,8 @@ scripts/check-formal-traces.sh "$HARVEST_TLA_TRACE_DIR"
   use a new database.
 - A trace starts at the row's insert. A row from before the recorder was
   installed fails the export.
+- `ActivityClaim` does not model `crash_strikes`, so the activity check
+  ignores that column. `WorkflowTaskClaim` matches it.
 - The model of `CodecRotation` has no trace check.
 
 ## Run the Kani proofs

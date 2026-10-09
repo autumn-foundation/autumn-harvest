@@ -20,6 +20,7 @@
 //! in every run.
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
@@ -44,16 +45,14 @@ const WORKFLOW_TERMINALS: &[&str] = &[
 /// Activity result events that always end the activity.
 const ACTIVITY_FINAL: &[&str] = &["ActivityCompleted", "ActivityCompletedExternally"];
 
-/// Activity result events that end the activity only when the row becomes
-/// terminal in the same transaction. Otherwise a retry follows.
+/// Activity result events that end the activity, unless the same
+/// transaction requeues the row for a retry. A result with no requeue
+/// therefore counts, so a stale result fails the check.
 const ACTIVITY_RESULTS: &[&str] = &[
     "ActivityFailed",
     "ActivityTimedOut",
     "ActivityFailedExternally",
 ];
-
-/// The terminal states of a task row.
-const TERMINAL_STATES: &[&str] = &["COMPLETED", "FAILED", "CANCELLED"];
 
 const INSTALL_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS harvest_tla_trace (
@@ -119,10 +118,13 @@ pub fn trace_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Install the recorder and clear its log, when recording is on.
+/// Install the recorder and clear its log, when recording is on. Otherwise
+/// remove a recorder that an earlier run left on a shared database.
 pub async fn install(conn: &mut AsyncPgConnection) {
     if trace_dir().is_some() {
         install_now(conn).await;
+    } else {
+        uninstall_unless_recording(conn).await;
     }
 }
 
@@ -133,8 +135,9 @@ pub async fn install_now(conn: &mut AsyncPgConnection) {
         .expect("install the TLA+ trace recorder");
 }
 
-/// Remove the recorder when recording is off. A red test calls it last, so
-/// a run without recording leaves no trigger on a shared database.
+/// Remove the recorder when recording is off. A test that calls
+/// [`install_now`] calls this last, so a run without recording leaves no
+/// trigger on a shared database.
 pub async fn uninstall_unless_recording(conn: &mut AsyncPgConnection) {
     if trace_dir().is_none() {
         conn.batch_execute(UNINSTALL_SQL)
@@ -310,7 +313,7 @@ fn step(
         return;
     };
 
-    if let std::collections::btree_map::Entry::Vacant(slot) = views.entry(task) {
+    if let Entry::Vacant(slot) = views.entry(task) {
         let [first, ..] = mine.as_slice() else {
             panic!("task {task}: an event precedes the row");
         };
@@ -335,7 +338,8 @@ fn step(
     let last = mine.last().copied();
     let mut view = last.map_or_else(|| old.clone(), |r| view_of(r, spec, old.terminal));
     let started = events.contains(&"ActivityStarted") && spec == "ActivityClaim";
-    view.terminal += terminal_events(spec, &events, &view.state);
+    let retried = old.state != "PENDING" && view.state == "PENDING";
+    view.terminal += terminal_events(spec, &events, retried);
     let hb = last.map_or_else(|| old_hb.clone(), |r| r.heartbeat_at.clone());
     let actor = parse_actor(actor, task);
 
@@ -343,7 +347,8 @@ fn step(
         Some("start")
     } else if view != old {
         Some("write")
-    } else if spec == "ActivityClaim" && view.state == "RUNNING" && hb.is_some() && hb != old_hb {
+    } else if spec == "ActivityClaim" && hb.is_some() && hb != old_hb {
+        // A beat in any state. A beat on a row that no claim holds fails.
         Some("heartbeat")
     } else {
         None
@@ -381,14 +386,12 @@ fn view_of(r: &LogRow, spec: &str, terminal: i32) -> View {
     }
 }
 
-/// The number of terminal events in one transaction of a row.
-fn terminal_events(spec: &str, events: &[&str], state: &str) -> i32 {
+/// The number of terminal events in one transaction of a row. `retried`
+/// is true when the transaction requeued the row.
+fn terminal_events(spec: &str, events: &[&str], retried: bool) -> i32 {
     let counts = |e: &&str| match spec {
         "WorkflowTaskClaim" => WORKFLOW_TERMINALS.contains(e),
-        _ => {
-            ACTIVITY_FINAL.contains(e)
-                || (ACTIVITY_RESULTS.contains(e) && TERMINAL_STATES.contains(&state))
-        }
+        _ => ACTIVITY_FINAL.contains(e) || (ACTIVITY_RESULTS.contains(e) && !retried),
     };
     let n = events.iter().filter(|e| counts(e)).count();
     i32::try_from(n).expect("event count fits i32")
@@ -451,6 +454,17 @@ pub fn write(case: &str, traces: &[TaskTrace], checks: impl Fn(&TaskTrace) -> Va
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
+    // Remove the files of an earlier run of this case, so TLC never checks
+    // a stale trace.
+    for entry in std::fs::read_dir(&dir)
+        .expect("read the trace dir")
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&format!("{stem}-")) && name.ends_with(".ndjson") {
+            std::fs::remove_file(entry.path()).expect("remove an old trace");
+        }
+    }
     for (n, trace) in traces.iter().enumerate() {
         let header = json!({
             "spec": trace.spec,
@@ -468,14 +482,36 @@ pub fn write(case: &str, traces: &[TaskTrace], checks: impl Fn(&TaskTrace) -> Va
     }
 }
 
+/// The checks of a red trace. TLC must reject it at its last line, so a
+/// false reject of an earlier line fails the check. `pre_fix` is the
+/// expected result of the pre-fix spec.
+pub fn reject_last(trace: &TaskTrace, pre_fix: &str) -> Value {
+    // Line 1 of the file is the header.
+    let last = format!("reject@{}", trace.lines.len() + 1);
+    let pre_fix = if pre_fix == "reject" {
+        last.clone()
+    } else {
+        pre_fix.to_string()
+    };
+    json!({ "fixed": last, "pre-fix": pre_fix })
+}
+
 /// Export the traces of one case that the fixed engine wrote, when
 /// recording is on. Each trace must be accepted.
+///
+/// # Panics
+///
+/// Panics when recording is on and the case wrote no trace, because the
+/// export would then check nothing.
 pub async fn export(url: &str, case: &str) {
     if trace_dir().is_none() {
         return;
     }
-    let mut conn = super::connect(url).await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(url)
+        .await
+        .expect("connect to export the TLA+ traces");
     let traces = take(&mut conn).await;
+    assert!(!traces.is_empty(), "{case}: no task row trace to export");
     write(case, &traces, |_| accept());
 }
 
@@ -569,23 +605,90 @@ mod tests {
     }
 
     #[test]
-    fn a_failure_that_retries_is_not_terminal() {
+    fn only_a_failure_that_retries_is_not_terminal() {
         assert_eq!(
-            terminal_events("ActivityClaim", &["ActivityFailed"], "PENDING"),
+            terminal_events("ActivityClaim", &["ActivityFailed"], true),
             0
         );
         assert_eq!(
-            terminal_events("ActivityClaim", &["ActivityFailed"], "FAILED"),
+            terminal_events("ActivityClaim", &["ActivityFailed"], false),
             1
         );
         assert_eq!(
-            terminal_events("ActivityClaim", &["ActivityCompleted"], "RUNNING"),
+            terminal_events("ActivityClaim", &["ActivityCompleted"], true),
             1
         );
         assert_eq!(
-            terminal_events("WorkflowTaskClaim", &["ActivityCompleted"], "COMPLETED"),
+            terminal_events("WorkflowTaskClaim", &["ActivityCompleted"], false),
             0
         );
+    }
+
+    /// An activity row of the activity `Uuid::nil()`.
+    fn activity(id: i64, tx: &str, op: &str, task: Uuid, state: &str) -> LogRow {
+        LogRow {
+            activity_id: Some(Uuid::nil()),
+            ..row(id, tx, op, task, "activity", state)
+        }
+    }
+
+    /// An event of the activity `Uuid::nil()`.
+    fn activity_event(id: i64, tx: &str, event_type: &str, worker: Option<&str>) -> LogRow {
+        LogRow {
+            activity_id: Some(Uuid::nil()),
+            event_worker: worker.map(String::from),
+            ..event(id, tx, event_type)
+        }
+    }
+
+    #[test]
+    fn the_activity_path_gives_start_heartbeat_and_finish_lines() {
+        let t = Uuid::new_v4();
+        let mut beat = claimed(activity(4, "4", "UPDATE", t, "RUNNING"), "w", 1);
+        beat.heartbeat_at = Some("t1".into());
+        let log = vec![
+            activity(1, "1", "INSERT", t, "PENDING"),
+            claimed(activity(2, "2", "UPDATE", t, "RUNNING"), "w", 1),
+            activity_event(3, "3", "ActivityStarted", Some("w")),
+            beat,
+            activity_event(5, "5", "ActivityCompleted", None),
+            claimed(activity(6, "5", "UPDATE", t, "COMPLETED"), "w", 1),
+        ];
+        let lines = &build(&log)[0].lines;
+        let ops: Vec<&str> = lines.iter().filter_map(|l| l["op"].as_str()).collect();
+        assert_eq!(ops, ["init", "write", "start", "heartbeat", "write"]);
+        assert_eq!(lines[2]["by"], "w");
+        assert_eq!(lines[4]["terminal"], 1);
+    }
+
+    #[test]
+    fn transactions_are_ordered_by_their_last_log_id() {
+        let t = Uuid::new_v4();
+        // Transaction "b" starts first but commits last.
+        let log = vec![
+            row(1, "a", "INSERT", t, "workflow", "PENDING"),
+            event(2, "b", "WorkflowCompleted"),
+            claimed(row(3, "c", "UPDATE", t, "workflow", "RUNNING"), "w", 1),
+            claimed(row(4, "b", "UPDATE", t, "workflow", "COMPLETED"), "w", 1),
+        ];
+        let lines = &build(&log)[0].lines;
+        assert_eq!(lines[1]["state"], "RUNNING");
+        assert_eq!(lines[2]["state"], "COMPLETED");
+        assert_eq!(lines[2]["terminal"], 1);
+    }
+
+    #[test]
+    fn a_red_trace_names_its_last_line() {
+        let trace = TaskTrace {
+            task_id: Uuid::nil(),
+            spec: "ActivityClaim",
+            lines: vec![Value::Null; 4],
+        };
+        assert_eq!(
+            reject_last(&trace, "accept"),
+            json!({ "fixed": "reject@5", "pre-fix": "accept" })
+        );
+        assert_eq!(reject_last(&trace, "reject")["pre-fix"], "reject@5");
     }
 
     #[test]

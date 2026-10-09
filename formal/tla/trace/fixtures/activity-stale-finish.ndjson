@@ -1,4 +1,4 @@
-{"spec":"ActivityClaim","case":"injected: the stale claim (w1, 1) finishes the task that (w1, 2) holds (issue #1789)","checks":{"fixed":"reject","pre-fix":"accept"}}
+{"spec":"ActivityClaim","case":"injected: the stale claim (w1, 1) finishes the task that (w1, 2) holds (issue #1789)","checks":{"fixed":"reject@8","pre-fix":"accept"}}
 {"op":"init","state":"PENDING","worker":null,"attempt":0,"strikes":0,"terminal":0,"actor":null}
 {"op":"write","state":"RUNNING","worker":"w1","attempt":1,"strikes":0,"terminal":0,"actor":null}
 {"op":"start","state":"RUNNING","worker":"w1","attempt":1,"strikes":0,"terminal":0,"actor":{"worker":"w1","attempt":1}}

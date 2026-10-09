@@ -26,7 +26,6 @@
 mod infra_faults;
 
 mod drain_hold;
-mod tla_trace;
 mod trace_activity;
 mod trace_red;
 
@@ -58,6 +57,8 @@ use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
+
+use crate::tla_trace;
 
 use crate::history_checker::{
     ExactlyOnceFire, FireInput, FireOutput, Recorder, assert_linearizable,
@@ -575,7 +576,7 @@ async fn chaos_repro_367_crash_orphan_is_reclaimed() {
     // → server rollback → row stranded RUNNING with the dead worker.
     let guard = arm(ChaosPlan::scripted().kill_at(WORKER_PERSIST_BEFORE_COMMIT)).await;
     let outcome = chaos_drive_one_workflow_task(
-        &url,
+        &tla_trace::actor_url(&url, task.id, "c367-crash-worker", task.attempt),
         Arc::clone(&registry),
         task.clone(),
         "c367-crash-worker".to_string(),
@@ -734,7 +735,7 @@ async fn chaos_repro_1348_terminal_metrics_survive_post_commit_cancellation() {
     let hold = guard.hold(WORKER_AFTER_OUTER_COMMIT);
 
     let cancelled = chaos_drive_one_workflow_task_cancel_at_hold(
-        &url,
+        &tla_trace::actor_url(&url, task.id, "c1348-worker", task.attempt),
         Arc::clone(&registry),
         task,
         "c1348-worker".to_string(),
@@ -877,7 +878,7 @@ async fn chaos_repro_492_outbox_cannot_double_deliver_inline_external_signal() {
     let guard = arm(ChaosPlan::scripted().hold_at(OUTBOX_INLINE_AFTER_REQUESTED)).await;
     let hold = guard.hold(OUTBOX_INLINE_AFTER_REQUESTED);
 
-    let drive_url = url.clone();
+    let drive_url = tla_trace::actor_url(&url, task.id, "c492-caller-worker", task.attempt);
     let drive_registry = Arc::clone(&registry);
     let drive = tokio::spawn(async move {
         chaos_drive_one_workflow_task(
@@ -1094,7 +1095,6 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
         1,
         "the crashed slot must be re-fired by a peer exactly once after the claim expires; {diag}"
     );
-    tla_trace::export(&url, "repro-350-pre-start").await;
 }
 
 // ── Reproducer 4b — issue #350 post-start crash (SCHED_AFTER_START_BEFORE_ADVANCE) ──
@@ -1237,7 +1237,6 @@ async fn chaos_repro_350_post_start_crash_dedupes_to_exactly_one() {
         1,
         "a post-start crash must yield exactly one execution through recovery (no double-fire); {diag}"
     );
-    tla_trace::export(&url, "repro-350-post-start").await;
 }
 
 // ── AC1(d) — expire a lease/heartbeat early ──────────────────────────────────
@@ -1378,7 +1377,6 @@ async fn chaos_ac1d_session_lease_expiry_marks_broken() {
         Some("session lease expired"),
         "the break must be attributed to the expired lease, not a dead/draining host",
     );
-    tla_trace::export(&url, "session-lease").await;
 }
 
 #[derive(diesel::QueryableByName)]
@@ -1567,7 +1565,7 @@ async fn chaos_seeded_convergence_sweep() {
             .expect("claim in sweep")
             {
                 let _ = chaos_drive_one_workflow_task(
-                    &url,
+                    &tla_trace::actor_url(&url, task.id, worker, task.attempt),
                     Arc::clone(&registry),
                     task,
                     worker.to_string(),
@@ -1634,7 +1632,7 @@ async fn chaos_seeded_convergence_sweep() {
             .expect("claim in recovery");
             let Some(task) = claimed else { break };
             let _ = chaos_drive_one_workflow_task(
-                &url,
+                &tla_trace::actor_url(&url, task.id, "sweep-recover", task.attempt),
                 Arc::clone(&registry),
                 task,
                 "sweep-recover".to_string(),
@@ -1707,8 +1705,10 @@ async fn oracle_flags_a_duplicate_terminal_event() {
     .await
     .expect("claim")
     .expect("a task is due");
+    let actor_url = tla_trace::actor_url(&url, task.id, "oracle-w", task.attempt);
     let _ =
-        chaos_drive_one_workflow_task(&url, Arc::clone(&registry), task, "oracle-w".into()).await;
+        chaos_drive_one_workflow_task(&actor_url, Arc::clone(&registry), task, "oracle-w".into())
+            .await;
 
     // The clean history converges.
     assert_converged(&url, "oracle", &[exec_id], "clean").await;
@@ -1739,11 +1739,16 @@ async fn oracle_flags_a_duplicate_terminal_event() {
     // claim, so each guard setting of the spec must reject its trace.
     if tla_trace::trace_dir().is_some() {
         let traces = tla_trace::take(&mut conn).await;
-        tla_trace::write(
-            "oracle-duplicate-terminal",
-            &traces,
-            |_| serde_json::json!({ "fixed": "reject", "pre-fix": "reject" }),
+        let forged = traces
+            .iter()
+            .all(|t| t.lines.last().is_some_and(|l| l["terminal"] == 2));
+        assert!(
+            !traces.is_empty() && forged,
+            "the trace must hold the forged event: {traces:#?}"
         );
+        tla_trace::write("oracle-duplicate-terminal", &traces, |t| {
+            tla_trace::reject_last(t, "reject")
+        });
     }
 }
 

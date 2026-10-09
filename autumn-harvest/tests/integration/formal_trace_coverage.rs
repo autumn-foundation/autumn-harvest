@@ -96,6 +96,15 @@ fn fixtures() -> Vec<Trace> {
         .collect()
 }
 
+/// True for `accept`, `reject` and `reject@N`. `N` names the file line that
+/// TLC must fail to match.
+fn valid_expect(expect: &str) -> bool {
+    expect.strip_prefix("reject@").map_or_else(
+        || matches!(expect, "accept" | "reject"),
+        |line| line.parse::<u32>().is_ok_and(|n| n > 0),
+    )
+}
+
 /// Why `trace` is malformed, or `None` when it is well formed.
 fn trace_defect(trace: &Trace) -> Option<String> {
     let name = &trace.name;
@@ -106,7 +115,7 @@ fn trace_defect(trace: &Trace) -> Option<String> {
         return Some(format!("{name}: no checks"));
     }
     for (guard, expect) in &trace.checks {
-        if !GUARDS.contains(&guard.as_str()) || !matches!(expect.as_str(), "accept" | "reject") {
+        if !GUARDS.contains(&guard.as_str()) || !valid_expect(expect) {
             return Some(format!("{name}: bad check `{guard}: {expect}`"));
         }
     }
@@ -135,10 +144,14 @@ fn trace_defect_flags_malformed_traces() {
     let ok = "{\"spec\":\"ActivityClaim\",\"checks\":{\"fixed\":\"accept\"}}\n\
               {\"op\":\"init\",\"state\":\"PENDING\",\"attempt\":0,\"strikes\":0,\"terminal\":0}\n";
     assert_eq!(trace_defect(&parse_trace("ok", ok)), None);
+    let at_line = ok.replace("accept", "reject@7");
+    assert_eq!(trace_defect(&parse_trace("ok", &at_line)), None);
     let bad = [
         ok.replace("ActivityClaim", "CodecRotation"),
         ok.replace("\"fixed\"", "\"loose\""),
         ok.replace("accept", "maybe"),
+        ok.replace("accept", "reject@0"),
+        ok.replace("accept", "reject@x"),
         ok.replace("\"init\"", "\"write\""),
         ok.replace("\"terminal\":0", "\"x\":0"),
     ];
@@ -174,11 +187,11 @@ fn each_traced_spec_has_a_clean_and_a_red_fixture() {
             "{spec} needs a fixture that the fixed spec accepts"
         );
         assert!(
-            of_spec
-                .iter()
-                .any(|t| check(t, "fixed") == Some("reject")
-                    && check(t, "pre-fix") == Some("accept")),
-            "{spec} needs a red fixture: rejected by `fixed`, accepted by `pre-fix`"
+            of_spec.iter().any(
+                |t| check(t, "fixed").is_some_and(|c| c.starts_with("reject@"))
+                    && check(t, "pre-fix") == Some("accept")
+            ),
+            "{spec} needs a red fixture: rejected by `fixed` at a named line, accepted by `pre-fix`"
         );
     }
 }
@@ -227,7 +240,8 @@ fn trace_runner_pins_the_same_tlc_as_the_model_runner() {
 #[test]
 fn ci_checks_the_trace_fixtures_on_every_pr() {
     let ci = parse_workflow(".github/workflows/ci.yml");
-    if let Some(defect) = formal_job_defect(&ci, "formal-models", RUNNER) {
+    let command = format!("{RUNNER} formal/tla/trace/fixtures");
+    if let Some(defect) = formal_job_defect(&ci, "formal-models", &command) {
         panic!("{defect} (issue #2003)");
     }
 }

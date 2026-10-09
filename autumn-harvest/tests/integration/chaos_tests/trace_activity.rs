@@ -97,7 +97,8 @@ async fn chaos_trace_real_worker_activities() {
     .await
     .expect("claim")
     .expect("the workflow task is due");
-    let _ = chaos_drive_one_workflow_task(&url, registry(), task, "trace-wf".into()).await;
+    let drive_url = tla_trace::actor_url(&url, task.id, "trace-wf", task.attempt);
+    let _ = chaos_drive_one_workflow_task(&drive_url, registry(), task, "trace-wf".into()).await;
 
     // A dead worker claims and starts the activity. It never registered.
     let dead = autumn_harvest::queue::claim_task(
