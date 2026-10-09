@@ -128,6 +128,10 @@ fn llm_loop(ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
                 }
             }
         }
+        // A source run for the reset test fails at the end, so reset admits it.
+        if input["fail_end"].as_bool() == Some(true) {
+            return Err(format!("failed after {ran} steps"));
+        }
         Ok(json!({ "ran": ran, "refused": null }))
     })
 }
@@ -616,6 +620,57 @@ async fn a_run_only_budget_ignores_an_over_long_key() {
     let (_, output) = harness.run(Some(&long_tenant), 10, hundred_tokens()).await;
     assert_eq!(output["ran"], 3, "{output}");
     assert_eq!(refused(&output), Some("run_llm_tokens"));
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn a_reset_fork_counts_toward_the_tenant_budget() {
+    use autumn_harvest::reset::{
+        ResetSignalReapplyPolicy, WorkflowResetRequest, reset_workflow_execution,
+    };
+
+    let _serial = TEST_SERIAL.lock().await;
+    let policy = QuotaPolicy::new("tenant").with_max_tenant_llm_tokens(250);
+    let harness = Harness::new("llm_reset_fork", Some(policy)).await;
+    let mut conn = connect(&harness.url).await;
+    let source = start_or_load_workflow_execution(
+        &mut conn,
+        params(
+            harness.name,
+            &format!("llm-{}", Uuid::new_v4().simple()),
+            ExecutionId::new(),
+            json!({ "tenant": "acme", "steps": 3, "step": hundred_tokens(), "fail_end": true }),
+        ),
+        None,
+    )
+    .await
+    .expect("start the source")
+    .exec_id;
+    wait_for_execution_state(&harness.url, source, "FAILED").await;
+    assert_eq!(ledger_rows(&harness.url, source).await, 3);
+
+    // The fork replays the same input. Its tenant already spent 300 of 250,
+    // so its first LLM step is refused.
+    let fork = reset_workflow_execution(
+        &mut conn,
+        source,
+        WorkflowResetRequest {
+            reset_to_event_id: Some(0),
+            reset_point: None,
+            reason: "fork a budgeted run".into(),
+            operator_id: "op".into(),
+            signal_reapply: ResetSignalReapplyPolicy::default(),
+            allow_terminal_source: true,
+            refuse_erased_source: false,
+        },
+        None,
+    )
+    .await
+    .expect("reset")
+    .new_exec_id;
+    let output = harness.output(fork).await;
+    assert_eq!(output["ran"], 0, "{output}");
+    assert_eq!(refused(&output), Some("tenant_llm_tokens"));
     harness.stop().await;
 }
 

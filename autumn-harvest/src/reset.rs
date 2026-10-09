@@ -1343,6 +1343,25 @@ async fn terminate_source_execution(
     Ok((deferred, closed_children))
 }
 
+/// The key of a reset fork: the key of its source when the workflow type has a
+/// tenant LLM cap (issue #1997), else `None`.
+fn fork_quota_key(source: &WorkflowExecution) -> Option<&str> {
+    let tenant_budget = crate::completion_trigger::GLOBAL_WORKFLOW_METADATA
+        .read()
+        .ok()
+        .and_then(|lock| {
+            lock.as_ref()
+                .and_then(|map| map.get(&source.workflow_name))
+                .and_then(|meta| meta.quota)
+        })
+        .is_some_and(|policy| policy.has_tenant_llm_cap());
+    if tenant_budget {
+        source.quota_key.as_deref()
+    } else {
+        None
+    }
+}
+
 async fn insert_fork_execution(
     conn: &mut AsyncPgConnection,
     source: &WorkflowExecution,
@@ -1439,7 +1458,11 @@ async fn insert_fork_execution(
         // `WHERE quota_key = $2` never matches NULL, and `list_quota_usage`
         // filters `WHERE quota_key IS NOT NULL`, so a reset fork neither
         // consumes headroom nor is blocked by one.
-        quota_key: None,
+        //
+        // A type with a tenant LLM cap (issue #1997) is the exception. The
+        // fork keeps the key of its source, so its LLM steps count toward the
+        // same tenant budget from the first step.
+        quota_key: fork_quota_key(source),
     };
 
     diesel::insert_into(harvest_workflow_executions::table)

@@ -29,7 +29,8 @@
 //!   the cap by its whole usage. Steps that run at the same time can all pass
 //!   the check before any of them records.
 //! - A run is one execution. A continue-as-new, a reset, a fork or a workflow
-//!   retry starts a new execution, so its run caps start from zero.
+//!   retry starts a new execution, so its run caps start from zero. A reset
+//!   fork keeps the key of its source when the type has a tenant LLM cap.
 //! - The tenant scope is `(workflow type, quota key)`, as for quota. It is
 //!   shard-local. A shard rebalance moves the ledger rows of a run.
 //! - A key that does not resolve fails open for the tenant caps. The run caps

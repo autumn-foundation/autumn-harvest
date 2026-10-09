@@ -15459,8 +15459,9 @@ async fn create_detached_child_executions(
         // continue-as-new/reset/workflow-level-retry. `ParentClosePolicy`
         // (#347) governs the detached child's *lifecycle*, not its *tenant
         // capacity*, so the two concerns are orthogonal.
-        let child_quota_key: Option<String> =
-            detached_quota.and_then(|p| crate::quota::resolve_quota_key(p.key_expr, input));
+        let child_quota_key: Option<String> = detached_quota
+            .filter(crate::quota::QuotaPolicy::uses_key)
+            .and_then(|p| crate::quota::resolve_quota_key(p.key_expr, input));
         if let Some(key) = child_quota_key.as_deref()
             && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
         {
@@ -22005,6 +22006,7 @@ async fn resolve_continue_as_new_verdict(
                 .workflows
                 .get(target)
                 .and_then(|info| info.quota)
+                .filter(crate::quota::QuotaPolicy::uses_key)
                 .and_then(|policy| crate::quota::resolve_quota_key(policy.key_expr, input))
         },
     );
@@ -22099,6 +22101,7 @@ fn continue_as_new_certainly_redirects(
     }
     let quota_key = target_info
         .quota
+        .filter(crate::quota::QuotaPolicy::uses_key)
         .and_then(|policy| crate::quota::resolve_quota_key(policy.key_expr, input));
     if let Some(key) = quota_key.as_deref()
         && crate::quota::quota_key_over_cap(key).is_some()

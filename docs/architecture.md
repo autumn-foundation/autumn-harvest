@@ -379,7 +379,7 @@ An agent loop can spend without limit. A budget caps the LLM tokens or the cost 
 *Limits.*
 
 - The cap is soft. The last step that passes can pass the cap by its whole usage, and steps that run at the same time can all pass the check.
-- A run is one execution. A continue-as-new, a reset, a fork or a workflow retry starts its run caps from zero.
+- A run is one execution. A continue-as-new, a reset, a fork or a workflow retry starts its run caps from zero. A reset fork keeps the key of its source when the type has a tenant LLM cap, so its steps count for the same tenant.
 - A key that does not resolve fails open for the tenant caps. The run caps still apply. A row recorded before `quota_reconcile` sets the key of its run never counts for the tenant.
 - The scope is shard-local, as for quota.
 - Keep retention longer than the window, because the ledger rows go with their run.
