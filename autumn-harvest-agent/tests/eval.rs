@@ -127,12 +127,12 @@ async fn the_recorded_model_reports_no_divergence() {
         panic!("the candidate completes: {:?}", evaluation.candidate);
     };
     assert_eq!(report.stop, AgentStop::Completed);
-    let RunEnd::Completed(recorded) = &evaluation.recorded else {
+    let RunEnd::Completed(source_report) = &evaluation.recorded else {
         panic!("the source completed: {:?}", evaluation.recorded);
     };
     assert_eq!(
         tool_results(report),
-        tool_results(recorded),
+        tool_results(source_report),
         "the candidate reads the recorded tool output"
     );
     assert!(!evaluation.end_diverged);
@@ -383,13 +383,21 @@ async fn a_history_that_is_not_an_agent_run_is_refused() {
 
 #[tokio::test]
 async fn a_current_thread_runtime_is_refused() {
-    let source = vec![WorkflowEvent::WorkflowStarted {
-        input: serde_json::to_value(AgentTask::new("hi")).unwrap(),
-        timestamp: chrono::Utc::now(),
-        last_completion_result: None,
-        last_error: None,
-        scheduled_time: None,
-    }];
+    let source = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: serde_json::to_value(AgentTask::new("hi")).unwrap(),
+            timestamp: chrono::Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::WorkflowFailed {
+            error: "provider down".into(),
+            error_type: None,
+            details: None,
+            non_retryable: None,
+        },
+    ];
     let (harness, _) = candidate(ScriptedModel::new(vec![answer("hi", 1)]));
 
     let result = evaluate(&source, &Candidate::new(harness)).await;

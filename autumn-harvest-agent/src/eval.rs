@@ -8,51 +8,64 @@
 //! The harness runs the real `agent_loop` body in the in-memory test engine.
 //! It writes nothing to a database. Each activity resolves as follows:
 //!
-//! - `agent_model_turn` asks the candidate model. This is the only live call.
+//! - `agent_model_turn` asks the candidate model, then the candidate policy.
+//!   These are the only live calls.
 //! - `agent_tool_call` returns the recorded outcome of the same call. A call
 //!   with no recorded outcome gets an error stub. No tool runs.
 //! - `agent_memory_snapshot` returns the recorded snapshot, or an empty one.
 //! - `agent_deliver` is a stub. No report leaves the harness.
 //! - Any other activity has no mock, so it fails the candidate run.
 //!
-//! The harness sends each approval again that the source received in time.
-//! It drops an approval that arrived after its deadline, so that approval
-//! cannot release a call.
+//! The harness sends again each signal that the source received before its
+//! deadline. Approvals are such signals. A signal that arrived after its
+//! deadline is dropped, so a late approval cannot release a call.
 //!
 //! # The fork rules
 //!
 //! An evaluation is an in-memory fork at the first event. It follows the fork
 //! rules of issue #2000:
 //!
-//! - The source stays unchanged. The harness reads a borrowed slice.
-//! - A completed source is accepted.
-//! - Effects are recorded or stubbed. There is no opt-in for live effects.
-//! - An erased source is always refused.
+//! - The harness reads a borrowed slice, so the source stays unchanged.
+//! - The harness accepts a completed source.
+//! - Each effect gets a recorded result or a stub. No option turns on live
+//!   effects.
+//! - The harness always refuses an erased source.
+//!
+//! The harness also refuses a source that has not ended. Such a source has no
+//! recorded frontier to compare against.
 //!
 //! # Matching
 //!
 //! A recorded tool outcome answers a call with the same step, tool name and
-//! arguments. Each model call gives new call ids, so the key has no id.
+//! arguments. A model gives new call ids on each call, so the key holds no id.
 //!
 //! A candidate call that equals the recorded call at the same turn and
 //! position takes the recorded id. Approval signal names hold the id, so the
-//! recorded approvals stay valid.
+//! recorded approvals stay valid. Any other candidate call gets a new id with
+//! the prefix `eval_`. A recorded approval therefore never releases it.
 //!
 //! # The diff
 //!
 //! The harness compares the decisions of each model turn: the tool calls, their
 //! arguments, the policy decisions and the stop reason. Two final answers with
-//! other words are [`Verdict::Reworded`], not a divergence.
+//! the same stop reason and different text get [`Verdict::Reworded`]. That is
+//! not a divergence. The harness also compares how the two runs end.
 //!
-//! The replay debugger (#949) compares commands. A new prompt changes every
-//! request, so a command diff always stops at the first model turn. This diff
-//! compares the decisions instead.
+//! The replay debugger (issue #949) compares commands. A new prompt changes
+//! every request, so a command diff always stops at the first model turn. This
+//! diff compares the decisions instead.
+//!
+//! # Cost
+//!
+//! Each candidate turn is a live model call. [`Candidate::max_turns`] caps
+//! them. The default cap is the recorded turn count plus
+//! [`DEFAULT_EXTRA_TURNS`].
 //!
 //! # Runtime
 //!
 //! The test engine resolves activities synchronously. The model call is
-//! async, so the harness blocks in place. That needs a multi-thread Tokio
-//! runtime.
+//! async, so the harness blocks in place. Blocking in place needs a
+//! multi-thread Tokio runtime.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -61,8 +74,8 @@ use autumn_harvest::erase::is_erasure_tombstone;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::testing::WorkflowTestEnv;
 use autumn_harvest::types::ActivityExecId;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::harness::AgentHarness;
@@ -76,9 +89,19 @@ use crate::workflow::{
     agent_model_turn_info, agent_tool_call_info,
 };
 
-/// The answer to a candidate call that has no recorded outcome.
+/// The error text of the stub outcome. A candidate call with no recorded
+/// outcome gets it.
 pub const NOT_RUN: &str =
     "not run: the evaluation has no recorded output for this call, and it runs no tool";
+
+/// The default number of live turns past the recorded turn count.
+pub const DEFAULT_EXTRA_TURNS: usize = 8;
+
+/// The failure of a model turn past the turn cap.
+const TURN_CAP_ERROR: &str = "the evaluation reached its turn cap";
+
+/// The prefix of a candidate call id that the harness replaced.
+const EVAL_ID_PREFIX: &str = "eval_";
 
 /// The prefix of the deadline timer of a signal wait.
 ///
@@ -90,16 +113,14 @@ const SIGNAL_TIMEOUT_PREFIX: &str = "__signal_timeout:";
 /// The candidate: a harness with a live model, and an optional new prompt.
 ///
 /// The harness supplies the model, the temperature, the tool definitions and
-/// the policy. Its tools never run.
+/// the policy. The model and the policy run live, so use a policy with no
+/// side effects. The tools, the memory store and the delivery never run.
 #[derive(Debug, Clone)]
 pub struct Candidate {
     harness: Arc<AgentHarness>,
     system: Option<String>,
     max_turns: Option<usize>,
 }
-
-/// Extra turns allowed past the recorded count.
-pub const DEFAULT_EXTRA_TURNS: usize = 8;
 
 impl Candidate {
     /// A candidate that uses `harness` for every model turn.
@@ -125,7 +146,10 @@ impl Candidate {
         self
     }
 
-    /// Cap the live model turns.
+    /// Cap the live model turns at `max_turns`.
+    ///
+    /// The turn past the cap fails the candidate run, and the report sets
+    /// [`Evaluation::turn_cap_reached`].
     #[must_use]
     pub const fn max_turns(mut self, max_turns: usize) -> Self {
         self.max_turns = Some(max_turns);
@@ -133,31 +157,31 @@ impl Candidate {
     }
 }
 
-/// Why an evaluation cannot start.
+/// Why an evaluation cannot start or finish.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum EvalError {
-    /// The history is not an `agent_loop` run.
+    /// The history is not an `agent_loop` run, or its input does not decode
+    /// as an `AgentTask`. An encoded input gives this error.
     #[error("the history is not an agent run: {0}")]
     NotAnAgentRun(String),
     /// The history holds an erasure tombstone. An evaluation never forks an
     /// erased source.
     #[error("the source run was erased, so it cannot be evaluated")]
     ErasedSource,
-    /// A recorded payload does not decode. A history with payload-store
-    /// references or encrypted payloads needs decoding before evaluation.
-    #[error("a recorded payload does not decode: {0}")]
-    Undecodable(String),
-    /// The source has not ended.
-    #[error("the source run has not ended")]
+    /// The source history has no terminal event.
+    #[error("the source run has not ended, so it has no recorded frontier")]
     InFlightSource,
+    /// A recorded or candidate payload does not decode.
+    #[error("a payload does not decode: {0}")]
+    Undecodable(String),
     /// The current runtime cannot block in place.
     #[error("evaluation needs a multi-thread Tokio runtime")]
     MultiThreadRuntimeRequired,
 }
 
 /// One side of a comparison.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Side {
     /// The recorded run.
@@ -167,8 +191,9 @@ pub enum Side {
 }
 
 /// How two decisions of one turn differ.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "side", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Divergence {
     /// One side answers and the other calls tools.
     Shape,
@@ -183,30 +208,32 @@ pub enum Divergence {
 }
 
 /// The verdict on one turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verdict", content = "divergence", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Verdict {
     /// The two decisions agree.
     Same,
-    /// Both sides answer with the same stop reason, in other words.
+    /// Both sides answer with the same stop reason and different text.
     Reworded,
     /// The decisions differ.
     Diverged(Divergence),
 }
 
 /// One tool call of a turn and its policy decision.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallDecision {
     /// The tool name.
     pub name: String,
     /// The tool arguments.
     pub arguments: Value,
     /// The policy decision.
+    #[serde(flatten)]
     pub decision: ToolDecision,
 }
 
 /// The decision of one model turn.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnDecision {
     /// The tool calls, in order.
     pub calls: Vec<CallDecision>,
@@ -243,71 +270,82 @@ impl TurnDecision {
 }
 
 /// The comparison of one turn.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnDiff {
     /// The turn index, from 0, across every segment of the run.
     pub turn: usize,
-    /// The recorded decision.
+    /// The recorded decision, or `None` when the recorded run has no such
+    /// turn.
     pub recorded: Option<TurnDecision>,
-    /// The candidate decision.
+    /// The candidate decision, or `None` when the candidate run has no such
+    /// turn.
     pub candidate: Option<TurnDecision>,
-    /// The verdict.
+    /// How the two decisions compare.
     pub verdict: Verdict,
 }
 
 /// How a run ended.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "end", content = "detail")]
+#[non_exhaustive]
 pub enum RunEnd {
     /// The run completed with this report.
     Completed(AgentReport),
-    /// The run failed, was cancelled or timed out. The text says why.
+    /// The run failed, or the engine cancelled it or timed it out. The text
+    /// says why.
     Failed(String),
-    /// The history ends before the run does.
-    InFlight,
 }
 
 /// The result of one evaluation.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Evaluation {
     /// One comparison per model turn.
     pub turns: Vec<TurnDiff>,
-    /// The index of the first divergent turn.
+    /// The index of the first divergent turn, or `None` when no turn
+    /// diverges.
     pub first_divergence: Option<usize>,
     /// How the recorded run ended.
     pub recorded: RunEnd,
     /// How the candidate run ended.
     pub candidate: RunEnd,
-    /// Candidate tool calls that got a recorded output.
-    pub replayed_tool_calls: u32,
-    /// Candidate tool calls that got an error stub.
-    pub stubbed_tool_calls: u32,
-    /// The run ends differ.
+    /// `true` when the two runs end in different ways.
+    ///
+    /// Two completed runs differ when their [`AgentStop`](crate::AgentStop)
+    /// values differ. A completed run and a failed run always differ. Two
+    /// failed runs do not differ.
     pub end_diverged: bool,
-    /// The turn cap stopped the candidate.
+    /// The number of candidate tool calls that got a recorded outcome.
+    pub replayed_tool_calls: u32,
+    /// The number of candidate tool calls that got the stub outcome.
+    pub stubbed_tool_calls: u32,
+    /// `true` when the turn cap stopped the candidate run.
     pub turn_cap_reached: bool,
 }
 
 impl Evaluation {
-    /// `true` when a turn diverges.
+    /// `true` when a turn diverges or the run ends differ.
     #[must_use]
     pub const fn diverged(&self) -> bool {
-        self.first_divergence.is_some()
+        self.first_divergence.is_some() || self.end_diverged
     }
 }
 
 /// Evaluate `candidate` against the recorded `history`.
 ///
-/// The candidate model answers every model turn live. Every other effect is
-/// recorded or stubbed. See the [module documentation](self).
+/// The candidate model and policy answer every model turn live. Every other
+/// effect is recorded or stubbed. See the [module documentation](self).
 ///
 /// A failure of the candidate model is not an error. It shows as
 /// [`RunEnd::Failed`] in [`Evaluation::candidate`].
 ///
+/// Decode payload-store references and encrypted payloads before the
+/// evaluation.
+///
 /// # Errors
 ///
-/// Returns an [`EvalError`] when the evaluation cannot start. The variants
-/// name the causes. No model call runs in these cases.
+/// Returns an [`EvalError`] when the history cannot be evaluated, when a
+/// payload does not decode, or when the runtime cannot block in place. A
+/// refused history costs no model call.
 pub async fn evaluate(
     history: &[WorkflowEvent],
     candidate: &Candidate,
@@ -320,10 +358,15 @@ pub async fn evaluate(
         task.system = Some(system.clone());
     }
     let input = serde_json::to_value(&task).map_err(|e| EvalError::Undecodable(e.to_string()))?;
+    let max_turns = candidate
+        .max_turns
+        .unwrap_or_else(|| recording.turns.len().saturating_add(DEFAULT_EXTRA_TURNS));
 
     let session = Arc::new(Mutex::new(Session {
         recorded_calls: recording.turns.iter().map(ModelTurn::calls).collect(),
         turn: 0,
+        max_turns,
+        cap_reached: false,
         tools: recording.tools.clone(),
         snapshots: recording.snapshots.iter().cloned().collect(),
         replayed: 0,
@@ -333,19 +376,18 @@ pub async fn evaluate(
     let model = {
         let session = Arc::clone(&session);
         let harness = Arc::clone(&candidate.harness);
+        let run_id = recording.run_id.clone();
         move |input: Value| -> Result<Value, String> {
-            let request: ModelTurnRequest = decode(input)?;
+            let mut request: ModelTurnRequest = decode(input)?;
+            // The test engine has its own ids. The policy sees the recorded
+            // run id instead.
+            if let Some(run_id) = &run_id {
+                request.run_id.clone_from(run_id);
+            }
+            let (index, recorded) = lock(&session).next_turn()?;
             let mut turn =
                 tokio::task::block_in_place(|| handle.block_on(harness.model_turn(request)))?;
-            let recorded = {
-                let mut session = lock(&session);
-                let recorded = session.recorded_calls.get(session.turn).cloned();
-                session.turn += 1;
-                recorded
-            };
-            if let Some(recorded) = recorded {
-                adopt_recorded_ids(&mut turn, &recorded);
-            }
+            align_call_ids(&mut turn, &recorded, index);
             encode(&turn)
         }
     };
@@ -381,30 +423,33 @@ pub async fn evaluate(
         Ok(output) => RunEnd::Completed(decode(output).map_err(EvalError::Undecodable)?),
         Err(error) => RunEnd::Failed(error),
     };
-    let (replayed, stubbed) = {
+    let (replayed, stubbed, cap_reached) = {
         let session = lock(&session);
-        (session.replayed, session.stubbed)
+        (session.replayed, session.stubbed, session.cap_reached)
     };
 
     let turns = diff_turns(&recording.turns, &candidate_turns);
     let first_divergence = turns
         .iter()
         .position(|turn| matches!(turn.verdict, Verdict::Diverged(_)));
+    let end_diverged = ends_differ(&recording.end, &candidate_end);
     Ok(Evaluation {
         turns,
         first_divergence,
         recorded: recording.end,
         candidate: candidate_end,
+        end_diverged,
         replayed_tool_calls: replayed,
         stubbed_tool_calls: stubbed,
-        end_diverged: false,
-        turn_cap_reached: false,
+        turn_cap_reached: cap_reached,
     })
 }
 
 /// What the source run recorded.
 struct Recording {
     task: AgentTask,
+    /// The run id of the first recorded model request.
+    run_id: Option<String>,
     turns: Vec<ModelTurn>,
     tools: Vec<RecordedTool>,
     snapshots: Vec<String>,
@@ -439,14 +484,16 @@ impl Recording {
         let task: AgentTask = serde_json::from_value(input.clone())
             .map_err(|e| EvalError::NotAnAgentRun(format!("the input is not an AgentTask: {e}")))?;
 
+        let model_name = agent_model_turn_info().name;
         let tool_name = agent_tool_call_info().name;
         let snapshot_name = agent_memory_snapshot_info().name;
         let mut scheduled: HashMap<ActivityExecId, (&str, &Value)> = HashMap::new();
+        let mut run_id = None;
         let mut tools = Vec::new();
         let mut snapshots = Vec::new();
         let mut timed_out: HashSet<&str> = HashSet::new();
         let mut signals = Vec::new();
-        let mut end = RunEnd::InFlight;
+        let mut end = None;
         for event in history {
             match event {
                 WorkflowEvent::ActivityScheduled {
@@ -455,6 +502,11 @@ impl Recording {
                     input,
                     ..
                 } => {
+                    if run_id.is_none() && name == model_name {
+                        let request: ModelTurnRequest =
+                            decode(input.clone()).map_err(EvalError::Undecodable)?;
+                        run_id = Some(request.run_id);
+                    }
                     scheduled.insert(*activity_id, (name.as_str(), input));
                 }
                 WorkflowEvent::ActivityCompleted {
@@ -493,38 +545,42 @@ impl Recording {
                     }
                 }
                 WorkflowEvent::WorkflowCompleted { output } => {
-                    end =
-                        RunEnd::Completed(decode(output.clone()).map_err(EvalError::Undecodable)?);
+                    end = Some(RunEnd::Completed(
+                        decode(output.clone()).map_err(EvalError::Undecodable)?,
+                    ));
                 }
                 WorkflowEvent::WorkflowFailed { error, .. } => {
-                    end = RunEnd::Failed(error.clone());
+                    end = Some(RunEnd::Failed(error.clone()));
                 }
                 WorkflowEvent::WorkflowCancelled { reason } => {
-                    end = RunEnd::Failed(format!("cancelled: {reason}"));
+                    end = Some(RunEnd::Failed(format!("cancelled: {reason}")));
                 }
                 WorkflowEvent::WorkflowExecutionTimedOut { .. } => {
-                    end = RunEnd::Failed("timed out".to_owned());
+                    end = Some(RunEnd::Failed("timed out".to_owned()));
                 }
                 _ => {}
             }
         }
         Ok(Self {
             task,
+            run_id,
             turns: model_turns(history)?,
             tools,
             snapshots,
             signals,
-            end,
+            end: end.ok_or(EvalError::InFlightSource)?,
         })
     }
 }
 
 /// The mutable state that the activity mocks share.
 struct Session {
-    /// The tool calls of each recorded turn, for id adoption.
+    /// The tool calls of each recorded turn, for id alignment.
     recorded_calls: Vec<Vec<ToolCall>>,
     /// The index of the next candidate turn.
     turn: usize,
+    max_turns: usize,
+    cap_reached: bool,
     tools: Vec<RecordedTool>,
     snapshots: VecDeque<String>,
     replayed: u32,
@@ -532,7 +588,24 @@ struct Session {
 }
 
 impl Session {
-    /// The recorded outcome of the same call, or an error stub.
+    /// Claim the next candidate turn. Returns its index and the recorded
+    /// calls of the same turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TURN_CAP_ERROR`] when the turn cap is reached.
+    fn next_turn(&mut self) -> Result<(usize, Vec<ToolCall>), String> {
+        if self.turn >= self.max_turns {
+            self.cap_reached = true;
+            return Err(TURN_CAP_ERROR.to_owned());
+        }
+        let index = self.turn;
+        self.turn += 1;
+        let recorded = self.recorded_calls.get(index).cloned().unwrap_or_default();
+        Ok((index, recorded))
+    }
+
+    /// The recorded outcome of the same call, or the stub outcome.
     fn answer(&mut self, request: &ToolCallRequest) -> ToolOutcome {
         let recorded = self.tools.iter_mut().find(|tool| {
             !tool.used
@@ -551,9 +624,12 @@ impl Session {
     }
 }
 
-/// Give each candidate call the id of the recorded call at the same position,
-/// when the two calls have the same name and arguments.
-fn adopt_recorded_ids(turn: &mut ModelTurn, recorded: &[ToolCall]) {
+/// Align the call ids of candidate turn `index` with the recorded turn.
+///
+/// A call that equals the recorded call at the same position takes the
+/// recorded id. Any other call gets a new `eval_` id, so no recorded approval
+/// name can match it.
+fn align_call_ids(turn: &mut ModelTurn, recorded: &[ToolCall], index: usize) {
     let calls = turn.content.iter_mut().filter_map(|part| match part {
         ContentPart::ToolCall {
             id,
@@ -562,9 +638,12 @@ fn adopt_recorded_ids(turn: &mut ModelTurn, recorded: &[ToolCall]) {
         } => Some((id, name, arguments)),
         _ => None,
     });
-    for ((id, name, arguments), original) in calls.zip(recorded) {
-        if *name == original.name && *arguments == original.arguments {
-            id.clone_from(&original.id);
+    for (position, (id, name, arguments)) in calls.enumerate() {
+        match recorded.get(position) {
+            Some(original) if *name == original.name && *arguments == original.arguments => {
+                id.clone_from(&original.id);
+            }
+            _ => *id = format!("{EVAL_ID_PREFIX}{index}_{position}_{id}"),
         }
     }
 }
@@ -646,6 +725,17 @@ fn verdict(recorded: Option<&TurnDecision>, candidate: Option<&TurnDecision>) ->
     }
 }
 
+/// `true` when the two runs end in different ways.
+fn ends_differ(recorded: &RunEnd, candidate: &RunEnd) -> bool {
+    match (recorded, candidate) {
+        (RunEnd::Completed(recorded), RunEnd::Completed(candidate)) => {
+            recorded.stop != candidate.stop
+        }
+        (RunEnd::Failed(_), RunEnd::Failed(_)) => false,
+        _ => true,
+    }
+}
+
 /// The signal of a signal-wait deadline timer, or `None` for another timer.
 fn timed_out_signal(timer_id: &str) -> Option<&str> {
     let rest = timer_id.strip_prefix(SIGNAL_TIMEOUT_PREFIX)?;
@@ -696,6 +786,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::TokenUsage;
     use serde_json::json;
 
     fn decision(calls: &[(&str, Value)], text: &str, stop: StopReason) -> TurnDecision {
@@ -710,6 +801,30 @@ mod tests {
                 .collect(),
             text: text.to_owned(),
             stop,
+        }
+    }
+
+    fn call(id: &str, name: &str, arguments: Value) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments,
+        }
+    }
+
+    fn turn_of(calls: &[ToolCall]) -> ModelTurn {
+        ModelTurn {
+            content: calls
+                .iter()
+                .map(|call| ContentPart::ToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                })
+                .collect(),
+            stop: StopReason::ToolUse,
+            usage: TokenUsage::default(),
+            decisions: Vec::new(),
         }
     }
 
@@ -754,6 +869,23 @@ mod tests {
     }
 
     #[test]
+    fn the_text_of_a_tool_turn_is_not_compared() {
+        let before = decision(&[("a", json!(1))], "Let me look.", StopReason::ToolUse);
+        let after = decision(&[("a", json!(1))], "Checking.", StopReason::ToolUse);
+        assert_eq!(verdict(Some(&before), Some(&after)), Verdict::Same);
+    }
+
+    #[test]
+    fn a_call_with_no_recorded_decision_reads_as_denied() {
+        let turn = turn_of(&[call("c1", "a", json!(1))]);
+        let decision = TurnDecision::of(&turn);
+        assert!(matches!(
+            decision.calls[0].decision,
+            ToolDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
     fn a_deadline_timer_names_its_signal() {
         assert_eq!(
             timed_out_signal("__signal_timeout:3:tool_approval:0:0:w1"),
@@ -779,37 +911,59 @@ mod tests {
 
     #[test]
     fn only_an_equal_call_takes_the_recorded_id() {
-        let recorded = vec![
-            ToolCall {
-                id: "r1".into(),
-                name: "a".into(),
-                arguments: json!(1),
-            },
-            ToolCall {
-                id: "r2".into(),
-                name: "b".into(),
-                arguments: json!(2),
-            },
-        ];
-        let mut turn = ModelTurn {
-            content: vec![
-                ContentPart::ToolCall {
-                    id: "c1".into(),
-                    name: "a".into(),
-                    arguments: json!(1),
-                },
-                ContentPart::ToolCall {
-                    id: "c2".into(),
-                    name: "b".into(),
-                    arguments: json!(3),
-                },
-            ],
-            stop: StopReason::ToolUse,
-            usage: crate::message::TokenUsage::default(),
-            decisions: Vec::new(),
-        };
-        adopt_recorded_ids(&mut turn, &recorded);
+        let recorded = vec![call("r1", "a", json!(1)), call("r2", "b", json!(2))];
+        let mut turn = turn_of(&[call("c1", "a", json!(1)), call("c2", "b", json!(3))]);
+        align_call_ids(&mut turn, &recorded, 4);
         let ids: Vec<String> = turn.calls().into_iter().map(|call| call.id).collect();
-        assert_eq!(ids, vec!["r1".to_owned(), "c2".to_owned()]);
+        assert_eq!(ids, vec!["r1".to_owned(), "eval_4_1_c2".to_owned()]);
+    }
+
+    #[test]
+    fn the_report_shapes_use_named_tags() {
+        assert_eq!(json!(Verdict::Same), json!({"verdict": "same"}));
+        assert_eq!(
+            json!(Verdict::Diverged(Divergence::Missing(Side::Recorded))),
+            json!({"verdict": "diverged", "divergence": {"kind": "missing", "side": "recorded"}})
+        );
+        let call = CallDecision {
+            name: "a".into(),
+            arguments: json!(1),
+            decision: ToolDecision::Deny {
+                reason: "no".into(),
+            },
+        };
+        let value = json!(call);
+        assert_eq!(
+            value,
+            json!({"name": "a", "arguments": 1, "decision": "deny", "reason": "no"})
+        );
+        let back: CallDecision = serde_json::from_value(value).unwrap();
+        assert_eq!(back, call);
+    }
+
+    #[test]
+    fn two_ends_differ_by_kind_and_stop() {
+        let failed = RunEnd::Failed("x".into());
+        assert!(!ends_differ(&failed, &RunEnd::Failed("y".into())));
+        let report = |stop| {
+            RunEnd::Completed(AgentReport {
+                stop,
+                text: String::new(),
+                steps_used: 0,
+                tool_calls: 0,
+                usage: TokenUsage::default(),
+                messages: Vec::new(),
+                followups: 0,
+                followup_dropped: false,
+            })
+        };
+        let done = report(crate::AgentStop::Completed);
+        assert!(!ends_differ(&done, &done.clone()));
+        assert!(ends_differ(
+            &done,
+            &report(crate::AgentStop::TokensExhausted)
+        ));
+        assert!(ends_differ(&done, &failed));
+        assert!(ends_differ(&failed, &done));
     }
 }
