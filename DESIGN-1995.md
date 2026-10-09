@@ -274,6 +274,10 @@ $ my-worker-upgrade-check \
 - The replay timeout cannot stop candidate code that never yields.
 - Nothing ties the candidate manifest to the binary under test. Build both
   from the same commit.
+- The check reads the in-flight runs once. A run that starts on the
+  baseline build after that read is not in the report. The operator closes
+  the baseline set first: the build policy points new starts at the
+  candidate build. The check only reads, so it cannot enforce this.
 - The baseline manifest describes one build. A run with an assigned build
   is compared only when `--baseline-build` names that build. A run with no
   assigned build is trusted to have run the baseline.

@@ -66,6 +66,14 @@ binary. Use `with_offloader` when the worker offloads large payloads. Use
 
 ## 3. Run the check
 
+The check reads the in-flight runs once. A run that starts on the baseline
+build after that read is not in the report. So close the baseline set first:
+point the build policy of each queue at the candidate build, so every new
+run starts there. See
+[Build-id routing](runbooks/safe-deploy.md#runbook-build-id-routing-for-safe-rolling-deploys).
+Then run the check. Without build routing, stop new starts of the checked
+workflows until you act on the report.
+
 ```console
 $ my-upgrade-check \
     --database-url-env SHARD0_URL --database-url-env SHARD1_URL \

@@ -611,8 +611,9 @@ behaviour change). Those deploys can use the plain drain runbook above.
 Use this when your replay test suite (e.g. `WorkflowReplayer`) confirms the new
 build handles all in-flight histories safely. The
 [upgrade check](../upgrade-check.md) gives that answer per in-flight run.
-Declare compat only when each run gets `migrate`, or a person accepts each
-`review` finding.
+Point the build policy at the new build before you run the check, so no new
+run starts on the old build after the check reads. Declare compat only when
+each run gets `migrate`, or a person accepts each `review` finding.
 
 **Step 1 — Deploy new workers with the new build id.**
 
