@@ -92,7 +92,7 @@ async fn rpc(app: &Router, body: Value) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"))
 }
 
-fn call(method: &str, params: Value) -> Value {
+fn call(method: &str, params: &Value) -> Value {
     json!({"jsonrpc": "2.0", "id": 7, "method": method, "params": params})
 }
 
@@ -100,7 +100,7 @@ fn call(method: &str, params: Value) -> Value {
 async fn initialize_advertises_the_tasks_extension() {
     let out = rpc(
         &router(),
-        call("initialize", json!({"protocolVersion": "2025-06-18"})),
+        call("initialize", &json!({"protocolVersion": "2025-06-18"})),
     )
     .await;
     assert_eq!(out["id"], 7);
@@ -113,7 +113,7 @@ async fn initialize_advertises_the_tasks_extension() {
 
 #[tokio::test]
 async fn server_discover_advertises_the_tasks_extension() {
-    let out = rpc(&router(), call("server/discover", json!({}))).await;
+    let out = rpc(&router(), call("server/discover", &json!({}))).await;
     assert_eq!(
         out["result"]["capabilities"]["extensions"][TASKS_EXTENSION],
         json!({})
@@ -122,7 +122,7 @@ async fn server_discover_advertises_the_tasks_extension() {
 
 #[tokio::test]
 async fn tools_list_serves_one_start_tool_per_mcp_workflow() {
-    let out = rpc(&router(), call("tools/list", json!({}))).await;
+    let out = rpc(&router(), call("tools/list", &json!({}))).await;
     let tools = out["result"]["tools"].as_array().expect("tools array");
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert_eq!(names, ["start_review_flow"]);
@@ -149,7 +149,7 @@ async fn tools_list_serves_one_start_tool_per_mcp_workflow() {
 async fn task_methods_need_the_client_capability() {
     let app = router();
     for method in ["tasks/get", "tasks/update", "tasks/cancel"] {
-        let out = rpc(&app, call(method, json!({"taskId": "x"}))).await;
+        let out = rpc(&app, call(method, &json!({"taskId": "x"}))).await;
         assert_eq!(out["error"]["code"], MISSING_CLIENT_CAPABILITY, "{method}");
         assert_eq!(
             out["error"]["data"]["requiredCapabilities"]["extensions"][TASKS_EXTENSION],
@@ -167,7 +167,7 @@ async fn a_malformed_task_id_is_invalid_params() {
             &app,
             call(
                 method,
-                json!({"taskId": "not-a-task", "inputResponses": {}, "_meta": declared()}),
+                &json!({"taskId": "not-a-task", "inputResponses": {}, "_meta": declared()}),
             ),
         )
         .await;
@@ -177,7 +177,7 @@ async fn a_malformed_task_id_is_invalid_params() {
 
 #[tokio::test]
 async fn a_missing_task_id_is_invalid_params() {
-    let out = rpc(&router(), call("tasks/get", json!({"_meta": declared()}))).await;
+    let out = rpc(&router(), call("tasks/get", &json!({"_meta": declared()}))).await;
     assert_eq!(out["error"]["code"], -32602, "{out}");
 }
 
@@ -187,7 +187,7 @@ async fn an_unknown_tool_is_invalid_params() {
         &router(),
         call(
             "tools/call",
-            json!({"name": "start_private_flow", "arguments": {"body": null}}),
+            &json!({"name": "start_private_flow", "arguments": {"body": null}}),
         ),
     )
     .await;
@@ -202,7 +202,7 @@ async fn a_start_that_fails_is_a_tool_error_not_a_task() {
         &router(),
         call(
             "tools/call",
-            json!({"name": "start_review_flow", "arguments": {"body": "d1"}, "_meta": declared()}),
+            &json!({"name": "start_review_flow", "arguments": {"body": "d1"}, "_meta": declared()}),
         ),
     )
     .await;
@@ -212,19 +212,19 @@ async fn a_start_that_fails_is_a_tool_error_not_a_task() {
 
 #[tokio::test]
 async fn an_unknown_method_is_method_not_found() {
-    let out = rpc(&router(), call("tasks/list", json!({"_meta": declared()}))).await;
+    let out = rpc(&router(), call("tasks/list", &json!({"_meta": declared()}))).await;
     assert_eq!(out["error"]["code"], -32601, "{out}");
 }
 
 #[tokio::test]
 async fn ping_answers_an_empty_result() {
-    let out = rpc(&router(), call("ping", json!({}))).await;
+    let out = rpc(&router(), call("ping", &json!({}))).await;
     assert_eq!(out["result"], json!({}));
 }
 
 #[tokio::test]
 async fn a_batch_is_an_invalid_request() {
-    let out = rpc(&router(), json!([call("ping", json!({}))])).await;
+    let out = rpc(&router(), json!([call("ping", &json!({}))])).await;
     assert_eq!(out["error"]["code"], -32600, "{out}");
 }
 
@@ -262,7 +262,7 @@ async fn a_non_json_content_type_is_refused() {
     let (status, _) = post_raw(
         &router(),
         "text/plain",
-        call("ping", json!({})).to_string(),
+        call("ping", &json!({})).to_string(),
         None,
     )
     .await;
@@ -280,7 +280,7 @@ fn session(role: &str) -> Session {
 #[tokio::test]
 async fn a_read_only_principal_is_refused() {
     let app = router_with(&open_state(), true);
-    let body = call("ping", json!({})).to_string();
+    let body = call("ping", &json!({})).to_string();
     let (status, text) = post_raw(
         &app,
         "application/json",
@@ -299,7 +299,7 @@ async fn an_anonymous_caller_is_refused_outside_dev() {
     let api_state = HarvestApiState::new();
     api_state.set_deployment_profile("prod");
     let app = router_with(&api_state, false);
-    let body = call("ping", json!({})).to_string();
+    let body = call("ping", &json!({})).to_string();
     let (status, _) = post_raw(&app, "application/json", body.clone(), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, _) = post_raw(&app, "application/json", body, Some(session("admin"))).await;
