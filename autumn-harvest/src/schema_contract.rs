@@ -47,7 +47,17 @@ use crate::info::{ActivityInfo, SideEffectInfo, WorkflowInfo};
 
 /// Schema-contract format version. Bump on a breaking change to the *artifact*
 /// shape (not to a workflow's payload schema).
-pub const SCHEMA_CONTRACT_VERSION: &str = "1";
+///
+/// Version `2` adds the `activities` and `side_effects` sections (issue #1994).
+/// A version `1` binary ignores unknown keys, so it would skip those sections
+/// in silence. The bump makes it refuse the file instead.
+pub const SCHEMA_CONTRACT_VERSION: &str = "2";
+
+/// Older format versions that this build still reads.
+///
+/// Version `1` is version `2` with no `activities` and no `side_effects`, so
+/// it reads as a contract with both sections empty.
+const READABLE_LEGACY_CONTRACT_VERSIONS: &[&str] = &["1"];
 
 /// Default checked-in baseline path, relative to the repository root.
 pub const DEFAULT_SCHEMA_CONTRACT_PATH: &str = "docs/workflow-schema-contract.json";
@@ -153,6 +163,37 @@ impl SchemaSubject {
 impl std::fmt::Display for SchemaSubject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// The item a schema belongs to, as the differ sees it (issue #1994).
+#[derive(Clone, Copy)]
+struct Subject<'a> {
+    kind: SchemaSubject,
+    /// Workflow or activity name. For a side effect, the owning workflow.
+    name: &'a str,
+    side_effect: Option<&'a str>,
+}
+
+impl Subject<'_> {
+    /// A delta about this subject with no payload path.
+    fn delta(
+        self,
+        role: Option<SchemaRole>,
+        change: ChangeKind,
+        verdict: Verdict,
+        reason: String,
+    ) -> SchemaDelta {
+        SchemaDelta {
+            subject: self.kind,
+            workflow: self.name.to_string(),
+            side_effect: self.side_effect.map(str::to_string),
+            role,
+            field_path: String::new(),
+            change,
+            verdict,
+            reason,
+        }
     }
 }
 
@@ -568,6 +609,15 @@ impl ActivitySchemaEntry {
             SchemaRole::Error | SchemaRole::Value => None,
         }
     }
+
+    /// Strip annotations from every published schema, in place.
+    fn canonicalize(&mut self) {
+        for slot in [&mut self.input_schema, &mut self.output_schema] {
+            if let Some(s) = slot.as_mut() {
+                *s = canonicalize_schema(s);
+            }
+        }
+    }
 }
 
 /// The published value schema of one side effect (issue #1994).
@@ -590,6 +640,13 @@ impl SideEffectSchemaEntry {
             workflow: info.workflow.to_string(),
             id: info.id.to_string(),
             value_schema: info.value_schema.map(|f| f()),
+        }
+    }
+
+    /// Strip annotations from the published schema, in place.
+    fn canonicalize(&mut self) {
+        if let Some(s) = self.value_schema.as_mut() {
+            *s = canonicalize_schema(s);
         }
     }
 }
@@ -643,6 +700,8 @@ impl CompatibilityRules {
                  is not a non-negative integer on either side: the engine's validator reads them \
                  with as_u64 and IGNORES anything else, so such a value is not a smaller bound \
                  but an absent one (fail closed)",
+                "Removing a side-effect declaration. It is not registered with the runtime, so \
+                 its call site can still read recorded values (issue #1994)",
             ]
             .into_iter()
             .map(ToString::to_string)
@@ -658,6 +717,8 @@ impl CompatibilityRules {
                 "Adding a workflow type, or publishing a schema for the first time",
                 "Removing a workflow type (gated more accurately by \
                  `harvest workflow-types reachability`, issue #520)",
+                "Adding an activity type or a side effect, or removing an activity type \
+                 (issue #1994)",
                 "Editing any annotation (title, description, examples, …)",
             ]
             .into_iter()
@@ -792,49 +853,110 @@ impl WorkflowSchemaContract {
             e.canonicalize();
             by_name.insert(e.name.clone(), e);
         }
-        let workflows: Vec<WorkflowSchemaEntry> = by_name.into_values().collect();
-        let coverage = SchemaCoverage {
-            workflows_total: workflows.len(),
-            with_input_schema: workflows
-                .iter()
-                .filter(|w| w.input_schema.is_some())
-                .count(),
-            with_output_schema: workflows
-                .iter()
-                .filter(|w| w.output_schema.is_some())
-                .count(),
-            with_error_schema: workflows
-                .iter()
-                .filter(|w| w.error_schema.is_some())
-                .count(),
-            ..SchemaCoverage::default()
-        };
-        Self {
+        let mut contract = Self {
             version: version.to_string(),
             contract_version: SCHEMA_CONTRACT_VERSION.to_string(),
             description: default_description(),
             compatibility: CompatibilityRules::current(),
-            coverage,
+            coverage: SchemaCoverage::default(),
             acknowledged_breaking_changes: Vec::new(),
-            workflows,
+            workflows: by_name.into_values().collect(),
             activities: Vec::new(),
             side_effects: Vec::new(),
-        }
+        };
+        contract.recount();
+        contract
     }
 
     /// Add the published schemas of registered activities (issue #1994).
+    ///
+    /// Pass the same `ActivityInfo` values that the runtime registers. An
+    /// activity with no schema is still listed, so coverage shows it. Duplicate
+    /// names collapse last-wins, the same as [`Self::from_infos`].
     #[must_use]
-    pub fn with_activities<'a>(self, _infos: impl IntoIterator<Item = &'a ActivityInfo>) -> Self {
+    pub fn with_activities<'a>(
+        mut self,
+        infos: impl IntoIterator<Item = &'a ActivityInfo>,
+    ) -> Self {
+        let added = infos.into_iter().map(ActivitySchemaEntry::from_info);
+        let all: Vec<ActivitySchemaEntry> = std::mem::take(&mut self.activities)
+            .into_iter()
+            .chain(added)
+            .collect();
+        self.activities = index_activities(all);
+        self.recount();
         self
     }
 
     /// Add the published value schemas of declared side effects (issue #1994).
+    ///
+    /// The key is `(workflow, id)`. Duplicate keys collapse last-wins.
     #[must_use]
     pub fn with_side_effects<'a>(
-        self,
-        _infos: impl IntoIterator<Item = &'a SideEffectInfo>,
+        mut self,
+        infos: impl IntoIterator<Item = &'a SideEffectInfo>,
     ) -> Self {
+        let added = infos.into_iter().map(SideEffectSchemaEntry::from_info);
+        let all: Vec<SideEffectSchemaEntry> = std::mem::take(&mut self.side_effects)
+            .into_iter()
+            .chain(added)
+            .collect();
+        self.side_effects = index_side_effects(all);
+        self.recount();
         self
+    }
+
+    /// Recompute [`Self::coverage`] from the three sections.
+    fn recount(&mut self) {
+        self.coverage = SchemaCoverage {
+            workflows_total: self.workflows.len(),
+            with_input_schema: self
+                .workflows
+                .iter()
+                .filter(|w| w.input_schema.is_some())
+                .count(),
+            with_output_schema: self
+                .workflows
+                .iter()
+                .filter(|w| w.output_schema.is_some())
+                .count(),
+            with_error_schema: self
+                .workflows
+                .iter()
+                .filter(|w| w.error_schema.is_some())
+                .count(),
+            activities_total: self.activities.len(),
+            with_activity_input_schema: self
+                .activities
+                .iter()
+                .filter(|a| a.input_schema.is_some())
+                .count(),
+            with_activity_output_schema: self
+                .activities
+                .iter()
+                .filter(|a| a.output_schema.is_some())
+                .count(),
+            side_effects_total: self.side_effects.len(),
+            with_side_effect_value_schema: self
+                .side_effects
+                .iter()
+                .filter(|s| s.value_schema.is_some())
+                .count(),
+        };
+    }
+
+    /// Look up an activity entry by name.
+    #[must_use]
+    pub fn activity(&self, name: &str) -> Option<&ActivitySchemaEntry> {
+        self.activities.iter().find(|a| a.name == name)
+    }
+
+    /// Look up a side-effect entry by its `(workflow, id)` key.
+    #[must_use]
+    pub fn side_effect(&self, workflow: &str, id: &str) -> Option<&SideEffectSchemaEntry> {
+        self.side_effects
+            .iter()
+            .find(|s| s.workflow == workflow && s.id == id)
     }
 
     /// Parse a contract document.
@@ -871,7 +993,9 @@ impl WorkflowSchemaContract {
         // may change what a verdict MEANS, and silently diffing it under v1
         // rules would hand back confident answers computed from the wrong
         // ruleset — the one failure mode a compatibility gate must never have.
-        if parsed.contract_version != SCHEMA_CONTRACT_VERSION {
+        if parsed.contract_version != SCHEMA_CONTRACT_VERSION
+            && !READABLE_LEGACY_CONTRACT_VERSIONS.contains(&parsed.contract_version.as_str())
+        {
             return Err(SchemaContractError::Parse(format!(
                 "contract_version `{}` is not supported by this build (expected `{}`). Upgrade \
                  the `harvest` CLI to match the checked-in baseline, or regenerate the baseline \
@@ -883,7 +1007,9 @@ impl WorkflowSchemaContract {
         // canonical schemas, sorted+unique entries, and accurate coverage.
         let rebuilt = Self::from_entries(&parsed.version, std::mem::take(&mut parsed.workflows));
         parsed.workflows = rebuilt.workflows;
-        parsed.coverage = rebuilt.coverage;
+        parsed.activities = index_activities(std::mem::take(&mut parsed.activities));
+        parsed.side_effects = index_side_effects(std::mem::take(&mut parsed.side_effects));
+        parsed.recount();
         Ok(parsed)
     }
 
@@ -973,6 +1099,9 @@ impl WorkflowSchemaContract {
     /// plus `new_acks`.
     fn rebase_onto(&self, current: &Self, new_acks: Vec<AcknowledgedBreakingChange>) -> Self {
         let mut next = Self::from_entries(&current.version, current.workflows.clone());
+        next.activities = index_activities(current.activities.clone());
+        next.side_effects = index_side_effects(current.side_effects.clone());
+        next.recount();
         if next.version == UNKNOWN_VERSION {
             // A bare `/workflows/registered` body carries no crate version;
             // keep the baseline's rather than regressing it to a placeholder.
@@ -983,6 +1112,31 @@ impl WorkflowSchemaContract {
         next.acknowledged_breaking_changes.extend(new_acks);
         next
     }
+}
+
+/// Canonicalise, deduplicate last-wins and sort activity entries by name.
+fn index_activities(
+    entries: impl IntoIterator<Item = ActivitySchemaEntry>,
+) -> Vec<ActivitySchemaEntry> {
+    let mut by_name: BTreeMap<String, ActivitySchemaEntry> = BTreeMap::new();
+    for mut e in entries {
+        e.canonicalize();
+        by_name.insert(e.name.clone(), e);
+    }
+    by_name.into_values().collect()
+}
+
+/// Canonicalise, deduplicate last-wins and sort side-effect entries by
+/// `(workflow, id)`.
+fn index_side_effects(
+    entries: impl IntoIterator<Item = SideEffectSchemaEntry>,
+) -> Vec<SideEffectSchemaEntry> {
+    let mut by_key: BTreeMap<(String, String), SideEffectSchemaEntry> = BTreeMap::new();
+    for mut e in entries {
+        e.canonicalize();
+        by_key.insert((e.workflow.clone(), e.id.clone()), e);
+    }
+    by_key.into_values().collect()
 }
 
 /// Placeholder version for a contract parsed from a bare
@@ -1002,7 +1156,8 @@ fn default_description() -> String {
     let stripped = ANNOTATION_KEYWORDS.join("/");
     format!(
         "Versioned machine-readable baseline of every registered workflow type's published \
-         input/output/error JSON Schema (issue #373), used by `harvest schema check` to gate \
+         input/output/error JSON Schema (issue #373), and of activity input/output and \
+         side-effect value schemas (issue #1994), used by `harvest schema check` to gate \
          backward-incompatible payload changes before they DLQ in-flight executions (issue \
          #794). Stored schemas are canonicalised: only the pure annotations ({stripped}) are \
          stripped, so a doc-comment edit never dirties this file. Every other keyword is \
@@ -1388,8 +1543,42 @@ fn collapse_unit_enum_branches(obj: &mut Map<String, Value>) {
 
 // ── The escape hatch, verified ───────────────────────────────────────────────
 
-/// The four fields that identify *which* change an acknowledgement covers.
-type AckIdentity<'a> = (&'a str, Option<SchemaRole>, &'a str, ChangeKind);
+/// The fields that identify *which* change an acknowledgement covers.
+///
+/// The subject and the side-effect id are part of it (issue #1994). Without
+/// them, an ack for workflow `charge` would also cover activity `charge`.
+type AckKey = (
+    SchemaSubject,
+    String,
+    Option<String>,
+    Option<SchemaRole>,
+    String,
+    ChangeKind,
+);
+
+/// The identity that an acknowledgement covers.
+fn ack_key(a: &AcknowledgedBreakingChange) -> AckKey {
+    (
+        a.subject,
+        a.workflow.clone(),
+        a.side_effect.clone(),
+        a.role,
+        a.field_path.clone(),
+        a.change,
+    )
+}
+
+/// The identity that an acknowledgement of `d` must carry.
+fn delta_key(d: &SchemaDelta) -> AckKey {
+    (
+        d.subject,
+        d.workflow.clone(),
+        d.side_effect.clone(),
+        d.role,
+        d.field_path.clone(),
+        d.change,
+    )
+}
 
 /// Breaking deltas in `diff` that `head` does not acknowledge.
 ///
@@ -1424,35 +1613,27 @@ pub fn unacknowledged_breaking<'d>(
     base: &WorkflowSchemaContract,
     head: &WorkflowSchemaContract,
 ) -> Vec<&'d SchemaDelta> {
-    let identity = |a: &AcknowledgedBreakingChange| {
-        (a.workflow.clone(), a.role, a.field_path.clone(), a.change)
-    };
-    let mut available: BTreeMap<(String, Option<SchemaRole>, String, ChangeKind), usize> =
-        BTreeMap::new();
+    let mut available: BTreeMap<AckKey, usize> = BTreeMap::new();
     for a in head
         .acknowledged_breaking_changes
         .iter()
         .filter(|a| !a.reason.trim().is_empty())
     {
-        *available.entry(identity(a)).or_default() += 1;
+        *available.entry(ack_key(a)).or_default() += 1;
     }
     // Consume the records the base revision already carried: they are not new.
     for a in &base.acknowledged_breaking_changes {
-        if let Some(n) = available.get_mut(&identity(a)) {
+        if let Some(n) = available.get_mut(&ack_key(a)) {
             *n = n.saturating_sub(1);
         }
     }
     diff.breaking()
-        .filter(|d| {
-            let key: AckIdentity<'_> = (&d.workflow, d.role, &d.field_path, d.change);
-            let owned = (key.0.to_string(), key.1, key.2.to_string(), key.3);
-            match available.get_mut(&owned) {
-                Some(n) if *n > 0 => {
-                    *n -= 1;
-                    false
-                }
-                _ => true,
+        .filter(|d| match available.get_mut(&delta_key(d)) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                false
             }
+            _ => true,
         })
         .collect()
 }
@@ -1481,17 +1662,13 @@ pub fn dropped_acknowledgements<'b>(
     base: &'b WorkflowSchemaContract,
     head: &WorkflowSchemaContract,
 ) -> Vec<&'b AcknowledgedBreakingChange> {
-    let identity = |a: &AcknowledgedBreakingChange| {
-        (a.workflow.clone(), a.role, a.field_path.clone(), a.change)
-    };
-    let mut available: BTreeMap<(String, Option<SchemaRole>, String, ChangeKind), usize> =
-        BTreeMap::new();
+    let mut available: BTreeMap<AckKey, usize> = BTreeMap::new();
     for a in &head.acknowledged_breaking_changes {
-        *available.entry(identity(a)).or_default() += 1;
+        *available.entry(ack_key(a)).or_default() += 1;
     }
     base.acknowledged_breaking_changes
         .iter()
-        .filter(|a| match available.get_mut(&identity(a)) {
+        .filter(|a| match available.get_mut(&ack_key(a)) {
             Some(n) if *n > 0 => {
                 *n -= 1;
                 false
@@ -1576,9 +1753,14 @@ pub fn diff_schema_contracts(
         let (Some(b), Some(c)) = (baseline.entry(name), current.entry(name)) else {
             continue;
         };
+        let subject = Subject {
+            kind: SchemaSubject::Workflow,
+            name,
+            side_effect: None,
+        };
         for role in SchemaRole::all() {
             diff_role(
-                name,
+                subject,
                 role,
                 b.schema_for(role),
                 c.schema_for(role),
@@ -1587,19 +1769,156 @@ pub fn diff_schema_contracts(
         }
     }
 
+    diff_activities(baseline, current, &mut diff);
+    diff_side_effects(baseline, current, &mut diff);
+
     diff.deltas.sort_by(|a, b| {
-        (&a.workflow, a.role, &a.field_path, a.change).cmp(&(
-            &b.workflow,
-            b.role,
-            &b.field_path,
-            b.change,
-        ))
+        (
+            a.subject,
+            &a.workflow,
+            &a.side_effect,
+            a.role,
+            &a.field_path,
+            a.change,
+        )
+            .cmp(&(
+                b.subject,
+                &b.workflow,
+                &b.side_effect,
+                b.role,
+                &b.field_path,
+                b.change,
+            ))
     });
     diff
 }
 
+/// Diff the activity sections (issue #1994).
+///
+/// The rules match the workflow walk. An added or removed activity is
+/// compatible, the same as an added or removed workflow.
+fn diff_activities(
+    baseline: &WorkflowSchemaContract,
+    current: &WorkflowSchemaContract,
+    diff: &mut SchemaContractDiff,
+) {
+    let base: BTreeSet<&str> = baseline
+        .activities
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect();
+    let cur: BTreeSet<&str> = current.activities.iter().map(|a| a.name.as_str()).collect();
+    let subject = |name| Subject {
+        kind: SchemaSubject::Activity,
+        name,
+        side_effect: None,
+    };
+    for name in cur.difference(&base) {
+        diff.push(subject(name).delta(
+            None,
+            ChangeKind::ActivityAdded,
+            Verdict::Compatible,
+            "new activity type. No recorded history exists for it yet".to_string(),
+        ));
+    }
+    for name in base.difference(&cur) {
+        diff.push(
+            subject(name).delta(
+                None,
+                ChangeKind::ActivityRemoved,
+                Verdict::Compatible,
+                "activity type is no longer registered. Payload compatibility is not the question \
+             here. A queued task of this type has no handler, so drain the queue before you \
+             remove it"
+                    .to_string(),
+            ),
+        );
+    }
+    for name in base.intersection(&cur) {
+        let (Some(b), Some(c)) = (baseline.activity(name), current.activity(name)) else {
+            continue;
+        };
+        for role in SchemaRole::activity() {
+            diff_role(
+                subject(name),
+                role,
+                b.schema_for(role),
+                c.schema_for(role),
+                diff,
+            );
+        }
+    }
+}
+
+/// Diff the side-effect sections (issue #1994).
+///
+/// An added side effect is compatible. A removed one is breaking: the
+/// declaration is not registered with the runtime, so its call site can
+/// outlive it. A silent removal would stop the check with the value still read.
+fn diff_side_effects(
+    baseline: &WorkflowSchemaContract,
+    current: &WorkflowSchemaContract,
+    diff: &mut SchemaContractDiff,
+) {
+    let key = |s: &SideEffectSchemaEntry| (s.workflow.clone(), s.id.clone());
+    let base: BTreeSet<(String, String)> = baseline.side_effects.iter().map(key).collect();
+    let cur: BTreeSet<(String, String)> = current.side_effects.iter().map(key).collect();
+    for (workflow, id) in cur.difference(&base) {
+        diff.push(
+            Subject {
+                kind: SchemaSubject::SideEffect,
+                name: workflow,
+                side_effect: Some(id),
+            }
+            .delta(
+                None,
+                ChangeKind::SideEffectAdded,
+                Verdict::Compatible,
+                "new side effect. No recorded value exists for it yet".to_string(),
+            ),
+        );
+    }
+    for (workflow, id) in base.difference(&cur) {
+        diff.push(
+            Subject {
+                kind: SchemaSubject::SideEffect,
+                name: workflow,
+                side_effect: Some(id),
+            }
+            .delta(
+                None,
+                ChangeKind::SideEffectRemoved,
+                Verdict::Breaking,
+                "the side-effect declaration was removed. The declaration is not registered \
+                 with the runtime, so the call site can still read recorded values. \
+                 Acknowledge the removal if the call site is gone too"
+                    .to_string(),
+            ),
+        );
+    }
+    for (workflow, id) in base.intersection(&cur) {
+        let (Some(b), Some(c)) = (
+            baseline.side_effect(workflow, id),
+            current.side_effect(workflow, id),
+        ) else {
+            continue;
+        };
+        diff_role(
+            Subject {
+                kind: SchemaSubject::SideEffect,
+                name: workflow,
+                side_effect: Some(id),
+            },
+            SchemaRole::Value,
+            b.value_schema.as_ref(),
+            c.value_schema.as_ref(),
+            diff,
+        );
+    }
+}
+
 fn diff_role(
-    workflow: &str,
+    subject: Subject<'_>,
     role: SchemaRole,
     baseline: Option<&Value>,
     current: Option<&Value>,
@@ -1607,38 +1926,30 @@ fn diff_role(
 ) {
     match (baseline, current) {
         (None, None) => {}
-        (None, Some(_)) => diff.push(SchemaDelta {
-            subject: SchemaSubject::Workflow,
-            workflow: workflow.to_string(),
-            side_effect: None,
-            role: Some(role),
-            field_path: String::new(),
-            change: ChangeKind::SchemaAdded,
-            verdict: Verdict::Compatible,
-            reason: format!(
+        (None, Some(_)) => diff.push(subject.delta(
+            Some(role),
+            ChangeKind::SchemaAdded,
+            Verdict::Compatible,
+            format!(
                 "a {role} schema is now published; recorded payloads were previously \
                  unconstrained by this gate"
             ),
-        }),
-        (Some(_), None) => diff.push(SchemaDelta {
-            subject: SchemaSubject::Workflow,
-            workflow: workflow.to_string(),
-            side_effect: None,
-            role: Some(role),
-            field_path: String::new(),
-            change: ChangeKind::SchemaRemoved,
-            verdict: Verdict::Breaking,
-            reason: format!(
+        )),
+        (Some(_), None) => diff.push(subject.delta(
+            Some(role),
+            ChangeKind::SchemaRemoved,
+            Verdict::Breaking,
+            format!(
                 "the published {role} schema was withdrawn. This does not break replay by \
                  itself, but it removes this payload from the gate's coverage — deleting a \
                  schema must never be a silent way to stop being checked"
             ),
-        }),
+        )),
         (Some(b), Some(c)) => {
             let bc = canonicalize_schema(b);
             let cc = canonicalize_schema(c);
             let mut ctx = DiffCtx {
-                workflow,
+                subject,
                 role,
                 base_root: &bc,
                 cur_root: &cc,
@@ -1654,7 +1965,7 @@ fn diff_role(
 
 /// Per-schema walk state.
 struct DiffCtx<'a> {
-    workflow: &'a str,
+    subject: Subject<'a>,
     role: SchemaRole,
     base_root: &'a Value,
     cur_root: &'a Value,
@@ -1724,14 +2035,8 @@ impl DiffCtx<'_> {
         reason: String,
     ) -> SchemaDelta {
         SchemaDelta {
-            subject: SchemaSubject::Workflow,
-            workflow: self.workflow.to_string(),
-            side_effect: None,
-            role: Some(self.role),
             field_path: field_path.to_string(),
-            change,
-            verdict,
-            reason,
+            ..self.subject.delta(Some(self.role), change, verdict, reason)
         }
     }
 }

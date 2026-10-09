@@ -17,7 +17,7 @@ use autumn_harvest::testing::WorkflowReplayer;
 use autumn_harvest::{
     AcknowledgedBreakingChange, DetCheckReport, DetSeverity, SchemaContractDiff, SchemaDelta,
     SchemaRole, WorkflowSchemaContract, check_paths, diff_schema_contracts,
-    dropped_acknowledgements, unacknowledged_breaking,
+    dropped_acknowledgements, subject_label, unacknowledged_breaking,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use diesel_async::AsyncPgConnection;
@@ -7547,8 +7547,11 @@ fn read_schema_contract(path: &Path) -> Result<WorkflowSchemaContract, CliError>
         .map_err(|e| CliError::InvalidInput(format!("`{}` is not usable: {e}", path.display())))
 }
 
-/// Renders a schema diff as `workflow.role: <field> — <verdict> — <reason>`
+/// Renders a schema diff as `subject.role: <field> — <verdict> — <reason>`
 /// lines, one per delta, plus a summary line.
+///
+/// The subject is a workflow name, `activity:<name>` or
+/// `<workflow>/side_effect:<id>` (issue #1994).
 #[must_use]
 pub fn format_schema_diff_text(diff: &SchemaContractDiff) -> String {
     use std::fmt::Write as _;
@@ -7565,7 +7568,7 @@ pub fn format_schema_diff_text(diff: &SchemaContractDiff) -> String {
         let _ = writeln!(
             out,
             "{}.{}: {} — {} — {}",
-            d.workflow,
+            subject_label(d.subject, &d.workflow, d.side_effect.as_deref()),
             role,
             field,
             d.verdict.as_str(),
@@ -7769,7 +7772,7 @@ fn format_unacknowledged(missing: &[&SchemaDelta]) -> String {
         let _ = writeln!(
             out,
             "  {}{role}{}: {} — {}",
-            d.workflow,
+            subject_label(d.subject, &d.workflow, d.side_effect.as_deref()),
             d.field_path,
             d.change.as_str(),
             d.reason
@@ -7789,7 +7792,7 @@ fn format_dropped(dropped: &[&AcknowledgedBreakingChange]) -> String {
         let _ = writeln!(
             out,
             "  {}{role}{}: {} — recorded as {:?}",
-            a.workflow,
+            subject_label(a.subject, &a.workflow, a.side_effect.as_deref()),
             a.field_path,
             a.change.as_str(),
             a.reason
@@ -7826,6 +7829,37 @@ fn guard_empty_current(
             current.display(),
             base.workflows.len(),
             base.workflows.len()
+        )));
+    }
+    // The same rule per section (issue #1994). A bare `GET /workflows/registered`
+    // array has no activity or side-effect section. Diffed as is, every activity
+    // reads as removed, which is compatible, so the gate would pass in silence.
+    let missing: Vec<(&str, usize)> = [
+        ("activities", base.activities.len(), cur.activities.len()),
+        (
+            "side effects",
+            base.side_effects.len(),
+            cur.side_effects.len(),
+        ),
+    ]
+    .into_iter()
+    .filter(|&(_, in_base, in_cur)| in_base > 0 && in_cur == 0)
+    .map(|(section, in_base, _)| (section, in_base))
+    .collect();
+    if !missing.is_empty() {
+        let sections: Vec<&str> = missing.iter().map(|&(section, _)| section).collect();
+        let counts: Vec<String> = missing
+            .iter()
+            .map(|(section, n)| format!("{section} ({n})"))
+            .collect();
+        return Err(CliError::InvalidInput(format!(
+            "`{}` publishes no {}, but the baseline has {}. A bare `GET /workflows/registered` \
+             body carries no activity or side-effect schemas, so generate `--current` with \
+             `WorkflowSchemaContract::with_activities` and `with_side_effects`. Regenerate the \
+             baseline directly if the removal is intended.",
+            current.display(),
+            sections.join(" and "),
+            counts.join(" and ")
         )));
     }
     Ok(())

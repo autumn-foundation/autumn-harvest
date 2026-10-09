@@ -1523,13 +1523,15 @@ impl ActivityInfo {
 
     /// Attach a raw input-schema generator function (issue #1994).
     #[must_use]
-    pub const fn with_input_schema_fn(self, _f: fn() -> serde_json::Value) -> Self {
+    pub const fn with_input_schema_fn(mut self, f: fn() -> serde_json::Value) -> Self {
+        self.input_schema = Some(f);
         self
     }
 
     /// Attach a raw output-schema generator function (issue #1994).
     #[must_use]
-    pub const fn with_output_schema_fn(self, _f: fn() -> serde_json::Value) -> Self {
+    pub const fn with_output_schema_fn(mut self, f: fn() -> serde_json::Value) -> Self {
+        self.output_schema = Some(f);
         self
     }
 
@@ -1543,7 +1545,8 @@ impl ActivityInfo {
         I: schemars::JsonSchema,
         O: schemars::JsonSchema,
     {
-        self
+        self.with_input_schema_fn(schema_for::<I>)
+            .with_output_schema_fn(schema_for::<O>)
     }
 }
 
@@ -1576,7 +1579,8 @@ impl SideEffectInfo {
 
     /// Attach a raw value-schema generator function.
     #[must_use]
-    pub const fn with_value_schema_fn(self, _f: fn() -> serde_json::Value) -> Self {
+    pub const fn with_value_schema_fn(mut self, f: fn() -> serde_json::Value) -> Self {
+        self.value_schema = Some(f);
         self
     }
 
@@ -1584,7 +1588,7 @@ impl SideEffectInfo {
     #[cfg(feature = "schema")]
     #[must_use]
     pub fn with_schema<T: schemars::JsonSchema>(self) -> Self {
-        self
+        self.with_value_schema_fn(schema_for::<T>)
     }
 }
 
