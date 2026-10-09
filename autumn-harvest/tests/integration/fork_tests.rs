@@ -54,10 +54,28 @@ fn charges(tag: &str) -> u32 {
         .unwrap_or(0)
 }
 
-/// Charges `amount`, then writes a receipt for the charge.
+/// Calls of `fork_lookup`, keyed by the `tag` of the run.
+static LOOKUPS: LazyLock<Mutex<HashMap<String, u32>>> = LazyLock::new(Mutex::default);
+
+fn lookups(tag: &str) -> u32 {
+    LOOKUPS
+        .lock()
+        .expect("lookups lock")
+        .get(tag)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Charges `amount`, then writes a receipt for the charge. With
+/// `"local": true`, it first runs the local activity `fork_lookup`.
 #[workflow]
 async fn fork_pay_wf(ctx: &WorkflowContext, input: Value) -> Result<Value, String> {
     let queue = ctx.queue_name().to_string();
+    if input["local"] == json!(true) {
+        ctx.execute_local_activity_raw("fork_lookup", input.clone(), None, Some(30))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     let charge = ctx
         .execute_activity_raw("fork_charge", input.clone(), &queue)
         .await
@@ -79,6 +97,18 @@ async fn fork_charge(_ctx: &ActivityContext, input: Value) -> Result<Value, Stri
     Ok(json!({ "charge_id": format!("ch-{count}"), "amount": input["amount"] }))
 }
 
+/// A local activity. Each call adds one to `LOOKUPS[tag]`.
+#[activity(start_to_close = "60s")]
+async fn fork_lookup(_ctx: &ActivityContext, input: Value) -> Result<Value, String> {
+    let tag = input["tag"].as_str().unwrap_or_default().to_string();
+    *LOOKUPS
+        .lock()
+        .map_err(|e| e.to_string())?
+        .entry(tag)
+        .or_insert(0) += 1;
+    Ok(json!("found"))
+}
+
 #[activity(start_to_close = "60s")]
 async fn fork_receipt(_ctx: &ActivityContext, input: Value) -> Result<Value, String> {
     Ok(json!({ "receipt_for": input["charge"]["charge_id"] }))
@@ -87,7 +117,7 @@ async fn fork_receipt(_ctx: &ActivityContext, input: Value) -> Result<Value, Str
 fn registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![fork_pay_wf_info()],
-        activities![fork_charge, fork_receipt],
+        activities![fork_charge, fork_receipt, fork_lookup],
     ))
 }
 
@@ -210,7 +240,10 @@ async fn completed_source(url: &str, pool: &DbPool, queue: &str, tag: &str) -> E
 }
 
 /// The stored rows of an execution and its history, for a before/after check.
-async fn snapshot(url: &str, exec_id: ExecutionId) -> (WorkflowExecution, Vec<(i32, String, Value)>) {
+async fn snapshot(
+    url: &str,
+    exec_id: ExecutionId,
+) -> (WorkflowExecution, Vec<(i32, String, Value)>) {
     let mut conn = connect(url).await;
     let row = harvest_workflow_executions::table
         .find(exec_id.as_uuid())
@@ -274,12 +307,21 @@ async fn fork_of_a_completed_run_leaves_the_source_unchanged() {
     assert_eq!(before.0.completed_at, after.0.completed_at);
     assert_eq!(before.0.error, after.0.error);
 
-    assert_ne!(fork_row.workflow_id, before.0.workflow_id, "a new workflow id");
+    assert_ne!(
+        fork_row.workflow_id, before.0.workflow_id,
+        "a new workflow id"
+    );
     assert_eq!(fork_row.parent_id, None, "a fork is a root");
     assert_eq!(fork_row.start_source.as_deref(), Some("fork"));
     let source_ref = source.to_string();
-    assert_eq!(fork_row.start_source_ref.as_deref(), Some(source_ref.as_str()));
-    assert_eq!(fork_row.output, before.0.output, "the fork returns the recorded result");
+    assert_eq!(
+        fork_row.start_source_ref.as_deref(),
+        Some(source_ref.as_str())
+    );
+    assert_eq!(
+        fork_row.output, before.0.output,
+        "the fork returns the recorded result"
+    );
 
     let (_, fork_events) = snapshot(&url, forked).await;
     let marker = fork_events
@@ -354,6 +396,32 @@ async fn recorded_fork_fails_closed_without_a_record() {
     assert!(
         error.contains("ForkEffectUnavailable") || error.contains("no recorded result"),
         "the failure names the missing record: {error}"
+    );
+}
+
+/// A recorded fork fails before an effect that it cannot serve. The local
+/// activity never runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recorded_fork_fails_before_a_local_activity() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("local");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+
+    // The new input takes the local-activity branch that the source skipped.
+    let mut local = request(ForkEffects::Recorded);
+    local.input = Some(json!({ "tag": queue, "amount": 42, "local": true }));
+    let forked = fork(&url, source, local).await;
+    let running = Running::start(&queue, &pool);
+    let row = wait_for_execution_state(&url, forked, "FAILED").await;
+    running.stop().await;
+
+    assert_eq!(lookups(&queue), 0, "the local activity never runs");
+    assert_eq!(charges(&queue), 1);
+    let error = row.error.unwrap_or_default();
+    assert!(
+        error.contains("RunLocalActivity"),
+        "the failure names the effect: {error}"
     );
 }
 

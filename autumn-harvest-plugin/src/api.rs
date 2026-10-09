@@ -55,7 +55,7 @@ use autumn_harvest::audit::{
     TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK, TARGET_THROTTLE, TARGET_TOKEN, TARGET_WORKER,
     TARGET_WORKFLOW, deny_readonly_mutation,
 };
-use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
+use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START, OP_WORKFLOW_FORK};
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
     BatchSubmission, BatchTargetSample,
@@ -79,6 +79,7 @@ use autumn_harvest::executor::{
     history_reached_terminal_seal,
 };
 use autumn_harvest::external_task;
+use autumn_harvest::fork::{WorkflowForkError, WorkflowForkRequest, fork_workflow_execution};
 use autumn_harvest::history_export::{
     DEFAULT_HISTORY_EXPORT_MAX_BYTES, HistoryExportDocument, HistoryExportError,
     HistoryExportRequest, HistoryPayloadPolicy, export_history_decoded,
@@ -4914,6 +4915,12 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             "/workflows/{id}/rerun",
             post(rerun_workflow).route_layer(require_admin.clone()),
         )
+        // Issue #2000: a fork starts a new run. A live fork runs effects for
+        // real, so the route is admin-only, as rerun is.
+        .route(
+            "/workflows/{id}/fork",
+            post(fork_workflow).route_layer(require_admin.clone()),
+        )
         .route(
             "/workflows/{id}/erase-payloads",
             post(erase_workflow_payloads_handler).route_layer(require_admin.clone()),
@@ -6938,6 +6945,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
             "/workflows/{id}/completion-deliveries/{delivery_id}/redrive",
         ),
         ("POST", "/workflows/{id}/reset"),
+        ("POST", "/workflows/{id}/fork"),
         ("POST", "/workflows/{id}/signal/{signal_name}"),
         ("GET", "/workflows/{id}/queries"),
         ("GET", "/workflows/{id}/query/{query_name}"),
@@ -7276,6 +7284,19 @@ pub const fn management_api_request_fields()
                 "reason",
                 "operator_id",
                 "signal_reapply",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/fork",
+            Some(&[
+                "fork_point",
+                "reason",
+                "operator_id",
+                "effects",
+                "workflow_id",
+                "input",
+                "activity_overrides",
             ]),
         ),
         ("POST", "/workflows/{id}/signal/{signal_name}", None), // free-form
@@ -8074,6 +8095,18 @@ pub const fn management_api_response_fields()
                 "source_timers_removed",
                 "source_signals_dropped",
                 "source_signals_buffered",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/fork",
+            Some(&[
+                "new_exec_id",
+                "workflow_id",
+                "forked_from_exec_id",
+                "fork_event_id",
+                "events_carried_over",
+                "effects",
             ]),
         ),
         (
@@ -25406,6 +25439,91 @@ async fn reset_workflow(
             reset_error_response(error)
         }
     }
+}
+
+/// `POST /workflows/{id}/fork` — non-destructive fork of a run (issue #2000).
+///
+/// The source stays unchanged. The fork defaults to recorded effects, so it
+/// never runs an effect for real unless the body sets `"effects": "live"`.
+async fn fork_workflow(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<WorkflowForkRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/fork";
+    let exec_id = match parse_execution_id(&id) {
+        Ok(eid) => eid,
+        Err(e) => return e.into_response(),
+    };
+    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+        Ok(conn) => conn,
+        Err(e) => return e.into_response(),
+    };
+    let exec_id_str = exec_id.to_string();
+    let runtime = api_state.runtime().ok();
+    let registry = runtime.as_ref().map(|r| r.registry().as_ref());
+    let result = fork_workflow_execution(&mut conn, exec_id, request, registry).await;
+
+    let error_summary = result.as_ref().err().map(ToString::to_string);
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_WORKFLOW_FORK,
+        target_type: TARGET_WORKFLOW,
+        target_id: Some(exec_id_str.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status: if result.is_ok() {
+            STATUS_SUCCEEDED
+        } else {
+            STATUS_FAILED
+        },
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    let audit_result = audit::insert_audit(&mut conn, &ar).await;
+    match result {
+        Ok(result) => {
+            // A committed fork must have its audit row, as a reset must.
+            if let Err(audit_err) = audit_result {
+                tracing::error!(error = %audit_err, new_exec_id = %result.new_exec_id, "audit insert failed for workflow.fork");
+                return AutumnError::service_unavailable_msg(format!(
+                    "audit insert failed: {audit_err}"
+                ))
+                .into_response();
+            }
+            (axum::http::StatusCode::CREATED, Json(result)).into_response()
+        }
+        Err(error) => fork_error_response(error),
+    }
+}
+
+fn fork_error_response(error: WorkflowForkError) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let status = match error {
+        WorkflowForkError::InvalidPoint(invalid) => return reset_invalid_point_response(invalid),
+        WorkflowForkError::Harvest(error) => return map_error(error).into_response(),
+        WorkflowForkError::ContinueAsNew | WorkflowForkError::InvalidOverride { .. } => {
+            axum::http::StatusCode::BAD_REQUEST
+        }
+        WorkflowForkError::ErasedSource { .. }
+        | WorkflowForkError::UnservableEffect { .. }
+        | WorkflowForkError::CarriedMutex { .. }
+        | WorkflowForkError::WorkflowIdInUse { .. } => axum::http::StatusCode::CONFLICT,
+    };
+    (
+        status,
+        Json(ResetErrorResponse {
+            message: error.to_string(),
+        }),
+    )
+        .into_response()
 }
 
 fn reset_error_response(error: WorkflowResetError) -> axum::response::Response {

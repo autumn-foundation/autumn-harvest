@@ -336,6 +336,9 @@ pub mod external_target_location;
 #[cfg(feature = "db")]
 pub mod external_task;
 pub mod failure;
+/// Non-destructive fork of a workflow run (issue #2000).
+#[cfg(feature = "db")]
+pub mod fork;
 /// Replay fuzz harness (issue #1835). Not a stable API.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
@@ -435,9 +438,6 @@ pub mod replay;
 pub mod replay_sample;
 /// Cross-region DR fencing and replication-lag measurement (issue #954).
 pub mod replication;
-/// Non-destructive fork of a workflow run (issue #2000).
-#[cfg(feature = "db")]
-pub mod fork;
 #[cfg(feature = "db")]
 pub mod reset;
 /// Resident workflow state between decisions (issue #1798).

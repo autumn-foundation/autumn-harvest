@@ -154,7 +154,7 @@
           "in": "query",
           "type": "string",
           "required": false,
-          "description": "Filter by workflow-start provenance (issue #740). One of the bounded StartSource set: api, schedule, backfill, signal_with_start, update_with_start, completion_trigger, webhook, child, batch, continue_as_new, reset, outbox, or 'unknown' (matches NULL / pre-upgrade rows). Any other value returns 400."
+          "description": "Filter by workflow-start provenance (issue #740). One of the bounded StartSource set: api, schedule, backfill, signal_with_start, update_with_start, completion_trigger, webhook, broker, child, batch, continue_as_new, reset, rerun, outbox, transactional, fork, or 'unknown' (matches NULL / pre-upgrade rows). Any other value returns 400."
         },
         {
           "name": "failure_cause",
@@ -3461,6 +3461,101 @@
         {
           "status": 503,
           "description": "The reset succeeded but the audit record for it could not be written. The new execution exists. Retry is not needed."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/{id}/fork",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Non-destructive fork of a workflow execution (issue #2000). Copy a history prefix of the source to a NEW execution with a NEW workflow id. The source is never changed, so a run in any state can be forked, including COMPLETED and TERMINATED. Admin-only. Provenance on the fork is start_source='fork', start_source_ref=<source execution id>; its history holds a WorkflowForked marker that names the source. effects defaults to recorded: a remote activity takes a caller override, or the result that the source recorded for the same name, occurrence and input; with neither it fails non-retryably with error_type ForkEffectUnavailable and never runs. In recorded mode, a local activity, a child workflow, an external activity, an external signal or an external cancel fails the fork run before it runs, and the fork sends no completion callback and fires no completion trigger. effects=live runs effects for real.",
+      "idempotency": "Not idempotent: each call creates a distinct new execution.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Execution UUID of the source run."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "fork_point",
+            "required": false,
+            "description": "Where the fork starts, as a reset_point: {\"type\":\"event_id\",\"event_id\":N}, {\"type\":\"first_activity_run\",\"activity_name\":\"name\"} or {\"type\":\"last_workflow_task\"}. Omitted = event 0 (WorkflowStarted). The point must be a clean decision boundary before any terminal event, and the carried history must hold no MutexGranted."
+          },
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Reason for the fork, recorded in the marker and the audit log."
+          },
+          {
+            "name": "operator_id",
+            "required": false,
+            "description": "Identity of the operator."
+          },
+          {
+            "name": "effects",
+            "required": false,
+            "description": "recorded (the default) or live. live runs activities and other effects for real."
+          },
+          {
+            "name": "workflow_id",
+            "required": false,
+            "description": "Business key of the fork. Omitted = <source workflow_id>-fork-<uuid>. A key that a live run holds returns 409."
+          },
+          {
+            "name": "input",
+            "required": false,
+            "description": "Replacement input for the fork. Needs fork point 0. A JSON null means no override."
+          },
+          {
+            "name": "activity_overrides",
+            "required": false,
+            "description": "Array of {activity_name, occurrence, output}. occurrence is the 1-based count of ActivityScheduled events with that name. The activity returns output and never runs, in both effects modes. The occurrence must come after the fork point."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 201,
+        "fields": [
+          "new_exec_id",
+          "workflow_id",
+          "forked_from_exec_id",
+          "fork_event_id",
+          "events_carried_over",
+          "effects"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution id or body; invalid fork point; continue-as-new history; invalid input or activity override."
+        },
+        {
+          "status": 401,
+          "description": "Admin authentication required."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 409,
+          "description": "The source payloads were erased (issue #495); recorded mode cannot serve an effect after the fork point (fork with effects=live); the carried history holds a mutex grant; or the workflow id is in use."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "The fork succeeded but the audit record for it could not be written. The new execution exists. Retry is not needed."
         }
       ]
     },

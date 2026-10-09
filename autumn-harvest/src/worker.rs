@@ -11031,6 +11031,11 @@ async fn fail_activities_for_broken_sessions(
     Ok(synthesized)
 }
 
+/// The activity ids of `scheduled`, in command order.
+fn scheduled_activity_ids(scheduled: &[ScheduledActivityCommand]) -> Vec<ActivityExecId> {
+    scheduled.iter().map(|s| s.activity_id).collect()
+}
+
 /// The pre-transaction plan for a batch of `ScheduleActivity` commands:
 /// the `ActivityScheduled` events (in `ScheduleActivity` command order), the
 /// fully-resolved [`queue::EnqueueParams`] for each, and the dynamic per-key
@@ -11374,6 +11379,9 @@ async fn persist_scheduled_activities(
     parent_priority: i32,
     context_headers: Option<&serde_json::Value>,
     workflow_input: &serde_json::Value,
+    // Issue #2000: `true` when the run is a fork, so a recorded fork serves
+    // each activity from its record instead of running it.
+    is_fork: bool,
 ) -> HarvestResult<()> {
     let ActivityEnqueuePlan {
         activity_events,
@@ -11400,7 +11408,7 @@ async fn persist_scheduled_activities(
     // activity-completion races, this is a *fresh* dispatch (the activities
     // being scheduled here cannot have completed yet), so no other in-band
     // check exists to catch it.
-    let (deferred, had_wake_requested, synthesized_broken_session_failure) =
+    let (deferred, had_wake_requested, synthesized_outcome) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             // Cancellable/renewable timer bookkeeping (issue #768): resolve
             // the ArmTimer/CancelTimer row mutations FIRST, then build the
@@ -11472,12 +11480,23 @@ async fn persist_scheduled_activities(
                 registry.payload_codecs(),
             )
             .await?;
+            // Issue #2000: a recorded fork resolves each activity here. It
+            // runs after the session check, which skips a settled activity.
+            let served_from_fork = crate::fork::serve_recorded_activities(
+                conn,
+                exec_id,
+                is_fork,
+                &scheduled_activity_ids(scheduled_activities),
+                &mut race_next_event_id,
+                registry.payload_codecs(),
+            )
+            .await?;
 
             let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
             Ok((
                 deferred,
                 had_wake_requested,
-                synthesized_broken_session_failure,
+                synthesized_broken_session_failure || served_from_fork,
             ))
         }))
         .await?;
@@ -11486,12 +11505,12 @@ async fn persist_scheduled_activities(
         start.spawn();
     }
 
-    // The synthesized SessionBroken failure(s) above are not tied to any
-    // external wake source (they were resolved entirely within this
-    // transaction), so the workflow must be woken unconditionally to
-    // observe them on its next decision cycle -- `had_wake_requested` alone
-    // would miss this case.
-    if had_wake_requested || synthesized_broken_session_failure {
+    // The synthesized SessionBroken failure(s) and fork outcomes above are
+    // not tied to any external wake source (they were resolved entirely
+    // within this transaction), so the workflow must be woken
+    // unconditionally to observe them on its next decision cycle --
+    // `had_wake_requested` alone would miss this case.
+    if had_wake_requested || synthesized_outcome {
         queue::wake_workflow_task(conn, exec_id).await?;
     }
 
@@ -13863,7 +13882,7 @@ async fn persist_mixed_suspension_batch(
         // Worker sessions (issue #606): fail any member activity whose session
         // already left ACTIVE so the workflow observes SessionBroken on its next
         // decision cycle instead of hanging on a task pinned to a dead host.
-        let synthesized_broken_session_failure = fail_activities_for_broken_sessions(
+        let broken_session_failure = fail_activities_for_broken_sessions(
             conn,
             exec_id,
             &batch.scheduled_activities,
@@ -13872,6 +13891,18 @@ async fn persist_mixed_suspension_batch(
             registry.payload_codecs(),
         )
         .await?;
+        // Issue #2000: a recorded fork resolves each activity here, after the
+        // session check, exactly as on the plain path.
+        let served_from_fork = crate::fork::serve_recorded_activities(
+            conn,
+            exec_id,
+            crate::fork::is_fork(parent_execution),
+            &scheduled_activity_ids(&batch.scheduled_activities),
+            &mut next_event_id,
+            registry.payload_codecs(),
+        )
+        .await?;
+        let synthesized_broken_session_failure = broken_session_failure || served_from_fork;
 
         // ── park ────────────────────────────────────────────────────────────
         let deadline = timer_fire_instants
@@ -20916,6 +20947,7 @@ async fn handle_suspended_workflow(
             context.persistence.task.priority,
             context.execution.context_headers.as_ref(),
             &context.execution.input,
+            crate::fork::is_fork(context.execution),
         )
         .await
     } else if let Some(activity_ids) = extract_all_activity_waits(commands) {
@@ -25420,6 +25452,31 @@ async fn process_workflow_task(
             router: resolved_router,
             resident: iter_resident,
         } = drive;
+
+        // Issue #2000: a recorded fork never runs an effect that it cannot
+        // serve from the record. It fails here, before any persist path.
+        if crate::fork::is_fork(&prepared.execution)
+            && crate::fork::fork_marker(&history_events)
+                .is_some_and(|(_, effects)| effects == crate::fork::ForkEffects::Recorded)
+            && let Some(command) = crate::fork::live_effect_refusal(update_result_command_source(
+                &run_outcome,
+                &pending_cmds,
+            ))
+        {
+            return fail_workflow_execution_clearing_strikes(
+                conn,
+                task,
+                worker_id,
+                Err::<(), _>(HarvestError::Config(format!(
+                    "recorded fork refused {command}: recorded mode cannot serve it, so \
+                     fork with effects = live to run it"
+                ))),
+                workflow_panic_strikes,
+                prepared.exec_id.as_uuid(),
+                registry.payload_codecs(),
+            )
+            .await;
+        }
 
         match run_outcome {
             WorkflowOutcome::Suspended { commands }
