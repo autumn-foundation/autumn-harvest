@@ -165,6 +165,17 @@ async fn connect(url: &str) -> AsyncPgConnection {
 
 /// Start a `fork_pay_wf` run on `queue`.
 async fn seed_run(conn: &mut AsyncPgConnection, queue: &str, input: &Value) -> ExecutionId {
+    seed_run_with(conn, queue, input, None, None).await
+}
+
+/// Start a `fork_pay_wf` run with a carryover, through an optional offloader.
+async fn seed_run_with(
+    conn: &mut AsyncPgConnection,
+    queue: &str,
+    input: &Value,
+    last_completion_result: Option<Value>,
+    offloader: Option<&autumn_harvest::payload_store::PayloadOffloader>,
+) -> ExecutionId {
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     let row = NewWorkflowExecution {
         quota_key: None,
@@ -209,17 +220,19 @@ async fn seed_run(conn: &mut AsyncPgConnection, queue: &str, input: &Value) -> E
         .execute(conn)
         .await
         .expect("insert workflow execution");
-    store::append_events(
+    store::append_events_offloaded_with_codecs(
         conn,
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: input.clone(),
             timestamp: Utc::now(),
-            last_completion_result: None,
+            last_completion_result,
             last_error: None,
             scheduled_time: None,
         }],
         0,
+        offloader,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("append WorkflowStarted");
@@ -811,6 +824,65 @@ async fn a_reset_of_a_fork_references_its_offloaded_overrides() {
         reset_refs.iter().map(|r| &r.blob_key).collect::<Vec<_>>(),
         fork_refs.iter().map(|r| &r.blob_key).collect::<Vec<_>>(),
         "the reset references the override blob"
+    );
+}
+
+/// An input override keeps an offloaded carryover as an envelope. The fork
+/// references its blob, so retention of the source cannot collect it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_input_override_keeps_an_offloaded_carryover() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("carryover");
+    let mut conn = connect(&url).await;
+    let offloader = Arc::new(autumn_harvest::payload_store::PayloadOffloader::new(
+        Arc::new(MemStore::default()),
+        64,
+        Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+    ));
+    let carryover = json!({ "previous": "X".repeat(512) });
+    let source = seed_run_with(
+        &mut conn,
+        &queue,
+        &json!({ "n": 1 }),
+        Some(carryover),
+        Some(&offloader),
+    )
+    .await;
+    let source_refs = store::load_payload_refs(&mut conn, source)
+        .await
+        .expect("refs");
+    assert_eq!(source_refs.len(), 1, "the carryover is offloaded");
+    let offloading = Arc::new(
+        HandlerRegistry::new(
+            vec![fork_pay_wf_info()],
+            activities![fork_charge, fork_receipt],
+        )
+        .with_payload_offloader(Some(offloader)),
+    );
+
+    let mut what_if = request(ForkEffects::Live);
+    what_if.input = Some(json!({ "n": 2 }));
+    let forked = fork_workflow_execution(&mut conn, source, what_if, Some(&offloading))
+        .await
+        .expect("fork")
+        .new_exec_id;
+
+    let (_, source_events) = snapshot(&url, source).await;
+    let (_, fork_events) = snapshot(&url, forked).await;
+    let start = &fork_events[0].2;
+    assert_eq!(start["data"]["input"], json!({ "n": 2 }));
+    assert_eq!(
+        start["data"]["last_completion_result"],
+        source_events[0].2["data"]["last_completion_result"],
+        "the carryover keeps its stored envelope"
+    );
+    let fork_refs = store::load_payload_refs(&mut conn, forked)
+        .await
+        .expect("refs");
+    assert_eq!(
+        fork_refs.iter().map(|r| &r.blob_key).collect::<Vec<_>>(),
+        source_refs.iter().map(|r| &r.blob_key).collect::<Vec<_>>(),
+        "the fork references the carryover blob"
     );
 }
 

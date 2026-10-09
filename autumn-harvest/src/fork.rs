@@ -293,18 +293,7 @@ async fn fork_in_transaction(
         Err(error) => return Err(error.into()),
     };
 
-    // The fork shares the blobs of the source. Its own references keep them
-    // alive after retention deletes the source.
-    let refs = crate::store::load_payload_refs(conn, source_id).await?;
-    let reachable = reachable_refs(
-        refs,
-        &rows,
-        fork_event_id,
-        request.input.is_none(),
-        &source.input,
-    );
-    crate::store::insert_payload_refs(conn, new_exec_id, &reachable).await?;
-    copy_prefix(
+    let mut copied_text = copy_prefix(
         conn,
         new_exec_id,
         &rows,
@@ -314,6 +303,15 @@ async fn fork_in_transaction(
         codecs,
     )
     .await?;
+    // The fork shares the blobs of the source. Its own references keep them
+    // alive after retention deletes the source. Only the bytes that the fork
+    // stores count, so a replaced input releases its blob.
+    if request.input.is_none() {
+        copied_text.push_str(&source.input.to_string());
+    }
+    let refs = crate::store::load_payload_refs(conn, source_id).await?;
+    let reachable = refs_named_in(refs, &copied_text);
+    crate::store::insert_payload_refs(conn, new_exec_id, &reachable).await?;
     let tail = fork_tail(source_id, fork_event_id, request);
     let tail_start = i32::try_from(plan.events_carried_over)
         .map_err(|_| HarvestError::Database("fork carried too many events".to_string()))?;
@@ -436,36 +434,6 @@ async fn check_shards(
             })
         }
     }
-}
-
-/// The payload references that the fork can still address.
-///
-/// A fork addresses a blob through an envelope in a carried row, or in the
-/// source input that it keeps. An input override rewrites the
-/// `WorkflowStarted` row, so that row and the source input do not count then.
-/// A blob key is a unique string, so a text search of those bytes finds each
-/// one. A reference outside them only delays the collection of a blob that no
-/// fork event names.
-fn reachable_refs(
-    refs: Vec<crate::payload_store::OffloadedRef>,
-    rows: &[HarvestEvent],
-    fork_event_id: i64,
-    keeps_source_input: bool,
-    source_input: &Value,
-) -> Vec<crate::payload_store::OffloadedRef> {
-    if refs.is_empty() {
-        return refs;
-    }
-    let mut text = rows
-        .iter()
-        .take_while(|row| i64::from(row.event_id) <= fork_event_id)
-        .filter(|row| keeps_source_input || row.event_id != 0)
-        .map(|row| row.event_data.to_string())
-        .collect::<String>();
-    if keeps_source_input {
-        text.push_str(&source_input.to_string());
-    }
-    refs_named_in(refs, &text)
 }
 
 /// The references in `refs` whose blob key appears in `text`.
@@ -655,8 +623,10 @@ async fn workflow_id_in_use(
 
 /// Insert the carried prefix as new rows of the fork.
 ///
-/// The rows keep their stored bytes. An input override rewrites only the
-/// `WorkflowStarted` row, which is the whole prefix at fork point `0`.
+/// The rows keep their stored bytes. An input override replaces only the
+/// stored `data.input` of the `WorkflowStarted` row. That row is the whole
+/// prefix at fork point `0`. The function returns the text of the stored
+/// rows, so the caller can find the blob keys that they name.
 async fn copy_prefix(
     conn: &mut AsyncPgConnection,
     new_exec_id: ExecutionId,
@@ -665,7 +635,7 @@ async fn copy_prefix(
     fork_event_id: i64,
     request: &WorkflowForkRequest,
     codecs: &PayloadCodecs,
-) -> HarvestResult<()> {
+) -> HarvestResult<String> {
     let mut copied = Vec::new();
     for (row, event) in rows.iter().zip(events) {
         if i64::from(row.event_id) > fork_event_id {
@@ -677,7 +647,7 @@ async fn copy_prefix(
                 if let WorkflowEvent::WorkflowStarted { input: field, .. } = &mut started {
                     field.clone_from(input);
                 }
-                codecs.encode_event(&started)?
+                with_start_input(&row.event_data, &codecs.encode_event(&started)?)
             }
             _ => row.event_data.clone(),
         };
@@ -689,14 +659,32 @@ async fn copy_prefix(
         });
     }
     if copied.is_empty() {
-        return Ok(());
+        return Ok(String::new());
     }
     diesel::insert_into(harvest_events::table)
         .values(&copied)
         .execute(conn)
         .await
         .map_err(database_error)?;
-    Ok(())
+    Ok(copied
+        .iter()
+        .map(|row| row.event_data.to_string())
+        .collect())
+}
+
+/// The stored start row with the `data.input` of `encoded` in place.
+///
+/// The other fields keep their stored bytes. So an offloaded
+/// `last_completion_result` stays an envelope and does not become a payload.
+fn with_start_input(stored: &Value, encoded: &Value) -> Value {
+    let mut row = stored.clone();
+    if let (Some(data), Some(input)) = (
+        row.get_mut("data").and_then(Value::as_object_mut),
+        encoded.pointer("/data/input"),
+    ) {
+        data.insert("input".to_string(), input.clone());
+    }
+    row
 }
 
 #[derive(Insertable)]
@@ -1593,40 +1581,32 @@ mod tests {
         }
     }
 
-    fn row(event_id: i32, data: Value) -> HarvestEvent {
-        HarvestEvent {
-            id: i64::from(event_id),
-            workflow_exec_id: Uuid::new_v4(),
-            event_id,
-            event_type: "T".to_string(),
-            event_data: data,
-            timestamp: chrono::Utc::now(),
-        }
+    #[test]
+    fn only_named_payload_refs_are_copied() {
+        let text = json!({ "data": { "output": { "key": "blob-carried" } } }).to_string();
+        let refs = vec![blob("blob-start"), blob("blob-carried")];
+        let kept = refs_named_in(refs, &text);
+        assert_eq!(
+            kept.into_iter().map(|r| r.blob_key).collect::<Vec<_>>(),
+            vec!["blob-carried"]
+        );
     }
 
     #[test]
-    fn only_reachable_payload_refs_are_copied() {
-        let rows = vec![
-            row(0, json!({ "data": { "input": { "key": "blob-start" } } })),
-            row(
-                1,
-                json!({ "data": { "output": { "key": "blob-carried" } } }),
-            ),
-            row(2, json!({ "data": { "output": { "key": "blob-after" } } })),
-        ];
-        let refs = || vec![blob("blob-start"), blob("blob-carried"), blob("blob-after")];
-        let keys = |kept: Vec<crate::payload_store::OffloadedRef>| {
-            kept.into_iter().map(|r| r.blob_key).collect::<Vec<_>>()
-        };
-        assert_eq!(
-            keys(reachable_refs(refs(), &rows, 1, true, &json!({}))),
-            vec!["blob-start", "blob-carried"]
-        );
-        // An input override drops the replaced start input.
-        assert_eq!(
-            keys(reachable_refs(refs(), &rows, 1, false, &json!({}))),
-            vec!["blob-carried"]
-        );
+    fn an_input_override_keeps_the_other_stored_bytes() {
+        let carryover = json!({ "_harvest_offloaded": { "key": "blob-last" } });
+        let stored = json!({
+            "type": "WorkflowStarted",
+            "data": { "input": { "old": 1 }, "last_completion_result": carryover },
+        });
+        let encoded = json!({
+            "type": "WorkflowStarted",
+            "data": { "input": { "new": 2 }, "last_completion_result": { "inflated": true } },
+        });
+        let row = with_start_input(&stored, &encoded);
+        assert_eq!(row["data"]["input"], json!({ "new": 2 }));
+        assert_eq!(row["data"]["last_completion_result"], carryover);
+        assert_eq!(row["type"], json!("WorkflowStarted"));
     }
 
     #[test]

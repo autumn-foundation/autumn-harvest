@@ -47,9 +47,10 @@ is refused with `409`.
 marker. A fork is a new root, not a child of the source.
 
 **Payloads.** The fork copies the payload references of the source that its
-carried rows or kept input still name, so retention of the source keeps the
-shared blobs. Matching inflates offloaded
-payloads first.
+stored rows or kept input still name, so retention of the source keeps the
+shared blobs. An input override replaces only the stored `data.input`, so an
+offloaded carryover stays an envelope. Matching inflates offloaded payloads
+first.
 
 **Invariants.** Two new `WorkflowEvent` variants: `WorkflowForked` and
 `ForkActivityResultOverridden`. Replay skips both. The override `output` is a
