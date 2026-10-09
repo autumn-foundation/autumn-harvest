@@ -999,16 +999,16 @@ fn build_finding(run_build: Option<&str>, baseline_build: Option<&str>) -> Optio
 
 /// The shard a run belongs to, among the shard ids that alias its database.
 ///
-/// The id encodes the shard the run started on. A rebalanced run keeps that
-/// id but lives elsewhere. So an encoded shard outside the group, or no
-/// encoded shard, gives the group's first shard id.
+/// The id encodes the shard the run started on, and a rebalance does not
+/// change it. The row's `shard_id` column follows the run, so it is the
+/// source. A value outside the group gives the group's first shard id.
 #[cfg(feature = "db")]
-fn shard_of(execution_id: ExecutionId, shards: &[ShardId]) -> ShardId {
-    let encoded = execution_id.shard();
-    if !encoded.is_unencoded() && shards.contains(&encoded) {
-        return encoded;
+fn shard_of(row_shard: i32, shards: &[ShardId]) -> ShardId {
+    let shard = ShardId::new(row_shard);
+    if shards.contains(&shard) {
+        return shard;
     }
-    shards.first().copied().unwrap_or(encoded)
+    shards.first().copied().unwrap_or(shard)
 }
 
 /// Keep at most `limit_per_shard` rows of each shard id in `shards`. Return
@@ -1035,7 +1035,7 @@ fn hold_to_limit(
     let mut per_shard: HashMap<ShardId, usize> = HashMap::new();
     let mut over: Vec<ShardId> = Vec::new();
     rows.retain(|row| {
-        let shard = shard_of(ExecutionId::from_uuid(row.id), shards);
+        let shard = shard_of(row.shard_id, shards);
         let count = per_shard.entry(shard).or_insert(0);
         *count = count.saturating_add(1);
         let keep = *count <= limit_per_shard;
@@ -1426,6 +1426,8 @@ impl Default for UpgradeCheckOptions {
 struct InFlightRow {
     #[diesel(sql_type = diesel::sql_types::Uuid)]
     id: uuid::Uuid,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    shard_id: i32,
     #[diesel(sql_type = diesel::sql_types::Text)]
     workflow_name: String,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
@@ -1453,7 +1455,7 @@ struct InFlightRow {
 /// runs only. A run on the candidate build, or on an older build, is outside
 /// the deploy decision.
 #[cfg(feature = "db")]
-const IN_FLIGHT_SQL: &str = "SELECT id, workflow_name, context_headers, execution_timeout, \
+const IN_FLIGHT_SQL: &str = "SELECT id, shard_id, workflow_name, context_headers, execution_timeout, \
      deadline_at, parent_id, workflow_id, queue_name, assigned_build_id \
      FROM harvest_workflow_executions \
      WHERE state = ANY($1) AND ($2::text IS NULL OR workflow_name = $2) \
@@ -1573,7 +1575,7 @@ impl UpgradeCheck {
                 }
                 Err(e) => return Err(e),
             };
-            verdict.shard_id = Some(shard_of(execution_id, shards));
+            verdict.shard_id = Some(shard_of(row.shard_id, shards));
             if self.structure.is_some()
                 && let Some(finding) = build_finding(
                     row.assigned_build_id.as_deref(),
@@ -1881,12 +1883,11 @@ mod tests {
     #[test]
     fn a_verdict_names_the_aliased_shard_its_run_belongs_to() {
         let (zero, one) = (ShardId::new(0), ShardId::new(1));
-        let on_one = ExecutionId::new_for_shard(one);
-        assert_eq!(super::shard_of(on_one, &[zero, one]), one);
-        // A rebalanced run keeps its id but lives in this group.
-        assert_eq!(super::shard_of(on_one, &[zero]), zero);
-        let unencoded = ExecutionId::from_uuid(uuid::Uuid::new_v4());
-        assert_eq!(super::shard_of(unencoded, &[one, zero]), one);
+        assert_eq!(super::shard_of(1, &[zero, one]), one);
+        assert_eq!(super::shard_of(0, &[zero, one]), zero);
+        // A row whose shard is not in the group lives in this database
+        // anyway, so it gets the group's first shard id.
+        assert_eq!(super::shard_of(7, &[one, zero]), one);
     }
 
     #[test]

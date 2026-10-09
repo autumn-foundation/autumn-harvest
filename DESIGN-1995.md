@@ -110,7 +110,9 @@ Later review rounds of the merged branch found more gaps:
     `external-const` boundary.
 12. With aliased shards, an over-limit line named the group's first shard.
     It now names each shard over its own limit. When the group read itself
-    stops at its limit, the line names every shard of the group.
+    stops at its limit, the line names every shard of the group. A run's
+    shard comes from its row's `shard_id` column, which follows a
+    rebalance. The id encodes only the shard the run started on.
 
 ---
 

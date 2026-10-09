@@ -61,13 +61,17 @@ async fn seed(
     events: &[WorkflowEvent],
     codecs: &PayloadCodecs,
 ) -> ExecutionId {
-    seed_on(conn, ExecutionId::new(), name, state, events, codecs).await
+    seed_on(conn, ExecutionId::new(), 0, name, state, events, codecs).await
 }
 
-/// Seed one run with the id `exec_id`, which can encode a shard.
+/// Seed one run with the id `exec_id`, in the row of shard `shard`.
+///
+/// The id encodes the shard the run started on. A rebalanced run keeps its
+/// id, and only the `shard_id` column moves.
 async fn seed_on(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
+    shard: i32,
     name: &str,
     state: &str,
     events: &[WorkflowEvent],
@@ -82,7 +86,7 @@ async fn seed_on(
         workflow_name: name,
         workflow_id: &workflow_id,
         run_id: Uuid::new_v4(),
-        shard_id: 0,
+        shard_id: shard,
         input: input.into(),
         parent_id: None,
         queue_name: "default",
@@ -415,7 +419,16 @@ async fn the_report_names_the_shard_over_its_limit() {
     let name = unique_name();
     for _ in 0..3 {
         let id = ExecutionId::new_for_shard(ShardId::new(1));
-        seed_on(&mut conn, id, &name, "RUNNING", &waiting_to_ship(), &codecs).await;
+        seed_on(
+            &mut conn,
+            id,
+            1,
+            &name,
+            "RUNNING",
+            &waiting_to_ship(),
+            &codecs,
+        )
+        .await;
     }
     // Shard 1, not the group's first shard id, holds the runs.
     let pool = ShardedDbPool::from_dsns(
@@ -443,6 +456,51 @@ async fn the_report_names_the_shard_over_its_limit() {
         report.incomplete[0].starts_with("shard 1: "),
         "{:?}",
         report.incomplete
+    );
+}
+
+#[tokio::test]
+async fn a_rebalanced_run_gets_the_shard_of_its_row() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let codecs = aead_codecs();
+    let name = unique_name();
+    // The run started on shard 1 and moved to shard 0. Its id still
+    // encodes shard 1.
+    let id = ExecutionId::new_for_shard(ShardId::new(1));
+    seed_on(
+        &mut conn,
+        id,
+        0,
+        &name,
+        "RUNNING",
+        &waiting_to_ship(),
+        &codecs,
+    )
+    .await;
+    let pool = ShardedDbPool::from_dsns(
+        [
+            (ShardId::new(0), url.clone()),
+            (ShardId::new(1), url.clone()),
+        ],
+        ShardId::new(0),
+        2,
+    )
+    .expect("pool");
+    let report = check_for(&name, &codecs)
+        .run(
+            &pool,
+            &UpgradeCheckOptions {
+                workflow_name: Some(name.clone()),
+                ..UpgradeCheckOptions::default()
+            },
+        )
+        .await;
+    assert_eq!(report.runs.len(), 1, "{report:#?}");
+    assert_eq!(
+        report.runs[0].shard_id,
+        Some(ShardId::new(0)),
+        "{report:#?}"
     );
 }
 
