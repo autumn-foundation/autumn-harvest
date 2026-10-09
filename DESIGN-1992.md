@@ -12,15 +12,15 @@ The public signature of `queue::complete_task` changes.
 
 ### 0.1 Facts found before the plan
 
-- `complete_task(conn, task_id, output)` filters on `id` and
+- `complete_task(conn, task_id, output)` filtered on `id` and
   `state = 'RUNNING'` only.
-- Only `worker.rs` calls it in production. It completes a *workflow* task in
+- Only `worker.rs` called it in production. It completed a *workflow* task in
   `persist_workflow_completion`, `persist_child_workflow_completion` and the
   continue-as-new seal.
-- Each of the three calls runs after `claim_still_held_for_update` in the same
+- Each of the three calls ran after `claim_still_held_for_update` in the same
   transaction (issue #1184). That guard locks the task row and checks
-  `claim_held(worker_id, attempt)`. So no production path completes a stale
-  claim today.
+  `claim_held(worker_id, attempt)`. So no production path completed a stale
+  claim.
 - The activity path already uses the fenced `complete_claimed_task`.
 - 16 test calls use `complete_task`. One is in the plugin. One models the
   pre-#1789 write on purpose (`Fencing::StateOnly` in
@@ -34,7 +34,7 @@ The public signature of `queue::complete_task` changes.
 
 | # | Idea | Verdict |
 |---|------|---------|
-| B1 | Make `complete_task` `pub(crate)`. | Rejected. 16 test calls need a public completion. A `testing`-feature twin keeps the unfenced write public. |
+| B1 | Make `complete_task` `pub(crate)`. | Rejected. 16 test calls need a public completion. A `testing`-feature twin would keep an unfenced write public. |
 | B2 | Delete `complete_task`. Callers use `complete_claimed_task`. | Rejected. Each caller then maps `ClaimWrite::LeaseLost` to an error by hand. |
 | B3 | Keep the name. Require a `&TaskClaim`. Return `NotFound` when the claim is not current. | **Adopted.** One public completion shape per outcome: `complete_task` errors, `complete_claimed_task` reports. Old call sites fail to compile, so no caller keeps the unfenced write by accident. |
 | B4 | Add `#[deprecated]` to the old function. | Rejected. A deprecated unfenced write is still public. |
@@ -44,7 +44,7 @@ The public signature of `queue::complete_task` changes.
 
 | # | How to make it harmful | Mitigation |
 |---|------------------------|------------|
-| R1 | A workflow-task claim does not match the fence, so a valid completion fails. | The fence uses the same `claim_held(worker_id, attempt)` as the #1184 guard, under the same row lock. Existing workflow completion suites cover it. |
+| R1 | A workflow-task claim does not match the fence, so a valid completion fails. | The #1184 guard checks `claim_held` plus `crash_strikes` under the same row lock. So the fence cannot fail after the guard passes. Existing workflow completion suites cover it. |
 | R2 | A changed error breaks a caller that matches on it. | The error stays `HarvestError::NotFound`. |
 | R3 | A test migration weakens a test. | Each test passes the claim it took. The late-completion test in `force_fail_tests.rs` keeps its assertion. |
 | R4 | The DST differential loses its unfenced baseline. | `Fencing::StateOnly` runs the pre-#1789 `UPDATE` as raw SQL in the test. |

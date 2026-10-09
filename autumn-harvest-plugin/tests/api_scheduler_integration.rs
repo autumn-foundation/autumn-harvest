@@ -3545,6 +3545,9 @@ async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
                 harvest_task_queue::state.eq("RUNNING"),
                 harvest_task_queue::worker_id.eq(Some("race-worker")),
                 harvest_task_queue::attempt.eq(1),
+                // One attempt keeps the terminal timeout, which appends an
+                // event, as the path under test.
+                harvest_task_queue::max_attempts.eq(1),
                 harvest_task_queue::started_at
                     .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(60))),
                 harvest_task_queue::start_to_close.eq(Some(chrono::Duration::seconds(1))),

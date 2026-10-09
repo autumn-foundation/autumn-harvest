@@ -3846,6 +3846,9 @@ pub(crate) async fn claim_handler_started(
 
 /// Complete the task that `claim` holds. A stale claim changes nothing.
 ///
+/// Returns [`ClaimWrite::LeaseLost`] for a stale claim. [`complete_task`] is
+/// the same write, but returns `NotFound` for a stale claim.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
@@ -4238,18 +4241,21 @@ pub async fn release_abandoned_claim(
     Ok(ClaimWrite::Applied)
 }
 
-/// Mark the task that `claim` holds as completed with the given output.
+/// Mark the task that `claim` holds as `COMPLETED` with `output`.
 ///
-/// Terminal completion clears any heartbeat checkpoint payload so it cannot be
-/// observed after the activity has successfully finished.
+/// `claim` fences the write (issue #1992). The row must be `RUNNING` under
+/// the `worker_id` and `attempt` of `claim`. The write also clears the
+/// heartbeat checkpoint, so no reader sees it after the task completes.
 ///
-/// The write is fenced by `claim` (issue #1992). Use
-/// [`complete_claimed_task`] when a lost claim is not an error.
+/// Use this function when a lost claim is a bug, for example after
+/// [`claim_still_held_for_update`] returns `true` in the same transaction.
+/// Use [`complete_claimed_task`] when a lost claim is a normal outcome.
 ///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::NotFound`] when `claim` is not
-/// current, and [`crate::error::HarvestError::Database`] on update failure.
+/// Returns [`crate::error::HarvestError::NotFound`] when the row is not
+/// `RUNNING` under `claim`, and [`crate::error::HarvestError::Database`] on
+/// update failure.
 pub async fn complete_task(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
@@ -4265,8 +4271,8 @@ pub async fn complete_task(
     Ok(())
 }
 
-/// The one task completion write. It always takes a claim, so no
-/// completion is unfenced.
+/// The one task completion write. It always takes a claim, so every
+/// completion is fenced.
 async fn complete_task_inner(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,

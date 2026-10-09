@@ -202,6 +202,7 @@ The capability-miss release keys on `(worker_id, crash_strikes, attempt)` (issue
 - Writes: `complete_claimed_task`, `fail_claimed_task`, `requeue_claimed_task_for_retry`, `defer_claimed_rate_limited_task`, `defer_claimed_retry_for_budget`, `defer_claimed_task_for_open_circuit`, `mark_claim_handler_started`, `release_unstarted_claim`, `release_abandoned_claim` and `record_heartbeat`.
 - Drain release of a joined activity (issue #1813): `requeue_claimed_task_for_retry`. It keeps `attempt`, because the handler ran.
 - Workflow-task writes: `requeue_claimed_workflow_task_after_deadlock` (issue #1797) and `requeue_claimed_workflow_task_after_panic` (issue #1815).
+- `complete_task`. It takes a `TaskClaim` and returns `NotFound` when the claim is not current (issue #1992). The three workflow-task completions in `worker.rs` call it after the `claim_still_held_for_update` guard.
 - `lock_claim_for_update`. The start fence, both finalize paths, the in-worker schedule-to-close and session-acquire timeouts, and `run_transactional` take it after the execution row lock.
 - `claim_is_current` and `task_status_for_claim`. The cancellation observer and `ActivityContext::check_durable_cancellation` read them.
 - `claim_still_held_for_update`. The workflow-task terminal guard takes `claim_held` and adds `crash_strikes = $c` (issue #1806). The stuck-running requeue keeps `crash_strikes`, so only `attempt` tells a same-worker re-claim apart.
@@ -211,7 +212,7 @@ The capability-miss release keys on `(worker_id, crash_strikes, attempt)` (issue
 
 *Lease lost.* A path that gets `ClaimLock::Lost` appends no event and returns `Ok`. It must not return an error, because `fail_execution_on_error` would then fail the workflow. After `Held`, a `LeaseLost` write is a bug, and `require_applied` rolls the transaction back. A fenced write outside the lock returns `LeaseLost` when it matches 0 rows. The heartbeat flusher, the cancellation observer and `check_durable_cancellation` stop the activity.
 
-*Not fenced.* `complete_task`, `fail_task`, `requeue_for_retry` and `defer_rate_limited_task` stay unfenced. The timeout sweeper in `timeout.rs`, cancellation and operator actions use them on purpose: they act on a row whatever its claim. Workflow-task writes use `claim_still_held_for_update`, which also checks `attempt` (issues #804, #1184 and #1806).
+*Not fenced.* `fail_task`, `requeue_for_retry` and `defer_rate_limited_task` stay unfenced. The timeout sweeper in `timeout.rs`, cancellation and operator actions use them on purpose: they act on a row whatever its claim. Workflow-task writes use `claim_still_held_for_update`, which also checks `attempt` (issues #804, #1184 and #1806).
 
 *Timeout retries (issue #1809).* A start-to-close or heartbeat timeout acts only on the scanned claim. The sweeper skips the row when a later claim holds it. It requeues a retry with `requeue_claimed_task_for_retry` under the scanned claim.
 
