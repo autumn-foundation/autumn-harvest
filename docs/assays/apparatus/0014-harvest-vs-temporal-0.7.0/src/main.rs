@@ -124,10 +124,35 @@ impl Settings {
     }
 }
 
-/// The database name in a Postgres URL: the last path segment, without a query.
+/// The database name in a Postgres URL: the last path segment, without a
+/// query, with percent escapes decoded as the connection decodes them.
 fn database_name_of(url: &str) -> String {
     let path = url.split('?').next().unwrap_or(url);
-    path.rsplit('/').next().unwrap_or("assay14").to_string()
+    let raw = path.rsplit('/').next().unwrap_or("assay14").as_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let hex = raw
+            .get(i + 1..i + 3)
+            .and_then(|pair| std::str::from_utf8(pair).ok())
+            .and_then(|pair| u8::from_str_radix(pair, 16).ok());
+        match (raw[i], hex) {
+            (b'%', Some(byte)) => {
+                out.push(byte);
+                i += 3;
+            }
+            (byte, _) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A Postgres identifier in double quotes, with inner quotes doubled.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -408,7 +433,7 @@ fn build_pool(url: &str, size: usize) -> DbPool {
 /// Drop and recreate the assay database, then apply the engine schema.
 async fn reset_database(settings: &Settings) {
     let mut admin = connect(&settings.admin_url).await;
-    let name = &settings.database_name;
+    let name = quote_ident(&settings.database_name);
     admin
         .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
         .await
