@@ -328,8 +328,9 @@ pub const METRIC_DB_QUERY_DURATION: &str = "harvest.db.query.duration";
 
 /// Gauge: poll loops that claim work from a queue on this worker (issue #1815).
 ///
-/// Labelled `{queue}`. One poll loop claims from all the worker's queues, so
-/// each queue reports the same count. The count covers every worker that
+/// Labelled `{queue}`. Each claim loop claims from all the worker's queues,
+/// so each queue reports the same count. A worker runs
+/// `max_concurrent_claims` loops, 2 by default. The count covers every worker that
 /// shares the metrics recorder. It drops when a worker drains. This is the Harvest form of
 /// `temporal_num_pollers`.
 pub const METRIC_WORKER_POLLERS: &str = "harvest.worker.pollers";

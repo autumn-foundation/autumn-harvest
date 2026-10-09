@@ -168,6 +168,18 @@ impl ClaimProbe {
         .await
     }
 
+    /// Claims that started more than `slack_ms` after the database time
+    /// `at_ms`, in epoch milliseconds.
+    async fn started_after(&self, at_ms: i64, slack_ms: i64) -> i64 {
+        self.scalar(&format!(
+            "SELECT count(*) AS v FROM claim_probe_{}
+              WHERE extract(epoch FROM started) * 1000 > {}",
+            self.suffix,
+            at_ms + slack_ms
+        ))
+        .await
+    }
+
     async fn scalar(&self, sql: &str) -> i64 {
         #[derive(diesel::QueryableByName)]
         struct Row {
@@ -303,8 +315,22 @@ fn build_registry(metrics: Arc<dyn MetricsRecorder>) -> Arc<HandlerRegistry> {
 /// The knobs a test varies.
 struct Knobs {
     claims: usize,
+    workflows: usize,
     activities: usize,
     poll_interval: Duration,
+}
+
+impl Knobs {
+    /// `claims` loops, 16 workflow slots, `activities` activity slots and a
+    /// 25 ms poll.
+    const fn new(claims: usize, activities: usize) -> Self {
+        Self {
+            claims,
+            workflows: 16,
+            activities,
+            poll_interval: Duration::from_millis(25),
+        }
+    }
 }
 
 fn build_worker(
@@ -316,7 +342,7 @@ fn build_worker(
     let mut config: WorkerRuntimeConfig = autumn_harvest::builder::WorkerConfig::default().into();
     config.worker_id = worker_id.to_owned();
     config.queues = vec![queue.to_owned()];
-    config.max_concurrent_workflows = 16;
+    config.max_concurrent_workflows = knobs.workflows;
     config.max_concurrent_activities = knobs.activities;
     config.max_concurrent_claims = knobs.claims;
     config.poll_interval = knobs.poll_interval;
@@ -427,6 +453,21 @@ async fn count(url: &str, sql: &str, bind: &str) -> i64 {
         .v
 }
 
+/// The database clock, in epoch milliseconds.
+async fn db_now_ms(url: &str) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = BigInt)]
+        v: i64,
+    }
+    let mut conn = connect(url).await;
+    diesel::sql_query("SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint AS v")
+        .get_result::<Row>(&mut conn)
+        .await
+        .expect("read the database clock")
+        .v
+}
+
 /// How many workflows on `queue` completed.
 async fn completed(url: &str, queue: &str) -> i64 {
     count(
@@ -480,11 +521,7 @@ async fn drain_overlap(claims: usize, n: usize) -> i64 {
     let probe = ClaimProbe::install(&url, &queue, 150).await;
     seed(&url, &queue, n, false).await;
     let pool = build_pool(&url);
-    let knobs = Knobs {
-        claims,
-        activities: 4,
-        poll_interval: Duration::from_millis(25),
-    };
+    let knobs = Knobs::new(claims, 4);
     let worker = build_worker(&queue, &queue, &knobs, Arc::new(NoOpMetrics));
     let handle = spawn_worker(&worker, &pool);
 
@@ -529,15 +566,11 @@ async fn a_multi_shard_worker_overlaps_claims_up_to_its_cap() {
         (ShardId::new(0), pool.clone()),
         (ShardId::new(1), build_pool(&url)),
     ]);
-    let knobs = Knobs {
-        claims: 4,
-        activities: 4,
-        poll_interval: Duration::from_millis(25),
-    };
+    let knobs = Knobs::new(4, 4);
     let mut config: WorkerRuntimeConfig = autumn_harvest::builder::WorkerConfig::default().into();
     config.worker_id.clone_from(&queue);
     config.queues = vec![queue.clone()];
-    config.max_concurrent_workflows = 16;
+    config.max_concurrent_workflows = knobs.workflows;
     config.max_concurrent_activities = knobs.activities;
     config.max_concurrent_claims = knobs.claims;
     config.poll_interval = knobs.poll_interval;
@@ -574,46 +607,51 @@ async fn max_concurrent_claims_of_one_keeps_claims_serial() {
 // AC3: safety.
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_claims_never_exceed_the_local_permits() {
+/// Drain `n` workflows with 4 claim loops and `permits` slots of `kind`.
+/// Return the most `kind` rows the worker held at once, and the largest
+/// claim overlap.
+async fn most_rows_held(kind: &str, permits: usize, n: usize) -> (i64, i64) {
     let (url, _container) = setup_db().await;
-    let queue = format!("cc-permits-{}", Uuid::new_v4());
+    let queue = format!("cc-permits-{kind}-{}", Uuid::new_v4());
     let probe = ClaimProbe::install(&url, &queue, 50).await;
-    let n = 8;
-    seed(&url, &queue, n, true).await;
+    let with_activity = kind == "activity";
+    seed(&url, &queue, n, with_activity).await;
     let pool = build_pool(&url);
-    let knobs = Knobs {
-        claims: 4,
-        activities: 1,
-        poll_interval: Duration::from_millis(25),
-    };
+    let mut knobs = Knobs::new(4, 4);
+    if with_activity {
+        knobs.activities = permits;
+    } else {
+        knobs.workflows = permits;
+    }
     let worker = build_worker(&queue, &queue, &knobs, Arc::new(NoOpMetrics));
     let handle = spawn_worker(&worker, &pool);
 
-    // Sample the activity rows this worker holds until the backlog drains.
+    // Sample the rows of `kind` this worker holds until the backlog drains.
+    let held_sql = format!(
+        "SELECT count(*) AS v FROM harvest_task_queue
+          WHERE worker_id = $1 AND state = 'RUNNING' AND task_type = '{kind}'"
+    );
     let mut most = 0;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while completed(&url, &queue).await < n as i64 && tokio::time::Instant::now() < deadline {
-        let held = count(
-            &url,
-            "SELECT count(*) AS v FROM harvest_task_queue
-              WHERE worker_id = $1 AND state = 'RUNNING' AND task_type = 'activity'",
-            &queue,
-        )
-        .await;
-        most = most.max(held);
+        most = most.max(count(&url, &held_sql, &queue).await);
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     worker.shutdown();
     handle.await.expect("worker joins");
     let overlap = probe.max_overlap().await;
     probe.remove().await;
-
     assert_eq!(
         completed(&url, &queue).await,
         n as i64,
         "every workflow completes"
     );
+    (most, overlap)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_claims_never_exceed_the_activity_permits() {
+    let (most, overlap) = most_rows_held("activity", 1, 8).await;
     assert!(
         overlap >= 2,
         "claims overlap, so the gate is tested; largest overlap {overlap}"
@@ -625,17 +663,29 @@ async fn concurrent_claims_never_exceed_the_local_permits() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_claims_never_exceed_the_workflow_permits() {
+    // A poll holds one permit across its claim, and a running task holds
+    // one. With 3 permits, two claims can overlap.
+    let (most, overlap) = most_rows_held("workflow", 3, 16).await;
+    assert!(
+        overlap >= 2,
+        "claims overlap, so the gate is tested; largest overlap {overlap}"
+    );
+    assert!(
+        most <= 3,
+        "a worker with 3 workflow permits holds at most 3 workflow rows; held {most}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_task_runs_once_under_concurrent_claims() {
     let (url, _container) = setup_db().await;
     let queue = format!("cc-once-{}", Uuid::new_v4());
+    let probe = ClaimProbe::install(&url, &queue, 30).await;
     let n = 24;
     let ids = seed(&url, &queue, n, true).await;
     let pool = build_pool(&url);
-    let knobs = Knobs {
-        claims: 4,
-        activities: 8,
-        poll_interval: Duration::from_millis(25),
-    };
+    let knobs = Knobs::new(4, 8);
     // Two workers, so claims race inside one worker and across workers.
     let a = build_worker(&format!("{queue}-a"), &queue, &knobs, Arc::new(NoOpMetrics));
     let b = build_worker(&format!("{queue}-b"), &queue, &knobs, Arc::new(NoOpMetrics));
@@ -647,7 +697,13 @@ async fn every_task_runs_once_under_concurrent_claims() {
     b.shutdown();
     ha.await.expect("worker a joins");
     hb.await.expect("worker b joins");
+    let overlap = probe.max_overlap().await;
+    probe.remove().await;
     assert!(drained, "every workflow completes");
+    assert!(
+        overlap >= 2,
+        "claims overlap, so the race is tested; largest overlap {overlap}"
+    );
 
     let runs = ACTIVITY_RUNS.lock().expect("runs map").clone();
     for id in &ids {
@@ -660,31 +716,37 @@ async fn every_task_runs_once_under_concurrent_claims() {
     }
 }
 
+/// Followers wake during a burst, then go idle with the leader. Count the
+/// claims of the idle window that follows the burst.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_idle_worker_claims_at_the_single_loop_rate() {
     let (url, _container) = setup_db().await;
-    let queue = format!("cc-idle-{}", Uuid::new_v4());
     let pool = build_pool(&url);
-    let poll = Duration::from_millis(50);
     let mut counts = Vec::new();
     for claims in [1, 4] {
+        let queue = format!("cc-idle-{claims}-{}", Uuid::new_v4());
+        seed(&url, &queue, 8, false).await;
         let counter = Arc::new(ClaimCounter::default());
-        let knobs = Knobs {
-            claims,
-            activities: 4,
-            poll_interval: poll,
-        };
+        let mut knobs = Knobs::new(claims, 4);
+        knobs.poll_interval = Duration::from_millis(50);
         let worker = build_worker(
-            &format!("{queue}-{claims}"),
+            &queue,
             &queue,
             &knobs,
             Arc::clone(&counter) as Arc<dyn MetricsRecorder>,
         );
         let handle = spawn_worker(&worker, &pool);
+        assert!(
+            wait_completed(&url, &queue, 8, Duration::from_secs(60)).await,
+            "the burst drains"
+        );
+        // Let the followers finish their runs, then count an idle window.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        counter.0.store(0, Ordering::Relaxed);
         tokio::time::sleep(Duration::from_secs(2)).await;
+        counts.push(AtomicUsize::load(&counter.0, Ordering::Relaxed));
         worker.shutdown();
         handle.await.expect("worker joins");
-        counts.push(AtomicUsize::load(&counter.0, Ordering::Relaxed));
     }
     let (one, four) = (counts[0], counts[1]);
     assert!(one > 0, "the idle worker polls");
@@ -695,30 +757,42 @@ async fn an_idle_worker_claims_at_the_single_loop_rate() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn no_task_stays_running_after_a_concurrent_worker_stops() {
+async fn no_claim_starts_after_a_concurrent_worker_stops() {
     let (url, _container) = setup_db().await;
     let queue = format!("cc-stop-{}", Uuid::new_v4());
     let probe = ClaimProbe::install(&url, &queue, 200).await;
     seed(&url, &queue, 40, true).await;
     let pool = build_pool(&url);
-    let knobs = Knobs {
-        claims: 4,
-        activities: 8,
-        poll_interval: Duration::from_millis(25),
-    };
+    let knobs = Knobs::new(4, 8);
     let worker = build_worker(&queue, &queue, &knobs, Arc::new(NoOpMetrics));
     let handle = spawn_worker(&worker, &pool);
 
     // Stop while claims are in flight.
     tokio::time::sleep(Duration::from_millis(900)).await;
+    let stopped_at = db_now_ms(&url).await;
     worker.shutdown();
-    handle.await.expect("worker joins");
+    tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("the worker stops")
+        .expect("worker joins");
+    // Every claim loop has returned, so the claim count stays fixed.
+    let claims_at_return = probe.claims().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let claims_later = probe.claims().await;
+    // A claim in flight at the stop can reach its update a little later.
+    // No loop starts a new claim.
+    let late = probe.started_after(stopped_at, 150).await;
     let overlap = probe.max_overlap().await;
     probe.remove().await;
 
     assert!(
         overlap >= 2,
         "claims overlap before the stop; largest overlap {overlap}"
+    );
+    assert_eq!(late, 0, "no claim starts after the stop");
+    assert_eq!(
+        claims_later, claims_at_return,
+        "no claim lands after the worker returns"
     );
     let running = count(
         &url,

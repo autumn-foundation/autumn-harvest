@@ -141,7 +141,8 @@ The full rules are in [`architecture.md`](../architecture.md) design decision 12
   `PENDING` for another worker or a later poll. Other types on the same
   worker are not affected.
 - When a slot frees, the worker polls again at once.
-- Two pollers can claim at the same moment and pass the cap. The worker then
+- Two claim loops can claim at the same moment and pass the cap. They can
+  be loops of one worker (`max_concurrent_claims`) or of two workers. The worker then
   puts the task back to `PENDING` with a short delay. This uses no attempt,
   writes no history event and spends no retry-budget token. The counter
   `harvest.activity.concurrency_deferred` counts these deferrals.
@@ -205,7 +206,9 @@ window is small and noisy. The limit suits request-and-response calls. For a
 long activity, prefer `max_concurrent` or raise `min_limit`.
 
 **`concurrency_deferred` rises steadily.** Claims often race past the cap,
-for example when one poll claims a batch of tasks of the type. Each
+for example when one poll claims a batch of tasks of the type, or when
+the claim loops of one worker claim the type at once. A worker with
+`max_concurrent_claims = 1` races less. Each
 deferral costs a short delay, from 50 ms to 5 s, not an attempt. A steady
 low rate is harmless. A high rate while the cap falls means that the
 dependency is degrading faster than the claims see it.

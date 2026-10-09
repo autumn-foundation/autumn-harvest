@@ -55,8 +55,8 @@
 //! - The claim skips a type at its cap, also on a row with capability
 //!   requirements. Its tasks stay `PENDING` for another worker or a later
 //!   poll.
-//! - A claim can still race past the cap, for example when two pollers
-//!   claim at once. The dispatch gate then defers the row with the fenced
+//! - A claim can still race past the cap, for example when two claim
+//!   loops claim at once, of one worker or of two. The dispatch gate then defers the row with the fenced
 //!   retry-budget write. The deferral uses no attempt and appends no event.
 //! - The gate runs before the retry budget, so a deferral spends no budget
 //!   token. A circuit short-circuit and a half-open probe take no slot.

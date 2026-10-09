@@ -7787,7 +7787,7 @@
               }
             }
           ],
-          "description": "Poll loops that claim from each queue, summed over worker replicas (issue #1815). One worker runs one poll loop over all its queues. A drained worker reports 0. When the last poller of a queue exits, its series ends; the queue-depth fallback then draws that queue at 0, and its backlog grows."
+          "description": "Poll loops that claim from each queue, summed over worker replicas (issue #1815). One worker runs max_concurrent_claims claim loops (2 by default), each over all its queues. A drained worker reports 0. When the last poller of a queue exits, its series ends; the queue-depth fallback then draws that queue at 0, and its backlog grows."
         },
         {
           "id": 872151,
