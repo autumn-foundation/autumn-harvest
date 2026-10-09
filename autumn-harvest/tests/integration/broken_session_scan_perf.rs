@@ -463,10 +463,10 @@ struct Point {
 }
 
 async fn measure(admin: &str, label: &str, n: i64, out_dir: &std::path::Path, full: bool) -> Point {
-    let db_name = format!(
-        "broken_session_perf_{label}_{n}_{}",
-        Uuid::new_v4().simple()
-    );
+    // PostgreSQL truncates identifiers to 63 bytes, so keep the name short.
+    let suffix = Uuid::new_v4().simple().to_string();
+    let db_name = format!("bsp_{label}_{n}_{}", &suffix[..16]);
+    assert!(db_name.len() <= 63, "database name {db_name} is too long");
     let url = create_fresh_db(admin, &db_name).await;
     let mut seed = AsyncPgConnection::establish(&url).await.unwrap();
     let _ = diesel::sql_query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
