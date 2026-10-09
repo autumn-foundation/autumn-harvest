@@ -864,6 +864,24 @@ fn release_builds_auditable_binaries_and_an_sbom() {
     }
 }
 
+/// Each CLI archive ships both license texts (issue #1990). The workspace
+/// declares `MIT OR Apache-2.0`, and both licenses require the text with a copy.
+#[test]
+fn release_archive_ships_both_license_texts() {
+    let doc = parse_workflow(RELEASE_WORKFLOW);
+    let package = job_steps(&doc, RELEASE_WORKFLOW, "binaries")
+        .iter()
+        .find(|s| text(s, "name") == Some("Package the archive"))
+        .and_then(|s| text(s, "run"))
+        .expect("binaries must have a `Package the archive` step with a `run`");
+    for file in ["LICENSE-MIT", "LICENSE-APACHE"] {
+        assert!(
+            package.contains(file),
+            "the archive must hold {file}:\n{package}"
+        );
+    }
+}
+
 /// Signing is keyless and verified in the same job. Provenance and the SBOM
 /// are attested against the archive digest, on a tag push only.
 /// `gh attestation verify --repo` accepts any run of this repository, so a

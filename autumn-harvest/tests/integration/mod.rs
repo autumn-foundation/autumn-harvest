@@ -252,6 +252,7 @@ mod replay_canary_tests;
 mod replay_drift_tests;
 #[cfg(feature = "fuzzing")]
 mod replay_fuzz_seeds;
+mod replay_positioning_docs;
 mod replay_tests;
 #[cfg(feature = "testing")]
 mod replay_verifier_tests;
@@ -308,6 +309,10 @@ mod sla_breach_tests;
 mod slo_pack_docs;
 mod slot_tuner_tests;
 mod sqlite_feasibility_docs;
+mod standalone_activity_docs;
+#[cfg(feature = "db")]
+mod standalone_activity_overhead_perf;
+mod standalone_activity_support;
 #[cfg(feature = "db")]
 mod start_idempotency_tests;
 #[cfg(feature = "db")]

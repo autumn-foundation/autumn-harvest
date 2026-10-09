@@ -166,9 +166,11 @@ jobs:
           ext=""
           if [ "$RUNNER_OS" = Windows ]; then ext=".exe"; fi
           mkdir -p "dist/${NAME}"
+          # The archive ships both license texts (issue #1990). `cp` fails
+          # the step if a license file is missing.
           cp "target/${TARGET}/release/harvest${ext}" \
             "target/${TARGET}/release/harvest-replay${ext}" \
-            README.md "dist/${NAME}/"
+            README.md LICENSE-MIT LICENSE-APACHE "dist/${NAME}/"
           tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
           rm -rf "dist/${NAME:?}"
       # The SBOM describes the package, features and target of the build.
