@@ -60,9 +60,9 @@ once. **No SQL change. No migration. No new `WorkflowEvent` variant.**
 
 | Hat | Notes |
 |-----|-------|
-| White | Assay #14 numbers above. Measured results are in `docs/performance.md` § "Claim concurrency". |
+| White | Assay #14 numbers above. Measured after the change on assay #14's workload: 1 loop keeps 0.94 claims in flight, 2 loops 1.86 and 4 loops 3.3. Throughput rises 21% to 35% with 2 loops, and 39% to 59% with 4. See `docs/performance.md` § "Claim concurrency". |
 | Red | The leader loop does not change, so the old behaviour stays as a floor. That is easy to trust. |
-| Black | (1) On a 4-core box, Postgres and the worker share the CPUs. Two loops may give less than 2×. (2) Followers add claim statements under load. (3) One more connection per extra loop. (4) A hot concurrency key makes loops lose `pg_try_advisory_xact_lock` more often. They return an empty claim, as two workers do today. |
+| Black | (1) On a 4-core box, Postgres and the worker share the CPUs. Two loops may give less than 2×. Measured: the mean claim time rises from 4 ms to 6 ms with 2 loops and to 9 ms with 4. (2) Followers add claim statements under load. (3) One more connection per extra loop. (4) A hot concurrency key makes loops lose `pg_try_advisory_xact_lock` more often. They return an empty claim, as two workers do today. |
 | Yellow | No SQL, schema or event change. The exactly-once, `SKIP LOCKED`, permit and fence arguments carry over unchanged. |
 | Green | B3 and B5 stay open. An adaptive cap can come later. |
 | Blue | Red: a slow-claim test that measures overlapping claims fails. Green: the setting and the follower loops. Refactor: shared helpers, docs and measurement. Then a multi-angle review. |

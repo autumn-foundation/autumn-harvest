@@ -11,7 +11,16 @@
      config
  }
  
-@@ -934,6 +938,10 @@
+@@ -684,6 +688,8 @@
+             concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+             priority: Priority::default(),
+             max_workflow_input_bytes: 0,
++            // Trunk added this field after assay #14 (issue #1977).
++            tenant: None,
+             start_at: None,
+             delay: None,
+             max_workflow_start_delay: None,
+@@ -934,6 +940,10 @@
               slots, {POOL_SIZE} connections, {WORKER_POLL_MS} ms poll. Input `{}`. Cap {} s.\n",
              settings.input_json, settings.cap_secs
          );

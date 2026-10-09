@@ -1,4 +1,4 @@
-## Engine — A worker runs more than one claim at once (assay #14, re-charter item 1)
+## Engine — A worker runs more than one claim at once (PR #2106, assay #14 re-charter item 1)
 
 **Behaviour change.** A worker now runs up to `max_concurrent_claims` claims
 at once. The default is 2. Before, one serial loop ran one claim at a time.

@@ -48,6 +48,10 @@ this page says nothing about what they cost in *that* table; see
   claim does not spill. At 100K, 8 claimers sustain 573 claims/s against 1.2 before. The
   full scan that the rest of this page measures now runs only as a
   fallback. See [the seek window](#the-seek-window-issue-1971).
+* **A worker now runs up to `max_concurrent_claims` claims at once (default
+  2).** One serial loop kept 0.94 claims in flight and capped throughput. On
+  assay #14's workload, two loops raise throughput 21% to 35%, and four
+  loops 39% to 59%. See [claim concurrency](#claim-concurrency).
 * **Before issue #1971, claim latency scaled superlinearly with
   pending-backlog depth.** The bullets below describe the full scan. 1k → 10k
   rows (10x) costs ~19x latency; 10k → 100k (10x) costs a further ~15x. Claim
@@ -1615,6 +1619,73 @@ same box in the same session, through assay #11's runner.
 
 **Claims in flight** is the claim count times the mean claim time, divided
 by the elapsed time. One serial loop cannot exceed 1.
+
+Host: 4 logical CPUs (Intel Xeon @ 2.10 GHz). PostgreSQL 16.15 with
+`fsync=off`, `synchronous_commit=off` and `max_connections=300`. One worker,
+8 workflow slots, 16 activity slots, 32 connections, 25 ms poll. Three
+rounds on 2026-10-09, 17:45 to 18:08 UTC. All 84 runs are valid. Raw output:
+[`results/raw/`](perf-artifacts/claim-concurrency/results/raw/). Graded:
+[`results/graded.md`](perf-artifacts/claim-concurrency/results/graded.md).
+
+### Results
+
+Completed workflows/sec, the mean of three runs:
+
+| depth | Temporal | 1 loop | 2 loops (default) | 4 loops |
+|--:|--:|--:|--:|--:|
+| 250 | 31.85 | 32.97 | 44.54 | 48.21 |
+| 500 | 37.29 | 34.97 | 42.34 | 48.49 |
+| 1,000 | 34.63 | 34.37 | 43.80 | 51.21 |
+| 2,000 | 35.13 | 32.09 | 41.76 | 51.10 |
+
+Temporal over harvest:
+
+| depth | 1 loop | 2 loops | 4 loops |
+|--:|--:|--:|--:|
+| 250 | 0.97x | 0.72x | 0.66x |
+| 500 | 1.07x | 0.88x | 0.77x |
+| 1,000 | 1.01x | 0.79x | 0.68x |
+| 2,000 | 1.09x | 0.84x | 0.69x |
+
+Claims in flight, mean claim time and mean pool connections in use:
+
+| depth | in flight 1 / 2 / 4 | claim ms 1 / 2 / 4 | connections 1 / 2 / 4 |
+|--:|--:|--:|--:|
+| 250 | 0.92 / 1.84 / 3.30 | 3.99 / 5.84 / 8.84 | 3.7 / 6.4 / 11.4 |
+| 500 | 0.93 / 1.84 / 3.18 | 3.78 / 6.16 / 8.49 | 3.6 / 6.6 / 11.0 |
+| 1,000 | 0.94 / 1.86 / 3.17 | 3.90 / 6.02 / 7.97 | 3.7 / 6.8 / 11.1 |
+| 2,000 | 0.94 / 1.87 / 3.36 | 4.20 / 6.35 / 8.78 | 3.8 / 6.8 / 11.7 |
+
+What the tables show:
+
+- **One loop reproduces assay #14's ceiling.** It keeps 0.92 to 0.94 claims
+  in flight, the same occupancy as the assay.
+- **Two loops keep about two claims in flight.** Throughput rises 21% to
+  35%. Harvest then runs 1.14x to 1.39x as fast as Temporal on this box.
+- **Four loops keep about 3.3 claims in flight.** Throughput rises 39% to
+  59%. The gain per loop falls, because the claims now contend on the
+  database. The mean claim time rises from about 4 ms to about 9 ms.
+- **Each loop holds about one more connection.** Size the pool for the slots
+  plus `max_concurrent_claims`.
+- **Depth does not change the result.** The seek window keeps the claim
+  flat from 250 to 2,000 rows (see [the seek window](#the-seek-window-issue-1971)).
+
+The default is 2. It clears the measured ceiling at the cost of one
+connection. Raise it to 4 when the pool and the database have room. Watch
+`rate(harvest_db_query_duration_sum{op="claim"}[5m])` per worker: it is the
+mean claims in flight. Divide it by `max_concurrent_claims` for the
+occupancy of each loop.
+
+### What the measurement does not establish
+
+- **Another box.** This host is not assay #14's host. Temporal reads 31.9 to
+  37.3 here, against 24.8 to 28.7 in assay #14. Only ratios from one box
+  compare.
+- **A tuned Temporal.** The Temporal arm runs at its defaults, as in assay
+  #11.
+- **Other shapes.** One worker, one queue and three activities per workflow.
+  A hot concurrency key or a rate-limited activity gains less, because the
+  loops contend for one advisory lock or one bucket row.
 
 ## Enqueue throughput
 
