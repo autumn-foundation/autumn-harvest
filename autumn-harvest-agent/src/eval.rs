@@ -84,7 +84,7 @@ use autumn_harvest::erase::is_erasure_tombstone;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString, parse_typed_payload};
 use autumn_harvest::policy::RetryPolicy;
-use autumn_harvest::testing::{MAX_TEST_ITERATIONS, WorkflowTestEnv};
+use autumn_harvest::testing::WorkflowTestEnv;
 use autumn_harvest::types::ActivityExecId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -109,10 +109,6 @@ pub const NOT_RUN: &str =
 
 /// The default number of live turns past the recorded turn count.
 pub const DEFAULT_EXTRA_TURNS: usize = 8;
-
-/// The engine cycles allowed for one candidate turn: the model call, its tool
-/// calls and its waits.
-const CYCLES_PER_TURN: usize = 64;
 
 /// The failure of a model turn past the turn cap.
 const TURN_CAP_ERROR: &str = "the evaluation reached its turn cap";
@@ -410,14 +406,11 @@ pub async fn evaluate(
         }
     };
 
-    // Each sequential await costs one engine cycle. A long source needs more
-    // cycles than the test engine allows by default.
-    let cycles = history
-        .len()
-        .saturating_add(max_turns.saturating_mul(CYCLES_PER_TURN))
-        .max(MAX_TEST_ITERATIONS);
+    // Each sequential await costs one engine cycle, and one turn can hold any
+    // number of tool calls. The engine cap guards against an endless loop.
+    // The turn cap already bounds this loop, so the harness lifts the cap.
     let mut env = WorkflowTestEnv::new()
-        .with_max_iterations(cycles)
+        .with_max_iterations(usize::MAX)
         .with_workflow_name(WORKFLOW_NAME)
         .mock_activity(agent_model_turn_info().name, model)
         .mock_activity(agent_tool_call_info().name, tool)
@@ -824,13 +817,17 @@ fn live_turn(
 ) -> Result<ModelTurn, String> {
     let mut attempt = 1;
     loop {
-        let align =
-            |content: &mut Vec<ContentPart>| align_call_ids(content, recorded, taken, index);
+        // The provider ids, before the alignment changes them.
+        let mut provider_ids = Vec::new();
+        let align = |content: &mut Vec<ContentPart>| {
+            provider_ids = call_ids(content);
+            align_call_ids(content, recorded, taken, index);
+        };
         let result = tokio::task::block_in_place(|| {
             handle.block_on(harness.model_turn_with(request.clone(), align))
         });
         let payload = match result {
-            Ok(turn) => return fit_result_cap(turn, harness.result_cap()),
+            Ok(turn) => return fit_result_cap(turn, &provider_ids, harness.result_cap()),
             Err(payload) => payload,
         };
         let delay = retry_delay(&payload, retry, attempt).ok_or(payload)?;
@@ -839,14 +836,39 @@ fn live_turn(
     }
 }
 
+/// The ids of the tool calls in `content`, in order.
+fn call_ids(content: &[ContentPart]) -> Vec<String> {
+    content
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::ToolCall { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Refuse a turn over the worker result cap, as a worker with no payload
 /// store does.
+///
+/// A worker records the turn with the provider ids. So the check measures
+/// the turn with `provider_ids`, not with the aligned ids.
 ///
 /// # Errors
 ///
 /// Returns a non-retryable `PayloadTooLarge` failure payload.
-fn fit_result_cap(turn: ModelTurn, cap: u64) -> Result<ModelTurn, String> {
-    if exceeds_bytes(&turn, cap) {
+fn fit_result_cap(turn: ModelTurn, provider_ids: &[String], cap: u64) -> Result<ModelTurn, String> {
+    let mut as_recorded = turn.clone();
+    let parts = as_recorded
+        .content
+        .iter_mut()
+        .filter_map(|part| match part {
+            ContentPart::ToolCall { id, .. } => Some(id),
+            _ => None,
+        });
+    for (id, provider_id) in parts.zip(provider_ids) {
+        id.clone_from(provider_id);
+    }
+    if exceeds_bytes(&as_recorded, cap) {
         return Err(ActivityFailure::non_retryable(
             "PayloadTooLarge",
             format!("the model turn is larger than the result cap of {cap} bytes"),
@@ -1164,6 +1186,16 @@ mod tests {
         let id = turn.calls()[0].id.clone();
         assert!(id.starts_with("eval_0_0_c1"), "{id}");
         assert_ne!(id, "eval_0_0_c1");
+    }
+
+    #[test]
+    fn the_result_cap_measures_the_provider_ids() {
+        let mut turn = turn_of(&[call("c1", "a", json!(1))]);
+        let fits = crate::bounds::json_len(&turn);
+        align_call_ids(&mut turn.content, &[], &HashSet::new(), 0);
+        let original = vec!["c1".to_owned()];
+        assert!(fit_result_cap(turn.clone(), &original, fits).is_ok());
+        assert!(fit_result_cap(turn, &original, fits - 1).is_err());
     }
 
     #[test]

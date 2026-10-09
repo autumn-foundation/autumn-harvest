@@ -69,8 +69,8 @@ The harness is a new `eval` module in `autumn-harvest-agent`, behind a new
 | R17 | A source that failed on a tool goes on past the failure. | The recorded terminal failure of a tool or snapshot fails the candidate at the same activity. |
 | R18 | A cancelled, timed-out or redriven source has no recorded end. | The harness refuses it. |
 | R19 | A stray approval releases a call. | The harness sends again only an approval for a wait that the source opened. |
-| R20 | A long source passes the test-engine cycle cap. | `WorkflowTestEnv::with_max_iterations` lets the harness size the cap. |
-| R21 | An oversized candidate turn passes. | The harness applies the worker result cap. |
+| R20 | A long source, or a turn with many calls, passes the test-engine cycle cap. | `WorkflowTestEnv::with_max_iterations` lets the harness lift the cap. The turn cap bounds the run. |
+| R21 | An oversized candidate turn passes. | The harness applies the worker result cap to the turn with the provider ids. |
 
 ### 0.4 Six thinking hats
 

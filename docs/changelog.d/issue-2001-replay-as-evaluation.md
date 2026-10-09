@@ -31,7 +31,7 @@ length.
 
 **Engine.** `WorkflowTestEnv::with_max_iterations` sets the cycle cap of one
 test run. The default stays `MAX_TEST_ITERATIONS` (1000). The evaluation
-raises it to fit a long source.
+lifts the cap, because its turn cap already bounds the run.
 
 **Fork rules.** An evaluation is an in-memory fork at the first event. The
 harness leaves the source unchanged, accepts a completed source, records or
