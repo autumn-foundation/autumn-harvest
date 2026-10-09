@@ -97,7 +97,7 @@ sourcing doc and flag anything unverified.
 
 | Engine | Model |
 |---|---|
-| **autumn-harvest** | Code-first async Rust with event-sourced deterministic replay. Also a first-class DAG surface (`#[dag]`, [unified DAG execution #256](https://github.com/autumn-foundation/autumn-harvest/issues/256)); [signals/queries/updates](https://github.com/autumn-foundation/autumn-harvest/issues/234) ([#140](https://github.com/autumn-foundation/autumn-harvest/issues/140), [#346](https://github.com/autumn-foundation/autumn-harvest/issues/346)); [Saga compensation](saga.md) ([#238](https://github.com/autumn-foundation/autumn-harvest/issues/238)); inbound [webhook triggers (#344)](https://github.com/autumn-foundation/autumn-harvest/issues/344). |
+| **autumn-harvest** | Code-first async Rust with event-sourced deterministic replay. Also a first-class DAG surface (`#[dag]`, [unified DAG execution #256](https://github.com/autumn-foundation/autumn-harvest/issues/256)); [signals/queries/updates](https://github.com/autumn-foundation/autumn-harvest/issues/234) ([#140](https://github.com/autumn-foundation/autumn-harvest/issues/140), [#346](https://github.com/autumn-foundation/autumn-harvest/issues/346)); [Saga compensation](saga.md) ([#238](https://github.com/autumn-foundation/autumn-harvest/issues/238)); inbound [webhook triggers (#344)](https://github.com/autumn-foundation/autumn-harvest/issues/344); [keyed entities](adr/0006-keyed-entity.md) ([#1975](https://github.com/autumn-foundation/autumn-harvest/issues/1975)) with one handler at a time for each key. |
 | Temporal | Code-first imperative durable Workflows + Activities (side effects isolated in Activities). ([docs](https://docs.temporal.io/)) |
 | DBOS | Code-first — ordinary functions annotated as durable **workflows** and **steps** via decorators/annotations. ([docs](https://docs.dbos.dev/)) |
 | Inngest | Event-driven step functions — functions triggered by events / cron / webhooks, logic split into memoized `step` calls. ([docs](https://www.inngest.com/docs/learn/how-functions-are-executed)) |
@@ -108,7 +108,7 @@ sourcing doc and flag anything unverified.
 
 | Engine | Approach |
 |---|---|
-| **autumn-harvest** | Event-sourced deterministic replay, layered with the deepest safety tooling in this set: **compile-time guardrails HVG001–HVG011** plus a `det_check` static analyzer (DET010/DET011) that flag non-deterministic patterns before they ship; the [`WorkflowReplayer` harness (Phase 3.5)](replay-verify.md) that replays current code against recorded histories in CI; **non-terminal [ND-blocking (#603)](https://github.com/autumn-foundation/autumn-harvest/issues/603)** that _parks and alerts_ a divergent run rather than silently wedging or failing it; and [deterministic side-effect primitives (#384)](https://github.com/autumn-foundation/autumn-harvest/issues/384) for time/UUID/random. See the [workflow determinism guide](workflow-determinism-guide.md). |
+| **autumn-harvest** | Event-sourced deterministic replay, layered with the deepest safety tooling in this set: **compile-time guardrails HVG001–HVG011** plus a `det_check` static analyzer (DET010/DET011) that flag non-deterministic patterns before they ship; the [`ReplayVerifier` CI gate (#251)](replay-verify.md), built on the `WorkflowReplayer` harness, that replays current code against recorded histories; **non-terminal [ND-blocking (#603)](https://github.com/autumn-foundation/autumn-harvest/issues/603)** that _parks and alerts_ a divergent run rather than silently wedging or failing it; and [deterministic side-effect primitives (#384)](https://github.com/autumn-foundation/autumn-harvest/issues/384) for time/UUID/random. See the [workflow determinism guide](workflow-determinism-guide.md), and [why Harvest keeps deterministic replay](why-deterministic-replay.md) for the trade-off against checkpoint-only steps. |
 | Temporal | Deterministic replay is core (Event History replayed against code); ships **Replay testing** to detect non-determinism before deploy. ([docs](https://docs.temporal.io/develop/safe-deployments)) |
 | DBOS | Checkpoint/resume from the last completed step (not command-comparison replay); docs state workflow functions must be deterministic and keep I/O in steps. ([docs](https://docs.dbos.dev/architecture)) |
 | Inngest | Step-based memoization; docs state **no determinism requirement** on the orchestration layer (each step runs once, result persisted, completed steps skipped on retry). ([docs](https://www.inngest.com/docs/learn/how-functions-are-executed)) |
@@ -219,7 +219,7 @@ replay tests alone:
 2. **[Deterministic side-effect primitives (#384)](https://github.com/autumn-foundation/autumn-harvest/issues/384)**
    give authors safe replacements (`ctx.system_now`, `ctx.new_uuid`,
    `ctx.random_*`) that record their value once and replay it verbatim.
-3. **The [`WorkflowReplayer` harness (Phase 3.5)](replay-verify.md)** replays a
+3. **The [`ReplayVerifier` gate (#251)](replay-verify.md)** replays a
    code change against recorded production histories in CI, so a non-determinism
    regression is a failed test, not a 2 a.m. page.
 4. **Non-terminal [ND-blocking (#603)](https://github.com/autumn-foundation/autumn-harvest/issues/603)**
@@ -229,6 +229,11 @@ replay tests alone:
    exactly where it was. Most engines in this set treat replay determinism as an
    author responsibility validated by replay tests; harvest additionally makes a
    divergent run a recoverable, observable state.
+
+Some engines skip replay and resume from step checkpoints instead.
+[Why Harvest keeps deterministic replay](why-deterministic-replay.md) states
+what replay buys, what it costs, and when a checkpoint-only engine is the
+better choice.
 
 ### 3. Embedded in your web app — no separate orchestrator cluster
 
@@ -298,6 +303,13 @@ where one exists.
   ([shard rebalancing](sharding.md#shard-rebalancing--migrating-quiescent-workflows-issue-964),
   [#964](https://github.com/autumn-foundation/autumn-harvest/issues/964)), but not
   running ones.
+- **Keyed entities are a library, not a native primitive.** `autumn_harvest::entity`
+  gives each key one handler at a time and durable state
+  ([ADR 0006](adr/0006-keyed-entity.md),
+  [#1975](https://github.com/autumn-foundation/autumn-harvest/issues/1975)). An
+  operation has no reply, so a caller reads state with a query. A Restate
+  virtual object call returns a result. An Azure durable entity call made from
+  an orchestration also returns one.
 - **No cross-engine benchmark on equal hardware.** harvest now publishes its
   own reproducible end-to-end numbers and the harness that produces them
   ([`benchmarks.md`](benchmarks.md),
@@ -374,3 +386,6 @@ Temporal-style Schedule object.
   concept map, a workflow-porting checklist, and a dual-run cutover playbook.
   This page answers _why / whether_ harvest; the migration guide answers
   _how_ to move.
+- **[Why Harvest keeps deterministic replay](why-deterministic-replay.md)**
+  ([#1993](https://github.com/autumn-foundation/autumn-harvest/issues/1993)):
+  what replay buys over checkpoint-only steps, and how Harvest lowers its cost.

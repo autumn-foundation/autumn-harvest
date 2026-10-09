@@ -313,6 +313,8 @@ pub mod dst;
 /// tunable is a compile error until it is surfaced.
 pub mod effective_config;
 pub mod eligibility;
+/// Keyed entity: serialized handlers over durable state for each key (issue #1975).
+pub mod entity;
 /// Targeted PII erasure for completed workflow executions (issue #495).
 ///
 /// Provides [`erase::erase_workflow_payloads`] (DB-gated) plus the pure
@@ -492,6 +494,8 @@ pub mod stall_diagnosis;
 pub mod start_idempotency;
 /// OpenTelemetry integration: trace-context propagation and metrics.
 pub mod telemetry;
+/// Tenant keys: validation shared by tokens, starts and retention (issue #1977).
+pub mod tenant;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_generator;
 /// Replay test harness for verifying workflow determinism pre-deploy.
@@ -778,7 +782,7 @@ pub use test_generator::TestHarnessGenerator;
 pub use testing::{
     BatchReplayReport, CiReport, FailOnMode, FixtureResult, FixtureStatus, HarnessErrorKind,
     ReplayBlocked, ReplayDrift, ReplayDriftReport, ReplayVerifier, ReportFormat, TestRunOutcome,
-    WorkflowTestEnv,
+    TestRunStatus, WorkflowTestEnv, WorkflowTestRun,
 };
 #[cfg(all(feature = "db", any(test, feature = "testing")))]
 pub use testing::{

@@ -1258,7 +1258,11 @@ impl HarvestApiState {
             WorkflowHandleClient::new(pool.sharded_pool().clone(), runtime.router().clone(), urls)
                 // Issue #684: wire the engine recorder so the in-process typed-update
                 // path emits harvest.update.admitted.
-                .with_metrics(runtime.registry.telemetry().metrics.clone()),
+                .with_metrics(runtime.registry.telemetry().metrics.clone())
+                // Issue #1979: the route decodes the output itself, through the
+                // gated read-path decoder (issue #608).
+                .with_codecs(self.payload_codecs())
+                .with_stored_result_output(),
         )
     }
 
@@ -3947,6 +3951,11 @@ struct CreateTokenRequest {
     /// Optional expiry; an expired token is rejected 401 on the next request.
     #[serde(default)]
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Optional tenant claim (issue #1977). A tenant-bound token reaches only
+    /// the runs of its tenant, through the tenant-scoped routes. It must be 1
+    /// to 128 bytes of visible ASCII, with no spaces.
+    #[serde(default)]
+    tenant: Option<String>,
 }
 
 fn default_token_scope() -> String {
@@ -3974,6 +3983,15 @@ async fn create_token_handler(
         )
             .into_response();
     };
+    if let Some(tenant) = body.tenant.as_deref()
+        && let Err(e) = autumn_harvest::tenant::validate_tenant(tenant)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("invalid tenant: {e}") })),
+        )
+            .into_response();
+    }
 
     let pool = match api_state.storage_pool() {
         Ok(p) => p,
@@ -3984,8 +4002,15 @@ async fn create_token_handler(
         Err(e) => return e.into_response(),
     };
 
-    match crate::api_token::create_token(&mut conn, &body.name, scope, body.expires_at, &actor)
-        .await
+    match crate::api_token::create_token(
+        &mut conn,
+        &body.name,
+        scope,
+        body.expires_at,
+        &actor,
+        body.tenant.as_deref(),
+    )
+    .await
     {
         Ok(mint) => {
             let id_str = mint.view.id.to_string();
@@ -5444,11 +5469,15 @@ pub struct StandaloneAdminAuth {
     deployment_profile: Option<String>,
     admin_auth_session_key: Option<String>,
     rate_limit: Option<crate::api_rate_limit::ApiRateLimit>,
+    roles: Option<crate::roles::HarvestRoles>,
+    #[cfg(feature = "oidc")]
+    oidc: Option<crate::oidc::OidcLogin>,
 }
 
 impl StandaloneAdminAuth {
-    /// A mount that declares nothing. [`Self::mount`] then returns the router
-    /// unchanged, which is the pre-issue-#1608 standalone posture.
+    /// A mount that declares nothing. [`Self::mount`] then adds only the tenant
+    /// binding layer (issue #1977). It passes every request with no verified
+    /// tenant unchanged, which is the pre-issue-#1608 standalone posture.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -5500,6 +5529,36 @@ impl StandaloneAdminAuth {
         rate_limit: crate::api_rate_limit::ApiRateLimit,
     ) -> Self {
         self.rate_limit = Some(rate_limit);
+        self
+    }
+
+    /// Install the custom-role layer (issue #1978).
+    ///
+    /// Each request needs a role that allows its route. Roles come from a
+    /// [`crate::roles::RoleGrant`] extension or the session key
+    /// [`crate::roles::SESSION_ROLES_KEY`]. A verified token skips the check.
+    /// See [`crate::roles`].
+    #[must_use]
+    pub fn with_roles(mut self, roles: crate::roles::HarvestRoles) -> Self {
+        self.roles = Some(roles);
+        self
+    }
+
+    /// Install OIDC login and its session boundary (issue #1978).
+    ///
+    /// This also installs the role layer with the roles of `login`, and
+    /// declares the auth boundary. The roles of `login` replace any set by
+    /// [`Self::with_roles`]. It turns off [`Self::with_read_only_role`]. The login routes sit outside the boundary.
+    /// The host must apply an autumn-web session layer outside the mounted
+    /// router. See [`crate::oidc`].
+    #[cfg(feature = "oidc")]
+    #[must_use]
+    pub fn with_oidc(mut self, login: crate::oidc::OidcLogin) -> Self {
+        self.admin_auth_boundary = true;
+        // The read-only role reads host session keys. The login replaces that
+        // host auth, so the custom roles decide alone.
+        self.read_only_role = false;
+        self.oidc = Some(login);
         self
     }
 
@@ -5564,8 +5623,9 @@ impl StandaloneAdminAuth {
     /// is how [`HarvestPlugin`] composes it.
     ///
     /// When an embedder auth boundary is declared, apply it outside. The
-    /// request order is then: embedder auth -> token layer -> read-only-role
-    /// layer -> authorizer -> per-route `require_admin` -> handler. Without
+    /// request order is then as follows. Embedder auth, the token layer, the
+    /// rate limiter, tenant binding, the read-only-role layer, the
+    /// authorizer, per-route `require_admin`, the handler. Without
     /// that declaration, enabling API tokens additionally installs a
     /// fail-closed token requirement on every non-public route.
     ///
@@ -5580,6 +5640,14 @@ impl StandaloneAdminAuth {
         if let Some(session_key) = &self.admin_auth_session_key {
             api_state.set_admin_auth_session_key(session_key.clone());
         }
+        #[cfg(feature = "oidc")]
+        let roles = self
+            .oidc
+            .as_ref()
+            .map(|login| login.roles().clone())
+            .or_else(|| self.roles.clone());
+        #[cfg(not(feature = "oidc"))]
+        let roles = self.roles.clone();
         let router = apply_admin_auth_layers(
             router,
             api_state,
@@ -5588,8 +5656,13 @@ impl StandaloneAdminAuth {
                 read_only_role: self.read_only_role,
                 authorizer: self.authorizer.clone(),
                 rate_limit: self.rate_limit.clone(),
+                roles,
             },
         );
+        #[cfg(feature = "oidc")]
+        if let Some(login) = &self.oidc {
+            return crate::oidc::apply_oidc(router, login, self.api_tokens);
+        }
         if self.api_tokens && !self.admin_auth_boundary {
             router.layer(middleware::from_fn(
                 crate::api_token::require_token_for_non_public,
@@ -5610,6 +5683,8 @@ pub(crate) struct AdminAuthLayers {
     pub authorizer: Option<crate::authz::SharedAuthorizer>,
     /// The per-client rate limiter (issue #1827).
     pub rate_limit: Option<crate::api_rate_limit::ApiRateLimit>,
+    /// The custom-role layer (issue #1978).
+    pub roles: Option<crate::roles::HarvestRoles>,
 }
 
 /// Wrap a composed Harvest router in the admin-auth layer stack.
@@ -5635,13 +5710,27 @@ pub(crate) struct AdminAuthLayers {
 /// layer. It runs after both built-in gates, so it can only deny. It sees the
 /// `TokenPrincipal` the token layer sets.
 ///
+/// Issue #1978: the custom-role layer sits INSIDE the read-only-class layer
+/// and OUTSIDE the authorizer. A verified token skips it. An allowed request
+/// carries a `RolePrincipal`, which the admin gate and the #1802 gate admit.
+/// The authorizer can then only narrow what a role allows.
+///
 /// Issue #1827: the rate-limit layer sits directly INSIDE the token layer. It
 /// keys a bucket on the verified `TokenPrincipal`, so an unverified bearer
-/// cannot open a new bucket. It runs before the read-only and authorizer
-/// layers, so a refused request reaches no handler.
+/// cannot open a new bucket. It runs before the tenant binding, read-only and
+/// authorizer layers, so a refused request reaches no handler.
 ///
-/// No layer is installed unless asked for, so a deployment that declares none
-/// does an identical amount of work as before.
+/// Issue #1977: the tenant binding layer sits directly INSIDE the rate-limit
+/// layer. Its refusals do a lookup and an audit write, so the limiter bounds
+/// them. It is always installed. A request with no verified tenant passes it
+/// unchanged.
+///
+/// With tokens on, a pre-auth layer of the same limiter sits OUTSIDE the token
+/// layer. It charges each claimed token to its address before the lookup. A
+/// flood of made-up tokens thus gets `429` and never reaches the pool. The
+/// inner layer refunds that charge when the token verifies.
+///
+/// No other layer is installed unless asked for.
 pub(crate) fn apply_admin_auth_layers(
     router: Router<()>,
     api_state: &HarvestApiState,
@@ -5654,15 +5743,28 @@ pub(crate) fn apply_admin_auth_layers(
             crate::authz::enforce_authorizer,
         ));
     }
+    if let Some(roles) = &layers.roles {
+        router = router.layer(middleware::from_fn_with_state(
+            (api_state.clone(), roles.clone()),
+            crate::roles::enforce_custom_roles,
+        ));
+    }
     if layers.read_only_role {
         router = router.layer(middleware::from_fn(enforce_read_only_class));
     }
-    if let Some(rate_limit) = &layers.rate_limit {
+    // Issue #1977: always installed. A request with no verified tenant passes
+    // it unchanged, so a deployment with no tenants sees no change.
+    router = router.layer(middleware::from_fn_with_state(
+        api_state.clone(),
+        crate::tenant::enforce_tenant_binding,
+    ));
+    let limiter = layers
+        .rate_limit
+        .clone()
+        .map(crate::api_rate_limit::ApiRateLimiter::new);
+    if let Some(limiter) = &limiter {
         router = router.layer(middleware::from_fn_with_state(
-            (
-                api_state.clone(),
-                crate::api_rate_limit::ApiRateLimiter::new(rate_limit.clone()),
-            ),
+            (api_state.clone(), limiter.clone()),
             crate::api_rate_limit::enforce_api_rate_limit,
         ));
     }
@@ -5671,6 +5773,12 @@ pub(crate) fn apply_admin_auth_layers(
             api_state.clone(),
             crate::api_token::enforce_token_scope,
         ));
+        if let Some(limiter) = limiter {
+            router = router.layer(middleware::from_fn_with_state(
+                (api_state.clone(), limiter),
+                crate::api_rate_limit::enforce_pre_auth_rate_limit,
+            ));
+        }
     }
     router
 }
@@ -5694,6 +5802,14 @@ pub(crate) async fn require_harvest_admin(
     if request
         .extensions()
         .get::<crate::api_token::TokenPrincipal>()
+        .is_some()
+    {
+        return next.run(request).await;
+    }
+    // Issue #1978: the role layer already allowed this route for this caller.
+    if request
+        .extensions()
+        .get::<crate::roles::RolePrincipal>()
         .is_some()
     {
         return next.run(request).await;
@@ -5752,10 +5868,15 @@ async fn admit_mutation(
     request: axum::extract::Request,
     next: Next,
 ) -> axum::response::Response {
+    // Issue #1978: a role principal counts as a credential, as a token does.
     let has_token = request
         .extensions()
         .get::<crate::api_token::TokenPrincipal>()
-        .is_some();
+        .is_some()
+        || request
+            .extensions()
+            .get::<crate::roles::RolePrincipal>()
+            .is_some();
     let session = request.extensions().get::<Session>().cloned();
     if !mutation_admitted(api_state, has_token, session).await {
         return AutumnError::unauthorized_msg("authentication required").into_response();
@@ -5890,6 +6011,11 @@ pub(crate) async fn has_harvest_admin_access(
     api_state: &HarvestApiState,
     session: Option<Session>,
 ) -> bool {
+    // Issue #1978: under the role layer, only an `admin`-scope role passes.
+    // A declared boundary must not widen a narrower role.
+    if let Some(admin) = crate::roles::role_admin_access() {
+        return admin;
+    }
     if api_state.admin_auth_boundary() {
         return true;
     }
@@ -6412,6 +6538,13 @@ pub(crate) const fn decode_gate(flag: bool, is_admin: bool) -> bool {
     flag && is_admin
 }
 
+/// The error a route returns when a stored codec column does not decode
+/// (issue #1979). It never carries the codec's own error text, which is
+/// embedder-controlled.
+fn undecodable_stored_payload() -> HarvestError {
+    HarvestError::Config("a stored payload could not be decoded".to_string())
+}
+
 /// Resolve the codec registry for read-path decoding, or `None` when this
 /// request must see today's bytes (issue #608).
 ///
@@ -6726,12 +6859,12 @@ pub(crate) fn decode_workflow_execution_fields(
     execution: &mut WorkflowExecution,
     codecs: &PayloadCodecs,
 ) -> LossyDecodeOutcome {
-    let mut outcome = codecs.decode_value_lossy(&mut execution.input);
+    let mut outcome = codecs.decode_column_lossy(&mut execution.input);
     if let Some(output) = execution.output.as_mut() {
-        outcome = outcome.merged(codecs.decode_value_lossy(output));
+        outcome = outcome.merged(codecs.decode_column_lossy(output));
     }
     if let Some(memo) = execution.memo.as_mut() {
-        outcome = outcome.merged(codecs.decode_value_lossy(memo));
+        outcome = outcome.merged(codecs.decode_column_lossy(memo));
     }
     if let Some(search_attrs) = execution.search_attrs.as_mut() {
         outcome = outcome.merged(codecs.decode_value_lossy(search_attrs));
@@ -7486,7 +7619,7 @@ pub const fn management_api_request_fields()
         (
             "POST",
             "/admin/tokens",
-            Some(&["name", "scope", "expires_at"]),
+            Some(&["name", "scope", "expires_at", "tenant"]),
         ),
         ("DELETE", "/admin/tokens/{id}", Some(&[])),
         (
@@ -9004,6 +9137,7 @@ pub const fn management_api_response_fields()
                 "last_used_at",
                 "revoked_at",
                 "secret",
+                "tenant",
             ]),
         ),
         ("DELETE", "/admin/tokens/{id}", Some(&["revoked"])),
@@ -11893,7 +12027,7 @@ async fn respond_with_workflow_result(
     if let Some(codecs) = decoder {
         let mut outcome = LossyDecodeOutcome::default();
         if let Some(output) = result.output.as_mut() {
-            outcome = outcome.merged(codecs.decode_value_lossy(output));
+            outcome = outcome.merged(codecs.decode_column_lossy(output));
         }
         if let Some(error) = result.error.as_mut() {
             outcome = outcome.merged(decode_error_field(codecs, error));
@@ -13671,7 +13805,11 @@ pub(crate) async fn build_awaitables_report(
             {
                 ctx.register_declarative_update_handler(h);
             }
-            let input = std::mem::take(&mut execution.input);
+            // The replayed handler gets the plaintext input (issue #1979).
+            let input = api_state
+                .payload_codecs()
+                .decode_column(&std::mem::take(&mut execution.input))
+                .map_err(|_| map_error(undecodable_stored_payload()))?;
             let outcome =
                 drive_query_replay_async(&ctx, workflow.handler, input, api_state.query_timeout())
                     .await;
@@ -16010,7 +16148,7 @@ async fn get_workflow_stack(
                     decode_outcome = decode_outcome.merged(codecs.decode_value_lossy(checkpoint));
                 }
                 let mut input = t.input;
-                decode_outcome = decode_outcome.merged(codecs.decode_value_lossy(&mut input));
+                decode_outcome = decode_outcome.merged(codecs.decode_column_lossy(&mut input));
                 Some(input)
             } else {
                 None
@@ -16668,6 +16806,9 @@ async fn probe_committed_start_replay(
     // only when the *retry* carried an explicit placement, so an unpinned keyed
     // replay keeps its pre-#697 response shape byte-for-byte.
     report_shard: Option<i32>,
+    // The verified tenant of the caller (issue #1977). A claim on a run of
+    // another tenant is a miss, so the engine refuses the start.
+    tenant: Option<&str>,
 ) -> Option<axum::response::Response> {
     use axum::response::IntoResponse as _;
     let pool = api_state.storage_pool().ok()?;
@@ -16698,16 +16839,20 @@ async fn probe_committed_start_replay(
     // `Some` claim implies the row existed at lookup time. Re-read its identity
     // for the no-op response; if it vanished or the read errors, return `None`
     // so the caller re-reserves / reclaims as needed.
-    let (dup_workflow_id, dup_state) = harvest_workflow_executions::table
+    let (dup_workflow_id, dup_state, dup_tenant) = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::id.eq(claim_exec_id.as_uuid()))
         .select((
             harvest_workflow_executions::workflow_id,
             harvest_workflow_executions::state,
+            harvest_workflow_executions::tenant,
         ))
-        .first::<(String, String)>(&mut probe_conn)
+        .first::<(String, String, Option<String>)>(&mut probe_conn)
         .await
         .optional()
         .ok()??;
+    if tenant.is_some() && dup_tenant.as_deref() != tenant {
+        return None;
+    }
     // Best-effort dedup audit (intentional asymmetry with the fresh-start arm's
     // 503-on-audit-failure): the original start was already audited when it
     // created the run, so a failed audit here is a no-op read and never fails
@@ -16966,6 +17111,7 @@ async fn handle_malformed_start_body(
     workflow_name: &str,
     headers: &axum::http::HeaderMap,
     rejection: JsonRejection,
+    tenant: Option<&str>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
     let header_key = match extract_start_idempotency_header_key(headers) {
@@ -17019,6 +17165,7 @@ async fn handle_malformed_start_body(
         route,
         // The body did not parse, so no placement can be read from it.
         None,
+        tenant,
     )
     .await
     {
@@ -17032,10 +17179,15 @@ pub(crate) async fn start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(workflow_name): Path<String>,
     maybe_session: Option<Extension<Session>>,
+    verified_tenant: Option<Extension<crate::tenant::VerifiedTenant>>,
     headers: axum::http::HeaderMap,
     body: Result<Json<StartWorkflowRequest>, JsonRejection>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
+
+    // The tenant binding layer sets this for a tenant-bound caller (issue
+    // #1977). The new run is stamped with it. The body cannot set a tenant.
+    let tenant: Option<&str> = verified_tenant.as_ref().map(|Extension(t)| t.as_str());
 
     // issue #808 (Codex P2): take the body as a `Result` so a malformed JSON
     // body no longer short-circuits with axum's `400`/`422` before the handler
@@ -17046,8 +17198,14 @@ pub(crate) async fn start_workflow(
     let request = match body {
         Ok(Json(req)) => req,
         Err(rejection) => {
-            return handle_malformed_start_body(&api_state, &workflow_name, &headers, rejection)
-                .await;
+            return handle_malformed_start_body(
+                &api_state,
+                &workflow_name,
+                &headers,
+                rejection,
+                tenant,
+            )
+            .await;
         }
     };
 
@@ -17477,6 +17635,7 @@ pub(crate) async fn start_workflow(
             request_id.as_deref(),
             route,
             pinned_shard_id,
+            tenant,
         )
         .await
     {
@@ -17747,6 +17906,18 @@ pub(crate) async fn start_workflow(
     // a `200` no-op before this check, so a workflow that gained a throttle/
     // debounce/batch policy after an original keyed start still returns the
     // existing execution rather than a `400` on retry.
+    // Issue #1977: a deferred start creates its run later, through a path
+    // that carries no tenant. Refuse it for a tenant-bound caller rather
+    // than start a run the caller then cannot reach.
+    if tenant.is_some() && (throttle_applies || is_debounced_start || has_batch_policy) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "a tenant-bound start cannot be throttled, debounced or batched"
+            })),
+        )
+            .into_response();
+    }
     if idempotency_key.is_some() && (throttle_applies || is_debounced_start || has_batch_policy) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
@@ -19361,6 +19532,7 @@ pub(crate) async fn start_workflow(
                 completion_callbacks,
                 start_source: effective_start_source,
                 start_source_ref: effective_start_source_ref.as_deref(),
+                tenant,
                 ..StartWorkflowParams::new(
                     &workflow_name,
                     &workflow_id,
@@ -19587,6 +19759,7 @@ pub(crate) async fn start_workflow(
         completion_callbacks,
         start_source: effective_start_source,
         start_source_ref: effective_start_source_ref.as_deref(),
+        tenant,
         ..StartWorkflowParams::new(&workflow_name, &workflow_id, exec_id, input, &queue_name)
     };
     let metrics_ref: Option<&(dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync)> =
@@ -22029,6 +22202,7 @@ pub(crate) async fn signal_with_start_workflow(
             workflow_info: runtime.registry.workflows.get(&workflow_name),
             start_source_override: request.start_source_override,
             start_source_ref_override: request.start_source_ref_override.clone(),
+            tenant: None,
         },
         Some(runtime.registry.telemetry().metrics.as_ref()),
         // issue #618 (PR #1014): gate a FRESH create AUTHORITATIVELY under the
@@ -22856,6 +23030,7 @@ async fn update_with_start_workflow(
         workflow_retry_policy: uws_workflow_retry_policy,
         max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
         reject_fresh_if_debounced,
+        tenant: None,
     };
 
     // A committed-replay hit short-circuits the authoritative in-lock call and
@@ -23675,9 +23850,23 @@ async fn rerun_workflow(
             .into_response();
     }
 
-    let effective_input = input_override
-        .clone()
-        .unwrap_or_else(|| source.input.clone());
+    // The start path encodes the input itself, so it gets the plaintext
+    // (issue #1979).
+    let effective_input = if let Some(input) = input_override.clone() {
+        input
+    } else if let Ok(input) = api_state.payload_codecs().decode_column(&source.input) {
+        input
+    } else {
+        // A rejected re-run is audited like every other rejection.
+        audit_rerun_failure_on(
+            &mut conn,
+            &audit_ctx,
+            Some(&exec_id_str),
+            "stored input could not be decoded",
+        )
+        .await;
+        return map_error(undecodable_stored_payload()).into_response();
+    };
 
     // Deferred-start policies are incompatible with a re-run: they admit the
     // start without creating an execution, so there is no execution_id to
@@ -26095,13 +26284,14 @@ pub(crate) async fn signal_workflow(
             Ok(b) => b,
             Err(e) => return map_error(e).into_response(),
         };
-        signal::send_signal_from_resolved(
+        signal::send_signal_from_resolved_with_codecs(
             bound.as_mut(),
             exec_id,
             target,
             &signal_name,
             payload,
             idempotency_key.as_deref(),
+            &api_state.payload_codecs(),
         )
         .await
     };
@@ -26310,13 +26500,13 @@ async fn hydrate_ctx_for_query(
     // resolve via pre-sent oneshot channels so the entire history replays
     // synchronously; this is read-only and appends no events / performs no
     // writes (issue #612 AC4).
-    let outcome = drive_query_replay_async(
-        &ctx,
-        workflow.handler,
-        execution.input.clone(),
-        api_state.query_timeout(),
-    )
-    .await;
+    // The replayed handler gets the plaintext input (issue #1979).
+    let input = api_state
+        .payload_codecs()
+        .decode_column(&execution.input)
+        .map_err(|_| map_error(undecodable_stored_payload()))?;
+    let outcome =
+        drive_query_replay_async(&ctx, workflow.handler, input, api_state.query_timeout()).await;
 
     if terminal {
         // Drift guard (Codex P2, PR #986 follow-up): if the driven handler
@@ -32409,7 +32599,7 @@ async fn list_dead_letters(
         // only; one audit row per request that touched ≥1 envelope.
         let mut outcome = LossyDecodeOutcome::default();
         for dl in &mut dead_letters {
-            outcome = outcome.merged(codecs.decode_value_lossy(&mut dl.input));
+            outcome = outcome.merged(codecs.decode_column_lossy(&mut dl.input));
             outcome = outcome.merged(decode_error_field(codecs, &mut dl.error));
         }
         // No live connection here: the per-shard DLQ loads are scoped inside
@@ -45458,6 +45648,9 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
         } => AutumnError::bad_request_msg(format!(
             "workflow execution already exists: {existing_exec_id} (state: {existing_state})"
         )),
+        // Issue #1977: the message names the key the caller sent, never a run.
+        e @ HarvestError::TenantConflict { .. } => AutumnError::bad_request_msg(e.to_string())
+            .with_status(axum::http::StatusCode::CONFLICT),
         // Safety-net fallback for a per-tenant resource quota rejection
         // (issue #946) reached from a route that has no bespoke structured
         // 429 arm of its own (every request-time `map_error` call site not
@@ -53899,6 +54092,7 @@ mod tests {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                tenant: None,
             },
             None,
             None,
@@ -53988,6 +54182,7 @@ mod tests {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                tenant: None,
             },
             None,
             None,
@@ -54115,6 +54310,7 @@ mod tests {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                tenant: None,
             },
             None,
             None,
@@ -54248,6 +54444,7 @@ mod tests {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                tenant: None,
             },
             None,
             None,
@@ -58067,6 +58264,7 @@ mod tests {
             migrated_run_terminal_state: None,
             staging_vacated_state: None,
             staging_vacated_by: None,
+            tenant: None,
         }
     }
 
@@ -60099,6 +60297,7 @@ mod mutation_gate_tests {
                 .insert(crate::api_token::TokenPrincipal {
                     id: uuid::Uuid::nil(),
                     scope: crate::api_token::TokenScope::Mutate,
+                    tenant: None,
                 });
         }
         harvest_api_router(api_state)

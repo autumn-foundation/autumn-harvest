@@ -958,6 +958,12 @@ fn build_tool_route(
     } else {
         handler
     };
+    // Issue #1977: a tool starts or reads a run with no tenant check, so a
+    // tenant-bound caller never reaches one. This gate sits inside the auth
+    // middleware below, so it sees the `VerifiedTenant` that middleware sets.
+    let handler = handler.layer(axum::middleware::from_fn(
+        crate::tenant::refuse_tenant_bound_mcp_tool,
+    ));
     // Issue #597 hardening: these routes are registered via
     // `AppBuilder::routes(...)`, not `nest()`, so they never pass through
     // the harvest management API's own auth layer (which only wraps the
@@ -1050,6 +1056,7 @@ async fn start_tool(
     Box::pin(crate::api::start_workflow(
         Extension(api_state),
         Path(workflow.to_string()),
+        None,
         None,
         headers,
         Ok(Json(crate::api::StartWorkflowRequest::from_input(body))),

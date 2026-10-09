@@ -1022,6 +1022,7 @@ fn start_params<'a>(
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     }
 }
 
@@ -1538,12 +1539,18 @@ async fn a_terminal_failure_write_records_a_persist_sample() {
 const HANGING_WORKFLOW: &str = "saturation_hanging_wf";
 const HANGING_ACTIVITY: &str = "saturation_hanging_activity";
 
+/// Hang until the worker cancels the attempt. A fixed sleep races the
+/// timeout scanner. If the sleep ends first, the attempt succeeds. The bound
+/// only stops a broken scanner from hanging the test.
 fn hangs<'a>(
-    _ctx: &'a ActivityContext,
+    ctx: &'a ActivityContext,
     _input: serde_json::Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !ctx.is_cancelled() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         Ok(serde_json::json!({}))
     })
 }
@@ -1583,7 +1590,11 @@ async fn a_scanner_enforced_activity_timeout_counts_as_a_failure() {
             name: HANGING_ACTIVITY,
             handler: hangs,
             default_retry_policy: Some(RetryPolicy::fixed(1, Duration::from_millis(10))),
-            default_start_to_close: Some(Duration::from_millis(300)),
+            // The deadline counts from the claim, not from the handler start.
+            // A timeout before the handler starts is not a failure, by design
+            // (issue #1785). The lag from claim to handler start can pass
+            // 500ms on a loaded runner, so the deadline leaves a wide margin.
+            default_start_to_close: Some(Duration::from_secs(3)),
             ..activity_info()
         }])
         .worker(WorkerConfig::default().with_queues([queue.as_str()]))

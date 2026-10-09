@@ -20,17 +20,20 @@ use autumn_harvest::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use autumn_harvest_agent::bounds;
+
 use crate::claude;
 use crate::tools;
 
-/// The signal-name prefix the CLI sends a decision to.
+use autumn_harvest_agent::approval::{Decision, await_decision};
+/// The approval signal names and the durable wait come from the agent
+/// adapter (issue #1973).
 ///
-/// The full name adds the turn, the position in that turn, and the tool-use id
-/// (see [`approval_signal`]). The daemon requires that full name as the
-/// approval token, so a decision names the one wait it releases. A stale or
-/// repeated approval stays staged under its own name. It never releases a
-/// later, unseen call.
-pub const SIGNAL_TOOL_APPROVAL: &str = "tool_approval";
+/// A name holds the turn, the position in that turn, and the tool-use id. The
+/// daemon requires that full name as the approval token, so a decision names
+/// the one wait it releases. A stale or repeated approval stays staged under
+/// its own name. It never releases a later, unseen call.
+pub use autumn_harvest_agent::approval::{approval_call_id, approval_signal};
 
 /// The registered workflow name.
 pub const WORKFLOW_NAME: &str = "agent_session";
@@ -77,6 +80,15 @@ pub const STOP_BATCH_FULL: &str = "batch_full";
 /// one call per listed entry is asking for more than its tools offered.
 pub const MAX_TURN_CALLS: usize = tools::MAX_ENTRIES;
 
+/// The serialised size of one `tool_result` block.
+///
+/// A block that cannot be serialised is measured as nothing, which is how
+/// [`over_input_cap`] treats a request it cannot serialise. Neither refuses
+/// work over a size it failed to read. The adapter owns that rule.
+fn block_bytes(block: &Value) -> u64 {
+    bounds::json_len(block)
+}
+
 /// Would this request be refused as too large to record?
 ///
 /// The transcript rides in the activity input, so it grows with every turn
@@ -101,19 +113,10 @@ pub const MAX_TURN_CALLS: usize = tools::MAX_ENTRIES;
 /// This runs inside the workflow, so it must answer the same way on replay.
 /// It reads no clock and no state outside its argument, and the cap is a
 /// constant of the build.
-/// The serialised size of one `tool_result` block.
 ///
-/// A block that cannot be serialised is measured as nothing, which is how
-/// [`over_input_cap`] treats a request it cannot serialise. Neither refuses
-/// work over a size it failed to read.
-fn block_bytes(block: &Value) -> u64 {
-    serde_json::to_vec(block).map_or(0, |json| json.len() as u64)
-}
-
+/// The measurement itself lives in the agent adapter (issue #1973).
 fn over_input_cap(request: &TurnRequest) -> bool {
-    serde_json::to_vec(request).is_ok_and(|json| {
-        json.len() as u64 > autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES
-    })
+    bounds::exceeds_activity_input(request)
 }
 
 /// The instructions the model runs under. The value is part of every request,
@@ -230,30 +233,6 @@ impl ToolOutcome {
             is_error: true,
         }
     }
-}
-
-/// The signal name that releases one specific tool call.
-///
-/// The name carries the turn and the position within it, not only the tool-use
-/// id. That makes it unique to ONE wait in the whole run, which matters for a
-/// decision that arrives late. A deadline that expires first is recorded ahead
-/// of the decision. The wait then resolves as a timeout, and the decision lands
-/// in history unconsumed. Under a name shared with a later wait, that stashed
-/// approval would release a call nobody reviewed. A name bound to its own
-/// occurrence can never be matched again.
-pub fn approval_signal(turn: u32, position: usize, call_id: &str) -> String {
-    format!("{SIGNAL_TOOL_APPROVAL}:{turn}:{position}:{call_id}")
-}
-
-/// The tool-use id one approval signal name releases.
-pub fn approval_call_id(signal_name: &str) -> Option<&str> {
-    let mut parts = signal_name.splitn(4, ':');
-    if parts.next()? != SIGNAL_TOOL_APPROVAL {
-        return None;
-    }
-    parts.next()?;
-    parts.next()?;
-    parts.next()
 }
 
 /// The decision the CLI sends for an approval-gated tool call.
@@ -420,21 +399,27 @@ async fn gated_call(
     position: usize,
     call: &ToolCall,
 ) -> Result<ToolOutcome, String> {
-    let decision: Option<ApprovalDecision> = ctx
-        .receive_signal_timeout(
-            &approval_signal(turn, position, &call.id),
-            Duration::from_secs(task.approval_timeout_secs),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    // The durable wait comes from the adapter. It records the same events as
+    // a plain signal wait, so a history from an older daemon still replays.
+    //
+    // A payload that is not an `ApprovalDecision` fails the session, as it
+    // did before. The startup check refuses such a history on the same rule,
+    // so the two stay consistent.
+    let decision = await_decision::<ApprovalDecision>(
+        ctx,
+        &approval_signal(turn, position, &call.id),
+        Duration::from_secs(task.approval_timeout_secs),
+    )
+    .await?;
 
     match decision {
-        Some(d) if d.approved => run_tool_call(ctx, &task.workspace, call).await,
-        Some(d) => Ok(ToolOutcome::error(format!(
+        Decision::Decided(d) if d.approved => run_tool_call(ctx, &task.workspace, call).await,
+        Decision::Decided(d) => Ok(ToolOutcome::error(format!(
             "denied by the operator: {}",
             d.note.unwrap_or_else(|| "no reason given".to_string())
         ))),
-        None => Ok(ToolOutcome::error(format!(
+        Decision::Unreadable(why) => Err(format!("the decision is not readable: {why}")),
+        Decision::TimedOut => Ok(ToolOutcome::error(format!(
             "denied: no approval arrived within {}s",
             task.approval_timeout_secs
         ))),

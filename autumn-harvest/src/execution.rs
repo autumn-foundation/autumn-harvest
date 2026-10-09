@@ -198,6 +198,50 @@ pub struct StartWorkflowParams<'a> {
     /// Optional human/operator attribution for the start (issue #740). `None`
     /// when absent.
     pub started_by: Option<&'a str>,
+    /// Verified tenant of the new run (issue #1977). `None` means no tenant.
+    ///
+    /// Set it only from a verified source: a tenant-bound credential, or
+    /// trusted in-process code. Never set it from caller input. The retention
+    /// janitor and the management API tenant check trust this value.
+    /// [`crate::tenant::validate_tenant`] must accept it, or the start fails.
+    pub tenant: Option<&'a str>,
+}
+
+/// Refuse a tenant-bound start whose prior run has another tenant (issue
+/// #1977).
+///
+/// A start with no tenant is trusted code, so it passes. A prior run with no
+/// tenant counts as another tenant.
+fn refuse_other_tenant(
+    request: &StartWorkflowParams<'_>,
+    existing: &WorkflowExecution,
+) -> HarvestResult<()> {
+    match request.tenant {
+        Some(tenant) if existing.tenant.as_deref() != Some(tenant) => {
+            Err(HarvestError::TenantConflict {
+                workflow_name: request.workflow_name.to_string(),
+                workflow_id: request.workflow_id.to_string(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Refuse a tenant-bound start whose idempotency claim names a run of another
+/// tenant (issue #1977).
+///
+/// Idempotency keys are shared across tenants. A duplicate must not hand one
+/// tenant the run of another.
+pub(crate) async fn refuse_other_tenant_claim(
+    conn: &mut AsyncPgConnection,
+    request: &StartWorkflowParams<'_>,
+    claimed: ExecutionId,
+) -> HarvestResult<()> {
+    if request.tenant.is_none() {
+        return Ok(());
+    }
+    let existing = load_execution(conn, claimed).await?;
+    refuse_other_tenant(request, &existing)
 }
 
 /// Origin marker for a normal scheduler-tick fire (issue #534).
@@ -294,6 +338,7 @@ impl<'a> StartWorkflowParams<'a> {
             start_source: StartSource::default(),
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         }
     }
 
@@ -576,6 +621,7 @@ mod start_params_new_tests {
             start_source,
             start_source_ref,
             started_by,
+            tenant,
         } = StartWorkflowParams::new("wf", "wf-1", exec_id, input.clone(), "default");
 
         assert_eq!(workflow_name, "wf");
@@ -619,6 +665,7 @@ mod start_params_new_tests {
         assert_eq!(start_source, StartSource::Unknown);
         assert!(start_source_ref.is_none());
         assert!(started_by.is_none());
+        assert!(tenant.is_none());
     }
 
     /// Struct-update syntax overrides only the named fields.
@@ -1162,6 +1209,12 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     if request.workflow_id.is_empty() {
         return Err(HarvestError::EmptyWorkflowId);
     }
+    // Every start path funnels through here, so one check covers them all.
+    if let Some(tenant) = request.tenant
+        && let Err(e) = crate::tenant::validate_tenant(tenant)
+    {
+        return Err(HarvestError::Config(format!("invalid tenant: {e}")));
+    }
 
     // Validate delayed start parameters (issue #322)
     if request.start_at.is_some() && request.delay.is_some() {
@@ -1345,6 +1398,13 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         && terminate_via_pre_check
         && !reject_fresh_if_debounced
     {
+        // A tenant conflict outranks a closed gate (issue #1977).
+        if request.tenant.is_some()
+            && let Some(prior) =
+                try_load_by_key(conn, request.workflow_name, request.workflow_id).await?
+        {
+            refuse_other_tenant(&request, &prior)?;
+        }
         admit_fresh_start(
             mode,
             metrics,
@@ -1385,6 +1445,8 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             try_load_by_key(conn, request.workflow_name, request.workflow_id).await?
         && matches!(existing.state.as_str(), "RUNNING" | "PAUSED")
     {
+        // Never cancel a run of another tenant (issue #1977).
+        refuse_other_tenant(&request, &existing)?;
         let existing_exec_id = ExecutionId::from_uuid(existing.id);
         // Ignore Config errors: the execution may have transitioned to a terminal
         // state between the pre-check and the cancel lock. In that race the prior
@@ -1465,14 +1527,14 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         workflow_id: request.workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: shard_id_value,
-        input: request.input.clone(),
+        input: codecs.encode_shared_column(&request.input)?,
         parent_id: request.parent_id,
         queue_name: request.queue_name,
         execution_timeout: effective_timeout,
         deadline_at,
         sla: effective_sla,
         sla_deadline_at,
-        memo: request.memo.clone(),
+        memo: codecs.encode_column_opt(request.memo.as_ref())?,
         search_attrs: request.search_attrs.clone(),
         assigned_build_id: assigned_build.clone(),
         parent_close_policy: None, // root or awaited child; detached uses worker path
@@ -1501,11 +1563,12 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         start_source_ref: request.start_source_ref,
         started_by: request.started_by,
         quota_key: quota_key.as_deref(),
+        tenant: request.tenant,
     };
     let mut enqueue = EnqueueParams::new(
         request.queue_name.to_owned(),
         TaskType::Workflow,
-        request.input.clone(),
+        row.input.clone(),
     );
     enqueue.workflow_exec_id = Some(exec_id.as_uuid());
     enqueue.required_build_id = assigned_build.clone();
@@ -1636,6 +1699,9 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                     .optional()
                     .map_err(database_error)?;
                 if let Some(seal) = reconciled_seal {
+                    // A seal of another tenant is still that tenant's run
+                    // (issue #1977). Do not report, attach to or replace it.
+                    refuse_other_tenant(&request, &seal)?;
                     if request.reuse_policy == WorkflowIdReusePolicy::RejectDuplicate {
                         // Report the effective terminal state, not the
                         // seal's own `MIGRATED` marker (issue #1596 review,
@@ -1712,6 +1778,10 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                 request.workflow_id,
             )
             .await?;
+            // A tenant conflict outranks a closed gate (issue #1977).
+            if let Some(prior) = prior.as_ref() {
+                refuse_other_tenant(&request, prior)?;
+            }
             if start_will_create_new_execution(
                 prior.as_ref().map(|e| e.state.as_str()),
                 request.reuse_policy,
@@ -1841,7 +1911,14 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             // guard — the new row has state RUNNING, not COMPLETED, so it
             // can never match, but the explicit exclusion is defensive.
             let (carryover_result, carryover_error) = if let Some(sched_id) = request.schedule_id {
-                resolve_carryover(conn, sched_id, exec_id.as_uuid(), request.scheduled_for).await?
+                resolve_carryover(
+                    conn,
+                    sched_id,
+                    exec_id.as_uuid(),
+                    request.scheduled_for,
+                    codecs,
+                )
+                .await?
             } else {
                 (None, None)
             };
@@ -1966,6 +2043,11 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         // attached to a dead seal permanently. `migrated_run_terminal_at`
         // is the reconciler's record that the live copy has finished;
         // treat that exactly like any other terminal prior below.
+        // Issue #1977: a tenant-bound start must not attach to, cancel,
+        // replace or seal a run of another tenant. The row lock is held, so
+        // the check and every branch below see the same row.
+        refuse_other_tenant(&request, &existing)?;
+
         let seal_observed_terminal =
             existing.state == "MIGRATED" && existing.migrated_run_terminal_at.is_some();
 
@@ -2505,16 +2587,19 @@ pub async fn start_or_load_workflow_execution_idempotent_with_codecs(
                     exec_id,
                     workflow_id,
                     state,
-                } => Ok((
-                    IdempotentStartOutcome::Deduplicated {
-                        exec_id,
-                        workflow_id,
-                        state,
-                    },
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                )),
+                } => {
+                    refuse_other_tenant_claim(conn, &request, exec_id).await?;
+                    Ok((
+                        IdempotentStartOutcome::Deduplicated {
+                            exec_id,
+                            workflow_id,
+                            state,
+                        },
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ))
+                }
                 crate::start_idempotency::StartIdempotencyReservation::Reserved => {
                     let workflow_name = request.workflow_name;
                     let (started, ds, dc, cm) =
@@ -3491,7 +3576,14 @@ async fn replace_execution(
     // the rerun (and any continue-as-new fork from it) must see the previous fire's
     // carryover rather than behaving like a first scheduled run.
     let (carryover_result, carryover_error) = if let Some(sched_id) = request.schedule_id {
-        resolve_carryover(conn, sched_id, new_exec_id.as_uuid(), request.scheduled_for).await?
+        resolve_carryover(
+            conn,
+            sched_id,
+            new_exec_id.as_uuid(),
+            request.scheduled_for,
+            codecs,
+        )
+        .await?
     } else {
         (None, None)
     };
@@ -6825,6 +6917,7 @@ macro_rules! with_start_params {
             start_source: $source,
             start_source_ref: $source_ref,
             started_by: None,
+            tenant: $request.tenant,
         }
     };
 }
@@ -7108,6 +7201,9 @@ pub struct SignalWithStartParams<'a> {
     /// coordinates, and the documented provenance query would return a
     /// different string for the two binding kinds.
     pub start_source_ref_override: Option<String>,
+    /// Tenant of a fresh run (issue #1977). An attach ignores it. See
+    /// [`StartWorkflowParams::tenant`].
+    pub tenant: Option<&'a str>,
 }
 
 /// Result of a [`signal_with_start_workflow_execution`] call.
@@ -7414,6 +7510,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
                     request.signal_name,
                     request.signal_payload,
                     request.idempotency_key.as_deref(),
+                    codecs,
                 )
                 .await?
             } else {
@@ -7972,11 +8069,18 @@ pub async fn rerun_workflow_execution_with_codecs(
             // polluting `?search_attr=` filtering and misleading compliance
             // tooling into believing the new run had been erased. Drop them.
             // (`context_headers` is NULLed rather than tombstoned by the row
-            // scrub, so it needs no equivalent test.)
-            let source_memo = source
-                .memo
-                .clone()
+            // scrub. So it needs no equivalent test.)
+            //
+            // The start path below encodes memo and input itself, so it needs
+            // the plaintext (issue #1979). A tombstone is not an envelope, so
+            // it decodes to itself and the filter still sees it.
+            let source_memo = codecs
+                .decode_column_opt(source.memo.as_ref())?
                 .filter(|v| !crate::erase::is_erasure_tombstone(v));
+            let source_input = match &request.input_override {
+                Some(input) => input.clone(),
+                None => codecs.decode_column(&source.input)?,
+            };
 
             // Strip the six replay-non-determinism diagnostic keys (issue #603):
             // a re-run has never diverged, so it must not display a phantom
@@ -8026,14 +8130,9 @@ pub async fn rerun_workflow_execution_with_codecs(
                 workflow_id: target_wf_id,
                 // Stay on the source's shard: a re-run is the same logical work.
                 exec_id: ExecutionId::new_for_shard(source_shard),
-                // VERBATIM — never decoded. `source.input` is byte-for-byte what
-                // the original start wrote, so decoding here would corrupt an
-                // encrypting deployment's re-run (and re-encrypt on write).
-                input: request
-                    .input_override
-                    .clone()
-                    .unwrap_or_else(|| source.input.clone())
-                    .into(),
+                // Decoded above. The start path encodes it once more, under
+                // the active key (issue #1979).
+                input: source_input.into(),
                 parent_id: None,
                 queue_name: &source.queue_name,
                 // The row value IS the effective (already ceiling-clamped) timeout.
@@ -8078,6 +8177,8 @@ pub async fn rerun_workflow_execution_with_codecs(
                 start_source: StartSource::Rerun,
                 start_source_ref: Some(source_exec_id_str.as_str()),
                 started_by: request.started_by,
+                // A re-run belongs to the tenant of its source (issue #1977).
+                tenant: source.tenant.as_deref(),
             };
 
             let (started, deferred_starts, deferred_checks, cancel_metrics) =
@@ -8347,11 +8448,12 @@ async fn stage_signal_with_idempotency(
     signal_name: &str,
     payload: serde_json::Value,
     idempotency_key: Option<&str>,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<bool> {
     let row = NewHarvestSignal {
         workflow_exec_id: exec_id.as_uuid(),
         signal_name,
-        payload,
+        payload: codecs.encode_column(&payload)?,
         idempotency_key,
     };
 
@@ -8483,6 +8585,9 @@ pub struct UpdateWithStartParams<'a> {
     /// so an attach/idempotent call is preserved while a fresh start is rejected
     /// — decided atomically under this call's lock (issue #499).
     pub reject_fresh_if_debounced: bool,
+    /// Tenant of a fresh run (issue #1977). An attach ignores it. See
+    /// [`StartWorkflowParams::tenant`].
+    pub tenant: Option<&'a str>,
 }
 
 /// Result of an [`update_with_start_workflow_execution`] call.
@@ -8852,7 +8957,8 @@ pub async fn lookup_idempotent_update_dedupe(
 /// wins rather than an arbitrary older terminated row.
 ///
 /// Returns `(last_completion_result, last_error)` where:
-/// - `last_completion_result` = `output` of the highest earlier-slot COMPLETED fire.
+/// - `last_completion_result` = `output` of the highest earlier-slot COMPLETED fire,
+///   decoded with `codecs` (issue #1979).
 /// - `last_error` = `error` of the highest earlier-slot terminal fire if it was
 ///   `FAILED`/`TIMED_OUT`; `None` if that fire `COMPLETED`/`CANCELLED`/`TERMINATED`.
 async fn resolve_carryover(
@@ -8860,6 +8966,7 @@ async fn resolve_carryover(
     schedule_id: uuid::Uuid,
     current_exec_id: uuid::Uuid,
     current_scheduled_for: Option<chrono::DateTime<chrono::Utc>>,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(Option<serde_json::Value>, Option<String>)> {
     use crate::schema::harvest_workflow_executions::dsl;
     use diesel::prelude::*;
@@ -8889,6 +8996,9 @@ async fn resolve_carryover(
         .optional()
         .map_err(database_error)?
         .flatten();
+    // The new `WorkflowStarted` event encodes the carryover itself, so it
+    // needs the plaintext, not a stored envelope (issue #1979).
+    let last_completion_result = codecs.decode_column_opt(last_completion_result.as_ref())?;
 
     // Highest earlier-slot terminal fire for this schedule, across *all* terminal states
     // (COMPLETED, FAILED, TIMED_OUT, CANCELLED, TERMINATED). Surfacing an error only
@@ -9710,9 +9820,60 @@ pub enum ExternalAwaitReadResult {
 /// is followed through its successor chain (same-shard) to the true terminal.
 ///
 /// **Never mutates the target or creates any linkage** — a pure read.
+///
+/// This form decodes the target's output with the identity registry. An
+/// envelope under another codec reads as still pending. Use
+/// [`read_external_await_outcome_with_codecs`] on a deployment that encodes
+/// columns (issue #1979).
+///
+/// # Errors
+///
+/// As [`read_external_await_outcome_with_codecs`].
 pub async fn read_external_await_outcome(
     conn: &mut AsyncPgConnection,
     target: ExecutionId,
+) -> HarvestResult<ExternalAwaitReadResult> {
+    read_external_await_outcome_with_codecs(conn, target, &store::DEFAULT_PAYLOAD_CODECS).await
+}
+
+/// The target's decoded output for an external await (issue #1979), or
+/// `None` when this registry cannot decode it.
+///
+/// A missing key must not fail the whole outbox tick, so the caller keeps the
+/// await pending. The codec error text is not logged.
+fn decoded_await_output(
+    codecs: &crate::payload_codec::PayloadCodecs,
+    target: ExecutionId,
+    execution: &WorkflowExecution,
+) -> Option<serde_json::Value> {
+    codecs
+        .decode_column_opt(execution.output.as_ref())
+        .map_or_else(
+            |_| {
+                tracing::warn!(
+                    target_exec_id = %target,
+                    "external await: the target output could not be decoded; staying pending"
+                );
+                None
+            },
+            |output| Some(output.unwrap_or(serde_json::Value::Null)),
+        )
+}
+
+/// [`read_external_await_outcome`], decoding the target's output column with
+/// `codecs` (issue #1979).
+///
+/// An output this registry cannot decode reads as
+/// [`ExternalAwaitReadResult::NotYetTerminal`], so the await stays pending
+/// and the outbox retries it.
+///
+/// # Errors
+///
+/// Propagates database failures.
+pub async fn read_external_await_outcome_with_codecs(
+    conn: &mut AsyncPgConnection,
+    target: ExecutionId,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<ExternalAwaitReadResult> {
     let mut current = target;
     for hop in 0..AWAIT_OUTCOME_CHAIN_MAX_HOPS {
@@ -9737,14 +9898,14 @@ pub async fn read_external_await_outcome(
         let state = reported_outcome_state(conn, current, &execution.state).await?;
         let outcome = match state {
             "COMPLETED" => {
-                // The target's `output` row column is read RAW. Core
-                // `append_events`/`load_history` use the identity codec (payload
-                // codecs are a plugin-layer concern), so on a codec-encrypting
-                // deployment this is the ciphertext envelope — the awaiter freezes
-                // it inflated into its own history, mirroring the `FAILED`-path
-                // `details` caveat below. A large output is copied inline without
-                // offloading (a documented future optimization — issue #757).
-                ExternalAwaitOutcome::Completed(execution.output.unwrap_or(serde_json::Value::Null))
+                // The `output` column can hold an envelope (issue #1979). The
+                // awaiter freezes the plaintext into its history, where the
+                // event codec encodes it again. A large output is copied
+                // inline, not offloaded (issue #757).
+                let Some(output) = decoded_await_output(codecs, current, &execution) else {
+                    return Ok(ExternalAwaitReadResult::NotYetTerminal);
+                };
+                ExternalAwaitOutcome::Completed(output)
             }
             "FAILED" => {
                 // The typed failure cause (issue #767) lives in the terminal
@@ -10539,6 +10700,7 @@ mod with_start_shared_unit_tests {
             workflow_retry_policy: Some(serde_json::json!({"max_attempts": 3})),
             max_workflow_attempts_ceiling: Some(4),
             reject_fresh_if_debounced: false,
+            tenant: None,
         }
     }
 

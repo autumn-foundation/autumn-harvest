@@ -126,6 +126,7 @@ async fn handle_webhook_after(
             // StartSource::SignalWithStart.
             start_source_override: None,
             start_source_ref_override: None,
+            tenant: None,
         },
     )
     .await?;

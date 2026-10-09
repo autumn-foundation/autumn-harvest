@@ -363,6 +363,7 @@ async fn insert_running_execution(
         start_source_ref: None,
         started_by: None,
         quota_key: Some(quota_key),
+        tenant: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)

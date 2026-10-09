@@ -548,6 +548,20 @@ pub enum HarvestError {
         existing_state: String,
     },
 
+    /// A start with a tenant met a prior run of another tenant (issue #1977).
+    ///
+    /// The start changes nothing: it does not attach to, cancel, replace or
+    /// seal the prior run. A run with no tenant counts as another tenant. The
+    /// error names no execution, so a caller learns only that the id is in
+    /// use.
+    #[error("workflow id {workflow_name}/{workflow_id} is in use by a run of another tenant")]
+    TenantConflict {
+        /// The workflow type of the start.
+        workflow_name: String,
+        /// The business key of the start.
+        workflow_id: String,
+    },
+
     /// An update request was rejected by the handler's validator before being
     /// admitted to the workflow's event history.
     ///

@@ -187,6 +187,38 @@ let harvest = autumn_harvest::HarvestBuilder::new()
     .build();
 ```
 
+### Per-tenant retention overrides (issue #1977)
+
+A tenant override keeps every run of one tenant for its own age. It matches
+the run's stored tenant, `harvest_workflow_executions.tenant`. A start by a
+tenant-bound caller sets that tenant. See
+[Tenant binding](security-posture.md#tenant-binding-issue-1977).
+
+```rust
+use std::time::Duration;
+use autumn_harvest::retention::RetentionConfig;
+
+let retention_config = RetentionConfig::with_max_age(Duration::from_secs(7 * 24 * 60 * 60))
+    .with_workflow_override("compliance_report", Duration::from_secs(365 * 24 * 60 * 60))
+    // Every run of tenant `acme`, of any type, is deleted after 30 days.
+    .with_tenant_override("acme", Duration::from_secs(30 * 24 * 60 * 60));
+```
+
+- **Precedence.** The tenant override wins. Then the type override. Then the
+  global `max_age`. A run of `acme` of type `compliance_report` is kept 30
+  days, not one year.
+- **No tenant.** A run with no tenant, or a tenant with no override, keeps
+  the type and global ages.
+- **Alone.** A tenant override alone turns on history retention. Runs of
+  other tenants are then never deleted.
+- **Legal hold wins.** A held run is never deleted.
+- **Bounds.** The age has the type-override bounds, 1 s to 10 years. The key
+  is 1 to 128 bytes of visible ASCII, with no spaces. Anything else makes
+  `try_build()` return `HarvestBuilderError::InvalidRetention`. The builder
+  cannot check that a tenant exists.
+- **Report.** `GET /admin/retention` shows the overrides as
+  `config.tenant_overrides`, in seconds.
+
 ---
 
 ## Operations & Debugging

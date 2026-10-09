@@ -200,6 +200,7 @@ fn start_params<'a>(
         start_source,
         start_source_ref,
         started_by: None,
+        tenant: None,
     }
 }
 
@@ -291,6 +292,7 @@ async fn signal_with_start_records_signal_with_start_source() {
             workflow_info: None,
             start_source_override: None,
             start_source_ref_override: None,
+            tenant: None,
         },
         None,
         None,
@@ -353,6 +355,7 @@ async fn update_with_start_records_update_with_start_source() {
             workflow_retry_policy: None,
             max_workflow_attempts_ceiling: None,
             reject_fresh_if_debounced: false,
+            tenant: None,
         },
         None,
         None,
