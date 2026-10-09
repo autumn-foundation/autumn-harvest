@@ -85,6 +85,8 @@ mod claim_continuation_priority_tests;
 mod claim_run_deadline_tests;
 #[cfg(feature = "db")]
 mod claim_seek_tests;
+#[cfg(feature = "db")]
+mod codec_column_coverage_tests;
 #[cfg(all(feature = "db", feature = "testing"))]
 mod codec_rotation_db_tests;
 #[cfg(feature = "db")]
@@ -136,6 +138,8 @@ mod drain_release_tests;
 mod dst_differential_tests;
 mod e2e_bench_cell_timeout_tests;
 mod e2e_bench_support;
+#[cfg(feature = "db")]
+mod entity_tests;
 mod event_batch_tests;
 mod event_partitioning_tests;
 mod executor_span_tests;

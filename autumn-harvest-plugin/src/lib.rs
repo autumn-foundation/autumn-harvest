@@ -52,6 +52,9 @@ pub mod dev;
 /// One entry point for a standalone embedding (issue #1613).
 pub mod embedding;
 pub mod lineage;
+/// OIDC login for Vantage and the management API (issue #1978).
+#[cfg(feature = "oidc")]
+pub mod oidc;
 pub mod outbox;
 pub mod plugin;
 pub mod preflight;
@@ -59,6 +62,8 @@ pub mod prelude;
 /// Fleet-wide task-queue coverage read model (issue #774).
 pub mod queue_coverage;
 pub mod replay_diagnosis;
+/// Custom roles for the management API and Vantage (issue #1978).
+pub mod roles;
 pub mod runner;
 /// Cross-site request rejection for Vantage and DLQ mutations (issue #1278).
 pub mod same_origin;

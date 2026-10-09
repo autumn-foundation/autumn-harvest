@@ -1399,7 +1399,7 @@ async fn start_child_on_target(
                     // column would make every shard-filtered scanner query (timeouts,
                     // outboxes, the SLA sweep) skip it.
                     shard_id: row.target_shard,
-                    input: spec.input.clone().into(),
+                    input: codecs.encode_column(&spec.input)?.into(),
                     parent_id: Some(parent_exec_id.as_uuid()),
                     queue_name: &spec.queue_name,
                     execution_timeout: spec.execution_timeout_secs.map(chrono::Duration::seconds),
@@ -1546,12 +1546,13 @@ async fn start_child_on_target(
                     // are returned rather than emitted inline.
                     let mut pending_cancel_metrics = Vec::new();
                     for start in
-                        crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+                        crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
                             conn,
                             child_exec_id,
                             crate::completion_trigger::TerminalState::Cancelled,
                             Some(metrics),
                             &mut pending_cancel_metrics,
+                            codecs,
                         )
                         .await?
                     {
@@ -1592,7 +1593,7 @@ async fn start_child_on_target(
                 let mut params = queue::EnqueueParams::new(
                     spec.queue_name.clone(),
                     TaskType::Workflow,
-                    spec.input.clone(),
+                    codecs.encode_column(&spec.input)?,
                 );
                 params.workflow_exec_id = Some(child_exec_id.as_uuid());
                 params.required_build_id = spec.assigned_build_id.clone();
@@ -1764,7 +1765,12 @@ async fn deliver_terminal(
     let child_exec_id = ExecutionId::from_uuid(row.child_exec_id);
     let parent_exec_id = ExecutionId::from_uuid(row.parent_exec_id);
     let state = child.state.clone();
-    let output = child.output.clone();
+    // The output column can hold an envelope (issue #1979). The parent's
+    // history gets the plaintext. A failure here takes the caller's retry
+    // path, so the child stays pending. The codec error text is not kept.
+    let output = codecs
+        .decode_column_opt(child.output.as_ref())
+        .map_err(|_| HarvestError::Config("the child output could not be decoded".to_string()))?;
     let error = child.error.clone();
     let typed_failure = child.typed_failure.clone();
 

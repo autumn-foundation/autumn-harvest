@@ -169,6 +169,10 @@ struct WorkflowHandleClientInner {
     router: ShardRouter,
     notification_database_urls: BTreeMap<ShardId, String>,
     payload_codecs: crate::payload_codec::PayloadCodecs,
+    /// Whether result reads decode the output column (issue #1979). The
+    /// management API turns it off, so only its gated read-path decoder
+    /// decodes (issue #608).
+    decode_result_output: bool,
     shared_state: crate::context::SharedState,
     update_handlers: Vec<crate::info::UpdateHandlerInfo>,
     query_handlers: Vec<crate::info::QueryHandlerInfo>,
@@ -233,6 +237,7 @@ impl std::fmt::Debug for WorkflowHandleClientInner {
                 &self.notification_database_urls,
             )
             .field("payload_codecs", &"<PayloadCodecs>")
+            .field("decode_result_output", &self.decode_result_output)
             .field("shared_state", &"<SharedState>")
             .field("update_handlers_count", &self.update_handlers.len())
             .field("query_handlers_count", &self.query_handlers.len())
@@ -342,6 +347,7 @@ impl WorkflowHandleClient {
                 start_idempotency_window:
                     crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW,
                 metrics: Arc::new(crate::telemetry::NoOpMetrics),
+                decode_result_output: true,
             }),
         }
     }
@@ -364,6 +370,30 @@ impl WorkflowHandleClient {
     pub fn with_codecs(self, codecs: crate::payload_codec::PayloadCodecs) -> Self {
         let mut inner = (*self.inner).clone();
         inner.payload_codecs = codecs;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// The client's codec registry (issue #1979).
+    ///
+    /// Typed signal helpers use it to encode the payload column. Pass it to
+    /// the `_with_codecs` signal functions.
+    #[must_use]
+    pub fn payload_codecs(&self) -> &crate::payload_codec::PayloadCodecs {
+        &self.inner.payload_codecs
+    }
+
+    /// Keep the stored output column in result reads (issue #1979).
+    ///
+    /// By default a result read decodes the output with the client's codec
+    /// registry. The management API calls this, so a non-admin caller gets
+    /// the stored bytes and only the gated read-path decoder decodes (issue
+    /// #608).
+    #[must_use]
+    pub fn with_stored_result_output(self) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.decode_result_output = false;
         Self {
             inner: Arc::new(inner),
         }
@@ -2301,6 +2331,16 @@ impl WorkflowHandle {
                 execution.state = state.to_string();
             }
         }
+        // Every caller reports the output to the user, so decode it here
+        // (issue #1979). No caller writes this row back. A client built with
+        // `with_stored_result_output` keeps the stored bytes.
+        if self.client.inner.decode_result_output {
+            execution.output = self
+                .client
+                .inner
+                .payload_codecs
+                .decode_column_opt(execution.output.as_ref())?;
+        }
         Ok(execution)
     }
 
@@ -2336,6 +2376,12 @@ impl WorkflowHandle {
                 target, execution.workflow_name, workflow_info.name
             )));
         }
+        // The replayed handler gets the plaintext input (issue #1979).
+        let query_input = self
+            .client
+            .inner
+            .payload_codecs
+            .decode_column(&execution.input)?;
         if WorkflowResultState::from_execution_state(&execution.state).is_terminal() {
             return Err(HarvestError::WorkflowNotRunning(target));
         }
@@ -2410,12 +2456,11 @@ impl WorkflowHandle {
         // returning its boxed future), mirroring the poll-time containment below.
         // Query replays emit no commands and append no events — map the caught
         // construction panic to a clean `QueryHandlerPanicked` (503).
-        let handler_fut = match crate::error::catch_construct(|| {
-            (workflow_info.handler)(&ctx, execution.input.clone())
-        }) {
-            Ok(fut) => fut,
-            Err(message) => return Err(HarvestError::QueryHandlerPanicked(message)),
-        };
+        let handler_fut =
+            match crate::error::catch_construct(|| (workflow_info.handler)(&ctx, query_input)) {
+                Ok(fut) => fut,
+                Err(message) => return Err(HarvestError::QueryHandlerPanicked(message)),
+            };
         tokio::pin!(handler_fut);
 
         let mut replay_result = None;

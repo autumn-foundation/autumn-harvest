@@ -2,6 +2,7 @@
 members = [
     "autumn-harvest",
     "autumn-harvest-plugin",
+    "autumn-harvest-agent",
     "autumn-harvest-macros",
     "autumn-harvest-cli",
     "autumn-harvest-redis",

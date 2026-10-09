@@ -1304,4 +1304,124 @@ mod tests {
             );
         }
     }
+
+    // ── column coverage (issue #1979) ──────────────────────────────────
+
+    #[test]
+    fn column_encoding_is_off_by_default() {
+        let codecs = PayloadCodecs::default();
+        codec("k1", KEY_A).register_with(&codecs).unwrap();
+        let payload = json!({"ssn": PAYLOAD_SECRET});
+        assert!(!codecs.column_encoding());
+        assert_eq!(codecs.encode_column(&payload).unwrap(), payload);
+    }
+
+    #[test]
+    fn column_encoding_is_shared_by_every_clone() {
+        let codecs = PayloadCodecs::default();
+        codec("k1", KEY_A).register_with(&codecs).unwrap();
+        let clone = codecs.clone();
+        codecs.set_column_encoding(true);
+        assert!(clone.column_encoding());
+        let payload = json!({"ssn": PAYLOAD_SECRET});
+        let stored = clone.encode_column(&payload).unwrap();
+        assert!(!stored.to_string().contains(PAYLOAD_SECRET));
+        assert_eq!(codec_envelope_key_id(&stored), Some("k1"));
+        assert_eq!(codecs.decode_column(&stored).unwrap(), payload);
+    }
+
+    #[test]
+    fn decode_column_passes_plaintext_and_tombstones_through() {
+        let codecs = PayloadCodecs::default();
+        codec("k1", KEY_A).register_with(&codecs).unwrap();
+        codecs.set_column_encoding(true);
+        let plain = json!({"ssn": PAYLOAD_SECRET});
+        assert_eq!(codecs.decode_column(&plain).unwrap(), plain);
+        let tombstone = crate::erase::erasure_tombstone();
+        assert_eq!(codecs.decode_column(&tombstone).unwrap(), tombstone);
+    }
+
+    #[test]
+    fn decode_column_fails_closed_without_the_key() {
+        let writer = PayloadCodecs::default();
+        codec("k1", KEY_A).register_with(&writer).unwrap();
+        writer.set_column_encoding(true);
+        let stored = writer
+            .encode_column(&json!({"ssn": PAYLOAD_SECRET}))
+            .unwrap();
+        let reader = PayloadCodecs::default();
+        let err = reader.decode_column(&stored).unwrap_err();
+        assert!(
+            matches!(err, crate::error::HarvestError::UnknownCodecKey { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_envelope_shaped_value_is_escaped_while_column_encoding_is_off() {
+        use base64::Engine as _;
+        let codecs = PayloadCodecs::default();
+        codec("k1", KEY_A).register_with(&codecs).unwrap();
+        let inner = json!({"role": "admin"});
+        let data = base64::engine::general_purpose::STANDARD.encode(inner.to_string());
+        let shaped = json!({"nested": {
+            crate::payload_codec::CODEC_ENVELOPE_KEY: 1,
+            "codec_id": "identity",
+            "data": data,
+        }});
+        let stored = codecs.encode_column(&shaped).unwrap();
+        assert_ne!(stored, shaped, "a collision is never stored verbatim");
+        assert_eq!(codecs.decode_column(&stored).unwrap(), shaped);
+        let plain = json!({"ssn": PAYLOAD_SECRET});
+        assert_eq!(codecs.encode_column(&plain).unwrap(), plain);
+    }
+
+    #[test]
+    fn a_column_read_shows_the_same_plaintext_with_the_switch_off_or_on() {
+        let codecs = PayloadCodecs::default();
+        codec("k1", KEY_A).register_with(&codecs).unwrap();
+        let plaintext = json!({"ssn": PAYLOAD_SECRET});
+        // A caller hands the engine a value that is already an envelope.
+        let client = codecs.encode_payload(&plaintext).unwrap();
+        let legacy_row = client.clone();
+        let escaped_row = codecs.encode_column(&client).unwrap();
+        codecs.set_column_encoding(true);
+        let encoded_row = codecs.encode_column(&client).unwrap();
+        for mut row in [legacy_row, escaped_row, encoded_row] {
+            let outcome = codecs.decode_column_lossy(&mut row);
+            assert_eq!(row, plaintext);
+            assert!(outcome.decoded >= 1 && outcome.failed == 0);
+        }
+    }
+
+    #[test]
+    fn a_column_read_decodes_a_plain_row_once_and_marks_a_missing_key() {
+        let writer = PayloadCodecs::default();
+        codec("k1", KEY_A).register_with(&writer).unwrap();
+        let mut plain = json!({"ssn": PAYLOAD_SECRET});
+        let outcome = writer.decode_column_lossy(&mut plain);
+        assert_eq!(plain, json!({"ssn": PAYLOAD_SECRET}));
+        assert!(!outcome.touched());
+
+        writer.set_column_encoding(true);
+        let mut stored = writer
+            .encode_column(&json!({"ssn": PAYLOAD_SECRET}))
+            .unwrap();
+        let outcome = PayloadCodecs::default().decode_column_lossy(&mut stored);
+        assert_eq!(outcome.failed, 1);
+        assert!(
+            stored
+                .get(crate::payload_codec::UNDECODABLE_MARKER_KEY)
+                .is_some()
+        );
+        assert!(!stored.to_string().contains(PAYLOAD_SECRET));
+    }
+
+    #[test]
+    fn the_builder_switch_turns_column_encoding_on() {
+        let builder = crate::HarvestBuilder::new();
+        assert!(!builder.payload_codecs().column_encoding());
+        let builder = builder.encode_payload_columns();
+        assert!(builder.payload_codecs().column_encoding());
+    }
 }
