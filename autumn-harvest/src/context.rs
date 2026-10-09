@@ -15977,6 +15977,8 @@ impl ActivityContext {
         // to a no-op passthrough when nested. So a nested transaction's
         // hint would flush with the outer task's outcome, instead of this
         // transaction's own.
+        // Issue #1996: how many recorded LLM calls the commit writes.
+        let committed_llm_calls = std::sync::atomic::AtomicUsize::new(0);
         let result = crate::dispatch::buffered_checkpoint(Box::pin(
             conn.transaction::<T, TxError, _>(async |conn| {
                 // Run user domain writes.
@@ -16063,14 +16065,16 @@ impl ActivityContext {
                 // Issue #1996: the recorded LLM calls commit with the event.
                 // A copy, so a rollback keeps them in the slot. The slot is
                 // emptied only after the commit.
+                let llm_calls = self.llm_calls();
                 crate::llm_ledger::insert_ledger_rows(
                     conn,
                     exec_id,
                     history.next_event_id,
                     &self.identity.activity_type,
-                    &self.llm_calls(),
+                    &llm_calls,
                 )
                 .await?;
+                committed_llm_calls.store(llm_calls.len(), std::sync::atomic::Ordering::SeqCst);
 
                 // Mark the task COMPLETED. The row lock above keeps the claim
                 // current, so a lost lease here is a bug, and the error rolls
@@ -16098,8 +16102,11 @@ impl ActivityContext {
                 // leaves it false so the failure flows through the normal path.
                 self.transactional_commit_occurred
                     .store(true, std::sync::atomic::Ordering::SeqCst);
-                // The commit wrote the recorded LLM calls (issue #1996).
-                drop(self.take_llm_calls());
+                // The commit wrote the first calls of the slot (issue #1996).
+                // A call recorded during the commit stays, so the worker logs
+                // it as dropped.
+                self.llm_calls
+                    .remove_first(committed_llm_calls.load(std::sync::atomic::Ordering::SeqCst));
                 Ok(value)
             }
             Err(e) => Err(match e {

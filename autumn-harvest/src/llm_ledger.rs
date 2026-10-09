@@ -265,6 +265,15 @@ impl LlmCallSlot {
     pub(crate) fn take(&self) -> Vec<LlmCall> {
         std::mem::take(&mut self.lock().calls)
     }
+
+    /// Remove the first `count` calls, which a commit already wrote.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
+    pub(crate) fn remove_first(&self, count: usize) {
+        let mut state = self.lock();
+        let count = count.min(state.calls.len());
+        state.calls.drain(..count);
+        drop(state);
+    }
 }
 
 /// One `harvest_llm_ledger` row to insert.
@@ -515,6 +524,20 @@ mod tests {
             filled < Duration::from_secs(3),
             "the fill counts from the last record, not the attempt start: {filled:?}"
         );
+    }
+
+    #[test]
+    fn remove_first_keeps_a_call_recorded_after_the_snapshot() {
+        let slot = LlmCallSlot::new();
+        slot.record(LlmCall::new("written", 1, 1)).unwrap();
+        let written = slot.snapshot().len();
+        slot.record(LlmCall::new("late", 1, 1)).unwrap();
+        slot.remove_first(written);
+        let left = slot.take();
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].model(), "late");
+        slot.remove_first(5);
+        assert_eq!(slot.take(), Vec::new(), "a large count empties the slot");
     }
 
     #[test]
