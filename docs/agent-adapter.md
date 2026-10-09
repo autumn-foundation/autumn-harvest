@@ -146,7 +146,9 @@ A worker with a payload cap other than the default must say so. Set
 - `precheck(precheck)` — the cheap check that can skip a heartbeat tick.
 
 The names `memory` and `schedule_followup` belong to the built-in tools.
-When a built-in is active, it hides an app tool with the same name.
+When a built-in is active, it hides an app tool with the same name. With a
+memory store installed, `memory` is always reserved, even in a run that gets
+no memory tool.
 
 A tool error is cut to fit the result cap too, so a huge error message
 cannot fail the run.

@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::error::AgentError;
 use crate::heartbeat::{HeartbeatTask, Precheck};
-use crate::memory::{MemoryScope, MemoryStore, MemoryTool, render_snapshot};
+use crate::memory::{MEMORY_TOOL, MemoryScope, MemoryStore, MemoryTool, render_snapshot};
 use crate::message::{RunId, ToolDefinition};
 use crate::model::{AgentModel, BoxFuture, ChatRequest};
 use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
@@ -418,7 +418,13 @@ impl AgentHarness {
     /// A built-in wins a name clash. Two tools with one name would make many
     /// providers refuse the request.
     fn visible<'a>(&'a self, builtins: &'a [Arc<dyn Tool>]) -> impl Iterator<Item = &'a dyn Tool> {
-        let taken = |name: &str| builtins.iter().any(|tool| tool.name() == name);
+        // With a store installed, `memory` stays reserved even when this run
+        // gets no memory tool. An app tool of that name could otherwise slip
+        // past the memory-write opt-in.
+        let reserved = self.memory.is_some();
+        let taken = move |name: &str| {
+            (reserved && name == MEMORY_TOOL) || builtins.iter().any(|tool| tool.name() == name)
+        };
         builtins.iter().map(AsRef::as_ref).chain(
             self.tools
                 .iter()

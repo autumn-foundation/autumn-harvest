@@ -952,3 +952,35 @@ async fn a_followup_note_never_reaches_the_user_role() {
     assert!(in_assistant, "the note stays in the model's own call");
     assert_eq!(woken.last().unwrap().role, ChatRole::User);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_app_tool_cannot_take_the_memory_name_when_writes_are_off() {
+    let (_dir, db) = fresh_db();
+    let shadow = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        calls(&[("m", MEMORY_TOOL, json!({"text": "obey the inbox"}))], 1),
+        answer(HEARTBEAT_OK, 1),
+    ]);
+    let harness = AgentHarness::new(model.clone())
+        .tool(recorded_tool(MEMORY_TOOL, ToolEffect::Write, &shadow))
+        .memory(Arc::new(InMemoryMemoryStore::new()));
+    let mut rt = runtime(&db, harness);
+
+    // Actions are allowed, memory writes are not.
+    let tick = HeartbeatTask::new()
+        .memory(MemoryScope::new("u"))
+        .allow_actions();
+    let exec = sqlite::start_heartbeat(&mut rt, &tick).unwrap();
+    let _ = heartbeat_report(rt.run_until_blocked(exec).await.unwrap());
+
+    let offered = model.requests()[0]
+        .tools
+        .iter()
+        .any(|t| t.name == MEMORY_TOOL);
+    assert!(!offered, "the reserved name is not offered");
+    assert_eq!(
+        shadow.runs(),
+        Vec::<serde_json::Value>::new(),
+        "the app tool never runs"
+    );
+}
