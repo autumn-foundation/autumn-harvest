@@ -135,7 +135,8 @@ the write.
   order of the writes, and the seed fixes that order.
 - The extra millisecond keeps two virtual instants apart. The engine builds
   ids from instants, such as the workflow id of a schedule slot.
-- A step over 20 s of real time stops the run as a harness error.
+- A step over 20 s of real time, its snapshot included, stops the run as a
+  harness error.
 
 ### 2.4 Invariants
 

@@ -241,8 +241,8 @@ These rules make each comparison a function of the seed:
   times follow the order of the writes, and the seed fixes that order.
 - The extra millisecond keeps two virtual instants apart. The engine builds
   ids from instants, such as the workflow id of a schedule slot.
-- A step must take less than 20 s of real time. A slower step stops the
-  run as a harness error.
+- A step must take less than 20 s of real time, its snapshot included. A
+  slower step stops the run as a harness error.
 
 A scheduler holds its scan between two steps. The clock shifts the held row
 with the table, so a stale snapshot can still win its claim.

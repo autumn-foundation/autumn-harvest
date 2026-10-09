@@ -88,7 +88,8 @@ const WARP_MS: i64 = TICK_MS + 1;
 const MAX_STEPS: usize = 1_000;
 
 /// A step that takes longer than this in real time voids the clock
-/// argument. The run then stops as a harness error.
+/// argument. The run then stops as a harness error. A step runs from one
+/// action to the next, so it includes the snapshot between them.
 const MAX_STEP_REAL: Duration = Duration::from_secs(20);
 
 /// The orphan reclaimer quarantines a task at this many strikes. The
@@ -429,6 +430,8 @@ struct PgWorld {
     scheduled: usize,
     held: BTreeMap<usize, Held>,
     registry: HandlerRegistry,
+    /// The real time at which the last action began.
+    step_started: Option<Instant>,
 }
 
 impl PgWorld {
@@ -482,6 +485,7 @@ impl PgWorld {
             scheduled: 0,
             held: BTreeMap::new(),
             registry: HandlerRegistry::new(workflows(), vec![add_info()]),
+            step_started: None,
         };
         for w in 0..config.workers {
             let worker = world.start_worker(w).await;
@@ -801,6 +805,16 @@ impl Drop for PgWorld {
     }
 }
 
+/// Stop the run when one step took `took` of real time, too much for the
+/// clock argument.
+fn assert_step_time(action: WorldAction, took: Duration) {
+    assert!(
+        took < MAX_STEP_REAL,
+        "a step before {action:?} took {took:?}: a step must take less than \
+         {MAX_STEP_REAL:?}, or real time can change a claim order"
+    );
+}
+
 async fn runs_started(conn: &mut AsyncPgConnection, id: uuid::Uuid) -> i32 {
     harvest_schedules::table
         .find(id)
@@ -812,7 +826,11 @@ async fn runs_started(conn: &mut AsyncPgConnection, id: uuid::Uuid) -> i32 {
 
 impl World for PgWorld {
     async fn apply(&mut self, action: WorldAction, _now_tick: u64) -> Effect {
+        // The last step ran from its action to this one, snapshot included.
         let started = Instant::now();
+        if let Some(last) = self.step_started.replace(started) {
+            assert_step_time(action, started - last);
+        }
         self.shift(STEP_MS).await;
         let effect = match action {
             WorldAction::Advance => {
@@ -839,12 +857,7 @@ impl World for PgWorld {
             WorldAction::Reclaim => self.reclaim().await,
             WorldAction::Sweep => self.sweep().await,
         };
-        let took = started.elapsed();
-        assert!(
-            took < MAX_STEP_REAL,
-            "{action:?} took {took:?}: a step must take less than {MAX_STEP_REAL:?}, or real \
-             time can change a claim order"
-        );
+        assert_step_time(action, started.elapsed());
         effect
     }
 
