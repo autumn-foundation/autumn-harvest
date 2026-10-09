@@ -1,7 +1,7 @@
 //! A recorder of task-row traces for TLA+ trace validation (issue #2003).
 //!
-//! Two triggers copy every committed write to `harvest_task_queue` and each
-//! activity or terminal event in `harvest_events` into `harvest_tla_trace`.
+//! Two triggers copy every committed write to `harvest_task_queue`, and each
+//! activity or terminal event in `harvest_events`, into `harvest_tla_trace`.
 //! A trigger row rolls back with its transaction, so the log holds committed
 //! steps only.
 //!
@@ -14,9 +14,10 @@
 //! writes. The trigger reads the name from the `harvest.trace_actor`
 //! setting. A line with no name can be explained by any writer.
 //!
-//! Recording runs only when `HARVEST_TLA_TRACE_DIR` is set, so a shared test
-//! database keeps no trigger. A red test calls [`install_now`] to record in
-//! every run.
+//! Recording runs only when `HARVEST_TLA_TRACE_DIR` is set. A run without
+//! it therefore leaves no trigger on a shared test database. A run with it
+//! leaves the triggers in place. A red test calls [`install_now`] to record
+//! in every run.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -133,7 +134,7 @@ pub async fn install_now(conn: &mut AsyncPgConnection) {
 }
 
 /// Remove the recorder when recording is off. A red test calls it last, so
-/// a shared database keeps no trigger.
+/// a run without recording leaves no trigger on a shared database.
 pub async fn uninstall_unless_recording(conn: &mut AsyncPgConnection) {
     if trace_dir().is_none() {
         conn.batch_execute(UNINSTALL_SQL)

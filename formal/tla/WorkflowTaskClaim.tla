@@ -146,8 +146,8 @@ CapMissRelease(c) ==
 
 \* release_unstarted_claim (issue #1813): a draining worker gives back a
 \* claim that never started. Its fence is claim_held, with no strikes term.
-\* It subtracts 1 from attempt and keeps crash_strikes. Issue #2003 found
-\* this action, because a chaos trace had no other match.
+\* It subtracts 1 from attempt and keeps crash_strikes. The trace check of
+\* issue #2003 found the gap: a chaos trace of #1813 matched no action.
 UnstartedRelease(c) ==
     /\ c \in inflight
     /\ IF /\ row.state = "RUNNING"

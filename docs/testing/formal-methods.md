@@ -269,16 +269,19 @@ The exporter maps the engine onto the spec in three places:
 
 - A parked workflow task is `RUNNING` with no `worker_id`. No claim holds
   it, so the trace logs it as `PENDING`.
-- `ActivityFailed` and `ActivityTimedOut` are terminal only when the row
-  becomes terminal in the same transaction. Otherwise a retry follows.
+- `ActivityCompleted` and `ActivityCompletedExternally` are always
+  terminal. `ActivityFailed`, `ActivityTimedOut` and
+  `ActivityFailedExternally` are terminal only when the row becomes
+  terminal in the same transaction. Otherwise a retry follows.
 - Transactions are in the order of their last log id. Row locks serialize
   the writes of one task row, so this order is the commit order.
 
 **The writer.** A test can open a connection with `tla_trace::actor_url`.
 The URL sets `harvest.trace_actor` to `<task>/<worker>/<attempt>`, and the
-trigger copies it. A line that names a claim of its own row must be
-explained by an action of that claim. A line with no name can be explained
-by any action. Production code does not set the name.
+trigger copies it. A line that names a claim of its own row must be a new
+claim, or an owner action of the named claim. A system action, such as an
+orphan reclaim, cannot explain it. A line with no name can be explained by
+any action. Production code does not set the name.
 
 ### Check a trace
 
@@ -303,18 +306,30 @@ A check names a guard setting:
 | `pre-fix` | `Fenced = FALSE` | `ChecksAttempt = FALSE`, `CapMissGuard = "strikes"` |
 
 The runner renames the workers `w1`, `w2` and so on. The models are
-symmetric in their workers, so equal traces share one TLC run. The runner
-fails when a result differs from its check, when TLC fails for another
-reason, or when a directory has no trace for a spec.
+symmetric in their workers, so equal traces share one TLC run.
+
+The runner fails in these cases:
+
+- A result differs from its check.
+- TLC fails for another reason.
+- A trace is malformed, or a directory is empty.
+- A directory has no trace for a spec.
 
 ### Red tests
 
-A red trace holds an injected protocol violation. Its header expects
-`"fixed": "reject"` and `"pre-fix": "accept"`. The second check proves that
-the fence causes the rejection, not a malformed trace.
+A red trace holds an injected protocol violation. There are two kinds:
 
-- `formal/tla/trace/fixtures/` holds a clean trace and a red trace for each
-  spec. The `formal-models` job in `ci.yml` checks them on every PR.
+- A **fence** red trace is a stale owner write. Its header expects
+  `"fixed": "reject"` and `"pre-fix": "accept"`. The second check proves
+  that the fence causes the rejection, not a malformed trace.
+- A **forged** red trace breaks the protocol under each guard, for example
+  with a second terminal event. Its header expects `reject` from both.
+
+The sources are:
+
+- `formal/tla/trace/fixtures/` holds at least one clean trace and one fence
+  red trace for each spec. The `formal-models` job in `ci.yml` checks them
+  on every PR that changes code.
 - `chaos_tests::trace_red` runs the #1789 and #1806 races on Postgres. The
   engine fences the stale write. The test then injects the stale write with
   the pre-fix guard, on a connection that names the stale claim.
@@ -324,9 +339,9 @@ the fence causes the rejection, not a malformed trace.
 ### In CI
 
 `chaos.yml` sets `HARVEST_TLA_TRACE_DIR`. After the chaos suite, it runs
-`scripts/check-formal-traces.sh "$HARVEST_TLA_TRACE_DIR"`. Every trace from
-the reproducers, the convergence sweep and the infrastructure faults is
-checked. The red traces must be rejected.
+`scripts/check-formal-traces.sh "$HARVEST_TLA_TRACE_DIR"`. The runner checks
+every trace from the reproducers, the convergence sweep and the
+infrastructure faults. TLC must reject each red trace.
 
 The infrastructure faults need Docker. `chaos_tests::trace_activity` runs
 activities on a real worker against any test database, so the
@@ -349,15 +364,21 @@ scripts/check-formal-traces.sh "$HARVEST_TLA_TRACE_DIR"
 - A fixture is malformed.
 - A spec has no clean fixture, or no red fixture that only the fence rejects.
 - A trace spec does not extend its model.
+- The two runners pin different TLC releases.
 - `ci.yml` or `chaos.yml` does not run the runner.
 - The chaos suite does not install the recorder or export its traces.
+- This page does not name a part of the trace check.
 
 ### Limits
 
-- The writer is known only where a test names it. A real `Worker` does not
+- Only a test can name the writer. A real `Worker` does not
   name its claims, so its lines can be explained by any claim.
 - An unobserved action changes no logged column. `TraceNext` omits it. Such
   an action only drops a claim, so a match never needs it.
+- A recording run leaves the triggers on its database. A shared
+  `HARVEST_TEST_DATABASE_URL` keeps them, and `partition` then refuses to
+  convert `harvest_events`. Drop the triggers before other tests use it, or
+  use a new database.
 - A trace starts at the row's insert. A row from before the recorder was
   installed fails the export.
 - The model of `CodecRotation` has no trace check.

@@ -11,14 +11,15 @@ spec matches every line. No production code changes.
 
 **Writer attribution.** A test can open a connection that names a claim
 through the `harvest.trace_actor` setting. A line that names a claim must
-be explained by an action of that claim, so a stale owner write fails the
-check.
+be a new claim or an owner action of that claim, so a stale owner write
+fails the check.
 
 **Red tests.** Each red trace holds an injected violation. The fixed spec
-must reject it, and the pre-fix spec must accept it, so only the fence
-causes the rejection. `formal/tla/trace/fixtures/` holds a clean trace and a
-red trace for each spec. The `formal-models` CI job checks them on every
-PR. `chaos_tests::trace_red` injects the #1789 and #1806 stale writes on
+must reject a stale owner write, and the pre-fix spec must accept it, so
+only the fence causes the rejection. A forged second terminal event must be
+rejected by both. `formal/tla/trace/fixtures/` holds at least one clean
+trace and one red trace for each spec. The `formal-models` CI job checks
+them on every PR that changes code. `chaos_tests::trace_red` injects the #1789 and #1806 stale writes on
 Postgres, and `chaos.yml` checks their traces after the suite.
 
 **Model change.** The first chaos run found a gap in `WorkflowTaskClaim`.

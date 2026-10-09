@@ -11,7 +11,8 @@
 //! - Each trace spec extends its model.
 //! - `ci.yml` checks the fixtures on every PR.
 //! - `chaos.yml` records the chaos traces and checks them.
-//! - The chaos suite installs the recorder and exports its traces.
+//! - The chaos suite installs the recorder and exports its traces. The
+//!   infrastructure-fault tests install it, and `converge` exports.
 //! - `docs/testing/formal-methods.md` names each part.
 
 use std::collections::BTreeMap;
@@ -331,10 +332,9 @@ fn chaos_suite_records_and_exports_traces() {
         assert!(suite.contains(call), "chaos_tests.rs must call `{call}`");
     }
     let infra = read("autumn-harvest/tests/integration/chaos_tests/infra_faults.rs");
-    assert!(
-        infra.contains("tla_trace::install("),
-        "infra_faults.rs must install the recorder"
-    );
+    for call in ["tla_trace::install(", "tla_trace::export("] {
+        assert!(infra.contains(call), "infra_faults.rs must call `{call}`");
+    }
 }
 
 #[test]
