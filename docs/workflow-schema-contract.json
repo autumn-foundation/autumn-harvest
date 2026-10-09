@@ -1,7 +1,7 @@
 {
-  "version": "0.6.0",
-  "contract_version": "1",
-  "description": "Versioned machine-readable baseline of every registered workflow type's published input/output/error JSON Schema (issue #373), used by `harvest schema check` to gate backward-incompatible payload changes before they DLQ in-flight executions (issue #794). Stored schemas are canonicalised: only the pure annotations (title/description/$comment/$schema/$id/examples/deprecated/readOnly/writeOnly) are stripped, so a doc-comment edit never dirties this file. Every other keyword is compared — see `compatibility.analysed_keywords` for the set the differ classifies, and `compatibility.unanalysed_keyword_policy` for what happens to the rest. Regenerate with `harvest schema update`; a breaking change must be acknowledged with a recorded justification. See docs/workflow-schema-contract-guide.md.",
+  "version": "0.7.0",
+  "contract_version": "2",
+  "description": "Versioned machine-readable baseline of every registered workflow type's published input/output/error JSON Schema (issue #373), and of activity input/output and side-effect value schemas (issue #1994), used by `harvest schema check` to gate backward-incompatible payload changes before they DLQ in-flight executions (issue #794). Stored schemas are canonicalised: only the pure annotations (title/description/$comment/$schema/$id/examples/deprecated/readOnly/writeOnly) are stripped, so a doc-comment edit never dirties this file. Every other keyword is compared — see `compatibility.analysed_keywords` for the set the differ classifies, and `compatibility.unanalysed_keyword_policy` for what happens to the rest. Regenerate with `harvest schema update`; a breaking change must be acknowledged with a recorded justification. See docs/workflow-schema-contract-guide.md.",
   "compatibility": {
     "perspective": "replay-read: JSON already recorded in harvest_events must still deserialize into the new type, and must still mean the same thing",
     "breaking_changes": [
@@ -18,7 +18,8 @@
       "Changing tuple arity",
       "Withdrawing a previously published schema (coverage regression)",
       "Any change to a constraint keyword outside the analysed set (fail closed)",
-      "A cardinality bound (minLength/maxLength/minItems/maxItems) that is present but is not a non-negative integer on either side: the engine's validator reads them with as_u64 and IGNORES anything else, so such a value is not a smaller bound but an absent one (fail closed)"
+      "A cardinality bound (minLength/maxLength/minItems/maxItems) that is present but is not a non-negative integer on either side: the engine's validator reads them with as_u64 and IGNORES anything else, so such a value is not a smaller bound but an absent one (fail closed)",
+      "Removing a side-effect declaration. It is not registered with the runtime, so its call site can still read recorded values (issue #1994)"
     ],
     "non_breaking_changes": [
       "Adding an optional property (Option<T> or #[serde(default)])",
@@ -30,6 +31,7 @@
       "Relaxing additionalProperties or a bound",
       "Adding a workflow type, or publishing a schema for the first time",
       "Removing a workflow type (gated more accurately by `harvest workflow-types reachability`, issue #520)",
+      "Adding an activity type or a side effect, or removing an activity type (issue #1994)",
       "Editing any annotation (title, description, examples, …)"
     ],
     "analysed_keywords": [
@@ -69,7 +71,12 @@
     "workflows_total": 2,
     "with_input_schema": 1,
     "with_output_schema": 1,
-    "with_error_schema": 1
+    "with_error_schema": 1,
+    "activities_total": 1,
+    "with_activity_input_schema": 1,
+    "with_activity_output_schema": 1,
+    "side_effects_total": 1,
+    "with_side_effect_value_schema": 1
   },
   "acknowledged_breaking_changes": [],
   "workflows": [
@@ -113,6 +120,34 @@
         "type": "object"
       },
       "error_schema": {
+        "type": "string"
+      }
+    }
+  ],
+  "activities": [
+    {
+      "name": "send_welcome_email",
+      "input_schema": {
+        "type": "string"
+      },
+      "output_schema": {
+        "properties": {
+          "message_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message_id"
+        ],
+        "type": "object"
+      }
+    }
+  ],
+  "side_effects": [
+    {
+      "workflow": "onboarding",
+      "id": "pick_variant",
+      "value_schema": {
         "type": "string"
       }
     }

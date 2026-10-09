@@ -1,7 +1,8 @@
 # Workflow Schema Contract — Replay-Compatibility Gate
 
 This guide is for anyone who changes a `#[workflow]` function's **input, output,
-or error type**. It explains what `docs/workflow-schema-contract.json` is, how
+or error type**, an `#[activity]` input or output type, or the type of a
+`ctx.side_effect` value. It explains what `docs/workflow-schema-contract.json` is, how
 `harvest schema check` classifies a change, and how to acknowledge a deliberate
 migration.
 
@@ -85,7 +86,7 @@ $ echo $?
 ## Generating `--current`
 
 Harvest is a **library**: the workflow registry lives in *your* process, so only
-your crate can enumerate it. Add a three-line binary:
+your crate can enumerate it. Add a short binary:
 
 ```rust
 // src/bin/dump-schema-contract.rs
@@ -93,7 +94,9 @@ fn main() {
     let contract = autumn_harvest::WorkflowSchemaContract::from_infos(
         env!("CARGO_PKG_VERSION"),
         &registered_workflows(), // the same Vec<WorkflowInfo> you pass to .workflows(...)
-    );
+    )
+    .with_activities(&registered_activities()) // the Vec<ActivityInfo> you register
+    .with_side_effects(&declared_side_effects()); // see "Activities and side effects"
     print!("{}", contract.to_json_pretty().unwrap());
 }
 ```
@@ -107,6 +110,59 @@ This runs offline: no database, no server, no `db` feature.
 
 `autumn-harvest/examples/schema_workflow.rs` is a working reference — run it
 with `--emit-contract` to see the generator in action.
+
+### Activities and side effects
+
+An activity result and a side-effect value are read back on replay too
+([issue #1994](https://github.com/autumn-foundation/autumn-harvest/issues/1994)).
+A workflow decodes a recorded `ActivityCompleted` result into its own type. It
+decodes a recorded side-effect value the same way. A retried activity decodes
+its stored input. A change to one of these types can break an in-flight run.
+
+Publish their schemas the same way a workflow does:
+
+```rust
+// The `schema` feature derives each schema from the type.
+let activities = vec![charge_info().with_schemas::<ChargeInput, Receipt>()];
+
+// A side effect is keyed by its workflow and its id.
+let side_effects = vec![checkout_info().side_effect("pick").with_schema::<Variant>()];
+
+let contract = WorkflowSchemaContract::from_infos(env!("CARGO_PKG_VERSION"), &workflows)
+    .with_activities(&activities)
+    .with_side_effects(&side_effects);
+```
+
+Without the `schema` feature, use `with_input_schema_fn`, `with_output_schema_fn`
+or `with_value_schema_fn` with a hand-written schema.
+
+For an activity with more than one input parameter, the input is the tuple of
+the parameter types, for example `with_schemas::<(String, u32), Receipt>()`.
+
+Pass the same `ActivityInfo` values that you register with the runtime. An
+activity with no schema is still listed, so `coverage` shows it.
+
+A side-effect declaration is not registered with the runtime. Only the
+contract reads it. A side effect with an id built at run time cannot publish
+a schema.
+
+The full ruleset applies to these payloads. Three rules are new:
+
+| Change | Verdict | Why |
+|---|---|---|
+| Add an activity or a side effect | Compatible | No history exists for it |
+| Remove an activity | Compatible | The same as a removed workflow. The handler is gone too |
+| Remove a side-effect declaration | **Breaking** | The call site can stay after the declaration goes. A removal must not stop the check in silence. Acknowledge it when the call site is gone too |
+
+The contract gets two sections, `activities` and `side_effects`. Each is left
+out of the file when it is empty. The artifact format is `contract_version`
+`2`. This build still reads a version `1` baseline. A version `1` binary
+refuses a version `2` file, so it cannot skip the new sections in silence.
+
+A bare `GET /workflows/registered` body has no activity or side-effect
+section. `schema check` and `schema update` refuse such a `--current` when the
+baseline has either section. Without that rule, every activity would read as
+removed, and that verdict is compatible.
 
 ### Alternative: a running server
 
@@ -455,10 +511,11 @@ breaking that fit*.
 `--format text` (default) prints one line per delta:
 
 ```
-<workflow>.<role>: <field_path> — <verdict> — <reason>
+<subject>.<role>: <field_path> — <verdict> — <reason>
 ```
 
-followed by a summary line. `--format json` emits the machine-readable diff:
+followed by a summary line. The subject is a workflow name, `activity:<name>`
+or `<workflow>/side_effect:<id>`. The role of a side effect is `value`. `--format json` emits the machine-readable diff:
 
 ```json
 {
@@ -478,6 +535,11 @@ followed by a summary line. `--format json` emits the machine-readable diff:
 ```
 
 `truncated: true` is added only when the delta cap was hit.
+
+A delta about an activity or a side effect also has a `subject` key
+(`activity` or `side_effect`). For an activity, `workflow` holds the activity
+name. A side-effect delta also has a `side_effect` key that holds the id. A
+workflow delta has neither key, so its JSON is unchanged.
 
 `field_path` is an RFC 6901 JSON Pointer **for ordinary object properties**,
 matching the violation format `POST /workflows/{name}/start` already returns —
@@ -719,7 +781,8 @@ recipe runs.
 ## Scope
 
 **In scope:** the `input_schema`, `output_schema`, and `error_schema` published
-by registered `#[workflow]` types (issue #373).
+by registered `#[workflow]` types (issue #373). Activity input and output
+schemas and side-effect value schemas (issue #1994).
 
 **Out of scope**, deliberately:
 
@@ -729,8 +792,8 @@ by registered `#[workflow]` types (issue #373).
   diff them yet. Their payloads are recorded too (`SignalReceived`,
   `UpdateAdmitted`), so the same hazard applies; extending the artifact with
   those roles is the obvious follow-up.
-- **Activity schemas** — an activity's recorded input/output has the same
-  hazard, but no published-schema surface exists for it yet.
+- **Activity and side-effect schemas over HTTP.** No route serves them. Use
+  the generator binary.
 - **Runtime enforcement / per-build pinning** — [issue #171](https://github.com/autumn-foundation/autumn-harvest/issues/171).
 - **Auto-migration or upcasting** of recorded payloads.
 - **Non-deterministic *code*** — [`harvest det-check`](workflow-determinism-guide.md#running-the-check-in-ci)
