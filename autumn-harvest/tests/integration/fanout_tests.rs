@@ -660,6 +660,8 @@ async fn fan_out_typed_single_activity_type_replays_correctly() {
         circuit_breaker: None,
         requires: None,
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        input_schema: None,
+        output_schema: None,
     };
 
     let exec_id = ExecutionId::new();
@@ -735,6 +737,8 @@ async fn fan_out_typed_collect_all_returns_per_slot_results() {
         circuit_breaker: None,
         requires: None,
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        input_schema: None,
+        output_schema: None,
     };
 
     let exec_id = ExecutionId::new();
@@ -1885,6 +1889,8 @@ fn windowed_test_activity_info(name: &'static str) -> autumn_harvest::info::Acti
         circuit_breaker: None,
         requires: None,
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        input_schema: None,
+        output_schema: None,
     }
 }
 

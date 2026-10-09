@@ -157,6 +157,8 @@ fn activity_info(name: &'static str, is_local: bool) -> ActivityInfo {
         max_result_bytes: None,
         requires: None,
         handler: job_handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 

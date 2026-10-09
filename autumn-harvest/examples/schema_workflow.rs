@@ -26,8 +26,15 @@
 //! harvest schema check --current current.json
 //! ```
 //!
-//! Every embedder writes an equivalent 3-line generator in their own crate: it
+//! Every embedder writes an equivalent short generator in their own crate: it
 //! is the only place the live registry is in scope.
+//!
+//! # Activities and side effects (issue #1994)
+//!
+//! The generator also publishes the `send_welcome_email` activity schemas and
+//! the `pick_variant` side-effect value schema. The CI gate checks them too.
+//! Under the `schema` feature, they derive from the Rust types. So a change to
+//! `EmailReceipt` changes the generated contract.
 
 #![allow(
     clippy::unused_async,
@@ -64,14 +71,38 @@ pub struct OnboardOutput {
     pub welcome_email_sent: bool,
 }
 
+/// The receipt that `send_welcome_email` returns. A workflow decodes it on
+/// replay, so its schema is gated (issue #1994).
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct EmailReceipt {
+    pub message_id: String,
+}
+
+// ── Activities ───────────────────────────────────────────────────────────────
+
+#[activity]
+pub async fn send_welcome_email(
+    _ctx: &ActivityContext,
+    email: String,
+) -> Result<EmailReceipt, String> {
+    Ok(EmailReceipt {
+        message_id: format!("welcome-{email}"),
+    })
+}
+
 // ── Workflows ────────────────────────────────────────────────────────────────
 
 #[workflow(description = "Handles new-user onboarding from signup to first action")]
 pub async fn onboarding(
-    _ctx: &WorkflowContext,
+    ctx: &WorkflowContext,
     _input: OnboardInput,
 ) -> Result<OnboardOutput, String> {
-    // Real implementation would dispatch activities here.
+    // Replay reads this value back, so `declared_side_effects` publishes its
+    // schema (issue #1994).
+    let _variant: String = ctx
+        .side_effect("pick_variant", || "control".to_string())
+        .map_err(|e| e.to_string())?;
     Ok(OnboardOutput {
         welcome_email_sent: true,
     })
@@ -126,6 +157,25 @@ fn onboard_error_schema() -> serde_json::Value {
     serde_json::json!({"type": "string"})
 }
 
+#[cfg(not(feature = "schema"))]
+fn email_address_schema() -> serde_json::Value {
+    serde_json::json!({"type": "string"})
+}
+
+#[cfg(not(feature = "schema"))]
+fn email_receipt_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {"message_id": {"type": "string"}},
+        "required": ["message_id"]
+    })
+}
+
+#[cfg(not(feature = "schema"))]
+fn variant_schema() -> serde_json::Value {
+    serde_json::json!({"type": "string"})
+}
+
 // ── The registry, as the embedder's app would build it ───────────────────────
 
 /// Every workflow this "app" registers, with its published schemas attached.
@@ -143,6 +193,35 @@ fn registered_workflows() -> Vec<WorkflowInfo> {
     ]
 }
 
+/// Every activity this "app" registers, with its published schemas attached
+/// (issue #1994).
+///
+/// The `schema` feature derives the schemas from the payload types. Without
+/// it, the hand-written schemas apply.
+fn registered_activities() -> Vec<ActivityInfo> {
+    let info = send_welcome_email_info();
+    #[cfg(feature = "schema")]
+    let info = info.with_schemas::<String, EmailReceipt>();
+    #[cfg(not(feature = "schema"))]
+    let info = info
+        .with_input_schema_fn(email_address_schema)
+        .with_output_schema_fn(email_receipt_schema);
+    vec![info]
+}
+
+/// Every side effect whose value schema this "app" declares (issue #1994).
+///
+/// A declaration is not registered with the runtime. Only the contract reads
+/// it, so copy the id from the `ctx.side_effect` call site.
+fn declared_side_effects() -> Vec<SideEffectInfo> {
+    let info = onboarding_info().side_effect("pick_variant");
+    #[cfg(feature = "schema")]
+    let info = info.with_schemas::<String>();
+    #[cfg(not(feature = "schema"))]
+    let info = info.with_value_schema_fn(variant_schema);
+    vec![info]
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -153,7 +232,9 @@ fn main() {
         let contract = autumn_harvest::WorkflowSchemaContract::from_infos(
             env!("CARGO_PKG_VERSION"),
             &registered_workflows(),
-        );
+        )
+        .with_activities(&registered_activities())
+        .with_side_effects(&declared_side_effects());
         print!("{}", contract.to_json_pretty().expect("serialize contract"));
         return;
     }

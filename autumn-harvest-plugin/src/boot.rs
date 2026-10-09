@@ -741,6 +741,8 @@ mod load_shed_sampler_tests {
             )),
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         }
     }
 

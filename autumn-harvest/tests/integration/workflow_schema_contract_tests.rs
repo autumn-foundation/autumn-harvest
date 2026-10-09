@@ -11,8 +11,8 @@
 use autumn_harvest::info::validate_against_schema;
 use autumn_harvest::schema_contract::{
     AcknowledgedBreakingChange, ChangeKind, MAX_DELTAS, SCHEMA_CONTRACT_VERSION,
-    SchemaContractDiff, SchemaRole, Verdict, WorkflowSchemaContract, WorkflowSchemaEntry,
-    canonicalize_schema, dropped_acknowledgements, unacknowledged_breaking,
+    SchemaContractDiff, SchemaRole, SchemaSubject, Verdict, WorkflowSchemaContract,
+    WorkflowSchemaEntry, canonicalize_schema, dropped_acknowledgements, unacknowledged_breaking,
 };
 use serde_json::{Value, json};
 
@@ -1116,6 +1116,8 @@ fn an_acknowledgement_without_a_reason_is_reported_as_breaking() {
     let mut c = input_contract(json!({"type":"object"}));
     c.acknowledged_breaking_changes
         .push(AcknowledgedBreakingChange {
+            subject: SchemaSubject::Workflow,
+            side_effect: None,
             workflow: "wf".to_string(),
             role: Some(SchemaRole::Input),
             field_path: "/email".to_string(),
@@ -1325,6 +1327,35 @@ fn the_checked_in_baseline_workflows_are_sorted_and_unique() {
         names, want,
         "the checked-in baseline must be stored sorted and unique — regenerate it"
     );
+
+    // The same holds for the issue #1994 sections, keyed by name and by
+    // `(workflow, id)`.
+    let empty = Vec::new();
+    let activities: Vec<&str> = raw["activities"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .map(|a| a["name"].as_str().expect("activity name"))
+        .collect();
+    let mut want = activities.clone();
+    want.sort_unstable();
+    want.dedup();
+    assert_eq!(activities, want, "activities must be sorted and unique");
+    let side_effects: Vec<(&str, &str)> = raw["side_effects"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .map(|e| {
+            (
+                e["workflow"].as_str().expect("workflow"),
+                e["id"].as_str().expect("id"),
+            )
+        })
+        .collect();
+    let mut want = side_effects.clone();
+    want.sort_unstable();
+    want.dedup();
+    assert_eq!(side_effects, want, "side effects must be sorted and unique");
 }
 
 #[test]
@@ -1345,6 +1376,26 @@ fn the_checked_in_baseline_schemas_are_canonicalised() {
                 stored,
                 "workflow `{name}` stores a non-canonical `{role}` — regenerate the baseline"
             );
+        }
+    }
+    // The issue #1994 sections are canonicalised the same way.
+    let empty = Vec::new();
+    let sections = [
+        ("activities", ["input_schema", "output_schema"].as_slice()),
+        ("side_effects", ["value_schema"].as_slice()),
+    ];
+    for (section, roles) in sections {
+        for entry in raw[section].as_array().unwrap_or(&empty) {
+            for role in roles {
+                let Some(stored) = entry.get(*role).filter(|v| !v.is_null()) else {
+                    continue;
+                };
+                assert_eq!(
+                    &canonicalize_schema(stored),
+                    stored,
+                    "`{section}` stores a non-canonical `{role}`: {entry}"
+                );
+            }
         }
     }
 }
@@ -2705,6 +2756,8 @@ fn a_pre_existing_acknowledgement_does_not_cover_a_fresh_break() {
         .iter()
         .filter(|d| d.verdict == Verdict::Breaking)
         .map(|d| AcknowledgedBreakingChange {
+            subject: d.subject,
+            side_effect: d.side_effect.clone(),
             workflow: d.workflow.clone(),
             role: d.role,
             field_path: d.field_path.clone(),
@@ -2852,6 +2905,8 @@ fn a_blank_reason_record_cannot_cover_a_breaking_change() {
         .iter()
         .filter(|d| d.verdict == Verdict::Breaking)
         .map(|d| AcknowledgedBreakingChange {
+            subject: d.subject,
+            side_effect: d.side_effect.clone(),
             workflow: d.workflow.clone(),
             role: d.role,
             field_path: d.field_path.clone(),
@@ -2988,6 +3043,8 @@ fn a_rewritten_acknowledgement_record_is_detected() {
 
     // Base carries a record for an unrelated, earlier break.
     let stale = AcknowledgedBreakingChange {
+        subject: SchemaSubject::Workflow,
+        side_effect: None,
         workflow: "some_other_workflow".to_string(),
         role: Some(SchemaRole::Output),
         field_path: "/legacy".to_string(),
@@ -3005,6 +3062,8 @@ fn a_rewritten_acknowledgement_record_is_detected() {
         .iter()
         .filter(|d| d.verdict == Verdict::Breaking)
         .map(|d| AcknowledgedBreakingChange {
+            subject: d.subject,
+            side_effect: d.side_effect.clone(),
             workflow: d.workflow.clone(),
             role: d.role,
             field_path: d.field_path.clone(),
@@ -3029,6 +3088,8 @@ fn a_legitimate_acknowledged_update_drops_nothing() {
     base_artifact
         .acknowledged_breaking_changes
         .push(AcknowledgedBreakingChange {
+            subject: SchemaSubject::Workflow,
+            side_effect: None,
             workflow: "some_other_workflow".to_string(),
             role: Some(SchemaRole::Output),
             field_path: "/legacy".to_string(),

@@ -691,8 +691,8 @@ pub use history_export::{
 };
 pub use info::{
     ActivityHandlerFn, ActivityInfo, DagInfo, InterfaceHandlerRecord, QueryHandlerFn,
-    QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerFn, UpdateHandlerInfo, UpdateValidatorFn,
-    WorkflowHandlerFn, WorkflowInfo, WorkflowInterfaceRecord,
+    QueryHandlerInfo, SideEffectInfo, SignalHandlerInfo, UpdateHandlerFn, UpdateHandlerInfo,
+    UpdateValidatorFn, WorkflowHandlerFn, WorkflowInfo, WorkflowInterfaceRecord,
 };
 pub use interceptor::{
     ActivityInterceptor, ActivityInterceptorFuture, ActivityInterceptorNext, ActivityInvocation,
@@ -750,10 +750,12 @@ pub use scheduler::{
     register_schedules, register_workflow_schedules, tick_once, trigger_unified_dag,
 };
 pub use schema_contract::{
-    AcknowledgedBreakingChange, ChangeKind, CompatibilityRules, DEFAULT_SCHEMA_CONTRACT_PATH,
-    MAX_DELTAS, SCHEMA_CONTRACT_VERSION, SchemaContractDiff, SchemaContractError, SchemaCoverage,
-    SchemaDelta, SchemaRole, Verdict, WorkflowSchemaContract, WorkflowSchemaEntry,
-    canonicalize_schema, diff_schema_contracts, dropped_acknowledgements, unacknowledged_breaking,
+    AcknowledgedBreakingChange, ActivitySchemaEntry, ChangeKind, CompatibilityRules,
+    DEFAULT_SCHEMA_CONTRACT_PATH, MAX_DELTAS, SCHEMA_CONTRACT_VERSION, SchemaContractDiff,
+    SchemaContractError, SchemaCoverage, SchemaDelta, SchemaRole, SchemaSubject,
+    SideEffectSchemaEntry, Verdict, WorkflowSchemaContract, WorkflowSchemaEntry,
+    canonicalize_schema, diff_schema_contracts, dropped_acknowledgements, subject_label,
+    unacknowledged_breaking,
 };
 #[cfg(feature = "db")]
 pub use shard::ShardedDbPool;

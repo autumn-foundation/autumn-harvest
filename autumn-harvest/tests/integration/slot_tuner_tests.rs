@@ -160,6 +160,8 @@ fn build_registry(telemetry: Arc<TelemetryConfig>) -> Arc<HandlerRegistry> {
             max_result_bytes: None,
             requires: None,
             handler: slow_activity,
+            input_schema: None,
+            output_schema: None,
         }],
         autumn_harvest::context::empty_shared_state(),
         telemetry,

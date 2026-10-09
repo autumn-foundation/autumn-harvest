@@ -402,6 +402,8 @@ pub fn canary_activity_info() -> ActivityInfo {
         circuit_breaker: None,
         requires: None,
         handler: canary_activity_handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 

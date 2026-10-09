@@ -183,6 +183,8 @@ fn rate_limited_activity_info(name: &'static str, rps: f64, burst: f64) -> Activ
         circuit_breaker: None,
         requires: None,
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        input_schema: None,
+        output_schema: None,
     }
 }
 

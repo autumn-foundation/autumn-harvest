@@ -262,6 +262,8 @@ fn heartbeat_registry(probe: HeartbeatCancellationProbe) -> Arc<HandlerRegistry>
             circuit_breaker: None,
             requires: None,
             handler: heartbeat_activity,
+            input_schema: None,
+            output_schema: None,
         }],
         Arc::new(state),
     ))
@@ -702,6 +704,8 @@ fn uncooperative_registry(probe: UncooperativeActivityProbe) -> Arc<HandlerRegis
             circuit_breaker: None,
             requires: None,
             handler: uncooperative_activity,
+            input_schema: None,
+            output_schema: None,
         }],
         Arc::new(state),
     ))

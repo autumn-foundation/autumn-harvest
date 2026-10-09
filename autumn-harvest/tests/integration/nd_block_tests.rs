@@ -1416,6 +1416,8 @@ const fn nowhere_activity(name: &'static str) -> ActivityInfo {
         max_result_bytes: None,
         requires: None,
         handler: never_finishing_activity,
+        input_schema: None,
+        output_schema: None,
     }
 }
 

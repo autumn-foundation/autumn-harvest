@@ -17,7 +17,7 @@ use autumn_harvest::testing::WorkflowReplayer;
 use autumn_harvest::{
     AcknowledgedBreakingChange, DetCheckReport, DetSeverity, SchemaContractDiff, SchemaDelta,
     SchemaRole, WorkflowSchemaContract, check_paths, diff_schema_contracts,
-    dropped_acknowledgements, unacknowledged_breaking,
+    dropped_acknowledgements, subject_label, unacknowledged_breaking,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use diesel_async::AsyncPgConnection;
@@ -7558,18 +7558,32 @@ async fn run_dr_promote(shards: &[String], format: DrFormat) -> Result<(), CliEr
 
 /// Reads and parses a schema-contract document, naming the path on failure.
 fn read_schema_contract(path: &Path) -> Result<WorkflowSchemaContract, CliError> {
+    read_schema_contract_and_shape(path).map(|(contract, _)| contract)
+}
+
+/// Reads a schema-contract document, and reports whether it is a bare
+/// `GET /workflows/registered` array (issue #1994).
+///
+/// A bare array has no activity or side-effect section, so the guard in
+/// [`guard_empty_current`] needs to know the shape.
+fn read_schema_contract_and_shape(path: &Path) -> Result<(WorkflowSchemaContract, bool), CliError> {
     let raw = std::fs::read_to_string(path).map_err(|e| {
         CliError::InvalidInput(format!(
             "failed to read schema contract `{}`: {e}",
             path.display()
         ))
     })?;
+    let bare = raw.trim_start().starts_with('[');
     WorkflowSchemaContract::parse(&raw)
+        .map(|contract| (contract, bare))
         .map_err(|e| CliError::InvalidInput(format!("`{}` is not usable: {e}", path.display())))
 }
 
-/// Renders a schema diff as `workflow.role: <field> — <verdict> — <reason>`
+/// Renders a schema diff as `subject.role: <field> — <verdict> — <reason>`
 /// lines, one per delta, plus a summary line.
+///
+/// The subject is a workflow name, `activity:<name>` or
+/// `<workflow>/side_effect:<id>` (issue #1994).
 #[must_use]
 pub fn format_schema_diff_text(diff: &SchemaContractDiff) -> String {
     use std::fmt::Write as _;
@@ -7586,7 +7600,7 @@ pub fn format_schema_diff_text(diff: &SchemaContractDiff) -> String {
         let _ = writeln!(
             out,
             "{}.{}: {} — {} — {}",
-            d.workflow,
+            subject_label(d.subject, &d.workflow, d.side_effect.as_deref()),
             role,
             field,
             d.verdict.as_str(),
@@ -7651,8 +7665,8 @@ pub fn run_schema_check(
     acknowledged_in: Option<&Path>,
 ) -> Result<(), CliError> {
     let base = read_schema_contract(baseline)?;
-    let cur = read_schema_contract(current)?;
-    guard_empty_current(&base, &cur, current)?;
+    let (cur, is_bare_registry) = read_schema_contract_and_shape(current)?;
+    guard_empty_current(&base, &cur, current, is_bare_registry)?;
     let diff = diff_schema_contracts(&base, &cur);
 
     match format {
@@ -7737,9 +7751,10 @@ pub fn run_schema_check(
     // Two siblings are deliberately NOT compared here. `version` records which
     // BUILD produced the artifact rather than what the gate checks, so tying
     // currency to it would force a regeneration on every crate version bump for
-    // no safety gain. `contract_version` needs no check at all — `parse` already
-    // hard-refuses a value this build does not implement — and `workflows` and
-    // `coverage` are rebuilt from the entries on parse.
+    // no safety gain. `contract_version` needs no check at all. `parse` refuses
+    // a value this build does not implement. It also refuses a legacy `1` that
+    // carries activity or side-effect content (issue #1994). `parse` rebuilds
+    // `workflows`, `activities`, `side_effects` and `coverage` from the entries.
     //
     // Reported before the delta staleness below because it is the stronger
     // claim: a stale schema means the artifact is behind, while a doctored
@@ -7790,7 +7805,7 @@ fn format_unacknowledged(missing: &[&SchemaDelta]) -> String {
         let _ = writeln!(
             out,
             "  {}{role}{}: {} — {}",
-            d.workflow,
+            subject_label(d.subject, &d.workflow, d.side_effect.as_deref()),
             d.field_path,
             d.change.as_str(),
             d.reason
@@ -7810,7 +7825,7 @@ fn format_dropped(dropped: &[&AcknowledgedBreakingChange]) -> String {
         let _ = writeln!(
             out,
             "  {}{role}{}: {} — recorded as {:?}",
-            a.workflow,
+            subject_label(a.subject, &a.workflow, a.side_effect.as_deref()),
             a.field_path,
             a.change.as_str(),
             a.reason
@@ -7836,6 +7851,7 @@ fn guard_empty_current(
     base: &WorkflowSchemaContract,
     cur: &WorkflowSchemaContract,
     current: &Path,
+    is_bare_registry: bool,
 ) -> Result<(), CliError> {
     if cur.workflows.is_empty() && !base.workflows.is_empty() {
         return Err(CliError::InvalidInput(format!(
@@ -7847,6 +7863,40 @@ fn guard_empty_current(
             current.display(),
             base.workflows.len(),
             base.workflows.len()
+        )));
+    }
+    // A bare `GET /workflows/registered` array has no activity or side-effect
+    // section (issue #1994). Diffed as is, it reports every one as removed and
+    // buries the real cause. A generated contract that drops a section is not
+    // refused here: each removal is then a delta of its own.
+    if !is_bare_registry {
+        return Ok(());
+    }
+    let missing: Vec<(&str, usize)> = [
+        ("activities", base.activities.len(), cur.activities.len()),
+        (
+            "side effects",
+            base.side_effects.len(),
+            cur.side_effects.len(),
+        ),
+    ]
+    .into_iter()
+    .filter(|&(_, in_base, in_cur)| in_base > 0 && in_cur == 0)
+    .map(|(section, in_base, _)| (section, in_base))
+    .collect();
+    if !missing.is_empty() {
+        let sections: Vec<&str> = missing.iter().map(|&(section, _)| section).collect();
+        let counts: Vec<String> = missing
+            .iter()
+            .map(|(section, n)| format!("{section} ({n})"))
+            .collect();
+        return Err(CliError::InvalidInput(format!(
+            "`{}` is a bare `GET /workflows/registered` body, so it publishes no {}, but the \
+             baseline has {}. Generate `--current` with \
+             `WorkflowSchemaContract::with_activities` and `with_side_effects` instead.",
+            current.display(),
+            sections.join(" and "),
+            counts.join(" and ")
         )));
     }
     Ok(())
@@ -7904,10 +7954,10 @@ pub fn run_schema_update(
     recorded_in: Option<&str>,
 ) -> Result<(), CliError> {
     let base = read_schema_contract(baseline)?;
-    let cur = read_schema_contract(current)?;
+    let (cur, is_bare_registry) = read_schema_contract_and_shape(current)?;
     // Refuse here too: `update` is the path that would OVERWRITE the baseline
     // with the empty document and disarm the gate for every later run.
-    guard_empty_current(&base, &cur, current)?;
+    guard_empty_current(&base, &cur, current, is_bare_registry)?;
     let diff = diff_schema_contracts(&base, &cur);
 
     // The core recomputes the diff internally rather than accepting ours: it is

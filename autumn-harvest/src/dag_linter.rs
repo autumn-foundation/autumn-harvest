@@ -397,6 +397,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: dummy_handler,
+                input_schema: None,
+                output_schema: None,
             },
         );
 

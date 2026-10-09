@@ -3368,6 +3368,8 @@ pub mod db {
             circuit_breaker: None,
             requires: None,
             handler: bench_activity,
+            input_schema: None,
+            output_schema: None,
         }
     }
 
