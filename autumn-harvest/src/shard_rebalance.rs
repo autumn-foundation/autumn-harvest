@@ -1570,12 +1570,16 @@ mod db {
             // The ledger `id` is an identity column of this shard, as the log
             // `id` is. The target mints a new one. `recorded_at` keeps its
             // value, so the tenant window still reads the true spend time.
+            //
+            // The staged rows carry no `quota_key`. The run still lives on the
+            // source, which counts them for the tenant. Activation sets the
+            // key, when the target takes the run over.
             diesel::sql_query(
                 "INSERT INTO harvest_llm_ledger \
                      (execution_id, workflow_name, quota_key, activity_name, activity_id, \
                       attempt, model, input_tokens, output_tokens, cost_micros, latency_ms, \
                       recorded_at) \
-                 SELECT execution_id, workflow_name, quota_key, activity_name, activity_id, \
+                 SELECT execution_id, workflow_name, NULL, activity_name, activity_id, \
                         attempt, model, input_tokens, output_tokens, cost_micros, latency_ms, \
                         recorded_at \
                  FROM jsonb_to_recordset($1::jsonb) AS r( \
@@ -2961,6 +2965,21 @@ mod db {
                             migrated_to_shard = NULL, \
                             migrated_at = NULL \
                       WHERE id = $1 AND state = 'MIGRATING'",
+                )
+                .bind::<SqlUuid, _>(exec_id.as_uuid())
+                .execute(&mut *conn)
+                .await
+                .map_err(database_error)?;
+
+                // The staged ledger rows carry no key (issue #1997). They count
+                // for the tenant from now on, under the key of the run. The
+                // run row holds the key that staging copied from the source.
+                diesel::sql_query(
+                    "UPDATE harvest_llm_ledger g \
+                        SET quota_key = e.quota_key \
+                       FROM harvest_workflow_executions e \
+                      WHERE g.execution_id = $1 AND e.id = $1 \
+                        AND g.quota_key IS NULL AND e.quota_key IS NOT NULL",
                 )
                 .bind::<SqlUuid, _>(exec_id.as_uuid())
                 .execute(&mut *conn)
