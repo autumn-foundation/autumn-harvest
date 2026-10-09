@@ -44,6 +44,10 @@ pub struct ChatResponse {
 /// Return an [`AgentError`] whose kind says whether a retry can succeed.
 /// `RateLimited`, `Transport` and `Unavailable` retry with backoff. Every
 /// other kind fails the call at once.
+///
+/// The LLM budgets count `input_tokens` plus `output_tokens` of
+/// [`ChatResponse::usage`]. Count the whole prompt in `input_tokens`, cached
+/// tokens included, even when the provider reports them apart.
 pub trait AgentModel: Send + Sync + std::fmt::Debug {
     /// Send one request and decode the answer.
     fn chat<'a>(

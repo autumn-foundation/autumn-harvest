@@ -1,6 +1,6 @@
 //! LLM token and cost budgets per run and per tenant (issue #1997).
 //!
-//! A runaway agent loop can spend without limit. A budget stops it. The caps
+//! A runaway agent loop can spend without limit. A declared budget stops it. The caps
 //! live on [`QuotaPolicy`], so a budget uses the quota key, the quota
 //! violation rule and the quota metric (issue #946).
 //!
@@ -12,7 +12,8 @@
 //! [`ActivityContext::record_llm_usage`](crate::context::ActivityContext::record_llm_usage)
 //! after it. The check refuses the step when the run or the tenant has spent
 //! its cap. The refusal is a non-retryable failure of type
-//! [`ERROR_TYPE_LLM_BUDGET_EXCEEDED`]. Workflow code reads it back with
+//! [`ERROR_TYPE_LLM_BUDGET_EXCEEDED`]. Workflow code tests for it with
+//! [`LlmBudgetExceeded::is_refusal`] and reads it with
 //! [`LlmBudgetExceeded::from_error`].
 //!
 //! # The ledger
@@ -24,13 +25,20 @@
 //!
 //! # Limits of the guarantee
 //!
-//! - The budget is a soft cap. Steps that run at the same time all read the
-//!   spend before any of them records. The overshoot is at most the steps in
-//!   flight.
+//! - The budget is a soft cap. The last step that passes the check can pass
+//!   the cap by its whole usage. Steps that run at the same time can all pass
+//!   the check before any of them records.
+//! - A run is one execution. A continue-as-new, a reset, a fork or a workflow
+//!   retry starts a new execution, so its run caps start from zero.
 //! - The tenant scope is `(workflow type, quota key)`, as for quota. It is
-//!   shard-local.
+//!   shard-local. A shard rebalance moves the ledger rows of a run.
 //! - A key that does not resolve fails open for the tenant caps. The run caps
-//!   still apply.
+//!   still apply. A row that a run records before `quota_reconcile` sets its
+//!   key never counts for the tenant.
+//! - The check reads the policy in its own process. A worker that does not
+//!   register the workflow type does not enforce the budget. It logs one
+//!   warning for each such type.
+//! - Each check sums every ledger row of the tenant in the window.
 //! - A ledger row cascades with its run. Keep retention longer than the
 //!   tenant window.
 //! - An activity that does not call the check is not budgeted. The budget
@@ -46,10 +54,28 @@ pub const DEFAULT_TENANT_LLM_WINDOW_SECS: u32 = 86_400;
 /// The error type of a step that a budget refuses.
 pub const ERROR_TYPE_LLM_BUDGET_EXCEEDED: &str = "LlmBudgetExceeded";
 
+/// The error type of a step whose spend read failed. It is retryable.
+pub const ERROR_TYPE_LLM_BUDGET_CHECK_FAILED: &str = "LlmBudgetCheckFailed";
+
+/// The retryable failure of a step whose spend read failed.
+///
+/// The check fails closed: a step that cannot read its spend does not run.
+#[must_use]
+pub fn check_failed(error: &dyn std::fmt::Display) -> ActivityFailure {
+    ActivityFailure::retryable(
+        ERROR_TYPE_LLM_BUDGET_CHECK_FAILED,
+        format!("could not read the LLM spend: {error}"),
+    )
+}
+
 /// The usage of one model call, as the ledger records it.
+///
+/// Build it with [`Self::new`]. Later releases can add fields.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct LlmUsage {
-    /// The model id that the provider reports.
+    /// The model id. The caller chooses it, for example from its
+    /// configuration or from the provider response.
     pub model: String,
     /// Prompt tokens.
     pub input_tokens: u64,
@@ -157,7 +183,7 @@ pub fn check_llm_budget(spend: &LlmSpend, policy: &QuotaPolicy) -> Option<QuotaV
 /// A step that a budget refused, as workflow code reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LlmBudgetExceeded {
-    /// The spent cap.
+    /// The resource whose cap is spent.
     pub resource: QuotaResource,
     /// The cap.
     pub limit: u64,
@@ -188,9 +214,20 @@ impl LlmBudgetExceeded {
             .with_details(details)
     }
 
+    /// `true` when an activity error is a budget refusal.
+    ///
+    /// It reads the error type only. Branch on it, not on
+    /// [`Self::from_error`]: the details can be unreadable, for example after
+    /// an erasure, and the branch must not change on replay.
+    #[must_use]
+    pub fn is_refusal(error: &HarvestError) -> bool {
+        error.activity_error_type() == Some(ERROR_TYPE_LLM_BUDGET_EXCEEDED)
+    }
+
     /// Read a refusal back from an activity error.
     ///
-    /// Returns `None` for every other error.
+    /// Returns `None` for every other error, and for a refusal whose details
+    /// are unreadable.
     #[must_use]
     pub fn from_error(error: &HarvestError) -> Option<Self> {
         match error {
@@ -215,17 +252,24 @@ impl LlmBudgetExceeded {
 /// `$1` is the run. `$2` is the tenant window in seconds. The tenant scope is
 /// the `(workflow_name, quota_key)` of the run. A run with no key has no
 /// tenant spend. Each sum reads one index of `harvest_llm_ledger`.
+///
+/// The sums are `NUMERIC`, clamped to the `BIGINT` range. A huge recorded
+/// value then reads as a spent cap, not as a read error.
 #[cfg(feature = "db")]
 const LLM_SPEND_SQL: &str = "\
     WITH run AS ( \
         SELECT workflow_name, quota_key FROM harvest_workflow_executions WHERE id = $1 \
     ), run_spend AS ( \
-        SELECT COALESCE(SUM(input_tokens + output_tokens), 0)::BIGINT AS tokens, \
-               COALESCE(SUM(cost_micros), 0)::BIGINT AS cost_micros \
+        SELECT LEAST(COALESCE(SUM(input_tokens::NUMERIC + output_tokens), 0), \
+                     9223372036854775807)::BIGINT AS tokens, \
+               LEAST(COALESCE(SUM(cost_micros::NUMERIC), 0), \
+                     9223372036854775807)::BIGINT AS cost_micros \
         FROM harvest_llm_ledger WHERE execution_id = $1 \
     ), tenant_spend AS ( \
-        SELECT COALESCE(SUM(l.input_tokens + l.output_tokens), 0)::BIGINT AS tokens, \
-               COALESCE(SUM(l.cost_micros), 0)::BIGINT AS cost_micros \
+        SELECT LEAST(COALESCE(SUM(l.input_tokens::NUMERIC + l.output_tokens), 0), \
+                     9223372036854775807)::BIGINT AS tokens, \
+               LEAST(COALESCE(SUM(l.cost_micros::NUMERIC), 0), \
+                     9223372036854775807)::BIGINT AS cost_micros \
         FROM harvest_llm_ledger l JOIN run r \
           ON l.workflow_name = r.workflow_name AND l.quota_key = r.quota_key \
         WHERE l.recorded_at >= NOW() - ($2::BIGINT * INTERVAL '1 second') \
@@ -288,7 +332,7 @@ pub async fn load_llm_spend(
 /// The attempt that recorded a ledger row.
 #[cfg(feature = "db")]
 #[derive(Debug, Clone, Copy)]
-pub struct LlmCallSite<'a> {
+pub(crate) struct LlmCallSite<'a> {
     /// The run.
     pub exec_id: crate::types::ExecutionId,
     /// The activity type.
@@ -305,7 +349,7 @@ pub struct LlmCallSite<'a> {
 ///
 /// Returns a database error when the write fails.
 #[cfg(feature = "db")]
-pub async fn record_llm_usage(
+pub(crate) async fn record_llm_usage(
     conn: &mut diesel_async::AsyncPgConnection,
     site: LlmCallSite<'_>,
     usage: &LlmUsage,
@@ -333,19 +377,43 @@ pub async fn record_llm_usage(
 /// The LLM budget of a workflow type, if it declares one.
 ///
 /// It reads the process-global mirror of each registered type, as admission
-/// does. A type with no LLM cap gives `None`.
+/// does. A type with no LLM cap gives `None`. A type that this process does
+/// not register also gives `None`, with one warning for each type.
 #[cfg(feature = "db")]
 #[must_use]
-pub fn policy_for(workflow_type: &str) -> Option<QuotaPolicy> {
-    crate::completion_trigger::GLOBAL_WORKFLOW_METADATA
+pub(crate) fn policy_for(workflow_type: &str) -> Option<QuotaPolicy> {
+    let registered = crate::completion_trigger::GLOBAL_WORKFLOW_METADATA
         .read()
         .ok()
         .and_then(|lock| {
             lock.as_ref()
                 .and_then(|map| map.get(workflow_type))
-                .and_then(|meta| meta.quota)
-        })
-        .filter(QuotaPolicy::has_llm_budget)
+                .map(|meta| meta.quota)
+        });
+    registered.map_or_else(
+        || {
+            warn_unregistered_once(workflow_type);
+            None
+        },
+        |quota| quota.filter(QuotaPolicy::has_llm_budget),
+    )
+}
+
+/// Warn once that this process cannot read the budget of a workflow type.
+#[cfg(feature = "db")]
+fn warn_unregistered_once(workflow_type: &str) {
+    static WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(Default::default);
+    let first = WARNED
+        .lock()
+        .is_ok_and(|mut warned| warned.insert(workflow_type.to_owned()));
+    if first {
+        tracing::warn!(
+            workflow_type,
+            "an LLM step runs in a process that does not register its workflow type; \
+             its LLM budget is not enforced here (issue #1997)"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -386,6 +454,11 @@ mod tests {
         assert_eq!(
             base.with_tenant_llm_window_secs(60).tenant_llm_window_secs,
             60
+        );
+        // A zero window would count nothing, so the builder raises it.
+        assert_eq!(
+            base.with_tenant_llm_window_secs(0).tenant_llm_window_secs,
+            1
         );
     }
 
@@ -512,6 +585,37 @@ mod tests {
             LlmBudgetExceeded::from_error(&HarvestError::NotFound("x".into())),
             None
         );
+    }
+
+    #[test]
+    fn a_refusal_is_found_by_its_type_even_with_unreadable_details() {
+        let erased = HarvestError::ActivityFailed {
+            name: "llm_step".into(),
+            attempt: 1,
+            error_type: ERROR_TYPE_LLM_BUDGET_EXCEEDED.into(),
+            details: Some(serde_json::json!({"_harvest_erased": true})),
+            source: "erased".into(),
+        };
+        assert!(LlmBudgetExceeded::is_refusal(&erased));
+        assert_eq!(LlmBudgetExceeded::from_error(&erased), None);
+        let other = HarvestError::NotFound("x".into());
+        assert!(!LlmBudgetExceeded::is_refusal(&other));
+    }
+
+    #[test]
+    fn a_failed_spend_read_fails_the_step_as_retryable() {
+        let failure = check_failed(&"connection refused");
+        assert!(!failure.non_retryable);
+        assert_eq!(failure.error_type, ERROR_TYPE_LLM_BUDGET_CHECK_FAILED);
+        assert!(failure.message.contains("connection refused"));
+    }
+
+    #[tokio::test]
+    async fn a_context_with_no_database_passes_and_records_nothing() {
+        let ctx = crate::context::ActivityContext::new_test();
+        assert_eq!(ctx.check_llm_budget().await, Ok(()));
+        let recorded = ctx.record_llm_usage(&LlmUsage::new("m", 1, 1)).await;
+        assert!(!recorded.expect("no database, no error"));
     }
 
     #[test]

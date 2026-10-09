@@ -196,8 +196,9 @@ impl std::fmt::Display for QuotaResource {
 /// Declared via `#[workflow(quota(key = "input.tenant_id",
 /// max_active_executions = 100, max_history_bytes = 10485760,
 /// max_dead_letters = 50))]` or the [`Self::new`] + `with_*` builder chain.
-/// Every cap is independently optional (issue #946 AC2) — a policy may
-/// declare just one, two, or all three.
+/// Every cap is independently optional (issue #946 AC2). A policy may
+/// declare any set of the three admission caps and the four LLM caps of
+/// issue #1997.
 ///
 /// # Examples
 ///
@@ -316,9 +317,12 @@ impl QuotaPolicy {
 
     /// Set the rolling window of the tenant LLM caps, in seconds (issue
     /// #1997).
+    ///
+    /// A zero window would count no spend and turn the tenant caps off. The
+    /// builder raises it to one second.
     #[must_use]
     pub const fn with_tenant_llm_window_secs(mut self, secs: u32) -> Self {
-        self.tenant_llm_window_secs = secs;
+        self.tenant_llm_window_secs = if secs == 0 { 1 } else { secs };
         self
     }
 

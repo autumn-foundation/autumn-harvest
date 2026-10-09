@@ -127,7 +127,7 @@ pub async fn agent_loop(ctx: &WorkflowContext, task: AgentTask) -> Result<AgentR
         {
             Ok(turn) => turn,
             // A spent LLM budget is a bound, so the run ends normally.
-            Err(error) if LlmBudgetExceeded::from_error(&error).is_some() => {
+            Err(error) if LlmBudgetExceeded::is_refusal(&error) => {
                 return Ok(progress.report(AgentStop::BudgetExceeded));
             }
             Err(error) => return Err(error.to_string()),
@@ -345,19 +345,17 @@ pub async fn agent_model_turn(
     ctx: &ActivityContext,
     request: ModelTurnRequest,
 ) -> Result<ModelTurn, String> {
-    let harness = harness(ctx)?;
-    // A spent budget refuses the call before it is paid for (issue #1997).
-    ctx.check_llm_budget().await?;
-    let (turn, latency) = harness.timed_model_turn(request).await?;
-    // The call is paid for. A failed write must not fail the turn, because a
-    // retry would pay again.
-    if let Err(error) = ctx
-        .record_llm_usage(&harness.ledger_usage(&turn.usage, latency))
+    harness(ctx)?
+        .metered_turn(
+            request,
+            || ctx.check_llm_budget(),
+            |usage| async move {
+                ctx.record_llm_usage(&usage)
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+        )
         .await
-    {
-        tracing::warn!(error = %error, "could not record the LLM usage of a model turn");
-    }
-    Ok(turn)
 }
 
 /// One tool call, as an activity.

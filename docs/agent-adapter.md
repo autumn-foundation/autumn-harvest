@@ -231,18 +231,34 @@ example a rejected API key, or four failed attempts.
 `max_total_tokens` bounds one run inside the workflow. A budget on the
 Postgres engine also bounds a tenant across runs, and it can bound cost.
 
-Each model turn checks the budget before the call. After the call, it
-records one row in `harvest_llm_ledger`: the model id, the tokens, the cost
-and the latency. Implement `AgentModel::model_id` and
-`AgentModel::cost_micros` to fill the model and the cost. The defaults are
-`"unknown"` and zero. A failed ledger write logs a warning and keeps the
-answer, because a retry would pay for the call again.
+Each model turn checks the budget before the call. After a call that
+returns, the turn records one row in `harvest_llm_ledger`: the model id, the
+tokens, the cost and the latency. A call that fails or times out records
+nothing, even when the provider charges for it.
+
+Implement two methods of `AgentModel` to fill the row:
+
+- `model_id` gives the model id. The default is `"unknown"`. The id is
+  your configuration, not the id that the provider reports.
+- `cost_micros` prices one call, in millionths of a currency unit. The
+  default is zero, so only the token caps apply. Price the cache counts
+  there if your provider bills them at another rate.
+
+The budget counts `input_tokens` plus `output_tokens`. `input_tokens` must
+count the whole prompt, cached tokens included. Some providers report the
+cached tokens apart, so add them to `input_tokens` in your `AgentModel`.
+
+A failed ledger write logs a warning and keeps the answer, because a retry
+would pay for the call again. A failed spend read retries the turn, and
+uses one of its four attempts.
 
 Declare the caps on `agent_loop`, and set the tenant on each task:
 
 ```rust
+use autumn_harvest::builder::HarvestBuilder;
 use autumn_harvest::quota::QuotaPolicy;
-use autumn_harvest_agent::workflow::{agent_loop_info, activities};
+use autumn_harvest_agent::AgentTask;
+use autumn_harvest_agent::workflow::{activities, agent_loop_info};
 
 let budget = QuotaPolicy::new("tenant")
     .with_max_run_llm_tokens(200_000)
@@ -257,9 +273,19 @@ let built = HarvestBuilder::new()
 let task = AgentTask::new("Summarise the ticket.").tenant("acme");
 ```
 
-A spent cap refuses the next model turn. The call is not sent, and the run
-ends under `budget_exceeded`. The SQLite backend has no quota, so it has no
-budget.
+Register `agent_loop` with its policy on every worker that runs
+`agent_model_turn`. The check reads the policy in its own process. A worker
+without it does not enforce the budget, and logs one warning.
+
+A spent cap refuses the next model turn. The adapter does not send the call,
+and the run ends under `budget_exceeded`. Three limits apply:
+
+- The cap is soft. The last turn that passes the check can pass the cap by
+  its whole usage. Runs of one tenant at the same time can pass it
+  together.
+- A task with no `tenant` has no tenant budget. Its run caps still apply.
+- The SQLite backend rejects a workflow that declares `quota`. A budgeted
+  `agent_loop` therefore does not build there.
 
 ## 8. History types
 

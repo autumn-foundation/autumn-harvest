@@ -1905,6 +1905,53 @@ async fn signal_idempotency_keys_and_timers_survive_the_copy() {
     );
 }
 
+/// Issue #1997: the run cap sums the LLM ledger by execution. A run that moves
+/// without its ledger would start its budget again on the target.
+#[tokio::test]
+async fn the_llm_ledger_moves_with_the_run() {
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "entity-ledger").await;
+    {
+        let mut source = shards.source().await;
+        diesel::sql_query(
+            "INSERT INTO harvest_llm_ledger \
+                 (execution_id, workflow_name, quota_key, activity_name, activity_id, attempt, \
+                  model, input_tokens, output_tokens, cost_micros, latency_ms, recorded_at) \
+             VALUES ($1, 'entity_flow', 'acme', 'llm_step', gen_random_uuid(), 1, \
+                     'm-1', 60, 40, 1234, 42, NOW() - INTERVAL '30 minutes')",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut source)
+        .await
+        .expect("seed a ledger row");
+    }
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut target = shards.target().await;
+    let spend = autumn_harvest::llm_budget::load_llm_spend(&mut target, exec_id, 3_600)
+        .await
+        .expect("read the spend on the target");
+    assert_eq!(
+        spend.run_tokens, 100,
+        "the run spend must move with the run"
+    );
+    assert_eq!(spend.run_cost_micros, 1_234);
+    // `recorded_at` keeps its value, so the tenant window reads the true time.
+    assert_eq!(
+        count(
+            &mut target,
+            "SELECT count(*)::BIGINT AS value FROM harvest_llm_ledger \
+              WHERE execution_id = $1 AND recorded_at < NOW() - INTERVAL '29 minutes'",
+            exec_id
+        )
+        .await,
+        1
+    );
+}
+
 // ── AC7: crash safety at every kill point ────────────────────────────────────
 
 #[tokio::test]

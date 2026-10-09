@@ -507,6 +507,7 @@ pub const COPIED_RELATIONS: &[&str] = &[
     "harvest_signals",
     "harvest_payload_refs",
     "harvest_workflow_logs",
+    "harvest_llm_ledger",
 ];
 
 /// Relations whose schemas must match between source and target before a
@@ -526,6 +527,7 @@ pub const SCHEMA_PARITY_RELATIONS: &[&str] = &[
     "harvest_signals",
     "harvest_payload_refs",
     "harvest_workflow_logs",
+    "harvest_llm_ledger",
     "harvest_task_queue",
 ];
 
@@ -1351,6 +1353,16 @@ mod db {
         )
         .await?;
 
+        // The LLM ledger of the run (issue #1997). The run cap sums it by
+        // execution, so a run that moves without it starts its budget again.
+        let llm_ledger = read_json(
+            source,
+            "SELECT COALESCE(jsonb_agg(to_jsonb(g)), '[]'::jsonb) AS payload \
+             FROM harvest_llm_ledger g WHERE g.execution_id = $1",
+            exec_id,
+        )
+        .await?;
+
         // The parked workflow task, captured but NOT staged (see the doc
         // comment). `to_jsonb` keeps every column, including the sticky hint and
         // the concurrency key, so the restored row is the one that was parked.
@@ -1555,6 +1567,29 @@ mod db {
             .await
             .map_err(database_error)?;
 
+            // The ledger `id` is an identity column of this shard, as the log
+            // `id` is. The target mints a new one. `recorded_at` keeps its
+            // value, so the tenant window still reads the true spend time.
+            diesel::sql_query(
+                "INSERT INTO harvest_llm_ledger \
+                     (execution_id, workflow_name, quota_key, activity_name, activity_id, \
+                      attempt, model, input_tokens, output_tokens, cost_micros, latency_ms, \
+                      recorded_at) \
+                 SELECT execution_id, workflow_name, quota_key, activity_name, activity_id, \
+                        attempt, model, input_tokens, output_tokens, cost_micros, latency_ms, \
+                        recorded_at \
+                 FROM jsonb_to_recordset($1::jsonb) AS r( \
+                     id bigint, execution_id uuid, workflow_name text, quota_key text, \
+                     activity_name text, activity_id uuid, attempt integer, model text, \
+                     input_tokens bigint, output_tokens bigint, cost_micros bigint, \
+                     latency_ms bigint, recorded_at timestamptz) \
+                 ORDER BY id",
+            )
+            .bind::<Jsonb, _>(&llm_ledger)
+            .execute(&mut *conn)
+            .await
+            .map_err(database_error)?;
+
             Ok(())
         }))
         .await?;
@@ -1694,6 +1729,7 @@ mod db {
         "DELETE FROM harvest_signals WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_payload_refs WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_workflow_logs WHERE workflow_exec_id = $1",
+        "DELETE FROM harvest_llm_ledger WHERE execution_id = $1",
         "DELETE FROM harvest_task_queue WHERE workflow_exec_id = $1",
     ];
 

@@ -34,6 +34,7 @@ use autumn_harvest::execution::{StartWorkflowParams, start_or_load_workflow_exec
 use autumn_harvest::info::{ActivityHandlerFn, ActivityInfo, WorkflowHandlerFn, WorkflowInfo};
 use autumn_harvest::llm_budget::{LlmBudgetExceeded, LlmUsage};
 use autumn_harvest::quota::QuotaPolicy;
+use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::types::{
     ExecutionId, Priority, StartSource, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
 };
@@ -90,7 +91,14 @@ fn llm_step(ctx: &ActivityContext, input: Value) -> BoxFut<'_> {
         )
         .with_cost_micros(input["cost_micros"].as_u64().unwrap_or(0))
         .with_latency(Duration::from_millis(42));
-        let recorded = ctx.record_llm_usage(&usage).await?;
+        let recorded = ctx
+            .record_llm_usage(&usage)
+            .await
+            .map_err(|error| error.to_string())?;
+        // A paid call that then fails, as a provider fault after the answer.
+        if input["fail_first"].as_bool() == Some(true) && ctx.attempt() == 1 {
+            return Err("transient fault after a paid call".to_owned());
+        }
         Ok(json!({ "recorded": recorded }))
     })
 }
@@ -243,6 +251,9 @@ fn params<'a>(
 struct Harness {
     url: String,
     name: &'static str,
+    /// A second workflow type with the same policy.
+    other: &'static str,
+    metrics: Arc<RejectedMetrics>,
     worker: Arc<autumn_harvest::worker::Worker>,
     handle: Option<tokio::task::JoinHandle<()>>,
     _container: Option<testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>>,
@@ -252,15 +263,29 @@ impl Harness {
     async fn new(prefix: &str, quota: Option<QuotaPolicy>) -> Self {
         let (url, container) = setup_test_database_url_or_env().await;
         let name = leaked(prefix);
-        let registry = Arc::new(HandlerRegistry::new(
-            vec![wf_info(name, llm_loop, quota)],
+        let other = leaked(&format!("{prefix}_other"));
+        let metrics = Arc::new(RejectedMetrics::default());
+        let telemetry = Arc::new(
+            autumn_harvest::telemetry::TelemetryConfig::builder()
+                .metrics(Arc::clone(&metrics) as Arc<dyn MetricsRecorder>)
+                .build(),
+        );
+        let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+            vec![
+                wf_info(name, llm_loop, quota),
+                wf_info(other, llm_loop, quota),
+            ],
             vec![act_info(STEP, llm_step)],
+            autumn_harvest::context::empty_shared_state(),
+            telemetry,
         ));
         let worker = build_runtime_worker(&format!("w-{name}"), 4, 4, registry);
         let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
         Self {
             url,
             name,
+            other,
+            metrics,
             worker,
             handle: Some(handle),
             _container: container,
@@ -269,6 +294,17 @@ impl Harness {
 
     /// Start one run of `steps` steps, each with the given usage.
     async fn start(&self, tenant: Option<&str>, steps: u64, step: Value) -> ExecutionId {
+        self.start_type(self.name, tenant, steps, step).await
+    }
+
+    /// [`Self::start`] for a chosen workflow type.
+    async fn start_type(
+        &self,
+        workflow: &'static str,
+        tenant: Option<&str>,
+        steps: u64,
+        step: Value,
+    ) -> ExecutionId {
         let mut conn = connect(&self.url).await;
         let mut input = json!({ "steps": steps, "step": step });
         if let Some(tenant) = tenant {
@@ -277,7 +313,7 @@ impl Harness {
         let workflow_id = format!("llm-{}", Uuid::new_v4().simple());
         start_or_load_workflow_execution(
             &mut conn,
-            params(self.name, &workflow_id, ExecutionId::new(), input),
+            params(workflow, &workflow_id, ExecutionId::new(), input),
             None,
         )
         .await
@@ -303,6 +339,38 @@ impl Harness {
         if let Some(handle) = self.handle.take() {
             handle.await.expect("worker join");
         }
+    }
+}
+
+impl Drop for Harness {
+    /// A failed test stops its worker too, so the worker does not run the
+    /// steps of a later test.
+    fn drop(&mut self) {
+        self.worker.shutdown();
+    }
+}
+
+/// Counts `harvest.quota.rejected` by `(workflow, resource)`.
+#[derive(Default)]
+struct RejectedMetrics {
+    rejected: Mutex<Vec<(String, String)>>,
+}
+
+impl RejectedMetrics {
+    fn rejected(&self) -> Vec<(String, String)> {
+        self.rejected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl MetricsRecorder for RejectedMetrics {
+    fn record_quota_rejected(&self, workflow: &str, resource: &str) {
+        self.rejected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((workflow.to_owned(), resource.to_owned()));
     }
 }
 
@@ -346,10 +414,16 @@ async fn a_run_budget_stops_further_llm_steps_once_exceeded() {
     assert_eq!(ledger_rows(&harness.url, first).await, 3);
     // The refusal is not retried: three paid steps and one refused call.
     assert_eq!(step_calls(first), 4);
+    // The refusal counts on the quota metric, under its LLM resource.
+    assert_eq!(
+        harness.metrics.rejected(),
+        vec![(harness.name.to_owned(), "run_llm_tokens".to_owned())]
+    );
 
     // The cap is per run. A second run of the same tenant spends its own.
     let (second, output) = harness.run(Some("acme"), 10, hundred_tokens()).await;
     assert_eq!(output["ran"], 3, "{output}");
+    assert_eq!(refused(&output), Some("run_llm_tokens"));
     assert_eq!(ledger_rows(&harness.url, second).await, 3);
     harness.stop().await;
 }
@@ -374,10 +448,19 @@ async fn a_tenant_budget_stops_llm_steps_across_runs() {
     // A run of the same tenant now stops at its first step.
     let (third, output) = harness.run(Some("acme"), 10, hundred_tokens()).await;
     assert_eq!(output["ran"], 0, "{output}");
+    assert_eq!(refused(&output), Some("tenant_llm_tokens"));
     assert_eq!(step_calls(third), 1);
 
     // Another tenant has its own budget.
     let (_, output) = harness.run(Some("globex"), 2, hundred_tokens()).await;
+    assert_eq!(output["ran"], 2, "{output}");
+
+    // The tenant scope is the workflow type and the key, as for quota. The
+    // same key under another type has its own budget.
+    let other = harness
+        .start_type(harness.other, Some("acme"), 2, hundred_tokens())
+        .await;
+    let output = harness.output(other).await;
     assert_eq!(output["ran"], 2, "{output}");
     harness.stop().await;
 }
@@ -417,6 +500,7 @@ async fn spend_outside_the_window_does_not_count() {
     // Control: inside the window, the spend of 300 refuses the next step.
     let (_, output) = harness.run(Some("acme"), 1, hundred_tokens()).await;
     assert_eq!(output["ran"], 0, "{output}");
+    assert_eq!(refused(&output), Some("tenant_llm_tokens"));
 
     // Move the spend two hours back, out of the one-hour window.
     let mut conn = connect(&harness.url).await;
@@ -482,6 +566,39 @@ async fn the_ledger_row_holds_the_usage_in_clear_columns() {
     assert_eq!((row.input_tokens, row.output_tokens), (7, 5));
     assert_eq!(row.cost_micros, 1_234);
     assert_eq!(row.latency_ms, 42);
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn a_retry_that_pays_again_records_again_and_counts() {
+    let _serial = TEST_SERIAL.lock().await;
+    let policy = QuotaPolicy::new("tenant").with_max_run_llm_tokens(150);
+    let harness = Harness::new("llm_retry", Some(policy)).await;
+    let mut step = hundred_tokens();
+    step["fail_first"] = json!(true);
+
+    // Attempt 1 pays 100 and fails. Attempt 2 passes the check at 100 and
+    // pays 100 more. The next step then reads 200 and is refused.
+    let (exec_id, output) = harness.run(Some("acme"), 5, step).await;
+    assert_eq!(output["ran"], 1, "{output}");
+    assert_eq!(refused(&output), Some("run_llm_tokens"));
+    assert_eq!(output["refused"]["current"], 200);
+
+    #[derive(diesel::QueryableByName)]
+    struct Attempt {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        attempt: i32,
+    }
+    let mut conn = connect(&harness.url).await;
+    let attempts: Vec<Attempt> = diesel::sql_query(
+        "SELECT attempt FROM harvest_llm_ledger WHERE execution_id = $1 ORDER BY id",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .load(&mut conn)
+    .await
+    .expect("ledger attempts");
+    let attempts: Vec<i32> = attempts.into_iter().map(|row| row.attempt).collect();
+    assert_eq!(attempts, vec![1, 2]);
     harness.stop().await;
 }
 

@@ -1353,12 +1353,18 @@ impl HandlerRegistry {
                     ),
                     "dag": self.dag_workflow_names.contains(name),
                     // A detached child start and a continue-as-new enforce
-                    // the quota inside the task.
+                    // the quota inside the task. An LLM step enforces the LLM
+                    // caps inside its activity task (issue #1997).
                     "quota": info.quota.map(|quota| serde_json::json!([
                         quota.key_expr,
                         quota.max_active_executions,
                         quota.max_history_bytes,
                         quota.max_dead_letters,
+                        quota.max_run_llm_tokens,
+                        quota.max_run_llm_cost_micros,
+                        quota.max_tenant_llm_tokens,
+                        quota.max_tenant_llm_cost_micros,
+                        quota.tenant_llm_window_secs,
                     ])),
                     "execution_timeout": info
                         .execution_timeout

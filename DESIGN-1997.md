@@ -30,7 +30,7 @@ Issue #1996 keeps the roll-up in the usage reports and its replay test.
 
 | # | Idea | Verdict |
 |---|------|---------|
-| B1 | A gate in `process_activity_task` for activities that a flag marks as LLM steps. | Rejected. The flag needs a new `ActivityInfo` field, and 220 struct literals build that type. The gate also adds a metadata lookup to every dispatch. |
+| B1 | A gate in `process_activity_task` for activities that a flag marks as LLM steps. | Rejected. The flag needs a new `ActivityInfo` field, and over 200 struct literals build that type. The gate also adds a metadata lookup to every dispatch. |
 | B2 | A check inside the workflow, from the recorded usage. | Rejected for tenants. A workflow cannot read the spend of other runs and stay deterministic. The agent loop already has the per-run form (`max_total_tokens`). |
 | B3 | An `ActivityInterceptor` that the user registers. | Rejected. A budget that works only after an extra registration is easy to lose. |
 | B4 | Caps on `QuotaPolicy`, checked by `ActivityContext::check_llm_budget` at the start of an LLM step. | **Adopted.** It reuses the quota key resolver, the `quota_key` column, the violation rule and the quota metric. The step that records the usage is also the step that checks it. |
@@ -41,14 +41,18 @@ Issue #1996 keeps the roll-up in the usage reports and its replay test.
 
 | # | How it fails | Mitigation |
 |---|--------------|------------|
-| R1 | Concurrent steps all read the spend before any of them records. | The budget is a soft cap. The overshoot is at most the steps in flight. The docs say so. |
+| R1 | Concurrent steps all read the spend before any of them records. | The budget is a soft cap. The last step that passes can pass the cap by its whole usage. Steps in flight can add to that. The docs say so. |
 | R2 | A tenant budget with no window blocks the tenant for ever. | The tenant cap counts a rolling window. The default is one day. |
-| R3 | A failed ledger write hides a spend. | `record_llm_usage` returns the error. The agent harness logs it and keeps the answer, because a retry would pay for the call again. |
-| R4 | A retry or a resume re-runs a paid call and the ledger misses it. | Each call writes its own row with its attempt number. A retry that pays again counts again. |
+| R3 | A failed ledger write hides a spend. | `record_llm_usage` returns a `HarvestResult`, not an activity payload, so `?` cannot turn it into a retry. The `agent_model_turn` activity logs it and keeps the answer, because a retry would pay for the call again. |
+| R4 | A retry or a resume re-runs a paid call and the ledger misses it. | Each recorded call writes its own row with its attempt number. A retry that pays again counts again. A call that fails or times out records nothing, because it returns no usage. The docs say so. |
 | R5 | The step fails as retryable, so the retry policy runs it again. | The failure is non-retryable. The circuit breaker ignores non-retryable failures. |
 | R6 | A tenant key from caller input aliases another tenant. | The key follows the quota rules: bounded length, scoped by workflow type, fail-open when it does not resolve. |
 | R7 | The budget check costs every activity a query. | Only a step that calls `check_llm_budget` pays. With no LLM cap declared, the check reads no row. |
 | R8 | Retention deletes a run, and the tenant spend drops. | The ledger cascades with its run. Keep retention longer than the window. The docs say so. |
+| R9 | The activity runs in a process that does not register the workflow type, so it cannot read the caps. | The check passes and logs one warning for each type. The docs say to register the workflow on each worker that runs its LLM steps. |
+| R10 | A shard rebalance moves a run without its ledger, so the run cap starts again. | The rebalance copies the ledger rows of the run, with their `recorded_at`. A test proves it. |
+| R11 | A huge recorded value overflows the sum, and every check fails as a read error. | The sums are `NUMERIC`, clamped to the `BIGINT` range. |
+| R12 | A zero window counts nothing, so the tenant caps never refuse. | The macro rejects 0. The builder raises 0 to one second. |
 
 ### 0.4 Six hats
 
@@ -77,7 +81,7 @@ design, because no assay has graded it.
 
 ### 1.1 Declaration
 
-Five optional fields on `QuotaPolicy`:
+Four optional caps and one window on `QuotaPolicy`:
 
 | Builder | Cap |
 |---|---|
@@ -92,10 +96,13 @@ keeps its meaning: an admission cap. `has_llm_budget` reports an LLM cap.
 
 ### 1.2 The ledger
 
-`harvest_llm_ledger` holds one row for each recorded call: the run, the
-workflow type, the `quota_key`, the activity, the attempt, the model, the
-input and output tokens, the cost and the latency. The row cascades with
-its run.
+`harvest_llm_ledger` holds one row for each recorded call. A row holds:
+
+- the run, the workflow type and the `quota_key`;
+- the activity and the attempt;
+- the model, the input and output tokens, the cost and the latency.
+
+The row cascades with its run. A shard rebalance copies it.
 
 ### 1.3 The check
 
@@ -109,8 +116,11 @@ resource, the cap and the spend. The rule is the quota rule:
 The check fails open when the key does not resolve, as admission does. A
 read error fails the step as retryable.
 
-`LlmBudgetExceeded::from_error` reads the typed failure back in workflow
-code.
+`LlmBudgetExceeded::is_refusal` tests for the failure by its type.
+`LlmBudgetExceeded::from_error` reads its details.
+
+The check reads the policy in its own process. A worker that does not
+register the workflow type passes the check and logs one warning.
 
 ### 1.4 The agent adapter
 
@@ -131,6 +141,10 @@ code.
 | Cost (dollar) budget | `llm_budget_tests::a_cost_budget_stops_llm_steps` |
 | Window | `llm_budget_tests::spend_outside_the_window_does_not_count` |
 | Ledger in clear | `llm_budget_tests::the_ledger_row_holds_the_usage_in_clear_columns` |
+| A retry records again | `llm_budget_tests::a_retry_that_pays_again_records_again_and_counts` |
 | No policy, no effect | `llm_budget_tests::a_run_with_no_llm_cap_is_never_refused` |
+| Rebalance keeps the spend | `shard_rebalance_db_tests::the_llm_ledger_moves_with_the_run` |
 | Pure rules | `quota::tests` and `llm_budget::tests` |
-| Agent stop | `autumn-harvest-agent` unit tests on the stop mapping |
+| Macro keys | `macros_workflow` and the `quota_llm_zero_window` compile-fail case |
+| Agent order | `harness::tests` on `metered_turn` |
+| Agent stop | `autumn-harvest-agent/tests/llm_budget.rs` |

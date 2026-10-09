@@ -265,8 +265,11 @@ impl ToolOutcome {
 }
 
 /// Why a run ended.
+///
+/// Later releases can add a reason, so a `match` needs a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AgentStop {
     /// The model gave a final answer.
     Completed,
@@ -278,8 +281,8 @@ pub enum AgentStop {
     TokensExhausted,
     /// The next request was too large to record. It was not sent.
     TranscriptFull,
-    /// A run or tenant LLM budget refused the next model call (issue
-    /// #1997). The call was not sent.
+    /// A run or tenant LLM budget refuses the next model call (issue
+    /// #1997). The adapter does not send the call.
     BudgetExceeded,
 }
 

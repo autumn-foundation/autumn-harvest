@@ -12,8 +12,9 @@
 -- `harvest_events`, no replay impact. The FK drops the rows with their run.
 --
 -- `quota_key` is copied from the run at write time. The tenant read then
--- needs no join. Both indexes include the summed columns, so each read can
--- be an index-only scan.
+-- filters the ledger alone. It does not join the executions for each row.
+-- Both indexes include the summed columns, so each read can be an
+-- index-only scan.
 --
 -- The foreign key locks `harvest_workflow_executions` while it is added. The
 -- timeout bounds that wait, so a busy table fails the migration fast instead

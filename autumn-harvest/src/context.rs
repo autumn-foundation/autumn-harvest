@@ -15222,10 +15222,13 @@ impl ActivityContext {
     /// no LLM cap, it returns at once and reads no row. A spent cap gives a
     /// non-retryable failure payload of type
     /// [`ERROR_TYPE_LLM_BUDGET_EXCEEDED`](crate::llm_budget::ERROR_TYPE_LLM_BUDGET_EXCEEDED).
-    /// A failed read gives a retryable payload.
+    /// A failed read gives a retryable payload of type
+    /// [`ERROR_TYPE_LLM_BUDGET_CHECK_FAILED`](crate::llm_budget::ERROR_TYPE_LLM_BUDGET_CHECK_FAILED).
     ///
     /// A context with no database, such as a test context or a local
-    /// activity, always passes.
+    /// activity, always passes. The check reads the policy in this process.
+    /// A worker that does not register the workflow type passes, and logs one
+    /// warning.
     ///
     /// # Errors
     ///
@@ -15252,13 +15255,7 @@ impl ActivityContext {
                 .await
             }
             .await
-            .map_err(|error| {
-                crate::failure::ActivityFailure::retryable(
-                    "LlmBudgetCheckFailed",
-                    format!("could not read the LLM spend: {error}"),
-                )
-                .into_error_payload()
-            })?;
+            .map_err(|error| crate::llm_budget::check_failed(&error).into_error_payload())?;
             if let Some(violation) = crate::llm_budget::check_llm_budget(&spend, &policy) {
                 self.metrics
                     .record_quota_rejected(self.workflow_type(), violation.resource.as_str());
@@ -15275,14 +15272,15 @@ impl ActivityContext {
     /// Record the usage of one model call in the LLM ledger (issue #1997).
     ///
     /// Call it after the model call, once for each call. A retry that pays
-    /// again records again. Returns `false` when the context has no
-    /// database, so nothing is recorded.
+    /// again records again. Returns `false` when nothing is recorded: the
+    /// context has no database, or the run row does not exist.
     ///
     /// # Errors
     ///
-    /// Returns an error payload when the write fails. The model call is
-    /// already paid for, so a caller can log the error and keep the answer.
-    // Without `db`, the body has no await: it always passes.
+    /// Returns the database error when the write fails. Do not fail the step
+    /// on it. The provider already charged for the call, so a retry pays
+    /// again. Log the error and keep the answer.
+    // Without `db`, the body has no await: it returns `false`.
     #[cfg_attr(
         not(feature = "db"),
         allow(clippy::unused_async, clippy::unused_async_trait_impl)
@@ -15290,11 +15288,9 @@ impl ActivityContext {
     pub async fn record_llm_usage(
         &self,
         usage: &crate::llm_budget::LlmUsage,
-    ) -> Result<bool, String> {
+    ) -> crate::error::HarvestResult<bool> {
         #[cfg(feature = "db")]
         if let Some(state) = self.transactional_state.as_ref() {
-            use crate::failure::IntoActivityErrorString as _;
-
             let site = crate::llm_budget::LlmCallSite {
                 exec_id: state.exec_id,
                 activity_name: self.activity_type(),
@@ -15305,14 +15301,7 @@ impl ActivityContext {
                 let mut conn = crate::pool::acquire_within_pool_bound(&state.pool).await?;
                 crate::llm_budget::record_llm_usage(&mut conn, site, usage).await
             }
-            .await
-            .map_err(|error| {
-                crate::failure::ActivityFailure::retryable(
-                    "LlmUsageNotRecorded",
-                    format!("could not record the LLM usage: {error}"),
-                )
-                .into_error_payload()
-            });
+            .await;
         }
         let _ = usage;
         Ok(false)

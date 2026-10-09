@@ -59,9 +59,9 @@ const LLM_QUOTA_KEYS: [&str; 5] = [
     "tenant_llm_window_secs",
 ];
 
-/// Per-tenant resource quota (issue #946). `key` is required; each of the
-/// three caps is independently optional -- a policy may declare just one,
-/// two, or all three (mirroring `QuotaPolicy`'s own `with_*` builder chain).
+/// Per-tenant resource quota (issue #946). `key` is required. Each admission
+/// cap and each LLM cap (issue #1997) is optional, as in the `with_*` builder
+/// chain of `QuotaPolicy`.
 struct QuotaArgs {
     key_expr: String,
     max_active_executions: Option<u32>,
@@ -125,7 +125,7 @@ struct WorkflowAttrs {
     /// Per-tenant resource quota (issue #946). Parsed from
     /// `#[workflow(quota(key = "input.tenant_id", max_active_executions = 100,
     /// max_history_bytes = "10MiB", max_dead_letters = 50))]`. `key` is
-    /// required; the three caps are each independently optional.
+    /// required. Each cap is optional.
     quota: Option<QuotaArgs>,
     /// Per-workflow-type cap override in bytes (issue #252). Parsed from
     /// `#[workflow(max_input_bytes = "8MiB")]` at compile time.
@@ -646,7 +646,16 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
                     let value: syn::LitInt = inner.value()?.parse()?;
                     // The window is a `u32` of seconds. Each cap is a `u64`.
                     llm[slot] = Some(if LLM_QUOTA_KEYS[slot] == "tenant_llm_window_secs" {
-                        u64::from(value.base10_parse::<u32>()?)
+                        let secs = value.base10_parse::<u32>()?;
+                        // A zero window counts no spend, so the tenant caps
+                        // would never refuse a step.
+                        if secs == 0 {
+                            return Err(syn::Error::new_spanned(
+                                &value,
+                                "quota `tenant_llm_window_secs` must be at least 1",
+                            ));
+                        }
+                        u64::from(secs)
                     } else {
                         value.base10_parse::<u64>()?
                     });
