@@ -1457,9 +1457,23 @@ Load each data key once, at startup, through a `KeyProvider`:
 | `FileKeyProvider` | `<dir>/<key_id>.key` that holds base64, for example a secret volume. |
 | `KmsKeyProvider` | A wrapped data key that a KMS unwraps (envelope encryption). |
 
-The `autumn-harvest-plugin` `aws-kms` feature adds `aws_kms::AwsKms`, which
-implements `KmsDecrypt` for AWS KMS. The core crate has no cloud dependency. To
-make a wrapped key, call `GenerateDataKey` with the codec key id as the
+`KmsKeyProvider` calls a KMS through the one-method `KmsDecrypt` trait. The
+core crate has no cloud dependency. `autumn-harvest-plugin` features supply
+the supported KMS bindings:
+
+| KMS | Plugin feature | Binding | Context binding |
+|-----|----------------|---------|-----------------|
+| AWS KMS | `aws-kms` | `aws_kms::AwsKms` | Encryption context |
+| HashiCorp Vault Transit | `vault-transit` | `vault_transit::VaultTransit` | Key derivation context |
+
+Each binding passes one shared test suite (`kms_conformance`, issue #1981).
+Vault Transit runs on any cloud and on premises. Harvest has no GCP Cloud KMS
+or Azure Key Vault binding yet. For another KMS, implement `KmsDecrypt` and
+send the context to the KMS as authenticated data.
+
+#### AWS KMS
+
+To make a wrapped key, call `GenerateDataKey` with the codec key id as the
 encryption context:
 
 ```sh
@@ -1492,6 +1506,83 @@ let harvest = HarvestBuilder::new()
     .aead_payload_codec_key(AeadCodec::load(&keys, "2026-10").await?)
     .try_build()?;
 ```
+
+#### HashiCorp Vault Transit
+
+The `vault-transit` feature uses the `reqwest` client that the plugin already
+has. It adds no crate to the lockfile. Make a Transit key with key derivation. Vault uses
+the context only for a derived key, so the binding refuses any other key.
+
+```sh
+vault secrets enable transit
+vault write transit/keys/harvest derived=true
+vault write -field=ciphertext transit/datakey/wrapped/harvest bits=256 \
+  context="$(printf '{"harvest_codec_key_id":"2026-10"}' | base64 | tr -d '\n')" \
+  > 2026-10.wrapped
+```
+
+The context is the base64 of the compact JSON object above. Use the codec key
+id as the value, and add no spaces. The `datakey/wrapped` endpoint returns the
+ciphertext only, so the plaintext key never leaves Vault. Vault refuses to unwrap the key under
+another key id or another Transit key.
+
+Give the Harvest token this policy. The binding reads the key to check that
+derivation is on. With another mount or a namespace, change the paths to match.
+
+```hcl
+path "transit/keys/harvest"    { capabilities = ["read"] }
+path "transit/decrypt/harvest" { capabilities = ["update"] }
+```
+
+```toml
+[dependencies]
+autumn-harvest-plugin = { version = "0.7", features = ["vault-transit"] }
+```
+
+```rust,ignore
+use autumn_harvest::aead_codec::{AeadCodec, KmsKeyProvider};
+use autumn_harvest_plugin::vault_transit::VaultTransit;
+
+let vault = VaultTransit::new(std::env::var("VAULT_ADDR")?, std::env::var("VAULT_TOKEN")?);
+let wrapped = std::fs::read_to_string("2026-10.wrapped")?;
+let keys = KmsKeyProvider::new(vault, "harvest")
+    .with_wrapped_key("2026-10", wrapped.trim().as_bytes().to_vec());
+let harvest = HarvestBuilder::new()
+    .aead_payload_codec_key(AeadCodec::load(&keys, "2026-10").await?)
+    .try_build()?;
+```
+
+The wrapped key is the `vault:v1:` text. Load it with `with_wrapped_key`, not
+`with_wrapped_key_base64`.
+
+- `with_mount` sets another Transit mount. Each mount segment uses letters,
+  digits, `_`, `-` and `.` only.
+- `with_namespace` sets a Vault Enterprise namespace.
+- The address must use `https`. Plain `http` is allowed for a loopback host,
+  for example a Vault Agent sidecar. `allow_plain_http` allows it for other
+  hosts, for development only.
+- The default client follows no redirect, so the token goes to the configured
+  address only. It sends plain `http` direct, never through a proxy. It trusts the bundled public CA roots, not the OS store, and
+  it ignores `VAULT_CACERT`.
+- Each request times out after 30 seconds, also with `with_client`.
+- `VaultTransit::new` takes the token once. The binding does not renew it. The
+  token must be valid when the process loads its keys.
+
+For a private CA, pass your own client to `with_client`. Turn off redirects on
+it. The module re-exports `reqwest`.
+
+```rust,ignore
+use autumn_harvest_plugin::vault_transit::reqwest;
+
+let ca = reqwest::Certificate::from_pem(&std::fs::read("vault-ca.pem")?)?;
+let client = reqwest::Client::builder()
+    .add_root_certificate(ca)
+    .redirect(reqwest::redirect::Policy::none())
+    .build()?;
+let vault = VaultTransit::new(vault_addr, vault_token).with_client(client);
+```
+
+### Codec rollout
 
 Use `aead_payload_codec_key`, not `payload_codec`, from the first deployment.
 It writes the key id into each envelope, so a later rotation needs no
