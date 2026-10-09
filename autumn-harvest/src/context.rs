@@ -15385,7 +15385,11 @@ impl ActivityContext {
     ///   cannot read the row.
     /// - A [`HarvestError`] when the pool or the read fails, or when the row is
     ///   not on this shard, for example during a rebalance.
-    #[cfg_attr(not(feature = "db"), allow(clippy::unused_async))]
+    // Without `db` the body has no `.await`, so both no-await lints fire.
+    #[cfg_attr(
+        not(feature = "db"),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
     pub async fn run_tenant(&self) -> HarvestResult<Option<String>> {
         // A local activity runs inside a tenant run, so `None` would be false.
         if self.is_local {
