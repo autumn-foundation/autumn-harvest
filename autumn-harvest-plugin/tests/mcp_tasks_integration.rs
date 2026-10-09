@@ -53,15 +53,16 @@ async fn task_approval_flow(ctx: &WorkflowContext, request_id: String) -> Result
     Ok(format!("{request_id}:{decision}"))
 }
 
-/// Waits twice on the same signal name and returns both payloads.
+/// Waits twice on the same signal name and returns both payloads. The name
+/// is not ASCII, so the input key cannot ride in an HTTP header.
 #[workflow(mcp)]
 async fn task_two_step_flow(ctx: &WorkflowContext, _input: String) -> Result<Value, String> {
     let first = ctx
-        .wait_for_signal("step")
+        .wait_for_signal("étape")
         .await
         .map_err(|e| e.to_string())?;
     let second = ctx
-        .wait_for_signal("step")
+        .wait_for_signal("étape")
         .await
         .map_err(|e| e.to_string())?;
     Ok(json!([first, second]))
@@ -188,7 +189,7 @@ async fn rpc(client: &TestClient, method: &str, params: Value) -> Value {
     out["result"].clone()
 }
 
-fn tool_call(name: &str, body: Value) -> Value {
+fn tool_call(name: &str, body: &Value) -> Value {
     json!({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": name, "arguments": {"body": body}, "_meta": declared()}
@@ -197,7 +198,7 @@ fn tool_call(name: &str, body: Value) -> Value {
 
 /// Create a task and return its `CreateTaskResult`.
 async fn create_task(client: &TestClient, name: &str, body: Value) -> Value {
-    let out = rpc_with(client, tool_call(name, body), None).await;
+    let out = rpc_with(client, tool_call(name, &body), None).await;
     assert!(out.get("error").is_none(), "{out}");
     out["result"].clone()
 }
@@ -422,7 +423,7 @@ async fn a_retried_task_create_starts_one_execution() {
     let _ = tracing_subscriber::fmt::try_init();
     let db = setup_db().await;
     let client = build_app(&db).await;
-    let call = tool_call("start_task_parked_flow", json!("retry"));
+    let call = tool_call("start_task_parked_flow", &json!("retry"));
 
     let first = rpc_with(&client, call.clone(), Some("create-1")).await;
     let retry = rpc_with(&client, call.clone(), Some("create-1")).await;
@@ -472,7 +473,7 @@ async fn each_wait_gets_its_own_key_and_a_retried_answer_is_ignored() {
     })
     .await;
     let key2 = only_key(&second);
-    assert!(key2.ends_with(":signal:step:2"), "{key2}");
+    assert!(key2.ends_with(":signal:étape:2"), "{key2}");
     // A key that is not open now is ignored.
     answer(&client, &task_id, &key1, json!({"n": 98})).await;
     answer(&client, &task_id, &key2, json!({"n": 2})).await;

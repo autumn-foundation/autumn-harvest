@@ -1616,10 +1616,9 @@ impl Plugin for HarvestPlugin {
                 builder.update_handlers(),
                 builder.dag_infos(),
             );
-            let mut routes = Vec::new();
-            if mcp_tools_enabled {
+            let mut routes = if mcp_tools_enabled {
                 crate::mcp_tools::record_schemas(&descriptors);
-                routes = crate::mcp_tools::build_mcp_tool_routes(
+                crate::mcp_tools::build_mcp_tool_routes(
                     &prefix,
                     &descriptors,
                     &api_state,
@@ -1629,8 +1628,10 @@ impl Plugin for HarvestPlugin {
                     // `enforce_read_only_class` layer on the nested management
                     // router), so the read-only class boundary is applied here too.
                     role_auth_enabled,
-                );
-            }
+                )
+            } else {
+                Vec::new()
+            };
             if mcp_tasks_enabled {
                 let path = mcp_tasks_path.unwrap_or_else(|| crate::mcp_tasks::tasks_path(&prefix));
                 routes.push(crate::mcp_tasks::build_mcp_task_route(

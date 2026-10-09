@@ -25,7 +25,6 @@
 //! Like the tool routes, this module runs at the HTTP edge only. It adds no
 //! `WorkflowEvent` variant and no migration.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use autumn_web::reexports::axum;
@@ -225,7 +224,7 @@ pub struct SignalWait {
 }
 
 /// The state of one task at one read.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSnapshot {
     /// The task id: the execution id from the start.
     pub task_id: String,
@@ -357,15 +356,14 @@ struct TaskTool {
     input_schema: Value,
 }
 
-/// The tools of the task route, keyed by tool name.
+/// The tools of the task route, in workflow-name order.
 struct TaskCatalog {
     tools: Vec<TaskTool>,
-    by_name: HashMap<String, usize>,
 }
 
 impl TaskCatalog {
     fn new(descriptors: &[McpWorkflowDescriptor]) -> Self {
-        let tools: Vec<TaskTool> = task_descriptors(descriptors)
+        let tools = task_descriptors(descriptors)
             .into_iter()
             .map(|d| {
                 let component = crate::mcp_tools::input_schema_component(&d.name);
@@ -378,6 +376,8 @@ impl TaskCatalog {
                     .map_or_else(String::new, |text| format!(" {text}"));
                 TaskTool {
                     name: format!("start_{}", d.name),
+                    // `start_tool` takes a `&'static str`. One leak for each
+                    // workflow, once for each plugin build.
                     workflow: Box::leak(d.name.clone().into_boxed_str()),
                     description: format!(
                         "Run the '{}' workflow as an MCP task.{about} The call returns a \
@@ -393,16 +393,11 @@ impl TaskCatalog {
                 }
             })
             .collect();
-        let by_name = tools
-            .iter()
-            .enumerate()
-            .map(|(i, tool)| (tool.name.clone(), i))
-            .collect();
-        Self { tools, by_name }
+        Self { tools }
     }
 
     fn tool(&self, name: &str) -> Option<&TaskTool> {
-        self.by_name.get(name).map(|&i| &self.tools[i])
+        self.tools.iter().find(|tool| tool.name == name)
     }
 
     fn serves(&self, workflow: &str) -> bool {
@@ -498,7 +493,7 @@ impl RpcError {
 
 type RpcResult = Result<Value, RpcError>;
 
-fn rpc_response(id: Value, result: RpcResult) -> Response {
+fn rpc_response(id: &Value, result: RpcResult) -> Response {
     let body = match result {
         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
         Err(err) => {
@@ -527,19 +522,19 @@ async fn serve(
         }
         Err(rejection) => {
             return rpc_response(
-                Value::Null,
+                &Value::Null,
                 Err(RpcError::new(PARSE_ERROR, rejection.body_text())),
             );
         }
     };
     let Some(object) = message.as_object() else {
-        return rpc_response(
-            Value::Null,
-            Err(RpcError::new(
-                INVALID_REQUEST,
-                "Invalid Request: batching is not supported",
-            )),
-        );
+        // The 2026-07-28 revision has no JSON-RPC batch.
+        let reason = if message.is_array() {
+            "Invalid Request: batching is not supported"
+        } else {
+            "Invalid Request: expected a JSON object"
+        };
+        return rpc_response(&Value::Null, Err(RpcError::new(INVALID_REQUEST, reason)));
     };
     let id = object.get("id").cloned();
     let id_ok = id
@@ -553,7 +548,7 @@ async fn serve(
     ) else {
         let err_id = id.filter(|v| v.is_string() || v.is_number());
         return rpc_response(
-            err_id.unwrap_or(Value::Null),
+            &err_id.unwrap_or(Value::Null),
             Err(RpcError::new(INVALID_REQUEST, "Invalid Request")),
         );
     };
@@ -563,7 +558,7 @@ async fn serve(
     };
     let params = object.get("params").cloned().unwrap_or(Value::Null);
     let result = dispatch(&api_state, &catalog, &headers, method, &params).await;
-    rpc_response(id, result)
+    rpc_response(&id, result)
 }
 
 async fn dispatch(
@@ -772,14 +767,14 @@ async fn tasks_update(
             continue;
         }
         let payload = answer.get("content").cloned().unwrap_or_else(|| json!({}));
+        // The input key is the delivery key. A header key wins over the
+        // query key, so the header from the request must not ride along.
         let mut headers = headers.clone();
-        let key = HeaderValue::from_str(&wait.key)
-            .map_err(|_| RpcError::new(INTERNAL_ERROR, "the input key is not a header value"))?;
-        headers.insert(autumn_harvest::audit::HEADER_IDEMPOTENCY_KEY, key);
+        headers.remove(autumn_harvest::audit::HEADER_IDEMPOTENCY_KEY);
         let response = crate::api::signal_workflow(
             Extension(api_state.clone()),
             Path((snapshot.run_id.to_string(), wait.signal_name.clone())),
-            Query(crate::api::SignalQuery::default()),
+            Query(crate::api::SignalQuery::with_key(wait.key.clone())),
             headers,
             Json(payload),
         )
@@ -817,14 +812,13 @@ async fn tasks_cancel(
         )),
     )
     .await;
-    match outcome {
-        Ok(_) => Ok(json!({"resultType": "complete"})),
-        Err(err) if err.status().is_server_error() => {
-            Err(RpcError::new(INTERNAL_ERROR, err.to_string()))
-        }
-        // A run that ended after the read is a conflict, and still an ack.
-        Err(_) => Ok(json!({"resultType": "complete"})),
+    // A run that ended after the read is a conflict, and still an ack.
+    if let Err(err) = outcome
+        && err.status().is_server_error()
+    {
+        return Err(RpcError::new(INTERNAL_ERROR, err.to_string()));
     }
+    Ok(json!({"resultType": "complete"}))
 }
 
 /// Load the task: the start row, its live run and the open signal waits.

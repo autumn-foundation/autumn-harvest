@@ -1958,6 +1958,16 @@ pub(crate) struct SignalQuery {
     idempotency_key: Option<String>,
 }
 
+impl SignalQuery {
+    /// A query that carries `key`, for the MCP Tasks route (issue #2005).
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub(crate) fn with_key(key: impl Into<String>) -> Self {
+        Self {
+            idempotency_key: Some(key.into()),
+        }
+    }
+}
+
 /// Response for the standalone signal route.
 ///
 /// `signal_delivered` is `true` when a signal row was freshly queued and
