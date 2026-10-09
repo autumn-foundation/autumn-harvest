@@ -25,7 +25,6 @@ pub const DEFAULT_MAX_STEPS: u32 = 8;
 pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 3_600;
 
 /// The input of one agent run: the workflow input.
-//
 // The flags are independent switches on a recorded payload. A flat bool per
 // switch keeps the wire shape plain, so the lint is allowed here.
 #[allow(clippy::struct_excessive_bools)]
