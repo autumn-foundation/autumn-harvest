@@ -351,8 +351,16 @@ fn assert_output_is_sealed(event: &EventRow, model: &str) {
         !text.contains(model),
         "the event holds no ledger field: {text}"
     );
-    for field in ["input_tokens", "output_tokens", "cost_usd_micros", "latency"] {
-        assert!(!text.contains(field), "the event holds no `{field}`: {text}");
+    for field in [
+        "input_tokens",
+        "output_tokens",
+        "cost_usd_micros",
+        "latency",
+    ] {
+        assert!(
+            !text.contains(field),
+            "the event holds no `{field}`: {text}"
+        );
     }
 }
 
@@ -421,10 +429,8 @@ fn llm_txn_step(ctx: &ActivityContext, _input: Value) -> BoxFut<'_> {
                 .with_cost_usd_micros(1_500)
                 .with_latency(Duration::from_millis(300)),
         )?;
-        ctx.run_transactional(|_conn| {
-            Box::pin(async move { Ok(json!({"answer": OUTPUT_SECRET})) })
-        })
-        .await
+        ctx.run_transactional(|_conn| Box::pin(async move { Ok(json!({"answer": OUTPUT_SECRET})) }))
+            .await
     })
 }
 
@@ -562,7 +568,13 @@ async fn a_transactional_activity_writes_its_calls_in_its_commit() {
     let queue = unique_queue("llm-txn");
     let registry = registry(
         vec![wf_info("llm_txn_wf", wf_txn)],
-        vec![activity_info("llm_txn_step", queue, false, None, llm_txn_step)],
+        vec![activity_info(
+            "llm_txn_step",
+            queue,
+            false,
+            None,
+            llm_txn_step,
+        )],
         &codecs,
     );
     let exec_ids = run_to_completion(
@@ -623,7 +635,11 @@ async fn a_failed_attempt_writes_no_row() {
 
     let mut conn = connect(&url).await;
     let rows = ledger_rows(&mut conn, exec_ids[0]).await;
-    assert_eq!(AtomicUsize::load(&FLAKY_CALLS, Ordering::SeqCst), 2, "two attempts ran");
+    assert_eq!(
+        AtomicUsize::load(&FLAKY_CALLS, Ordering::SeqCst),
+        2,
+        "two attempts ran"
+    );
     assert_eq!(rows.len(), 1, "only the completed attempt writes: {rows:?}");
     assert_eq!(rows[0].model, "model-attempt-2");
 }

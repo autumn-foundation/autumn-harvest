@@ -374,7 +374,13 @@ mod tests {
     }
 
     /// A row that carries only agent cost ledger figures (issue #1996).
-    fn llm_row(group: &str, calls: i64, tokens: (i64, i64), cost: i64, unpriced: i64) -> UsageShardRow {
+    fn llm_row(
+        group: &str,
+        calls: i64,
+        tokens: (i64, i64),
+        cost: i64,
+        unpriced: i64,
+    ) -> UsageShardRow {
         UsageShardRow {
             llm_calls: calls,
             llm_input_tokens: tokens.0,

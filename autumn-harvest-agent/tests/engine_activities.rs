@@ -12,11 +12,11 @@ use std::sync::Arc;
 use autumn_harvest::context::{ActivityContext, SharedStateMap};
 use autumn_harvest::failure::parse_typed_payload;
 use autumn_harvest_agent::workflow::{agent_model_turn_info, agent_tool_call_info};
+use autumn_harvest_agent::{AgentError, AgentModel, ChatRequest, ChatResponse};
 use autumn_harvest_agent::{
     AgentHarness, ChatMessage, ChatRole, ModelTurn, ModelTurnRequest, Rule, StopReason, TokenUsage,
     ToolCall, ToolCallRequest, ToolDecision, ToolEffect, ToolOutcome, ToolRules,
 };
-use autumn_harvest_agent::{AgentError, AgentModel, ChatRequest, ChatResponse};
 use common::{Recorder, ScriptedModel, calls, recorded_tool};
 use serde_json::json;
 
@@ -350,7 +350,10 @@ async fn a_model_with_no_name_or_price_records_an_unpriced_unknown_call() {
 
     let ledger = ctx.llm_calls();
     assert_eq!(ledger.len(), 1, "{ledger:?}");
-    assert_eq!(ledger[0].model(), autumn_harvest_agent::model::UNKNOWN_MODEL_ID);
+    assert_eq!(
+        ledger[0].model(),
+        autumn_harvest_agent::model::UNKNOWN_MODEL_ID
+    );
     assert_eq!(ledger[0].input_tokens(), 5);
     assert_eq!(ledger[0].cost_usd_micros(), None);
 }
