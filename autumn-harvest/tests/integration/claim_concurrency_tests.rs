@@ -84,6 +84,11 @@ async fn exec(conn: &mut AsyncPgConnection, sql: &str) {
 // The slow-claim probe.
 // ---------------------------------------------------------------------------
 
+/// Serializes probe DDL. Parallel tests on one shared database otherwise
+/// change triggers on `harvest_task_queue` at the same time.
+const PROBE_DDL_LOCK: &str = "SELECT pg_advisory_lock(hashtext('claim_concurrency_tests'))";
+const PROBE_DDL_UNLOCK: &str = "SELECT pg_advisory_unlock(hashtext('claim_concurrency_tests'))";
+
 /// A trigger that makes each claim on one queue sleep, and logs its interval.
 struct ClaimProbe {
     url: String,
@@ -95,6 +100,7 @@ impl ClaimProbe {
     async fn install(url: &str, queue: &str, sleep_ms: u32) -> Self {
         let suffix = Uuid::new_v4().simple().to_string();
         let mut conn = connect(url).await;
+        exec(&mut conn, PROBE_DDL_LOCK).await;
         exec(
             &mut conn,
             &format!(
@@ -129,6 +135,7 @@ impl ClaimProbe {
             ),
         )
         .await;
+        exec(&mut conn, PROBE_DDL_UNLOCK).await;
         Self {
             url: url.to_owned(),
             suffix,
@@ -145,6 +152,9 @@ impl ClaimProbe {
     }
 
     /// The most claims that ran at one time.
+    ///
+    /// The peak is at the start of some claim. So count, at each start, the
+    /// claims that started by then and had not finished.
     async fn max_overlap(&self) -> i64 {
         let s = &self.suffix;
         self.scalar(&format!(
@@ -152,8 +162,8 @@ impl ClaimProbe {
                  SELECT count(*) AS n
                    FROM claim_probe_{s} p
                    JOIN claim_probe_{s} q
-                     ON q.started < p.finished AND q.finished > p.started
-                  GROUP BY p.started, p.finished) o"
+                     ON q.started <= p.started AND q.finished > p.started
+                  GROUP BY p.ctid) o"
         ))
         .await
     }
@@ -176,6 +186,7 @@ impl ClaimProbe {
     async fn remove(self) {
         let s = &self.suffix;
         let mut conn = connect(&self.url).await;
+        exec(&mut conn, PROBE_DDL_LOCK).await;
         exec(
             &mut conn,
             &format!("DROP TRIGGER claim_probe_trg_{s} ON harvest_task_queue"),
@@ -183,6 +194,7 @@ impl ClaimProbe {
         .await;
         exec(&mut conn, &format!("DROP FUNCTION claim_probe_fn_{s}()")).await;
         exec(&mut conn, &format!("DROP TABLE claim_probe_{s}")).await;
+        exec(&mut conn, PROBE_DDL_UNLOCK).await;
     }
 }
 
@@ -500,6 +512,55 @@ async fn a_worker_overlaps_claims_up_to_its_cap() {
     assert!(
         overlap <= 4,
         "no more than 4 claims run at once; largest overlap {overlap}"
+    );
+}
+
+/// The multi-shard loop runs followers too. Two shards share one database
+/// here, so each claim target sees the same backlog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_multi_shard_worker_overlaps_claims_up_to_its_cap() {
+    let (url, _container) = setup_db().await;
+    let queue = format!("cc-multi-{}", Uuid::new_v4());
+    let probe = ClaimProbe::install(&url, &queue, 150).await;
+    let n = 16;
+    seed(&url, &queue, n, false).await;
+    let pool = build_pool(&url);
+    let pools = std::collections::BTreeMap::from([
+        (ShardId::new(0), pool.clone()),
+        (ShardId::new(1), build_pool(&url)),
+    ]);
+    let knobs = Knobs {
+        claims: 4,
+        activities: 4,
+        poll_interval: Duration::from_millis(25),
+    };
+    let mut config: WorkerRuntimeConfig = autumn_harvest::builder::WorkerConfig::default().into();
+    config.worker_id.clone_from(&queue);
+    config.queues = vec![queue.clone()];
+    config.max_concurrent_workflows = 16;
+    config.max_concurrent_activities = knobs.activities;
+    config.max_concurrent_claims = knobs.claims;
+    config.poll_interval = knobs.poll_interval;
+    config.shutdown_timeout = Duration::from_secs(5);
+    config.shard_assignments = vec![ShardId::new(0), ShardId::new(1)];
+    config.sharded_pool = Some(autumn_harvest::shard::ShardedDbPool::from_map(
+        pools,
+        ShardId::new(0),
+    ));
+    let worker = Arc::new(
+        Worker::new(config, build_registry(Arc::new(NoOpMetrics))).expect("worker should build"),
+    );
+    let handle = spawn_worker(&worker, &pool);
+
+    let drained = wait_completed(&url, &queue, n as i64, Duration::from_secs(60)).await;
+    worker.shutdown();
+    handle.await.expect("worker joins");
+    let overlap = probe.max_overlap().await;
+    probe.remove().await;
+    assert!(drained, "every workflow completes");
+    assert!(
+        (3..=4).contains(&overlap),
+        "a multi-shard worker with 4 claim loops runs 3 or 4 claims at once; largest overlap {overlap}"
     );
 }
 

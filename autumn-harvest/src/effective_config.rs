@@ -1055,6 +1055,23 @@ mod tests {
     }
 
     #[test]
+    fn view_reports_the_claim_loop_cap() {
+        let default_view = WorkerConfigView::from_worker_config(
+            &WorkerConfig::default(),
+            Duration::from_millis(500),
+        );
+        assert_eq!(
+            default_view.max_concurrent_claims,
+            crate::worker::DEFAULT_MAX_CONCURRENT_CLAIMS
+        );
+        let view = WorkerConfigView::from_worker_config(
+            &WorkerConfig::default().with_max_concurrent_claims(4),
+            Duration::from_millis(500),
+        );
+        assert_eq!(view.max_concurrent_claims, 4);
+    }
+
+    #[test]
     fn derived_bools_track_their_source_tunable() {
         // Off: zero sticky timeout, zero poison-pill threshold, no tuner.
         let off = WorkerConfig {

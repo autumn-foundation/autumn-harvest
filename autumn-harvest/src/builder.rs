@@ -5399,6 +5399,21 @@ mod tests {
     }
 
     #[test]
+    fn max_concurrent_claims_defaults_above_one_and_the_setter_overrides_it() {
+        let config = WorkerConfig::default();
+        assert_eq!(
+            config.max_concurrent_claims,
+            crate::worker::DEFAULT_MAX_CONCURRENT_CLAIMS
+        );
+        assert!(
+            config.max_concurrent_claims > 1,
+            "more than one claim in flight by default"
+        );
+        let serial = WorkerConfig::default().with_max_concurrent_claims(1);
+        assert_eq!(serial.max_concurrent_claims, 1);
+    }
+
+    #[test]
     fn worker_heartbeat_interval_defaults_to_5s() {
         assert_eq!(
             WorkerConfig::default().worker_heartbeat_interval,
