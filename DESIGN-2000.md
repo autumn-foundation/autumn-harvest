@@ -142,6 +142,7 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | A missing runtime writes overrides with no codec. | Return `503`. |
 | A member of a closed source session fails with `SessionBroken`. | Resolve from the record before the session check. Skip each settled activity there. |
 | A transient store fault becomes `ForkEffectUnavailable`. | Return the load error. The decision rolls back and retries. |
+| A live fork stalls on a fault in the source history. | Load the source only in recorded mode. |
 
 ## 2. Tests
 

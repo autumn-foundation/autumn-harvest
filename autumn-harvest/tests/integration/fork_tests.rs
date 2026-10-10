@@ -149,10 +149,14 @@ struct Running {
 
 impl Running {
     fn start(queue: &str, pool: &DbPool) -> Self {
+        Self::start_with(queue, pool, registry())
+    }
+
+    fn start_with(queue: &str, pool: &DbPool, registry: Arc<HandlerRegistry>) -> Self {
         let mut config = runtime_config(&format!("w-{queue}"), 2, 2, Duration::from_secs(10));
         config.queues = vec![queue.to_string()];
         config.max_concurrent_sessions = 2;
-        let worker = Arc::new(Worker::new(config, registry()).expect("worker builds"));
+        let worker = Arc::new(Worker::new(config, registry).expect("worker builds"));
         let handle = spawn_test_worker(Arc::clone(&worker), pool.clone());
         Self { worker, handle }
     }
@@ -930,6 +934,59 @@ async fn an_input_override_keeps_an_offloaded_carryover() {
         source_refs.iter().map(|r| &r.blob_key).collect::<Vec<_>>(),
         "the fork references the carryover blob"
     );
+}
+
+/// A live fork never reads the source history. A source blob that is gone
+/// does not stop the fork from running its activities.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_fork_does_not_read_the_source_history() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("live-blob");
+    let mut conn = connect(&url).await;
+    let blobs = Arc::new(MemStore::default());
+    let offloader = Arc::new(autumn_harvest::payload_store::PayloadOffloader::new(
+        Arc::clone(&blobs) as Arc<dyn autumn_harvest::payload_store::PayloadStore>,
+        64,
+        Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+    ));
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    // Only the fork runs. The source keeps its history.
+    diesel::delete(autumn_harvest::schema::harvest_task_queue::table.filter(
+        autumn_harvest::schema::harvest_task_queue::workflow_exec_id.eq(Some(source.as_uuid())),
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the source task");
+    store::append_events_offloaded_with_codecs(
+        &mut conn,
+        source,
+        &[WorkflowEvent::ActivityScheduled {
+            activity_id: autumn_harvest::types::ActivityExecId::new(),
+            name: "fork_charge".to_string(),
+            input: json!({ "blob": "X".repeat(512) }),
+            queue: queue.clone(),
+        }],
+        1,
+        Some(&offloader),
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("append an offloaded event");
+    blobs.blobs.lock().expect("blobs lock").clear();
+
+    let forked = fork(&url, source, request(ForkEffects::Live)).await;
+    let offloading = Arc::new(
+        HandlerRegistry::new(
+            vec![fork_pay_wf_info()],
+            activities![fork_charge, fork_receipt],
+        )
+        .with_payload_offloader(Some(offloader)),
+    );
+    let running = Running::start_with(&queue, &pool, offloading);
+    wait_for_execution_state(&url, forked, "COMPLETED").await;
+    running.stop().await;
+    assert_eq!(charges(&queue), 1, "the live fork charges once");
 }
 
 /// A source erased after the fork exists serves no record. The fork fails

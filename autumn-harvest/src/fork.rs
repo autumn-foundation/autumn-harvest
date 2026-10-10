@@ -1229,8 +1229,12 @@ pub(crate) async fn serve_recorded_activities(
     let fork_events = crate::store::load_history_inflated(conn, exec_id, codecs, offloader)
         .await?
         .events;
+    // A live fork takes no record, so it never reads the source. A fault in
+    // the source history then cannot stop its dispatch.
     let source_events = match fork_marker(&fork_events) {
-        Some((source_id, _)) if record_source_is_readable(conn, source_id).await? => {
+        Some((source_id, ForkEffects::Recorded))
+            if record_source_is_readable(conn, source_id).await? =>
+        {
             crate::store::load_history_inflated(conn, source_id, codecs, offloader)
                 .await?
                 .events

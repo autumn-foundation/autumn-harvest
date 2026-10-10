@@ -29,6 +29,7 @@ is never written, so a run in any state can be forked, `COMPLETED` and
   `SessionBroken`.
 
 `"effects": "live"` runs effects for real. An override applies in both modes.
+A live fork never reads the source history after the fork exists.
 
 **Overrides.** `input` replaces the workflow input at fork point `0`. It
 passes the input schema (issue #373) and the byte cap (issue #252).
@@ -70,7 +71,8 @@ events. Fork a run only after every worker runs this version.
 history stay byte-identical; a recorded fork does not run a completed
 activity again; a live fork does; a fork with no record fails closed; an
 override replaces a result; a recorded fork fails before a local activity;
-a recorded fork serves a member of a closed session;
+a recorded fork serves a member of a closed session; a live fork runs
+with a source blob gone;
 an erased source is refused in both modes; a fork of a fork of an erased run
 is refused; a later fork point carries the prefix; a reset of a recorded
 fork stays recorded; only a recorded fork suppresses completion
