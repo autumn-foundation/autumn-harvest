@@ -523,3 +523,44 @@ async fn a_read_only_call_refuses_a_write_tool_at_run_time() {
     assert!(outcome.content.contains("may only read"));
     assert_eq!(recorder.runs(), Vec::<serde_json::Value>::new());
 }
+
+/// A model that reports a cost above the ledger limit.
+#[derive(Debug)]
+struct OverpricedModel(Arc<ScriptedModel>);
+
+impl AgentModel for OverpricedModel {
+    fn chat<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+    ) -> autumn_harvest_agent::model::BoxFuture<'a, Result<ChatResponse, AgentError>> {
+        self.0.chat(request)
+    }
+
+    fn model_id(&self) -> &'static str {
+        "test-model-1"
+    }
+
+    fn cost_usd_micros(&self, _usage: &TokenUsage) -> Option<u64> {
+        Some(u64::MAX)
+    }
+}
+
+#[tokio::test]
+async fn a_refused_cost_still_records_the_turn_as_unpriced() {
+    let model = ScriptedModel::new(vec![calls(&[], 11)]);
+    let ctx = with_harness(AgentHarness::new(Arc::new(OverpricedModel(model))));
+
+    let info = agent_model_turn_info();
+    let result = (info.handler)(&ctx, serde_json::to_value(turn_request()).unwrap()).await;
+    assert!(result.is_ok(), "a ledger refusal never fails the turn");
+
+    let ledger = ctx.llm_calls();
+    assert_eq!(ledger.len(), 1, "{ledger:?}");
+    assert_eq!(
+        ledger[0].model(),
+        "test-model-1",
+        "the valid model id stays"
+    );
+    assert_eq!(ledger[0].input_tokens(), 11);
+    assert_eq!(ledger[0].cost_usd_micros(), None, "the bad cost is dropped");
+}
