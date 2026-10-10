@@ -804,10 +804,24 @@ pub fn validate_fork(
     Ok(plan)
 }
 
+/// The most activity overrides that one fork request can set.
+///
+/// The fork appends one event per override in one insert. The cap keeps that
+/// insert below the bind-parameter limit of Postgres.
+pub const MAX_ACTIVITY_OVERRIDES: usize = 1_000;
+
 fn validate_overrides(
     prefix: &[WorkflowEvent],
     overrides: &[ForkActivityOverride],
 ) -> Result<(), WorkflowForkError> {
+    if overrides.len() > MAX_ACTIVITY_OVERRIDES {
+        return Err(WorkflowForkError::InvalidOverride {
+            message: format!(
+                "{} activity overrides; the limit is {MAX_ACTIVITY_OVERRIDES}",
+                overrides.len()
+            ),
+        });
+    }
     let mut carried = HashMap::<&str, u32>::new();
     for event in prefix {
         if let WorkflowEvent::ActivityScheduled { name, .. } = event {
@@ -1774,6 +1788,27 @@ mod tests {
             matches!(error, WorkflowForkError::InvalidOverride { .. }),
             "{error}"
         );
+    }
+
+    #[test]
+    fn the_override_count_is_bounded() {
+        let (source, _, _) = source();
+        let many = |count: u32| WorkflowForkRequest {
+            activity_overrides: (2..2 + count)
+                .map(|occurrence| ForkActivityOverride {
+                    activity_name: "charge".to_string(),
+                    occurrence,
+                    output: json!("stub"),
+                })
+                .collect(),
+            ..WorkflowForkRequest::default()
+        };
+        let cap = u32::try_from(MAX_ACTIVITY_OVERRIDES).expect("cap");
+        assert!(validate_fork(&source, 2, &many(cap)).is_ok());
+        assert!(matches!(
+            validate_fork(&source, 2, &many(cap + 1)),
+            Err(WorkflowForkError::InvalidOverride { .. })
+        ));
     }
 
     #[test]

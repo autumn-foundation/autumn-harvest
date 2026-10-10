@@ -34,7 +34,8 @@ A live fork never reads the source history after the fork exists.
 **Overrides.** `input` replaces the workflow input at fork point `0`. It
 passes the input schema (issue #373) and the byte cap (issue #252).
 `activity_overrides` sets the result of one activity occurrence after the
-fork point.
+fork point. A request sets at most 1,000 overrides
+(`fork::MAX_ACTIVITY_OVERRIDES`).
 
 **Refusals.** An erased source (issue #495) is always refused, under a
 `FOR SHARE` lock on the source row. So is a fork whose fork lineage reaches

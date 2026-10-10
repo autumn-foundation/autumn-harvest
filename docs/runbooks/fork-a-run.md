@@ -64,7 +64,8 @@ again, such as a new UUID or a session id, has no record. It fails closed.
 ```
 
 `occurrence` counts the `ActivityScheduled` events with that name, from 1. An
-override applies in both modes. The activity never runs.
+override applies in both modes. The activity never runs. A request can set
+at most 1,000 overrides.
 
 A new input or an override can change the input of a later activity. That
 activity then has no record. Give it an override too, or the fork fails

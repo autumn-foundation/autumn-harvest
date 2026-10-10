@@ -3517,7 +3517,7 @@
           {
             "name": "activity_overrides",
             "required": false,
-            "description": "Array of {activity_name, occurrence, output}. occurrence is the 1-based count of ActivityScheduled events with that name. The activity returns output and never runs, in both effects modes. The occurrence must come after the fork point."
+            "description": "Array of {activity_name, occurrence, output}. occurrence is the 1-based count of ActivityScheduled events with that name. The activity returns output and never runs, in both effects modes. The occurrence must come after the fork point. At most 1,000 entries; more returns 400."
           }
         ]
       },
