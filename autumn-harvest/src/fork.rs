@@ -280,12 +280,10 @@ async fn fork_in_transaction(
         input,
         start_source: StartSource::Fork,
         quota_key: quota.as_ref().map(|(key, _)| key.as_str()),
-        // A completion callback notifies an outside system. Only a live fork
-        // may do that.
-        completion_callbacks: match request.effects {
-            ForkEffects::Live => source.completion_callbacks.clone(),
-            ForkEffects::Recorded => None,
-        },
+        // The row keeps the callback targets of its source. A recorded fork
+        // never sends them, because the terminal path checks its marker. A
+        // later live fork of this fork then sends them.
+        completion_callbacks: source.completion_callbacks.clone(),
     };
     let fork = match crate::reset::insert_fork_row(conn, &source, new_exec_id, row).await {
         Ok(fork) => fork,

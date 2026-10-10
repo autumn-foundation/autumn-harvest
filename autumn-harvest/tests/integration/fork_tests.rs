@@ -1537,10 +1537,22 @@ async fn only_a_recorded_fork_suppresses_completion_notifications() {
     let queue = unique("notify");
     let mut conn = connect(&url).await;
     let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let targets = json!([{ "url": "https://callbacks.invalid/done" }]);
+    diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
+        .set(harvest_workflow_executions::completion_callbacks.eq(Some(targets.clone())))
+        .execute(&mut conn)
+        .await
+        .expect("set the callback targets");
     let recorded = fork(&url, source, request(ForkEffects::Recorded)).await;
     let live = fork(&url, source, request(ForkEffects::Live)).await;
+    let live_of_recorded = fork(&url, recorded, request(ForkEffects::Live)).await;
 
-    for (exec_id, expected) in [(source, false), (recorded, true), (live, false)] {
+    for (exec_id, expected) in [
+        (source, false),
+        (recorded, true),
+        (live, false),
+        (live_of_recorded, false),
+    ] {
         let row = snapshot(&url, exec_id).await.0;
         assert_eq!(
             is_recorded_fork(&mut conn, &row)
@@ -1550,8 +1562,12 @@ async fn only_a_recorded_fork_suppresses_completion_notifications() {
             "{exec_id}"
         );
     }
-    let recorded_row = snapshot(&url, recorded).await.0;
-    assert_eq!(recorded_row.completion_callbacks, None);
+    // The marker gates the callbacks, so each row keeps the targets. A live
+    // fork of a recorded fork then sends them.
+    for exec_id in [recorded, live, live_of_recorded] {
+        let row = snapshot(&url, exec_id).await.0;
+        assert_eq!(row.completion_callbacks, Some(targets.clone()), "{exec_id}");
+    }
 }
 
 /// A running source stays running, with no new event, after a fork.
