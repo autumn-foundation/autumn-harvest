@@ -36,6 +36,9 @@ env:
   # construction*, so no magic list to keep in sync here). A manual dispatch can
   # supply explicit seeds to replay a printed failure verbatim.
   CHAOS_SEEDS: ${{ github.event.inputs.seeds || '' }}
+  # The chaos suite writes one TLA+ trace per task row here (issue #2003).
+  # The step after the suite checks each trace with TLC.
+  HARVEST_TLA_TRACE_DIR: /tmp/harvest-tla-traces
 
 jobs:
   chaos:
@@ -63,3 +66,15 @@ jobs:
         # serially keeps container resource use bounded. The suite is scoped to the
         # `chaos_tests` module so only the fault-injection tests run under `chaos`.
         run: 'cargo test -p autumn-harvest --features chaos --test integration chaos_tests:: -- --nocapture --test-threads=1'
+      - name: Check the chaos traces against the TLA+ specs
+        # Issue #2003. Each trace must be a behavior of ActivityClaim or
+        # WorkflowTaskClaim. Each red trace holds an injected violation, so
+        # TLC must reject it. See docs/testing/formal-methods.md.
+        run: scripts/check-formal-traces.sh "$HARVEST_TLA_TRACE_DIR"
+      - name: Upload the chaos traces
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: chaos-tla-traces
+          path: /tmp/harvest-tla-traces
+          if-no-files-found: ignore

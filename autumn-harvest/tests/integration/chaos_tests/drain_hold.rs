@@ -109,4 +109,5 @@ async fn chaos_repro_1813_drain_releases_a_claim_that_never_started() {
         drain < SHUTDOWN_TIMEOUT,
         "the release must not wait for the drain deadline: took {drain:?}; {diag}"
     );
+    super::tla_trace::export(&url, "repro-1813").await;
 }

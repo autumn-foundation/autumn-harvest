@@ -430,6 +430,10 @@ jobs:
         run: cargo clippy -p autumn-harvest-agent --all-targets --no-deps -- -D warnings
       - name: Clippy autumn-harvest-agent (sqlite feature)
         run: cargo clippy -p autumn-harvest-agent --all-targets --features sqlite --no-deps -- -D warnings
+      - name: Clippy autumn-harvest-agent (eval feature, issue #2001)
+        run: cargo clippy -p autumn-harvest-agent --all-targets --features eval --no-deps -- -D warnings
+      - name: Clippy autumn-harvest-agent (sqlite and eval features, issue #2001)
+        run: cargo clippy -p autumn-harvest-agent --all-targets --features sqlite,eval --no-deps -- -D warnings
       - name: Check autumn-harvest-agent depends on no Autumn crate outside the engine
         run: ./scripts/check-agent-adapter-deps.sh
       # Same issue #962 rule as every other crate on this page: a workspace
@@ -629,6 +633,16 @@ jobs:
       # Quoted for the trailing-`::` YAML reason above.
       - name: Run standalone-activity decision guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration standalone_activity_docs::"
+
+      # Issue #2004: the safety report lives under `docs/`, so a docs-only
+      # change skips the `test` matrix. These guards run here, ungated. They
+      # check that each result has a real command. They check that the
+      # report states each known limit.
+      #
+      # Guarded by `safety_report_docs::guards_run_on_docs_only_changes`.
+      # Quoted for the trailing-`::` YAML reason above.
+      - name: Run docs/safety-report.md guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration safety_report_docs::"
 
       # Folio corpus harness: internal link check across all of docs/ (see
       # docs/audits/corpus-link-check.py). Same reasoning as the docs-only
@@ -1142,10 +1156,11 @@ jobs:
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-sqlite
       # Issue #1973. Offline: a scripted model, no API key, no network. The
-      # crash test runs its own binary as a child process.
-      - name: Run autumn-harvest-agent tests (issue #1973)
+      # crash test runs its own binary as a child process. Issue #2001 adds
+      # the `eval` suite.
+      - name: Run autumn-harvest-agent tests (issues #1973, #2001)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
-        run: cargo test -p autumn-harvest-agent --features sqlite
+        run: cargo test -p autumn-harvest-agent --features sqlite,eval
       # The agent-daemon example's suite is offline: a scripted stub model, no
       # API key, and no network. Linux only, because the daemon's control
       # surface is a Unix domain socket.
@@ -2144,7 +2159,8 @@ jobs:
 
   # TLA+ models of the core protocols (issue #1819). The runner checks each
   # row of formal/tla/models.txt. A `violation:` row is a counter-example, and
-  # it must fail on its named invariant. See docs/testing/formal-methods.md.
+  # it must fail on its named invariant. The job also checks the trace
+  # fixtures (issue #2003). See docs/testing/formal-methods.md.
   formal-models:
     name: TLA+ models
     needs: changes
@@ -2153,12 +2169,17 @@ jobs:
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
       needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # A full run takes about 40 seconds. The runner image has Java.
+    # The models take about 40 seconds and the trace fixtures about 10.
+    # The runner image has Java and Python.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Model-check every manifest row with TLC
         run: scripts/check-formal-models.sh
+      # Issue #2003: TLC must accept each clean fixture trace and reject
+      # each red one. The chaos traces are checked in chaos.yml.
+      - name: Check the trace fixtures against the TLA+ specs
+        run: scripts/check-formal-traces.sh formal/tla/trace/fixtures
 
   # Kani proofs of the pure kernels (issue #1819). The script fails when Kani
   # verifies fewer proofs than the source holds, or when a cover check fails.

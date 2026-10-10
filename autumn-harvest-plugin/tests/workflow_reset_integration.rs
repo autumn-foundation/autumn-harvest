@@ -9,6 +9,10 @@ use std::time::Duration;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::models::WorkflowExecution;
+use autumn_harvest::reset::{
+    ResetSignalReapplyPolicy, WorkflowResetError, WorkflowResetRequest, preview_workflow_reset,
+    reset_workflow_execution,
+};
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::schema::{
     harvest_events, harvest_signals, harvest_task_queue, harvest_workflow_executions,
@@ -69,6 +73,8 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
+    // `POST /workflows/batch_reset` is admin-only. The host owns that boundary.
+    api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::new(HandlerRegistry::new(vec![], vec![])),
@@ -678,4 +684,295 @@ async fn reset_strips_stale_nd_diagnostic_search_attrs_from_fork() {
             "fork must not inherit the stale ND diagnostic key '{key}': {attrs}"
         );
     }
+}
+
+// ── a fork never uses a PII-erased source (issue #1999) ─────────────────────
+
+/// Seed a run in the terminal `state`.
+async fn seed_terminal_execution(
+    conn: &mut AsyncPgConnection,
+    workflow_id: &str,
+    state: &str,
+) -> ExecutionId {
+    let (exec_id, _) = seed_execution(conn, workflow_id).await;
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq(state),
+            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+        ))
+        .execute(conn)
+        .await
+        .expect("mark terminal");
+    exec_id
+}
+
+/// Erase the payloads of `exec_id`, as `POST /workflows/{id}/erase-payloads` does.
+async fn erase(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
+    let outcome =
+        autumn_harvest::erase::erase_workflow_payloads(conn, exec_id, "gdpr subject request")
+            .await
+            .expect("erase payloads");
+    assert!(
+        outcome.fields_tombstoned > 0,
+        "the fixture must erase something: {outcome:?}"
+    );
+}
+
+/// Seed a terminal run in `state` and erase its payloads.
+async fn seed_erased_execution(
+    conn: &mut AsyncPgConnection,
+    workflow_id: &str,
+    state: &str,
+) -> ExecutionId {
+    let exec_id = seed_terminal_execution(conn, workflow_id, state).await;
+    erase(conn, exec_id).await;
+    exec_id
+}
+
+/// Find the batch item for `exec_id`.
+fn batch_item(body: &Value, exec_id: ExecutionId) -> Value {
+    body["items"]
+        .as_array()
+        .expect("items array")
+        .iter()
+        .find(|item| item["exec_id"] == json!(exec_id.to_string()))
+        .cloned()
+        .unwrap_or_else(|| panic!("no batch item for {exec_id}: {body}"))
+}
+
+/// Count the reset forks of `exec_id`. A fork names its source in
+/// `start_source_ref` (issue #740).
+async fn fork_count(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64 {
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::start_source.eq(Some("reset")))
+        .filter(harvest_workflow_executions::start_source_ref.eq(Some(exec_id.to_string())))
+        .count()
+        .get_result(conn)
+        .await
+        .expect("count forks")
+}
+
+fn batch_reset_body(preview: bool) -> Value {
+    json!({
+        "filter": {
+            "workflow_name": "resettable",
+            "states": ["FAILED", "CANCELLED", "TIMED_OUT"]
+        },
+        "reset_point": { "type": "event_id", "event_id": 0 },
+        "reason": "replay the failed cohort",
+        "operator_id": "oncall",
+        "preview": preview
+    })
+}
+
+fn terminal_reset_request() -> WorkflowResetRequest {
+    WorkflowResetRequest {
+        reset_to_event_id: Some(0),
+        reset_point: None,
+        reason: "fork a terminal run".to_string(),
+        operator_id: "oncall".to_string(),
+        signal_reapply: ResetSignalReapplyPolicy::default(),
+        allow_terminal_source: true,
+    }
+}
+
+/// The engine refuses an erased source with no opt-in. This is what keeps
+/// every fork path safe, a future one included.
+#[tokio::test]
+async fn reset_refuses_an_erased_source_with_no_opt_in() {
+    let (url, _container) = setup_database().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+        .await
+        .expect("connect");
+    let exec_id = seed_erased_execution(&mut conn, "wf-erased-engine", "FAILED").await;
+
+    let error = reset_workflow_execution(&mut conn, exec_id, terminal_reset_request(), None)
+        .await
+        .expect_err("a fork over an erased source must be refused");
+
+    assert!(
+        matches!(error, WorkflowResetError::ErasedSource { .. }),
+        "expected ErasedSource, got: {error:?}"
+    );
+    assert_eq!(fork_count(&mut conn, exec_id).await, 0, "no fork exists");
+}
+
+/// A dry run must return the rejection the real reset returns. Otherwise a
+/// preview approves a fork that the reset then refuses.
+#[tokio::test]
+async fn preview_refuses_an_erased_source() {
+    let (url, _container) = setup_database().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+        .await
+        .expect("connect");
+    let exec_id = seed_erased_execution(&mut conn, "wf-erased-preview", "FAILED").await;
+
+    let error = preview_workflow_reset(&mut conn, exec_id, terminal_reset_request())
+        .await
+        .expect_err("a preview over an erased source must be refused");
+
+    assert!(
+        matches!(error, WorkflowResetError::ErasedSource { .. }),
+        "expected ErasedSource, got: {error:?}"
+    );
+}
+
+/// A batch reset must not fork a PII-erased run. The fork would resume on
+/// tombstones. The erased run is skipped with a typed reason. The intact run
+/// in the same cohort still resets.
+#[tokio::test]
+async fn batch_reset_skips_an_erased_source_and_resets_the_rest() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+        .await
+        .expect("connect");
+    let erased = seed_erased_execution(&mut conn, "wf-batch-erased", "TIMED_OUT").await;
+    let intact = seed_terminal_execution(&mut conn, "wf-batch-intact", "FAILED").await;
+
+    let (status, body) = post_json(&app, "/workflows/batch_reset", batch_reset_body(false)).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["total"], json!(2), "body: {body}");
+    assert_eq!(body["reset_count"], json!(1), "body: {body}");
+    assert_eq!(body["skipped_count"], json!(1), "body: {body}");
+
+    let skipped = batch_item(&body, erased);
+    assert_eq!(skipped["outcome"], json!("skipped"), "item: {skipped}");
+    assert_eq!(
+        skipped["skip_reason"],
+        json!({ "type": "erased_source" }),
+        "the skip must name erasure, not an infrastructure error: {skipped}"
+    );
+    assert!(skipped.get("new_exec_id").is_none(), "item: {skipped}");
+    assert_eq!(
+        fork_count(&mut conn, erased).await,
+        0,
+        "no fork of the erased run"
+    );
+
+    let reset = batch_item(&body, intact);
+    assert_eq!(reset["outcome"], json!("reset"), "item: {reset}");
+    assert_eq!(
+        fork_count(&mut conn, intact).await,
+        1,
+        "the intact run forks"
+    );
+}
+
+/// The dry run must predict the real outcome. It reports the erased run as
+/// skipped with the same typed reason.
+#[tokio::test]
+async fn batch_reset_preview_reports_an_erased_source_as_skipped() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+        .await
+        .expect("connect");
+    let erased = seed_erased_execution(&mut conn, "wf-batch-preview-erased", "CANCELLED").await;
+    let intact = seed_terminal_execution(&mut conn, "wf-batch-preview-intact", "FAILED").await;
+
+    let (status, body) = post_json(&app, "/workflows/batch_reset", batch_reset_body(true)).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["total"], json!(2), "body: {body}");
+    assert_eq!(body["reset_count"], json!(0), "body: {body}");
+    assert_eq!(body["skipped_count"], json!(1), "body: {body}");
+    let skipped = batch_item(&body, erased);
+    assert_eq!(skipped["outcome"], json!("skipped"), "item: {skipped}");
+    assert_eq!(skipped["skip_reason"], json!({ "type": "erased_source" }));
+    assert_eq!(batch_item(&body, intact)["outcome"], json!("previewed"));
+    assert_eq!(
+        fork_count(&mut conn, erased).await,
+        0,
+        "a preview forks nothing"
+    );
+    assert_eq!(
+        fork_count(&mut conn, intact).await,
+        0,
+        "a preview forks nothing"
+    );
+}
+
+/// Count the backends that wait for a lock.
+async fn lock_waiters(conn: &mut AsyncPgConnection) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Waiters {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    diesel::sql_query("SELECT count(*) AS n FROM pg_locks WHERE NOT granted")
+        .get_result::<Waiters>(conn)
+        .await
+        .expect("read pg_locks")
+        .n
+}
+
+/// An erasure can commit after the batch resolve and before the fork lock.
+/// The fork must refuse, and the item must keep the typed reason.
+///
+/// The erasure runs in an open transaction, so it holds the row lock. The
+/// unlocked resolve reads the intact row and passes. The fork then waits on
+/// the row lock. The erasure commits, and the fork reads the tombstone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_reset_refuses_an_erasure_that_lands_before_the_fork_lock() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+        .await
+        .expect("connect");
+    let exec_id = seed_terminal_execution(&mut conn, "wf-batch-race", "FAILED").await;
+
+    let (erased_tx, erased_rx) = tokio::sync::oneshot::channel::<()>();
+    let (commit_tx, commit_rx) = tokio::sync::oneshot::channel::<()>();
+    let eraser = tokio::spawn({
+        let url = url.clone();
+        async move {
+            let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+                .await
+                .expect("connect eraser");
+            conn.transaction::<(), diesel::result::Error, _>(async move |conn| {
+                erase(conn, exec_id).await;
+                erased_tx.send(()).expect("signal erased");
+                commit_rx.await.expect("commit signal");
+                Ok(())
+            })
+            .await
+            .expect("commit erasure");
+        }
+    });
+    erased_rx.await.expect("erasure is open");
+
+    let batch = tokio::spawn({
+        let app = app.clone();
+        async move { post_json(&app, "/workflows/batch_reset", batch_reset_body(false)).await }
+    });
+
+    // Wait until the fork blocks on the row lock that the erasure holds.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while lock_waiters(&mut conn).await == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the fork never waited on the row lock"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    commit_tx.send(()).expect("release the erasure");
+    eraser.await.expect("eraser task");
+    let (status, body) = batch.await.expect("batch task");
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let item = batch_item(&body, exec_id);
+    assert_eq!(item["outcome"], json!("skipped"), "item: {item}");
+    assert_eq!(
+        item["skip_reason"],
+        json!({ "type": "erased_source" }),
+        "a refusal at the fork must stay typed: {item}"
+    );
+    // Only a fork-time skip carries the resolved id. This proves the fork ran.
+    assert_eq!(item["resolved_event_id"], json!(0), "item: {item}");
+    assert_eq!(fork_count(&mut conn, exec_id).await, 0, "no fork exists");
 }
