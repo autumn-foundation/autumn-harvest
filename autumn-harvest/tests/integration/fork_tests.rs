@@ -679,7 +679,6 @@ async fn a_reset_of_a_recorded_fork_stays_recorded() {
             operator_id: "tester".to_string(),
             signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::Drop,
             allow_terminal_source: false,
-            refuse_erased_source: false,
         },
         Some(&registry()),
     )
@@ -732,7 +731,6 @@ async fn a_reset_of_a_nested_recorded_fork_stays_recorded() {
             operator_id: "tester".to_string(),
             signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::Drop,
             allow_terminal_source: false,
-            refuse_erased_source: false,
         },
         Some(&registry()),
     )
@@ -780,7 +778,6 @@ async fn a_reset_of_a_fork_keeps_its_overrides() {
             operator_id: "tester".to_string(),
             signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::Drop,
             allow_terminal_source: false,
-            refuse_erased_source: false,
         },
         Some(&registry()),
     )
@@ -876,7 +873,6 @@ async fn a_reset_of_a_fork_references_its_offloaded_overrides() {
             operator_id: "tester".to_string(),
             signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::Drop,
             allow_terminal_source: false,
-            refuse_erased_source: false,
         },
         Some(&offloading),
     )

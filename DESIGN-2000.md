@@ -13,8 +13,9 @@ source stays unchanged. By default, the fork does not run an effect again.
 ### 0.1 Facts found before the plan
 
 - Reset (`reset.rs`) seals the source `TERMINATED`. It rejects `COMPLETED`
-  and `TERMINATED` sources. It refuses an erased source only when an
-  in-process caller sets `refuse_erased_source`.
+  and `TERMINATED` sources. It refused an erased source only when an
+  in-process caller set `refuse_erased_source`. Issue #1999 later removed
+  that flag, so every reset now refuses an erased source.
 - Reset already copies a history prefix to a new execution on the same
   shard. It inserts new rows and never changes a source row.
 - Replay matches an activity by position and name, not by id. An
