@@ -115,8 +115,8 @@ pub struct QuiescenceObservation {
     pub live_external_tasks: i64,
     /// Non-terminal children on this shard.
     pub live_children: i64,
-    /// Non-terminal forks on this shard that name this execution as their
-    /// source (issue #2000). See [`QuiescenceBlocker::LiveFork`].
+    /// Live forks on this shard whose fork lineage holds this execution
+    /// (issue #2000). See [`QuiescenceBlocker::LiveFork`].
     pub live_forks: i64,
     /// In-flight `harvest_cross_shard_children` rows parented by this execution.
     pub cross_shard_child_rows: i64,
@@ -205,11 +205,12 @@ pub enum QuiescenceBlocker {
     /// an erased ancestor would go unseen. A fork therefore stays with its
     /// lineage.
     ForkLineage,
-    /// A fork that is not terminal names the execution as its source (issue
-    /// #2000). A recorded fork reads the outcomes of its source on its own
-    /// shard. A migrated source records its later outcomes on the target, so
-    /// the fork would not see them and would fail closed. The source therefore
-    /// stays until each of its forks is terminal.
+    /// The fork lineage of a live fork holds the execution (issue #2000). A
+    /// recorded fork reads the outcomes of its source on its own shard. A
+    /// migrated source records its later outcomes on the target, so the fork
+    /// would not see them and would fail closed. A reset of a fork reads the
+    /// source of the fork it resets. So every run in the lineage stays until
+    /// each live fork is terminal.
     LiveFork,
 }
 
@@ -243,7 +244,7 @@ impl QuiescenceBlocker {
             Self::ForkLineage => {
                 "the execution is a fork, which reads its source and lineage on this shard"
             }
-            Self::LiveFork => "a live fork on this shard reads this execution as its source",
+            Self::LiveFork => "a live fork on this shard has this execution in its fork lineage",
         }
     }
 }
@@ -718,6 +719,26 @@ mod db {
         resolve_forward_chain,
     };
 
+    /// The fork lineage of every live fork, as `lineage.source_ref` rows (issue
+    /// #2000). It starts at the source of each non-terminal fork. It then
+    /// follows `start_source_ref` up while the row is a fork, for at most 64
+    /// links. A reset of a fork names the sealed fork as its source, but its
+    /// marker names the original source. So the walk must reach past the
+    /// sealed fork. A macro, so both predicates use one literal.
+    macro_rules! live_fork_lineage_sql {
+        () => {
+            "WITH RECURSIVE lineage(source_ref, depth) AS ( \
+                SELECT f.start_source_ref, 1 FROM harvest_workflow_executions f \
+                 WHERE f.start_source = 'fork' \
+                   AND f.state IN ('RUNNING', 'PAUSED', 'MIGRATING', 'MIGRATED') \
+                UNION \
+                SELECT p.start_source_ref, l.depth + 1 FROM lineage l \
+                  JOIN harvest_workflow_executions p ON p.id::text = l.source_ref \
+                 WHERE p.start_source = 'fork' AND l.depth < 64 \
+             ) SELECT 1 FROM lineage l WHERE l.source_ref = e.id::text"
+        };
+    }
+
     /// The SQL half of the quiescence predicate, as one AND-able fragment over
     /// an alias `e` bound to `harvest_workflow_executions`.
     ///
@@ -726,7 +747,8 @@ mod db {
     /// SQL and Rust could drift, so it is written once and
     /// `the_sql_predicate_agrees_with_the_pure_predicate` in
     /// `shard_rebalance_db_tests.rs` pins them together against real rows.
-    const QUIESCENCE_SQL: &str = "\
+    const QUIESCENCE_SQL: &str = concat!(
+        "\
         e.state = 'RUNNING' \
         AND e.parent_id IS NULL \
         AND e.schedule_id IS NULL \
@@ -754,9 +776,9 @@ mod db {
             AND x.state = 'PENDING') \
         AND NOT EXISTS (SELECT 1 FROM harvest_workflow_executions c WHERE c.parent_id = e.id \
             AND c.state IN ('RUNNING', 'PAUSED', 'MIGRATING', 'MIGRATED')) \
-        AND NOT EXISTS (SELECT 1 FROM harvest_workflow_executions f \
-            WHERE f.start_source = 'fork' AND f.start_source_ref = e.id::text \
-            AND f.state IN ('RUNNING', 'PAUSED', 'MIGRATING', 'MIGRATED')) \
+        AND NOT EXISTS (",
+        live_fork_lineage_sql!(),
+        ") \
         AND NOT EXISTS (SELECT 1 FROM harvest_cross_shard_children x \
             WHERE x.parent_exec_id = e.id) \
         AND NOT EXISTS (SELECT 1 FROM harvest_mutex_locks ml \
@@ -764,7 +786,8 @@ mod db {
         AND NOT EXISTS (SELECT 1 FROM harvest_mutex_waiters mw \
             WHERE mw.waiter_exec_id = e.id) \
         AND NOT EXISTS (SELECT 1 FROM harvest_dead_letters dl \
-            WHERE dl.workflow_exec_id = e.id)";
+            WHERE dl.workflow_exec_id = e.id)"
+    );
 
     /// The second half of the cutover's `WHERE`: "the source history is still
     /// exactly the history verification passed on".
@@ -860,7 +883,8 @@ mod db {
         dead_letter_rows: i64,
     }
 
-    const OBSERVE_SQL: &str = "\
+    const OBSERVE_SQL: &str = concat!(
+        "\
         SELECT e.state, \
                e.parent_id, \
                (e.schedule_id IS NOT NULL) AS schedule_attributed, \
@@ -896,10 +920,9 @@ mod db {
                (SELECT count(*) FROM harvest_workflow_executions c WHERE c.parent_id = e.id \
                   AND c.state IN ('RUNNING', 'PAUSED', 'MIGRATING', 'MIGRATED'))::BIGINT \
                   AS live_children, \
-               (SELECT count(*) FROM harvest_workflow_executions f \
-                  WHERE f.start_source = 'fork' AND f.start_source_ref = e.id::text \
-                  AND f.state IN ('RUNNING', 'PAUSED', 'MIGRATING', 'MIGRATED'))::BIGINT \
-                  AS live_forks, \
+               (SELECT count(*) FROM (",
+        live_fork_lineage_sql!(),
+        ") AS live)::BIGINT AS live_forks, \
                (SELECT count(*) FROM harvest_cross_shard_children x \
                   WHERE x.parent_exec_id = e.id)::BIGINT AS cross_shard_child_rows, \
                (SELECT count(*) FROM harvest_mutex_locks ml \
@@ -909,7 +932,8 @@ mod db {
                (SELECT count(*) FROM harvest_dead_letters dl \
                   WHERE dl.workflow_exec_id = e.id)::BIGINT AS dead_letter_rows \
         FROM harvest_workflow_executions e \
-        WHERE e.id = $1";
+        WHERE e.id = $1"
+    );
 
     /// Gather the facts [`assess_quiescence`] needs for one execution.
     ///

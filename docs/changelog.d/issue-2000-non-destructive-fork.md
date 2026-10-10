@@ -55,9 +55,10 @@ shard are refused. The erased-lineage walk locks each ancestor and fails
 closed past 64 links. A lineage that reaches a deleted run fails closed
 too, because retention can delete an erased run.
 In recorded mode, a source suffix with an effect that the mode cannot serve
-is refused with `409`. A mutex grant after the fork point counts as one. A fork history that reaches the worker history event
-cap or byte cap (issue #1804) is refused with `409` too. The first workflow
-task of that fork would dead-letter it.
+is refused with `409`. A mutex grant after the fork point counts as one. A
+fork history that reaches the worker history event cap or byte cap (issue
+#1804) is refused with `409` too. The first workflow task of that fork would
+dead-letter it.
 
 **Admission.** A fork is a fresh start. An admission gate (issue #618)
 refuses it with `503`, and load shedding (issue #1794) with `429`.
@@ -66,16 +67,18 @@ refuses it with `503`, and load shedding (issue #1794) with `429`.
 (issue #946), as a start is. The key resolves from the fork input under
 the current policy: a kept input is decoded, and a new input is used as
 is. A fork over a cap is refused with
-`429`, and the fork row stores its key. The history cap counts the copied
-prefix, a new input and the appended events, because a fork starts with
-that history. The measure is an upper bound. An override that the
-offloader stores out of line counts as its envelope.
+`429`, and the fork row stores its key. A fork starts with a history, so
+the history quota and the worker caps count it. The fork measures its
+stored rows after the insert, in the same transaction, with
+`pg_column_size`. That is the measure of the quota and the worker, so it is
+exact. A fork over a cap rolls back.
 
 **Shard rebalancing.** A fork never migrates on its own (issue #964). It
 reads its source and walks its lineage on its own shard, so the new
 `ForkLineage` quiescence blocker keeps it with them. The source cannot move
 away from a fork either. The new `LiveFork` blocker keeps a run on its
-shard while a fork that names it as its source is not terminal.
+shard while it is in the fork lineage of a live fork. A reset of a fork
+reads the source of the fork it resets, so the walk follows the lineage up.
 
 **Lineage.** The fork row has `start_source = fork` and
 `start_source_ref = <source id>`. Its history holds a `WorkflowForked`

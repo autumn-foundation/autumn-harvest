@@ -1354,6 +1354,60 @@ async fn the_history_quota_counts_an_offloaded_override_as_its_envelope() {
     );
 }
 
+/// The history cap reads the stored fork rows with the worker measure, so it
+/// is exact. A byte cap at the stored size refuses the fork. One byte more
+/// admits the same fork.
+#[tokio::test]
+async fn the_history_cap_uses_the_stored_measure() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("cap-measure");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let mut overrides = request(ForkEffects::Recorded);
+    overrides.activity_overrides = (1..=50)
+        .map(|occurrence| ForkActivityOverride {
+            activity_name: "fork_charge".to_string(),
+            occurrence,
+            output: json!({ "n": occurrence }),
+        })
+        .collect();
+    let free = fork_workflow_execution(&mut conn, source, overrides.clone(), Some(&registry()))
+        .await
+        .expect("fork without a cap")
+        .new_exec_id;
+    let stored: i64 = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(free.as_uuid()))
+        .select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+            "COALESCE(SUM(pg_column_size(event_data)), 0)::BIGINT",
+        ))
+        .first(&mut conn)
+        .await
+        .expect("measure the fork");
+    let stored = u64::try_from(stored).expect("size");
+    let capped = |cap: u64| {
+        HandlerRegistry::new(
+            vec![fork_pay_wf_info()],
+            activities![fork_charge, fork_receipt],
+        )
+        .with_history_policy(
+            autumn_harvest::WorkflowHistoryPolicy::default().with_byte_hard_cap(cap),
+        )
+    };
+    let at_cap =
+        fork_workflow_execution(&mut conn, source, overrides.clone(), Some(&capped(stored))).await;
+    assert!(
+        matches!(
+            at_cap,
+            Err(WorkflowForkError::HistoryCapReached { measure: "bytes", observed, .. })
+                if observed == stored
+        ),
+        "a fork at the cap is refused with its stored size: {at_cap:?}"
+    );
+    fork_workflow_execution(&mut conn, source, overrides, Some(&capped(stored + 1)))
+        .await
+        .expect("one byte under the cap is admitted");
+}
+
 /// A fork whose history reaches a worker history cap could never run. Its
 /// first workflow task would dead-letter it. So the fork is refused, and no
 /// row is written.

@@ -5279,6 +5279,42 @@ async fn the_source_of_a_live_fork_is_refused_by_the_sql_predicate_too() {
 }
 
 #[tokio::test]
+async fn the_source_of_a_reset_fork_is_refused_too() {
+    // A reset of a fork names the sealed fork as its source. Its marker names
+    // the original source, which it reads (issue #2000). So the predicate
+    // walks the fork lineage past the sealed fork.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "lineage-source").await;
+    let sealed = quiescent_fixture(&shards, "sealed-fork").await;
+    let reset = quiescent_fixture(&shards, "reset-of-fork").await;
+
+    let mut source = shards.source().await;
+    for (fork, of, state) in [(sealed, exec_id, "TERMINATED"), (reset, sealed, "RUNNING")] {
+        diesel::sql_query(
+            "UPDATE harvest_workflow_executions SET start_source = 'fork', \
+             start_source_ref = $2, state = $3 WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(fork.as_uuid())
+        .bind::<diesel::sql_types::Text, _>(of.as_uuid().to_string())
+        .bind::<diesel::sql_types::Text, _>(state)
+        .execute(&mut source)
+        .await
+        .expect("mark the fork lineage");
+    }
+
+    let verdict = assess_quiescence(&observe_quiescence(&mut source, exec_id).await.expect("obs"));
+    assert!(verdict.blockers().contains(&QuiescenceBlocker::LiveFork));
+    let outcome = migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate must not error, only decline");
+    assert!(
+        matches!(outcome, MigrationOutcome::Skipped { .. }),
+        "expected a skip with named blockers, got {outcome:?}"
+    );
+    assert_eq!(authoritative_shards(&shards, exec_id).await, vec![SOURCE]);
+}
+
+#[tokio::test]
 async fn cancelling_a_sealed_source_is_left_pending_not_reported_delivered() {
     // The cancel outbox maps a terminal-state error to `ExternalCancelDelivered`
     // and never retries. A rebalanced seal is not terminal — the run is alive

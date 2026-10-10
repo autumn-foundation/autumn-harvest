@@ -266,16 +266,6 @@ async fn fork_in_transaction(
         }
     };
     let plan = validate_fork(&events, fork_event_id, request)?;
-    let (tail, history_bytes) = measure_fork_history(
-        conn,
-        registry,
-        source_id,
-        request,
-        codecs,
-        fork_event_id,
-        plan.events_carried_over,
-    )
-    .await?;
 
     let workflow_id = fork_workflow_id(conn, &source, request).await?;
 
@@ -284,21 +274,12 @@ async fn fork_in_transaction(
         Some(input) => codecs.encode_column(input)?,
         None => source.input.clone(),
     };
-    let quota_key = admit_fork(
-        conn,
-        registry,
-        &source,
-        request,
-        codecs,
-        new_exec_id,
-        history_bytes,
-    )
-    .await?;
+    let quota = admit_fork(conn, registry, &source, request, codecs, new_exec_id).await?;
     let row = crate::reset::ForkRow {
         workflow_id: &workflow_id,
         input,
         start_source: StartSource::Fork,
-        quota_key: quota_key.as_deref(),
+        quota_key: quota.as_ref().map(|(key, _)| key.as_str()),
         // A completion callback notifies an outside system. Only a live fork
         // may do that.
         completion_callbacks: match request.effects {
@@ -327,6 +308,7 @@ async fn fork_in_transaction(
     .await?;
     let kept_input = request.input.is_none().then_some(&source.input);
     share_payload_refs(conn, source_id, new_exec_id, &copied, kept_input).await?;
+    let tail = fork_tail(source_id, fork_event_id, request);
     let tail_start = i32::try_from(plan.events_carried_over)
         .map_err(|_| HarvestError::Database("fork carried too many events".to_string()))?;
     crate::store::append_events_offloaded_with_codecs(
@@ -336,6 +318,17 @@ async fn fork_in_transaction(
         tail_start,
         registry.and_then(HandlerRegistry::payload_offloader),
         codecs,
+    )
+    .await?;
+    let history_quota = quota
+        .as_ref()
+        .and_then(|(key, limit)| limit.map(|limit| (key.as_str(), limit)));
+    check_stored_history(
+        conn,
+        registry,
+        &source.workflow_name,
+        new_exec_id,
+        history_quota,
     )
     .await?;
     crate::reset::enqueue_fork_workflow_task(conn, &fork, new_exec_id, registry).await?;
@@ -617,7 +610,8 @@ async fn erased_fork_ancestor(
     }
 }
 
-/// Admit the fork as a fresh start, and return its tenant quota key.
+/// Admit the fork as a fresh start. Return its tenant quota key and the
+/// history byte limit of that quota.
 ///
 /// A fork adds a runnable run beside its source, so it passes the same checks
 /// as a start. First come the admission gate (issue #618) and load shedding
@@ -625,7 +619,8 @@ async fn erased_fork_ancestor(
 /// #946). The key resolves from the fork input under the current policy. A
 /// kept input is decoded first. The key that the source stored can be stale
 /// after a policy change, so it is not reused. The check runs under the key
-/// lock, and the fork row stores the key.
+/// lock, and the fork row stores the key. The history limit is checked after
+/// the insert, by [`check_stored_history`].
 async fn admit_fork(
     conn: &mut AsyncPgConnection,
     registry: Option<&HandlerRegistry>,
@@ -633,8 +628,7 @@ async fn admit_fork(
     request: &WorkflowForkRequest,
     codecs: &PayloadCodecs,
     new_exec_id: ExecutionId,
-    history_bytes: u64,
-) -> HarvestResult<Option<String>> {
+) -> HarvestResult<Option<(String, Option<u64>)>> {
     let name = source.workflow_name.as_str();
     crate::execution::admit_fresh_start(
         crate::admission_gate::GateMode::Check,
@@ -688,79 +682,65 @@ async fn admit_fork(
         new_exec_id,
     )
     .await?;
-    // A fork starts with a history. A start has no history yet, so the quota
-    // must count the fork history here, before the insert.
-    if let Some(limit) = policy.max_history_bytes {
-        let usage =
-            crate::quota::load_quota_usage_excluding(conn, name, &key, &[new_exec_id.as_uuid()])
-                .await?;
+    Ok(Some((key, policy.max_history_bytes)))
+}
+
+/// The stored size of the fork history, in the measures of the worker caps.
+#[derive(diesel::QueryableByName)]
+struct StoredHistory {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    events: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    bytes: i64,
+}
+
+/// Refuse a fork whose stored history reaches a history cap or quota.
+///
+/// The check runs after the insert, in the fork transaction. It reads the
+/// stored rows with `pg_column_size`, the measure of the worker and of the
+/// quota. So it is exact for compression, offloaded fields and row overhead.
+/// A refusal rolls the whole fork back.
+async fn check_stored_history(
+    conn: &mut AsyncPgConnection,
+    registry: Option<&HandlerRegistry>,
+    workflow_name: &str,
+    new_exec_id: ExecutionId,
+    history_quota: Option<(&str, u64)>,
+) -> Result<(), WorkflowForkError> {
+    let stored: StoredHistory = diesel::sql_query(
+        "SELECT count(*)::BIGINT AS events, \
+                COALESCE(SUM(pg_column_size(event_data)), 0)::BIGINT AS bytes \
+           FROM harvest_events WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(new_exec_id.as_uuid())
+    .get_result(conn)
+    .await?;
+    let bytes = u64::try_from(stored.bytes).unwrap_or(0);
+    if let Some(registry) = registry {
+        let events = u64::try_from(stored.events).unwrap_or(0);
+        check_history_caps(registry.history_policy(), events, bytes)?;
+    }
+    if let Some((key, limit)) = history_quota {
+        let usage = crate::quota::load_quota_usage_excluding(
+            conn,
+            workflow_name,
+            key,
+            &[new_exec_id.as_uuid()],
+        )
+        .await?;
         let current = u64::try_from(usage.history_bytes).unwrap_or(0);
-        if current.saturating_add(history_bytes) > limit {
+        if current.saturating_add(bytes) > limit {
             return Err(HarvestError::QuotaExceeded {
-                workflow_name: name.to_string(),
-                key,
+                workflow_name: workflow_name.to_string(),
+                key: key.to_string(),
                 resource: crate::quota::QuotaResource::HistoryBytes,
                 limit,
                 current,
-            });
+            }
+            .into());
         }
     }
-    Ok(Some(key))
-}
-
-/// An upper bound of the bytes that the fork stores beyond the source prefix.
-///
-/// It counts the encoded marker and override events of the tail, as the
-/// offloader stores them. A new input adds its encoded size. The replaced input stays in the prefix
-/// measure, so the bound errs high and the cap fails closed.
-fn added_bytes(
-    request: &WorkflowForkRequest,
-    codecs: &PayloadCodecs,
-    offloader: Option<&crate::payload_store::PayloadOffloader>,
-    tail: &[WorkflowEvent],
-) -> HarvestResult<u64> {
-    let size = |value: &Value| serde_json::to_vec(value).map_or(0, |bytes| bytes.len() as u64);
-    let mut bytes = match &request.input {
-        Some(input) => size(&codecs.encode_column(input)?),
-        None => 0,
-    };
-    // The tail is offloaded as it is appended, so a large override counts as
-    // its envelope.
-    for event in tail {
-        let encoded = codecs.encode_event(event)?;
-        let stored = offloader.map_or_else(|| size(&encoded), |off| off.offloaded_size(&encoded));
-        bytes = bytes.saturating_add(stored);
-    }
-    Ok(bytes)
-}
-
-/// Build the fork tail and measure the fork history in stored bytes.
-///
-/// The worker sums the same measures. So the fork history is checked against
-/// its caps here, before any row is written.
-async fn measure_fork_history(
-    conn: &mut AsyncPgConnection,
-    registry: Option<&HandlerRegistry>,
-    source_id: ExecutionId,
-    request: &WorkflowForkRequest,
-    codecs: &PayloadCodecs,
-    fork_event_id: i64,
-    carried: usize,
-) -> Result<(Vec<WorkflowEvent>, u64), WorkflowForkError> {
-    let tail = fork_tail(source_id, fork_event_id, request);
-    let bytes = prefix_bytes(conn, source_id.as_uuid(), fork_event_id)
-        .await?
-        .saturating_add(added_bytes(
-            request,
-            codecs,
-            registry.and_then(HandlerRegistry::payload_offloader),
-            &tail,
-        )?);
-    if let Some(registry) = registry {
-        let events = (carried as u64).saturating_add(tail.len() as u64);
-        check_history_caps(registry.history_policy(), events, bytes)?;
-    }
-    Ok((tail, bytes))
+    Ok(())
 }
 
 /// Refuse a fork history that reaches a worker history cap.
@@ -783,27 +763,6 @@ fn check_history_caps(
     breach("events", events, policy.event_hard_cap())
         .or_else(|| breach("bytes", bytes, policy.byte_hard_cap()))
         .map_or(Ok(()), Err)
-}
-
-/// The stored bytes of the source events up to `fork_event_id`.
-///
-/// The measure is `pg_column_size`, as for the quota usage of a key.
-async fn prefix_bytes(
-    conn: &mut AsyncPgConnection,
-    source_id: Uuid,
-    fork_event_id: i64,
-) -> HarvestResult<u64> {
-    let last = i32::try_from(fork_event_id).unwrap_or(i32::MAX);
-    let bytes: i64 = harvest_events::table
-        .filter(harvest_events::workflow_exec_id.eq(source_id))
-        .filter(harvest_events::event_id.le(last))
-        .select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
-            "COALESCE(SUM(pg_column_size(event_data)), 0)::BIGINT",
-        ))
-        .first(conn)
-        .await
-        .map_err(database_error)?;
-    Ok(u64::try_from(bytes).unwrap_or(0))
 }
 
 /// Apply the start checks of the workflow type to an input override.
