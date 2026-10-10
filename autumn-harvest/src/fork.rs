@@ -1234,8 +1234,23 @@ fn decision_siblings(events: &[WorkflowEvent], index: usize) -> std::ops::Range<
 /// The error text of the terminal that `ctx.race()` writes for a loser.
 const RACE_LOSER_ERROR: &str = "lost race to a sibling branch";
 
+/// Whether `event` is the terminal that `apply_race_loser_cancellations` writes.
+///
+/// The text alone is not enough. An activity can fail with the same text.
+/// The engine terminal also has attempt 1, type `Error`, no retry and no
+/// details, so the whole shape must match.
 fn is_race_loser(event: &WorkflowEvent) -> bool {
-    matches!(event, WorkflowEvent::ActivityFailed { error, .. } if error == RACE_LOSER_ERROR)
+    matches!(
+        event,
+        WorkflowEvent::ActivityFailed {
+            error,
+            attempt: 1,
+            error_type,
+            non_retryable: true,
+            details: None,
+            ..
+        } if error == RACE_LOSER_ERROR && error_type == "Error"
+    )
 }
 
 /// A failure that the engine wrote, not one that the activity returned.
@@ -1780,6 +1795,38 @@ mod tests {
                 assert!(is_unavailable(&resolution), "{resolution:?}");
             }
         }
+    }
+
+    #[test]
+    fn an_application_failure_with_the_race_text_is_not_a_race_loser() {
+        let first = ActivityExecId::new();
+        // The activity itself failed with this text after three attempts.
+        let source = vec![
+            started(json!({})),
+            scheduled(first, "slow", json!({})),
+            WorkflowEvent::ActivityFailed {
+                activity_id: first,
+                error: RACE_LOSER_ERROR.to_string(),
+                attempt: 3,
+                error_type: "Error".to_string(),
+                non_retryable: false,
+                details: None,
+            },
+        ];
+        let id = ActivityExecId::new();
+        let fork = vec![
+            started(json!({})),
+            marker(ForkEffects::Recorded),
+            scheduled(id, "slow", json!({})),
+        ];
+        let resolution = resolve_activity(&fork, &source, id);
+        assert!(
+            matches!(
+                resolution,
+                ForkResolution::Serve(WorkflowEvent::ActivityFailed { attempt: 3, .. })
+            ),
+            "the recorded failure is served: {resolution:?}"
+        );
     }
 
     #[test]

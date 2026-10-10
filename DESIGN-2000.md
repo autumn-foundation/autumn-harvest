@@ -152,6 +152,7 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | A source with no stored quota key skips admission. | Resolve the key from the decoded source input. |
 | The override cap refuses an output that the offloader would store. | Exempt it, as the worker exempts a real result. |
 | 16,384 payload references or more exceed the bind limit. | Insert the references in chunks of 1,000 rows. |
+| An activity failure with the race text is held as a race loser. | Match the whole shape of the engine terminal. |
 
 ## 2. Tests
 
