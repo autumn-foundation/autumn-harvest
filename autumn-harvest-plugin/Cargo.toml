@@ -104,7 +104,7 @@ tower = "0.5"
 # operator role (issue #776) matches a request's nest-stripped path against
 # CLASSIFIED_ROUTES to recover its RouteClass, with correct static-beats-param
 # precedence. MatchedPath is unusable in a nested-router layer (axum #1441).
-matchit = "0.8"
+matchit = "0.9"
 # Strict (non-lossy) percent-decoding for `GET /admin/queue-coverage`'s raw
 # query string (issue #774 review): axum's built-in `Query` extractor is
 # backed by `serde_urlencoded`/`form_urlencoded`, which always succeeds by
