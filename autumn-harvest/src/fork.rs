@@ -186,6 +186,20 @@ pub enum WorkflowForkError {
         /// The scan bound.
         depth: usize,
     },
+    /// The fork history reaches a worker history cap (issue #1804). The first
+    /// workflow task would dead-letter the fork, so it is refused.
+    #[error(
+        "the fork would store {observed} history {measure}, which reaches the cap of {cap}; fork \
+         at an earlier point or with fewer overrides"
+    )]
+    HistoryCapReached {
+        /// The capped measure: `events` or `bytes`.
+        measure: &'static str,
+        /// The prospective value of the measure.
+        observed: u64,
+        /// The cap.
+        cap: u64,
+    },
     /// The source shard cannot take the fork, or the business key cannot be
     /// checked on every shard.
     #[error("{message}")]
@@ -241,30 +255,7 @@ async fn fork_in_transaction(
     registry: Option<&HandlerRegistry>,
     codecs: &PayloadCodecs,
 ) -> Result<ForkResult, WorkflowForkError> {
-    let source = harvest_workflow_executions::table
-        .find(source_id.as_uuid())
-        .for_share()
-        .select(WorkflowExecution::as_select())
-        .first(conn)
-        .await
-        .optional()?
-        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {source_id}")))?;
-    // Issue #495: an erased source is refused in every effects mode. The
-    // check reads the locked row, before any event is read.
-    if crate::erase::execution_input_is_erased(&source.input) {
-        return Err(WorkflowForkError::ErasedSource { exec_id: source_id });
-    }
-    // Erasure does not reach a fork, which is a new root. So a fork of a fork
-    // of an erased run is refused too.
-    if let Some(erased) = erased_fork_ancestor(conn, &source).await? {
-        return Err(WorkflowForkError::ErasedSource { exec_id: erased });
-    }
-    if let (Some(input), Some(registry)) = (&request.input, registry) {
-        check_input_override(registry, &source.workflow_name, input)?;
-    }
-    if let Some(registry) = registry {
-        check_override_outputs(registry, &request.activity_overrides)?;
-    }
+    let source = load_fork_source(conn, source_id, request, registry).await?;
 
     let rows = crate::reset::load_event_rows(conn, source_id).await?;
     let events = decode_rows(&rows, codecs)?;
@@ -275,6 +266,16 @@ async fn fork_in_transaction(
         }
     };
     let plan = validate_fork(&events, fork_event_id, request)?;
+    let (tail, history_bytes) = measure_fork_history(
+        conn,
+        registry,
+        source_id,
+        request,
+        codecs,
+        fork_event_id,
+        plan.events_carried_over,
+    )
+    .await?;
 
     let workflow_id = fork_workflow_id(conn, &source, request).await?;
 
@@ -290,7 +291,7 @@ async fn fork_in_transaction(
         request,
         codecs,
         new_exec_id,
-        fork_event_id,
+        history_bytes,
     )
     .await?;
     let row = crate::reset::ForkRow {
@@ -326,7 +327,6 @@ async fn fork_in_transaction(
     .await?;
     let kept_input = request.input.is_none().then_some(&source.input);
     share_payload_refs(conn, source_id, new_exec_id, &copied, kept_input).await?;
-    let tail = fork_tail(source_id, fork_event_id, request);
     let tail_start = i32::try_from(plan.events_carried_over)
         .map_err(|_| HarvestError::Database("fork carried too many events".to_string()))?;
     crate::store::append_events_offloaded_with_codecs(
@@ -348,6 +348,40 @@ async fn fork_in_transaction(
         events_carried_over: plan.events_carried_over,
         effects: request.effects,
     })
+}
+
+/// Load the source row `FOR SHARE` and apply the checks that need no history.
+async fn load_fork_source(
+    conn: &mut AsyncPgConnection,
+    source_id: ExecutionId,
+    request: &WorkflowForkRequest,
+    registry: Option<&HandlerRegistry>,
+) -> Result<WorkflowExecution, WorkflowForkError> {
+    let source = harvest_workflow_executions::table
+        .find(source_id.as_uuid())
+        .for_share()
+        .select(WorkflowExecution::as_select())
+        .first(conn)
+        .await
+        .optional()?
+        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {source_id}")))?;
+    // Issue #495: an erased source is refused in every effects mode. The
+    // check reads the locked row, before any event is read.
+    if crate::erase::execution_input_is_erased(&source.input) {
+        return Err(WorkflowForkError::ErasedSource { exec_id: source_id });
+    }
+    // Erasure does not reach a fork, which is a new root. So a fork of a fork
+    // of an erased run is refused too.
+    if let Some(erased) = erased_fork_ancestor(conn, &source).await? {
+        return Err(WorkflowForkError::ErasedSource { exec_id: erased });
+    }
+    if let (Some(input), Some(registry)) = (&request.input, registry) {
+        check_input_override(registry, &source.workflow_name, input)?;
+    }
+    if let Some(registry) = registry {
+        check_override_outputs(registry, &request.activity_overrides)?;
+    }
+    Ok(source)
 }
 
 /// The workflow id of the fork: the caller's choice, or a new derived id.
@@ -599,7 +633,7 @@ async fn admit_fork(
     request: &WorkflowForkRequest,
     codecs: &PayloadCodecs,
     new_exec_id: ExecutionId,
-    fork_event_id: i64,
+    history_bytes: u64,
 ) -> HarvestResult<Option<String>> {
     let name = source.workflow_name.as_str();
     crate::execution::admit_fresh_start(
@@ -654,17 +688,14 @@ async fn admit_fork(
         new_exec_id,
     )
     .await?;
-    // A fork starts with the copied prefix. A start has no history yet, so
-    // the history cap must count the prefix here, before the insert.
+    // A fork starts with a history. A start has no history yet, so the quota
+    // must count the fork history here, before the insert.
     if let Some(limit) = policy.max_history_bytes {
-        let prefix = prefix_bytes(conn, source.id, fork_event_id)
-            .await?
-            .saturating_add(added_bytes(source, request, codecs, fork_event_id)?);
         let usage =
             crate::quota::load_quota_usage_excluding(conn, name, &key, &[new_exec_id.as_uuid()])
                 .await?;
         let current = u64::try_from(usage.history_bytes).unwrap_or(0);
-        if current.saturating_add(prefix) > limit {
+        if current.saturating_add(history_bytes) > limit {
             return Err(HarvestError::QuotaExceeded {
                 workflow_name: name.to_string(),
                 key,
@@ -683,21 +714,65 @@ async fn admit_fork(
 /// input adds its encoded size. The replaced input stays in the prefix
 /// measure, so the bound errs high and the cap fails closed.
 fn added_bytes(
-    source: &WorkflowExecution,
     request: &WorkflowForkRequest,
     codecs: &PayloadCodecs,
-    fork_event_id: i64,
+    tail: &[WorkflowEvent],
 ) -> HarvestResult<u64> {
     let size = |value: &Value| serde_json::to_vec(value).map_or(0, |bytes| bytes.len() as u64);
     let mut bytes = match &request.input {
         Some(input) => size(&codecs.encode_column(input)?),
         None => 0,
     };
-    let source_id = ExecutionId::from_uuid(source.id);
-    for event in fork_tail(source_id, fork_event_id, request) {
-        bytes = bytes.saturating_add(size(&codecs.encode_event(&event)?));
+    for event in tail {
+        bytes = bytes.saturating_add(size(&codecs.encode_event(event)?));
     }
     Ok(bytes)
+}
+
+/// Build the fork tail and measure the fork history in stored bytes.
+///
+/// The worker sums the same measures. So the fork history is checked against
+/// its caps here, before any row is written.
+async fn measure_fork_history(
+    conn: &mut AsyncPgConnection,
+    registry: Option<&HandlerRegistry>,
+    source_id: ExecutionId,
+    request: &WorkflowForkRequest,
+    codecs: &PayloadCodecs,
+    fork_event_id: i64,
+    carried: usize,
+) -> Result<(Vec<WorkflowEvent>, u64), WorkflowForkError> {
+    let tail = fork_tail(source_id, fork_event_id, request);
+    let bytes = prefix_bytes(conn, source_id.as_uuid(), fork_event_id)
+        .await?
+        .saturating_add(added_bytes(request, codecs, &tail)?);
+    if let Some(registry) = registry {
+        let events = (carried as u64).saturating_add(tail.len() as u64);
+        check_history_caps(registry.history_policy(), events, bytes)?;
+    }
+    Ok((tail, bytes))
+}
+
+/// Refuse a fork history that reaches a worker history cap.
+///
+/// The worker fails a run when its history count or its stored bytes reach a
+/// cap. A fork at the cap could not run one workflow task.
+fn check_history_caps(
+    policy: crate::context::WorkflowHistoryPolicy,
+    events: u64,
+    bytes: u64,
+) -> Result<(), WorkflowForkError> {
+    let breach = |measure, observed, cap: Option<u64>| {
+        cap.filter(|cap| observed >= *cap)
+            .map(|cap| WorkflowForkError::HistoryCapReached {
+                measure,
+                observed,
+                cap,
+            })
+    };
+    breach("events", events, policy.event_hard_cap())
+        .or_else(|| breach("bytes", bytes, policy.byte_hard_cap()))
+        .map_or(Ok(()), Err)
 }
 
 /// The stored bytes of the source events up to `fork_event_id`.
@@ -2330,6 +2405,24 @@ mod tests {
             validate_fork(&source, 2, &many(cap + 1)),
             Err(WorkflowForkError::InvalidOverride { .. })
         ));
+    }
+
+    #[test]
+    fn a_history_at_a_worker_cap_is_refused() {
+        let policy = crate::context::WorkflowHistoryPolicy::default()
+            .with_event_hard_cap(10)
+            .with_byte_hard_cap(100);
+        assert!(check_history_caps(policy, 9, 99).is_ok());
+        let refused = |events, bytes| match check_history_caps(policy, events, bytes) {
+            Err(WorkflowForkError::HistoryCapReached { measure, .. }) => Some(measure),
+            _ => None,
+        };
+        assert_eq!(refused(10, 0), Some("events"));
+        assert_eq!(refused(0, 100), Some("bytes"));
+        let unlimited = crate::context::WorkflowHistoryPolicy::default()
+            .without_event_hard_cap()
+            .without_byte_hard_cap();
+        assert!(check_history_caps(unlimited, u64::MAX, u64::MAX).is_ok());
     }
 
     #[test]

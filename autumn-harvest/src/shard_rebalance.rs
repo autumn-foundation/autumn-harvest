@@ -115,6 +115,9 @@ pub struct QuiescenceObservation {
     pub live_external_tasks: i64,
     /// Non-terminal children on this shard.
     pub live_children: i64,
+    /// Non-terminal forks on this shard that name this execution as their
+    /// source (issue #2000). See [`QuiescenceBlocker::LiveFork`].
+    pub live_forks: i64,
     /// In-flight `harvest_cross_shard_children` rows parented by this execution.
     pub cross_shard_child_rows: i64,
     /// Durable mutex keys this execution currently **holds**
@@ -202,6 +205,12 @@ pub enum QuiescenceBlocker {
     /// an erased ancestor would go unseen. A fork therefore stays with its
     /// lineage.
     ForkLineage,
+    /// A fork that is not terminal names the execution as its source (issue
+    /// #2000). A recorded fork reads the outcomes of its source on its own
+    /// shard. A migrated source records its later outcomes on the target, so
+    /// the fork would not see them and would fail closed. The source therefore
+    /// stays until each of its forks is terminal.
+    LiveFork,
 }
 
 impl QuiescenceBlocker {
@@ -234,6 +243,7 @@ impl QuiescenceBlocker {
             Self::ForkLineage => {
                 "the execution is a fork, which reads its source and lineage on this shard"
             }
+            Self::LiveFork => "a live fork on this shard reads this execution as its source",
         }
     }
 }
@@ -315,6 +325,9 @@ pub fn assess_quiescence(obs: &QuiescenceObservation) -> Quiescence {
     }
     if obs.live_children > 0 {
         blockers.push(QuiescenceBlocker::LiveChild);
+    }
+    if obs.live_forks > 0 {
+        blockers.push(QuiescenceBlocker::LiveFork);
     }
     if obs.cross_shard_child_rows > 0 {
         blockers.push(QuiescenceBlocker::CrossShardChildRow);
@@ -741,6 +754,9 @@ mod db {
             AND x.state = 'PENDING') \
         AND NOT EXISTS (SELECT 1 FROM harvest_workflow_executions c WHERE c.parent_id = e.id \
             AND c.state IN ('RUNNING', 'PAUSED', 'MIGRATING', 'MIGRATED')) \
+        AND NOT EXISTS (SELECT 1 FROM harvest_workflow_executions f \
+            WHERE f.start_source = 'fork' AND f.start_source_ref = e.id::text \
+            AND f.state IN ('RUNNING', 'PAUSED', 'MIGRATING', 'MIGRATED')) \
         AND NOT EXISTS (SELECT 1 FROM harvest_cross_shard_children x \
             WHERE x.parent_exec_id = e.id) \
         AND NOT EXISTS (SELECT 1 FROM harvest_mutex_locks ml \
@@ -833,6 +849,8 @@ mod db {
         #[diesel(sql_type = BigInt)]
         live_children: i64,
         #[diesel(sql_type = BigInt)]
+        live_forks: i64,
+        #[diesel(sql_type = BigInt)]
         cross_shard_child_rows: i64,
         #[diesel(sql_type = BigInt)]
         held_mutex_locks: i64,
@@ -878,6 +896,10 @@ mod db {
                (SELECT count(*) FROM harvest_workflow_executions c WHERE c.parent_id = e.id \
                   AND c.state IN ('RUNNING', 'PAUSED', 'MIGRATING', 'MIGRATED'))::BIGINT \
                   AS live_children, \
+               (SELECT count(*) FROM harvest_workflow_executions f \
+                  WHERE f.start_source = 'fork' AND f.start_source_ref = e.id::text \
+                  AND f.state IN ('RUNNING', 'PAUSED', 'MIGRATING', 'MIGRATED'))::BIGINT \
+                  AS live_forks, \
                (SELECT count(*) FROM harvest_cross_shard_children x \
                   WHERE x.parent_exec_id = e.id)::BIGINT AS cross_shard_child_rows, \
                (SELECT count(*) FROM harvest_mutex_locks ml \
@@ -922,6 +944,7 @@ mod db {
             active_sessions: row.active_sessions,
             live_external_tasks: row.live_external_tasks,
             live_children: row.live_children,
+            live_forks: row.live_forks,
             cross_shard_child_rows: row.cross_shard_child_rows,
             held_mutex_locks: row.held_mutex_locks,
             queued_mutex_waiters: row.queued_mutex_waiters,

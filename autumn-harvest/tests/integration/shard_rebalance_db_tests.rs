@@ -5236,6 +5236,49 @@ async fn a_fork_is_refused_by_the_sql_predicate_too() {
 }
 
 #[tokio::test]
+async fn the_source_of_a_live_fork_is_refused_by_the_sql_predicate_too() {
+    // A recorded fork reads its source on its own shard (issue #2000). The
+    // source stays there while the fork is live, and may move after that.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "fork-source").await;
+    let fork_id = quiescent_fixture(&shards, "fork-of-source").await;
+
+    let mut source = shards.source().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET start_source = 'fork', \
+         start_source_ref = $2 WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(fork_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(exec_id.as_uuid().to_string())
+    .execute(&mut source)
+    .await
+    .expect("mark the second run as a fork of the first");
+
+    let verdict = assess_quiescence(&observe_quiescence(&mut source, exec_id).await.expect("obs"));
+    assert!(verdict.blockers().contains(&QuiescenceBlocker::LiveFork));
+    let outcome = migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate must not error, only decline");
+    assert!(
+        matches!(outcome, MigrationOutcome::Skipped { .. }),
+        "expected a skip with named blockers, got {outcome:?}"
+    );
+    assert_eq!(authoritative_shards(&shards, exec_id).await, vec![SOURCE]);
+
+    diesel::sql_query("UPDATE harvest_workflow_executions SET state = 'COMPLETED' WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(fork_id.as_uuid())
+        .execute(&mut source)
+        .await
+        .expect("complete the fork");
+    let verdict = assess_quiescence(&observe_quiescence(&mut source, exec_id).await.expect("obs"));
+    assert!(
+        verdict.is_eligible(),
+        "a terminal fork reads no source: {:?}",
+        verdict.blockers()
+    );
+}
+
+#[tokio::test]
 async fn cancelling_a_sealed_source_is_left_pending_not_reported_delivered() {
     // The cancel outbox maps a terminal-state error to `ExternalCancelDelivered`
     // and never retries. A rebalanced seal is not terminal — the run is alive

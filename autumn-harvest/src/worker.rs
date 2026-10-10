@@ -40804,7 +40804,13 @@ mod tests {
             interval,
         );
 
-        advance_sampler_ticks(interval, 5).await;
+        // The accept is real loopback I/O, not paused time. A slow runner can
+        // land it after a fixed tick count. So the test ticks until the
+        // accept lands, under a deadline in real time.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while listener.touch_count() == 0 && std::time::Instant::now() < deadline {
+            advance_sampler_ticks(interval, 1).await;
+        }
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
         listener.stop();

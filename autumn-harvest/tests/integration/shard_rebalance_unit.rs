@@ -48,6 +48,7 @@ fn timer_parked() -> QuiescenceObservation {
         active_sessions: 0,
         live_external_tasks: 0,
         live_children: 0,
+        live_forks: 0,
         cross_shard_child_rows: 0,
         held_mutex_locks: 0,
         queued_mutex_waiters: 0,
@@ -807,6 +808,23 @@ fn a_fork_is_blocked_from_migrating() {
     assert!(
         verdict.blockers().contains(&QuiescenceBlocker::ForkLineage),
         "expected a named ForkLineage blocker, got {:?}",
+        verdict.blockers()
+    );
+}
+
+#[test]
+fn the_source_of_a_live_fork_is_blocked_from_migrating() {
+    // A recorded fork reads its source on the shard of the fork (issue
+    // #2000). A migrated source would hide later outcomes from the fork.
+    let obs = QuiescenceObservation {
+        live_forks: 1,
+        ..timer_parked()
+    };
+    let verdict = assess_quiescence(&obs);
+    assert!(!verdict.is_eligible());
+    assert!(
+        verdict.blockers().contains(&QuiescenceBlocker::LiveFork),
+        "expected a named LiveFork blocker, got {:?}",
         verdict.blockers()
     );
 }

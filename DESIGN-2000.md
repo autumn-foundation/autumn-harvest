@@ -162,6 +162,8 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | The history cap misses a new input and the appended events. | Add an upper bound of their encoded size. |
 | A held race loser gets no loser terminal, so its `ActivityScheduled` stays open. | Mark the held task; `cancel_activity_task` treats the mark as open. |
 | Retention can delete a record source while a recorded fork runs. | Not fixed: the fork fails closed. The runbook says to fork inside the retention window or hold the source. |
+| A shard migration can move a record source away from its live fork. | The `LiveFork` quiescence blocker keeps the source on its shard while a fork that names it is not terminal. |
+| A fork history at the worker event cap or byte cap dead-letters on its first task. | Refuse the fork with `409` before any row is written. |
 
 ## 2. Tests
 

@@ -1313,6 +1313,46 @@ async fn the_history_quota_counts_a_large_input_override() {
     );
 }
 
+/// A fork whose history reaches a worker history cap could never run. Its
+/// first workflow task would dead-letter it. So the fork is refused, and no
+/// row is written.
+#[tokio::test]
+async fn a_fork_that_reaches_a_history_cap_is_refused() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("history-cap");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1 });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    let capped = |policy: autumn_harvest::WorkflowHistoryPolicy| {
+        HandlerRegistry::new(
+            vec![fork_pay_wf_info()],
+            activities![fork_charge, fork_receipt],
+        )
+        .with_history_policy(policy)
+    };
+    let policies = [
+        autumn_harvest::WorkflowHistoryPolicy::default().with_event_hard_cap(1),
+        autumn_harvest::WorkflowHistoryPolicy::default().with_byte_hard_cap(1),
+    ];
+    for policy in policies {
+        let mut named = request(ForkEffects::Recorded);
+        named.workflow_id = Some(unique("capped-fork"));
+        let result =
+            fork_workflow_execution(&mut conn, source, named.clone(), Some(&capped(policy))).await;
+        assert!(
+            matches!(result, Err(WorkflowForkError::HistoryCapReached { .. })),
+            "a fork that reaches the cap is refused: {result:?}"
+        );
+        let written: i64 = harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::workflow_id.eq(named.workflow_id.unwrap()))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("count fork rows");
+        assert_eq!(written, 0, "a refused fork writes no row");
+    }
+}
+
 /// A held race loser still gets its loser terminal when the race resolves in
 /// the fork. Every activity that the fork schedules then has an outcome, so
 /// a later reset or fork point after the race stays valid.
