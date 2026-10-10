@@ -38,7 +38,7 @@ passes the input schema (issue #373) and the byte cap (issue #252).
 `activity_overrides` sets the result of one activity occurrence after the
 fork point. A request sets at most 1,000 overrides
 (`fork::MAX_ACTIVITY_OVERRIDES`). Each output passes the result byte cap of
-its activity (issue #252).
+its activity (issue #252), unless the offloader stores it out of line.
 
 **Refusals.** An erased source (issue #495) is always refused, under a
 `FOR SHARE` lock on the source row. So is a fork whose fork lineage reaches
@@ -53,7 +53,8 @@ is refused with `409`.
 
 **Quota.** A fork is admitted under the tenant quota of its workflow type
 (issue #946), as a start is. A kept input keeps the quota key of the
-source. A new input resolves its own key. A fork over a cap is refused with
+source, or resolves it from the decoded input when the source has none. A
+new input resolves its own key. A fork over a cap is refused with
 `429`, and the fork row stores its key.
 
 **Lineage.** The fork row has `start_source = fork` and

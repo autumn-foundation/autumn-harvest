@@ -149,6 +149,9 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | An override output skips the result byte cap. | Check each output against the cap of its activity. |
 | A fork skips tenant quota admission. | Admit the fork under the quota key of its input, and store the key. |
 | A held race loser parks the run when the fork no longer runs its winner. | Hold a loser only beside a served source sibling. Otherwise fail it closed. |
+| A source with no stored quota key skips admission. | Resolve the key from the decoded source input. |
+| The override cap refuses an output that the offloader would store. | Exempt it, as the worker exempts a real result. |
+| 16,384 payload references or more exceed the bind limit. | Insert the references in chunks of 1,000 rows. |
 
 ## 2. Tests
 

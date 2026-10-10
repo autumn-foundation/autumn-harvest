@@ -276,8 +276,15 @@ async fn fork_in_transaction(
         Some(input) => codecs.encode_column(input)?,
         None => source.input.clone(),
     };
-    let quota_key =
-        admit_quota(conn, registry, &source, request.input.as_ref(), new_exec_id).await?;
+    let quota_key = admit_quota(
+        conn,
+        registry,
+        &source,
+        request.input.as_ref(),
+        codecs,
+        new_exec_id,
+    )
+    .await?;
     let row = crate::reset::ForkRow {
         workflow_id: &workflow_id,
         input,
@@ -309,18 +316,8 @@ async fn fork_in_transaction(
         codecs,
     )
     .await?;
-    // The fork shares the blobs of the source. Its own references keep them
-    // alive after retention deletes the source. Only the rows that the fork
-    // stores count, so a replaced input releases its blob.
-    let mut keys = envelope_keys(&copied);
-    if request.input.is_none() {
-        keys.extend(
-            crate::payload_store::extract_offload_ref(&source.input).map(|blob| blob.blob_key),
-        );
-    }
-    let refs = crate::store::load_payload_refs(conn, source_id).await?;
-    let reachable = refs_named_in(refs, &keys);
-    crate::store::insert_payload_refs(conn, new_exec_id, &reachable).await?;
+    let kept_input = request.input.is_none().then_some(&source.input);
+    share_payload_refs(conn, source_id, new_exec_id, &copied, kept_input).await?;
     let tail = fork_tail(source_id, fork_event_id, request);
     let tail_start = i32::try_from(plan.events_carried_over)
         .map_err(|_| HarvestError::Database("fork carried too many events".to_string()))?;
@@ -445,6 +442,28 @@ async fn check_shards(
     }
 }
 
+/// Give the fork its own references to the source blobs that it names.
+///
+/// The fork shares the blobs of the source. Its own references keep them
+/// alive after retention deletes the source. Only the rows that the fork
+/// stores count, so a replaced input releases its blob.
+async fn share_payload_refs(
+    conn: &mut AsyncPgConnection,
+    source_id: ExecutionId,
+    new_exec_id: ExecutionId,
+    copied: &[Value],
+    kept_input: Option<&Value>,
+) -> HarvestResult<()> {
+    let mut keys = envelope_keys(copied);
+    keys.extend(
+        kept_input
+            .and_then(crate::payload_store::extract_offload_ref)
+            .map(|blob| blob.blob_key),
+    );
+    let refs = crate::store::load_payload_refs(conn, source_id).await?;
+    crate::store::insert_payload_refs(conn, new_exec_id, &refs_named_in(refs, &keys)).await
+}
+
 /// The blob keys that the offload envelopes in the stored `rows` name.
 pub(crate) fn envelope_keys<'a>(
     rows: impl IntoIterator<Item = &'a Value>,
@@ -554,15 +573,16 @@ async fn erased_fork_ancestor(
 /// Admit the fork under the tenant quota of its workflow type (issue #946).
 ///
 /// A fork adds a runnable run beside its source, so it is admitted as a start
-/// is. A new input resolves its own key. A kept input keeps the key of the
-/// source, which the start of the source resolved from the same input. The
-/// stored input can be encoded or offloaded, so it is not read again. The
-/// check runs under the key lock, and the fork row stores the key.
+/// is. A new input resolves its own key. A kept input keeps the stored key
+/// of the source. A source with no stored key, such as a reset run, resolves
+/// it from its decoded input. The check runs under the key lock, and the
+/// fork row stores the key.
 async fn admit_quota(
     conn: &mut AsyncPgConnection,
     registry: Option<&HandlerRegistry>,
     source: &WorkflowExecution,
     input: Option<&Value>,
+    codecs: &PayloadCodecs,
     new_exec_id: ExecutionId,
 ) -> HarvestResult<Option<String>> {
     let name = source.workflow_name.as_str();
@@ -582,10 +602,13 @@ async fn admit_quota(
     let Some(policy) = policy else {
         return Ok(None);
     };
-    let key = input.map_or_else(
-        || source.quota_key.clone(),
-        |input| crate::quota::resolve_quota_key(policy.key_expr, input),
-    );
+    let key = match (input, source.quota_key.as_ref()) {
+        (Some(input), _) => crate::quota::resolve_quota_key(policy.key_expr, input),
+        (None, Some(stored)) => Some(stored.clone()),
+        (None, None) => {
+            crate::quota::resolve_quota_key(policy.key_expr, &codecs.decode_column(&source.input)?)
+        }
+    };
     let Some(key) = key else {
         return Ok(None);
     };
@@ -655,7 +678,8 @@ fn check_input_override(
 /// Apply the result byte cap of each named activity to its override output.
 ///
 /// A real result passes the same cap (issue #252), so an override cannot
-/// bypass the payload guard of the deployment.
+/// bypass the payload guard of the deployment. An output that the offloader
+/// stores out of line is exempt, as for a real result.
 fn check_override_outputs(
     registry: &HandlerRegistry,
     overrides: &[ForkActivityOverride],
@@ -663,7 +687,12 @@ fn check_override_outputs(
     for item in overrides {
         let cap = registry.activity_result_cap(&item.activity_name);
         let observed = serde_json::to_vec(&item.output).map_or(0, |bytes| bytes.len() as u64);
-        if cap > 0 && observed > cap {
+        // The offloader stores a large output as a small envelope. The worker
+        // exempts a real result for the same reason.
+        let offload_applies = registry
+            .payload_offloader()
+            .is_some_and(|offloader| observed > offloader.threshold());
+        if cap > 0 && observed > cap && !offload_applies {
             return Err(WorkflowForkError::InvalidOverride {
                 message: format!(
                     "the output of '{}' occurrence {} has {observed} bytes, over the cap of {cap}",
@@ -2031,6 +2060,35 @@ mod tests {
             check_override_outputs(&registry, &with(json!("X".repeat(64)))),
             Err(WorkflowForkError::InvalidOverride { .. })
         ));
+        // An output over the offload threshold is stored as a small envelope,
+        // so the cap does not apply, as for a real result.
+        let offloader = crate::payload_store::PayloadOffloader::new(
+            std::sync::Arc::new(NoStore),
+            8,
+            std::sync::Arc::new(crate::telemetry::NoOpMetrics),
+        );
+        let mut offloading =
+            HandlerRegistry::new(vec![], vec![]).with_payload_offloader(Some(offloader.into()));
+        offloading.max_activity_result_bytes = 16;
+        assert!(check_override_outputs(&offloading, &with(json!("X".repeat(64)))).is_ok());
+    }
+
+    /// A payload store that the cap check never calls.
+    struct NoStore;
+
+    impl crate::payload_store::PayloadStore for NoStore {
+        fn store_id(&self) -> &'static str {
+            "none"
+        }
+        fn put(&self, _bytes: &[u8]) -> crate::payload_store::PayloadStoreFuture<'_, String> {
+            Box::pin(async { Ok(String::new()) })
+        }
+        fn get(&self, _key: &str) -> crate::payload_store::PayloadStoreFuture<'_, Vec<u8>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn delete(&self, _key: &str) -> crate::payload_store::PayloadStoreFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     #[test]

@@ -1086,6 +1086,59 @@ async fn a_fork_is_admitted_under_the_tenant_quota() {
     assert_eq!(row.quota_key.as_deref(), Some(other.as_str()));
 }
 
+/// A source with no stored quota key, such as a reset run, resolves the key
+/// from its input. A kept input then cannot skip the quota.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_resolves_a_quota_key_that_the_source_lacks() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("quota-null");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1, "tenant": queue });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    let mut info = fork_pay_wf_info();
+    info.quota =
+        Some(autumn_harvest::quota::QuotaPolicy::new("tenant").with_max_active_executions(5));
+    let quota_registry = Arc::new(HandlerRegistry::new(
+        vec![info],
+        activities![fork_charge, fork_receipt],
+    ));
+    let forked = fork_workflow_execution(
+        &mut conn,
+        source,
+        request(ForkEffects::Live),
+        Some(&quota_registry),
+    )
+    .await
+    .expect("fork")
+    .new_exec_id;
+    let row = snapshot(&url, forked).await.0;
+    assert_eq!(row.quota_key.as_deref(), Some(queue.as_str()));
+}
+
+/// The fork inserts its payload references in chunks. Postgres caps a
+/// statement at 65,535 parameters, and each reference binds four.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn payload_references_insert_past_the_parameter_limit() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("refs");
+    let mut conn = connect(&url).await;
+    let exec_id = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let refs = (0..16_500)
+        .map(|n| autumn_harvest::payload_store::OffloadedRef {
+            blob_key: format!("{queue}/blob-{n}"),
+            store_id: "fork-test".to_string(),
+            byte_len: 1,
+        })
+        .collect::<Vec<_>>();
+    store::insert_payload_refs(&mut conn, exec_id, &refs)
+        .await
+        .expect("insert the references");
+    let stored = store::load_payload_refs(&mut conn, exec_id)
+        .await
+        .expect("load the references");
+    assert_eq!(stored.len(), refs.len());
+}
+
 /// A source erased after the fork exists serves no record. The fork fails
 /// closed and never charges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
