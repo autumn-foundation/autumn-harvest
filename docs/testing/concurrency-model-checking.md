@@ -117,7 +117,7 @@ choice, and [`simulation.md`](simulation.md) describes the harness.
 |------|----------------|--------------------------------------------|----------|
 | **loom** | In-process locks/atomics, exhaustive interleavings | `circuit_breaker` generation fence + single probe; `sessions` slot bound/balance. Cannot reach async (`slot_tuner`, `heartbeat`) or any Postgres-coordinated race. | **Adopted** (issue #1800; runs on every PR) |
 | **Shuttle** | In-process locks **+ async/futures**, randomized PCT (scales past loom) | Everything loom reaches, **plus** `slot_tuner.rs` semaphore accounting and `heartbeat.rs` mpsc ordering that loom structurally cannot. Still cannot model Postgres. | **Adopted** (issue #1800; runs on every PR) |
-| **DST** (`autumn_harvest::dst`) | Seeded single-thread interleavings of Postgres-coordinated store operations | The activity claim protocol, checked against Postgres by a differential test. Not the `worker.rs` loop. | **Adopted** (issue #1830; per PR and nightly) |
+| **DST** (`autumn_harvest::dst`) | Seeded single-thread interleavings of Postgres-coordinated store operations | The activity claim protocol, checked against Postgres by a differential test. The world simulation runs the `worker.rs` loop, one whole poll per step (issue #2002). | **Adopted** (issues #1830 and #2002; per PR and nightly) |
 | **Turmoil** | Simulated peer TCP/UDP networks, partitions/latency | ~none — harvest has no custom peer networking; it coordinates through Postgres, which Turmoil cannot simulate. | **No** |
 
 **Bottom line.** loom for in-process locks, Shuttle for async primitives,

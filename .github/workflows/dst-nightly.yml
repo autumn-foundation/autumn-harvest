@@ -4,6 +4,9 @@
 #   Four shards run 1000000 seeds each.
 # - `differential`: replays oracle runs on Postgres. Four shards run 500
 #   seeds each.
+# - `world`: the world simulation of issue #2002. It runs the real worker
+#   loop, the resident path, timers and the scheduler fire claim on
+#   Postgres. Four shards run 250 seeds each.
 # - `alert`: a failed scheduled run opens an issue, or comments on the open
 #   one. GitHub tells only the last editor of a cron about a failure.
 #
@@ -132,9 +135,60 @@ jobs:
         timeout-minutes: 60
         run: 'cargo test -p autumn-harvest --test integration dst_differential_tests:: -- --nocapture --test-threads=1'
 
+  world:
+    name: Worker world (shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      SEEDS: "250"
+      SEED_BASE: ${{ github.event.inputs.seed_base || '' }}
+      SHARD: ${{ matrix.shard }}
+      RUN_NUMBER: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Pick the seeds
+        run: |
+          for value in "$SEEDS" "$SEED_BASE"; do
+            case "$value" in
+              *[!0-9]*) echo "not a decimal number: '$value'" >&2; exit 1 ;;
+            esac
+          done
+          # Bash arithmetic is signed 64-bit with no overflow check. These
+          # bounds keep every value below i64::MAX.
+          if [ "${#SEEDS}" -gt 9 ] || [ "${#SEED_BASE}" -gt 18 ]; then
+            echo "seeds must have at most 9 digits, seed_base at most 18" >&2
+            exit 1
+          fi
+          # Force base 10. Bash reads a leading 0 as octal.
+          SEEDS=$((10#$SEEDS))
+          if [ -n "$SEED_BASE" ]; then SEED_BASE=$((10#$SEED_BASE)); fi
+          # A fixed stride per run: 4 shards of the largest allowed size.
+          base="${SEED_BASE:-$((RUN_NUMBER * 4 * 999999999))}"
+          echo "HARVEST_DST_SEED_BASE=$((base + SHARD * SEEDS))" >> "$GITHUB_ENV"
+          echo "HARVEST_DST_SEEDS=$SEEDS" >> "$GITHUB_ENV"
+      - name: Build the integration tests
+        # A separate step, so a slow build does not count against the
+        # sweep timeout. Debug mode, as in `differential`: Postgres bounds
+        # the run time, and a release build of this target is large.
+        timeout-minutes: 40
+        run: cargo test -p autumn-harvest --test integration --no-run
+      - name: Run the worker loop under the seeded world
+        # The test owns a Postgres container (testcontainers), so the
+        # runner needs only Docker. Each run clones a fresh database.
+        timeout-minutes: 70
+        run: 'cargo test -p autumn-harvest --test integration dst_world_tests::world_seed_sweep -- --nocapture --test-threads=1'
+
   alert:
     name: Report a failed nightly
-    needs: [sweep, differential]
+    needs: [sweep, differential, world]
     if: failure() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10

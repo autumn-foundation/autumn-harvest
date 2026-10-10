@@ -302,7 +302,8 @@ pub mod diagnostic;
 /// Task dispatch channel seam (issue #1312): Postgres stays the source of
 /// truth, a [`dispatch::TaskDispatch`] carries task references.
 pub mod dispatch;
-/// Deterministic simulation of the activity claim protocol (issue #1830).
+/// Deterministic simulation of the activity claim protocol (issue #1830),
+/// and of the real worker loop (issue #2002).
 pub mod dst;
 /// Effective runtime-configuration introspection (issue #695).
 ///
