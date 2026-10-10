@@ -58,8 +58,8 @@ module counts at the audited revision, recomputed by CI:
 | `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 16 modules | Only by dropping multi-worker concurrency. |
 | `row-lock` blocking row lock (Diesel `.for_update()`) | 18 modules | Subsumed by the single write lock. |
 | `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 16 modules | Yes — integer epoch milliseconds. |
-| `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 47 modules | Case by case — the SQL must be read, not inferred from the ORM. |
-| `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 34 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
+| `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 48 modules | Case by case — the SQL must be read, not inferred from the ORM. |
+| `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 35 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
 | `advisory-lock` (`pg_advisory_*` / `pg_try_advisory_*`) | 15 modules | Subsumed by the single write lock. |
 | `to_regclass` table-existence probes | 11 modules | Yes — `sqlite_master` lookup. |
 | `listen/notify` push wakeups | 4 modules | No — polling is a degradation, not a translation. |
@@ -107,7 +107,7 @@ have grown past that round's 18 as new Postgres-only syntax lands; each module
 the open rule newly catches has so far already been (b) or (c). The counts move;
 the classifications do not.
 
-That 47 of the 68 coupled modules hand-write SQL is therefore the more
+That 48 of the 68 coupled modules hand-write SQL is therefore the more
 decision-relevant number than any dialect tally. It is the volume of query text
 a second backend must re-author by hand, and it is knowable exactly.
 
@@ -182,7 +182,7 @@ Classification rule:
 | `execution` | diesel, skip-locked, row-lock, advisory-lock, interval-sql, raw-pg-sql, raw-sql | (c) | Start/reuse matrix under `FOR UPDATE`; row-lock ordering is load-bearing. Issue #1596 review added `pg_advisory_xact_lock(hashtext(key)::bigint)` ahead of the row lock, closing an admission race between concurrent starts and a reconciled seal; subsumed by the single write lock. |
 | `external_target_location` | diesel | (c) | Placement-aware resolution for `workflow_id`-addressed signal/cancel (#1146). Like `cross_shard_child` above, the coupling is **architectural, not syntactic**: the module exists *because* there is more than one database. It answers "which shard holds this business key?" by fanning a read across every expected shard and merging the per-shard answers. A single-file SQLite deployment has exactly one shard, so the fan-out has nothing to do — the engine's own single-shard short-circuit already skips it — and the whole module would be dropped, leaving the shard-local resolver it delegates to (`execution::resolve_execution_id_by_workflow_id`) as the entire answer. Its lone mechanism is the `AsyncPgConnection` in its signatures. |
 | `external_task` | diesel, row-lock | (b) | `find_by_token_locked` serialises completion/failure; subsumed. |
-| `fork` | diesel | (b) | Non-destructive fork of a run (issue #2000). It copies a history prefix to a new root execution, in chunks of 1,000 rows. The source row, each ancestor and the record source are read `FOR SHARE` through the Diesel builder, so the detector sees only `diesel`. The single write lock subsumes those share locks. |
+| `fork` | diesel, raw-pg-sql, raw-sql | (b) | Non-destructive fork of a run (issue #2000). It copies a history prefix to a new root execution, in chunks of 1,000 rows. The source row, each ancestor and the record source are read `FOR SHARE` through the Diesel builder. The single write lock subsumes those share locks. The history-quota check sums `pg_column_size(event_data)` over the prefix with a `::BIGINT` cast; SQLite's `length(event_data)` is a direct substitute, as for `quota`. |
 | `handle` | diesel | (a) | Read paths. |
 | `heartbeat` | diesel | (a) | Batched last-write-wins update. |
 | `hot_swap` | diesel | (a) | **Nothing to port: the match is a doc comment.** The runtime workflow-module registry (issue #967, behind the `hot-code-swap` feature) is a purely in-process table of compiled WASM modules and never touches a connection. `diesel_async` appears once, in prose explaining why the method is named `load_module` rather than `load` — `RunQueryDsl`'s blanket impl would otherwise capture the shorter name. Kept as a row rather than an exclusion because the audit is grep-level by design and will keep finding it. |
@@ -377,7 +377,7 @@ disputed:
 
 - **26 modules are class (c)** — portable only by dropping a capability or
   reimplementing wholesale — against 8 that are trivially trait-able.
-- **47 modules reach for raw SQL**, so their portability cannot be read off
+- **48 modules reach for raw SQL**, so their portability cannot be read off
   their Diesel usage at all.
 - The **capability losses are documented and unavoidable** on the single-writer
   side (*Known capability losses*, below), so the second backend is not the same
