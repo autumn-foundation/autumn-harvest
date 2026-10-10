@@ -1219,6 +1219,42 @@ async fn an_admission_gate_refuses_a_fork() {
     );
 }
 
+/// The copied prefix counts against the history cap of the tenant quota. A
+/// fork starts with that history, so the cap sees it before the insert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_copied_prefix_counts_against_the_history_quota() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("quota-bytes");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1, "tenant": queue });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    let mut info = fork_pay_wf_info();
+    info.quota = Some(autumn_harvest::quota::QuotaPolicy::new("tenant").with_max_history_bytes(16));
+    let quota_registry = Arc::new(HandlerRegistry::new(
+        vec![info],
+        activities![fork_charge, fork_receipt],
+    ));
+    let result = fork_workflow_execution(
+        &mut conn,
+        source,
+        request(ForkEffects::Live),
+        Some(&quota_registry),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(WorkflowForkError::Harvest(
+                autumn_harvest::error::HarvestError::QuotaExceeded {
+                    resource: autumn_harvest::quota::QuotaResource::HistoryBytes,
+                    ..
+                }
+            ))
+        ),
+        "the prefix alone exceeds the cap: {result:?}"
+    );
+}
+
 /// The fork inserts its payload references in chunks. Postgres caps a
 /// statement at 65,535 parameters, and each reference binds four.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

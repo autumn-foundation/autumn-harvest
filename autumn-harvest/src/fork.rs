@@ -290,6 +290,7 @@ async fn fork_in_transaction(
         request.input.as_ref(),
         codecs,
         new_exec_id,
+        fork_event_id,
     )
     .await?;
     let row = crate::reset::ForkRow {
@@ -598,6 +599,7 @@ async fn admit_fork(
     input: Option<&Value>,
     codecs: &PayloadCodecs,
     new_exec_id: ExecutionId,
+    fork_event_id: i64,
 ) -> HarvestResult<Option<String>> {
     let name = source.workflow_name.as_str();
     crate::execution::admit_fresh_start(
@@ -652,7 +654,46 @@ async fn admit_fork(
         new_exec_id,
     )
     .await?;
+    // A fork starts with the copied prefix. A start has no history yet, so
+    // the history cap must count the prefix here, before the insert.
+    if let Some(limit) = policy.max_history_bytes {
+        let prefix = prefix_bytes(conn, source.id, fork_event_id).await?;
+        let usage =
+            crate::quota::load_quota_usage_excluding(conn, name, &key, &[new_exec_id.as_uuid()])
+                .await?;
+        let current = u64::try_from(usage.history_bytes).unwrap_or(0);
+        if current.saturating_add(prefix) > limit {
+            return Err(HarvestError::QuotaExceeded {
+                workflow_name: name.to_string(),
+                key,
+                resource: crate::quota::QuotaResource::HistoryBytes,
+                limit,
+                current,
+            });
+        }
+    }
     Ok(Some(key))
+}
+
+/// The stored bytes of the source events up to `fork_event_id`.
+///
+/// The measure is `pg_column_size`, as for the quota usage of a key.
+async fn prefix_bytes(
+    conn: &mut AsyncPgConnection,
+    source_id: Uuid,
+    fork_event_id: i64,
+) -> HarvestResult<u64> {
+    let last = i32::try_from(fork_event_id).unwrap_or(i32::MAX);
+    let bytes: i64 = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(source_id))
+        .filter(harvest_events::event_id.le(last))
+        .select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+            "COALESCE(SUM(pg_column_size(event_data)), 0)::BIGINT",
+        ))
+        .first(conn)
+        .await
+        .map_err(database_error)?;
+    Ok(u64::try_from(bytes).unwrap_or(0))
 }
 
 /// Apply the start checks of the workflow type to an input override.

@@ -44,6 +44,12 @@ The route is admin-only. Each call creates a new execution.
 A recorded fork cannot charge a card again under a new identity. Use
 `"effects": "live"` only when you want real effects.
 
+A recorded fork reads its source while it runs. Retention does not wait for
+it. If retention deletes the source first, each later activity has no record
+and fails closed with `ForkEffectUnavailable`. Fork a run well inside its
+retention window, or hold the source with `POST /workflows/{id}/legal-hold`
+(issue #747) while the fork runs.
+
 A race branch that lost in the source stays pending in the fork, so the same
 branch wins again. If the fork no longer runs the winner, the losing branch
 fails closed instead. An activity whose input holds a value that the fork makes

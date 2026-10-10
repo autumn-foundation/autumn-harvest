@@ -62,7 +62,8 @@ refuses it with `503`, and load shedding (issue #1794) with `429`.
 (issue #946), as a start is. The key resolves from the fork input under
 the current policy: a kept input is decoded, and a new input is used as
 is. A fork over a cap is refused with
-`429`, and the fork row stores its key.
+`429`, and the fork row stores its key. The history cap counts the copied
+prefix, because a fork starts with that history.
 
 **Shard rebalancing.** A fork never migrates on its own (issue #964). It
 reads its source and walks its lineage on its own shard, so the new
