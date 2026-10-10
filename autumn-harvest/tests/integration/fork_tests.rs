@@ -1023,6 +1023,69 @@ async fn a_fork_copies_a_prefix_past_the_parameter_limit() {
     assert_eq!(events.len(), MARKERS + 2, "the prefix and the marker");
 }
 
+/// A fork is admitted under the tenant quota of its workflow type, as a start
+/// is. A kept input keeps the key of the source. A new input resolves its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_is_admitted_under_the_tenant_quota() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("quota");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1, "tenant": queue });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    // The start of the source admitted it under its tenant key.
+    diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
+        .set(harvest_workflow_executions::quota_key.eq(Some(queue.as_str())))
+        .execute(&mut conn)
+        .await
+        .expect("stamp the source key");
+    let mut info = fork_pay_wf_info();
+    info.quota =
+        Some(autumn_harvest::quota::QuotaPolicy::new("tenant").with_max_active_executions(2));
+    let quota_registry = Arc::new(HandlerRegistry::new(
+        vec![info],
+        activities![fork_charge, fork_receipt],
+    ));
+
+    let first = fork_workflow_execution(
+        &mut conn,
+        source,
+        request(ForkEffects::Live),
+        Some(&quota_registry),
+    )
+    .await
+    .expect("the source and one fork fit the cap")
+    .new_exec_id;
+    let row = snapshot(&url, first).await.0;
+    assert_eq!(row.quota_key.as_deref(), Some(queue.as_str()));
+
+    let over = fork_workflow_execution(
+        &mut conn,
+        source,
+        request(ForkEffects::Live),
+        Some(&quota_registry),
+    )
+    .await;
+    assert!(
+        matches!(
+            over,
+            Err(WorkflowForkError::Harvest(
+                autumn_harvest::error::HarvestError::QuotaExceeded { .. }
+            ))
+        ),
+        "a third active run of the key is refused: {over:?}"
+    );
+
+    let other = format!("{queue}-other");
+    let mut elsewhere = request(ForkEffects::Live);
+    elsewhere.input = Some(json!({ "tag": queue, "amount": 1, "tenant": other }));
+    let moved = fork_workflow_execution(&mut conn, source, elsewhere, Some(&quota_registry))
+        .await
+        .expect("a new input resolves its own key")
+        .new_exec_id;
+    let row = snapshot(&url, moved).await.0;
+    assert_eq!(row.quota_key.as_deref(), Some(other.as_str()));
+}
+
 /// A source erased after the fork exists serves no record. The fork fails
 /// closed and never charges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

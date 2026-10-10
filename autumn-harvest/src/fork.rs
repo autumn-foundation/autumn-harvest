@@ -276,10 +276,13 @@ async fn fork_in_transaction(
         Some(input) => codecs.encode_column(input)?,
         None => source.input.clone(),
     };
+    let quota_key =
+        admit_quota(conn, registry, &source, request.input.as_ref(), new_exec_id).await?;
     let row = crate::reset::ForkRow {
         workflow_id: &workflow_id,
         input,
         start_source: StartSource::Fork,
+        quota_key: quota_key.as_deref(),
         // A completion callback notifies an outside system. Only a live fork
         // may do that.
         completion_callbacks: match request.effects {
@@ -546,6 +549,66 @@ async fn erased_fork_ancestor(
         }),
         _ => Ok(None),
     }
+}
+
+/// Admit the fork under the tenant quota of its workflow type (issue #946).
+///
+/// A fork adds a runnable run beside its source, so it is admitted as a start
+/// is. A new input resolves its own key. A kept input keeps the key of the
+/// source, which the start of the source resolved from the same input. The
+/// stored input can be encoded or offloaded, so it is not read again. The
+/// check runs under the key lock, and the fork row stores the key.
+async fn admit_quota(
+    conn: &mut AsyncPgConnection,
+    registry: Option<&HandlerRegistry>,
+    source: &WorkflowExecution,
+    input: Option<&Value>,
+    new_exec_id: ExecutionId,
+) -> HarvestResult<Option<String>> {
+    let name = source.workflow_name.as_str();
+    let policy = registry
+        .and_then(|registry| registry.workflows.get(name))
+        .and_then(|info| info.quota)
+        .or_else(|| {
+            crate::completion_trigger::GLOBAL_WORKFLOW_METADATA
+                .read()
+                .ok()
+                .and_then(|lock| {
+                    lock.as_ref()
+                        .and_then(|map| map.get(name))
+                        .and_then(|meta| meta.quota)
+                })
+        });
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    let key = input.map_or_else(
+        || source.quota_key.clone(),
+        |input| crate::quota::resolve_quota_key(policy.key_expr, input),
+    );
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    if let Some(observed_bytes) = crate::quota::quota_key_over_cap(&key) {
+        return Err(HarvestError::PayloadTooLarge {
+            kind: crate::error::PayloadKind::QuotaKey,
+            observed_bytes,
+            cap_bytes: crate::quota::MAX_QUOTA_KEY_BYTES,
+            workflow_type: name.to_string(),
+            activity_name: None,
+        });
+    }
+    crate::execution::enforce_quota_admission(
+        conn,
+        Some(policy),
+        Some(&key),
+        name,
+        None,
+        None,
+        new_exec_id,
+    )
+    .await?;
+    Ok(Some(key))
 }
 
 /// Apply the start checks of the workflow type to an input override.

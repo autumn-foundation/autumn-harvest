@@ -1389,6 +1389,7 @@ async fn insert_fork_execution(
                 crate::types::StartSource::Reset
             },
             completion_callbacks: source.completion_callbacks.clone(),
+            quota_key: None,
         },
     )
     .await
@@ -1406,6 +1407,9 @@ pub(crate) struct ForkRow<'a> {
     pub(crate) start_source: crate::types::StartSource,
     /// A recorded fork drops the targets, so that it sends no notification.
     pub(crate) completion_callbacks: Option<Value>,
+    /// The quota key that admitted the row. A reset passes `None`. A fork
+    /// passes the key of its quota admission (issue #946).
+    pub(crate) quota_key: Option<&'a str>,
 }
 
 /// Insert the execution row of a fork of `source`.
@@ -1505,8 +1509,10 @@ pub(crate) async fn insert_fork_row(
         // whatever key its original admission resolved: `load_quota_usage`'s
         // `WHERE quota_key = $2` never matches NULL, and `list_quota_usage`
         // filters `WHERE quota_key IS NOT NULL`, so a reset fork neither
-        // consumes headroom nor is blocked by one.
-        quota_key: None,
+        // consumes headroom nor is blocked by one. A fork of issue #2000 is
+        // new work beside its source, so it passes the key it was admitted
+        // under.
+        quota_key: spec.quota_key,
         // A reset fork belongs to the tenant of its source (issue #1977).
         tenant: source.tenant.as_deref(),
     };

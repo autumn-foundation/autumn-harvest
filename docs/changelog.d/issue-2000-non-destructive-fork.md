@@ -49,6 +49,11 @@ closed past 64 links.
 In recorded mode, a source suffix with an effect that the mode cannot serve
 is refused with `409`.
 
+**Quota.** A fork is admitted under the tenant quota of its workflow type
+(issue #946), as a start is. A kept input keeps the quota key of the
+source. A new input resolves its own key. A fork over a cap is refused with
+`429`, and the fork row stores its key.
+
 **Lineage.** The fork row has `start_source = fork` and
 `start_source_ref = <source id>`. Its history holds a `WorkflowForked`
 marker. A fork is a new root, not a child of the source.
