@@ -155,6 +155,8 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | An activity failure with the race text is held as a race loser. | Match the whole shape of the engine terminal. |
 | A race won by a timer fails its loser closed. | Also hold a loser beside a pending timer of the same fork decision. |
 | A migrated fork misses its source and its lineage on the target shard. | A `ForkLineage` quiescence blocker keeps a fork on its shard. |
+| Retention deletes an erased ancestor, and the gap reads as a clean lineage. | Refuse a lineage with a missing ancestor (`LineageGap`, `409`). |
+| A kept input reuses a stale quota key. | Resolve the key from the decoded input under the current policy. |
 
 ## 2. Tests
 

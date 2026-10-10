@@ -1115,6 +1115,68 @@ async fn a_fork_resolves_a_quota_key_that_the_source_lacks() {
     assert_eq!(row.quota_key.as_deref(), Some(queue.as_str()));
 }
 
+/// A kept input resolves its quota key under the current policy. A stale key
+/// that the source stored at its own start does not decide the tenant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_resolves_its_quota_key_under_the_current_policy() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("quota-now");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1, "tenant": queue });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
+        .set(harvest_workflow_executions::quota_key.eq(Some("stale-tenant")))
+        .execute(&mut conn)
+        .await
+        .expect("stamp a stale key");
+    let mut info = fork_pay_wf_info();
+    info.quota =
+        Some(autumn_harvest::quota::QuotaPolicy::new("tenant").with_max_active_executions(5));
+    let quota_registry = Arc::new(HandlerRegistry::new(
+        vec![info],
+        activities![fork_charge, fork_receipt],
+    ));
+    let forked = fork_workflow_execution(
+        &mut conn,
+        source,
+        request(ForkEffects::Live),
+        Some(&quota_registry),
+    )
+    .await
+    .expect("fork")
+    .new_exec_id;
+    let row = snapshot(&url, forked).await.0;
+    assert_eq!(row.quota_key.as_deref(), Some(queue.as_str()));
+}
+
+/// A fork whose lineage reaches a deleted ancestor is refused. Retention can
+/// delete an erased run, so a gap cannot prove that the lineage is clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_lineage_with_a_deleted_ancestor_is_refused() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("gap");
+    let mut conn = connect(&url).await;
+    let root = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let first = fork(&url, root, request(ForkEffects::Recorded)).await;
+    diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(root.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("retain the root");
+
+    let result = fork_workflow_execution(
+        &mut conn,
+        first,
+        request(ForkEffects::Recorded),
+        Some(&registry()),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(WorkflowForkError::LineageGap { exec_id }) if exec_id == root),
+        "a deleted ancestor fails closed: {result:?}"
+    );
+}
+
 /// The fork inserts its payload references in chunks. Postgres caps a
 /// statement at 65,535 parameters, and each reference binds four.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -50,14 +50,15 @@ each fork on its own. A fork point at or after a terminal
 event, a carried `MutexGranted` and a continue-as-new history are refused.
 As for a rerun, a draining source shard and a business key held on any
 shard are refused. The erased-lineage walk locks each ancestor and fails
-closed past 64 links.
+closed past 64 links. A lineage that reaches a deleted run fails closed
+too, because retention can delete an erased run.
 In recorded mode, a source suffix with an effect that the mode cannot serve
 is refused with `409`.
 
 **Quota.** A fork is admitted under the tenant quota of its workflow type
-(issue #946), as a start is. A kept input keeps the quota key of the
-source, or resolves it from the decoded input when the source has none. A
-new input resolves its own key. A fork over a cap is refused with
+(issue #946), as a start is. The key resolves from the fork input under
+the current policy: a kept input is decoded, and a new input is used as
+is. A fork over a cap is refused with
 `429`, and the fork row stores its key.
 
 **Shard rebalancing.** A fork never migrates on its own (issue #964). It

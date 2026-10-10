@@ -5208,7 +5208,7 @@ async fn a_schedule_attributed_execution_is_refused_by_the_sql_predicate_too() {
 #[tokio::test]
 async fn a_fork_is_refused_by_the_sql_predicate_too() {
     // A fork reads its source and walks its lineage on its own shard (issue
-    // #2000), so neither the pure predicate nor the cutover SQL moves it.
+    // #2000). Neither the pure predicate nor the cutover SQL moves it.
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "forked-run").await;
 

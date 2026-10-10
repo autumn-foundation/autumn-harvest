@@ -25564,6 +25564,7 @@ fn fork_error_response(error: WorkflowForkError) -> axum::response::Response {
         | WorkflowForkError::CarriedMutex { .. }
         | WorkflowForkError::WorkflowIdInUse { .. }
         | WorkflowForkError::LineageTooDeep { .. }
+        | WorkflowForkError::LineageGap { .. }
         | WorkflowForkError::ShardRefused { .. } => axum::http::StatusCode::CONFLICT,
     };
     (

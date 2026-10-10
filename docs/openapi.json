@@ -11065,7 +11065,7 @@
             "description": "Execution not found."
           },
           "409": {
-            "description": "The source, or a run in its fork lineage, had its payloads erased (issue #495); recorded mode cannot serve an effect after the fork point (fork with effects=live); the carried history holds a mutex grant; the workflow id is in use on any shard, or a shard it routes to cannot be checked; the source shard is draining; or the fork lineage is deeper than 64 links."
+            "description": "The source, or a run in its fork lineage, had its payloads erased (issue #495); recorded mode cannot serve an effect after the fork point (fork with effects=live); the carried history holds a mutex grant; the workflow id is in use on any shard, or a shard it routes to cannot be checked; the source shard is draining; or the fork lineage is deeper than 64 links or reaches a run that no longer exists."
           },
           "413": {
             "description": "The quota key that the fork input resolves exceeds its byte cap (issue #946)."

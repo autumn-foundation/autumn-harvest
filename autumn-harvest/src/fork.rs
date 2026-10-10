@@ -171,6 +171,13 @@ pub enum WorkflowForkError {
         /// The workflow id.
         workflow_id: String,
     },
+    /// A run in the fork lineage no longer exists, so its erasure cannot be
+    /// ruled out.
+    #[error("fork lineage ancestor {exec_id} no longer exists, so its erasure cannot be ruled out")]
+    LineageGap {
+        /// The missing ancestor.
+        exec_id: ExecutionId,
+    },
     /// The fork lineage is deeper than the erased-lineage scan.
     #[error(
         "the fork lineage is deeper than {depth} links, so no erased ancestor can be ruled out"
@@ -517,15 +524,16 @@ const MAX_FORK_LINEAGE: usize = 64;
 
 /// The first erased run in the fork lineage above `source`, if any.
 ///
-/// It follows `start_source_ref` while the row is a fork. A missing ancestor
-/// ends the walk, because retention may delete it. Each ancestor row is read
-/// `FOR SHARE`, as the source is. So an erasure of an ancestor cannot commit
-/// between this check and the fork.
+/// It follows `start_source_ref` while the row is a fork. Each ancestor row
+/// is read `FOR SHARE`, as the source is. So an erasure of an ancestor cannot
+/// commit between this check and the fork.
 ///
 /// # Errors
 ///
-/// Returns [`WorkflowForkError::LineageTooDeep`] past
-/// [`MAX_FORK_LINEAGE`] links. The walk fails closed there.
+/// Returns [`WorkflowForkError::LineageGap`] when an ancestor no longer
+/// exists, because retention can delete an erased run. Returns
+/// [`WorkflowForkError::LineageTooDeep`] past [`MAX_FORK_LINEAGE`] links. The
+/// walk fails closed in both cases.
 async fn erased_fork_ancestor(
     conn: &mut AsyncPgConnection,
     source: &WorkflowExecution,
@@ -551,8 +559,12 @@ async fn erased_fork_ancestor(
                 .await
                 .optional()
                 .map_err(database_error)?;
+        // Retention can delete an erased run. A missing link therefore cannot
+        // prove that the lineage is clean, so the walk fails closed.
         let Some((input, start_source, start_source_ref)) = row else {
-            return Ok(None);
+            return Err(WorkflowForkError::LineageGap {
+                exec_id: ExecutionId::from_uuid(parent),
+            });
         };
         if crate::erase::execution_input_is_erased(&input) {
             return Ok(Some(ExecutionId::from_uuid(parent)));
@@ -573,10 +585,10 @@ async fn erased_fork_ancestor(
 /// Admit the fork under the tenant quota of its workflow type (issue #946).
 ///
 /// A fork adds a runnable run beside its source, so it is admitted as a start
-/// is. A new input resolves its own key. A kept input keeps the stored key
-/// of the source. A source with no stored key, such as a reset run, resolves
-/// it from its decoded input. The check runs under the key lock, and the
-/// fork row stores the key.
+/// is. The key resolves from the fork input under the current policy. A
+/// kept input is decoded first. The key that the source stored can be stale
+/// after a policy change, so it is not reused. The check runs under the key
+/// lock, and the fork row stores the key.
 async fn admit_quota(
     conn: &mut AsyncPgConnection,
     registry: Option<&HandlerRegistry>,
@@ -602,10 +614,9 @@ async fn admit_quota(
     let Some(policy) = policy else {
         return Ok(None);
     };
-    let key = match (input, source.quota_key.as_ref()) {
-        (Some(input), _) => crate::quota::resolve_quota_key(policy.key_expr, input),
-        (None, Some(stored)) => Some(stored.clone()),
-        (None, None) => {
+    let key = match input {
+        Some(input) => crate::quota::resolve_quota_key(policy.key_expr, input),
+        None => {
             crate::quota::resolve_quota_key(policy.key_expr, &codecs.decode_column(&source.input)?)
         }
     };

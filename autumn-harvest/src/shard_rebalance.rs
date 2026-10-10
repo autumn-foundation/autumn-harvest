@@ -198,8 +198,8 @@ pub enum QuiescenceBlocker {
     /// The execution is a fork of another run (issue #2000). A recorded fork
     /// reads its source, and a new fork walks the fork lineage, on the shard
     /// of the fork. Only the fork moves in a migration, so on the target both
-    /// lookups would miss: every recorded result would fail closed, and an
-    /// erased ancestor would go unseen. A fork therefore stays with its
+    /// lookups would miss. Every recorded result would then fail closed, and
+    /// an erased ancestor would go unseen. A fork therefore stays with its
     /// lineage.
     ForkLineage,
 }
