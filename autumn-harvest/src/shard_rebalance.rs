@@ -70,6 +70,10 @@ use crate::types::ShardId;
 /// of the predicate said "no task rows at all", which would have refused to
 /// migrate every timer-parked workflow — i.e. the entire population this
 /// feature exists to move.
+///
+/// Each bool is an independent fact, and several can hold at once. The
+/// predicate names every blocker, so an enum would lose information.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuiescenceObservation {
     /// `harvest_workflow_executions.state`.
@@ -83,6 +87,10 @@ pub struct QuiescenceObservation {
     /// overlap enforcement is shard-local, so its runs may not move away from
     /// it — see [`QuiescenceBlocker::ScheduleAttributed`].
     pub schedule_attributed: bool,
+    /// Whether the execution is a fork of another run
+    /// (`harvest_workflow_executions.start_source = 'fork'`, issue #2000). See
+    /// [`QuiescenceBlocker::ForkLineage`].
+    pub fork_lineage: bool,
     /// Workflow task rows a worker currently holds
     /// (`state = 'RUNNING' AND worker_id IS NOT NULL`).
     pub claimed_workflow_tasks: i64,
@@ -187,6 +195,13 @@ pub enum QuiescenceBlocker {
     /// forwarded residences, which is a change to the scheduler rather than to
     /// this feature.
     ScheduleAttributed,
+    /// The execution is a fork of another run (issue #2000). A recorded fork
+    /// reads its source, and a new fork walks the fork lineage, on the shard
+    /// of the fork. Only the fork moves in a migration, so on the target both
+    /// lookups would miss: every recorded result would fail closed, and an
+    /// erased ancestor would go unseen. A fork therefore stays with its
+    /// lineage.
+    ForkLineage,
 }
 
 impl QuiescenceBlocker {
@@ -216,6 +231,9 @@ impl QuiescenceBlocker {
                 "a dead-letter row is attributed to this execution; redrive or discard it first"
             }
             Self::NonDeterminismBlocked => "the run is blocked on a replay non-determinism",
+            Self::ForkLineage => {
+                "the execution is a fork, which reads its source and lineage on this shard"
+            }
         }
     }
 }
@@ -264,6 +282,9 @@ pub fn assess_quiescence(obs: &QuiescenceObservation) -> Quiescence {
     }
     if obs.schedule_attributed {
         blockers.push(QuiescenceBlocker::ScheduleAttributed);
+    }
+    if obs.fork_lineage {
+        blockers.push(QuiescenceBlocker::ForkLineage);
     }
     if obs.claimed_workflow_tasks > 0 {
         blockers.push(QuiescenceBlocker::ClaimedWorkflowTask);
@@ -696,6 +717,7 @@ mod db {
         e.state = 'RUNNING' \
         AND e.parent_id IS NULL \
         AND e.schedule_id IS NULL \
+        AND e.start_source IS DISTINCT FROM 'fork' \
         AND e.nd_blocked_at IS NULL \
         AND NOT EXISTS (SELECT 1 FROM harvest_task_queue t WHERE t.workflow_exec_id = e.id \
             AND t.task_type = 'workflow' AND t.state = 'RUNNING' AND t.worker_id IS NOT NULL) \
@@ -776,6 +798,8 @@ mod db {
                  WHERE m.execution_id = e.id AND m.legal_hold_verified \
                    AND m.verified_legal_hold_set_at IS NOT DISTINCT FROM e.legal_hold_set_at)";
 
+    // One column per fact of `QuiescenceObservation`, bools included.
+    #[allow(clippy::struct_excessive_bools)]
     #[derive(diesel::QueryableByName)]
     struct QuiescenceRow {
         #[diesel(sql_type = Text)]
@@ -784,6 +808,8 @@ mod db {
         parent_id: Option<Uuid>,
         #[diesel(sql_type = Bool)]
         schedule_attributed: bool,
+        #[diesel(sql_type = Bool)]
+        fork_lineage: bool,
         #[diesel(sql_type = Bool)]
         nd_blocked: bool,
         #[diesel(sql_type = BigInt)]
@@ -820,6 +846,7 @@ mod db {
         SELECT e.state, \
                e.parent_id, \
                (e.schedule_id IS NOT NULL) AS schedule_attributed, \
+               (e.start_source IS NOT DISTINCT FROM 'fork') AS fork_lineage, \
                (e.nd_blocked_at IS NOT NULL) AS nd_blocked, \
                (SELECT count(*) FROM harvest_task_queue t WHERE t.workflow_exec_id = e.id \
                   AND t.task_type = 'workflow' AND t.state = 'RUNNING' \
@@ -884,6 +911,7 @@ mod db {
             state: row.state,
             parent_id: row.parent_id.map(ExecutionId::from_uuid),
             schedule_attributed: row.schedule_attributed,
+            fork_lineage: row.fork_lineage,
             claimed_workflow_tasks: row.claimed_workflow_tasks,
             due_pending_tasks: row.due_pending_tasks,
             parked_workflow_tasks: row.parked_workflow_tasks,

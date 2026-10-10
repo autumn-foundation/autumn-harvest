@@ -5206,6 +5206,36 @@ async fn a_schedule_attributed_execution_is_refused_by_the_sql_predicate_too() {
 }
 
 #[tokio::test]
+async fn a_fork_is_refused_by_the_sql_predicate_too() {
+    // A fork reads its source and walks its lineage on its own shard (issue
+    // #2000), so neither the pure predicate nor the cutover SQL moves it.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "forked-run").await;
+
+    let mut source = shards.source().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET start_source = 'fork', \
+         start_source_ref = gen_random_uuid()::text WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut source)
+    .await
+    .expect("mark the run as a fork");
+
+    let verdict = assess_quiescence(&observe_quiescence(&mut source, exec_id).await.expect("obs"));
+    assert!(verdict.blockers().contains(&QuiescenceBlocker::ForkLineage));
+
+    let outcome = migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate must not error, only decline");
+    assert!(
+        matches!(outcome, MigrationOutcome::Skipped { .. }),
+        "expected a skip with named blockers, got {outcome:?}"
+    );
+    assert_eq!(authoritative_shards(&shards, exec_id).await, vec![SOURCE]);
+}
+
+#[tokio::test]
 async fn cancelling_a_sealed_source_is_left_pending_not_reported_delivered() {
     // The cancel outbox maps a terminal-state error to `ExternalCancelDelivered`
     // and never retries. A rebalanced seal is not terminal — the run is alive

@@ -19,7 +19,9 @@ is never written, so a run in any state can be forked, `COMPLETED` and
   wins again. It stays pending only when the same decision serves a sibling
   that won in the source. Otherwise nothing would wake the run, so the
   branch fails with `ForkEffectUnavailable`. A race loser is the exact
-  terminal that the engine writes, not any failure with the same text.
+  terminal that the engine writes, not any failure with the same text. A
+  loser also stays pending when the same fork decision started a timer that
+  has not fired, because a timer can win a race too.
 - The fork sends no completion callback and fires no completion trigger.
 - A reset of a fork keeps `start_source = fork` and appends a marker with the
   mode of that fork, so it keeps that mode. It copies the overrides of that
@@ -57,6 +59,10 @@ is refused with `409`.
 source, or resolves it from the decoded input when the source has none. A
 new input resolves its own key. A fork over a cap is refused with
 `429`, and the fork row stores its key.
+
+**Shard rebalancing.** A fork never migrates on its own (issue #964). It
+reads its source and walks its lineage on its own shard, so the new
+`ForkLineage` quiescence blocker keeps it with them.
 
 **Lineage.** The fork row has `start_source = fork` and
 `start_source_ref = <source id>`. Its history holds a `WorkflowForked`

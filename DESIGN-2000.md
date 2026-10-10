@@ -153,6 +153,8 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | The override cap refuses an output that the offloader would store. | Exempt it, as the worker exempts a real result. |
 | 16,384 payload references or more exceed the bind limit. | Insert the references in chunks of 1,000 rows. |
 | An activity failure with the race text is held as a race loser. | Match the whole shape of the engine terminal. |
+| A race won by a timer fails its loser closed. | Also hold a loser beside a pending timer of the same fork decision. |
+| A migrated fork misses its source and its lineage on the target shard. | A `ForkLineage` quiescence blocker keeps a fork on its shard. |
 
 ## 2. Tests
 

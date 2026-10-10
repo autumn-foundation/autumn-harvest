@@ -1153,12 +1153,12 @@ pub fn resolve_activity(
 
 /// Settle the race losers of one scheduling batch.
 ///
-/// A held loser waits for its race to cancel it again. That needs a source
-/// winner to resolve in the same batch, because its outcome wakes the
-/// workflow. A race schedules its branches in one decision, so the siblings
-/// of a loser are the run of `ActivityScheduled` events around it in the
-/// source. With no served sibling, nothing wakes the workflow, so the loser
-/// fails closed as unavailable.
+/// A held loser waits for its race to cancel it again. That needs a winner
+/// that wakes the workflow. One winner is a source sibling that the same
+/// batch serves. Another is a timer of the same fork decision that has not
+/// fired. A race schedules its branches in one decision, so the siblings of
+/// a loser are the run of command events around it. With neither winner,
+/// nothing wakes the workflow, so the loser fails closed as unavailable.
 #[must_use]
 pub fn settle_holds(
     fork_events: &[WorkflowEvent],
@@ -1184,7 +1184,7 @@ pub fn settle_holds(
                 decision_siblings(source_events, index)
                     .any(|sibling| sibling != index && served.contains(&sibling))
             });
-            if winner_served {
+            if winner_served || pending_timer_beside(fork_events, id) {
                 return (id, resolution);
             }
             let settled = scheduled_occurrence(fork_events, |own| own == id)
@@ -1214,21 +1214,51 @@ fn nth_scheduled(events: &[WorkflowEvent], name: &str, occurrence: u32) -> Optio
     })
 }
 
-/// The indices of the `ActivityScheduled` run that holds `index`.
+/// The indices of the run of command events that holds `index`.
 ///
-/// One decision appends its scheduled activities next to each other.
+/// One decision appends its scheduled activities and started timers next to
+/// each other.
 fn decision_siblings(events: &[WorkflowEvent], index: usize) -> std::ops::Range<usize> {
-    let is_scheduled =
-        |event: &WorkflowEvent| matches!(event, WorkflowEvent::ActivityScheduled { .. });
+    let is_command = |event: &WorkflowEvent| {
+        matches!(
+            event,
+            WorkflowEvent::ActivityScheduled { .. } | WorkflowEvent::TimerStarted { .. }
+        )
+    };
     let start = events[..index]
         .iter()
-        .rposition(|event| !is_scheduled(event))
+        .rposition(|event| !is_command(event))
         .map_or(0, |before| before + 1);
     let end = events[index..]
         .iter()
-        .position(|event| !is_scheduled(event))
+        .position(|event| !is_command(event))
         .map_or(events.len(), |after| index + after);
     start..end
+}
+
+/// Whether the fork decision that scheduled `id` also started a timer that
+/// has not fired or been cancelled.
+///
+/// That timer wakes the workflow later. A source race that a timer won then
+/// resolves the same way in the fork.
+fn pending_timer_beside(fork_events: &[WorkflowEvent], id: ActivityExecId) -> bool {
+    let Some(index) = fork_events.iter().position(|event| {
+        matches!(event, WorkflowEvent::ActivityScheduled { activity_id, .. } if *activity_id == id)
+    }) else {
+        return false;
+    };
+    fork_events[decision_siblings(fork_events, index)]
+        .iter()
+        .any(|event| {
+            let WorkflowEvent::TimerStarted { timer_id, .. } = event else {
+                return false;
+            };
+            !fork_events.iter().any(|later| match later {
+                WorkflowEvent::TimerFired { timer_id: done }
+                | WorkflowEvent::TimerCancelled { timer_id: done } => done == timer_id,
+                _ => false,
+            })
+        })
 }
 
 /// The error text of the terminal that `ctx.race()` writes for a loser.
@@ -1826,6 +1856,49 @@ mod tests {
                 ForkResolution::Serve(WorkflowEvent::ActivityFailed { attempt: 3, .. })
             ),
             "the recorded failure is served: {resolution:?}"
+        );
+    }
+
+    #[test]
+    fn a_race_loser_is_held_beside_a_pending_timer() {
+        let slow = ActivityExecId::new();
+        let timer = crate::types::TimerId::new("t-1");
+        // The timer won the source race.
+        let source = vec![
+            started(json!({})),
+            scheduled(slow, "slow", json!({})),
+            WorkflowEvent::TimerStarted {
+                timer_id: timer.clone(),
+                duration_secs: 5,
+            },
+            WorkflowEvent::TimerFired { timer_id: timer },
+            WorkflowEvent::ActivityFailed {
+                activity_id: slow,
+                error: RACE_LOSER_ERROR.to_string(),
+                attempt: 1,
+                error_type: "Error".to_string(),
+                non_retryable: true,
+                details: None,
+            },
+        ];
+        // The fork starts the same race. Its timer fires later and wakes the
+        // run, so the loser waits for it.
+        let id = ActivityExecId::new();
+        let fork = vec![
+            started(json!({})),
+            marker(ForkEffects::Recorded),
+            scheduled(id, "slow", json!({})),
+            WorkflowEvent::TimerStarted {
+                timer_id: crate::types::TimerId::new("t-2"),
+                duration_secs: 5,
+            },
+        ];
+        let batch = vec![(id, resolve_activity(&fork, &source, id))];
+        let settled = settle_holds(&fork, &source, batch);
+        assert!(
+            matches!(settled[0].1, ForkResolution::Hold),
+            "{:?}",
+            settled[0].1
         );
     }
 
