@@ -710,12 +710,13 @@ async fn admit_fork(
 
 /// An upper bound of the bytes that the fork stores beyond the source prefix.
 ///
-/// It counts the encoded marker and override events of the tail. A new
-/// input adds its encoded size. The replaced input stays in the prefix
+/// It counts the encoded marker and override events of the tail, as the
+/// offloader stores them. A new input adds its encoded size. The replaced input stays in the prefix
 /// measure, so the bound errs high and the cap fails closed.
 fn added_bytes(
     request: &WorkflowForkRequest,
     codecs: &PayloadCodecs,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
     tail: &[WorkflowEvent],
 ) -> HarvestResult<u64> {
     let size = |value: &Value| serde_json::to_vec(value).map_or(0, |bytes| bytes.len() as u64);
@@ -723,8 +724,12 @@ fn added_bytes(
         Some(input) => size(&codecs.encode_column(input)?),
         None => 0,
     };
+    // The tail is offloaded as it is appended, so a large override counts as
+    // its envelope.
     for event in tail {
-        bytes = bytes.saturating_add(size(&codecs.encode_event(event)?));
+        let encoded = codecs.encode_event(event)?;
+        let stored = offloader.map_or_else(|| size(&encoded), |off| off.offloaded_size(&encoded));
+        bytes = bytes.saturating_add(stored);
     }
     Ok(bytes)
 }
@@ -745,7 +750,12 @@ async fn measure_fork_history(
     let tail = fork_tail(source_id, fork_event_id, request);
     let bytes = prefix_bytes(conn, source_id.as_uuid(), fork_event_id)
         .await?
-        .saturating_add(added_bytes(request, codecs, &tail)?);
+        .saturating_add(added_bytes(
+            request,
+            codecs,
+            registry.and_then(HandlerRegistry::payload_offloader),
+            &tail,
+        )?);
     if let Some(registry) = registry {
         let events = (carried as u64).saturating_add(tail.len() as u64);
         check_history_caps(registry.history_policy(), events, bytes)?;

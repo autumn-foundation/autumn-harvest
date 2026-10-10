@@ -1309,6 +1309,51 @@ async fn the_history_quota_counts_a_large_input_override() {
     );
 }
 
+/// An override that the offloader stores out of line counts as its envelope.
+/// A large offloaded result must not exhaust a history quota that the stored
+/// fork fits.
+#[tokio::test]
+async fn the_history_quota_counts_an_offloaded_override_as_its_envelope() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("quota-offload");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1, "tenant": queue });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    let prefix: i64 = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(source.as_uuid()))
+        .select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+            "COALESCE(SUM(pg_column_size(event_data)), 0)::BIGINT",
+        ))
+        .first(&mut conn)
+        .await
+        .expect("measure the prefix");
+    let mut info = fork_pay_wf_info();
+    info.quota = Some(
+        autumn_harvest::quota::QuotaPolicy::new("tenant")
+            .with_max_history_bytes(u64::try_from(prefix).expect("size") + 8_192),
+    );
+    let offloader = Arc::new(autumn_harvest::payload_store::PayloadOffloader::new(
+        Arc::new(MemStore::default()),
+        64,
+        Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+    ));
+    let offloading = Arc::new(
+        HandlerRegistry::new(vec![info], activities![fork_charge, fork_receipt])
+            .with_payload_offloader(Some(offloader)),
+    );
+    let mut large = request(ForkEffects::Recorded);
+    large.activity_overrides = vec![ForkActivityOverride {
+        activity_name: "fork_charge".to_string(),
+        occurrence: 1,
+        output: json!({ "charge_id": "X".repeat(100_000) }),
+    }];
+    let result = fork_workflow_execution(&mut conn, source, large, Some(&offloading)).await;
+    assert!(
+        result.is_ok(),
+        "the stored fork holds an envelope, which fits the cap: {result:?}"
+    );
+}
+
 /// A fork whose history reaches a worker history cap could never run. Its
 /// first workflow task would dead-letter it. So the fork is refused, and no
 /// row is written.

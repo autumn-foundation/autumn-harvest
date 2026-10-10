@@ -241,6 +241,42 @@ impl PayloadOffloader {
         &self.store
     }
 
+    /// An upper bound of the stored size of `value` after
+    /// [`Self::offload_event_value`]. It uploads nothing.
+    ///
+    /// Each field that the offloader would store out of line counts as an
+    /// envelope. Its blob key counts as [`MAX_BLOB_KEY_BYTES`], the longest key
+    /// that an object store accepts. A caller can then check a cap before a
+    /// write without an upload.
+    #[must_use]
+    pub fn offloaded_size(&self, value: &Value) -> u64 {
+        let size = |value: &Value| serde_json::to_vec(value).map_or(0, |bytes| bytes.len() as u64);
+        let mut value = value.clone();
+        if let Some(data) = value.get_mut("data").and_then(Value::as_object_mut) {
+            let longest_key = "k".repeat(MAX_BLOB_KEY_BYTES);
+            for key in PAYLOAD_FIELD_KEYS {
+                let Some(field) = data.get_mut(key) else {
+                    continue;
+                };
+                let Ok(bytes) = serde_json::to_vec(field) else {
+                    continue;
+                };
+                if field.is_null()
+                    || (!is_offload_envelope(field) && bytes.len() as u64 <= self.threshold)
+                {
+                    continue;
+                }
+                *field = build_offload_envelope(
+                    &self.store_id,
+                    &longest_key,
+                    bytes.len() as u64,
+                    &hex_sha256(&bytes),
+                );
+            }
+        }
+        size(&value)
+    }
+
     /// Offload any over-threshold payload field inside a serialized event's
     /// `data` object, replacing each with a reference envelope in place.
     ///
@@ -431,6 +467,10 @@ fn parse_offload_envelope(field: &Value) -> Option<OffloadEnvelope> {
     })
 }
 
+/// The blob key bound of [`PayloadOffloader::offloaded_size`]. S3 and GCS
+/// accept object keys of at most 1,024 bytes.
+pub const MAX_BLOB_KEY_BYTES: usize = 1_024;
+
 fn build_offload_envelope(store_id: &str, key: &str, len: u64, checksum: &str) -> Value {
     serde_json::json!({
         OFFLOAD_ENVELOPE_KEY: 1,
@@ -542,6 +582,27 @@ mod tests {
         assert!(uploads.any(), "a blob upload is counted");
         assert_eq!(refs[0].store_id, "mem", "the store id is unchanged");
         assert_eq!(store.puts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn the_offloaded_size_bounds_the_stored_event() {
+        let off = offloader(MemStore::new(), 64);
+        let size = |value: &Value| serde_json::to_vec(value).unwrap().len() as u64;
+        let small = event_with_output(serde_json::json!("x"));
+        assert_eq!(
+            off.offloaded_size(&small),
+            size(&small),
+            "inline stays as is"
+        );
+
+        let mut large = event_with_output(serde_json::json!("x".repeat(100_000)));
+        let estimate = off.offloaded_size(&large);
+        assert!(
+            estimate < 2_000,
+            "an envelope replaces the field: {estimate}"
+        );
+        off.offload_event_value(&mut large).await.unwrap();
+        assert!(estimate >= size(&large), "the estimate is an upper bound");
     }
 
     #[tokio::test]

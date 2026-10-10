@@ -68,7 +68,8 @@ the current policy: a kept input is decoded, and a new input is used as
 is. A fork over a cap is refused with
 `429`, and the fork row stores its key. The history cap counts the copied
 prefix, a new input and the appended events, because a fork starts with
-that history. The measure is an upper bound.
+that history. The measure is an upper bound. An override that the
+offloader stores out of line counts as its envelope.
 
 **Shard rebalancing.** A fork never migrates on its own (issue #964). It
 reads its source and walks its lineage on its own shard, so the new
