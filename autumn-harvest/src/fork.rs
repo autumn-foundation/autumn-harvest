@@ -1004,7 +1004,10 @@ struct NewForkEvent {
 }
 
 /// Effects that recorded mode cannot serve, as event type names.
-const UNSERVABLE_EVENTS: [&str; 6] = [
+///
+/// A `MutexGranted` marks a mutex acquire, which recorded mode fails.
+const UNSERVABLE_EVENTS: [&str; 7] = [
+    "MutexGranted",
     "LocalActivityScheduled",
     "ChildWorkflowStarted",
     "ChildWorkflowSpawnedDetached",
@@ -2300,7 +2303,18 @@ mod tests {
             matches!(error, WorkflowForkError::CarriedMutex { ref key, event_id: 1 } if key == "acct-1"),
             "{error}"
         );
-        assert!(validate_fork(&events, 0, &WorkflowForkRequest::default()).is_ok());
+        // Before the grant, a recorded fork would fail at the acquire. So it
+        // is refused at once, and only a live fork may run it.
+        let error = validate_fork(&events, 0, &WorkflowForkRequest::default()).unwrap_err();
+        assert!(
+            matches!(error, WorkflowForkError::UnservableEffect { ref kind, event_id: 1 } if kind == "MutexGranted"),
+            "{error}"
+        );
+        let live = WorkflowForkRequest {
+            effects: ForkEffects::Live,
+            ..WorkflowForkRequest::default()
+        };
+        assert!(validate_fork(&events, 0, &live).is_ok());
     }
 
     #[test]

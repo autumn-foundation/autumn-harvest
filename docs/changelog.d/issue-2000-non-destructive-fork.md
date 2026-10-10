@@ -55,7 +55,7 @@ shard are refused. The erased-lineage walk locks each ancestor and fails
 closed past 64 links. A lineage that reaches a deleted run fails closed
 too, because retention can delete an erased run.
 In recorded mode, a source suffix with an effect that the mode cannot serve
-is refused with `409`. A fork history that reaches the worker history event
+is refused with `409`. A mutex grant after the fork point counts as one. A fork history that reaches the worker history event
 cap or byte cap (issue #1804) is refused with `409` too. The first workflow
 task of that fork would dead-letter it.
 
