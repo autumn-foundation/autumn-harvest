@@ -95,7 +95,7 @@ aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "al
 # `aes-gcm`'s own `zeroize` feature clears only a temporary key. These turn on
 # `ZeroizeOnDrop` for the AES round keys and the GHASH state. All three crates
 # are already in the lockfile through `aes-gcm`.
-aes = { version = "0.8.4", features = ["zeroize"] }
+aes = { version = "0.9.2", features = ["zeroize"] }
 ghash = { version = "0.5.1", default-features = false, features = ["zeroize"] }
 polyval = { version = "0.7.3", default-features = false, features = ["zeroize"] }
 # Clears data-key bytes on drop (issue #1825). Already in the lockfile.
