@@ -136,6 +136,13 @@ Later review rounds of the merged branch found more gaps:
     non-default placement failed, and the run got `pin`.
     `with_shard_router` now passes the candidate router into the replay
     context.
+19. `check_encoded` built its snapshot with no run metadata, so a
+    deadline-aware workflow replayed with no deadline. `EncodedHistory`
+    now carries the row's headers, timeout, deadline, parent, workflow id
+    and queue.
+20. A run that ended after the scan had its history decoded before its
+    state was read. A history the candidate cannot decode then gave
+    `pin`. The state is now read first, and an ended run is skipped.
 
 ---
 

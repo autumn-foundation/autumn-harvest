@@ -484,6 +484,18 @@ pub struct EncodedHistory {
     pub event_data: Vec<serde_json::Value>,
     /// The run's pending signals, with encoded payloads.
     pub pending_signals: Vec<PendingSignal>,
+    /// The run's `context_headers` column, still codec-encoded.
+    pub context_headers: Option<serde_json::Value>,
+    /// The run's `execution_timeout`. Deadline-aware code reads it.
+    pub execution_timeout: Option<chrono::Duration>,
+    /// The run's `deadline_at`. `ctx.should_continue_as_new()` reads it.
+    pub deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The run's parent, when it is a child run.
+    pub parent_execution_id: Option<ExecutionId>,
+    /// The run's `workflow_id`.
+    pub workflow_id: Option<String>,
+    /// The run's task queue.
+    pub queue_name: Option<String>,
 }
 
 // ── the check ───────────────────────────────────────────────────────────────
@@ -729,6 +741,19 @@ impl UpgradeCheck {
         RunVerdict::new(execution_id, name, findings)
     }
 
+    /// Decode a stored `context_headers` column with the candidate codecs.
+    /// `Err` means the candidate cannot read it.
+    fn decode_headers(
+        &self,
+        stored: Option<&serde_json::Value>,
+    ) -> Result<Option<HashMap<String, String>>, ()> {
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        let decoded = self.codecs.decode_column(stored).map_err(|_| ())?;
+        serde_json::from_value(decoded).map(Some).map_err(|_| ())
+    }
+
     /// Decode a stored history with the candidate codecs, then give it its
     /// verdict. The plaintext stays in memory.
     pub async fn check_encoded(&self, history: EncodedHistory) -> RunVerdict {
@@ -760,16 +785,19 @@ impl UpgradeCheck {
                 }
             }
         }
+        let Ok(context_headers) = self.decode_headers(history.context_headers.as_ref()) else {
+            return undecodable(history.execution_id, history.workflow_name, None);
+        };
         let snapshot = HistorySnapshot {
             workflow_name: history.workflow_name,
             execution_id: history.execution_id,
             events,
-            context_headers: None,
-            execution_timeout: None,
-            deadline_at: None,
-            parent_execution_id: None,
-            workflow_id: None,
-            queue_name: None,
+            context_headers,
+            execution_timeout: history.execution_timeout,
+            deadline_at: history.deadline_at,
+            parent_execution_id: history.parent_execution_id,
+            workflow_id: history.workflow_id,
+            queue_name: history.queue_name,
         };
         self.check_snapshot_with(snapshot, &pending).await
     }
@@ -1020,6 +1048,17 @@ fn shard_of(row_shard: i32, shards: &[ShardId]) -> ShardId {
         return shard;
     }
     shards.first().copied().unwrap_or(shard)
+}
+
+/// One run as its snapshot read it.
+#[cfg(feature = "db")]
+enum RunRead {
+    /// The run ended or left the table after the scan.
+    Gone,
+    /// A rebalance moved the run after the scan.
+    Moved,
+    /// The run is in flight: its fresh row, history and pending signals.
+    Live(Box<(InFlightRow, crate::store::EventHistory, Vec<PendingSignal>)>),
 }
 
 /// What became of a run between the scan and the snapshot of its history.
@@ -1595,22 +1634,19 @@ impl UpgradeCheck {
         let mut verdicts = Vec::with_capacity(rows.len());
         for row in rows {
             let execution_id = ExecutionId::from_uuid(row.id);
-            let loaded = self.read_run(&mut conn, execution_id).await;
-            let (row, mut verdict) = match loaded {
-                // The run left the table after the scan, so it needs no verdict.
-                Ok((None, _, _)) => continue,
-                Ok((Some(fresh), history, pending)) => {
-                    match after_scan(&fresh.state) {
-                        AfterScan::InFlight => {}
-                        AfterScan::Ended => continue,
-                        AfterScan::Moved => {
-                            incomplete.push(format!(
-                                "run {execution_id}: moved to another shard during the check; \
-                                 run the check again"
-                            ));
-                            continue;
-                        }
-                    }
+            let (row, mut verdict) = match self.read_run(&mut conn, execution_id).await {
+                // The run ended or left the table after the scan, so it needs
+                // no verdict.
+                Ok(RunRead::Gone) => continue,
+                Ok(RunRead::Moved) => {
+                    incomplete.push(format!(
+                        "run {execution_id}: moved to another shard during the check; \
+                         run the check again"
+                    ));
+                    continue;
+                }
+                Ok(RunRead::Live(live)) => {
+                    let (fresh, history, pending) = *live;
                     let verdict = match self.snapshot_for(&fresh, execution_id, history.events) {
                         Some(snapshot) => self.check_snapshot_with(snapshot, &pending).await,
                         None => undecodable(execution_id, fresh.workflow_name.clone(), None),
@@ -1645,15 +1681,15 @@ impl UpgradeCheck {
     /// `harvest_signals` and into history unseen by either read. A resume
     /// updates `deadline_at` and appends to history in one commit, so the
     /// row is read again here too.
+    ///
+    /// The row's state is classified first. A run that ended or moved has
+    /// no history read. So an ended run's history that the candidate cannot
+    /// decode gives no finding.
     async fn read_run(
         &self,
         conn: &mut diesel_async::AsyncPgConnection,
         execution_id: ExecutionId,
-    ) -> crate::error::HarvestResult<(
-        Option<InFlightRow>,
-        crate::store::EventHistory,
-        Vec<PendingSignal>,
-    )> {
+    ) -> crate::error::HarvestResult<RunRead> {
         use diesel_async::RunQueryDsl as _;
 
         let codecs = Arc::clone(&self.codecs);
@@ -1667,6 +1703,14 @@ impl UpgradeCheck {
                     .load(conn)
                     .await
                     .map_err(crate::error::database_error)?;
+                let Some(fresh) = fresh.into_iter().next() else {
+                    return Ok(RunRead::Gone);
+                };
+                match after_scan(&fresh.state) {
+                    AfterScan::InFlight => {}
+                    AfterScan::Ended => return Ok(RunRead::Gone),
+                    AfterScan::Moved => return Ok(RunRead::Moved),
+                }
                 let history = crate::store::load_history_inflated(
                     conn,
                     execution_id,
@@ -1675,7 +1719,7 @@ impl UpgradeCheck {
                 )
                 .await?;
                 let pending = load_pending_signals(conn, execution_id, &codecs).await?;
-                Ok((fresh.into_iter().next(), history, pending))
+                Ok(RunRead::Live(Box::new((fresh, history, pending))))
             })
             .await
     }
@@ -1688,13 +1732,7 @@ impl UpgradeCheck {
         execution_id: ExecutionId,
         events: Vec<WorkflowEvent>,
     ) -> Option<HistorySnapshot> {
-        let context_headers = match &row.context_headers {
-            None => None,
-            Some(stored) => {
-                let decoded = self.codecs.decode_column(stored).ok()?;
-                Some(serde_json::from_value::<HashMap<String, String>>(decoded).ok()?)
-            }
-        };
+        let context_headers = self.decode_headers(row.context_headers.as_ref()).ok()?;
         Some(HistorySnapshot {
             workflow_name: row.workflow_name.clone(),
             execution_id,

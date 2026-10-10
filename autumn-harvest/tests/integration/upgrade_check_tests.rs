@@ -793,6 +793,12 @@ fn encoded(codecs: &PayloadCodecs, events: &[WorkflowEvent]) -> EncodedHistory {
         execution_id: ExecutionId::new(),
         event_data,
         pending_signals: Vec::new(),
+        context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
+        parent_execution_id: None,
+        workflow_id: None,
+        queue_name: None,
     }
 }
 
@@ -1167,4 +1173,36 @@ async fn the_replay_uses_the_candidate_shard_router() {
         .check_snapshot(snapshot(vec![started()]))
         .await;
     assert_eq!(run.verdict, Verdict::Migrate, "{run:#?}");
+}
+
+/// The candidate checkpoints first when the run has a deadline.
+pub fn order_by_deadline_wf(ctx: &WorkflowContext, input: Value) -> WfFuture<'_> {
+    Box::pin(async move {
+        if ctx.deadline().is_some() {
+            return ctx
+                .execute_activity_raw("checkpoint", json!({}), "default")
+                .await
+                .map_err(|e| e.to_string());
+        }
+        order_wf(ctx, input).await
+    })
+}
+
+#[tokio::test]
+async fn an_encoded_history_keeps_its_run_metadata() {
+    let codecs = PayloadCodecs::default();
+    let blind = check_of(order_by_deadline_wf)
+        .check_encoded(encoded(&codecs, &reserving()))
+        .await;
+    assert_eq!(blind.verdict, Verdict::Migrate, "{blind:#?}");
+    // With its timeout, `ctx.deadline()` is set, and the run takes the
+    // checkpoint branch that the recorded `reserve` does not match.
+    let history = EncodedHistory {
+        execution_timeout: Some(chrono::Duration::hours(1)),
+        deadline_at: Some(Utc::now() + chrono::Duration::hours(1)),
+        ..encoded(&codecs, &reserving())
+    };
+    let run = check_of(order_by_deadline_wf).check_encoded(history).await;
+    assert_eq!(run.verdict, Verdict::Pin, "{run:#?}");
+    assert_eq!(kinds(&run), [FindingKind::Nondeterminism]);
 }
