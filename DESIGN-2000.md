@@ -165,6 +165,8 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | Retention can delete a record source while a recorded fork runs. | Not fixed: the fork fails closed. The runbook says to fork inside the retention window or hold the source. |
 | A shard migration can move a record source away from its live fork. | The `LiveFork` quiescence blocker keeps each run in the fork lineage of a live fork on its shard. The walk reaches past a fork that a reset sealed. |
 | A fork history at the worker event cap or byte cap dead-letters on its first task. | Refuse the fork with `409`. The check reads the stored rows, and the refusal rolls the fork back. |
+| A loser is held beside a served sibling of an enclosing join, so nothing cancels it. | Hold only for the provable winner of the same race: the one sibling that resolved before the cancel. |
+| A fork audit goes to the default shard, not the source shard. | Audit on the source-shard connection, as a reset does. |
 
 ## 2. Tests
 

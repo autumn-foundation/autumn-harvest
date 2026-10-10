@@ -16,14 +16,15 @@ is never written, so a run in any state can be forked, `COMPLETED` and
   signal, an external cancel, a continue-as-new or a mutex acquire fails the
   fork run before it runs. A successor run would hold no fork marker.
 - A race branch that lost in the source stays pending, so the same branch
-  wins again. It stays pending only when the same decision serves a sibling
-  that won in the source. Otherwise nothing would wake the run, so the
-  branch fails with `ForkEffectUnavailable`. A race loser is the exact
-  terminal that the engine writes, not any failure with the same text. A
-  held loser keeps a mark on its task, so the race still records its loser
-  terminal when the winner resolves. A
-  loser also stays pending when the same fork decision started a timer that
-  has not fired, because a timer can win a race too.
+  wins again. It stays pending only when the source winner of that race is
+  provable and the fork repeats it. The winner is the one sibling that
+  resolved before the source cancelled the loser. Otherwise nothing would
+  wake the run, so the branch fails with `ForkEffectUnavailable`. A timer
+  can win a race too. Then the matching timer of the same fork decision must
+  still be pending. A race loser is the exact terminal that the engine
+  writes, not any failure with the same text. A held loser keeps a mark on
+  its task, so the race still records its loser terminal when the winner
+  resolves.
 - The fork sends no completion callback and fires no completion trigger.
 - A reset of a fork keeps `start_source = fork` and appends a marker with the
   mode of that fork, so it keeps that mode. It copies the overrides of that

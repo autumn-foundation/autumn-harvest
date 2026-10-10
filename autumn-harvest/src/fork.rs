@@ -1287,12 +1287,12 @@ pub fn resolve_activity(
 
 /// Settle the race losers of one scheduling batch.
 ///
-/// A held loser waits for its race to cancel it again. That needs a winner
-/// that wakes the workflow. One winner is a source sibling that the same
-/// batch serves. Another is a timer of the same fork decision that has not
-/// fired. A race schedules its branches in one decision, so the siblings of
-/// a loser are the run of command events around it. With neither winner,
-/// nothing wakes the workflow, so the loser fails closed as unavailable.
+/// A held loser waits for its race to cancel it again. That needs the winner
+/// of that race to wake the workflow. So the loser is held only when the
+/// source winner is provable and the fork repeats it. An activity winner must
+/// be served in the same batch. A timer winner must be the matching timer of
+/// the same fork decision, and it must still be pending. Otherwise nothing
+/// would cancel the loser, so it fails closed as unavailable.
 #[must_use]
 pub fn settle_holds(
     fork_events: &[WorkflowEvent],
@@ -1314,11 +1314,13 @@ pub fn settle_holds(
             if !matches!(resolution, ForkResolution::Hold) {
                 return (id, resolution);
             }
-            let winner_served = source_index(id).is_some_and(|index| {
-                decision_siblings(source_events, index)
-                    .any(|sibling| sibling != index && served.contains(&sibling))
-            });
-            if winner_served || pending_timer_beside(fork_events, id) {
+            let winner_waits = source_index(id)
+                .and_then(|index| source_race_winner(source_events, index))
+                .is_some_and(|winner| match winner {
+                    RaceWinner::Activity(sibling) => served.contains(&sibling),
+                    RaceWinner::Timer(ordinal) => pending_timer_beside(fork_events, id, ordinal),
+                });
+            if winner_waits {
                 return (id, resolution);
             }
             let settled = scheduled_occurrence(fork_events, |own| own == id)
@@ -1370,12 +1372,67 @@ fn decision_siblings(events: &[WorkflowEvent], index: usize) -> std::ops::Range<
     start..end
 }
 
-/// Whether the fork decision that scheduled `id` also started a timer that
-/// has not fired or been cancelled.
+/// The branch that won a source race.
+enum RaceWinner {
+    /// The source index of the winning `ActivityScheduled`.
+    Activity(usize),
+    /// The position of the winning timer among the timers of the decision.
+    Timer(usize),
+}
+
+/// The provable winner of the race that the source loser at `index` lost.
 ///
-/// That timer wakes the workflow later. A source race that a timer won then
-/// resolves the same way in the fork.
-fn pending_timer_beside(fork_events: &[WorkflowEvent], id: ActivityExecId) -> bool {
+/// A race schedules its branches in one decision. The source cancels a loser
+/// only after a branch resolves. So the winner is a sibling whose outcome
+/// comes before the loser terminal. A sibling of an enclosing join can also
+/// resolve in that window. With more than one such sibling, the winner is not
+/// provable, and the result is `None`.
+fn source_race_winner(source_events: &[WorkflowEvent], index: usize) -> Option<RaceWinner> {
+    let WorkflowEvent::ActivityScheduled {
+        activity_id: loser, ..
+    } = source_events.get(index)?
+    else {
+        return None;
+    };
+    let cancelled = source_events
+        .iter()
+        .position(|event| terminal_activity_id(event) == Some(*loser))?;
+    let before = &source_events[..cancelled];
+    let mut timers = 0;
+    let mut winners = Vec::new();
+    for sibling in decision_siblings(source_events, index) {
+        match &source_events[sibling] {
+            WorkflowEvent::ActivityScheduled { activity_id, .. } if sibling != index => {
+                if before.iter().any(|event| {
+                    terminal_activity_id(event) == Some(*activity_id) && !is_race_loser(event)
+                }) {
+                    winners.push(RaceWinner::Activity(sibling));
+                }
+            }
+            WorkflowEvent::TimerStarted { timer_id, .. } => {
+                if before.iter().any(|event| {
+                    matches!(event, WorkflowEvent::TimerFired { timer_id: fired } if fired == timer_id)
+                }) {
+                    winners.push(RaceWinner::Timer(timers));
+                }
+                timers += 1;
+            }
+            _ => {}
+        }
+    }
+    if winners.len() == 1 {
+        winners.pop()
+    } else {
+        None
+    }
+}
+
+/// Whether the `ordinal`-th timer that the fork decision of `id` started has
+/// not fired or been cancelled.
+///
+/// That timer wakes the workflow later. A source race that the matching timer
+/// won then resolves the same way in the fork.
+fn pending_timer_beside(fork_events: &[WorkflowEvent], id: ActivityExecId, ordinal: usize) -> bool {
     let Some(index) = fork_events.iter().position(|event| {
         matches!(event, WorkflowEvent::ActivityScheduled { activity_id, .. } if *activity_id == id)
     }) else {
@@ -1383,10 +1440,12 @@ fn pending_timer_beside(fork_events: &[WorkflowEvent], id: ActivityExecId) -> bo
     };
     fork_events[decision_siblings(fork_events, index)]
         .iter()
-        .any(|event| {
-            let WorkflowEvent::TimerStarted { timer_id, .. } = event else {
-                return false;
-            };
+        .filter_map(|event| match event {
+            WorkflowEvent::TimerStarted { timer_id, .. } => Some(timer_id),
+            _ => None,
+        })
+        .nth(ordinal)
+        .is_some_and(|timer_id| {
             !fork_events.iter().any(|later| match later {
                 WorkflowEvent::TimerFired { timer_id: done }
                 | WorkflowEvent::TimerCancelled { timer_id: done } => done == timer_id,
@@ -2098,6 +2157,77 @@ mod tests {
             scheduled(z, "slow", json!({})),
         ];
         let settled = settle(&[z], &fork);
+        assert!(is_unavailable(&settled[0].1), "{:?}", settled[0].1);
+    }
+
+    #[test]
+    fn a_loser_is_held_only_by_the_winner_of_its_own_race() {
+        // The source runs `join!(race(slow, fast), other)`. `fast` wins.
+        let (slow, fast, other) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let loser = WorkflowEvent::ActivityFailed {
+            activity_id: slow,
+            error: RACE_LOSER_ERROR.to_string(),
+            attempt: 1,
+            error_type: "Error".to_string(),
+            non_retryable: true,
+            details: None,
+        };
+        let done = |id, output: &str| WorkflowEvent::ActivityCompleted {
+            activity_id: id,
+            output: json!(output),
+        };
+        let batch_of = |late: bool| {
+            let mut events = vec![
+                started(json!({})),
+                scheduled(slow, "slow", json!({})),
+                scheduled(fast, "fast", json!({})),
+                scheduled(other, "other", json!({})),
+            ];
+            if late {
+                events.extend([done(fast, "won"), loser.clone(), done(other, "o")]);
+            } else {
+                events.extend([done(other, "o"), done(fast, "won"), loser.clone()]);
+            }
+            events
+        };
+        let settle = |source: &[WorkflowEvent], names: &[&str]| {
+            let ids = names
+                .iter()
+                .map(|_| ActivityExecId::new())
+                .collect::<Vec<_>>();
+            let mut fork = vec![started(json!({})), marker(ForkEffects::Recorded)];
+            fork.extend(
+                ids.iter()
+                    .zip(names)
+                    .map(|(id, name)| scheduled(*id, name, json!({}))),
+            );
+            let batch = ids
+                .iter()
+                .map(|id| (*id, resolve_activity(&fork, source, *id)))
+                .collect::<Vec<_>>();
+            settle_holds(&fork, source, batch)
+        };
+
+        // The fork serves `other`, not `fast`. Nothing cancels `slow` again,
+        // so it fails closed.
+        let late = batch_of(true);
+        let settled = settle(&late, &["slow", "other"]);
+        assert!(is_unavailable(&settled[0].1), "{:?}", settled[0].1);
+        // The fork serves the winner, so the loser is held.
+        let settled = settle(&late, &["slow", "fast", "other"]);
+        assert!(
+            matches!(settled[0].1, ForkResolution::Hold),
+            "{:?}",
+            settled[0].1
+        );
+        // Two siblings resolved before the cancel, so the winner is not
+        // provable. The loser fails closed.
+        let early = batch_of(false);
+        let settled = settle(&early, &["slow", "fast", "other"]);
         assert!(is_unavailable(&settled[0].1), "{:?}", settled[0].1);
     }
 
