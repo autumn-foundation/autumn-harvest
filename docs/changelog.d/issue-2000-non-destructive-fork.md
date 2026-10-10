@@ -95,7 +95,8 @@ first.
 payload field, so the codec encodes it and erasure tombstones it. A fork
 inserts new event rows only. It is not an exception to the append-only rule
 of `harvest_events`. New `StartSource::Fork` and audit operation
-`workflow.fork`. No migration.
+`workflow.fork`. A fork is audited on the shard of its source, as a reset
+is. No migration.
 
 **Rolling deploy.** A worker that predates this change cannot decode the new
 events. Fork a run only after every worker runs this version.

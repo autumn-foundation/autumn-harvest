@@ -25450,19 +25450,15 @@ async fn fork_workflow(
     use axum::response::IntoResponse as _;
 
     let context = audit_context(&headers, &api_state);
-    let audit = |target_id: &str, failure: Option<&str>| {
-        audit_fork(
-            &api_state,
-            &context,
-            target_id.to_string(),
-            failure.map(str::to_string),
-        )
-    };
+    // Before the source shard resolves, a refusal is audited on the default
+    // shard, as for a reset.
 
     let exec_id = match parse_execution_id(&id) {
         Ok(eid) => eid,
         Err(e) => {
-            let _ = audit(&id, Some("malformed execution id")).await;
+            let _ =
+                audit_fork_on_default(&api_state, &context, &id, Some("malformed execution id"))
+                    .await;
             return e.into_response();
         }
     };
@@ -25472,7 +25468,8 @@ async fn fork_workflow(
     let runtime = match api_state.runtime() {
         Ok(runtime) => runtime,
         Err(e) => {
-            let _ = audit(&exec_id_str, Some(&e.to_string())).await;
+            let failure = e.to_string();
+            let _ = audit_fork_on_default(&api_state, &context, &exec_id_str, Some(&failure)).await;
             return map_error(e).into_response();
         }
     };
@@ -25487,12 +25484,12 @@ async fn fork_workflow(
         Some(runtime.registry().as_ref()),
     )
     .await;
-    drop(conn);
 
+    // The fork commits on the source shard. Its audit row goes there too.
     match result {
         Ok(result) => {
             // A committed fork must have its audit row, as a reset must.
-            if let Err(audit_err) = audit(&exec_id_str, None).await {
+            if let Err(audit_err) = audit_fork(&mut conn, &context, &exec_id_str, None).await {
                 tracing::error!(error = %audit_err, new_exec_id = %result.new_exec_id, "audit insert failed for workflow.fork");
                 return AutumnError::service_unavailable_msg(format!(
                     "the fork {} exists, but its audit insert failed: {audit_err}",
@@ -25503,30 +25500,41 @@ async fn fork_workflow(
             (axum::http::StatusCode::CREATED, Json(result)).into_response()
         }
         Err(error) => {
-            let _ = audit(&exec_id_str, Some(&error.to_string())).await;
+            let failure = error.to_string();
+            let _ = audit_fork(&mut conn, &context, &exec_id_str, Some(&failure)).await;
             fork_error_response(error)
         }
     }
 }
 
-/// Write one `workflow.fork` audit row on its own connection.
-///
-/// `failure` is the error summary of a refused fork, or `None` on success.
-async fn audit_fork(
+/// Write one `workflow.fork` audit row on the default shard.
+async fn audit_fork_on_default(
     api_state: &HarvestApiState,
-    (actor, source, request_id): &(String, String, Option<String>),
-    target_id: String,
-    failure: Option<String>,
+    context: &(String, String, Option<String>),
+    target_id: &str,
+    failure: Option<&str>,
 ) -> Result<(), String> {
     let pool = api_state.storage_pool().map_err(|e| e.to_string())?;
     let mut conn = acquire_conn(pool.default_pool())
         .await
         .map_err(|e| e.to_string())?;
+    audit_fork(&mut conn, context, target_id, failure).await
+}
+
+/// Write one `workflow.fork` audit row on `conn`.
+///
+/// `failure` is the error summary of a refused fork, or `None` on success.
+async fn audit_fork(
+    conn: &mut AsyncPgConnection,
+    (actor, source, request_id): &(String, String, Option<String>),
+    target_id: &str,
+    failure: Option<&str>,
+) -> Result<(), String> {
     let ar = NewAuditRecord {
         actor,
         operation: OP_WORKFLOW_FORK,
         target_type: TARGET_WORKFLOW,
-        target_id: Some(&target_id),
+        target_id: Some(target_id),
         route_or_command: "POST /workflows/{id}/fork",
         request_id: request_id.as_deref(),
         idempotency_key: None,
@@ -25535,11 +25543,11 @@ async fn audit_fork(
         } else {
             STATUS_SUCCEEDED
         },
-        error_summary: failure.as_deref(),
+        error_summary: failure,
         shard_id: None,
         source,
     };
-    audit::insert_audit(&mut conn, &ar)
+    audit::insert_audit(conn, &ar)
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())

@@ -110,7 +110,12 @@ async fn post_fork(
 
 /// Insert a `COMPLETED` run with a one-event history.
 async fn seed_completed(conn: &mut AsyncPgConnection) -> ExecutionId {
-    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    seed_completed_on(conn, 0).await
+}
+
+/// Insert a `COMPLETED` run with a one-event history on `shard`.
+async fn seed_completed_on(conn: &mut AsyncPgConnection, shard: i32) -> ExecutionId {
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(shard));
     let input = json!({ "order": 7 });
     let row = NewWorkflowExecution {
         quota_key: None,
@@ -118,7 +123,7 @@ async fn seed_completed(conn: &mut AsyncPgConnection) -> ExecutionId {
         workflow_name: "fork_http_wf",
         workflow_id: &format!("wf-{}", Uuid::new_v4()),
         run_id: Uuid::new_v4(),
-        shard_id: 0,
+        shard_id: shard,
         input: input.clone().into(),
         parent_id: None,
         queue_name: "fork-http-unpolled",
@@ -289,5 +294,96 @@ async fn fork_route_maps_refusals() {
             .as_str()
             .unwrap_or_default()
             .contains("erased")
+    );
+}
+
+/// Create and migrate two shard databases next to the database at `url`.
+async fn two_shard_urls(url: &str) -> (String, String) {
+    use diesel_async::SimpleAsyncConnection as _;
+
+    let mut admin = AsyncPgConnection::establish(url).await.expect("connect");
+    let (base, query) = url
+        .split_once('?')
+        .map_or((url, None), |(b, q)| (b, Some(q)));
+    let prefix = base.rsplit_once('/').map_or(base, |(prefix, _)| prefix);
+    let mut urls = Vec::new();
+    for _ in 0..2 {
+        let name = format!("harvest_fork_shard_{}", Uuid::new_v4().simple());
+        diesel::sql_query(format!("CREATE DATABASE {name}"))
+            .execute(&mut admin)
+            .await
+            .expect("create shard database");
+        let shard_url = query.map_or_else(
+            || format!("{prefix}/{name}"),
+            |q| format!("{prefix}/{name}?{q}"),
+        );
+        let mut conn = AsyncPgConnection::establish(&shard_url)
+            .await
+            .expect("connect shard");
+        conn.batch_execute(&autumn_harvest::test_init_sql())
+            .await
+            .expect("migrate shard");
+        urls.push(shard_url);
+    }
+    (urls[0].clone(), urls[1].clone())
+}
+
+async fn fork_audit_rows(url: &str, target: &str) -> i64 {
+    let mut conn = AsyncPgConnection::establish(url).await.expect("connect");
+    autumn_harvest::schema::harvest_audit_log::table
+        .filter(autumn_harvest::schema::harvest_audit_log::operation.eq("workflow.fork"))
+        .filter(autumn_harvest::schema::harvest_audit_log::target_id.eq(target))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count audit rows")
+}
+
+/// The fork commits on the shard of its source, so its audit row lands there
+/// too, as for a reset. The default shard is not involved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fork_route_audits_on_the_source_shard() {
+    let (url, _container) = setup_database().await;
+    let (url_a, url_b) = two_shard_urls(&url).await;
+    let mut pools = std::collections::BTreeMap::new();
+    pools.insert(ShardId::new(0), build_pool(&url_a));
+    pools.insert(ShardId::new(1), build_pool(&url_b));
+    let storage = HarvestDbPool::sharded(autumn_harvest::shard::ShardedDbPool::from_map(
+        pools,
+        ShardId::new(0),
+    ));
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(storage);
+    api_state.install(HarvestApiRuntime::new(
+        Arc::new(HandlerRegistry::new(vec![], vec![])),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("fork-shard-test".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0), ShardId::new(1)],
+            ShardId::new(0),
+        ),
+    ));
+    let app = harvest_api_router(api_state);
+
+    let mut shard_b = AsyncPgConnection::establish(&url_b).await.expect("connect");
+    let source = seed_completed_on(&mut shard_b, 1).await.to_string();
+    let (status, body) = post_fork(&app, &source, json!({ "reason": "what-if" }), true).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    assert_eq!(
+        fork_audit_rows(&url_b, &source).await,
+        1,
+        "audit on the source shard"
+    );
+    assert_eq!(
+        fork_audit_rows(&url_a, &source).await,
+        0,
+        "no audit on the default shard"
     );
 }
