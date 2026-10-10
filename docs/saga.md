@@ -692,11 +692,11 @@ offloaded blobs before opening the fork's transaction — so `erase-payloads`,
 which takes its own `FOR UPDATE` lock, can commit tombstones anywhere in that
 window and the pre-flight would have already passed on the intact row. The fork
 therefore rechecks erasure **under the same row lock it takes to seal the
-source** (`WorkflowResetRequest::refuse_erased_source`), before copying a single
-event. That serialises the two operations: erasure either committed before the
-lock, in which case the fork sees it and refuses, or it queues behind the lock
-and the fork completes on intact events. The flag is `#[serde(skip)]`, so the
-public reset endpoint cannot set it and is byte-for-byte unchanged.
+source**, before copying a single event. That serialises the two operations:
+erasure either committed before the lock, in which case the fork sees it and
+refuses, or it queues behind the lock and the fork completes on intact events.
+Every fork path runs this check, not only DAG retry (issue #1999). See
+[Workflow reset](workflow-reset.md#a-fork-never-uses-a-pii-erased-source).
 
 The refusal is correct **independently of compensation**: the issue #148 fork
 carries over the upstream events, whose `output` fields are now tombstones, so a
