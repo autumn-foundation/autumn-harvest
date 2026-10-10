@@ -16,7 +16,9 @@ is never written, so a run in any state can be forked, `COMPLETED` and
   signal, an external cancel, a continue-as-new or a mutex acquire fails the
   fork run before it runs. A successor run would hold no fork marker.
 - A race branch that lost in the source stays pending, so the same branch
-  wins again.
+  wins again. It stays pending only when the same decision serves a sibling
+  that won in the source. Otherwise nothing would wake the run, so the
+  branch fails with `ForkEffectUnavailable`.
 - The fork sends no completion callback and fires no completion trigger.
 - A reset of a fork keeps `start_source = fork` and appends a marker with the
   mode of that fork, so it keeps that mode. It copies the overrides of that

@@ -45,7 +45,8 @@ A recorded fork cannot charge a card again under a new identity. Use
 `"effects": "live"` only when you want real effects.
 
 A race branch that lost in the source stays pending in the fork, so the same
-branch wins again. An activity whose input holds a value that the fork makes
+branch wins again. If the fork no longer runs the winner, the losing branch
+fails closed instead. An activity whose input holds a value that the fork makes
 again, such as a new UUID or a session id, has no record. It fails closed.
 
 ## 3. Change the fork
