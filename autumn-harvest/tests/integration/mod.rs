@@ -138,9 +138,11 @@ mod delayed_start_tests;
 mod det_check_tests;
 mod determinism_static_analysis_docs;
 mod dispatch_tests;
+mod docs_guard_support;
 mod drain_release_tests;
 #[cfg(feature = "db")]
 mod dst_differential_tests;
+mod dst_world_tests;
 mod e2e_bench_cell_timeout_tests;
 mod e2e_bench_support;
 #[cfg(feature = "db")]
@@ -275,6 +277,7 @@ mod retry_budget_tests;
 mod retry_chain_routing_tests;
 mod retry_clock_skew_tests;
 mod retry_now_tests;
+mod safety_report_docs;
 mod saga_tests;
 mod scanner_lease_tests;
 mod scanner_liveness_tests;

@@ -582,7 +582,7 @@ pub async fn agent_model_turn(
     request: ModelTurnRequest,
 ) -> Result<ModelTurn, String> {
     let harness = harness(ctx)?;
-    let (turn, latency) = harness.model_turn_timed(request).await?;
+    let (turn, latency) = harness.model_turn_timed(request, |_content| {}).await?;
     harness.record_turn(ctx, &turn.usage, latency);
     Ok(turn)
 }

@@ -152,6 +152,46 @@ impl ThrowawayDb {
         db
     }
 
+    /// Create a database named `prefix` plus a unique suffix, as a copy of
+    /// `template`, on the server of `admin_url`. No migration runs, so a
+    /// copy is much faster than [`Self::create_on`].
+    ///
+    /// # Panics
+    /// Panics when the server is unreachable or the copy fails. A copy fails
+    /// while another session uses `template`.
+    pub async fn clone_on(admin_url: &str, prefix: &str, template: &str) -> Self {
+        use diesel_async::{AsyncConnection, AsyncPgConnection, SimpleAsyncConnection};
+        assert!(
+            (1..=30).contains(&prefix.len())
+                && prefix
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+            "a throwaway prefix must match [a-z0-9_]{{1,30}}: {prefix:?}"
+        );
+        let name = format!("{prefix}_{}", uuid::Uuid::new_v4().simple());
+        let mut admin = AsyncPgConnection::establish(admin_url)
+            .await
+            .expect("the admin server must be reachable");
+        admin
+            .batch_execute(&format!(
+                "CREATE DATABASE \"{name}\" TEMPLATE \"{template}\""
+            ))
+            .await
+            .expect("copy the template database");
+        Self {
+            admin_url: admin_url.to_string(),
+            name,
+        }
+    }
+
+    /// Keep the database after the guard goes, and return its name.
+    #[must_use]
+    pub fn keep(self) -> String {
+        let name = self.name.clone();
+        std::mem::forget(self);
+        name
+    }
+
     /// The name of the throwaway database.
     #[must_use]
     pub fn name(&self) -> &str {
