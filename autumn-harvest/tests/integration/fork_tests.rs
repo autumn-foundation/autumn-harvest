@@ -70,10 +70,25 @@ fn lookups(tag: &str) -> u32 {
 
 /// Charges `amount`, then writes a receipt for the charge. With
 /// `"local": true`, it first runs the local activity `fork_lookup`. With
-/// `"session": true`, it charges in a worker session.
+/// `"session": true`, it charges in a worker session. With `"race": true`,
+/// the charge races a receipt on a queue that no worker polls, and wins.
 #[workflow]
 async fn fork_pay_wf(ctx: &WorkflowContext, input: Value) -> Result<Value, String> {
     let queue = ctx.queue_name().to_string();
+    if input["race"] == json!(true) {
+        let won = ctx
+            .race()
+            .activity_raw("fork_charge", input.clone(), &queue)
+            .activity_raw(
+                "fork_receipt",
+                json!({ "charge": "none" }),
+                &format!("{queue}-idle"),
+            )
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(json!({ "winner": won.index, "value": won.value }));
+    }
     if input["local"] == json!(true) {
         ctx.execute_local_activity_raw("fork_lookup", input.clone(), None, Some(30))
             .await
@@ -1252,6 +1267,85 @@ async fn the_copied_prefix_counts_against_the_history_quota() {
             ))
         ),
         "the prefix alone exceeds the cap: {result:?}"
+    );
+}
+
+/// The history cap counts the rows that the fork stores, not only the source
+/// prefix. A large input override must not slip past a cap that the source
+/// prefix alone fits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_history_quota_counts_a_large_input_override() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("quota-override");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1, "tenant": queue });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    let prefix: i64 = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(source.as_uuid()))
+        .select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+            "COALESCE(SUM(pg_column_size(event_data)), 0)::BIGINT",
+        ))
+        .first(&mut conn)
+        .await
+        .expect("measure the prefix");
+    let cap = u64::try_from(prefix).expect("size") + 200;
+    let mut info = fork_pay_wf_info();
+    info.quota =
+        Some(autumn_harvest::quota::QuotaPolicy::new("tenant").with_max_history_bytes(cap));
+    let quota_registry = Arc::new(HandlerRegistry::new(
+        vec![info],
+        activities![fork_charge, fork_receipt],
+    ));
+    let mut large = request(ForkEffects::Live);
+    large.input = Some(json!({ "tag": queue, "tenant": queue, "note": "X".repeat(4_096) }));
+    let result = fork_workflow_execution(&mut conn, source, large, Some(&quota_registry)).await;
+    assert!(
+        matches!(
+            result,
+            Err(WorkflowForkError::Harvest(
+                autumn_harvest::error::HarvestError::QuotaExceeded {
+                    resource: autumn_harvest::quota::QuotaResource::HistoryBytes,
+                    ..
+                }
+            ))
+        ),
+        "the large input exceeds the cap: {result:?}"
+    );
+}
+
+/// A held race loser still gets its loser terminal when the race resolves in
+/// the fork. Every activity that the fork schedules then has an outcome, so
+/// a later reset or fork point after the race stays valid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_race_loser_gets_its_terminal_in_the_fork() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("race");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1, "race": true });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    let running = Running::start(&queue, &pool);
+    let source_row = wait_for_execution_state(&url, source, "COMPLETED").await;
+    running.stop().await;
+
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let running = Running::start(&queue, &pool);
+    let row = wait_for_execution_state(&url, forked, "COMPLETED").await;
+    running.stop().await;
+    assert_eq!(row.output, source_row.output);
+    assert_eq!(charges(&queue), 1, "the fork never charges");
+
+    let (_, events) = snapshot(&url, forked).await;
+    let count = |kinds: &[&str]| {
+        events
+            .iter()
+            .filter(|(_, kind, _)| kinds.contains(&kind.as_str()))
+            .count()
+    };
+    assert_eq!(
+        count(&["ActivityScheduled"]),
+        count(&["ActivityCompleted", "ActivityFailed"]),
+        "every scheduled activity has a terminal: {events:#?}"
     );
 }
 

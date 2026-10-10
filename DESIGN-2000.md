@@ -159,6 +159,8 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | A kept input reuses a stale quota key. | Resolve the key from the decoded input under the current policy. |
 | A fork skips the admission gate and load shedding. | Run `admit_fresh_start` in `GateMode::Check` before the insert. |
 | The history cap does not see the copied prefix. | Add the prefix bytes to the usage before the insert. |
+| The history cap misses a new input and the appended events. | Add an upper bound of their encoded size. |
+| A held race loser gets no loser terminal, so its `ActivityScheduled` stays open. | Mark the held task; `cancel_activity_task` treats the mark as open. |
 | Retention can delete a record source while a recorded fork runs. | Not fixed: the fork fails closed. The runbook says to fork inside the retention window or hold the source. |
 
 ## 2. Tests

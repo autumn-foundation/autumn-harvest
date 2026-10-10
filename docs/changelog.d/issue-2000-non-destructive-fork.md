@@ -20,6 +20,8 @@ is never written, so a run in any state can be forked, `COMPLETED` and
   that won in the source. Otherwise nothing would wake the run, so the
   branch fails with `ForkEffectUnavailable`. A race loser is the exact
   terminal that the engine writes, not any failure with the same text. A
+  held loser keeps a mark on its task, so the race still records its loser
+  terminal when the winner resolves. A
   loser also stays pending when the same fork decision started a timer that
   has not fired, because a timer can win a race too.
 - The fork sends no completion callback and fires no completion trigger.
@@ -63,7 +65,8 @@ refuses it with `503`, and load shedding (issue #1794) with `429`.
 the current policy: a kept input is decoded, and a new input is used as
 is. A fork over a cap is refused with
 `429`, and the fork row stores its key. The history cap counts the copied
-prefix, because a fork starts with that history.
+prefix, a new input and the appended events, because a fork starts with
+that history. The measure is an upper bound.
 
 **Shard rebalancing.** A fork never migrates on its own (issue #964). It
 reads its source and walks its lineage on its own shard, so the new

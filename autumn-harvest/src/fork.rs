@@ -287,7 +287,7 @@ async fn fork_in_transaction(
         conn,
         registry,
         &source,
-        request.input.as_ref(),
+        request,
         codecs,
         new_exec_id,
         fork_event_id,
@@ -596,7 +596,7 @@ async fn admit_fork(
     conn: &mut AsyncPgConnection,
     registry: Option<&HandlerRegistry>,
     source: &WorkflowExecution,
-    input: Option<&Value>,
+    request: &WorkflowForkRequest,
     codecs: &PayloadCodecs,
     new_exec_id: ExecutionId,
     fork_event_id: i64,
@@ -626,7 +626,7 @@ async fn admit_fork(
     let Some(policy) = policy else {
         return Ok(None);
     };
-    let key = match input {
+    let key = match &request.input {
         Some(input) => crate::quota::resolve_quota_key(policy.key_expr, input),
         None => {
             crate::quota::resolve_quota_key(policy.key_expr, &codecs.decode_column(&source.input)?)
@@ -657,7 +657,9 @@ async fn admit_fork(
     // A fork starts with the copied prefix. A start has no history yet, so
     // the history cap must count the prefix here, before the insert.
     if let Some(limit) = policy.max_history_bytes {
-        let prefix = prefix_bytes(conn, source.id, fork_event_id).await?;
+        let prefix = prefix_bytes(conn, source.id, fork_event_id)
+            .await?
+            .saturating_add(added_bytes(source, request, codecs, fork_event_id)?);
         let usage =
             crate::quota::load_quota_usage_excluding(conn, name, &key, &[new_exec_id.as_uuid()])
                 .await?;
@@ -673,6 +675,29 @@ async fn admit_fork(
         }
     }
     Ok(Some(key))
+}
+
+/// An upper bound of the bytes that the fork stores beyond the source prefix.
+///
+/// It counts the encoded marker and override events of the tail. A new
+/// input adds its encoded size. The replaced input stays in the prefix
+/// measure, so the bound errs high and the cap fails closed.
+fn added_bytes(
+    source: &WorkflowExecution,
+    request: &WorkflowForkRequest,
+    codecs: &PayloadCodecs,
+    fork_event_id: i64,
+) -> HarvestResult<u64> {
+    let size = |value: &Value| serde_json::to_vec(value).map_or(0, |bytes| bytes.len() as u64);
+    let mut bytes = match &request.input {
+        Some(input) => size(&codecs.encode_column(input)?),
+        None => 0,
+    };
+    let source_id = ExecutionId::from_uuid(source.id);
+    for event in fork_tail(source_id, fork_event_id, request) {
+        bytes = bytes.saturating_add(size(&codecs.encode_event(&event)?));
+    }
+    Ok(bytes)
 }
 
 /// The stored bytes of the source events up to `fork_event_id`.
@@ -1323,6 +1348,14 @@ fn pending_timer_beside(fork_events: &[WorkflowEvent], id: ActivityExecId) -> bo
         })
 }
 
+/// The task error of a race loser that a recorded fork holds.
+///
+/// The race cancels the loser again when its winner resolves. The task is
+/// already `CANCELLED`, so `queue::cancel_activity_task` matches this mark
+/// too. The race then records the loser terminal, and no scheduled activity
+/// stays open in the fork history.
+pub(crate) const FORK_HOLD_ERROR: &str = "held by the fork record (issue #2000)";
+
 /// The error text of the terminal that `ctx.race()` writes for a loser.
 const RACE_LOSER_ERROR: &str = "lost race to a sibling branch";
 
@@ -1597,7 +1630,12 @@ pub(crate) async fn serve_recorded_activities(
         .set((
             harvest_task_queue::state.eq("CANCELLED"),
             harvest_task_queue::worker_id.eq(None::<String>),
-            harvest_task_queue::error.eq(Some("resolved by the fork record (issue #2000)")),
+            // A held loser keeps a mark, so the race still finds it.
+            harvest_task_queue::error.eq(Some(if outcome.is_some() {
+                "resolved by the fork record (issue #2000)"
+            } else {
+                FORK_HOLD_ERROR
+            })),
             harvest_task_queue::completed_at.eq(Some(chrono::Utc::now())),
         ))
         .execute(conn)

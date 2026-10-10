@@ -4422,6 +4422,9 @@ pub async fn cancel_open_tasks_for_execution(
 /// is still open (`PENDING`/`RUNNING`) — the loser-cancellation primitive for
 /// `ctx.race()` (issue #600).
 ///
+/// A loser that a recorded fork holds is already `CANCELLED` with the hold
+/// mark of issue #2000. It counts as open here.
+///
 /// Returns `Some((activity_name, queue_name))` if a still-open row was
 /// transitioned to `CANCELLED` (the caller should then record a synthetic
 /// terminal event for it so replay never re-observes it as in-progress, and
@@ -4444,7 +4447,11 @@ pub async fn cancel_activity_task(
     let cancelled = diesel::update(
         dsl::harvest_task_queue
             .filter(dsl::activity_id.eq(Some(activity_id.as_uuid())))
-            .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
+            .filter(
+                dsl::state.eq_any(["PENDING", "RUNNING"]).or(dsl::state
+                    .eq("CANCELLED")
+                    .and(dsl::error.eq(Some(crate::fork::FORK_HOLD_ERROR)))),
+            ),
     )
     .set((
         dsl::state.eq("CANCELLED"),
