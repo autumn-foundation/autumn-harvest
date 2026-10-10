@@ -200,7 +200,7 @@ proptest = { workspace = true }
 # Issue #1978: the OIDC round-trip test signs ID tokens for a local mock
 # identity provider. All three crates are already in the lockfile.
 jsonwebtoken = { version = "11.1", default-features = false, features = ["rust_crypto"] }
-ed25519-dalek = "2.2"
+ed25519-dalek = "3.0"
 # The KMS binding tests also use `base64` for the fake wire formats (issue
 # #1981).
 base64 = "0.22"
