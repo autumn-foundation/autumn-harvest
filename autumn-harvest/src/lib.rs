@@ -729,7 +729,7 @@ pub use replay::{
 pub use reset::{
     BatchResetItem, BatchResetOutcome, ResetInvalidPoint, ResetPlan, ResetPoint, ResetResult,
     ResetSignalReapplyPolicy, ResetSkipReason, ResetUnresolvedSideEffect, WorkflowResetError,
-    WorkflowResetRequest, preview_workflow_reset, reset_workflow_execution,
+    WorkflowResetRequest, batch_skip_reason, preview_workflow_reset, reset_workflow_execution,
     resolve_batch_reset_one, resolve_reset_point, validate_reset_point,
 };
 pub use retention::{

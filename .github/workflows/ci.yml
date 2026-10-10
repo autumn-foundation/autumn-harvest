@@ -2144,7 +2144,8 @@ jobs:
 
   # TLA+ models of the core protocols (issue #1819). The runner checks each
   # row of formal/tla/models.txt. A `violation:` row is a counter-example, and
-  # it must fail on its named invariant. See docs/testing/formal-methods.md.
+  # it must fail on its named invariant. The job also checks the trace
+  # fixtures (issue #2003). See docs/testing/formal-methods.md.
   formal-models:
     name: TLA+ models
     needs: changes
@@ -2153,12 +2154,17 @@ jobs:
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
       needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # A full run takes about 40 seconds. The runner image has Java.
+    # The models take about 40 seconds and the trace fixtures about 10.
+    # The runner image has Java and Python.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Model-check every manifest row with TLC
         run: scripts/check-formal-models.sh
+      # Issue #2003: TLC must accept each clean fixture trace and reject
+      # each red one. The chaos traces are checked in chaos.yml.
+      - name: Check the trace fixtures against the TLA+ specs
+        run: scripts/check-formal-traces.sh formal/tla/trace/fixtures
 
   # Kani proofs of the pure kernels (issue #1819). The script fails when Kani
   # verifies fewer proofs than the source holds, or when a cover check fails.
