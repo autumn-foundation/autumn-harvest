@@ -146,6 +146,7 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | A text search of blob keys misses an escaped key. | Match the keys of parsed envelopes exactly. |
 | A prefix of 16,384 events or more exceeds the bind limit. | Insert the prefix in chunks of 1,000 rows. |
 | A request with 16,383 overrides or more exceeds the bind limit. | Refuse more than 1,000 overrides with `400`. |
+| An override output skips the result byte cap. | Check each output against the cap of its activity. |
 
 ## 2. Tests
 

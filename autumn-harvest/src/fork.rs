@@ -255,6 +255,9 @@ async fn fork_in_transaction(
     if let (Some(input), Some(registry)) = (&request.input, registry) {
         check_input_override(registry, &source.workflow_name, input)?;
     }
+    if let Some(registry) = registry {
+        check_override_outputs(registry, &request.activity_overrides)?;
+    }
 
     let rows = crate::reset::load_event_rows(conn, source_id).await?;
     let events = decode_rows(&rows, codecs)?;
@@ -582,6 +585,29 @@ fn check_input_override(
         return Err(WorkflowForkError::InvalidOverride {
             message: format!("the input has {observed} bytes, over the cap of {cap}"),
         });
+    }
+    Ok(())
+}
+
+/// Apply the result byte cap of each named activity to its override output.
+///
+/// A real result passes the same cap (issue #252), so an override cannot
+/// bypass the payload guard of the deployment.
+fn check_override_outputs(
+    registry: &HandlerRegistry,
+    overrides: &[ForkActivityOverride],
+) -> Result<(), WorkflowForkError> {
+    for item in overrides {
+        let cap = registry.activity_result_cap(&item.activity_name);
+        let observed = serde_json::to_vec(&item.output).map_or(0, |bytes| bytes.len() as u64);
+        if cap > 0 && observed > cap {
+            return Err(WorkflowForkError::InvalidOverride {
+                message: format!(
+                    "the output of '{}' occurrence {} has {observed} bytes, over the cap of {cap}",
+                    item.activity_name, item.occurrence
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -1788,6 +1814,24 @@ mod tests {
             matches!(error, WorkflowForkError::InvalidOverride { .. }),
             "{error}"
         );
+    }
+
+    #[test]
+    fn an_override_output_passes_the_result_cap() {
+        let mut registry = HandlerRegistry::new(vec![], vec![]);
+        registry.max_activity_result_bytes = 16;
+        let with = |output: Value| {
+            vec![ForkActivityOverride {
+                activity_name: "charge".to_string(),
+                occurrence: 1,
+                output,
+            }]
+        };
+        assert!(check_override_outputs(&registry, &with(json!("small"))).is_ok());
+        assert!(matches!(
+            check_override_outputs(&registry, &with(json!("X".repeat(64)))),
+            Err(WorkflowForkError::InvalidOverride { .. })
+        ));
     }
 
     #[test]

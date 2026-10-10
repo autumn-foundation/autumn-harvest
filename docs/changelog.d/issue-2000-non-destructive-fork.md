@@ -35,7 +35,8 @@ A live fork never reads the source history after the fork exists.
 passes the input schema (issue #373) and the byte cap (issue #252).
 `activity_overrides` sets the result of one activity occurrence after the
 fork point. A request sets at most 1,000 overrides
-(`fork::MAX_ACTIVITY_OVERRIDES`).
+(`fork::MAX_ACTIVITY_OVERRIDES`). Each output passes the result byte cap of
+its activity (issue #252).
 
 **Refusals.** An erased source (issue #495) is always refused, under a
 `FOR SHARE` lock on the source row. So is a fork whose fork lineage reaches
