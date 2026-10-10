@@ -51,9 +51,9 @@ is refused with `409`.
 `start_source_ref = <source id>`. Its history holds a `WorkflowForked`
 marker. A fork is a new root, not a child of the source.
 
-**Payloads.** The fork copies the payload references of the source that its
-stored rows or kept input still name, so retention of the source keeps the
-shared blobs. An input override replaces only the stored `data.input`, so an
+**Payloads.** The fork copies the payload references of the source whose
+blob key an offload envelope in its stored rows or kept input names, so
+retention of the source keeps the shared blobs. The key match is exact. An input override replaces only the stored `data.input`, so an
 offloaded carryover stays an envelope. Matching inflates offloaded payloads
 first.
 
@@ -72,7 +72,7 @@ history stay byte-identical; a recorded fork does not run a completed
 activity again; a live fork does; a fork with no record fails closed; an
 override replaces a result; a recorded fork fails before a local activity;
 a recorded fork serves a member of a closed session; a live fork runs
-with a source blob gone;
+with a source blob gone; a prefix of 16,501 events copies in chunks;
 an erased source is refused in both modes; a fork of a fork of an erased run
 is refused; a later fork point carries the prefix; a reset of a recorded
 fork stays recorded; only a recorded fork suppresses completion

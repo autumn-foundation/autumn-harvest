@@ -143,6 +143,8 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | A member of a closed source session fails with `SessionBroken`. | Resolve from the record before the session check. Skip each settled activity there. |
 | A transient store fault becomes `ForkEffectUnavailable`. | Return the load error. The decision rolls back and retries. |
 | A live fork stalls on a fault in the source history. | Load the source only in recorded mode. |
+| A text search of blob keys misses an escaped key. | Match the keys of parsed envelopes exactly. |
+| A prefix of 16,384 events or more exceeds the bind limit. | Insert the prefix in chunks of 1,000 rows. |
 
 ## 2. Tests
 

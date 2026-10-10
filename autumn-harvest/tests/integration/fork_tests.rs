@@ -989,6 +989,40 @@ async fn a_live_fork_does_not_read_the_source_history() {
     assert_eq!(charges(&queue), 1, "the live fork charges once");
 }
 
+/// A fork copies a prefix longer than one insert can bind. Postgres caps a
+/// statement at 65,535 parameters, and each copied row binds four.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_copies_a_prefix_past_the_parameter_limit() {
+    const MARKERS: usize = 16_500;
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("long");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let markers = (0..MARKERS)
+        .map(|n| WorkflowEvent::MarkerRecorded {
+            name: "step".to_string(),
+            details: json!(n),
+        })
+        .collect::<Vec<_>>();
+    for (n, chunk) in markers.chunks(1_000).enumerate() {
+        let start = i32::try_from(1 + n * 1_000).expect("event id");
+        store::append_events(&mut conn, source, chunk, start)
+            .await
+            .expect("append markers");
+    }
+
+    let mut at_end = request(ForkEffects::Recorded);
+    at_end.fork_point = Some(ResetPoint::EventId {
+        event_id: i64::try_from(MARKERS).expect("event id"),
+    });
+    let result = fork_workflow_execution(&mut conn, source, at_end, Some(&registry()))
+        .await
+        .expect("fork succeeds");
+    assert_eq!(result.events_carried_over, MARKERS + 1);
+    let (_, events) = snapshot(&url, result.new_exec_id).await;
+    assert_eq!(events.len(), MARKERS + 2, "the prefix and the marker");
+}
+
 /// A source erased after the fork exists serves no record. The fork fails
 /// closed and never charges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

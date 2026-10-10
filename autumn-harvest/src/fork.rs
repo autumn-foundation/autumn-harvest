@@ -293,7 +293,7 @@ async fn fork_in_transaction(
         Err(error) => return Err(error.into()),
     };
 
-    let mut copied_text = copy_prefix(
+    let copied = copy_prefix(
         conn,
         new_exec_id,
         &rows,
@@ -304,13 +304,16 @@ async fn fork_in_transaction(
     )
     .await?;
     // The fork shares the blobs of the source. Its own references keep them
-    // alive after retention deletes the source. Only the bytes that the fork
+    // alive after retention deletes the source. Only the rows that the fork
     // stores count, so a replaced input releases its blob.
+    let mut keys = envelope_keys(&copied);
     if request.input.is_none() {
-        copied_text.push_str(&source.input.to_string());
+        keys.extend(
+            crate::payload_store::extract_offload_ref(&source.input).map(|blob| blob.blob_key),
+        );
     }
     let refs = crate::store::load_payload_refs(conn, source_id).await?;
-    let reachable = refs_named_in(refs, &copied_text);
+    let reachable = refs_named_in(refs, &keys);
     crate::store::insert_payload_refs(conn, new_exec_id, &reachable).await?;
     let tail = fork_tail(source_id, fork_event_id, request);
     let tail_start = i32::try_from(plan.events_carried_over)
@@ -436,16 +439,27 @@ async fn check_shards(
     }
 }
 
-/// The references in `refs` whose blob key appears in `text`.
+/// The blob keys that the offload envelopes in the stored `rows` name.
+pub(crate) fn envelope_keys<'a>(
+    rows: impl IntoIterator<Item = &'a Value>,
+) -> std::collections::HashSet<String> {
+    rows.into_iter()
+        .flat_map(crate::payload_store::refs_in_event_value)
+        .map(|blob| blob.blob_key)
+        .collect()
+}
+
+/// The references in `refs` whose blob key is in `keys`.
 ///
-/// A blob key is a unique string, so a text search finds each envelope that
-/// names it.
+/// The keys come from parsed envelopes, so the match is exact. A text search
+/// misses a key that JSON escapes. It also keeps a key that a longer key
+/// contains.
 pub(crate) fn refs_named_in(
     refs: Vec<crate::payload_store::OffloadedRef>,
-    text: &str,
+    keys: &std::collections::HashSet<String>,
 ) -> Vec<crate::payload_store::OffloadedRef> {
     refs.into_iter()
-        .filter(|blob| text.contains(&blob.blob_key))
+        .filter(|blob| keys.contains(&blob.blob_key))
         .collect()
 }
 
@@ -625,8 +639,11 @@ async fn workflow_id_in_use(
 ///
 /// The rows keep their stored bytes. An input override replaces only the
 /// stored `data.input` of the `WorkflowStarted` row. That row is the whole
-/// prefix at fork point `0`. The function returns the text of the stored
-/// rows, so the caller can find the blob keys that they name.
+/// prefix at fork point `0`. The function returns the stored rows, so the
+/// caller can find the blob keys that they name.
+///
+/// The insert runs in chunks. One statement for a long prefix exceeds the
+/// bind-parameter limit of Postgres.
 async fn copy_prefix(
     conn: &mut AsyncPgConnection,
     new_exec_id: ExecutionId,
@@ -635,7 +652,7 @@ async fn copy_prefix(
     fork_event_id: i64,
     request: &WorkflowForkRequest,
     codecs: &PayloadCodecs,
-) -> HarvestResult<String> {
+) -> HarvestResult<Vec<Value>> {
     let mut copied = Vec::new();
     for (row, event) in rows.iter().zip(events) {
         if i64::from(row.event_id) > fork_event_id {
@@ -658,19 +675,19 @@ async fn copy_prefix(
             event_data,
         });
     }
-    if copied.is_empty() {
-        return Ok(String::new());
+    for chunk in copied.chunks(COPY_CHUNK_ROWS) {
+        diesel::insert_into(harvest_events::table)
+            .values(chunk)
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
     }
-    diesel::insert_into(harvest_events::table)
-        .values(&copied)
-        .execute(conn)
-        .await
-        .map_err(database_error)?;
-    Ok(copied
-        .iter()
-        .map(|row| row.event_data.to_string())
-        .collect())
+    Ok(copied.into_iter().map(|row| row.event_data).collect())
 }
+
+/// Rows per insert of the carried prefix. Each row binds four parameters, so
+/// one chunk stays far below the limit of 65,535.
+const COPY_CHUNK_ROWS: usize = 1_000;
 
 /// The stored start row with the `data.input` of `encoded` in place.
 ///
@@ -1604,12 +1621,31 @@ mod tests {
 
     #[test]
     fn only_named_payload_refs_are_copied() {
-        let text = json!({ "data": { "output": { "key": "blob-carried" } } }).to_string();
-        let refs = vec![blob("blob-start"), blob("blob-carried")];
-        let kept = refs_named_in(refs, &text);
+        let envelope = |key: &str| {
+            json!({
+                "_harvest_offload_envelope": 1,
+                "store_id": "s",
+                "key": key,
+                "len": 1,
+                "checksum": "c",
+            })
+        };
+        let rows = [
+            json!({ "data": { "output": envelope("blob-10") } }),
+            json!({ "data": { "input": envelope("a\"b\\c") } }),
+        ];
+        let refs = vec![
+            blob("blob-1"),
+            blob("blob-10"),
+            blob("a\"b\\c"),
+            blob("blob-gone"),
+        ];
+        let kept = refs_named_in(refs, &envelope_keys(&rows));
+        // A key that JSON escapes still matches. A key that a named key
+        // contains does not.
         assert_eq!(
             kept.into_iter().map(|r| r.blob_key).collect::<Vec<_>>(),
-            vec!["blob-carried"]
+            vec!["blob-10", "a\"b\\c"]
         );
     }
 
