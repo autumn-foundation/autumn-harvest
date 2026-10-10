@@ -125,6 +125,17 @@ Later review rounds of the merged branch found more gaps:
 15. With offloaded history and no offloader, the check skipped every
     payload check, the pending signals too. A pending signal is never
     offloaded, so it is now checked against the candidate schema.
+16. A read of `limits::ATTEMPTS` matched a local `ATTEMPTS` by its last
+    segment, so the dependency's item was never read. A match that is not
+    exact now also goes to the crates the path names.
+17. A run moved to another shard after its source shard was read became a
+    `MIGRATED` seal and was dropped. If the target shard was read first,
+    no part of the check saw it. Such a run now makes the report
+    incomplete.
+18. The replay had no shard router. A fresh child spawn with a
+    non-default placement failed, and the run got `pin`.
+    `with_shard_router` now passes the candidate router into the replay
+    context.
 
 ---
 

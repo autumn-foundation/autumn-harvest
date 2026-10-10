@@ -1135,3 +1135,36 @@ async fn the_replay_uses_the_candidate_build_id() {
     assert_eq!(run.verdict, Verdict::Pin, "{run:#?}");
     assert_eq!(kinds(&run), [FindingKind::Nondeterminism]);
 }
+
+/// The candidate pins its first child to shard 1.
+pub fn order_with_child_wf(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
+    Box::pin(async move {
+        ctx.spawn_child_workflow_raw_placed(
+            "child_wf",
+            json!(1),
+            &autumn_harvest::shard::ChildPlacement::Shard(autumn_harvest::types::ShardId::new(1)),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })
+}
+
+#[tokio::test]
+async fn the_replay_uses_the_candidate_shard_router() {
+    // The run has not spawned its child yet. The candidate router makes
+    // shard 1 writable, so the spawn resolves as the worker resolves it.
+    let shards = vec![
+        autumn_harvest::types::ShardId::new(0),
+        autumn_harvest::types::ShardId::new(1),
+    ];
+    let router = autumn_harvest::ShardRouter::new(
+        shards.clone(),
+        shards,
+        autumn_harvest::types::ShardId::new(0),
+    );
+    let run = check_of(order_with_child_wf)
+        .with_shard_router(router)
+        .check_snapshot(snapshot(vec![started()]))
+        .await;
+    assert_eq!(run.verdict, Verdict::Migrate, "{run:#?}");
+}

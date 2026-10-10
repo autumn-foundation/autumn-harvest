@@ -27,13 +27,15 @@ fn __autumn_workflow_info_wf_dep_const() -> u8 {
     }
 }
 
+const ATTEMPTS: u64 = const 9_u64;
+
 fn wf_dep_const(_1: &WorkflowContext, _2: u64) -> {async fn body of wf_dep_const()} {
     debug ctx => _1;
     debug attempt => _2;
     let mut _0: {async fn body of wf_dep_const()};
 
     bb0: {
-        _0 = {coroutine@flow.rs:39:87: 44:2 (#0)} { ctx: copy _1, attempt: copy _2 };
+        _0 = {coroutine@flow.rs:43:87: 48:2 (#0)} { ctx: copy _1, attempt: copy _2 };
         return;
     }
 }

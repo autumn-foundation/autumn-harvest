@@ -80,6 +80,7 @@ manifests the same. So give the check each value the candidate worker sets:
 | `max_activity_input_bytes`, `max_signal_payload_bytes`, `max_workflow_input_bytes` | `with_payload_caps` |
 | `history_continue_as_new_threshold`, `history_continue_as_new_deadline_fraction`, `history_event_hard_cap` | `with_history_policy` |
 | A build id. A workflow can branch on `ctx.build_id()`. | `with_build_id` |
+| A shard router, with its writable shards and residency map. A child spawn with a non-default placement needs it. | `with_shard_router` |
 
 Each default matches the worker default. The replay applies the payload
 caps to the commands that a run sends next. A run whose next payload is

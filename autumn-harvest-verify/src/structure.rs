@@ -635,7 +635,14 @@ impl DocIndex {
             let tail = rest.get(at.saturating_add(6)..).unwrap_or_default();
             let name = const_name(tail);
             let paths = self.const_paths(name);
-            if paths.is_empty() {
+            // A read such as `limits::ATTEMPTS` can match a local `ATTEMPTS`
+            // only by its last segment. The local item may be unrelated, so
+            // the name also goes to the crates its path names.
+            let suffix = format!("::{name}");
+            let exact = !paths.is_empty()
+                && (name.starts_with('<')
+                    || paths.iter().any(|p| p == name || p.ends_with(&suffix)));
+            if !exact {
                 missing.push(name.to_string());
             }
             found.extend(paths);

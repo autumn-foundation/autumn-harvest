@@ -633,6 +633,15 @@ impl UpgradeCheck {
         self
     }
 
+    /// The candidate worker's shard router, with its writable shards and
+    /// residency map. A fresh child spawn with a non-default placement needs
+    /// it.
+    #[must_use]
+    pub fn with_shard_router(mut self, router: crate::shard::ShardRouter) -> Self {
+        self.replayer = self.replayer.with_shard_router(router);
+        self
+    }
+
     /// Configure the replayer further, for example with shared state.
     #[must_use]
     pub fn map_replayer(mut self, f: impl FnOnce(WorkflowReplayer) -> WorkflowReplayer) -> Self {
@@ -1011,6 +1020,31 @@ fn shard_of(row_shard: i32, shards: &[ShardId]) -> ShardId {
         return shard;
     }
     shards.first().copied().unwrap_or(shard)
+}
+
+/// What became of a run between the scan and the snapshot of its history.
+#[cfg(feature = "db")]
+#[derive(Debug, PartialEq, Eq)]
+enum AfterScan {
+    /// The run is still in flight, so it gets a verdict.
+    InFlight,
+    /// The run ended, so it needs no verdict.
+    Ended,
+    /// A rebalance moved the run. This row is the source seal. The target
+    /// shard can already be scanned, so the report is incomplete.
+    Moved,
+}
+
+/// Classify the state that the snapshot read for a run.
+#[cfg(feature = "db")]
+fn after_scan(state: &str) -> AfterScan {
+    if crate::replay_sample::IN_FLIGHT_STATES.contains(&state) {
+        AfterScan::InFlight
+    } else if state == "MIGRATED" {
+        AfterScan::Moved
+    } else {
+        AfterScan::Ended
+    }
 }
 
 /// Keep at most `limit_per_shard` rows of each shard id in `shards`. Return
@@ -1446,6 +1480,8 @@ struct InFlightRow {
     queue_name: String,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     assigned_build_id: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    state: String,
 }
 
 /// The columns of [`InFlightRow`]. Both row queries select them.
@@ -1453,7 +1489,7 @@ struct InFlightRow {
 macro_rules! in_flight_select {
     () => {
         "SELECT id, shard_id, workflow_name, context_headers, execution_timeout, \
-         deadline_at, parent_id, workflow_id, queue_name, assigned_build_id \
+         deadline_at, parent_id, workflow_id, queue_name, assigned_build_id, state \
          FROM harvest_workflow_executions "
     };
 }
@@ -1474,10 +1510,10 @@ const IN_FLIGHT_SQL: &str = concat!(
      ORDER BY created_at, id LIMIT $3"
 );
 
-/// One run's row, read again in the snapshot that reads its history. A run
-/// that left the in-flight states since the scan has no row here.
+/// One run's row, read again in the snapshot that reads its history.
+/// [`after_scan`] decides what its state means.
 #[cfg(feature = "db")]
-const RUN_ROW_SQL: &str = concat!(in_flight_select!(), "WHERE id = $1 AND state = ANY($2)");
+const RUN_ROW_SQL: &str = concat!(in_flight_select!(), "WHERE id = $1");
 
 #[cfg(feature = "db")]
 impl UpgradeCheck {
@@ -1554,49 +1590,27 @@ impl UpgradeCheck {
                     .map_err(crate::error::database_error)
             })
             .await?;
-        let over_limit = hold_to_limit(&mut rows, shards, options.limit_per_shard, group_limit);
+        let mut incomplete = hold_to_limit(&mut rows, shards, options.limit_per_shard, group_limit);
 
         let mut verdicts = Vec::with_capacity(rows.len());
         for row in rows {
             let execution_id = ExecutionId::from_uuid(row.id);
-            let codecs = Arc::clone(&self.codecs);
-            let offloader = self.offloader.clone();
-            // One snapshot for every read (`REPEATABLE READ`). A worker that
-            // ingests a pending signal between them would otherwise move it out
-            // of `harvest_signals` and into history unseen by either read. A
-            // resume updates `deadline_at` and appends to history in one
-            // commit, so the row is read again here too.
-            let loaded = conn
-                .build_transaction()
-                .repeatable_read()
-                .read_only()
-                .run(async |conn| {
-                    let fresh: Vec<InFlightRow> = diesel::sql_query(RUN_ROW_SQL)
-                        .bind::<diesel::sql_types::Uuid, _>(execution_id.as_uuid())
-                        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&states)
-                        .load(conn)
-                        .await
-                        .map_err(crate::error::database_error)?;
-                    let history = crate::store::load_history_inflated(
-                        conn,
-                        execution_id,
-                        &codecs,
-                        offloader.as_deref(),
-                    )
-                    .await?;
-                    let pending = load_pending_signals(conn, execution_id, &codecs).await?;
-                    Ok::<_, crate::error::HarvestError>((
-                        fresh.into_iter().next(),
-                        history,
-                        pending,
-                    ))
-                })
-                .await;
+            let loaded = self.read_run(&mut conn, execution_id).await;
             let (row, mut verdict) = match loaded {
-                // The run ended or left the table after the scan, so it needs
-                // no verdict.
+                // The run left the table after the scan, so it needs no verdict.
                 Ok((None, _, _)) => continue,
                 Ok((Some(fresh), history, pending)) => {
+                    match after_scan(&fresh.state) {
+                        AfterScan::InFlight => {}
+                        AfterScan::Ended => continue,
+                        AfterScan::Moved => {
+                            incomplete.push(format!(
+                                "run {execution_id}: moved to another shard during the check; \
+                                 run the check again"
+                            ));
+                            continue;
+                        }
+                    }
                     let verdict = match self.snapshot_for(&fresh, execution_id, history.events) {
                         Some(snapshot) => self.check_snapshot_with(snapshot, &pending).await,
                         None => undecodable(execution_id, fresh.workflow_name.clone(), None),
@@ -1621,7 +1635,49 @@ impl UpgradeCheck {
             verdict.build_id = row.assigned_build_id;
             verdicts.push(verdict);
         }
-        Ok((verdicts, over_limit))
+        Ok((verdicts, incomplete))
+    }
+
+    /// Read one run's row, history and pending signals in one snapshot.
+    ///
+    /// The snapshot is `REPEATABLE READ`. A worker that ingests a pending
+    /// signal between two reads would otherwise move it out of
+    /// `harvest_signals` and into history unseen by either read. A resume
+    /// updates `deadline_at` and appends to history in one commit, so the
+    /// row is read again here too.
+    async fn read_run(
+        &self,
+        conn: &mut diesel_async::AsyncPgConnection,
+        execution_id: ExecutionId,
+    ) -> crate::error::HarvestResult<(
+        Option<InFlightRow>,
+        crate::store::EventHistory,
+        Vec<PendingSignal>,
+    )> {
+        use diesel_async::RunQueryDsl as _;
+
+        let codecs = Arc::clone(&self.codecs);
+        let offloader = self.offloader.clone();
+        conn.build_transaction()
+            .repeatable_read()
+            .read_only()
+            .run(async |conn| {
+                let fresh: Vec<InFlightRow> = diesel::sql_query(RUN_ROW_SQL)
+                    .bind::<diesel::sql_types::Uuid, _>(execution_id.as_uuid())
+                    .load(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+                let history = crate::store::load_history_inflated(
+                    conn,
+                    execution_id,
+                    &codecs,
+                    offloader.as_deref(),
+                )
+                .await?;
+                let pending = load_pending_signals(conn, execution_id, &codecs).await?;
+                Ok((fresh.into_iter().next(), history, pending))
+            })
+            .await
     }
 
     /// The replay input for `row`. `None` when the candidate codecs cannot
@@ -1912,6 +1968,16 @@ mod tests {
     fn one_manifest_alone_is_a_usage_error() {
         let err = parse(&["--database-url", "x", "--baseline-structure", "old.json"]);
         assert!(matches!(err, Err(UpgradeCheckError::Usage(_))));
+    }
+
+    #[test]
+    fn a_run_that_moved_during_the_scan_is_not_dropped() {
+        use super::{AfterScan, after_scan};
+        assert_eq!(after_scan("RUNNING"), AfterScan::InFlight);
+        assert_eq!(after_scan("PAUSED"), AfterScan::InFlight);
+        assert_eq!(after_scan("COMPLETED"), AfterScan::Ended);
+        assert_eq!(after_scan("FAILED"), AfterScan::Ended);
+        assert_eq!(after_scan("MIGRATED"), AfterScan::Moved);
     }
 
     #[test]

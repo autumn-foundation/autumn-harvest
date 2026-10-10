@@ -35,6 +35,10 @@ pub fn __autumn_workflow_info_wf_dep_const() -> u8 {
     0
 }
 
+/// A local `const` with the same last segment as the dependency's. It is
+/// unrelated, so it must not stand in for `limits::ATTEMPTS`.
+pub const ATTEMPTS: u64 = 9;
+
 /// A branch on a dependency's `const`, and a read of a std `const`.
 pub async fn wf_dep_const(ctx: &WorkflowContext, attempt: u64) -> Result<u64, String> {
     if attempt < limits::ATTEMPTS {
