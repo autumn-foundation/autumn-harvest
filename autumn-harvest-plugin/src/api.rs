@@ -25555,6 +25555,19 @@ fn fork_error_response(error: WorkflowForkError) -> axum::response::Response {
 
     let status = match error {
         WorkflowForkError::InvalidPoint(invalid) => return reset_invalid_point_response(invalid),
+        // A fork is a fresh admission (issue #2000), so a gate answers as it
+        // does for a start or a rerun.
+        WorkflowForkError::Harvest(HarvestError::AdmissionBlocked { gate_id, reason }) => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "admission blocked",
+                    "gate_id": gate_id,
+                    "reason": reason,
+                })),
+            )
+                .into_response();
+        }
         WorkflowForkError::Harvest(error) => return map_error(error).into_response(),
         WorkflowForkError::ContinueAsNew | WorkflowForkError::InvalidOverride { .. } => {
             axum::http::StatusCode::BAD_REQUEST

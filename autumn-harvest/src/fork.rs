@@ -283,7 +283,7 @@ async fn fork_in_transaction(
         Some(input) => codecs.encode_column(input)?,
         None => source.input.clone(),
     };
-    let quota_key = admit_quota(
+    let quota_key = admit_fork(
         conn,
         registry,
         &source,
@@ -582,14 +582,16 @@ async fn erased_fork_ancestor(
     }
 }
 
-/// Admit the fork under the tenant quota of its workflow type (issue #946).
+/// Admit the fork as a fresh start, and return its tenant quota key.
 ///
-/// A fork adds a runnable run beside its source, so it is admitted as a start
-/// is. The key resolves from the fork input under the current policy. A
+/// A fork adds a runnable run beside its source, so it passes the same checks
+/// as a start. First come the admission gate (issue #618) and load shedding
+/// (issue #1794), in `GateMode::Check`. Then comes the tenant quota (issue
+/// #946). The key resolves from the fork input under the current policy. A
 /// kept input is decoded first. The key that the source stored can be stale
 /// after a policy change, so it is not reused. The check runs under the key
 /// lock, and the fork row stores the key.
-async fn admit_quota(
+async fn admit_fork(
     conn: &mut AsyncPgConnection,
     registry: Option<&HandlerRegistry>,
     source: &WorkflowExecution,
@@ -598,6 +600,14 @@ async fn admit_quota(
     new_exec_id: ExecutionId,
 ) -> HarvestResult<Option<String>> {
     let name = source.workflow_name.as_str();
+    crate::execution::admit_fresh_start(
+        crate::admission_gate::GateMode::Check,
+        None,
+        name,
+        &source.queue_name,
+        source.shard_id,
+        source.owner.as_deref(),
+    )?;
     let policy = registry
         .and_then(|registry| registry.workflows.get(name))
         .and_then(|info| info.quota)

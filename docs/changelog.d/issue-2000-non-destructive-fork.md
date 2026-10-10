@@ -55,6 +55,9 @@ too, because retention can delete an erased run.
 In recorded mode, a source suffix with an effect that the mode cannot serve
 is refused with `409`.
 
+**Admission.** A fork is a fresh start. An admission gate (issue #618)
+refuses it with `503`, and load shedding (issue #1794) with `429`.
+
 **Quota.** A fork is admitted under the tenant quota of its workflow type
 (issue #946), as a start is. The key resolves from the fork input under
 the current policy: a kept input is decoded, and a new input is used as

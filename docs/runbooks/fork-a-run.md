@@ -110,7 +110,9 @@ not show it under the source (see
 | `409` | The fork lineage is deeper than 64 links. | Fork a run nearer the root. |
 | `409` | A run in the fork lineage no longer exists, for example after retention. Its erasure cannot be ruled out. | Fork a run whose lineage still exists, or start a new run. |
 | `429` | The fork would exceed the tenant quota of its workflow type (issue #946). A fork counts as an active run of its quota key. | Wait for a run of the key to finish, or fork with an input for another key. |
+| `429` | Load shedding refuses new starts on the queue of the fork (issue #1794). | Retry after the backlog drains. |
 | `422` | An unknown field or a bad `effects` value. | Fix the body. |
+| `503` | An admission gate blocks new starts for the fork (issue #618). The body names the gate. | Retry after the gate is lifted. |
 | `503` | The node has not finished start-up, or the fork exists but its audit row failed. | Retry in the first case. In the second, the message names the fork. Do not retry. |
 
 ## Scope

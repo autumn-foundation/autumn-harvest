@@ -157,6 +157,7 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | A migrated fork misses its source and its lineage on the target shard. | A `ForkLineage` quiescence blocker keeps a fork on its shard. |
 | Retention deletes an erased ancestor, and the gap reads as a clean lineage. | Refuse a lineage with a missing ancestor (`LineageGap`, `409`). |
 | A kept input reuses a stale quota key. | Resolve the key from the decoded input under the current policy. |
+| A fork skips the admission gate and load shedding. | Run `admit_fresh_start` in `GateMode::Check` before the insert. |
 
 ## 2. Tests
 

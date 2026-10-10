@@ -1177,6 +1177,48 @@ async fn a_fork_lineage_with_a_deleted_ancestor_is_refused() {
     );
 }
 
+/// A fork is a fresh admission. An admission gate on its queue refuses it,
+/// as the gate refuses a start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admission_gate_refuses_a_fork() {
+    use autumn_harvest::admission_gate::{
+        AdmissionGate, AdmissionGateCache, AdmissionGateId, GateScope,
+        set_global_admission_gate_cache,
+    };
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("gate");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let cache = Arc::new(AdmissionGateCache::new());
+    cache.refresh(vec![AdmissionGate {
+        id: AdmissionGateId(Uuid::new_v4()),
+        scope: GateScope::Queue(queue.clone()),
+        reason: "incident".to_string(),
+        message: None,
+        created_by: "test".to_string(),
+        created_at: Utc::now(),
+        expires_at: None,
+    }]);
+    set_global_admission_gate_cache(Some(cache));
+    let result = fork_workflow_execution(
+        &mut conn,
+        source,
+        request(ForkEffects::Live),
+        Some(&registry()),
+    )
+    .await;
+    set_global_admission_gate_cache(None);
+    assert!(
+        matches!(
+            result,
+            Err(WorkflowForkError::Harvest(
+                autumn_harvest::error::HarvestError::AdmissionBlocked { .. }
+            ))
+        ),
+        "the gate refuses the fork: {result:?}"
+    );
+}
+
 /// The fork inserts its payload references in chunks. Postgres caps a
 /// statement at 65,535 parameters, and each reference binds four.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

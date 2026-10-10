@@ -3555,7 +3555,7 @@
         },
         {
           "status": 429,
-          "description": "The fork would exceed the tenant quota of its workflow type (issue #946). A fork counts as an active run of its quota key."
+          "description": "The fork would exceed the tenant quota of its workflow type (issue #946), or load shedding refuses new starts on its queue (issue #1794). A fork counts as an active run of its quota key."
         },
         {
           "status": 500,
@@ -3563,7 +3563,7 @@
         },
         {
           "status": 503,
-          "description": "The node has not finished start-up, or the fork succeeded but its audit record could not be written. In the second case the message names the new execution. Retry is not needed."
+          "description": "An admission gate blocks new starts for the fork (issue #618), the node has not finished start-up, or the fork succeeded but its audit record could not be written. In the last case the message names the new execution. Retry is not needed."
         }
       ]
     },

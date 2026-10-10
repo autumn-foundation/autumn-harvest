@@ -790,7 +790,7 @@ fn evaluate_start_gate(
 /// The manual gate runs first and returns [`HarvestError::AdmissionBlocked`].
 /// Load shedding (issue #1794) runs second and returns
 /// [`HarvestError::LoadShed`]. Each refusal records its metric once.
-fn admit_fresh_start(
+pub(crate) fn admit_fresh_start(
     mode: crate::admission_gate::GateMode,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     workflow_name: &str,
