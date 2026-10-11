@@ -233,13 +233,13 @@ impl Timing {
     /// The commit range is the persist p50 to p99. The dispatch hop is the
     /// `dispatch_latency` p50. The decide time follows from replay
     /// throughput. The wake hop closes the gap to the measured end-to-end
-    /// p50 of 470.5 ms.
+    /// p50 of 473.26 ms.
     pub const BENCH: Self = Self {
         decide_us: 2,
-        commit_us: (3_050, 6_190),
-        dispatch_us: 14_750,
+        commit_us: (2_820, 6_950),
+        dispatch_us: 12_580,
         activity_us: (50, 150),
-        wake_us: 135_800,
+        wake_us: 138_560,
     };
 
     /// Durations with no spread.

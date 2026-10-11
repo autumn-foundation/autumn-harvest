@@ -17,11 +17,12 @@ defects prove that the invariants catch a bad discard.
 persist and claim durations and run latency. The probe starts no metric
 sampler. Without it, the bench keeps `NoOpMetrics`.
 
-**Results.** On the bench workflow, commits are 2.6 % of unloaded
-latency and 1.6 % under load. Gated speculation saves about 0 %, and it
-keeps every invariant. Eager release saves 2.95 %, but it runs effects
-twice and strands 6.1 % of runs under faults. The prefix check alone
-keeps every safety invariant except owner identity.
+**Results.** On the bench workflow, commits are 2.4 % of unloaded
+latency and 1.6 % under load. Gated speculation saves nothing
+measurable. It keeps every invariant under faults. Eager release saves
+about 3 % in the model. It runs effects twice and strands 5.5 % of
+`chain` runs and 3.8 % of `fan-out` runs. In the model, a prefix check
+alone keeps every safety invariant except owner identity.
 
 **Gate.** `speculative_execution_docs` guards the report in the `lint`
 job. The change adds no migration and no new `WorkflowEvent` variant.

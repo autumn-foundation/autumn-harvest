@@ -72,7 +72,9 @@ fn report_states_its_status_and_revision() {
 /// The word after `**Verdict: ` in `text`, such as `no-go`.
 fn verdict(text: &str) -> Option<&str> {
     let rest = &text[text.find("**Verdict: ")? + "**Verdict: ".len()..];
-    rest.split(['*', ' ']).next().map(|word| word.trim_end_matches('.'))
+    rest.split(['*', ' '])
+        .next()
+        .map(|word| word.trim_end_matches('.'))
 }
 
 #[test]
@@ -113,7 +115,11 @@ fn every_cited_test_exists() {
     let report = read(REPORT);
     let tests = read(MODEL_TESTS);
     let cited = first_cells(&section_of(&report, "### Cited tests"));
-    assert!(cited.len() >= 15, "the report cites only {} tests", cited.len());
+    assert!(
+        cited.len() >= 15,
+        "the report cites only {} tests",
+        cited.len()
+    );
     for name in &cited {
         assert!(
             tests.contains(&format!("fn {name}(")),
@@ -133,7 +139,10 @@ fn the_invariants_table_matches_the_model() {
         .map(|(name, _)| name)
         .collect();
     let table = first_cells(&section_of(&report, "### Invariants"));
-    assert_eq!(table, names, "the invariants table must list SpecInvariant in order");
+    assert_eq!(
+        table, names,
+        "the invariants table must list SpecInvariant in order"
+    );
 }
 
 #[test]

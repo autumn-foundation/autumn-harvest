@@ -130,9 +130,9 @@ fn run_twice_reports_a_difference() {
 #[test]
 fn golden_speculation_traces_are_equal_on_every_platform() {
     let golden = [
-        (0, Mode::Serial, Workload::Chain, 69, 0xa364_e61d_7394_0fc4),
-        (1, Mode::Gated, Workload::FanOut, 95, 0x6f52_78fe_5434_e46b),
-        (2, Mode::Eager, Workload::Chain, 86, 0x7299_3780_d739_be0a),
+        (0, Mode::Serial, Workload::Chain, 76, 0x0d63_b689_7faa_32ff),
+        (1, Mode::Gated, Workload::FanOut, 93, 0x6259_370d_4818_7586),
+        (2, Mode::Eager, Workload::Chain, 86, 0x8a70_57dc_fc21_251b),
     ];
     for (seed, mode, workload, lines, hash) in golden {
         let config = SpecConfig::new(seed)
@@ -163,7 +163,7 @@ fn serial_chain_latency_has_a_closed_form() {
 }
 
 /// The end-to-end p50 of the bench workflow, unloaded, `fsync` on.
-const MEASURED_CHAIN_P50_US: u64 = 470_500;
+const MEASURED_CHAIN_P50_US: u64 = 473_260;
 
 #[test]
 fn the_calibrated_model_matches_the_measured_bench() {
