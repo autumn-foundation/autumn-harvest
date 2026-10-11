@@ -588,8 +588,9 @@ The sweeper reports every cohort it considered and left alone, with the reason:
   and this sweep has no archiver (issue #2009). `harvest partition maintain`
   reports it on such a shard. Nothing drops until a process with the
   archiver sweeps, or until you delete the row in `harvest_partition_export`.
-- `another process is exporting this shard` — another process holds the
-  export lock (issue #2009). Expected with more than one runner.
+- `another process holds the export lock of this shard` — an exporter holds
+  the lock exclusive, or a sweep with no archiver holds it shared (issue
+  #2009). Expected with more than one runner. The next pass tries again.
 - `unbounded upper bound` — a partition with no upper bound, which this engine
   never creates. It means something else attached one by hand; it can never be
   swept.

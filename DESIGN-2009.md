@@ -77,6 +77,8 @@ API and tests, and docs. These changes followed. Each has a test.
 | C8 | Internal types were public, and core-built types were exhaustive. | `SegmentWriter`, `RowDigest` and `sha256_hex` are crate-private. The manifest, segment entry, archived partition and `RetentionHooks` are `non_exhaustive`. | Builds |
 | C9 | (Codex) The trait lets a timed-out `put` land later. A late manifest at the one fixed key could replace the manifest that the drop checked. | Manifest keys name their content. A reuse hint and a drop record replace the fixed key. Only the dropping attempt writes the record. | `exports_of_different_rows_have_different_manifest_keys`, `find_dropped_reads_the_drop_record` |
 | C10 | (Codex) The directory backend synced only the deepest new directory. | It syncs the parent of each directory that the write creates. | Unit tests of the backend |
+| C11 | (Codex) A sweep with no archiver could read "no marker" just before the first exporter wrote it, then drop. | Every applying sweep takes the export lock. An exporter takes it exclusive and writes the marker under it. A sweep with no archiver takes it shared and reads the marker under it. | `a_sweep_without_an_archiver_drops_nothing_while_an_exporter_holds_the_lock`, `an_exporter_writes_no_marker_while_a_sweep_without_an_archiver_holds_the_lock` |
+| C12 | (Codex) A least-privilege runtime role had no grant on the marker table. | The preflight probe requires `SELECT` and `INSERT` on it. The upgrade guide and `docs/archival.md` name the grant. | `the_partition_export_marker_is_covered_by_the_privilege_probe` |
 
 The row checksum detects a change. It is not a security boundary, the same
 as the append-only guard.

@@ -367,8 +367,10 @@ pub const EXPORT_CHECK_BUDGET_REASON: &str = "export check exceeded its budget";
 /// (issue #2009). It drops nothing, so no partition is lost unexported.
 pub const EXPORT_REQUIRED_REASON: &str = "export required, but no archiver is set";
 
-/// Another process holds the export lock of this shard (issue #2009).
-pub const EXPORT_BUSY_REASON: &str = "another process is exporting this shard";
+/// Another process holds the export lock of this shard in a conflicting mode
+/// (issue #2009). An exporter holds it exclusive. A sweep with no archiver
+/// holds it shared.
+pub const EXPORT_BUSY_REASON: &str = "another process holds the export lock of this shard";
 
 /// Every reason [`sweep`] can report. Used by the documentation guard.
 pub const SWEEP_REASONS: &[&str] = &[

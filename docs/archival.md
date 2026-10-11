@@ -271,9 +271,13 @@ key of each dropped partition. Each backend call has the
   They report `export required, but no archiver is set`. To end the
   requirement, for example after you remove the archiver for good, run
   `DELETE FROM harvest_partition_export;` on the shard.
-- **The lock.** One process at a time exports a shard. It holds the session
-  advisory lock `partition_archive::EXPORT_LOCK_KEY`. Another process
-  reports `another process is exporting this shard` and drops nothing.
+- **The lock.** Every applying sweep takes the session advisory lock
+  `partition_archive::EXPORT_LOCK_KEY`. An exporter takes it exclusive and
+  only then writes the marker. A sweep with no archiver takes it shared and
+  only then reads the marker. So one process at a time exports a shard, and
+  no sweep with no archiver can miss a marker that an exporter is writing. A
+  sweep that cannot take the lock reports
+  `another process holds the export lock of this shard` and drops nothing.
 - **Reuse.** A failed drop leaves its export in place. The next pass reads it
   back and uses it when it still checks clean. A stale export gets one new
   export in the same pass.
@@ -330,6 +334,8 @@ partitions. `history_with_codecs` decodes payload fields with your codec keys.
 - **Erasure does not reach an export.** Delete the object yourself.
 - **Older binaries ignore the marker.** Deploy the archiver to every process
   before you rely on it.
+- **Grants.** A least-privilege runtime role needs `SELECT` and `INSERT` on
+  `harvest_partition_export`. The startup preflight checks it.
 - **No straggler deletes.** `try_build` refuses a partition archiver together
   with `partitions.straggler_grace_secs`. A straggler delete removes rows
   that no export holds. On a marked shard, the sweep skips straggler deletes.

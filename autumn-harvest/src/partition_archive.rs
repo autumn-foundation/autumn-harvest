@@ -867,21 +867,29 @@ pub(crate) async fn locked_checksum(
 /// The session advisory lock that lets one process at a time export a shard.
 ///
 /// Every runner sweeps every shard. Without this lock, two processes export
-/// the same partition at once, and each uploads the whole partition. The key
-/// shows in `pg_locks` as `objid` and `classid` of an `advisory` lock.
+/// the same partition at once, and each uploads the whole partition. An
+/// exporter holds it exclusive. A sweep with no archiver holds it shared. The
+/// key shows in `pg_locks` as `objid` and `classid` of an `advisory` lock.
 pub const EXPORT_LOCK_KEY: i64 = 0x4856_5354_2009_0001;
 
 /// What an applying sweep may do with a droppable partition (issue #2009).
+///
+/// Every applying sweep takes the export lock. An exporting sweep takes it
+/// exclusive, and only then writes the marker. A sweep with no archiver takes
+/// it shared, and only then reads the marker. So no sweep with no archiver can
+/// decide that a shard has no marker while an exporter turns the marker on.
 #[cfg(feature = "db")]
 #[derive(Debug)]
 pub(crate) enum ExportGate<'a> {
-    /// No archiver and no export marker: drop as before.
+    /// A read-only pass. It holds no lock and drops nothing.
     Off,
-    /// The shard holds the export marker, but this sweep has no archiver.
+    /// No archiver and no marker: drop as before. Holds the lock shared.
+    Plain,
+    /// No archiver, but the shard holds the marker. Holds the lock shared.
     Required,
-    /// This sweep has an archiver, but another process holds the export lock.
+    /// Another process holds the lock in a conflicting mode. Holds nothing.
     Busy,
-    /// This sweep has an archiver and holds the export lock.
+    /// This sweep has an archiver. Holds the lock exclusive.
     Active(&'a PartitionExport),
 }
 
@@ -905,51 +913,74 @@ async fn flag(
         .map_err(crate::error::database_error)
 }
 
+/// Whether the shard holds the export marker. A database without the marker
+/// table holds none.
+#[cfg(feature = "db")]
+async fn marked(conn: &mut diesel_async::AsyncPgConnection) -> crate::error::HarvestResult<bool> {
+    Ok(flag(
+        conn,
+        "SELECT to_regclass('harvest_partition_export') IS NOT NULL AS v",
+    )
+    .await?
+        && flag(
+            conn,
+            "SELECT EXISTS (SELECT 1 FROM harvest_partition_export) AS v",
+        )
+        .await?)
+}
+
 #[cfg(feature = "db")]
 impl<'a> ExportGate<'a> {
-    /// Resolve the gate for one applying pass.
-    ///
-    /// With an archiver, this writes the export marker first. From then on a
-    /// sweep with no archiver on this shard drops nothing. Then it tries the
-    /// export lock, and does not wait for it.
+    /// Resolve the gate for one applying pass. It never waits for the lock.
     ///
     /// # Errors
     ///
     /// [`crate::error::HarvestError::Database`] on a query failure. With an
     /// archiver, a database without the marker table also fails, so no
-    /// export runs where the marker cannot protect it.
+    /// export runs where the marker cannot protect it. The lock is released
+    /// before an error returns.
     pub(crate) async fn resolve(
         conn: &mut diesel_async::AsyncPgConnection,
         export: Option<&'a PartitionExport>,
     ) -> crate::error::HarvestResult<Self> {
         let Some(export) = export else {
-            let marked = flag(
+            let shared = flag(
                 conn,
-                "SELECT to_regclass('harvest_partition_export') IS NOT NULL AS v",
+                &format!("SELECT pg_try_advisory_lock_shared({EXPORT_LOCK_KEY}) AS v"),
             )
-            .await?
-                && flag(
-                    conn,
-                    "SELECT EXISTS (SELECT 1 FROM harvest_partition_export) AS v",
-                )
-                .await?;
-            return Ok(if marked { Self::Required } else { Self::Off });
+            .await?;
+            if !shared {
+                return Ok(Self::Busy);
+            }
+            let gate = match marked(conn).await {
+                Ok(true) => Self::Required,
+                Ok(false) => Self::Plain,
+                Err(e) => {
+                    Self::Plain.release(conn).await;
+                    return Err(e);
+                }
+            };
+            return Ok(gate);
         };
-        crate::partition::exec(
-            conn,
-            "INSERT INTO harvest_partition_export (singleton) VALUES (TRUE) ON CONFLICT DO NOTHING",
-        )
-        .await?;
-        let locked = flag(
+        let exclusive = flag(
             conn,
             &format!("SELECT pg_try_advisory_lock({EXPORT_LOCK_KEY}) AS v"),
         )
         .await?;
-        Ok(if locked {
-            Self::Active(export)
-        } else {
-            Self::Busy
-        })
+        if !exclusive {
+            return Ok(Self::Busy);
+        }
+        let gate = Self::Active(export);
+        if let Err(e) = crate::partition::exec(
+            conn,
+            "INSERT INTO harvest_partition_export (singleton) VALUES (TRUE) ON CONFLICT DO NOTHING",
+        )
+        .await
+        {
+            gate.release(conn).await;
+            return Err(e);
+        }
+        Ok(gate)
     }
 
     /// The blocked reason when this gate allows no drop.
@@ -957,28 +988,29 @@ impl<'a> ExportGate<'a> {
         match self {
             Self::Required => Some(crate::partition::EXPORT_REQUIRED_REASON),
             Self::Busy => Some(crate::partition::EXPORT_BUSY_REASON),
-            Self::Off | Self::Active(_) => None,
+            Self::Off | Self::Plain | Self::Active(_) => None,
         }
     }
 
     /// Whether the straggler `DELETE` may run. It removes rows that no
-    /// export holds, so it runs only when no export is in use.
+    /// export holds, so it runs only on a shard with no export in use.
     pub(crate) const fn allows_straggler_delete(&self) -> bool {
-        matches!(self, Self::Off)
+        matches!(self, Self::Off | Self::Plain)
     }
 
-    /// Release the export lock, if this gate holds it.
+    /// Release the export lock in the mode this gate holds it.
     ///
     /// A failure is only logged. A broken connection ends its session, and
     /// the session end releases the lock.
     pub(crate) async fn release(&self, conn: &mut diesel_async::AsyncPgConnection) {
-        if matches!(self, Self::Active(_))
-            && let Err(e) = flag(
-                conn,
-                &format!("SELECT pg_advisory_unlock({EXPORT_LOCK_KEY}) AS v"),
-            )
-            .await
-        {
+        let sql = match self {
+            Self::Plain | Self::Required => {
+                format!("SELECT pg_advisory_unlock_shared({EXPORT_LOCK_KEY}) AS v")
+            }
+            Self::Active(_) => format!("SELECT pg_advisory_unlock({EXPORT_LOCK_KEY}) AS v"),
+            Self::Off | Self::Busy => return,
+        };
+        if let Err(e) = flag(conn, &sql).await {
             tracing::warn!(error = %e, "could not release the partition export lock");
         }
     }

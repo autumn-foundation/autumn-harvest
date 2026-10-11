@@ -795,6 +795,69 @@ async fn another_exporting_process_makes_the_shard_busy() {
 }
 
 #[tokio::test]
+async fn a_sweep_without_an_archiver_drops_nothing_while_an_exporter_holds_the_lock() {
+    // The first export can start while a sweep with no archiver runs. That
+    // sweep takes the lock shared, so it waits out an exporter that holds
+    // it exclusive, and drops nothing in the meantime.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_partitioned(&mut conn).await;
+    let aged = seed_aged_partition(&mut conn, 3).await;
+    let mut exporter = connect(&url).await;
+    let key = partition_archive::EXPORT_LOCK_KEY;
+    exporter
+        .batch_execute(&format!("SELECT pg_advisory_lock({key})"))
+        .await
+        .expect("hold the export lock exclusive");
+
+    let plain = partition::sweep(&mut conn, Utc::now(), &SweepOptions::default(), None)
+        .await
+        .expect("sweep");
+    assert_kept(&mut conn, &aged, &plain, partition::EXPORT_BUSY_REASON).await;
+
+    exporter
+        .batch_execute(&format!("SELECT pg_advisory_unlock({key})"))
+        .await
+        .expect("release");
+    let plain = partition::sweep(&mut conn, Utc::now(), &SweepOptions::default(), None)
+        .await
+        .expect("sweep");
+    assert_eq!(plain.dropped, vec![aged.name], "{plain:?}");
+}
+
+#[tokio::test]
+async fn an_exporter_writes_no_marker_while_a_sweep_without_an_archiver_holds_the_lock() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_partitioned(&mut conn).await;
+    let aged = seed_aged_partition(&mut conn, 3).await;
+    let mut plain = connect(&url).await;
+    let key = partition_archive::EXPORT_LOCK_KEY;
+    plain
+        .batch_execute(&format!("SELECT pg_advisory_lock_shared({key})"))
+        .await
+        .expect("hold the export lock shared");
+
+    let backend = Arc::new(TestArchiver::default());
+    let outcome = sweep_with(&mut conn, backend.clone()).await;
+    assert_kept(&mut conn, &aged, &outcome, partition::EXPORT_BUSY_REASON).await;
+    assert!(
+        backend.log.lock().unwrap().is_empty(),
+        "no upload while busy"
+    );
+    let marker = diesel::sql_query("SELECT COUNT(*)::bigint AS n FROM harvest_partition_export")
+        .get_result::<CountRow>(&mut conn)
+        .await
+        .expect("count")
+        .n;
+    assert_eq!(marker, 0, "the marker waits for the exclusive lock");
+    plain
+        .batch_execute(&format!("SELECT pg_advisory_unlock_shared({key})"))
+        .await
+        .expect("release");
+}
+
+#[tokio::test]
 async fn a_failed_drop_reuses_the_export_on_the_next_pass() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
