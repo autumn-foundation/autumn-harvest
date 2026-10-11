@@ -205,7 +205,8 @@ each fix has a test:
   the root, so that failure is a gap.
 - The check accepted a call to a body that the manifest omits. It now
   refuses such a manifest, a handler index past the list, and an edge out
-  of an exit. It also refuses a body that the root cannot reach.
+  of an exit. It also refuses a body that the root cannot reach, and two
+  bodies that share an id.
 - The follow read only `{async block@..}`. An `async` closure step, whose
   future is `{async closure body@..}`, was a false `proven-deterministic`.
   It is now followed.
@@ -309,7 +310,7 @@ crate its own `--target-dir`, and delete it after the run.
 | A local type named `Saga` is not the engine saga | `saga_graph::a_local_type_named_saga_is_not_the_engine_saga` |
 | The engine MIR in the same run changes no verdict | `saga_graph::the_engine_mir_in_the_same_run_changes_no_verdict` |
 | A renamed or re-exported engine saga is still seen | `saga_graph::a_renamed_or_re_exported_engine_saga_is_still_seen` |
-| The check refuses a reference to a missing body or handler, or a body the root cannot reach | `saga::tests::a_reference_to_a_missing_body_is_refused` |
+| The check refuses a reference to a missing body or handler, a body the root cannot reach, or a doubled body id | `saga::tests::a_reference_to_a_missing_body_is_refused`; `saga::tests::a_stray_or_doubled_body_is_refused` |
 | A clock read in an `async` closure step is found | `async_block_follow::a_clock_read_in_a_saga_step_block_is_found` (`wf_step_async_closure`) |
 | A boundary that runs code is `unknown` beside a saga | `saga::tests::a_boundary_that_runs_code_is_unknown_beside_a_visible_saga` |
 | The check refuses an old manifest | `saga_graph::a_manifest_without_flow_graphs_is_refused`; `cli::check_structure_refuses_a_manifest_without_flow_graphs` |

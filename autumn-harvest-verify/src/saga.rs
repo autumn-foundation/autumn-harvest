@@ -115,6 +115,15 @@ pub fn check(manifest: &StructureManifest) -> Result<Vec<SagaReport>, CheckError
                 workflow.workflow, workflow.root
             )));
         }
+        // A reference names a body by id, so two bodies of one id make it
+        // ambiguous. The check would also read both.
+        let mut ids: BTreeSet<&str> = BTreeSet::new();
+        if let Some(twice) = workflow.bodies.iter().find(|b| !ids.insert(b.id.as_str())) {
+            return Err(CheckError(format!(
+                "{}: two bodies have the id `{}`",
+                workflow.workflow, twice.id
+            )));
+        }
         // The manifest names a flow format, so each body must carry a graph.
         // A body without one checked no code.
         for body in &workflow.bodies {
@@ -821,7 +830,10 @@ mod tests {
         };
         let err = check(&manifest(dangling)).expect_err("a handler index past the list");
         assert!(err.to_string().contains("handler 0"), "{err}");
+    }
 
+    #[test]
+    fn a_stray_or_doubled_body_is_refused() {
         // No reference reaches the body `w::stray` from the root. Its gap
         // would mark a workflow that has no saga.
         let mut stray = manifest(FlowGraph {
@@ -840,6 +852,32 @@ mod tests {
         }
         let err = check(&stray).expect_err("a body the root never reaches");
         assert!(err.to_string().contains("w::stray"), "{err}");
+
+        // Two bodies share the id `w::helper`. A reference to it is ambiguous,
+        // and the check would read both.
+        let mut twice = manifest(FlowGraph {
+            nodes: vec![
+                node(FlowEvent::Entry),
+                node(FlowEvent::Call {
+                    callees: vec!["w::helper".to_string()],
+                }),
+            ],
+            edges: vec![edge(0, 1, None)],
+        });
+        if let Some(w) = twice.workflows.first_mut() {
+            for _ in 0..2 {
+                w.bodies.push(BodyNode {
+                    id: "w::helper".to_string(),
+                    flow: Some(FlowGraph {
+                        nodes: vec![node(FlowEvent::Entry)],
+                        edges: Vec::new(),
+                    }),
+                    ..BodyNode::default()
+                });
+            }
+        }
+        let err = check(&twice).expect_err("two bodies with one id");
+        assert!(err.to_string().contains("w::helper"), "{err}");
     }
 
     #[test]

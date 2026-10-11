@@ -145,7 +145,8 @@ Four review agents read the first version. Each fix has a test.
 24. A `handlers` entry that no registration node names is refused. Its
     bodies would read as entries, so a helper could look covered.
 25. A body that no reference reaches from the root is refused. The check
-    reads every body, so its gap would mark a workflow with no saga.
+    reads every body, so its gap would mark a workflow with no saga. Two
+    bodies of one id are refused too, as a reference to them is ambiguous.
 
 ---
 
