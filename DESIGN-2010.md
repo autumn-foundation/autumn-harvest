@@ -97,6 +97,10 @@ Four review agents read the first version. Each fix has a test.
    same-named local impl no longer stands in for it.
 10. The check ignored a node that the entry cannot reach. A saga or a gap
     there was silent. Such a graph is now refused.
+11. A local `Saga` method that took the engine saga, such as
+    `other::Saga::compensate_all`, read as the engine unwind. A saga
+    method now needs the engine path, `Saga` or `autumn_harvest::..`, and
+    no body here. Any other such call is a `saga-escape`.
 
 ---
 

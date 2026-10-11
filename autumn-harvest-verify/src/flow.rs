@@ -33,6 +33,9 @@ pub struct BlockFacts {
     pub handlers: BTreeMap<String, usize>,
     /// `(block, argument index)` → the bodies passed there.
     pub arguments: BTreeMap<(String, usize), Vec<String>>,
+    /// Blocks whose call resolves to a body here. The engine has no body
+    /// here, so such a call is never an engine `Saga` method.
+    pub bodied: BTreeSet<String>,
 }
 
 /// Build the flow graph of `body`.
@@ -50,7 +53,7 @@ pub fn build(body: &Body, facts: &BlockFacts) -> FlowGraph {
     let mut arms: BTreeMap<usize, (String, String)> = BTreeMap::new();
     for block in body.blocks.iter().filter(|b| !b.cleanup) {
         let mut chain = Vec::new();
-        for event in escapes(body, block) {
+        for event in escapes(body, block, facts) {
             chain.push(push(&mut nodes, &block.label, event));
         }
         if let Some(outcome) = exits.get(block.label.as_str()) {
@@ -224,7 +227,7 @@ fn block_event(body: &Body, block: &BasicBlock, facts: &BlockFacts) -> Option<Fl
             .or_else(|| body.locals.get(&dest.local).map(String::as_str))
             .unwrap_or_default();
         let returns_saga = !ty.trim_start().starts_with('&') && is_saga_type(ty);
-        match saga_method(callee) {
+        match engine_method(callee, label, facts) {
             Some("compensate_all") if self_saga => {
                 return Some(FlowEvent::SagaCompensate { tracked: false });
             }
@@ -276,15 +279,25 @@ const SAGA_METHODS: [&str; 5] = [
 /// The method name when `callee` names one of [`SAGA_METHODS`] on a type
 /// named `Saga`. The caller still checks the operand or result type, because
 /// a workflow crate can have its own `Saga`.
+///
+/// MIR trims the engine path to `Saga`, or prints it from `autumn_harvest`.
+/// Any other module path, such as `other::Saga`, names a local type.
 fn saga_method(callee: &str) -> Option<&'static str> {
     let bare = strip_generics_everywhere(callee);
-    let mut segments = bare.rsplit("::");
-    let method = segments.next()?;
-    let owner = segments.next()?;
-    if owner != "Saga" {
+    let (owner, method) = bare.rsplit_once("::")?;
+    let module = owner.strip_suffix("Saga")?;
+    if !(module.is_empty() || module.starts_with("autumn_harvest::")) {
         return None;
     }
     SAGA_METHODS.into_iter().find(|m| *m == method)
+}
+
+/// [`saga_method`] for the call in block `label`, when it is an engine call.
+///
+/// A crate-root type named `Saga` prints as bare `Saga`, as the trimmed
+/// engine type does. Its call resolves to a body here, so it is excluded.
+fn engine_method(callee: &str, label: &str, facts: &BlockFacts) -> Option<&'static str> {
+    saga_method(callee).filter(|_| !facts.bodied.contains(label))
 }
 
 /// The engine's `Saga` type, behind any references.
@@ -325,7 +338,7 @@ const fn operand_place(operand: &Operand) -> Option<&Place> {
 /// A copy, move or reborrow into another `Saga` local keeps it in view. A
 /// call to a `Saga` method or a drop keeps it too. Any other use, such as a
 /// call argument or a closure capture, is an escape.
-fn escapes(body: &Body, block: &BasicBlock) -> Vec<FlowEvent> {
+fn escapes(body: &Body, block: &BasicBlock, facts: &BlockFacts) -> Vec<FlowEvent> {
     let mut out = Vec::new();
     for statement in &block.statements {
         let Statement::Assign { rvalue, .. } = statement else {
@@ -363,7 +376,8 @@ fn escapes(body: &Body, block: &BasicBlock) -> Vec<FlowEvent> {
         let bare = strip_generics_everywhere(callee);
         // A saga stays in view only through an engine method that takes it
         // as operand 0, such as `step`. Any other callee can keep it.
-        let saga_call = saga_method(callee).is_some() && args_saga(body, &block.terminator);
+        let saga_call = engine_method(callee, &block.label, facts).is_some()
+            && args_saga(body, &block.terminator);
         let kept = saga_call
             || bare.ends_with("drop_in_place")
             || (saga_local(body, dest) && is_reborrow(&bare));
@@ -663,6 +677,8 @@ mod tests {
             Some("pending_compensation_count")
         );
         assert_eq!(saga_method("own::Saga::consume"), None);
+        assert_eq!(saga_method("other::Saga::compensate_all"), None);
+        assert_eq!(saga_method("MySaga::new"), None);
         assert_eq!(saga_method("Sagas::new"), None);
         assert_eq!(saga_method("new"), None);
     }

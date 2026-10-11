@@ -62,3 +62,65 @@ pub async fn wf_own_type_takes_engine_saga(ctx: &WorkflowContext) -> Out {
     own::Saga::consume(saga);
     ctx.execute_activity_raw("ship", a).await
 }
+
+/// A second local `Saga` with a method named like an engine method.
+mod other {
+    pub struct Saga {
+        n: u64,
+    }
+
+    impl Saga {
+        /// Takes the engine saga and runs no compensation.
+        pub async fn compensate_all(saga: &mut autumn_harvest::Saga<'_>) -> Result<(), String> {
+            let _ = saga;
+            Ok(())
+        }
+    }
+}
+
+/// A local `Saga` at the crate root. MIR prints its path with no module.
+pub struct Saga {
+    n: u64,
+}
+
+impl Saga {
+    /// Takes the engine saga and runs no compensation.
+    pub async fn compensate_all(saga: &mut autumn_harvest::Saga<'_>) -> Result<(), String> {
+        let _ = saga;
+        Ok(())
+    }
+}
+
+pub fn __autumn_workflow_info_wf_module_lookalike_compensate() -> u8 {
+    0
+}
+
+/// `other::Saga::compensate_all` is not the engine unwind.
+pub async fn wf_module_lookalike_compensate(ctx: &WorkflowContext) -> Out {
+    let mut saga = autumn_harvest::Saga::new(ctx);
+    let a = saga
+        .step(
+            || async { ctx.execute_activity_raw("reserve", 1).await },
+            |a| async move { ctx.execute_activity_raw("release", a).await.map(|_| ()) },
+        )
+        .await?;
+    other::Saga::compensate_all(&mut saga).await?;
+    Err(format!("late {a}"))
+}
+
+pub fn __autumn_workflow_info_wf_root_lookalike_compensate() -> u8 {
+    0
+}
+
+/// The crate-root `Saga::compensate_all` is not the engine unwind.
+pub async fn wf_root_lookalike_compensate(ctx: &WorkflowContext) -> Out {
+    let mut saga = autumn_harvest::Saga::new(ctx);
+    let a = saga
+        .step(
+            || async { ctx.execute_activity_raw("reserve", 1).await },
+            |a| async move { ctx.execute_activity_raw("release", a).await.map(|_| ()) },
+        )
+        .await?;
+    Saga::compensate_all(&mut saga).await?;
+    Err(format!("late {a}"))
+}

@@ -580,13 +580,21 @@ fn a_local_type_named_saga_is_not_the_engine_saga() {
         report(&reports, "wf_own_saga_type").verdict,
         SagaVerdict::NoSaga
     );
-    // An engine saga handed to a method of the local type escapes.
-    let r = report(&reports, "wf_own_type_takes_engine_saga");
-    assert_eq!(r.verdict, SagaVerdict::Unknown, "{r:#?}");
-    assert!(
-        r.unknown.iter().any(|u| u.starts_with("saga-escapes: ")),
-        "{r:#?}"
-    );
+    // An engine saga handed to a method of a local type escapes. A local
+    // method named `compensate_all` is not the engine unwind, so it never
+    // clears a pending step.
+    for name in [
+        "wf_own_type_takes_engine_saga",
+        "wf_module_lookalike_compensate",
+        "wf_root_lookalike_compensate",
+    ] {
+        let r = report(&reports, name);
+        assert_eq!(r.verdict, SagaVerdict::Unknown, "{name}: {r:#?}");
+        assert!(
+            r.unknown.iter().any(|u| u.starts_with("saga-escapes: ")),
+            "{name}: {r:#?}"
+        );
+    }
 }
 
 #[test]

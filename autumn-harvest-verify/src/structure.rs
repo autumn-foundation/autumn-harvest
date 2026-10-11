@@ -859,6 +859,10 @@ fn block_facts(
     for (index, block) in steps.iter().enumerate() {
         facts.steps.insert((*block).to_string(), index);
     }
+    // A closure argument edge (`many`) starts a closure, not the callee.
+    for edge in edges.iter().filter(|e| !e.many) {
+        facts.bodied.insert(edge.block.clone());
+    }
     for edge in edges.iter().filter(|e| !e.resume) {
         facts
             .calls

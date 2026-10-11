@@ -1115,3 +1115,1425 @@ fn wf_own_type_takes_engine_saga::{closure#0}::{closure#1}::{closure#0}::{closur
         return;
     }
 }
+
+fn other::<impl at flow.rs:72:5: 72:14>::compensate_all(_1: &mut autumn_harvest::Saga<'_>) -> {async fn body of other::Saga::compensate_all()} {
+    debug saga => _1;
+    let mut _0: {async fn body of other::Saga::compensate_all()};
+
+    bb0: {
+        _0 = {coroutine@flow.rs:74:96: 77:10 (#0)} { saga: move _1 };
+        return;
+    }
+}
+
+fn other::<impl at flow.rs:72:5: 72:14>::compensate_all::{closure#0}(_1: Pin<&mut {async fn body of other::Saga::compensate_all()}>, _2: &mut Context<'_>) -> Poll<Result<(), String>> {
+    coroutine layout {
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+        }
+        storage_conflicts = BitMatrix(0x0) {}
+    }
+    debug _task_context => _8;
+    debug saga => ((*_7).0: &mut autumn_harvest::Saga<'_>);
+    let mut _0: std::task::Poll<std::result::Result<(), std::string::String>>;
+    let _3: &mut autumn_harvest::Saga<'_>;
+    let mut _4: ();
+    let mut _5: std::result::Result<(), std::string::String>;
+    let mut _6: u32;
+    let mut _7: &mut {async fn body of other::Saga::compensate_all()};
+    let mut _8: std::future::ResumeTy;
+    let mut _9: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug saga => _3;
+        scope 2 {
+        }
+    }
+
+    bb0: {
+        _9 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _8 = std::future::ResumeTy(move _9);
+        _7 = copy (_1.0: &mut {async fn body of other::Saga::compensate_all()});
+        _6 = discriminant((*_7));
+        switchInt(move _6) -> [0: bb3, 1: bb1, otherwise: bb2];
+    }
+
+    bb1: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb1, unwind continue];
+    }
+
+    bb2: {
+        unreachable;
+    }
+
+    bb3: {
+        _3 = move ((*_7).0: &mut autumn_harvest::Saga<'_>);
+        _4 = ();
+        _5 = Result::<(), String>::Ok(move _4);
+        _0 = Poll::<Result<(), String>>::Ready(move _5);
+        discriminant((*_7)) = 1;
+        return;
+    }
+}
+
+fn <impl at flow.rs:86:1: 86:10>::compensate_all(_1: &mut autumn_harvest::Saga<'_>) -> {async fn body of Saga::compensate_all()} {
+    debug saga => _1;
+    let mut _0: {async fn body of Saga::compensate_all()};
+
+    bb0: {
+        _0 = {coroutine@flow.rs:88:92: 91:6 (#0)} { saga: move _1 };
+        return;
+    }
+}
+
+fn <impl at flow.rs:86:1: 86:10>::compensate_all::{closure#0}(_1: Pin<&mut {async fn body of Saga::compensate_all()}>, _2: &mut Context<'_>) -> Poll<Result<(), String>> {
+    coroutine layout {
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+        }
+        storage_conflicts = BitMatrix(0x0) {}
+    }
+    debug _task_context => _8;
+    debug saga => ((*_7).0: &mut autumn_harvest::Saga<'_>);
+    let mut _0: std::task::Poll<std::result::Result<(), std::string::String>>;
+    let _3: &mut autumn_harvest::Saga<'_>;
+    let mut _4: ();
+    let mut _5: std::result::Result<(), std::string::String>;
+    let mut _6: u32;
+    let mut _7: &mut {async fn body of Saga::compensate_all()};
+    let mut _8: std::future::ResumeTy;
+    let mut _9: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug saga => _3;
+        scope 2 {
+        }
+    }
+
+    bb0: {
+        _9 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _8 = std::future::ResumeTy(move _9);
+        _7 = copy (_1.0: &mut {async fn body of Saga::compensate_all()});
+        _6 = discriminant((*_7));
+        switchInt(move _6) -> [0: bb3, 1: bb1, otherwise: bb2];
+    }
+
+    bb1: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb1, unwind continue];
+    }
+
+    bb2: {
+        unreachable;
+    }
+
+    bb3: {
+        _3 = move ((*_7).0: &mut autumn_harvest::Saga<'_>);
+        _4 = ();
+        _5 = Result::<(), String>::Ok(move _4);
+        _0 = Poll::<Result<(), String>>::Ready(move _5);
+        discriminant((*_7)) = 1;
+        return;
+    }
+}
+
+fn __autumn_workflow_info_wf_module_lookalike_compensate() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_module_lookalike_compensate(_1: &WorkflowContext) -> {async fn body of wf_module_lookalike_compensate()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_module_lookalike_compensate()};
+
+    bb0: {
+        _0 = {coroutine@flow.rs:99:75: 109:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_module_lookalike_compensate::{closure#0}(_1: Pin<&mut {async fn body of wf_module_lookalike_compensate()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    coroutine layout {
+        field _s0: &WorkflowContext;
+        field _s1: autumn_harvest::Saga<'_>;
+        field _s2: u64;
+        field _s3: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:103:13: 103:15}, {async block@flow.rs:103:16: 103:21}, {closure@flow.rs:104:13: 104:16}, {async block@flow.rs:104:17: 104:27}>()};
+        field _s4: {async fn body of other::Saga::compensate_all()};
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+            Suspend0 (3): [_s0, _s1, _s3],
+            Suspend1 (4): [_s0, _s1, _s2, _s4],
+        }
+        storage_conflicts = BitMatrix(5x5) {(_s0, _s0), (_s0, _s1), (_s0, _s2), (_s0, _s3), (_s0, _s4), (_s1, _s0), (_s1, _s1), (_s1, _s2), (_s1, _s3), (_s1, _s4), (_s2, _s0), (_s2, _s1), (_s2, _s2), (_s2, _s4), (_s3, _s0), (_s3, _s1), (_s3, _s3), (_s4, _s0), (_s4, _s1), (_s4, _s2), (_s4, _s4)}
+    }
+    debug _task_context => _51;
+    debug ctx => ((*_48).0: &autumn_harvest::WorkflowContext);
+    coroutine debug ctx => _s0;
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _3: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, std::string::String>, u64>;
+    let mut _4: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:103:13: 103:15}, {async block@flow.rs:103:16: 103:21}, {closure@flow.rs:104:13: 104:16}, {async block@flow.rs:104:17: 104:27}>()};
+    let mut _5: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:103:13: 103:15}, {async block@flow.rs:103:16: 103:21}, {closure@flow.rs:104:13: 104:16}, {async block@flow.rs:104:17: 104:27}>()};
+    let mut _6: &mut autumn_harvest::Saga<'_>;
+    let mut _7: {closure@flow.rs:103:13: 103:15};
+    let mut _8: {closure@flow.rs:104:13: 104:16};
+    let mut _9: &&autumn_harvest::WorkflowContext;
+    let mut _10: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _11: std::pin::Pin<&mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:103:13: 103:15}, {async block@flow.rs:103:16: 103:21}, {closure@flow.rs:104:13: 104:16}, {async block@flow.rs:104:17: 104:27}>()}>;
+    let mut _12: &mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:103:13: 103:15}, {async block@flow.rs:103:16: 103:21}, {closure@flow.rs:104:13: 104:16}, {async block@flow.rs:104:17: 104:27}>()};
+    let mut _13: &mut std::task::Context<'_>;
+    let mut _14: std::future::ResumeTy;
+    let mut _15: isize;
+    let mut _17: std::future::ResumeTy;
+    let mut _18: isize;
+    let mut _21: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, std::string::String>>;
+    let mut _22: {async fn body of other::Saga::compensate_all()};
+    let mut _23: {async fn body of other::Saga::compensate_all()};
+    let mut _24: &mut autumn_harvest::Saga<'_>;
+    let mut _25: std::task::Poll<std::result::Result<(), std::string::String>>;
+    let mut _26: std::pin::Pin<&mut {async fn body of other::Saga::compensate_all()}>;
+    let mut _27: &mut {async fn body of other::Saga::compensate_all()};
+    let mut _28: &mut std::task::Context<'_>;
+    let mut _29: std::future::ResumeTy;
+    let mut _30: isize;
+    let mut _32: std::future::ResumeTy;
+    let mut _33: isize;
+    let mut _36: std::string::String;
+    let mut _37: std::string::String;
+    let mut _38: std::fmt::Arguments<'_>;
+    let mut _40: &u64;
+    let mut _42: core::fmt::rt::Argument<'_>;
+    let mut _43: &[u8; 8];
+    let _44: &[core::fmt::rt::Argument<'_>; 1];
+    let mut _45: &u64;
+    let mut _46: std::result::Result<u64, std::string::String>;
+    let mut _47: u32;
+    let mut _48: &mut {async fn body of wf_module_lookalike_compensate()};
+    let mut _49: &autumn_harvest::WorkflowContext;
+    let mut _50: &autumn_harvest::WorkflowContext;
+    let mut _51: std::future::ResumeTy;
+    let mut _52: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug ctx => (((*_48) as variant#4).0: &autumn_harvest::WorkflowContext);
+        coroutine debug saga => _s1;
+        scope 2 {
+            debug saga => (((*_48) as variant#4).1: autumn_harvest::Saga<'_>);
+            coroutine debug a => _s2;
+            coroutine debug __awaitee => _s3;
+            let _19: std::result::Result<std::convert::Infallible, std::string::String>;
+            let _20: u64;
+            scope 3 {
+                debug a => (((*_48) as variant#4).2: u64);
+                coroutine debug __awaitee => _s4;
+                let _34: std::result::Result<std::convert::Infallible, std::string::String>;
+                let _35: ();
+                let _39: (&u64,);
+                scope 10 {
+                    debug __awaitee => (((*_48) as variant#4).3: {async fn body of other::Saga::compensate_all()});
+                    let _31: std::result::Result<(), std::string::String>;
+                    scope 11 {
+                        debug result => _31;
+                    }
+                }
+                scope 12 {
+                    debug residual => _34;
+                    scope 13 {
+                    }
+                }
+                scope 14 {
+                    debug val => _35;
+                    scope 15 {
+                    }
+                }
+                scope 16 {
+                    debug args => _39;
+                    let _41: [core::fmt::rt::Argument<'_>; 1];
+                    scope 17 {
+                        debug args => _41;
+                    }
+                }
+            }
+            scope 4 {
+                debug __awaitee => (((*_48) as variant#3).2: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:103:13: 103:15}, {async block@flow.rs:103:16: 103:21}, {closure@flow.rs:104:13: 104:16}, {async block@flow.rs:104:17: 104:27}>()});
+                let _16: std::result::Result<u64, std::string::String>;
+                scope 5 {
+                    debug result => _16;
+                }
+            }
+            scope 6 {
+                debug residual => _19;
+                scope 7 {
+                }
+            }
+            scope 8 {
+                debug val => _20;
+                scope 9 {
+                }
+            }
+        }
+    }
+
+    bb0: {
+        _52 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _51 = std::future::ResumeTy(move _52);
+        _48 = copy (_1.0: &mut {async fn body of wf_module_lookalike_compensate()});
+        _47 = discriminant((*_48));
+        switchInt(move _47) -> [0: bb37, 1: bb36, 2: bb35, 3: bb33, 4: bb34, otherwise: bb7];
+    }
+
+    bb1: {
+        _6 = &mut (((*_48) as variant#4).1: autumn_harvest::Saga<'_>);
+        _49 = no_retag copy (((*_48) as variant#4).0: &autumn_harvest::WorkflowContext);
+        _7 = {closure@flow.rs:103:13: 103:15} { ctx: copy _49 };
+        _9 = &(((*_48) as variant#4).0: &autumn_harvest::WorkflowContext);
+        _8 = {closure@flow.rs:104:13: 104:16} { ctx: move _9 };
+        _5 = autumn_harvest::Saga::<'_>::step::<u64, {closure@flow.rs:103:13: 103:15}, {async block@flow.rs:103:16: 103:21}, {closure@flow.rs:104:13: 104:16}, {async block@flow.rs:104:17: 104:27}>(move _6, move _7, move _8) -> [return: bb2, unwind: bb32];
+    }
+
+    bb2: {
+        _4 = <{async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:103:13: 103:15}, {async block@flow.rs:103:16: 103:21}, {closure@flow.rs:104:13: 104:16}, {async block@flow.rs:104:17: 104:27}>()} as IntoFuture>::into_future(move _5) -> [return: bb3, unwind: bb32];
+    }
+
+    bb3: {
+        (((*_48) as variant#3).2: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:103:13: 103:15}, {async block@flow.rs:103:16: 103:21}, {closure@flow.rs:104:13: 104:16}, {async block@flow.rs:104:17: 104:27}>()}) = move _4;
+        goto -> bb4;
+    }
+
+    bb4: {
+        _12 = &mut (((*_48) as variant#3).2: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:103:13: 103:15}, {async block@flow.rs:103:16: 103:21}, {closure@flow.rs:104:13: 104:16}, {async block@flow.rs:104:17: 104:27}>()});
+        _11 = Pin::<&mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:103:13: 103:15}, {async block@flow.rs:103:16: 103:21}, {closure@flow.rs:104:13: 104:16}, {async block@flow.rs:104:17: 104:27}>()}>::new_unchecked(copy _12) -> [return: bb5, unwind: bb31];
+    }
+
+    bb5: {
+        _14 = copy _51;
+        _13 = copy (_14.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
+        _10 = <{async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:103:13: 103:15}, {async block@flow.rs:103:16: 103:21}, {closure@flow.rs:104:13: 104:16}, {async block@flow.rs:104:17: 104:27}>()} as Future>::poll(move _11, copy _13) -> [return: bb6, unwind: bb31];
+    }
+
+    bb6: {
+        _15 = discriminant(_10);
+        switchInt(move _15) -> [0: bb9, 1: bb8, otherwise: bb7];
+    }
+
+    bb7: {
+        unreachable;
+    }
+
+    bb8: {
+        _0 = Poll::<Result<u64, String>>::Pending;
+        discriminant((*_48)) = 3;
+        return;
+    }
+
+    bb9: {
+        _16 = move ((_10 as Ready).0: std::result::Result<u64, std::string::String>);
+        drop((((*_48) as variant#3).2: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:103:13: 103:15}, {async block@flow.rs:103:16: 103:21}, {closure@flow.rs:104:13: 104:16}, {async block@flow.rs:104:17: 104:27}>()})) -> [return: bb10, unwind: bb32];
+    }
+
+    bb10: {
+        _3 = <Result<u64, String> as Try>::branch(copy _16) -> [return: bb11, unwind: bb32];
+    }
+
+    bb11: {
+        _18 = discriminant(_3);
+        switchInt(move _18) -> [0: bb12, 1: bb13, otherwise: bb7];
+    }
+
+    bb12: {
+        _20 = copy ((_3 as Continue).0: u64);
+        (((*_48) as variant#4).2: u64) = copy _20;
+        _24 = &mut (((*_48) as variant#4).1: autumn_harvest::Saga<'_>);
+        _23 = other::Saga::compensate_all(copy _24) -> [return: bb14, unwind: bb32];
+    }
+
+    bb13: {
+        _19 = move ((_3 as Break).0: std::result::Result<std::convert::Infallible, std::string::String>);
+        _46 = <Result<u64, String> as FromResidual<Result<Infallible, String>>>::from_residual(copy _19) -> [return: bb38, unwind: bb32];
+    }
+
+    bb14: {
+        _22 = <{async fn body of other::Saga::compensate_all()} as IntoFuture>::into_future(move _23) -> [return: bb15, unwind: bb32];
+    }
+
+    bb15: {
+        (((*_48) as variant#4).3: {async fn body of other::Saga::compensate_all()}) = move _22;
+        goto -> bb16;
+    }
+
+    bb16: {
+        _27 = &mut (((*_48) as variant#4).3: {async fn body of other::Saga::compensate_all()});
+        _26 = Pin::<&mut {async fn body of other::Saga::compensate_all()}>::new_unchecked(copy _27) -> [return: bb17, unwind: bb30];
+    }
+
+    bb17: {
+        _29 = copy _51;
+        _28 = copy (_29.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
+        _25 = <{async fn body of other::Saga::compensate_all()} as Future>::poll(move _26, copy _28) -> [return: bb18, unwind: bb30];
+    }
+
+    bb18: {
+        _30 = discriminant(_25);
+        switchInt(move _30) -> [0: bb20, 1: bb19, otherwise: bb7];
+    }
+
+    bb19: {
+        _0 = Poll::<Result<u64, String>>::Pending;
+        discriminant((*_48)) = 4;
+        return;
+    }
+
+    bb20: {
+        _31 = move ((_25 as Ready).0: std::result::Result<(), std::string::String>);
+        drop((((*_48) as variant#4).3: {async fn body of other::Saga::compensate_all()})) -> [return: bb21, unwind: bb32];
+    }
+
+    bb21: {
+        _21 = <Result<(), String> as Try>::branch(copy _31) -> [return: bb22, unwind: bb32];
+    }
+
+    bb22: {
+        _33 = discriminant(_21);
+        switchInt(move _33) -> [0: bb23, 1: bb24, otherwise: bb7];
+    }
+
+    bb23: {
+        _35 = copy ((_21 as Continue).0: ());
+        _40 = &(((*_48) as variant#4).2: u64);
+        _39 = (move _40,);
+        _45 = no_retag copy (_39.0: &u64);
+        _42 = core::fmt::rt::Argument::<'_>::new_display::<u64>(copy _45) -> [return: bb25, unwind: bb32];
+    }
+
+    bb24: {
+        _34 = move ((_21 as Break).0: std::result::Result<std::convert::Infallible, std::string::String>);
+        _46 = <Result<u64, String> as FromResidual<Result<Infallible, String>>>::from_residual(copy _34) -> [return: bb39, unwind: bb32];
+    }
+
+    bb25: {
+        _41 = [move _42];
+        _43 = const b"\x05late \xc0\x00";
+        _44 = &_41;
+        _38 = Arguments::<'_>::new::<8, 1>(move _43, copy _44) -> [return: bb26, unwind: bb32];
+    }
+
+    bb26: {
+        _37 = format(move _38) -> [return: bb27, unwind: bb32];
+    }
+
+    bb27: {
+        _36 = must_use::<String>(move _37) -> [return: bb28, unwind: bb32];
+    }
+
+    bb28: {
+        _46 = Result::<u64, String>::Err(move _36);
+        goto -> bb29;
+    }
+
+    bb29: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _46);
+        discriminant((*_48)) = 1;
+        return;
+    }
+
+    bb30 (cleanup): {
+        drop((((*_48) as variant#4).3: {async fn body of other::Saga::compensate_all()})) -> [return: bb32, unwind terminate(cleanup)];
+    }
+
+    bb31 (cleanup): {
+        drop((((*_48) as variant#3).2: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:103:13: 103:15}, {async block@flow.rs:103:16: 103:21}, {closure@flow.rs:104:13: 104:16}, {async block@flow.rs:104:17: 104:27}>()})) -> [return: bb32, unwind terminate(cleanup)];
+    }
+
+    bb32 (cleanup): {
+        discriminant((*_48)) = 2;
+        resume;
+    }
+
+    bb33: {
+        _17 = move _51;
+        _51 = move _17;
+        goto -> bb4;
+    }
+
+    bb34: {
+        _32 = move _51;
+        _51 = move _32;
+        goto -> bb16;
+    }
+
+    bb35: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb35, unwind continue];
+    }
+
+    bb36: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb36, unwind continue];
+    }
+
+    bb37: {
+        (((*_48) as variant#4).0: &autumn_harvest::WorkflowContext) = copy ((*_48).0: &autumn_harvest::WorkflowContext);
+        _50 = no_retag copy (((*_48) as variant#4).0: &autumn_harvest::WorkflowContext);
+        (((*_48) as variant#4).1: autumn_harvest::Saga<'_>) = autumn_harvest::Saga::<'_>::new(copy _50) -> [return: bb1, unwind: bb32];
+    }
+
+    bb38: {
+        goto -> bb29;
+    }
+
+    bb39: {
+        goto -> bb29;
+    }
+}
+
+alloc4 (size: 8, align: 1) {
+    05 6c 61 74 65 20 c0 00                         │ .late ..
+}
+
+fn wf_module_lookalike_compensate::{closure#0}::{closure#0}(_1: {closure@flow.rs:103:13: 103:15}) -> {async block@flow.rs:103:16: 103:21} {
+    debug ctx => const WorkflowContext;
+    let mut _0: {async block@flow.rs:103:16: 103:21};
+    let mut _2: &autumn_harvest::WorkflowContext;
+
+    bb0: {
+        _2 = no_retag copy (_1.0: &autumn_harvest::WorkflowContext);
+        _0 = {coroutine@flow.rs:103:16: 103:21 (#0)} { ctx: copy _2 };
+        return;
+    }
+}
+
+fn wf_module_lookalike_compensate::{closure#0}::{closure#0}::{closure#0}(_1: Pin<&mut {async block@flow.rs:103:16: 103:21}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    coroutine layout {
+        field _s0: std::future::Ready<Result<u64, String>>;
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+            Suspend0 (3): [_s0],
+        }
+        storage_conflicts = BitMatrix(1x1) {(_s0, _s0)}
+    }
+    debug _task_context => _17;
+    debug ctx => (*((*_16).0: &autumn_harvest::WorkflowContext));
+    coroutine debug __awaitee => _s0;
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _3: std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _4: std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _5: &str;
+    let mut _6: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _7: std::pin::Pin<&mut std::future::Ready<std::result::Result<u64, std::string::String>>>;
+    let mut _8: &mut std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _9: &mut std::task::Context<'_>;
+    let mut _10: std::future::ResumeTy;
+    let mut _11: isize;
+    let mut _13: std::future::ResumeTy;
+    let mut _14: &autumn_harvest::WorkflowContext;
+    let mut _15: u32;
+    let mut _16: &mut {async block@flow.rs:103:16: 103:21};
+    let mut _17: std::future::ResumeTy;
+    let mut _18: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug __awaitee => (((*_16) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>);
+        let _12: std::result::Result<u64, std::string::String>;
+        scope 2 {
+            debug result => _12;
+        }
+    }
+
+    bb0: {
+        _18 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _17 = std::future::ResumeTy(move _18);
+        _16 = copy (_1.0: &mut {async block@flow.rs:103:16: 103:21});
+        _15 = discriminant((*_16));
+        switchInt(move _15) -> [0: bb15, 1: bb14, 2: bb13, 3: bb12, otherwise: bb6];
+    }
+
+    bb1: {
+        _3 = <std::future::Ready<Result<u64, String>> as IntoFuture>::into_future(move _4) -> [return: bb2, unwind: bb11];
+    }
+
+    bb2: {
+        (((*_16) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>) = move _3;
+        goto -> bb3;
+    }
+
+    bb3: {
+        _8 = &mut (((*_16) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>);
+        _7 = Pin::<&mut std::future::Ready<Result<u64, String>>>::new_unchecked(copy _8) -> [return: bb4, unwind: bb10];
+    }
+
+    bb4: {
+        _10 = copy _17;
+        _9 = copy (_10.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
+        _6 = <std::future::Ready<Result<u64, String>> as Future>::poll(move _7, copy _9) -> [return: bb5, unwind: bb10];
+    }
+
+    bb5: {
+        _11 = discriminant(_6);
+        switchInt(move _11) -> [0: bb8, 1: bb7, otherwise: bb6];
+    }
+
+    bb6: {
+        unreachable;
+    }
+
+    bb7: {
+        _0 = Poll::<Result<u64, String>>::Pending;
+        discriminant((*_16)) = 3;
+        return;
+    }
+
+    bb8: {
+        _12 = move ((_6 as Ready).0: std::result::Result<u64, std::string::String>);
+        drop((((*_16) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>)) -> [return: bb9, unwind: bb11];
+    }
+
+    bb9: {
+        _0 = Poll::<Result<u64, String>>::Ready(copy _12);
+        discriminant((*_16)) = 1;
+        return;
+    }
+
+    bb10 (cleanup): {
+        drop((((*_16) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>)) -> [return: bb11, unwind terminate(cleanup)];
+    }
+
+    bb11 (cleanup): {
+        discriminant((*_16)) = 2;
+        resume;
+    }
+
+    bb12: {
+        _13 = move _17;
+        _17 = move _13;
+        goto -> bb3;
+    }
+
+    bb13: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb13, unwind continue];
+    }
+
+    bb14: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb14, unwind continue];
+    }
+
+    bb15: {
+        _14 = no_retag copy ((*_16).0: &autumn_harvest::WorkflowContext);
+        _5 = const "reserve";
+        _4 = WorkflowContext::execute_activity_raw(copy _14, move _5, const 1_u64) -> [return: bb1, unwind: bb11];
+    }
+}
+
+alloc2 (size: 7, align: 1) {
+    72 65 73 65 72 76 65                            │ reserve
+}
+
+fn wf_module_lookalike_compensate::{closure#0}::{closure#1}(_1: {closure@flow.rs:104:13: 104:16}, _2: u64) -> {async block@flow.rs:104:17: 104:27} {
+    debug a => _2;
+    debug ctx => (*(_1.0: &&autumn_harvest::WorkflowContext));
+    let mut _0: {async block@flow.rs:104:17: 104:27};
+    let mut _3: &&autumn_harvest::WorkflowContext;
+
+    bb0: {
+        _3 = no_retag copy (_1.0: &&autumn_harvest::WorkflowContext);
+        _0 = {coroutine@flow.rs:104:17: 104:27 (#0)} { ctx: copy (*_3), a: copy _2 };
+        return;
+    }
+}
+
+fn wf_module_lookalike_compensate::{closure#0}::{closure#1}::{closure#0}(_1: Pin<&mut {async block@flow.rs:104:17: 104:27}>, _2: &mut Context<'_>) -> Poll<Result<(), String>> {
+    coroutine layout {
+        field _s0: std::future::Ready<Result<u64, String>>;
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+            Suspend0 (3): [_s0],
+        }
+        storage_conflicts = BitMatrix(1x1) {(_s0, _s0)}
+    }
+    debug _task_context => _20;
+    debug ctx => ((*_19).0: &autumn_harvest::WorkflowContext);
+    debug a => ((*_19).1: u64);
+    coroutine debug __awaitee => _s0;
+    let mut _0: std::task::Poll<std::result::Result<(), std::string::String>>;
+    let mut _3: std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _4: std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _5: &str;
+    let mut _6: u64;
+    let mut _7: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _8: std::pin::Pin<&mut std::future::Ready<std::result::Result<u64, std::string::String>>>;
+    let mut _9: &mut std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _10: &mut std::task::Context<'_>;
+    let mut _11: std::future::ResumeTy;
+    let mut _12: isize;
+    let mut _14: std::future::ResumeTy;
+    let mut _15: {closure@flow.rs:104:79: 104:82};
+    let mut _16: &autumn_harvest::WorkflowContext;
+    let mut _17: std::result::Result<(), std::string::String>;
+    let mut _18: u32;
+    let mut _19: &mut {async block@flow.rs:104:17: 104:27};
+    let mut _20: std::future::ResumeTy;
+    let mut _21: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug __awaitee => (((*_19) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>);
+        let _13: std::result::Result<u64, std::string::String>;
+        scope 2 {
+            debug result => _13;
+        }
+    }
+
+    bb0: {
+        _21 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _20 = std::future::ResumeTy(move _21);
+        _19 = copy (_1.0: &mut {async block@flow.rs:104:17: 104:27});
+        _18 = discriminant((*_19));
+        switchInt(move _18) -> [0: bb16, 1: bb15, 2: bb14, 3: bb13, otherwise: bb6];
+    }
+
+    bb1: {
+        _3 = <std::future::Ready<Result<u64, String>> as IntoFuture>::into_future(move _4) -> [return: bb2, unwind: bb12];
+    }
+
+    bb2: {
+        (((*_19) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>) = move _3;
+        goto -> bb3;
+    }
+
+    bb3: {
+        _9 = &mut (((*_19) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>);
+        _8 = Pin::<&mut std::future::Ready<Result<u64, String>>>::new_unchecked(copy _9) -> [return: bb4, unwind: bb11];
+    }
+
+    bb4: {
+        _11 = copy _20;
+        _10 = copy (_11.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
+        _7 = <std::future::Ready<Result<u64, String>> as Future>::poll(move _8, copy _10) -> [return: bb5, unwind: bb11];
+    }
+
+    bb5: {
+        _12 = discriminant(_7);
+        switchInt(move _12) -> [0: bb8, 1: bb7, otherwise: bb6];
+    }
+
+    bb6: {
+        unreachable;
+    }
+
+    bb7: {
+        _0 = Poll::<Result<(), String>>::Pending;
+        discriminant((*_19)) = 3;
+        return;
+    }
+
+    bb8: {
+        _13 = move ((_7 as Ready).0: std::result::Result<u64, std::string::String>);
+        drop((((*_19) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>)) -> [return: bb9, unwind: bb12];
+    }
+
+    bb9: {
+        _15 = {closure@flow.rs:104:79: 104:82};
+        _17 = Result::<u64, String>::map::<(), {closure@flow.rs:104:79: 104:82}>(copy _13, move _15) -> [return: bb10, unwind: bb12];
+    }
+
+    bb10: {
+        _0 = Poll::<Result<(), String>>::Ready(move _17);
+        discriminant((*_19)) = 1;
+        return;
+    }
+
+    bb11 (cleanup): {
+        drop((((*_19) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>)) -> [return: bb12, unwind terminate(cleanup)];
+    }
+
+    bb12 (cleanup): {
+        discriminant((*_19)) = 2;
+        resume;
+    }
+
+    bb13: {
+        _14 = move _20;
+        _20 = move _14;
+        goto -> bb3;
+    }
+
+    bb14: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb14, unwind continue];
+    }
+
+    bb15: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb15, unwind continue];
+    }
+
+    bb16: {
+        _16 = no_retag copy ((*_19).0: &autumn_harvest::WorkflowContext);
+        _5 = const "release";
+        _6 = copy ((*_19).1: u64);
+        _4 = WorkflowContext::execute_activity_raw(copy _16, move _5, move _6) -> [return: bb1, unwind: bb12];
+    }
+}
+
+alloc3 (size: 7, align: 1) {
+    72 65 6c 65 61 73 65                            │ release
+}
+
+fn wf_module_lookalike_compensate::{closure#0}::{closure#1}::{closure#0}::{closure#0}(_1: {closure@flow.rs:104:79: 104:82}, _2: u64) -> () {
+    let mut _0: ();
+
+    bb0: {
+        return;
+    }
+}
+
+fn __autumn_workflow_info_wf_root_lookalike_compensate() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_root_lookalike_compensate(_1: &WorkflowContext) -> {async fn body of wf_root_lookalike_compensate()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_root_lookalike_compensate()};
+
+    bb0: {
+        _0 = {coroutine@flow.rs:116:73: 126:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_root_lookalike_compensate::{closure#0}(_1: Pin<&mut {async fn body of wf_root_lookalike_compensate()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    coroutine layout {
+        field _s0: &WorkflowContext;
+        field _s1: autumn_harvest::Saga<'_>;
+        field _s2: u64;
+        field _s3: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:120:13: 120:15}, {async block@flow.rs:120:16: 120:21}, {closure@flow.rs:121:13: 121:16}, {async block@flow.rs:121:17: 121:27}>()};
+        field _s4: {async fn body of Saga::compensate_all()};
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+            Suspend0 (3): [_s0, _s1, _s3],
+            Suspend1 (4): [_s0, _s1, _s2, _s4],
+        }
+        storage_conflicts = BitMatrix(5x5) {(_s0, _s0), (_s0, _s1), (_s0, _s2), (_s0, _s3), (_s0, _s4), (_s1, _s0), (_s1, _s1), (_s1, _s2), (_s1, _s3), (_s1, _s4), (_s2, _s0), (_s2, _s1), (_s2, _s2), (_s2, _s4), (_s3, _s0), (_s3, _s1), (_s3, _s3), (_s4, _s0), (_s4, _s1), (_s4, _s2), (_s4, _s4)}
+    }
+    debug _task_context => _51;
+    debug ctx => ((*_48).0: &autumn_harvest::WorkflowContext);
+    coroutine debug ctx => _s0;
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _3: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, std::string::String>, u64>;
+    let mut _4: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:120:13: 120:15}, {async block@flow.rs:120:16: 120:21}, {closure@flow.rs:121:13: 121:16}, {async block@flow.rs:121:17: 121:27}>()};
+    let mut _5: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:120:13: 120:15}, {async block@flow.rs:120:16: 120:21}, {closure@flow.rs:121:13: 121:16}, {async block@flow.rs:121:17: 121:27}>()};
+    let mut _6: &mut autumn_harvest::Saga<'_>;
+    let mut _7: {closure@flow.rs:120:13: 120:15};
+    let mut _8: {closure@flow.rs:121:13: 121:16};
+    let mut _9: &&autumn_harvest::WorkflowContext;
+    let mut _10: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _11: std::pin::Pin<&mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:120:13: 120:15}, {async block@flow.rs:120:16: 120:21}, {closure@flow.rs:121:13: 121:16}, {async block@flow.rs:121:17: 121:27}>()}>;
+    let mut _12: &mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:120:13: 120:15}, {async block@flow.rs:120:16: 120:21}, {closure@flow.rs:121:13: 121:16}, {async block@flow.rs:121:17: 121:27}>()};
+    let mut _13: &mut std::task::Context<'_>;
+    let mut _14: std::future::ResumeTy;
+    let mut _15: isize;
+    let mut _17: std::future::ResumeTy;
+    let mut _18: isize;
+    let mut _21: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, std::string::String>>;
+    let mut _22: {async fn body of Saga::compensate_all()};
+    let mut _23: {async fn body of Saga::compensate_all()};
+    let mut _24: &mut autumn_harvest::Saga<'_>;
+    let mut _25: std::task::Poll<std::result::Result<(), std::string::String>>;
+    let mut _26: std::pin::Pin<&mut {async fn body of Saga::compensate_all()}>;
+    let mut _27: &mut {async fn body of Saga::compensate_all()};
+    let mut _28: &mut std::task::Context<'_>;
+    let mut _29: std::future::ResumeTy;
+    let mut _30: isize;
+    let mut _32: std::future::ResumeTy;
+    let mut _33: isize;
+    let mut _36: std::string::String;
+    let mut _37: std::string::String;
+    let mut _38: std::fmt::Arguments<'_>;
+    let mut _40: &u64;
+    let mut _42: core::fmt::rt::Argument<'_>;
+    let mut _43: &[u8; 8];
+    let _44: &[core::fmt::rt::Argument<'_>; 1];
+    let mut _45: &u64;
+    let mut _46: std::result::Result<u64, std::string::String>;
+    let mut _47: u32;
+    let mut _48: &mut {async fn body of wf_root_lookalike_compensate()};
+    let mut _49: &autumn_harvest::WorkflowContext;
+    let mut _50: &autumn_harvest::WorkflowContext;
+    let mut _51: std::future::ResumeTy;
+    let mut _52: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug ctx => (((*_48) as variant#4).0: &autumn_harvest::WorkflowContext);
+        coroutine debug saga => _s1;
+        scope 2 {
+            debug saga => (((*_48) as variant#4).1: autumn_harvest::Saga<'_>);
+            coroutine debug a => _s2;
+            coroutine debug __awaitee => _s3;
+            let _19: std::result::Result<std::convert::Infallible, std::string::String>;
+            let _20: u64;
+            scope 3 {
+                debug a => (((*_48) as variant#4).2: u64);
+                coroutine debug __awaitee => _s4;
+                let _34: std::result::Result<std::convert::Infallible, std::string::String>;
+                let _35: ();
+                let _39: (&u64,);
+                scope 10 {
+                    debug __awaitee => (((*_48) as variant#4).3: {async fn body of Saga::compensate_all()});
+                    let _31: std::result::Result<(), std::string::String>;
+                    scope 11 {
+                        debug result => _31;
+                    }
+                }
+                scope 12 {
+                    debug residual => _34;
+                    scope 13 {
+                    }
+                }
+                scope 14 {
+                    debug val => _35;
+                    scope 15 {
+                    }
+                }
+                scope 16 {
+                    debug args => _39;
+                    let _41: [core::fmt::rt::Argument<'_>; 1];
+                    scope 17 {
+                        debug args => _41;
+                    }
+                }
+            }
+            scope 4 {
+                debug __awaitee => (((*_48) as variant#3).2: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:120:13: 120:15}, {async block@flow.rs:120:16: 120:21}, {closure@flow.rs:121:13: 121:16}, {async block@flow.rs:121:17: 121:27}>()});
+                let _16: std::result::Result<u64, std::string::String>;
+                scope 5 {
+                    debug result => _16;
+                }
+            }
+            scope 6 {
+                debug residual => _19;
+                scope 7 {
+                }
+            }
+            scope 8 {
+                debug val => _20;
+                scope 9 {
+                }
+            }
+        }
+    }
+
+    bb0: {
+        _52 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _51 = std::future::ResumeTy(move _52);
+        _48 = copy (_1.0: &mut {async fn body of wf_root_lookalike_compensate()});
+        _47 = discriminant((*_48));
+        switchInt(move _47) -> [0: bb37, 1: bb36, 2: bb35, 3: bb33, 4: bb34, otherwise: bb7];
+    }
+
+    bb1: {
+        _6 = &mut (((*_48) as variant#4).1: autumn_harvest::Saga<'_>);
+        _49 = no_retag copy (((*_48) as variant#4).0: &autumn_harvest::WorkflowContext);
+        _7 = {closure@flow.rs:120:13: 120:15} { ctx: copy _49 };
+        _9 = &(((*_48) as variant#4).0: &autumn_harvest::WorkflowContext);
+        _8 = {closure@flow.rs:121:13: 121:16} { ctx: move _9 };
+        _5 = autumn_harvest::Saga::<'_>::step::<u64, {closure@flow.rs:120:13: 120:15}, {async block@flow.rs:120:16: 120:21}, {closure@flow.rs:121:13: 121:16}, {async block@flow.rs:121:17: 121:27}>(move _6, move _7, move _8) -> [return: bb2, unwind: bb32];
+    }
+
+    bb2: {
+        _4 = <{async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:120:13: 120:15}, {async block@flow.rs:120:16: 120:21}, {closure@flow.rs:121:13: 121:16}, {async block@flow.rs:121:17: 121:27}>()} as IntoFuture>::into_future(move _5) -> [return: bb3, unwind: bb32];
+    }
+
+    bb3: {
+        (((*_48) as variant#3).2: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:120:13: 120:15}, {async block@flow.rs:120:16: 120:21}, {closure@flow.rs:121:13: 121:16}, {async block@flow.rs:121:17: 121:27}>()}) = move _4;
+        goto -> bb4;
+    }
+
+    bb4: {
+        _12 = &mut (((*_48) as variant#3).2: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:120:13: 120:15}, {async block@flow.rs:120:16: 120:21}, {closure@flow.rs:121:13: 121:16}, {async block@flow.rs:121:17: 121:27}>()});
+        _11 = Pin::<&mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:120:13: 120:15}, {async block@flow.rs:120:16: 120:21}, {closure@flow.rs:121:13: 121:16}, {async block@flow.rs:121:17: 121:27}>()}>::new_unchecked(copy _12) -> [return: bb5, unwind: bb31];
+    }
+
+    bb5: {
+        _14 = copy _51;
+        _13 = copy (_14.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
+        _10 = <{async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:120:13: 120:15}, {async block@flow.rs:120:16: 120:21}, {closure@flow.rs:121:13: 121:16}, {async block@flow.rs:121:17: 121:27}>()} as Future>::poll(move _11, copy _13) -> [return: bb6, unwind: bb31];
+    }
+
+    bb6: {
+        _15 = discriminant(_10);
+        switchInt(move _15) -> [0: bb9, 1: bb8, otherwise: bb7];
+    }
+
+    bb7: {
+        unreachable;
+    }
+
+    bb8: {
+        _0 = Poll::<Result<u64, String>>::Pending;
+        discriminant((*_48)) = 3;
+        return;
+    }
+
+    bb9: {
+        _16 = move ((_10 as Ready).0: std::result::Result<u64, std::string::String>);
+        drop((((*_48) as variant#3).2: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:120:13: 120:15}, {async block@flow.rs:120:16: 120:21}, {closure@flow.rs:121:13: 121:16}, {async block@flow.rs:121:17: 121:27}>()})) -> [return: bb10, unwind: bb32];
+    }
+
+    bb10: {
+        _3 = <Result<u64, String> as Try>::branch(copy _16) -> [return: bb11, unwind: bb32];
+    }
+
+    bb11: {
+        _18 = discriminant(_3);
+        switchInt(move _18) -> [0: bb12, 1: bb13, otherwise: bb7];
+    }
+
+    bb12: {
+        _20 = copy ((_3 as Continue).0: u64);
+        (((*_48) as variant#4).2: u64) = copy _20;
+        _24 = &mut (((*_48) as variant#4).1: autumn_harvest::Saga<'_>);
+        _23 = Saga::compensate_all(copy _24) -> [return: bb14, unwind: bb32];
+    }
+
+    bb13: {
+        _19 = move ((_3 as Break).0: std::result::Result<std::convert::Infallible, std::string::String>);
+        _46 = <Result<u64, String> as FromResidual<Result<Infallible, String>>>::from_residual(copy _19) -> [return: bb38, unwind: bb32];
+    }
+
+    bb14: {
+        _22 = <{async fn body of Saga::compensate_all()} as IntoFuture>::into_future(move _23) -> [return: bb15, unwind: bb32];
+    }
+
+    bb15: {
+        (((*_48) as variant#4).3: {async fn body of Saga::compensate_all()}) = move _22;
+        goto -> bb16;
+    }
+
+    bb16: {
+        _27 = &mut (((*_48) as variant#4).3: {async fn body of Saga::compensate_all()});
+        _26 = Pin::<&mut {async fn body of Saga::compensate_all()}>::new_unchecked(copy _27) -> [return: bb17, unwind: bb30];
+    }
+
+    bb17: {
+        _29 = copy _51;
+        _28 = copy (_29.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
+        _25 = <{async fn body of Saga::compensate_all()} as Future>::poll(move _26, copy _28) -> [return: bb18, unwind: bb30];
+    }
+
+    bb18: {
+        _30 = discriminant(_25);
+        switchInt(move _30) -> [0: bb20, 1: bb19, otherwise: bb7];
+    }
+
+    bb19: {
+        _0 = Poll::<Result<u64, String>>::Pending;
+        discriminant((*_48)) = 4;
+        return;
+    }
+
+    bb20: {
+        _31 = move ((_25 as Ready).0: std::result::Result<(), std::string::String>);
+        drop((((*_48) as variant#4).3: {async fn body of Saga::compensate_all()})) -> [return: bb21, unwind: bb32];
+    }
+
+    bb21: {
+        _21 = <Result<(), String> as Try>::branch(copy _31) -> [return: bb22, unwind: bb32];
+    }
+
+    bb22: {
+        _33 = discriminant(_21);
+        switchInt(move _33) -> [0: bb23, 1: bb24, otherwise: bb7];
+    }
+
+    bb23: {
+        _35 = copy ((_21 as Continue).0: ());
+        _40 = &(((*_48) as variant#4).2: u64);
+        _39 = (move _40,);
+        _45 = no_retag copy (_39.0: &u64);
+        _42 = core::fmt::rt::Argument::<'_>::new_display::<u64>(copy _45) -> [return: bb25, unwind: bb32];
+    }
+
+    bb24: {
+        _34 = move ((_21 as Break).0: std::result::Result<std::convert::Infallible, std::string::String>);
+        _46 = <Result<u64, String> as FromResidual<Result<Infallible, String>>>::from_residual(copy _34) -> [return: bb39, unwind: bb32];
+    }
+
+    bb25: {
+        _41 = [move _42];
+        _43 = const b"\x05late \xc0\x00";
+        _44 = &_41;
+        _38 = Arguments::<'_>::new::<8, 1>(move _43, copy _44) -> [return: bb26, unwind: bb32];
+    }
+
+    bb26: {
+        _37 = format(move _38) -> [return: bb27, unwind: bb32];
+    }
+
+    bb27: {
+        _36 = must_use::<String>(move _37) -> [return: bb28, unwind: bb32];
+    }
+
+    bb28: {
+        _46 = Result::<u64, String>::Err(move _36);
+        goto -> bb29;
+    }
+
+    bb29: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _46);
+        discriminant((*_48)) = 1;
+        return;
+    }
+
+    bb30 (cleanup): {
+        drop((((*_48) as variant#4).3: {async fn body of Saga::compensate_all()})) -> [return: bb32, unwind terminate(cleanup)];
+    }
+
+    bb31 (cleanup): {
+        drop((((*_48) as variant#3).2: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:120:13: 120:15}, {async block@flow.rs:120:16: 120:21}, {closure@flow.rs:121:13: 121:16}, {async block@flow.rs:121:17: 121:27}>()})) -> [return: bb32, unwind terminate(cleanup)];
+    }
+
+    bb32 (cleanup): {
+        discriminant((*_48)) = 2;
+        resume;
+    }
+
+    bb33: {
+        _17 = move _51;
+        _51 = move _17;
+        goto -> bb4;
+    }
+
+    bb34: {
+        _32 = move _51;
+        _51 = move _32;
+        goto -> bb16;
+    }
+
+    bb35: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb35, unwind continue];
+    }
+
+    bb36: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb36, unwind continue];
+    }
+
+    bb37: {
+        (((*_48) as variant#4).0: &autumn_harvest::WorkflowContext) = copy ((*_48).0: &autumn_harvest::WorkflowContext);
+        _50 = no_retag copy (((*_48) as variant#4).0: &autumn_harvest::WorkflowContext);
+        (((*_48) as variant#4).1: autumn_harvest::Saga<'_>) = autumn_harvest::Saga::<'_>::new(copy _50) -> [return: bb1, unwind: bb32];
+    }
+
+    bb38: {
+        goto -> bb29;
+    }
+
+    bb39: {
+        goto -> bb29;
+    }
+}
+
+alloc4 (size: 8, align: 1) {
+    05 6c 61 74 65 20 c0 00                         │ .late ..
+}
+
+fn wf_root_lookalike_compensate::{closure#0}::{closure#0}(_1: {closure@flow.rs:120:13: 120:15}) -> {async block@flow.rs:120:16: 120:21} {
+    debug ctx => const WorkflowContext;
+    let mut _0: {async block@flow.rs:120:16: 120:21};
+    let mut _2: &autumn_harvest::WorkflowContext;
+
+    bb0: {
+        _2 = no_retag copy (_1.0: &autumn_harvest::WorkflowContext);
+        _0 = {coroutine@flow.rs:120:16: 120:21 (#0)} { ctx: copy _2 };
+        return;
+    }
+}
+
+fn wf_root_lookalike_compensate::{closure#0}::{closure#0}::{closure#0}(_1: Pin<&mut {async block@flow.rs:120:16: 120:21}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    coroutine layout {
+        field _s0: std::future::Ready<Result<u64, String>>;
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+            Suspend0 (3): [_s0],
+        }
+        storage_conflicts = BitMatrix(1x1) {(_s0, _s0)}
+    }
+    debug _task_context => _17;
+    debug ctx => (*((*_16).0: &autumn_harvest::WorkflowContext));
+    coroutine debug __awaitee => _s0;
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _3: std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _4: std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _5: &str;
+    let mut _6: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _7: std::pin::Pin<&mut std::future::Ready<std::result::Result<u64, std::string::String>>>;
+    let mut _8: &mut std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _9: &mut std::task::Context<'_>;
+    let mut _10: std::future::ResumeTy;
+    let mut _11: isize;
+    let mut _13: std::future::ResumeTy;
+    let mut _14: &autumn_harvest::WorkflowContext;
+    let mut _15: u32;
+    let mut _16: &mut {async block@flow.rs:120:16: 120:21};
+    let mut _17: std::future::ResumeTy;
+    let mut _18: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug __awaitee => (((*_16) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>);
+        let _12: std::result::Result<u64, std::string::String>;
+        scope 2 {
+            debug result => _12;
+        }
+    }
+
+    bb0: {
+        _18 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _17 = std::future::ResumeTy(move _18);
+        _16 = copy (_1.0: &mut {async block@flow.rs:120:16: 120:21});
+        _15 = discriminant((*_16));
+        switchInt(move _15) -> [0: bb15, 1: bb14, 2: bb13, 3: bb12, otherwise: bb6];
+    }
+
+    bb1: {
+        _3 = <std::future::Ready<Result<u64, String>> as IntoFuture>::into_future(move _4) -> [return: bb2, unwind: bb11];
+    }
+
+    bb2: {
+        (((*_16) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>) = move _3;
+        goto -> bb3;
+    }
+
+    bb3: {
+        _8 = &mut (((*_16) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>);
+        _7 = Pin::<&mut std::future::Ready<Result<u64, String>>>::new_unchecked(copy _8) -> [return: bb4, unwind: bb10];
+    }
+
+    bb4: {
+        _10 = copy _17;
+        _9 = copy (_10.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
+        _6 = <std::future::Ready<Result<u64, String>> as Future>::poll(move _7, copy _9) -> [return: bb5, unwind: bb10];
+    }
+
+    bb5: {
+        _11 = discriminant(_6);
+        switchInt(move _11) -> [0: bb8, 1: bb7, otherwise: bb6];
+    }
+
+    bb6: {
+        unreachable;
+    }
+
+    bb7: {
+        _0 = Poll::<Result<u64, String>>::Pending;
+        discriminant((*_16)) = 3;
+        return;
+    }
+
+    bb8: {
+        _12 = move ((_6 as Ready).0: std::result::Result<u64, std::string::String>);
+        drop((((*_16) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>)) -> [return: bb9, unwind: bb11];
+    }
+
+    bb9: {
+        _0 = Poll::<Result<u64, String>>::Ready(copy _12);
+        discriminant((*_16)) = 1;
+        return;
+    }
+
+    bb10 (cleanup): {
+        drop((((*_16) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>)) -> [return: bb11, unwind terminate(cleanup)];
+    }
+
+    bb11 (cleanup): {
+        discriminant((*_16)) = 2;
+        resume;
+    }
+
+    bb12: {
+        _13 = move _17;
+        _17 = move _13;
+        goto -> bb3;
+    }
+
+    bb13: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb13, unwind continue];
+    }
+
+    bb14: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb14, unwind continue];
+    }
+
+    bb15: {
+        _14 = no_retag copy ((*_16).0: &autumn_harvest::WorkflowContext);
+        _5 = const "reserve";
+        _4 = WorkflowContext::execute_activity_raw(copy _14, move _5, const 1_u64) -> [return: bb1, unwind: bb11];
+    }
+}
+
+alloc2 (size: 7, align: 1) {
+    72 65 73 65 72 76 65                            │ reserve
+}
+
+fn wf_root_lookalike_compensate::{closure#0}::{closure#1}(_1: {closure@flow.rs:121:13: 121:16}, _2: u64) -> {async block@flow.rs:121:17: 121:27} {
+    debug a => _2;
+    debug ctx => (*(_1.0: &&autumn_harvest::WorkflowContext));
+    let mut _0: {async block@flow.rs:121:17: 121:27};
+    let mut _3: &&autumn_harvest::WorkflowContext;
+
+    bb0: {
+        _3 = no_retag copy (_1.0: &&autumn_harvest::WorkflowContext);
+        _0 = {coroutine@flow.rs:121:17: 121:27 (#0)} { ctx: copy (*_3), a: copy _2 };
+        return;
+    }
+}
+
+fn wf_root_lookalike_compensate::{closure#0}::{closure#1}::{closure#0}(_1: Pin<&mut {async block@flow.rs:121:17: 121:27}>, _2: &mut Context<'_>) -> Poll<Result<(), String>> {
+    coroutine layout {
+        field _s0: std::future::Ready<Result<u64, String>>;
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+            Suspend0 (3): [_s0],
+        }
+        storage_conflicts = BitMatrix(1x1) {(_s0, _s0)}
+    }
+    debug _task_context => _20;
+    debug ctx => ((*_19).0: &autumn_harvest::WorkflowContext);
+    debug a => ((*_19).1: u64);
+    coroutine debug __awaitee => _s0;
+    let mut _0: std::task::Poll<std::result::Result<(), std::string::String>>;
+    let mut _3: std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _4: std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _5: &str;
+    let mut _6: u64;
+    let mut _7: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _8: std::pin::Pin<&mut std::future::Ready<std::result::Result<u64, std::string::String>>>;
+    let mut _9: &mut std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _10: &mut std::task::Context<'_>;
+    let mut _11: std::future::ResumeTy;
+    let mut _12: isize;
+    let mut _14: std::future::ResumeTy;
+    let mut _15: {closure@flow.rs:121:79: 121:82};
+    let mut _16: &autumn_harvest::WorkflowContext;
+    let mut _17: std::result::Result<(), std::string::String>;
+    let mut _18: u32;
+    let mut _19: &mut {async block@flow.rs:121:17: 121:27};
+    let mut _20: std::future::ResumeTy;
+    let mut _21: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug __awaitee => (((*_19) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>);
+        let _13: std::result::Result<u64, std::string::String>;
+        scope 2 {
+            debug result => _13;
+        }
+    }
+
+    bb0: {
+        _21 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _20 = std::future::ResumeTy(move _21);
+        _19 = copy (_1.0: &mut {async block@flow.rs:121:17: 121:27});
+        _18 = discriminant((*_19));
+        switchInt(move _18) -> [0: bb16, 1: bb15, 2: bb14, 3: bb13, otherwise: bb6];
+    }
+
+    bb1: {
+        _3 = <std::future::Ready<Result<u64, String>> as IntoFuture>::into_future(move _4) -> [return: bb2, unwind: bb12];
+    }
+
+    bb2: {
+        (((*_19) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>) = move _3;
+        goto -> bb3;
+    }
+
+    bb3: {
+        _9 = &mut (((*_19) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>);
+        _8 = Pin::<&mut std::future::Ready<Result<u64, String>>>::new_unchecked(copy _9) -> [return: bb4, unwind: bb11];
+    }
+
+    bb4: {
+        _11 = copy _20;
+        _10 = copy (_11.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
+        _7 = <std::future::Ready<Result<u64, String>> as Future>::poll(move _8, copy _10) -> [return: bb5, unwind: bb11];
+    }
+
+    bb5: {
+        _12 = discriminant(_7);
+        switchInt(move _12) -> [0: bb8, 1: bb7, otherwise: bb6];
+    }
+
+    bb6: {
+        unreachable;
+    }
+
+    bb7: {
+        _0 = Poll::<Result<(), String>>::Pending;
+        discriminant((*_19)) = 3;
+        return;
+    }
+
+    bb8: {
+        _13 = move ((_7 as Ready).0: std::result::Result<u64, std::string::String>);
+        drop((((*_19) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>)) -> [return: bb9, unwind: bb12];
+    }
+
+    bb9: {
+        _15 = {closure@flow.rs:121:79: 121:82};
+        _17 = Result::<u64, String>::map::<(), {closure@flow.rs:121:79: 121:82}>(copy _13, move _15) -> [return: bb10, unwind: bb12];
+    }
+
+    bb10: {
+        _0 = Poll::<Result<(), String>>::Ready(move _17);
+        discriminant((*_19)) = 1;
+        return;
+    }
+
+    bb11 (cleanup): {
+        drop((((*_19) as variant#3).0: std::future::Ready<std::result::Result<u64, std::string::String>>)) -> [return: bb12, unwind terminate(cleanup)];
+    }
+
+    bb12 (cleanup): {
+        discriminant((*_19)) = 2;
+        resume;
+    }
+
+    bb13: {
+        _14 = move _20;
+        _20 = move _14;
+        goto -> bb3;
+    }
+
+    bb14: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb14, unwind continue];
+    }
+
+    bb15: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb15, unwind continue];
+    }
+
+    bb16: {
+        _16 = no_retag copy ((*_19).0: &autumn_harvest::WorkflowContext);
+        _5 = const "release";
+        _6 = copy ((*_19).1: u64);
+        _4 = WorkflowContext::execute_activity_raw(copy _16, move _5, move _6) -> [return: bb1, unwind: bb12];
+    }
+}
+
+alloc3 (size: 7, align: 1) {
+    72 65 6c 65 61 73 65                            │ release
+}
+
+fn wf_root_lookalike_compensate::{closure#0}::{closure#1}::{closure#0}::{closure#0}(_1: {closure@flow.rs:121:79: 121:82}, _2: u64) -> () {
+    let mut _0: ();
+
+    bb0: {
+        return;
+    }
+}
