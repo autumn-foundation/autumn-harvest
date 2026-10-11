@@ -1755,13 +1755,14 @@ impl<'a> Analyzer<'a> {
         emit: bool,
         out: &mut TaintSet,
     ) {
+        let block = returning_block(body);
         let Some(span) = brace_form(&body.return_ty) else {
+            self.follow_named_future(closure, body, ret, hops, &block, out);
             return;
         };
         if !span.starts_with("{async block@") || !span.contains(".rs:") {
             return;
         }
-        let block = returning_block(body);
         let coroutines = self.program.nested_coroutines(closure, &span);
         if coroutines.is_empty() && emit {
             self.push_boundary(BoundaryKind::UnresolvedCallback, &span, closure, &block);
@@ -1783,6 +1784,41 @@ impl<'a> Analyzer<'a> {
         if emit && captures_mut_ref(body, &interior) {
             let detail = format!("{span} captures a `&mut` reference");
             self.push_boundary(BoundaryKind::UnresolvedCallback, &detail, closure, &block);
+        }
+    }
+
+    /// Analyze the `Future::poll` impl of a named type that an invoked
+    /// closure returns, when that impl has a body here (issue #2010).
+    ///
+    /// A type with no such impl is not a first-party future, so nothing is
+    /// followed. A future of another crate was built by a call that was
+    /// analyzed or reported on its own.
+    fn follow_named_future(
+        &mut self,
+        closure: &str,
+        body: &Body,
+        ret: &TaintSet,
+        hops: &[Hop],
+        block: &str,
+        out: &mut TaintSet,
+    ) {
+        let ty = body.return_ty.trim();
+        if ty.is_empty() || ty.starts_with('&') || ty.starts_with('(') {
+            return;
+        }
+        let poll = format!("<{ty} as std::future::Future>::poll");
+        let targets = match self.program.resolve_call(closure, &poll) {
+            Resolution::Body(target) => vec![target],
+            Resolution::Bodies(targets, _) => targets,
+            Resolution::Boundary(..) | Resolution::External(_) => return,
+        };
+        for target in targets {
+            self.recorder.future_edge(closure, block, &target);
+            let params = self.program.body(&target).map_or(0, |b| b.params.len());
+            let mut seeded = vec![ret.clone()];
+            seeded.resize(params.max(1), TaintSet::new());
+            let outcome = self.analyze_body(&target, &Substitution::new(), &seeded, hops);
+            out.absorb(&outcome.ret);
         }
     }
 

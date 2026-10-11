@@ -230,3 +230,28 @@ pub async fn wf_step_write_arc(ctx: &WorkflowContext) -> Out {
     let value = seen.lock().map_or(0, |slot| *slot);
     ctx.execute_activity_raw("b", value).await
 }
+
+/// A first-party future whose `poll` reads the clock.
+pub struct ClockFuture;
+
+impl Future for ClockFuture {
+    type Output = Out;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Out> {
+        std::task::Poll::Ready(Ok(now_nanos()))
+    }
+}
+
+pub fn __autumn_workflow_info_wf_step_named_future() -> u8 {
+    0
+}
+
+/// The step closure returns a named future, and its result feeds a command.
+pub async fn wf_step_named_future(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let a = saga.step(|| ClockFuture, |_| async { Ok(()) }).await?;
+    ctx.execute_activity_raw("b", a).await
+}
