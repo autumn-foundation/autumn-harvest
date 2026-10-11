@@ -126,12 +126,13 @@ impl SourceIndex {
         // A `mod x;` declaration names a file that MIR may never name, such as
         // a file with types only. Each one read adds its own to the queue.
         // Each entry carries its module path. A `#[path]` file has a path that
-        // does not give its module, so the declaring module gives it.
+        // does not give its module, so the declaring module gives it. MIR can
+        // name that file too, so a file is read once per module path.
         let mut queue: Vec<(String, Vec<String>)> = expanded
             .iter()
             .map(|f| (f.clone(), file_module(f)))
             .collect();
-        let mut seen: BTreeSet<String> = expanded;
+        let mut seen: BTreeSet<(String, Vec<String>)> = queue.iter().cloned().collect();
         while let Some((file, module)) = queue.pop() {
             let file = &file;
             let Some(text) = read_relative(roots, file) else {
@@ -148,9 +149,12 @@ impl SourceIndex {
             match index.absorb_syn(&text, &module) {
                 Some(children) => {
                     for (child, path) in module_files(roots, file, &children) {
-                        if seen.insert(child.clone()) {
-                            let mut child_module = module.clone();
-                            child_module.extend(path);
+                        let mut child_module = module.clone();
+                        child_module.extend(path);
+                        // A `#[path]` cycle grows the module path. The cap ends it.
+                        if child_module.len() <= MODULE_DEPTH
+                            && seen.insert((child.clone(), child_module.clone()))
+                        {
                             queue.push((child, child_module));
                         }
                     }
@@ -352,6 +356,9 @@ fn future_self_type(item: &syn::ItemImpl) -> Option<String> {
     };
     Some(self_ty.path.segments.last()?.ident.to_string())
 }
+
+/// The deepest module path the source index follows.
+const MODULE_DEPTH: usize = 16;
 
 /// Each `mod x;` in `items`, as the path of inline modules around it and its
 /// name. A `mod x { .. }` with a body adds its name to the path.
@@ -687,6 +694,29 @@ mod tests {
         assert!(index.type_fields.contains_key("Shared"), "{index:?}");
         assert!(index.type_paths.contains("state::Shared"), "{index:?}");
         assert!(index.type_paths.contains("outer::inner::Deep"), "{index:?}");
+    }
+
+    #[test]
+    fn a_path_attribute_file_that_mir_names_gets_its_declared_module() {
+        // MIR names the moved file too, so it is seen first by its own path.
+        // Its declared module path must still be indexed.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let write = |file: &str, text: &str| {
+            let path = dir.path().join(file);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, text).expect("write");
+        };
+        write("src/lib.rs", "#[path = \"types/state.rs\"]\nmod state;\n");
+        write("src/types/state.rs", "pub struct Shared(u64);\n");
+        // A file that declares itself must not loop.
+        write("src/again.rs", "#[path = \"again.rs\"]\nmod again;\n");
+        let files = BTreeSet::from([
+            "src/lib.rs".to_string(),
+            "src/types/state.rs".to_string(),
+            "src/again.rs".to_string(),
+        ]);
+        let index = SourceIndex::build(&[dir.path().to_path_buf()], &files);
+        assert!(index.type_paths.contains("state::Shared"), "{index:?}");
     }
 
     #[test]
