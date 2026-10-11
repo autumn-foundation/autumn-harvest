@@ -28,6 +28,7 @@ const BOUNDS: &[&str] = &[
     "MAX_HOST_CALL_BYTES",
     "MAX_HOST_CALL_NAME_BYTES",
     "MAX_HOST_CALLS",
+    "MAX_JOURNAL_BYTES",
     "HOST_CALL_DENIED",
     "HOST_CALL_INVALID",
     "HOST_CALL_LIMIT",
@@ -52,11 +53,12 @@ fn test_fns(source: &str) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     let mut after_test_attr = false;
     for line in source.lines().map(str::trim) {
-        if line == "#[test]" {
+        if line.starts_with("#[") && line.ends_with("test]") {
             after_test_attr = true;
             continue;
         }
-        if after_test_attr && let Some(rest) = line.strip_prefix("fn ") {
+        let signature = line.strip_prefix("async ").unwrap_or(line);
+        if after_test_attr && let Some(rest) = signature.strip_prefix("fn ") {
             let name: String = rest
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '_')
@@ -119,10 +121,10 @@ fn report_cites_the_issue_and_states_a_verdict() {
         .lines()
         .find(|line| line.starts_with("**Verdict:**"))
         .unwrap_or_else(|| panic!("{REPORT} must have a `**Verdict:**` line"));
-    assert!(
-        verdict.contains("go"),
-        "the verdict must say go or no-go: {verdict}"
-    );
+    let says_go = verdict
+        .split(|c: char| !(c.is_alphanumeric() || c == '-'))
+        .any(|word| matches!(word.to_ascii_lowercase().as_str(), "go" | "no-go"));
+    assert!(says_go, "the verdict must say go or no-go: {verdict}");
 }
 
 #[test]
@@ -202,12 +204,13 @@ fn guards_run_on_docs_only_changes() {
 #[test]
 fn helpers_parse_their_inputs() {
     let source = "pub const A: usize = 64 * 1024;\npub const B: i64 = -3;\n\
-                  #[test]\n#[ignore = \"x\"]\nfn one() {}\nfn helper() {}\n#[test]\nfn two() {}\n";
+                  #[test]\n#[ignore = \"x\"]\nfn one() {}\nfn helper() {}\n#[test]\nfn two() {}\n\
+                  #[tokio::test]\nasync fn three() {}\n";
     assert_eq!(const_value(source, "A"), 65_536);
     assert_eq!(const_value(source, "B"), -3);
     assert_eq!(
         test_fns(source),
-        BTreeSet::from(["one".to_owned(), "two".to_owned()])
+        BTreeSet::from(["one".to_owned(), "two".to_owned(), "three".to_owned()])
     );
 
     let report = "## 3. What the tests prove\n\n| Claim | Test |\n|---|---|\n\

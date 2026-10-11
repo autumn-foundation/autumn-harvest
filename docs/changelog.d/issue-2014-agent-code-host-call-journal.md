@@ -19,15 +19,21 @@ name is denied in-band and journaled. A journaled run links no ambient
 `env::` import, so each nondeterministic value goes through the journal. A
 changed request on replay, or a journal left unconsumed, is a non-retryable
 `WasmJournalDivergence`. A transient handler failure is a retryable
-`HostCallFailed` and is not journaled. Requests, responses, names and the
-call count are bounded.
+`HostCallFailed` and is not journaled. The host bounds requests, responses,
+names, the call count and the journal bytes. The journal stores raw JSON
+text, so a persisted journal replays byte for byte. A replay checks each
+grant again.
 
 **Invariants.** No migration. No new `WorkflowEvent` variant. No worker or
 replay change. `wasm_activities` gains one crate-private hook that links the
 extra import.
 
-**Tests.** Nineteen unit tests in `src/wasm_journal.rs` cover record, replay,
-resume, denial, divergence, a malformed journal, bounds, panics and
-cancellation. One more is an ignored microbenchmark. The
-`agent_code_journal_docs` guard suite checks that the report cites each
-test and each bound. The `lint` job runs it.
+**Tests.** Thirty-one unit tests in `src/wasm_journal.rs` cover record,
+replay, resume, denial, divergence, revoked grants, malformed journals,
+bounds at their edges, bad calls, panics and cancellation. Targeted mutation
+runs confirm the key checks. One more test is an ignored microbenchmark. The
+`agent_code_journal_docs` guard suite checks that the report cites each test
+and each bound. The `lint` job runs it.
+
+**Also.** `WasmJournalDivergence` joins the WASM faults that give no limit
+sample. The wire-format test pins both new error types.

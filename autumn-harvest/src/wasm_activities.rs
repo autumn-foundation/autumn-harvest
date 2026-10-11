@@ -687,10 +687,8 @@ fn link_host_functions(
     Ok(())
 }
 
-/// Extra host functions that a caller links after the granted capabilities.
-///
-/// The journaled host call of issue #2014 uses this hook. Each other caller
-/// passes `None`.
+/// Extra host functions that a caller links after the granted capabilities
+/// (issue #2014).
 pub(crate) type ExtraLink<'a> = dyn Fn(&mut Linker<HostState>) -> Result<(), ActivityFailure> + 'a;
 
 /// Invoke a compiled WASM activity module against a JSON input under the given
@@ -780,6 +778,40 @@ pub fn invoke_wasm_activity_cancellable(
     dispatch_start: Option<Instant>,
     cancel: Option<&CancellationToken>,
 ) -> Result<serde_json::Value, ActivityFailure> {
+    invoke_wasm_activity_contained(
+        store,
+        module,
+        input,
+        caps,
+        limits,
+        deadline,
+        dispatch_start,
+        cancel,
+        None,
+    )
+}
+
+/// Serialize the input and run the guest with each host-glue panic contained.
+///
+/// `extra_link` adds host functions after the granted capabilities. The
+/// journaled host call of issue #2014 uses it. Each other caller passes `None`.
+///
+/// # Errors
+///
+/// Returns an [`ActivityFailure`] for the same causes as
+/// [`invoke_wasm_activity_cancellable`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn invoke_wasm_activity_contained(
+    store: &WasmModuleStore,
+    module: &Module,
+    input: &serde_json::Value,
+    caps: &WasmCapabilities,
+    limits: &WasmLimits,
+    deadline: Option<Duration>,
+    dispatch_start: Option<Instant>,
+    cancel: Option<&CancellationToken>,
+    extra_link: Option<&ExtraLink<'_>>,
+) -> Result<serde_json::Value, ActivityFailure> {
     // Serialized here, outside the `catch_unwind`, so a serialization failure
     // stays the typed error it always was rather than becoming a panic payload.
     let input_bytes = match serde_json::to_vec(input) {
@@ -800,7 +832,7 @@ pub fn invoke_wasm_activity_cancellable(
             deadline,
             dispatch_start,
             cancel,
-            None,
+            extra_link,
         )
     }));
     match result {
@@ -862,50 +894,6 @@ pub(crate) fn invoke_wasm_guest_bytes(
     }));
     match result {
         Ok(inner) => inner,
-        Err(payload) => Err(ActivityFailure::wasm_trap(format!(
-            "host glue panicked during wasm invocation: {}",
-            crate::error::panic_message(payload)
-        ))),
-    }
-}
-
-/// Invoke a guest with no ambient capability and with `link` as its only
-/// host surface (issue #2014).
-///
-/// The input path, the bounds and the panic containment are those of
-/// [`invoke_wasm_activity_cancellable`].
-///
-/// # Errors
-///
-/// Returns an [`ActivityFailure`] for the same causes as
-/// [`invoke_wasm_activity_cancellable`].
-pub(crate) fn invoke_wasm_activity_linked(
-    store: &WasmModuleStore,
-    module: &Module,
-    input: &serde_json::Value,
-    limits: &WasmLimits,
-    deadline: Option<Duration>,
-    cancel: Option<&CancellationToken>,
-    link: &ExtraLink<'_>,
-) -> Result<serde_json::Value, ActivityFailure> {
-    let input_bytes = serde_json::to_vec(input).map_err(|e| {
-        ActivityFailure::wasm_trap(format!("failed to serialize activity input as JSON: {e}"))
-    })?;
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        invoke_wasm_activity_inner(
-            store,
-            module,
-            &input_bytes,
-            &WasmCapabilities::default(),
-            limits,
-            deadline,
-            None,
-            cancel,
-            Some(link),
-        )
-    }));
-    match result {
-        Ok(inner) => inner.map(|(value, _fuel_consumed)| value),
         Err(payload) => Err(ActivityFailure::wasm_trap(format!(
             "host glue panicked during wasm invocation: {}",
             crate::error::panic_message(payload)

@@ -1489,6 +1489,16 @@ mod tests {
                 ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED,
                 false,
             ),
+            (
+                ActivityFailure::wasm_journal_divergence("diverged"),
+                ERROR_TYPE_WASM_JOURNAL_DIVERGENCE,
+                true,
+            ),
+            (
+                ActivityFailure::host_call_failed("down"),
+                ERROR_TYPE_HOST_CALL_FAILED,
+                false,
+            ),
         ];
         for (failure, want_type, want_non_retryable) in cases {
             let payload = failure.into_error_payload();
@@ -1500,6 +1510,15 @@ mod tests {
             assert_eq!(error_type, want_type);
             assert_eq!(non_retryable, want_non_retryable, "{want_type}");
         }
+    }
+
+    /// History stores these names, so a rename breaks old `ActivityFailed`
+    /// events (issue #2014).
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn host_call_error_type_names_are_stable() {
+        assert_eq!(ERROR_TYPE_WASM_JOURNAL_DIVERGENCE, "WasmJournalDivergence");
+        assert_eq!(ERROR_TYPE_HOST_CALL_FAILED, "HostCallFailed");
     }
 
     /// A WASM failure's `non_retryable` flag is intrinsic to the constructor and

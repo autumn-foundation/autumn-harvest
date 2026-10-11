@@ -53,7 +53,7 @@ JSON. The result is one of these:
 | `>= 0` | The packed `(ptr << 32) \| len` of a response, as `run` returns it. The response is `{"ok": value}` or `{"err": message}`. |
 | `HOST_CALL_DENIED` (-1) | The embedder did not grant the name. No handler ran. |
 | `HOST_CALL_INVALID` (-2) | A bad pointer, a bad name or a bad request. Nothing is journaled. |
-| `HOST_CALL_LIMIT` (-3) | The run reached the call budget. |
+| `HOST_CALL_LIMIT` (-3) | The run reached the call budget or the journal byte budget. |
 
 The host writes the response through the guest `alloc` export. The guest
 never makes a second call to fetch a long response.
@@ -78,10 +78,13 @@ Each call appends one `HostCallEntry`:
 |-------|---------|
 | `seq` | The position of the call in the run. |
 | `name` | The capability name. |
-| `request` | The decoded request. |
-| `outcome` | `ok` with a response, `err` with a message, or `denied`. |
+| `request` | The request as raw JSON text, exactly as the guest sent it. |
+| `outcome` | `ok` with a raw JSON response, `err` with a message, or `denied`. |
 
 The journal is plain JSON. The caller can persist it as heartbeat details.
+The request and the response are text, not decoded values. A persisted
+journal therefore replays byte for byte. A decoded float can change its last
+digit on a round trip, and the replay would then diverge.
 
 ### 2.4 Replay and resume
 
@@ -97,13 +100,15 @@ A replay checks each call against its entry:
 - A different name or request is a divergence.
 - A run that ends with entries left over is a divergence.
 - A malformed journal is a divergence before the guest runs. A gap in `seq`,
-  too many entries or an outcome over the size bounds makes it malformed.
+  too many entries, too many bytes or a value over its bound makes it
+  malformed.
 - A divergence is a non-retryable `WasmJournalDivergence`. The journal stays
   unchanged.
 
-A replay does not check the grants again. The journal is the record:
+A replay checks the grants again for each `ok` or `err` entry:
 
-- A recorded `ok` entry replays after its grant is revoked.
+- A revoked grant is a divergence. Recorded data never reaches a guest that
+  lost the capability.
 - A recorded `denied` entry stays denied after a new grant.
 - With an empty grant set, the import is not linked. A run with a full
   journal then fails as `SandboxDenied`.
@@ -125,9 +130,14 @@ failure.
 
 | Bound | Value | Effect |
 |-------|-------|--------|
-| `MAX_HOST_CALL_BYTES` (65536) | Request and response size | The host rejects a larger request before it reads the bytes. A larger response becomes an `err` outcome. |
+| `MAX_HOST_CALL_BYTES` (65536) | Request, response and escaped message size | The host rejects a larger request before it reads the bytes. A larger response becomes an `err` outcome. The host cuts a longer message. |
 | `MAX_HOST_CALL_NAME_BYTES` (128) | Name size | A longer name is `HOST_CALL_INVALID`. |
 | `MAX_HOST_CALLS` (256) | Calls per run | Later calls return `HOST_CALL_LIMIT`. The journal stops growing. |
+| `MAX_JOURNAL_BYTES` (1048576) | Journal size | A live call that could push the journal past it returns `HOST_CALL_LIMIT`. This bounds host memory and the persisted size. |
+
+The host checks each budget before it parses the call, so a call over a
+budget costs no parse. The host checks a request as JSON without a value
+tree. It decodes the request only for a live handler.
 
 The fuel, memory and wall-clock bounds of the sandbox apply unchanged. A
 handler panic becomes a retryable `WasmTrap`, so the worker does not crash.
@@ -155,21 +165,33 @@ The tests are unit tests in `src/wasm_journal.rs`. CI runs them in the
 | A granted call runs once and is journaled. | `a_live_host_call_is_journaled` |
 | A full replay runs no handler and gives the same output. | `a_replay_serves_the_journal_without_running_the_handler` |
 | A retry replays the finished calls and runs only the rest. | `a_failed_attempt_resumes_from_its_journal_prefix` |
+| A persisted journal replays a float byte for byte. | `a_persisted_journal_replays_floats_byte_for_byte` |
 | An ungranted name is denied in-band and journaled. | `an_ungranted_host_call_is_denied_in_band_and_journaled` |
+| A replayed denial stays denied after a new grant. | `a_replayed_denial_stays_denied_after_a_new_grant` |
 | With no grant, the import is not linked. | `no_grant_means_the_host_call_import_is_not_linked` |
 | A changed request on replay is a non-retryable divergence. | `a_divergent_request_on_replay_is_non_retryable` |
+| A changed name on replay is a non-retryable divergence. | `a_divergent_name_on_replay_is_non_retryable` |
+| A revoked grant is a divergence on replay. | `a_revoked_grant_is_a_divergence_on_replay` |
 | Entries left over after the run are a divergence. | `an_unconsumed_journal_entry_is_a_divergence` |
+| A failed replay with entries left stays retryable. | `a_failed_replay_with_entries_left_stays_retryable` |
 | A malformed journal is rejected before the guest runs. | `a_malformed_journal_is_rejected_before_the_guest_runs` |
+| A recorded outcome over its bound makes the journal malformed. | `an_oversized_recorded_outcome_is_a_malformed_journal` |
+| A journal over the call budget is malformed. A journal at the budget is not. | `a_journal_over_the_call_budget_is_malformed` |
 | A journaled run links no ambient import. | `a_journaled_run_links_no_ambient_import` |
 | A fatal handler error is journaled and replayed. | `a_fatal_handler_error_is_journaled_and_replayed` |
 | A transient handler error is retryable and not journaled. | `a_transient_handler_error_is_retryable_and_not_journaled` |
-| An oversized request never reaches the handler. | `an_oversized_request_is_rejected_before_the_handler` |
+| An oversized request never reaches the handler. A request at the bound does. | `an_oversized_request_is_rejected_before_the_handler` |
+| Each bad call is invalid, runs no handler and is not journaled. | `each_bad_call_is_invalid_and_not_journaled` |
 | An oversized response is journaled as an error. | `an_oversized_response_is_journaled_as_an_error` |
-| The call budget bounds the journal. | `the_host_call_budget_bounds_the_journal` |
+| A response at the bound is served. | `a_response_at_the_bound_is_served` |
+| An error message is bounded after JSON escaping. | `an_error_message_is_bounded_after_json_escaping` |
+| The call budget bounds the journal, also on replay. | `the_host_call_budget_bounds_the_journal` |
+| The byte budget bounds host memory. | `the_journal_byte_budget_bounds_host_memory` |
 | A handler panic becomes a `WasmTrap`. | `a_panicking_handler_is_contained_as_a_wasm_trap` |
 | The handler gets a stable `seq`, also on resume. | `the_handler_receives_the_journal_sequence_number` |
 | A cancelled run skips the handler. | `a_cancelled_run_skips_the_handler` |
 | A guest trap keeps its finished calls in the journal. | `a_guest_trap_keeps_the_calls_it_made_in_the_journal` |
+| A failed response write keeps the call in the journal. The retry does not repeat it. | `a_failed_response_write_keeps_the_call_in_the_journal` |
 | The journal round-trips through JSON. | `the_journal_round_trips_through_json` |
 | One call, live or replayed, takes less than 1 ms (manual run only). | `host_call_overhead_microbenchmark` |
 
@@ -233,9 +255,18 @@ as ADR 0002 requires for non-Rust code.
 - **The journal is at-least-once at its edge.** A crash between a side effect
   and its journal write repeats that one effect. A downstream system can
   drop the repeat with the activity id, `seq` and a request hash.
-- **Some calls leave no entry.** An invalid call, a call over the budget, a
+- **Some calls leave no entry.** An invalid call, a call over a budget, a
   transient failure, a handler panic and a cancelled call are not
   journaled.
+- **Host parse work is not charged to fuel.** The host checks a request of
+  up to 64 KiB as JSON. Only the wall clock bounds a guest that repeats bad
+  calls.
+- **The journal is not bound to its module or input.** A retry after a hot
+  swap replays responses that another module received, if each call matches.
+  The format also has no version tag.
+- **Pre-guest time is not charged.** `invoke_journaled` does not take the
+  dispatch start, so resolve and compile time do not count against the
+  deadline.
 - **A handler is not interruptible.** The epoch deadline stops guest code
   only. A slow handler delays the deadline until it returns. A handler must
   bound its own time.
@@ -252,7 +283,7 @@ as ADR 0002 requires for non-Rust code.
 | Step | Scope | Rough cost |
 |------|-------|------------|
 | G1 — durable journal | A synchronous journal write per live call. Use a task-queue column or a new table. Apply the payload codec and the PII erasure rules. | ~3 weeks |
-| G2 — worker wiring | Grants on `HarvestBuilder::wasm_activity`. Load the journal at attempt start and pass `seq` keys. Add metrics for denied and diverged calls. | ~2 weeks |
+| G2 — worker wiring | Grants on `HarvestBuilder::wasm_activity`. Load the journal at attempt start. Bind it to the module hash and the input hash, and give the format a version. Pass the dispatch start. Add metrics for denied and diverged calls. | ~2 weeks |
 | G3 — typed ABI | Move `host_call` to a WIT interface on the component model, as the WASM spike recommends. | ~1 quarter, shared with T1 |
 
 The go needs G1 and G2. G3 can follow the T1 work in the hot-code-swap

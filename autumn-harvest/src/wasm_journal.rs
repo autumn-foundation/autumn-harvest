@@ -15,7 +15,8 @@
 //! - [`HOST_CALL_DENIED`]: the embedder did not grant the name.
 //! - [`HOST_CALL_INVALID`]: a bad pointer, name or request. The host journals
 //!   nothing.
-//! - [`HOST_CALL_LIMIT`]: the run made [`MAX_HOST_CALLS`] calls already.
+//! - [`HOST_CALL_LIMIT`]: the run reached [`MAX_HOST_CALLS`] or
+//!   [`MAX_JOURNAL_BYTES`].
 //!
 //! # Grants
 //!
@@ -27,22 +28,26 @@
 //! # Journal
 //!
 //! Each call appends one [`HostCallEntry`]: a sequence number, the name, the
-//! request and the outcome. [`invoke_journaled`] takes the journal of an
-//! earlier attempt. It replays those entries in order and then runs live. A
-//! mismatch is a non-retryable divergence. The caller persists the returned
-//! journal, also after a failure.
+//! request and the outcome. The request and the response are raw JSON text,
+//! so a persisted journal replays byte for byte. [`invoke_journaled`] takes
+//! the journal of an earlier attempt. It replays those entries in order and
+//! then runs live. A mismatch is a non-retryable divergence. The caller
+//! persists the returned journal, also after a failure.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use wasmtime::{Caller, Extern, Linker, Module};
 
 use crate::failure::ActivityFailure;
-use crate::wasm_activities::{HostState, WasmLimits, WasmModuleStore, invoke_wasm_activity_linked};
+use crate::wasm_activities::{
+    HostState, WasmCapabilities, WasmLimits, WasmModuleStore, invoke_wasm_activity_contained,
+};
 
 /// Import module name of the host call.
 pub const HOST_CALL_MODULE: &str = "harvest";
@@ -50,7 +55,7 @@ pub const HOST_CALL_MODULE: &str = "harvest";
 /// Import function name of the host call.
 pub const HOST_CALL_FUNCTION: &str = "host_call";
 
-/// Largest request or response, in bytes, that one host call can carry.
+/// Largest request, response or error message, in JSON bytes, of one call.
 pub const MAX_HOST_CALL_BYTES: usize = 64 * 1024;
 
 /// Longest capability name, in bytes.
@@ -59,19 +64,28 @@ pub const MAX_HOST_CALL_NAME_BYTES: usize = 128;
 /// Most host calls that one run can make, replayed calls included.
 pub const MAX_HOST_CALLS: u32 = 256;
 
+/// Largest journal, in bytes of names, requests and outcomes.
+///
+/// It bounds the host memory that a journal holds, and the size that the
+/// caller persists.
+pub const MAX_JOURNAL_BYTES: usize = 1024 * 1024;
+
 /// In-band result: the embedder did not grant this capability.
 pub const HOST_CALL_DENIED: i64 = -1;
 
 /// In-band result: the call has a bad pointer, name or request.
 pub const HOST_CALL_INVALID: i64 = -2;
 
-/// In-band result: the run reached [`MAX_HOST_CALLS`].
+/// In-band result: the run reached [`MAX_HOST_CALLS`] or [`MAX_JOURNAL_BYTES`].
 pub const HOST_CALL_LIMIT: i64 = -3;
 
 /// One host call, as a handler sees it.
 #[derive(Debug)]
 pub struct HostCall<'a> {
-    /// Position of the call in the journal. Use it in an idempotency key.
+    /// Position of the call in the journal.
+    ///
+    /// A re-run after a lost entry can send another request at the same
+    /// position. An idempotency key therefore needs the request too.
     pub seq: u32,
     /// The capability name.
     pub name: &'a str,
@@ -147,8 +161,8 @@ impl HostCallGrants {
 pub enum HostCallOutcome {
     /// The handler returned this response.
     Ok {
-        /// The response value.
-        response: Value,
+        /// The response as raw JSON text.
+        response: String,
     },
     /// The handler returned a fatal error, or the response was too large.
     Err {
@@ -166,10 +180,23 @@ pub struct HostCallEntry {
     pub seq: u32,
     /// The capability name.
     pub name: String,
-    /// The decoded request.
-    pub request: Value,
+    /// The request as the guest sent it, in raw JSON text.
+    pub request: String,
     /// The outcome.
     pub outcome: HostCallOutcome,
+}
+
+impl HostCallEntry {
+    /// The bytes that this entry counts against [`MAX_JOURNAL_BYTES`].
+    #[must_use]
+    pub const fn byte_size(&self) -> usize {
+        let outcome = match &self.outcome {
+            HostCallOutcome::Ok { response } => response.len(),
+            HostCallOutcome::Err { message } => message.len(),
+            HostCallOutcome::Denied => 0,
+        };
+        self.name.len() + self.request.len() + outcome
+    }
 }
 
 /// The ordered host-call journal of one activity.
@@ -179,8 +206,17 @@ pub struct HostCallJournal {
     pub entries: Vec<HostCallEntry>,
 }
 
+impl HostCallJournal {
+    /// The bytes that this journal counts against [`MAX_JOURNAL_BYTES`].
+    #[must_use]
+    pub fn byte_size(&self) -> usize {
+        self.entries.iter().map(HostCallEntry::byte_size).sum()
+    }
+}
+
 /// The result of one journaled run.
 #[derive(Debug)]
+#[must_use = "persist the journal, also after a failure"]
 pub struct JournaledRun {
     /// The guest output or the typed failure.
     pub result: Result<Value, ActivityFailure>,
@@ -222,6 +258,7 @@ pub fn invoke_journaled(
     }
     let prior_len = prior.entries.len();
     let session = Arc::new(Mutex::new(Session {
+        bytes: prior.byte_size(),
         entries: prior.entries,
         ..Session::default()
     }));
@@ -256,7 +293,17 @@ pub fn invoke_journaled(
                 ActivityFailure::wasm_trap(format!("failed to link harvest::host_call: {e}"))
             })
     };
-    let result = invoke_wasm_activity_linked(store, module, input, limits, deadline, cancel, &link);
+    let result = invoke_wasm_activity_contained(
+        store,
+        module,
+        input,
+        &WasmCapabilities::default(),
+        limits,
+        deadline,
+        None,
+        cancel,
+        Some(&link),
+    );
 
     let session = std::mem::take(&mut *lock(&session));
     let result = match (result, session.abort) {
@@ -279,10 +326,11 @@ pub fn invoke_journaled(
     }
 }
 
-/// A shape defect of an earlier journal, or `None`.
+/// A defect of an earlier journal, or `None`.
 ///
-/// Each `seq` must equal its position, and the journal must fit the call
-/// budget. A replay keys on the position, so a gap would serve a wrong entry.
+/// A live run can write only a journal that passes this check. A replay keys
+/// on the position, so a gap in `seq` would serve a wrong entry. A recorded
+/// value over its bound would bypass the bound of a live call.
 fn journal_defect(journal: &HostCallJournal) -> Option<String> {
     if journal.entries.len() > MAX_HOST_CALLS as usize {
         return Some(format!(
@@ -290,12 +338,46 @@ fn journal_defect(journal: &HostCallJournal) -> Option<String> {
             journal.entries.len()
         ));
     }
+    if journal.byte_size() > MAX_JOURNAL_BYTES {
+        return Some(format!(
+            "the journal holds {} bytes, over the {MAX_JOURNAL_BYTES}-byte budget",
+            journal.byte_size()
+        ));
+    }
     journal
         .entries
         .iter()
         .enumerate()
-        .find(|(index, entry)| usize::try_from(entry.seq).ok() != Some(*index))
-        .map(|(index, entry)| format!("journal entry {index} has seq {}", entry.seq))
+        .find_map(|(index, entry)| entry_defect(index, entry))
+}
+
+/// A defect of one recorded entry at `index`, or `None`.
+fn entry_defect(index: usize, entry: &HostCallEntry) -> Option<String> {
+    if usize::try_from(entry.seq).ok() != Some(index) {
+        return Some(format!("journal entry {index} has seq {}", entry.seq));
+    }
+    let outcome_ok = match &entry.outcome {
+        HostCallOutcome::Ok { response } => {
+            response.len() <= MAX_HOST_CALL_BYTES && is_json(response.as_bytes())
+        }
+        HostCallOutcome::Err { message } => escaped_len(message) <= MAX_HOST_CALL_BYTES,
+        HostCallOutcome::Denied => true,
+    };
+    let fits = entry.name.len() <= MAX_HOST_CALL_NAME_BYTES
+        && entry.request.len() <= MAX_HOST_CALL_BYTES
+        && is_json(entry.request.as_bytes())
+        && outcome_ok;
+    (!fits).then(|| format!("journal entry {index} breaks a size bound or is not JSON"))
+}
+
+/// Whether `bytes` hold one JSON value. No value tree is built.
+fn is_json(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<IgnoredAny>(bytes).is_ok()
+}
+
+/// The length of `text` as a JSON string, quotes and escapes included.
+fn escaped_len(text: &str) -> usize {
+    serde_json::to_string(text).map_or(usize::MAX, |json| json.len())
 }
 
 /// The journal state of one run.
@@ -303,6 +385,8 @@ fn journal_defect(journal: &HostCallJournal) -> Option<String> {
 struct Session {
     /// The earlier entries, then each live entry.
     entries: Vec<HostCallEntry>,
+    /// The sum of [`HostCallEntry::byte_size`] over `entries`.
+    bytes: usize,
     /// The index of the next call.
     cursor: usize,
     replayed: usize,
@@ -313,8 +397,6 @@ struct Session {
 
 /// The next step of a call, as the session sees it.
 enum Next {
-    /// The run reached [`MAX_HOST_CALLS`].
-    Limit,
     /// A recorded outcome, or a divergence.
     Replay(Result<HostCallOutcome, ActivityFailure>),
     /// No recorded entry is left. Run the call live with this `seq`.
@@ -322,19 +404,38 @@ enum Next {
 }
 
 impl Session {
+    /// Whether a call with these lengths stays within the run budgets.
+    ///
+    /// A live call reserves room for the largest outcome, so the journal
+    /// never passes [`MAX_JOURNAL_BYTES`].
+    const fn admits(&self, name_len: usize, req_len: usize) -> bool {
+        if self.cursor >= MAX_HOST_CALLS as usize {
+            return false;
+        }
+        self.cursor < self.entries.len()
+            || self.bytes + name_len + req_len + MAX_HOST_CALL_BYTES <= MAX_JOURNAL_BYTES
+    }
+
     /// Decide the next step of a call to `name` with `request`.
-    fn next(&mut self, name: &str, request: &Value) -> Next {
-        let seq = match u32::try_from(self.cursor) {
-            Ok(seq) if seq < MAX_HOST_CALLS => seq,
-            _ => return Next::Limit,
+    fn next(&mut self, name: &str, request: &str, grants: &HostCallGrants) -> Next {
+        let Ok(seq) = u32::try_from(self.cursor) else {
+            return Next::Replay(Err(ActivityFailure::wasm_journal_divergence(
+                "the host-call cursor exceeds u32",
+            )));
         };
         let Some(entry) = self.entries.get(self.cursor) else {
             return Next::Live(seq);
         };
-        if entry.name != name || entry.request != *request {
+        if entry.name != name || entry.request != request {
             return Next::Replay(Err(ActivityFailure::wasm_journal_divergence(format!(
                 "host call {seq} is '{name}', but the journal holds '{}' or another request",
                 entry.name
+            ))));
+        }
+        // A revoked grant must not keep serving recorded data to the guest.
+        if entry.outcome != HostCallOutcome::Denied && !grants.is_granted(name) {
+            return Next::Replay(Err(ActivityFailure::wasm_journal_divergence(format!(
+                "host call {seq} replays '{name}', which is no longer granted"
             ))));
         }
         let outcome = entry.outcome.clone();
@@ -345,6 +446,7 @@ impl Session {
 
     /// Append a live entry.
     fn record(&mut self, entry: HostCallEntry) {
+        self.bytes += entry.byte_size();
         self.entries.push(entry);
         self.cursor += 1;
         self.live += 1;
@@ -352,7 +454,7 @@ impl Session {
 }
 
 /// Lock the session. A poisoned lock still holds valid data, because each
-/// update is one push and two increments.
+/// update is one push and a few increments.
 fn lock(session: &Mutex<Session>) -> MutexGuard<'_, Session> {
     session.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -365,12 +467,23 @@ fn host_call(
     cancel: Option<&CancellationToken>,
     args: [i32; 4],
 ) -> wasmtime::Result<i64> {
-    let Some((name, request)) = read_call(caller, args) else {
+    let [name_ptr, name_len, req_ptr, req_len] = args;
+    let (Ok(name_len), Ok(req_len)) = (usize::try_from(name_len), usize::try_from(req_len)) else {
+        return Ok(HOST_CALL_INVALID);
+    };
+    if name_len > MAX_HOST_CALL_NAME_BYTES || req_len > MAX_HOST_CALL_BYTES {
+        return Ok(HOST_CALL_INVALID);
+    }
+    // Check the budgets before any parse, so a call over a budget costs the
+    // host no work.
+    if !lock(session).admits(name_len, req_len) {
+        return Ok(HOST_CALL_LIMIT);
+    }
+    let Some((name, request)) = read_call(caller, name_ptr, name_len, req_ptr, req_len) else {
         return Ok(HOST_CALL_INVALID);
     };
     let outcome = match next_outcome(session, grants, cancel, name, request) {
-        Ok(Some(outcome)) => outcome,
-        Ok(None) => return Ok(HOST_CALL_LIMIT),
+        Ok(outcome) => outcome,
         Err(abort) => {
             lock(session).abort = Some(abort);
             return Err(wasmtime::Error::msg(
@@ -380,30 +493,31 @@ fn host_call(
     };
     let envelope = match outcome {
         HostCallOutcome::Denied => return Ok(HOST_CALL_DENIED),
-        HostCallOutcome::Ok { response } => serde_json::json!({ "ok": response }),
-        HostCallOutcome::Err { message } => serde_json::json!({ "err": message }),
+        HostCallOutcome::Ok { response } => format!("{{\"ok\":{response}}}"),
+        HostCallOutcome::Err { message } => serde_json::json!({ "err": message }).to_string(),
     };
-    write_response(caller, &envelope)
+    write_response(caller, envelope.as_bytes())
 }
 
-/// Read the name and the request of one call.
+/// Read the name and the raw request text of one call.
 ///
-/// Each length is checked before the read, so a guest cannot make the host
-/// scan a large slice outside its fuel budget. `None` means a bad call.
-fn read_call(caller: &mut Caller<'_, HostState>, args: [i32; 4]) -> Option<(String, Value)> {
-    let [name_ptr, name_len, req_ptr, req_len] = args;
-    let name_len = usize::try_from(name_len).ok()?;
-    let req_len = usize::try_from(req_len).ok()?;
-    if name_len > MAX_HOST_CALL_NAME_BYTES || req_len > MAX_HOST_CALL_BYTES {
-        return None;
-    }
+/// The caller checks each length first, so a guest cannot make the host scan
+/// a large slice. The request is checked as JSON without a value tree. `None`
+/// means a bad call.
+fn read_call(
+    caller: &mut Caller<'_, HostState>,
+    name_ptr: i32,
+    name_len: usize,
+    req_ptr: i32,
+    req_len: usize,
+) -> Option<(String, String)> {
     let Some(Extern::Memory(memory)) = caller.get_export("memory") else {
         return None;
     };
     let data = memory.data(&*caller);
     let name = std::str::from_utf8(guest_slice(data, name_ptr, name_len)?).ok()?;
-    let request = serde_json::from_slice(guest_slice(data, req_ptr, req_len)?).ok()?;
-    Some((name.to_owned(), request))
+    let request = std::str::from_utf8(guest_slice(data, req_ptr, req_len)?).ok()?;
+    is_json(request.as_bytes()).then(|| (name.to_owned(), request.to_owned()))
 }
 
 /// A bounds-checked slice of guest memory.
@@ -414,18 +528,17 @@ fn guest_slice(data: &[u8], ptr: i32, len: usize) -> Option<&[u8]> {
 
 /// Replay the next entry, or run the call live and journal it.
 ///
-/// `Ok(None)` means the run reached [`MAX_HOST_CALLS`]. `Err` stops the run.
+/// `Err` stops the run.
 fn next_outcome(
     session: &Mutex<Session>,
     grants: &HostCallGrants,
     cancel: Option<&CancellationToken>,
     name: String,
-    request: Value,
-) -> Result<Option<HostCallOutcome>, ActivityFailure> {
-    let next = lock(session).next(&name, &request);
+    request: String,
+) -> Result<HostCallOutcome, ActivityFailure> {
+    let next = lock(session).next(&name, &request, grants);
     let seq = match next {
-        Next::Limit => return Ok(None),
-        Next::Replay(outcome) => return outcome.map(Some),
+        Next::Replay(outcome) => return outcome,
         Next::Live(seq) => seq,
     };
 
@@ -438,21 +551,28 @@ fn next_outcome(
                     "wasm activity cancelled before completion",
                 ));
             }
-            let call = HostCall {
-                seq,
-                name: &name,
-                request: &request,
-            };
-            match handler(&call) {
-                Ok(response) => bounded_response(response),
-                Err(HostCallError::Fatal(message)) => HostCallOutcome::Err {
-                    message: bounded_message(message),
+            match serde_json::from_str::<Value>(&request) {
+                Err(e) => HostCallOutcome::Err {
+                    message: bounded_message(format!("host call request is not JSON: {e}")),
                 },
-                Err(HostCallError::Transient(message)) => {
-                    return Err(ActivityFailure::host_call_failed(format!(
-                        "host call '{name}' failed: {}",
-                        bounded_message(message)
-                    )));
+                Ok(decoded) => {
+                    let call = HostCall {
+                        seq,
+                        name: &name,
+                        request: &decoded,
+                    };
+                    match handler(&call) {
+                        Ok(response) => bounded_response(&response),
+                        Err(HostCallError::Fatal(message)) => HostCallOutcome::Err {
+                            message: bounded_message(message),
+                        },
+                        Err(HostCallError::Transient(message)) => {
+                            return Err(ActivityFailure::host_call_failed(format!(
+                                "host call '{name}' failed: {}",
+                                bounded_message(message)
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -466,29 +586,30 @@ fn next_outcome(
         request,
         outcome: outcome.clone(),
     });
-    Ok(Some(outcome))
+    Ok(outcome)
 }
 
 /// Keep a response within [`MAX_HOST_CALL_BYTES`], or turn it into an error.
-fn bounded_response(response: Value) -> HostCallOutcome {
-    match serde_json::to_vec(&response) {
-        Ok(bytes) if bytes.len() <= MAX_HOST_CALL_BYTES => HostCallOutcome::Ok { response },
-        Ok(bytes) => HostCallOutcome::Err {
+fn bounded_response(response: &Value) -> HostCallOutcome {
+    let text = response.to_string();
+    if text.len() <= MAX_HOST_CALL_BYTES {
+        HostCallOutcome::Ok { response: text }
+    } else {
+        HostCallOutcome::Err {
             message: format!(
                 "host call response ({} bytes) exceeds the {MAX_HOST_CALL_BYTES}-byte limit",
-                bytes.len()
+                text.len()
             ),
-        },
-        Err(e) => HostCallOutcome::Err {
-            message: format!("host call response is not JSON: {e}"),
-        },
+        }
     }
 }
 
-/// Cut a message to [`MAX_HOST_CALL_BYTES`] on a character boundary.
+/// Cut a message on a character boundary until its JSON form fits
+/// [`MAX_HOST_CALL_BYTES`]. Escapes count, so control characters cannot
+/// expand it past the bound.
 fn bounded_message(mut message: String) -> String {
-    if message.len() > MAX_HOST_CALL_BYTES {
-        let mut end = MAX_HOST_CALL_BYTES;
+    while escaped_len(&message) > MAX_HOST_CALL_BYTES {
+        let mut end = message.len().min(MAX_HOST_CALL_BYTES) / 2;
         while !message.is_char_boundary(end) {
             end -= 1;
         }
@@ -497,12 +618,10 @@ fn bounded_message(mut message: String) -> String {
     message
 }
 
-/// Place `envelope` in guest memory through the guest `alloc` export.
+/// Place `bytes` in guest memory through the guest `alloc` export.
 ///
 /// Returns the packed `(ptr << 32) | len`. A bad `alloc` traps the guest.
-fn write_response(caller: &mut Caller<'_, HostState>, envelope: &Value) -> wasmtime::Result<i64> {
-    let bytes = serde_json::to_vec(envelope)
-        .map_err(|e| wasmtime::Error::msg(format!("host call envelope is not JSON: {e}")))?;
+fn write_response(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> wasmtime::Result<i64> {
     let len = u32::try_from(bytes.len())
         .ok()
         .and_then(|len| i32::try_from(len).ok())
@@ -518,7 +637,7 @@ fn write_response(caller: &mut Caller<'_, HostState>, envelope: &Value) -> wasmt
     let start = usize::try_from(ptr)
         .map_err(|_| wasmtime::Error::msg("alloc returned a negative pointer"))?;
     memory
-        .write(&mut *caller, start, &bytes)
+        .write(&mut *caller, start, bytes)
         .map_err(|_| wasmtime::Error::msg("alloc returned an out-of-bounds pointer"))?;
     let packed = (u64::from(ptr.cast_unsigned()) << 32) | u64::from(len.cast_unsigned());
     Ok(packed.cast_signed())
@@ -545,8 +664,15 @@ mod tests {
         name: &'a str,
         request: &'a str,
         calls: u32,
-        req_len: Option<usize>,
+        /// WAT data for the name, when it is not plain text.
+        name_data: Option<&'a str>,
+        name_ptr: i32,
+        name_len: Option<i64>,
+        req_ptr: i32,
+        req_len: Option<i64>,
         trap_after: bool,
+        /// `alloc` returns a bad pointer after this many successful calls.
+        alloc_fails_after: Option<u32>,
         extra_import: &'a str,
     }
 
@@ -556,8 +682,13 @@ mod tests {
                 name,
                 request,
                 calls,
+                name_data: None,
+                name_ptr: 0,
+                name_len: None,
+                req_ptr: 1024,
                 req_len: None,
                 trap_after: false,
+                alloc_fails_after: None,
                 extra_import: "",
             }
         }
@@ -566,8 +697,21 @@ mod tests {
         /// the last response envelope, or `{"code":N}` for a negative code.
         fn wat(&self) -> String {
             let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-            let req_len = self.req_len.unwrap_or(self.request.len());
+            let name_data = self.name_data.map_or_else(|| esc(self.name), str::to_owned);
+            let name_len = self
+                .name_len
+                .unwrap_or_else(|| i64::try_from(self.name.len()).unwrap());
+            let req_len = self
+                .req_len
+                .unwrap_or_else(|| i64::try_from(self.request.len()).unwrap());
             let trap = if self.trap_after { "(unreachable)" } else { "" };
+            let alloc_fails = self.alloc_fails_after.map_or_else(String::new, |n| {
+                format!(
+                    "(global.set $allocs (i32.add (global.get $allocs) (i32.const 1)))
+                     (if (i32.gt_u (global.get $allocs) (i32.const {n}))
+                       (then (return (i32.const 0x7fffffff))))"
+                )
+            });
             format!(
                 r#"
                 (module
@@ -575,13 +719,15 @@ mod tests {
                   {extra}
                   (memory (export "memory") 4)
                   (global $bump (mut i32) (i32.const 131072))
-                  (data (i32.const 0) "{name}")
+                  (global $allocs (mut i32) (i32.const 0))
+                  (data (i32.const 0) "{name_data}")
                   (data (i32.const 256) "{{\"code\":-1}}")
                   (data (i32.const 296) "{{\"code\":-2}}")
                   (data (i32.const 336) "{{\"code\":-3}}")
                   (data (i32.const 1024) "{request}")
                   (func (export "alloc") (param $len i32) (result i32)
                     (local $ptr i32)
+                    {alloc_fails}
                     (local.set $ptr (global.get $bump))
                     (global.set $bump (i32.add (global.get $bump) (local.get $len)))
                     (local.get $ptr))
@@ -591,8 +737,8 @@ mod tests {
                     (block $done
                       (loop $next
                         (br_if $done (i32.ge_u (local.get $i) (i32.const {calls})))
-                        (local.set $r (call $hc (i32.const 0) (i32.const {name_len})
-                                                (i32.const 1024) (i32.const {req_len})))
+                        (local.set $r (call $hc (i32.const {name_ptr}) (i32.const {name_len})
+                                                (i32.const {req_ptr}) (i32.const {req_len})))
                         (br_if $done (i64.lt_s (local.get $r) (i64.const 0)))
                         (local.set $i (i32.add (local.get $i) (i32.const 1)))
                         (br $next)))
@@ -608,10 +754,10 @@ mod tests {
                       (else (local.get $r)))))
                 "#,
                 extra = self.extra_import,
-                name = esc(self.name),
-                name_len = self.name.len(),
                 request = esc(self.request),
                 calls = self.calls,
+                name_ptr = self.name_ptr,
+                req_ptr = self.req_ptr,
             )
         }
     }
@@ -672,6 +818,23 @@ mod tests {
         })
     }
 
+    /// Assert a non-retryable divergence.
+    fn assert_divergence(out: &JournaledRun) {
+        let failure = out.result.as_ref().unwrap_err();
+        assert_eq!(failure.error_type, ERROR_TYPE_WASM_JOURNAL_DIVERGENCE);
+        assert!(failure.non_retryable);
+    }
+
+    /// Assert an in-band `HOST_CALL_INVALID` that ran no handler and
+    /// journaled nothing.
+    fn assert_invalid(guest: &Guest<'_>) {
+        let runs = Arc::new(AtomicU32::new(0));
+        let out = run(guest, &upper_grant(&runs), HostCallJournal::default());
+        assert_eq!(out.result.unwrap(), json!({ "code": HOST_CALL_INVALID }));
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert_eq!(out.journal.entries, []);
+    }
+
     const UPPER_REQ: &str = r#"{"text":"hi"}"#;
 
     #[test]
@@ -688,9 +851,9 @@ mod tests {
             vec![HostCallEntry {
                 seq: 0,
                 name: "text.upper".into(),
-                request: json!({ "text": "hi" }),
+                request: UPPER_REQ.into(),
                 outcome: HostCallOutcome::Ok {
-                    response: json!({ "text": "HI" })
+                    response: r#"{"text":"HI"}"#.into()
                 },
             }]
         );
@@ -731,6 +894,23 @@ mod tests {
     }
 
     #[test]
+    fn a_persisted_journal_replays_floats_byte_for_byte() {
+        // This f64 does not survive a parse and print through `Value`.
+        let request = r#"{"x":-1.1193133179981887e-17}"#;
+        let grants = HostCallGrants::new().grant("num.echo", |call| Ok(call.request.clone()));
+        let guest = Guest::new("num.echo", request, 1);
+        let first = run(&guest, &grants, HostCallJournal::default());
+        assert_eq!(first.journal.entries[0].request, request);
+
+        // Persist the journal the way heartbeat details do, then reload it.
+        let stored = serde_json::to_value(&first.journal).unwrap().to_string();
+        let reloaded: HostCallJournal = serde_json::from_str(&stored).unwrap();
+        let second = run(&guest, &grants, reloaded);
+        assert_eq!(second.result.unwrap(), first.result.unwrap());
+        assert_eq!(second.replayed, 1);
+    }
+
+    #[test]
     fn an_ungranted_host_call_is_denied_in_band_and_journaled() {
         let runs = Arc::new(AtomicU32::new(0));
         let guest = Guest::new("net.fetch", r#"{"url":"https://example.com"}"#, 1);
@@ -741,6 +921,22 @@ mod tests {
         assert_eq!(out.journal.entries.len(), 1);
         assert_eq!(out.journal.entries[0].name, "net.fetch");
         assert_eq!(out.journal.entries[0].outcome, HostCallOutcome::Denied);
+    }
+
+    #[test]
+    fn a_replayed_denial_stays_denied_after_a_new_grant() {
+        let guest = Guest::new("text.upper", UPPER_REQ, 1);
+        let denied = run(
+            &guest,
+            &HostCallGrants::new().grant("other", |_call| Ok(json!(null))),
+            HostCallJournal::default(),
+        );
+        let runs = Arc::new(AtomicU32::new(0));
+        let out = run(&guest, &upper_grant(&runs), denied.journal);
+
+        assert_eq!(out.result.unwrap(), json!({ "code": HOST_CALL_DENIED }));
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert_eq!(out.replayed, 1);
     }
 
     #[test]
@@ -760,18 +956,41 @@ mod tests {
         let grants = upper_grant(&runs);
         let guest = Guest::new("text.upper", UPPER_REQ, 1);
         let mut journal = run(&guest, &grants, HostCallJournal::default()).journal;
-        journal.entries[0].request = json!({ "text": "bye" });
+        journal.entries[0].request = r#"{"text":"bye"}"#.into();
 
         let out = run(&guest, &grants, journal.clone());
-        let failure = out.result.unwrap_err();
-        assert_eq!(failure.error_type, ERROR_TYPE_WASM_JOURNAL_DIVERGENCE);
-        assert!(failure.non_retryable);
+        assert_divergence(&out);
         assert_eq!(
             runs.load(Ordering::SeqCst),
             1,
             "a divergent replay ran live"
         );
         assert_eq!(out.journal, journal, "a divergence changed the journal");
+    }
+
+    #[test]
+    fn a_divergent_name_on_replay_is_non_retryable() {
+        let runs = Arc::new(AtomicU32::new(0));
+        let grants = upper_grant(&runs).grant("text.lower", |_call| Ok(json!(null)));
+        let guest = Guest::new("text.upper", UPPER_REQ, 1);
+        let mut journal = run(&guest, &grants, HostCallJournal::default()).journal;
+        journal.entries[0].name = "text.lower".into();
+
+        let out = run(&guest, &grants, journal);
+        assert_divergence(&out);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_revoked_grant_is_a_divergence_on_replay() {
+        let runs = Arc::new(AtomicU32::new(0));
+        let guest = Guest::new("text.upper", UPPER_REQ, 1);
+        let journal = run(&guest, &upper_grant(&runs), HostCallJournal::default()).journal;
+
+        let revoked = HostCallGrants::new().grant("other", |_call| Ok(json!(null)));
+        let out = run(&guest, &revoked, journal);
+        assert_divergence(&out);
+        assert_eq!(out.replayed, 0);
     }
 
     #[test]
@@ -784,10 +1003,27 @@ mod tests {
         extra.seq = 1;
         journal.entries.push(extra);
 
-        let out = run(&guest, &grants, journal);
+        assert_divergence(&run(&guest, &grants, journal));
+    }
+
+    #[test]
+    fn a_failed_replay_with_entries_left_stays_retryable() {
+        let effects = Arc::new(AtomicU32::new(0));
+        let grants = counter_grant(&effects, &Arc::new(AtomicBool::new(false)));
+        let journal = run(
+            &Guest::new("counter.next", "{}", 2),
+            &grants,
+            HostCallJournal::default(),
+        )
+        .journal;
+        let mut trapping = Guest::new("counter.next", "{}", 1);
+        trapping.trap_after = true;
+
+        let out = run(&trapping, &grants, journal.clone());
         let failure = out.result.unwrap_err();
-        assert_eq!(failure.error_type, ERROR_TYPE_WASM_JOURNAL_DIVERGENCE);
-        assert!(failure.non_retryable);
+        assert_eq!(failure.error_type, ERROR_TYPE_WASM_TRAP);
+        assert!(!failure.non_retryable);
+        assert_eq!(out.journal, journal);
     }
 
     #[test]
@@ -799,23 +1035,65 @@ mod tests {
         journal.entries[0].seq = 5;
 
         let out = run(&guest, &grants, journal.clone());
-        let failure = out.result.unwrap_err();
-        assert_eq!(failure.error_type, ERROR_TYPE_WASM_JOURNAL_DIVERGENCE);
-        assert!(failure.non_retryable);
+        assert_divergence(&out);
         assert_eq!((out.replayed, out.live), (0, 0));
         assert_eq!(out.journal, journal);
         assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn a_journaled_run_links_no_ambient_import() {
+    fn an_oversized_recorded_outcome_is_a_malformed_journal() {
         let runs = Arc::new(AtomicU32::new(0));
-        let mut guest = Guest::new("text.upper", UPPER_REQ, 1);
-        guest.extra_import = r#"(import "env" "now_millis" (func $now (result i64)))"#;
-        let out = run(&guest, &upper_grant(&runs), HostCallJournal::default());
+        let grants = upper_grant(&runs);
+        let guest = Guest::new("text.upper", UPPER_REQ, 1);
+        let mut journal = run(&guest, &grants, HostCallJournal::default()).journal;
+        journal.entries[0].outcome = HostCallOutcome::Ok {
+            response: format!("\"{}\"", "x".repeat(MAX_HOST_CALL_BYTES)),
+        };
 
-        let failure = out.result.unwrap_err();
-        assert_eq!(failure.error_type, ERROR_TYPE_SANDBOX_DENIED);
+        let out = run(&guest, &grants, journal);
+        assert_divergence(&out);
+        assert_eq!(out.replayed, 0);
+    }
+
+    #[test]
+    fn a_journal_over_the_call_budget_is_malformed() {
+        let entry = |seq| HostCallEntry {
+            seq,
+            name: "counter.next".into(),
+            request: "{}".into(),
+            outcome: HostCallOutcome::Ok {
+                response: "{}".into(),
+            },
+        };
+        let full = HostCallJournal {
+            entries: (0..MAX_HOST_CALLS).map(entry).collect(),
+        };
+        assert_eq!(journal_defect(&full), None);
+
+        let over = HostCallJournal {
+            entries: (0..=MAX_HOST_CALLS).map(entry).collect(),
+        };
+        assert!(journal_defect(&over).is_some());
+    }
+
+    #[test]
+    fn a_journaled_run_links_no_ambient_import() {
+        for import in [
+            r#"(import "env" "now_millis" (func $now (result i64)))"#,
+            r#"(import "env" "random_u64" (func $rand (result i64)))"#,
+            r#"(import "env" "env_get" (func $env (param i32 i32 i32 i32) (result i32)))"#,
+        ] {
+            let runs = Arc::new(AtomicU32::new(0));
+            let mut guest = Guest::new("text.upper", UPPER_REQ, 1);
+            guest.extra_import = import;
+            let out = run(&guest, &upper_grant(&runs), HostCallJournal::default());
+            assert_eq!(
+                out.result.unwrap_err().error_type,
+                ERROR_TYPE_SANDBOX_DENIED,
+                "{import}"
+            );
+        }
     }
 
     #[test]
@@ -859,20 +1137,48 @@ mod tests {
 
     #[test]
     fn an_oversized_request_is_rejected_before_the_handler() {
-        let runs = Arc::new(AtomicU32::new(0));
-        let mut guest = Guest::new("text.upper", UPPER_REQ, 1);
-        guest.req_len = Some(MAX_HOST_CALL_BYTES + 1);
-        let out = run(&guest, &upper_grant(&runs), HostCallJournal::default());
+        // Valid JSON, one byte over the bound, so only the length check
+        // rejects it.
+        let pad = |len: usize| format!("{UPPER_REQ}{}", " ".repeat(len - UPPER_REQ.len()));
+        let over = pad(MAX_HOST_CALL_BYTES + 1);
+        assert_invalid(&Guest::new("text.upper", &over, 1));
 
-        assert_eq!(out.result.unwrap(), json!({ "code": HOST_CALL_INVALID }));
-        assert_eq!(runs.load(Ordering::SeqCst), 0);
-        assert_eq!(out.journal.entries, []);
+        let runs = Arc::new(AtomicU32::new(0));
+        let at = pad(MAX_HOST_CALL_BYTES);
+        let out = run(
+            &Guest::new("text.upper", &at, 1),
+            &upper_grant(&runs),
+            HostCallJournal::default(),
+        );
+        assert_eq!(out.result.unwrap(), json!({ "ok": { "text": "HI" } }));
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn each_bad_call_is_invalid_and_not_journaled() {
+        let long_name = "n".repeat(MAX_HOST_CALL_NAME_BYTES + 1);
+        assert_invalid(&Guest::new(&long_name, UPPER_REQ, 1));
+
+        let mut negative = Guest::new("text.upper", UPPER_REQ, 1);
+        negative.req_len = Some(-1);
+        assert_invalid(&negative);
+
+        let mut out_of_bounds = Guest::new("text.upper", UPPER_REQ, 1);
+        out_of_bounds.req_ptr = 4 * 65_536 - 4;
+        assert_invalid(&out_of_bounds);
+
+        let mut not_utf8 = Guest::new("text.upper", UPPER_REQ, 1);
+        not_utf8.name_data = Some("\\ff\\fe");
+        not_utf8.name_len = Some(2);
+        assert_invalid(&not_utf8);
+
+        assert_invalid(&Guest::new("text.upper", "{not json", 1));
     }
 
     #[test]
     fn an_oversized_response_is_journaled_as_an_error() {
         let grants = HostCallGrants::new().grant("blob.read", |_call| {
-            Ok(Value::String("x".repeat(MAX_HOST_CALL_BYTES + 1)))
+            Ok(Value::String("x".repeat(MAX_HOST_CALL_BYTES - 1)))
         });
         let guest = Guest::new("blob.read", "{}", 1);
         let out = run(&guest, &grants, HostCallJournal::default());
@@ -886,6 +1192,38 @@ mod tests {
     }
 
     #[test]
+    fn a_response_at_the_bound_is_served() {
+        // Two quotes plus the body make exactly the bound.
+        let grants = HostCallGrants::new().grant("blob.read", |_call| {
+            Ok(Value::String("x".repeat(MAX_HOST_CALL_BYTES - 2)))
+        });
+        let out = run(
+            &Guest::new("blob.read", "{}", 1),
+            &grants,
+            HostCallJournal::default(),
+        );
+        assert!(out.result.unwrap().get("ok").is_some());
+    }
+
+    #[test]
+    fn an_error_message_is_bounded_after_json_escaping() {
+        let grants = HostCallGrants::new().grant("noisy", |_call| {
+            Err(HostCallError::Fatal("\u{1}é".repeat(MAX_HOST_CALL_BYTES)))
+        });
+        let out = run(
+            &Guest::new("noisy", "{}", 1),
+            &grants,
+            HostCallJournal::default(),
+        );
+        let HostCallOutcome::Err { message } = &out.journal.entries[0].outcome else {
+            panic!("expected an error outcome");
+        };
+        assert!(escaped_len(message) <= MAX_HOST_CALL_BYTES);
+        assert_ne!(message, "");
+        assert!(out.result.unwrap().get("err").is_some());
+    }
+
+    #[test]
     fn the_host_call_budget_bounds_the_journal() {
         let effects = Arc::new(AtomicU32::new(0));
         let grants = counter_grant(&effects, &Arc::new(AtomicBool::new(false)));
@@ -895,6 +1233,29 @@ mod tests {
         assert_eq!(out.result.unwrap(), json!({ "code": HOST_CALL_LIMIT }));
         assert_eq!(out.journal.entries.len(), MAX_HOST_CALLS as usize);
         assert_eq!(effects.load(Ordering::SeqCst), MAX_HOST_CALLS);
+
+        // A replay of the full journal hits the same budget and runs nothing.
+        let replay = run(&guest, &grants, out.journal);
+        assert_eq!(replay.result.unwrap(), json!({ "code": HOST_CALL_LIMIT }));
+        assert_eq!(replay.replayed, MAX_HOST_CALLS as usize);
+        assert_eq!(effects.load(Ordering::SeqCst), MAX_HOST_CALLS);
+    }
+
+    #[test]
+    fn the_journal_byte_budget_bounds_host_memory() {
+        // 60 KB of valid JSON per call, until the budget stops it.
+        let big = format!("[{}0]", "0,".repeat(30_000));
+        let grants = HostCallGrants::new().grant("noop", |_call| Ok(json!(null)));
+        let out = run(
+            &Guest::new("noop", &big, UNTIL_CODE),
+            &grants,
+            HostCallJournal::default(),
+        );
+
+        assert_eq!(out.result.unwrap(), json!({ "code": HOST_CALL_LIMIT }));
+        assert!(out.journal.byte_size() <= MAX_JOURNAL_BYTES);
+        assert!(out.journal.entries.len() < MAX_HOST_CALLS as usize);
+        assert_eq!(journal_defect(&out.journal), None);
     }
 
     #[test]
@@ -929,29 +1290,26 @@ mod tests {
 
     #[test]
     fn a_cancelled_run_skips_the_handler() {
+        // Call the host path directly: a guest run could hit the epoch
+        // trap first, and then this check would not run.
         let runs = Arc::new(AtomicU32::new(0));
         let grants = upper_grant(&runs);
-        let guest = Guest::new("text.upper", UPPER_REQ, 1);
-        let store = WasmModuleStore::new();
-        let module = compile(&store, &guest);
+        let session = Mutex::new(Session::default());
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        let out = invoke_journaled(
-            &store,
-            &module,
-            &Value::Null,
+        let failure = next_outcome(
+            &session,
             &grants,
-            &limits(),
-            None,
-            HostCallJournal::default(),
             Some(&cancel),
-        );
-        let failure = out.result.unwrap_err();
+            "text.upper".into(),
+            UPPER_REQ.into(),
+        )
+        .unwrap_err();
         assert_eq!(failure.error_type, ERROR_TYPE_RESOURCE_EXHAUSTED);
         assert!(!failure.non_retryable);
         assert_eq!(runs.load(Ordering::SeqCst), 0);
-        assert_eq!(out.journal.entries, []);
+        assert_eq!(lock(&session).entries, []);
     }
 
     #[test]
@@ -965,6 +1323,31 @@ mod tests {
         assert_eq!(out.result.unwrap_err().error_type, ERROR_TYPE_WASM_TRAP);
         assert_eq!(out.journal.entries.len(), 2);
         assert_eq!(out.live, 2);
+    }
+
+    #[test]
+    fn a_failed_response_write_keeps_the_call_in_the_journal() {
+        // `alloc` succeeds for the input, then fails for the response.
+        let runs = Arc::new(AtomicU32::new(0));
+        let grants = upper_grant(&runs);
+        let mut guest = Guest::new("text.upper", UPPER_REQ, 1);
+        guest.alloc_fails_after = Some(1);
+
+        let first = run(&guest, &grants, HostCallJournal::default());
+        assert_eq!(first.result.unwrap_err().error_type, ERROR_TYPE_WASM_TRAP);
+        assert_eq!(first.live, 1);
+        assert!(matches!(
+            first.journal.entries[0].outcome,
+            HostCallOutcome::Ok { .. }
+        ));
+
+        let retry = run(
+            &Guest::new("text.upper", UPPER_REQ, 1),
+            &grants,
+            first.journal,
+        );
+        assert_eq!(retry.result.unwrap(), json!({ "ok": { "text": "HI" } }));
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the side effect ran twice");
     }
 
     /// Measure one journaled host call, live and replayed. Not a CI gate.
@@ -1026,15 +1409,15 @@ mod tests {
                 HostCallEntry {
                     seq: 0,
                     name: "a".into(),
-                    request: json!({ "k": 1 }),
+                    request: r#"{"k":1}"#.into(),
                     outcome: HostCallOutcome::Ok {
-                        response: json!([1, 2]),
+                        response: "[1,2]".into(),
                     },
                 },
                 HostCallEntry {
                     seq: 1,
                     name: "b".into(),
-                    request: json!(null),
+                    request: "null".into(),
                     outcome: HostCallOutcome::Err {
                         message: "nope".into(),
                     },
@@ -1042,7 +1425,7 @@ mod tests {
                 HostCallEntry {
                     seq: 2,
                     name: "c".into(),
-                    request: json!("x"),
+                    request: "\"x\"".into(),
                     outcome: HostCallOutcome::Denied,
                 },
             ],
@@ -1050,10 +1433,11 @@ mod tests {
         let value = serde_json::to_value(&journal).unwrap();
         assert_eq!(
             value["entries"][0]["outcome"],
-            json!({ "kind": "ok", "response": [1, 2] })
+            json!({ "kind": "ok", "response": "[1,2]" })
         );
         assert_eq!(value["entries"][2]["outcome"], json!({ "kind": "denied" }));
         let back: HostCallJournal = serde_json::from_value(value).unwrap();
         assert_eq!(back, journal);
+        assert_eq!(journal_defect(&back), None);
     }
 }
