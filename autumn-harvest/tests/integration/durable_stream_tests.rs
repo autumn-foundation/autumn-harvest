@@ -635,20 +635,15 @@ async fn the_listener_wakes_on_commit_only_and_merges_wakes() {
         "a rolled-back cycle must not wake a reader"
     );
 
-    // Three wakes in one transaction reach the listener as one. Postgres
-    // merges equal notifications of a transaction. The post-commit sender
-    // merges per channel too. Separate transactions can each wake the
-    // reader, so the test does not use them.
-    Box::pin(
-        conn.transaction::<(), autumn_harvest::HarvestError, _>(async |c| {
-            for _ in 0..3 {
-                autumn_harvest::notify::notify_durable_stream(c, exec_id.as_uuid()).await?;
-            }
-            Ok(())
-        }),
-    )
-    .await
-    .expect("commit");
+    // The forwarder merges the wakes that arrive before the reader looks.
+    // A post-commit sender of another test can send these in separate
+    // batches, so let all of them arrive before the reader waits.
+    for _ in 0..3 {
+        autumn_harvest::notify::notify_durable_stream(&mut conn, exec_id.as_uuid())
+            .await
+            .expect("notify");
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(
         listener.wait_timeout(Duration::from_secs(5)).await,
         DurableStreamWait::Woken
@@ -656,7 +651,7 @@ async fn the_listener_wakes_on_commit_only_and_merges_wakes() {
     assert_eq!(
         listener.wait_timeout(Duration::from_millis(500)).await,
         DurableStreamWait::TimedOut,
-        "three wakes in one commit must merge into one"
+        "wakes that arrive before the reader looks must merge into one"
     );
 }
 
