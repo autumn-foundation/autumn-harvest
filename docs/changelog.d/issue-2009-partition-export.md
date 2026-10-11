@@ -78,6 +78,10 @@ The export reads rows and the drop is DDL, so the two sanctioned
 core `integration` target and `mcp_tasks_integration` did not compile. This
 change removes the stale field from both tests.
 
+#2102 added `docs/safety-report.md` while #2100 and #2101 changed the limits
+that it restates. `safety_report_docs` failed on `trunk-dev`. This change
+restates the new simulator and trace-check limits in the report.
+
 **Tests.**
 
 - `partition_archive_tests`, 17 DB tests: export, verify, drop and read
