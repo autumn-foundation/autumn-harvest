@@ -203,3 +203,30 @@ pub async fn wf_step_write_cell(ctx: &WorkflowContext) -> Out {
     }
     ctx.execute_activity_raw("b", seen.get()).await
 }
+
+pub fn __autumn_workflow_info_wf_step_write_arc() -> u8 {
+    0
+}
+
+/// The same write, through an owned `Arc<Mutex<_>>` clone.
+pub async fn wf_step_write_arc(ctx: &WorkflowContext) -> Out {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(0_u64));
+    {
+        let mut saga = Saga::new(ctx);
+        saga.step(
+            || {
+                let shared = std::sync::Arc::clone(&seen);
+                async move {
+                    if let Ok(mut slot) = shared.lock() {
+                        *slot = now_nanos();
+                    }
+                    ctx.execute_activity_raw("a", 1).await
+                }
+            },
+            |_| async { Ok(()) },
+        )
+        .await?;
+    }
+    let value = seen.lock().map_or(0, |slot| *slot);
+    ctx.execute_activity_raw("b", value).await
+}

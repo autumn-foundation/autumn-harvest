@@ -170,8 +170,9 @@ A `noop-compensation` note does not change the verdict.
 - The check trusts the `Saga` contract: a failed step unwinds every earlier
   step.
 - The determinism model does not track a write through `&self` of an
-  interior-mutable local, such as `Cell::set`. This gap predates #2010. A
-  followed `async` block that captures such a value adds a boundary.
+  interior-mutable local, such as `Cell::set` or a write through
+  `Mutex::lock`. This gap predates #2010. A followed `async` block that
+  captures such a value, owned or shared, adds a boundary.
 - MIR text is not a stable API. A rustc change that removes the
   `Try::branch` shape moves a step to untracked. The walk hard-codes the
   case values of `Poll` and `ControlFlow`. A change to them is not

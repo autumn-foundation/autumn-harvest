@@ -2735,9 +2735,10 @@ fn first_sentence(reason: &str) -> &str {
 ///
 /// A capture can write back only through a reference. A `&mut` can hide in a
 /// named type, as in `Refs<'_>`, so any capture type that holds a lifetime
-/// counts. A shared `&T` counts only when `T` names an interior-mutable type
-/// of the model's `[[ambient_type]]` table, such as `&Cell<u64>`. An owned
-/// type with no lifetime holds no reference.
+/// counts. A type that names an interior-mutable type of the model's
+/// `[[ambient_type]]` table counts too, owned or shared. `&Cell<u64>` and an
+/// `Arc<Mutex<u64>>` clone each reach state the caller reads. Any other
+/// shared `&T`, or owned type with no lifetime, holds no writable reference.
 fn captures_mut_ref(body: &Body, interior: &[&str]) -> bool {
     body.blocks
         .iter()
@@ -2763,12 +2764,13 @@ fn may_write_through(ty: &str, interior: &[&str]) -> bool {
     if ty.contains("&mut") {
         return true;
     }
-    if ty.starts_with('&') {
-        return ty
-            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .any(|word| interior.contains(&word));
+    let names_interior = ty
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|word| interior.contains(&word));
+    if names_interior {
+        return true;
     }
-    ty.contains('\'')
+    !ty.starts_with('&') && ty.contains('\'')
 }
 
 /// The label of the block that writes the return place `_0`, or `bb0`.
@@ -2863,6 +2865,10 @@ mod tests {
         assert!(may_write_through("Refs<'_>", &interior));
         assert!(may_write_through("&std::cell::Cell<u64>", &interior));
         assert!(may_write_through("&std::sync::Mutex<u64>", &interior));
+        assert!(may_write_through(
+            "std::sync::Arc<std::sync::Mutex<u64>>",
+            &interior
+        ));
         assert!(!may_write_through("&WorkflowContext", &interior));
         assert!(!may_write_through("&Refs<'_>", &interior));
         assert!(!may_write_through("&CellPhone", &interior));
