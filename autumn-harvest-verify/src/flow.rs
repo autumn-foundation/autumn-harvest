@@ -33,8 +33,8 @@ pub struct BlockFacts {
     pub handlers: BTreeMap<String, usize>,
     /// `(block, argument index)` → the bodies passed there.
     pub arguments: BTreeMap<(String, usize), Vec<String>>,
-    /// Blocks whose call resolves to a body here. The engine has no body
-    /// here, so such a call is never an engine `Saga` method.
+    /// Blocks whose call resolves to a body here outside the engine crate.
+    /// Such a call is never an engine `Saga` method.
     pub bodied: BTreeSet<String>,
 }
 
@@ -295,7 +295,8 @@ fn saga_method(callee: &str) -> Option<&'static str> {
 /// [`saga_method`] for the call in block `label`, when it is an engine call.
 ///
 /// A crate-root type named `Saga` prints as bare `Saga`, as the trimmed
-/// engine type does. Its call resolves to a body here, so it is excluded.
+/// engine type does. Its call resolves to a body outside the engine crate,
+/// so it is excluded.
 fn engine_method(callee: &str, label: &str, facts: &BlockFacts) -> Option<&'static str> {
     saga_method(callee).filter(|_| !facts.bodied.contains(label))
 }

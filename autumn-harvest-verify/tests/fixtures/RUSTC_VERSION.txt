@@ -185,3 +185,10 @@ cargo 1.94.1 (29ea6fb6a 2026-03-24)
 #         --extern ah=libautumn_harvest.rlib \
 #         --extern facade=libfacade.rlib -L . -o flow.mir flow.rs
 #   rm libautumn_harvest.rlib libfacade.rlib
+
+# `saga_graph/harvest_stub.mir` (issue #2010) is the MIR of the stub engine
+# crate itself. A test analyzes it beside a workflow crate, as a run with
+# `-p autumn-harvest` does. From `saga_graph/`:
+#
+#   rustc --crate-type lib --edition 2024 --crate-name autumn_harvest \
+#         --emit=mir -o harvest_stub.mir harvest_stub.rs

@@ -617,6 +617,60 @@ fn a_renamed_or_re_exported_engine_saga_is_still_seen() {
     }
 }
 
+/// The saga verdicts of `dir/flow.mir`, analyzed together with the MIR of
+/// the stub engine crate, as a run with `-p autumn-harvest` does.
+fn verdicts_with_engine(dir: &Path) -> Vec<(String, SagaVerdict)> {
+    let read = |path: PathBuf| {
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    };
+    let docs = vec![
+        mir::parse("flow", "flow.mir", &read(dir.join("flow.mir"))),
+        mir::parse(
+            "autumn_harvest",
+            "harvest_stub.mir",
+            &read(fixture_dir().join("harvest_stub.mir")),
+        ),
+    ];
+    let entries = entry::discover(&docs);
+    let program = Program::build(
+        docs,
+        &SourceRoots {
+            roots: vec![dir.to_path_buf(), fixture_dir()],
+        },
+    )
+    .expect("build");
+    let model = Model::builtin().expect("the embedded model must parse");
+    let outcome = analysis::analyze_full(&program, &model, &entries);
+    let m = structure::manifest(&model.version, "rustc test", outcome.structures);
+    let mut have: Vec<(String, SagaVerdict)> = saga::check(&m)
+        .expect("check")
+        .into_iter()
+        .map(|r| (r.name, r.verdict))
+        .collect();
+    have.sort_by(|a, b| a.0.cmp(&b.0));
+    have
+}
+
+#[test]
+fn the_engine_mir_in_the_same_run_changes_no_verdict() {
+    // The engine `Saga` methods then have bodies here. They must still read
+    // as engine operations, and a local lookalike must still not.
+    let mut alone: Vec<(String, SagaVerdict)> =
+        check().into_iter().map(|r| (r.name, r.verdict)).collect();
+    alone.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(verdicts_with_engine(&fixture_dir()), alone);
+
+    let own = verdicts_with_engine(&fixture_dir().with_file_name("saga_graph_own"));
+    for name in [
+        "wf_own_type_takes_engine_saga",
+        "wf_module_lookalike_compensate",
+        "wf_root_lookalike_compensate",
+    ] {
+        let verdict = own.iter().find(|(n, _)| n == name).map(|(_, v)| *v);
+        assert_eq!(verdict, Some(SagaVerdict::Unknown), "{name}: {own:?}");
+    }
+}
+
 #[test]
 fn a_unit_result_is_an_ok_exit() {
     let reports = check();

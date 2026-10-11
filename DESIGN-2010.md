@@ -100,7 +100,9 @@ Four review agents read the first version. Each fix has a test.
 11. A local `Saga` method that took the engine saga, such as
     `other::Saga::compensate_all`, read as the engine unwind. A saga
     method now needs the engine path, `Saga` or `autumn_harvest::..`, and
-    no body here. Any other such call is a `saga-escape`.
+    no body here outside the engine crate. Any other such call is a
+    `saga-escape`. A run that also analyzes the engine crate keeps each
+    verdict.
 12. A boundary counted only when no saga was in sight. A body outside the
     analysis can hold a second saga with a gap. Now each boundary that runs
     code gives `unknown`. An `external-const` does not count.

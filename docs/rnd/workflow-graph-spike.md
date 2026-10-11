@@ -215,7 +215,7 @@ each fix has a test:
   `autumn_harvest::` and ends in `::Saga`. MIR prints that defining crate
   even through a crate rename or a facade re-export. A method counts as a saga
   operation only when its path is the engine `Saga` and it has no body
-  here. The graph does not see a saga in an `Option` or a struct field.
+  here outside the engine crate. The graph does not see a saga in an `Option` or a struct field.
 - A body in a crate outside the analysis is a boundary. A saga passed into
   it is a `saga-escapes`, because the call is not a `Saga` method.
 
@@ -298,6 +298,7 @@ crate its own `--target-dir`, and delete it after the run.
 | A future of an untrusted crate is a boundary | `async_block_follow::a_future_of_an_untrusted_crate_is_a_boundary`; `async_block_follow::an_erased_future_of_an_untrusted_crate_is_a_boundary` |
 | The check refuses a malformed or disconnected graph | `saga::tests::a_malformed_graph_is_refused` |
 | A local type named `Saga` is not the engine saga | `saga_graph::a_local_type_named_saga_is_not_the_engine_saga` |
+| The engine MIR in the same run changes no verdict | `saga_graph::the_engine_mir_in_the_same_run_changes_no_verdict` |
 | A renamed or re-exported engine saga is still seen | `saga_graph::a_renamed_or_re_exported_engine_saga_is_still_seen` |
 | The check refuses a reference to a missing body or handler | `saga::tests::a_reference_to_a_missing_body_is_refused` |
 | A clock read in an `async` closure step is found | `async_block_follow::a_clock_read_in_a_saga_step_block_is_found` (`wf_step_async_closure`) |

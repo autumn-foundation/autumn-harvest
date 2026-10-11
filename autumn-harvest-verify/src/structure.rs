@@ -492,11 +492,13 @@ impl<'p> StructureBuilder<'p> {
                 &cyclic,
             );
             let blocks: Vec<&str> = sited.iter().map(|(_, block)| *block).collect();
+            let in_engine = |id: &str| program.qualified_name(id).starts_with("autumn_harvest::");
             let mut facts = block_facts(
                 &blocks,
                 edges.get(id.as_str()).map_or(&[][..], Vec::as_slice),
                 arguments.get(id.as_str()).map_or(&[][..], Vec::as_slice),
                 &show,
+                &in_engine,
             );
             facts.handlers = handler_blocks(&handler_at, id);
             let flow = flow_graph(body, &facts);
@@ -854,13 +856,15 @@ fn block_facts(
     edges: &[&Edge],
     arguments: &[&ArgumentEdge],
     show: &dyn Fn(&str) -> String,
+    in_engine: &dyn Fn(&str) -> bool,
 ) -> BlockFacts {
     let mut facts = BlockFacts::default();
     for (index, block) in steps.iter().enumerate() {
         facts.steps.insert((*block).to_string(), index);
     }
-    // A closure argument edge (`many`) starts a closure, not the callee.
-    for edge in edges.iter().filter(|e| !e.many) {
+    // A closure argument edge (`many`) starts a closure, not the callee. A
+    // body of the engine crate is the engine method itself.
+    for edge in edges.iter().filter(|e| !e.many && !in_engine(&e.callee)) {
         facts.bodied.insert(edge.block.clone());
     }
     for edge in edges.iter().filter(|e| !e.resume) {

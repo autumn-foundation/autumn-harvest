@@ -1,0 +1,361 @@
+// WARNING: This output format is intended for human consumers only
+// and is subject to change without notice. Knock yourself out.
+// HINT: See also -Z dump-mir for MIR at specific points during compilation.
+fn <impl at harvest_stub.rs:12:1: 12:21>::execute_activity_raw(_1: &WorkflowContext, _2: &str, _3: u64) -> std::future::Ready<Result<u64, String>> {
+    debug self => _1;
+    debug name => _2;
+    debug input => _3;
+    let mut _0: std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _4: std::result::Result<u64, std::string::String>;
+
+    bb0: {
+        _4 = Result::<u64, String>::Ok(copy _3);
+        _0 = ready::<Result<u64, String>>(move _4) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+fn <impl at harvest_stub.rs:12:1: 12:21>::receive_signal(_1: &WorkflowContext, _2: &str) -> std::future::Ready<Result<u64, String>> {
+    debug self => _1;
+    debug name => _2;
+    let mut _0: std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _3: std::result::Result<u64, std::string::String>;
+
+    bb0: {
+        _3 = Result::<u64, String>::Ok(const 0_u64);
+        _0 = ready::<Result<u64, String>>(move _3) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+fn <impl at harvest_stub.rs:12:1: 12:21>::register_signal_handler(_1: &WorkflowContext, _2: &str, _3: H) -> () {
+    debug self => _1;
+    debug name => _2;
+    debug handler => _3;
+    let mut _0: ();
+
+    bb0: {
+        drop(_3) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+fn <impl at harvest_stub.rs:12:1: 12:21>::register_update_handler(_1: &WorkflowContext, _2: &str, _3: V, _4: H) -> () {
+    debug self => _1;
+    debug name => _2;
+    debug validator => _3;
+    debug handler => _4;
+    let mut _0: ();
+
+    bb0: {
+        drop(_4) -> [return: bb1, unwind: bb3];
+    }
+
+    bb1: {
+        drop(_3) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        return;
+    }
+
+    bb3 (cleanup): {
+        drop(_3) -> [return: bb4, unwind terminate(cleanup)];
+    }
+
+    bb4 (cleanup): {
+        resume;
+    }
+}
+
+fn <impl at harvest_stub.rs:40:1: 40:22>::new(_1: &WorkflowContext) -> Saga<'_> {
+    debug ctx => _1;
+    let mut _0: Saga<'_>;
+
+    bb0: {
+        _0 = Saga::<'_> { ctx: copy _1, pending: const 0_usize };
+        return;
+    }
+}
+
+// MIR FOR CTFE
+fn <impl at harvest_stub.rs:40:1: 40:22>::new(_1: &WorkflowContext) -> Saga<'_> {
+    debug ctx => _1;
+    let mut _0: Saga<'_>;
+    let mut _2: &WorkflowContext;
+
+    bb0: {
+        StorageLive(_2);
+        _2 = copy _1;
+        _0 = Saga::<'_> { ctx: move _2, pending: const 0_usize };
+        StorageDead(_2);
+        return;
+    }
+}
+
+fn <impl at harvest_stub.rs:40:1: 40:22>::step(_1: &mut Saga<'_>, _2: Step, _3: Compensate) -> {async fn body of Saga<'_>::step<T, Step, StepFuture, Compensate, CompensationFuture>()} {
+    debug self => _1;
+    debug step => _2;
+    debug compensate => _3;
+    let mut _0: {async fn body of Saga<'_>::step<T, Step, StepFuture, Compensate, CompensationFuture>()};
+
+    bb0: {
+        _0 = {coroutine@harvest_stub.rs:55:5: 61:6 (#0)} { self: move _1, step: move _2, compensate: move _3 };
+        return;
+    }
+}
+
+fn <impl at harvest_stub.rs:40:1: 40:22>::step::{closure#0}(_1: Pin<&mut {async fn body of Saga<'_>::step<T, Step, StepFuture, Compensate, CompensationFuture>()}>, _2: &mut Context<'_>) -> Poll<Result<T, String>> {
+    coroutine layout {
+        field _s0: &mut Saga<'_>;
+        field _s1: Compensate;
+        field _s2: StepFuture;
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+            Suspend0 (3): [_s0, _s1, _s2],
+        }
+        storage_conflicts = BitMatrix(3x3) {(_s0, _s0), (_s0, _s1), (_s0, _s2), (_s1, _s0), (_s1, _s1), (_s1, _s2), (_s2, _s0), (_s2, _s1), (_s2, _s2)}
+    }
+    debug _task_context => _25;
+    debug self => ((*_21).0: &mut Saga<'_>);
+    debug step => ((*_21).1: Step);
+    debug compensate => ((*_21).2: Compensate);
+    coroutine debug self => _s0;
+    let mut _0: std::task::Poll<std::result::Result<T, std::string::String>>;
+    let mut _5: StepFuture;
+    let mut _6: StepFuture;
+    let mut _7: ();
+    let mut _8: std::task::Poll<std::result::Result<T, std::string::String>>;
+    let mut _9: std::pin::Pin<&mut StepFuture>;
+    let mut _10: &mut StepFuture;
+    let mut _11: &mut std::task::Context<'_>;
+    let mut _12: std::future::ResumeTy;
+    let mut _13: isize;
+    let mut _15: std::future::ResumeTy;
+    let mut _16: bool;
+    let mut _17: &std::result::Result<T, std::string::String>;
+    let mut _18: (usize, bool);
+    let mut _19: std::result::Result<T, std::string::String>;
+    let mut _20: u32;
+    let mut _21: &mut {async fn body of Saga<'_>::step<T, Step, StepFuture, Compensate, CompensationFuture>()};
+    let mut _22: &mut Saga<'_>;
+    let mut _23: &mut Saga<'_>;
+    let mut _24: &mut Saga<'_>;
+    let mut _25: std::future::ResumeTy;
+    let mut _26: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug self => (((*_21) as variant#3).0: &mut Saga<'_>);
+        let _3: Step;
+        scope 2 {
+            debug step => _3;
+            coroutine debug compensate => _s1;
+            scope 3 {
+                debug compensate => (((*_21) as variant#3).1: Compensate);
+                coroutine debug __awaitee => _s2;
+                let _4: std::result::Result<T, std::string::String>;
+                scope 4 {
+                    debug out => _4;
+                }
+                scope 5 {
+                    debug __awaitee => (((*_21) as variant#3).2: StepFuture);
+                    let _14: std::result::Result<T, std::string::String>;
+                    scope 6 {
+                        debug result => _14;
+                    }
+                }
+            }
+        }
+    }
+
+    bb0: {
+        _26 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _25 = std::future::ResumeTy(move _26);
+        _21 = copy (_1.0: &mut {async fn body of Saga<'_>::step<T, Step, StepFuture, Compensate, CompensationFuture>()});
+        _20 = discriminant((*_21));
+        switchInt(move _20) -> [0: bb22, 1: bb21, 2: bb20, 3: bb19, otherwise: bb6];
+    }
+
+    bb1: {
+        _5 = <StepFuture as IntoFuture>::into_future(move _6) -> [return: bb2, unwind: bb17];
+    }
+
+    bb2: {
+        (((*_21) as variant#3).2: StepFuture) = move _5;
+        goto -> bb3;
+    }
+
+    bb3: {
+        _10 = &mut (((*_21) as variant#3).2: StepFuture);
+        _9 = Pin::<&mut StepFuture>::new_unchecked(copy _10) -> [return: bb4, unwind: bb16];
+    }
+
+    bb4: {
+        _12 = copy _25;
+        _11 = copy (_12.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
+        _8 = <StepFuture as Future>::poll(move _9, copy _11) -> [return: bb5, unwind: bb16];
+    }
+
+    bb5: {
+        _13 = discriminant(_8);
+        switchInt(move _13) -> [0: bb8, 1: bb7, otherwise: bb6];
+    }
+
+    bb6: {
+        unreachable;
+    }
+
+    bb7: {
+        _0 = Poll::<Result<T, String>>::Pending;
+        discriminant((*_21)) = 3;
+        return;
+    }
+
+    bb8: {
+        _14 = move ((_8 as Ready).0: std::result::Result<T, std::string::String>);
+        _4 = move _14;
+        drop((((*_21) as variant#3).2: StepFuture)) -> [return: bb9, unwind: bb17];
+    }
+
+    bb9: {
+        _17 = &_4;
+        _16 = Result::<T, String>::is_ok(move _17) -> [return: bb10, unwind: bb15];
+    }
+
+    bb10: {
+        switchInt(move _16) -> [0: bb13, otherwise: bb11];
+    }
+
+    bb11: {
+        _22 = no_retag copy (((*_21) as variant#3).0: &mut Saga<'_>);
+        _18 = AddWithOverflow(copy ((*_22).1: usize), const 1_usize);
+        _23 = no_retag copy (((*_21) as variant#3).0: &mut Saga<'_>);
+        assert(!move (_18.1: bool), "attempt to compute `{} + {}`, which would overflow", copy ((*_23).1: usize), const 1_usize) -> [success: bb12, unwind: bb15];
+    }
+
+    bb12: {
+        _24 = no_retag copy (((*_21) as variant#3).0: &mut Saga<'_>);
+        ((*_24).1: usize) = move (_18.0: usize);
+        goto -> bb13;
+    }
+
+    bb13: {
+        _19 = move _4;
+        drop((((*_21) as variant#3).1: Compensate)) -> [return: bb14, unwind: bb18];
+    }
+
+    bb14: {
+        _0 = Poll::<Result<T, String>>::Ready(move _19);
+        discriminant((*_21)) = 1;
+        return;
+    }
+
+    bb15 (cleanup): {
+        drop(_4) -> [return: bb17, unwind terminate(cleanup)];
+    }
+
+    bb16 (cleanup): {
+        drop((((*_21) as variant#3).2: StepFuture)) -> [return: bb17, unwind terminate(cleanup)];
+    }
+
+    bb17 (cleanup): {
+        drop((((*_21) as variant#3).1: Compensate)) -> [return: bb18, unwind terminate(cleanup)];
+    }
+
+    bb18 (cleanup): {
+        discriminant((*_21)) = 2;
+        resume;
+    }
+
+    bb19: {
+        _15 = move _25;
+        _25 = move _15;
+        goto -> bb3;
+    }
+
+    bb20: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb20, unwind continue];
+    }
+
+    bb21: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb21, unwind continue];
+    }
+
+    bb22: {
+        (((*_21) as variant#3).0: &mut Saga<'_>) = move ((*_21).0: &mut Saga<'_>);
+        _3 = move ((*_21).1: Step);
+        (((*_21) as variant#3).1: Compensate) = move ((*_21).2: Compensate);
+        _7 = ();
+        _6 = <Step as FnOnce<()>>::call_once(copy _3, move _7) -> [return: bb1, unwind: bb17];
+    }
+}
+
+fn <impl at harvest_stub.rs:40:1: 40:22>::compensate_all(_1: &mut Saga<'_>) -> {async fn body of Saga<'_>::compensate_all()} {
+    debug self => _1;
+    let mut _0: {async fn body of Saga<'_>::compensate_all()};
+
+    bb0: {
+        _0 = {coroutine@harvest_stub.rs:63:66: 66:6 (#0)} { self: move _1 };
+        return;
+    }
+}
+
+fn <impl at harvest_stub.rs:40:1: 40:22>::compensate_all::{closure#0}(_1: Pin<&mut {async fn body of Saga<'_>::compensate_all()}>, _2: &mut Context<'_>) -> Poll<Result<(), String>> {
+    coroutine layout {
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+        }
+        storage_conflicts = BitMatrix(0x0) {}
+    }
+    debug _task_context => _8;
+    debug self => ((*_7).0: &mut Saga<'_>);
+    let mut _0: std::task::Poll<std::result::Result<(), std::string::String>>;
+    let _3: &mut Saga<'_>;
+    let mut _4: ();
+    let mut _5: std::result::Result<(), std::string::String>;
+    let mut _6: u32;
+    let mut _7: &mut {async fn body of Saga<'_>::compensate_all()};
+    let mut _8: std::future::ResumeTy;
+    let mut _9: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug self => _3;
+    }
+
+    bb0: {
+        _9 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _8 = std::future::ResumeTy(move _9);
+        _7 = copy (_1.0: &mut {async fn body of Saga<'_>::compensate_all()});
+        _6 = discriminant((*_7));
+        switchInt(move _6) -> [0: bb3, 1: bb1, otherwise: bb2];
+    }
+
+    bb1: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb1, unwind continue];
+    }
+
+    bb2: {
+        unreachable;
+    }
+
+    bb3: {
+        _3 = move ((*_7).0: &mut Saga<'_>);
+        ((*_3).1: usize) = const 0_usize;
+        _4 = ();
+        _5 = Result::<(), String>::Ok(move _4);
+        _0 = Poll::<Result<(), String>>::Ready(move _5);
+        discriminant((*_7)) = 1;
+        return;
+    }
+}
