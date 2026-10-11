@@ -14,12 +14,13 @@
 //! A warm decision must decide exactly as a cold replay would. The resident
 //! path therefore accepts only a narrow set of suspensions:
 //!
-//! - The cycle awaits exactly one command: an activity, a timer or a signal.
-//!   With one awaited command there is no race whose winner could differ.
+//! - The cycle awaits one command: an activity, a timer or a signal. Or it
+//!   awaits two or more activities, such as a join of parallel tool calls
+//!   (issue #2008). A join resolves branch by branch, so no winner exists.
 //! - Each other command is a marker, a side effect, progress, current
 //!   details, a log line or a search-attribute upsert.
-//! - The context has no park token, push signal handler, held mutex, cancel
-//!   request or non-determinism record, and no unread history.
+//! - The context has no open race, park token, push signal handler, held
+//!   mutex, cancel request or non-determinism record, and no unread history.
 //! - A signal wait is not for a name that a non-blocking claim probed with a
 //!   scan that reached the end of history. A cold replay of the longer
 //!   history could hand the new signal to that probe instead.
@@ -27,11 +28,26 @@
 //! # When a warm decision resumes
 //!
 //! The delta must start with the events of the last suspension, in order.
-//! Then it must hold exactly one event that resolves the awaited command.
-//! That event must be an activity success, a timer fire or a signal. The
-//! start and heartbeat events of the awaited activity may come before it,
-//! because replay skips those too. The live channels carry these payloads
-//! exactly, as a replay reads them. Any other delta declines.
+//! Then it must hold at least one event that resolves a parked await. Each
+//! parked await resolves at most once. A resolving event must be an
+//! activity success, a timer fire or a signal. The start and heartbeat
+//! events of a parked activity may come before its result, because replay
+//! skips those too. The live channels carry these payloads exactly, as a
+//! replay reads them. Any other delta declines.
+//!
+//! # Partial joins
+//!
+//! A delta can resolve only some activities of a join (issue #2008). Each
+//! other activity gets a `WaitForActivity` command again, with its live
+//! sender. A cold replay emits the same command for an activity with no
+//! result, and that command writes no event. Then the executor sees a
+//! parked future and suspends.
+//!
+//! Such a cycle must only wait. A branch that runs a command while a
+//! sibling stays parked can order its commands differently from a cold
+//! replay. A branch that fails can drop a sibling. After the poll, the
+//! resume therefore checks that the cycle suspends with only its re-parked
+//! waits. Otherwise it declines with [`ResumeDeclined::SiblingStillParked`].
 //!
 //! A warm cycle appends the delta to the matcher as consumed events. The
 //! replay position, the history length and the history scans then match a
@@ -73,21 +89,22 @@ pub enum ResumeDeclined {
     KeyChanged,
     /// The delta does not start with the events of the last suspension.
     OwnEventsMismatch,
-    /// The delta holds no event after the events of the last suspension.
+    /// The delta resolves no parked await.
     NoResolution,
-    /// The delta holds more than one event after the events of the last
-    /// suspension.
+    /// The delta holds an event after every parked await resolved, or a
+    /// second result for one await.
     ExtraEvents,
     /// The resolving event has a payload that the live channel cannot carry
     /// exactly, for example an activity failure. Holds the event type.
     InexactResolution(&'static str),
-    /// The event after the own events does not resolve the awaited command.
-    /// Holds the event type.
+    /// An event after the own events neither resolves a parked await nor
+    /// reports its progress. Holds the event type.
     UnexpectedEvent(&'static str),
     /// The parked future no longer waits for the result.
     ReceiverDropped,
     /// A cycle that re-parked a sibling activity did more than wait for it
-    /// (issue #2008).
+    /// (issue #2008). A branch ran a command, failed or dropped a sibling.
+    /// A cold replay can read that history another way.
     SiblingStillParked,
 }
 
@@ -193,7 +210,7 @@ impl std::fmt::Debug for ResidentKey {
     }
 }
 
-/// The one command that a resident workflow awaits, with its live channel.
+/// One command that a resident workflow awaits, with its live channel.
 enum Awaiting {
     Activity {
         activity_id: ActivityExecId,
@@ -261,6 +278,50 @@ impl Awaiting {
                 | WorkflowEvent::ActivityHeartbeat { activity_id: id, .. }
                 if id == activity_id
         )
+    }
+
+    /// Whether `event` is a terminal event of this await, of any kind.
+    fn is_resolved_by(&self, event: &WorkflowEvent) -> bool {
+        match (self, event) {
+            (
+                Self::Activity { activity_id, .. },
+                WorkflowEvent::ActivityCompleted {
+                    activity_id: id, ..
+                }
+                | WorkflowEvent::ActivityFailed {
+                    activity_id: id, ..
+                }
+                | WorkflowEvent::ActivityTimedOut {
+                    activity_id: id, ..
+                },
+            ) => id == activity_id,
+            (Self::Timer { timer_id, .. }, WorkflowEvent::TimerFired { timer_id: id }) => {
+                id == timer_id
+            }
+            (
+                Self::Signal { signal_name, .. },
+                WorkflowEvent::SignalReceived {
+                    signal_name: name, ..
+                },
+            ) => name == signal_name,
+            _ => false,
+        }
+    }
+
+    /// The command that parks this activity again, with its live sender
+    /// (issue #2008). A cold replay emits the same command for an activity
+    /// with no result. A timer or a signal cannot wait again this way.
+    fn into_wait(self) -> Option<WorkflowCommand> {
+        match self {
+            Self::Activity {
+                activity_id,
+                result_tx,
+            } => Some(WorkflowCommand::WaitForActivity {
+                activity_id,
+                result_tx,
+            }),
+            Self::Timer { .. } | Self::Signal { .. } => None,
+        }
     }
 
     /// Sends the result in `event` to the parked future.
@@ -356,13 +417,26 @@ impl OwnEvent {
     }
 }
 
-/// Reads one suspension's commands. Returns the index of the one awaited
-/// command and the events the worker writes, or the reason why the
+/// The awaited commands and own events of one suspension.
+struct SuspensionPlan {
+    /// The index of each awaited command, in command order.
+    awaited: Vec<usize>,
+    /// The events that the worker writes for the suspension.
+    own_events: Vec<OwnEvent>,
+}
+
+/// Whether `cmd` awaits an activity result.
+const fn awaits_activity(cmd: &WorkflowCommand) -> bool {
+    matches!(
+        cmd,
+        WorkflowCommand::ScheduleActivity { .. } | WorkflowCommand::WaitForActivity { .. }
+    )
+}
+
+/// Reads one suspension's commands. Returns its plan, or the reason why the
 /// suspension cannot stay resident.
-fn plan_suspension(
-    commands: &[WorkflowCommand],
-) -> Result<(usize, Vec<OwnEvent>), ResidentOutcome> {
-    let mut awaited = None;
+fn plan_suspension(commands: &[WorkflowCommand]) -> Result<SuspensionPlan, ResidentOutcome> {
+    let mut awaited = Vec::new();
     let mut own_events = Vec::new();
     for (index, cmd) in commands.iter().enumerate() {
         let awaits = match cmd {
@@ -396,25 +470,56 @@ fn plan_suspension(
             if !cmd.awaits_result() {
                 return Err(ResidentOutcome::Unsupported);
             }
-            // A second awaited command means a join or a race.
-            if awaited.is_some() {
-                return Err(ResidentOutcome::MultiAwait);
-            }
-            awaited = Some(index);
+            awaited.push(index);
         }
     }
-    awaited
-        .map(|index| (index, own_events))
-        .ok_or(ResidentOutcome::Unsupported)
+    match awaited.as_slice() {
+        [] => Err(ResidentOutcome::Unsupported),
+        // A join of activities resolves branch by branch (issue #2008).
+        [_] => Ok(SuspensionPlan {
+            awaited,
+            own_events,
+        }),
+        _ if awaited
+            .iter()
+            .all(|&index| awaits_activity(&commands[index])) =>
+        {
+            Ok(SuspensionPlan {
+                awaited,
+                own_events,
+            })
+        }
+        // A timer or a signal next to another await follows other replay
+        // rules. The path does not cover the mix.
+        _ => Err(ResidentOutcome::MultiAwait),
+    }
+}
+
+/// Whether a cycle that re-parked `reparked` siblings only waits for them
+/// again (issue #2008).
+///
+/// The cycle must suspend with only the re-parked waits, and the capture
+/// must keep each of them. A dropped sibling has a closed receiver, so the
+/// capture refuses it.
+fn only_waits_again(drive: &DriveResult, reparked: usize) -> bool {
+    let WorkflowOutcome::Suspended { commands } = &drive.outcome else {
+        return false;
+    };
+    commands.len() == reparked
+        && commands
+            .iter()
+            .all(|cmd| matches!(cmd, WorkflowCommand::WaitForActivity { .. }))
+        && drive.resident.is_parked()
 }
 
 /// A suspended workflow that stays in memory between decisions (issue #1798).
 ///
 /// It holds the parked handler future, its context, and the live channel of
-/// the one command the future awaits. Dropping it drops the future.
+/// each command the future awaits. Dropping it drops the future.
 pub struct ResidentWorkflow {
     future: OwnedHandlerFuture,
-    awaiting: Awaiting,
+    /// The parked awaits, in command order. Two or more are all activities.
+    parked: Vec<Awaiting>,
     own_events: Vec<OwnEvent>,
     key: ResidentKey,
     ctx: Arc<WorkflowContext>,
@@ -424,6 +529,7 @@ impl std::fmt::Debug for ResidentWorkflow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResidentWorkflow")
             .field("execution_id", &self.ctx.execution_id())
+            .field("parked", &self.parked.len())
             .field("own_events", &self.own_events)
             .field("key", &self.key)
             .finish_non_exhaustive()
@@ -433,8 +539,8 @@ impl std::fmt::Debug for ResidentWorkflow {
 impl ResidentWorkflow {
     /// Keeps a suspended cycle resident when a warm decision can resume it.
     ///
-    /// On success the awaited command in `outcome` gets a closed channel,
-    /// and the returned value holds the live one. On an error the caller
+    /// On success each awaited command in `outcome` gets a closed channel,
+    /// and the returned value holds the live ones. On an error the caller
     /// drops `future` as on a cold cycle. The error names the miss reason
     /// (issue #2007).
     pub(crate) fn capture(
@@ -449,31 +555,40 @@ impl ResidentWorkflow {
         if let Some(blocker) = ctx.resident_blocker() {
             return Err(blocker);
         }
-        let (index, own_events) = plan_suspension(commands)?;
+        let SuspensionPlan {
+            awaited,
+            own_events,
+        } = plan_suspension(commands)?;
         // A cold replay could hand the new signal to an earlier probe.
-        if let WorkflowCommand::WaitForSignal { signal_name, .. } = &commands[index]
-            && ctx.signal_probed_at_frontier(signal_name)
-        {
-            return Err(ResidentOutcome::Blocked);
+        for &index in &awaited {
+            if let WorkflowCommand::WaitForSignal { signal_name, .. } = &commands[index]
+                && ctx.signal_probed_at_frontier(signal_name)
+            {
+                return Err(ResidentOutcome::Blocked);
+            }
         }
-        let awaiting =
-            Awaiting::take_from(&mut commands[index]).ok_or(ResidentOutcome::Unsupported)?;
+        let parked = awaited
+            .iter()
+            .map(|&index| Awaiting::take_from(&mut commands[index]))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(ResidentOutcome::Unsupported)?;
         Ok(Self {
             future,
-            awaiting,
+            parked,
             own_events,
             key,
             ctx: Arc::clone(ctx),
         })
     }
 
-    /// Returns the event in `delta` that resolves the awaited command.
+    /// Matches `delta` to the parked awaits. Returns the resolving event of
+    /// each parked await, or `None` for one that stays parked.
     ///
     /// Decision boundaries (issue #1833) are skipped. Replay never reads them.
-    fn resolving_event<'a>(
+    fn resolutions<'a>(
         &self,
         delta: &'a [WorkflowEvent],
-    ) -> Result<&'a WorkflowEvent, ResumeDeclined> {
+    ) -> Result<Vec<Option<&'a WorkflowEvent>>, ResumeDeclined> {
         let mut events = delta.iter().filter(|event| !event.is_decision_boundary());
         // A delta shorter than the own events is checked as far as it goes.
         let own_match = self
@@ -483,13 +598,43 @@ impl ResidentWorkflow {
         if !own_match {
             return Err(ResumeDeclined::OwnEventsMismatch);
         }
-        // Replay skips progress events only up to the resolving event.
-        let mut rest = events.skip_while(|event| self.awaiting.is_progress(event));
-        match (rest.next(), rest.next()) {
-            (Some(event), None) => Ok(event),
-            (Some(_), Some(_)) => Err(ResumeDeclined::ExtraEvents),
-            (None, _) => Err(ResumeDeclined::NoResolution),
+        let mut resolved: Vec<Option<&WorkflowEvent>> = vec![None; self.parked.len()];
+        for event in events {
+            if resolved.iter().all(Option::is_some) {
+                return Err(ResumeDeclined::ExtraEvents);
+            }
+            // Replay skips progress events of an activity only up to its
+            // result.
+            let progress = self
+                .parked
+                .iter()
+                .zip(&resolved)
+                .any(|(parked, result)| result.is_none() && parked.is_progress(event));
+            if progress {
+                continue;
+            }
+            let Some(index) = self
+                .parked
+                .iter()
+                .position(|parked| parked.is_resolved_by(event))
+            else {
+                return Err(ResumeDeclined::UnexpectedEvent(event.type_name()));
+            };
+            if resolved[index].is_some() {
+                return Err(ResumeDeclined::ExtraEvents);
+            }
+            if matches!(
+                event,
+                WorkflowEvent::ActivityFailed { .. } | WorkflowEvent::ActivityTimedOut { .. }
+            ) {
+                return Err(ResumeDeclined::InexactResolution(event.type_name()));
+            }
+            resolved[index] = Some(event);
         }
+        if resolved.iter().all(Option::is_none) {
+            return Err(ResumeDeclined::NoResolution);
+        }
+        Ok(resolved)
     }
 
     /// Resumes this workflow with the events written since it suspended.
@@ -504,17 +649,31 @@ impl ResidentWorkflow {
         if key.is_some_and(|key| *key != self.key) {
             return Err(ResumeDeclined::KeyChanged);
         }
-        let event = self.resolving_event(delta)?;
+        let resolved = self.resolutions(delta)?;
         let Self {
             future,
-            awaiting,
+            parked,
             key,
             ctx,
             ..
         } = self;
-        awaiting.deliver(event)?;
-        ctx.begin_resident_cycle(delta);
-        Ok(crate::executor::drive_resumed(ctx, future, span_meta, key).await)
+        let mut waits = Vec::new();
+        for (parked, event) in parked.into_iter().zip(resolved) {
+            match event {
+                Some(event) => parked.deliver(event)?,
+                // Only an activity can wait again. Capture parks a timer or a
+                // signal only alone, and a delta always resolves a lone await.
+                None => waits.push(parked.into_wait().ok_or(ResumeDeclined::NoResolution)?),
+            }
+        }
+        let reparked = waits.len();
+        ctx.begin_resident_cycle(delta, waits);
+        let drive = crate::executor::drive_resumed(ctx, future, span_meta, key).await;
+        // Dropping the drive drops the future. The worker then replays cold.
+        if reparked > 0 && !only_waits_again(&drive, reparked) {
+            return Err(ResumeDeclined::SiblingStillParked);
+        }
+        Ok(drive)
     }
 }
 

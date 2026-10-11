@@ -7380,11 +7380,18 @@ impl WorkflowContext {
     /// replay. The call ordinals and sequence counters keep their values. A
     /// replay from the top counts up to the same values.
     ///
+    /// Last, it queues `waits`: the commands that park unresolved activities
+    /// of a join again (issue #2008). A cold replay emits the same commands.
+    ///
     /// # Panics
     ///
     /// Panics if the matcher mutex is poisoned.
     #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
-    pub(crate) fn begin_resident_cycle(&self, delta: &[WorkflowEvent]) {
+    pub(crate) fn begin_resident_cycle(
+        &self,
+        delta: &[WorkflowEvent],
+        waits: Vec<WorkflowCommand>,
+    ) {
         self.set_suspending(false);
         self.log_commands_queued
             .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -7394,6 +7401,9 @@ impl WorkflowContext {
             .lock()
             .expect("matcher lock poisoned")
             .append_consumed(delta);
+        for wait in waits {
+            self.push_command(wait);
+        }
     }
 
     /// Whether a non-blocking signal claim probed `signal_name` with a scan
