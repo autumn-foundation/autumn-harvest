@@ -464,3 +464,48 @@ fn workflow_info_declared_dependency_builders_set_fields() {
     assert_eq!(info.declared_activities, Some(["send_email"].as_slice()));
     assert_eq!(info.declared_children, Some(["generate_report"].as_slice()));
 }
+
+// Issue #1997: the LLM budget keys of `quota(...)`.
+#[workflow(quota(
+    key = "input.tenant",
+    max_run_llm_tokens = 20000,
+    max_run_llm_cost_micros = 500000,
+    max_tenant_llm_tokens = 1000000,
+    max_tenant_llm_cost_micros = 25000000,
+    tenant_llm_window_secs = 3600
+))]
+async fn llm_budget_workflow(_ctx: &WorkflowContext, _input: String) -> Result<(), String> {
+    Ok(())
+}
+
+#[workflow(quota(key = "input.tenant", max_tenant_llm_tokens = 10))]
+async fn llm_tenant_only_workflow(_ctx: &WorkflowContext, _input: String) -> Result<(), String> {
+    Ok(())
+}
+
+#[test]
+fn quota_llm_keys_set_the_llm_caps() {
+    let policy = __autumn_workflow_info_llm_budget_workflow()
+        .quota
+        .expect("quota is declared");
+    assert_eq!(policy.max_run_llm_tokens, Some(20_000));
+    assert_eq!(policy.max_run_llm_cost_micros, Some(500_000));
+    assert_eq!(policy.max_tenant_llm_tokens, Some(1_000_000));
+    assert_eq!(policy.max_tenant_llm_cost_micros, Some(25_000_000));
+    assert_eq!(policy.tenant_llm_window_secs, 3_600);
+    assert!(policy.has_llm_budget());
+    assert!(!policy.has_any_cap());
+}
+
+#[test]
+fn an_omitted_llm_window_keeps_the_default() {
+    let policy = __autumn_workflow_info_llm_tenant_only_workflow()
+        .quota
+        .expect("quota is declared");
+    assert_eq!(policy.max_tenant_llm_tokens, Some(10));
+    assert_eq!(policy.max_run_llm_tokens, None);
+    assert_eq!(
+        policy.tenant_llm_window_secs,
+        autumn_harvest::llm_budget::DEFAULT_TENANT_LLM_WINDOW_SECS
+    );
+}

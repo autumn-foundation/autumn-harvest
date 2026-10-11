@@ -367,6 +367,31 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 
 ---
 
+**13. LLM budgets per run and per tenant (issue #1997)**
+
+An agent loop can spend without limit. A budget caps the LLM tokens or the cost of one run, or of one tenant in a rolling window. `llm_budget.rs` holds the rule, the ledger write and the spend read. `ActivityContext::check_llm_budget` and `ActivityContext::record_llm_usage` are the two calls.
+
+*Declaration.* The caps are on `QuotaPolicy`, so a budget reuses the quota key, the `quota_key` column and the quota rule. `max_run_llm_tokens` and `max_run_llm_cost_micros` cap one run. `max_tenant_llm_tokens` and `max_tenant_llm_cost_micros` cap one `(workflow type, quota key)` pair in `tenant_llm_window_secs`, one day by default. Cost is in millionths of a currency unit. The LLM caps do not change admission: `has_any_cap` stays false for a policy with only LLM caps. A policy with only run LLM caps does not use the key, so a start does not resolve or check it (`uses_key`). The macro rejects a zero window, and the builder raises it to one second.
+
+*Ledger.* `harvest_llm_ledger` holds one row for each recorded model call, in clear columns. A retry that pays again records again. A call that fails or times out records nothing. The row is not an event, so replay does not change. It cascades with its run. A shard rebalance moves it with the run, but not in the staged copy. Activation copies the rows to the target after the source reaches `COMMITTED`. The settle transaction then deletes the source rows. Until activation, the source counts the spend of the run for its tenant.
+
+*Rule.* An LLM step calls the check before its model call. With no LLM cap, the check returns at once and reads no row. Otherwise one query reads the run spend and the tenant spend. The sums are `NUMERIC`, clamped to the `BIGINT` range. The first cap whose spend is equal to or above it refuses the step, in the order run tokens, run cost, tenant tokens, tenant cost. The refusal is a non-retryable failure of type `LlmBudgetExceeded`. Its details name the resource, the cap and the spend. `LlmBudgetExceeded::is_refusal` tests the error type, and `LlmBudgetExceeded::from_error` reads the details. A failed read fails the step as the retryable `LlmBudgetCheckFailed`. The metric is `harvest.quota.rejected{workflow, resource}`.
+
+*Limits.*
+
+- The cap is soft. The last step that passes can pass the cap by its whole usage, and steps that run at the same time can all pass the check.
+- A run is one execution. A continue-as-new, a reset, a fork or a workflow retry starts its run caps from zero. A reset fork keeps the key of its source, so its steps count for the same tenant.
+- A key that does not resolve fails open for the tenant caps. The run caps still apply. A row recorded before `quota_reconcile` sets the key of its run never counts for the tenant.
+- The scope is shard-local, as for quota.
+- Keep retention longer than the window, because the ledger rows go with their run.
+- The check reads the policy in its own process. Register the workflow type on each worker that runs its LLM steps. A worker without it passes the check and logs one warning for each type.
+- A check with a tenant cap sums every ledger row of the tenant in the window. A tenant with many calls a day pays for that on each step. A policy with only run caps skips that sum.
+- A step that does not call the check is not budgeted. A local activity has no database in its context, so the check always passes there.
+- The SQLite backend rejects a workflow that declares `quota`, so a budget does not build there.
+- A refused step is not parked: parking needs a wake when the window moves.
+
+*Limiter.* No limit is keyed on tokens. `adaptive_limit.rs` (decision 12) is the current limiter. A token-keyed limit must build on it, after the assay #14 apparatus grades that design. See `DESIGN-1997.md` §0.5.
+
 ## Module Guide
 
 | Module | Phase | Purpose |
@@ -422,6 +447,7 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `poison_pill.rs` | 3.17 | Poison-pill task quarantine (issue #367): pure `quarantine_decision`/`ReclaimAction` (no DB dep), `orphaned_running_tasks_query` (worker-liveness reclaim, independent of per-task timeouts), `reclaim_orphaned_tasks` (increment `crash_strikes`, requeue-or-quarantine), `spawn_poison_pill_reclaimer`. The loop uses `reclaim_orphaned_tasks_witnessed` (issue #1879). It holds the last strike until two sweeps in a row see the orphan (`OrphanWitness`) and the worker wrote no heartbeat for two stale windows (`quarantine_confirm_secs`). A worker that heartbeats again within that time keeps its task. Quarantine → `harvest_dead_letters` with `DeadLetterReason::PoisonPill` + terminal `WorkflowFailed` (no new event variant). `WorkerConfig::poison_pill_threshold` (default 3, 0 disables). Shard-local. Issue #1876: each pass locks a task row with `FOR UPDATE SKIP LOCKED`. A pass skips a row that another session holds. The next pass retries it. A timeout or a deadlock on one row skips that row, not the pass. |
 | `circuit_breaker.rs` | 3.18 | Per-activity circuit breaker (issue #369): `CircuitBreakerRegistry` (closed/open/half-open, rolling-window failure count, single half-open probe, `on_dispatch`/`on_result`, `force_open`/`force_close`, `snapshot`/`list`), `CircuitPhase`, `DispatchDecision`, `CircuitTransition`, `CircuitSnapshot`. Pure/in-process, per-shard; consulted by the worker before dispatch and shared with the management API via `HandlerRegistry::circuit_breakers()`. No new event variant, no migration. |
 | `adaptive_limit.rs` | 3.18 | Adaptive concurrency limit per activity type (issue #1836): `AdaptiveLimitConfig`, `AdaptiveLimitRegistry` (`try_acquire`/`saturated`/`snapshot`), `Acquire`, `LimitPermit`, `SampleOutcome`. In process, per worker. The claim skips a type at its cap. See design decision 12. No new event variant, no migration. |
+| `llm_budget.rs` | 3.18 | LLM token and cost budgets per run and per tenant (issue #1997): `LlmUsage`, `LlmSpend`, `check_llm_budget`, `check_failed`, `LlmBudgetExceeded` (`is_refusal`, `from_error`), `load_llm_spend`. The caps are on `QuotaPolicy`. Steps call `ActivityContext::check_llm_budget` and `ActivityContext::record_llm_usage`. See design decision 13. Migration `20261009050206_harvest_llm_ledger` adds the `harvest_llm_ledger` side table. No new event variant. |
 | `retry_budget.rs` | 3.18 | Per-activity-type retry budget (issue #1793): `RetryBudgetConfig`, `RetryBudgetRegistry` (`admit`/`commit`/`release`/`cancel_deferral`/`wake_delay`/`available`), `Admission`, `BudgetTicket`, `SlotReservation`. In process, per worker. The worker consults it before dispatch and defers a retry when the bucket is empty. See design decision 11. No new event variant, no migration. |
 | `slot_tuner.rs` | 3.42 | Adaptive worker dispatch-slot tuner (issue #548): `SlotTuner` trait, `DefaultSlotTuner` (pool-pressure shrink / saturated-and-waiting grow / hold), `SlotTunerConfig { min_slots, max_slots, tuner }` (`::new`/`::with_tuner`), pure helpers `initial_target`/`apply_action`/`validate_band`/`tuned_available`, `TunedSlotRuntime` (owns withheld `OwnedSemaphorePermit`s; `resize_toward`/`release_all_withheld`), `spawn_slot_tuner_loop`. Opt-in via `WorkerConfig::with_slot_tuner`; `None` (default) is byte-identical to the pre-#548 fixed-concurrency semaphore. No new event variant, no migration, no replay surface — purely an in-process semaphore control constructed inside `worker.rs::spawn_monitoring_tasks` (never stored on `Worker` itself, to avoid clippy's significant-drop propagation into every `Worker`-holding test). See [`docs/operations/adaptive-slot-tuner.md`](operations/adaptive-slot-tuner.md). |
 | `migrations/` | 1 | SQL -- run with `diesel migration run` |

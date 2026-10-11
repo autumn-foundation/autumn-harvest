@@ -1906,6 +1906,162 @@ async fn signal_idempotency_keys_and_timers_survive_the_copy() {
     );
 }
 
+/// Issue #1997: the run cap sums the LLM ledger by execution. A run that moves
+/// without its ledger would start its budget again on the target.
+#[tokio::test]
+async fn the_llm_ledger_moves_with_the_run() {
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "entity-ledger").await;
+    {
+        let mut source = shards.source().await;
+        diesel::sql_query(
+            "INSERT INTO harvest_llm_ledger \
+                 (execution_id, workflow_name, quota_key, activity_name, activity_id, attempt, \
+                  model, input_tokens, output_tokens, cost_micros, latency_ms, recorded_at) \
+             VALUES ($1, 'entity_flow', 'acme', 'llm_step', gen_random_uuid(), 1, \
+                     'm-1', 60, 40, 1234, 42, NOW() - INTERVAL '30 minutes')",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut source)
+        .await
+        .expect("seed a ledger row");
+    }
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut target = shards.target().await;
+    let spend = autumn_harvest::llm_budget::load_llm_spend(&mut target, exec_id, 3_600, true)
+        .await
+        .expect("read the spend on the target");
+    assert_eq!(
+        spend.run_tokens, 100,
+        "the run spend must move with the run"
+    );
+    assert_eq!(spend.run_cost_micros, 1_234);
+    // `recorded_at` keeps its value, so the tenant window reads the true time.
+    assert_eq!(
+        count(
+            &mut target,
+            "SELECT count(*)::BIGINT AS value FROM harvest_llm_ledger \
+              WHERE execution_id = $1 AND recorded_at < NOW() - INTERVAL '29 minutes'",
+            exec_id
+        )
+        .await,
+        1
+    );
+
+    // The cutover drops the source rows. Otherwise the tenant spend of the
+    // source shard would still count a run that now lives on the target.
+    let mut source = shards.source().await;
+    assert_eq!(
+        count(
+            &mut source,
+            "SELECT count(*)::BIGINT AS value FROM harvest_llm_ledger WHERE execution_id = $1",
+            exec_id
+        )
+        .await,
+        0,
+        "the source must not keep the spend it handed to the target"
+    );
+}
+
+/// Issue #1997: the tenant spend of a moving run counts on at least one shard
+/// in every phase, and each row keeps its own key.
+///
+/// The source keeps the ledger through the cutover. Activation copies it to
+/// the target with the original keys. The source then deletes it.
+#[tokio::test]
+async fn the_llm_ledger_counts_on_one_shard_in_every_phase_and_keeps_its_keys() {
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "entity-ledger-stage").await;
+    {
+        let mut source = shards.source().await;
+        diesel::sql_query(
+            "UPDATE harvest_workflow_executions SET quota_key = 'acme' WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut source)
+        .await
+        .expect("tag the run with a key");
+        // One row recorded under the key, and one recorded before the
+        // reconciler set it. The second never counts for the tenant.
+        diesel::sql_query(
+            "INSERT INTO harvest_llm_ledger \
+                 (execution_id, workflow_name, quota_key, activity_name, activity_id, attempt, \
+                  model, input_tokens, output_tokens, cost_micros, latency_ms) \
+             VALUES ($1, 'entity_flow', 'acme', 'llm_step', gen_random_uuid(), 1, \
+                     'm-1', 60, 40, 0, 1), \
+                    ($1, 'entity_flow', NULL, 'llm_step', gen_random_uuid(), 1, \
+                     'm-1', 5, 5, 0, 1)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut source)
+        .await
+        .expect("seed the ledger rows");
+    }
+    let tenant_rows = "SELECT count(*)::BIGINT AS value FROM harvest_llm_ledger \
+                        WHERE execution_id = $1 AND quota_key = 'acme'";
+    let unkeyed_rows = "SELECT count(*)::BIGINT AS value FROM harvest_llm_ledger \
+                         WHERE execution_id = $1 AND quota_key IS NULL";
+
+    let (mut source, mut target) = (shards.source().await, shards.target().await);
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+    assert!(
+        commit_cutover(&mut source, exec_id, TARGET)
+            .await
+            .expect("cutover"),
+        "the cutover must commit"
+    );
+    // A crash here leaves the run cut over but not active. The source still
+    // counts the spend, and the target does not count it yet.
+    assert_eq!(count(&mut source, tenant_rows, exec_id).await, 1);
+    assert_eq!(count(&mut target, tenant_rows, exec_id).await, 0);
+
+    activate_target(&mut source, &mut target, exec_id)
+        .await
+        .expect("activate");
+    assert_eq!(count(&mut target, tenant_rows, exec_id).await, 1);
+    assert_eq!(
+        count(&mut target, unkeyed_rows, exec_id).await,
+        1,
+        "a row recorded without a key must not gain one on the move"
+    );
+    assert_eq!(
+        count(
+            &mut source,
+            "SELECT count(*)::BIGINT AS value FROM harvest_llm_ledger WHERE execution_id = $1",
+            exec_id
+        )
+        .await,
+        0,
+        "the source drops its copy once the target holds it"
+    );
+
+    // A second activation, as a resume would run it, copies nothing twice.
+    activate_target(&mut source, &mut target, exec_id)
+        .await
+        .expect("activate again");
+    assert_eq!(
+        count(
+            &mut target,
+            "SELECT count(*)::BIGINT AS value FROM harvest_llm_ledger WHERE execution_id = $1",
+            exec_id
+        )
+        .await,
+        2
+    );
+}
+
 // ── AC7: crash safety at every kill point ────────────────────────────────────
 
 #[tokio::test]

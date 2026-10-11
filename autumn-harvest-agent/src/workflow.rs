@@ -19,6 +19,7 @@
 
 use std::time::Duration;
 
+use autumn_harvest::llm_budget::LlmBudgetExceeded;
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
 
@@ -276,10 +277,17 @@ async fn run_segment(
         if exceeds_bytes(&request, task.request_cap()) {
             return Ok(AgentStop::TranscriptFull);
         }
-        let turn: ModelTurn = ctx
+        let turn: ModelTurn = match ctx
             .execute_activity(&agent_model_turn_info(), request)
             .await
-            .map_err(|e| e.to_string())?;
+        {
+            Ok(turn) => turn,
+            // A spent LLM budget is a bound, so the run ends normally.
+            Err(error) if LlmBudgetExceeded::is_refusal(&error) => {
+                return Ok(AgentStop::BudgetExceeded);
+            }
+            Err(error) => return Err(error.to_string()),
+        };
 
         progress.usage = progress.usage.saturating_add(turn.usage);
         let over_budget = task
@@ -577,7 +585,17 @@ pub async fn agent_model_turn(
     ctx: &ActivityContext,
     request: ModelTurnRequest,
 ) -> Result<ModelTurn, String> {
-    harness(ctx)?.model_turn(request).await
+    harness(ctx)?
+        .metered_turn(
+            request,
+            || ctx.check_llm_budget(),
+            |usage| async move {
+                ctx.record_llm_usage(&usage)
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await
 }
 
 /// One tool call, as an activity.

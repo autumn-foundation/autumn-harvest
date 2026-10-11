@@ -1,0 +1,5 @@
+error: quota `tenant_llm_window_secs` must be at least 1
+ --> tests/compile_fail/quota_llm_zero_window.rs:5:93
+  |
+5 | #[workflow(quota(key = "input.tenant", max_tenant_llm_tokens = 10, tenant_llm_window_secs = 0))]
+  |                                                                                             ^

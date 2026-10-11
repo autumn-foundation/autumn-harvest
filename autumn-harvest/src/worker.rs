@@ -1353,12 +1353,18 @@ impl HandlerRegistry {
                     ),
                     "dag": self.dag_workflow_names.contains(name),
                     // A detached child start and a continue-as-new enforce
-                    // the quota inside the task.
+                    // the quota inside the task. An LLM step enforces the LLM
+                    // caps inside its activity task (issue #1997).
                     "quota": info.quota.map(|quota| serde_json::json!([
                         quota.key_expr,
                         quota.max_active_executions,
                         quota.max_history_bytes,
                         quota.max_dead_letters,
+                        quota.max_run_llm_tokens,
+                        quota.max_run_llm_cost_micros,
+                        quota.max_tenant_llm_tokens,
+                        quota.max_tenant_llm_cost_micros,
+                        quota.tenant_llm_window_secs,
                     ])),
                     "execution_timeout": info
                         .execution_timeout
@@ -12233,6 +12239,7 @@ async fn persist_all_started_child_workflows(
             // start path runs in `execution.rs`, applied per child here.
             let child_quota_key: Option<String> = defaults
                 .quota
+                .filter(crate::quota::QuotaPolicy::uses_key)
                 .and_then(|p| crate::quota::resolve_quota_key(p.key_expr, &child.input));
             if let Some(key) = child_quota_key.as_deref()
                 && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
@@ -12886,6 +12893,7 @@ fn cross_shard_child_spec(
     let defaults = resolve_child_workflow_defaults(registry, workflow_name);
     let quota_key: Option<String> = defaults
         .quota
+        .filter(crate::quota::QuotaPolicy::uses_key)
         .and_then(|p| crate::quota::resolve_quota_key(p.key_expr, input));
     if let Some(key) = quota_key.as_deref()
         && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
@@ -13116,6 +13124,7 @@ async fn insert_awaited_child_execution(
     // continue-as-new/reset/workflow-level-retry.
     let child_quota_key: Option<String> = defaults
         .quota
+        .filter(crate::quota::QuotaPolicy::uses_key)
         .and_then(|p| crate::quota::resolve_quota_key(p.key_expr, &child.input));
     if let Some(key) = child_quota_key.as_deref()
         && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
@@ -15584,8 +15593,9 @@ async fn create_detached_child_executions(
         // continue-as-new/reset/workflow-level-retry. `ParentClosePolicy`
         // (#347) governs the detached child's *lifecycle*, not its *tenant
         // capacity*, so the two concerns are orthogonal.
-        let child_quota_key: Option<String> =
-            detached_quota.and_then(|p| crate::quota::resolve_quota_key(p.key_expr, input));
+        let child_quota_key: Option<String> = detached_quota
+            .filter(crate::quota::QuotaPolicy::uses_key)
+            .and_then(|p| crate::quota::resolve_quota_key(p.key_expr, input));
         if let Some(key) = child_quota_key.as_deref()
             && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
         {
@@ -22196,6 +22206,7 @@ async fn resolve_continue_as_new_verdict(
                 .workflows
                 .get(target)
                 .and_then(|info| info.quota)
+                .filter(crate::quota::QuotaPolicy::uses_key)
                 .and_then(|policy| crate::quota::resolve_quota_key(policy.key_expr, input))
         },
     );
@@ -22290,6 +22301,7 @@ fn continue_as_new_certainly_redirects(
     }
     let quota_key = target_info
         .quota
+        .filter(crate::quota::QuotaPolicy::uses_key)
         .and_then(|policy| crate::quota::resolve_quota_key(policy.key_expr, input));
     if let Some(key) = quota_key.as_deref()
         && crate::quota::quota_key_over_cap(key).is_some()

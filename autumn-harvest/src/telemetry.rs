@@ -1241,11 +1241,15 @@ pub const METRIC_ADMISSION_GATES_ACTIVE: &str = "harvest.admission.gates_active"
 /// its resolved per-tenant [`crate::quota::QuotaPolicy`] key is at or over
 /// one of its declared caps (issue #946).
 ///
+/// It also counts each LLM step that an LLM budget refuses (issue #1997).
+///
 /// Labels:
 ///   - `"workflow"` (= [`METRIC_LABEL_WORKFLOW`]) — the workflow type name.
-///   - `"resource"` (= [`METRIC_LABEL_RESOURCE`]) — which cap was exhausted
-///     (`"active_executions"`, `"history_bytes"`, or `"dead_letters"`, per
-///     [`crate::quota::QuotaResource::as_str`]).
+///   - `"resource"` (= [`METRIC_LABEL_RESOURCE`]) — which cap was exhausted,
+///     per [`crate::quota::QuotaResource::as_str`]. A start rejection gives
+///     `"active_executions"`, `"history_bytes"` or `"dead_letters"`. An LLM
+///     refusal gives `"run_llm_tokens"`, `"run_llm_cost_micros"`,
+///     `"tenant_llm_tokens"` or `"tenant_llm_cost_micros"`.
 ///
 /// The *resolved tenant key* is deliberately **not** a label — it is
 /// caller/tenant-controlled input and would be unbounded cardinality. Per-key
@@ -2802,7 +2806,8 @@ pub trait MetricsRecorder: Send + Sync {
     }
 
     /// A fresh workflow start was rejected because its resolved per-tenant
-    /// quota key is at or over a declared cap (issue #946).
+    /// quota key is at or over a declared cap (issue #946). An LLM budget
+    /// also calls it for each refused LLM step (issue #1997).
     ///
     /// `workflow` is the workflow type name; `resource` is the bounded
     /// [`crate::quota::QuotaResource::as_str`] value naming the exhausted

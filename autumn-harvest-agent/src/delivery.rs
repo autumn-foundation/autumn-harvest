@@ -96,6 +96,7 @@ pub fn report_text(source: ReportSource, stop: AgentStop, text: &str) -> Option<
         | AgentStop::StepsExhausted
         | AgentStop::TokensExhausted
         | AgentStop::TranscriptFull
+        | AgentStop::BudgetExceeded
         | AgentStop::LoopDetected => {
             let notice = format!("The agent stopped early: {}.", stop_name(stop));
             Some(if text.is_empty() {
@@ -186,6 +187,9 @@ mod tests {
         assert_eq!(text, "The agent stopped early: loop_detected.");
         let text = report_text(ReportSource::Run, AgentStop::StepsExhausted, "partial").unwrap();
         assert!(text.ends_with("partial"), "{text}");
+        // A spent LLM budget also ends the run early (issue #1997).
+        let text = report_text(ReportSource::Heartbeat, AgentStop::BudgetExceeded, "").unwrap();
+        assert_eq!(text, "The agent stopped early: budget_exceeded.");
     }
 
     #[test]

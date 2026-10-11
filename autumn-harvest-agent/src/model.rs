@@ -44,10 +44,32 @@ pub struct ChatResponse {
 /// Return an [`AgentError`] whose kind says whether a retry can succeed.
 /// `RateLimited`, `Transport` and `Unavailable` retry with backoff. Every
 /// other kind fails the call at once.
+///
+/// The LLM budgets count `input_tokens` plus `output_tokens` of
+/// [`ChatResponse::usage`]. Count the whole prompt in `input_tokens`, cached
+/// tokens included, even when the provider reports them apart.
 pub trait AgentModel: Send + Sync + std::fmt::Debug {
     /// Send one request and decode the answer.
     fn chat<'a>(
         &'a self,
         request: &'a ChatRequest,
     ) -> BoxFuture<'a, Result<ChatResponse, AgentError>>;
+
+    /// The model id that the LLM ledger records (issue #1997).
+    ///
+    /// The default is `"unknown"`.
+    // An implementation can return a field, so the borrow stays.
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn model_id(&self) -> &str {
+        "unknown"
+    }
+
+    /// The cost of one call, in millionths of a currency unit (issue #1997).
+    ///
+    /// The cost budgets sum this value. The default is zero, so only the
+    /// token budgets apply.
+    fn cost_micros(&self, usage: &TokenUsage) -> u64 {
+        let _ = usage;
+        0
+    }
 }

@@ -139,6 +139,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          legal_hold_tests
 linux        autumn-harvest         integration                      -                          lifecycle_model_props
 linux        autumn-harvest         integration                      -                          lineage_store_tests
+linux        autumn-harvest         integration                      -                          llm_budget_tests
 linux        autumn-harvest         integration                      -                          metrics_integration
 linux        autumn-harvest         integration                      -                          migrate_tests
 linux        autumn-harvest         integration                      -                          mixed_suspension_tests

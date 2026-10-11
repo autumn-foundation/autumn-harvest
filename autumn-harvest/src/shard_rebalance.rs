@@ -507,6 +507,7 @@ pub const COPIED_RELATIONS: &[&str] = &[
     "harvest_signals",
     "harvest_payload_refs",
     "harvest_workflow_logs",
+    "harvest_llm_ledger",
 ];
 
 /// Relations whose schemas must match between source and target before a
@@ -518,7 +519,8 @@ pub const COPIED_RELATIONS: &[&str] = &[
 /// there is no longer anything to abort. A column mismatch discovered there
 /// would leave the run `RUNNING` on the target with no task row on either shard,
 /// so `harvest_task_queue` has to be checked here, before the seal, even though
-/// it is not part of the staged copy.
+/// it is not part of the staged copy. `harvest_llm_ledger` is checked for the
+/// same reason: activation copies it to the target (issue #1997).
 pub const SCHEMA_PARITY_RELATIONS: &[&str] = &[
     "harvest_workflow_executions",
     "harvest_events",
@@ -526,6 +528,7 @@ pub const SCHEMA_PARITY_RELATIONS: &[&str] = &[
     "harvest_signals",
     "harvest_payload_refs",
     "harvest_workflow_logs",
+    "harvest_llm_ledger",
     "harvest_task_queue",
 ];
 
@@ -1694,6 +1697,7 @@ mod db {
         "DELETE FROM harvest_signals WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_payload_refs WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_workflow_logs WHERE workflow_exec_id = $1",
+        "DELETE FROM harvest_llm_ledger WHERE execution_id = $1",
         "DELETE FROM harvest_task_queue WHERE workflow_exec_id = $1",
     ];
 
@@ -2652,6 +2656,7 @@ mod db {
         // always executes to completion whether or not the primary query reads
         // them; only the seal's row count is needed to answer "did the cutover
         // happen?".
+
         let sql = format!(
             "WITH sealed AS ( \
                  UPDATE harvest_workflow_executions e \
@@ -2886,6 +2891,14 @@ mod db {
             ))
         })?;
         let staged_task: Option<Value> = staged.payload;
+        // The LLM ledger of the run, still on the source (issue #1997).
+        let llm_ledger = read_json(
+            source,
+            "SELECT COALESCE(jsonb_agg(to_jsonb(g) ORDER BY g.id), '[]'::jsonb) AS payload \
+             FROM harvest_llm_ledger g WHERE g.execution_id = $1",
+            exec_id,
+        )
+        .await?;
 
         Box::pin(target.transaction::<(), HarvestError, _>(async |conn| {
             if fenced && let Some(settle) = settle {
@@ -2918,6 +2931,35 @@ mod db {
                       WHERE id = $1 AND state = 'MIGRATING'",
                 )
                 .bind::<SqlUuid, _>(exec_id.as_uuid())
+                .execute(&mut *conn)
+                .await
+                .map_err(database_error)?;
+
+                // The LLM ledger moves here, not at stage time (issue #1997).
+                // Until now the source counted the spend of the run for its
+                // tenant. Each row keeps its own `quota_key`, so a row recorded
+                // before its run had a key still counts for no tenant. The
+                // guard makes a resumed activation copy nothing twice. The
+                // target mints a new `id`, and `recorded_at` keeps its value.
+                diesel::sql_query(
+                    "INSERT INTO harvest_llm_ledger \
+                         (execution_id, workflow_name, quota_key, activity_name, activity_id, \
+                          attempt, model, input_tokens, output_tokens, cost_micros, \
+                          latency_ms, recorded_at) \
+                     SELECT execution_id, workflow_name, quota_key, activity_name, activity_id, \
+                            attempt, model, input_tokens, output_tokens, cost_micros, \
+                            latency_ms, recorded_at \
+                     FROM jsonb_to_recordset($2::jsonb) AS r( \
+                         id bigint, execution_id uuid, workflow_name text, quota_key text, \
+                         activity_name text, activity_id uuid, attempt integer, model text, \
+                         input_tokens bigint, output_tokens bigint, cost_micros bigint, \
+                         latency_ms bigint, recorded_at timestamptz) \
+                     WHERE NOT EXISTS ( \
+                         SELECT 1 FROM harvest_llm_ledger g WHERE g.execution_id = $1) \
+                     ORDER BY id",
+                )
+                .bind::<SqlUuid, _>(exec_id.as_uuid())
+                .bind::<Jsonb, _>(&llm_ledger)
                 .execute(&mut *conn)
                 .await
                 .map_err(database_error)?;
@@ -3036,6 +3078,21 @@ mod db {
             if fenced && let Some(settle) = settle {
                 crate::replication::assert_fence(conn, settle.source_shard).await?;
             }
+            // The target holds the LLM ledger now (issue #1997). The source
+            // drops its copy in the commit that settles the move, so the
+            // tenant spend never counts on two shards after it. A crash
+            // before this commit counts it on both shards for a while, never
+            // on none.
+            diesel::sql_query(
+                "DELETE FROM harvest_llm_ledger g \
+                  WHERE g.execution_id = $1 \
+                    AND EXISTS (SELECT 1 FROM harvest_shard_migrations m \
+                                WHERE m.execution_id = $1 AND m.phase = 'COMMITTED')",
+            )
+            .bind::<SqlUuid, _>(exec_id.as_uuid())
+            .execute(&mut *conn)
+            .await
+            .map_err(database_error)?;
             let settled = diesel::sql_query(
                 "UPDATE harvest_shard_migrations \
                     SET phase = 'DONE', staged_task = NULL, updated_at = NOW() \

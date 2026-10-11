@@ -148,6 +148,16 @@ pub enum QuotaResource {
     HistoryBytes,
     /// Count of `harvest_dead_letters` rows sharing the resolved key.
     DeadLetters,
+    /// LLM tokens that one run spent (issue #1997).
+    RunLlmTokens,
+    /// LLM cost that one run spent, in millionths of a currency unit (issue
+    /// #1997).
+    RunLlmCostMicros,
+    /// LLM tokens that the resolved key spent in the window (issue #1997).
+    TenantLlmTokens,
+    /// LLM cost that the resolved key spent in the window, in millionths of
+    /// a currency unit (issue #1997).
+    TenantLlmCostMicros,
 }
 
 impl QuotaResource {
@@ -159,6 +169,10 @@ impl QuotaResource {
             Self::ActiveExecutions => "active_executions",
             Self::HistoryBytes => "history_bytes",
             Self::DeadLetters => "dead_letters",
+            Self::RunLlmTokens => "run_llm_tokens",
+            Self::RunLlmCostMicros => "run_llm_cost_micros",
+            Self::TenantLlmTokens => "tenant_llm_tokens",
+            Self::TenantLlmCostMicros => "tenant_llm_cost_micros",
         }
     }
 }
@@ -182,8 +196,9 @@ impl std::fmt::Display for QuotaResource {
 /// Declared via `#[workflow(quota(key = "input.tenant_id",
 /// max_active_executions = 100, max_history_bytes = 10485760,
 /// max_dead_letters = 50))]` or the [`Self::new`] + `with_*` builder chain.
-/// Every cap is independently optional (issue #946 AC2) — a policy may
-/// declare just one, two, or all three.
+/// Every cap is independently optional (issue #946 AC2). A policy may
+/// declare any set of the three admission caps and the four LLM caps of
+/// issue #1997.
 ///
 /// # Examples
 ///
@@ -214,6 +229,20 @@ pub struct QuotaPolicy {
     /// Maximum `harvest_dead_letters` rows sharing the resolved key.
     /// `None` = uncapped.
     pub max_dead_letters: Option<u32>,
+    /// Maximum LLM tokens of one run (issue #1997). `None` = uncapped.
+    pub max_run_llm_tokens: Option<u64>,
+    /// Maximum LLM cost of one run, in millionths of a currency unit (issue
+    /// #1997). `None` = uncapped.
+    pub max_run_llm_cost_micros: Option<u64>,
+    /// Maximum LLM tokens of the resolved key in the window (issue #1997).
+    /// `None` = uncapped.
+    pub max_tenant_llm_tokens: Option<u64>,
+    /// Maximum LLM cost of the resolved key in the window, in millionths of a
+    /// currency unit (issue #1997). `None` = uncapped.
+    pub max_tenant_llm_cost_micros: Option<u64>,
+    /// The rolling window of the two tenant LLM caps, in seconds (issue
+    /// #1997). See [`crate::llm_budget::DEFAULT_TENANT_LLM_WINDOW_SECS`].
+    pub tenant_llm_window_secs: u32,
 }
 
 impl QuotaPolicy {
@@ -226,6 +255,11 @@ impl QuotaPolicy {
             max_active_executions: None,
             max_history_bytes: None,
             max_dead_letters: None,
+            max_run_llm_tokens: None,
+            max_run_llm_cost_micros: None,
+            max_tenant_llm_tokens: None,
+            max_tenant_llm_cost_micros: None,
+            tenant_llm_window_secs: crate::llm_budget::DEFAULT_TENANT_LLM_WINDOW_SECS,
         }
     }
 
@@ -250,7 +284,78 @@ impl QuotaPolicy {
         self
     }
 
-    /// `true` when at least one cap is declared.
+    /// Set the maximum LLM tokens of one run (issue #1997).
+    #[must_use]
+    pub const fn with_max_run_llm_tokens(mut self, max: u64) -> Self {
+        self.max_run_llm_tokens = Some(max);
+        self
+    }
+
+    /// Set the maximum LLM cost of one run, in millionths of a currency unit
+    /// (issue #1997).
+    #[must_use]
+    pub const fn with_max_run_llm_cost_micros(mut self, max: u64) -> Self {
+        self.max_run_llm_cost_micros = Some(max);
+        self
+    }
+
+    /// Set the maximum LLM tokens of the resolved key in the window (issue
+    /// #1997).
+    #[must_use]
+    pub const fn with_max_tenant_llm_tokens(mut self, max: u64) -> Self {
+        self.max_tenant_llm_tokens = Some(max);
+        self
+    }
+
+    /// Set the maximum LLM cost of the resolved key in the window, in
+    /// millionths of a currency unit (issue #1997).
+    #[must_use]
+    pub const fn with_max_tenant_llm_cost_micros(mut self, max: u64) -> Self {
+        self.max_tenant_llm_cost_micros = Some(max);
+        self
+    }
+
+    /// Set the rolling window of the tenant LLM caps, in seconds (issue
+    /// #1997).
+    ///
+    /// A zero window would count no spend and turn the tenant caps off. The
+    /// builder raises it to one second.
+    #[must_use]
+    pub const fn with_tenant_llm_window_secs(mut self, secs: u32) -> Self {
+        self.tenant_llm_window_secs = if secs == 0 { 1 } else { secs };
+        self
+    }
+
+    /// `true` when at least one LLM cap is declared (issue #1997).
+    ///
+    /// The LLM caps apply to LLM steps, not to admission. They do not change
+    /// [`Self::has_any_cap`].
+    #[must_use]
+    pub const fn has_llm_budget(&self) -> bool {
+        self.max_run_llm_tokens.is_some()
+            || self.max_run_llm_cost_micros.is_some()
+            || self.max_tenant_llm_tokens.is_some()
+            || self.max_tenant_llm_cost_micros.is_some()
+    }
+
+    /// `true` when a start must resolve and stamp the key (issue #1997).
+    ///
+    /// Only a policy whose sole caps are run LLM caps does not use the key.
+    /// A start then skips the key, so the key cannot refuse it. The LLM caps
+    /// do not change admission.
+    #[must_use]
+    pub const fn uses_key(&self) -> bool {
+        self.has_any_cap() || self.has_tenant_llm_cap() || !self.has_llm_budget()
+    }
+
+    /// `true` when a tenant LLM cap is declared (issue #1997). Only then
+    /// does the budget check sum the tenant spend.
+    #[must_use]
+    pub const fn has_tenant_llm_cap(&self) -> bool {
+        self.max_tenant_llm_tokens.is_some() || self.max_tenant_llm_cost_micros.is_some()
+    }
+
+    /// `true` when at least one admission cap is declared.
     ///
     /// A [`QuotaPolicy`] with every cap `None` resolves a key but enforces
     /// nothing; the enforcement layer treats it as a no-op rather than
@@ -809,6 +914,55 @@ mod tests {
         );
         assert_eq!(QuotaResource::HistoryBytes.as_str(), "history_bytes");
         assert_eq!(QuotaResource::DeadLetters.as_str(), "dead_letters");
+    }
+
+    #[test]
+    fn llm_quota_resources_have_stable_names() {
+        for (resource, name) in [
+            (QuotaResource::RunLlmTokens, "run_llm_tokens"),
+            (QuotaResource::RunLlmCostMicros, "run_llm_cost_micros"),
+            (QuotaResource::TenantLlmTokens, "tenant_llm_tokens"),
+            (QuotaResource::TenantLlmCostMicros, "tenant_llm_cost_micros"),
+        ] {
+            assert_eq!(resource.as_str(), name);
+            assert_eq!(serde_json::to_value(resource).unwrap(), name);
+        }
+    }
+
+    #[test]
+    fn only_a_run_only_llm_policy_skips_the_key() {
+        assert!(QuotaPolicy::new("t").uses_key());
+        assert!(QuotaPolicy::new("t").with_max_dead_letters(1).uses_key());
+        assert!(
+            QuotaPolicy::new("t")
+                .with_max_tenant_llm_tokens(1)
+                .uses_key()
+        );
+        assert!(
+            QuotaPolicy::new("t")
+                .with_max_run_llm_tokens(1)
+                .with_max_active_executions(1)
+                .uses_key()
+        );
+        assert!(
+            !QuotaPolicy::new("t")
+                .with_max_run_llm_tokens(1)
+                .with_max_run_llm_cost_micros(1)
+                .uses_key()
+        );
+    }
+
+    #[test]
+    fn llm_caps_never_refuse_an_admission() {
+        let policy = QuotaPolicy::new("tenant")
+            .with_max_run_llm_tokens(0)
+            .with_max_tenant_llm_cost_micros(0);
+        let usage = QuotaUsage {
+            active_executions: 9,
+            history_bytes: 9,
+            dead_letters: 9,
+        };
+        assert!(check_quota(&usage, &policy).is_none());
     }
 
     #[test]

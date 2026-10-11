@@ -12,12 +12,13 @@ use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::error::AgentError;
 use crate::heartbeat::{HeartbeatTask, Precheck};
 use crate::memory::{MEMORY_TOOL, MemoryScope, MemoryStore, MemoryTool, render_snapshot};
-use crate::message::{ContentPart, RunId, ToolDefinition};
+use crate::message::{ContentPart, RunId, TokenUsage, ToolDefinition};
 use crate::model::{AgentModel, BoxFuture, ChatRequest};
 use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
 use crate::tool::{Tool, ToolContext, ToolEffect};
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
+use autumn_harvest::llm_budget::LlmUsage;
 
 use crate::types::{ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome};
 
@@ -214,6 +215,33 @@ impl AgentHarness {
         self.model_turn_with(request, |_content| {}).await
     }
 
+    /// One model turn between an LLM budget check and a ledger write (issue
+    /// #1997).
+    ///
+    /// `check` runs first. A refusal returns at once, and the model is not
+    /// called. After a turn that returns, `record` writes its usage. A failed
+    /// write logs a warning and keeps the turn, because a retry would pay for
+    /// the call again. A call that fails or times out records nothing.
+    pub(crate) async fn metered_turn<C, CF, R, RF>(
+        &self,
+        request: ModelTurnRequest,
+        check: C,
+        record: R,
+    ) -> Result<ModelTurn, String>
+    where
+        C: FnOnce() -> CF,
+        CF: std::future::Future<Output = Result<(), String>>,
+        R: FnOnce(LlmUsage) -> RF,
+        RF: std::future::Future<Output = Result<bool, String>>,
+    {
+        check().await?;
+        let (turn, latency) = self.timed_model_turn(request, |_content| {}).await?;
+        if let Err(error) = record(self.ledger_usage(&turn.usage, latency)).await {
+            tracing::warn!(error = %error, "could not record the LLM usage of a model turn");
+        }
+        Ok(turn)
+    }
+
     /// Run one model call, let `prepare` edit the model content, then ask
     /// the policy about each tool call.
     ///
@@ -228,6 +256,17 @@ impl AgentHarness {
         request: ModelTurnRequest,
         prepare: impl FnOnce(&mut Vec<ContentPart>),
     ) -> Result<ModelTurn, String> {
+        self.timed_model_turn(request, prepare)
+            .await
+            .map(|(turn, _)| turn)
+    }
+
+    /// [`Self::model_turn_with`], with the time that the model call took.
+    pub(crate) async fn timed_model_turn(
+        &self,
+        request: ModelTurnRequest,
+        prepare: impl FnOnce(&mut Vec<ContentPart>),
+    ) -> Result<(ModelTurn, Duration), String> {
         let builtins = self.builtins(
             request.memory_scope.as_ref(),
             request.extra_tools.iter().cloned(),
@@ -239,6 +278,7 @@ impl AgentHarness {
             max_tokens: request.max_output_tokens,
             temperature: self.temperature,
         };
+        let started = std::time::Instant::now();
         let response = match tokio::time::timeout(self.model_timeout, self.client.chat(&chat)).await
         {
             Ok(response) => response.map_err(|err| model_failure(&err))?,
@@ -250,6 +290,7 @@ impl AgentHarness {
                 .into_error_payload());
             }
         };
+        let latency = started.elapsed();
         let mut content = response.content;
         prepare(&mut content);
         let mut turn = ModelTurn {
@@ -294,7 +335,7 @@ impl AgentHarness {
                 });
             turn.decisions.push(decision);
         }
-        Ok(turn)
+        Ok((turn, latency))
     }
 
     /// Run one tool call.
@@ -355,6 +396,21 @@ impl AgentHarness {
         let cap = self.max_result_bytes.saturating_sub(OUTCOME_ENVELOPE_BYTES);
         let max = usize::try_from(cap / 12).unwrap_or(usize::MAX);
         ToolOutcome::error(&cut_bytes(message, max))
+    }
+
+    /// The ledger usage of one model call (issue #1997).
+    ///
+    /// The model id is the id that [`AgentModel::model_id`] configures. The
+    /// `input_tokens` count already holds the cached prompt tokens, so this
+    /// function does not add the cache counts again.
+    pub(crate) fn ledger_usage(&self, usage: &TokenUsage, latency: Duration) -> LlmUsage {
+        LlmUsage::new(
+            self.client.model_id(),
+            u64::from(usage.input_tokens),
+            u64::from(usage.output_tokens),
+        )
+        .with_cost_micros(self.client.cost_micros(usage))
+        .with_latency(latency)
     }
 
     /// Load the memory of `scope` and render it as the frozen snapshot.
@@ -554,6 +610,180 @@ mod tests {
     use super::*;
     use crate::bounds::json_len;
     use crate::error::ErrorKind;
+
+    /// A model with a fixed id and a price of one micro per token.
+    #[derive(Debug)]
+    struct PricedModel;
+
+    impl AgentModel for PricedModel {
+        fn chat<'a>(
+            &'a self,
+            _request: &'a ChatRequest,
+        ) -> crate::model::BoxFuture<'a, Result<crate::model::ChatResponse, AgentError>> {
+            Box::pin(async { Err(AgentError::new(ErrorKind::Provider, "unused")) })
+        }
+
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn model_id(&self) -> &str {
+            "priced-1"
+        }
+
+        fn cost_micros(&self, usage: &TokenUsage) -> u64 {
+            u64::from(usage.total())
+        }
+    }
+
+    #[test]
+    fn the_ledger_usage_reads_the_model_id_the_cost_and_the_latency() {
+        let harness = AgentHarness::new(Arc::new(PricedModel));
+        let usage = TokenUsage {
+            input_tokens: 30,
+            output_tokens: 12,
+            cache_read_tokens: 20,
+            cache_write_tokens: 0,
+        };
+        let ledger = harness.ledger_usage(&usage, Duration::from_millis(1_500));
+        assert_eq!(ledger.model, "priced-1");
+        // The input count already holds the cached tokens.
+        assert_eq!((ledger.input_tokens, ledger.output_tokens), (30, 12));
+        assert_eq!(ledger.cost_micros, 42);
+        assert_eq!(ledger.latency_ms, 1_500);
+    }
+
+    #[test]
+    fn a_model_with_the_defaults_records_an_unknown_id_and_no_cost() {
+        let model = PricedModelDefaults;
+        assert_eq!(model.model_id(), "unknown");
+        assert_eq!(model.cost_micros(&TokenUsage::new(5, 5)), 0);
+    }
+
+    #[derive(Debug)]
+    struct PricedModelDefaults;
+
+    impl AgentModel for PricedModelDefaults {
+        fn chat<'a>(
+            &'a self,
+            _request: &'a ChatRequest,
+        ) -> crate::model::BoxFuture<'a, Result<crate::model::ChatResponse, AgentError>> {
+            Box::pin(async { Err(AgentError::new(ErrorKind::Provider, "unused")) })
+        }
+    }
+
+    /// A model that answers with a fixed usage and counts its calls.
+    #[derive(Debug, Default)]
+    struct CountingModel {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl AgentModel for CountingModel {
+        fn chat<'a>(
+            &'a self,
+            _request: &'a ChatRequest,
+        ) -> crate::model::BoxFuture<'a, Result<crate::model::ChatResponse, AgentError>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Ok(crate::model::ChatResponse {
+                    content: vec![crate::message::ContentPart::Text("hi".into())],
+                    stop_reason: crate::message::StopReason::EndTurn,
+                    usage: TokenUsage::new(7, 3),
+                })
+            })
+        }
+
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn model_id(&self) -> &str {
+            "counted-1"
+        }
+
+        fn cost_micros(&self, usage: &TokenUsage) -> u64 {
+            u64::from(usage.total()) * 2
+        }
+    }
+
+    fn turn_request() -> ModelTurnRequest {
+        ModelTurnRequest {
+            run_id: "run-1".into(),
+            session_id: None,
+            steps_used: 0,
+            max_steps: 4,
+            usage: TokenUsage::default(),
+            messages: vec![crate::message::ChatMessage::text(
+                crate::message::ChatRole::User,
+                "go",
+            )],
+            max_output_tokens: None,
+            read_only: false,
+            memory_scope: None,
+            extra_tools: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_turn_never_calls_the_model_or_records() {
+        let model = Arc::new(CountingModel::default());
+        let harness = AgentHarness::new(model.clone());
+        let recorded = std::sync::Mutex::new(Vec::new());
+        let outcome = harness
+            .metered_turn(
+                turn_request(),
+                || async { Err("refused".to_owned()) },
+                |usage| {
+                    recorded.lock().unwrap().push(usage);
+                    async { Ok(true) }
+                },
+            )
+            .await;
+        assert_eq!(outcome, Err("refused".to_owned()));
+        assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(recorded.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_turn_records_its_usage_once_after_the_call() {
+        let model = Arc::new(CountingModel::default());
+        let harness = AgentHarness::new(model.clone());
+        let recorded = std::sync::Mutex::new(Vec::new());
+        let turn = harness
+            .metered_turn(
+                turn_request(),
+                || async {
+                    // The check runs before the call.
+                    assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+                    Ok(())
+                },
+                |usage| {
+                    recorded.lock().unwrap().push(usage);
+                    async { Ok(true) }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(turn.usage, TokenUsage::new(7, 3));
+        assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let recorded = recorded.into_inner().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].model, "counted-1");
+        assert_eq!(
+            (recorded[0].input_tokens, recorded[0].output_tokens),
+            (7, 3)
+        );
+        assert_eq!(recorded[0].cost_micros, 20);
+    }
+
+    #[tokio::test]
+    async fn a_failed_ledger_write_keeps_the_paid_turn() {
+        let model = Arc::new(CountingModel::default());
+        let harness = AgentHarness::new(model.clone());
+        let turn = harness
+            .metered_turn(
+                turn_request(),
+                || async { Ok(()) },
+                |_| async { Err("ledger down".to_owned()) },
+            )
+            .await;
+        assert!(turn.is_ok(), "{turn:?}");
+        assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn retryable_kinds_are_marked_retryable() {

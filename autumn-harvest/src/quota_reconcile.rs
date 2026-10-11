@@ -360,6 +360,19 @@ fn registered_quota_policy(workflow_name: &str) -> Option<QuotaPolicy> {
         })
 }
 
+/// `true` when the sweep must backfill the key of a type with this policy.
+///
+/// A policy with only run LLM caps does not use the key (issue #1997). A
+/// start skips it, so the sweep skips it too. Otherwise an unresolvable key
+/// would keep each row of the type a candidate on every sweep.
+#[cfg(feature = "db")]
+const fn reconciles_key(quota: Option<crate::quota::QuotaPolicy>) -> bool {
+    match quota {
+        Some(policy) => policy.uses_key(),
+        None => false,
+    }
+}
+
 /// Names of every currently-registered workflow type declaring a
 /// [`QuotaPolicy`], anywhere in the process.
 ///
@@ -383,7 +396,7 @@ fn registered_quota_workflow_names() -> Vec<String> {
         .and_then(|lock| {
             lock.as_ref().map(|map| {
                 map.iter()
-                    .filter(|(_, meta)| meta.quota.is_some())
+                    .filter(|(_, meta)| reconciles_key(meta.quota))
                     .map(|(name, _)| name.clone())
                     .collect()
             })
@@ -697,6 +710,21 @@ pub fn spawn_quota_key_reconciler_for_shard(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_run_only_llm_policy_is_not_reconciled() {
+        use crate::quota::QuotaPolicy;
+
+        assert!(!reconciles_key(None));
+        assert!(reconciles_key(Some(QuotaPolicy::new("t"))));
+        assert!(reconciles_key(Some(
+            QuotaPolicy::new("t").with_max_tenant_llm_tokens(1)
+        )));
+        assert!(!reconciles_key(Some(
+            QuotaPolicy::new("t").with_max_run_llm_tokens(1)
+        )));
+    }
 
     // -- resolve_backfill ----------------------------------------------
 

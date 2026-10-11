@@ -49,12 +49,25 @@ struct ThrottleArgs {
     schedule_to_start: Option<String>,
 }
 
-/// Per-tenant resource quota (issue #946). `key` is required; each of the
-/// three caps is independently optional -- a policy may declare just one,
-/// two, or all three (mirroring `QuotaPolicy`'s own `with_*` builder chain).
+/// The LLM budget keys of `quota(...)` (issue #1997). Each maps to the
+/// `QuotaPolicy` builder of the same name with a `with_` prefix.
+const LLM_QUOTA_KEYS: [&str; 5] = [
+    "max_run_llm_tokens",
+    "max_run_llm_cost_micros",
+    "max_tenant_llm_tokens",
+    "max_tenant_llm_cost_micros",
+    "tenant_llm_window_secs",
+];
+
+/// Per-tenant resource quota (issue #946). `key` is required. Each admission
+/// cap and each LLM cap (issue #1997) is optional, as in the `with_*` builder
+/// chain of `QuotaPolicy`.
 struct QuotaArgs {
     key_expr: String,
     max_active_executions: Option<u32>,
+    /// The LLM caps and the tenant window (issue #1997), in the order of
+    /// [`LLM_QUOTA_KEYS`].
+    llm: [Option<u64>; 5],
     /// Already parsed at attribute-parse time via [`parse_byte_size_macro`]
     /// (e.g. `"10MiB"` -> `10_485_760`), mirroring `#[workflow(max_input_bytes
     /// = "8MiB")]`'s own compile-time byte-size validation -- a typo is a
@@ -112,7 +125,7 @@ struct WorkflowAttrs {
     /// Per-tenant resource quota (issue #946). Parsed from
     /// `#[workflow(quota(key = "input.tenant_id", max_active_executions = 100,
     /// max_history_bytes = "10MiB", max_dead_letters = 50))]`. `key` is
-    /// required; the three caps are each independently optional.
+    /// required. Each cap is optional.
     quota: Option<QuotaArgs>,
     /// Per-workflow-type cap override in bytes (issue #252). Parsed from
     /// `#[workflow(max_input_bytes = "8MiB")]` at compile time.
@@ -584,6 +597,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             });
             Ok(())
         } else if meta.path.is_ident("quota") {
+            let mut llm: [Option<u64>; 5] = [None; 5];
             let mut key_expr: Option<String> = None;
             let mut max_active_executions: Option<u32> = None;
             let mut max_history_bytes: Option<u64> = None;
@@ -625,9 +639,33 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
                     let n: u32 = value.base10_parse()?;
                     max_dead_letters = Some(n);
                     Ok(())
+                } else if let Some(slot) = LLM_QUOTA_KEYS
+                    .iter()
+                    .position(|name| inner.path.is_ident(name))
+                {
+                    let value: syn::LitInt = inner.value()?.parse()?;
+                    // The window is a `u32` of seconds. Each cap is a `u64`.
+                    llm[slot] = Some(if LLM_QUOTA_KEYS[slot] == "tenant_llm_window_secs" {
+                        let secs = value.base10_parse::<u32>()?;
+                        // A zero window counts no spend, so the tenant caps
+                        // would never refuse a step.
+                        if secs == 0 {
+                            return Err(syn::Error::new_spanned(
+                                &value,
+                                "quota `tenant_llm_window_secs` must be at least 1",
+                            ));
+                        }
+                        u64::from(secs)
+                    } else {
+                        value.base10_parse::<u64>()?
+                    });
+                    Ok(())
                 } else {
                     Err(inner.error(
-                        "expected `key`, `max_active_executions`, `max_history_bytes`, or `max_dead_letters`",
+                        "expected `key`, `max_active_executions`, `max_history_bytes`, \
+                         `max_dead_letters`, `max_run_llm_tokens`, `max_run_llm_cost_micros`, \
+                         `max_tenant_llm_tokens`, `max_tenant_llm_cost_micros`, or \
+                         `tenant_llm_window_secs`",
                     ))
                 }
             })?;
@@ -637,6 +675,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             result.quota = Some(QuotaArgs {
                 key_expr,
                 max_active_executions,
+                llm,
                 max_history_bytes,
                 max_dead_letters,
             });
@@ -1009,6 +1048,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Some(QuotaArgs {
             key_expr,
             max_active_executions,
+            llm,
             max_history_bytes,
             max_dead_letters,
         }) => {
@@ -1023,6 +1063,16 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
             if let Some(n) = max_dead_letters {
                 policy = quote! { #policy.with_max_dead_letters(#n) };
+            }
+            for (name, value) in LLM_QUOTA_KEYS.iter().zip(llm) {
+                let Some(value) = value else { continue };
+                let setter = quote::format_ident!("with_{}", name);
+                policy = if *name == "tenant_llm_window_secs" {
+                    let secs = u32::try_from(value).unwrap_or(u32::MAX);
+                    quote! { #policy.#setter(#secs) }
+                } else {
+                    quote! { #policy.#setter(#value) }
+                };
             }
             quote! { ::std::option::Option::Some(#policy) }
         }
