@@ -101,6 +101,18 @@ pub struct CheckError(String);
 pub fn check(manifest: &StructureManifest) -> Result<Vec<SagaReport>, CheckError> {
     check_header(Some(&manifest.format), manifest.flow.as_deref())?;
     for workflow in &manifest.workflows {
+        // A workflow with no body for its root checked no code.
+        let roots = workflow
+            .bodies
+            .iter()
+            .filter(|b| b.id == workflow.root)
+            .count();
+        if roots != 1 {
+            return Err(CheckError(format!(
+                "{}: {roots} bodies match the root `{}`, not 1",
+                workflow.workflow, workflow.root
+            )));
+        }
         for body in &workflow.bodies {
             if let Some(graph) = &body.flow {
                 validate(graph).map_err(|e| CheckError(format!("{}: {e}", body.id)))?;
@@ -492,6 +504,16 @@ mod tests {
         };
         let err = check(&manifest(stray_label)).expect_err("a label off a tracked step");
         assert!(err.to_string().contains("label"), "{err}");
+
+        let mut rootless = manifest(FlowGraph {
+            nodes: vec![node(FlowEvent::Entry)],
+            edges: Vec::new(),
+        });
+        if let Some(w) = rootless.workflows.first_mut() {
+            w.bodies.clear();
+        }
+        let err = check(&rootless).expect_err("no body matches the root");
+        assert!(err.to_string().contains("root"), "{err}");
 
         let no_entry = FlowGraph {
             nodes: vec![node(FlowEvent::SagaNew)],

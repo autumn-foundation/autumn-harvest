@@ -43,7 +43,12 @@ fn verdict<'a>(all: &'a [WorkflowVerdict], name: &str) -> &'a Verdict {
 #[test]
 fn a_clock_read_in_a_saga_step_block_is_found() {
     let all = verdicts();
-    for name in ["wf_saga_clock", "wf_saga_async_fn", "wf_step_named_future"] {
+    for name in [
+        "wf_saga_clock",
+        "wf_saga_async_fn",
+        "wf_step_named_future",
+        "wf_step_mut_ref_future",
+    ] {
         assert!(
             matches!(verdict(&all, name), Verdict::NondeterminismFound { .. }),
             "{name}: {:?}",

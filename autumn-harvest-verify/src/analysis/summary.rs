@@ -1811,7 +1811,8 @@ impl<'a> Analyzer<'a> {
         block: &str,
         out: &mut TaintSet,
     ) -> bool {
-        let ty = body.return_ty.trim();
+        // `&mut F`, `Pin<&mut F>` and `Box<F>` forward `Future` to `F`.
+        let ty = future_target(body.return_ty.trim());
         if ty.is_empty() || ty.starts_with('&') || ty.starts_with('(') {
             return false;
         }
@@ -2819,6 +2820,32 @@ fn may_write_through(ty: &str, interior: &[&str]) -> bool {
     !ty.starts_with('&') && ty.contains('\'')
 }
 
+/// The type whose `Future` impl a returned value forwards to. `&mut F`,
+/// `Pin<&mut F>`, `Pin<Box<F>>` and `Box<F>` all forward to `F`.
+fn future_target(ty: &str) -> &str {
+    let mut ty = ty.trim();
+    loop {
+        let inner = ty
+            .strip_prefix("&mut ")
+            .or_else(|| wrapper_inner(ty, "Pin"))
+            .or_else(|| wrapper_inner(ty, "Box"));
+        match inner {
+            Some(inner) => ty = inner.trim(),
+            None => return ty,
+        }
+    }
+}
+
+/// `T` of `W<T>` or of `path::W<T>`.
+fn wrapper_inner<'t>(ty: &'t str, wrapper: &str) -> Option<&'t str> {
+    let open = ty.find('<')?;
+    let head = ty.get(..open)?;
+    if head != wrapper && !head.ends_with(&format!("::{wrapper}")) {
+        return None;
+    }
+    ty.get(open.saturating_add(1)..)?.strip_suffix('>')
+}
+
 /// The label of the block that writes the return place `_0`, or `bb0`.
 fn returning_block(body: &Body) -> String {
     body.blocks
@@ -2902,6 +2929,17 @@ fn source_hint(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_forwarding_wrapper_names_its_future() {
+        assert_eq!(future_target("&mut ClockFuture"), "ClockFuture");
+        assert_eq!(future_target("Pin<&mut ClockFuture>"), "ClockFuture");
+        assert_eq!(
+            future_target("std::pin::Pin<std::boxed::Box<ClockFuture>>"),
+            "ClockFuture"
+        );
+        assert_eq!(future_target("Result<u64, String>"), "Result<u64, String>");
+    }
 
     #[test]
     fn a_capture_that_can_hold_a_mut_ref_may_write_through() {

@@ -287,3 +287,15 @@ pub async fn wf_step_named_write_future(ctx: &WorkflowContext) -> Out {
     }
     ctx.execute_activity_raw("b", seen).await
 }
+
+pub fn __autumn_workflow_info_wf_step_mut_ref_future() -> u8 {
+    0
+}
+
+/// The step closure returns `&mut F` for a first-party future `F`.
+pub async fn wf_step_mut_ref_future(ctx: &WorkflowContext) -> Out {
+    let mut fut = ClockFuture;
+    let mut saga = Saga::new(ctx);
+    let a = saga.step(|| &mut fut, |_| async { Ok(()) }).await?;
+    ctx.execute_activity_raw("b", a).await
+}
