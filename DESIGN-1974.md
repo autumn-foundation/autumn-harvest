@@ -34,7 +34,7 @@ an opt-in durable mode. The best-effort mode stays the default.
 | R6 | Fill the disk with a publish loop. | A per-execution cap of 10,000 chunks, at most about 70 MB. Overflow drops the newest and stores one terminal marker. |
 | R7 | Exceed the Postgres limit of 65,535 bind parameters. | The store inserts in batches of 1,000 rows. |
 | R8 | Hold a pooled connection while a slow client reads. | The producer releases the connection before it sends a page. |
-| R9 | Leave rows after retention, erasure or a shard move. | `ON DELETE CASCADE`, an erasure delete, and the shard-rebalance copy list. The append locks the run row `FOR KEY SHARE` and stores nothing after an erasure, so a stale inline write cannot restore erased output. |
+| R9 | Leave rows after retention, erasure or a shard move. | `ON DELETE CASCADE`, an erasure delete, and the shard-rebalance copy list. The append locks the run row `FOR KEY SHARE` and stores nothing for a terminal or erased run, so a stale inline write cannot restore erased output. |
 | R10 | Change replay. | The context reads nothing back. During replay the call claims an offset and pushes no command. |
 | R11 | Mix offsets of the two modes in one SSE stream. | Each mode has its own route and its own `NOTIFY` channel. |
 | R12 | Break today's best-effort callers. | `publish_progress` and `GET /stream` do not change. |
@@ -42,6 +42,7 @@ an opt-in durable mode. The best-effort mode stays the default.
 | R14 | Hold a `LISTEN` connection for a finished run. | A run that is terminal at connect gets its chunks and `event: end` with no `LISTEN`. |
 | R15 | Treat live code as replay. A signal that waits at the cursor makes the raw cursor check report replay, so the chunks before `wait_for_signal` are lost. | The durable gate skips such events, as `prepare_match` does, but it only reads the matcher. It moves no cursor, so later code sees the same `ctx.is_replaying()`. Unit tests and an SSE test cover a signal that arrives before the first cycle. |
 | R16 | Lose chunks in a shard move. A decision between verification and cutover can store chunks and park with no new event, so the history guard passes. | Activation copies every source chunk, with `ON CONFLICT DO NOTHING`. A re-run can fill an offset below the target's highest one, so a high-water mark is not enough. The source is sealed then, so no later chunk can appear. The copy runs only when activation moves the target to `RUNNING`: a terminated copy can be erased, and a copy would restore erased output. |
+| R17 | Write to a demoted database. A stale worker in a fenced region stores chunks on the inline path, so a later failback finds divergent output. | The append asserts `replication::assert_fence` in its own transaction, as an event append does. A fenced worker gets `ShardFenced` and stores nothing. |
 
 ### 0.3 Six thinking hats
 

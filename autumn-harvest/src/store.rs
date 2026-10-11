@@ -2858,7 +2858,8 @@ pub struct DurableStreamChunk {
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] if a statement fails.
+/// Returns [`HarvestError::ShardFenced`] if the DR fence rejects this
+/// process. Returns [`HarvestError::Database`] if a statement fails.
 pub async fn append_stream_chunks(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -2884,6 +2885,11 @@ async fn append_stream_chunks_in_tx(
     max_chunks: u32,
 ) -> HarvestResult<usize> {
     use crate::schema::harvest_stream_chunks::dsl;
+
+    // Cross-region DR fence (see `replication::assert_fence`). It runs in this
+    // transaction, so a fence cannot commit between the check and the insert.
+    // The inline paths call this on a bare connection, so the check is here.
+    crate::replication::assert_fence(conn, exec_id.shard()).await?;
 
     // Serialize with a terminal write and with PII erasure. Both hold the
     // run's row `FOR UPDATE`, so this `FOR KEY SHARE` read waits for them.

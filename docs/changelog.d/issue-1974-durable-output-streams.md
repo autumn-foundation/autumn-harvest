@@ -25,8 +25,9 @@ streaming needs a stream that a client can resume at any offset.
 - Cap: 10,000 chunks per execution, then one terminal marker at offset
   `i64::MAX`. The 7,000-byte chunk cap of the best-effort mode applies.
 - PII erasure deletes the chunks and reports `stream_chunks_deleted`. The
-  append reads the run with `FOR KEY SHARE` and stores nothing after an
-  erasure, so a stale inline write cannot restore erased output. A shard
+  append reads the run with `FOR KEY SHARE` and stores nothing for a terminal
+  or erased run, so a stale inline write cannot restore erased output. The
+  append also asserts the cross-region DR fence in its own transaction. A shard
   rebalance copies them at staging. Activation copies the source chunks again,
   so a chunk stored after verification is not lost. `ON DELETE CASCADE` ties them to the execution.
 - `TestRunOutcome::recorded_durable_progress()` returns the chunks of a no-DB

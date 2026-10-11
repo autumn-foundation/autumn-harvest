@@ -252,9 +252,11 @@ same transaction as the decision cycle. The table is not `harvest_events`.
 - **Append-only invariant.** The change does not write `harvest_events`. No new
   `WorkflowEvent` variant.
 - **Retention.** Rows have `ON DELETE CASCADE` on the execution. PII erasure
-  deletes them and reports `stream_chunks_deleted`. An append after an
-  erasure stores nothing, so a stale worker cannot restore erased output. A
-  shard rebalance copies them.
+  deletes them and reports `stream_chunks_deleted`. An append to a terminal
+  or erased run stores nothing, so a stale worker cannot restore erased
+  output. A shard rebalance copies them.
+- **DR fence.** The append asserts the cross-region write fence in its own
+  transaction, as an event append does. A fenced worker stores no chunk.
 - **Tenant binding.** A tenant-bound token can read the durable stream of a
   run of its own tenant. The route is in `TENANT_SCOPED_ROUTES`. Another
   tenant's run answers `404`.
