@@ -64,12 +64,23 @@ pub struct PollReport {
 }
 
 /// One page of the scan.
+/// One row of the page query: token, run, token time, database time.
+type PageRow = (
+    uuid::Uuid,
+    uuid::Uuid,
+    chrono::DateTime<chrono::Utc>,
+    chrono::DateTime<chrono::Utc>,
+);
+
 struct Page {
     items: Vec<PendingRemoteTask>,
     /// The last token that the query returned, decoded or not.
     last: Option<ExternalActivityToken>,
     /// `true` when the query returned a full page.
     full: bool,
+    /// The database time of the query. The first-read wait uses it, so
+    /// both sides of the compare use one clock.
+    db_now: chrono::DateTime<chrono::Utc>,
 }
 
 /// `first` with "no row" as `None`.
@@ -99,6 +110,7 @@ async fn pending_page(
             harvest_external_tasks::token,
             harvest_external_tasks::workflow_exec_id,
             harvest_external_tasks::created_at,
+            diesel::dsl::sql::<diesel::sql_types::Timestamptz>("now()"),
         ))
         .order(harvest_external_tasks::token.asc())
         .limit(limit)
@@ -106,14 +118,17 @@ async fn pending_page(
     if let Some(after) = after {
         query = query.filter(harvest_external_tasks::token.gt(after.as_uuid()));
     }
-    let rows: Vec<(uuid::Uuid, uuid::Uuid, chrono::DateTime<chrono::Utc>)> =
-        query.load(conn).await.map_err(database_error)?;
+    let rows: Vec<PageRow> = query.load(conn).await.map_err(database_error)?;
+    let db_now = rows
+        .as_slice()
+        .first()
+        .map_or_else(chrono::Utc::now, |row| row.3);
     let full = i64::try_from(rows.len()).is_ok_and(|n| n >= limit);
     let last = rows
         .last()
-        .map(|(token, _, _)| ExternalActivityToken::from_uuid(*token));
+        .map(|(token, ..)| ExternalActivityToken::from_uuid(*token));
     let mut items = Vec::with_capacity(rows.len());
-    for (token, exec, recorded_at) in rows {
+    for (token, exec, recorded_at, _) in rows {
         let token = ExternalActivityToken::from_uuid(token);
         let execution_id = ExecutionId::from_uuid(exec);
         match load_handle(conn, codecs, execution_id, token).await {
@@ -138,7 +153,12 @@ async fn pending_page(
             }
         }
     }
-    Ok(Page { items, last, full })
+    Ok(Page {
+        items,
+        last,
+        full,
+        db_now,
+    })
 }
 
 /// Read the handle from the `ActivityAwaitingExternal` event of `token`.
@@ -323,6 +343,23 @@ struct Backoff {
     until: Instant,
 }
 
+/// Record the wait of `token`. A full map first drops its expired waits.
+/// When it is still full, a new token gets no wait, and no live wait is lost.
+fn record_wait(
+    waits: &mut HashMap<ExternalActivityToken, Backoff>,
+    token: ExternalActivityToken,
+    entry: Backoff,
+    now: Instant,
+) {
+    if waits.len() >= MAX_BACKOFF_ENTRIES && !waits.contains_key(&token) {
+        waits.retain(|_, wait| wait.until > now);
+        if waits.len() >= MAX_BACKOFF_ENTRIES {
+            return;
+        }
+    }
+    waits.insert(token, entry);
+}
+
 /// Polls pending remote tasks and settles the ones that ended.
 ///
 /// Run one poller for each shard pool. Two pollers on one shard are safe:
@@ -452,12 +489,13 @@ impl RemoteTaskPoller {
             if page.full { page.last } else { None };
 
         let now = Instant::now();
+        let db_now = page.db_now;
         let due: Vec<PendingRemoteTask> = {
             let backoff = self.backoff.lock().unwrap_or_else(PoisonError::into_inner);
             page.items
                 .into_iter()
                 .filter(|p| backoff.get(&p.token).is_none_or(|b| b.until <= now))
-                .filter(Self::first_read_due)
+                .filter(|p| Self::first_read_due(p, db_now))
                 .collect()
         };
         let mut report = PollReport {
@@ -542,9 +580,6 @@ impl RemoteTaskPoller {
 
     fn back_off(&self, token: ExternalActivityToken) {
         let mut backoff = self.backoff.lock().unwrap_or_else(PoisonError::into_inner);
-        if backoff.len() >= MAX_BACKOFF_ENTRIES {
-            backoff.clear();
-        }
         let errors = backoff
             .get(&token)
             .map_or(1, |b| b.errors.saturating_add(1));
@@ -552,25 +587,26 @@ impl RemoteTaskPoller {
             .interval
             .saturating_mul(1_u32 << errors.min(16))
             .min(MAX_BACKOFF);
-        backoff.insert(
-            token,
-            Backoff {
-                errors,
-                until: Instant::now() + delay,
-            },
-        );
+        let now = Instant::now();
+        let entry = Backoff {
+            errors,
+            until: now + delay,
+        };
+        record_wait(&mut backoff, token, entry, now);
+        drop(backoff);
     }
 
-    /// `false` while the start poll interval of `pending` runs. The token
-    /// time is in the database, so a restart keeps the wait.
-    fn first_read_due(pending: &PendingRemoteTask) -> bool {
+    /// `false` while the start poll interval of `pending` runs at the
+    /// database time `db_now`. The token time is in the database, so a
+    /// restart keeps the wait.
+    fn first_read_due(pending: &PendingRemoteTask, db_now: chrono::DateTime<chrono::Utc>) -> bool {
         let Some(wait) = pending.handle.poll_interval_ms.map(Duration::from_millis) else {
             return true;
         };
         chrono::Duration::from_std(wait.min(MAX_SERVER_POLL_INTERVAL))
             .ok()
             .and_then(|wait| pending.recorded_at.checked_add_signed(wait))
-            .is_none_or(|due| chrono::Utc::now() >= due)
+            .is_none_or(|due| db_now >= due)
     }
 
     /// Respect the poll interval of the server, when it is longer than ours.
@@ -579,17 +615,14 @@ impl RemoteTaskPoller {
             self.clear_backoff(token);
             return;
         };
+        let now = Instant::now();
+        let entry = Backoff {
+            errors: 0,
+            until: now + interval.min(MAX_SERVER_POLL_INTERVAL),
+        };
         let mut waits = self.backoff.lock().unwrap_or_else(PoisonError::into_inner);
-        if waits.len() >= MAX_BACKOFF_ENTRIES {
-            waits.clear();
-        }
-        waits.insert(
-            token,
-            Backoff {
-                errors: 0,
-                until: Instant::now() + interval.min(MAX_SERVER_POLL_INTERVAL),
-            },
-        );
+        record_wait(&mut waits, token, entry, now);
+        drop(waits);
     }
 
     fn clear_backoff(&self, token: ExternalActivityToken) {
@@ -624,7 +657,70 @@ impl RemoteTaskPoller {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_MESSAGE_BYTES, truncate};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    use super::{
+        Backoff, MAX_BACKOFF_ENTRIES, MAX_MESSAGE_BYTES, PendingRemoteTask, RemoteTaskPoller,
+        record_wait, truncate,
+    };
+    use crate::remote_task::{RemoteProtocol, RemoteTaskHandle};
+    use crate::types::{ExecutionId, ExternalActivityToken};
+
+    fn full_map(until: Instant) -> HashMap<ExternalActivityToken, Backoff> {
+        (0..MAX_BACKOFF_ENTRIES)
+            .map(|_| (ExternalActivityToken::new(), Backoff { errors: 1, until }))
+            .collect()
+    }
+
+    #[test]
+    fn a_full_map_keeps_its_live_waits() {
+        let now = Instant::now();
+        let mut waits = full_map(now + Duration::from_secs(60));
+        let token = ExternalActivityToken::new();
+        let entry = Backoff {
+            errors: 0,
+            until: now + Duration::from_secs(60),
+        };
+        record_wait(&mut waits, token, entry, now);
+        assert_eq!(waits.len(), MAX_BACKOFF_ENTRIES, "no live wait is dropped");
+        assert!(!waits.contains_key(&token));
+    }
+
+    #[test]
+    fn a_full_map_drops_its_expired_waits() {
+        let now = Instant::now();
+        let mut waits = full_map(now);
+        let token = ExternalActivityToken::new();
+        let entry = Backoff {
+            errors: 0,
+            until: now + Duration::from_secs(60),
+        };
+        record_wait(&mut waits, token, entry, now);
+        assert_eq!(waits.len(), 1);
+        assert!(waits.contains_key(&token));
+    }
+
+    #[test]
+    fn the_first_read_uses_the_database_clock() {
+        // A database clock one day ahead of this host.
+        let recorded_at = chrono::Utc::now() + chrono::Duration::days(1);
+        let pending = PendingRemoteTask {
+            token: ExternalActivityToken::new(),
+            execution_id: ExecutionId::new(),
+            handle: RemoteTaskHandle {
+                server: "reports".into(),
+                protocol: RemoteProtocol::Mcp,
+                task_id: "t-1".into(),
+                poll_interval_ms: Some(5_000),
+            },
+            recorded_at,
+        };
+        let early = recorded_at + chrono::Duration::seconds(4);
+        let late = recorded_at + chrono::Duration::seconds(6);
+        assert!(!RemoteTaskPoller::first_read_due(&pending, early));
+        assert!(RemoteTaskPoller::first_read_due(&pending, late));
+    }
 
     #[test]
     fn truncate_cuts_on_a_char_boundary() {
