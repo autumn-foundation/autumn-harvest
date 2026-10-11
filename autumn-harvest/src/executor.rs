@@ -1072,10 +1072,17 @@ pub async fn run_workflow_with_context(
 /// everything it touches: the ungated [`ReplayDeclarativeHandlers`] and
 /// [`ReplayPayloadLimits`] structs, and the ungated
 /// `WorkflowContext::register_declarative_{query,update}_handler` it calls.
+///
+/// It also installs the candidate's shard router, when there is one. A fresh
+/// child spawn with a non-default placement needs it (issue #1995).
 pub(crate) fn register_declarative_handlers(
-    ctx: &WorkflowContext,
+    ctx: WorkflowContext,
     handlers: ReplayDeclarativeHandlers<'_>,
-) {
+) -> WorkflowContext {
+    let ctx = match handlers.router {
+        Some(router) => ctx.with_shard_router(router.clone()),
+        None => ctx,
+    };
     let wf_name = ctx.workflow_type();
     for h in handlers.queries.iter().filter(|h| h.workflow == wf_name) {
         ctx.register_declarative_query_handler(h);
@@ -1083,6 +1090,7 @@ pub(crate) fn register_declarative_handlers(
     for h in handlers.updates.iter().filter(|h| h.workflow == wf_name) {
         ctx.register_declarative_update_handler(h);
     }
+    ctx
 }
 
 /// The candidate build's declarative `#[query]` / `#[update]` handlers, carried
@@ -1112,6 +1120,9 @@ pub struct ReplayDeclarativeHandlers<'a> {
     pub queries: &'a [&'a crate::info::QueryHandlerInfo],
     /// Declarative update handlers to register before the workflow body runs.
     pub updates: &'a [&'a crate::info::UpdateHandlerInfo],
+    /// The candidate worker's shard router. `None` leaves the context on the
+    /// process-global router, as before.
+    pub router: Option<&'a crate::shard::ShardRouter>,
 }
 
 /// The **candidate** worker's payload limits, applied to a replay context.
@@ -1261,7 +1272,7 @@ pub async fn run_workflow_strict(
     // Mirror the live worker: register declarative handlers before any workflow
     // code runs, so a body that branches on `ctx.list_query_names()` sees the
     // candidate's registrations rather than an empty registry.
-    register_declarative_handlers(&ctx, declarative_handlers);
+    let ctx = register_declarative_handlers(ctx, declarative_handlers);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
 
@@ -1332,7 +1343,7 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
     // Mirror the live worker: register declarative handlers before any workflow
     // code runs, so a body that branches on `ctx.list_query_names()` sees the
     // candidate's registrations rather than an empty registry.
-    register_declarative_handlers(&ctx, declarative_handlers);
+    let ctx = register_declarative_handlers(ctx, declarative_handlers);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
 
@@ -1653,7 +1664,7 @@ pub(crate) async fn run_workflow_canary(
     // Mirror the live worker: register declarative handlers before any workflow
     // code runs, so a body that branches on `ctx.list_query_names()` sees the
     // candidate's registrations rather than an empty registry.
-    register_declarative_handlers(&ctx, declarative_handlers);
+    let ctx = register_declarative_handlers(ctx, declarative_handlers);
 
     let span = tracing::info_span!(
         "harvest.workflow.execute",

@@ -73,7 +73,6 @@ reduction:index@HashMap
 reduction:insert@HashSet
 reduction:is_empty
 reduction:len@HashSet
-reduction:min
 reduction:product
 reduction:remove@HashMap
 reduction:remove@HashSet
@@ -110,7 +109,11 @@ sink:execute_activity_fan_out_collect@WorkflowContext
 sink:execute_activity_fan_out_collect_raw@WorkflowContext
 sink:execute_activity_fan_out_collect_raw_windowed@WorkflowContext
 sink:execute_activity_fan_out_collect_windowed@WorkflowContext
+# Issue #1986: the fan-out helpers with options. No corpus workflow calls them
+# yet, as for the other fan-out helpers in this list.
+sink:execute_activity_fan_out_raw_with@WorkflowContext
 sink:execute_activity_fan_out_windowed@WorkflowContext
+sink:execute_activity_fan_out_with@WorkflowContext
 sink:execute_activity_raw@Session
 sink:execute_activity_raw_with_opts@WorkflowContext
 sink:execute_activity_with_opts@WorkflowContext
@@ -124,7 +127,6 @@ sink:mutex@WorkflowContext
 sink:patched@WorkflowContext
 sink:race@WorkflowContext
 sink:random_f64@WorkflowContext
-sink:receive_signal@WorkflowContext
 sink:receive_signal_timeout@WorkflowContext
 sink:release@MutexGuard
 sink:request_cancel_external_workflow@WorkflowContext

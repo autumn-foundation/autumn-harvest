@@ -1,0 +1,6 @@
+{"spec":"WorkflowTaskClaim","case":"injected: the stale cycle (w1, 1) closes the run that (w1, 2) holds (issue #1806)","checks":{"fixed":"reject@6","pre-fix":"accept"}}
+{"op":"init","state":"PENDING","worker":null,"attempt":0,"strikes":0,"terminal":0,"actor":null}
+{"op":"write","state":"RUNNING","worker":"w1","attempt":1,"strikes":0,"terminal":0,"actor":null}
+{"op":"write","state":"PENDING","worker":null,"attempt":1,"strikes":0,"terminal":0,"actor":null}
+{"op":"write","state":"RUNNING","worker":"w1","attempt":2,"strikes":0,"terminal":0,"actor":null}
+{"op":"write","state":"COMPLETED","worker":"w1","attempt":2,"strikes":0,"terminal":1,"actor":{"worker":"w1","attempt":1}}

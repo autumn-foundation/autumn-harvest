@@ -22,6 +22,7 @@ pub mod model;
 pub mod pipeline;
 pub mod report;
 pub mod resolve;
+pub mod structure;
 mod util;
 pub mod verdict;
 
@@ -131,6 +132,10 @@ pub struct Cli {
     /// Print every analysis boundary name, one per line, and exit 0.
     #[arg(long)]
     pub list_boundaries: bool,
+    /// Write the structure manifest of every workflow to this file (issue #1995).
+    /// `autumn_harvest::upgrade_check` diffs two of them, one per build.
+    #[arg(long, value_name = "FILE")]
+    pub emit_structure: Option<std::path::PathBuf>,
 }
 
 /// CLI entry: parses `argv` (tolerating the `harvest-verify` subcommand token cargo inserts),
@@ -173,6 +178,12 @@ pub fn cli_main(argv: Vec<String>) -> i32 {
                     }
                 },
             };
+            if let Some(path) = &cli.emit_structure
+                && let Err(e) = write_structure(path, &report)
+            {
+                eprintln!("error: {e}");
+                return 2;
+            }
             println!("{rendered}");
             if cli.report {
                 let summary = report.summary();
@@ -192,6 +203,19 @@ pub fn cli_main(argv: Vec<String>) -> i32 {
             2
         }
     }
+}
+
+/// Write the structure manifest of `report` to `path`.
+fn write_structure(path: &std::path::Path, report: &Report) -> Result<()> {
+    let manifest = report.structure.clone().unwrap_or_default();
+    let json = serde_json::to_string_pretty(&manifest).map_err(|e| Error::Io {
+        path: path.display().to_string(),
+        source: std::io::Error::other(e),
+    })?;
+    std::fs::write(path, json).map_err(|e| Error::Io {
+        path: path.display().to_string(),
+        source: e,
+    })
 }
 
 /// Validate the inputs the CLI owns, then hand off to [`verify`].
@@ -232,6 +256,7 @@ fn run(cli: &Cli) -> Result<Report> {
         source_roots: cli.source_root.clone(),
         mir_paths: cli.mir.clone(),
         strict: cli.strict,
+        emit_structure: cli.emit_structure.is_some(),
     };
     verify(&build, &opts)
 }
@@ -263,6 +288,8 @@ pub struct Options {
     /// `unknown` verdicts, unused allowlist entries and a run that discovered
     /// no workflow at all fail the run.
     pub strict: bool,
+    /// Build the structure manifest into [`Report::structure`] (issue #1995).
+    pub emit_structure: bool,
 }
 
 /// End-to-end: emit MIR for `build` (unless `opts.mir_paths` covers everything and

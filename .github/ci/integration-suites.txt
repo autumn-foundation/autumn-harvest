@@ -46,6 +46,7 @@
 # per-suite `cargo test` runs CI executes. One suite per line. Read by
 # two PRs each appending a line both land with no textual conflict; a
 # union-merge duplicate/reorder is caught (never a conflict) by
+allos        autumn-harvest         integration                      -                          assay_rerun_docs
 allos        autumn-harvest         integration                      -                          benchmarks_docs
 allos        autumn-harvest         integration                      -                          hot_code_swap_docs
 allos        autumn-harvest         integration                      -                          lock_order_docs
@@ -124,10 +125,12 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          drain_release_tests
 linux        autumn-harvest         integration                      -                          dst_differential_tests
 linux        autumn-harvest         integration                      -                          durable_stream_tests
+linux        autumn-harvest         integration                      -                          dst_world_tests
 linux        autumn-harvest         integration                      -                          entity_tests
 linux        autumn-harvest         integration                      -                          event_batch_tests
 linux        autumn-harvest         integration                      -                          event_partitioning_tests
 linux        autumn-harvest         integration                      -                          external_outbox_scan_tests
+linux        autumn-harvest         integration                      -                          fanout_result_writer_db_tests
 linux        autumn-harvest         integration                      -                          force_fail
 linux        autumn-harvest         integration                      -                          history_ceiling_claim_tests
 linux        autumn-harvest         integration                      -                          history_crash_tests
@@ -242,6 +245,7 @@ linux        autumn-harvest         integration                      testing    
 linux        autumn-harvest         integration                      testing                    scheduler_carryover_tests
 linux        autumn-harvest         integration                      testing                    shard_rebalance_db_tests
 linux        autumn-harvest         integration                      testing                    transactional_activity_tests
+linux        autumn-harvest         integration                      testing                    upgrade_check_db_tests
 linux        autumn-harvest         integration                      testing                    worker_session_tests
 linux        autumn-harvest         integration                      wasm-activities            wasm_activities_tests
 linux        autumn-harvest-plugin  activity_info_api_integration    -                          -
@@ -283,6 +287,7 @@ linux        autumn-harvest-plugin  interface_schema_integration     -          
 linux        autumn-harvest-plugin  legal_hold_integration           -                          -
 linux        autumn-harvest-plugin  lineage_tree_integration         -                          -
 linux        autumn-harvest-plugin  load_shed_localpg                -                          -
+linux        autumn-harvest-plugin  mcp_tasks_integration            mcp,unified-dag-execution  -
 linux        autumn-harvest-plugin  mcp_tools_integration            mcp,unified-dag-execution  -
 linux        autumn-harvest-plugin  openapi_response_conformance     -                          -
 linux        autumn-harvest-plugin  outbox_integration               -                          -

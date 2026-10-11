@@ -3223,6 +3223,39 @@ fn parse_schedule_from_expr(expr: &str) -> Option<Schedule> {
     )
 }
 
+/// The workflow schedules due at `now`, oldest slot first.
+///
+/// The tick fires each of them through
+/// [`claim_and_fire_workflow_schedule`]. The world simulation of issue #2002
+/// reads the due list with this function too, so its scan cannot drift
+/// from the tick.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] when the read fails.
+#[doc(hidden)]
+pub async fn due_workflow_schedules(
+    conn: &mut AsyncPgConnection,
+    now: DateTime<Utc>,
+) -> HarvestResult<Vec<HarvestSchedule>> {
+    use crate::schema::harvest_schedules::dsl;
+
+    dsl::harvest_schedules
+        .filter(dsl::workflow_name.is_not_null())
+        .filter(dsl::is_paused.eq(false))
+        // Auto-paused schedules (issue #360) are excluded from the due list.
+        .filter(dsl::auto_paused_at.is_null())
+        // Exhausted schedules (issue #478) are permanently terminal — never re-fire.
+        .filter(dsl::exhausted_at.is_null())
+        .filter(dsl::next_run_at.is_not_null())
+        .filter(dsl::next_run_at.le(now))
+        .order(dsl::next_run_at.asc())
+        .select(HarvestSchedule::as_select())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn tick_workflow_schedules(
     conn: &mut AsyncPgConnection,
@@ -3236,20 +3269,7 @@ async fn tick_workflow_schedules(
 
     let now = Utc::now();
 
-    let due: Vec<HarvestSchedule> = dsl::harvest_schedules
-        .filter(dsl::workflow_name.is_not_null())
-        .filter(dsl::is_paused.eq(false))
-        // Auto-paused schedules (issue #360) are excluded from the due list.
-        .filter(dsl::auto_paused_at.is_null())
-        // Exhausted schedules (issue #478) are permanently terminal — never re-fire.
-        .filter(dsl::exhausted_at.is_null())
-        .filter(dsl::next_run_at.is_not_null())
-        .filter(dsl::next_run_at.le(now))
-        .order(dsl::next_run_at.asc())
-        .select(HarvestSchedule::as_select())
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let due = due_workflow_schedules(conn, now).await?;
 
     for schedule in due {
         let Some(ref wf_name) = schedule.workflow_name else {

@@ -310,26 +310,34 @@ where one exists.
   operation has no reply, so a caller reads state with a query. A Restate
   virtual object call returns a result. An Azure durable entity call made from
   an orchestration also returns one.
-- **No cross-engine benchmark on equal hardware.** harvest now publishes its
-  own reproducible end-to-end numbers and the harness that produces them
+- **Behind Temporal on throughput, on one measured box.** harvest publishes
+  its own reproducible end-to-end numbers and the harness that produces them
   ([`benchmarks.md`](benchmarks.md),
-  [#941](https://github.com/autumn-foundation/autumn-harvest/issues/941)), so
-  this page no longer has to omit performance entirely. What is still missing
-  is the thing a comparison page actually needs: **every engine measured on
-  one machine, each tuned by someone who operates it.** No cell on this page
-  claims a throughput or latency comparison against another engine, and none
-  will until that exists. A competitor's own published figure is not a
-  substitute — it carries hardware, configuration and staleness this project
-  cannot vouch for, and its unit is usually per-action or per-state-transition
-  rather than per-workflow.
+  [#941](https://github.com/autumn-foundation/autumn-harvest/issues/941)).
+  [Assay #14](assays/0014-harvest-vs-temporal-0.7.0-depth-sweep.md)
+  ([#1972](https://github.com/autumn-foundation/autumn-harvest/issues/1972))
+  measures harvest 0.7.0 against Temporal 1.25.2 on one 4-core box. Both
+  engines use one Postgres server and run a 3-activity workflow. Temporal
+  completed more workflows/sec at every backlog depth from 250 to 2,000:
 
-  One same-box measurement now exists, and it goes against harvest.
-  [Assay #11](assays/0011-harvest-vs-temporal-single-box.md) ran harvest's
-  Postgres mode and Temporal's Go SDK on one 4-core box, against one Postgres
-  server, at one 3-activity shape. Harvest sustained 5.47 workflows/sec.
-  Temporal sustained 43.29. That is one shape on one box, so the tables above
-  still carry no performance cell. Read the assay for what the result may and
-  may not be read to mean.
+  | harvest mode | Temporal ahead by |
+  |:--|--:|
+  | default (Postgres claim path), 0.7.0 | 1.78x to 7.17x |
+  | Redis dispatch, 0.7.0 | 1.74x to 2.10x |
+  | default, with the #1971 claim fix (PR #2052, merged to `trunk-dev`, not yet released) | 1.16x to 1.36x |
+
+  Without the claim fix, the default-mode gap grows sharply with backlog
+  depth. With it, harvest's own rate stays flat, and the gap grows only from
+  1.16x to 1.36x.
+
+  The bounds matter more than the ratios. It is one workflow shape on one
+  small box, with Temporal at its defaults and its four services sharing four
+  cores. That venue favours harvest, so a better-tuned Temporal could widen
+  the gap. A competitor's own published figure is not a substitute: its
+  hardware, configuration and unit (often per action) differ. The assay
+  states what the result may and may not be read to mean. Its predecessor,
+  [assay #11](assays/0011-harvest-vs-temporal-single-box.md), measured the
+  same shape on 0.6.x on another host.
 
 ---
 
@@ -389,3 +397,7 @@ Temporal-style Schedule object.
 - **[Why Harvest keeps deterministic replay](why-deterministic-replay.md)**
   ([#1993](https://github.com/autumn-foundation/autumn-harvest/issues/1993)):
   what replay buys over checkpoint-only steps, and how Harvest lowers its cost.
+- **[Safety report](safety-report.md)**
+  ([#2004](https://github.com/autumn-foundation/autumn-harvest/issues/2004)):
+  the claim, tests, results and known limits for leases, fencing,
+  exactly-once completion and signal ordering.

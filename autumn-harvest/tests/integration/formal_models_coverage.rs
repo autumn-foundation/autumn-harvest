@@ -280,7 +280,7 @@ fn model_runner_reads_the_manifest_and_pins_tlc() {
 /// The job must have the same `if:` as [`GATE_TEMPLATE_JOB`] and no
 /// `continue-on-error`. One ungated step must be one plain command that
 /// starts with `command`.
-fn formal_job_defect(doc: &Value, job: &str, command: &str) -> Option<String> {
+pub fn formal_job_defect(doc: &Value, job: &str, command: &str) -> Option<String> {
     let jobs = doc.get("jobs");
     let Some(node) = jobs.and_then(|j| j.get(job)) else {
         return Some(format!("ci.yml must define a `{job}` job"));

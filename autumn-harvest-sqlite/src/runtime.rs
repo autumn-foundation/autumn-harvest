@@ -1833,6 +1833,7 @@ fn apply_schedule_activity(
         session_id,
         session_worker_id,
         schedule_to_start_override,
+        result_writer,
         ..
     } = cmd
     else {
@@ -1850,6 +1851,13 @@ fn apply_schedule_activity(
         return Err(SqliteError::Unsupported(
             "ScheduleActivity.schedule_to_start_override — used only by the \
              session-acquire dispatch, which is outside the sqlite subset"
+                .to_string(),
+        ));
+    }
+    if *result_writer {
+        return Err(SqliteError::Unsupported(
+            "ScheduleActivity.result_writer — the fan-out result writer (issue #1986) \
+             needs a PayloadStore, which is outside the sqlite subset"
                 .to_string(),
         ));
     }
