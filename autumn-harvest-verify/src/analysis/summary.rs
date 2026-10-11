@@ -32,7 +32,7 @@ use crate::model::callee::CalleePath;
 use crate::model::{
     CallClass, CtxMethodRule, ForbiddenRule, Model, SanitizerRule, SinkRule, SourceRule,
 };
-use crate::resolve::{Ambiguity, Program, Resolution, Substitution};
+use crate::resolve::{Ambiguity, Program, Resolution, Substitution, is_coroutine_span};
 use crate::structure::{Recorder, SinkSite};
 use crate::util::{crate_root, last_segment, peel_refs, strip_generics_everywhere};
 use crate::verdict::{Boundary, BoundaryKind, Finding, FindingKind, Hop, Site, TaintKind};
@@ -1734,7 +1734,7 @@ impl<'a> Analyzer<'a> {
     }
 
     /// Analyze the `async` block that an invoked closure returns (issue
-    /// #2010).
+    /// #2010). The body of an `async` closure is followed the same way.
     ///
     /// The callee that invoked the closure also polls the future it returns.
     /// When that callee has no body here, as `Saga::step` has none, no poll
@@ -1758,10 +1758,10 @@ impl<'a> Analyzer<'a> {
         let block = returning_block(body);
         let interior = self.interior_types();
         let inner = brace_form(&body.return_ty)
-            .filter(|span| span.starts_with("{async block@") && span.contains(".rs:"));
+            .filter(|span| is_coroutine_span(span) && span.contains(".rs:"));
         // The block itself, behind `&mut`, `Pin` or `Box` at most, is polled
         // as it is. Any other type around it has a `poll` of its own.
-        if future_target(&body.return_ty).starts_with("{async block@") {
+        if is_coroutine_span(future_target(&body.return_ty)) {
             if let Some(span) = &inner {
                 self.follow_block(closure, span, &block, ret, hops, emit, out);
             }

@@ -1542,8 +1542,9 @@ fn closure_param_span(body: &Body) -> Option<String> {
     (ty.starts_with('{') && ty.contains('@') && ty.ends_with('}')).then(|| ty.to_string())
 }
 
-/// The `{async block@..}` span of a coroutine body, which takes
-/// `Pin<&mut {async block@..}>` as its first parameter (issue #2010).
+/// The `{async block@..}` or `{async closure body@..}` span of a coroutine
+/// body, which takes `Pin<&mut ..>` of it as its first parameter (issue
+/// #2010).
 fn coroutine_param_span(body: &Body) -> Option<String> {
     let (_, ty) = body.params.first()?;
     let inner = ty
@@ -1552,7 +1553,14 @@ fn coroutine_param_span(body: &Body) -> Option<String> {
         .or_else(|| ty.trim().strip_prefix("std::pin::Pin<"))?
         .strip_suffix('>')?;
     let inner = peel_refs(inner).trim().trim_start_matches("mut ").trim();
-    (inner.starts_with("{async block@") && inner.ends_with('}')).then(|| inner.to_string())
+    (is_coroutine_span(inner) && inner.ends_with('}')).then(|| inner.to_string())
+}
+
+/// The span of a coroutine that a closure can return: an `async` block, or
+/// the body of an `async` closure.
+#[must_use]
+pub fn is_coroutine_span(span: &str) -> bool {
+    span.starts_with("{async block@") || span.starts_with("{async closure body@")
 }
 
 /// `Box<dyn Jitter>` / `&dyn Jitter + Send` → `Jitter`.

@@ -200,7 +200,10 @@ each fix has a test:
   analysis can hold a second saga with a gap. Each boundary that runs code
   now gives `unknown`.
 - The check accepted a call to a body that the manifest omits. It now
-  refuses such a manifest.
+  refuses such a manifest, and a handler index past the list too.
+- The follow read only `{async block@..}`. An `async` closure step, whose
+  future is `{async closure body@..}`, was a false `proven-deterministic`.
+  It is now followed.
 
 ### Generics and third-party crates
 
@@ -295,7 +298,8 @@ crate its own `--target-dir`, and delete it after the run.
 | The check refuses a malformed or disconnected graph | `saga::tests::a_malformed_graph_is_refused` |
 | A local type named `Saga` is not the engine saga | `saga_graph::a_local_type_named_saga_is_not_the_engine_saga` |
 | A renamed or re-exported engine saga is still seen | `saga_graph::a_renamed_or_re_exported_engine_saga_is_still_seen` |
-| The check refuses a reference to a missing body | `saga::tests::a_reference_to_a_missing_body_is_refused` |
+| The check refuses a reference to a missing body or handler | `saga::tests::a_reference_to_a_missing_body_is_refused` |
+| A clock read in an `async` closure step is found | `async_block_follow::a_clock_read_in_a_saga_step_block_is_found` (`wf_step_async_closure`) |
 | A boundary that runs code is `unknown` beside a saga | `saga::tests::a_boundary_that_runs_code_is_unknown_beside_a_visible_saga` |
 | The check refuses an old manifest | `saga_graph::a_manifest_without_flow_graphs_is_refused`; `cli::check_structure_refuses_a_manifest_without_flow_graphs` |
 | The CLI exit codes | `cli::check_structure_prints_a_verdict_per_workflow_and_fails_on_a_gap`; `cli::check_structure_strict_fails_on_unknown` |

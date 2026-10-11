@@ -302,8 +302,9 @@ when the MIR shows it, and its closure `bodies`.
 
 A closure that returns an `async` block hands that future to its caller.
 When the caller has no body in the analysis, as `Saga::step` has none, the
-analysis follows the `async` block itself. So the steps inside a saga
-closure are in the graph. The analysis follows only a block that the
+analysis follows the `async` block itself. It follows the body of an
+`async` closure the same way. So the steps inside a saga closure are in the
+graph. The analysis follows only a block that the
 closure itself builds. A block that captures a `&mut` reference adds an
 `unresolved-callback` boundary, because its writes cannot reach the
 caller.

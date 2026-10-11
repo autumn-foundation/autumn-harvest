@@ -106,6 +106,11 @@ Four review agents read the first version. Each fix has a test.
     code gives `unknown`. An `external-const` does not count.
 13. A call to a body that the manifest omits was not checked. That body
     could hold the only saga. Such a manifest is now refused.
+14. The future of an `async` closure prints as `{async closure body@..}`.
+    The follow read only `{async block@..}`, so a clock read in an `async`
+    closure step was a false `proven-deterministic`. It is now followed.
+15. A `handler` node could name an index past the workflow `handlers`
+    list. Such a manifest is now refused.
 
 ---
 

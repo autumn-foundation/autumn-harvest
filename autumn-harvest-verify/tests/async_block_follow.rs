@@ -48,6 +48,7 @@ fn a_clock_read_in_a_saga_step_block_is_found() {
         "wf_saga_async_fn",
         "wf_step_named_future",
         "wf_step_mut_ref_future",
+        "wf_step_async_closure",
     ] {
         assert!(
             matches!(verdict(&all, name), Verdict::NondeterminismFound { .. }),
@@ -75,6 +76,7 @@ fn a_case_the_analysis_cannot_follow_is_never_proven() {
         "wf_step_wrapped_block",
         "wf_step_external_future",
         "wf_step_boxed_external",
+        "wf_step_async_closure",
     ] {
         assert!(
             !matches!(verdict(&all, name), Verdict::ProvenDeterministic),

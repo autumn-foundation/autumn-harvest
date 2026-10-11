@@ -120,20 +120,17 @@ pub fn check(manifest: &StructureManifest) -> Result<Vec<SagaReport>, CheckError
                 validate(graph).map_err(|e| CheckError(format!("{}: {e}", body.id)))?;
             }
         }
-        if let Some(missing) = missing_body(workflow) {
-            return Err(CheckError(format!(
-                "{}: a node or handler names `{missing}`, which has no body",
-                workflow.workflow
-            )));
+        if let Some(problem) = dangling_reference(workflow) {
+            return Err(CheckError(format!("{}: {problem}", workflow.workflow)));
         }
     }
     Ok(manifest.workflows.iter().map(check_workflow).collect())
 }
 
-/// The first body that a call, a saga step or a handler names, and that
-/// the workflow does not hold. That code is never checked, so it could
-/// hide a saga or a gap.
-fn missing_body(workflow: &WorkflowStructure) -> Option<&str> {
+/// The first reference that points at nothing. It is a body that a call, a
+/// saga step or a handler names, or a handler index past the list. That
+/// code is never checked, so it could hide a saga or a gap.
+fn dangling_reference(workflow: &WorkflowStructure) -> Option<String> {
     let ids: BTreeSet<&str> = workflow.bodies.iter().map(|b| b.id.as_str()).collect();
     let mut named: Vec<&String> = Vec::new();
     let graphs = workflow.bodies.iter().filter_map(|b| b.flow.as_ref());
@@ -145,6 +142,12 @@ fn missing_body(workflow: &WorkflowStructure) -> Option<&str> {
                 compensate,
                 ..
             } => named.extend(forward.iter().chain(compensate)),
+            FlowEvent::Handler { handler } if *handler >= workflow.handlers.len() => {
+                let count = workflow.handlers.len();
+                return Some(format!(
+                    "a node names handler {handler}, but the workflow has {count} handlers"
+                ));
+            }
             _ => {}
         }
     }
@@ -154,6 +157,7 @@ fn missing_body(workflow: &WorkflowStructure) -> Option<&str> {
         .chain(handlers)
         .map(String::as_str)
         .find(|id| !ids.contains(id))
+        .map(|missing| format!("a node or handler names `{missing}`, which has no body"))
 }
 
 /// Refuse a graph the fixpoint would read wrong. A dropped edge or a
@@ -626,6 +630,17 @@ mod tests {
         }
         let err = check(&handler).expect_err("a handler with a missing body");
         assert!(err.to_string().contains("w::on_signal"), "{err}");
+
+        // A handler node names an entry of `handlers` that is not there.
+        let dangling = FlowGraph {
+            nodes: vec![
+                node(FlowEvent::Entry),
+                node(FlowEvent::Handler { handler: 0 }),
+            ],
+            edges: vec![edge(0, 1, None)],
+        };
+        let err = check(&manifest(dangling)).expect_err("a handler index past the list");
+        assert!(err.to_string().contains("handler 0"), "{err}");
     }
 
     #[test]

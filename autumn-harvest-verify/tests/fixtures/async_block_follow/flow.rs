@@ -395,3 +395,14 @@ pub async fn wf_step_boxed_external(ctx: &WorkflowContext) -> Out {
         .await?;
     ctx.execute_activity_raw("b", a).await
 }
+
+pub fn __autumn_workflow_info_wf_step_async_closure() -> u8 {
+    0
+}
+
+/// The forward step is an `async` closure that reads the clock.
+pub async fn wf_step_async_closure(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let a = saga.step(async || Ok(now_nanos()), |_| async { Ok(()) }).await?;
+    ctx.execute_activity_raw("b", a).await
+}
