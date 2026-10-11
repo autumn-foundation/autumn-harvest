@@ -554,6 +554,35 @@ fn every_fixture_workflow_gets_its_expected_verdict() {
 }
 
 #[test]
+fn a_local_type_named_saga_is_not_the_engine_saga() {
+    let dir = fixture_dir().with_file_name("saga_graph_own");
+    let text = std::fs::read_to_string(dir.join("flow.mir")).expect("read");
+    let docs = vec![mir::parse("flow", "flow.mir", &text)];
+    let entries = entry::discover(&docs);
+    let program = Program::build(docs, &SourceRoots { roots: vec![dir] }).expect("build");
+    let model = Model::builtin().expect("the embedded model must parse");
+    let outcome = analysis::analyze_full(&program, &model, &entries);
+    let m = structure::manifest(&model.version, "rustc test", outcome.structures);
+    let w = workflow(&m, "wf_own_saga_type");
+    for b in &w.bodies {
+        assert!(
+            flow(b).nodes.iter().all(|n| !matches!(
+                n.event,
+                FlowEvent::SagaNew | FlowEvent::SagaStep { .. } | FlowEvent::SagaCompensate { .. }
+            )),
+            "{}: {:#?}",
+            b.id,
+            flow(b)
+        );
+    }
+    let reports = saga::check(&m).expect("check");
+    assert_eq!(
+        report(&reports, "wf_own_saga_type").verdict,
+        SagaVerdict::NoSaga
+    );
+}
+
+#[test]
 fn a_unit_result_is_an_ok_exit() {
     let reports = check();
     let r = report(&reports, "wf_unit");

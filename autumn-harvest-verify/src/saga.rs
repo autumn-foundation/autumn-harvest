@@ -100,7 +100,34 @@ pub struct CheckError(String);
 /// `no-saga`.
 pub fn check(manifest: &StructureManifest) -> Result<Vec<SagaReport>, CheckError> {
     check_header(Some(&manifest.format), manifest.flow.as_deref())?;
+    for workflow in &manifest.workflows {
+        for body in &workflow.bodies {
+            if let Some(graph) = &body.flow {
+                validate(graph).map_err(|e| CheckError(format!("{}: {e}", body.id)))?;
+            }
+        }
+    }
     Ok(manifest.workflows.iter().map(check_workflow).collect())
+}
+
+/// Refuse a graph the fixpoint would read wrong. A dropped edge or a
+/// missing entry would hide an exit, and so give a false `covered`.
+fn validate(graph: &FlowGraph) -> Result<(), String> {
+    let entries = count(graph, |e| matches!(e, FlowEvent::Entry));
+    if entries != 1 {
+        return Err(format!("the flow graph has {entries} entry nodes, not 1"));
+    }
+    let size = graph.nodes.len();
+    for edge in &graph.edges {
+        for end in [edge.from, edge.to] {
+            if end >= size {
+                return Err(format!(
+                    "an edge names node {end}, but the graph has {size} nodes"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Parse a manifest from JSON text.
@@ -399,6 +426,32 @@ mod tests {
             compensate: Vec::new(),
             tracked: true,
         }
+    }
+
+    fn manifest(graph: FlowGraph) -> StructureManifest {
+        StructureManifest {
+            format: STRUCTURE_FORMAT.to_string(),
+            flow: Some(FLOW_FORMAT.to_string()),
+            workflows: vec![workflow(graph)],
+            ..StructureManifest::default()
+        }
+    }
+
+    #[test]
+    fn a_malformed_graph_is_refused() {
+        let out_of_range = FlowGraph {
+            nodes: vec![node(FlowEvent::Entry), node(FlowEvent::SagaNew)],
+            edges: vec![edge(0, 1, None), edge(1, 7, None)],
+        };
+        let err = check(&manifest(out_of_range)).expect_err("edge to node 7");
+        assert!(err.to_string().contains("node 7"), "{err}");
+
+        let no_entry = FlowGraph {
+            nodes: vec![node(FlowEvent::SagaNew)],
+            edges: Vec::new(),
+        };
+        let err = check(&manifest(no_entry)).expect_err("no entry node");
+        assert!(err.to_string().contains("entry"), "{err}");
     }
 
     #[test]

@@ -1,0 +1,522 @@
+// WARNING: This output format is intended for human consumers only
+// and is subject to change without notice. Knock yourself out.
+// HINT: See also -Z dump-mir for MIR at specific points during compilation.
+fn own::<impl at flow.rs:17:5: 17:14>::new() -> own::Saga {
+    let mut _0: own::Saga;
+
+    bb0: {
+        _0 = own::Saga { steps: const 0_u64 };
+        return;
+    }
+}
+
+// MIR FOR CTFE
+fn own::<impl at flow.rs:17:5: 17:14>::new() -> own::Saga {
+    let mut _0: own::Saga;
+
+    bb0: {
+        _0 = own::Saga { steps: const 0_u64 };
+        return;
+    }
+}
+
+fn own::<impl at flow.rs:17:5: 17:14>::step(_1: &mut own::Saga, _2: u64) -> {async fn body of own::Saga::step()} {
+    debug self => _1;
+    debug value => _2;
+    let mut _0: {async fn body of own::Saga::step()};
+
+    bb0: {
+        _0 = {coroutine@flow.rs:22:73: 24:10 (#0)} { self: move _1, value: copy _2 };
+        return;
+    }
+}
+
+fn own::<impl at flow.rs:17:5: 17:14>::step::{closure#0}(_1: Pin<&mut {async fn body of own::Saga::step()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    coroutine layout {
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+        }
+        storage_conflicts = BitMatrix(0x0) {}
+    }
+    debug _task_context => _8;
+    debug self => ((*_7).0: &mut own::Saga);
+    debug value => ((*_7).1: u64);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &mut own::Saga;
+    let mut _5: std::result::Result<u64, std::string::String>;
+    let mut _6: u32;
+    let mut _7: &mut {async fn body of own::Saga::step()};
+    let mut _8: std::future::ResumeTy;
+    let mut _9: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug self => _3;
+        let _4: u64;
+        scope 2 {
+            debug value => _4;
+        }
+    }
+
+    bb0: {
+        _9 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _8 = std::future::ResumeTy(move _9);
+        _7 = copy (_1.0: &mut {async fn body of own::Saga::step()});
+        _6 = discriminant((*_7));
+        switchInt(move _6) -> [0: bb3, 1: bb1, otherwise: bb2];
+    }
+
+    bb1: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb1, unwind continue];
+    }
+
+    bb2: {
+        unreachable;
+    }
+
+    bb3: {
+        _3 = move ((*_7).0: &mut own::Saga);
+        _4 = copy ((*_7).1: u64);
+        _5 = Result::<u64, String>::Ok(copy _4);
+        _0 = Poll::<Result<u64, String>>::Ready(move _5);
+        discriminant((*_7)) = 1;
+        return;
+    }
+}
+
+fn own::<impl at flow.rs:17:5: 17:14>::compensate_all(_1: &mut own::Saga) -> {async fn body of own::Saga::compensate_all()} {
+    debug self => _1;
+    let mut _0: {async fn body of own::Saga::compensate_all()};
+
+    bb0: {
+        _0 = {coroutine@flow.rs:26:70: 28:10 (#0)} { self: move _1 };
+        return;
+    }
+}
+
+fn own::<impl at flow.rs:17:5: 17:14>::compensate_all::{closure#0}(_1: Pin<&mut {async fn body of own::Saga::compensate_all()}>, _2: &mut Context<'_>) -> Poll<Result<(), String>> {
+    coroutine layout {
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+        }
+        storage_conflicts = BitMatrix(0x0) {}
+    }
+    debug _task_context => _8;
+    debug self => ((*_7).0: &mut own::Saga);
+    let mut _0: std::task::Poll<std::result::Result<(), std::string::String>>;
+    let _3: &mut own::Saga;
+    let mut _4: ();
+    let mut _5: std::result::Result<(), std::string::String>;
+    let mut _6: u32;
+    let mut _7: &mut {async fn body of own::Saga::compensate_all()};
+    let mut _8: std::future::ResumeTy;
+    let mut _9: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug self => _3;
+    }
+
+    bb0: {
+        _9 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _8 = std::future::ResumeTy(move _9);
+        _7 = copy (_1.0: &mut {async fn body of own::Saga::compensate_all()});
+        _6 = discriminant((*_7));
+        switchInt(move _6) -> [0: bb3, 1: bb1, otherwise: bb2];
+    }
+
+    bb1: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb1, unwind continue];
+    }
+
+    bb2: {
+        unreachable;
+    }
+
+    bb3: {
+        _3 = move ((*_7).0: &mut own::Saga);
+        _4 = ();
+        _5 = Result::<(), String>::Ok(move _4);
+        _0 = Poll::<Result<(), String>>::Ready(move _5);
+        discriminant((*_7)) = 1;
+        return;
+    }
+}
+
+fn __autumn_workflow_info_wf_own_saga_type() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_own_saga_type(_1: &WorkflowContext) -> {async fn body of wf_own_saga_type()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_own_saga_type()};
+
+    bb0: {
+        _0 = {coroutine@flow.rs:37:61: 42:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_own_saga_type::{closure#0}(_1: Pin<&mut {async fn body of wf_own_saga_type()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    coroutine layout {
+        field _s0: &WorkflowContext;
+        field _s1: own::Saga;
+        field _s2: u64;
+        field _s3: {async fn body of own::Saga::step()};
+        field _s4: {async fn body of own::Saga::compensate_all()};
+        field _s5: std::future::Ready<Result<u64, String>>;
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+            Suspend0 (3): [_s0, _s1, _s3],
+            Suspend1 (4): [_s0, _s1, _s2, _s4],
+            Suspend2 (5): [_s1, _s5],
+        }
+        storage_conflicts = BitMatrix(6x6) {(_s0, _s0), (_s0, _s1), (_s0, _s2), (_s0, _s3), (_s0, _s4), (_s0, _s5), (_s1, _s0), (_s1, _s1), (_s1, _s2), (_s1, _s3), (_s1, _s4), (_s1, _s5), (_s2, _s0), (_s2, _s1), (_s2, _s2), (_s2, _s4), (_s2, _s5), (_s3, _s0), (_s3, _s1), (_s3, _s3), (_s4, _s0), (_s4, _s1), (_s4, _s2), (_s4, _s4), (_s5, _s0), (_s5, _s1), (_s5, _s2), (_s5, _s5)}
+    }
+    debug _task_context => _49;
+    debug ctx => ((*_47).0: &autumn_harvest::WorkflowContext);
+    coroutine debug ctx => _s0;
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _3: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, std::string::String>, u64>;
+    let mut _4: {async fn body of own::Saga::step()};
+    let mut _5: {async fn body of own::Saga::step()};
+    let mut _6: &mut own::Saga;
+    let mut _7: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _8: std::pin::Pin<&mut {async fn body of own::Saga::step()}>;
+    let mut _9: &mut {async fn body of own::Saga::step()};
+    let mut _10: &mut std::task::Context<'_>;
+    let mut _11: std::future::ResumeTy;
+    let mut _12: isize;
+    let mut _14: std::future::ResumeTy;
+    let mut _15: isize;
+    let mut _18: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, std::string::String>>;
+    let mut _19: {async fn body of own::Saga::compensate_all()};
+    let mut _20: {async fn body of own::Saga::compensate_all()};
+    let mut _21: &mut own::Saga;
+    let mut _22: std::task::Poll<std::result::Result<(), std::string::String>>;
+    let mut _23: std::pin::Pin<&mut {async fn body of own::Saga::compensate_all()}>;
+    let mut _24: &mut {async fn body of own::Saga::compensate_all()};
+    let mut _25: &mut std::task::Context<'_>;
+    let mut _26: std::future::ResumeTy;
+    let mut _27: isize;
+    let mut _29: std::future::ResumeTy;
+    let mut _30: isize;
+    let mut _33: std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _34: std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _35: &str;
+    let mut _36: u64;
+    let mut _37: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _38: std::pin::Pin<&mut std::future::Ready<std::result::Result<u64, std::string::String>>>;
+    let mut _39: &mut std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _40: &mut std::task::Context<'_>;
+    let mut _41: std::future::ResumeTy;
+    let mut _42: isize;
+    let mut _44: std::future::ResumeTy;
+    let mut _45: std::result::Result<u64, std::string::String>;
+    let mut _46: u32;
+    let mut _47: &mut {async fn body of wf_own_saga_type()};
+    let mut _48: &autumn_harvest::WorkflowContext;
+    let mut _49: std::future::ResumeTy;
+    let mut _50: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug ctx => (((*_47) as variant#4).0: &autumn_harvest::WorkflowContext);
+        coroutine debug saga => _s1;
+        scope 2 {
+            debug saga => (((*_47) as variant#5).0: own::Saga);
+            coroutine debug a => _s2;
+            coroutine debug __awaitee => _s3;
+            let _16: std::result::Result<std::convert::Infallible, std::string::String>;
+            let _17: u64;
+            scope 3 {
+                debug a => (((*_47) as variant#4).2: u64);
+                coroutine debug __awaitee => _s4;
+                coroutine debug __awaitee => _s5;
+                let _31: std::result::Result<std::convert::Infallible, std::string::String>;
+                let _32: ();
+                scope 10 {
+                    debug __awaitee => (((*_47) as variant#4).3: {async fn body of own::Saga::compensate_all()});
+                    let _28: std::result::Result<(), std::string::String>;
+                    scope 11 {
+                        debug result => _28;
+                    }
+                }
+                scope 12 {
+                    debug residual => _31;
+                    scope 13 {
+                    }
+                }
+                scope 14 {
+                    debug val => _32;
+                    scope 15 {
+                    }
+                }
+                scope 16 {
+                    debug __awaitee => (((*_47) as variant#5).1: std::future::Ready<std::result::Result<u64, std::string::String>>);
+                    let _43: std::result::Result<u64, std::string::String>;
+                    scope 17 {
+                        debug result => _43;
+                    }
+                }
+            }
+            scope 4 {
+                debug __awaitee => (((*_47) as variant#3).2: {async fn body of own::Saga::step()});
+                let _13: std::result::Result<u64, std::string::String>;
+                scope 5 {
+                    debug result => _13;
+                }
+            }
+            scope 6 {
+                debug residual => _16;
+                scope 7 {
+                }
+            }
+            scope 8 {
+                debug val => _17;
+                scope 9 {
+                }
+            }
+        }
+    }
+
+    bb0: {
+        _50 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _49 = std::future::ResumeTy(move _50);
+        _47 = copy (_1.0: &mut {async fn body of wf_own_saga_type()});
+        _46 = discriminant((*_47));
+        switchInt(move _46) -> [0: bb42, 1: bb41, 2: bb40, 3: bb37, 4: bb38, 5: bb39, otherwise: bb7];
+    }
+
+    bb1: {
+        _6 = &mut (((*_47) as variant#5).0: own::Saga);
+        _5 = own::Saga::step(move _6, const 1_u64) -> [return: bb2, unwind: bb36];
+    }
+
+    bb2: {
+        _4 = <{async fn body of own::Saga::step()} as IntoFuture>::into_future(move _5) -> [return: bb3, unwind: bb36];
+    }
+
+    bb3: {
+        (((*_47) as variant#3).2: {async fn body of own::Saga::step()}) = move _4;
+        goto -> bb4;
+    }
+
+    bb4: {
+        _9 = &mut (((*_47) as variant#3).2: {async fn body of own::Saga::step()});
+        _8 = Pin::<&mut {async fn body of own::Saga::step()}>::new_unchecked(copy _9) -> [return: bb5, unwind: bb35];
+    }
+
+    bb5: {
+        _11 = copy _49;
+        _10 = copy (_11.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
+        _7 = <{async fn body of own::Saga::step()} as Future>::poll(move _8, copy _10) -> [return: bb6, unwind: bb35];
+    }
+
+    bb6: {
+        _12 = discriminant(_7);
+        switchInt(move _12) -> [0: bb9, 1: bb8, otherwise: bb7];
+    }
+
+    bb7: {
+        unreachable;
+    }
+
+    bb8: {
+        _0 = Poll::<Result<u64, String>>::Pending;
+        discriminant((*_47)) = 3;
+        return;
+    }
+
+    bb9: {
+        _13 = move ((_7 as Ready).0: std::result::Result<u64, std::string::String>);
+        drop((((*_47) as variant#3).2: {async fn body of own::Saga::step()})) -> [return: bb10, unwind: bb36];
+    }
+
+    bb10: {
+        _3 = <Result<u64, String> as Try>::branch(copy _13) -> [return: bb11, unwind: bb36];
+    }
+
+    bb11: {
+        _15 = discriminant(_3);
+        switchInt(move _15) -> [0: bb12, 1: bb13, otherwise: bb7];
+    }
+
+    bb12: {
+        _17 = copy ((_3 as Continue).0: u64);
+        (((*_47) as variant#4).2: u64) = copy _17;
+        _21 = &mut (((*_47) as variant#5).0: own::Saga);
+        _20 = own::Saga::compensate_all(move _21) -> [return: bb14, unwind: bb36];
+    }
+
+    bb13: {
+        _16 = move ((_3 as Break).0: std::result::Result<std::convert::Infallible, std::string::String>);
+        _45 = <Result<u64, String> as FromResidual<Result<Infallible, String>>>::from_residual(copy _16) -> [return: bb43, unwind: bb36];
+    }
+
+    bb14: {
+        _19 = <{async fn body of own::Saga::compensate_all()} as IntoFuture>::into_future(move _20) -> [return: bb15, unwind: bb36];
+    }
+
+    bb15: {
+        (((*_47) as variant#4).3: {async fn body of own::Saga::compensate_all()}) = move _19;
+        goto -> bb16;
+    }
+
+    bb16: {
+        _24 = &mut (((*_47) as variant#4).3: {async fn body of own::Saga::compensate_all()});
+        _23 = Pin::<&mut {async fn body of own::Saga::compensate_all()}>::new_unchecked(copy _24) -> [return: bb17, unwind: bb34];
+    }
+
+    bb17: {
+        _26 = copy _49;
+        _25 = copy (_26.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
+        _22 = <{async fn body of own::Saga::compensate_all()} as Future>::poll(move _23, copy _25) -> [return: bb18, unwind: bb34];
+    }
+
+    bb18: {
+        _27 = discriminant(_22);
+        switchInt(move _27) -> [0: bb20, 1: bb19, otherwise: bb7];
+    }
+
+    bb19: {
+        _0 = Poll::<Result<u64, String>>::Pending;
+        discriminant((*_47)) = 4;
+        return;
+    }
+
+    bb20: {
+        _28 = move ((_22 as Ready).0: std::result::Result<(), std::string::String>);
+        drop((((*_47) as variant#4).3: {async fn body of own::Saga::compensate_all()})) -> [return: bb21, unwind: bb36];
+    }
+
+    bb21: {
+        _18 = <Result<(), String> as Try>::branch(copy _28) -> [return: bb22, unwind: bb36];
+    }
+
+    bb22: {
+        _30 = discriminant(_18);
+        switchInt(move _30) -> [0: bb23, 1: bb24, otherwise: bb7];
+    }
+
+    bb23: {
+        _32 = copy ((_18 as Continue).0: ());
+        _48 = no_retag copy (((*_47) as variant#4).0: &autumn_harvest::WorkflowContext);
+        _35 = const "ship";
+        _36 = copy (((*_47) as variant#4).2: u64);
+        _34 = WorkflowContext::execute_activity_raw(copy _48, move _35, move _36) -> [return: bb25, unwind: bb36];
+    }
+
+    bb24: {
+        _31 = move ((_18 as Break).0: std::result::Result<std::convert::Infallible, std::string::String>);
+        _45 = <Result<u64, String> as FromResidual<Result<Infallible, String>>>::from_residual(copy _31) -> [return: bb44, unwind: bb36];
+    }
+
+    bb25: {
+        _33 = <std::future::Ready<Result<u64, String>> as IntoFuture>::into_future(move _34) -> [return: bb26, unwind: bb36];
+    }
+
+    bb26: {
+        (((*_47) as variant#5).1: std::future::Ready<std::result::Result<u64, std::string::String>>) = move _33;
+        goto -> bb27;
+    }
+
+    bb27: {
+        _39 = &mut (((*_47) as variant#5).1: std::future::Ready<std::result::Result<u64, std::string::String>>);
+        _38 = Pin::<&mut std::future::Ready<Result<u64, String>>>::new_unchecked(copy _39) -> [return: bb28, unwind: bb33];
+    }
+
+    bb28: {
+        _41 = copy _49;
+        _40 = copy (_41.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
+        _37 = <std::future::Ready<Result<u64, String>> as Future>::poll(move _38, copy _40) -> [return: bb29, unwind: bb33];
+    }
+
+    bb29: {
+        _42 = discriminant(_37);
+        switchInt(move _42) -> [0: bb31, 1: bb30, otherwise: bb7];
+    }
+
+    bb30: {
+        _0 = Poll::<Result<u64, String>>::Pending;
+        discriminant((*_47)) = 5;
+        return;
+    }
+
+    bb31: {
+        _43 = move ((_37 as Ready).0: std::result::Result<u64, std::string::String>);
+        _45 = move _43;
+        drop((((*_47) as variant#5).1: std::future::Ready<std::result::Result<u64, std::string::String>>)) -> [return: bb32, unwind: bb36];
+    }
+
+    bb32: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _45);
+        discriminant((*_47)) = 1;
+        return;
+    }
+
+    bb33 (cleanup): {
+        drop((((*_47) as variant#5).1: std::future::Ready<std::result::Result<u64, std::string::String>>)) -> [return: bb36, unwind terminate(cleanup)];
+    }
+
+    bb34 (cleanup): {
+        drop((((*_47) as variant#4).3: {async fn body of own::Saga::compensate_all()})) -> [return: bb36, unwind terminate(cleanup)];
+    }
+
+    bb35 (cleanup): {
+        drop((((*_47) as variant#3).2: {async fn body of own::Saga::step()})) -> [return: bb36, unwind terminate(cleanup)];
+    }
+
+    bb36 (cleanup): {
+        discriminant((*_47)) = 2;
+        resume;
+    }
+
+    bb37: {
+        _14 = move _49;
+        _49 = move _14;
+        goto -> bb4;
+    }
+
+    bb38: {
+        _29 = move _49;
+        _49 = move _29;
+        goto -> bb16;
+    }
+
+    bb39: {
+        _44 = move _49;
+        _49 = move _44;
+        goto -> bb27;
+    }
+
+    bb40: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb40, unwind continue];
+    }
+
+    bb41: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb41, unwind continue];
+    }
+
+    bb42: {
+        (((*_47) as variant#4).0: &autumn_harvest::WorkflowContext) = copy ((*_47).0: &autumn_harvest::WorkflowContext);
+        (((*_47) as variant#5).0: own::Saga) = own::Saga::new() -> [return: bb1, unwind: bb36];
+    }
+
+    bb43: {
+        goto -> bb32;
+    }
+
+    bb44: {
+        goto -> bb32;
+    }
+}
+
+alloc1 (size: 4, align: 1) {
+    73 68 69 70                                     │ ship
+}

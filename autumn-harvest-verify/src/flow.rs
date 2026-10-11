@@ -200,10 +200,20 @@ fn block_event(body: &Body, block: &BasicBlock, facts: &BlockFacts) -> Option<Fl
         ..
     } = &block.terminator
     {
+        // MIR trims the callee to `Saga::<'_>::step`, but it declares each
+        // local with its full path. So the engine type is read from the
+        // saga operand, or from the value a call returns.
+        let self_saga = args_saga(body, &block.terminator);
+        let ty = dest_ty
+            .as_deref()
+            .or_else(|| body.locals.get(&dest.local).map(String::as_str))
+            .unwrap_or_default();
+        let returns_saga = !ty.trim_start().starts_with('&') && is_saga_type(ty);
         match saga_method(callee) {
-            Some("new") => return Some(FlowEvent::SagaNew),
-            Some("compensate_all") => return Some(FlowEvent::SagaCompensate { tracked: false }),
-            Some("step") => {
+            Some("compensate_all") if self_saga => {
+                return Some(FlowEvent::SagaCompensate { tracked: false });
+            }
+            Some("step") if self_saga => {
                 let bodies = |index: usize| {
                     facts
                         .arguments
@@ -218,18 +228,10 @@ fn block_event(body: &Body, block: &BasicBlock, facts: &BlockFacts) -> Option<Fl
                     tracked: false,
                 });
             }
-            Some(_) => {}
-            // Another call that returns a saga value, such as a helper that
-            // builds one, brings a new saga into this body.
-            None => {
-                let ty = dest_ty
-                    .as_deref()
-                    .or_else(|| body.locals.get(&dest.local).map(String::as_str))
-                    .unwrap_or_default();
-                if !ty.trim_start().starts_with('&') && is_saga_type(ty) {
-                    return Some(FlowEvent::SagaNew);
-                }
-            }
+            // `Saga::new`, or another call that returns a saga value, such
+            // as a helper that builds one, brings a new saga into this body.
+            _ if returns_saga => return Some(FlowEvent::SagaNew),
+            _ => {}
         }
     }
     if let Some(&handler) = facts.handlers.get(label) {
@@ -262,11 +264,24 @@ fn saga_method(callee: &str) -> Option<&'static str> {
         .or(Some("other"))
 }
 
-/// A type whose head is `Saga`, behind any references.
+/// The engine's `Saga` type, behind any references.
+///
+/// The path must start at the `autumn_harvest` crate, as the model's trust
+/// row does. A workflow crate's own type named `Saga` is not the engine's.
 fn is_saga_type(ty: &str) -> bool {
     let ty = peel_refs(ty).trim().trim_start_matches("mut ").trim();
     let head = ty.split('<').next().unwrap_or(ty);
-    !head.starts_with('{') && (head == "Saga" || head.ends_with("::Saga"))
+    head.starts_with("autumn_harvest::") && head.ends_with("::Saga")
+}
+
+/// Operand 0 of the call is the engine's `Saga`, by reference or by value.
+fn args_saga(body: &Body, terminator: &Terminator) -> bool {
+    let Terminator::Call { args, .. } = terminator else {
+        return false;
+    };
+    args.first()
+        .and_then(operand_place)
+        .is_some_and(|place| saga_local(body, place))
 }
 
 fn saga_local(body: &Body, place: &Place) -> bool {
@@ -627,8 +642,11 @@ mod tests {
 
     #[test]
     fn a_saga_type_is_found_behind_references() {
-        assert!(is_saga_type("&mut Saga<'_>"));
+        assert!(is_saga_type("&mut autumn_harvest::Saga<'_>"));
         assert!(is_saga_type("autumn_harvest::Saga<'_>"));
+        assert!(is_saga_type("autumn_harvest::saga::Saga<'_>"));
+        assert!(!is_saga_type("&mut Saga<'_>"));
+        assert!(!is_saga_type("own::Saga"));
         assert!(!is_saga_type(
             "{async fn body of autumn_harvest::Saga<'_>::step<u64>()}"
         ));
@@ -639,7 +657,7 @@ mod tests {
     #[test]
     fn a_saga_annotation_is_found_in_a_place_type() {
         assert!(annotates_a_saga(
-            "{coroutine} { s: move (((*_4) as variant#5).1: Saga<'_>) }"
+            "{coroutine} { s: move (((*_4) as variant#5).1: autumn_harvest::Saga<'_>) }"
         ));
         assert!(!annotates_a_saga(
             "move (((*_4) as variant#3).2: {async fn body of Saga<'_>::step<u64>()})"

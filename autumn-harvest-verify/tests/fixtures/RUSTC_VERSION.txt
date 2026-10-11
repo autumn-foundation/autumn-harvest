@@ -154,3 +154,20 @@ cargo 1.94.1 (29ea6fb6a 2026-03-24)
 #         --extern autumn_harvest=libautumn_harvest.rlib \
 #         --extern other_crate=libother_crate.rlib -o flow.mir flow.rs
 #   rm libautumn_harvest.rlib libother_crate.rlib
+
+# `saga_graph_own/flow.mir` (issue #2010) holds a workflow crate's own type
+# named `Saga`. It uses the stub of `saga_graph/` and the same two steps,
+# from `saga_graph_own/`:
+#
+#   rustc --crate-type lib --edition 2024 --crate-name autumn_harvest \
+#         -o libautumn_harvest.rlib harvest_stub.rs
+#   rustc --crate-type lib --edition 2024 --emit=mir \
+#         --extern autumn_harvest=libautumn_harvest.rlib -o flow.mir flow.rs
+#   rm libautumn_harvest.rlib
+#
+# It is a fixture of its own on purpose. In one dump with the engine's
+# `Saga`, the resolver maps the trimmed `Saga::<'_>::new` to the local impl
+# by name. That adds a conservative `external-const` boundary, not a wrong
+# verdict, and it is outside the scope of issue #2010. The type has a field
+# for a like reason: MIR prints a unit struct value as `const own::Saga`, and
+# the structure digest reads that as an `external-const` boundary.
