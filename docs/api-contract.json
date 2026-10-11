@@ -80,6 +80,14 @@
           "description": "Typed comparison/set predicate over search attributes in key:op:value form, op in {eq, ne, gt, gte, lt, lte, in, exists} (issue #506). Repeatable; ANDed. Numeric values compare numerically, booleans as booleans, else strings. Comparison ops require a numeric value. Malformed predicates and nested .-paths return 400. Backed by the existing idx_harvest_we_search GIN index (no migration)."
         },
         {
+          "name": "filter",
+          "in": "query",
+          "type": "string",
+          "required": false,
+          "repeated": true,
+          "description": "Filter expression with AND, OR and parentheses (issue #1982). AND binds tighter than OR. Fields: attrs.<key> (=, !=, >, >=, <, <=, IN, EXISTS), state, workflow_name, owner, severity (=, !=, IN), started_at (>, >=, <, <= with an RFC 3339 string). Values: a quoted string, a number, true or false. <> is the same as !=. A filter with OR must find each row through an index: each OR branch, or the whole filter, holds an attrs.* predicate or workflow_name with = or IN. The parameter is repeatable. Each value joins the query with AND. An empty value is ignored. Limits: 2048 bytes, 8 levels and 100 IN values for each value, and 32 predicates for the request. state = 'MIGRATED' gets 400; use state=MIGRATED. Errors return 400. Example: attrs.phase = 'blocked' OR (workflow_name = 'payment' AND attrs.amount > 10000)."
+        },
+        {
           "name": "limit",
           "in": "query",
           "type": "integer",
@@ -9339,6 +9347,31 @@
         {
           "status": 503,
           "description": "SSE notification URL not configured."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/changes/stream",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Server-Sent Events signal for live list views (issue #1982). Listens to the harvest_events LISTEN/NOTIFY channel on each shard, the channel of the #324 stream. Sends event:changed with data {\"notifications\": n}, the count of notifications since the last frame, at most once each second. One notification can cover more than one event of a run. A frame names no execution and holds no payload. A client fetches the list again. Sends event:stream-error and closes when a shard listener closes, so the client connects again. The stream sends a :ping comment every 15 s by default. Admin-gated, the same as GET /executions/{exec_id}/events/stream. Each stream holds one dedicated LISTEN connection for each shard.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "content_type": "text/event-stream",
+        "status": 200,
+        "note": "Content-Type: text/event-stream. Frames: event:changed (data {\"notifications\": n}), or a final event:stream-error (data {\"error\": \"listener_closed\", \"retry\": true}).",
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 503,
+          "description": "SSE notification URL not configured, or a shard listener is not available."
         }
       ]
     },

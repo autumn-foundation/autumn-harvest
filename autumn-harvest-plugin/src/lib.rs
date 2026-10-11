@@ -89,6 +89,8 @@ pub mod usage;
 pub mod vault_transit;
 pub mod version_gate_retirement;
 pub mod version_usage;
+/// The `filter` grammar of `GET /workflows` (issue #1982).
+mod visibility_query;
 pub mod workflow_count;
 pub mod workflow_reachability;
 

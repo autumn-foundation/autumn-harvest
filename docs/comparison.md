@@ -285,7 +285,10 @@ where one exists.
   [#385](https://github.com/autumn-foundation/autumn-harvest/issues/385)), a
   [schedules management page (#333)](https://github.com/autumn-foundation/autumn-harvest/issues/333),
   [DAG list + detail pages (#426)](https://github.com/autumn-foundation/autumn-harvest/issues/426)
-  and a rendered DAG run graph. Temporal, Inngest, Hatchet, DBOS (Conductor), and Restate all
+  and a rendered DAG run graph. The workflow list takes `AND`/`OR` filter
+  expressions, and the list and detail pages update live
+  ([#1982](https://github.com/autumn-foundation/autumn-harvest/issues/1982)).
+  Temporal, Inngest, Hatchet, DBOS (Conductor), and Restate all
   ship more mature UIs today.
 - **Younger project, smaller ecosystem.** harvest is pre-1.0 (0.x, breaking
   changes in minor versions) with a smaller community, fewer third-party
