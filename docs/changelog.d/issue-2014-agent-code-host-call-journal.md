@@ -7,11 +7,12 @@ A guest imports one function, `harvest::host_call(name, request)`. The
 embedder grants each capability by name through `HostCallGrants`. The host
 journals each call as `seq`, name, request and outcome.
 `invoke_journaled` replays an earlier journal in order and then runs live.
-So a retry does not repeat a finished side effect.
+So a retry does not repeat a finished side effect, if the caller persists
+the journal.
 
 **Verdict.** Conditional go for journaled host calls in WASM activities. A
-durable, synchronous journal store must land first. No-go for WASM
-workflows, as the hot-code-swap report already states.
+durable, synchronous journal store must land first. Not yet for WASM
+workflows: tier T2 stays a conditional go that waits for demonstrated demand.
 
 **Design.** With no grant, the import is not linked. A call to an ungranted
 name is denied in-band and journaled. A journaled run links no ambient

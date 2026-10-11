@@ -28,8 +28,9 @@ database.** The prototype is a new `wasm_journal` module behind the existing
 - `ActivityContext::heartbeat_details` gives a retry the last checkpoint that
   the previous attempt flushed. Heartbeat writes are batched, not synchronous.
 - The WASM spike has no heartbeat import yet (`wasm-activities-spike.md` §4).
-- ADR 0002 makes workflow authoring Rust-only. An activity body may run in
-  the sandbox. The step stays an activity, so the boundary holds.
+- ADR 0002 makes workflow and activity authoring Rust-only. The activity
+  stays Rust. The guest is sandboxed code that it runs through an explicit
+  host-call boundary.
 - `hot-code-swap.md` §9 rates WASM activities "go" (T1) and WASM workflows
   "conditional go" (T2).
 
@@ -43,8 +44,8 @@ database.** The prototype is a new `wasm_journal` module behind the existing
 | B4 | Journal into a new Postgres table. | Deferred to GA. The spike proves the semantics in memory first. |
 | B5 | Return the journal to the caller, even on failure. The caller persists it. | **Adopted.** The spike stays storage-free. The write-up names the GA store. |
 | B6 | Use WASI 0.2 and the component model. | Rejected for the spike. The engine disables the component model today. The verdict lists it as a GA step. |
-| B7 | Snapshot guest memory instead of a journal. | Rejected. Snapshots are large and opaque. A journal is small and can be read by an auditor. |
-| B8 | Let the host write the response through the guest `alloc` export. | **Adopted.** A short guest buffer never forces a second call, so a side effect never runs twice. |
+| B7 | Snapshot guest memory instead of a journal. | Rejected. Snapshots are large and opaque. A journal is small, and an auditor can read it. |
+| B8 | Let the host write the response through the guest `alloc` export. | **Adopted.** A short guest buffer never forces a second call, so a side effect never runs twice for that reason. |
 
 ### 0.3 Reverse brainstorm — how can this design do harm?
 
@@ -60,8 +61,8 @@ database.** The prototype is a new `wasm_journal` module behind the existing
 | R8 | A huge request burns host CPU outside the fuel budget. | The host rejects a request over `MAX_HOST_CALL_BYTES` before it reads the bytes. |
 | R9 | A huge response bypasses the guest memory limit. | A response over `MAX_HOST_CALL_BYTES` is journaled as a `Fatal` error. The guest gets the error envelope. |
 | R10 | A call loop grows the journal without bound. | After `MAX_HOST_CALLS` calls, the host returns `HOST_CALL_LIMIT`. Nothing more is journaled. |
-| R11 | A handler panic crashes the worker. | The existing `catch_unwind` maps it to `WasmTrap`. The journal lock tolerates poison. |
-| R12 | A crash between the side effect and the journal write runs the effect twice. | The host appends the entry before it writes the response. A lost write is still possible, so the handler gets `seq` for an idempotency key. The write-up names the GA fix. |
+| R11 | A handler panic crashes the worker. | A `catch_unwind` maps it to `WasmTrap`. The journal lock tolerates poison. |
+| R12 | A crash between the side effect and the journal write runs the effect twice. | The host appends the entry before it writes the response. A lost write is still possible. The handler gets `seq`, which with the request forms an idempotency key. The write-up names the GA fix. |
 | R13 | A slow handler holds the guest past its deadline. | Epoch interrupts do not reach host code. The write-up states this limit. The host skips the handler when the cancel token fired. |
 | R14 | A malformed name or pointer reads out of bounds. | Each read is bounds-checked. A bad call returns `HOST_CALL_INVALID` and journals nothing. |
 | R15 | A forged journal injects responses. | The journal is host data. The guest cannot write it. The GA store must be engine-owned, like heartbeat details. |
@@ -74,8 +75,8 @@ database.** The prototype is a new `wasm_journal` module behind the existing
 | Red | Teams fear generated code that acts twice or acts in secret. A journal that an auditor can read is the reassurance they want. |
 | Black | A journal does not make a side effect atomic. A slow handler escapes the epoch. LLM code still needs a compile step and a signature. |
 | Yellow | One import gives an open capability set and a full audit trail. A retry resumes past its finished calls. History stays unchanged. |
-| Green | The `seq` gives an idempotency key. A journal can feed replay-as-evaluation (#2001) for generated code. |
-| Blue | Ship the prototype and the write-up. Verdict: conditional go for journaled activities, no-go for WASM workflows. |
+| Green | The `seq` and a request hash give an idempotency key. A journal can feed replay-as-evaluation (#2001) for generated code. |
+| Blue | Ship the prototype and the write-up. Verdict: conditional go for journaled activities, not yet for WASM workflows. |
 
 ### 0.5 Decisions
 

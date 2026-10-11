@@ -33,7 +33,7 @@ Two things were missing for generated code:
 - **No open grant set.** The three grants were fixed booleans. An embedder
   could not give a guest a new capability.
 
-Also, the two nondeterministic grants made a re-run differ from the first run.
+The two nondeterministic grants made a re-run differ from the first run.
 
 ## 2. The prototype
 
@@ -55,9 +55,8 @@ JSON. The result is one of these:
 | `HOST_CALL_INVALID` (-2) | A bad pointer, a bad name or a bad request. Nothing is journaled. |
 | `HOST_CALL_LIMIT` (-3) | The run reached the call budget. |
 
-The host places the response through the guest `alloc` export. So a short
-guest buffer never forces a second call, and a side effect never runs twice
-for that reason.
+The host writes the response through the guest `alloc` export. The guest
+never makes a second call to fetch a long response.
 
 ### 2.2 Capability grants
 
@@ -82,7 +81,7 @@ Each call appends one `HostCallEntry`:
 | `request` | The decoded request. |
 | `outcome` | `ok` with a response, `err` with a message, or `denied`. |
 
-The journal is plain JSON, so it can be persisted as heartbeat details.
+The journal is plain JSON. The caller can persist it as heartbeat details.
 
 ### 2.4 Replay and resume
 
@@ -90,15 +89,24 @@ The journal is plain JSON, so it can be persisted as heartbeat details.
 
 1. It serves the recorded entries in order. A served call runs no handler.
 2. When the recorded entries end, it runs live and appends new entries.
-3. It returns the journal also after a failure. The next attempt resumes
+3. It also returns the journal after a failure. The next attempt resumes
    from it.
 
 A replay checks each call against its entry:
 
 - A different name or request is a divergence.
 - A run that ends with entries left over is a divergence.
+- A malformed journal is a divergence before the guest runs. A gap in `seq`,
+  too many entries or an outcome over the size bounds makes it malformed.
 - A divergence is a non-retryable `WasmJournalDivergence`. The journal stays
   unchanged.
+
+A replay does not check the grants again. The journal is the record:
+
+- A recorded `ok` entry replays after its grant is revoked.
+- A recorded `denied` entry stays denied after a new grant.
+- With an empty grant set, the import is not linked. A run with a full
+  journal then fails as `SandboxDenied`.
 
 ### 2.5 Handler failures
 
@@ -110,8 +118,8 @@ A handler returns `Fatal` or `Transient`:
   the attempt as a retryable `HostCallFailed`. The retry calls the handler
   again.
 
-Without this split, a journaled network blip would fail each retry in the
-same way.
+If the host journaled a transient failure, each retry would replay that
+failure.
 
 ### 2.6 Bounds
 
@@ -122,7 +130,9 @@ same way.
 | `MAX_HOST_CALLS` (256) | Calls per run | Later calls return `HOST_CALL_LIMIT`. The journal stops growing. |
 
 The fuel, memory and wall-clock bounds of the sandbox apply unchanged. A
-handler panic becomes a `WasmTrap`, so the worker does not crash.
+handler panic becomes a retryable `WasmTrap`, so the worker does not crash.
+The host does not journal the panicked call, so the retry runs its handler
+again.
 
 ### 2.7 Write order
 
@@ -130,8 +140,10 @@ The host journals a live call before it writes the response to the guest. A
 later trap in the guest therefore keeps the call in the journal. The next
 attempt replays it.
 
-The handler gets `seq`. An activity id plus `seq` is a stable idempotency key
-for a downstream system.
+The handler gets `seq`. An activity id plus `seq` identifies a call
+position. A downstream system must also compare the request, or key on a
+request hash. A re-run after a lost entry can send another request at the
+same position.
 
 ## 3. What the tests prove
 
@@ -147,7 +159,7 @@ The tests are unit tests in `src/wasm_journal.rs`. CI runs them in the
 | With no grant, the import is not linked. | `no_grant_means_the_host_call_import_is_not_linked` |
 | A changed request on replay is a non-retryable divergence. | `a_divergent_request_on_replay_is_non_retryable` |
 | Entries left over after the run are a divergence. | `an_unconsumed_journal_entry_is_a_divergence` |
-| A journal with a gap in `seq` is rejected before the guest runs. | `a_malformed_journal_is_rejected_before_the_guest_runs` |
+| A malformed journal is rejected before the guest runs. | `a_malformed_journal_is_rejected_before_the_guest_runs` |
 | A journaled run links no ambient import. | `a_journaled_run_links_no_ambient_import` |
 | A fatal handler error is journaled and replayed. | `a_fatal_handler_error_is_journaled_and_replayed` |
 | A transient handler error is retryable and not journaled. | `a_transient_handler_error_is_retryable_and_not_journaled` |
@@ -159,9 +171,9 @@ The tests are unit tests in `src/wasm_journal.rs`. CI runs them in the
 | A cancelled run skips the handler. | `a_cancelled_run_skips_the_handler` |
 | A guest trap keeps its finished calls in the journal. | `a_guest_trap_keeps_the_calls_it_made_in_the_journal` |
 | The journal round-trips through JSON. | `the_journal_round_trips_through_json` |
-| One host call costs well under one millisecond. | `host_call_overhead_microbenchmark` |
+| One call, live or replayed, takes less than 1 ms (manual run only). | `host_call_overhead_microbenchmark` |
 
-The last test is `#[ignore]`d. Run it with this command:
+The last test has `#[ignore]`. Run it with this command:
 
 ```sh
 cargo test -p autumn-harvest --features wasm-activities --lib \
@@ -171,8 +183,9 @@ cargo test -p autumn-harvest --features wasm-activities --lib \
 ## 4. Cost
 
 The microbenchmark runs a guest that makes 200 calls to a trivial handler. It
-compares the run with a one-call run of the same guest. Three runs of a debug
-build on the spike machine gave these medians:
+compares the run with a one-call run of the same guest. Each run reports the
+median of 31 samples. The table gives the range over three runs of an
+unoptimized debug build:
 
 | Path | Cost |
 |------|------|
@@ -185,32 +198,44 @@ Both encode and decode JSON, and both write the response to the guest. The
 per-run instantiate stays the larger cost. A real handler, such as an HTTP
 call, costs far more than the journal.
 
+These figures measure an in-memory journal. G1 adds one database round trip
+per live call. Nothing measures that cost yet, and it likely dominates.
+
 ## 5. Comparison with Golem
 
-Golem runs WASM components as durable workers. It records each host call in
-an operation log and replays the log after a crash.
+Golem runs WASM components as durable workers. By default, it records each
+host call in an operation log. After a crash, it replays the log to rebuild
+the worker.
 
 | Property | Golem | This prototype |
 |----------|-------|----------------|
-| Each host call recorded | Yes | Yes |
+| Each host call recorded | Yes, by default | Yes |
 | Replay without a repeated side effect | Yes | Yes, inside one activity |
 | Capability control | WASI and component imports | Named grants on a deny-all linker |
 | Unit of durability | The whole worker | One activity attempt |
-| Durable state across steps | Guest memory | Workflow history, as today |
-| Authoring surface | Any WASM language | Activity bodies only, per ADR 0002 |
+| Durable state across steps | Guest memory, rebuilt by log replay | Workflow history, as today |
+| Authoring surface | Any WASM language | Rust activities that run sandboxed guest code |
 
 The prototype gets the main benefit, journaled side effects, at activity
 scope. It does not make the guest itself durable across steps. The Rust
-workflow keeps that role, so ADR 0002 holds.
+workflow keeps that role.
+
+ADR 0002 makes workflow and activity authoring Rust-only. The activity stays
+a Rust activity. The guest is sandboxed code that the activity runs, not a
+second authoring surface. Each call crosses an explicit host-call boundary,
+as ADR 0002 requires for non-Rust code.
 
 ## 6. Limits
 
 - **Persistence is the caller's job.** The prototype returns the journal and
-  does not store it. Heartbeat details are batched, so a crash can lose the
-  last entries. A lost entry runs again on the retry.
+  does not store it. The worker batches heartbeat details. A crash can lose
+  the last entries, and a lost entry runs again on the retry.
 - **The journal is at-least-once at its edge.** A crash between a side effect
-  and its journal write repeats that one effect. The `seq` idempotency key
-  lets a downstream system drop the repeat.
+  and its journal write repeats that one effect. A downstream system can
+  drop the repeat with the activity id, `seq` and a request hash.
+- **Some calls leave no entry.** An invalid call, a call over the budget, a
+  transient failure, a handler panic and a cancelled call are not
+  journaled.
 - **A handler is not interruptible.** The epoch deadline stops guest code
   only. A slow handler delays the deadline until it returns. A handler must
   bound its own time.
@@ -230,26 +255,26 @@ workflow keeps that role, so ADR 0002 holds.
 | G2 — worker wiring | Grants on `HarvestBuilder::wasm_activity`. Load the journal at attempt start and pass `seq` keys. Add metrics for denied and diverged calls. | ~2 weeks |
 | G3 — typed ABI | Move `host_call` to a WIT interface on the component model, as the WASM spike recommends. | ~1 quarter, shared with T1 |
 
-G1 and G2 deliver the verdict. G3 can follow the T1 work of the hot-code-swap
+The go needs G1 and G2. G3 can follow the T1 work in the hot-code-swap
 report.
 
 ## 8. Verdict
 
-**Verdict:** conditional go for journaled host calls in WASM activities. No-go
-for WASM workflows.
+**Verdict:** conditional go for journaled host calls in WASM activities. Not
+yet for WASM workflows: tier T2 stays a conditional go that waits for T1 users
+and demonstrated demand.
 
 Conditions for the go:
 
 1. G1 lands first. A journal that a crash can lose is not a journal.
 2. The first production use names its grants and its compile and signing
    service.
-3. The step stays an activity. ADR 0002 and the hot-code-swap verdict stand:
-   WASM workflows (tier T2) wait for demonstrated demand.
+3. The step stays an activity. ADR 0002 and the hot-code-swap verdict stand.
 
 Reasons for the go:
 
 - The prototype proves the semantics: no repeated side effect on replay,
-  divergence detection, and a full audit trail.
+  divergence detection, and an audit entry for each completed call.
 - It needs no new `WorkflowEvent` variant, no migration and no change to
   replay.
 - The added code is small and stays inside the existing sandbox.
@@ -261,4 +286,5 @@ Reasons for the go:
 - [ADR 0002](../adr/0002-rust-native-execution-boundary.md), the Rust-only
   authoring boundary.
 - [ADR 0004](../adr/0004-security-extras.md), signed modules (#1838).
-- Golem documentation, golem.cloud, on durable workers and the operation log.
+- Golem documentation on durable workers and the operation log,
+  [learn.golem.cloud](https://learn.golem.cloud), read 2026-10-11.

@@ -180,6 +180,7 @@ pub const ERROR_TYPE_WASM_OUTPUT_TOO_LARGE: &str = "WasmOutputTooLarge";
 ///
 /// A journaled WASM activity replays its host-call journal on a retry. The
 /// re-run made a different call, or finished with recorded calls left over.
+/// A malformed journal fails the same way before the guest runs.
 /// **Non-retryable**: the same journal diverges in the same way on each
 /// attempt.
 #[cfg(feature = "wasm-activities")]
