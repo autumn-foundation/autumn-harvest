@@ -406,3 +406,61 @@ pub async fn wf_step_async_closure(ctx: &WorkflowContext) -> Out {
     let a = saga.step(async || Ok(now_nanos()), |_| async { Ok(()) }).await?;
     ctx.execute_activity_raw("b", a).await
 }
+
+/// Returns its argument. A first-party helper with a body.
+pub fn identity<T>(value: T) -> T {
+    value
+}
+
+pub fn __autumn_workflow_info_wf_step_identity_write() -> u8 {
+    0
+}
+
+/// The step block writes the clock through a captured reference. The
+/// closure builds it in a temporary and returns it through `identity`.
+pub async fn wf_step_identity_write(ctx: &WorkflowContext) -> Out {
+    let mut seen = 0_u64;
+    {
+        let mut saga = Saga::new(ctx);
+        saga.step(
+            || {
+                let s = &mut seen;
+                let f = async move {
+                    *s = now_nanos();
+                    ctx.execute_activity_raw("a", 1).await
+                };
+                identity(f)
+            },
+            |_| async { Ok(()) },
+        )
+        .await?;
+    }
+    ctx.execute_activity_raw("b", seen).await
+}
+
+pub fn __autumn_workflow_info_wf_step_moved_write() -> u8 {
+    0
+}
+
+/// The step block writes the clock through a captured reference. The
+/// closure moves it through a tuple before it returns it.
+pub async fn wf_step_moved_write(ctx: &WorkflowContext) -> Out {
+    let mut seen = 0_u64;
+    {
+        let mut saga = Saga::new(ctx);
+        saga.step(
+            || {
+                let s = &mut seen;
+                let f = async move {
+                    *s = now_nanos();
+                    ctx.execute_activity_raw("a", 1).await
+                };
+                let pair = (f, 1_u8);
+                pair.0
+            },
+            |_| async { Ok(()) },
+        )
+        .await?;
+    }
+    ctx.execute_activity_raw("b", seen).await
+}

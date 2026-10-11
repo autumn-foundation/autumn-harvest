@@ -81,6 +81,8 @@ fn a_case_the_analysis_cannot_follow_is_never_proven() {
         "wf_step_external_future",
         "wf_step_boxed_external",
         "wf_step_async_closure",
+        "wf_step_identity_write",
+        "wf_step_moved_write",
     ] {
         assert!(
             !matches!(verdict(&all, name), Verdict::ProvenDeterministic),

@@ -2844,13 +2844,18 @@ fn first_sentence(reason: &str) -> &str {
 /// A capture can be a projection of the closure environment, as in
 /// `move (_1.0: &mut u64)`. Its local is the closure, so the type is read
 /// from the place annotation in the text as well.
+///
+/// The block can reach `_0` through a temporary, a tuple or a call. So each
+/// coroutine aggregate the closure builds is read, not only the value it
+/// returns.
 fn captures_mut_ref(body: &Body, interior: &[&str]) -> bool {
     body.blocks
         .iter()
         .flat_map(|block| &block.statements)
         .filter_map(|statement| match statement {
             Statement::Assign { dest, rvalue }
-                if dest.local == Local(0) && dest.projections.is_empty() =>
+                if (dest.local == Local(0) && dest.projections.is_empty())
+                    || rvalue.text.trim_start().starts_with("{coroutine@") =>
             {
                 Some(rvalue)
             }

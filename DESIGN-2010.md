@@ -120,6 +120,11 @@ Four review agents read the first version. Each fix has a test.
     the file layout and any inline `mod`.
 17. A `step` node could name an index past the body `steps` list. Such a
     manifest is now refused.
+18. The `&mut` capture check read only the value written to `_0`. A block
+    moved through a tuple before the return was a false proof. Each
+    coroutine the closure builds is now read.
+19. A body with only a `saga-escape` node read as `no-saga`. An escape now
+    counts as a saga use, so the verdict is `unknown`.
 
 ---
 

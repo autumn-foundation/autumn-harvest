@@ -293,10 +293,13 @@ pub fn check_workflow(workflow: &WorkflowStructure) -> SagaReport {
             continue;
         };
         let owners = count(graph, |e| matches!(e, FlowEvent::SagaNew));
+        // An escape is a saga use too: a saga value reached this body.
         let operations = count(graph, |e| {
             matches!(
                 e,
-                FlowEvent::SagaStep { .. } | FlowEvent::SagaCompensate { .. }
+                FlowEvent::SagaStep { .. }
+                    | FlowEvent::SagaCompensate { .. }
+                    | FlowEvent::SagaEscape { .. }
             )
         });
         if owners == 0 && operations == 0 {
@@ -788,6 +791,29 @@ mod tests {
         assert_eq!(
             check_workflow(&workflow(graph)).verdict,
             SagaVerdict::Covered
+        );
+    }
+
+    #[test]
+    fn a_body_with_only_a_saga_escape_is_unknown() {
+        // A saga value arrives and leaves. No saga node owns or steps it.
+        let graph = FlowGraph {
+            nodes: vec![
+                node(FlowEvent::Entry),
+                node(FlowEvent::SagaEscape {
+                    to: "dep::finish".to_string(),
+                }),
+                node(FlowEvent::Exit {
+                    outcome: ExitOutcome::Ok,
+                }),
+            ],
+            edges: vec![edge(0, 1, None), edge(1, 2, None)],
+        };
+        let r = check_workflow(&workflow(graph));
+        assert_eq!(r.verdict, SagaVerdict::Unknown, "{r:#?}");
+        assert!(
+            r.unknown.iter().any(|u| u.starts_with("saga-escapes: ")),
+            "{r:#?}"
         );
     }
 
