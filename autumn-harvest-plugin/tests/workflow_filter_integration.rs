@@ -1784,12 +1784,29 @@ async fn filter_errors_return_400() {
         ("(attrs.a = 1", "')'"),
         ("attrs.a.b = 1", "nested"),
         ("phase = 'x'", "unknown field"),
-        ("", "empty"),
+        ("state = 'MIGRATED'", "state=MIGRATED"),
+        ("attrs.a > 1e-2000000000", "out of range"),
     ] {
         let (status, body) = get_json(&app, format!("/workflows?filter={}", enc(filter))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{filter:?}: {body}");
         assert!(body.to_string().contains(needle), "{filter:?}: {body}");
     }
+
+    // An empty value is absent, the same as `state=`.
+    let (status, body) = get_json(&app, "/workflows?filter=%20").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The predicate limit counts every `filter` value of the request.
+    let many = (0..33)
+        .map(|i| format!("filter={}", enc(&format!("attrs.k{i} EXISTS"))))
+        .collect::<Vec<_>>()
+        .join("&");
+    let (status, body) = get_json(&app, format!("/workflows?{many}")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.to_string().contains("more than 32 predicates"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -1874,9 +1891,11 @@ async fn filter_or_explain_uses_the_search_index() {
         plan.contains("BitmapOr"),
         "the OR must join index scans:\n{plan}"
     );
-    assert!(
-        plan.contains("idx_harvest_we_search"),
-        "the OR branches must use idx_harvest_we_search:\n{plan}"
+    assert_eq!(
+        plan.matches("Bitmap Index Scan on idx_harvest_we_search")
+            .count(),
+        2,
+        "each OR branch must use idx_harvest_we_search:\n{plan}"
     );
     assert!(!plan.contains("Seq Scan"), "no full scan:\n{plan}");
 }
@@ -1993,4 +2012,161 @@ async fn change_stream_needs_admin_and_a_notification_url() {
     let app = harvest_api_router(api_state);
     let (status, body) = get_json(&app, "/workflows/changes/stream").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+}
+
+#[tokio::test]
+async fn filter_applies_on_the_history_bloat_path() {
+    let (database_url, _container) = setup_single_database().await;
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(build_pool(&database_url)));
+    let app = harvest_api_router(api_state);
+
+    for (id, attrs) in [
+        ("b-a", json!({ "a": 1 })),
+        ("b-b", json!({ "b": 1 })),
+        ("b-c", json!({ "c": 1 })),
+    ] {
+        seed_workflow(&database_url, ShardId::new(0), "flow", id, Some(attrs)).await;
+    }
+    let uri = format!(
+        "/workflows?history_bloat_min_events=1&filter={}",
+        enc("attrs.a = 1 OR attrs.b = 1")
+    );
+    let (status, body) = get_json(&app, uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(sorted_ids(&body), ["b-a", "b-b"]);
+}
+
+async fn get_html(app: &HarvestApiApp, uri: &str) -> (StatusCode, String) {
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .expect("GET request failed");
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read the body");
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+#[tokio::test]
+async fn vantage_list_filter_and_live_detail_page() {
+    let (database_url, _container) = setup_single_database().await;
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(build_pool(&database_url)));
+    let ui = autumn_harvest_plugin::harvest_ui_router(api_state);
+
+    let live = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "flow",
+        "ui-live",
+        Some(json!({ "phase": "blocked" })),
+    )
+    .await;
+    let other = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "flow",
+        "ui-other",
+        Some(json!({ "phase": "open" })),
+    )
+    .await;
+    let row = |id: ExecutionId| format!("workflows/{id}");
+
+    // The list applies the filter and marks its live regions.
+    let filter = enc("attrs.phase = 'blocked' OR attrs.amount > 10");
+    let (status, html) = get_html(&ui, &format!("/workflows?filter={filter}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains(&row(live)), "{html}");
+    assert!(!html.contains(&row(other)), "{html}");
+    assert!(
+        html.contains(r#"id="live-results" data-live-region"#),
+        "{html}"
+    );
+    assert!(html.contains(r#"<script src="assets/live.js" defer></script>"#));
+
+    // A bad filter keeps the page, lists every row and shows the error inline.
+    let (status, html) = get_html(&ui, &format!("/workflows?filter={}", enc("attrs.a ="))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("invalid filter: expected a value"), "{html}");
+    assert!(
+        html.contains(&row(live)) && html.contains(&row(other)),
+        "{html}"
+    );
+
+    // The detail page of a live run is live, with the newest event id.
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+    let newest: Option<i32> = autumn_harvest::schema::harvest_events::table
+        .filter(autumn_harvest::schema::harvest_events::workflow_exec_id.eq(live.as_uuid()))
+        .select(diesel::dsl::max(
+            autumn_harvest::schema::harvest_events::event_id,
+        ))
+        .first(&mut conn)
+        .await
+        .expect("newest event id");
+    let newest = newest.expect("a started run has an event");
+    let (status, html) = get_html(&ui, &format!("/workflows/{live}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains(r#"<script src="../assets/live.js" defer></script>"#),
+        "{html}"
+    );
+    assert!(
+        html.contains(&format!(r#"data-live-last-event-id="{newest}""#)),
+        "{html}"
+    );
+    assert!(
+        html.contains(&format!(
+            r#"data-live-stream="../../executions/{live}/events/stream""#
+        )),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"id="live-detail" data-live-region"#),
+        "{html}"
+    );
+}
+
+#[tokio::test]
+async fn change_stream_ends_with_stream_error_when_a_listener_closes() {
+    let (database_url, _container) = setup_single_database().await;
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::from(build_pool(&database_url)));
+    api_state
+        .set_workflow_result_notification_database_urls([(ShardId::new(0), database_url.clone())]);
+    let app = harvest_api_router(api_state);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/workflows/changes/stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("open the change stream");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // End the LISTEN backend of this test database.
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+    diesel::sql_query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE datname = current_database() AND query LIKE 'LISTEN%' \
+         AND pid <> pg_backend_pid()",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("terminate the listener");
+
+    let frame = wait_for_sse_event(response, "stream-error", std::time::Duration::from_secs(10))
+        .await
+        .expect("a stream-error frame after the listener closes");
+    assert!(frame.contains("listener_closed"), "{frame}");
 }

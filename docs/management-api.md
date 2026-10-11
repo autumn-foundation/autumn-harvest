@@ -288,7 +288,8 @@ event: changed
 data: {"notifications":3}
 ```
 
-`notifications` is the count of event appends since the last frame. A frame
+`notifications` is the count of `harvest_events` notifications since the
+last frame. One notification can cover more than one event of a run. A frame
 names no execution and holds no payload. A client fetches the list again.
 
 When a shard listener closes, the stream sends one frame and ends. The client
@@ -305,8 +306,11 @@ data: {"error":"listener_closed","retry":true}
 | `401` | No admin access. The route uses the same gate as the execution event stream. |
 | `503` | No notification URL is set, or a shard listener is not available. |
 
-Each open stream holds one `LISTEN` connection for each shard. The
+Each open stream holds one `LISTEN` connection for each shard. The stream
+waits at most 5 s for each shard connection. The
 [proxy notes](#reverse-proxy-and-cdn-notes) above apply.
+
+---
 
 ## Addressing workflows by business id (`/workflows/by-id/...`)
 
@@ -631,8 +635,11 @@ term      = "(" or_expr ")" | predicate
 predicate = field op value
           | field "IN" "(" value { "," value } ")"
           | attr "EXISTS"
+field     = attr | system
 attr      = "attrs." ( key | quoted-string )
-op        = "=" | "!=" | ">" | ">=" | "<" | "<="
+system    = "state" | "workflow_name" | "owner" | "severity" | "started_at"
+key       = a letter or "_", then letters, digits, "_" or "-"
+op        = "=" | "!=" | "<>" | ">" | ">=" | "<" | "<="
 value     = quoted-string | number | "true" | "false"
 ```
 
@@ -651,25 +658,32 @@ that is not a plain word.
 
 **Semantics.** Attribute predicates have the same meaning as the
 [typed predicates](#typed-search-attribute-predicates-get-workflows). `!=`
-matches a row that has the field and a different value. A comparison matches
-number-typed values only. Only top-level keys are filterable. A nested
-`attrs.a.b` gets `400`.
+matches a row that has the field and a different value. So `owner != 'ops'`
+does not match a row with no owner. `<>` is the same as `!=`. A comparison
+matches number-typed values only. Only top-level keys are filterable. A
+nested `attrs.a.b` gets `400`.
 
-**Index rule.** Each branch of each `OR` must hold an indexed predicate: an
-`attrs.*` predicate, or `workflow_name` with `=` or `IN`. Postgres then joins
-the index scans with `BitmapOr`. A branch with no such predicate, for example
-`attrs.a = 1 OR state = 'RUNNING'`, gets `400`. An `OR` that defeats every
-index costs a full scan of the table. A filter with no `OR` needs no index
-predicate.
+**Index rule.** A filter with `OR` must find each row that it matches through
+an index. An index predicate is an `attrs.*` predicate, or `workflow_name`
+with `=` or `IN`. Each `OR` branch can hold one, and Postgres then joins the
+index scans with `BitmapOr`. One predicate on the whole filter is also
+enough, as in `attrs.tenant = 'acme' AND (state = 'FAILED' OR owner = 'x')`.
+`attrs.a = 1 OR state = 'RUNNING'` gets `400`, because it costs a full scan
+of the table. A filter with no `OR` needs no index predicate.
 
-**Limits.** 2048 bytes, 8 levels of parentheses, 32 predicates and 100 `IN`
-values. A filter over a limit gets `400`.
+**Limits.** A filter value holds at most 2048 bytes, 8 levels of parentheses
+and 100 `IN` values. All `filter` values of a request hold at most 32
+predicates. A filter over a limit gets `400`.
 
-**Errors.** A syntax error gets `400`. The message gives the byte offset of
-the error.
+**Errors.** A syntax error gets `400`, and the message gives the byte offset.
+A number that Postgres cannot hold, such as `1e400`, also gets `400`. So does
+a string with a control character. An empty `filter` value is ignored.
 
-**Default list.** The default list hides `MIGRATED` rows. `filter` does not
-change that. Use `state=MIGRATED` to see them.
+**States.** The default list hides `MIGRATED` rows, so `state = 'MIGRATED'`
+gets `400`. Use the `state=MIGRATED` parameter. The stalled list
+(`no_progress_minutes`) shows `RUNNING` and `SUSPENDED` rows. The `state=PAUSED`
+parameter adds paused rows. A `state` predicate in `filter` cannot widen that
+set.
 
 ```bash
 # Blocked runs, or large payments:
@@ -680,7 +694,8 @@ curl -G /workflows \
   --data-urlencode "filter=attrs.phase = 'blocked' OR (workflow_name = 'payment' AND attrs.amount > 10000)"
 ```
 
-`GET /workflows/count` and the CLI do not take `filter` yet.
+`GET /workflows/count` ignores `filter` and counts every row. The CLI has no
+`filter` flag yet.
 
 ## Workflow Stack (describe)
 

@@ -541,7 +541,7 @@ async fn ui_lists_workflows_and_renders_detail_page() {
     assert!(!list_html.contains("http://"));
     assert!(!list_html.contains("https://"));
     // Issue #1982: the list loads one same-origin script for live refresh.
-    // The page holds no inline script.
+    // The page holds no inline `<script>` element.
     assert_eq!(list_html.matches("<script").count(), 1, "{list_html}");
     assert!(list_html.contains(r#"<script src="assets/live.js" defer></script>"#));
 

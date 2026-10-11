@@ -10909,9 +10909,26 @@ pub(crate) fn parse_workflow_filters(
                 filters.search_attr_predicates.push(predicate);
             }
             "filter" => {
+                // An empty value is absent, the same as `state=` or `owner=`.
+                if value.trim().is_empty() {
+                    continue;
+                }
                 let expr = crate::visibility_query::parse(value).map_err(|message| {
                     AutumnError::bad_request_msg(format!("invalid filter: {message}"))
                 })?;
+                // The predicate limit applies to the request, not to each value.
+                let total = filters
+                    .filter
+                    .iter()
+                    .chain(std::iter::once(&expr))
+                    .map(crate::visibility_query::predicate_count)
+                    .sum::<usize>();
+                if total > crate::visibility_query::MAX_PREDICATES {
+                    return Err(AutumnError::bad_request_msg(format!(
+                        "invalid filter: the filter values hold more than {} predicates",
+                        crate::visibility_query::MAX_PREDICATES
+                    )));
+                }
                 filters.filter.push(expr);
             }
             "failure_cause" => {
@@ -45261,6 +45278,9 @@ async fn stream_execution_events(
         .into_response()
 }
 
+/// The longest wait for the `LISTEN` connection of one shard.
+const WORKFLOW_CHANGES_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The shortest gap between two `changed` frames on the change stream.
 const WORKFLOW_CHANGES_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -45283,6 +45303,39 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Opens one `LISTEN` connection for each shard, all at the same time.
+///
+/// Each connect has a 5 s limit, so one silent shard cannot hold the request.
+/// Returns the first shard that failed.
+async fn connect_change_listeners(
+    urls: &BTreeMap<ShardId, String>,
+) -> Result<Vec<autumn_harvest::notify::WorkflowEventListener>, i32> {
+    use autumn_harvest::notify::WorkflowEventListener;
+
+    let connects = urls.iter().map(|(shard, url)| async move {
+        let connect = WorkflowEventListener::connect(url);
+        match tokio::time::timeout(WORKFLOW_CHANGES_CONNECT_TIMEOUT, connect).await {
+            Ok(Ok(listener)) => Ok(listener),
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    shard = shard.as_i32(),
+                    error = %e,
+                    "workflow change stream: shard listener failed"
+                );
+                Err(shard.as_i32())
+            }
+            Err(_) => {
+                tracing::warn!(
+                    shard = shard.as_i32(),
+                    "workflow change stream: shard listener timed out"
+                );
+                Err(shard.as_i32())
+            }
+        }
+    });
+    futures::future::try_join_all(connects).await
+}
+
 /// `GET /workflows/changes/stream` (issue #1982): a live signal for list views.
 ///
 /// The stream listens to `harvest_events` on each shard. That is the channel
@@ -45297,7 +45350,7 @@ async fn stream_workflow_changes(
     Extension(api_state): Extension<HarvestApiState>,
     session: Option<axum::extract::Extension<Session>>,
 ) -> axum::response::Response {
-    use autumn_harvest::notify::{WorkflowEventListener, WorkflowEventWaitOutcome};
+    use autumn_harvest::notify::WorkflowEventWaitOutcome;
     use axum::response::sse::{Event, KeepAlive, Sse};
     use futures::SinkExt as _;
     use std::sync::atomic::Ordering;
@@ -45312,26 +45365,15 @@ async fn stream_workflow_changes(
         .into_response();
     };
 
-    // Listen before the response starts. A change after this point is not
-    // lost.
-    let mut listeners = Vec::with_capacity(urls.len());
-    for (shard, url) in &urls {
-        match WorkflowEventListener::connect(url).await {
-            Ok(listener) => listeners.push(listener),
-            Err(e) => {
-                tracing::warn!(
-                    shard = shard.as_i32(),
-                    error = %e,
-                    "workflow change stream: shard listener failed"
-                );
-                return AutumnError::service_unavailable_msg(format!(
-                    "the notification listener for shard {} is not available",
-                    shard.as_i32()
-                ))
-                .into_response();
-            }
-        }
-    }
+    // The listeners start before the response, so the stream gets each later
+    // change. The client fetches the page once on connect, which covers the
+    // time before.
+    let Ok(listeners) = connect_change_listeners(&urls).await else {
+        return AutumnError::service_unavailable_msg(
+            "a shard notification listener is not available".to_string(),
+        )
+        .into_response();
+    };
 
     let signal = std::sync::Arc::new(WorkflowChangeSignal::default());
     let tasks = listeners
@@ -45379,6 +45421,10 @@ async fn stream_workflow_changes(
                 return;
             }
             let count = signal.count.swap(0, Ordering::Relaxed);
+            // A late permit from a change that the last frame counted.
+            if count == 0 {
+                continue;
+            }
             let frame = Event::default()
                 .event("changed")
                 .data(serde_json::json!({ "notifications": count }).to_string());

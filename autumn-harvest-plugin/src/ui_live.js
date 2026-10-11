@@ -20,6 +20,9 @@
   var minGap = Number(root.getAttribute("data-live-gap-ms")) || 2000;
   var pollEvery = Number(root.getAttribute("data-live-poll-ms")) || 10000;
   var lastEventId = root.getAttribute("data-live-last-event-id");
+  // A live stream can stop without an error, for example on a half-open TCP
+  // connection. A slow timed fetch covers that case.
+  var safetyEvery = 60000;
   // These HTTP statuses do not change on a retry. The page polls instead.
   var noRetry = { 401: true, 403: true, 404: true, 405: true };
 
@@ -30,48 +33,74 @@
   var lastRefresh = 0;
   var gapTimer = null;
   var pollTimer = null;
+  var pollMs = 0;
   var retryTimer = null;
+  var keptTimer = null;
+  var keptDoc = null;
   var backoff = 1000;
   var controller = null;
+  var connected = false;
+  var connectedOnce = false;
+  // The last HTML that the script put in each region, by id.
+  var applied = {};
+
+  var regions = document.querySelectorAll("[data-live-region]");
+  for (var r = 0; r < regions.length; r++) {
+    applied[regions[r].id] = regions[r].innerHTML;
+  }
 
   function setStatus(text) {
     root.hidden = false;
     root.textContent = text;
   }
 
-  // An operator edit marks its form. A marked or focused region is not
-  // swapped, so a refresh never removes typed text.
-  document.addEventListener(
-    "input",
-    function (event) {
-      var form = event.target && event.target.form;
-      if (form) {
-        form.setAttribute("data-live-dirty", "");
+  // A form with a changed field holds operator input.
+  function edited(region) {
+    var fields = region.querySelectorAll("input, textarea, select");
+    for (var i = 0; i < fields.length; i++) {
+      var field = fields[i];
+      if (field.type === "checkbox" || field.type === "radio") {
+        if (field.checked !== field.defaultChecked) {
+          return true;
+        }
+      } else if (field.tagName === "SELECT") {
+        for (var j = 0; j < field.options.length; j++) {
+          if (field.options[j].selected !== field.options[j].defaultSelected) {
+            return true;
+          }
+        }
+      } else if (field.type !== "hidden" && field.value !== field.defaultValue) {
+        return true;
       }
-    },
-    true
-  );
-
-  function busy(region) {
-    var active = document.activeElement;
-    if (
-      active &&
-      region.contains(active) &&
-      /^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(active.tagName)
-    ) {
-      return true;
     }
-    return region.querySelector("[data-live-dirty]") !== null;
+    return false;
   }
 
-  // Returns true when a busy region kept its old content.
+  // A region with focus or with operator input keeps its content, so a
+  // refresh never moves the focus or removes typed text.
+  function busy(region) {
+    var active = document.activeElement;
+    if (active && active !== document.body && region.contains(active)) {
+      return true;
+    }
+    return edited(region);
+  }
+
+  // Returns "swapped", "kept" (a busy region kept old content) or "foreign"
+  // (the document is not this page, for example a login page).
   function swap(doc) {
+    var found = 0;
     var kept = false;
-    var regions = document.querySelectorAll("[data-live-region]");
-    for (var i = 0; i < regions.length; i++) {
-      var region = regions[i];
+    var current = document.querySelectorAll("[data-live-region]");
+    for (var i = 0; i < current.length; i++) {
+      var region = current[i];
       var fresh = region.id ? doc.getElementById(region.id) : null;
       if (!fresh) {
+        continue;
+      }
+      found++;
+      var html = fresh.innerHTML;
+      if (applied[region.id] === html) {
         continue;
       }
       if (busy(region)) {
@@ -80,25 +109,49 @@
       }
       var open = [];
       var details = region.querySelectorAll("details");
+      var before = details.length;
       for (var j = 0; j < details.length; j++) {
         if (details[j].open) {
           open.push(j);
         }
       }
-      region.innerHTML = fresh.innerHTML;
+      region.innerHTML = html;
+      applied[region.id] = html;
       details = region.querySelectorAll("details");
-      for (var k = 0; k < open.length; k++) {
-        if (details[open[k]]) {
-          details[open[k]].open = true;
+      // An index names the same panel only when the count is the same.
+      if (details.length === before) {
+        for (var k = 0; k < open.length; k++) {
+          if (details[open[k]]) {
+            details[open[k]].open = true;
+          }
         }
       }
     }
-    // A page with no live root has nothing more to show, for example a
-    // run that has ended.
-    if (!doc.querySelector("[data-live-stream]")) {
-      stop("Run ended. Live updates are off.");
+    if (found === 0) {
+      return "foreign";
     }
-    return kept;
+    var freshRoot = doc.querySelector("[data-live-stream]");
+    if (!freshRoot) {
+      // The page has nothing more to show, for example a run that ended.
+      stop("Live updates are off. The run ended.");
+    } else if (freshRoot.getAttribute("data-live-last-event-id")) {
+      // The fetched page is current, so the stream can resume after it.
+      lastEventId = freshRoot.getAttribute("data-live-last-event-id");
+    }
+    return kept ? "kept" : "swapped";
+  }
+
+  // Tries a kept document again until each region takes it.
+  function retryKept() {
+    keptTimer = null;
+    if (!keptDoc || stopped) {
+      return;
+    }
+    if (swap(keptDoc) === "kept") {
+      keptTimer = setTimeout(retryKept, minGap);
+    } else {
+      keptDoc = null;
+    }
   }
 
   function refresh() {
@@ -130,16 +183,29 @@
       headers: { Accept: "text/html" },
     })
       .then(function (response) {
-        if (!response.ok) {
+        var type = response.headers.get("content-type") || "";
+        if (!response.ok || response.redirected || type.indexOf("text/html") !== 0) {
           throw new Error("page " + response.status);
         }
         return response.text();
       })
       .then(function (html) {
         var doc = new DOMParser().parseFromString(html, "text/html");
-        if (swap(doc)) {
-          setStatus("Live. Updates wait while you edit a form.");
-        } else if (!stopped) {
+        var result = swap(doc);
+        if (result === "foreign") {
+          throw new Error("not this page");
+        }
+        if (stopped) {
+          return;
+        }
+        if (result === "kept") {
+          keptDoc = doc;
+          if (!keptTimer) {
+            keptTimer = setTimeout(retryKept, minGap);
+          }
+          setStatus("Live. Part of the page waits while you use it.");
+        } else {
+          keptDoc = null;
           setStatus("Live. Updated " + new Date().toLocaleTimeString() + ".");
         }
       })
@@ -155,16 +221,27 @@
       });
   }
 
-  function startPolling() {
-    if (!pollTimer && !stopped) {
-      pollTimer = setInterval(refresh, pollEvery);
+  function startPolling(every) {
+    if (stopped || (pollTimer && pollMs === every)) {
+      return;
     }
+    stopPolling();
+    pollMs = every;
+    pollTimer = setInterval(refresh, every);
   }
 
   function stopPolling() {
     if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;
+    }
+  }
+
+  function disconnect() {
+    connected = false;
+    if (controller) {
+      controller.abort();
+      controller = null;
     }
   }
 
@@ -175,9 +252,7 @@
       clearTimeout(retryTimer);
       retryTimer = null;
     }
-    if (controller) {
-      controller.abort();
-    }
+    disconnect();
     setStatus(text);
   }
 
@@ -199,11 +274,13 @@
     if (!hasData) {
       return;
     }
-    if (name === "stream-end") {
-      ending = true;
-    }
     if (name === "stream-error" || name === "error") {
       throw new Error("stream " + name);
+    }
+    // A real frame proves that the stream works.
+    backoff = 1000;
+    if (name === "stream-end") {
+      ending = true;
     }
     refresh();
   }
@@ -220,28 +297,36 @@
   }
 
   function connect() {
-    if (stopped) {
+    if (stopped || connected || document.hidden) {
       return;
     }
     var headers = { Accept: "text/event-stream" };
     if (lastEventId) {
       headers["Last-Event-ID"] = lastEventId;
     }
-    controller = window.AbortController ? new AbortController() : null;
+    var own = window.AbortController ? new AbortController() : null;
+    controller = own;
+    connected = true;
     var retry = true;
     fetch(streamUrl, {
       credentials: "same-origin",
       headers: headers,
-      signal: controller ? controller.signal : undefined,
+      signal: own ? own.signal : undefined,
     })
       .then(function (response) {
-        if (!response.ok || !response.body) {
+        var type = response.headers.get("content-type") || "";
+        if (!response.ok || !response.body || type.indexOf("text/event-stream") !== 0) {
           retry = !noRetry[response.status];
           throw new Error("stream " + response.status);
         }
-        stopPolling();
-        backoff = 1000;
+        startPolling(safetyEvery);
         setStatus("Live.");
+        // A page with no resume cursor, or a reconnect, can miss a change
+        // from before the stream opened. One fetch covers that time.
+        if (connectedOnce || !lastEventId) {
+          refresh();
+        }
+        connectedOnce = true;
         var reader = response.body.getReader();
         var decoder = new TextDecoder();
         var buffer = "";
@@ -264,24 +349,52 @@
         return pump();
       })
       .catch(function () {
+        if (own) {
+          own.abort();
+        }
+        if (controller !== own) {
+          // A newer connection, or a hidden tab, replaced this one.
+          return;
+        }
+        connected = false;
+        controller = null;
         if (stopped) {
           return;
         }
+        // The page polls until the stream is back. After the run ends, the
+        // polls fetch the final state.
+        startPolling(pollEvery);
         if (ending) {
-          // The run ended. One last fetch shows the final state.
           refresh();
           return;
         }
         setStatus("Live stream is not available. The page checks for changes.");
-        startPolling();
         if (retry) {
           reconnectLater();
         }
       });
   }
 
+  // A hidden tab holds no stream, so it holds no database connection.
   document.addEventListener("visibilitychange", function () {
-    if (!document.hidden && pending) {
+    if (stopped) {
+      return;
+    }
+    if (document.hidden) {
+      disconnect();
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+      return;
+    }
+    if (ending) {
+      refresh();
+      return;
+    }
+    // A successful connect fetches the page once.
+    connect();
+    if (pending) {
       pending = false;
       refresh();
     }

@@ -1240,9 +1240,9 @@ per-shard `WHERE` clause. Its attribute leaves use the SQL in the table above.
 Every key and value is a bound parameter. The merge, the cursor and the
 partial-availability rules do not change.
 
-Each `OR` branch must hold an attribute predicate or `workflow_name` with `=`
-or `IN`. So each shard can join index scans with `BitmapOr`, and an `OR` never
-forces a full scan of a shard.
+A filter with `OR` must find each row through an attribute predicate or
+`workflow_name` with `=` or `IN`. So each shard can use its indexes, for
+example with `BitmapOr`, and an `OR` never forces a full scan of a shard.
 
 ---
 

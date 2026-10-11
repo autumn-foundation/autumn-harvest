@@ -90,22 +90,32 @@ pub fn parse(raw: &str) -> Result<Expr, String> {
             token.at
         ));
     }
-    if !anchored_or_free(&expr) {
-        return Err("each OR branch needs an indexed predicate: an attrs.* \
-             predicate, or workflow_name with = or IN"
-            .to_string());
+    // An `OR` that no index can serve forces a full scan. So a filter with
+    // an `OR` must find each row that it matches through an index.
+    if has_or(&expr) && !anchored(&expr) {
+        return Err(
+            "a filter with OR needs an indexed predicate on each OR branch, \
+             or on the whole filter: an attrs.* predicate, or workflow_name with = or IN"
+                .to_string(),
+        );
     }
     Ok(expr)
 }
 
-/// Whether each `OR` in `expr` has an anchor in each branch.
-fn anchored_or_free(expr: &Expr) -> bool {
+/// The number of predicates in `expr`.
+pub fn predicate_count(expr: &Expr) -> usize {
     match expr {
-        Expr::Leaf(_) => true,
-        Expr::And(children) => children.iter().all(anchored_or_free),
-        Expr::Or(children) => {
-            children.iter().all(anchored) && children.iter().all(anchored_or_free)
-        }
+        Expr::Leaf(_) => 1,
+        Expr::And(children) | Expr::Or(children) => children.iter().map(predicate_count).sum(),
+    }
+}
+
+/// Whether `expr` holds an `OR`.
+fn has_or(expr: &Expr) -> bool {
+    match expr {
+        Expr::Leaf(_) => false,
+        Expr::Or(_) => true,
+        Expr::And(children) => children.iter().any(has_or),
     }
 }
 
@@ -189,6 +199,10 @@ fn lex(raw: &str) -> Result<Vec<Token>, String> {
                 i += 2;
                 TokenKind::Op("!=")
             }
+            b'<' if bytes.get(i + 1) == Some(&b'>') => {
+                i += 2;
+                TokenKind::Op("!=")
+            }
             b'>' | b'<' => {
                 let wide = bytes.get(i + 1) == Some(&b'=');
                 i += if wide { 2 } else { 1 };
@@ -210,7 +224,11 @@ fn lex(raw: &str) -> Result<Vec<Token>, String> {
                     return Err(format!("expected a number at byte {at}"));
                 }
                 i = next;
-                TokenKind::Num(raw[at..i].to_string())
+                let text = &raw[at..i];
+                if number_json(text).is_none() {
+                    return Err(format!("the number at byte {at} is out of range"));
+                }
+                TokenKind::Num(text.to_string())
             }
             c if c.is_ascii_alphabetic() || c == b'_' => {
                 while i < bytes.len()
@@ -244,6 +262,11 @@ fn lex_string(raw: &str, start: usize) -> Result<(String, usize), String> {
             }
         } else if c as u32 == u32::from(quote) {
             return Ok((text, start + 1 + offset + 1));
+        } else if c.is_control() {
+            // Postgres rejects a NUL byte in text and in `jsonb`.
+            return Err(format!(
+                "the string at byte {start} holds a control character"
+            ));
         } else {
             text.push(c);
         }
@@ -496,6 +519,13 @@ impl Parser {
                 return Ok(value);
             }
             let upper = value.to_ascii_uppercase();
+            // The default list hides `MIGRATED` rows, so this filter could
+            // never match. The `state` parameter shows them.
+            if upper == "MIGRATED" {
+                return Err(format!(
+                    "state MIGRATED at byte {value_at} is not filterable here; use state=MIGRATED"
+                ));
+            }
             if crate::api::KNOWN_WORKFLOW_STATES.contains(&upper.as_str()) {
                 Ok(upper)
             } else {
@@ -575,10 +605,29 @@ impl Literal {
     fn into_json(self) -> Value {
         match self {
             Self::Str(text) => Value::String(text),
-            Self::Num(text) => crate::api::coerce_scalar(&text),
+            // The lexer checks each number, so `Null` does not occur.
+            Self::Num(text) => number_json(&text).unwrap_or(Value::Null),
             Self::Bool(flag) => Value::Bool(flag),
         }
     }
+}
+
+/// Converts number text to a JSON number. Returns `None` when JSON or
+/// Postgres `numeric` cannot hold the value, for example `1e400`, or
+/// `1e-400`, which `f64` reads as zero.
+fn number_json(text: &str) -> Option<Value> {
+    if let Ok(n) = text.parse::<i64>() {
+        return Some(Value::Number(n.into()));
+    }
+    if let Ok(n) = text.parse::<u64>() {
+        return Some(Value::Number(n.into()));
+    }
+    let n = text.parse::<f64>().ok().filter(|n| n.is_finite())?;
+    let mantissa = text.split(['e', 'E']).next().unwrap_or(text);
+    if n == 0.0 && mantissa.bytes().any(|b| matches!(b, b'1'..=b'9')) {
+        return None;
+    }
+    serde_json::Number::from_f64(n).map(Value::Number)
 }
 
 /// Returns the one child, or a node of the children.
@@ -975,23 +1024,40 @@ mod tests {
     }
 
     #[test]
-    fn each_or_branch_needs_an_index_anchor() {
+    fn a_filter_with_or_needs_an_index_anchor() {
         // A state-only branch has no general index.
         let message = rejected("attrs.a = 1 OR state = 'RUNNING'");
         assert!(message.contains("index"), "{message}");
         assert!(rejected("owner = 'x' OR severity = 'y'").contains("index"));
         assert!(rejected("started_at > '2026-01-01T00:00:00Z' OR attrs.a = 1").contains("index"));
-        // An AND branch is anchored by one anchored child.
+        assert!(rejected("workflow_name != 'w' OR attrs.a = 1").contains("index"));
+        // Each OR branch holds an anchor.
         parse("(attrs.a = 1 AND state = 'RUNNING') OR workflow_name = 'w'").unwrap();
         parse("workflow_name IN ('a','b') OR attrs.x EXISTS").unwrap();
         parse("attrs.a != 1 OR attrs.b > 2").unwrap();
-        // A nested OR is anchored only when each of its branches is.
+        // The whole filter holds an anchor, so an OR below it needs none.
+        parse("attrs.c = 1 AND (state = 'FAILED' OR severity = 'high')").unwrap();
+        parse("(attrs.a = 1 OR owner = 'x') AND attrs.c = 1").unwrap();
         parse("(attrs.a = 1 OR attrs.b = 1) AND state = 'RUNNING'").unwrap();
-        assert!(rejected("(attrs.a = 1 OR owner = 'x') AND attrs.c = 1").contains("index"));
         // With no OR, no anchor is needed.
         parse("state = 'RUNNING' AND owner = 'x'").unwrap();
-        // `workflow_name !=` is not an anchor.
-        assert!(rejected("workflow_name != 'w' OR attrs.a = 1").contains("index"));
+    }
+
+    #[test]
+    fn values_that_postgres_rejects_fail_early() {
+        assert!(rejected("attrs.a > 1e-2000000000").contains("out of range"));
+        assert!(rejected("attrs.a = 1e400").contains("out of range"));
+        assert!(rejected("owner = 'a\u{0}b'").contains("control character"));
+        assert!(rejected("attrs.a = 'x\u{1}'").contains("control character"));
+        assert_eq!(parsed("attrs.a = 0.0e5"), "a=0.0");
+        assert!(rejected("state = 'MIGRATED'").contains("state=MIGRATED"));
+        assert!(rejected("state IN ('RUNNING', 'migrated')").contains("state=MIGRATED"));
+    }
+
+    #[test]
+    fn angle_brackets_mean_not_equal() {
+        assert_eq!(parsed("attrs.a <> 1"), "a!=1");
+        assert_eq!(parsed("owner<>'x'"), "Owner:Ne(\"x\")");
     }
 
     #[test]

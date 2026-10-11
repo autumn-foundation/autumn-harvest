@@ -58,15 +58,15 @@ worse than no `OR`.
 
 | # | How to make it fail | Mitigation |
 |---|--------------------|------------|
-| R1 | An `OR` branch with no indexed predicate forces a full scan. | The compiler rejects the filter (`400`) unless each `OR` branch holds an anchor: an `attrs.*` predicate, or `workflow_name` with `=` or `IN`. |
+| R1 | An `OR` branch with no indexed predicate forces a full scan. | A filter with `OR` must find each row through an anchor: an `attrs.*` predicate, or `workflow_name` with `=` or `IN`. Else the compiler rejects it (`400`). |
 | R2 | A value goes into the SQL text. | Every value and key is a bound parameter. The operator text comes from a closed enum. |
 | R3 | Deep nesting overflows the parser stack. | Depth limit 8. Length limit 2048 bytes. At most 32 predicates and 100 `IN` values. |
 | R4 | `a OR b AND c` parses as `(a OR b) AND c`. | `AND` binds tighter than `OR`. Unit tests and database tests prove both forms. |
 | R5 | The stalled or bloat list ignores the filter. | All three loaders call one helper. A test covers the stalled path. |
 | R6 | A tenant key named like a system field changes meaning. | Attributes always use the `attrs.` prefix. |
 | R7 | `"100"` and `100` match the same rows by accident. | Quotes decide the type. `100` is a number. `"100"` is a string. |
-| R8 | Live refresh wipes text that an operator types in a form. | A region with focus or with edited input is not swapped. The swap runs later. |
-| R9 | Live refresh floods the server. | The server coalesces `changed` frames to one each second. The client fetches at most once each 2 s (list) or 3 s (detail), and stops when the tab is hidden. |
+| R8 | Live refresh wipes text that an operator types in a form. | A region with focus, or with a changed form field, is not swapped. The script tries it again each gap. |
+| R9 | Live refresh floods the server. | The server coalesces `changed` frames to one each second. The client fetches at most once each 2 s (list) or 3 s (detail). A hidden tab closes its stream. |
 | R10 | The change stream leaks data to a viewer. | The `changed` frame holds a count only. The route is admin-gated, the same as #324. |
 | R11 | A non-admin or a failed stream sees a frozen page. | The client falls back to a timed fetch each 10 s. A browser without JavaScript gets the static page. |
 | R12 | A long history gives `409 slow_consumer` on the detail stream. | The client sends `Last-Event-ID` with the last event id that the page shows. The backfill is empty. |
@@ -82,7 +82,7 @@ worse than no `OR`.
 | Black | A grammar is a public contract. A change later breaks callers. A script tag breaks the "no JavaScript" promise in the docs. A change stream is one more route to secure. |
 | Yellow | No migration. Attribute leaves reuse the #506 SQL and its index proof. The swap keeps one renderer on the server. A failed stream still leaves a working page. |
 | Green | Later: `NOT`, more system fields, the grammar on `GET /workflows/count`, a CLI flag, a server-side filter on the change stream. |
-| Blue | TDD order: parser unit tests, then SQL text tests, then database tests for results and `EXPLAIN`, then the stream route, then the UI. Then docs, the changelog fragment and a review. |
+| Blue | TDD order: parser unit tests, then SQL text tests, then database tests for results and `EXPLAIN`. Then the stream route, the UI, the docs, the changelog fragment and a review. |
 
 ### 0.5 Decisions
 
@@ -119,7 +119,7 @@ worse than no `OR`.
 
 4. An attribute leaf compiles to the #506 SQL. A system leaf compiles to a
    column comparison. All columns are qualified with the table name.
-5. Index rule: each branch of each `OR` must hold an anchor. An anchor is an
+5. Index rule: a filter with `OR` must hold an anchor. An anchor is an
    `attrs.*` predicate, or `workflow_name` with `=` or `IN`. An `AND` holds an
    anchor when one child holds one. An `OR` holds an anchor when each branch
    holds one. A filter with no `OR` needs no anchor.
@@ -132,12 +132,37 @@ worse than no `OR`.
    - reads the stream with `fetch` and a stream reader,
    - on a frame, fetches the page HTML and swaps each region by its id,
    - falls back to a timed fetch when the stream fails,
-   - pauses while the tab is hidden.
+   - closes the stream while the tab is hidden.
 
    The list form gets a `filter` field. A detail page of a run that ended, or
    a page rendered after a rejected action, has no live script.
 
-### 0.6 Out of scope
+### 0.6 Corrections after the review
+
+Four review agents read the change: grammar and SQL, the change stream, the
+UI script, and tests and docs. The change now has these corrections:
+
+- The index rule reads the whole filter. `attrs.a = 1 AND (state = 'X' OR
+  owner = 'y')` has an index path, so it passes.
+- The grammar rejects numbers that Postgres cannot hold, control characters
+  and `state = 'MIGRATED'`. It accepts `<>`. The 32-predicate limit counts
+  the whole request. An empty `filter` value is ignored.
+- The change stream connects to all shards at the same time, with a 5 s
+  timeout. It sends no frame with a count of zero.
+- The detail page reads the newest event id before the events. A failed read
+  gives a static page.
+- The script treats a focused element or a changed field as busy, and tries
+  a kept region again. It skips a region with the same HTML. It fetches the
+  page after each reconnect. It closes the stream in a hidden tab, and it
+  takes the cursor from each fetched page. A redirect or a page with no live
+  regions is a failed fetch.
+- The docs say that inline `confirm()` handlers need a CSP exception.
+
+Not changed: one shared `LISTEN` for each shard and process (R14), and API
+tokens on the stream. The stream uses the #324 gate, which admits sessions
+and the admin boundary only.
+
+### 0.7 Out of scope
 
 - `NOT`. A negated GIN predicate cannot use the index.
 - The grammar on `GET /workflows/count` and in the CLI.
@@ -152,7 +177,7 @@ worse than no `OR`.
 |----------------|----------|--------------|
 | The list API accepts an OR filter and returns correct results (precedence and grouping). | `visibility_query` unit tests: precedence, groups, errors, SQL text. `workflow_filter_integration`: `filter_or_precedence_and_grouping`, plus the stalled path and two shards. | `visibility_query` module. `filter` arm in `parse_workflow_filters`. One helper in the three loaders. |
 | `EXPLAIN` for a representative OR query uses an index on a seeded fixture. | `filter_or_explain_uses_the_search_index` seeds 20 000 rows and runs `EXPLAIN` on the exact list query. | `explain_workflow_list` test hook. The anchor rule. |
-| Vantage list and detail pages update without a manual reload. | `ui_integration`: the pages load `live.js` and mark regions. `workflow_filter_integration`: the change stream sends `changed` after an event. | `GET /workflows/changes/stream`. `assets/live.js`. Region marks. |
+| Vantage list and detail pages update without a manual reload. | `ui::tests` and `vantage_list_filter_and_live_detail_page`: the pages load `live.js` and mark regions. `workflow_filter_integration`: the change stream sends `changed` after an event. A Chromium run of `live.js` against a stub server. | `GET /workflows/changes/stream`. `assets/live.js`. Region marks. |
 
 ## 2. Known limits
 

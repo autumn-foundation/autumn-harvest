@@ -1590,6 +1590,8 @@ struct LiveView {
     last_event_id: Option<i32>,
     /// The shortest gap between two fetches, in milliseconds.
     gap_ms: u32,
+    /// The gap between two timed fetches, in milliseconds.
+    poll_ms: u32,
 }
 
 /// The live-refresh script of the workflow list and detail pages.
@@ -1866,6 +1868,27 @@ async fn render_workflow_detail_page(
         .await
         .map_err(map_error)?;
 
+    // The newest event id (issue #1982). Only a live page needs it. It is read
+    // before the events, so the stream sends an event that lands later. A
+    // failed read makes the page static. It does not fail the page.
+    let last_event_id: Option<i32> =
+        if rendered_at_action_url || is_terminal_workflow_state(&execution.state) {
+            None
+        } else {
+            harvest_events::table
+                .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
+                .select(diesel::dsl::max(harvest_events::event_id))
+                .first(&mut conn)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(
+                        error = %e,
+                        "workflow detail: newest event id read failed; the page is not live"
+                    );
+                    None
+                })
+        };
+
     // Resolve event_page before any DB queries so we can use OFFSET/LIMIT directly.
     let page_size = DETAIL_EVENT_PAGE_SIZE;
     let (event_page, event_page_error, jump_event_error) =
@@ -2071,20 +2094,6 @@ async fn render_workflow_detail_page(
     } else {
         Vec::new()
     };
-
-    // The newest event id (issue #1982). Only a live page needs it.
-    let last_event_id: Option<i32> =
-        if rendered_at_action_url || crate::api::is_terminal_state(&execution.state) {
-            None
-        } else {
-            harvest_events::table
-                .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
-                .select(diesel::dsl::max(harvest_events::event_id))
-                .first(&mut conn)
-                .await
-                .map_err(database_error)
-                .map_err(map_error)?
-        };
 
     drop(conn);
     if !is_terminal_workflow_state(&execution.state)
@@ -5565,6 +5574,7 @@ fn render_workflow_list(
         self_url: None,
         last_event_id: None,
         gap_ms: 2000,
+        poll_ms: 10_000,
     };
     layout_live("Workflows · Vantage", &body, "", None, Some(&live))
 }
@@ -6023,6 +6033,7 @@ fn render_workflow_detail(
 ///
 /// `last_event_id` is the newest event of the run (issue #1982). The live
 /// script resumes the #324 stream after it, so the stream sends no backfill.
+/// `None` gives a static page.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn render_workflow_detail_live(
     execution: &WorkflowExecution,
@@ -6532,20 +6543,21 @@ fn render_workflow_detail_live(
     // element and not just a string prefix (issue #1687 review).
     let html_base = rendered_at_action_url.then_some("..");
     // A run that ended has no more events. A page from a rejected action
-    // holds typed values that a swap must not remove.
-    let live =
-        (!rendered_at_action_url && !crate::api::is_terminal_state(&execution.state)).then(|| {
-            LiveView {
-                script_src: "../assets/live.js",
-                stream: format!("../../executions/{exec_id_str}/events/stream"),
-                self_url: Some(workflow_detail_href(
-                    &exec_id_str,
-                    event_page,
-                    selected_log_level,
-                )),
-                last_event_id,
-                gap_ms: 3000,
-            }
+    // holds typed values that a swap must not remove. `last_event_id` is
+    // `None` for a page that is not live.
+    let live = last_event_id
+        .filter(|_| !rendered_at_action_url && !is_terminal_workflow_state(&execution.state))
+        .map(|last_event_id| LiveView {
+            script_src: "../assets/live.js",
+            stream: format!("../../executions/{exec_id_str}/events/stream"),
+            self_url: Some(workflow_detail_href(
+                &exec_id_str,
+                event_page,
+                selected_log_level,
+            )),
+            last_event_id: Some(last_event_id),
+            gap_ms: 3000,
+            poll_ms: 10_000,
         });
     layout_live(&title, &body, "../", html_base, live.as_ref())
 }
@@ -7099,7 +7111,7 @@ fn layout(title: &str, body: &Markup, base_href: &str, html_base: Option<&str>) 
 /// [`layout`], plus the live-refresh script and its settings (issue #1982).
 ///
 /// The page loads the script from the same origin, with `defer`. The page
-/// holds no inline script.
+/// holds no inline `<script>` element.
 fn layout_live(
     title: &str,
     body: &Markup,
@@ -7143,7 +7155,8 @@ fn layout_live(
                             data-live-stream=(live.stream)
                             data-live-self=[live.self_url.as_deref()]
                             data-live-last-event-id=[live.last_event_id]
-                            data-live-gap-ms=(live.gap_ms) {}
+                            data-live-gap-ms=(live.gap_ms)
+                            data-live-poll-ms=(live.poll_ms) {}
                     }
                     (body)
                 }

@@ -203,8 +203,9 @@ curl -G /workflows --data-urlencode \
   "filter=attrs.phase = 'blocked' OR (workflow_name = 'payment' AND attrs.amount > 10000)"
 ```
 
-Each `OR` branch must hold an `attrs.*` predicate, or `workflow_name` with `=`
-or `IN`. Postgres then joins the index scans with `BitmapOr`. See
+Each `OR` branch, or the whole filter, must hold an `attrs.*` predicate or
+`workflow_name` with `=` or `IN`. Postgres then joins the index scans with
+`BitmapOr`. See
 [Filter expressions](management-api.md#filter-expressions-get-workflows) for
 the grammar.
 
