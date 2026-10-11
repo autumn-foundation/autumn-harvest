@@ -316,6 +316,7 @@ mod signal_with_start_tests;
 mod sla_breach_tests;
 mod slo_pack_docs;
 mod slot_tuner_tests;
+mod speculative_execution_docs;
 mod sqlite_feasibility_docs;
 mod standalone_activity_docs;
 #[cfg(feature = "db")]
