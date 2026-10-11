@@ -128,8 +128,9 @@ pub fn check(manifest: &StructureManifest) -> Result<Vec<SagaReport>, CheckError
 }
 
 /// The first reference that points at nothing. It is a body that a call, a
-/// saga step or a handler names, or a handler index past the list. That
-/// code is never checked, so it could hide a saga or a gap.
+/// saga step or a handler names, or a handler index past the list. The call
+/// list of each body counts too. That code is never checked, so it could
+/// hide a saga or a gap.
 fn dangling_reference(workflow: &WorkflowStructure) -> Option<String> {
     let ids: BTreeSet<&str> = workflow.bodies.iter().map(|b| b.id.as_str()).collect();
     let mut named: Vec<&String> = Vec::new();
@@ -152,9 +153,11 @@ fn dangling_reference(workflow: &WorkflowStructure) -> Option<String> {
         }
     }
     let handlers = workflow.handlers.iter().flat_map(|h| &h.bodies);
+    let calls = workflow.bodies.iter().flat_map(|b| &b.calls);
     named
         .into_iter()
         .chain(handlers)
+        .chain(calls.map(|call| &call.callee))
         .map(String::as_str)
         .find(|id| !ids.contains(id))
         .map(|missing| format!("a node or handler names `{missing}`, which has no body"))
@@ -497,7 +500,7 @@ fn emits_a_step(workflow: &WorkflowStructure, start: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structure::{FlowEdge, FlowNode, HandlerSite};
+    use crate::structure::{CallSite, FlowEdge, FlowNode, HandlerSite};
 
     fn node(event: FlowEvent) -> FlowNode {
         FlowNode {
@@ -653,6 +656,25 @@ mod tests {
         }
         let err = check(&handler).expect_err("a handler with a missing body");
         assert!(err.to_string().contains("w::on_signal"), "{err}");
+
+        // A body-level call names a body the workflow does not hold.
+        let mut body_call = manifest(FlowGraph {
+            nodes: vec![node(FlowEvent::Entry)],
+            edges: Vec::new(),
+        });
+        if let Some(body) = body_call
+            .workflows
+            .first_mut()
+            .and_then(|w| w.bodies.first_mut())
+        {
+            body.calls.push(CallSite {
+                callee: "w::hidden".to_string(),
+                in_loop: false,
+                resume: false,
+            });
+        }
+        let err = check(&body_call).expect_err("a body call to a missing body");
+        assert!(err.to_string().contains("w::hidden"), "{err}");
 
         // A handler node names an entry of `handlers` that is not there.
         let dangling = FlowGraph {

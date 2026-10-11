@@ -140,7 +140,8 @@ reaches no node, such as an arm that never returns, is untracked. An exit
 node has no out-edge. The check refuses a graph that breaks these rules,
 names a missing node, has other than one entry, or has a node that the entry
 cannot reach, or an exit with an out-edge. It also refuses a call, a saga
-step or a handler that names a body or handler the workflow does not hold.
+step, a handler or a body `calls` entry that names a body or handler the
+workflow does not hold.
 
 `WorkflowStructure.handlers` lists each handler registration: its kind
 (`signal`, `update`, `query` or `other`), its name when the MIR shows it,
