@@ -349,7 +349,9 @@ async fn fork_in_transaction(
         history_quota,
     )
     .await?;
-    crate::reset::enqueue_fork_workflow_task(conn, &fork, new_exec_id, registry).await?;
+    // A fork is admitted as a fresh start, so its first task is a new start in
+    // the claim order (issue #1824).
+    crate::reset::enqueue_fork_workflow_task(conn, &fork, new_exec_id, registry, true).await?;
 
     Ok(ForkResult {
         new_exec_id,

@@ -875,7 +875,9 @@ pub const NEW_START_HANDICAP_SECS: u32 = 30;
 /// Every other task is a continuation. That includes an activity task and a
 /// woken workflow task. It also includes the first task of a child, a
 /// continue-as-new, a reset fork, a workflow retry or a DLQ redrive. Each of
-/// these extends admitted work. The admission gate uses a similar split.
+/// these extends admitted work. The admission gate uses a similar split. A
+/// non-destructive fork (issue #2000) is admitted as a fresh start, so its
+/// first task is a new start.
 ///
 /// A new start sorts as if it were due [`NEW_START_HANDICAP_SECS`] later. So
 /// at equal priority, a continuation goes first under a backlog. The

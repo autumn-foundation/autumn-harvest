@@ -892,7 +892,7 @@ pub async fn reset_workflow_execution(
             let signals_buffered =
                 reapply_or_drop_signals(conn, exec_id, new_exec_id, request.signal_reapply).await?;
 
-            enqueue_fork_workflow_task(conn, &fork, new_exec_id, registry).await?;
+            enqueue_fork_workflow_task(conn, &fork, new_exec_id, registry, false).await?;
 
             Ok((
                 ResetResult {
@@ -1758,11 +1758,15 @@ async fn reapply_or_drop_signals(
 }
 
 /// Enqueue the first workflow task of a fork.
+///
+/// `new_start` marks the task as a fresh admission in the claim order (issue
+/// #1824). A non-destructive fork is one. A reset continues admitted work.
 pub(crate) async fn enqueue_fork_workflow_task(
     conn: &mut AsyncPgConnection,
     fork: &WorkflowExecution,
     new_exec_id: ExecutionId,
     registry: Option<&HandlerRegistry>,
+    new_start: bool,
 ) -> Result<(), HarvestError> {
     // The fork row holds the source's stored input, which may be an envelope
     // (issue #1979). The concurrency key needs the plaintext. The task stores
@@ -1780,6 +1784,7 @@ pub(crate) async fn enqueue_fork_workflow_task(
     let mut enqueue = EnqueueParams::new(fork.queue_name.clone(), TaskType::Workflow, task_input);
     enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
     enqueue.required_build_id = fork.assigned_build_id.clone();
+    enqueue.new_start = new_start;
     if let Some(reg) = registry
         && let Some(input) = &decoded
         && let Some(info) = reg.workflows.get(&fork.workflow_name)

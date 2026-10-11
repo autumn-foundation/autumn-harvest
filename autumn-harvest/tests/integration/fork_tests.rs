@@ -986,6 +986,49 @@ async fn a_large_input_override_is_offloaded() {
     assert_eq!(fork_refs.len(), 1, "the fork references the input blob");
 }
 
+/// A fork is admitted as a fresh start, so its first task is a new start in
+/// the claim order (issue #1824). A reset continues admitted work, so its
+/// first task is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_task_is_a_new_start() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("new-start");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let new_start = |exec_id: ExecutionId| {
+        autumn_harvest::schema::harvest_task_queue::table
+            .filter(
+                autumn_harvest::schema::harvest_task_queue::workflow_exec_id
+                    .eq(Some(exec_id.as_uuid())),
+            )
+            .select(autumn_harvest::schema::harvest_task_queue::new_start)
+    };
+    let fork_flags: Vec<bool> = new_start(forked).load(&mut conn).await.expect("fork task");
+    assert_eq!(fork_flags, vec![true], "the fork task is a new start");
+
+    let reset = reset_workflow_execution(
+        &mut conn,
+        forked,
+        WorkflowResetRequest {
+            reset_to_event_id: Some(0),
+            reset_point: None,
+            reason: "retry".to_string(),
+            operator_id: "tester".to_string(),
+            signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::Drop,
+            allow_terminal_source: false,
+        },
+        Some(&registry()),
+    )
+    .await
+    .expect("reset the fork");
+    let reset_flags: Vec<bool> = new_start(reset.new_exec_id)
+        .load(&mut conn)
+        .await
+        .expect("reset task");
+    assert_eq!(reset_flags, vec![false], "a reset task is a continuation");
+}
+
 /// A live fork never reads the source history. A source blob that is gone
 /// does not stop the fork from running its activities.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
