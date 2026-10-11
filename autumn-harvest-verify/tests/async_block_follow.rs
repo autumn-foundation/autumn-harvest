@@ -72,6 +72,7 @@ fn a_case_the_analysis_cannot_follow_is_never_proven() {
         "wf_step_named_write_future",
         "wf_step_move_mut",
         "wf_step_boxed_dyn",
+        "wf_step_wrapped_block",
     ] {
         assert!(
             !matches!(verdict(&all, name), Verdict::ProvenDeterministic),

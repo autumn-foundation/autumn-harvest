@@ -1756,32 +1756,62 @@ impl<'a> Analyzer<'a> {
         out: &mut TaintSet,
     ) {
         let block = returning_block(body);
-        let Some(span) = brace_form(&body.return_ty) else {
+        let interior = self.interior_types();
+        let inner = brace_form(&body.return_ty)
+            .filter(|span| span.starts_with("{async block@") && span.contains(".rs:"));
+        // The block itself, behind `&mut`, `Pin` or `Box` at most, is polled
+        // as it is. Any other type around it has a `poll` of its own.
+        if future_target(&body.return_ty).starts_with("{async block@") {
+            if let Some(span) = &inner {
+                self.follow_block(closure, span, &block, ret, hops, emit, out);
+            }
+        } else {
             let followed = self.follow_named_future(closure, body, ret, hops, &block, out);
-            if followed && emit && may_write_through(&body.return_ty, &self.interior_types()) {
+            if let Some(span) = &inner {
+                self.follow_block(closure, span, &block, ret, hops, emit, out);
+            }
+            if emit && followed && may_write_through(&body.return_ty, &interior) {
                 let detail = format!("{} can write through its fields", body.return_ty.trim());
                 self.push_boundary(BoundaryKind::UnresolvedCallback, &detail, closure, &block);
             }
-            return;
-        };
-        if !span.starts_with("{async block@") || !span.contains(".rs:") {
-            return;
+            if emit && !followed && inner.is_some() {
+                let detail = format!("{} wraps an `async` block", body.return_ty.trim());
+                self.push_boundary(BoundaryKind::UnresolvedCallback, &detail, closure, &block);
+            }
         }
-        let coroutines = self.program.nested_coroutines(closure, &span);
+        if emit && inner.is_some() && captures_mut_ref(body, &interior) {
+            let detail = format!("{} captures a `&mut` reference", body.return_ty.trim());
+            self.push_boundary(BoundaryKind::UnresolvedCallback, &detail, closure, &block);
+        }
+    }
+
+    /// Analyze the coroutine of the `async` block `span`, nested under
+    /// `closure`, or report a boundary when no such body exists.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the hop chain and taint sinks of one closure invocation"
+    )]
+    fn follow_block(
+        &mut self,
+        closure: &str,
+        span: &str,
+        block: &str,
+        ret: &TaintSet,
+        hops: &[Hop],
+        emit: bool,
+        out: &mut TaintSet,
+    ) {
+        let coroutines = self.program.nested_coroutines(closure, span);
         if coroutines.is_empty() && emit {
-            self.push_boundary(BoundaryKind::UnresolvedCallback, &span, closure, &block);
+            self.push_boundary(BoundaryKind::UnresolvedCallback, span, closure, block);
         }
         for coroutine in coroutines {
-            self.recorder.future_edge(closure, &block, &coroutine);
+            self.recorder.future_edge(closure, block, &coroutine);
             let params = self.program.body(&coroutine).map_or(0, |b| b.params.len());
             let mut seeded = vec![ret.clone()];
             seeded.resize(params.max(1), TaintSet::new());
             let outcome = self.analyze_body(&coroutine, &Substitution::new(), &seeded, hops);
             out.absorb(&outcome.ret);
-        }
-        if emit && captures_mut_ref(body, &self.interior_types()) {
-            let detail = format!("{span} captures a `&mut` reference");
-            self.push_boundary(BoundaryKind::UnresolvedCallback, &detail, closure, &block);
         }
     }
 

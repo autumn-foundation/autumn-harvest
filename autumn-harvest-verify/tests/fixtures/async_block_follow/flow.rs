@@ -339,3 +339,30 @@ pub async fn wf_step_boxed_dyn(ctx: &WorkflowContext) -> Out {
         .await?;
     ctx.execute_activity_raw("b", a).await
 }
+
+/// A first-party wrapper whose `poll` ignores the inner future.
+pub struct Wrap<F>(F);
+
+impl<F: Future<Output = Out>> Future for Wrap<F> {
+    type Output = Out;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Out> {
+        std::task::Poll::Ready(Ok(now_nanos()))
+    }
+}
+
+pub fn __autumn_workflow_info_wf_step_wrapped_block() -> u8 {
+    0
+}
+
+/// The step closure returns `Wrap<{async block}>`.
+pub async fn wf_step_wrapped_block(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let a = saga
+        .step(|| Wrap(async { Ok(1) }), |_| async { Ok(()) })
+        .await?;
+    ctx.execute_activity_raw("b", a).await
+}
