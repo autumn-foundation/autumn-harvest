@@ -345,12 +345,19 @@ fn mirror_body(page_text: &str, source: &LimitSource) -> String {
     let body = section(page_text, &format!("\n{}\n", source.heading), "\n## ")
         .unwrap_or_else(|| panic!("{} lacks `{}`", source.page, source.heading));
     let page = source.page.strip_prefix("docs/").unwrap_or(source.page);
-    let mut out = String::new();
-    for line in body
+    // A loose list puts a blank line between bullets. The list ends at the
+    // first line that is neither blank, a bullet nor indented.
+    let lines: Vec<&str> = body
         .lines()
         .skip_while(|line| !line.starts_with("- "))
-        .take_while(|line| line.starts_with("- ") || line.starts_with("  "))
-    {
+        .take_while(|line| line.is_empty() || line.starts_with("- ") || line.starts_with("  "))
+        .collect();
+    let used = lines
+        .iter()
+        .rposition(|line| !line.is_empty())
+        .map_or(0, |at| at + 1);
+    let mut out = String::new();
+    for line in &lines[..used] {
         out.push_str(&rebase_links(line, page));
         out.push('\n');
     }
@@ -552,6 +559,8 @@ fn helpers_parse_their_inputs() {
         mirror_body(page, &source),
         "- One [x](testing/p.md#y).\n  Two.\n- Three.\n"
     );
+    let loose = "# P\n\n## Limits\n\n- One.\n\n- Two.\n  More.\n\nOutro.\n";
+    assert_eq!(mirror_body(loose, &source), "- One.\n\n- Two.\n  More.\n");
     let report = "a\n<!-- mirror: testing/p.md#limits -->\n- old\n<!-- /mirror -->\nb\n";
     let (from, to) = mirror_span(report, source.link).expect("the mirror has both markers");
     assert_eq!(&report[from..to], "- old\n");
