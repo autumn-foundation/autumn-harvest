@@ -1,0 +1,33 @@
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -597,6 +597,10 @@
+     config.shard_assignments = vec![ShardId::new(0)];
+     config.max_concurrent_workflows = WORKFLOW_SLOTS;
+     config.max_concurrent_activities = ACTIVITY_SLOTS;
++    // Claim-concurrency measurement: unset keeps the worker default.
++    if let Ok(raw) = std::env::var("ASSAY14_MAX_CONCURRENT_CLAIMS") {
++        config.max_concurrent_claims = raw.parse().expect("a claim cap is a whole number");
++    }
+     config
+ }
+ 
+@@ -684,6 +688,8 @@
+             concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+             priority: Priority::default(),
+             max_workflow_input_bytes: 0,
++            // Trunk added this field after assay #14 (issue #1977).
++            tenant: None,
+             start_at: None,
+             delay: None,
+             max_workflow_start_delay: None,
+@@ -934,6 +940,10 @@
+              slots, {POOL_SIZE} connections, {WORKER_POLL_MS} ms poll. Input `{}`. Cap {} s.\n",
+             settings.input_json, settings.cap_secs
+         );
++        println!(
++            "Claim loops: {}.\n",
++            std::env::var("ASSAY14_MAX_CONCURRENT_CLAIMS").unwrap_or_else(|_| "default".into())
++        );
+     }
+     for arm in settings.arms.clone() {
+         for depth in settings.depths.clone() {

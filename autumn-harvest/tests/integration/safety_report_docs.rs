@@ -89,7 +89,7 @@ const LIMIT_SOURCES: &[LimitSource] = &[
             ),
             (
                 "Trace conformance of `CodecRotation`.",
-                "No check compares test traces with the `CodecRotation` model.",
+                "No trace check covers the `CodecRotation` model.",
             ),
         ],
     },
@@ -100,19 +100,19 @@ const LIMIT_SOURCES: &[LimitSource] = &[
         limits: &[
             (
                 "drives the store statements, not the `worker.rs` loop.",
-                "The oracle simulator drives store statements, not the `worker.rs` loop.",
+                "The oracle harness drives store statements, not the `worker.rs` loop.",
             ),
             (
                 "A world crash falls between two steps.",
-                "A world crash falls between two steps, so no worker dies inside a task body.",
+                "A world crash falls between two steps.",
             ),
             (
                 "The world workload never fails an activity",
-                "The world simulation never fails an activity",
+                "The world workload never fails an activity.",
             ),
             (
                 "draws actions from fixed weights.",
-                "Both simulators draw actions from fixed weights.",
+                "It draws actions from fixed weights.",
             ),
             (
                 "does not model the timeout sweeper, the `FAILED` state or the poison-pill \
