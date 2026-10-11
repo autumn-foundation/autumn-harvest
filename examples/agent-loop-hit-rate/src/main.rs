@@ -128,6 +128,8 @@ impl MetricsRecorder for Counts {
 
 /// Renders the counts as a Markdown table.
 fn render(resident: &BTreeMap<String, u64>, cache_hits: u64, cache_misses: u64) -> String {
+    use std::fmt::Write as _;
+
     let total: u64 = resident.values().sum();
     let mut out = String::from("| Outcome | Decisions | Share |\n|---|---:|---:|\n");
     let mut rows: Vec<(&String, &u64)> = resident.iter().collect();
@@ -139,12 +141,10 @@ fn render(resident: &BTreeMap<String, u64>, cache_hits: u64, cache_misses: u64) 
         } else {
             format!("miss: `{key}`")
         };
-        out.push_str(&format!("| {label} | {n} | {} |\n", share(*n, total)));
+        let _ = writeln!(out, "| {label} | {n} | {} |", share(*n, total));
     }
-    out.push_str(&format!("| **total** | {total} | |\n\n"));
-    out.push_str(&format!(
-        "Cache: {cache_hits} hits, {cache_misses} misses.\n"
-    ));
+    let _ = writeln!(out, "| **total** | {total} | |\n");
+    let _ = writeln!(out, "Cache: {cache_hits} hits, {cache_misses} misses.");
     out
 }
 
