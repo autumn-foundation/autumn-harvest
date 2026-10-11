@@ -44,7 +44,8 @@ events.
   take it reports `another process holds the export lock of this shard`. In
   a caller's transaction, each sweep also takes a transaction lock on the
   same key. It holds until that transaction ends, so a pending marker or a
-  pending drop cannot race the other kind of sweep.
+  pending drop cannot race the other kind of sweep. The marker work runs in
+  a savepoint, so a failure there cannot leave the session lock held.
 - **Keys.** A key holds the shard and the cohort bounds. Segment and
   manifest keys hold a SHA-256 prefix of their content, so a late upload
   cannot replace a finished object.
@@ -89,13 +90,13 @@ moved.
 
 **Tests.**
 
-- `partition_archive_tests`, 21 DB tests: export, verify, drop and read
+- `partition_archive_tests`, 22 DB tests: export, verify, drop and read
   back; the legacy partition; the retention runtime; a failed upload; a
   lost object; changed bytes; a slow backend; a row
   changed or deleted after the export; a live owner; no straggler deletes;
   the marker and the status report; the lock in both modes; reuse; the
-  export budget; a caller transaction, for its settings and the marker; a
-  dry run.
+  export budget; a caller transaction, for its settings, the marker and a
+  failed marker write; a dry run.
 - 17 unit tests in `partition_archive::tests`.
 - The builder test
   `a_partition_archiver_with_straggler_deletes_fails_the_build`.

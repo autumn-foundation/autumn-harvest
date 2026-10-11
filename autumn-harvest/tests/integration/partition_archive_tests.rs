@@ -1163,3 +1163,42 @@ async fn a_dry_run_writes_no_marker() {
     );
     assert!(exists(&mut conn, &name).await, "a dry run drops nothing");
 }
+
+/// A failed marker write in a caller transaction must not leak the session
+/// lock. Without a savepoint, the error aborts the caller transaction, and
+/// the unlock that follows fails too.
+#[tokio::test]
+async fn a_failed_marker_write_in_a_caller_transaction_releases_the_lock() {
+    use diesel_async::{AnsiTransactionManager, TransactionManager};
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_partitioned(&mut conn).await;
+
+    AnsiTransactionManager::begin_transaction(&mut conn)
+        .await
+        .expect("begin the caller transaction");
+    conn.batch_execute("DROP TABLE harvest_partition_export")
+        .await
+        .expect("hide the marker table in the caller transaction");
+    let failed = partition::sweep_exporting(
+        &mut conn,
+        Utc::now(),
+        &SweepOptions::default(),
+        None,
+        &export_to(Arc::new(TestArchiver::default())),
+    )
+    .await;
+    assert!(failed.is_err(), "the marker write fails: {failed:?}");
+    AnsiTransactionManager::rollback_transaction(&mut conn)
+        .await
+        .expect("roll back the caller transaction");
+
+    let held = diesel::sql_query(
+        "SELECT count(*) AS n FROM pg_locks \
+          WHERE locktype = 'advisory' AND pid = pg_backend_pid()",
+    )
+    .get_result::<CountRow>(&mut conn)
+    .await
+    .expect("count advisory locks");
+    assert_eq!(held.n, 0, "the session lock is released");
+}
