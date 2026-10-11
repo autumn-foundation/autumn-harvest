@@ -135,6 +135,7 @@ fn make_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 notification_database_url: None,
                 max_concurrent_workflows: 4,
                 max_concurrent_activities: 4,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(20),
                 shutdown_timeout: Duration::from_secs(2),
                 cancellation_grace_period: Duration::from_secs(1),

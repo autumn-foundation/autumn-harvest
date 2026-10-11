@@ -76,6 +76,13 @@ pub const DEFAULT_ACTIVITY_START_TO_CLOSE: Duration = Duration::from_secs(10 * 6
 /// itself stopped before the platform sends `SIGKILL`.
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 
+/// Default cap on the claims one worker runs at once: 2.
+///
+/// Assay #14 measured claim-loop occupancy at 0.94, which fits one claim in
+/// flight. That loop capped throughput. See
+/// [`WorkerConfig::with_max_concurrent_claims`].
+pub const DEFAULT_MAX_CONCURRENT_CLAIMS: usize = 2;
+
 /// Default sticky routing window (issue #1798): 5 seconds.
 ///
 /// A follow-up task of a suspended execution waits up to this long for the
@@ -3845,6 +3852,12 @@ pub struct WorkerConfig {
     pub max_concurrent_workflows: usize,
     /// Maximum concurrent activity executions on this worker.
     pub max_concurrent_activities: usize,
+    /// The most claims this worker runs at once.
+    ///
+    /// Default: [`DEFAULT_MAX_CONCURRENT_CLAIMS`] (2). `1` is
+    /// one serial claim loop. Must be at least 1. See
+    /// [`Self::with_max_concurrent_claims`].
+    pub max_concurrent_claims: usize,
     /// The drain budget on shutdown or on a remote drain without a deadline.
     ///
     /// Default: [`DEFAULT_SHUTDOWN_TIMEOUT`] (25 s). Keep it at least 5 s
@@ -4397,6 +4410,7 @@ impl Default for WorkerConfig {
             shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 20,
             max_concurrent_activities: 50,
+            max_concurrent_claims: DEFAULT_MAX_CONCURRENT_CLAIMS,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             workflow_cache_size: 1000,
             resident_workflows: true,
@@ -4931,6 +4945,34 @@ impl WorkerConfig {
         self
     }
 
+    /// Set the most claims this worker runs at once.
+    ///
+    /// One claim loop runs one claim at a time. Assay #14 measured that loop
+    /// busy 94% of the time, so it capped throughput. Extra loops claim only
+    /// after a claim returns work, and stop at the first empty claim. An idle
+    /// worker therefore polls at the rate of one loop.
+    ///
+    /// Each claim in flight holds one pool connection. Size the pool for
+    /// this value plus the running tasks. `1` restores one serial claim
+    /// loop. `0` fails worker validation.
+    ///
+    /// A worker that claims through a dispatch channel gains nothing. Extra
+    /// loops claim only through Postgres.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default().with_max_concurrent_claims(4);
+    /// assert_eq!(config.max_concurrent_claims, 4);
+    /// ```
+    #[must_use]
+    pub const fn with_max_concurrent_claims(mut self, n: usize) -> Self {
+        self.max_concurrent_claims = n;
+        self
+    }
+
     /// Attach a key-value capability label (issue #382).
     #[must_use]
     pub fn with_label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
@@ -5364,6 +5406,18 @@ mod tests {
         assert_eq!(infos.len(), 2);
         assert!(!infos[0].mcp);
         assert!(infos[1].mcp);
+    }
+
+    #[test]
+    fn max_concurrent_claims_defaults_above_one_and_the_setter_overrides_it() {
+        let config = WorkerConfig::default();
+        assert_eq!(config.max_concurrent_claims, DEFAULT_MAX_CONCURRENT_CLAIMS);
+        assert!(
+            config.max_concurrent_claims > 1,
+            "more than one claim in flight by default"
+        );
+        let serial = WorkerConfig::default().with_max_concurrent_claims(1);
+        assert_eq!(serial.max_concurrent_claims, 1);
     }
 
     #[test]

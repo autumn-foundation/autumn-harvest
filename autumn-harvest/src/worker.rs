@@ -82,6 +82,8 @@ pub type DbPool = deadpool::managed::Pool<
 /// `GLOBAL_DEFAULT_WORKFLOW_QUEUE` and so must not run on a read-only path.
 pub const DEFAULT_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+pub use crate::builder::DEFAULT_MAX_CONCURRENT_CLAIMS;
+
 /// Ceiling for the overdue-schedule gauge's adaptive sampling interval (issue
 /// #696).
 ///
@@ -176,6 +178,10 @@ pub struct WorkerRuntimeConfig {
     pub max_concurrent_workflows: usize,
     /// Maximum concurrent activity task executions.
     pub max_concurrent_activities: usize,
+    /// The most claims this worker runs at once. `1` is one serial claim
+    /// loop. Must be at least 1. See
+    /// [`crate::builder::WorkerConfig::max_concurrent_claims`].
+    pub max_concurrent_claims: usize,
     /// Interval between queue poll attempts when idle.
     pub poll_interval: Duration,
     /// Maximum time to wait for in-flight tasks during shutdown.
@@ -330,12 +336,18 @@ impl WorkerRuntimeConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`HarvestError::Config`] if `queues` is empty, or if
-    /// `cancellation_grace_period` exceeds [`MAX_CANCELLATION_GRACE_PERIOD`].
+    /// Returns [`HarvestError::Config`] if `queues` is empty, if
+    /// `max_concurrent_claims` is 0, or if `cancellation_grace_period`
+    /// exceeds [`MAX_CANCELLATION_GRACE_PERIOD`].
     pub fn validate(&self) -> HarvestResult<()> {
         if self.queues.is_empty() {
             return Err(HarvestError::Config(
                 "worker must poll at least one queue".into(),
+            ));
+        }
+        if self.max_concurrent_claims == 0 {
+            return Err(HarvestError::Config(
+                "max_concurrent_claims is 0; a worker needs at least one claim loop".into(),
             ));
         }
         if self.cancellation_grace_period > MAX_CANCELLATION_GRACE_PERIOD {
@@ -447,6 +459,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             shard_notification_database_urls: cfg.shard_notification_database_urls,
             max_concurrent_workflows: cfg.max_concurrent_workflows,
             max_concurrent_activities: cfg.max_concurrent_activities,
+            max_concurrent_claims: cfg.max_concurrent_claims,
             poll_interval: DEFAULT_WORKER_POLL_INTERVAL,
             shutdown_timeout: cfg.shutdown_timeout,
             cancellation_grace_period: cfg.cancellation_grace_period,
@@ -30347,7 +30360,7 @@ static POLLERS_BY_RECORDER: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<usize, RecorderPollers>>,
 > = std::sync::LazyLock::new(std::sync::Mutex::default);
 
-/// Counts one running poll loop and keeps `harvest.worker.pollers` current
+/// Counts one running claim loop and keeps `harvest.worker.pollers` current
 /// (issue #1815).
 ///
 /// The guard sets the gauge when its loop starts and again when the loop
@@ -32658,6 +32671,55 @@ const fn dispatch_kind_admitted(
     }
 }
 
+/// Which claim loop runs a Postgres poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollRole {
+    /// The poll loop. It owns the listener, the timer and the capacity wake.
+    Leader,
+    /// A follower claim loop. See [`Worker::run_claim_followers`].
+    Follower,
+}
+
+/// Whether a follower claims on one target through Postgres.
+///
+/// The follower claims only where the leader polls Postgres. An unverified
+/// registration claims nothing (see [`may_claim_tasks`]). A per-shard
+/// channel, or a global channel the loop may use, takes the claims. This
+/// mirrors `run_poll_loop` and `run_poll_loop_multi`. A leader in degraded
+/// dispatch mode drains Postgres alone.
+const fn follower_polls_postgres(
+    registration_pending: bool,
+    per_shard_channel: bool,
+    usable_global_channel: bool,
+) -> bool {
+    may_claim_tasks(registration_pending) && !per_shard_channel && !usable_global_channel
+}
+
+/// Whether `claim_loops` in-flight claims can hold every connection of a
+/// pool of `max_size`.
+///
+/// A task, a heartbeat and a persist then wait behind the claims.
+const fn claim_loops_fill_pool(claim_loops: usize, max_size: usize) -> bool {
+    claim_loops >= max_size
+}
+
+/// One Postgres claim target of a follower claim loop.
+///
+/// See [`Worker::run_claim_followers`].
+struct ClaimTarget<'a> {
+    /// The shard that `pool` serves. `None` on a legacy single pool.
+    shard: Option<crate::types::ShardId>,
+    /// The pool the claim runs on.
+    pool: &'a DbPool,
+    /// Set while this shard's registration is not verified.
+    registration_pending: &'a AtomicBool,
+    /// The pool acquisition bound. See [`shard_acquire_bound`].
+    acquire_bound: Option<Duration>,
+    /// Whether the global dispatch channel may serve this target. Only the
+    /// single-pool loop allows it.
+    global_dispatch: bool,
+}
+
 /// What one Postgres poll may claim (issue #1787).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PollAdmission {
@@ -33802,13 +33864,32 @@ impl Worker {
             .map(|(shard, _)| self.shard_dispatch.get(shard).cloned())
             .collect();
 
-        self.run_poll_loop_multi(
-            shard_targets.clone(),
-            shard_listeners,
-            &registration_pending_per_shard,
-            &shard_dispatch,
-        )
-        .await;
+        // The followers poll Postgres where the leader would (no global
+        // channel on this path).
+        let more_work = tokio::sync::Notify::new();
+        let acquire_bound = shard_acquire_bound(true, self.config.poll_interval);
+        let claim_targets: Vec<ClaimTarget<'_>> = shard_targets
+            .iter()
+            .zip(&registration_pending_per_shard)
+            .map(|((shard, shard_pool), pending)| ClaimTarget {
+                shard: Some(*shard),
+                pool: shard_pool,
+                registration_pending: pending,
+                acquire_bound,
+                global_dispatch: false,
+            })
+            .collect();
+        self.warn_if_claim_loops_fill_pools(&claim_targets);
+        tokio::join!(
+            self.run_poll_loop_multi(
+                shard_targets.clone(),
+                shard_listeners,
+                &registration_pending_per_shard,
+                &shard_dispatch,
+                &more_work,
+            ),
+            self.run_claim_followers(&claim_targets, &more_work),
+        );
 
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received (multi-shard)");
 
@@ -33852,12 +33933,16 @@ impl Worker {
     /// anywhere. When all shards are idle we `tokio::select!` across all
     /// per-shard listeners (falling back to a `poll_interval` sleep for shards
     /// without a listener) before the next full scan.
+    ///
+    /// A successful Postgres claim wakes one follower through `more_work`.
+    /// See [`Self::run_claim_followers`].
     async fn run_poll_loop_multi(
         &self,
         shard_targets: Vec<(crate::types::ShardId, DbPool)>,
         mut shard_listeners: Vec<Option<crate::notify::QueueListener>>,
         registration_pending_per_shard: &[Arc<AtomicBool>],
         shard_dispatch: &[Option<crate::dispatch::InstalledDispatch>],
+        more_work: &tokio::sync::Notify,
     ) {
         let _poller = self.poller_guard();
         let n = shard_targets.len();
@@ -33904,14 +33989,17 @@ impl Worker {
                     )
                     .await
                 } else {
-                    u32::from(
-                        self.poll_once(
+                    let claimed = self
+                        .poll_once(
                             &shard_targets[idx].1,
                             shard_acquire_bound(true, self.config.poll_interval),
                             Some(shard_targets[idx].0),
                         )
-                        .await,
-                    )
+                        .await;
+                    if claimed {
+                        more_work.notify_one();
+                    }
+                    u32::from(claimed)
                 };
                 if dispatched > 0 {
                     any_claimed = true;
@@ -34291,7 +34379,7 @@ impl Worker {
         // coverage.
         let dispatch_allowed = self.dispatch_span_allowed();
 
-        self.run_poll_loop(
+        self.run_single_pool_claim_loops(
             pool,
             poll_shard,
             listener,
@@ -35280,6 +35368,7 @@ impl Worker {
                         // only a database with a DR marker (issue #1823).
                         // The fence is pinned before the heartbeat starts.
                         dr_fencing: crate::replication::FenceRegistry::is_enabled(),
+                        claim_loops: self.config.max_concurrent_claims,
                     },
                     payload: self.registry.payload_policy(),
                 }),
@@ -36041,6 +36130,7 @@ impl Worker {
         mut listener: Option<crate::notify::QueueListener>,
         registration_pending: &AtomicBool,
         dispatch_allowed: bool,
+        more_work: &tokio::sync::Notify,
     ) {
         let _poller = self.poller_guard();
         // Dispatch-channel state for this loop (issue #1312). All three are
@@ -36127,6 +36217,8 @@ impl Worker {
                 )
                 .await
             {
+                // More work may wait. Wake one follower claim loop.
+                more_work.notify_one();
                 // Per-shard dispatch counter (issue #961, AC5). Emitted on the
                 // single-shard path too, so `harvest.shard.dispatched` is a
                 // uniform series across deployment shapes whenever the worker
@@ -36930,6 +37022,147 @@ impl Worker {
         exclusions
     }
 
+    /// Run the single-pool leader loop and its followers until shutdown.
+    async fn run_single_pool_claim_loops(
+        &self,
+        pool: &DbPool,
+        shard: Option<crate::types::ShardId>,
+        listener: Option<crate::notify::QueueListener>,
+        registration_pending: &AtomicBool,
+        dispatch_allowed: bool,
+    ) {
+        let more_work = tokio::sync::Notify::new();
+        let claim_targets = [ClaimTarget {
+            shard,
+            pool,
+            registration_pending,
+            acquire_bound: shard_acquire_bound(false, self.config.poll_interval),
+            global_dispatch: dispatch_allowed,
+        }];
+        self.warn_if_claim_loops_fill_pools(&claim_targets);
+        tokio::join!(
+            self.run_poll_loop(
+                pool,
+                shard,
+                listener,
+                registration_pending,
+                dispatch_allowed,
+                &more_work,
+            ),
+            self.run_claim_followers(&claim_targets, &more_work),
+        );
+    }
+
+    /// Warn when the claim loops alone can hold every connection of a claim
+    /// pool. See [`claim_loops_fill_pool`].
+    fn warn_if_claim_loops_fill_pools(&self, targets: &[ClaimTarget<'_>]) {
+        let claim_loops = self.config.max_concurrent_claims;
+        for target in targets {
+            let max_size = target.pool.status().max_size;
+            if claim_loops_fill_pool(claim_loops, max_size) {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    shard = ?target.shard,
+                    max_concurrent_claims = claim_loops,
+                    pool_max_size = max_size,
+                    "the claim loops can hold every pool connection; tasks, heartbeats and \
+                     persists then wait behind them. Use a larger pool or lower \
+                     max_concurrent_claims"
+                );
+            }
+        }
+    }
+
+    /// Run `max_concurrent_claims - 1` follower claim loops beside the leader.
+    ///
+    /// Assay #14 measured claim-loop occupancy at 0.94, which fits one claim
+    /// in flight. That loop capped throughput. A follower adds a claim in flight only while claims return
+    /// work. The leader alone still guarantees progress, so a follower needs
+    /// no timer and no listener. See `DESIGN-claim-concurrency.md`.
+    ///
+    /// The caller joins this future with the leader. The drain therefore
+    /// starts only after every claim loop returns.
+    async fn run_claim_followers(
+        &self,
+        targets: &[ClaimTarget<'_>],
+        more_work: &tokio::sync::Notify,
+    ) {
+        let followers = self.config.max_concurrent_claims.saturating_sub(1);
+        futures::future::join_all(
+            (0..followers).map(|_| self.run_claim_follower(targets, more_work)),
+        )
+        .await;
+    }
+
+    /// One follower claim loop.
+    ///
+    /// It waits for a wake from a successful claim. It then claims until a
+    /// claim returns nothing, and wakes one more follower after each success.
+    async fn run_claim_follower(
+        &self,
+        targets: &[ClaimTarget<'_>],
+        more_work: &tokio::sync::Notify,
+    ) {
+        let _poller = self.poller_guard();
+        let mut start = 0usize;
+        loop {
+            tokio::select! {
+                biased;
+                () = self.shutdown.cancelled() => return,
+                () = more_work.notified() => {}
+            }
+            while !self.shutdown.is_cancelled() && self.follower_claim(targets, &mut start).await {
+                more_work.notify_one();
+            }
+            // This run ended on an empty claim or on shutdown. A wake stored
+            // during the run would only cost one more empty claim. The next
+            // success wakes a follower again.
+            let _ = futures::FutureExt::now_or_never(more_work.notified());
+        }
+    }
+
+    /// One follower claim attempt over `targets`, from a rotating start.
+    ///
+    /// A follower claims only where the leader polls Postgres. It skips a
+    /// target with an unverified registration or with a dispatch channel.
+    /// Returns `true` when it claimed and dispatched one task.
+    async fn follower_claim(&self, targets: &[ClaimTarget<'_>], start: &mut usize) -> bool {
+        let n = targets.len();
+        for i in 0..n {
+            if self.shutdown.is_cancelled() {
+                return false;
+            }
+            let idx = (*start + i) % n;
+            let target = &targets[idx];
+            // Fully qualified: diesel's `RunQueryDsl::load` shadows it.
+            let pending = AtomicBool::load(target.registration_pending, Ordering::Relaxed);
+            let per_shard_channel = target
+                .shard
+                .is_some_and(|shard| self.shard_dispatch.contains_key(&shard));
+            // Read the global channel only where it may serve, as the leader does.
+            let global_channel = target.global_dispatch && self.global_dispatch_binding().is_some();
+            if !follower_polls_postgres(pending, per_shard_channel, global_channel) {
+                continue;
+            }
+            if self
+                .poll_once_as(
+                    PollRole::Follower,
+                    target.pool,
+                    target.acquire_bound,
+                    target.shard,
+                )
+                .await
+            {
+                if let Some(shard) = target.shard {
+                    self.record_shard_dispatched_many(shard, 1);
+                }
+                *start = (idx + 1) % n;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Execute a single poll iteration.
     ///
     /// Claims one task of a kind with a free permit and dispatches it. Returns
@@ -36942,12 +37175,28 @@ impl Worker {
     /// exhausted pool on one shard cannot park the loop and strand its peers.
     /// See `shard_acquire_bound`. A timeout increments
     /// `harvest.db.pool_acquire_timeout{site="claim"}`.
+    async fn poll_once(
+        &self,
+        pool: &DbPool,
+        acquire_bound: Option<Duration>,
+        shard: Option<crate::types::ShardId>,
+    ) -> bool {
+        self.poll_once_as(PollRole::Leader, pool, acquire_bound, shard)
+            .await
+    }
+
+    /// [`Self::poll_once`] for one claim loop `role`.
+    ///
+    /// Only the leader runs the throttle check after an empty claim. A
+    /// follower ends each run with an empty claim, so its check would repeat
+    /// the leader's and count each throttled key once more.
     // significant_drop_tightening: `permits` holds `OwnedSemaphorePermit`s
     // across the claim on purpose (issue #1787). An earlier drop would let a
     // slot tuner shrink take the permit of a row this poll then claims.
     #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
-    async fn poll_once(
+    async fn poll_once_as(
         &self,
+        role: PollRole,
         pool: &DbPool,
         acquire_bound: Option<Duration>,
         shard: Option<crate::types::ShardId>,
@@ -37067,7 +37316,9 @@ impl Worker {
             }
 
             // All queues tried — emit throttle metrics and report idle.
-            self.emit_throttle_metrics(&mut conn).await;
+            if role == PollRole::Leader {
+                self.emit_throttle_metrics(&mut conn).await;
+            }
             return false;
         }
 
@@ -37108,7 +37359,9 @@ impl Worker {
                 true
             }
             Ok(None) => {
-                self.emit_throttle_metrics(&mut conn).await;
+                if role == PollRole::Leader {
+                    self.emit_throttle_metrics(&mut conn).await;
+                }
                 false
             }
             Err(e) => {
@@ -40846,6 +41099,7 @@ mod tests {
             shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 10,
             max_concurrent_activities: 20,
+            max_concurrent_claims: DEFAULT_MAX_CONCURRENT_CLAIMS,
             poll_interval: Duration::from_millis(100),
             shutdown_timeout: Duration::from_secs(5),
             cancellation_grace_period: Duration::from_secs(5),
@@ -40957,6 +41211,16 @@ mod tests {
         // a worker that can never dispatch a task must never look healthy.
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("max_slots is 0"));
+    }
+
+    #[test]
+    fn runtime_config_validate_rejects_zero_claim_loops() {
+        let mut cfg = default_runtime_config();
+        cfg.max_concurrent_claims = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("max_concurrent_claims is 0"));
+        cfg.max_concurrent_claims = 1;
+        assert!(cfg.validate().is_ok(), "one serial claim loop is valid");
     }
 
     #[test]
@@ -41720,6 +41984,7 @@ mod tests {
             shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 5,
             max_concurrent_activities: 15,
+            max_concurrent_claims: 3,
             shutdown_timeout: Duration::from_secs(60),
             workflow_cache_size: 500,
             resident_workflows: true,
@@ -41766,6 +42031,7 @@ mod tests {
         );
         assert_eq!(runtime_cfg.max_concurrent_workflows, 5);
         assert_eq!(runtime_cfg.max_concurrent_activities, 15);
+        assert_eq!(runtime_cfg.max_concurrent_claims, 3);
         assert_eq!(runtime_cfg.shutdown_timeout, Duration::from_secs(60));
         assert_eq!(runtime_cfg.poll_interval, Duration::from_millis(500));
         assert_eq!(
@@ -47734,6 +48000,34 @@ mod tests {
             "pre-fix, the claimant's own window was narrower than the default \
              peer's -- without that gap this test proves nothing"
         );
+    }
+
+    /// A follower polls Postgres only where the leader would.
+    #[test]
+    fn a_follower_polls_postgres_only_where_the_leader_does() {
+        // (registration pending, per-shard channel, usable global channel)
+        for (pending, per_shard, global, polls) in [
+            (false, false, false, true),
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, true, true, false),
+            (true, true, true, false),
+        ] {
+            assert_eq!(
+                follower_polls_postgres(pending, per_shard, global),
+                polls,
+                "pending={pending} per_shard={per_shard} global={global}"
+            );
+        }
+    }
+
+    #[test]
+    fn claim_loops_that_can_fill_the_pool_are_flagged() {
+        assert!(!claim_loops_fill_pool(2, 10));
+        assert!(!claim_loops_fill_pool(9, 10));
+        assert!(claim_loops_fill_pool(10, 10));
+        assert!(claim_loops_fill_pool(4, 2));
     }
 
     #[test]

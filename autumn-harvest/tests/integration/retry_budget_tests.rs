@@ -292,6 +292,7 @@ fn build_worker_with(
                 notification_database_url: None,
                 max_concurrent_workflows: 4,
                 max_concurrent_activities: 8,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(10),
                 shutdown_timeout: Duration::from_secs(5),
                 cancellation_grace_period: Duration::from_secs(1),
