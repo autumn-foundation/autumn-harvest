@@ -299,3 +299,43 @@ pub async fn wf_step_mut_ref_future(ctx: &WorkflowContext) -> Out {
     let a = saga.step(|| &mut fut, |_| async { Ok(()) }).await?;
     ctx.execute_activity_raw("b", a).await
 }
+
+pub fn __autumn_workflow_info_wf_step_move_mut() -> u8 {
+    0
+}
+
+/// A `move` closure hands its captured `&mut` to the block.
+pub async fn wf_step_move_mut(ctx: &WorkflowContext) -> Out {
+    let mut seen = 0_u64;
+    {
+        let s = &mut seen;
+        let mut saga = Saga::new(ctx);
+        saga.step(
+            move || async move {
+                *s = now_nanos();
+                ctx.execute_activity_raw("a", 1).await
+            },
+            |_| async { Ok(()) },
+        )
+        .await?;
+    }
+    ctx.execute_activity_raw("b", seen).await
+}
+
+type BoxedOut<'a> = std::pin::Pin<Box<dyn Future<Output = Out> + Send + 'a>>;
+
+pub fn __autumn_workflow_info_wf_step_boxed_dyn() -> u8 {
+    0
+}
+
+/// The step closure erases its block behind `Pin<Box<dyn Future>>`.
+pub async fn wf_step_boxed_dyn(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let a = saga
+        .step(
+            || -> BoxedOut<'_> { Box::pin(async { Ok(now_nanos()) }) },
+            |_| async { Ok(()) },
+        )
+        .await?;
+    ctx.execute_activity_raw("b", a).await
+}

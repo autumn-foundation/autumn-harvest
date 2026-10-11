@@ -70,6 +70,8 @@ fn a_case_the_analysis_cannot_follow_is_never_proven() {
         "wf_step_write_cell",
         "wf_step_write_arc",
         "wf_step_named_write_future",
+        "wf_step_move_mut",
+        "wf_step_boxed_dyn",
     ] {
         assert!(
             !matches!(verdict(&all, name), Verdict::ProvenDeterministic),

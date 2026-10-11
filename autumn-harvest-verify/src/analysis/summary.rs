@@ -2786,6 +2786,10 @@ fn first_sentence(reason: &str) -> &str {
 /// `[[ambient_type]]` table counts too, owned or shared. `&Cell<u64>` and an
 /// `Arc<Mutex<u64>>` clone each reach state the caller reads. Any other
 /// shared `&T`, or owned type with no lifetime, holds no writable reference.
+///
+/// A capture can be a projection of the closure environment, as in
+/// `move (_1.0: &mut u64)`. Its local is the closure, so the type is read
+/// from the place annotation in the text as well.
 fn captures_mut_ref(body: &Body, interior: &[&str]) -> bool {
     body.blocks
         .iter()
@@ -2798,10 +2802,26 @@ fn captures_mut_ref(body: &Body, interior: &[&str]) -> bool {
             }
             _ => None,
         })
-        .flat_map(|rvalue| &rvalue.reads)
-        .filter_map(operand_place)
-        .filter_map(|place| body.locals.get(&place.local))
-        .any(|ty| may_write_through(ty, interior))
+        .any(|rvalue| {
+            let local_types = rvalue
+                .reads
+                .iter()
+                .filter_map(operand_place)
+                .filter_map(|place| body.locals.get(&place.local))
+                .map(String::as_str);
+            local_types
+                .chain(annotated_types(&rvalue.text))
+                .any(|ty| may_write_through(ty, interior))
+        })
+}
+
+/// Each place annotation type in `text`, as `T` in `(_1.0: T)`.
+fn annotated_types(text: &str) -> impl Iterator<Item = &str> {
+    text.match_indices(": ").filter_map(move |(at, _)| {
+        let rest = text.get(at.saturating_add(2)..)?;
+        let end = rest.find([')', ',', '}']).unwrap_or(rest.len());
+        rest.get(..end)
+    })
 }
 
 /// A value of type `ty` can hold a reference that writes. See
