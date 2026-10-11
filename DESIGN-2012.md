@@ -114,7 +114,7 @@ stands for the `ActivityCompleted` event that Harvest appends.
 |-----|----------------------|------|
 | `Backout` | 1. Each step runs in a savepoint. | `ROLLBACK` |
 | `Saga` | 1 per step, through the real `Saga` helper. | Compensations, LIFO |
-| `Hybrid` | 2: reserve commits alone, then debit and place in one backout transaction. | Restock compensation, then `ROLLBACK` |
+| `Hybrid` | 2: reserve commits alone, then debit and place in one backout transaction. | `ROLLBACK`, then the restock compensation |
 
 ### 2.2 Module layout
 
@@ -181,6 +181,14 @@ its thresholds and G1 to G4 do not change. The method changes:
   conflict retries are reported in their own columns.
 - The report flags a cell where the best arm's range overlaps the
   runner-up's range. G1 and G2 are inconclusive in such a cell.
+
+### 3.2 Note, 2026-10-11, after the first run
+
+`verdict::judge` encodes the overlap rule. G1 and G2 compare `backout`
+with the other arms, so an overlap counts only when it involves the
+`backout` range. An overlap between `saga` and `hybrid` leaves G2 as it
+is. Review found the gap after the first run. The second run, on the
+final code, is the one that the report gives.
 
 ## 4. Test plan (red, green, refactor)
 
