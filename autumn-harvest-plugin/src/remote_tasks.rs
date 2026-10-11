@@ -275,6 +275,11 @@ impl HttpRemoteTasks {
         {
             return Err(too_large());
         }
+        let event_stream = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/event-stream"));
         let mut raw = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|e| {
             RemoteTaskError::retryable(format!("{method}: read failed: {}", e.without_url()))
@@ -283,12 +288,15 @@ impl HttpRemoteTasks {
                 return Err(too_large());
             }
             raw.extend_from_slice(&chunk);
+            // A server may keep an event stream open after the response, so
+            // the read stops at the first full response with this id.
+            if event_stream
+                && chunk.contains(&b'\n')
+                && std::str::from_utf8(&raw).is_ok_and(|text| sse_response(text, id).is_some())
+            {
+                break;
+            }
         }
-        let event_stream = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.starts_with("text/event-stream"));
         let envelope = if event_stream {
             std::str::from_utf8(&raw)
                 .ok()

@@ -16,6 +16,7 @@ use autumn_web::reexports::axum::http::{HeaderMap, StatusCode};
 use autumn_web::reexports::axum::response::{IntoResponse, Response};
 use autumn_web::reexports::axum::routing::post;
 use autumn_web::reexports::axum::{Json, Router};
+use futures::StreamExt as _;
 use serde_json::{Value, json};
 
 /// One request that the stub saw.
@@ -369,4 +370,41 @@ async fn a2a_start_and_get_use_message_send_and_tasks_get() {
     );
     assert_eq!(seen[1].body["method"], "tasks/get");
     assert_eq!(seen[1].body["params"]["id"], "a-1");
+}
+
+/// A server may keep an event stream open after the response. The client
+/// stops reading at the first full response with its request id.
+#[tokio::test]
+async fn an_open_event_stream_returns_at_the_matching_response() {
+    use autumn_web::reexports::axum::body::Body;
+    let (url, _) = serve(Arc::new(|body| {
+        let event = format!(
+            "event: message\ndata: {}\n\n",
+            json!({"jsonrpc": "2.0", "id": body["id"], "result": {"resultType": "task", "taskId": "t-s"}})
+        );
+        let stream = futures::stream::iter([Ok::<_, std::io::Error>(event.into_bytes())])
+            .chain(futures::stream::pending());
+        Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(stream))
+            .expect("response")
+    }))
+    .await;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client");
+    let client = HttpRemoteTasks::with_client(client).server("reports", RemoteServer::mcp(&url));
+
+    let began = std::time::Instant::now();
+    let start = client
+        .start(&request(RemoteProtocol::Mcp, "export"), "k")
+        .await
+        .expect("the response arrived before the stream ends");
+    assert!(
+        matches!(start, RemoteTaskStart::Task(ref h) if h.task_id == "t-s"),
+        "{start:?}"
+    );
+    assert!(began.elapsed() < std::time::Duration::from_secs(4));
 }
