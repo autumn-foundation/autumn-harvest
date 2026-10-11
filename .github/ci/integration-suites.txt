@@ -48,6 +48,7 @@
 # union-merge duplicate/reorder is caught (never a conflict) by
 allos        autumn-harvest         integration                      -                          assay_rerun_docs
 allos        autumn-harvest         integration                      -                          benchmarks_docs
+allos        autumn-harvest         integration                      -                          contention_adaptive_atomicity_docs
 allos        autumn-harvest         integration                      -                          hot_code_swap_docs
 allos        autumn-harvest         integration                      -                          lock_order_docs
 allos        autumn-harvest         integration                      -                          otel_semconv_docs
@@ -224,6 +225,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          workflow_reachability_samples_tests
 linux        autumn-harvest         integration                      -                          workflow_retry_tests
 linux        autumn-harvest         integration                      -                          workflow_task_timeout_tests
+linux        autumn-harvest         integration                      atomicity-spike            atomicity_spike_tests
 linux        autumn-harvest         integration                      hot-code-swap,testing      hot_code_swap_tests
 linux        autumn-harvest         integration                      testing                    backup_verify_refs_batch_perf
 linux        autumn-harvest         integration                      testing                    backup_verify_retention_batch_perf

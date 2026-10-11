@@ -25,6 +25,8 @@ mod alert_pack_docs;
 #[cfg(feature = "db")]
 mod append_only_guard_tests;
 mod assay_rerun_docs;
+#[cfg(feature = "atomicity-spike")]
+mod atomicity_spike_tests;
 #[cfg(feature = "db")]
 mod audit_chain_tests;
 mod audit_export_docs;
@@ -98,6 +100,7 @@ mod completion_trigger_outbox_queue_perf;
 mod concurrency_key_tests;
 mod concurrency_model_ci;
 mod concurrency_supersede_tests;
+mod contention_adaptive_atomicity_docs;
 mod context_headers_tests;
 mod cross_region_dr_docs;
 #[cfg(feature = "db")]

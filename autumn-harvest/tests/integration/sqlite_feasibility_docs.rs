@@ -228,6 +228,18 @@ const AUDIT_EXCLUDED_MODULES: &[&str] = &["chaos"];
 /// coupling.
 const SKIPPED_SUBDIRS: &[&str] = &["dst"];
 
+/// R&D spike subdirectories of `autumn-harvest/src` that the flat scan
+/// skips, each with the Cargo feature that turns it on.
+///
+/// A spike is not an engine surface. It sits behind a feature that the
+/// default build leaves off, and no production path calls it. So a port to
+/// `SQLite` does not carry it, the same reason that `chaos` is out of scope.
+/// A spike can have Postgres coupling, so it cannot go in `SKIPPED_SUBDIRS`.
+/// `spike_subdirectories_stay_out_of_the_default_build` checks the gate.
+/// A spike that becomes a production module must leave this list and enter
+/// the inventory.
+const SPIKE_SUBDIRS: &[(&str, &str)] = &[("atomicity", "atomicity-spike")];
+
 /// Every auditable core `.rs` module directly under `autumn-harvest/src`, as
 /// `(module name, path)`.
 ///
@@ -257,7 +269,10 @@ fn core_module_files() -> Vec<(String, PathBuf)> {
                 .and_then(|s| s.to_str())
                 .unwrap_or_default()
                 .to_string();
-            if name != "bin" && !SKIPPED_SUBDIRS.contains(&name.as_str()) {
+            if name != "bin"
+                && !SKIPPED_SUBDIRS.contains(&name.as_str())
+                && !SPIKE_SUBDIRS.iter().any(|(dir, _)| *dir == name)
+            {
                 subdirs.push(name);
             }
             continue;
@@ -452,6 +467,36 @@ fn skipped_subdirectories_have_no_postgres_coupling() {
             }
         }
         assert!(files > 0, "skipped subdirectory {dir} has no .rs files");
+    }
+}
+
+#[test]
+fn spike_subdirectories_stay_out_of_the_default_build() {
+    let manifest = std::fs::read_to_string(repo_root().join("autumn-harvest/Cargo.toml"))
+        .expect("read the crate manifest");
+    let default = manifest
+        .lines()
+        .find(|line| line.starts_with("default = "))
+        .expect("the crate has default features");
+    let lib = read_normalized(&repo_root().join("autumn-harvest/src/lib.rs"));
+    for (dir, feature) in SPIKE_SUBDIRS {
+        assert!(
+            repo_root().join("autumn-harvest/src").join(dir).is_dir(),
+            "`SPIKE_SUBDIRS` lists `{dir}`, but the directory does not exist"
+        );
+        assert!(
+            manifest.contains(&format!("\n{feature} = [")),
+            "the spike `{dir}` names the feature `{feature}`, which Cargo.toml lacks"
+        );
+        assert!(
+            !default.contains(&format!("\"{feature}\"")),
+            "the default build turns on the spike feature `{feature}`: {default}"
+        );
+        let gate = format!("#[cfg(feature = \"{feature}\")]\n#[doc(hidden)]\npub mod {dir};");
+        assert!(
+            lib.contains(&gate),
+            "lib.rs must declare `{dir}` behind `{feature}` only: expected `{gate}`"
+        );
     }
 }
 
