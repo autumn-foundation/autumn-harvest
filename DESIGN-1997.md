@@ -50,7 +50,7 @@ Issue #1996 keeps the roll-up in the usage reports and its replay test.
 | R7 | The budget check costs every activity a query. | Only a step that calls `check_llm_budget` pays. With no LLM cap declared, the check reads no row. |
 | R8 | Retention deletes a run, and the tenant spend drops. | The ledger cascades with its run. Keep retention longer than the window. The docs say so. |
 | R9 | The activity runs in a process that does not register the workflow type, so it cannot read the caps. | The check passes and logs one warning for each type. The docs say to register the workflow on each worker that runs its LLM steps. |
-| R10 | A shard rebalance moves a run without its ledger, so the run cap starts again. | The rebalance copies the ledger rows of the run, with their `recorded_at`. The cutover deletes the source copy, so the tenant spend does not count twice. A test proves both. |
+| R10 | A shard rebalance moves a run without its ledger, so the run cap starts again. | Activation copies the ledger rows of the run, with their `recorded_at`, after the source reaches `COMMITTED`. The settle transaction deletes the source copy, so the tenant spend does not count twice. A test proves both. |
 | R11 | A huge recorded value overflows the sum, and every check fails as a read error. | The sums are `NUMERIC`, clamped to the `BIGINT` range. |
 | R12 | A zero window counts nothing, so the tenant caps never refuse. | The macro rejects 0. The builder raises 0 to one second. |
 
