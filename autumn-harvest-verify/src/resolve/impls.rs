@@ -56,6 +56,14 @@ impl<'ast> syn::visit::Visit<'ast> for FieldScan {
         self.visit_type(&reference.elem);
     }
 
+    fn visit_type_ptr(&mut self, pointer: &'ast syn::TypePtr) {
+        // A `*mut` pointer writes as a `&mut` reference does.
+        if pointer.mutability.is_some() {
+            self.0.mut_ref = true;
+        }
+        self.visit_type(&pointer.elem);
+    }
+
     fn visit_lifetime(&mut self, lifetime: &'ast syn::Lifetime) {
         if lifetime.ident != "static" {
             self.0.lifetime = true;
@@ -699,6 +707,20 @@ mod tests {
             names("Shared").is_some_and(|n| n.contains("Mutex")),
             "{index:?}"
         );
+    }
+
+    #[test]
+    fn a_raw_mut_pointer_field_can_write() {
+        // `*mut` writes as `&mut` does. A `*const` field cannot write.
+        let mut index = SourceIndex::default();
+        index.absorb_syn(
+            "struct Ptr(*mut u64);\nstruct Step(Ptr);\nstruct Read(*const u64);\n",
+            &[],
+        );
+        let facts = |ty: &str| index.type_fields.get(ty).cloned().unwrap_or_default();
+        assert!(facts("Ptr").mut_ref, "{index:?}");
+        assert!(facts("Step").names.contains("Ptr"), "{index:?}");
+        assert!(!facts("Read").mut_ref, "{index:?}");
     }
 
     #[test]

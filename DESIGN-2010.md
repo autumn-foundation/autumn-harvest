@@ -164,7 +164,8 @@ Four review agents read the first version. Each fix has a test.
     extension, so the test reads the `line:col` shape. A block of another
     crate prints a def path, so it is still not followed.
 30. A raw `*mut` pointer writes as a `&mut` reference does. A capture of one
-    is a boundary, as a `&mut` capture is.
+    is a boundary, as a `&mut` capture is. A local type with a `*mut` field
+    is interior-mutable, as one with a `&mut` field is.
 
 ---
 
