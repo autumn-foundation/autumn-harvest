@@ -39,11 +39,12 @@ pub struct SourceIndex {
     pub foreign_fns: BTreeSet<String>,
     /// Function name → generic parameter names, in declaration order.
     pub fn_generics: BTreeMap<String, Vec<String>>,
-    /// Names of the modules the sources declare, inline or in a file.
-    pub modules: BTreeSet<String>,
-    /// Names of the structs, enums, unions and type aliases the sources
-    /// declare.
-    pub types: BTreeSet<String>,
+    /// The structs, enums, unions and type aliases the sources declare, each
+    /// by its module path and name, such as `helpers::Clock`.
+    ///
+    /// The module path comes from the file path and any inline `mod` around
+    /// the item. It can be longer than the path MIR prints, never shorter.
+    pub type_paths: BTreeSet<String>,
     /// Source file → why it could not be indexed.
     ///
     /// A file MIR named that the source roots could not produce, or that `syn`
@@ -82,7 +83,7 @@ impl SourceIndex {
                 }
                 continue;
             };
-            if !index.absorb_syn(&text) && files.contains(file) {
+            if !index.absorb_syn(&text, &file_module(file)) && files.contains(file) {
                 index.unreadable.insert(
                     file.clone(),
                     "the source file could not be parsed as Rust".to_string(),
@@ -152,15 +153,22 @@ impl SourceIndex {
 
     /// `false` when `syn` rejected the file (its `extern` blocks and generic
     /// parameter lists are then invisible).
-    fn absorb_syn(&mut self, text: &str) -> bool {
+    fn absorb_syn(&mut self, text: &str, module: &[String]) -> bool {
         let Ok(file) = syn::parse_file(text) else {
             return false;
         };
-        self.absorb_items(&file.items, 0);
+        self.absorb_items(&file.items, 0, module);
         true
     }
 
-    fn absorb_items(&mut self, items: &[syn::Item], depth: u32) {
+    /// Record the type `name`, declared in `module`.
+    fn declare(&mut self, module: &[String], name: &syn::Ident) {
+        let mut path = module.to_vec();
+        path.push(name.to_string());
+        self.type_paths.insert(path.join("::"));
+    }
+
+    fn absorb_items(&mut self, items: &[syn::Item], depth: u32, module: &[String]) {
         if depth > 8 {
             return;
         }
@@ -173,22 +181,15 @@ impl SourceIndex {
                             .insert(item.sig.ident.to_string(), generics);
                     }
                 }
-                syn::Item::Struct(item) => {
-                    self.types.insert(item.ident.to_string());
-                }
-                syn::Item::Enum(item) => {
-                    self.types.insert(item.ident.to_string());
-                }
-                syn::Item::Union(item) => {
-                    self.types.insert(item.ident.to_string());
-                }
-                syn::Item::Type(item) => {
-                    self.types.insert(item.ident.to_string());
-                }
+                syn::Item::Struct(item) => self.declare(module, &item.ident),
+                syn::Item::Enum(item) => self.declare(module, &item.ident),
+                syn::Item::Union(item) => self.declare(module, &item.ident),
+                syn::Item::Type(item) => self.declare(module, &item.ident),
                 syn::Item::Mod(item) => {
-                    self.modules.insert(item.ident.to_string());
                     if let Some((_, items)) = &item.content {
-                        self.absorb_items(items, depth.saturating_add(1));
+                        let mut inner = module.to_vec();
+                        inner.push(item.ident.to_string());
+                        self.absorb_items(items, depth.saturating_add(1), &inner);
                     }
                 }
                 syn::Item::ForeignMod(item) => {
@@ -230,6 +231,29 @@ fn generic_names(generics: &syn::Generics) -> Vec<String> {
 }
 
 /// Every `.rs` file directly under `dir` (relative to whichever root holds it).
+/// The module path a source file stands for, from its path.
+///
+/// `src/a/b.rs` and `src/a/b/mod.rs` give `a::b`. A crate root, `lib.rs` or
+/// `main.rs`, gives no segment. A file outside `src/` keeps its whole path,
+/// which is longer than MIR prints, so a suffix match still holds.
+fn file_module(file: &str) -> Vec<String> {
+    let mut parts: Vec<&str> = file.trim_end_matches(".rs").split('/').collect();
+    if let Some(at) = parts.iter().rposition(|p| *p == "src") {
+        parts.drain(..=at);
+    }
+    if parts
+        .last()
+        .is_some_and(|p| matches!(*p, "mod" | "lib" | "main"))
+    {
+        parts.pop();
+    }
+    parts
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn siblings(roots: &[PathBuf], dir: &Path) -> Vec<String> {
     for root in roots {
         let full = root.join(dir);
@@ -362,6 +386,15 @@ fn generic_param_name(param: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_file_path_gives_its_module_path() {
+        assert_eq!(super::file_module("src/lib.rs"), Vec::<String>::new());
+        assert_eq!(super::file_module("src/a/b.rs"), ["a", "b"]);
+        assert_eq!(super::file_module("crates/x/src/a/mod.rs"), ["a"]);
+        assert_eq!(super::file_module("flow.rs"), ["flow"]);
+    }
+
     use super::*;
 
     #[test]

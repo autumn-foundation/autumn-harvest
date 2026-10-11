@@ -115,7 +115,10 @@ Four review agents read the first version. Each fix has a test.
     list. Such a manifest is now refused.
 16. MIR prints a dependency type as `helpers::Clock`, the same as a type of
     a local `helpers` module. A local module name is no proof alone. The
-    sources must also declare a type of that name.
+    sources must declare that type in that module: the printed path must be
+    a suffix of a declared module path and name.
+17. A `step` node could name an index past the body `steps` list. Such a
+    manifest is now refused.
 
 ---
 

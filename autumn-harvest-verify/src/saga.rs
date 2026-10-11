@@ -117,7 +117,8 @@ pub fn check(manifest: &StructureManifest) -> Result<Vec<SagaReport>, CheckError
         }
         for body in &workflow.bodies {
             if let Some(graph) = &body.flow {
-                validate(graph).map_err(|e| CheckError(format!("{}: {e}", body.id)))?;
+                validate(graph, body.steps.len())
+                    .map_err(|e| CheckError(format!("{}: {e}", body.id)))?;
             }
         }
         if let Some(problem) = dangling_reference(workflow) {
@@ -165,7 +166,7 @@ fn dangling_reference(workflow: &WorkflowStructure) -> Option<String> {
 
 /// Refuse a graph the fixpoint would read wrong. A dropped edge or a
 /// missing entry would hide an exit, and so give a false `covered`.
-fn validate(graph: &FlowGraph) -> Result<(), String> {
+fn validate(graph: &FlowGraph, steps: usize) -> Result<(), String> {
     let entries = count(graph, |e| matches!(e, FlowEvent::Entry));
     if entries != 1 {
         return Err(format!("the flow graph has {entries} entry nodes, not 1"));
@@ -178,6 +179,17 @@ fn validate(graph: &FlowGraph) -> Result<(), String> {
                     "an edge names node {end}, but the graph has {size} nodes"
                 ));
             }
+        }
+    }
+    // A step node indexes the body `steps`. A missing step reads as a body
+    // with no command, so a `noop-compensation` note would be wrong.
+    for node in &graph.nodes {
+        if let FlowEvent::Step { step } = node.event
+            && step >= steps
+        {
+            return Err(format!(
+                "a node names step {step}, but the body has {steps} steps"
+            ));
         }
     }
     // An exit returns, so nothing runs after it.
@@ -611,6 +623,14 @@ mod tests {
         };
         let err = check(&manifest(disconnected)).expect_err("unreachable nodes");
         assert!(err.to_string().contains("reach"), "{err}");
+
+        // A step node names an entry of the body `steps` that is not there.
+        let err = check(&manifest(FlowGraph {
+            nodes: vec![node(FlowEvent::Entry), node(FlowEvent::Step { step: 0 })],
+            edges: vec![edge(0, 1, None)],
+        }))
+        .expect_err("a step index past the list");
+        assert!(err.to_string().contains("step 0"), "{err}");
 
         // Nodes after a return never run, so a gap there would be hidden.
         let past_exit = FlowGraph {

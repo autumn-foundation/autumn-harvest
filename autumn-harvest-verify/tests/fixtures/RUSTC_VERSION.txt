@@ -144,12 +144,13 @@ cargo 1.94.1 (29ea6fb6a 2026-03-24)
 #
 # `async_block_follow/flow.mir` (issue #2010) was produced the same way, on
 # rustc 1.99.0, with a second stub crate that stands for an untrusted
-# dependency. From `async_block_follow/`:
+# dependency. Its source sits in `dep/`, so the source index does not read
+# it as first-party code. From `async_block_follow/`:
 #
 #   rustc --crate-type lib --edition 2024 --crate-name autumn_harvest \
 #         -o libautumn_harvest.rlib harvest_stub.rs
 #   rustc --crate-type lib --edition 2024 --crate-name other_crate \
-#         -o libother_crate.rlib other_crate.rs
+#         -o libother_crate.rlib dep/other_crate.rs
 #   rustc --crate-type lib --edition 2024 --emit=mir \
 #         --extern autumn_harvest=libautumn_harvest.rlib \
 #         --extern other_crate=libother_crate.rlib -o flow.mir flow.rs

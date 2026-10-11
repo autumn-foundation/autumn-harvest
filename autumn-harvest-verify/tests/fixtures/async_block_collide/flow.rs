@@ -21,6 +21,23 @@ pub fn local() -> u8 {
     2
 }
 
+/// An unrelated local type with the dependency type's name. Its `poll`
+/// reads no clock, so following it would hide the dependency `poll`.
+pub struct ClockFuture {
+    n: u64,
+}
+
+impl std::future::Future for ClockFuture {
+    type Output = Out;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Out> {
+        std::task::Poll::Ready(Ok(self.n))
+    }
+}
+
 pub fn __autumn_workflow_info_wf_colliding_crate() -> u8 {
     0
 }

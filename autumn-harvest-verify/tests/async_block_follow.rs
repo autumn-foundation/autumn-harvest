@@ -154,6 +154,7 @@ fn an_erased_future_of_an_untrusted_crate_is_a_boundary() {
 fn a_dependency_named_like_a_local_module_is_still_a_boundary() {
     // MIR prints `helpers::ClockFuture` for the dependency, and the crate
     // has a `helpers` module. The module name alone is no evidence.
+    // A local `ClockFuture` exists too. Its `poll` must not stand in.
     let all = verdicts_in(&fixture_dir().with_file_name("async_block_collide"));
     let Verdict::Unknown { boundaries } = verdict(&all, "wf_colliding_crate") else {
         panic!("{:?}", verdict(&all, "wf_colliding_crate"));
@@ -161,7 +162,8 @@ fn a_dependency_named_like_a_local_module_is_still_a_boundary() {
     assert!(
         boundaries
             .iter()
-            .any(|b| b.detail.contains("helpers::ClockFuture")),
+            .any(|b| b.kind.name() == "external-crate-body"
+                && b.detail == "<helpers::ClockFuture as std::future::Future>::poll"),
         "{boundaries:?}"
     );
 }

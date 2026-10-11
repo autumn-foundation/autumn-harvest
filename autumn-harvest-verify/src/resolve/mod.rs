@@ -1364,9 +1364,9 @@ impl Program {
     /// Is the rooted type path `path` first-party?
     ///
     /// MIR prints a local type without its crate name, as `models::Order`. It
-    /// prints a dependency type the same way, as `helpers::Clock`. So a root
-    /// that names a local module is no proof alone. The sources must also
-    /// declare a type of that name. An analyzed crate name is proof.
+    /// prints a dependency type the same way, as `helpers::Clock`. So the
+    /// sources must declare that type in that module. The printed path is a
+    /// suffix of the declared path. An analyzed crate name is proof alone.
     #[must_use]
     pub fn is_first_party_type(&self, path: &str) -> bool {
         let bare = strip_generics_everywhere(path);
@@ -1374,8 +1374,11 @@ impl Program {
             return false;
         };
         self.crates.contains(root)
-            || (self.sources.modules.contains(root)
-                && self.sources.types.contains(last_segment(&bare)))
+            || self
+                .sources
+                .type_paths
+                .iter()
+                .any(|declared| is_segment_suffix(&bare, &segments(declared)))
     }
 
     /// `crate::path` for a body id — the spelling every report uses.

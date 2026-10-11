@@ -293,7 +293,8 @@ events when a path joins them with no other event on it.
 `saga-step` has at least one `ok` and one `err` edge, and no other node has
 a labeled edge. `--check-structure` refuses a graph that breaks this, names
 a missing node, has other than one `entry`, or has a node that the `entry`
-cannot reach, or an `exit` with an out-edge. It also refuses a `call`, a
+cannot reach, an `exit` with an out-edge, or a `step` past the body
+`steps` list. It also refuses a `call`, a
 `saga-step`, a handler or a body `calls` entry that names a body or handler
 the workflow does not hold.
 
