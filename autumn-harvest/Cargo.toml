@@ -331,6 +331,12 @@ serde_yaml = "0.9"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 
+# Runs the real `agent_loop` on a Postgres worker to measure the resident hit
+# rate (issue #2007). Path only, so `cargo publish` drops it. The loom and
+# shuttle models never use it.
+[target.'cfg(not(any(loom, shuttle)))'.dev-dependencies]
+autumn-harvest-agent = { path = "../autumn-harvest-agent" }
+
 # loom is only pulled in under `RUSTFLAGS="--cfg loom"`. It must live under a
 # `cfg(loom)` target dependency rather than `[dev-dependencies]` because the
 # `crate::loom_sync` shim references `loom::sync::*` from the *library* sources

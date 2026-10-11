@@ -2583,7 +2583,9 @@ pub mod db {
 
     use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
     use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
-    use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics, TelemetryConfig};
+    use autumn_harvest::telemetry::{
+        MetricsRecorder, RESIDENT_MISS_REASONS, RESIDENT_OUTCOME_HIT, TelemetryConfig,
+    };
     use autumn_harvest::types::{ExecutionId, ShardId};
     use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
     use autumn_harvest::{
@@ -3197,9 +3199,97 @@ pub mod db {
         /// carried no task id. Counted rather than ignored, so the published
         /// population can be reconciled against the population that ran.
         unrecorded_dispatches: Mutex<usize>,
+        /// Resident outcomes of every decision (issue #2007).
+        resident: Arc<ResidentTally>,
+    }
+
+    /// Counts `harvest.workflow.resident` outcomes (issue #2007).
+    ///
+    /// One atomic counter per reason, so a decision takes no lock and makes
+    /// no allocation. Slot 0 counts hits. Slot `1 + i` counts the miss
+    /// reason `RESIDENT_MISS_REASONS[i]`.
+    #[derive(Debug)]
+    pub struct ResidentTally(Vec<std::sync::atomic::AtomicU64>);
+
+    impl Default for ResidentTally {
+        fn default() -> Self {
+            Self(
+                (0..=RESIDENT_MISS_REASONS.len())
+                    .map(|_| std::sync::atomic::AtomicU64::new(0))
+                    .collect(),
+            )
+        }
+    }
+
+    impl ResidentTally {
+        fn count(&self, slot: usize) -> u64 {
+            std::sync::atomic::AtomicU64::load(&self.0[slot], std::sync::atomic::Ordering::Relaxed)
+        }
+
+        /// A report note: the hit rate and each miss reason.
+        #[must_use]
+        pub fn note(&self) -> String {
+            let hits = self.count(0);
+            let misses: Vec<(&str, u64)> = RESIDENT_MISS_REASONS
+                .iter()
+                .enumerate()
+                .map(|(i, reason)| (*reason, self.count(i + 1)))
+                .filter(|(_, n)| *n > 0)
+                .collect();
+            let total = hits + misses.iter().map(|(_, n)| n).sum::<u64>();
+            #[allow(clippy::cast_precision_loss)] // Counts stay far below 2^52.
+            let rate = if total == 0 {
+                "n/a".to_owned()
+            } else {
+                format!("{:.1}%", hits as f64 * 100.0 / total as f64)
+            };
+            let misses = if misses.is_empty() {
+                "none".to_owned()
+            } else {
+                misses
+                    .iter()
+                    .map(|(reason, n)| format!("{reason}={n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            format!(
+                "resident hit rate (issue #2007): {rate}, {hits} of {total} decisions; \
+                 misses: {misses}"
+            )
+        }
+    }
+
+    impl MetricsRecorder for ResidentTally {
+        fn record_workflow_resident(
+            &self,
+            _workflow_name: &str,
+            _queue: &str,
+            outcome: &str,
+            reason: &str,
+        ) {
+            let slot = if outcome == RESIDENT_OUTCOME_HIT {
+                Some(0)
+            } else {
+                RESIDENT_MISS_REASONS
+                    .iter()
+                    .position(|known| *known == reason)
+                    .map(|i| i + 1)
+            };
+            // Every reason is in the list. A unit test in `resident.rs`
+            // checks this, so the tally can drop an unknown one.
+            if let Some(slot) = slot {
+                self.0[slot].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     impl BenchObservations {
+        /// The resident-outcome note of this run (issue #2007).
+        #[must_use]
+        pub fn resident_note(&self) -> String {
+            self.resident.note()
+        }
+
         #[must_use]
         pub fn activity_starts(&self) -> Vec<(Uuid, DateTime<Utc>)> {
             self.activity_starts.lock().expect("poisoned").clone()
@@ -3374,12 +3464,18 @@ pub mod db {
     /// Build the registry both bench workflows and all three activities share.
     #[must_use]
     pub fn build_registry() -> (Arc<HandlerRegistry>, Arc<BenchObservations>) {
+        // Issue #2007: count resident outcomes. Every other metric stays a
+        // no-op, as before.
+        let resident = Arc::new(ResidentTally::default());
         let telemetry = Arc::new(
             TelemetryConfig::builder()
-                .metrics(Arc::new(NoOpMetrics) as Arc<dyn MetricsRecorder>)
+                .metrics(Arc::clone(&resident) as Arc<dyn MetricsRecorder>)
                 .build(),
         );
-        let observations = Arc::new(BenchObservations::default());
+        let observations = Arc::new(BenchObservations {
+            resident,
+            ..BenchObservations::default()
+        });
         let mut state = std::collections::HashMap::new();
         state.insert(
             std::any::TypeId::of::<Arc<BenchObservations>>(),
@@ -4016,7 +4112,7 @@ pub mod db {
         let scenario_started = Instant::now();
         let cluster = Box::pin(setup_shards(shard_count)).await?;
         let sharded = cluster.sharded_pool();
-        let (registry, _observations) = build_registry();
+        let (registry, observations) = build_registry();
         let fleet = start_fleet(&cluster, &sharded, &registry, &census);
         let deadline = scenario_deadline();
         let shards = cluster.shard_ids();
@@ -4141,6 +4237,7 @@ pub mod db {
                 vec![
                     shard_note(&per_shard),
                     format!("topology: {}", topology.as_str()),
+                    observations.resident_note(),
                     format!(
                         "closed loop: {inflight} workflows in flight per shard, {requested} \
                          measured completions, warmup population {}",
@@ -4552,6 +4649,7 @@ pub mod db {
                 vec![
                     shard_note(&per_shard),
                     format!("topology: {}", topology.as_str()),
+                    observations.resident_note(),
                     format!("target pace: {target:.1} workflow starts/s"),
                     format!(
                         "host-to-database clock offset before the window: {} ms (per shard, \
@@ -4848,6 +4946,7 @@ pub mod db {
                 vec![
                     shard_note(&per_shard),
                     format!("topology: {}", topology.as_str()),
+                    observations.resident_note(),
                     format!(
                         "target pace: {PACED_STARTS_PER_SEC_PER_SHARD:.1} signals/s per shard, \
                          one paced sender per shard running concurrently; achieved {}/s",

@@ -263,6 +263,10 @@ ignore = true
 # candidate for a dedicated dedup PR, not bundled into this harness.
 multiple-versions = "warn"
 wildcards = "deny"
+# Issue #2007: a path dev-dependency with no version is not a wildcard risk.
+# `cargo publish` drops it. The core crate takes the agent crate this way,
+# because the agent crate publishes after the core crate.
+allow-wildcard-paths = true
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
