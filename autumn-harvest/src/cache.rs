@@ -28,7 +28,7 @@ use std::num::NonZeroUsize;
 use uuid::Uuid;
 
 use crate::event::WorkflowEvent;
-use crate::resident::ResidentWorkflow;
+use crate::resident::Residency;
 
 /// Cached state for a suspended workflow execution.
 ///
@@ -67,11 +67,11 @@ pub(crate) struct HistoryBytesMark {
     pub(crate) warm_steps: u32,
 }
 
-/// One cache entry: the event snapshot, the resident workflow if any, and
-/// the stored-history byte mark if any.
+/// One cache entry: the event snapshot, the resident state of its
+/// suspension, and the stored-history byte mark if any.
 struct CacheEntry {
     state: CachedWorkflowState,
-    resident: Option<ResidentWorkflow>,
+    resident: Residency,
     // Only the `db` worker reads the mark.
     #[cfg_attr(not(feature = "db"), allow(dead_code))]
     history_bytes: Option<HistoryBytesMark>,
@@ -168,10 +168,10 @@ impl WorkflowCache {
     /// cache.insert(Uuid::new_v4(), state);
     /// ```
     pub fn insert(&mut self, exec_id: Uuid, state: CachedWorkflowState) {
-        let _displaced = self.insert_resident(exec_id, state, None);
+        let _displaced = self.insert_resident(exec_id, state, Residency::Unknown);
     }
 
-    /// Inserts a snapshot with the resident workflow of its suspension
+    /// Inserts a snapshot with the resident state of its suspension
     /// (issue #1798).
     ///
     /// When resident state is off, `resident` is not stored. An existing
@@ -182,8 +182,8 @@ impl WorkflowCache {
         &mut self,
         exec_id: Uuid,
         state: CachedWorkflowState,
-        resident: Option<ResidentWorkflow>,
-    ) -> Option<(CachedWorkflowState, Option<ResidentWorkflow>)> {
+        resident: Residency,
+    ) -> Option<(CachedWorkflowState, Residency)> {
         self.insert_resident_with_history_bytes(exec_id, state, resident, None)
     }
 
@@ -193,10 +193,14 @@ impl WorkflowCache {
         &mut self,
         exec_id: Uuid,
         state: CachedWorkflowState,
-        resident: Option<ResidentWorkflow>,
+        resident: Residency,
         history_bytes: Option<HistoryBytesMark>,
-    ) -> Option<(CachedWorkflowState, Option<ResidentWorkflow>)> {
-        let resident = resident.filter(|_| self.resident_enabled);
+    ) -> Option<(CachedWorkflowState, Residency)> {
+        let resident = if self.resident_enabled {
+            resident
+        } else {
+            Residency::Unknown
+        };
         if self
             .inner
             .peek(&exec_id)
@@ -216,16 +220,13 @@ impl WorkflowCache {
             .map(|(_, entry)| (entry.state, entry.resident))
     }
 
-    /// Removes an entry and returns its snapshot and resident workflow
+    /// Removes an entry and returns its snapshot and resident state
     /// (issue #1798).
     ///
     /// The worker takes the entry on a hit, so no other task can resume the
     /// same parked future.
     #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the db-gated worker takes entries.
-    pub(crate) fn take(
-        &mut self,
-        exec_id: &Uuid,
-    ) -> Option<(CachedWorkflowState, Option<ResidentWorkflow>)> {
+    pub(crate) fn take(&mut self, exec_id: &Uuid) -> Option<(CachedWorkflowState, Residency)> {
         self.take_with_history_bytes(exec_id)
             .map(|(state, resident, _)| (state, resident))
     }
@@ -236,11 +237,7 @@ impl WorkflowCache {
     pub(crate) fn take_with_history_bytes(
         &mut self,
         exec_id: &Uuid,
-    ) -> Option<(
-        CachedWorkflowState,
-        Option<ResidentWorkflow>,
-        Option<HistoryBytesMark>,
-    )> {
+    ) -> Option<(CachedWorkflowState, Residency, Option<HistoryBytesMark>)> {
         self.inner
             .pop(exec_id)
             .map(|entry| (entry.state, entry.resident, entry.history_bytes))
@@ -341,6 +338,7 @@ impl std::fmt::Debug for WorkflowCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resident::ResidentWorkflow;
 
     fn make_state(next_event_id: i32) -> CachedWorkflowState {
         CachedWorkflowState {
@@ -416,7 +414,12 @@ mod tests {
             warm_steps: 0,
         };
 
-        let _ = cache.insert_resident_with_history_bytes(id, make_state(7), None, Some(mark));
+        let _ = cache.insert_resident_with_history_bytes(
+            id,
+            make_state(7),
+            Residency::Unknown,
+            Some(mark),
+        );
         let (_, _, taken) = cache.take_with_history_bytes(&id).expect("entry");
         assert_eq!(taken, Some(mark), "the take returns the mark");
         assert!(
@@ -508,18 +511,25 @@ mod tests {
     async fn take_removes_the_entry_with_its_resident_workflow() {
         let mut cache = WorkflowCache::new(5);
         let id = Uuid::new_v4();
-        cache.insert_resident(id, make_state(7), Some(resident().await));
+        cache.insert_resident(id, make_state(7), Residency::Parked(resident().await));
 
         let (state, live) = cache.take(&id).expect("entry is present");
         assert_eq!(state.next_event_id, 7);
-        assert!(live.is_some(), "the resident workflow comes with the entry");
+        assert!(
+            live.is_parked(),
+            "the resident workflow comes with the entry"
+        );
         assert!(cache.take(&id).is_none(), "a take removes the entry");
     }
 
     #[tokio::test]
     async fn close_releases_every_entry_and_stops_resident_capture() {
         let mut cache = WorkflowCache::new(5);
-        cache.insert_resident(Uuid::new_v4(), make_state(3), Some(resident().await));
+        cache.insert_resident(
+            Uuid::new_v4(),
+            make_state(3),
+            Residency::Parked(resident().await),
+        );
         cache.insert(Uuid::new_v4(), make_state(5));
 
         let closed = cache.close();
@@ -530,9 +540,32 @@ mod tests {
 
         // A task that outlives the shutdown drain cannot park a future again.
         let id = Uuid::new_v4();
-        cache.insert_resident(id, make_state(7), Some(resident().await));
+        cache.insert_resident(id, make_state(7), Residency::Parked(resident().await));
         let (_, live) = cache.take(&id).expect("the snapshot is kept");
-        assert!(live.is_none(), "a closed cache keeps no resident workflow");
+        assert!(
+            !live.is_parked(),
+            "a closed cache keeps no resident workflow"
+        );
+    }
+
+    #[test]
+    fn an_entry_keeps_the_miss_reason_of_its_suspension() {
+        // Issue #2007: the next decision reports why it replays.
+        let mut cache = WorkflowCache::new(5);
+        let id = Uuid::new_v4();
+        cache.insert_resident(
+            id,
+            make_state(7),
+            Residency::Missed(crate::telemetry::ResidentOutcome::Race),
+        );
+        let (_, residency) = cache.take(&id).expect("entry is present");
+        assert!(
+            matches!(
+                residency,
+                Residency::Missed(crate::telemetry::ResidentOutcome::Race)
+            ),
+            "{residency:?}"
+        );
     }
 
     #[test]
@@ -540,7 +573,7 @@ mod tests {
         let mut cache = WorkflowCache::new(5);
         let id = Uuid::new_v4();
         cache.insert(id, make_state(9));
-        let refused = cache.insert_resident(id, make_state(4), None);
+        let refused = cache.insert_resident(id, make_state(4), Residency::Unknown);
 
         assert_eq!(refused.map(|(state, _)| state.next_event_id), Some(4));
         assert_eq!(cache.get(&id).map(|state| state.next_event_id), Some(9));
@@ -550,12 +583,12 @@ mod tests {
     async fn disabled_resident_state_keeps_only_the_snapshot() {
         let mut cache = WorkflowCache::new(5).with_resident(false);
         let id = Uuid::new_v4();
-        cache.insert_resident(id, make_state(7), Some(resident().await));
+        cache.insert_resident(id, make_state(7), Residency::Parked(resident().await));
 
         let (state, live) = cache.take(&id).expect("entry is present");
         assert_eq!(state.next_event_id, 7);
         assert!(
-            live.is_none(),
+            !live.is_parked(),
             "a disabled cache must drop the resident workflow"
         );
     }

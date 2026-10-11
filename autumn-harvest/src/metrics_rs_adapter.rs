@@ -96,11 +96,12 @@ use crate::telemetry::{
     METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DEBOUNCED, METRIC_WORKFLOW_DURATION,
     METRIC_WORKFLOW_HISTORY_BLOAT, METRIC_WORKFLOW_HISTORY_OVERSIZED, METRIC_WORKFLOW_HISTORY_SIZE,
     METRIC_WORKFLOW_ND_BLOCKED, METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PANIC,
-    METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED, METRIC_WORKFLOW_RETRIES,
-    METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_START_THROTTLED, METRIC_WORKFLOW_STARTED,
-    METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL, METRIC_WORKFLOW_TIMEOUT,
-    METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder, PoisonReason, SessionAcquisitionOutcome,
-    SlotType, TunerDecision, WebhookOutcome, WorkflowStatus,
+    METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED, METRIC_WORKFLOW_RESIDENT,
+    METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_START_THROTTLED,
+    METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL,
+    METRIC_WORKFLOW_TIMEOUT, METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder, PoisonReason,
+    ResidentOutcome, SessionAcquisitionOutcome, SlotType, TunerDecision, WebhookOutcome,
+    WorkflowStatus,
 };
 use crate::telemetry::{
     DbOp, METRIC_DB_POOL_IDLE, METRIC_DB_POOL_IN_USE, METRIC_DB_POOL_WAIT,
@@ -901,6 +902,16 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
+    fn record_workflow_resident(&self, workflow_name: &str, queue: &str, outcome: ResidentOutcome) {
+        counter!(
+            METRIC_WORKFLOW_RESIDENT,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_OUTCOME => outcome.as_str(),
+        )
+        .increment(1);
+    }
+
     fn record_external_signal_sent(&self, outcome: &str, reason_code: Option<&str>) {
         if let Some(reason) = reason_code {
             counter!(
@@ -1673,6 +1684,7 @@ mod tests {
         rec.record_concurrency_key_deferred("cap", 1);
         rec.record_workflow_cache_hit("wf", "q");
         rec.record_workflow_cache_miss("wf", "q");
+        rec.record_workflow_resident("wf", "q", ResidentOutcome::Hit);
         rec.record_rate_limit_tokens_available("rl", 10.0);
         rec.record_rate_limit_refill_rate("rl", 2.0);
         rec.record_rate_limit_throttled("rl");
