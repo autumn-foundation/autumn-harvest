@@ -88,8 +88,8 @@ const LIMIT_SOURCES: &[LimitSource] = &[
                 "No model covers shard-generation fencing or the rebalance cutover.",
             ),
             (
-                "Trace conformance.",
-                "No check compares test traces with the models.",
+                "Trace conformance of `CodecRotation`.",
+                "No check compares chaos traces with `CodecRotation`.",
             ),
         ],
     },
@@ -100,11 +100,19 @@ const LIMIT_SOURCES: &[LimitSource] = &[
         limits: &[
             (
                 "drives the store statements, not the `worker.rs` loop.",
-                "The simulator drives store statements, not the `worker.rs` loop.",
+                "The oracle harness drives store statements, not the `worker.rs` loop.",
+            ),
+            (
+                "A world crash falls between two steps.",
+                "A world crash falls between two steps, so no worker dies inside a task body.",
+            ),
+            (
+                "The world workload never fails an activity",
+                "the world workload never fails an activity or quarantines a task.",
             ),
             (
                 "draws actions from fixed weights.",
-                "It draws actions from fixed weights.",
+                "The scheduler draws actions from fixed weights.",
             ),
             (
                 "does not model the timeout sweeper, the `FAILED` state or the poison-pill \
