@@ -113,6 +113,9 @@ Four review agents read the first version. Each fix has a test.
     closure step was a false `proven-deterministic`. It is now followed.
 15. A `handler` node could name an index past the workflow `handlers`
     list. Such a manifest is now refused.
+16. MIR prints a dependency type as `helpers::Clock`, the same as a type of
+    a local `helpers` module. A local module name is no proof alone. The
+    sources must also declare a type of that name.
 
 ---
 

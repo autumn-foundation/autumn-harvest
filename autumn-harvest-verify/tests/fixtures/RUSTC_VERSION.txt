@@ -192,3 +192,17 @@ cargo 1.94.1 (29ea6fb6a 2026-03-24)
 #
 #   rustc --crate-type lib --edition 2024 --crate-name autumn_harvest \
 #         --emit=mir -o harvest_stub.mir harvest_stub.rs
+
+# `async_block_collide/flow.mir` (issue #2010) uses a dependency crate named
+# `helpers`, and the workflow crate has a `helpers` module. MIR prints both as
+# `helpers::..`. The dependency source sits in `dep/`, so the source index
+# does not read it as a sibling of `flow.rs`. From `async_block_collide/`:
+#
+#   rustc --crate-type lib --edition 2024 --crate-name autumn_harvest \
+#         -o libautumn_harvest.rlib ../async_block_follow/harvest_stub.rs
+#   rustc --crate-type lib --edition 2024 --crate-name helpers \
+#         -o libhelpers.rlib dep/helpers.rs
+#   rustc --crate-type lib --edition 2024 --emit=mir \
+#         --extern autumn_harvest=libautumn_harvest.rlib \
+#         --extern helpers=libhelpers.rlib -o flow.mir flow.rs
+#   rm libautumn_harvest.rlib libhelpers.rlib

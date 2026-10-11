@@ -1864,7 +1864,7 @@ impl<'a> Analyzer<'a> {
             .map_or(ty, |local| future_target(local));
         if let Some(root) = crate_root(full)
             && !self.is_trusted_root(root)
-            && !self.program.is_first_party_root(root)
+            && !self.program.is_first_party_type(full)
         {
             let detail = format!("<{full} as std::future::Future>::poll");
             return Err((BoundaryKind::ExternalCrateBody, detail));

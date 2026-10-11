@@ -39,6 +39,11 @@ pub struct SourceIndex {
     pub foreign_fns: BTreeSet<String>,
     /// Function name → generic parameter names, in declaration order.
     pub fn_generics: BTreeMap<String, Vec<String>>,
+    /// Names of the modules the sources declare, inline or in a file.
+    pub modules: BTreeSet<String>,
+    /// Names of the structs, enums, unions and type aliases the sources
+    /// declare.
+    pub types: BTreeSet<String>,
     /// Source file → why it could not be indexed.
     ///
     /// A file MIR named that the source roots could not produce, or that `syn`
@@ -168,7 +173,20 @@ impl SourceIndex {
                             .insert(item.sig.ident.to_string(), generics);
                     }
                 }
+                syn::Item::Struct(item) => {
+                    self.types.insert(item.ident.to_string());
+                }
+                syn::Item::Enum(item) => {
+                    self.types.insert(item.ident.to_string());
+                }
+                syn::Item::Union(item) => {
+                    self.types.insert(item.ident.to_string());
+                }
+                syn::Item::Type(item) => {
+                    self.types.insert(item.ident.to_string());
+                }
                 syn::Item::Mod(item) => {
+                    self.modules.insert(item.ident.to_string());
                     if let Some((_, items)) = &item.content {
                         self.absorb_items(items, depth.saturating_add(1));
                     }

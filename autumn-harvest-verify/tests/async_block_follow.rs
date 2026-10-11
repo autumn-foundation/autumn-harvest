@@ -22,7 +22,11 @@ fn fixture_dir() -> PathBuf {
 }
 
 fn verdicts() -> Vec<WorkflowVerdict> {
-    let dir = fixture_dir();
+    verdicts_in(&fixture_dir())
+}
+
+fn verdicts_in(dir: &Path) -> Vec<WorkflowVerdict> {
+    let dir = dir.to_path_buf();
     let path = dir.join("flow.mir");
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
@@ -142,6 +146,22 @@ fn an_erased_future_of_an_untrusted_crate_is_a_boundary() {
         boundaries
             .iter()
             .any(|b| b.kind.name() == "dyn-dispatch" && b.detail.contains("dyn Future")),
+        "{boundaries:?}"
+    );
+}
+
+#[test]
+fn a_dependency_named_like_a_local_module_is_still_a_boundary() {
+    // MIR prints `helpers::ClockFuture` for the dependency, and the crate
+    // has a `helpers` module. The module name alone is no evidence.
+    let all = verdicts_in(&fixture_dir().with_file_name("async_block_collide"));
+    let Verdict::Unknown { boundaries } = verdict(&all, "wf_colliding_crate") else {
+        panic!("{:?}", verdict(&all, "wf_colliding_crate"));
+    };
+    assert!(
+        boundaries
+            .iter()
+            .any(|b| b.detail.contains("helpers::ClockFuture")),
         "{boundaries:?}"
     );
 }

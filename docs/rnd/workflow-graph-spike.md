@@ -191,7 +191,8 @@ each fix has a test:
   cut the `unknown` exits of the engine examples from 12 to 4.
 - A closure can return a future of an untrusted crate that it builds with
   no call, such as a unit struct. Its `poll` has no body here, so it is a
-  boundary. A same-named local impl no longer stands in for it.
+  boundary. A same-named local impl no longer stands in for it. A local
+  module with the crate name does not hide it either.
 - The check skipped a node that the entry cannot reach. It now refuses such
   a graph.
 - A local `other::Saga::compensate_all` that took the engine saga read as
@@ -295,7 +296,7 @@ crate its own `--target-dir`, and delete it after the run.
 | Every fixture case gets its verdict | `saga_graph::every_fixture_workflow_gets_its_expected_verdict` |
 | A back edge carries a pending step to an exit | `saga::tests::a_gap_reached_only_through_a_back_edge_is_found` |
 | The `async` block follow never gives a false proof | `async_block_follow::a_case_the_analysis_cannot_follow_is_never_proven` |
-| A future of an untrusted crate is a boundary | `async_block_follow::a_future_of_an_untrusted_crate_is_a_boundary`; `async_block_follow::an_erased_future_of_an_untrusted_crate_is_a_boundary` |
+| A future of an untrusted crate is a boundary | `async_block_follow::a_future_of_an_untrusted_crate_is_a_boundary`; `async_block_follow::an_erased_future_of_an_untrusted_crate_is_a_boundary`; `async_block_follow::a_dependency_named_like_a_local_module_is_still_a_boundary` |
 | The check refuses a malformed or disconnected graph | `saga::tests::a_malformed_graph_is_refused` |
 | A local type named `Saga` is not the engine saga | `saga_graph::a_local_type_named_saga_is_not_the_engine_saga` |
 | The engine MIR in the same run changes no verdict | `saga_graph::the_engine_mir_in_the_same_run_changes_no_verdict` |
