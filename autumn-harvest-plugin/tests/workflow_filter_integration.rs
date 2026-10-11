@@ -2273,3 +2273,44 @@ async fn change_stream_signals_a_triage_update() {
         .await
         .expect("a changed frame after the triage update");
 }
+
+#[tokio::test]
+async fn change_stream_signals_a_search_attribute_update() {
+    let (database_url, _container) = setup_single_database().await;
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::from(build_pool(&database_url)));
+    api_state
+        .set_workflow_result_notification_database_urls([(ShardId::new(0), database_url.clone())]);
+    let app = harvest_api_router(api_state);
+    let exec_id = seed_workflow(&database_url, ShardId::new(0), "flow", "sa-1", None).await;
+
+    let stream = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/workflows/changes/stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("open the change stream");
+    assert_eq!(stream.status(), StatusCode::OK);
+
+    // A workflow cycle can upsert search attributes and append no event, for
+    // example when it then parks on a signal wait.
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+    let patch: std::collections::HashMap<String, Option<Value>> =
+        [("phase".to_string(), Some(json!("blocked")))]
+            .into_iter()
+            .collect();
+    autumn_harvest::store::update_search_attrs(&mut conn, exec_id, &patch)
+        .await
+        .expect("update search attributes");
+
+    wait_for_sse_event(stream, "changed", std::time::Duration::from_secs(10))
+        .await
+        .expect("a changed frame after the search attribute update");
+}
