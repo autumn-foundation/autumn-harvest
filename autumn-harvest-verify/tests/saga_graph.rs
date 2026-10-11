@@ -569,6 +569,7 @@ fn every_fixture_workflow_gets_its_expected_verdict() {
         ("wf_unit", Covered),
         ("wf_untracked", Unknown),
         ("wf_unwind_boxed", Unknown),
+        ("wf_unwind_branched", Unknown),
         ("wf_unwind_then_err", Covered),
         ("wf_unwind_wrapped", Unknown),
         ("wf_update_handler", NoSaga),
@@ -725,19 +726,21 @@ fn an_unwind_that_is_never_awaited_is_a_gap() {
 
 #[test]
 fn an_unwind_passed_to_a_wrapper_is_an_escape() {
-    // The walk knows only the plain `.await` shape. A wrapper call or an
-    // aggregate can still run the unwind, so each is an escape.
+    // The walk knows only the plain `.await` shape. A wrapper call, an
+    // aggregate or a branch can still lead to the unwind, so each is an
+    // escape.
     let reports = check();
     for (name, to) in [
         ("wf_unwind_boxed", "Box::pin"),
         ("wf_unwind_wrapped", "Option::Some"),
+        ("wf_unwind_branched", "control flow at bb"),
     ] {
         let r = report(&reports, name);
         assert_eq!(r.verdict, SagaVerdict::Unknown, "{r:#?}");
         assert!(
             r.unknown
                 .iter()
-                .any(|u| u.starts_with("saga-escapes: ") && u.ends_with(&format!(" to {to}"))),
+                .any(|u| u.starts_with("saga-escapes: ") && u.contains(&format!(" to {to}"))),
             "{r:#?}"
         );
     }

@@ -355,8 +355,9 @@ does not change the verdict.
 
 The check follows `saga.step(..).await?` exactly. It follows the value,
 not only the control flow. The check counts `compensate_all` only when the
-body awaits it. A future passed to another call, as `Box::pin`, or moved
-into an aggregate, as `Some(..)`, is a `saga-escape`. The check trusts the `Saga` contract: a failed step unwinds
+body awaits it. A future passed to another call, as `Box::pin`, moved
+into an aggregate, as `Some(..)`, or held across a branch is a
+`saga-escape`. The check trusts the `Saga` contract: a failed step unwinds
 every earlier step. A panic is not an error exit. DAG compensation runs in
 the engine, so the graph cannot see it. See
 [`docs/rnd/workflow-graph-spike.md`](rnd/workflow-graph-spike.md) for the

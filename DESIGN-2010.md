@@ -144,9 +144,11 @@ Four review agents read the first version. Each fix has a test.
     read too. It honors `#[path]`, and the declaring module gives the path.
     MIR can name the moved file too, so a file is read once per module
     path. A depth cap of 16 ends a `#[path]` cycle. A type declared in a
-    function body is indexed too, under the function path. A
-    `macro_rules!` arm that parses as items is indexed as items. Another
-    arm, or a type that a call names, gets every fact of the macro.
+    function body is indexed too, under the function path. So is a type
+    in a default trait method body. The item walk in a file has no depth
+    cap, so it skips no nested type. A `macro_rules!` arm that parses as
+    items is indexed as items. Another arm, or a type that a call names,
+    gets every fact of the macro.
     A type alias counts its target as a field, so a wrapper of an alias of
     `Arc<Mutex<u64>>` is interior-mutable too. An associated type in an
     `impl` block counts the same way.
@@ -186,7 +188,8 @@ Four review agents read the first version. Each fix has a test.
     `.await` shape. A future passed to another call, as `Box::pin`, can still
     run the unwind. That call is a `saga-escape`, so the verdict is
     `unknown`. A future moved into an aggregate, as `Some(..)`, is an escape
-    too. A dropped future does not unwind, so it is still a gap.
+    too. So is a future held across a branch, as the walk does not follow
+    one. A dropped future does not unwind, so it is still a gap.
 
 ---
 

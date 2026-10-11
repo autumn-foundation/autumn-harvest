@@ -270,7 +270,7 @@ impl SourceIndex {
     /// items. Another arm gives each type it names every fact of the macro.
     /// A macro defined in a dependency has no facts here, so its call adds
     /// nothing.
-    fn absorb_macro(&mut self, item: &syn::ItemMacro, depth: u32, module: &[String]) {
+    fn absorb_macro(&mut self, item: &syn::ItemMacro, module: &[String]) {
         let tokens = &item.mac.tokens;
         let Some(name) = item.mac.path.segments.last().map(|s| s.ident.to_string()) else {
             return;
@@ -279,7 +279,7 @@ impl SourceIndex {
             let names = passed_names(tokens.clone());
             self.macro_calls.push((name, names));
             if let Ok(file) = syn::parse2::<syn::File>(tokens.clone()) {
-                self.absorb_items(&file.items, depth.saturating_add(1), module);
+                self.absorb_items(&file.items, module);
             }
             return;
         }
@@ -289,7 +289,7 @@ impl SourceIndex {
         let facts = FieldFacts::of_tokens(tokens.clone());
         for body in arm_bodies(tokens.clone()) {
             if let Ok(file) = syn::parse2::<syn::File>(body.clone()) {
-                self.absorb_items(&file.items, depth.saturating_add(1), module);
+                self.absorb_items(&file.items, module);
                 continue;
             }
             for declared in declared_names(body.clone()) {
@@ -365,7 +365,7 @@ impl SourceIndex {
     /// declares, as the path of inline modules around it and its name.
     fn absorb_syn(&mut self, text: &str, module: &[String]) -> Option<Vec<Declared>> {
         let file = syn::parse_file(text).ok()?;
-        self.absorb_items(&file.items, 0, module);
+        self.absorb_items(&file.items, module);
         let mut children = Vec::new();
         declared_module_files(&file.items, &mut Vec::new(), &mut children);
         Some(children)
@@ -397,26 +397,20 @@ impl SourceIndex {
 
     /// Absorb the items declared in the body of the function `name`. A
     /// workflow can declare a wrapper type there.
-    fn absorb_body(
-        &mut self,
-        block: &syn::Block,
-        name: &syn::Ident,
-        depth: u32,
-        module: &[String],
-    ) {
+    fn absorb_body(&mut self, block: &syn::Block, name: &syn::Ident, module: &[String]) {
         let mut found = BodyItems::default();
         syn::visit::Visit::visit_block(&mut found, block);
         if !found.0.is_empty() {
             let mut inner = module.to_vec();
             inner.push(name.to_string());
-            self.absorb_items(&found.0, depth.saturating_add(1), &inner);
+            self.absorb_items(&found.0, &inner);
         }
     }
 
-    fn absorb_items(&mut self, items: &[syn::Item], depth: u32, module: &[String]) {
-        if depth > 8 {
-            return;
-        }
+    /// Absorb `items`, declared in `module`. There is no depth cap, as a
+    /// skipped type would read as one that cannot write. The recursion is
+    /// as deep as the tree `syn` already parsed.
+    fn absorb_items(&mut self, items: &[syn::Item], module: &[String]) {
         for item in items {
             match item {
                 syn::Item::Fn(item) => {
@@ -425,7 +419,7 @@ impl SourceIndex {
                         self.fn_generics
                             .insert(item.sig.ident.to_string(), generics);
                     }
-                    self.absorb_body(&item.block, &item.sig.ident, depth, module);
+                    self.absorb_body(&item.block, &item.sig.ident, module);
                 }
                 syn::Item::Struct(item) => {
                     self.declare(module, &item.ident);
@@ -450,7 +444,7 @@ impl SourceIndex {
                     if let Some((_, items)) = &item.content {
                         let mut inner = module.to_vec();
                         inner.push(item.ident.to_string());
-                        self.absorb_items(items, depth.saturating_add(1), &inner);
+                        self.absorb_items(items, &inner);
                     }
                 }
                 syn::Item::ForeignMod(item) => {
@@ -473,7 +467,7 @@ impl SourceIndex {
                                     .entry(f.sig.ident.to_string())
                                     .or_insert(generics);
                             }
-                            self.absorb_body(&f.block, &f.sig.ident, depth, module);
+                            self.absorb_body(&f.block, &f.sig.ident, module);
                         }
                         // An associated type is an alias. Its target counts as
                         // a field, as a free alias target does.
@@ -482,7 +476,17 @@ impl SourceIndex {
                         }
                     }
                 }
-                syn::Item::Macro(item) => self.absorb_macro(item, depth, module),
+                syn::Item::Macro(item) => self.absorb_macro(item, module),
+                syn::Item::Trait(item) => {
+                    // A default method body can declare a wrapper too.
+                    for member in &item.items {
+                        if let syn::TraitItem::Fn(f) = member
+                            && let Some(block) = &f.default
+                        {
+                            self.absorb_body(block, &f.sig.ident, module);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1073,6 +1077,32 @@ mod tests {
         for name in ["&Tick", "&&Tock", "Tuck"] {
             assert!(index.future_impls.contains(name), "{name}: {index:?}");
         }
+    }
+
+    #[test]
+    fn a_type_in_a_default_trait_method_is_indexed() {
+        let mut index = SourceIndex::default();
+        index.absorb_syn(
+            "trait Run { fn run(&self) { struct Shared(Arc<Mutex<u64>>); } }\n",
+            &[],
+        );
+        let names = index.type_fields.get("Shared").map(|f| f.names.clone());
+        assert!(names.is_some_and(|n| n.contains("Mutex")), "{index:?}");
+    }
+
+    #[test]
+    fn a_deeply_nested_type_is_indexed() {
+        // The index has no depth cap, so a deep type is never skipped.
+        let depth = 20;
+        let text = format!(
+            "{}struct Deep(Arc<Mutex<u64>>);{}",
+            "mod m { ".repeat(depth),
+            " }".repeat(depth)
+        );
+        let mut index = SourceIndex::default();
+        index.absorb_syn(&text, &[]);
+        let names = index.type_fields.get("Deep").map(|f| f.names.clone());
+        assert!(names.is_some_and(|n| n.contains("Mutex")), "{index:?}");
     }
 
     #[test]

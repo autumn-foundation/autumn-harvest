@@ -612,18 +612,10 @@ impl AwaitState {
     }
 }
 
-/// Follow the `.await` of the saga call in `block`, and its `?` when
-/// `want_arms` is set.
-///
-/// The walk follows the value, not only the control flow. The call result
-/// must reach `poll` through `into_future`, the `Pin` constructors, moves
-/// and borrows. The `switchInt` after `poll` must read the discriminant of
-/// that `poll` result, and case `0` is `Ready`. `Try::branch` must read the
-/// `Ready` payload. Its `switchInt` gives case `0` for `Continue` and case
-/// `1` for `Break`. Any other shape returns `None`. So a call such as
-/// `map_err`, or a `?` on another value, cannot pass for the step result.
-/// The callee that takes the future that `block` builds, when that future
-/// goes into a call other than drop glue. A dropped future gives `None`.
+/// Where the future that `block` builds escapes the walk, when it is not
+/// dropped. That is a call other than drop glue, an aggregate, or control
+/// flow that the walk does not follow, such as a branch. A dropped future
+/// gives `None`.
 fn future_escape(blocks: &HashMap<&str, &BasicBlock>, block: &BasicBlock) -> Option<String> {
     let Terminator::Call {
         dest,
@@ -663,12 +655,26 @@ fn future_escape(blocks: &HashMap<&str, &BasicBlock>, block: &BasicBlock) -> Opt
                 }
                 at = target.as_deref()?;
             }
+            // The future is still held, so a later block can await it.
+            Terminator::Call { .. } | Terminator::SwitchInt { .. } => {
+                return Some(format!("control flow at {at}"));
+            }
             _ => return None,
         }
     }
-    None
+    Some(format!("a walk past {MAX_AWAIT_WALK} blocks"))
 }
 
+/// Follow the `.await` of the saga call in `block`, and its `?` when
+/// `want_arms` is set.
+///
+/// The walk follows the value, not only the control flow. The call result
+/// must reach `poll` through `into_future`, the `Pin` constructors, moves
+/// and borrows. The `switchInt` after `poll` must read the discriminant of
+/// that `poll` result, and case `0` is `Ready`. `Try::branch` must read the
+/// `Ready` payload. Its `switchInt` gives case `0` for `Continue` and case
+/// `1` for `Break`. Any other shape returns `None`. So a call such as
+/// `map_err`, or a `?` on another value, cannot pass for the step result.
 fn await_walk(
     blocks: &HashMap<&str, &BasicBlock>,
     block: &BasicBlock,

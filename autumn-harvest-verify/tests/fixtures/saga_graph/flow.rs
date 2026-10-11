@@ -649,3 +649,26 @@ pub async fn wf_unwind_wrapped(ctx: &WorkflowContext) -> Out {
     }
     Ok(a)
 }
+
+pub fn __autumn_workflow_info_wf_unwind_branched() -> u8 {
+    0
+}
+
+/// The unwind future is held across an `if` and awaited after it. The walk
+/// does not follow a branch, so the unwind is unproven, not dropped.
+pub async fn wf_unwind_branched(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let a = saga
+        .step(
+            || async { ctx.execute_activity_raw("reserve", 1).await },
+            |a| async move { ctx.execute_activity_raw("release", a).await.map(|_| ()) },
+        )
+        .await?;
+    if a > 10 {
+        let unwind = saga.compensate_all();
+        let message = if a > 20 { "far too big" } else { "too big" };
+        unwind.await?;
+        return Err(message.to_string());
+    }
+    Ok(a)
+}
