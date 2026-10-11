@@ -135,8 +135,10 @@ Inputs:
   the same time. In an open system it is the arrival rate on that key times
   the run duration. In a closed loop of `C` clients it is `C` times the
   share of runs that touch the key.
-- `hold_after_hot_step`: the time from the hot write to the end of the run.
-  Backout holds the hot lock this much longer than a saga does.
+- `hold_after_hot_step`: the time that backout holds the hot lock longer
+  than a saga does. That is the sum of the step durations after the hot
+  step. (Amended 2026-10-11, see section 3.1: the first text said "from the
+  hot write to the end of the run", which also counts the hot step itself.)
 - `commit_latency`: the time of one small commit.
 - `hot_step_commutative`: the hot step is a bounded add or subtract.
 
@@ -164,6 +166,21 @@ verdict is **go with changes**, and the write-up names the change.
 
 Matrix: 3 arms, 2 contention levels, `step_work` of 0 ms and 20 ms. Each cell
 runs 16 clients for 10 s, with `fail_rate = 0.1`, three times.
+
+### 3.1 Amendment, 2026-10-11, before any measurement
+
+Review found method defects before the first run produced data. The rule,
+its thresholds and G1 to G4 do not change. The method changes:
+
+- Goodput counts only the runs that commit before the deadline, over the
+  10 s window. The drain no longer counts.
+- The pool opens every connection before the first timed cell.
+- Each repetition runs every cell and rotates the arm order. A `CHECKPOINT`
+  runs before each cell.
+- G4 reads only the two invariants, as written above. Run errors and
+  conflict retries are reported in their own columns.
+- The report flags a cell where the best arm's range overlaps the
+  runner-up's range. G1 and G2 are inconclusive in such a cell.
 
 ## 4. Test plan (red, green, refactor)
 

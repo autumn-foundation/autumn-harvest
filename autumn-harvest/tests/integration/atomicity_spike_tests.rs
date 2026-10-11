@@ -2,7 +2,8 @@
 //! Database tests for the atomicity spike (issue #2012).
 //!
 //! Set `HARVEST_TEST_DATABASE_URL` to use a running Postgres. Otherwise each
-//! test boots a testcontainers Postgres. Each test creates its own tables.
+//! test boots one testcontainers Postgres. Each test creates its own tables
+//! and drops them.
 //!
 //! `measure_the_full_matrix` is `#[ignore]`. It runs the pre-registered
 //! matrix for about 6 minutes and prints the report tables:
@@ -16,13 +17,10 @@ use std::time::Duration;
 
 use diesel::sql_types::{BigInt, Text};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
-use testcontainers::{ContainerAsync, ImageExt};
-use testcontainers_modules::postgres::Postgres;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 use autumn_harvest::atomicity::backout::run_backout;
 use autumn_harvest::atomicity::harness::{
-    self, CellConfig, Contention, Order, RunOutcome, Totals, Workload,
+    self, CellConfig, CellResult, Contention, Order, RetryCounter, RunOutcome, Totals, Workload,
 };
 use autumn_harvest::atomicity::rule::{Atomicity, choose};
 use autumn_harvest::atomicity::verdict::{self, ArmResult, Cell};
@@ -31,34 +29,10 @@ use autumn_harvest::telemetry::NoOpMetrics;
 use autumn_harvest::tx_retry::TxRetryPolicy;
 use autumn_harvest::worker::DbPool;
 
-async fn setup_db() -> (String, Option<ContainerAsync<Postgres>>) {
-    if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
-        return (url, None);
-    }
-    let container = Postgres::default()
-        .with_tag("16")
-        .start()
-        .await
-        .expect("start the Postgres container");
-    let host = container.get_host().await.expect("host");
-    let port = container.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
-    (url, Some(container))
-}
+use crate::integration_e2e::{build_test_pool, setup_test_database_url_or_env};
 
 async fn connect(url: &str) -> AsyncPgConnection {
     AsyncPgConnection::establish(url).await.expect("connect")
-}
-
-fn make_pool(url: &str, size: usize) -> DbPool {
-    let manager =
-        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
-            url,
-        );
-    deadpool::managed::Pool::builder(manager)
-        .max_size(size)
-        .build()
-        .expect("build the pool")
 }
 
 #[derive(diesel::QueryableByName)]
@@ -67,12 +41,17 @@ struct Label {
     label: String,
 }
 
-/// A scratch table for the savepoint tests, with a unique name.
+/// A scratch table for the savepoint tests.
+///
+/// It is a temporary table, so it goes away with the connection, even
+/// after a failed assertion.
 async fn scratch_table(conn: &mut AsyncPgConnection) -> String {
     let name = format!("atomicity_scratch_{}", uuid::Uuid::new_v4().simple());
-    conn.batch_execute(&format!("CREATE TABLE {name} (label TEXT PRIMARY KEY)"))
-        .await
-        .expect("create the scratch table");
+    conn.batch_execute(&format!(
+        "CREATE TEMPORARY TABLE {name} (label TEXT PRIMARY KEY)"
+    ))
+    .await
+    .expect("create the scratch table");
     name
 }
 
@@ -100,7 +79,7 @@ fn declined() -> HarvestError {
 
 #[tokio::test]
 async fn a_failed_step_rolls_back_to_its_savepoint_only() {
-    let (url, _container) = setup_db().await;
+    let (url, _container) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     let table = scratch_table(&mut conn).await;
     let t = table.as_str();
@@ -129,7 +108,7 @@ async fn a_failed_step_rolls_back_to_its_savepoint_only() {
 
 #[tokio::test]
 async fn a_failed_run_leaves_no_row() {
-    let (url, _container) = setup_db().await;
+    let (url, _container) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     let table = scratch_table(&mut conn).await;
     let t = table.as_str();
@@ -154,12 +133,12 @@ async fn a_failed_run_leaves_no_row() {
         matches!(result, Err(HarvestError::WorkflowFailed { ref reason, .. }) if reason == "declined"),
         "the body error is returned verbatim: {result:?}"
     );
-    assert!(labels(&mut conn, &table).await.is_empty());
+    assert_eq!(labels(&mut conn, &table).await, Vec::<String>::new());
 }
 
 #[tokio::test]
 async fn a_sql_error_in_a_step_does_not_poison_the_run() {
-    let (url, _container) = setup_db().await;
+    let (url, _container) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     let table = scratch_table(&mut conn).await;
     let t = table.as_str();
@@ -196,7 +175,7 @@ async fn txid(conn: &mut AsyncPgConnection) -> HarvestResult<i64> {
 
 #[tokio::test]
 async fn a_body_runs_inside_one_transaction() {
-    let (url, _container) = setup_db().await;
+    let (url, _container) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
     let ids = run_backout(
@@ -216,7 +195,7 @@ async fn a_body_runs_inside_one_transaction() {
 }
 
 /// The history rows that one run writes under each arm.
-fn history_rows(arm: Atomicity, outcome: RunOutcome) -> i64 {
+const fn history_rows(arm: Atomicity, outcome: RunOutcome) -> i64 {
     match (arm, outcome) {
         (Atomicity::Backout, RunOutcome::Committed) => 1,
         (Atomicity::Backout, RunOutcome::RolledBack) => 0,
@@ -230,10 +209,8 @@ fn history_rows(arm: Atomicity, outcome: RunOutcome) -> i64 {
     }
 }
 
-async fn one_order(arm: Atomicity, decline: bool) -> Totals {
-    let (url, _container) = setup_db().await;
-    let mut conn = connect(&url).await;
-    let pool = make_pool(&url, 4);
+async fn one_order(url: &str, pool: &DbPool, arm: Atomicity, decline: bool) -> Totals {
+    let mut conn = connect(url).await;
     let workload = Workload::create(&mut conn, Contention::High)
         .await
         .expect("create the workload");
@@ -244,26 +221,28 @@ async fn one_order(arm: Atomicity, decline: bool) -> Totals {
         decline,
     };
 
-    let outcome = harness::run_order(&pool, &workload, arm, order, Duration::ZERO)
-        .await
-        .expect("the run ends without a database error");
+    let outcome = harness::run_order(pool, &workload, arm, order, Duration::ZERO).await;
+    let totals = workload.totals(&mut conn).await;
+    workload.drop_tables(&mut conn).await.expect("drop");
+
+    let outcome = outcome.expect("the run ends without a database error");
     let expected = if decline {
         RunOutcome::RolledBack
     } else {
         RunOutcome::Committed
     };
     assert_eq!(outcome, expected, "{arm:?}");
-
-    let totals = workload.totals(&mut conn).await.expect("totals");
+    let totals = totals.expect("totals");
     assert_eq!(totals.history_rows, history_rows(arm, outcome), "{arm:?}");
-    workload.drop_tables(&mut conn).await.expect("drop");
     totals
 }
 
 #[tokio::test]
 async fn each_arm_commits_an_order() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
     for arm in Atomicity::ALL {
-        let totals = one_order(arm, false).await;
+        let totals = one_order(&url, &pool, arm, false).await;
         assert_eq!(
             (
                 totals.stock_taken,
@@ -279,8 +258,10 @@ async fn each_arm_commits_an_order() {
 
 #[tokio::test]
 async fn each_arm_undoes_a_declined_order() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
     for arm in Atomicity::ALL {
-        let totals = one_order(arm, true).await;
+        let totals = one_order(&url, &pool, arm, true).await;
         assert_eq!(
             (
                 totals.stock_taken,
@@ -296,7 +277,7 @@ async fn each_arm_undoes_a_declined_order() {
 
 #[tokio::test]
 async fn commit_latency_is_positive() {
-    let (url, _container) = setup_db().await;
+    let (url, _container) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     let latency = harness::commit_latency(&mut conn, 5)
         .await
@@ -307,8 +288,8 @@ async fn commit_latency_is_positive() {
 
 #[tokio::test]
 async fn a_short_hot_cell_keeps_the_invariants_for_each_arm() {
-    let (url, _container) = setup_db().await;
-    let pool = make_pool(&url, 8);
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
     for arm in Atomicity::ALL {
         let result = harness::run_cell(
             &pool,
@@ -333,65 +314,258 @@ async fn a_short_hot_cell_keeps_the_invariants_for_each_arm() {
             i64::try_from(result.committed).expect("fits"),
             "{arm:?}"
         );
-        assert!(result.p50 <= result.p90, "{arm:?}");
+        let committed = i64::try_from(result.committed).expect("fits");
+        let rolled_back = i64::try_from(result.rolled_back).expect("fits");
+        assert_eq!(
+            result.totals.history_rows,
+            committed * history_rows(arm, RunOutcome::Committed)
+                + rolled_back * history_rows(arm, RunOutcome::RolledBack),
+            "{arm:?} commits exactly its own transactions"
+        );
+        assert!(result.committed_in_window <= result.committed, "{arm:?}");
     }
+}
+
+#[tokio::test]
+async fn a_cell_rejects_a_fail_rate_outside_zero_to_one() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    for fail_rate in [f64::NAN, -0.1, 1.5] {
+        let result = harness::run_cell(
+            &pool,
+            CellConfig {
+                arm: Atomicity::Backout,
+                contention: Contention::High,
+                clients: 1,
+                duration: Duration::from_millis(10),
+                step_work: Duration::ZERO,
+                fail_rate,
+                seed: 1,
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(HarvestError::Config(_))),
+            "{fail_rate}: {result:?}"
+        );
+    }
+}
+
+#[derive(diesel::QueryableByName)]
+struct Count {
+    #[diesel(sql_type = BigInt)]
+    n: i64,
+}
+
+async fn bump(conn: &mut AsyncPgConnection, table: &str, label: &str) -> HarvestResult<()> {
+    diesel::sql_query(format!("UPDATE {table} SET n = n + 1 WHERE label = $1"))
+        .bind::<Text, _>(label)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// One side of the deadlock test. It locks `first`, waits for the other
+/// side on its first attempt, then locks `second`. It ignores the error of
+/// the second step, as a body with an optional step does.
+async fn lock_both(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    first: &str,
+    second: &str,
+    barrier: &tokio::sync::Barrier,
+    retries: &RetryCounter,
+) -> HarvestResult<()> {
+    let attempts = std::sync::atomic::AtomicU32::new(0);
+    run_backout(conn, retries, TxRetryPolicy::DEFAULT, async |steps| {
+        let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        steps.step(async |c| bump(c, table, first).await).await?;
+        if attempt == 0 {
+            barrier.wait().await;
+        }
+        let _ = steps.step(async |c| bump(c, table, second).await).await;
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_deadlock_in_an_ignored_step_still_retries_the_whole_run() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut setup = connect(&url).await;
+    let table = format!("atomicity_locks_{}", uuid::Uuid::new_v4().simple());
+    setup
+        .batch_execute(&format!(
+            "CREATE TABLE {table} (label TEXT PRIMARY KEY, n BIGINT NOT NULL);
+             INSERT INTO {table} VALUES ('a', 0), ('b', 0);"
+        ))
+        .await
+        .expect("create the lock table");
+    let mut left = connect(&url).await;
+    let mut right = connect(&url).await;
+    let barrier = tokio::sync::Barrier::new(2);
+    let retries = RetryCounter::default();
+
+    let (l, r) = tokio::join!(
+        lock_both(&mut left, &table, "a", "b", &barrier, &retries),
+        lock_both(&mut right, &table, "b", "a", &barrier, &retries),
+    );
+    let counts = diesel::sql_query(format!("SELECT n FROM {table} ORDER BY label"))
+        .load::<Count>(&mut setup)
+        .await
+        .map(|rows| rows.into_iter().map(|row| row.n).collect::<Vec<_>>());
+    setup
+        .batch_execute(&format!("DROP TABLE {table}"))
+        .await
+        .expect("drop the lock table");
+
+    l.expect("the left run commits");
+    r.expect("the right run commits");
+    assert!(
+        retries.get() >= 1,
+        "Postgres broke the cycle, so one run retried"
+    );
+    assert_eq!(
+        counts.expect("read the counts"),
+        [2, 2],
+        "each run updated both rows, so the victim did not commit half a run"
+    );
+}
+
+#[tokio::test]
+async fn a_run_inside_an_open_transaction_rolls_back_only_its_savepoint() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let table = scratch_table(&mut conn).await;
+    let t = table.as_str();
+
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |tx| {
+        let inner = run_backout(tx, &NoOpMetrics, TxRetryPolicy::DEFAULT, async |steps| {
+            steps.step(async |c| insert(c, t, "a").await).await?;
+            Err::<(), _>(declined())
+        })
+        .await;
+        assert!(inner.is_err(), "the body error reaches the caller");
+        insert(tx, t, "b").await
+    }))
+    .await
+    .expect("the outer transaction commits");
+
+    assert_eq!(labels(&mut conn, &table).await, ["b"]);
 }
 
 /// Repetitions per cell in the full measurement.
 const REPETITIONS: usize = 3;
 
+/// Every run of one arm in one cell, across the repetitions.
+struct ArmSummary {
+    config: CellConfig,
+    runs: Vec<CellResult>,
+}
+
+impl ArmSummary {
+    fn goodputs(&self) -> Vec<f64> {
+        let mut values: Vec<f64> = self.runs.iter().map(CellResult::goodput).collect();
+        values.sort_by(f64::total_cmp);
+        values
+    }
+
+    /// The run with the median goodput.
+    fn median(&self) -> CellResult {
+        let mut runs = self.runs.clone();
+        runs.sort_by(|a, b| a.goodput().total_cmp(&b.goodput()));
+        runs[runs.len() / 2]
+    }
+
+    fn invariants_held(&self) -> bool {
+        self.runs.iter().all(|run| run.totals.consistent())
+    }
+}
+
+const fn ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1e3
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // one linear report: setup, runs, two tables
 #[ignore = "runs for about 6 minutes; see the module docs"]
 async fn measure_the_full_matrix() {
-    let (url, _container) = setup_db().await;
+    let (url, _container) = setup_test_database_url_or_env().await;
     let clients = 16;
-    let pool = make_pool(&url, clients + 4);
+    let pool = build_test_pool(&url);
+    assert_eq!(
+        pool.status().max_size,
+        clients + 4,
+        "the pool keeps four spare connections"
+    );
     let mut conn = connect(&url).await;
+
+    // Open every pool connection before the first timed cell.
+    let mut warm = Vec::new();
+    for _ in 0..clients + 4 {
+        warm.push(pool.get().await.expect("warm the pool"));
+    }
+    drop(warm);
+
     let commit = harness::commit_latency(&mut conn, 200)
         .await
         .expect("measure the commit latency");
     println!("commit latency (median of 200): {commit:?}\n");
 
-    println!(
-        "| contention | step work | arm | goodput (runs/s) median [min, max] | P50 ms | P90 ms | declined | errors | invariants |"
-    );
-    println!("|---|---|---|---|---|---|---|---|---|");
-    let mut cells: Vec<Cell> = Vec::new();
+    // Each repetition runs every cell, and rotates the arm order.
     let configs = harness::matrix(clients, Duration::from_secs(10), 2012);
-    for config in &configs {
-        let mut runs = Vec::new();
-        for rep in 0..REPETITIONS {
-            let seeded = CellConfig {
-                seed: config.seed + rep as u64,
-                ..*config
-            };
-            runs.push(
-                harness::run_cell(&pool, seeded)
+    let mut summaries: Vec<ArmSummary> = configs
+        .iter()
+        .map(|config| ArmSummary {
+            config: *config,
+            runs: Vec::new(),
+        })
+        .collect();
+    for rep in 0..REPETITIONS {
+        for group in (0..summaries.len()).step_by(Atomicity::ALL.len()) {
+            for offset in 0..Atomicity::ALL.len() {
+                let index = group + (offset + rep) % Atomicity::ALL.len();
+                let config = CellConfig {
+                    seed: summaries[index].config.seed + rep as u64,
+                    ..summaries[index].config
+                };
+                conn.batch_execute("CHECKPOINT").await.expect("checkpoint");
+                let run = harness::run_cell(&pool, config)
                     .await
-                    .expect("run the cell"),
-            );
+                    .expect("run the cell");
+                summaries[index].runs.push(run);
+            }
         }
-        runs.sort_by(|a, b| a.goodput().total_cmp(&b.goodput()));
-        let median = runs[REPETITIONS / 2];
-        let held = runs
-            .iter()
-            .all(|run| run.errors == 0 && run.totals.consistent());
+    }
+
+    println!(
+        "| contention | step work | arm | goodput (runs/s) median [min, max] | P50 ms | P90 ms | declined P90 ms | declined | errors | retries | drain ms | invariants |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
+    let mut cells: Vec<Cell> = Vec::new();
+    for summary in &summaries {
+        let config = summary.config;
+        let goodputs = summary.goodputs();
+        let median = summary.median();
+        let held = summary.invariants_held();
         println!(
-            "| {} | {} ms | {} | {:.1} [{:.1}, {:.1}] | {:.1} | {:.1} | {} | {} | {} |",
+            "| {} | {} ms | `{}` | {:.1} [{:.1}, {:.1}] | {:.1} | {:.1} | {:.1} | {} | {} | {} | {:.0} | {} |",
             config.contention.as_str(),
             config.step_work.as_millis(),
             config.arm.as_str(),
             median.goodput(),
-            runs[0].goodput(),
-            runs[REPETITIONS - 1].goodput(),
-            median.p50.as_secs_f64() * 1e3,
-            median.p90.as_secs_f64() * 1e3,
+            goodputs[0],
+            goodputs[goodputs.len() - 1],
+            ms(median.p50),
+            ms(median.p90),
+            ms(median.declined_p90),
             median.rolled_back,
-            runs.iter().map(|run| run.errors).sum::<u64>(),
+            summary.runs.iter().map(|run| run.errors).sum::<u64>(),
+            summary.runs.iter().map(|run| run.retries).sum::<u64>(),
+            ms(median.drain),
             if held { "held" } else { "BROKEN" },
         );
         let long_steps = !config.step_work.is_zero();
-        let pick = choose(&config.profile(commit)).atomicity;
         let result = ArmResult {
             arm: config.arm,
             goodput: median.goodput(),
@@ -406,34 +580,31 @@ async fn measure_the_full_matrix() {
                 contention: config.contention,
                 long_steps,
                 arms: vec![result],
-                pick,
+                pick: choose(&config.profile(commit)).atomicity,
             }),
         }
     }
 
-    println!("\n| contention | step work | rule pick | reason | best arm |");
-    println!("|---|---|---|---|---|");
-    for config in configs.iter().filter(|c| c.arm == Atomicity::Backout) {
+    println!(
+        "\n| contention | step work | rule pick | reason | best arm | best range overlaps runner-up |"
+    );
+    println!("|---|---|---|---|---|---|");
+    for group in summaries.chunks(Atomicity::ALL.len()) {
+        let config = group[0].config;
         let choice = choose(&config.profile(commit));
-        let cell = cells
-            .iter()
-            .find(|cell| {
-                cell.contention == config.contention
-                    && cell.long_steps == !config.step_work.is_zero()
-            })
-            .expect("cell");
-        let best = cell
-            .arms
-            .iter()
-            .max_by(|a, b| a.goodput.total_cmp(&b.goodput))
-            .expect("arms");
+        let mut ranked: Vec<&ArmSummary> = group.iter().collect();
+        ranked.sort_by(|a, b| b.median().goodput().total_cmp(&a.median().goodput()));
+        let best = ranked[0].goodputs();
+        let next = ranked[1].goodputs();
+        let overlap = best[0] <= next[next.len() - 1];
         println!(
-            "| {} | {} ms | {} | {:?} | {} |",
+            "| {} | {} ms | `{}` | `{:?}` | `{}` | {} |",
             config.contention.as_str(),
             config.step_work.as_millis(),
             choice.atomicity.as_str(),
             choice.reason,
-            best.arm.as_str(),
+            ranked[0].config.arm.as_str(),
+            if overlap { "yes" } else { "no" },
         );
     }
 

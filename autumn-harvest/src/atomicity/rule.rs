@@ -114,7 +114,7 @@ mod tests {
     use super::*;
 
     /// A short, cold, same-database workflow.
-    fn cold() -> WorkloadProfile {
+    const fn cold() -> WorkloadProfile {
         WorkloadProfile {
             effects_outside_database: false,
             total_hold: Duration::from_millis(3),
@@ -126,7 +126,7 @@ mod tests {
     }
 
     /// A hot workflow whose backout hold costs more than a commit.
-    fn hot_and_slow() -> WorkloadProfile {
+    const fn hot_and_slow() -> WorkloadProfile {
         WorkloadProfile {
             hot_key_concurrency: 16.0,
             total_hold: Duration::from_millis(60),

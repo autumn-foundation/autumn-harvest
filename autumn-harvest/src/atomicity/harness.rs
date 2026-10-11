@@ -12,6 +12,7 @@
 //! favours the saga.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use diesel::sql_types::BigInt;
@@ -24,7 +25,7 @@ use crate::context::WorkflowContext;
 use crate::error::{HarvestError, HarvestResult};
 use crate::pool::acquire_within_pool_bound;
 use crate::saga::Saga;
-use crate::telemetry::NoOpMetrics;
+use crate::telemetry::MetricsRecorder;
 use crate::tx_retry::TxRetryPolicy;
 use crate::types::ExecutionId;
 use crate::worker::DbPool;
@@ -89,14 +90,33 @@ pub struct Order {
 pub enum RunOutcome {
     /// Every step committed.
     Committed,
-    /// The order was declined, and every effect is undone.
+    /// The place step declined the order, and the arm undid every effect.
     RolledBack,
 }
 
 /// The tables of one cell. Each cell gets fresh tables.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Workload {
     prefix: String,
+    retries: RetryCounter,
+}
+
+/// Counts the conflict retries of the backout transactions.
+#[derive(Debug, Default)]
+pub struct RetryCounter(AtomicU64);
+
+impl RetryCounter {
+    /// The retries so far.
+    #[must_use]
+    pub fn get(&self) -> u64 {
+        AtomicU64::load(&self.0, Ordering::Relaxed)
+    }
+}
+
+impl MetricsRecorder for RetryCounter {
+    fn record_db_transaction_retry(&self, _site: &str, _reason: &str) {
+        AtomicU64::fetch_add(&self.0, 1, Ordering::Relaxed);
+    }
 }
 
 /// The sums that the invariants compare.
@@ -160,7 +180,16 @@ impl Workload {
                  SELECT g, {INITIAL_BALANCE} FROM generate_series(0, {ACCOUNTS} - 1) AS g;"
         ))
         .await?;
-        Ok(Self { prefix })
+        Ok(Self {
+            prefix,
+            retries: RetryCounter::default(),
+        })
+    }
+
+    /// The conflict retries of the backout transactions so far.
+    #[must_use]
+    pub fn retries(&self) -> u64 {
+        self.retries.get()
     }
 
     /// Drop the tables.
@@ -341,7 +370,7 @@ async fn backout_run(
     let mut conn = acquire_within_pool_bound(pool).await?;
     run_backout(
         &mut conn,
-        &NoOpMetrics,
+        &workload.retries,
         TxRetryPolicy::DEFAULT,
         async |steps| {
             if with_reserve {
@@ -495,8 +524,8 @@ impl CellConfig {
     /// The clients form a closed loop, and the SKU draw is uniform. Each
     /// client is always in a run, so this is clients over SKUs.
     #[must_use]
-    pub fn hot_key_concurrency(&self) -> f64 {
-        #[allow(clippy::cast_precision_loss)]
+    pub const fn hot_key_concurrency(&self) -> f64 {
+        #[allow(clippy::cast_precision_loss)] // a client or SKU count far below 2^53
         let ratio = self.clients as f64 / self.contention.skus() as f64;
         ratio
     }
@@ -523,30 +552,38 @@ impl CellConfig {
 pub struct CellResult {
     /// The cell.
     pub config: CellConfig,
-    /// Committed runs.
+    /// Committed runs, the drain included.
     pub committed: u64,
+    /// Runs that committed before the deadline. Goodput counts only these.
+    pub committed_in_window: u64,
     /// Declined runs, fully undone.
     pub rolled_back: u64,
     /// Runs that ended in a database or pool error.
     pub errors: u64,
-    /// The wall time of the cell.
-    pub elapsed: Duration,
+    /// Conflict retries of backout transactions.
+    pub retries: u64,
+    /// The time from the deadline to the end of the last run.
+    pub drain: Duration,
     /// The median latency of a committed run.
     pub p50: Duration,
     /// The 90th percentile latency of a committed run.
     pub p90: Duration,
+    /// The 90th percentile latency of a declined run, its undo included.
+    pub declined_p90: Duration,
     /// The invariant sums after the drain.
     pub totals: Totals,
 }
 
 impl CellResult {
-    /// Committed runs per second.
+    /// Runs that committed before the deadline, per second of the window.
+    ///
+    /// The window excludes the drain, so a slow arm gains no time from it.
     #[must_use]
-    pub fn goodput(&self) -> f64 {
-        let seconds = self.elapsed.as_secs_f64();
+    pub const fn goodput(&self) -> f64 {
+        let seconds = self.config.duration.as_secs_f64();
         if seconds > 0.0 {
-            #[allow(clippy::cast_precision_loss)]
-            let committed = self.committed as f64;
+            #[allow(clippy::cast_precision_loss)] // a run count far below 2^53
+            let committed = self.committed_in_window as f64;
             committed / seconds
         } else {
             0.0
@@ -557,29 +594,37 @@ impl CellResult {
 #[derive(Default)]
 struct ClientStats {
     committed: u64,
+    committed_in_window: u64,
     rolled_back: u64,
     errors: u64,
     latencies: Vec<Duration>,
+    declined_latencies: Vec<Duration>,
 }
 
-/// Run one cell on fresh tables, then drop them.
-///
-/// # Errors
-///
-/// Returns a database or pool error from the setup or the totals. A failed
-/// run counts in [`CellResult::errors`].
-pub async fn run_cell(pool: &DbPool, config: CellConfig) -> HarvestResult<CellResult> {
-    let mut conn = acquire_within_pool_bound(pool).await?;
-    let workload = Arc::new(Workload::create(&mut conn, config.contention).await?);
-    let fail_rate = config.fail_rate.clamp(0.0, 1.0);
-    let skus = config.contention.skus();
+impl ClientStats {
+    fn merge(&mut self, other: Self) {
+        self.committed += other.committed;
+        self.committed_in_window += other.committed_in_window;
+        self.rolled_back += other.rolled_back;
+        self.errors += other.errors;
+        self.latencies.extend(other.latencies);
+        self.declined_latencies.extend(other.declined_latencies);
+    }
+}
 
+/// Run the clients of one cell until the deadline, then wait for them.
+async fn drive(
+    pool: &DbPool,
+    workload: &Arc<Workload>,
+    config: CellConfig,
+) -> HarvestResult<(ClientStats, Duration)> {
+    let skus = config.contention.skus();
     let start = Instant::now();
     let deadline = start + config.duration;
     let mut clients = tokio::task::JoinSet::new();
     for client in 0..config.clients {
         let pool = pool.clone();
-        let workload = Arc::clone(&workload);
+        let workload = Arc::clone(workload);
         let seed = config.seed ^ (client as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         clients.spawn(async move {
             let mut rng = StdRng::seed_from_u64(seed);
@@ -589,15 +634,24 @@ pub async fn run_cell(pool: &DbPool, config: CellConfig) -> HarvestResult<CellRe
                     sku: rng.gen_range(0..skus),
                     account: rng.gen_range(0..ACCOUNTS),
                     amount: rng.gen_range(1..=MAX_AMOUNT),
-                    decline: rng.gen_bool(fail_rate),
+                    decline: rng.gen_bool(config.fail_rate),
                 };
                 let began = Instant::now();
-                match run_order(&pool, &workload, config.arm, order, config.step_work).await {
+                let outcome =
+                    run_order(&pool, &workload, config.arm, order, config.step_work).await;
+                let ended = Instant::now();
+                match outcome {
                     Ok(RunOutcome::Committed) => {
                         stats.committed += 1;
-                        stats.latencies.push(began.elapsed());
+                        if ended <= deadline {
+                            stats.committed_in_window += 1;
+                        }
+                        stats.latencies.push(ended - began);
                     }
-                    Ok(RunOutcome::RolledBack) => stats.rolled_back += 1,
+                    Ok(RunOutcome::RolledBack) => {
+                        stats.rolled_back += 1;
+                        stats.declined_latencies.push(ended - began);
+                    }
                     Err(error) => {
                         tracing::warn!(%error, "atomicity spike run failed");
                         stats.errors += 1;
@@ -609,27 +663,68 @@ pub async fn run_cell(pool: &DbPool, config: CellConfig) -> HarvestResult<CellRe
     }
 
     let mut total = ClientStats::default();
+    let mut join_error = None;
     while let Some(joined) = clients.join_next().await {
-        let stats = joined
-            .map_err(|error| HarvestError::Dispatch(format!("atomicity client task: {error}")))?;
-        total.committed += stats.committed;
-        total.rolled_back += stats.rolled_back;
-        total.errors += stats.errors;
-        total.latencies.extend(stats.latencies);
+        match joined {
+            Ok(stats) => total.merge(stats),
+            Err(error) => join_error = Some(error),
+        }
     }
-    let elapsed = start.elapsed();
+    let drain = Instant::now().saturating_duration_since(deadline);
+    join_error.map_or_else(
+        || Ok((total, drain)),
+        |error| {
+            Err(HarvestError::Dispatch(format!(
+                "atomicity client task: {error}"
+            )))
+        },
+    )
+}
 
-    let totals = workload.totals(&mut conn).await?;
+/// Run one cell on fresh tables, then drop them.
+///
+/// `run_cell` drops the tables on every path, an error path included.
+///
+/// # Errors
+///
+/// Returns a config error for a `fail_rate` outside `[0, 1]`. Returns a
+/// database or pool error from the setup, a client or the totals. A failed
+/// run counts in [`CellResult::errors`].
+pub async fn run_cell(pool: &DbPool, config: CellConfig) -> HarvestResult<CellResult> {
+    if !(0.0..=1.0).contains(&config.fail_rate) {
+        return Err(HarvestError::Config(format!(
+            "fail_rate must be in [0, 1], got {}",
+            config.fail_rate
+        )));
+    }
+    let workload = {
+        let mut conn = acquire_within_pool_bound(pool).await?;
+        Arc::new(Workload::create(&mut conn, config.contention).await?)
+    };
+
+    let driven = drive(pool, &workload, config).await;
+    let mut conn = acquire_within_pool_bound(pool).await?;
+    let totals = match driven {
+        Ok(_) => workload.totals(&mut conn).await,
+        Err(_) => Ok(Totals::default()),
+    };
     workload.drop_tables(&mut conn).await?;
+    let (mut total, drain) = driven?;
+    let totals = totals?;
+
     total.latencies.sort_unstable();
+    total.declined_latencies.sort_unstable();
     Ok(CellResult {
         config,
         committed: total.committed,
+        committed_in_window: total.committed_in_window,
         rolled_back: total.rolled_back,
         errors: total.errors,
-        elapsed,
+        retries: workload.retries(),
+        drain,
         p50: percentile(&total.latencies, 50.0),
         p90: percentile(&total.latencies, 90.0),
+        declined_p90: percentile(&total.declined_latencies, 90.0),
         totals,
     })
 }
@@ -641,7 +736,7 @@ pub async fn run_cell(pool: &DbPool, config: CellConfig) -> HarvestResult<CellRe
 ///
 /// # Errors
 ///
-/// Returns a database error.
+/// Returns a database error. The probe drops its table on every path.
 pub async fn commit_latency(
     conn: &mut AsyncPgConnection,
     samples: usize,
@@ -649,16 +744,24 @@ pub async fn commit_latency(
     let table = format!("atomicity_probe_{}", uuid::Uuid::new_v4().simple());
     conn.batch_execute(&format!("CREATE TABLE {table} (id BIGSERIAL PRIMARY KEY)"))
         .await?;
+    let insert = format!("INSERT INTO {table} DEFAULT VALUES");
     let mut times = Vec::with_capacity(samples.max(1));
+    let mut probe = Ok(());
     for _ in 0..samples.max(1) {
         let began = Instant::now();
-        conn.batch_execute(&format!(
-            "BEGIN; INSERT INTO {table} DEFAULT VALUES; COMMIT;"
-        ))
-        .await?;
+        let sql = insert.as_str();
+        probe = Box::pin(conn.transaction::<(), HarvestError, _>(async |tx| {
+            tx.batch_execute(sql).await?;
+            Ok(())
+        }))
+        .await;
+        if probe.is_err() {
+            break;
+        }
         times.push(began.elapsed());
     }
     conn.batch_execute(&format!("DROP TABLE {table}")).await?;
+    probe?;
     times.sort_unstable();
     Ok(percentile(&times, 50.0))
 }
@@ -685,7 +788,7 @@ pub fn matrix(clients: usize, duration: Duration, seed: u64) -> Vec<CellConfig> 
     cells
 }
 
-/// The `p`th percentile of sorted `values`, by the nearest-rank method.
+/// The `p`th percentile of `sorted`, by the nearest-rank method.
 ///
 /// Returns zero for an empty slice.
 #[must_use]
@@ -693,6 +796,7 @@ pub fn percentile(sorted: &[Duration], p: f64) -> Duration {
     if sorted.is_empty() {
         return Duration::ZERO;
     }
+    // The rank is in [0, len] for p in [0, 100], and the clamp covers the rest.
     #[allow(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
@@ -706,7 +810,7 @@ pub fn percentile(sorted: &[Duration], p: f64) -> Duration {
 mod tests {
     use super::*;
 
-    fn config(contention: Contention) -> CellConfig {
+    const fn config(contention: Contention) -> CellConfig {
         CellConfig {
             arm: Atomicity::Backout,
             contention,
@@ -771,18 +875,24 @@ mod tests {
     }
 
     #[test]
-    fn goodput_is_committed_runs_per_second() {
+    fn goodput_counts_only_runs_inside_the_window() {
         let result = CellResult {
             config: config(Contention::Low),
-            committed: 500,
+            committed: 520,
+            committed_in_window: 500,
             rolled_back: 50,
             errors: 0,
-            elapsed: Duration::from_secs(2),
+            retries: 0,
+            drain: Duration::from_millis(80),
             p50: Duration::ZERO,
             p90: Duration::ZERO,
+            declined_p90: Duration::ZERO,
             totals: Totals::default(),
         };
-        assert!((result.goodput() - 250.0).abs() < 1e-9);
+        assert!(
+            (result.goodput() - 50.0).abs() < 1e-9,
+            "500 runs in the 10 s window; the drain does not count"
+        );
     }
 
     #[test]

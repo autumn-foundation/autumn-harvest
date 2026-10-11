@@ -46,6 +46,7 @@ pub enum Outcome {
 }
 
 /// The value of each criterion and the outcome.
+#[allow(clippy::struct_excessive_bools)] // one bool per pre-registered criterion
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Verdict {
     /// Backout has the highest goodput in every low-contention cell.
@@ -125,7 +126,7 @@ fn pick_is_near_best(cell: &Cell) -> bool {
 mod tests {
     use super::*;
 
-    fn arm(arm: Atomicity, goodput: f64) -> ArmResult {
+    const fn arm(arm: Atomicity, goodput: f64) -> ArmResult {
         ArmResult {
             arm,
             goodput,

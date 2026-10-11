@@ -6,10 +6,13 @@
 //! only. The body then decides: it can propagate the error, which rolls back
 //! the whole run, or it can go on with the next step.
 //!
-//! A deadlock or a serialization abort ends the whole transaction. The runner
-//! then runs the body again from the start, through
-//! [`run_with_conflict_retry`]. It never retries a step in place. The outer
-//! locks stay held, so the same cycle could form again.
+//! A deadlock or a serialization abort inside a step aborts only that
+//! savepoint in Postgres. [`Steps`] still records the conflict. After the
+//! body returns, [`run_backout`] rolls back the whole transaction and runs
+//! the body again from the start, through [`run_with_conflict_retry`]. This
+//! holds even when the body ignores the step error. The runner never
+//! retries a step in place. The outer locks stay held, so the same cycle
+//! could form again.
 //!
 //! Inside an open transaction, such as the one that `run_transactional`
 //! gives, the run becomes one savepoint of the outer transaction. The owner
@@ -21,7 +24,7 @@ use diesel_async::{AsyncConnection, AsyncPgConnection};
 
 use crate::error::{HarvestError, HarvestResult};
 use crate::telemetry::MetricsRecorder;
-use crate::tx_retry::{TxRetryPolicy, run_with_conflict_retry};
+use crate::tx_retry::{TxRetryPolicy, classify_conflict, run_with_conflict_retry};
 
 /// The `site` label of a backout run in the retry metrics.
 pub const SITE_BACKOUT: &str = "atomicity_backout";
@@ -60,6 +63,8 @@ where
 /// The steps of one run, inside its open transaction.
 pub struct Steps<'c> {
     conn: &'c mut AsyncPgConnection,
+    /// The first conflict abort of a step in this run.
+    conflict: Option<HarvestError>,
 }
 
 impl Steps<'_> {
@@ -67,17 +72,26 @@ impl Steps<'_> {
     ///
     /// # Errors
     ///
-    /// Returns the step error after the rollback to the savepoint.
+    /// Returns the step error after the rollback to the savepoint. A conflict
+    /// abort also marks the whole run for a retry.
     pub async fn step<T, F>(&mut self, step: F) -> HarvestResult<T>
     where
         for<'r> F: StepFn<&'r mut AsyncPgConnection, HarvestResult<T>, Fut: Send> + Send,
         T: Send,
     {
-        Box::pin(
+        let result = Box::pin(
             self.conn
                 .transaction::<T, HarvestError, _>(async move |savepoint| step(savepoint).await),
         )
-        .await
+        .await;
+        if let Err(error @ HarvestError::Database(message)) = &result
+            && self.conflict.is_none()
+            && classify_conflict(error).is_some()
+        {
+            // `classify_conflict` matches only `Database`, so this copy is exact.
+            self.conflict = Some(HarvestError::Database(message.clone()));
+        }
+        result
     }
 }
 
@@ -88,8 +102,8 @@ impl Steps<'_> {
 ///
 /// # Errors
 ///
-/// Returns the body error after the rollback. After the last conflict
-/// retry, returns the conflict error.
+/// Returns the body error after the rollback. A step conflict wins over the
+/// body result. After the last conflict retry, returns the conflict error.
 pub async fn run_backout<T, F>(
     conn: &mut AsyncPgConnection,
     metrics: &(dyn MetricsRecorder + Send + Sync),
@@ -107,8 +121,13 @@ where
         policy,
         async |conn| {
             Box::pin(conn.transaction::<T, HarvestError, _>(async |tx| {
-                let mut steps = Steps { conn: tx };
-                body(&mut steps).await
+                let mut steps = Steps {
+                    conn: tx,
+                    conflict: None,
+                };
+                let result = body(&mut steps).await;
+                // A conflict wins over any result, so the run always retries.
+                steps.conflict.map_or(result, Err)
             }))
             .await
         },
