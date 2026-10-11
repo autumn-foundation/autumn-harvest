@@ -110,6 +110,20 @@ pub fn predicate_count(expr: &Expr) -> usize {
     }
 }
 
+/// The workflow names that `expr` names with `workflow_name =` or `IN`.
+pub fn workflow_names(expr: &Expr) -> Vec<String> {
+    match expr {
+        Expr::Leaf(Leaf::System(SystemField::WorkflowName, SystemTest::Eq(name))) => {
+            vec![name.clone()]
+        }
+        Expr::Leaf(Leaf::System(SystemField::WorkflowName, SystemTest::In(names))) => names.clone(),
+        Expr::Leaf(_) => Vec::new(),
+        Expr::And(children) | Expr::Or(children) => {
+            children.iter().flat_map(workflow_names).collect()
+        }
+    }
+}
+
 /// Whether `expr` holds an `OR`.
 fn has_or(expr: &Expr) -> bool {
     match expr {
@@ -1052,6 +1066,15 @@ mod tests {
         assert_eq!(parsed("attrs.a = 0.0e5"), "a=0.0");
         assert!(rejected("state = 'MIGRATED'").contains("state=MIGRATED"));
         assert!(rejected("state IN ('RUNNING', 'migrated')").contains("state=MIGRATED"));
+    }
+
+    #[test]
+    fn workflow_names_lists_eq_and_in_names() {
+        let expr =
+            parse("workflow_name = 'a' OR (workflow_name IN ('b', 'c') AND attrs.x = 1)").unwrap();
+        assert_eq!(workflow_names(&expr), ["a", "b", "c"]);
+        let expr = parse("workflow_name != 'a' AND attrs.x = 1").unwrap();
+        assert_eq!(workflow_names(&expr), Vec::<String>::new());
     }
 
     #[test]

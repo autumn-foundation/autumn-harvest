@@ -685,6 +685,10 @@ gets `400`. Use the `state=MIGRATED` parameter. The stalled list
 parameter adds paused rows. A `state` predicate in `filter` cannot widen that
 set.
 
+**Canary runs.** The default list hides the synthetic liveness canary runs.
+A filter that names a canary workflow with `workflow_name =` or `IN` shows
+the runs of that workflow, the same as the `workflow_name=` parameter.
+
 ```bash
 # Blocked runs, or large payments:
 curl "/workflows?filter=attrs.phase%20%3D%20'blocked'%20OR%20(workflow_name%20%3D%20'payment'%20AND%20attrs.amount%20%3E%2010000)"

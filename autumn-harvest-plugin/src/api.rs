@@ -41840,21 +41840,36 @@ fn exclude_canary_from_list(workflow_name: Option<&str>) -> bool {
 /// LIKE wildcard ambiguity) and works inside the stalled loader's
 /// correlated-subquery context. The prefix is always a *bound* `Text` param,
 /// never interpolated.
+///
+/// A `filter` expression that names a canary workflow with `=` or `IN` also
+/// opts back in (issue #1982). Only the canary names that it names pass.
 fn apply_canary_list_exclusion<'a>(
     query: harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg>,
-    workflow_name: Option<&str>,
+    filters: &WorkflowFilters,
 ) -> harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg> {
     use diesel::dsl::sql;
-    use diesel::sql_types::{Bool, Text};
+    use diesel::sql_types::{Array, Bool, Text};
 
-    if exclude_canary_from_list(workflow_name) {
-        query.filter(
-            sql::<Bool>("NOT starts_with(harvest_workflow_executions.workflow_name, ")
-                .bind::<Text, _>(autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX)
-                .sql(")"),
-        )
+    if !exclude_canary_from_list(filters.workflow_name.as_deref()) {
+        return query;
+    }
+    let named: Vec<String> = filters
+        .filter
+        .iter()
+        .flat_map(crate::visibility_query::workflow_names)
+        .filter(|name| autumn_harvest::canary::is_canary_workflow(name))
+        .collect();
+    let excluded = sql::<Bool>("(NOT starts_with(harvest_workflow_executions.workflow_name, ")
+        .bind::<Text, _>(autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX);
+    if named.is_empty() {
+        query.filter(excluded.sql("))"))
     } else {
-        query
+        query.filter(
+            excluded
+                .sql(") OR harvest_workflow_executions.workflow_name = ANY(")
+                .bind::<Array<Text>, _>(named)
+                .sql("))"),
+        )
     }
 }
 
@@ -42011,7 +42026,7 @@ fn workflow_list_query(
     }
     // Issue #796 (AC8): hide synthetic liveness canary runs from the default
     // list unless the caller explicitly filters to a canary workflow name.
-    query = apply_canary_list_exclusion(query, filters.workflow_name.as_deref());
+    query = apply_canary_list_exclusion(query, filters);
     if let Some(after) = filters.started_after {
         query = query.filter(harvest_workflow_executions::started_at.ge(after));
     }
@@ -42452,7 +42467,7 @@ pub(crate) async fn load_stalled_workflows(
     // Without this, a canary stuck RUNNING (e.g. when the timeout scanner is
     // itself wedged — a failure the canary exists to detect) would surface in
     // `GET /workflows?no_progress_minutes=N`, the same endpoint AC8 excludes.
-    query = apply_canary_list_exclusion(query, filters.workflow_name.as_deref());
+    query = apply_canary_list_exclusion(query, filters);
     if let Some(owner) = &filters.owner {
         query = query.filter(harvest_workflow_executions::owner.eq(owner.as_str()));
     }
@@ -42844,7 +42859,7 @@ pub(crate) async fn load_history_bloat_workflows(
     }
     // Issue #796 (AC8): hide synthetic liveness canary runs unless the caller
     // explicitly filters to a canary workflow name.
-    query = apply_canary_list_exclusion(query, filters.workflow_name.as_deref());
+    query = apply_canary_list_exclusion(query, filters);
     if let Some(owner) = &filters.owner {
         query = query.filter(harvest_workflow_executions::owner.eq(owner.as_str()));
     }

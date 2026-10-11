@@ -2170,3 +2170,46 @@ async fn change_stream_ends_with_stream_error_when_a_listener_closes() {
         .expect("a stream-error frame after the listener closes");
     assert!(frame.contains("listener_closed"), "{frame}");
 }
+
+#[tokio::test]
+async fn filter_that_names_a_canary_workflow_shows_it() {
+    let (database_url, _container) = setup_single_database().await;
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(build_pool(&database_url)));
+    let app = harvest_api_router(api_state);
+
+    let canary = autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX;
+    seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        canary,
+        "c-1",
+        Some(json!({ "x": 1 })),
+    )
+    .await;
+    seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "flow",
+        "f-1",
+        Some(json!({ "x": 1 })),
+    )
+    .await;
+
+    // A filter that names the canary shows it, the same as `workflow_name=`.
+    for filter in [
+        format!("workflow_name = '{canary}'"),
+        format!("workflow_name IN ('{canary}') OR attrs.y = 1"),
+    ] {
+        let (status, body) = get_json(&app, format!("/workflows?filter={}", enc(&filter))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(sorted_ids(&body), ["c-1"], "{filter}");
+    }
+
+    // A filter that does not name it keeps the default exclusion.
+    let (_, body) = get_json(&app, format!("/workflows?filter={}", enc("attrs.x = 1"))).await;
+    assert_eq!(sorted_ids(&body), ["f-1"]);
+    let filter = format!("workflow_name = '{canary}' OR attrs.x = 1");
+    let (_, body) = get_json(&app, format!("/workflows?filter={}", enc(&filter))).await;
+    assert_eq!(sorted_ids(&body), ["c-1", "f-1"]);
+}
