@@ -2891,7 +2891,10 @@ fn captures_mut_ref(body: &Body, interior: &[&str]) -> bool {
         })
         .flatten()
         .filter_map(operand_place)
-        .any(|place| place_type(body, place).is_none_or(|ty| may_write_through(ty, interior)));
+        .any(|place| {
+            place_type(body, place)
+                .is_none_or(|ty| may_write_through(ty, interior) || hides_captures(ty))
+        });
     call_writes
         || body
             .blocks
@@ -2907,16 +2910,27 @@ fn captures_mut_ref(body: &Body, interior: &[&str]) -> bool {
                 _ => None,
             })
             .any(|rvalue| {
-                let local_types = rvalue
-                    .reads
-                    .iter()
-                    .filter_map(operand_place)
+                let places = || rvalue.reads.iter().filter_map(operand_place);
+                let root_types = places()
                     .filter_map(|place| body.locals.get(&place.local))
                     .map(String::as_str);
-                local_types
+                // A projected read, as `(_1.0: u64)`, has its own type in an
+                // annotation. Its root can be the closure itself.
+                let own_types = places()
+                    .filter(|place| place.projections.is_empty())
+                    .filter_map(|place| body.locals.get(&place.local))
+                    .map(String::as_str)
+                    .chain(annotated_types(&rvalue.text));
+                root_types
                     .chain(annotated_types(&rvalue.text))
                     .any(|ty| may_write_through(ty, interior))
+                    || own_types.into_iter().any(hides_captures)
             })
+}
+
+/// A closure type hides its own captures, and they can write.
+fn hides_captures(ty: &str) -> bool {
+    ty.contains("{closure@")
 }
 
 /// The type of `place` in `body`, when MIR prints it.

@@ -589,3 +589,30 @@ pub async fn wf_step_raw_ptr_write(ctx: &WorkflowContext) -> Out {
     }
     ctx.execute_activity_raw("b", seen).await
 }
+
+pub fn __autumn_workflow_info_wf_step_closure_capture() -> u8 {
+    0
+}
+
+/// A saga step block calls a captured closure that writes the clock into
+/// shared state. A clone of that state feeds a later command.
+pub async fn wf_step_closure_capture(ctx: &WorkflowContext) -> Out {
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(0_u64));
+    let kept = std::sync::Arc::clone(&shared);
+    {
+        let mut saga = Saga::new(ctx);
+        saga.step(
+            move || {
+                let write = move || *shared.lock().unwrap() = now_nanos();
+                async move {
+                    write();
+                    ctx.execute_activity_raw("a", 1).await
+                }
+            },
+            |_| async { Ok(()) },
+        )
+        .await?;
+    }
+    let seen = *kept.lock().unwrap();
+    ctx.execute_activity_raw("b", seen).await
+}

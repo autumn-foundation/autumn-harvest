@@ -305,7 +305,7 @@ crate its own `--target-dir`, and delete it after the run.
 | Each resume target rejoins the state-0 graph | `saga_graph::every_resume_target_rejoins_code_that_state_zero_reaches` |
 | Every fixture case gets its verdict | `saga_graph::every_fixture_workflow_gets_its_expected_verdict` |
 | A back edge carries a pending step to an exit | `saga::tests::a_gap_reached_only_through_a_back_edge_is_found` |
-| The `async` block follow never gives a false proof, in a `.rs` file or an extensionless module, or through a raw pointer | `async_block_follow::a_case_the_analysis_cannot_follow_is_never_proven`; `analysis::summary::tests::a_source_span_needs_no_rs_extension` |
+| The `async` block follow never gives a false proof, in a `.rs` file or an extensionless module, through a raw pointer, or through a captured closure | `async_block_follow::a_case_the_analysis_cannot_follow_is_never_proven`; `analysis::summary::tests::a_source_span_needs_no_rs_extension` |
 | A future of an untrusted crate is a boundary | `async_block_follow::a_future_of_an_untrusted_crate_is_a_boundary`; `async_block_follow::an_erased_future_of_an_untrusted_crate_is_a_boundary`; `async_block_follow::a_dependency_named_like_a_local_module_is_still_a_boundary` |
 | A local wrapper of interior-mutable state in any module file can write | `async_block_follow::a_wrapper_in_a_nested_module_file_is_indexed`; `resolve::impls::tests::a_module_file_named_by_a_path_attribute_is_indexed` |
 | The check refuses a malformed or disconnected graph | `saga::tests::a_malformed_graph_is_refused`; `saga::tests::an_unlabeled_edge_from_a_tracked_step_is_refused` |
