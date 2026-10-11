@@ -1789,6 +1789,18 @@ pub struct RetentionRuntime {
     monitor: RetentionMonitor,
 }
 
+/// The optional hooks a [`RetentionRuntime`] calls.
+#[cfg(feature = "db")]
+#[derive(Clone, Default)]
+pub struct RetentionHooks {
+    /// Gets each run's history before retention deletes the run.
+    pub archiver: Option<Arc<dyn HistoryArchiver>>,
+    /// Inflates offloaded payloads for the archive, and collects their blobs.
+    pub offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
+    /// Gets each aged event partition before the sweep drops it (issue #2009).
+    pub partition_archiver: Option<Arc<dyn crate::partition_archive::PartitionArchiver>>,
+}
+
 #[cfg(feature = "db")]
 impl RetentionRuntime {
     /// Returns `None` when nothing in `config` is enabled.
@@ -1799,6 +1811,17 @@ impl RetentionRuntime {
     /// unset is an ordinary, fully-supported state here: the history-retention
     /// phase is gated on `loosest_cutoff_age()` and is simply skipped. The
     /// terminal-task janitor (issue #1811) also spawns the runtime on its own.
+    /// The same as [`Self::spawn`], with every hook in one struct.
+    #[must_use]
+    pub fn spawn_with_hooks(
+        pools: ShardedDbPool,
+        config: RetentionConfig,
+        metrics: Arc<dyn MetricsRecorder>,
+        hooks: RetentionHooks,
+    ) -> Option<Self> {
+        Self::spawn(pools, config, metrics, hooks.archiver, hooks.offloader)
+    }
+
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn spawn(

@@ -394,6 +394,8 @@ pub mod migrate;
 /// Durable mutual-exclusion locks for workflow code (`ctx.mutex`, issue #691).
 pub mod mutex;
 pub mod partition;
+/// Export of aged event partitions to object storage (issue #2009).
+pub mod partition_archive;
 pub mod payload_codec;
 pub mod payload_store;
 /// The connection transport a DSN's `sslmode` selects, with TLS through

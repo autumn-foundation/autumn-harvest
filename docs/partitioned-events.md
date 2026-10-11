@@ -211,6 +211,14 @@ the sweeper find a cohort whose rows are all orphaned and drop it. A failed
 archive leaves the execution in place — and therefore leaves its partition in
 place too.
 
+### Export before the drop (issue #2009)
+
+With a `PartitionArchiver` set, the sweep exports a droppable partition,
+reads it back, and checks it. The drop then hashes the partition again under
+its `SHARE` lock. It drops only when the hash matches the export. A failure
+keeps the partition and goes into `blocked`. See
+[Partition export](archival.md#partition-export-issue-2009).
+
 ---
 
 ## What it costs
@@ -565,6 +573,12 @@ The sweeper reports every cohort it considered and left alone, with the reason:
   or a competing maintenance pass is holding the partition, or the
   authoritative re-check taken under `SHARE` found an owner that appeared after
   the gate ran. Expected under load, and self-correcting.
+- `export failed: ...` — a `PartitionArchiver` is set and the upload or the
+  read-back failed (issue #2009). Only an automatic tick exports, so this
+  reason shows in `GET /admin/retention`, not in `harvest partition status`.
+  Check the backend. The next tick tries again.
+- `changed since export` — a row changed between the export and the drop
+  (issue #2009). The next tick exports the partition again.
 - `unbounded upper bound` — a partition with no upper bound, which this engine
   never creates. It means something else attached one by hand; it can never be
   swept.

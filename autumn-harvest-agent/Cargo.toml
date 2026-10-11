@@ -37,6 +37,8 @@ autumn-harvest-sqlite = { version = "0.7.0", path = "../autumn-harvest-sqlite" }
 futures = { workspace = true }
 proptest = { workspace = true }
 tempfile = "3"
+# Measures gzip against delta encoding (issue #2009). Already in the lockfile.
+flate2 = "1"
 tokio = { workspace = true }
 
 [[test]]

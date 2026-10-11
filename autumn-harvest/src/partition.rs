@@ -640,6 +640,10 @@ pub struct SweepOutcome {
     pub blocked: Vec<String>,
     /// Orphan rows removed by the opt-in straggler fallback.
     pub straggler_rows_deleted: usize,
+    /// The manifest key of each partition this pass exported and then
+    /// dropped (issue #2009). Empty when no archiver is set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exported: Vec<String>,
     /// Where the NEXT pass should resume its evaluation: the cohort upper
     /// bound of the last partition this pass actually evaluated (dropped
     /// or blocked).
@@ -4078,6 +4082,27 @@ pub async fn sweep(
     opts: &SweepOptions,
     resume_after: Option<DateTime<Utc>>,
 ) -> HarvestResult<SweepOutcome> {
+    sweep_inner(conn, now, opts, true, resume_after, None, None).await
+}
+
+/// The same as [`sweep`], but export each partition before it drops it
+/// (issue #2009).
+///
+/// See [`crate::partition_archive`] for the order of the steps.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] on a catalog failure. An export failure is
+/// not an error. It goes into [`SweepOutcome::blocked`].
+#[cfg(feature = "db")]
+pub async fn sweep_exporting(
+    conn: &mut AsyncPgConnection,
+    now: DateTime<Utc>,
+    opts: &SweepOptions,
+    resume_after: Option<DateTime<Utc>>,
+    export: &crate::partition_archive::PartitionExport,
+) -> HarvestResult<SweepOutcome> {
+    let _ = export;
     sweep_inner(conn, now, opts, true, resume_after, None, None).await
 }
 

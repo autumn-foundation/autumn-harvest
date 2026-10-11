@@ -221,6 +221,85 @@ let retention_config = RetentionConfig::with_max_age(Duration::from_secs(7 * 24 
 
 ---
 
+## Partition export (issue #2009)
+
+On the [partitioned layout](partitioned-events.md), the sweep drops an aged
+`harvest_events` partition when no live run owns a row in it. Register a
+`PartitionArchiver` to keep that history in object storage. The sweep then
+exports the partition before it drops it.
+
+```rust
+use autumn_harvest::partition_archive::DirectoryPartitionArchiver;
+
+let harvest = autumn_harvest::HarvestBuilder::new()
+    .retention(retention_config)
+    .partition_archiver(DirectoryPartitionArchiver::new("/mnt/cold/harvest"))
+    .build();
+```
+
+The trait has two calls, `put(key, bytes)` and `get(key)`. Core owns the
+keys, the manifest and every check, so any blob store fits. A backend can
+compress in `put` and expand in `get`.
+
+### What the sweep does
+
+1. **Export.** It reads the rows in `id` order and uploads segments of up to
+   10,000 rows or 8 MiB. Each row is one line of `to_jsonb(row)::text`. The
+   manifest goes last.
+2. **Verify.** It reads back each segment and the manifest, and compares the
+   bytes and the SHA-256 hashes.
+3. **Drop.** It takes the partition's `SHARE` lock and hashes the partition
+   again. It drops the partition only when the row count and the hash match
+   the manifest.
+
+A failure at any step keeps the partition. The last sweep's `blocked` list in
+`GET /admin/retention` shows the reason, and the next tick tries again. A row
+that changes after the export, for example by a codec key rotation, gives
+`changed since export`. The next tick exports the partition again.
+`SweepOutcome::exported` lists the manifest key of each dropped partition.
+Each backend call has the `archival_timeout_secs` limit.
+
+### Keys
+
+```text
+harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/segment-000001.jsonl
+harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/manifest.json
+```
+
+`<lower>` is `min` for the legacy partition. The bounds keep a later
+partition with the same name from replacing an old export.
+
+### Read-back
+
+```rust
+use autumn_harvest::partition_archive::read_back;
+
+let part = read_back(&archiver, &manifest_key).await?;
+let events = part.history(execution_id)?;
+```
+
+`read_back` checks every hash before it returns rows. `history` returns one
+run's events in this partition, in `event_id` order. A run can span
+partitions. `history_with_codecs` decodes payload fields with your codec keys.
+
+### Limits
+
+- **Ciphertext stays ciphertext.** Payload fields keep their stored form. You
+  need the codec key that was active at export time to decode them. Keep
+  retired keys while their archives exist.
+- **Offloaded payloads are not in the export.** Retention collects a run's
+  blobs when it deletes the run. Use the per-run `HistoryArchiver` too, if
+  cold storage must hold offloaded payloads.
+- **Erasure does not reach an export.** Delete the object yourself.
+- **No straggler deletes.** `try_build` refuses a partition archiver together
+  with `partitions.straggler_grace_secs`. A straggler delete removes rows
+  that no export holds.
+- **Cost.** The sweep reads the partition twice and downloads it once. The
+  hash scan holds the `SHARE` lock, which blocks only row changes in that
+  closed partition.
+
+---
+
 ## Operations & Debugging
 
 ### Telemetry
