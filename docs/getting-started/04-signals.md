@@ -103,7 +103,7 @@ awakeable. The workflow sends the token to another system, then waits:
 ```rust
 #[workflow]
 async fn approve(ctx: &WorkflowContext, request: String) -> HarvestResult<String> {
-    let promise = ctx.new_promise()?;
+    let mut promise = ctx.new_promise()?;
     ctx.execute_activity_raw(
         "send_for_approval",
         serde_json::json!({ "request": request, "token": promise.id().to_string() }),

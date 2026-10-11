@@ -124,7 +124,7 @@ fn order_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
 /// Creates a promise, publishes its token through an activity and waits.
 fn promise_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
     Box::pin(async move {
-        let promise = ctx.new_promise().map_err(|e| e.to_string())?;
+        let mut promise = ctx.new_promise().map_err(|e| e.to_string())?;
         ctx.execute_activity_raw("publish_token", json!(promise.id().to_string()), "default")
             .await
             .map_err(|e| e.to_string())?;
@@ -139,7 +139,7 @@ fn promise_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
 fn late_wait_promise_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
     Box::pin(async move {
         ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
-        let promise = ctx.promise("approval").map_err(|e| e.to_string())?;
+        let mut promise = ctx.promise("approval").map_err(|e| e.to_string())?;
         match promise.wait::<Value>().await.map_err(|e| e.to_string())? {
             Ok(value) => Ok(json!({ "resolved": value })),
             Err(rejected) => Ok(json!({ "rejected": rejected.error })),

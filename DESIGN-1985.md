@@ -95,7 +95,7 @@ buffered signal of that name.
 ### 1.2 Durable promise (item 2)
 
 ```rust
-let promise = ctx.new_promise()?;            // key: a recorded UUIDv7
+let mut promise = ctx.new_promise()?;        // key: a recorded UUIDv7
 let token = promise.id().to_string();        // "<exec-id>/<key>"
 // ...hand `token` to any caller...
 let value: Approval = promise.wait().await??;

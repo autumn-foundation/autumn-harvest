@@ -52,5 +52,7 @@ fn compile_fail_cases() {
     t.compile_fail("tests/compile_fail/workflow_unsupported_attribute.rs");
     // Issue #940 AC2: an unknown chaos injection-point name is a compile error.
     t.compile_fail("tests/compile_fail/chaos_unknown_point_is_compile_error.rs");
+    // Issue #1985: a promise handle takes one wait at a time.
+    t.compile_fail("tests/compile_fail/promise_concurrent_wait.rs");
     t.pass("tests/compile_fail/suppressed_guardrails.rs");
 }

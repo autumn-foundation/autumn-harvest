@@ -12,7 +12,7 @@ use autumn_harvest::prelude::*;
 
 #[workflow]
 async fn approve(ctx: &WorkflowContext, request: String) -> HarvestResult<String> {
-    let promise = ctx.new_promise()?;
+    let mut promise = ctx.new_promise()?;
     ctx.execute_activity_raw(
         "send_for_approval",
         serde_json::json!({ "request": request, "token": promise.id().to_string() }),
@@ -33,8 +33,9 @@ async fn approve(ctx: &WorkflowContext, request: String) -> HarvestResult<String
 | `promise.wait::<T>()` | `HarvestResult<Result<T, PromiseRejected>>`. The outer error is an engine error. The inner error is a rejection. |
 | `promise.wait_timeout::<T>(d)` | `Ok(None)` when the durable timer fires first. |
 
-Every wait on one handle returns the same settlement, also when two waits
-run at the same time.
+A wait takes `&mut self`, so a handle takes one wait at a time. Every later
+wait on the handle returns the same settlement. Each timed wait keeps its own
+deadline.
 
 The token is `<execution-id>/<key>`. A key holds only `A-Z`, `a-z`, `0-9`,
 `.`, `_`, `:` and `-`, and is 128 bytes or fewer.

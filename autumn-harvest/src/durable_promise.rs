@@ -6,7 +6,7 @@
 //!
 //! ```rust,no_run
 //! # async fn example(ctx: &autumn_harvest::WorkflowContext) -> autumn_harvest::HarvestResult<()> {
-//! let promise = ctx.new_promise()?;
+//! let mut promise = ctx.new_promise()?;
 //! let token = promise.id().to_string();
 //! // Send `token` to the system that settles the promise.
 //! # let _ = token;
@@ -279,10 +279,9 @@ pub struct PromiseRejected {
 pub struct DurablePromise<'a> {
     context: &'a WorkflowContext,
     id: PromiseId,
-    /// The settlement, after the first wait takes it. A promise has one
-    /// settlement, so a later wait reads it here. Another signal wait would
-    /// park forever.
-    settlement: tokio::sync::OnceCell<Value>,
+    /// The settlement, after a wait takes it. A promise has one settlement,
+    /// so a later wait reads it here. Another signal wait would park forever.
+    settlement: Option<Value>,
 }
 
 impl fmt::Debug for DurablePromise<'_> {
@@ -298,7 +297,7 @@ impl<'a> DurablePromise<'a> {
         Self {
             context,
             id,
-            settlement: tokio::sync::OnceCell::const_new(),
+            settlement: None,
         }
     }
 
@@ -311,22 +310,20 @@ impl<'a> DurablePromise<'a> {
     /// Waits until a caller settles the promise.
     ///
     /// The outer error is an engine error, for example a replay drift. The
-    /// inner error is a rejection. Every wait on this handle returns the same
-    /// settlement, also when waits run at the same time.
+    /// inner error is a rejection. A wait takes `&mut self`, so the handle
+    /// takes one wait at a time. Every later wait returns the same settlement.
     ///
     /// # Errors
     ///
     /// Returns [`crate::HarvestError::Serialization`] if the settlement or
     /// its value does not decode. Propagates all errors from
     /// [`WorkflowContext::wait_for_signal`].
-    pub async fn wait<T: DeserializeOwned>(&self) -> HarvestResult<Result<T, PromiseRejected>> {
-        let raw = self
-            .settlement
-            .get_or_try_init(|| async {
-                self.context.wait_for_signal(&self.id.signal_name()).await
-            })
-            .await?;
-        PromiseSettlement::decode(raw.clone())
+    pub async fn wait<T: DeserializeOwned>(&mut self) -> HarvestResult<Result<T, PromiseRejected>> {
+        if let Some(raw) = &self.settlement {
+            return PromiseSettlement::decode(raw.clone());
+        }
+        let raw = self.context.wait_for_signal(&self.id.signal_name()).await?;
+        PromiseSettlement::decode(self.settlement.insert(raw).clone())
     }
 
     /// Waits until a caller settles the promise, or until `timeout` passes.
@@ -339,29 +336,21 @@ impl<'a> DurablePromise<'a> {
     /// Same as [`wait`](Self::wait), and the errors of
     /// [`WorkflowContext::wait_for_signal_timeout`].
     pub async fn wait_timeout<T: DeserializeOwned>(
-        &self,
+        &mut self,
         timeout: Duration,
     ) -> HarvestResult<Option<Result<T, PromiseRejected>>> {
-        // `Err(None)` is a timeout. It leaves the cell empty for a later wait.
-        let raw = self
-            .settlement
-            .get_or_try_init(|| async {
-                match self
-                    .context
-                    .wait_for_signal_timeout(&self.id.signal_name(), timeout)
-                    .await
-                {
-                    Ok(Some(raw)) => Ok(raw),
-                    Ok(None) => Err(None),
-                    Err(e) => Err(Some(e)),
-                }
-            })
-            .await;
-        match raw {
-            Ok(raw) => PromiseSettlement::decode(raw.clone()).map(Some),
-            Err(None) => Ok(None),
-            Err(Some(e)) => Err(e),
+        if let Some(raw) = &self.settlement {
+            return PromiseSettlement::decode(raw.clone()).map(Some);
         }
+        // A timeout stores nothing, so a later wait can still take the settlement.
+        let Some(raw) = self
+            .context
+            .wait_for_signal_timeout(&self.id.signal_name(), timeout)
+            .await?
+        else {
+            return Ok(None);
+        };
+        PromiseSettlement::decode(self.settlement.insert(raw).clone()).map(Some)
     }
 }
 
