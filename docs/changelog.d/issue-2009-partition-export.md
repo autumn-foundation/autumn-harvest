@@ -82,6 +82,11 @@ change removes the stale field from both tests.
 that it restates. `safety_report_docs` failed on `trunk-dev`. This change
 restates the new simulator and trace-check limits in the report.
 
+`a_task_moves_through_the_spec_states` from #2104 failed at random. A wake
+that commits between the history-head read and the signal-queue read made an
+answered wait look open again. `open_signal_waits` now reads the head again
+and reports no wait when it moved.
+
 **Tests.**
 
 - `partition_archive_tests`, 17 DB tests: export, verify, drop and read
