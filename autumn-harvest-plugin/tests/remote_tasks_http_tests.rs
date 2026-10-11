@@ -261,7 +261,9 @@ async fn truncated_body_url(status: &'static str) -> String {
 async fn a_body_read_failure_follows_the_status() {
     for (status, retryable) in [
         ("400 Bad Request", false),
+        ("307 Temporary Redirect", false),
         ("503 Service Unavailable", true),
+        ("200 OK", true),
     ] {
         let url = truncated_body_url(status).await;
         let client = HttpRemoteTasks::new().server("reports", RemoteServer::mcp(&url));

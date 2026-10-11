@@ -269,9 +269,9 @@ impl HttpRemoteTasks {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .is_some_and(is_event_stream);
-        let raw = read_body(&mut response, method, id, event_stream, status).await?;
+        let (raw, event) = read_body(&mut response, method, id, event_stream, status).await?;
         let envelope = if event_stream {
-            sse_response(utf8_prefix(&raw), id)
+            event
         } else {
             serde_json::from_slice::<Value>(&raw).ok()
         };
@@ -314,14 +314,15 @@ impl HttpRemoteTasks {
 /// Read the body of `response`, at most [`MAX_RESPONSE_BYTES`].
 ///
 /// A server may keep an event stream open after the response. So the read
-/// of an event stream stops at the first full response with `id`.
+/// of an event stream stops at the first full response with `id`, and
+/// returns that response too.
 async fn read_body(
     response: &mut reqwest::Response,
     method: &str,
     id: u64,
     event_stream: bool,
     status: reqwest::StatusCode,
-) -> Result<Vec<u8>, RemoteTaskError> {
+) -> Result<(Vec<u8>, Option<Value>), RemoteTaskError> {
     // The status is known before the body. A busy server stays retryable,
     // and a refused request stays refused.
     let too_large = || {
@@ -339,35 +340,25 @@ async fn read_body(
         return Err(too_large());
     }
     let mut raw = Vec::new();
+    let mut reader = event_stream.then(|| SseReader::new(id));
     while let Some(chunk) = response.chunk().await.map_err(|e| {
         let message = format!("{method}: read failed: {}", e.without_url());
-        if status.is_client_error() && !busy(status) {
-            RemoteTaskError::non_retryable(message)
-        } else {
+        // Only a cut 2xx body or a busy server is worth a retry.
+        if status.is_success() || busy(status) {
             RemoteTaskError::retryable(message)
+        } else {
+            RemoteTaskError::non_retryable(message)
         }
     })? {
         if raw.len() + chunk.len() > MAX_RESPONSE_BYTES {
             return Err(too_large());
         }
         raw.extend_from_slice(&chunk);
-        if event_stream
-            && chunk.iter().any(|b| matches!(b, b'\n' | b'\r'))
-            && sse_response(utf8_prefix(&raw), id).is_some()
-        {
-            break;
+        if let Some(event) = reader.as_mut().and_then(|r| r.push(&chunk)) {
+            return Ok((raw, Some(event)));
         }
     }
-    Ok(raw)
-}
-
-/// The valid UTF-8 start of `raw`. A chunk can end inside a character of
-/// the next event, and the events before it still count.
-fn utf8_prefix(raw: &[u8]) -> &str {
-    match std::str::from_utf8(raw) {
-        Ok(text) => text,
-        Err(e) => std::str::from_utf8(&raw[..e.valid_up_to()]).unwrap_or_default(),
-    }
+    Ok((raw, None))
 }
 
 /// `true` for a status that asks the client to try again: 429 or 5xx.
@@ -408,33 +399,6 @@ fn belongs_to(envelope: &Value, id: u64) -> bool {
     }
 }
 
-/// The lines of an event stream, each with `true` when a line end follows.
-///
-/// CR, LF and CRLF each end a line, as the event-stream format requires.
-fn sse_lines(body: &str) -> Vec<(&str, bool)> {
-    let bytes = body.as_bytes();
-    let mut lines = Vec::new();
-    let (mut start, mut i) = (0, 0);
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\n' | b'\r' => {
-                lines.push((&body[start..i], true));
-                i += if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
-                    2
-                } else {
-                    1
-                };
-                start = i;
-            }
-            _ => i += 1,
-        }
-    }
-    if start < bytes.len() {
-        lines.push((&body[start..], false));
-    }
-    lines
-}
-
 /// `true` when `content_type` names an event stream.
 ///
 /// Media types are case-insensitive, and parameters follow a `;`.
@@ -445,52 +409,90 @@ fn is_event_stream(content_type: &str) -> bool {
         .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
-/// The JSON-RPC response with `id` in a `text/event-stream` body.
+/// An event-stream reader that keeps its state across chunks. It reads
+/// each byte once and returns the JSON-RPC response with the request id.
 ///
 /// The parse follows the event-stream interpretation rules:
 ///
 /// - one leading BOM goes;
+/// - CR, LF and CRLF each end a line, also when a chunk ends between CR
+///   and LF;
+/// - a line decodes as UTF-8 with replacement, so a bad byte spoils only
+///   its own line;
 /// - a line that starts with `:` is a comment;
 /// - a field is the text before the first `:`, and its value loses one
 ///   leading space;
 /// - `data` values join with a line feed;
 /// - a blank line dispatches the event;
 /// - an event with no blank line after it is not dispatched.
-fn sse_response(body: &str, id: u64) -> Option<Value> {
-    let body = body.strip_prefix('\u{feff}').unwrap_or(body);
-    let mut data: Vec<&str> = Vec::new();
-    for (line, ended) in sse_lines(body) {
-        if !ended {
-            break;
+struct SseReader {
+    id: u64,
+    /// The bytes of the line that has no line end yet.
+    line: Vec<u8>,
+    /// The last byte was a CR, so a LF next ends no new line.
+    after_cr: bool,
+    /// The first line is read, so no BOM can follow.
+    started: bool,
+    /// The `data` values of the current event, each with a line feed.
+    data: String,
+}
+
+impl SseReader {
+    const fn new(id: u64) -> Self {
+        Self {
+            id,
+            line: Vec::new(),
+            after_cr: false,
+            started: false,
+            data: String::new(),
         }
-        if line.is_empty() {
-            if let Some(message) = decode_event(&data)
-                && belongs_to(&message, id)
-            {
-                return Some(message);
+    }
+
+    /// Read `bytes`. Returns the first response with the request id.
+    fn push(&mut self, bytes: &[u8]) -> Option<Value> {
+        for &byte in bytes {
+            if std::mem::take(&mut self.after_cr) && byte == b'\n' {
+                continue;
             }
-            data.clear();
-            continue;
+            if matches!(byte, b'\r' | b'\n') {
+                self.after_cr = byte == b'\r';
+                let line = std::mem::take(&mut self.line);
+                if let Some(message) = self.end_line(&line) {
+                    return Some(message);
+                }
+            } else {
+                self.line.push(byte);
+            }
+        }
+        None
+    }
+
+    fn end_line(&mut self, raw: &[u8]) -> Option<Value> {
+        let raw = if std::mem::replace(&mut self.started, true) {
+            raw
+        } else {
+            raw.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(raw)
+        };
+        let line = String::from_utf8_lossy(raw);
+        if line.is_empty() {
+            let data = std::mem::take(&mut self.data);
+            let data = data.strip_suffix('\n')?;
+            return serde_json::from_str::<Value>(data)
+                .ok()
+                .filter(|message| belongs_to(message, self.id));
         }
         if line.starts_with(':') {
-            continue;
+            return None;
         }
-        let (field, value) = line.split_once(':').map_or((line, ""), |(field, value)| {
+        let (field, value) = line.split_once(':').map_or((&*line, ""), |(field, value)| {
             (field, value.strip_prefix(' ').unwrap_or(value))
         });
         if field == "data" {
-            data.push(value);
+            self.data.push_str(value);
+            self.data.push('\n');
         }
+        None
     }
-    None
-}
-
-/// The JSON value of one event's joined `data` lines.
-fn decode_event(data: &[&str]) -> Option<Value> {
-    if data.is_empty() {
-        return None;
-    }
-    serde_json::from_str(&data.join("\n")).ok()
 }
 
 /// The `Mcp-Name` header value. A value that is not visible ASCII uses the
@@ -575,6 +577,11 @@ impl RemoteTaskTransport for HttpRemoteTasks {
 mod tests {
     use super::*;
 
+    /// The response with `id` in a whole event-stream body.
+    fn sse_response(body: &str, id: u64) -> Option<Value> {
+        SseReader::new(id).push(body.as_bytes())
+    }
+
     #[test]
     fn sse_response_picks_the_message_with_the_request_id() {
         let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n\
@@ -632,6 +639,31 @@ mod tests {
             &json!({"jsonrpc": "1.0", "id": 9, "result": {}}),
             9
         ));
+    }
+
+    #[test]
+    fn a_bad_byte_spoils_only_its_own_line() {
+        let mut body = b": keep-alive \xFF\n".to_vec();
+        body.extend_from_slice(b"data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}\n\n");
+        assert_eq!(
+            SseReader::new(2).push(&body),
+            Some(json!({"jsonrpc": "2.0", "id": 2, "result": {}}))
+        );
+    }
+
+    #[test]
+    fn the_reader_keeps_its_state_across_chunks() {
+        let body = "\u{feff}data: {\"jsonrpc\":\"2.0\",\r\ndata: \"id\":8,\"result\":{}}\r\n\n";
+        let mut reader = SseReader::new(8);
+        let bytes = body.as_bytes();
+        // One byte at a time: a split BOM, a split CRLF and split lines.
+        for byte in &bytes[..bytes.len() - 1] {
+            assert_eq!(reader.push(std::slice::from_ref(byte)), None);
+        }
+        assert_eq!(
+            reader.push(&bytes[bytes.len() - 1..]),
+            Some(json!({"jsonrpc": "2.0", "id": 8, "result": {}}))
+        );
     }
 
     #[test]
