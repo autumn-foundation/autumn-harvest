@@ -1409,6 +1409,7 @@ async fn insert_fork_execution(
             },
             completion_callbacks: source.completion_callbacks.clone(),
             quota_key: None,
+            assigned_build_id: source.assigned_build_id.clone(),
         },
     )
     .await
@@ -1429,6 +1430,9 @@ pub(crate) struct ForkRow<'a> {
     /// The quota key that admitted the row. A reset passes `None`. A fork
     /// passes the key of its quota admission (issue #946).
     pub(crate) quota_key: Option<&'a str>,
+    /// The build that runs the row. A carried history needs a build that can
+    /// replay it, so a reset keeps the source build.
+    pub(crate) assigned_build_id: Option<String>,
 }
 
 /// Insert the execution row of a fork of `source`.
@@ -1492,7 +1496,7 @@ pub(crate) async fn insert_fork_row(
         sla_deadline_at,
         memo: source.memo.clone(),
         search_attrs: fork_search_attrs,
-        assigned_build_id: source.assigned_build_id.clone(),
+        assigned_build_id: spec.assigned_build_id,
         parent_close_policy: None, // reset fork is a fresh root execution
         owner: source.owner.as_deref(),
         runbook_url: source.runbook_url.as_deref(),

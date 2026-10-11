@@ -287,6 +287,7 @@ async fn fork_in_transaction(
         // never sends them, because the terminal path checks its marker. A
         // later live fork of this fork then sends them.
         completion_callbacks: source.completion_callbacks.clone(),
+        assigned_build_id: fork_build(conn, &source, fork_event_id, new_exec_id).await?,
     };
     let fork = match crate::reset::insert_fork_row(conn, &source, new_exec_id, row).await {
         Ok(fork) => fork,
@@ -364,6 +365,25 @@ async fn fork_in_transaction(
         events_carried_over: plan.events_carried_over,
         effects: request.effects,
     })
+}
+
+/// The build that runs the fork.
+///
+/// A fork at point 0 carries no decision to replay. So it takes the build of
+/// a fresh start under the current policy of its queue. A retired source
+/// build then cannot strand it. A carried prefix needs a build that can
+/// replay it, so the fork keeps the source build, as a reset does.
+async fn fork_build(
+    conn: &mut AsyncPgConnection,
+    source: &WorkflowExecution,
+    fork_event_id: i64,
+    new_exec_id: ExecutionId,
+) -> HarvestResult<Option<String>> {
+    if fork_event_id > 0 {
+        return Ok(source.assigned_build_id.clone());
+    }
+    let policy = crate::build_routing::get_build_policy(conn, &source.queue_name).await?;
+    Ok(policy.map(|policy| policy.resolve_assigned_build(new_exec_id)))
 }
 
 /// Load the source row `FOR SHARE` and apply the checks that need no history.

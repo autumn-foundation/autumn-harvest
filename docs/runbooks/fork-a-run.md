@@ -50,6 +50,13 @@ and fails closed with `ForkEffectUnavailable`. Fork a run well inside its
 retention window, or hold the source with `POST /workflows/{id}/legal-hold`
 (issue #747) while the fork runs.
 
+Under build routing, a fork at point 0 takes the build of a fresh start under
+the current policy of its queue. A fork with a carried prefix keeps the source
+build, because that build can replay the prefix. If the source build is
+retired, the fork stays pending. Declare the current build compatible with the
+source build, as in [`safe-deploy.md`](safe-deploy.md), only when it can replay
+that history.
+
 A race branch that lost in the source stays pending in the fork, so the same
 branch wins again. If the fork no longer runs the winner, the losing branch
 fails closed instead. An activity whose input holds a value that the fork makes

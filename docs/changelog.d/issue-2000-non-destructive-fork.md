@@ -26,6 +26,8 @@ is never written, so a run in any state can be forked, `COMPLETED` and
   writes, not any failure with the same text. A held loser keeps a mark on
   its task, so the race still records its loser terminal when the winner
   resolves.
+- Under build routing, a fork at point 0 takes the build of a fresh start. A
+  fork with a carried prefix keeps the source build, which can replay it.
 - The fork sends no completion callback and fires no completion trigger.
   Its marker gates them, so the fork row keeps the callback targets of its
   source. A later live fork of this fork then sends them.

@@ -1091,6 +1091,64 @@ async fn a_served_stored_result_keeps_its_blob() {
     assert!(shared, "the fork references the served stored-result blob");
 }
 
+/// A fork at point 0 carries no decision to replay, so it takes the build of
+/// a fresh start under the current policy. A fork with a carried prefix keeps
+/// the source build, which can replay that prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_a_fork_with_a_prefix_keeps_the_source_build() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("build");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+    let mut conn = connect(&url).await;
+    diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
+        .set(harvest_workflow_executions::assigned_build_id.eq(Some("build-old")))
+        .execute(&mut conn)
+        .await
+        .expect("pin the source build");
+    autumn_harvest::build_routing::set_build_policy(&mut conn, &queue, "build-new", None)
+        .await
+        .expect("set the current build");
+    let fresh = fork_workflow_execution(&mut conn, source, request(ForkEffects::Recorded), None)
+        .await
+        .expect("fork at point 0");
+    assert_eq!(fresh.fork_event_id, 0);
+    let new = Some("build-new".to_string());
+    assert_eq!(build_of(&url, fresh.new_exec_id).await, (new.clone(), new));
+
+    let mut later = request(ForkEffects::Recorded);
+    later.fork_point = Some(ResetPoint::FirstActivityRun {
+        activity_name: "fork_receipt".to_string(),
+    });
+    let prefix = fork_workflow_execution(&mut conn, source, later, None)
+        .await
+        .expect("fork with a prefix");
+    assert!(prefix.fork_event_id > 0);
+    let old = Some("build-old".to_string());
+    assert_eq!(build_of(&url, prefix.new_exec_id).await, (old.clone(), old));
+}
+
+/// The build of a fork row and the build that its first task requires.
+async fn build_of(url: &str, exec_id: ExecutionId) -> (Option<String>, Option<String>) {
+    let mut conn = connect(url).await;
+    let row: Option<String> = harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(harvest_workflow_executions::assigned_build_id)
+        .first(&mut conn)
+        .await
+        .expect("fork row");
+    let task: Option<String> = autumn_harvest::schema::harvest_task_queue::table
+        .filter(
+            autumn_harvest::schema::harvest_task_queue::workflow_exec_id
+                .eq(Some(exec_id.as_uuid())),
+        )
+        .select(autumn_harvest::schema::harvest_task_queue::required_build_id)
+        .first(&mut conn)
+        .await
+        .expect("fork task");
+    (row, task)
+}
+
 /// A live fork never reads the source history. A source blob that is gone
 /// does not stop the fork from running its activities.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
