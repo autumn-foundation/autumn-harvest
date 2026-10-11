@@ -96,6 +96,7 @@ $ cargo harvest-verify --list-boundaries
 | `--format text\|json` | Output format. `text` (default) is human-readable; `json` emits the full report. |
 | `--report` | **Also** print the `analyzed/proven/unknown/found/allowed` counts on **stderr**. The `text` renderer already ends with that same line plus the boundary set on stdout, so this flag exists to get the counts onto a separate stream (a CI step summary, say) — it does not add information. |
 | `--list-boundaries` | Print every boundary name, one per line, and exit `0`. |
+| `--emit-structure <FILE>` | Also write the structure manifest of each workflow to `FILE`. The report on stdout does not change. See [Structure manifest](#structure-manifest). |
 
 **There is no `--release` flag, and optimized builds are refused.** MIR inlining
 is on at `opt-level ≥ 1`, and an inlined helper leaves no `Call` terminator — the
@@ -140,7 +141,7 @@ counts and the boundary set. Verbatim, from a real run over this repo's examples
 $ cargo run -p autumn-harvest-verify --bin cargo-harvest-verify -- harvest-verify \
     -p autumn-harvest --all-examples --no-default-features --features testing \
     --allowlist harvest-verify.allow.toml --report
-harvest-verify: model 2026.09.0, rustc 1.98.0 (88d9e12ae 2026-08-18)
+harvest-verify: model 2026.10.0, rustc 1.98.0 (88d9e12ae 2026-08-18)
 
 proven-deterministic  workflow_logs::import_batch
 ... one line per workflow ...
@@ -148,7 +149,7 @@ proven-deterministic  workflow_logs::import_batch
 warning: skipping example wasm_activity: required feature(s) not enabled: wasm-activities
 
 analyzed 57: proven 56, unknown 0, found 0, allowed 1
-verdicts hold under model 2026.09.0; boundaries not analyzed: dyn-dispatch, indirect-call, ffi, unsafe-raw-pointer, inline-asm, external-crate-body, unmodeled-ctx-method, unresolved-generic, recursion, mir-parse, missing-body, drop-glue
+verdicts hold under model 2026.10.0; boundaries not analyzed: dyn-dispatch, indirect-call, ffi, unsafe-raw-pointer, inline-asm, external-crate-body, unmodeled-ctx-method, unresolved-generic, recursion, mir-parse, missing-body, drop-glue
 ```
 
 Three things about that footer are worth knowing before you quote it:
@@ -234,6 +235,36 @@ annotated with a source location. Where it cannot match one uniquely it names th
 function's own header rather than guessing a line.
 
 ---
+
+## Structure manifest
+
+`--emit-structure FILE` writes the call graph that the analysis resolved, one
+graph per workflow (issue #1995). The
+[upgrade check](upgrade-check.md) diffs two manifests, one per build, to find
+the workflow code that changed. The run builds the manifest only when you
+pass the flag.
+
+Each workflow lists every body it can reach:
+
+| Field | Meaning |
+|---|---|
+| `id` | The body path. The id drops spans, so a line shift keeps it. |
+| `digest` | SHA-256 of the raw MIR text of the body, of each item nested under it, of each `const` item it reads and of each `allocN` footer they name. It drops spans and `allocN` numbers. |
+| `calls` | Each call site. `in_loop` marks a call in a cycle of the caller's control flow, or a closure that the caller passes to another call. `resume` marks a call that handles an existing future, such as `poll`. |
+| `steps` | Each command the body emits. `kind` comes from the `step` field of the model's `[[sink]]` row, or of a `[[non_sink]]` row that can park the workflow, such as `await_condition`. `key` is the step name, such as the activity name, when the MIR shows it. |
+
+The workflow also lists its `unknown` boundaries. Two bodies whose ids
+normalize to the same text add an `ambiguous-body-id` boundary, because
+their `#2` suffix follows the digest, not the body.
+
+MIR prints a `const` read from another crate by path, such as
+`const limits::ATTEMPTS`, and not by value. When that crate is in the
+analyzed set, the digest includes the item from its MIR. A std, core or
+trusted crate is skipped. Any other crate adds an `external-const` boundary,
+because a change to its value does not change the reader's MIR. An activity
+body is not in
+the graph: a workflow names an activity through its `X_info()` function and
+never calls the body.
 
 ## The allowlist
 

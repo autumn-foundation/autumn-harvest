@@ -17,6 +17,7 @@ publish = false
 clap = { version = "4.5", features = ["derive"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.11"
 syn = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
@@ -25,6 +26,9 @@ toml = { workspace = true }
 # The corpus proof (guardrails pass) calls the syntactic engine directly.
 autumn-harvest = { version = "0.7.0", path = "../autumn-harvest", default-features = false, features = ["testing"] }
 tempfile = "3"
+# The end-to-end structure test runs the core upgrade check (issue #1995).
+chrono = { workspace = true }
+tokio = { workspace = true }
 
 [[bin]]
 name = "cargo-harvest-verify"

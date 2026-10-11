@@ -65,6 +65,12 @@ pub struct SinkRule {
     /// Zero-based closure-argument indexes that must NOT be descended (e.g. `side_effect`'s closure).
     #[serde(default)]
     pub opaque_closure_args: Vec<usize>,
+    /// The history record this sink writes, such as `activity` or `timer` (issue #1995).
+    #[serde(default)]
+    pub step: Option<String>,
+    /// Zero-based argument index, without `self`, that holds the step key.
+    #[serde(default)]
+    pub step_key_arg: usize,
     pub reason: String,
 }
 
@@ -78,6 +84,11 @@ pub struct CtxMethodRule {
     pub path: String,
     #[serde(default = "default_ctx")]
     pub receiver: String,
+    /// Set on a method that can suspend the workflow without a command, such
+    /// as `await_condition` (issue #1995). The structure manifest records a
+    /// step site of this kind, and no run can prove it complete.
+    #[serde(default)]
+    pub step: Option<String>,
     pub reason: String,
 }
 

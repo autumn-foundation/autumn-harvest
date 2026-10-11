@@ -539,6 +539,10 @@ pub struct WorkflowReplayer {
     /// [`register_fn`](Self::register_fn) (a bare fn pointer carries no override),
     /// which resolves to the global cap — byte-for-byte the pre-fix behavior.
     workflow_input_caps: HashMap<String, u64>,
+    /// The candidate worker's shard router (issue #1995). A fresh child spawn
+    /// with a non-default placement resolves its shard through it. `None`
+    /// leaves the replay on the process-global router.
+    shard_router: Option<crate::shard::ShardRouter>,
 }
 
 /// Owned borrows of a replayer's declarative handlers.
@@ -550,6 +554,7 @@ pub struct WorkflowReplayer {
 struct DeclarativeHandlerRefs<'a> {
     queries: Vec<&'a crate::info::QueryHandlerInfo>,
     updates: Vec<&'a crate::info::UpdateHandlerInfo>,
+    router: Option<&'a crate::shard::ShardRouter>,
 }
 
 impl<'a> DeclarativeHandlerRefs<'a> {
@@ -558,6 +563,7 @@ impl<'a> DeclarativeHandlerRefs<'a> {
         crate::executor::ReplayDeclarativeHandlers {
             queries: &self.queries,
             updates: &self.updates,
+            router: self.router,
         }
     }
 }
@@ -616,6 +622,7 @@ impl WorkflowReplayer {
             declarative_queries: Vec::new(),
             declarative_updates: Vec::new(),
             workflow_input_caps: HashMap::new(),
+            shard_router: None,
         }
     }
 
@@ -782,6 +789,17 @@ impl WorkflowReplayer {
         self
     }
 
+    /// Give the replay the **candidate** worker's shard router (issue #1995).
+    ///
+    /// A fresh child spawn with a non-default `ChildPlacement` resolves its
+    /// shard through the router. Without one, the spawn fails, and the replay
+    /// reports a failure the promoted worker would not have.
+    #[must_use]
+    pub fn with_shard_router(mut self, router: crate::shard::ShardRouter) -> Self {
+        self.shard_router = Some(router);
+        self
+    }
+
     /// Register the **candidate's** declarative `#[query]` handlers on the replay
     /// context (issue #798).
     ///
@@ -808,6 +826,7 @@ impl WorkflowReplayer {
         DeclarativeHandlerRefs {
             queries: self.declarative_queries.iter().collect(),
             updates: self.declarative_updates.iter().collect(),
+            router: self.shard_router.as_ref(),
         }
     }
 
@@ -4776,6 +4795,9 @@ fn fixture_replayer(
         // verifier retained from `register`. Each fixture resolves its own cap
         // from this map by workflow type, mirroring the live worker.
         workflow_input_caps: defaults.workflow_input_caps.clone(),
+        // The bundle verifier has no router to pass. A fixture replay keeps
+        // the process-global one.
+        shard_router: None,
     }
 }
 
