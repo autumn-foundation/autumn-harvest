@@ -133,7 +133,7 @@ failure.
 | `MAX_HOST_CALL_BYTES` (65536) | Request, response and escaped message size | The host rejects a larger request before it reads the bytes. A larger response becomes an `err` outcome. The host cuts a longer message. |
 | `MAX_HOST_CALL_NAME_BYTES` (128) | Name size | A longer name is `HOST_CALL_INVALID`. |
 | `MAX_HOST_CALLS` (256) | Calls per run | Later calls return `HOST_CALL_LIMIT`. The journal stops growing. |
-| `MAX_JOURNAL_BYTES` (1048576) | Journal size | A live call that could push the journal past it returns `HOST_CALL_LIMIT`. This bounds host memory and the persisted size. |
+| `MAX_JOURNAL_BYTES` (1048576) | Journal size in JSON, escapes included | A live call that could push the journal past it returns `HOST_CALL_LIMIT`. This bounds host memory and the persisted size. |
 
 The host checks each budget before it parses the call, so a call over a
 budget costs no parse. The host checks a request as JSON without a value
@@ -186,7 +186,8 @@ The tests are unit tests in `src/wasm_journal.rs`. CI runs them in the
 | A response at the bound is served. | `a_response_at_the_bound_is_served` |
 | An error message is bounded after JSON escaping. | `an_error_message_is_bounded_after_json_escaping` |
 | The call budget bounds the journal, also on replay. | `the_host_call_budget_bounds_the_journal` |
-| The byte budget bounds host memory. | `the_journal_byte_budget_bounds_host_memory` |
+| The byte budget bounds host memory and the persisted size. | `the_journal_byte_budget_bounds_host_memory` |
+| The byte count covers JSON escapes and framing. | `byte_size_bounds_the_serialized_journal` |
 | A handler panic becomes a `WasmTrap`. | `a_panicking_handler_is_contained_as_a_wasm_trap` |
 | The handler gets a stable `seq`, also on resume. | `the_handler_receives_the_journal_sequence_number` |
 | A cancelled run skips the handler. | `a_cancelled_run_skips_the_handler` |

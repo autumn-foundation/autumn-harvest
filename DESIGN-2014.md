@@ -120,7 +120,7 @@ database.** The prototype is a new `wasm_journal` module behind the existing
 | Review: red → green | `a_persisted_journal_replays_floats_byte_for_byte` | Raw JSON text survives persistence. |
 | Review: red → green | `a_divergent_name_on_replay_is_non_retryable`, `a_revoked_grant_is_a_divergence_on_replay` | R4 for the name, and R17. |
 | Review: red → green | `an_oversized_recorded_outcome_is_a_malformed_journal`, `a_journal_over_the_call_budget_is_malformed` | A recorded value cannot bypass a bound. |
-| Review: red → green | `the_journal_byte_budget_bounds_host_memory` | R10 for bytes, not only calls. |
+| Review: red → green | `the_journal_byte_budget_bounds_host_memory`, `byte_size_bounds_the_serialized_journal` | R10 for bytes, escapes included, not only calls. |
 | Review: red → green | `an_error_message_is_bounded_after_json_escaping`, `a_response_at_the_bound_is_served` | R9 at its edges. |
 | Review | `each_bad_call_is_invalid_and_not_journaled`, `a_failed_response_write_keeps_the_call_in_the_journal`, `a_failed_replay_with_entries_left_stays_retryable`, `a_replayed_denial_stays_denied_after_a_new_grant` | R12, R14 and the replay edges. Mutation runs confirm each one. |
 | Refactor | `host_call_overhead_microbenchmark` (ignored) | The cost of one call, live and replayed. |

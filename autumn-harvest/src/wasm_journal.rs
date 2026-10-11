@@ -64,11 +64,18 @@ pub const MAX_HOST_CALL_NAME_BYTES: usize = 128;
 /// Most host calls that one run can make, replayed calls included.
 pub const MAX_HOST_CALLS: u32 = 256;
 
-/// Largest journal, in bytes of names, requests and outcomes.
+/// Largest journal, in bytes of its JSON form.
 ///
 /// It bounds the host memory that a journal holds, and the size that the
-/// caller persists.
+/// caller persists. The count includes escapes and entry framing.
 pub const MAX_JOURNAL_BYTES: usize = 1024 * 1024;
+
+/// An upper bound on the JSON framing of one entry: its keys, its `seq`, its
+/// outcome tag and a separating comma.
+const ENTRY_FRAMING_BYTES: usize = 96;
+
+/// An upper bound on the JSON framing of the journal object itself.
+const JOURNAL_FRAMING_BYTES: usize = 16;
 
 /// In-band result: the embedder did not grant this capability.
 pub const HOST_CALL_DENIED: i64 = -1;
@@ -188,14 +195,18 @@ pub struct HostCallEntry {
 
 impl HostCallEntry {
     /// The bytes that this entry counts against [`MAX_JOURNAL_BYTES`].
+    ///
+    /// It is an upper bound on the length of the entry in JSON. Each string
+    /// counts with its escapes, so a control character cannot grow the
+    /// persisted journal past the budget.
     #[must_use]
-    pub const fn byte_size(&self) -> usize {
+    pub fn byte_size(&self) -> usize {
         let outcome = match &self.outcome {
-            HostCallOutcome::Ok { response } => response.len(),
-            HostCallOutcome::Err { message } => message.len(),
+            HostCallOutcome::Ok { response } => escaped_len(response),
+            HostCallOutcome::Err { message } => escaped_len(message),
             HostCallOutcome::Denied => 0,
         };
-        self.name.len() + self.request.len() + outcome
+        ENTRY_FRAMING_BYTES + escaped_len(&self.name) + escaped_len(&self.request) + outcome
     }
 }
 
@@ -208,9 +219,16 @@ pub struct HostCallJournal {
 
 impl HostCallJournal {
     /// The bytes that this journal counts against [`MAX_JOURNAL_BYTES`].
+    ///
+    /// It is an upper bound on the length of the journal in JSON.
     #[must_use]
     pub fn byte_size(&self) -> usize {
-        self.entries.iter().map(HostCallEntry::byte_size).sum()
+        JOURNAL_FRAMING_BYTES
+            + self
+                .entries
+                .iter()
+                .map(HostCallEntry::byte_size)
+                .sum::<usize>()
     }
 }
 
@@ -406,14 +424,19 @@ enum Next {
 impl Session {
     /// Whether a call with these lengths stays within the run budgets.
     ///
-    /// A live call reserves room for the largest outcome, so the journal
-    /// never passes [`MAX_JOURNAL_BYTES`].
+    /// A live call reserves room for its largest entry, so the journal never
+    /// passes [`MAX_JOURNAL_BYTES`]. Escaping can grow a name six times. It
+    /// can grow JSON text, such as a request or a response, at most two
+    /// times. A message is already bounded in its escaped form.
     const fn admits(&self, name_len: usize, req_len: usize) -> bool {
         if self.cursor >= MAX_HOST_CALLS as usize {
             return false;
         }
-        self.cursor < self.entries.len()
-            || self.bytes + name_len + req_len + MAX_HOST_CALL_BYTES <= MAX_JOURNAL_BYTES
+        let reserve = ENTRY_FRAMING_BYTES
+            + (6 * name_len + 2)
+            + (2 * req_len + 2)
+            + (2 * MAX_HOST_CALL_BYTES + 2);
+        self.cursor < self.entries.len() || self.bytes + reserve <= MAX_JOURNAL_BYTES
     }
 
     /// Decide the next step of a call to `name` with `request`.
@@ -1254,6 +1277,8 @@ mod tests {
 
         assert_eq!(out.result.unwrap(), json!({ "code": HOST_CALL_LIMIT }));
         assert!(out.journal.byte_size() <= MAX_JOURNAL_BYTES);
+        let persisted = serde_json::to_string(&out.journal).unwrap().len();
+        assert!(persisted <= MAX_JOURNAL_BYTES);
         assert!(out.journal.entries.len() < MAX_HOST_CALLS as usize);
         assert_eq!(journal_defect(&out.journal), None);
     }
@@ -1400,6 +1425,42 @@ mod tests {
             replay < Duration::from_millis(1),
             "a replayed call took {replay:?}"
         );
+    }
+
+    #[test]
+    fn byte_size_bounds_the_serialized_journal() {
+        let journal = HostCallJournal {
+            entries: vec![
+                HostCallEntry {
+                    seq: 0,
+                    name: "a\u{1}".into(),
+                    request: "{\"q\":\"\\\"x\\\"\"}\n".into(),
+                    outcome: HostCallOutcome::Err {
+                        message: "\u{1}".repeat(1000),
+                    },
+                },
+                HostCallEntry {
+                    seq: 1,
+                    name: "b".into(),
+                    request: "[\"\\\\\"]".into(),
+                    outcome: HostCallOutcome::Ok {
+                        response: "{\"k\":\"\\\"\"}".into(),
+                    },
+                },
+                HostCallEntry {
+                    seq: 2,
+                    name: "c".into(),
+                    request: "null".into(),
+                    outcome: HostCallOutcome::Denied,
+                },
+            ],
+        };
+        for entry in &journal.entries {
+            let serialized = serde_json::to_string(entry).unwrap().len();
+            assert!(serialized <= entry.byte_size(), "{serialized} > {entry:?}");
+        }
+        let serialized = serde_json::to_string(&journal).unwrap().len();
+        assert!(serialized <= journal.byte_size());
     }
 
     #[test]

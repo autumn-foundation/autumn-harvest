@@ -28,7 +28,7 @@ grant again.
 replay change. `wasm_activities` gains one crate-private hook that links the
 extra import.
 
-**Tests.** Thirty-one unit tests in `src/wasm_journal.rs` cover record,
+**Tests.** Thirty-two unit tests in `src/wasm_journal.rs` cover record,
 replay, resume, denial, divergence, revoked grants, malformed journals,
 bounds at their edges, bad calls, panics and cancellation. Targeted mutation
 runs confirm the key checks. One more test is an ignored microbenchmark. The
