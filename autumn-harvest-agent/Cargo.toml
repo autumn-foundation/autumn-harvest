@@ -15,6 +15,9 @@ categories = ["asynchronous"]
 default = []
 # Register the agent loop on the embedded SQLite backend.
 sqlite = ["dep:autumn-harvest-sqlite"]
+# Replay-as-evaluation (issue #2001). Drives a recorded run in the in-memory
+# test engine, so it needs the engine's `testing` surface.
+eval = ["autumn-harvest/testing"]
 
 [dependencies]
 # The backend-neutral core only: no Diesel, no Postgres, no autumn-web.
@@ -47,6 +50,10 @@ required-features = ["sqlite"]
 [[test]]
 name = "always_on"
 required-features = ["sqlite"]
+
+[[test]]
+name = "eval"
+required-features = ["eval", "sqlite"]
 
 [lints]
 workspace = true

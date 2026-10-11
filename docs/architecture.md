@@ -82,7 +82,7 @@ Eight crates in the workspace. `autumn-harvest` is the public library and `autum
 
 `autumn-harvest-redis` is an **optional** dependency of `autumn-harvest-plugin`, behind that crate's `redis` cargo feature (issue #1312). It implements the core `dispatch::TaskDispatch` seam over Redis Streams. The default build never compiles it, and the plugin rejects `[harvest.redis] url` on a build without the feature. `autumn-harvest-redis` depends on `autumn-harvest` with `default-features = false`, so the channel never pulls the `db` feature into a caller that does not want it. See [`docs/operations/redis-dispatch.md`](operations/redis-dispatch.md).
 
-`autumn-harvest-agent` is the durable agent loop (issue #1973). The agent loop is a workflow, and each model call and tool call is an activity. It owns its agent primitives (`AgentModel`, `Tool`, `ToolPolicy`, `Approval`), modelled on `autumn-plugin-agent` but with no dependency on it. It depends on `autumn-harvest` with `default-features = false` only, so it has no Postgres, no `autumn-web` and no Autumn plugin dependency. `scripts/check-agent-adapter-deps.sh` gates that in CI. See [`docs/agent-adapter.md`](agent-adapter.md) and [ADR 0006](adr/0006-agent-adapter-framework.md).
+`autumn-harvest-agent` is the durable agent loop (issue #1973). The agent loop is a workflow, and each model call and tool call is an activity. It owns its agent primitives (`AgentModel`, `Tool`, `ToolPolicy`, `Approval`), modelled on `autumn-plugin-agent` but with no dependency on it. It depends on `autumn-harvest` with `default-features = false` only, so it has no Postgres, no `autumn-web` and no Autumn plugin dependency. `scripts/check-agent-adapter-deps.sh` gates that in CI. Its `eval` feature (issue #2001) also turns on the engine's `testing` feature for replay-as-evaluation. See [`docs/agent-adapter.md`](agent-adapter.md) and [ADR 0006](adr/0006-agent-adapter-framework.md).
 
 Macro-generated code must use `::autumn_harvest::` paths for everything. The proc-macro crate has no dependency on `serde_json` or `autumn-web` itself; it emits token streams that resolve via the `::autumn_harvest::` path. `lib.rs` re-exports `serde_json` at `::autumn_harvest::serde_json` and exposes its own local `task_duration()` parser at `::autumn_harvest::task_duration` for exactly this reason.
 
@@ -222,7 +222,7 @@ The capability-miss release keys on `(worker_id, crash_strikes, attempt)` (issue
 
 *Model.* `formal/tla/ActivityClaim.tla` models this protocol (issue #1819). TLC checks the invariant over every interleaving of a bounded model (3 workers, 5 claims). With the fence off, it reproduces the #1789 bug. See [`formal-methods.md`](testing/formal-methods.md).
 
-*Simulation.* `autumn_harvest::dst` drives the same protocol from a seed, with 3 workers, stalls and crashes (issue #1830). A differential test replays each run on Postgres through the production statements. With the fence off, a sweep reproduces the #1789 bug. See [`simulation.md`](testing/simulation.md).
+*Simulation.* `autumn_harvest::dst` drives the same protocol from a seed, with 3 workers, stalls and crashes (issue #1830). A differential test replays each run on Postgres through the production statements. With the fence off, a sweep reproduces the #1789 bug. The world simulation runs the real worker loop, timers and the scheduler fire claim under a seed (issue #2002). See [`simulation.md`](testing/simulation.md).
 
 **10. Suspension readiness (issue #1797)**
 
@@ -1936,10 +1936,14 @@ randomized- and model-checking-based testing layers, and CI run coverage:
   (issue #1819).
 * [`docs/testing/simulation.md`](testing/simulation.md) — seeded,
   deterministic simulation of the activity claim protocol, with a Postgres
-  differential test (issue #1830).
+  differential test (issue #1830). The world simulation runs the real
+  worker loop under a seed (issue #2002).
 * [`docs/testing/ci-db-suite-allowlist.md`](testing/ci-db-suite-allowlist.md)
   — the DB suites that CI does not run from the manifest, each with a
   reason, and an owner for debt (issue #1799).
+* [`docs/safety-report.md`](safety-report.md) — the four safety guarantees,
+  with the tests, the results, a command for each result and the known
+  limits (issue #2004).
 
 ---
 

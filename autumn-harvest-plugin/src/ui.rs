@@ -2675,7 +2675,6 @@ async fn reset_workflow_ui(
                 operator_id: actor.clone(),
                 signal_reapply: ResetSignalReapplyPolicy::default(),
                 allow_terminal_source: false,
-                refuse_erased_source: false,
             };
             let runtime = api_state.runtime().ok();
             let registry = runtime.as_ref().map(|r| r.registry().as_ref());

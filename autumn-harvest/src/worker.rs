@@ -38059,6 +38059,60 @@ impl Worker {
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }
+
+    /// Run one poll-loop iteration and wait for the task it claims.
+    ///
+    /// This is a hook for the world simulation of issue #2002. It is not a
+    /// stable API. It runs the Postgres path of `run_poll_loop` once, for
+    /// the first assigned shard only. The simulator then runs one actor at a
+    /// time, so a seed fixes the order of every claim and every decision.
+    ///
+    /// Call [`Self::dst_register`] first. Never call this on a worker that
+    /// runs [`Self::run`]: a drain closes the same task tracker.
+    ///
+    /// Returns `true` when the poll claimed a task. Returns `false` with no
+    /// claim when the worker is not registered, has a slot tuner, or shuts
+    /// down.
+    #[doc(hidden)]
+    pub async fn dst_poll_once(&self, pool: &DbPool) -> bool {
+        let registered = std::sync::atomic::AtomicBool::load(
+            &self.monitoring_started,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        if !registered || self.config.slot_tuner.is_some() || self.shutdown.is_cancelled() {
+            return false;
+        }
+        let shard = match self.config.shard_assignments.as_slice() {
+            [shard, ..] => Some(*shard),
+            [] => None,
+        };
+        let claimed = self.poll_once(pool, None, shard).await;
+        // A closed tracker waits for every body that it holds. It then
+        // reopens, so the next poll can spawn again.
+        self.dispatched.tracker.close();
+        self.dispatched.tracker.wait().await;
+        self.dispatched.tracker.reopen();
+        claimed
+    }
+
+    /// Write this worker's liveness row, as `run` does at startup.
+    ///
+    /// This is a hook for the world simulation of issue #2002. It is not a
+    /// stable API. Returns `true` when the row is written.
+    ///
+    /// The simulation starts no monitoring task. A slot tuner needs those
+    /// tasks to withhold permits, so a worker with a tuner returns `false`.
+    #[doc(hidden)]
+    pub async fn dst_register(&self, pool: &DbPool) -> bool {
+        if self.config.slot_tuner.is_some() {
+            return false;
+        }
+        // No tuner means no permit to withhold, so dispatch may start.
+        self.monitoring_started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // `register_in_fleet` returns whether a retry is pending.
+        !self.register_in_fleet(pool, None).await
+    }
 }
 
 /// The instant at which a drain cancels its running activities (issue #1813).
