@@ -2858,31 +2858,77 @@ fn first_sentence(reason: &str) -> &str {
 ///
 /// The block can reach `_0` through a temporary, a tuple or a call. So each
 /// coroutine aggregate the closure builds is read, not only the value it
-/// returns.
+/// returns. A call that writes `_0`, such as `SharedFuture::new(handle)`,
+/// has its arguments read too. An argument whose type is not printed counts
+/// as one that can write.
 fn captures_mut_ref(body: &Body, interior: &[&str]) -> bool {
-    body.blocks
+    let call_writes = body
+        .blocks
         .iter()
-        .flat_map(|block| &block.statements)
-        .filter_map(|statement| match statement {
-            Statement::Assign { dest, rvalue }
-                if (dest.local == Local(0) && dest.projections.is_empty())
-                    || rvalue.text.trim_start().starts_with("{coroutine@") =>
+        .filter_map(|block| match &block.terminator {
+            Terminator::Call { dest, args, .. }
+                if dest.local == Local(0) && dest.projections.is_empty() =>
             {
-                Some(rvalue)
+                Some(args)
             }
             _ => None,
         })
-        .any(|rvalue| {
-            let local_types = rvalue
-                .reads
-                .iter()
-                .filter_map(operand_place)
-                .filter_map(|place| body.locals.get(&place.local))
-                .map(String::as_str);
-            local_types
-                .chain(annotated_types(&rvalue.text))
-                .any(|ty| may_write_through(ty, interior))
-        })
+        .flatten()
+        .filter_map(operand_place)
+        .any(|place| place_type(body, place).is_none_or(|ty| may_write_through(ty, interior)));
+    call_writes
+        || body
+            .blocks
+            .iter()
+            .flat_map(|block| &block.statements)
+            .filter_map(|statement| match statement {
+                Statement::Assign { dest, rvalue }
+                    if (dest.local == Local(0) && dest.projections.is_empty())
+                        || rvalue.text.trim_start().starts_with("{coroutine@") =>
+                {
+                    Some(rvalue)
+                }
+                _ => None,
+            })
+            .any(|rvalue| {
+                let local_types = rvalue
+                    .reads
+                    .iter()
+                    .filter_map(operand_place)
+                    .filter_map(|place| body.locals.get(&place.local))
+                    .map(String::as_str);
+                local_types
+                    .chain(annotated_types(&rvalue.text))
+                    .any(|ty| may_write_through(ty, interior))
+            })
+}
+
+/// The type of `place` in `body`, when MIR prints it.
+///
+/// A plain local has its declared type. A field of a local, as `_1.0`, has
+/// no local of its own. MIR prints its type in an annotation, as
+/// `(_1.0: Arc<u64>)`, which the body text holds.
+fn place_type<'b>(body: &'b Body, place: &Place) -> Option<&'b str> {
+    let key = match place.projections.as_slice() {
+        [] => return body.locals.get(&place.local).map(String::as_str),
+        [Projection::Field(field)] => format!("(_{}.{field}: ", place.local.0),
+        [Projection::Deref, Projection::Field(field)] => {
+            format!("((*_{}).{field}: ", place.local.0)
+        }
+        _ => return None,
+    };
+    let at = body.text.find(&key)?.saturating_add(key.len());
+    let rest = body.text.get(at..)?;
+    let mut depth = 0_usize;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '(' | '<' | '[' | '{' => depth = depth.saturating_add(1),
+            ')' if depth == 0 => return rest.get(..i),
+            ')' | '>' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Each place annotation type in `text`, as `T` in `(_1.0: T)`.

@@ -9618,6 +9618,438 @@ fn wf_step_named_shared_future::{closure#0}::{closure#2}(_1: {closure@flow.rs:50
     }
 }
 
+fn <impl at flow.rs:507:1: 507:18>::new(_1: Arc<std::sync::Mutex<u64>>) -> SharedFuture {
+    debug shared => _1;
+    let mut _0: SharedFuture;
+
+    bb0: {
+        _0 = SharedFuture { shared: copy _1 };
+        return;
+    }
+}
+
+fn __autumn_workflow_info_wf_step_named_shared_ctor() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_step_named_shared_ctor(_1: &WorkflowContext) -> {async fn body of wf_step_named_shared_ctor()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_step_named_shared_ctor()};
+
+    bb0: {
+        _0 = {coroutine@flow.rs:519:70: 529:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_step_named_shared_ctor::{closure#0}(_1: Pin<&mut {async fn body of wf_step_named_shared_ctor()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    coroutine layout {
+        field _s0: &WorkflowContext;
+        field _s1: Arc<std::sync::Mutex<u64>>;
+        field _s2: Saga<'_>;
+        field _s3: {async fn body of Saga<'_>::step<u64, {closure@flow.rs:524:19: 524:26}, SharedFuture, {closure@flow.rs:524:54: 524:57}, {async block@flow.rs:524:58: 524:63}>()};
+        field _s4: std::future::Ready<Result<u64, String>>;
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+            Suspend0 (3): [_s0, _s1, _s2, _s3],
+            Suspend1 (4): [_s1, _s4],
+        }
+        storage_conflicts = BitMatrix(5x5) {(_s0, _s0), (_s0, _s1), (_s0, _s2), (_s0, _s3), (_s0, _s4), (_s1, _s0), (_s1, _s1), (_s1, _s2), (_s1, _s3), (_s1, _s4), (_s2, _s0), (_s2, _s1), (_s2, _s2), (_s2, _s3), (_s3, _s0), (_s3, _s1), (_s3, _s2), (_s3, _s3), (_s4, _s0), (_s4, _s1), (_s4, _s4)}
+    }
+    debug _task_context => _44;
+    debug ctx => ((*_41).0: &autumn_harvest::WorkflowContext);
+    coroutine debug ctx => _s0;
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _3: std::sync::Mutex<u64>;
+    let mut _5: &std::sync::Arc<std::sync::Mutex<u64>>;
+    let mut _6: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, std::string::String>, u64>;
+    let mut _7: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:524:19: 524:26}, SharedFuture, {closure@flow.rs:524:54: 524:57}, {async block@flow.rs:524:58: 524:63}>()};
+    let mut _8: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:524:19: 524:26}, SharedFuture, {closure@flow.rs:524:54: 524:57}, {async block@flow.rs:524:58: 524:63}>()};
+    let mut _9: &mut autumn_harvest::Saga<'_>;
+    let mut _10: {closure@flow.rs:524:19: 524:26};
+    let mut _11: {closure@flow.rs:524:54: 524:57};
+    let mut _12: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _13: std::pin::Pin<&mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:524:19: 524:26}, SharedFuture, {closure@flow.rs:524:54: 524:57}, {async block@flow.rs:524:58: 524:63}>()}>;
+    let mut _14: &mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:524:19: 524:26}, SharedFuture, {closure@flow.rs:524:54: 524:57}, {async block@flow.rs:524:58: 524:63}>()};
+    let mut _15: &mut std::task::Context<'_>;
+    let mut _16: std::future::ResumeTy;
+    let mut _17: isize;
+    let mut _19: std::future::ResumeTy;
+    let mut _20: isize;
+    let mut _24: std::result::Result<std::sync::MutexGuard<'_, u64>, std::sync::PoisonError<std::sync::MutexGuard<'_, u64>>>;
+    let _25: &std::sync::Mutex<u64>;
+    let mut _26: &std::sync::Arc<std::sync::Mutex<u64>>;
+    let mut _27: {closure@flow.rs:527:40: 527:43};
+    let mut _28: std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _29: std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _30: &str;
+    let mut _31: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _32: std::pin::Pin<&mut std::future::Ready<std::result::Result<u64, std::string::String>>>;
+    let mut _33: &mut std::future::Ready<std::result::Result<u64, std::string::String>>;
+    let mut _34: &mut std::task::Context<'_>;
+    let mut _35: std::future::ResumeTy;
+    let mut _36: isize;
+    let mut _38: std::future::ResumeTy;
+    let mut _39: std::result::Result<u64, std::string::String>;
+    let mut _40: u32;
+    let mut _41: &mut {async fn body of wf_step_named_shared_ctor()};
+    let mut _42: &autumn_harvest::WorkflowContext;
+    let mut _43: &autumn_harvest::WorkflowContext;
+    let mut _44: std::future::ResumeTy;
+    let mut _45: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug ctx => (((*_41) as variant#3).0: &autumn_harvest::WorkflowContext);
+        coroutine debug shared => _s1;
+        scope 2 {
+            debug shared => (((*_41) as variant#4).0: std::sync::Arc<std::sync::Mutex<u64>>);
+            coroutine debug saga => _s2;
+            let _23: u64;
+            scope 3 {
+                debug saga => (((*_41) as variant#3).2: autumn_harvest::Saga<'_>);
+                let _4: std::sync::Arc<std::sync::Mutex<u64>>;
+                scope 4 {
+                    debug handle => _4;
+                    coroutine debug __awaitee => _s3;
+                    let _21: std::result::Result<std::convert::Infallible, std::string::String>;
+                    let _22: u64;
+                    scope 5 {
+                        debug __awaitee => (((*_41) as variant#3).3: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:524:19: 524:26}, SharedFuture, {closure@flow.rs:524:54: 524:57}, {async block@flow.rs:524:58: 524:63}>()});
+                        let _18: std::result::Result<u64, std::string::String>;
+                        scope 6 {
+                            debug result => _18;
+                        }
+                    }
+                    scope 7 {
+                        debug residual => _21;
+                        scope 8 {
+                        }
+                    }
+                    scope 9 {
+                        debug val => _22;
+                        scope 10 {
+                        }
+                    }
+                }
+            }
+            scope 11 {
+                debug seen => _23;
+                coroutine debug __awaitee => _s4;
+                scope 12 {
+                    debug __awaitee => (((*_41) as variant#4).1: std::future::Ready<std::result::Result<u64, std::string::String>>);
+                    let _37: std::result::Result<u64, std::string::String>;
+                    scope 13 {
+                        debug result => _37;
+                    }
+                }
+            }
+        }
+    }
+
+    bb0: {
+        _45 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _44 = std::future::ResumeTy(move _45);
+        _41 = copy (_1.0: &mut {async fn body of wf_step_named_shared_ctor()});
+        _40 = discriminant((*_41));
+        switchInt(move _40) -> [0: bb38, 1: bb37, 2: bb36, 3: bb34, 4: bb35, otherwise: bb10];
+    }
+
+    bb1: {
+        (((*_41) as variant#4).0: std::sync::Arc<std::sync::Mutex<u64>>) = Arc::<std::sync::Mutex<u64>>::new(move _3) -> [return: bb2, unwind: bb33];
+    }
+
+    bb2: {
+        _42 = no_retag copy (((*_41) as variant#3).0: &autumn_harvest::WorkflowContext);
+        (((*_41) as variant#3).2: autumn_harvest::Saga<'_>) = Saga::<'_>::new(copy _42) -> [return: bb3, unwind: bb32];
+    }
+
+    bb3: {
+        _5 = &(((*_41) as variant#4).0: std::sync::Arc<std::sync::Mutex<u64>>);
+        _4 = <Arc<std::sync::Mutex<u64>> as Clone>::clone(move _5) -> [return: bb4, unwind: bb32];
+    }
+
+    bb4: {
+        _9 = &mut (((*_41) as variant#3).2: autumn_harvest::Saga<'_>);
+        _10 = {closure@flow.rs:524:19: 524:26} { handle: move _4 };
+        _11 = {closure@flow.rs:524:54: 524:57};
+        _8 = Saga::<'_>::step::<u64, {closure@flow.rs:524:19: 524:26}, SharedFuture, {closure@flow.rs:524:54: 524:57}, {async block@flow.rs:524:58: 524:63}>(move _9, move _10, move _11) -> [return: bb5, unwind: bb32];
+    }
+
+    bb5: {
+        _7 = <{async fn body of Saga<'_>::step<u64, {closure@flow.rs:524:19: 524:26}, SharedFuture, {closure@flow.rs:524:54: 524:57}, {async block@flow.rs:524:58: 524:63}>()} as IntoFuture>::into_future(move _8) -> [return: bb6, unwind: bb32];
+    }
+
+    bb6: {
+        (((*_41) as variant#3).3: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:524:19: 524:26}, SharedFuture, {closure@flow.rs:524:54: 524:57}, {async block@flow.rs:524:58: 524:63}>()}) = move _7;
+        goto -> bb7;
+    }
+
+    bb7: {
+        _14 = &mut (((*_41) as variant#3).3: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:524:19: 524:26}, SharedFuture, {closure@flow.rs:524:54: 524:57}, {async block@flow.rs:524:58: 524:63}>()});
+        _13 = Pin::<&mut {async fn body of Saga<'_>::step<u64, {closure@flow.rs:524:19: 524:26}, SharedFuture, {closure@flow.rs:524:54: 524:57}, {async block@flow.rs:524:58: 524:63}>()}>::new_unchecked(copy _14) -> [return: bb8, unwind: bb31];
+    }
+
+    bb8: {
+        _16 = copy _44;
+        _15 = copy (_16.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
+        _12 = <{async fn body of Saga<'_>::step<u64, {closure@flow.rs:524:19: 524:26}, SharedFuture, {closure@flow.rs:524:54: 524:57}, {async block@flow.rs:524:58: 524:63}>()} as Future>::poll(move _13, copy _15) -> [return: bb9, unwind: bb31];
+    }
+
+    bb9: {
+        _17 = discriminant(_12);
+        switchInt(move _17) -> [0: bb12, 1: bb11, otherwise: bb10];
+    }
+
+    bb10: {
+        unreachable;
+    }
+
+    bb11: {
+        _0 = Poll::<Result<u64, String>>::Pending;
+        discriminant((*_41)) = 3;
+        return;
+    }
+
+    bb12: {
+        _18 = move ((_12 as Ready).0: std::result::Result<u64, std::string::String>);
+        drop((((*_41) as variant#3).3: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:524:19: 524:26}, SharedFuture, {closure@flow.rs:524:54: 524:57}, {async block@flow.rs:524:58: 524:63}>()})) -> [return: bb13, unwind: bb32];
+    }
+
+    bb13: {
+        _6 = <Result<u64, String> as Try>::branch(copy _18) -> [return: bb14, unwind: bb32];
+    }
+
+    bb14: {
+        _20 = discriminant(_6);
+        switchInt(move _20) -> [0: bb15, 1: bb16, otherwise: bb10];
+    }
+
+    bb15: {
+        _22 = copy ((_6 as Continue).0: u64);
+        _26 = &(((*_41) as variant#4).0: std::sync::Arc<std::sync::Mutex<u64>>);
+        _25 = <Arc<std::sync::Mutex<u64>> as Deref>::deref(move _26) -> [return: bb18, unwind: bb32];
+    }
+
+    bb16: {
+        _21 = move ((_6 as Break).0: std::result::Result<std::convert::Infallible, std::string::String>);
+        _39 = <Result<u64, String> as FromResidual<Result<Infallible, String>>>::from_residual(copy _21) -> [return: bb17, unwind: bb32];
+    }
+
+    bb17: {
+        drop((((*_41) as variant#4).0: std::sync::Arc<std::sync::Mutex<u64>>)) -> [return: bb29, unwind: bb33];
+    }
+
+    bb18: {
+        _24 = std::sync::Mutex::<u64>::lock(copy _25) -> [return: bb19, unwind: bb32];
+    }
+
+    bb19: {
+        _27 = {closure@flow.rs:527:40: 527:43};
+        _23 = Result::<std::sync::MutexGuard<'_, u64>, PoisonError<std::sync::MutexGuard<'_, u64>>>::map_or::<u64, {closure@flow.rs:527:40: 527:43}>(move _24, const 0_u64, move _27) -> [return: bb20, unwind: bb32];
+    }
+
+    bb20: {
+        _43 = no_retag copy (((*_41) as variant#3).0: &autumn_harvest::WorkflowContext);
+        _30 = const "b";
+        _29 = WorkflowContext::execute_activity_raw(copy _43, move _30, copy _23) -> [return: bb21, unwind: bb32];
+    }
+
+    bb21: {
+        _28 = <std::future::Ready<Result<u64, String>> as IntoFuture>::into_future(move _29) -> [return: bb22, unwind: bb32];
+    }
+
+    bb22: {
+        (((*_41) as variant#4).1: std::future::Ready<std::result::Result<u64, std::string::String>>) = move _28;
+        goto -> bb23;
+    }
+
+    bb23: {
+        _33 = &mut (((*_41) as variant#4).1: std::future::Ready<std::result::Result<u64, std::string::String>>);
+        _32 = Pin::<&mut std::future::Ready<Result<u64, String>>>::new_unchecked(copy _33) -> [return: bb24, unwind: bb30];
+    }
+
+    bb24: {
+        _35 = copy _44;
+        _34 = copy (_35.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
+        _31 = <std::future::Ready<Result<u64, String>> as Future>::poll(move _32, copy _34) -> [return: bb25, unwind: bb30];
+    }
+
+    bb25: {
+        _36 = discriminant(_31);
+        switchInt(move _36) -> [0: bb27, 1: bb26, otherwise: bb10];
+    }
+
+    bb26: {
+        _0 = Poll::<Result<u64, String>>::Pending;
+        discriminant((*_41)) = 4;
+        return;
+    }
+
+    bb27: {
+        _37 = move ((_31 as Ready).0: std::result::Result<u64, std::string::String>);
+        _39 = move _37;
+        drop((((*_41) as variant#4).1: std::future::Ready<std::result::Result<u64, std::string::String>>)) -> [return: bb28, unwind: bb32];
+    }
+
+    bb28: {
+        drop((((*_41) as variant#4).0: std::sync::Arc<std::sync::Mutex<u64>>)) -> [return: bb29, unwind: bb33];
+    }
+
+    bb29: {
+        _0 = Poll::<Result<u64, String>>::Ready(move _39);
+        discriminant((*_41)) = 1;
+        return;
+    }
+
+    bb30 (cleanup): {
+        drop((((*_41) as variant#4).1: std::future::Ready<std::result::Result<u64, std::string::String>>)) -> [return: bb32, unwind terminate(cleanup)];
+    }
+
+    bb31 (cleanup): {
+        drop((((*_41) as variant#3).3: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:524:19: 524:26}, SharedFuture, {closure@flow.rs:524:54: 524:57}, {async block@flow.rs:524:58: 524:63}>()})) -> [return: bb32, unwind terminate(cleanup)];
+    }
+
+    bb32 (cleanup): {
+        drop((((*_41) as variant#4).0: std::sync::Arc<std::sync::Mutex<u64>>)) -> [return: bb33, unwind terminate(cleanup)];
+    }
+
+    bb33 (cleanup): {
+        discriminant((*_41)) = 2;
+        resume;
+    }
+
+    bb34: {
+        _19 = move _44;
+        _44 = move _19;
+        goto -> bb7;
+    }
+
+    bb35: {
+        _38 = move _44;
+        _44 = move _38;
+        goto -> bb23;
+    }
+
+    bb36: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb36, unwind continue];
+    }
+
+    bb37: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb37, unwind continue];
+    }
+
+    bb38: {
+        (((*_41) as variant#3).0: &autumn_harvest::WorkflowContext) = copy ((*_41).0: &autumn_harvest::WorkflowContext);
+        _3 = std::sync::Mutex::<u64>::new(const 0_u64) -> [return: bb1, unwind: bb33];
+    }
+}
+
+alloc5 (size: 1, align: 1) {
+    62                                              │ b
+}
+
+fn wf_step_named_shared_ctor::{closure#0}::{closure#0}(_1: {closure@flow.rs:524:19: 524:26}) -> SharedFuture {
+    debug handle => (_1.0: std::sync::Arc<std::sync::Mutex<u64>>);
+    let mut _0: SharedFuture;
+    let mut _2: std::sync::Arc<std::sync::Mutex<u64>>;
+
+    bb0: {
+        _2 = move (_1.0: std::sync::Arc<std::sync::Mutex<u64>>);
+        _0 = SharedFuture::new(move _2) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+fn wf_step_named_shared_ctor::{closure#0}::{closure#1}(_1: {closure@flow.rs:524:54: 524:57}, _2: u64) -> {async block@flow.rs:524:58: 524:63} {
+    let mut _0: {async block@flow.rs:524:58: 524:63};
+
+    bb0: {
+        _0 = {coroutine@flow.rs:524:58: 524:63 (#0)};
+        return;
+    }
+}
+
+fn wf_step_named_shared_ctor::{closure#0}::{closure#1}::{closure#0}(_1: Pin<&mut {async block@flow.rs:524:58: 524:63}>, _2: &mut Context<'_>) -> Poll<Result<(), String>> {
+    coroutine layout {
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+        }
+        storage_conflicts = BitMatrix(0x0) {}
+    }
+    debug _task_context => _7;
+    let mut _0: std::task::Poll<std::result::Result<(), std::string::String>>;
+    let mut _3: ();
+    let mut _4: std::result::Result<(), std::string::String>;
+    let mut _5: u32;
+    let mut _6: &mut {async block@flow.rs:524:58: 524:63};
+    let mut _7: std::future::ResumeTy;
+    let mut _8: std::ptr::NonNull<std::task::Context<'_>>;
+
+    bb0: {
+        _8 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _7 = std::future::ResumeTy(move _8);
+        _6 = copy (_1.0: &mut {async block@flow.rs:524:58: 524:63});
+        _5 = discriminant((*_6));
+        switchInt(move _5) -> [0: bb3, 1: bb1, otherwise: bb2];
+    }
+
+    bb1: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb1, unwind continue];
+    }
+
+    bb2: {
+        unreachable;
+    }
+
+    bb3: {
+        _3 = ();
+        _4 = Result::<(), String>::Ok(move _3);
+        _0 = Poll::<Result<(), String>>::Ready(move _4);
+        discriminant((*_6)) = 1;
+        return;
+    }
+}
+
+fn wf_step_named_shared_ctor::{closure#0}::{closure#2}(_1: {closure@flow.rs:527:40: 527:43}, _2: std::sync::MutexGuard<'_, u64>) -> u64 {
+    debug v => _2;
+    let mut _0: u64;
+    let mut _3: &u64;
+    let mut _4: &std::sync::MutexGuard<'_, u64>;
+
+    bb0: {
+        _4 = &_2;
+        _3 = <std::sync::MutexGuard<'_, u64> as Deref>::deref(move _4) -> [return: bb1, unwind: bb3];
+    }
+
+    bb1: {
+        _0 = copy (*_3);
+        drop(_2) -> [return: bb2, unwind continue];
+    }
+
+    bb2: {
+        return;
+    }
+
+    bb3 (cleanup): {
+        drop(_2) -> [return: bb4, unwind terminate(cleanup)];
+    }
+
+    bb4 (cleanup): {
+        resume;
+    }
+}
+
 fn Wrap(_1: F) -> Wrap<F> {
     let mut _0: Wrap<F>;
 

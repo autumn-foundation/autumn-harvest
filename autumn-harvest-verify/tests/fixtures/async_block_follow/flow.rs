@@ -503,3 +503,27 @@ pub async fn wf_step_named_shared_future(ctx: &WorkflowContext) -> Out {
     let seen = shared.lock().map_or(0, |v| *v);
     ctx.execute_activity_raw("b", seen).await
 }
+
+impl SharedFuture {
+    /// Builds the future around the shared state.
+    pub fn new(shared: std::sync::Arc<std::sync::Mutex<u64>>) -> Self {
+        Self { shared }
+    }
+}
+
+pub fn __autumn_workflow_info_wf_step_named_shared_ctor() -> u8 {
+    0
+}
+
+/// As `wf_step_named_shared_future`, through a first-party constructor.
+pub async fn wf_step_named_shared_ctor(ctx: &WorkflowContext) -> Out {
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(0_u64));
+    {
+        let mut saga = Saga::new(ctx);
+        let handle = shared.clone();
+        saga.step(move || SharedFuture::new(handle), |_| async { Ok(()) })
+            .await?;
+    }
+    let seen = shared.lock().map_or(0, |v| *v);
+    ctx.execute_activity_raw("b", seen).await
+}
