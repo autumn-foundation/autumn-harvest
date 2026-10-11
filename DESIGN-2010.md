@@ -47,7 +47,7 @@ work is in `autumn-harvest-verify` only.
 | R4 | Use two sagas. An unwind of one clears the other. | Two or more `saga-new` nodes in one body give `multiple-sagas`. |
 | R5 | The coroutine dispatch adds false paths or hides real ones. | The entry is the target of state `0`. In the fixture, each resume target jumps back into a poll loop that state `0` reaches. |
 | R6 | Read an old manifest with no flow graph. Every workflow then reads as "no saga". | The manifest names its flow format. The check refuses a manifest without it. |
-| R7 | A boundary hides the body that owns the saga. | A workflow with no saga and a boundary gets `unknown`, not `no-saga`. |
+| R7 | A boundary hides the body that owns the saga. | A boundary that runs code gives `unknown`, with or without a saga in sight. An `external-const` runs no code. |
 | R8 | Ignore the result: `let _ = saga.step(..).await`. | No `Try::branch` reads it, so the result is untracked. |
 | R9 | A step sits in a loop, and a later iteration fails outside the saga. | The check is a fixpoint over cycles. |
 | R10 | A compensation emits no command. | It is a `noop-compensation` note. Some steps have nothing to undo. |
@@ -101,6 +101,9 @@ Four review agents read the first version. Each fix has a test.
     `other::Saga::compensate_all`, read as the engine unwind. A saga
     method now needs the engine path, `Saga` or `autumn_harvest::..`, and
     no body here. Any other such call is a `saga-escape`.
+12. A boundary counted only when no saga was in sight. A body outside the
+    analysis can hold a second saga with a gap. Now each boundary that runs
+    code gives `unknown`. An `external-const` does not count.
 
 ---
 
@@ -153,10 +156,10 @@ flag is a **gap**. In any other body, an exit with a set flag gives
 
 | Verdict | When |
 |---|---|
-| `no-saga` | No body has a saga node, and the workflow has no boundary. |
+| `no-saga` | No body has a saga node, and no boundary runs code. |
 | `covered` | No gap, and no reason for `unknown`. |
 | `gap` | At least one gap, and no reason for `unknown`. |
-| `unknown` | `saga-escapes`, `saga-result-untracked`, `multiple-sagas`, `saga-recreated`, `saga-dropped-pending`, `no-flow-graph`, or a boundary with no saga in sight. The report lists each gap as possible. |
+| `unknown` | `saga-escapes`, `saga-result-untracked`, `multiple-sagas`, `saga-recreated`, `saga-dropped-pending`, `no-flow-graph`, or a boundary that runs code. The report lists each gap as possible. |
 
 A `noop-compensation` note does not change the verdict.
 

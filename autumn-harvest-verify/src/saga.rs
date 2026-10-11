@@ -20,7 +20,9 @@
 //! - A saga escapes the body that owns it.
 //! - The result of a step is untracked.
 //! - One body builds two sagas.
-//! - The workflow has a boundary and no saga in sight.
+//! - The workflow has a boundary that runs code. A body outside the
+//!   analysis can hold a saga and a gap, even beside a visible saga. An
+//!   external constant runs no code, so it does not count.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -274,8 +276,10 @@ pub fn check_workflow(workflow: &WorkflowStructure) -> SagaReport {
         unknown.extend(reasons);
     }
 
-    if !uses_saga {
-        for boundary in &workflow.boundaries {
+    // A body outside the analysis can hold a saga and a gap, whether or not
+    // a saga is in sight. An external constant runs no code, so it cannot.
+    for boundary in &workflow.boundaries {
+        if !boundary.starts_with("external-const:") {
             unknown.insert(format!("boundary: {boundary}"));
         }
     }
@@ -642,5 +646,33 @@ mod tests {
             check_workflow(&workflow(graph)).verdict,
             SagaVerdict::Covered
         );
+    }
+
+    #[test]
+    fn a_boundary_that_runs_code_is_unknown_beside_a_visible_saga() {
+        let graph = FlowGraph {
+            nodes: vec![
+                node(FlowEvent::Entry),
+                node(FlowEvent::SagaNew),
+                node(FlowEvent::Exit {
+                    outcome: ExitOutcome::Ok,
+                }),
+            ],
+            edges: vec![edge(0, 1, None), edge(1, 2, None)],
+        };
+        // A body outside the analysis can hold a second saga with a gap.
+        let mut hidden = workflow(graph.clone());
+        hidden.boundaries = vec!["external-crate-body: dep::book".to_string()];
+        let r = check_workflow(&hidden);
+        assert_eq!(r.verdict, SagaVerdict::Unknown, "{r:#?}");
+        assert!(
+            r.unknown.iter().any(|u| u.starts_with("boundary: ")),
+            "{r:#?}"
+        );
+
+        // An external constant runs no code, so it cannot hide a saga.
+        let mut constant = workflow(graph);
+        constant.boundaries = vec!["external-const: dep::LIMIT".to_string()];
+        assert_eq!(check_workflow(&constant).verdict, SagaVerdict::Covered);
     }
 }

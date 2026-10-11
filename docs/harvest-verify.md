@@ -340,7 +340,7 @@ checked 2: covered 1, gap 1, unknown 0, no-saga 0
 | `saga-recreated` | A new saga starts while a step of the old one is pending. |
 | `saga-dropped-pending` | A body other than the workflow root exits with a step pending. Its caller cannot unwind that step. |
 | `no-flow-graph` | A body in the manifest has no flow graph. |
-| `boundary` | The workflow has a boundary and no saga in sight. The boundary can hide one. |
+| `boundary` | The workflow has a boundary that runs code. It can hide a saga and a gap, with or without a saga in sight. An `external-const` runs no code, so it does not count. |
 
 A `noop-compensation` note marks a compensation that emits no command. It
 does not change the verdict.

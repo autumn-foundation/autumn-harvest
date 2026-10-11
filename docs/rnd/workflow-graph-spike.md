@@ -103,7 +103,9 @@ The check gives these verdicts:
 | Exits with an `unknown` outcome | 18 of 242 (7.4 %) |
 
 All four `unknown` coverage verdicts have the reason `boundary`. The
-workflow has no saga in sight, and a boundary could hide one.
+workflow has no saga in sight, and a boundary could hide one. A boundary
+that runs code gives `unknown` beside a visible saga too. An
+`external-const` runs no code, so `billing_checkout` keeps its verdict.
 
 ### The gaps are real
 
@@ -194,6 +196,9 @@ each fix has a test:
   a graph.
 - A local `other::Saga::compensate_all` that took the engine saga read as
   the engine unwind. It gave a false `covered`. It is now a `saga-escapes`.
+- A boundary counted only when no saga was in sight. A body outside the
+  analysis can hold a second saga with a gap. Each boundary that runs code
+  now gives `unknown`.
 
 ### Generics and third-party crates
 
@@ -286,6 +291,7 @@ crate its own `--target-dir`, and delete it after the run.
 | A future of an untrusted crate is a boundary | `async_block_follow::a_future_of_an_untrusted_crate_is_a_boundary` |
 | The check refuses a malformed or disconnected graph | `saga::tests::a_malformed_graph_is_refused` |
 | A local type named `Saga` is not the engine saga | `saga_graph::a_local_type_named_saga_is_not_the_engine_saga` |
+| A boundary that runs code is `unknown` beside a saga | `saga::tests::a_boundary_that_runs_code_is_unknown_beside_a_visible_saga` |
 | The check refuses an old manifest | `saga_graph::a_manifest_without_flow_graphs_is_refused`; `cli::check_structure_refuses_a_manifest_without_flow_graphs` |
 | The CLI exit codes | `cli::check_structure_prints_a_verdict_per_workflow_and_fails_on_a_gap`; `cli::check_structure_strict_fails_on_unknown` |
 | A bin target is analyzable | `driver::tests::an_uplifted_bin_is_resolved_through_its_hard_link_in_deps` |
