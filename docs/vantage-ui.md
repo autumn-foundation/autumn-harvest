@@ -317,7 +317,8 @@ the next 60 s fetch, because the execution stream sends events only.
 
 The detail page of a run that ended has no live script. When a live run ends,
 the stream sends `stream-end`, the script fetches the page one last time, and
-then it stops. A page rendered after a rejected action has no live script, so
+then it stops. A region in use at that time takes the final state when the
+operator leaves it. A page rendered after a rejected action has no live script, so
 the values that the operator typed stay.
 
 A browser without JavaScript gets the same server-rendered pages. The

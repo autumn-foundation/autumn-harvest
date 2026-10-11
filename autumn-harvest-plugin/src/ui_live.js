@@ -143,9 +143,11 @@
   }
 
   // Tries a kept document again until each region takes it.
+  // It runs after a stop too, so a region in use when the run ends still
+  // takes the final state.
   function retryKept() {
     keptTimer = null;
-    if (!keptDoc || stopped) {
+    if (!keptDoc) {
       return;
     }
     if (swap(keptDoc) === "kept") {
@@ -196,17 +198,21 @@
         if (result === "foreign") {
           throw new Error("not this page");
         }
-        if (stopped) {
-          return;
-        }
         if (result === "kept") {
           keptDoc = doc;
           if (!keptTimer) {
             keptTimer = setTimeout(retryKept, minGap);
           }
-          setStatus("Live. Part of the page waits while you use it.");
         } else {
           keptDoc = null;
+        }
+        // After a stop, the status keeps the stop text.
+        if (stopped) {
+          return;
+        }
+        if (result === "kept") {
+          setStatus("Live. Part of the page waits while you use it.");
+        } else {
           setStatus("Live. Updated " + new Date().toLocaleTimeString() + ".");
         }
       })
