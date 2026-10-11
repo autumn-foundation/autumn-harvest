@@ -154,6 +154,7 @@ pub fn dropped_key(prefix: &str) -> String {
 /// Each verified export writes it. The next pass reads it to find an export
 /// to use again. A stale hint costs one new export, not data, because the
 /// drop checks the partition against the manifest under its lock.
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
 fn latest_key(prefix: &str) -> String {
     format!("{prefix}/latest.json")
 }
@@ -611,15 +612,18 @@ impl DirectoryPartitionArchiver {
 }
 
 /// Write `bytes` to a temporary file next to `path`, sync it, rename it, and
-/// sync the directory.
-async fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt as _;
+/// sync the directories.
+///
+/// `std::fs`, not `tokio::fs`: loom and shuttle builds compile `tokio::fs`
+/// out. The caller runs this on the blocking pool.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     // A new directory's entry lives in its parent. List the directories that
     // `create_dir_all` makes, so their parents can be synced after the write.
     let mut created = Vec::new();
     let mut probe = dir;
-    while let Err(e) = tokio::fs::metadata(probe).await {
+    while let Err(e) = std::fs::metadata(probe) {
         if e.kind() != std::io::ErrorKind::NotFound {
             return Err(e);
         }
@@ -629,60 +633,72 @@ async fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             _ => break,
         }
     }
-    tokio::fs::create_dir_all(dir).await?;
+    std::fs::create_dir_all(dir)?;
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("object");
     let tmp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
-    let written = async {
-        let mut file = tokio::fs::File::create(&tmp).await?;
-        file.write_all(bytes).await?;
-        file.sync_all().await?;
+    let written = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
         drop(file);
-        tokio::fs::rename(&tmp, path).await?;
-        sync_dir(dir).await?;
+        std::fs::rename(&tmp, path)?;
+        sync_dir(dir)?;
         for new_dir in &created {
             if let Some(parent) = new_dir.parent() {
-                sync_dir(parent).await?;
+                sync_dir(parent)?;
             }
         }
         Ok(())
-    }
-    .await;
+    })();
     if written.is_err() {
-        let _ = tokio::fs::remove_file(&tmp).await;
+        let _ = std::fs::remove_file(&tmp);
     }
     written
 }
 
 /// Sync a directory, so a rename in it survives a crash. A no-op off Unix,
 /// where a directory cannot be opened for a sync.
-async fn sync_dir(dir: &Path) -> std::io::Result<()> {
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
-    tokio::fs::File::open(dir).await?.sync_all().await?;
+    std::fs::File::open(dir)?.sync_all()?;
     #[cfg(not(unix))]
     let _ = dir;
     Ok(())
+}
+
+/// Read the file at `path`, or `None` when it does not exist.
+fn read_file(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Run blocking file I/O on the blocking pool, off the async workers.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> Result<T, ArchiveError> {
+    Ok(tokio::task::spawn_blocking(work).await??)
 }
 
 impl PartitionArchiver for DirectoryPartitionArchiver {
     fn put<'a>(&'a self, key: &'a str, bytes: Vec<u8>) -> ArchiveIo<'a, ()> {
         let path = self.path_of(key);
         Box::pin(async move {
-            write_atomic(&path?, &bytes).await?;
-            Ok(())
+            let path = path?;
+            blocking(move || write_atomic(&path, &bytes)).await
         })
     }
 
     fn get<'a>(&'a self, key: &'a str) -> ArchiveIo<'a, Option<Vec<u8>>> {
         let path = self.path_of(key);
         Box::pin(async move {
-            match tokio::fs::read(path?).await {
-                Ok(bytes) => Ok(Some(bytes)),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(e) => Err(e.into()),
-            }
+            let path = path?;
+            blocking(move || read_file(&path)).await
         })
     }
 }
