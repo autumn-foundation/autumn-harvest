@@ -41768,9 +41768,9 @@ fn apply_min_history_events_filter(
 /// `harvest_workflow_executions` query. `visibility_query::SqlFilter` holds
 /// the SQL for all three.
 ///
-/// Shared by all three list loaders so each list code path filters
-/// identically — without this the `no_progress_minutes` (stalled)
-/// path silently ignored every search-attribute filter (issue #506 review).
+/// All three list loaders share this helper, so each list path filters the
+/// same way. Before issue #506, the `no_progress_minutes` (stalled) path
+/// ignored every search-attribute filter.
 ///
 /// Every fragment stays on an index path: `@>` (containment) and `?` (key
 /// existence) both hit the existing `idx_harvest_we_search` GIN index;
