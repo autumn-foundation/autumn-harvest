@@ -15,6 +15,10 @@
 //! [`Fence::PrefixOnly`] is the check of most suspended commit paths today.
 //! [`Logging::ReadsOnly`] is the asymmetric logging of Halfmoon.
 //!
+//! Two engine rules hold in every mode. A commit fails when an activity
+//! result was appended after its decision read the history. An activity
+//! result waits for the row lock of a commit in flight.
+//!
 //! See `docs/rnd/speculative-execution-spike.md`.
 
 use std::cmp::Ordering;
@@ -450,6 +454,11 @@ pub struct SpecStats {
     pub fenced: u64,
     /// Commits that the prefix check rejected.
     pub prefix_lost: u64,
+    /// Commits that lost because a result was appended after their decision
+    /// read the history. They also count in `prefix_lost`.
+    pub stale_reads: u64,
+    /// Result appends that waited for the row lock of a commit in flight.
+    pub blocked_results: u64,
     /// Commits that failed and applied nothing.
     pub failed_commits: u64,
     /// Commits that applied from a worker without the current claim.
@@ -491,6 +500,8 @@ impl SpecStats {
         self.discarded_speculative += other.discarded_speculative;
         self.fenced += other.fenced;
         self.prefix_lost += other.prefix_lost;
+        self.stale_reads += other.stale_reads;
+        self.blocked_results += other.blocked_results;
         self.failed_commits += other.failed_commits;
         self.stale_commits += other.stale_commits;
         self.crashes += other.crashes;
@@ -689,6 +700,10 @@ struct Exec {
     replayed: State,
     scheduled: BTreeSet<Effect>,
     results: BTreeSet<(u32, u32)>,
+    /// The commits in flight. Each holds the row lock of the execution.
+    locks: BTreeSet<u64>,
+    /// Results that wait for the row lock.
+    blocked: Vec<Effect>,
     started_at: u64,
     done: bool,
 }
@@ -746,6 +761,7 @@ enum Event {
         epoch: u32,
         decision: Decision,
         fail: bool,
+        stale: bool,
         id: u64,
     },
     /// The worker reads the outcome of its commit.
@@ -796,6 +812,19 @@ impl Ord for Queued {
     fn cmp(&self, other: &Self) -> Ordering {
         (other.at, other.seq).cmp(&(self.at, self.seq))
     }
+}
+
+/// The fields of a commit that reaches the store.
+#[derive(Debug, Clone, Copy)]
+struct Sent {
+    worker: Holder,
+    exec: usize,
+    generation: u64,
+    epoch: u32,
+    fail: bool,
+    /// A result was appended after the decision read the history.
+    stale: bool,
+    id: u64,
 }
 
 /// The outcome of a commit at the store.
@@ -890,6 +919,8 @@ impl<'a> Model<'a> {
                 replayed: State::default(),
                 scheduled: BTreeSet::new(),
                 results: BTreeSet::new(),
+                locks: BTreeSet::new(),
+                blocked: Vec::new(),
                 started_at,
                 done: false,
             });
@@ -1049,8 +1080,20 @@ impl<'a> Model<'a> {
                 epoch,
                 decision,
                 fail,
+                stale,
                 id,
-            } => self.commit(worker, exec, generation, epoch, &decision, fail, id),
+            } => {
+                let commit = Sent {
+                    worker,
+                    exec,
+                    generation,
+                    epoch,
+                    fail,
+                    stale,
+                    id,
+                };
+                self.commit(&commit, &decision);
+            }
             Event::Respond {
                 worker,
                 exec,
@@ -1246,6 +1289,17 @@ impl<'a> Model<'a> {
         self.next_commit += 1;
         let id = self.next_commit;
         self.in_flight.insert(id, (worker, key));
+        // The commit appends from the event id that its decision read. A
+        // result appended since then takes that id, and the commit fails on
+        // `UNIQUE (workflow_exec_id, event_id)`.
+        let durable = &mut self.execs[exec];
+        let stale_read = durable
+            .inputs
+            .get(decision.seen..)
+            .unwrap_or_default()
+            .iter()
+            .any(|input| matches!(input, Input::Result { .. }));
+        durable.locks.insert(id);
         if crash {
             self.faults += 1;
             self.push(self.now + crash_at, Event::Crash { worker: worker.0 });
@@ -1257,28 +1311,27 @@ impl<'a> Model<'a> {
             epoch,
             decision,
             fail,
+            stale: stale_read,
             id,
         };
         self.push(self.now + flight, event);
     }
 
-    #[allow(clippy::too_many_arguments, reason = "the fields of one commit event")]
-    fn commit(
-        &mut self,
-        worker: Holder,
-        exec: usize,
-        generation: u64,
-        epoch: u32,
-        decision: &Decision,
-        fail: bool,
-        id: u64,
-    ) {
+    fn commit(&mut self, commit: &Sent, decision: &Decision) {
+        let Sent {
+            worker,
+            exec,
+            generation,
+            id,
+            ..
+        } = *commit;
         self.in_flight.remove(&id);
         if self.lost.remove(&id) {
             return;
         }
         // The store applies the commit now, even when the worker is stalled.
-        let outcome = self.apply(worker, exec, epoch, decision, fail);
+        let outcome = self.apply(commit, decision);
+        self.execs[exec].locks.remove(&id);
         let orphan = self.orphans.remove(&id);
         if orphan && outcome == CommitOutcome::Applied {
             self.stats.landed_in_crash += 1;
@@ -1288,6 +1341,7 @@ impl<'a> Model<'a> {
             &format!("e{exec} commit d{} {}", decision.base, outcome.as_str()),
         );
         if orphan {
+            self.flush(exec);
             return;
         }
         let respond = Event::Respond {
@@ -1300,6 +1354,19 @@ impl<'a> Model<'a> {
         match self.stalled(worker) {
             Some(until) => self.push(until, respond),
             None => self.respond(worker, exec, generation, outcome),
+        }
+        // A response can send the next commit first. It then takes the lock
+        // again, and the blocked results keep waiting.
+        self.flush(exec);
+    }
+
+    /// Append the blocked results of `exec`, if no commit holds its lock.
+    fn flush(&mut self, exec: usize) {
+        if !self.execs[exec].locks.is_empty() {
+            return;
+        }
+        for effect in std::mem::take(&mut self.execs[exec].blocked) {
+            self.effect_done(effect);
         }
     }
 
@@ -1328,14 +1395,15 @@ impl<'a> Model<'a> {
     }
 
     /// Apply a commit at the store.
-    fn apply(
-        &mut self,
-        worker: Holder,
-        exec: usize,
-        epoch: u32,
-        decision: &Decision,
-        fail: bool,
-    ) -> CommitOutcome {
+    fn apply(&mut self, commit: &Sent, decision: &Decision) -> CommitOutcome {
+        let Sent {
+            worker,
+            exec,
+            epoch,
+            fail,
+            stale,
+            ..
+        } = *commit;
         let durable = &self.execs[exec];
         let owner = durable.owner == worker && durable.epoch == epoch;
         if fail {
@@ -1346,8 +1414,9 @@ impl<'a> Model<'a> {
             self.stats.fenced += 1;
             return CommitOutcome::Fenced;
         }
-        if decision.base != durable.decisions {
+        if decision.base != durable.decisions || stale {
             self.stats.prefix_lost += 1;
+            self.stats.stale_reads += u64::from(stale);
             return CommitOutcome::PrefixLost;
         }
         if !owner {
@@ -1497,6 +1566,12 @@ impl<'a> Model<'a> {
 
     fn effect_done(&mut self, effect: Effect) {
         let durable = &mut self.execs[effect.exec];
+        if !durable.locks.is_empty() {
+            // The append waits for the row lock of the commit in flight.
+            durable.blocked.push(effect);
+            self.stats.blocked_results += 1;
+            return;
+        }
         if !durable.scheduled.contains(&effect) {
             self.stats.orphan_results += 1;
             self.log("act", &format!("{effect} result rejected"));
@@ -1538,6 +1613,12 @@ impl<'a> Model<'a> {
             } else {
                 self.stats.lost_in_crash += 1;
                 self.lost.insert(id);
+                // The connection dies, so the transaction and its lock end.
+                for exec in 0..self.execs.len() {
+                    if self.execs[exec].locks.remove(&id) {
+                        self.flush(exec);
+                    }
+                }
             }
         }
         self.log(&Self::label(holder), "crash");

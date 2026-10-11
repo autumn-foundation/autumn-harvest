@@ -290,6 +290,22 @@ fn a_speculation_only_defect_is_found_and_replays_from_its_seed() {
 }
 
 #[test]
+fn a_result_waits_for_the_row_lock_and_a_stale_read_loses() {
+    let summary = speculate::sweep(&SWEEP, |seed| {
+        SpecConfig::new(seed)
+            .with_workload(Workload::FanOut)
+            .with_timing(SPREAD)
+    })
+    .unwrap_or_else(|failure| panic!("{failure}"));
+    let stats = summary.stats;
+    // A result that lands while a commit holds the row lock waits for it.
+    assert!(stats.blocked_results > 0, "{stats:?}");
+    // A result appended after a decision read the history fails its commit.
+    assert!(stats.stale_reads > 0, "{stats:?}");
+    assert_eq!(stats.completed, SWEEP.count * 4, "{stats:?}");
+}
+
+#[test]
 fn eager_release_hides_one_commit_per_hop_on_a_chain() {
     let serial = speculate::run(&quiet(0, Mode::Serial, Workload::Chain));
     let eager = speculate::run(&quiet(0, Mode::Eager, Workload::Chain).checking(&[]));

@@ -99,6 +99,14 @@ workflows read the event id again under the row lock, so they have no
 prefix check. No suspended branch checks the claim epoch, unless the run
 is paused. `PrefixOnly` models the common branches.
 
+Two more engine rules apply in every mode:
+
+- A commit fails when an activity result was appended after its decision
+  read the history. The result took the event id that the commit uses.
+- A commit holds the row lock of its execution while it is in flight. An
+  activity result waits for that lock before it appends. A signal does
+  not wait: it goes to a separate table until a decision reads it.
+
 At each commit send, the seed can inject three faults:
 
 - a crash while the commit is in flight;
@@ -215,12 +223,12 @@ unless a row says otherwise.
 | Config | Result |
 |---|---|
 | `Serial` and `Gated`, `Chain` and `FanOut`, `Full` and `ReadsOnly` | Pass. Every invariant holds in all 8 configs. |
-| `Gated`, `FanOut`, spread timing, busy faults | Pass. 80 speculative decisions were discarded and repaired. |
+| `Gated`, `FanOut`, spread timing, busy faults | Pass. 278 speculative decisions were discarded and repaired. |
 | `Gated` with the `keep-tail` plant, the config above | Fail on seed 41: `ReplayEquivalent`. |
 | `Serial` with the `keep-tail` plant, the same config | Pass. `Serial` has no speculative tail. |
 | `Gated` with the `keep-on-failure` plant | Fail on seed 0: `Converges` on `Chain`, `ReplayEquivalent` on `FanOut`. |
 | `Gated`, `PrefixOnly` fence, all checks | Fail on seed 18 (`Chain`) and seed 24 (`FanOut`): `CommitByOwner`. |
-| `Gated`, `PrefixOnly` fence, all other checks | Pass. 50 stale commits on `Chain` and 64 on `FanOut` do no harm. |
+| `Gated`, `PrefixOnly` fence, all other checks | Pass. 50 stale commits on `Chain` and 62 on `FanOut` do no harm. |
 | `Eager`, `EffectAfterCommit` | Fail on seed 0. An effect leaves before its commit, by design. |
 | `Eager`, `EffectOnce` | Fail on seed 0. |
 | `Eager`, `Converges` | Fail on seed 3. |
@@ -247,8 +255,8 @@ The `Eager` failures have two causes:
   nothing runs the effect again. The run never completes.
 
 Over 1,000 seeds, `Eager` stranded 219 of 4,000 `Chain` runs (5.5 %) and
-151 of 4,000 `FanOut` runs (3.8 %). It ran 1,190 more effects than
-`Serial` on `Chain`, and 3,536 more on `FanOut`.
+150 of 4,000 `FanOut` runs (3.8 %). It ran 1,189 more effects than
+`Serial` on `Chain`, and 3,540 more on `FanOut`.
 
 ### Latency
 
@@ -257,11 +265,11 @@ Mean latency over 4,000 runs, in milliseconds.
 | Timing | Workload | Faults | `Serial` | `Gated` | `Eager` |
 |---|---|---|--:|--:|--:|
 | Bench | `Chain` | none | 473.254 | 473.254 | 458.614 |
-| Bench | `Chain` | default | 607.280 | 607.280 | 576.072 |
-| Bench | `FanOut` | none | 287.478 | 287.478 | 278.380 |
-| Bench | `FanOut` | default | 390.983 | 390.984 | 371.977 |
-| Spread | `FanOut` | none | 341.542 | 341.542 | 330.246 |
-| Spread | `FanOut` | default | 574.641 | 574.641 | 549.476 |
+| Bench | `Chain` | default | 607.281 | 607.281 | 576.264 |
+| Bench | `FanOut` | none | 287.543 | 287.543 | 278.532 |
+| Bench | `FanOut` | default | 391.183 | 391.183 | 372.370 |
+| Spread | `FanOut` | none | 344.042 | 344.042 | 332.913 |
+| Spread | `FanOut` | default | 573.406 | 573.407 | 550.157 |
 
 The `Eager` rows with faults average only the runs that completed.
 
@@ -270,12 +278,15 @@ of 4.885 ms. At the measured commit p50 of 2.82 ms, three commits are
 1.8 % of 473.26 ms.
 
 `Gated` runs few speculative decisions, and they save nothing. With no
-faults, it made none on bench `FanOut` and 75 on spread `FanOut`. Paired
-runs gave equal latency on 982 of 1,000 spread `FanOut` seeds. Three
-facts explain this:
+faults, it made none on bench `FanOut` and 14 on spread `FanOut`. Paired
+runs gave equal latency on all 1,000 seeds of both workloads. Four facts
+explain this:
 
 - On the `Chain` workload, the next input needs an activity. The activity
   needs the commit. So no input is ready while a commit is in flight.
+- An activity result waits for the row lock of a commit in flight. So no
+  new result becomes durable during the commit. Only a signal can feed a
+  speculative decision. On spread `FanOut`, 881 result appends waited.
 - With bench timing, the four results of a round land within about
   100 µs. One 2 µs decision reads them all.
 - A speculative decision overlaps only an in-flight commit. It can save
@@ -303,6 +314,7 @@ The cited tests run 64 or 256 seeds. The 1,000-seed numbers come from
 | `a_prefix_only_fence_lets_a_stale_owner_commit` | `PrefixOnly` breaks `CommitByOwner`. |
 | `a_prefix_only_fence_keeps_every_other_invariant` | `PrefixOnly` keeps every other invariant. |
 | `serial_and_gated_keep_every_invariant_under_faults` | `Serial` and `Gated` pass under each fault. |
+| `a_result_waits_for_the_row_lock_and_a_stale_read_loses` | A result waits for the row lock, and a stale read fails its commit. |
 | `a_planted_repair_defect_is_found_and_replays_from_its_seed` | The `keep-on-failure` plant fails, and its seed replays it. |
 | `reads_only_logging_drops_exactly_the_write_rows` | `ReadsOnly` drops the write rows and nothing else. |
 | `golden_speculation_traces_are_equal_on_every_platform` | Fixed seeds give fixed traces on each platform. |
@@ -315,7 +327,7 @@ the scheduled effects. Every invariant holds, with the same latency.
 | Workload | `Full` rows | `ReadsOnly` rows | Saved |
 |---|--:|--:|--:|
 | `Chain`, 1,000 seeds with faults | 40,000 | 28,000 | 30 % |
-| `FanOut`, 1,000 seeds with faults | 81,067 | 49,067 | 39 % |
+| `FanOut`, 1,000 seeds with faults | 81,066 | 49,066 | 39 % |
 
 The saving does not carry over to Harvest for three reasons:
 
