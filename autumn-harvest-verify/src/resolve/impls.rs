@@ -355,6 +355,11 @@ impl SourceIndex {
                             }
                             self.absorb_body(&f.block, &f.sig.ident, depth, module);
                         }
+                        // An associated type is an alias. Its target counts as
+                        // a field, as a free alias target does.
+                        if let syn::ImplItem::Type(t) = member {
+                            self.scan_types(&t.ident, std::iter::once(&t.ty));
+                        }
                     }
                 }
                 _ => {}
@@ -774,6 +779,26 @@ mod tests {
             "{index:?}"
         );
         assert!(index.type_paths.contains("wf::Shared"), "{index:?}");
+    }
+
+    #[test]
+    fn an_associated_type_records_what_its_target_holds() {
+        // `<Tag as Family>::Shared` names the associated type `Shared`.
+        let mut index = SourceIndex::default();
+        index.absorb_syn(
+            "impl Family for Tag { type Shared = std::sync::Arc<std::sync::Mutex<u64>>; }\n\
+             struct Wrapper(<Tag as Family>::Shared);\n",
+            &[],
+        );
+        let names = |ty: &str| index.type_fields.get(ty).map(|f| f.names.clone());
+        assert!(
+            names("Wrapper").is_some_and(|n| n.contains("Shared")),
+            "{index:?}"
+        );
+        assert!(
+            names("Shared").is_some_and(|n| n.contains("Mutex")),
+            "{index:?}"
+        );
     }
 
     #[test]

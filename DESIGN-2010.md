@@ -146,7 +146,8 @@ Four review agents read the first version. Each fix has a test.
     path. A depth cap of 16 ends a `#[path]` cycle. A type declared in a
     function body is indexed too, under the function path.
     A type alias counts its target as a field, so a wrapper of an alias of
-    `Arc<Mutex<u64>>` is interior-mutable too.
+    `Arc<Mutex<u64>>` is interior-mutable too. An associated type in an
+    `impl` block counts the same way.
 24. A `handlers` entry that no registration node names is refused. Its
     bodies would read as entries, so a helper could look covered.
 25. A body that no reference reaches from the root is refused. The check
