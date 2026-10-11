@@ -93,6 +93,9 @@ async fn reset_to_unpartitioned(conn: &mut AsyncPgConnection) {
         "DELETE FROM harvest_execution_summaries",
         "DELETE FROM harvest_workflow_executions",
         "DELETE FROM harvest_events",
+        // Issue #2009: an exporting suite on a shared database can leave the
+        // marker, which stops every drop without an archiver.
+        "DELETE FROM harvest_partition_export",
     ] {
         diesel::sql_query(stmt).execute(conn).await.expect(stmt);
     }

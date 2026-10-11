@@ -1564,6 +1564,7 @@ async fn run_partition_maintenance_pass(
     owner: crate::scanner_health::ScannerOwner,
     shutdown: &CancellationToken,
     tick_fenced: bool,
+    partition_archiver: Option<&Arc<dyn crate::partition_archive::PartitionArchiver>>,
 ) {
     if !config.partitions.enabled {
         return;
@@ -1689,13 +1690,20 @@ async fn run_partition_maintenance_pass(
             // Issue #1823: the connection predates the pass, so it joins it.
             // A lost guard then ends its backend.
             let _member = crate::replication::join_fenced_pass(pool, &mut conn).await;
-            crate::partition::maintain_with_progress(
+            // Issue #2009: with an archiver, each drop waits for a checked
+            // export. The shard ID goes into each key.
+            let export = partition_archiver.map(|archiver| {
+                crate::partition_archive::PartitionExport::new(Arc::clone(archiver), shard.as_i32())
+                    .with_io_timeout(config.archival_timeout())
+            });
+            crate::partition::maintain_exporting(
                 &mut conn,
                 now,
                 config.partitions.lookahead_cohorts,
                 &sweep_opts,
                 cursor.resume_after,
                 cursor.catch_up_target,
+                export.as_ref(),
                 &mut tick_partition,
             )
             .await
@@ -1789,6 +1797,64 @@ pub struct RetentionRuntime {
     monitor: RetentionMonitor,
 }
 
+/// The optional hooks a [`RetentionRuntime`] calls.
+///
+/// Start from [`RetentionHooks::default`] and add hooks with the `with_*`
+/// calls. The struct is `non_exhaustive`, so a new hook is not a breaking
+/// change.
+#[cfg(feature = "db")]
+#[derive(Clone, Default)]
+#[non_exhaustive]
+pub struct RetentionHooks {
+    /// Gets each run's history before retention deletes the run.
+    pub archiver: Option<Arc<dyn HistoryArchiver>>,
+    /// Inflates offloaded payloads for the archive, and collects their blobs.
+    pub offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
+    /// Gets each aged event partition before the sweep drops it (issue #2009).
+    pub partition_archiver: Option<Arc<dyn crate::partition_archive::PartitionArchiver>>,
+}
+
+#[cfg(feature = "db")]
+impl RetentionHooks {
+    /// Set the history archiver.
+    #[must_use]
+    pub fn with_archiver(mut self, archiver: Option<Arc<dyn HistoryArchiver>>) -> Self {
+        self.archiver = archiver;
+        self
+    }
+
+    /// Set the payload offloader.
+    #[must_use]
+    pub fn with_offloader(
+        mut self,
+        offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
+    ) -> Self {
+        self.offloader = offloader;
+        self
+    }
+
+    /// Set the partition archiver (issue #2009).
+    #[must_use]
+    pub fn with_partition_archiver(
+        mut self,
+        archiver: Option<Arc<dyn crate::partition_archive::PartitionArchiver>>,
+    ) -> Self {
+        self.partition_archiver = archiver;
+        self
+    }
+}
+
+#[cfg(feature = "db")]
+impl std::fmt::Debug for RetentionHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetentionHooks")
+            .field("archiver", &self.archiver.is_some())
+            .field("offloader", &self.offloader.is_some())
+            .field("partition_archiver", &self.partition_archiver.is_some())
+            .finish()
+    }
+}
+
 #[cfg(feature = "db")]
 impl RetentionRuntime {
     /// Returns `None` when nothing in `config` is enabled.
@@ -1800,7 +1866,6 @@ impl RetentionRuntime {
     /// phase is gated on `loosest_cutoff_age()` and is simply skipped. The
     /// terminal-task janitor (issue #1811) also spawns the runtime on its own.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
     pub fn spawn(
         pools: ShardedDbPool,
         config: RetentionConfig,
@@ -1808,6 +1873,50 @@ impl RetentionRuntime {
         archiver: Option<Arc<dyn HistoryArchiver>>,
         offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
     ) -> Option<Self> {
+        Self::spawn_inner(
+            pools,
+            config,
+            metrics,
+            RetentionHooks::default()
+                .with_archiver(archiver)
+                .with_offloader(offloader),
+        )
+    }
+
+    /// The same as [`Self::spawn`], with every hook in one struct.
+    ///
+    /// Use it to set a partition archiver (issue #2009).
+    #[must_use]
+    pub fn spawn_with_hooks(
+        pools: ShardedDbPool,
+        config: RetentionConfig,
+        metrics: Arc<dyn MetricsRecorder>,
+        hooks: RetentionHooks,
+    ) -> Option<Self> {
+        Self::spawn_inner(pools, config, metrics, hooks)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn spawn_inner(
+        pools: ShardedDbPool,
+        config: RetentionConfig,
+        metrics: Arc<dyn MetricsRecorder>,
+        hooks: RetentionHooks,
+    ) -> Option<Self> {
+        let RetentionHooks {
+            archiver,
+            offloader,
+            partition_archiver,
+        } = hooks;
+        // Issue #2009: an export turns the straggler delete off, because no
+        // export holds the rows it removes. `try_build` refuses the pair, but
+        // a direct caller can still set both.
+        if partition_archiver.is_some() && config.partitions.straggler_grace_secs.is_some() {
+            tracing::warn!(
+                "partitions.straggler_grace_secs has no effect with a partition archiver; \
+                 the sweep skips straggler deletes while it exports"
+            );
+        }
         if !config.enabled() {
             return None;
         }
@@ -1903,6 +2012,7 @@ impl RetentionRuntime {
                 owner,
                 &shutdown_task,
                 false,
+                partition_archiver.as_ref(),
             )
             .await;
             if shutdown_task.is_cancelled() {
@@ -2079,6 +2189,7 @@ impl RetentionRuntime {
                         owner,
                         &shutdown_task,
                         true,
+                        partition_archiver.as_ref(),
                     )
                     .await;
 

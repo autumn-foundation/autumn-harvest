@@ -214,6 +214,7 @@ mod otel_semconv_docs;
 mod panic_containment_tests;
 #[cfg(feature = "db")]
 mod parent_close_cascade_unfinished_handlers_perf;
+mod partition_archive_tests;
 mod partitioned_events_docs;
 mod pause_tests;
 #[cfg(feature = "testing")]

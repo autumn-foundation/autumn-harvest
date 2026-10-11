@@ -563,6 +563,8 @@ struct PreparedHarvestRuntime {
     shard_router: ShardRouter,
     retention_config: RetentionConfig,
     history_archiver: Option<Arc<dyn autumn_harvest::HistoryArchiver>>,
+    /// Gets each aged event partition before the drop (issue #2009).
+    partition_archiver: Option<Arc<dyn autumn_harvest::partition_archive::PartitionArchiver>>,
     /// Secret-free effective-config snapshot (issue #695) captured here — the
     /// single seam every `BuiltHarvest` consumer (the `HarvestPlugin` web-app
     /// path and the standalone runner) funnels through — so it rides on the
@@ -765,6 +767,7 @@ impl PreparedHarvestRuntime {
         .map_err(AutumnError::service_unavailable_msg)?;
         let retention_config = built.retention().clone();
         let history_archiver = built.history_archiver().cloned();
+        let partition_archiver = built.partition_archiver().cloned();
         install_completion_callback_config(&built);
         // Resolved here, while `built` is still owned, but NOT published until
         // every fallible step below has succeeded (issue #953, Codex review
@@ -884,6 +887,7 @@ impl PreparedHarvestRuntime {
             shard_router,
             retention_config,
             history_archiver,
+            partition_archiver,
             effective_config,
         })
     }
@@ -1376,12 +1380,14 @@ impl HarvestRunner {
             .as_ref()
             .map_or_else(SchedulerMonitor::offline, SchedulerRuntime::monitor);
         let retention = if prepared.retention_config.enabled() {
-            RetentionRuntime::spawn(
+            RetentionRuntime::spawn_with_hooks(
                 prepared.storage_pool.sharded_pool().clone(),
                 prepared.retention_config.clone(),
                 Arc::clone(&registry.telemetry().metrics),
-                prepared.history_archiver,
-                registry.payload_offloader_arc(),
+                autumn_harvest::retention::RetentionHooks::default()
+                    .with_archiver(prepared.history_archiver)
+                    .with_offloader(registry.payload_offloader_arc())
+                    .with_partition_archiver(prepared.partition_archiver),
             )
         } else {
             tracing::info!(
