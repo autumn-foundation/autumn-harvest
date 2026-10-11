@@ -3878,7 +3878,7 @@
               }
             }
           ],
-          "description": "Share of workflow decisions by resident outcome. `hit` resumed a resident workflow and replayed nothing. Each other series names why a decision replayed history (issues #1798, #2007, #2008)."
+          "description": "Share of workflow decisions by resident outcome. `hit` resumed the parked workflow. Each other series names why a decision replayed history (issues #1798, #2007, #2008)."
         },
         {
           "id": 63,

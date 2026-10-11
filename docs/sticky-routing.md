@@ -24,7 +24,7 @@ A cache entry also keeps the suspended workflow itself (issue #1798, step 2). Th
 
 A warm decision must decide exactly as a cold replay would. The resident path therefore accepts a narrow set of suspensions:
 
-- The cycle awaits one command, an activity, a timer or a signal. Or it awaits two or more activities, such as a `futures::join!` or `try_join_all` of parallel tool calls (issue #2008).
+- The cycle awaits one command: an activity, a timer or a signal. Or it awaits two or more activities, such as a `futures::join!` or `try_join_all` of parallel tool calls (issue #2008).
 - Each other command is a marker, a side effect, progress, current details, a log line or a search-attribute upsert.
 - The context has no open `ctx.race()`, park token, push signal handler, held mutex, cancel request or non-determinism record, and no unread history.
 - A signal wait is not for a name that `try_wait_for_signal`, `try_receive_signal` or a drain probed with a scan that reached the end of history.
@@ -32,18 +32,18 @@ A warm decision must decide exactly as a cold replay would. The resident path th
 
 A warm decision resumes only on an exact delta. The delta holds the events of the last suspension, in order. Then it holds at least one event that resolves a parked await: an activity success, a timer fire or a signal. Each parked await resolves at most once. The start and heartbeat events of a parked activity may come before its result. The context inputs must not have changed, for example the deadline, shard, build, queue, parent, headers or handler.
 
-A delta can resolve only some activities of a join. The worker then parks the others again with a `WaitForActivity` command, which a cold replay emits too. Such a cycle must only wait. If a branch runs a command, fails, or drops a parked sibling, the worker drops the cycle and replays cold (`ResumeDeclined::SiblingStillParked`).
+A delta can resolve only some activities of a join. The resume then parks the others again with a `WaitForActivity` command, which a cold replay emits too. Such a cycle must only wait. If a branch runs a command, fails, drops a parked sibling or reads the replay position, the worker drops the cycle and replays cold (`ResumeDeclined::SiblingStillParked`). The cycle fires no side effect that replay suppresses, such as a log line or a business metric. So a dropped cycle does not repeat one. A delta with several results runs as one cycle per result, in history order, as a cold replay matches them.
 
-Any other delta declines. A decline drops the resident workflow and runs a cold replay, which is always correct. Joins that mix kinds, races, activity failures, updates, cancels and child workflows therefore still replay cold.
+Any other delta declines. A decline drops the resident workflow and runs a cold replay, which is always correct. Joins with a timer or a signal next to another await, races, activity failures, updates, cancels and child workflows therefore still replay cold.
 
-**Observing it.** `harvest.workflow.resident` counts each decision on a worker with resident state on (issue #2007). Its `outcome` label is `hit` for a resumed decision. Each other value names why the decision replayed: `cold`, `declined`, `multi_await`, `race`, `mutex`, `hot_swap`, `blocked` or `unsupported`. The hit rate is `hit` over all outcomes. A resumed cycle also records `harvest.replay = false` on its `harvest.workflow.execute` span. A decline logs `resident workflow declined; replaying cold (issue #1798)` at `debug` level, with the `ResumeDeclined` reason.
+**Observing it.** `harvest.workflow.resident` counts each decision attempt on a worker with resident state on (issue #2007). Its `outcome` label is `hit` for a resumed decision. Each other value names why the decision replayed: `cold`, `declined`, `multi_await`, `race`, `mutex`, `hot_swap`, `blocked` or `unsupported`. The hit rate is `hit` over all outcomes. A resumed cycle also records `harvest.replay = false` on its `harvest.workflow.execute` span. A decline logs `resident workflow declined; replaying cold (issue #1798)` at `debug` level, with the `ResumeDeclined` reason.
 
 **Limits.**
 
 - Resident state lives only in worker memory. A restart, a failover, an LRU eviction or a decision that does not commit drops it. The next decision then replays cold.
 - A timer that a cold replay re-arms writes no second `TimerStarted`. Its fire then declines and replays cold.
 - A resident future keeps the state of a foreign future, such as a raw `tokio::time::sleep` in a `select!`. Such a workflow is not deterministic on a cold worker either. Use a Harvest timer instead.
-- A join branch that runs a command after its own await, while a later branch has a command event, fails a cold replay. A warm decision cannot always see this shape. When the last parked activity of such a join resolves, the warm decision runs on, and the failure shows at the next cold replay. Issue #1798 has the same limit for a single wait. Run the next command after the join, or check in-flight histories with `ReplayVerifier`.
+- A join branch that runs a command after its own await, while a later branch has a command event, fails a cold replay. A warm decision cannot always see this shape. When the earlier branch's result arrives last, the warm decision runs on, and the failure shows at the next cold replay. Issue #1798 has the same limit for a single wait. Run the next command after the join, or check in-flight histories with `ReplayVerifier`.
 
 ## Configuration
 
@@ -95,7 +95,7 @@ Each release is one `UPDATE` per pool. At worst it scans all `RUNNING` rows of t
 | `harvest.workflow.cache_miss` | counter | Task required a full history reload from Postgres. |
 | `harvest.workflow.resident` | counter | One per decision with resident state on (issue #2007). The `outcome` label is `hit`, or the reason why the decision replayed. Labels: `workflow`, `queue`, `outcome`. |
 
-Both metrics carry a `workflow` label (the workflow name). `execution.id` is deliberately excluded per ADR-0001 §7 (cardinality).
+All three metrics carry a `workflow` label (the workflow name). `execution.id` is deliberately excluded per ADR-0001 §7 (cardinality).
 
 Monitor the **hit ratio** (`cache_hit / (cache_hit + cache_miss)`) per worker. With sticky routing on, the ratio climbs toward 1 for long-running workflows that suspend many times. A ratio that stays near 0 may indicate the lease TTL is shorter than the median inter-task delay.
 

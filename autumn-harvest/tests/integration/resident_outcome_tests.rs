@@ -10,6 +10,7 @@
 //! 3. A join of activities stays resident. Each tool result is a hit.
 //! 4. An agent loop with parallel tool calls hits on every decision after
 //!    the first. The test prints the hit rate, which the design records.
+//! 5. A worker with resident state off records no outcome.
 //!
 //! Each test uses its own queue and worker id, so the tests can share one
 //! database.
@@ -82,12 +83,12 @@ static JOIN_BODY_STARTS: AtomicU64 = AtomicU64::new(0);
 /// Body starts of `tool_loop_workflow`. Only one test runs it.
 static TOOL_LOOP_BODY_STARTS: AtomicU64 = AtomicU64::new(0);
 
-fn echo_activity<'a>(_ctx: &'a ActivityContext, input: Value) -> HandlerFuture<'a> {
+fn echo_activity(_ctx: &ActivityContext, input: Value) -> HandlerFuture<'_> {
     Box::pin(async move { Ok(input) })
 }
 
 /// One activity, then one signal. Each await ends one decision.
-fn sequential_workflow<'a>(ctx: &'a WorkflowContext, input: Value) -> HandlerFuture<'a> {
+fn sequential_workflow(ctx: &WorkflowContext, input: Value) -> HandlerFuture<'_> {
     Box::pin(async move {
         let queue = input["queue"].as_str().ok_or("missing queue")?;
         let echo = ctx
@@ -100,7 +101,7 @@ fn sequential_workflow<'a>(ctx: &'a WorkflowContext, input: Value) -> HandlerFut
 }
 
 /// Joins an activity with a signal wait. The path does not cover the mix.
-fn mixed_join_workflow<'a>(ctx: &'a WorkflowContext, input: Value) -> HandlerFuture<'a> {
+fn mixed_join_workflow(ctx: &WorkflowContext, input: Value) -> HandlerFuture<'_> {
     Box::pin(async move {
         let queue = input["queue"].as_str().ok_or("missing queue")?;
         let (echo, go) = futures::join!(
@@ -115,7 +116,7 @@ fn mixed_join_workflow<'a>(ctx: &'a WorkflowContext, input: Value) -> HandlerFut
 }
 
 /// Joins three activities.
-fn activity_join_workflow<'a>(ctx: &'a WorkflowContext, input: Value) -> HandlerFuture<'a> {
+fn activity_join_workflow(ctx: &WorkflowContext, input: Value) -> HandlerFuture<'_> {
     JOIN_BODY_STARTS.fetch_add(1, Ordering::SeqCst);
     Box::pin(async move {
         let queue = input["queue"].as_str().ok_or("missing queue")?;
@@ -128,7 +129,7 @@ fn activity_join_workflow<'a>(ctx: &'a WorkflowContext, input: Value) -> Handler
 }
 
 /// An agent loop: a model call, then parallel tool calls, per round.
-fn tool_loop_workflow<'a>(ctx: &'a WorkflowContext, input: Value) -> HandlerFuture<'a> {
+fn tool_loop_workflow(ctx: &WorkflowContext, input: Value) -> HandlerFuture<'_> {
     TOOL_LOOP_BODY_STARTS.fetch_add(1, Ordering::SeqCst);
     Box::pin(async move {
         let queue = input["queue"].as_str().ok_or("missing queue")?;
@@ -205,6 +206,11 @@ fn info_for(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn
 
 /// Builds a worker from `WorkerConfig::default()`. It polls only `queue`.
 fn build_worker(queue: &str, log: Arc<OutcomeLog>) -> Arc<Worker> {
+    build_worker_with(queue, log, WorkerConfig::default())
+}
+
+/// Builds a worker from `config`. It polls only `queue`.
+fn build_worker_with(queue: &str, log: Arc<OutcomeLog>, config: WorkerConfig) -> Arc<Worker> {
     let built = HarvestBuilder::new()
         .workflows(vec![
             info_for(SEQUENTIAL, sequential_workflow),
@@ -218,7 +224,7 @@ fn build_worker(queue: &str, log: Arc<OutcomeLog>) -> Arc<Worker> {
             propagator: Arc::new(NoOpPropagator),
             metrics: log as Arc<dyn MetricsRecorder>,
         })
-        .worker(WorkerConfig::default().with_queues([queue]))
+        .worker(config.with_queues([queue]))
         .build();
     let (registry, _dags, _schedules, worker_config) = built.into_worker_parts();
     let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
@@ -270,13 +276,28 @@ async fn start_run(
     Arc<Worker>,
     tokio::task::JoinHandle<()>,
 ) {
+    start_run_with(url, workflow_name, WorkerConfig::default()).await
+}
+
+/// [`start_run`] with a worker built from `config`.
+async fn start_run_with(
+    url: &str,
+    workflow_name: &'static str,
+    config: WorkerConfig,
+) -> (
+    ExecutionId,
+    AsyncPgConnection,
+    Arc<OutcomeLog>,
+    Arc<Worker>,
+    tokio::task::JoinHandle<()>,
+) {
     let pool = build_test_pool(url);
     let mut conn = AsyncPgConnection::establish(url)
         .await
         .expect("connect to test DB");
     let queue = unique_id("resident-outcome-q");
     let log = Arc::new(OutcomeLog::default());
-    let worker = build_worker(&queue, Arc::clone(&log));
+    let worker = build_worker_with(&queue, Arc::clone(&log), config);
     let handle = spawn(&worker, &pool);
     let exec_id = ExecutionId::new();
     let workflow_id = unique_id("resident-outcome-wf");
@@ -288,6 +309,34 @@ async fn start_run(
     .await
     .expect("start workflow");
     (exec_id, conn, log, worker, handle)
+}
+
+/// Waits until the workflow task of `exec_id` is parked: `RUNNING` with no
+/// claim. The decision before it has then committed.
+async fn wait_parked(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let query = diesel::sql_query(
+            "SELECT count(*) AS n FROM harvest_task_queue \
+             WHERE workflow_exec_id = $1 AND task_type = 'workflow' \
+               AND state = 'RUNNING' AND worker_id IS NULL",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid());
+        let parked = diesel_async::RunQueryDsl::get_result::<Count>(query, conn)
+            .await
+            .map_or(0, |row| row.n);
+        if parked > 0 {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the workflow task did not park");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[derive(diesel::QueryableByName)]
+struct Count {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    n: i64,
 }
 
 /// Waits until `log` holds `decisions` outcomes of `workflow`.
@@ -315,6 +364,7 @@ async fn a_sequential_run_is_cold_once_then_hits() {
     let (exec_id, mut conn, log, worker, handle) = start_run(&url, SEQUENTIAL).await;
 
     wait_decisions(&log, SEQUENTIAL, 2).await;
+    wait_parked(&mut conn, exec_id).await;
     autumn_harvest::signal::send_signal(&mut conn, exec_id, "go", json!("go"))
         .await
         .expect("send signal");
@@ -341,6 +391,7 @@ async fn a_join_of_an_activity_and_a_signal_is_a_multi_await_miss() {
 
     // Decision 2 runs when the activity completes.
     wait_decisions(&log, MIXED_JOIN, 2).await;
+    wait_parked(&mut conn, exec_id).await;
     autumn_harvest::signal::send_signal(&mut conn, exec_id, "go", json!("go"))
         .await
         .expect("send signal");
@@ -425,5 +476,41 @@ async fn an_agent_loop_with_parallel_tool_calls_hits_after_the_first_decision() 
         1,
         "{outcomes:?}"
     );
+    stop(&worker, handle).await;
+}
+
+/// AC (issue #2007): a worker with resident state off records nothing.
+#[tokio::test]
+async fn a_worker_with_resident_state_off_records_no_outcome() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let config = WorkerConfig::default().with_resident_workflows(false);
+    let (exec_id, mut conn, log, worker, handle) = start_run_with(&url, SEQUENTIAL, config).await;
+
+    // No outcome arrives, so wait for the park of decision 2 instead.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let history = autumn_harvest::store::load_history(&mut conn, exec_id)
+            .await
+            .expect("load history");
+        let done = history.events.iter().any(|event| {
+            matches!(
+                event,
+                autumn_harvest::event::WorkflowEvent::ActivityCompleted { .. }
+            )
+        });
+        if done {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the activity did not complete");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    wait_parked(&mut conn, exec_id).await;
+    autumn_harvest::signal::send_signal(&mut conn, exec_id, "go", json!("go"))
+        .await
+        .expect("send signal");
+    wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", Duration::from_secs(30))
+        .await;
+
+    assert!(log.of(SEQUENTIAL).is_empty(), "{:?}", log.of(SEQUENTIAL));
     stop(&worker, handle).await;
 }

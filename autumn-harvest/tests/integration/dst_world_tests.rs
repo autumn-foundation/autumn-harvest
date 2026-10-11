@@ -1040,14 +1040,11 @@ async fn a_join_resumes_warm_through_the_worker() {
     let snapshot = world.read_snapshot().await;
     let run = &snapshot.executions[0];
     assert_eq!(run.status, "COMPLETED", "{:?}", run.events);
+    // Decision 2 reads one result and parks the other activity.
     assert_eq!(
-        decisions.as_slice().first(),
-        Some(&Ran::Cold),
-        "{decisions:?}"
-    );
-    assert!(
-        decisions.len() >= 2 && decisions[1..].iter().all(|ran| *ran == Ran::Warm),
-        "each decision after the first must resume the join: {decisions:?}"
+        decisions,
+        [Ran::Cold, Ran::Warm, Ran::Warm],
+        "each decision after the first must resume the join"
     );
 }
 

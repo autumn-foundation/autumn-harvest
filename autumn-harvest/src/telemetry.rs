@@ -628,8 +628,8 @@ pub const METRIC_WORKFLOW_CACHE_HIT: &str = "harvest.workflow.cache_hit";
 /// the existing cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_CACHE_MISS: &str = "harvest.workflow.cache_miss";
 
-/// Counter: one per workflow decision on a worker with resident state on
-/// (issue #2007).
+/// Counter: one per workflow decision attempt on a worker with resident
+/// state on (issue #2007).
 ///
 /// Labels: `workflow`, `queue` and `outcome`. The [`ResidentOutcome`] enum
 /// bounds `outcome`. `hit` means that the decision resumed a resident
@@ -1873,13 +1873,13 @@ impl std::fmt::Display for WebhookOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ResidentOutcome {
-    /// The decision resumed the resident workflow. No replay ran.
+    /// The decision resumed the resident workflow.
     Hit,
     /// The worker held no resident state for the run, for example after a
     /// cache miss or on the first decision.
     Cold,
-    /// The resident workflow did not resume. The delta or the context
-    /// inputs did not match. See `resident::ResumeDeclined`.
+    /// The resident workflow did not resume. The delta, the context inputs
+    /// or the warm cycle failed a check. See `resident::ResumeDeclined`.
     Declined,
     /// The last suspension awaited more than one command, in a shape that
     /// the resident path does not cover.
@@ -3926,9 +3926,10 @@ pub trait MetricsRecorder: Send + Sync {
     /// A workflow decision ran on a worker with resident state on (issue
     /// #2007).
     ///
-    /// The worker calls this once per decision. `outcome` is
-    /// [`ResidentOutcome::Hit`] when the decision resumed a resident
-    /// workflow, or the reason why it replayed history.
+    /// The worker calls this once per decision attempt, after its first
+    /// drive. A decision that does not commit runs again and records again.
+    /// `outcome` is [`ResidentOutcome::Hit`] when the decision resumed a
+    /// resident workflow, or the reason why it replayed history.
     ///
     /// Maps to the counter [`METRIC_WORKFLOW_RESIDENT`] with labels
     /// `workflow`, `queue` and `outcome`.
@@ -5050,11 +5051,6 @@ mod tests {
         assert_eq!(METRIC_LABEL_BUILD_ID, "build_id");
     }
 
-    // -----------------------------------------------------------------------
-    // RED-phase tests for harvest.workflow.terminal counter (issue #519)
-    // These tests fail until the implementation is complete.
-    // -----------------------------------------------------------------------
-
     #[test]
     fn resident_outcome_labels_are_stable_and_distinct() {
         // Dashboards and alerts key on these strings (issue #2007).
@@ -5075,7 +5071,26 @@ mod tests {
         );
         assert_eq!(METRIC_WORKFLOW_RESIDENT, "harvest.workflow.resident");
         assert_eq!(ResidentOutcome::MultiAwait.to_string(), "multi_await");
+        // An exhaustive match: a new variant must join `ALL`.
+        for outcome in ResidentOutcome::ALL {
+            match outcome {
+                ResidentOutcome::Hit
+                | ResidentOutcome::Cold
+                | ResidentOutcome::Declined
+                | ResidentOutcome::MultiAwait
+                | ResidentOutcome::Race
+                | ResidentOutcome::Mutex
+                | ResidentOutcome::HotSwap
+                | ResidentOutcome::Blocked
+                | ResidentOutcome::Unsupported => {}
+            }
+        }
     }
+
+    // -----------------------------------------------------------------------
+    // RED-phase tests for harvest.workflow.terminal counter (issue #519)
+    // These tests fail until the implementation is complete.
+    // -----------------------------------------------------------------------
 
     #[test]
     fn metric_workflow_terminal_constant_has_correct_name() {

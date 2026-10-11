@@ -61,6 +61,9 @@ counter, `harvest.workflow.resident`. `ResumeDeclined` gains one variant.
 | R7 | The counter double-counts a decision. | The worker records once per decision, on the first cycle only. |
 | R8 | The extended path is never exercised under faults. | The DST world workload gains a join. A seeded test pins a warm partial resume through the real worker. |
 | R9 | The change lowers the hit rate of today's shapes. | All existing resident tests stay green. The measurement covers a single-await workload too. |
+| R10 | Two results land in one delta, and the earlier branch runs on. A cold replay fails, but the warm cycle accepts. Review found it. | A delta with several results runs as one cycle per result, in history order. Each cycle but the last must only wait. |
+| R11 | A branch reads `ctx.info()`, `replay_position()` or `is_replaying()` while a sibling is parked. A cold replay can stop its cursor at the sibling command and read another value. Review found it. | Such a cycle is a speculation. A position read declines it. |
+| R12 | A post-poll decline repeats a log line or a business metric, because the cold replay fires it again. Review found it. | A speculative cycle fires no side effect that replay suppresses. |
 
 ### 0.4 Six thinking hats
 
@@ -101,7 +104,8 @@ Two more facts came out of the experiment:
 
 - E1, E2 and E4 show that a re-park by `WaitForActivity` equals the cold
   result, also with a progress event of the parked sibling.
-- **A gap in issue #1798.** After `Sa Sb B Cb`, today's single-await path
+- **A gap in issue #1798.** After `Sa Sb B Cb`, the single-await path of
+  issue #1798
   keeps `join!(async { a; c }, b)` resident with one wait for `a`. When
   `a` finishes, the warm decision schedules `c`, but a cold replay of that
   history fails (E7). A warm decision cannot tell this shape from E3.
@@ -118,17 +122,18 @@ Two more facts came out of the experiment:
 | Label | Meaning |
 |-------|---------|
 | `hit` | The decision resumed the resident workflow. |
-| `cold` | The worker had no cache entry for the run. |
+| `cold` | The worker held no resident state for the run, for example after a cache miss or on the first decision. |
 | `declined` | The resident workflow did not resume. See `ResumeDeclined`. |
 | `multi_await` | The last suspension awaited more than one command, in a shape the path does not cover. |
 | `race` | The last suspension was inside `ctx.race()`. |
 | `mutex` | The last suspension held or acquired a durable mutex. |
 | `hot_swap` | The workflow runs in a hot-swap module. |
-| `blocked` | Another context state blocked the capture. See `resident_blocker`. |
+| `blocked` | Another context state blocked the capture (see `resident_blocker`), or a probe reached the signal of the wait at the frontier. |
 | `unsupported` | The last suspension had a command that the path does not cover. |
 
 The worker records `harvest.workflow.resident{workflow, queue, outcome}`
-once per decision, when resident state is on. A cache entry keeps the
+once per decision attempt, when resident state is on. A decision that
+does not commit runs again and records again. A cache entry keeps the
 reason why its suspension did not stay resident. The next decision reads
 it.
 
@@ -147,17 +152,24 @@ it.
   only its re-parks, and each must still have a live receiver. Otherwise
   the resume declines with `ResumeDeclined::SiblingStillParked`. The worker
   drops the future and replays cold.
+- **Speculation.** A cycle with a re-park must not read the replay
+  position, and it fires no side effect that replay suppresses. A read
+  declines the resume.
+- **One cycle per result.** A delta with several results runs as one
+  cycle per result, in history order. A cold replay matches results in
+  that order, so each early result faces the check of its own cycle.
 
 ### 1.3 Known limit
 
 A join branch that runs a command after its own await fails a cold
-replay when a later branch has a command event (E6, E7). When the last
-parked activity of such a join resolves, the warm decision cannot tell
-the branch code from code after the join (E3). It runs on, and the
-failure shows at the next cold replay. Issue #1798 has the same limit
-for a single wait. The post-poll check catches the shape while a sibling
-is still parked. `docs/sticky-routing.md` names the limit, and
-`ReplayVerifier` finds such a history before a deploy.
+replay when a later branch has a command event (E6, E7). The checks
+catch this shape while a sibling is still parked, also when both results
+land in one delta in branch order. When the earlier branch's result
+arrives last, the warm decision cannot tell the branch code from code
+after the join (E3). It runs on, and the failure shows at the next cold
+replay. Issue #1798 has the same limit for a single wait.
+`docs/sticky-routing.md` names the limit, and `ReplayVerifier` finds
+such a history before a deploy.
 
 ## 2. Tests
 
@@ -165,18 +177,20 @@ Red first, then green. Each row names the test that pins it.
 
 | Behaviour | Test |
 |-----------|------|
-| Each miss reason is named. | `resident::tests::capture_names_why_a_suspension_is_not_resident` |
+| Capture names each miss reason. | `resident::tests::capture_names_why_a_suspension_is_not_resident` |
 | A race in flight is a `race` miss on a cold replay. | `resident::tests::a_race_in_flight_is_a_race_miss_on_a_cold_replay` |
 | A cache entry keeps its miss reason. | `cache::tests::an_entry_keeps_the_miss_reason_of_its_suspension` |
 | The labels are stable. | `telemetry::tests::resident_outcome_labels_are_stable_and_distinct` |
 | The worker records one outcome per decision. | `resident_outcome_tests::a_sequential_run_is_cold_once_then_hits` |
 | A mixed join is a `multi_await` miss. | `resident_outcome_tests::a_join_of_an_activity_and_a_signal_is_a_multi_await_miss` |
 | A join of activities stays resident. | `resident::tests::an_activity_join_stays_resident` |
-| Warm equals cold for a join, in each arrival order. | `resident::tests::warm_activity_join_matches_cold_replay_in_every_arrival_order` |
+| Warm equals cold for a join, in twelve arrival modes with and without progress events. | `resident::tests::warm_activity_join_matches_cold_replay_in_every_arrival_order` |
 | An agent loop with parallel tool calls resumes every decision. | `resident::tests::warm_tool_loop_resumes_every_decision_in_every_arrival_order` |
 | A partial result does not replay the body. | `resident::tests::warm_tool_loop_runs_the_body_once` |
 | The fan-out helper matches cold. | `resident::tests::warm_fan_out_matches_cold_replay_in_every_arrival_order` |
-| A branch that runs on while a sibling is parked replays cold. | `resident::tests::a_branch_that_runs_on_while_a_sibling_is_parked_replays_cold` |
+| A branch that runs on, fails or reads the position while a sibling is parked declines. Two results in one delta run in history order. | `resident::tests::a_branch_that_runs_on_while_a_sibling_is_parked_replays_cold` |
+| A join declines when the context inputs change. | `resident::tests::a_join_declines_when_its_context_inputs_change` |
+| A worker with resident state off records nothing. | `resident_outcome_tests::a_worker_with_resident_state_off_records_no_outcome` |
 | A partial delta re-parks the sibling. | `resident::tests::a_partial_delta_re_parks_the_sibling` |
 | Join deltas that a replay could read another way decline. | `resident::tests::join_deltas_that_replay_could_read_differently_decline` |
 | A failed join with a parked sibling declines. | `resident::tests::a_sibling_left_parked_by_a_failed_branch_declines` |
@@ -190,7 +204,7 @@ Red first, then green. Each row names the test that pins it.
 | Criterion | Evidence |
 |-----------|----------|
 | Depends on the hit-rate sibling (#2007). | The counter part of #2007 ships first, in its own commit: `harvest.workflow.resident` with a bounded miss reason, listed in `docs/telemetry.md`. Section 4 measures with it. The e2e bench run of #2007 stays open there. |
-| The dominant miss reason is covered, and the hit rate on the same workload rises. | Before the change, the agent loop misses with `multi_await`, and then with `blocked` on the wait that the cold replay leaves. A join of activities now stays resident. Section 4: 3 of 10 hits before, 10 of 11 after, on the same workload. |
+| The path covers the dominant miss reason, and the hit rate on the same workload rises. | Before the change, the agent loop misses with `multi_await`, and then with `blocked` on the wait that the cold replay leaves. A join of activities now stays resident. Section 4: 3 of 10 hits before, 10 of 11 after, on the same workload. |
 | The extended path runs under DST. | The DST world's scheduled workflow joins two activities. `a_join_resumes_warm_through_the_worker` pins a warm partial resume through the real worker. The seeded sweep passes every invariant, with more warm decisions than before. |
 
 ## 4. Measurement
@@ -212,10 +226,15 @@ test prints the outcome of each decision.
 The before run shows a second miss. A cold replay of a partial join
 leaves the `ActivityStarted` event of a running tool unread. Capture then
 refuses the last wait as `blocked`, so the next decision replays too. A
-throwaway test confirmed this: the same partial history with no
-`ActivityStarted` event stays resident. A resident join does not replay,
-so that miss goes away as well. The number of decisions depends on how
-the tool results arrive.
+cold capture of `Sa Sb Started(a) Ca` stays resident, and one of
+`Sa Sb Started(a) Ca Started(b)` reports `blocked`. A resident join does
+not replay, so that miss goes away as well.
+
+This is one run of each. The number of decisions depends on how the tool
+results arrive. The deterministic evidence is the differential test
+`warm_tool_loop_resumes_every_decision_in_every_arrival_order`: before
+the change, the oldest-first order resumed 4 of 8 decisions; now it
+resumes all 8, and every other mode resumes every decision too.
 
 **DST world sweep, seeds 0 to 11.**
 `HARVEST_DST_SEEDS=12 cargo test -p autumn-harvest --test integration
@@ -227,7 +246,9 @@ dst_world_tests::world_seed_sweep -- --nocapture --test-threads=1`
 | After | 44 | 170 | 19 |
 
 A cold decision follows a crash, a restart or a first decision, so its
-count does not change. Every invariant holds in both runs.
+count does not change. Every invariant holds in both runs. With the new
+workload, `a_planted_failure_replays_from_its_seed_alone` still fails
+seed 0 with the plant, and the seed still passes without it.
 
 **Reproduce.** Point `HARVEST_TEST_DATABASE_URL` at a migrated Postgres
 and run the two commands above, at the red commit and at the head.

@@ -2912,6 +2912,11 @@ pub struct WorkflowContext {
     /// The number of `ctx.race()` calls in flight (issue #2007). A race
     /// that suspends cannot stay resident.
     open_races: std::sync::atomic::AtomicUsize,
+    /// Set while a resident cycle runs with re-parked siblings (issue #2008).
+    /// Such a cycle must not read the replay position.
+    speculative: std::sync::atomic::AtomicBool,
+    /// Set when a speculative cycle reads the replay position.
+    speculation_read_position: std::sync::atomic::AtomicBool,
     /// Monotonically increasing counter for naming worker-session identity
     /// markers (issue #606). Each `create_session()` call increments this once
     /// so each session has a stable, unique `session:{seq}` marker name across
@@ -3619,6 +3624,8 @@ impl WorkflowContext {
             shard_router: None,
             race_seq: Mutex::new(0),
             open_races: std::sync::atomic::AtomicUsize::new(0),
+            speculative: std::sync::atomic::AtomicBool::new(false),
+            speculation_read_position: std::sync::atomic::AtomicBool::new(false),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
@@ -3793,6 +3800,8 @@ impl WorkflowContext {
             shard_router: None,
             race_seq: Mutex::new(0),
             open_races: std::sync::atomic::AtomicUsize::new(0),
+            speculative: std::sync::atomic::AtomicBool::new(false),
+            speculation_read_position: std::sync::atomic::AtomicBool::new(false),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
@@ -3865,6 +3874,8 @@ impl WorkflowContext {
             shard_router: None,
             race_seq: Mutex::new(0),
             open_races: std::sync::atomic::AtomicUsize::new(0),
+            speculative: std::sync::atomic::AtomicBool::new(false),
+            speculation_read_position: std::sync::atomic::AtomicBool::new(false),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
@@ -4635,6 +4646,7 @@ impl WorkflowContext {
     /// The current cursor position in the history events during replay.
     #[must_use]
     pub fn replay_position(&self) -> usize {
+        self.note_position_read();
         self.match_history(|m| m.position())
     }
 
@@ -4903,6 +4915,10 @@ impl WorkflowContext {
     /// ones that lock the matcher directly rather than calling
     /// [`Self::is_replaying`] — so the two spellings can never drift.
     pub(crate) fn replay_suppresses_side_effects(&self) -> bool {
+        // A speculative cycle may be dropped, so it fires no side effect.
+        if self.note_position_read() {
+            return true;
+        }
         let matcher = self.matcher.lock().expect("matcher lock poisoned");
         matcher.is_replaying() || matcher.has_terminal_failure_tail()
     }
@@ -4914,6 +4930,7 @@ impl WorkflowContext {
     /// Used only where the question really is "did the matcher run off the end
     /// of recorded history?", never as a replay-suppression guard.
     fn at_history_frontier(&self) -> bool {
+        self.note_position_read();
         !self
             .matcher
             .lock()
@@ -7382,6 +7399,7 @@ impl WorkflowContext {
     ///
     /// Last, it queues `waits`: the commands that park unresolved activities
     /// of a join again (issue #2008). A cold replay emits the same commands.
+    /// A cycle with waits is speculative until [`Self::end_speculation`].
     ///
     /// # Panics
     ///
@@ -7401,9 +7419,38 @@ impl WorkflowContext {
             .lock()
             .expect("matcher lock poisoned")
             .append_consumed(delta);
+        self.speculative
+            .store(!waits.is_empty(), std::sync::atomic::Ordering::SeqCst);
+        self.speculation_read_position
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         for wait in waits {
             self.push_command(wait);
         }
+    }
+
+    /// Records a read of the replay position in a speculative cycle.
+    ///
+    /// A warm cycle with re-parked siblings consumed the whole delta, but a
+    /// cold replay can stop its cursor at a sibling command (issue #2008).
+    /// So such a read can differ, and the resume must decline. Returns
+    /// whether the cycle is speculative.
+    fn note_position_read(&self) -> bool {
+        let speculative = self.speculative.load(std::sync::atomic::Ordering::SeqCst);
+        if speculative {
+            self.speculation_read_position
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        speculative
+    }
+
+    /// Ends a speculative cycle (issue #2008). Returns whether it read the
+    /// replay position.
+    #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
+    pub(crate) fn end_speculation(&self) -> bool {
+        self.speculative
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.speculation_read_position
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Whether a non-blocking signal claim probed `signal_name` with a scan

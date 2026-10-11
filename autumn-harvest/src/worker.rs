@@ -21728,12 +21728,23 @@ fn delta_is_contiguous(from_event_id: i32, delta: &store::EventHistory) -> bool 
 ///
 /// A parked workflow counts as a hit. A decline of its resume changes the
 /// outcome to [`ResidentOutcome::Declined`].
-fn resident_outcome_before_drive(residency: &crate::resident::Residency) -> ResidentOutcome {
+const fn resident_outcome_before_drive(residency: &crate::resident::Residency) -> ResidentOutcome {
     match residency {
         crate::resident::Residency::Parked(_) => ResidentOutcome::Hit,
         crate::resident::Residency::Missed(reason) => *reason,
         crate::resident::Residency::Unknown => ResidentOutcome::Cold,
     }
+}
+
+/// The resident state of a suspension that cannot stay resident (issue
+/// #2007). A hot-swap module wins over `reason`, because it binds around
+/// every drive.
+const fn final_miss(hot_swapped: bool, reason: ResidentOutcome) -> crate::resident::Residency {
+    crate::resident::Residency::Missed(if hot_swapped {
+        ResidentOutcome::HotSwap
+    } else {
+        reason
+    })
 }
 
 /// Puts a taken cache entry back, and drops any displaced entry outside the
@@ -25410,7 +25421,7 @@ async fn process_workflow_task(
     });
     let mut warm_resident = warm_residency.into_workflow();
     // The resident state of the final cycle, kept for the next decision.
-    let mut final_resident = crate::resident::Residency::Unknown;
+    let mut final_resident: crate::resident::Residency;
     // A module-hosted workflow binds its module around one drive only, so
     // it cannot stay resident.
     #[cfg(feature = "hot-code-swap")]
@@ -26294,8 +26305,7 @@ async fn process_workflow_task(
                     // (via handle_suspended_workflow) gets a valid span reference.
                     let execute_span = tracing::Span::none();
                     // Issue #2007: an external-op batch cannot stay resident.
-                    final_resident =
-                        crate::resident::Residency::Missed(ResidentOutcome::Unsupported);
+                    final_resident = final_miss(hot_swapped, ResidentOutcome::Unsupported);
                     break (
                         WorkflowOutcome::Suspended {
                             commands: reconstructed_commands,
@@ -26489,7 +26499,7 @@ async fn process_workflow_task(
                 // The original span was dropped above.
                 let execute_span = tracing::Span::none();
                 // Issue #2007: an external-op batch cannot stay resident.
-                final_resident = crate::resident::Residency::Missed(ResidentOutcome::Unsupported);
+                final_resident = final_miss(hot_swapped, ResidentOutcome::Unsupported);
                 break (
                     WorkflowOutcome::Suspended {
                         commands: remaining_commands_with_unresolved,
@@ -26500,8 +26510,8 @@ async fn process_workflow_task(
                 );
             }
             other => {
-                final_resident = if hot_swapped && prepared.resident_enabled {
-                    crate::resident::Residency::Missed(ResidentOutcome::HotSwap)
+                final_resident = if hot_swapped {
+                    final_miss(hot_swapped, ResidentOutcome::HotSwap)
                 } else {
                     iter_resident
                 };
