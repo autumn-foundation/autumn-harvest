@@ -187,7 +187,8 @@ its thresholds and G1 to G4 do not change. The method changes:
 `verdict::judge` encodes the overlap rule. G1 and G2 compare `backout`
 with the other arms, so an overlap counts only when it involves the
 `backout` range. An overlap between `saga` and `hybrid` leaves G2 as it
-is. Review found the gap after the first run. The second run, on the
+is. The ranges decide before the medians do. A median order inside an
+overlap is open, so it gives an inconclusive result, not a failure. Review found the gap after the first run. The second run, on the
 final code, is the one that the report gives.
 
 ## 4. Test plan (red, green, refactor)

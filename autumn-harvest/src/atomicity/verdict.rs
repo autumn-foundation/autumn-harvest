@@ -178,25 +178,36 @@ fn others(cell: &Cell, arm: Atomicity) -> impl Iterator<Item = &ArmResult> {
     cell.arms.iter().filter(move |result| result.arm != arm)
 }
 
-/// G1 in one cell: backout has the best median, and its range clears the rest.
+/// The two ranges share a value, so their order is open.
+fn overlaps(a: &ArmResult, b: &ArmResult) -> bool {
+    a.min <= b.max && b.min <= a.max
+}
+
+/// G1 in one cell: backout beats every other arm.
+///
+/// An arm whose range clears backout from above fails the cell. Otherwise an
+/// overlap with backout leaves the order open, whatever the medians say.
 fn backout_wins(cell: &Cell) -> Criterion {
     let backout = result_of(cell, Atomicity::Backout);
-    if others(cell, Atomicity::Backout).any(|other| other.goodput > backout.goodput) {
+    if others(cell, Atomicity::Backout).any(|other| other.min > backout.max) {
         Criterion::Fails
-    } else if others(cell, Atomicity::Backout).any(|other| other.max >= backout.min) {
+    } else if others(cell, Atomicity::Backout).any(|other| overlaps(other, backout)) {
         Criterion::Inconclusive
     } else {
         Criterion::Holds
     }
 }
 
-/// G2 in one cell: another arm has a better median, and its range clears backout.
+/// G2 in one cell: another arm beats backout.
+///
+/// An arm whose range clears backout from above holds the cell. Backout
+/// whose range clears every other arm fails it. Any other case is open.
 fn backout_loses(cell: &Cell) -> Criterion {
     let backout = result_of(cell, Atomicity::Backout);
-    if others(cell, Atomicity::Backout).all(|other| other.goodput <= backout.goodput) {
-        Criterion::Fails
-    } else if others(cell, Atomicity::Backout).any(|other| other.min > backout.max) {
+    if others(cell, Atomicity::Backout).any(|other| other.min > backout.max) {
         Criterion::Holds
+    } else if others(cell, Atomicity::Backout).all(|other| other.max < backout.min) {
+        Criterion::Fails
     } else {
         Criterion::Inconclusive
     }
@@ -313,6 +324,40 @@ mod tests {
         cells[0].arms[0].min = 200.0;
         cells[0].arms[2].max = 200.0;
         assert_eq!(verdict(&cells).g1, Criterion::Inconclusive);
+    }
+
+    #[test]
+    fn a_lower_median_inside_an_overlap_makes_g1_inconclusive() {
+        let mut cells = passing();
+        cells[1].arms[0] = ArmResult {
+            min: 190.0,
+            max: 215.0,
+            ..arm(Atomicity::Backout, 200.0)
+        };
+        cells[1].arms[2] = ArmResult {
+            min: 195.0,
+            max: 212.0,
+            ..arm(Atomicity::Hybrid, 205.0)
+        };
+        let verdict = verdict(&cells);
+        assert_eq!(verdict.g1, Criterion::Inconclusive);
+        assert_eq!(verdict.outcome, Outcome::GoWithChanges);
+    }
+
+    #[test]
+    fn a_higher_backout_median_inside_an_overlap_makes_g2_inconclusive() {
+        let mut cells = passing();
+        cells[3].arms[0] = ArmResult {
+            min: 40.0,
+            max: 50.0,
+            ..arm(Atomicity::Backout, 48.0)
+        };
+        cells[3].arms[2] = ArmResult {
+            min: 44.0,
+            max: 46.0,
+            ..arm(Atomicity::Hybrid, 45.0)
+        };
+        assert_eq!(verdict(&cells).g2, Criterion::Inconclusive);
     }
 
     #[test]
