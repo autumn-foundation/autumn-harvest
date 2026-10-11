@@ -672,3 +672,33 @@ pub async fn wf_unwind_branched(ctx: &WorkflowContext) -> Out {
     }
     Ok(a)
 }
+
+/// A user function named `drop` that awaits the future it takes.
+pub mod user_drop {
+    pub async fn drop<F: std::future::Future<Output = Result<(), String>>>(
+        future: F,
+    ) -> Result<(), String> {
+        future.await
+    }
+}
+
+pub fn __autumn_workflow_info_wf_unwind_user_drop() -> u8 {
+    0
+}
+
+/// The unwind goes into a user function named `drop`, which awaits it. It
+/// is not drop glue, so the unwind is unproven, not dropped.
+pub async fn wf_unwind_user_drop(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let a = saga
+        .step(
+            || async { ctx.execute_activity_raw("reserve", 1).await },
+            |a| async move { ctx.execute_activity_raw("release", a).await.map(|_| ()) },
+        )
+        .await?;
+    if a > 10 {
+        user_drop::drop(saga.compensate_all()).await?;
+        return Err("too big".to_string());
+    }
+    Ok(a)
+}

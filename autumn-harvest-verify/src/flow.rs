@@ -22,6 +22,14 @@ use crate::util::{peel_refs, strip_generics_everywhere};
 /// The longest chain of blocks the `.await?` walk after `Saga::step` follows.
 const MAX_AWAIT_WALK: usize = 64;
 
+/// The std calls that drop a value. MIR prints each by its full path.
+const DROP_PATHS: [&str; 4] = [
+    "std::mem::drop",
+    "core::mem::drop",
+    "std::ptr::drop_in_place",
+    "core::ptr::drop_in_place",
+];
+
 /// What the structure builder already knows about each block of a body.
 #[derive(Debug, Default)]
 pub struct BlockFacts {
@@ -650,7 +658,9 @@ fn future_escape(blocks: &HashMap<&str, &BasicBlock>, block: &BasicBlock) -> Opt
             } => {
                 if args.iter().any(|a| state.holds_future(Some(a))) {
                     let bare = strip_generics_everywhere(callee);
-                    let dropped = bare.contains("drop_in_place") || bare.ends_with("::drop");
+                    // Only the std paths drop. A user function named `drop`
+                    // can await the future.
+                    let dropped = DROP_PATHS.contains(&bare.as_str());
                     return (!dropped).then(|| bare.clone());
                 }
                 at = target.as_deref()?;

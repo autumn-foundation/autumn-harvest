@@ -522,11 +522,16 @@ impl SourceIndex {
                 }
                 syn::Item::Macro(item) => self.absorb_macro(item, module),
                 syn::Item::Trait(item) => {
-                    // A default method body can declare a wrapper too.
+                    // A default method body can declare a wrapper too. A
+                    // closure in it sees the trait and method generics.
                     for member in &item.items {
-                        if let syn::TraitItem::Fn(f) = member
-                            && let Some(block) = &f.default
-                        {
+                        let syn::TraitItem::Fn(f) = member else {
+                            continue;
+                        };
+                        let mut generics = generic_names(&item.generics);
+                        generics.extend(generic_names(&f.sig.generics));
+                        self.record_generics(&f.sig.ident, &generics);
+                        if let Some(block) = &f.default {
                             self.absorb_body(block, &f.sig.ident, module);
                         }
                     }
@@ -1284,6 +1289,24 @@ mod tests {
         );
         let names = index.type_fields.get("Shared").map(|f| f.names.clone());
         assert!(names.is_some_and(|n| n.contains("Mutex")), "{index:?}");
+    }
+
+    #[test]
+    fn a_default_trait_method_records_its_generics() {
+        // A closure in the default body can return either parameter.
+        let mut index = SourceIndex::default();
+        index.absorb_syn(
+            "trait Run<Ctx> { fn run<StepFuture>(&self, f: StepFuture) {} }\n",
+            &[],
+        );
+        let names = index
+            .fn_generic_names
+            .get("run")
+            .cloned()
+            .unwrap_or_default();
+        for name in ["Ctx", "StepFuture"] {
+            assert!(names.contains(name), "{name}: {index:?}");
+        }
     }
 
     #[test]

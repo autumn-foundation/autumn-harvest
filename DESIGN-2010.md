@@ -193,13 +193,15 @@ Four review agents read the first version. Each fix has a test.
     run the unwind. That call is a `saga-escape`, so the verdict is
     `unknown`. A future moved into an aggregate, as `Some(..)`, is an escape
     too. So is a future held across a branch, as the walk does not follow
-    one. A dropped future does not unwind, so it is still a gap.
+    one. A dropped future does not unwind, so it is still a gap. Only the
+    std `drop` and `drop_in_place` paths drop. A user function named
+    `drop` is an escape, as it can await the future.
 34. A closure sees the generics of each function around it. So a step
     closure that returns `StepFuture` of its enclosing function is an
     `unresolved-generic` boundary, not a value that is not a future. The
     index keys generics by bare function name. A name that any function of
     that name declares counts as generic, so a same-named function cannot
-    hide one.
+    hide one. A trait method records the trait and method generics too.
 
 ---
 

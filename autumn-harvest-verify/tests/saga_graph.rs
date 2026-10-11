@@ -571,6 +571,7 @@ fn every_fixture_workflow_gets_its_expected_verdict() {
         ("wf_unwind_boxed", Unknown),
         ("wf_unwind_branched", Unknown),
         ("wf_unwind_then_err", Covered),
+        ("wf_unwind_user_drop", Unknown),
         ("wf_unwind_wrapped", Unknown),
         ("wf_update_handler", NoSaga),
     ];
@@ -734,6 +735,7 @@ fn an_unwind_passed_to_a_wrapper_is_an_escape() {
         ("wf_unwind_boxed", "Box::pin"),
         ("wf_unwind_wrapped", "Option::Some"),
         ("wf_unwind_branched", "control flow at bb"),
+        ("wf_unwind_user_drop", "user_drop::drop"),
     ] {
         let r = report(&reports, name);
         assert_eq!(r.verdict, SagaVerdict::Unknown, "{r:#?}");
