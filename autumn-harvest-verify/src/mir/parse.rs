@@ -770,6 +770,7 @@ fn parse_terminator(src: &str) -> Terminator {
         return Terminator::SwitchInt {
             operand: parse_operand(inner),
             targets: cfg_targets(&entries),
+            values: case_values(&entries),
         };
     }
     if let Some(inner) = call_like(head, "drop") {
@@ -941,6 +942,16 @@ fn cfg_targets(entries: &Entries<'_>) -> Vec<String> {
         .iter()
         .filter(|(k, value)| *k != Some("unwind") && is_bb(value))
         .map(|(_, value)| (*value).to_owned())
+        .collect()
+}
+
+/// The case value of each `switchInt` target, in the order of
+/// [`cfg_targets`]. A target with no printed value gets an empty string.
+fn case_values(entries: &Entries<'_>) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|(k, value)| *k != Some("unwind") && is_bb(value))
+        .map(|(k, _)| k.unwrap_or_default().to_owned())
         .collect()
 }
 
@@ -1250,6 +1261,10 @@ mod tests {
             "    bb0: {\n        switchInt(copy (((*_61) as variant#3).4: bool)) -> [-1: bb1, 0: bb2, otherwise: bb3];\n    }\n",
         );
         assert_eq!(switch.successors(), vec!["bb1", "bb2", "bb3"]);
+        let Terminator::SwitchInt { values, .. } = &switch else {
+            panic!("expected a SwitchInt, got {switch:?}");
+        };
+        assert_eq!(values, &["-1", "0", "otherwise"]);
         assert!(matches!(
             switch,
             Terminator::SwitchInt {

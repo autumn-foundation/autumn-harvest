@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::entry::Entry;
+use crate::flow::BlockFacts;
 use crate::mir::MirDoc;
 use crate::mir::ast::{Body, Operand, Place, Statement, Terminator};
 use crate::resolve::Program;
@@ -152,6 +153,18 @@ pub enum ExitOutcome {
     Unknown,
 }
 
+impl ExitOutcome {
+    /// The outcome as the manifest spells it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Err => "err",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// One edge of a flow graph.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FlowEdge {
@@ -233,6 +246,30 @@ pub struct Recorder {
     pub edges: BTreeSet<Edge>,
     /// Each step site it classified.
     pub sinks: BTreeSet<SinkSite>,
+    /// Each closure or fn item passed as an argument, with its index
+    /// (issue #2010).
+    pub arguments: BTreeSet<ArgumentEdge>,
+    /// Each handler registration it met (issue #2010).
+    pub handlers: BTreeSet<HandlerCall>,
+}
+
+/// A body passed as argument `index` of the call in `block`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ArgumentEdge {
+    pub caller: String,
+    pub block: String,
+    /// The call operand index, `self` included.
+    pub index: usize,
+    pub body: String,
+}
+
+/// A handler registration call.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct HandlerCall {
+    pub caller: String,
+    pub block: String,
+    /// The model row path, such as `register_signal_handler`.
+    pub method: String,
 }
 
 /// A call edge between two body ids.
@@ -282,6 +319,31 @@ impl Recorder {
         self.insert_edge(from, block, to, false, true);
     }
 
+    /// Record that `body` is argument `index` of the call in `block`.
+    pub fn argument(&mut self, from: &str, block: &str, index: usize, body: &str) {
+        self.arguments.insert(ArgumentEdge {
+            caller: from.to_string(),
+            block: block.to_string(),
+            index,
+            body: body.to_string(),
+        });
+    }
+
+    /// Record the `async` block a closure returns. The closure builds it, and
+    /// the caller of the closure polls it once.
+    pub fn future_edge(&mut self, from: &str, block: &str, to: &str) {
+        self.insert_edge(from, block, to, false, false);
+    }
+
+    /// Record a handler registration in `block`.
+    pub fn handler(&mut self, body: &str, block: &str, method: &str) {
+        self.handlers.insert(HandlerCall {
+            caller: body.to_string(),
+            block: block.to_string(),
+            method: method.to_string(),
+        });
+    }
+
     fn insert_edge(&mut self, from: &str, block: &str, to: &str, resume: bool, many: bool) {
         self.edges.insert(Edge {
             caller: from.to_string(),
@@ -319,7 +381,7 @@ pub fn manifest(
         format: STRUCTURE_FORMAT.to_string(),
         model_version: model_version.to_string(),
         rustc_version: rustc_version.to_string(),
-        flow: None,
+        flow: Some(FLOW_FORMAT.to_string()),
         workflows,
     }
 }
@@ -404,6 +466,9 @@ impl<'p> StructureBuilder<'p> {
             sinks.entry(site.body.as_str()).or_default().push(site);
         }
 
+        let (handlers, handler_at) = self.handlers(recorder, &display, &show);
+        let arguments = group_arguments(recorder, &display);
+
         let mut bodies = Vec::with_capacity(ids.len());
         for id in ids {
             let cyclic = self.cyclic_blocks(id);
@@ -421,28 +486,26 @@ impl<'p> StructureBuilder<'p> {
             calls.sort_by(|a, b| {
                 (&a.callee, a.resume, a.in_loop).cmp(&(&b.callee, b.resume, b.in_loop))
             });
-            let mut steps: Vec<StepSite> = Vec::new();
-            for site in sinks.get(id.as_str()).into_iter().flatten() {
-                let key = match (&site.step, site.key_arg, body) {
-                    (Some(_), Some(arg), Some(body)) => self.step_key(body, &site.block, arg),
-                    _ => None,
-                };
-                steps.push(StepSite {
-                    sink: site.sink.clone(),
-                    kind: site.step.clone().unwrap_or_else(|| "other".to_string()),
-                    key,
-                    in_loop: cyclic.contains(&site.block),
-                });
-            }
-            steps.sort_by(|a, b| {
-                (&a.kind, &a.key, &a.sink, a.in_loop).cmp(&(&b.kind, &b.key, &b.sink, b.in_loop))
-            });
+            let sited = self.step_sites(
+                sinks.get(id.as_str()).map_or(&[][..], Vec::as_slice),
+                body,
+                &cyclic,
+            );
+            let blocks: Vec<&str> = sited.iter().map(|(_, block)| *block).collect();
+            let mut facts = block_facts(
+                &blocks,
+                edges.get(id.as_str()).map_or(&[][..], Vec::as_slice),
+                arguments.get(id.as_str()).map_or(&[][..], Vec::as_slice),
+                &show,
+            );
+            facts.handlers = handler_blocks(&handler_at, id);
+            let flow = flow_graph(body, &facts);
             bodies.push(BodyNode {
                 id: show(id),
                 digest: self.digests.get(id.as_str()).cloned().unwrap_or_default(),
                 calls,
-                steps,
-                flow: None,
+                steps: sited.into_iter().map(|(step, _)| step).collect(),
+                flow: Some(flow),
             });
         }
         bodies.sort_by(|a, b| a.id.cmp(&b.id));
@@ -459,8 +522,83 @@ impl<'p> StructureBuilder<'p> {
             root: show(root),
             boundaries,
             bodies,
-            handlers: Vec::new(),
+            handlers,
         }
+    }
+
+    /// The step sites of one body, sorted, each with its block.
+    fn step_sites<'s>(
+        &mut self,
+        sites: &[&'s SinkSite],
+        body: Option<&Body>,
+        cyclic: &BTreeSet<String>,
+    ) -> Vec<(StepSite, &'s str)> {
+        let mut out: Vec<(StepSite, &str)> = Vec::new();
+        for site in sites {
+            let key = match (&site.step, site.key_arg, body) {
+                (Some(_), Some(arg), Some(body)) => self.step_key(body, &site.block, arg),
+                _ => None,
+            };
+            let step = StepSite {
+                sink: site.sink.clone(),
+                kind: site.step.clone().unwrap_or_else(|| "other".to_string()),
+                key,
+                in_loop: cyclic.contains(&site.block),
+            };
+            out.push((step, site.block.as_str()));
+        }
+        out.sort_by(|(a, x), (b, y)| {
+            (&a.kind, &a.key, &a.sink, a.in_loop, x).cmp(&(&b.kind, &b.key, &b.sink, b.in_loop, y))
+        });
+        out
+    }
+
+    /// The handler list of one workflow, and the index of each registration
+    /// by `(body, block)`.
+    fn handlers(
+        &mut self,
+        recorder: &Recorder,
+        display: &BTreeMap<String, String>,
+        show: &dyn Fn(&str) -> String,
+    ) -> (Vec<HandlerSite>, BTreeMap<(String, String), usize>) {
+        let program = self.program;
+        let mut list = Vec::new();
+        let mut at = BTreeMap::new();
+        for call in &recorder.handlers {
+            if !display.contains_key(&call.caller) {
+                continue;
+            }
+            // Operand 0 is the context, and operand 1 is the handler name.
+            let name = program.body(&call.caller).and_then(|body| {
+                let block = body.blocks.iter().find(|b| b.label == call.block)?;
+                let Terminator::Call { args, .. } = &block.terminator else {
+                    return None;
+                };
+                let markers = self.markers();
+                key_of_operand(markers, body, args.get(1)?, 0)
+            });
+            let mut bodies: Vec<String> = recorder
+                .arguments
+                .iter()
+                .filter(|a| a.caller == call.caller && a.block == call.block)
+                .filter(|a| display.contains_key(&a.body))
+                .map(|a| show(&a.body))
+                .collect();
+            bodies.sort_unstable();
+            bodies.dedup();
+            let kind = ["signal", "update", "query"]
+                .into_iter()
+                .find(|k| call.method.contains(k))
+                .unwrap_or("other");
+            at.insert((call.caller.clone(), call.block.clone()), list.len());
+            list.push(HandlerSite {
+                kind: kind.to_string(),
+                method: call.method.clone(),
+                name,
+                bodies,
+            });
+        }
+        (list, at)
     }
 
     /// Display ids, unique within the workflow, and a boundary per collision.
@@ -668,6 +806,80 @@ impl<'p> StructureBuilder<'p> {
                 .collect()
         })
     }
+}
+
+/// Each recorded argument whose body is in the graph, by caller.
+fn group_arguments<'r>(
+    recorder: &'r Recorder,
+    display: &BTreeMap<String, String>,
+) -> BTreeMap<&'r str, Vec<&'r ArgumentEdge>> {
+    let mut out: BTreeMap<&str, Vec<&ArgumentEdge>> = BTreeMap::new();
+    for argument in &recorder.arguments {
+        if display.contains_key(&argument.body) {
+            out.entry(argument.caller.as_str())
+                .or_default()
+                .push(argument);
+        }
+    }
+    out
+}
+
+/// Block → handler index, for the registrations in body `id`.
+fn handler_blocks(at: &BTreeMap<(String, String), usize>, id: &str) -> BTreeMap<String, usize> {
+    at.iter()
+        .filter(|((caller, _), _)| caller == id)
+        .map(|((_, block), index)| (block.clone(), *index))
+        .collect()
+}
+
+/// The flow graph of `body`. A body with no MIR gets only its entry.
+fn flow_graph(body: Option<&Body>, facts: &BlockFacts) -> FlowGraph {
+    body.map_or_else(
+        || FlowGraph {
+            nodes: vec![FlowNode {
+                at: String::new(),
+                event: FlowEvent::Entry,
+            }],
+            edges: Vec::new(),
+        },
+        |body| crate::flow::build(body, facts),
+    )
+}
+
+/// What the flow graph needs to know of each block of one body.
+///
+/// `steps` holds the block of each step site, in the sorted step order.
+fn block_facts(
+    steps: &[&str],
+    edges: &[&Edge],
+    arguments: &[&ArgumentEdge],
+    show: &dyn Fn(&str) -> String,
+) -> BlockFacts {
+    let mut facts = BlockFacts::default();
+    for (index, block) in steps.iter().enumerate() {
+        facts.steps.insert((*block).to_string(), index);
+    }
+    for edge in edges.iter().filter(|e| !e.resume) {
+        facts
+            .calls
+            .entry(edge.block.clone())
+            .or_default()
+            .push(show(&edge.callee));
+    }
+    for callees in facts.calls.values_mut() {
+        callees.sort_unstable();
+        callees.dedup();
+    }
+    for argument in arguments {
+        let bodies = facts
+            .arguments
+            .entry((argument.block.clone(), argument.index))
+            .or_default();
+        bodies.push(show(&argument.body));
+        bodies.sort_unstable();
+        bodies.dedup();
+    }
+    facts
 }
 
 fn hex(bytes: &[u8]) -> String {

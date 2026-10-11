@@ -1506,6 +1506,15 @@ fn closure_param_span(body: &Body) -> Option<String> {
     let (_, ty) = body.params.first()?;
     let ty = peel_refs(ty).trim();
     let ty = ty.trim_start_matches("mut ").trim();
+    // The coroutine of an `async` block takes `Pin<&mut {async block@..}>`
+    // (issue #2010).
+    let ty = ty
+        .strip_prefix("Pin<")
+        .or_else(|| ty.strip_prefix("std::pin::Pin<"))
+        .and_then(|inner| inner.strip_suffix('>'))
+        .map_or(ty, |inner| {
+            peel_refs(inner).trim().trim_start_matches("mut ").trim()
+        });
     (ty.starts_with('{') && ty.contains('@') && ty.ends_with('}')).then(|| ty.to_string())
 }
 

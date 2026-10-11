@@ -1221,7 +1221,8 @@ fn mirs_of(
 ///    and uplifts it by hard-linking `examples/NAME-HASH`. So the hashed sibling
 ///    is found by asking the filesystem which file in that directory *is* the
 ///    same file (same device and inode), which is exactly the relation "cargo
-///    uplifted this from that unit's output".
+///    uplifted this from that unit's output". A bin is uplifted from `deps/`
+///    to the profile directory, so `deps/` beside it is searched too.
 /// 3. **A single unambiguous candidate.** Only reachable where the uplift was a
 ///    copy rather than a hard link. Exactly one `<name>-<hash>.mir` in the
 ///    directory is accepted; **two or more is an error**, not a choice.
@@ -1284,21 +1285,30 @@ fn mir_for_artifact(filenames: &[PathBuf]) -> crate::Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// The hashed file `path` was uplifted from: the sibling that *is* the same
+/// The hashed file `path` was uplifted from: the file that *is* the same
 /// file on disk.
+///
+/// An example is uplifted within `examples/`, so its original is a sibling.
+/// A bin is uplifted from `deps/` to the profile directory, so its original
+/// is in `deps/` beside it (issue #2010).
 fn hashed_original(path: &Path) -> Option<PathBuf> {
     let dir = path.parent()?;
     let name = path.file_name()?.to_str()?;
-    for entry in std::fs::read_dir(dir).ok()?.filter_map(Result::ok) {
-        let candidate = entry.path();
-        if candidate.file_name().and_then(|n| n.to_str()) == Some(name) {
+    for dir in [dir.to_path_buf(), dir.join("deps")] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
-        }
-        if mir_beside(&candidate).is_none() {
-            continue;
-        }
-        if same_file(path, &candidate) {
-            return Some(candidate);
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let candidate = entry.path();
+            if candidate.file_name().and_then(|n| n.to_str()) == Some(name) {
+                continue;
+            }
+            if mir_beside(&candidate).is_none() {
+                continue;
+            }
+            if same_file(path, &candidate) {
+                return Some(candidate);
+            }
         }
     }
     None
@@ -2099,6 +2109,38 @@ mod tests {
             Some(examples.join("spike-46fe075bef8c6793.mir")),
             "the hashed original is the file the uplifted copy IS, not the \
              newest file whose name looks similar"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_uplifted_bin_is_resolved_through_its_hard_link_in_deps() {
+        // Cargo uplifts a bin from `deps/NAME-HASH` to the profile directory,
+        // with `-` for `_` in the name (issue #2010).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = dir.path().join("debug");
+        let deps = profile.join("deps");
+        std::fs::create_dir_all(&deps).expect("mkdir");
+        let hashed = deps.join("standalone_runner-1fe9236c6b192898");
+        std::fs::write(&hashed, "ELF").expect("write");
+        let uplifted = profile.join("standalone-runner");
+        std::fs::hard_link(&hashed, &uplifted).expect("hard link");
+        std::fs::write(
+            deps.join("standalone_runner-1fe9236c6b192898.mir"),
+            "// mir",
+        )
+        .expect("write");
+        // A decoy from another build of the same bin.
+        std::fs::write(deps.join("standalone_runner-deadbeefdeadbeef"), "ELF").expect("write");
+        std::fs::write(
+            deps.join("standalone_runner-deadbeefdeadbeef.mir"),
+            "// decoy",
+        )
+        .expect("write");
+
+        assert_eq!(
+            mir_for_artifact(std::slice::from_ref(&uplifted)).expect("identity is unambiguous"),
+            Some(deps.join("standalone_runner-1fe9236c6b192898.mir"))
         );
     }
 

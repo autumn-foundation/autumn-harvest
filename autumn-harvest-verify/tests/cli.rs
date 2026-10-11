@@ -528,9 +528,8 @@ fn check_structure_writes_json() {
         "json",
     ]);
     assert_eq!(code(&out), 1);
-    let reports: Vec<autumn_harvest_verify::saga::SagaReport> =
-        serde_json::from_str(&stdout(&out))
-            .unwrap_or_else(|e| panic!("stdout is not JSON: {e}\n{}", stdout(&out)));
+    let reports: Vec<autumn_harvest_verify::saga::SagaReport> = serde_json::from_str(&stdout(&out))
+        .unwrap_or_else(|e| panic!("stdout is not JSON: {e}\n{}", stdout(&out)));
     assert!(reports.iter().any(|r| r.name == "wf_gap_tail"));
 }
 

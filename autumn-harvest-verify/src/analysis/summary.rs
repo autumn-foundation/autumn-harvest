@@ -178,6 +178,8 @@ struct InvokedArgument<'i> {
     has_env: bool,
     /// `[ambiguous closure (N candidates, unioned)]`, or empty.
     note: &'i str,
+    /// Boundaries are reported on this pass.
+    emit: bool,
 }
 
 /// Everything about one call site that is fixed once `(body, substitution)` is:
@@ -254,11 +256,13 @@ impl<'m> CallClasses<'m> {
         })
     }
 
-    /// The call registers a handler closure, which is analyzed entry-adjacent.
-    fn registers_handler(&self) -> bool {
-        self.classes
-            .iter()
-            .any(|c| matches!(c, CallClass::HandlerRegistration(_)))
+    /// The `[[handler_registration]]` row, if the call registers a handler
+    /// closure. That closure is analyzed entry-adjacent.
+    fn handler_registration(&self) -> Option<&'m CtxMethodRule> {
+        self.classes.iter().find_map(|c| match c {
+            CallClass::HandlerRegistration(rule) => Some(*rule),
+            _ => None,
+        })
     }
 
     /// The call is a ctx primitive whose return value is recorded in history
@@ -631,7 +635,9 @@ impl<'a> Analyzer<'a> {
                 };
                 changed |= self.transfer_call(frame, call, state, report.as_deref_mut());
             }
-            Terminator::SwitchInt { operand, targets } => {
+            Terminator::SwitchInt {
+                operand, targets, ..
+            } => {
                 if targets.len() >= 2
                     && let Some(report) = report
                 {
@@ -764,7 +770,8 @@ impl<'a> Analyzer<'a> {
             return false;
         }
 
-        if site.registers_handler() {
+        if let Some(rule) = site.handler_registration() {
+            self.record_handler(frame, rule);
             self.descend_closures(frame, call, &arg_taints, state, &BTreeSet::new(), emit);
             return false;
         }
@@ -828,6 +835,12 @@ impl<'a> Analyzer<'a> {
             step: rule.step.clone(),
             key_arg: None,
         });
+    }
+
+    /// Keep a handler registration for the structure manifest (issue #2010).
+    fn record_handler(&mut self, frame: Frame<'_>, rule: &CtxMethodRule) {
+        self.recorder
+            .handler(frame.path, &frame.block.label, &rule.path);
     }
 
     /// Keep a sink call site for the structure manifest (issue #1995).
@@ -1570,6 +1583,7 @@ impl<'a> Analyzer<'a> {
                         target: &target,
                         has_env,
                         note: &note,
+                        emit,
                     },
                     arg_taints,
                     state,
@@ -1666,6 +1680,7 @@ impl<'a> Analyzer<'a> {
                 target,
                 has_env,
                 note,
+                emit,
             } = invoked;
             let hop = Hop {
                 function: frame.path.to_string(),
@@ -1704,14 +1719,58 @@ impl<'a> Analyzer<'a> {
             }
             self.recorder
                 .closure_edge(frame.path, &frame.block.label, target);
+            self.recorder
+                .argument(frame.path, &frame.block.label, index, target);
             let outcome = self.analyze_body(target, &Substitution::new(), &seeded, &inner_hops);
             out.absorb(&outcome.ret);
+            self.follow_returned_future(target, callee_body, &outcome.ret, &inner_hops, emit, out);
             // What the closure wrote through its environment is written back
             // onto the locals it captured, which is the only way a capture-by-
             // reference mutation reaches the caller.
             if has_env && let Some(written) = outcome.out.get(&0) {
                 Self::write_back_closure_captures(frame.body, operand, written, state);
             }
+        }
+    }
+
+    /// Analyze the `async` block that an invoked closure returns (issue
+    /// #2010).
+    ///
+    /// The callee that invoked the closure also polls the future it returns.
+    /// When that callee has no body here, as `Saga::step` has none, no poll
+    /// call reaches the coroutine body. So the body is analyzed here, as the
+    /// poll would run it. Parameter 0 is the future, so it carries the taint
+    /// of the closure result.
+    fn follow_returned_future(
+        &mut self,
+        closure: &str,
+        body: &Body,
+        ret: &TaintSet,
+        hops: &[Hop],
+        emit: bool,
+        out: &mut TaintSet,
+    ) {
+        let Some(span) = brace_form(&body.return_ty) else {
+            return;
+        };
+        if !span.starts_with("{async block@") {
+            return;
+        }
+        let block = returning_block(body);
+        let coroutines = self.program.closure_bodies_near(closure, &span);
+        if coroutines.is_empty() {
+            if emit {
+                self.push_boundary(BoundaryKind::UnresolvedCallback, &span, closure, &block);
+            }
+            return;
+        }
+        for coroutine in coroutines {
+            self.recorder.future_edge(closure, &block, &coroutine);
+            let params = self.program.body(&coroutine).map_or(0, |b| b.params.len());
+            let mut seeded = vec![ret.clone()];
+            seeded.resize(params.max(1), TaintSet::new());
+            let outcome = self.analyze_body(&coroutine, &Substitution::new(), &seeded, hops);
+            out.absorb(&outcome.ret);
         }
     }
 
@@ -2421,7 +2480,10 @@ fn implicit_flow(
 fn tainted_branches(body: &Body, state: &TaintState, graph: &ControlGraph) -> Vec<BranchRecord> {
     let mut out = Vec::new();
     for block in &body.blocks {
-        let Terminator::SwitchInt { operand, targets } = &block.terminator else {
+        let Terminator::SwitchInt {
+            operand, targets, ..
+        } = &block.terminator
+        else {
             continue;
         };
         if targets.len() < 2 {
@@ -2656,13 +2718,57 @@ fn first_sentence(reason: &str) -> &str {
     )
 }
 
+/// The label of the block that writes the return place `_0`, or `bb0`.
+fn returning_block(body: &Body) -> String {
+    body.blocks
+        .iter()
+        .find(|block| {
+            block.statements.iter().any(|statement| {
+                matches!(statement, Statement::Assign { dest, .. }
+                    if dest.local == Local(0) && dest.projections.is_empty())
+            })
+        })
+        .map_or_else(|| "bb0".to_string(), |block| block.label.clone())
+}
+
 /// The `{closure@..}` / `{async block@..}` brace form inside a type, if any.
+///
+/// A `{async fn body of f<..>}` group is skipped whole (issue #2010). It is
+/// the future of an `async fn`, and the closures in its generic arguments
+/// went to the call that built it. A naive cut there gave a broken span and
+/// a false `unresolved-callback` boundary.
 fn brace_form(ty: &str) -> Option<String> {
-    let at = ty.find('{')?;
-    let rest = ty.get(at..)?;
-    let end = rest.find('}')?;
-    let form = rest.get(..end.saturating_add(1))?;
-    form.contains('@').then(|| form.to_string())
+    let mut rest = ty;
+    loop {
+        let at = rest.find('{')?;
+        rest = rest.get(at..)?;
+        if rest.starts_with("{async fn body of ") {
+            rest = rest.get(balanced_group_len(rest)?..)?;
+            continue;
+        }
+        let end = rest.find('}')?;
+        let form = rest.get(..end.saturating_add(1))?;
+        return form.contains('@').then(|| form.to_string());
+    }
+}
+
+/// The byte length of the `{..}` group at the start of `text`, nested groups
+/// included.
+fn balanced_group_len(text: &str) -> Option<usize> {
+    let mut depth = 0_usize;
+    for (i, c) in text.char_indices() {
+        match c {
+            '{' => depth = depth.saturating_add(1),
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i.saturating_add(1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 const fn operand_place(operand: &Operand) -> Option<&Place> {
@@ -2690,4 +2796,27 @@ fn source_hint(path: &str) -> Option<String> {
         .trim_start_matches('@');
     let head = rest.split(": ").next()?;
     (!head.is_empty()).then(|| head.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn brace_form_skips_an_async_fn_body_group() {
+        assert_eq!(
+            brace_form("{async fn body of Saga<'_>::step<u64, {closure@a.rs:1:2: 1:4}>()}"),
+            None
+        );
+        assert_eq!(
+            brace_form("Map<{async fn body of f()}, {closure@a.rs:3:4: 3:9}>").as_deref(),
+            Some("{closure@a.rs:3:4: 3:9}")
+        );
+        assert_eq!(
+            brace_form("Pin<&mut {async block@a.rs:5:6: 5:9}>").as_deref(),
+            Some("{async block@a.rs:5:6: 5:9}")
+        );
+        assert_eq!(balanced_group_len("{a{b}c}d"), Some(7));
+        assert_eq!(balanced_group_len("{a{b}"), None);
+    }
 }

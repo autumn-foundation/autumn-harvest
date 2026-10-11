@@ -83,7 +83,12 @@ fn subtree_keys(w: &WorkflowStructure, start: &str) -> Vec<String> {
         seen.push(id.clone());
         let b = body(w, &id);
         keys.extend(b.steps.iter().filter_map(|s| s.key.clone()));
-        queue.extend(b.calls.iter().filter(|c| !c.resume).map(|c| c.callee.clone()));
+        queue.extend(
+            b.calls
+                .iter()
+                .filter(|c| !c.resume)
+                .map(|c| c.callee.clone()),
+        );
     }
     keys.sort_unstable();
     keys
@@ -124,7 +129,11 @@ fn every_body_has_a_flow_graph() {
 fn a_saga_future_is_not_an_unresolved_callback() {
     let m = manifest();
     for name in ["wf_covered", "wf_gap_after_step", "wf_loop"] {
-        assert_eq!(workflow(&m, name).boundaries, Vec::<String>::new(), "{name}");
+        assert_eq!(
+            workflow(&m, name).boundaries,
+            Vec::<String>::new(),
+            "{name}"
+        );
     }
 }
 
@@ -275,7 +284,11 @@ fn the_graph_does_not_change_the_body_digests() {
 fn a_workflow_with_no_saga_is_no_saga() {
     let reports = check();
     for name in ["wf_no_saga", "wf_handlers"] {
-        assert_eq!(report(&reports, name).verdict, SagaVerdict::NoSaga, "{name}");
+        assert_eq!(
+            report(&reports, name).verdict,
+            SagaVerdict::NoSaga,
+            "{name}"
+        );
     }
 }
 

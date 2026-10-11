@@ -118,3 +118,21 @@ cargo 1.94.1 (29ea6fb6a 2026-03-24)
 # Its `<impl at ...>` headers are relative to the WORKSPACE ROOT
 # (`autumn-harvest/examples/deterministic_primitives.rs`), not to this
 # directory, so resolution tests must use the workspace root as a source root.
+
+# `saga_graph/flow.mir` (issue #2010) was produced on rustc 1.99.0
+# (b940084d7 2026-09-28), the toolchain `rust-toolchain.toml` pins. It needs
+# TWO steps, like `bodyless_dependency.mir`: the stub `autumn_harvest` crate
+# must have no body in the analyzed set, and its crate name makes it trusted.
+# From `saga_graph/`:
+#
+#   rustc --crate-type lib --edition 2024 --crate-name autumn_harvest \
+#         -o libautumn_harvest.rlib harvest_stub.rs
+#   rustc --crate-type lib --edition 2024 --emit=mir \
+#         --extern autumn_harvest=libautumn_harvest.rlib -o flow.mir flow.rs
+#   rm libautumn_harvest.rlib
+#
+# The flow graph reads the `?` lowering: `Try::branch`, a `switchInt` with
+# cases `0` and `1`, and `from_residual`. After a re-emit, check that each
+# `saga.step(..).await?` still prints that shape:
+#
+#   grep -c 'as Try>::branch' saga_graph/flow.mir

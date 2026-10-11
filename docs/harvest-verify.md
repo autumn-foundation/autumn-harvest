@@ -97,6 +97,7 @@ $ cargo harvest-verify --list-boundaries
 | `--report` | **Also** print the `analyzed/proven/unknown/found/allowed` counts on **stderr**. The `text` renderer already ends with that same line plus the boundary set on stdout, so this flag exists to get the counts onto a separate stream (a CI step summary, say) — it does not add information. |
 | `--list-boundaries` | Print every boundary name, one per line, and exit `0`. |
 | `--emit-structure <FILE>` | Also write the structure manifest of each workflow to `FILE`. The report on stdout does not change. See [Structure manifest](#structure-manifest). |
+| `--check-structure <FILE>` | Read a structure manifest and run the saga compensation coverage check over it. Nothing is built. Exit `1` on a gap, `2` on a bad manifest. With `--strict`, an `unknown` verdict also exits `1`. See [Saga compensation coverage](#saga-compensation-coverage). |
 
 **There is no `--release` flag, and optimized builds are refused.** MIR inlining
 is on at `opt-level ≥ 1`, and an inlined helper leaves no `Call` terminator — the
@@ -265,6 +266,67 @@ because a change to its value does not change the reader's MIR. An activity
 body is not in
 the graph: a workflow names an activity through its `X_info()` function and
 never calls the body.
+
+### Flow graphs and handlers
+
+Each body also has a `flow` graph (issue #2010). The manifest names its
+format in `flow`, as `harvest-flow/1`. A node is an event. An edge joins two
+events when a path joins them with no other event on it.
+
+| Node `kind` | Meaning |
+|---|---|
+| `entry` | The first block. For a coroutine, the target of state `0`. |
+| `step` | A step site. `step` is its index in `steps`. |
+| `call` | A call that starts other bodies of the graph, in `callees`. |
+| `handler` | A handler registration. `handler` is its index in the workflow `handlers`. |
+| `saga-new` | `Saga::new`. |
+| `saga-step` | `Saga::step`. `forward` and `compensate` name its closure bodies. `tracked` is true when its out-edges carry the label `ok` or `err`. |
+| `saga-compensate` | `Saga::compensate_all`. |
+| `saga-escape` | A `Saga` value reaches a call or a value that is not a `Saga` method. |
+| `exit` | A write of the returned value. `outcome` is `ok` or `err` for a literal, and `unknown` for any other value. |
+
+`at` names the MIR block of a node. It is for diagnostics only.
+
+The workflow `handlers` list each signal, update or query handler: its
+`kind`, its model `method`, its `name` when the MIR shows it, and its
+closure `bodies`.
+
+A closure that returns an `async` block hands that future to its caller.
+When the caller has no body in the analysis, as `Saga::step` has none, the
+analysis follows the `async` block itself. So the steps inside a saga
+closure are in the graph.
+
+## Saga compensation coverage
+
+`--check-structure FILE` reads a manifest and runs one property over the
+flow graphs. It reads no MIR. The question is: can a completed forward step
+of a `Saga` reach an error exit with no unwind on the way?
+
+```console
+$ cargo harvest-verify -p my-workflows --lib --emit-structure wf.json
+$ cargo harvest-verify --check-structure wf.json
+gap  my_workflows::order::place_order
+  gap: my_workflows::order::place_order::{closure#0} at bb24 returns err
+covered  my_workflows::order::refund
+```
+
+| Verdict | Meaning |
+|---|---|
+| `no-saga` | No body uses a `Saga`, and no boundary can hide one. |
+| `covered` | Each error exit after a completed forward step unwinds first. |
+| `gap` | An error exit can follow a completed forward step with no unwind. The usual cause is a `?` on a call outside the saga. |
+| `unknown` | The graph cannot show the answer. The reason is one of `saga-escapes`, `saga-result-untracked`, `multiple-sagas` or `boundary`. Any gaps are listed as possible. |
+
+A `noop-compensation` note marks a compensation that emits no command. It
+does not change the verdict.
+
+The check follows `saga.step(..).await?` exactly. Another shape, such as
+`saga.step(..).await.map_err(..)?`, gives `saga-result-untracked`. A saga
+passed to a helper gives `saga-escapes`. The check trusts the `Saga`
+contract: a failed step unwinds every earlier step. A panic is not an error
+exit. DAG compensation runs in the engine, so the graph cannot see it. See
+[`docs/rnd/workflow-graph-spike.md`](rnd/workflow-graph-spike.md) for the
+measured `unknown` rate.
 
 ## The allowlist
 

@@ -17,6 +17,7 @@ pub mod allowlist;
 pub mod analysis;
 pub mod driver;
 pub mod entry;
+mod flow;
 pub mod mir;
 pub mod model;
 pub mod pipeline;
@@ -137,6 +138,10 @@ pub struct Cli {
     /// `autumn_harvest::upgrade_check` diffs two of them, one per build.
     #[arg(long, value_name = "FILE")]
     pub emit_structure: Option<std::path::PathBuf>,
+    /// Read a structure manifest and run the saga compensation coverage
+    /// check over it, with no build (issue #2010). Exit 1 on a gap.
+    #[arg(long, value_name = "FILE")]
+    pub check_structure: Option<std::path::PathBuf>,
 }
 
 /// CLI entry: parses `argv` (tolerating the `harvest-verify` subcommand token cargo inserts),
@@ -165,6 +170,10 @@ pub fn cli_main(argv: Vec<String>) -> i32 {
             println!("{}", kind.name());
         }
         return 0;
+    }
+
+    if let Some(path) = &cli.check_structure {
+        return check_structure(path, cli.format, cli.strict);
     }
 
     match run(&cli) {
@@ -204,6 +213,43 @@ pub fn cli_main(argv: Vec<String>) -> i32 {
             2
         }
     }
+}
+
+/// Run the saga coverage check over the manifest at `path`, and print the
+/// result. The exit code is 0 when clean, 1 on a gap and 2 on a tool error.
+/// With `strict`, an `unknown` verdict also fails the run.
+fn check_structure(path: &std::path::Path, format: Format, strict: bool) -> i32 {
+    let manifest: structure::StructureManifest = match std::fs::read_to_string(path)
+        .map_err(|e| e.to_string())
+        .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()))
+    {
+        Ok(manifest) => manifest,
+        Err(e) => {
+            eprintln!("error: cannot read {}: {e}", path.display());
+            return 2;
+        }
+    };
+    let reports = match saga::check(&manifest) {
+        Ok(reports) => reports,
+        Err(e) => {
+            eprintln!("error: {}: {e}", path.display());
+            return 2;
+        }
+    };
+    match format {
+        Format::Text => println!("{}", saga::render_text(&reports)),
+        Format::Json => match serde_json::to_string_pretty(&reports) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 2;
+            }
+        },
+    }
+    let failed = |verdict: saga::SagaVerdict| {
+        verdict == saga::SagaVerdict::Gap || (strict && verdict == saga::SagaVerdict::Unknown)
+    };
+    i32::from(reports.iter().any(|r| failed(r.verdict)))
 }
 
 /// Write the structure manifest of `report` to `path`.
