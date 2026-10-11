@@ -24,7 +24,7 @@
 //!   analysis can hold a saga and a gap, even beside a visible saga. An
 //!   external constant runs no code, so it does not count.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
@@ -127,7 +127,7 @@ pub fn check(manifest: &StructureManifest) -> Result<Vec<SagaReport>, CheckError
             validate(graph, body.steps.len())
                 .map_err(|e| CheckError(format!("{}: {e}", body.id)))?;
         }
-        if let Some(problem) = dangling_reference(workflow) {
+        if let Some(problem) = dangling_reference(workflow).or_else(|| unreached_body(workflow)) {
             return Err(CheckError(format!("{}: {problem}", workflow.workflow)));
         }
     }
@@ -182,6 +182,48 @@ fn dangling_reference(workflow: &WorkflowStructure) -> Option<String> {
         .map(String::as_str)
         .find(|id| !ids.contains(id))
         .map(|missing| format!("a node or handler names `{missing}`, which has no body"))
+}
+
+/// The first body that no reference reaches from the root. The check reads
+/// every body, so a stray gap would mark a workflow that has no saga.
+fn unreached_body(workflow: &WorkflowStructure) -> Option<String> {
+    let bodies: BTreeMap<&str, &BodyNode> =
+        workflow.bodies.iter().map(|b| (b.id.as_str(), b)).collect();
+    let mut reached: BTreeSet<&str> = BTreeSet::from([workflow.root.as_str()]);
+    let mut queue: Vec<&str> = vec![workflow.root.as_str()];
+    while let Some(id) = queue.pop() {
+        let Some(body) = bodies.get(id) else {
+            continue;
+        };
+        let mut next: Vec<&String> = body.calls.iter().map(|c| &c.callee).collect();
+        for node in body.flow.iter().flat_map(|graph| &graph.nodes) {
+            match &node.event {
+                FlowEvent::Call { callees } => next.extend(callees),
+                FlowEvent::SagaStep {
+                    forward,
+                    compensate,
+                    ..
+                } => next.extend(forward.iter().chain(compensate)),
+                FlowEvent::Handler { handler } => {
+                    let site = workflow.handlers.get(*handler);
+                    next.extend(
+                        site.into_iter()
+                            .flat_map(|h| h.bodies.iter().chain(&h.returns)),
+                    );
+                }
+                _ => {}
+            }
+        }
+        for callee in next {
+            if reached.insert(callee.as_str()) {
+                queue.push(callee.as_str());
+            }
+        }
+    }
+    bodies
+        .keys()
+        .find(|id| !reached.contains(*id))
+        .map(|stray| format!("no reference reaches the body `{stray}` from the root"))
 }
 
 /// The bodies that start an execution: the workflow root, each handler
@@ -779,6 +821,25 @@ mod tests {
         };
         let err = check(&manifest(dangling)).expect_err("a handler index past the list");
         assert!(err.to_string().contains("handler 0"), "{err}");
+
+        // No reference reaches the body `w::stray` from the root. Its gap
+        // would mark a workflow that has no saga.
+        let mut stray = manifest(FlowGraph {
+            nodes: vec![node(FlowEvent::Entry)],
+            edges: Vec::new(),
+        });
+        if let Some(w) = stray.workflows.first_mut() {
+            w.bodies.push(BodyNode {
+                id: "w::stray".to_string(),
+                flow: Some(FlowGraph {
+                    nodes: vec![node(FlowEvent::Entry)],
+                    edges: Vec::new(),
+                }),
+                ..BodyNode::default()
+            });
+        }
+        let err = check(&stray).expect_err("a body the root never reaches");
+        assert!(err.to_string().contains("w::stray"), "{err}");
     }
 
     #[test]

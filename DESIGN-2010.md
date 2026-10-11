@@ -141,9 +141,11 @@ Four review agents read the first version. Each fix has a test.
     local type's fields hold. A type whose fields hold `&mut`, a lifetime,
     an interior-mutable type or another such type counts as interior-mutable.
     The index follows each `mod x;` to its file, so a file of types only is
-    read too.
+    read too. It honors `#[path]`, and the declaring module gives the path.
 24. A `handlers` entry that no registration node names is refused. Its
     bodies would read as entries, so a helper could look covered.
+25. A body that no reference reaches from the root is refused. The check
+    reads every body, so its gap would mark a workflow with no saga.
 
 ---
 

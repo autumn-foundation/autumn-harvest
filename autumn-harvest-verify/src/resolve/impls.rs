@@ -117,9 +117,14 @@ impl SourceIndex {
         }
         // A `mod x;` declaration names a file that MIR may never name, such as
         // a file with types only. Each one read adds its own to the queue.
-        let mut queue: Vec<String> = expanded.iter().cloned().collect();
+        // Each entry carries its module path. A `#[path]` file has a path that
+        // does not give its module, so the declaring module gives it.
+        let mut queue: Vec<(String, Vec<String>)> = expanded
+            .iter()
+            .map(|f| (f.clone(), file_module(f)))
+            .collect();
         let mut seen: BTreeSet<String> = expanded;
-        while let Some(file) = queue.pop() {
+        while let Some((file, module)) = queue.pop() {
             let file = &file;
             let Some(text) = read_relative(roots, file) else {
                 // Only the files MIR *named* are worth reporting; the siblings
@@ -132,11 +137,13 @@ impl SourceIndex {
                 }
                 continue;
             };
-            match index.absorb_syn(&text, &file_module(file)) {
+            match index.absorb_syn(&text, &module) {
                 Some(children) => {
-                    for child in module_files(roots, file, &children) {
+                    for (child, path) in module_files(roots, file, &children) {
                         if seen.insert(child.clone()) {
-                            queue.push(child);
+                            let mut child_module = module.clone();
+                            child_module.extend(path);
+                            queue.push((child, child_module));
                         }
                     }
                 }
@@ -213,7 +220,7 @@ impl SourceIndex {
     /// `None` when `syn` rejected the file (its `extern` blocks and generic
     /// parameter lists are then invisible). Otherwise each `mod x;` it
     /// declares, as the path of inline modules around it and its name.
-    fn absorb_syn(&mut self, text: &str, module: &[String]) -> Option<Vec<Vec<String>>> {
+    fn absorb_syn(&mut self, text: &str, module: &[String]) -> Option<Vec<Declared>> {
         let file = syn::parse_file(text).ok()?;
         self.absorb_items(&file.items, 0, module);
         let mut children = Vec::new();
@@ -330,7 +337,7 @@ fn future_self_type(item: &syn::ItemImpl) -> Option<String> {
 
 /// Each `mod x;` in `items`, as the path of inline modules around it and its
 /// name. A `mod x { .. }` with a body adds its name to the path.
-fn declared_module_files(items: &[syn::Item], path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+fn declared_module_files(items: &[syn::Item], path: &mut Vec<String>, out: &mut Vec<Declared>) {
     for item in items {
         let syn::Item::Mod(item) = item else {
             continue;
@@ -338,10 +345,38 @@ fn declared_module_files(items: &[syn::Item], path: &mut Vec<String>, out: &mut 
         path.push(item.ident.to_string());
         match &item.content {
             Some((_, inner)) => declared_module_files(inner, path, out),
-            None => out.push(path.clone()),
+            None => out.push(Declared {
+                path: path.clone(),
+                file: path_attribute(&item.attrs),
+            }),
         }
         path.pop();
     }
+}
+
+/// A body-less `mod x;` declaration.
+struct Declared {
+    /// The module path below the declaring file, inline modules included.
+    path: Vec<String>,
+    /// The `#[path = "..."]` value, when the declaration has one.
+    file: Option<String>,
+}
+
+/// The value of a `#[path = "..."]` attribute.
+fn path_attribute(attrs: &[syn::Attribute]) -> Option<String> {
+    attrs.iter().find_map(|attr| {
+        let syn::Meta::NameValue(meta) = &attr.meta else {
+            return None;
+        };
+        let syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(value),
+            ..
+        }) = &meta.value
+        else {
+            return None;
+        };
+        meta.path.is_ident("path").then(|| value.value())
+    })
 }
 
 /// The files of the modules `children` that `file` declares and that exist.
@@ -351,7 +386,14 @@ fn declared_module_files(items: &[syn::Item], path: &mut Vec<String>, out: &mut 
 /// `src/a.rs` then `src/a/b.rs`. Each module is `x.rs` or `x/mod.rs`. In an
 /// unknown layout the file can be either kind, so both directories are read.
 /// An extra file only adds to the index.
-fn module_files(roots: &[PathBuf], file: &str, children: &[Vec<String>]) -> Vec<String> {
+///
+/// A `#[path]` value replaces the `x.rs` name. At the top of a file it is
+/// relative to the directory of that file, as rustc reads it.
+fn module_files(
+    roots: &[PathBuf],
+    file: &str,
+    children: &[Declared],
+) -> Vec<(String, Vec<String>)> {
     let path = Path::new(file);
     let Some(parent) = path.parent() else {
         return Vec::new();
@@ -369,18 +411,29 @@ fn module_files(roots: &[PathBuf], file: &str, children: &[Vec<String>]) -> Vec<
     };
     let mut out = Vec::new();
     for child in children {
-        let Some((name, inline)) = child.split_last() else {
+        let Some((name, inline)) = child.path.split_last() else {
             continue;
         };
-        for base in &bases {
+        let top = [parent.to_path_buf()];
+        let bases = match &child.file {
+            Some(_) if inline.is_empty() => &top[..],
+            _ => &bases[..],
+        };
+        for base in bases {
             let dir = inline.iter().fold(base.clone(), |dir, part| dir.join(part));
-            for candidate in [
-                dir.join(format!("{name}.rs")),
-                dir.join(name).join("mod.rs"),
-            ] {
+            let candidates = child.file.as_ref().map_or_else(
+                || {
+                    vec![
+                        dir.join(format!("{name}.rs")),
+                        dir.join(name).join("mod.rs"),
+                    ]
+                },
+                |named| vec![dir.join(named)],
+            );
+            for candidate in candidates {
                 let candidate = candidate.to_string_lossy().into_owned();
                 if read_relative(roots, &candidate).is_some() {
-                    out.push(candidate);
+                    out.push((candidate, child.path.clone()));
                 }
             }
         }
@@ -588,6 +641,35 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_module_file_named_by_a_path_attribute_is_indexed() {
+        // `#[path]` moves the file away from `state.rs`. Its types must be
+        // indexed, or a capture of them reads as read-only.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let write = |file: &str, text: &str| {
+            let path = dir.path().join(file);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, text).expect("write");
+        };
+        write(
+            "src/lib.rs",
+            "#[path = \"types/state.rs\"]\nmod state;\nmod outer { #[path = \"inner.rs\"] mod inner; }\n",
+        );
+        write(
+            "src/types/state.rs",
+            "pub struct Shared(std::sync::Arc<std::sync::Mutex<u64>>);\n",
+        );
+        write(
+            "src/outer/inner.rs",
+            "pub struct Deep(std::cell::Cell<u64>);\n",
+        );
+        let files = BTreeSet::from(["src/lib.rs".to_string()]);
+        let index = SourceIndex::build(&[dir.path().to_path_buf()], &files);
+        assert!(index.type_fields.contains_key("Shared"), "{index:?}");
+        assert!(index.type_paths.contains("state::Shared"), "{index:?}");
+        assert!(index.type_paths.contains("outer::inner::Deep"), "{index:?}");
+    }
 
     #[test]
     fn a_trait_impl_header_is_split_into_trait_and_self_type() {
