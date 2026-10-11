@@ -616,3 +616,30 @@ pub async fn wf_step_closure_capture(ctx: &WorkflowContext) -> Out {
     let seen = *kept.lock().unwrap();
     ctx.execute_activity_raw("b", seen).await
 }
+
+/// A future that only a shared reference implements. Its `poll` reads the
+/// clock.
+pub struct RefClock;
+
+impl Future for &RefClock {
+    type Output = Out;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::task::Poll::Ready(Ok(now_nanos()))
+    }
+}
+
+static REF_CLOCK: RefClock = RefClock;
+
+pub fn __autumn_workflow_info_wf_step_ref_future() -> u8 {
+    0
+}
+
+/// The forward step returns `&RefClock`, a future by its `&` impl.
+pub async fn wf_step_ref_future(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let a = saga.step(|| &REF_CLOCK, |_| async { Ok(()) }).await?;
+    ctx.execute_activity_raw("b", a).await
+}

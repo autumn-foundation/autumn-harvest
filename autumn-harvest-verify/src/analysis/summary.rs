@@ -1874,7 +1874,23 @@ impl<'a> Analyzer<'a> {
     ) -> Result<bool, (BoundaryKind, String)> {
         // `&mut F`, `Pin<&mut F>` and `Box<F>` forward `Future` to `F`.
         let ty = future_target(body.return_ty.trim());
-        if ty.is_empty() || ty.starts_with('&') || ty.starts_with('(') {
+        // A shared reference is a future only by a local `impl Future for &T`.
+        // That `poll` is not followed, so it is a boundary.
+        if let Some(referent) = ty.strip_prefix('&') {
+            // `&'a T` names its lifetime first.
+            let referent = referent.trim_start();
+            let referent = referent.strip_prefix('\'').map_or(referent, |rest| {
+                rest.split_once(' ').map_or("", |(_, ty)| ty)
+            });
+            let referent = strip_generics_everywhere(referent.trim());
+            let name = last_segment(&referent);
+            if self.program.sources_impl_future(&format!("&{name}")) {
+                let detail = format!("<{ty} as std::future::Future>::poll");
+                return Err((BoundaryKind::UnresolvedCallback, detail));
+            }
+            return Ok(false);
+        }
+        if ty.is_empty() || ty.starts_with('(') {
             return Ok(false);
         }
         // The signature trims a dependency type to `Tick`. The `_0` local

@@ -344,17 +344,21 @@ fn generic_names(generics: &syn::Generics) -> Vec<String> {
         .collect()
 }
 
-/// Every `.rs` file directly under `dir` (relative to whichever root holds it).
 /// The self type name of an `impl Future for T` block, with no generics.
+/// An impl for a shared reference, `&T`, gives `&T`.
 fn future_self_type(item: &syn::ItemImpl) -> Option<String> {
     let (_, trait_path, _) = item.trait_.as_ref()?;
     if trait_path.segments.last()?.ident != "Future" {
         return None;
     }
-    let syn::Type::Path(self_ty) = item.self_ty.as_ref() else {
+    let (prefix, self_ty) = match item.self_ty.as_ref() {
+        syn::Type::Reference(r) if r.mutability.is_none() => ("&", r.elem.as_ref()),
+        other => ("", other),
+    };
+    let syn::Type::Path(self_ty) = self_ty else {
         return None;
     };
-    Some(self_ty.path.segments.last()?.ident.to_string())
+    Some(format!("{prefix}{}", self_ty.path.segments.last()?.ident))
 }
 
 /// The deepest module path the source index follows.
@@ -515,6 +519,7 @@ fn layout_module<'p>(parts: &'p [&'p str]) -> &'p [&'p str] {
     &[]
 }
 
+/// Every `.rs` file directly under `dir` (relative to whichever root holds it).
 fn siblings(roots: &[PathBuf], dir: &Path) -> Vec<String> {
     for root in roots {
         let full = root.join(dir);
