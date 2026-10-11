@@ -96,11 +96,12 @@ use crate::telemetry::{
     METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DEBOUNCED, METRIC_WORKFLOW_DURATION,
     METRIC_WORKFLOW_HISTORY_BLOAT, METRIC_WORKFLOW_HISTORY_OVERSIZED, METRIC_WORKFLOW_HISTORY_SIZE,
     METRIC_WORKFLOW_ND_BLOCKED, METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PANIC,
-    METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED, METRIC_WORKFLOW_RETRIES,
-    METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_START_THROTTLED, METRIC_WORKFLOW_STARTED,
-    METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL, METRIC_WORKFLOW_TIMEOUT,
-    METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder, PoisonReason, SessionAcquisitionOutcome,
-    SlotType, TunerDecision, WebhookOutcome, WorkflowStatus,
+    METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED, METRIC_WORKFLOW_RESIDENT_HIT,
+    METRIC_WORKFLOW_RESIDENT_MISS, METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED,
+    METRIC_WORKFLOW_START_THROTTLED, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT,
+    METRIC_WORKFLOW_TERMINAL, METRIC_WORKFLOW_TIMEOUT, METRIC_WORKFLOW_UNFINISHED_HANDLERS,
+    MetricsRecorder, PoisonReason, SessionAcquisitionOutcome, SlotType, TunerDecision,
+    WebhookOutcome, WorkflowStatus,
 };
 use crate::telemetry::{
     DbOp, METRIC_DB_POOL_IDLE, METRIC_DB_POOL_IN_USE, METRIC_DB_POOL_WAIT,
@@ -901,6 +902,25 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
+    fn record_workflow_resident_hit(&self, workflow_name: &str, queue: &str) {
+        counter!(
+            METRIC_WORKFLOW_RESIDENT_HIT,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_workflow_resident_miss(&self, workflow_name: &str, queue: &str, reason: &str) {
+        counter!(
+            METRIC_WORKFLOW_RESIDENT_MISS,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_REASON => reason.to_owned(),
+        )
+        .increment(1);
+    }
+
     fn record_external_signal_sent(&self, outcome: &str, reason_code: Option<&str>) {
         if let Some(reason) = reason_code {
             counter!(
@@ -1673,6 +1693,8 @@ mod tests {
         rec.record_concurrency_key_deferred("cap", 1);
         rec.record_workflow_cache_hit("wf", "q");
         rec.record_workflow_cache_miss("wf", "q");
+        rec.record_workflow_resident_hit("wf", "q");
+        rec.record_workflow_resident_miss("wf", "q", "cold");
         rec.record_rate_limit_tokens_available("rl", 10.0);
         rec.record_rate_limit_refill_rate("rl", 2.0);
         rec.record_rate_limit_throttled("rl");
@@ -1856,6 +1878,39 @@ mod tests {
                 )
             })
             .collect();
+        assert_eq!(*capture.counters.lock().unwrap(), expected);
+    }
+
+    #[test]
+    fn bridges_resident_hits_and_misses_with_the_bounded_reason_label() {
+        // Issue #2007: one hit series, and one miss series per reason.
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            let rec = MetricsRsRecorder;
+            rec.record_workflow_resident_hit("wf", "q");
+            for miss in crate::resident::ResidentMiss::ALL {
+                rec.record_workflow_resident_miss("wf", "q", miss.as_str());
+            }
+        });
+
+        let labels = |reason: Option<&str>| {
+            let mut labels = vec![
+                (METRIC_LABEL_WORKFLOW.to_owned(), "wf".to_owned()),
+                (METRIC_LABEL_QUEUE.to_owned(), "q".to_owned()),
+            ];
+            if let Some(reason) = reason {
+                labels.push((METRIC_LABEL_REASON.to_owned(), reason.to_owned()));
+            }
+            labels
+        };
+        let mut expected: Vec<CounterKey> =
+            vec![(METRIC_WORKFLOW_RESIDENT_HIT.to_owned(), labels(None))];
+        expected.extend(crate::resident::ResidentMiss::ALL.iter().map(|miss| {
+            (
+                METRIC_WORKFLOW_RESIDENT_MISS.to_owned(),
+                labels(Some(miss.as_str())),
+            )
+        }));
         assert_eq!(*capture.counters.lock().unwrap(), expected);
     }
 

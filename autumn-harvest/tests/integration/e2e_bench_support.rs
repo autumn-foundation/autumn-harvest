@@ -3371,14 +3371,104 @@ pub mod db {
         }
     }
 
+    /// Counts resident hits and misses by reason (issue #2007).
+    ///
+    /// The `throughput` scenario reports the counts in its notes. Every
+    /// other recorder method stays a no-op.
+    #[derive(Default)]
+    pub struct ResidentCounts {
+        /// `hit`, or the miss reason, to its count.
+        counts: Mutex<BTreeMap<String, u64>>,
+    }
+
+    impl ResidentCounts {
+        /// A copy of the counts so far.
+        #[must_use]
+        pub fn snapshot(&self) -> BTreeMap<String, u64> {
+            self.counts.lock().expect("poisoned").clone()
+        }
+
+        fn add(&self, key: &str) {
+            *self
+                .counts
+                .lock()
+                .expect("poisoned")
+                .entry(key.to_owned())
+                .or_default() += 1;
+        }
+    }
+
+    impl MetricsRecorder for ResidentCounts {
+        fn record_workflow_resident_hit(&self, _workflow_name: &str, _queue: &str) {
+            self.add("hit");
+        }
+
+        fn record_workflow_resident_miss(&self, _workflow_name: &str, _queue: &str, reason: &str) {
+            self.add(reason);
+        }
+    }
+
+    /// Renders the resident counts that `after` adds to `before`.
+    #[must_use]
+    pub fn resident_note(before: &BTreeMap<String, u64>, after: &BTreeMap<String, u64>) -> String {
+        let delta: BTreeMap<&str, u64> = after
+            .iter()
+            .map(|(key, n)| (key.as_str(), n - before.get(key).copied().unwrap_or(0)))
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        let hits = delta.get("hit").copied().unwrap_or(0);
+        let total: u64 = delta.values().sum();
+        let misses = delta
+            .iter()
+            .filter(|(key, _)| **key != "hit")
+            .map(|(key, n)| format!("{key} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "decision counts here are far below 2^53"
+        )]
+        let rate = if total == 0 {
+            "n/a".to_owned()
+        } else {
+            format!("{:.1}%", hits as f64 * 100.0 / total as f64)
+        };
+        format!(
+            "resident decisions (issue #2007, measured loop): {hits} hits of {total}, \
+             hit rate {rate}; misses: {}",
+            if misses.is_empty() { "none" } else { &misses }
+        )
+    }
+
+    #[test]
+    fn the_resident_note_counts_only_the_measured_decisions() {
+        let counts = ResidentCounts::default();
+        counts.record_workflow_resident_miss("wf", "q", "cold");
+        let before = counts.snapshot();
+        counts.record_workflow_resident_miss("wf", "q", "cold");
+        for _ in 0..3 {
+            counts.record_workflow_resident_hit("wf", "q");
+        }
+        assert_eq!(
+            resident_note(&before, &counts.snapshot()),
+            "resident decisions (issue #2007, measured loop): 3 hits of 4, hit rate 75.0%; \
+             misses: cold 1"
+        );
+        assert!(resident_note(&before, &before).ends_with("hit rate n/a; misses: none"));
+    }
+
     /// Build the registry both bench workflows and all three activities share.
     #[must_use]
     pub fn build_registry() -> (Arc<HandlerRegistry>, Arc<BenchObservations>) {
-        let telemetry = Arc::new(
-            TelemetryConfig::builder()
-                .metrics(Arc::new(NoOpMetrics) as Arc<dyn MetricsRecorder>)
-                .build(),
-        );
+        build_registry_with_metrics(Arc::new(NoOpMetrics))
+    }
+
+    /// [`build_registry`] with `metrics` as the recorder.
+    #[must_use]
+    pub fn build_registry_with_metrics(
+        metrics: Arc<dyn MetricsRecorder>,
+    ) -> (Arc<HandlerRegistry>, Arc<BenchObservations>) {
+        let telemetry = Arc::new(TelemetryConfig::builder().metrics(metrics).build());
         let observations = Arc::new(BenchObservations::default());
         let mut state = std::collections::HashMap::new();
         state.insert(
@@ -4016,7 +4106,9 @@ pub mod db {
         let scenario_started = Instant::now();
         let cluster = Box::pin(setup_shards(shard_count)).await?;
         let sharded = cluster.sharded_pool();
-        let (registry, _observations) = build_registry();
+        let resident = Arc::new(ResidentCounts::default());
+        let (registry, _observations) =
+            build_registry_with_metrics(Arc::clone(&resident) as Arc<dyn MetricsRecorder>);
         let fleet = start_fleet(&cluster, &sharded, &registry, &census);
         let deadline = scenario_deadline();
         let shards = cluster.shard_ids();
@@ -4041,6 +4133,7 @@ pub mod db {
             .map(|l| u64::try_from(l.completed).unwrap_or(0))
             .collect();
 
+        let resident_before = resident.snapshot();
         let loops = run_closed_loop(
             &cluster,
             "meas",
@@ -4050,6 +4143,7 @@ pub mod db {
             &census,
         )
         .await;
+        let resident_note = resident_note(&resident_before, &resident.snapshot());
         let requested = per_shard_total * shards.len();
 
         // Completion instants come from the database clock (`completed_at`), so
@@ -4141,6 +4235,7 @@ pub mod db {
                 vec![
                     shard_note(&per_shard),
                     format!("topology: {}", topology.as_str()),
+                    resident_note,
                     format!(
                         "closed loop: {inflight} workflows in flight per shard, {requested} \
                          measured completions, warmup population {}",

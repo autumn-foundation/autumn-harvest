@@ -4077,6 +4077,104 @@
           "description": "Terminal harvest_task_queue rows deleted by the terminal-task janitor (issue #1811), by task state. A flat zero while the table grows means the janitor is off (terminal_task_retention_secs = null) or the role lacks DELETE. GET /admin/retention reports the per-shard outcome and any error."
         },
         {
+          "id": 159295,
+          "type": "timeseries",
+          "title": "Resident hit ratio (issue #2007)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 108
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum (rate(harvest_workflow_resident_hit_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval])) / (sum (rate(harvest_workflow_resident_hit_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval])) + sum (rate(harvest_workflow_resident_miss_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval])))",
+              "legendFormat": "resident hit ratio",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Share of decisions that resume the parked workflow and replay nothing (issue #2007). Each decision records one sample while resident workflows are on. The workflow cache hit ratio is an upper bound of this ratio."
+        },
+        {
+          "id": 741012,
+          "type": "timeseries",
+          "title": "Resident misses by reason (issue #2007)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 108
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (reason) (rate(harvest_workflow_resident_miss_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{reason}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Decisions per second that replay cold, by reason (issue #2007). The reason set is closed: cold, multi_await, race, mutex, hot_swap, command, condition, signal_handler, context, key_changed, delta, failure. See docs/telemetry.md#resident-hit-rate-issue-2007."
+        },
+        {
           "id": 931,
           "type": "timeseries",
           "title": "Dispatch rate by shard",

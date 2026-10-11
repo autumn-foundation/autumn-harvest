@@ -34,7 +34,7 @@ A warm decision resumes only on an exact delta. The delta holds the events of th
 
 Any other delta declines. A decline drops the resident workflow and runs a cold replay, which is always correct. Joins, races, activity failures, updates, cancels and child workflows therefore still replay cold.
 
-**Observing it.** The cache metrics do not tell a resume from a replay. A resumed cycle records `harvest.replay = false` on its `harvest.workflow.execute` span. A decline logs `resident workflow declined; replaying cold (issue #1798)` at `debug` level, with the `ResumeDeclined` reason.
+**Observing it.** The cache metrics do not tell a resume from a replay. `harvest.workflow.resident_hit` and `harvest.workflow.resident_miss{reason}` do (issue #2007). Each decision records one of them while resident workflows are on. See [Resident hit rate](telemetry.md#resident-hit-rate-issue-2007). A resumed cycle also records `harvest.replay = false` on its `harvest.workflow.execute` span. A decline logs `resident workflow declined; replaying cold (issue #1798)` at `debug` level, with the `ResumeDeclined` reason.
 
 **Limits.**
 
@@ -90,8 +90,10 @@ Each release is one `UPDATE` per pool. At worst it scans all `RUNNING` rows of t
 |--------|------|-------------|
 | `harvest.workflow.cache_hit` | counter | Task served from in-process LRU cache (delta load). The task resumes the resident workflow or replays the cached history. |
 | `harvest.workflow.cache_miss` | counter | Task required a full history reload from Postgres. |
+| `harvest.workflow.resident_hit` | counter | The task resumes the parked workflow and replays nothing (issue #2007). |
+| `harvest.workflow.resident_miss` | counter | The task replays cold while resident workflows are on. The `reason` label says why (issue #2007). |
 
-Both metrics carry a `workflow` label (the workflow name). `execution.id` is deliberately excluded per ADR-0001 §7 (cardinality).
+Each metric carries the `workflow` and `queue` labels. `resident_miss` also carries `reason`. `execution.id` is deliberately excluded per ADR-0001 §7 (cardinality).
 
 Monitor the **hit ratio** (`cache_hit / (cache_hit + cache_miss)`) per worker. With sticky routing on, the ratio climbs toward 1 for long-running workflows that suspend many times. A ratio that stays near 0 may indicate the lease TTL is shorter than the median inter-task delay.
 

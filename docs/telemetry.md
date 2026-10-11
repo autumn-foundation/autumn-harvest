@@ -337,6 +337,10 @@ metric is emitted in the source code.
 | `harvest.workflow.timeout` | Counter | `timeout.rs` — `enforce_workflow_execution_timeouts`, when a run's per-run `deadline_at` (issue #243) elapses. Labels: `workflow`, `queue` |
 | `harvest.workflow.chain_timeout` | Counter | `timeout.rs` — `enforce_workflow_execution_timeouts`, when a run's chain-scoped `chain_deadline_at` (issue #617) elapses. The chain cap is anchored at the first run's start and carried verbatim across every continue-as-new, so this counter — distinct from `harvest.workflow.timeout` — fires when a whole continue-as-new chain (not a single run) outlives its lifetime cap. Labels: `workflow`, `queue`. Both a chain and a run timeout still emit `harvest.workflow.terminal{outcome="timed_out"}`; the chain-vs-run distinction lives only in these two counters |
 | `harvest.workflow.history_bloat` | Counter | `worker.rs` — via the shared `emit_history_bloat_warning_if_crossed` helper, called from two places: (1) `process_workflow_task`'s `Persisted` arm, post-commit, for a still-**RUNNING** (non-terminal, `WorkflowOutcome::Suspended`) execution (same "compute pre-transaction, act only after commit" discipline as `harvest.signal.unhandled`/`harvest.update.completed`/`harvest.update.failed`, issue #684, so an ND-blocked / paused-parked / persist-failed cycle can never emit); and (2) `fail_workflow_for_history_cap`, when a single decision cycle grows history from below the soft threshold straight past `event_hard_cap` in one inline append batch (e.g. local-activity or external-signal persistence), bypassing (1) entirely — the crossing still happened in the same decision, so it is emitted there too, before the execution is terminally DLQ'd. Fires once per still-**RUNNING** or newly-hard-cap-terminal-failed execution the moment its recorded `harvest_events` count first crosses `history_bloat_warn_fraction * event_hard_cap` (`WorkflowHistoryPolicy`, default fraction `0.2048` since issue #1804, so 10,240 events under the default 50,000-event cap, clamped below `1.0`); a guarded `history_bloat_warned_at` column on the execution row makes the crossing idempotent across replays/retries once the mark is durably set. **Delivery is at-least-once, not exactly-once**: the counter is emitted BEFORE the guard is persisted, so a worker crash in the narrow window between the two leaves the guard unset and a future retry of the same decision cycle may re-emit rather than silently losing the signal forever — deliberate, since the guard is a one-shot, non-recurring gate with no later crossing to fall back on for a given execution (PR #1139 review). Observation-only — the run keeps executing normally; a permanently flat, never-incrementing series when the event cap is unlimited (`history_event_hard_cap_unlimited()`) or the warn fraction is `0` (`history_bloat_warn_fraction(0.0)`), which is the disabled/no-op state, not a health issue. Pair with `GET /api/harvest/workflows?history_bloat_min_events=<N>` (or `harvest workflow list --history-bloat-min-events <N>`) to discover and rank the specific offending, still-live execution(s) by current history size (issue #704) |
+| `harvest.workflow.cache_hit` | Counter | `worker.rs` — `process_workflow_task`, once per decision that loads only the delta from the in-process cache |
+| `harvest.workflow.cache_miss` | Counter | `worker.rs` — `process_workflow_task`, once per decision that loads the full history |
+| `harvest.workflow.resident_hit` | Counter | `worker.rs` — `process_workflow_task`, once per decision that resumes the parked workflow and replays nothing (issue #2007). See [Resident hit rate](#resident-hit-rate-issue-2007) |
+| `harvest.workflow.resident_miss` | Counter | `worker.rs` — `process_workflow_task`, once per decision that replays cold while resident workflows are on. Labels: `workflow`, `queue`, `reason` (issue #2007) |
 | `harvest.activity.duration` | Histogram | `worker.rs` — `dispatch_activity_handler`, on activity completion (success or failure) |
 | `harvest.activity.failed` | Counter | `worker.rs` — `dispatch_activity_handler`, on each failed attempt; richer labels than `harvest.activity.attempts` (`workflow.type`, `error.type`, `non_retryable`) |
 | `harvest.activity.attempts` | Counter | `worker.rs` — `dispatch_activity_handler`, once per attempt for **both** outcomes; use for success-rate SLOs: `rate(attempts{outcome="completed"}[5m]) / rate(attempts[5m])` (issue #528) |
@@ -431,6 +435,10 @@ metric is emitted in the source code.
 |--------|--------|
 | `harvest.workflow.started` | `workflow`, `queue` |
 | `harvest.workflow.duration` | `workflow`, `queue`, `status` (`completed\|failed\|suspended\|continued_as_new`), `build_id` — capped, see [`build_id` label](#build_id-label) (issue #1814) |
+| `harvest.workflow.cache_hit` | `workflow`, `queue` |
+| `harvest.workflow.cache_miss` | `workflow`, `queue` |
+| `harvest.workflow.resident_hit` | `workflow`, `queue` |
+| `harvest.workflow.resident_miss` | `workflow`, `queue`, `reason` (`cold\|multi_await\|race\|mutex\|hot_swap\|command\|condition\|signal_handler\|context\|key_changed\|delta\|failure` — `ResidentMiss::as_str`, closed set) |
 | `harvest.activity.duration` | `activity`, `queue`, `status` (`completed\|failed`), `build_id` — capped, see [`build_id` label](#build_id-label) (issue #1814) |
 | `harvest.activity.failed` | `activity`, `workflow.type`, `error.type`, `non_retryable` |
 | `harvest.activity.attempts` | `activity`, `queue`, `outcome` (`completed\|failed`), `build_id` — capped, see [`build_id` label](#build_id-label) (issue #1814) |
@@ -547,6 +555,58 @@ another recorder must forward these methods too, or the build is lost.
 
 The ramp guard does not read these metrics. It counts runs in the database by
 `assigned_build_id`. See `docs/operations/build-ramp-guard.md`.
+
+### Resident hit rate (issue #2007)
+
+A warm decision can resume the parked workflow and replay nothing (issue
+#1798). Two counters show how often that happens. While resident workflows
+are on, each decision that drives the workflow records exactly one sample:
+
+- `harvest.workflow.resident_hit` when the decision resumes the parked
+  workflow.
+- `harvest.workflow.resident_miss{reason}` when the decision replays cold.
+
+The worker records no sample while sticky routing or `resident_workflows`
+is off, or after the cache closes at shutdown. A local-activity re-drive
+inside one decision does not record a second sample. A decision that fails
+before it drives the workflow records no sample, for example on an input it
+cannot decode.
+
+A miss has exactly one `reason`:
+
+| `reason` | The decision replays cold because |
+|----------|-----------------------------------|
+| `cold` | This worker holds no resident state for the run: the first decision, a cache miss, an LRU eviction or a restart. |
+| `multi_await` | The last suspension awaited two or more commands, for example a `futures::join!`. |
+| `race` | The last suspension was part of a race: `ctx.race()`, `wait_for_signal_timeout` or a child with a deadline. Work that cancels race losers also counts here. |
+| `mutex` | The last suspension held or waited for a durable mutex. |
+| `hot_swap` | The workflow runs in a hot-swapped module. |
+| `command` | The last suspension sent a command that the resident path does not take, for example a child workflow or a local activity. |
+| `condition` | The last suspension waited for a condition (`await_condition`). |
+| `signal_handler` | The workflow has a push signal handler. |
+| `context` | Another context state blocked the capture, for example a cancel request or a non-determinism record. |
+| `key_changed` | A context input changed since the suspension, for example the deadline or the shard. |
+| `delta` | The new events did not resolve the parked wait exactly. Examples: two results in one delta, or a gap in the event ids. |
+| `failure` | The awaited activity failed or timed out. |
+
+A raw `select!` over two Harvest futures records no race marker. It counts
+as `multi_await` while both sides wait, and as `race` after it drops one
+side. Each reason is a class of suspension that a wider resident path could
+take. The closed set bounds the `reason` label.
+
+The hit rate per workflow type:
+
+```promql
+sum by (workflow) (rate(harvest_workflow_resident_hit_total[5m]))
+/
+(sum by (workflow) (rate(harvest_workflow_resident_hit_total[5m]))
+ + sum by (workflow) (rate(harvest_workflow_resident_miss_total[5m])))
+```
+
+`harvest.workflow.cache_hit` counts delta loads. A cache hit can still
+replay cold, so the cache hit rate is an upper bound of the resident hit
+rate. The recorded measurements are in
+[`docs/rnd/2026-10-11-resident-hit-rate.md`](rnd/2026-10-11-resident-hit-rate.md).
 
 ### Saga compensation metrics (issue #801)
 
