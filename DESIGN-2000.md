@@ -169,6 +169,8 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | A fork audit goes to the default shard, not the source shard. | Audit on the source-shard connection, as a reset does. |
 | A timer at the same position in a changed fork decision is taken for the source winner. | Hold only when the fork decision schedules the same commands as the source decision. Judge a timer only by its own later events. |
 | An input override skips the offloader. | Encode, then offload the new input as an appended field is, and record its blob reference. |
+| A copied fan-out stored result loses its blob reference. | Share the keys of stored results in the decoded prefix too. |
+| An activity failure with the abandon text is taken for an engine record. | Match the whole engine shape and the absence of a start, as `replay.rs` does. |
 
 ## 2. Tests
 

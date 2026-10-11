@@ -314,13 +314,18 @@ async fn fork_in_transaction(
         start_input.as_ref().map(|(input, _)| input),
     )
     .await?;
-    if let Some((_, refs)) = &start_input
-        && !refs.is_empty()
-    {
-        crate::store::insert_payload_refs(conn, new_exec_id, refs).await?;
-    }
     let kept_input = request.input.is_none().then_some(&source.input);
-    share_payload_refs(conn, source_id, new_exec_id, &copied, kept_input).await?;
+    share_payload_refs(
+        conn,
+        (source_id, new_exec_id),
+        &copied,
+        kept_input,
+        &events[..plan.events_carried_over],
+        start_input
+            .as_ref()
+            .map_or(&[], |(_, refs)| refs.as_slice()),
+    )
+    .await?;
     let tail = fork_tail(source_id, fork_event_id, request);
     let tail_start = i32::try_from(plan.events_carried_over)
         .map_err(|_| HarvestError::Database("fork carried too many events".to_string()))?;
@@ -494,22 +499,47 @@ async fn check_shards(
 ///
 /// The fork shares the blobs of the source. Its own references keep them
 /// alive after retention deletes the source. Only the rows that the fork
-/// stores count, so a replaced input releases its blob.
+/// stores count, so a replaced input releases its blob. The blobs of a new
+/// input, `input_refs`, are recorded in the same insert.
 async fn share_payload_refs(
     conn: &mut AsyncPgConnection,
-    source_id: ExecutionId,
-    new_exec_id: ExecutionId,
+    (source_id, new_exec_id): (ExecutionId, ExecutionId),
     copied: &[Value],
     kept_input: Option<&Value>,
+    prefix: &[WorkflowEvent],
+    input_refs: &[crate::payload_store::OffloadedRef],
 ) -> HarvestResult<()> {
+    let keys = shared_keys(copied, kept_input, prefix);
+    let refs = crate::store::load_payload_refs(conn, source_id).await?;
+    let mut shared = refs_named_in(refs, &keys);
+    shared.extend_from_slice(input_refs);
+    crate::store::insert_payload_refs(conn, new_exec_id, &shared).await
+}
+
+/// The blob keys that the copied history names.
+///
+/// They are the offload envelopes in the stored rows, the kept input, and the
+/// fan-out stored results in the decoded prefix. A result writer records a
+/// reference, not an envelope. The reference is in a payload field, so a
+/// codec can hide it in the stored row. The decoded event shows it.
+fn shared_keys(
+    copied: &[Value],
+    kept_input: Option<&Value>,
+    prefix: &[WorkflowEvent],
+) -> std::collections::HashSet<String> {
     let mut keys = envelope_keys(copied);
     keys.extend(
         kept_input
             .and_then(crate::payload_store::extract_offload_ref)
             .map(|blob| blob.blob_key),
     );
-    let refs = crate::store::load_payload_refs(conn, source_id).await?;
-    crate::store::insert_payload_refs(conn, new_exec_id, &refs_named_in(refs, &keys)).await
+    keys.extend(prefix.iter().filter_map(|event| match event {
+        WorkflowEvent::ActivityCompleted { output, .. } => {
+            crate::fan_out::StoredResult::from_recorded_value(output).map(|stored| stored.key)
+        }
+        _ => None,
+    }));
+    keys
 }
 
 /// The blob keys that the offload envelopes in the stored `rows` name.
@@ -1318,7 +1348,9 @@ pub fn resolve_activity(
     }
     match recorded_terminal(source_events, name, occurrence, input) {
         Some(event) if is_race_loser(event) => ForkResolution::Hold,
-        Some(event) if !is_synthetic(event) => ForkResolution::Serve(rebind(event, activity_id)),
+        Some(event) if !is_synthetic(source_events, event) => {
+            ForkResolution::Serve(rebind(event, activity_id))
+        }
         _ => ForkResolution::Serve(unavailable(activity_id, name, occurrence)),
     }
 }
@@ -1549,13 +1581,35 @@ fn is_race_loser(event: &WorkflowEvent) -> bool {
     )
 }
 
-/// A failure that the engine wrote, not one that the activity returned.
-fn is_synthetic(event: &WorkflowEvent) -> bool {
-    matches!(
-        event,
-        WorkflowEvent::ActivityFailed { error, .. }
-            if error == crate::event::ABANDONED_DISPATCH_REASON
-    )
+/// Whether `event` is the abandoned-dispatch failure that the engine wrote,
+/// not one that the activity returned.
+///
+/// An activity can fail with the same text. So the whole shape must match, as
+/// in `replay.rs` (issue #1265). The engine writes attempt 1, type `Error`,
+/// no retry and no details. It never dispatches the activity, so the source
+/// holds no `ActivityStarted` or heartbeat for it.
+fn is_synthetic(source_events: &[WorkflowEvent], event: &WorkflowEvent) -> bool {
+    let WorkflowEvent::ActivityFailed {
+        activity_id,
+        error,
+        attempt: 1,
+        error_type,
+        non_retryable: true,
+        details: None,
+    } = event
+    else {
+        return false;
+    };
+    error == crate::event::ABANDONED_DISPATCH_REASON
+        && error_type == "Error"
+        && !source_events.iter().any(|seen| {
+            matches!(
+                seen,
+                WorkflowEvent::ActivityStarted { activity_id: id, .. }
+                    | WorkflowEvent::ActivityHeartbeat { activity_id: id, .. }
+                    if id == activity_id
+            )
+        })
 }
 
 /// Name, 1-based occurrence and input of the first `ActivityScheduled` whose
@@ -2096,6 +2150,67 @@ mod tests {
                 assert!(is_unavailable(&resolution), "{resolution:?}");
             }
         }
+    }
+
+    #[test]
+    fn an_application_failure_with_the_abandon_text_is_served() {
+        let failed = |id, attempt| WorkflowEvent::ActivityFailed {
+            activity_id: id,
+            error: crate::event::ABANDONED_DISPATCH_REASON.to_string(),
+            attempt,
+            error_type: "Error".to_string(),
+            non_retryable: true,
+            details: None,
+        };
+        // A later attempt, or a dispatched first attempt, is the activity's
+        // own failure. The fork serves it as recorded.
+        let (later, dispatched) = (ActivityExecId::new(), ActivityExecId::new());
+        let cases = [
+            vec![
+                started(json!({})),
+                scheduled(later, "slow", json!({})),
+                failed(later, 2),
+            ],
+            vec![
+                started(json!({})),
+                scheduled(dispatched, "slow", json!({})),
+                WorkflowEvent::ActivityStarted {
+                    activity_id: dispatched,
+                    worker_id: crate::types::WorkerId::new("w"),
+                },
+                failed(dispatched, 1),
+            ],
+        ];
+        for source in cases {
+            let id = ActivityExecId::new();
+            let fork = vec![
+                started(json!({})),
+                marker(ForkEffects::Recorded),
+                scheduled(id, "slow", json!({})),
+            ];
+            let resolution = resolve_activity(&fork, &source, id);
+            assert!(
+                matches!(&resolution, ForkResolution::Serve(WorkflowEvent::ActivityFailed { error, .. })
+                    if error == crate::event::ABANDONED_DISPATCH_REASON),
+                "{resolution:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_result_blob_is_shared_with_the_fork() {
+        let stored = crate::fan_out::StoredResult::new("s", "result-blob", 1, "c");
+        let id = ActivityExecId::new();
+        let prefix = [
+            started(json!({})),
+            scheduled(id, "charge", json!({})),
+            WorkflowEvent::ActivityCompleted {
+                activity_id: id,
+                output: stored.to_recorded_value(),
+            },
+        ];
+        let keys = shared_keys(&[], None, &prefix);
+        assert!(keys.contains("result-blob"), "{keys:?}");
     }
 
     #[test]
