@@ -204,9 +204,8 @@ The partition test fails with the fence off ([`chaos.md`](testing/chaos.md)).
 
 - No model covers shard-generation fencing or the rebalance cutover. See
   [`formal-methods.md`](testing/formal-methods.md#not-modelled-yet).
-- Trace checks cover `ActivityClaim` and `WorkflowTaskClaim` only. No check
-  compares test traces with `CodecRotation`. See
-  [`formal-methods.md`](testing/formal-methods.md#not-modelled-yet).
+- Only `ActivityClaim` and `WorkflowTaskClaim` are checked against chaos
+  traces. No trace check covers the `CodecRotation` model.
 - The models are bounded. `ActivityClaim` has 3 workers and 5 claims.
   `WorkflowTaskClaim` has 2 workers, 5 claims and 2 strikes.
 - The model `SelfRelease` uses a stronger guard than the code.
@@ -216,12 +215,11 @@ The partition test fails with the fence off ([`chaos.md`](testing/chaos.md)).
   fence by design. The timeout sweeper acts only on the claim it scanned
   (#1809). The model `TimeoutFail` has no such check.
 - The oracle harness does not model the timeout sweeper, the `FAILED` state
-  or quarantine. The world simulation runs the real sweeper and reclaimer.
-- The world simulation never fails an activity and never quarantines.
-- A world crash falls between two steps. No simulated worker dies inside a
-  task body.
-- The scheduler draws actions from fixed weights. It does not use PCT
+  or quarantine. It draws actions from fixed weights. It does not use PCT
   (probabilistic concurrency testing).
+- A world crash falls between two steps. No worker dies inside a task body.
+- The world workload never fails an activity. It does not reach quarantine
+  or the `FAILED` state.
 - A 0.6 worker has no claim fence. A mixed 0.6 and 0.7 fleet must keep
   timeouts terminal until the upgrade ends
   ([ADR 0005](adr/0005-activity-timeout-retry-and-open-circuit.md)).

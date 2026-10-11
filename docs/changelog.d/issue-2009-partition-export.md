@@ -79,19 +79,11 @@ route.
 The export reads rows and the drop is DDL, so the two sanctioned
 `event_data` writers do not change.
 
-**Also fixed.** #2102 and #2104 merged tests that set
-`WorkflowResetRequest::refuse_erased_source`, which #2103 had removed. The
-core `integration` target and `mcp_tasks_integration` did not compile. This
-change removes the stale field from both tests.
-
-#2102 added `docs/safety-report.md` while #2100 and #2101 changed the limits
-that it restates. `safety_report_docs` failed on `trunk-dev`. This change
-restates the new simulator and trace-check limits in the report.
-
-`a_task_moves_through_the_spec_states` from #2104 failed at random. A wake
-that commits between the history-head read and the signal-queue read made an
-answered wait look open again. `open_signal_waits` now reads the head again
-and reports no wait when it moved.
+**Also fixed.** `a_task_moves_through_the_spec_states` from #2104 failed at
+random. A wake that commits between the history-head read and the
+signal-queue read made an answered wait look open again.
+`open_signal_waits` now reads the head again and reports no wait when it
+moved.
 
 **Tests.**
 
