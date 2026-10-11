@@ -359,6 +359,17 @@ pub const EXPORT_FAILED_REASON: &str = "export failed";
 /// row changed after the export, so the next pass exports again.
 pub const CHANGED_REASON: &str = "changed since export";
 
+/// The checksum under the drop lock ran past `exact_scan_timeout` (issue
+/// #2009). Raise the timeout or narrow the cohort width.
+pub const EXPORT_CHECK_BUDGET_REASON: &str = "export check exceeded its budget";
+
+/// A process exported this shard before, but this sweep has no archiver
+/// (issue #2009). It drops nothing, so no partition is lost unexported.
+pub const EXPORT_REQUIRED_REASON: &str = "export required, but no archiver is set";
+
+/// Another process holds the export lock of this shard (issue #2009).
+pub const EXPORT_BUSY_REASON: &str = "another process is exporting this shard";
+
 /// Every reason [`sweep`] can report. Used by the documentation guard.
 pub const SWEEP_REASONS: &[&str] = &[
     OWNED_REASON,
@@ -367,6 +378,9 @@ pub const SWEEP_REASONS: &[&str] = &[
     UNBOUNDED_REASON,
     EXPORT_FAILED_REASON,
     CHANGED_REASON,
+    EXPORT_CHECK_BUDGET_REASON,
+    EXPORT_REQUIRED_REASON,
+    EXPORT_BUSY_REASON,
 ];
 
 // ── Cohort algebra (pure) ──────────────────────────────────────────────────
@@ -4175,133 +4189,206 @@ async fn sweep_inner(
     let mut attempts = 0usize;
     let mut last_attempted: Option<DateTime<Utc>> = None;
     let mut reached_end = true;
-    for part in parts {
-        // The DEFAULT partition is structural: dropping it would make an
-        // append for an uncovered cohort fail outright. It is drained, never
-        // dropped.
-        if part.is_default {
-            continue;
-        }
-        // Only cohorts entirely in the past are candidates. A partition still
-        // accepting writes can always gain a row between the gate check and the
-        // drop.
-        let Some(upper) = part.upper else {
-            outcome
-                .blocked
-                .push(format!("{} ({UNBOUNDED_REASON})", part.name));
-            continue;
-        };
-        if skipping {
-            if resume_after.is_some_and(|cursor| upper <= cursor) {
+    // Issue #2009: resolve the export gate once per applying pass. It can
+    // hold a session lock, so every path below must reach the release.
+    let gate = if apply {
+        crate::partition_archive::ExportGate::resolve(conn, export).await?
+    } else {
+        crate::partition_archive::ExportGate::Off
+    };
+    let mut exports = 0usize;
+    let looped: HarvestResult<()> = async {
+        for part in parts {
+            // The DEFAULT partition is structural: dropping it would make an
+            // append for an uncovered cohort fail outright. It is drained, never
+            // dropped.
+            if part.is_default {
                 continue;
             }
-            skipping = false;
-        }
-        if upper > now {
-            continue;
-        }
-
-        // Checked here, after the cheap skips above, not at the top of the
-        // loop. A tick can exhaust its budget on exactly the last eligible
-        // partition. It must not then report `truncated` just because the
-        // remaining partitions in the list are DEFAULT or still open.
-        // Those cost nothing and were never going to be attempted anyway.
-        if outcome.dropped.len() >= opts.max_drops || attempts >= opts.max_attempts {
-            outcome.truncated = true;
-            reached_end = false;
-            break;
-        }
-
-        // Counted here, not at the top of the loop. This is the gate
-        // evaluation the budget exists to bound, up to a tier-3 scan under
-        // `exact_scan_timeout`. A blocked partition costs exactly as much as
-        // a dropped one. The cheap skips above (DEFAULT, still open,
-        // unbounded) reach no such scan and do not spend the budget.
-        attempts += 1;
-        // Review finding: a per-shard tick before this whole pass starts
-        // is not bounded progress. Up to `max_attempts` partitions at
-        // `exact_scan_timeout` each can still run past the liveness
-        // scanner's staleness threshold before the pass returns. Ticking
-        // once per attempted partition here bounds the gap between proofs
-        // of life to one gate evaluation, not one whole pass.
-        if let Some(cb) = &mut progress {
-            cb();
-        }
-        // Review finding: a fixed oldest-first restart every pass cannot
-        // converge past a permanently blocked oldest run — see
-        // `SweepOutcome::next_resume`. Recorded before the outcome of
-        // THIS partition is known. A pass that ends by hitting budget on
-        // the very next iteration then still resumes after this one,
-        // rather than re-attempting it.
-        last_attempted = Some(upper);
-        if let Some(reason) =
-            cohort_occupancy(conn, &EventScope::cohort(part.lower, upper), upper, opts).await?
-        {
-            outcome.blocked.push(format!("{} ({reason})", part.name));
-            // Deliberately NOT after a scan timeout. That reason means the
-            // partition was too big to prove anything about; following it with
-            // an unbounded orphan DELETE over that same partition inverts the
-            // "bounded pass, retry next tick" contract this module is built on.
-            if apply
-                && export.is_none()
-                && reason != SCAN_BUDGET_REASON
-                && let Some(grace) = opts.straggler_grace
-                && let Ok(grace) = chrono::Duration::from_std(grace)
-                && upper + grace <= now
-            {
-                outcome.straggler_rows_deleted += delete_orphan_rows(
-                    conn,
-                    part.lower,
-                    upper,
-                    opts.straggler_batch,
-                    opts.exact_scan_timeout,
-                    reborrow_progress(&mut progress),
-                )
-                .await?;
+            // Only cohorts entirely in the past are candidates. A partition still
+            // accepting writes can always gain a row between the gate check and the
+            // drop.
+            let Some(upper) = part.upper else {
+                outcome
+                    .blocked
+                    .push(format!("{} ({UNBOUNDED_REASON})", part.name));
+                continue;
+            };
+            if skipping {
+                if resume_after.is_some_and(|cursor| upper <= cursor) {
+                    continue;
+                }
+                skipping = false;
             }
-            continue;
-        }
+            if upper > now {
+                continue;
+            }
 
-        if !apply {
-            // Read-only: report the partition as droppable without taking a
-            // lock or issuing DDL.
-            outcome.dropped.push(part.name);
-            continue;
-        }
-        // Issue #2009: export, read back and check before the drop. A failure
-        // keeps the partition and retries next pass.
-        let manifest = match export {
-            Some(export) => match crate::partition_archive::export_partition(
-                conn,
+            // Checked here, after the cheap skips above, not at the top of the
+            // loop. A tick can exhaust its budget on exactly the last eligible
+            // partition. It must not then report `truncated` just because the
+            // remaining partitions in the list are DEFAULT or still open.
+            // Those cost nothing and were never going to be attempted anyway.
+            if outcome.dropped.len() >= opts.max_drops || attempts >= opts.max_attempts {
+                outcome.truncated = true;
+                reached_end = false;
+                break;
+            }
+
+            // Issue #2009: with no export possible, nothing may drop. The gate
+            // check costs nothing, so it spends no budget.
+            if let Some(reason) = gate.blocks_drops() {
+                outcome.blocked.push(format!("{} ({reason})", part.name));
+                continue;
+            }
+
+            // Counted here, not at the top of the loop. This is the gate
+            // evaluation the budget exists to bound, up to a tier-3 scan under
+            // `exact_scan_timeout`. A blocked partition costs exactly as much as
+            // a dropped one. The cheap skips above (DEFAULT, still open,
+            // unbounded) reach no such scan and do not spend the budget.
+            attempts += 1;
+            // Review finding: a per-shard tick before this whole pass starts
+            // is not bounded progress. Up to `max_attempts` partitions at
+            // `exact_scan_timeout` each can still run past the liveness
+            // scanner's staleness threshold before the pass returns. Ticking
+            // once per attempted partition here bounds the gap between proofs
+            // of life to one gate evaluation, not one whole pass.
+            if let Some(cb) = &mut progress {
+                cb();
+            }
+            // Review finding: a fixed oldest-first restart every pass cannot
+            // converge past a permanently blocked oldest run — see
+            // `SweepOutcome::next_resume`. Recorded before the outcome of
+            // THIS partition is known. A pass that ends by hitting budget on
+            // the very next iteration then still resumes after this one,
+            // rather than re-attempting it.
+            let prev_attempted = last_attempted;
+            last_attempted = Some(upper);
+            if let Some(reason) =
+                cohort_occupancy(conn, &EventScope::cohort(part.lower, upper), upper, opts).await?
+            {
+                outcome.blocked.push(format!("{} ({reason})", part.name));
+                // Deliberately NOT after a scan timeout. That reason means the
+                // partition was too big to prove anything about; following it with
+                // an unbounded orphan DELETE over that same partition inverts the
+                // "bounded pass, retry next tick" contract this module is built on.
+                if apply
+                    && gate.allows_straggler_delete()
+                    && reason != SCAN_BUDGET_REASON
+                    && let Some(grace) = opts.straggler_grace
+                    && let Ok(grace) = chrono::Duration::from_std(grace)
+                    && upper + grace <= now
+                {
+                    outcome.straggler_rows_deleted += delete_orphan_rows(
+                        conn,
+                        part.lower,
+                        upper,
+                        opts.straggler_batch,
+                        opts.exact_scan_timeout,
+                        reborrow_progress(&mut progress),
+                    )
+                    .await?;
+                }
+                continue;
+            }
+
+            if !apply {
+                // Read-only: report the partition as droppable without taking a
+                // lock or issuing DDL.
+                outcome.dropped.push(part.name);
+                continue;
+            }
+            let crate::partition_archive::ExportGate::Active(export) = &gate else {
+                let result = drop_partition(conn, &part, upper, opts, None).await?;
+                if result == DropOutcome::Dropped {
+                    outcome.dropped.push(part.name);
+                } else {
+                    outcome
+                        .blocked
+                        .push(format!("{} ({})", part.name, result.reason()));
+                }
+                continue;
+            };
+            // Issue #2009: export, read back and check before the drop. An
+            // earlier export that still reads back clean is used again. A
+            // failure keeps the partition and retries next pass.
+            let mut fresh = false;
+            let mut manifest = crate::partition_archive::reusable_export(
                 export,
                 &part,
                 upper,
                 reborrow_progress(&mut progress),
             )
-            .await
-            {
-                Ok(manifest) => Some(manifest),
-                Err(cause) => {
-                    outcome
-                        .blocked
-                        .push(format!("{} ({EXPORT_FAILED_REASON}: {cause})", part.name));
-                    continue;
+            .await;
+            if manifest.is_none() {
+                if exports >= export.max_exports_per_pass {
+                    // Not attempted after all, so the next pass resumes here.
+                    last_attempted = prev_attempted;
+                    outcome.truncated = true;
+                    reached_end = false;
+                    break;
                 }
-            },
-            None => None,
-        };
-        let reason = match drop_partition(conn, &part, upper, opts, manifest.as_ref()).await? {
-            DropOutcome::Dropped => {
+                exports += 1;
+                fresh = true;
+                match crate::partition_archive::export_partition(
+                    conn,
+                    export,
+                    &part,
+                    upper,
+                    reborrow_progress(&mut progress),
+                )
+                .await
+                {
+                    Ok(m) => manifest = Some(m),
+                    Err(cause) => {
+                        outcome
+                            .blocked
+                            .push(format!("{} ({EXPORT_FAILED_REASON}: {cause})", part.name));
+                        continue;
+                    }
+                }
+            }
+            let mut result = drop_partition(conn, &part, upper, opts, manifest.as_ref()).await?;
+            // A reused export can be stale. Export once more in the same pass,
+            // so a stale export cannot block the partition forever.
+            if result == DropOutcome::Changed && !fresh && exports < export.max_exports_per_pass {
+                exports += 1;
+                match crate::partition_archive::export_partition(
+                    conn,
+                    export,
+                    &part,
+                    upper,
+                    reborrow_progress(&mut progress),
+                )
+                .await
+                {
+                    Ok(m) => {
+                        result = drop_partition(conn, &part, upper, opts, Some(&m)).await?;
+                        manifest = Some(m);
+                    }
+                    Err(cause) => {
+                        outcome
+                            .blocked
+                            .push(format!("{} ({EXPORT_FAILED_REASON}: {cause})", part.name));
+                        continue;
+                    }
+                }
+            }
+            if result == DropOutcome::Dropped {
                 outcome.exported.extend(manifest.map(|m| m.key()));
                 outcome.dropped.push(part.name);
-                continue;
+            } else {
+                outcome
+                    .blocked
+                    .push(format!("{} ({})", part.name, result.reason()));
             }
-            DropOutcome::Recheck => RECHECK_REASON,
-            DropOutcome::Changed => CHANGED_REASON,
-            DropOutcome::ScanBudget => SCAN_BUDGET_REASON,
-        };
-        outcome.blocked.push(format!("{} ({reason})", part.name));
+        }
+        Ok(())
     }
+    .await;
+    gate.release(conn).await;
+    looped?;
     // `reached_end` is true whenever the loop ran out of partitions
     // before it ran out of budget, truncated or not. Either way there is
     // no later partition this pass left unvisited, in THIS pass's own
@@ -4759,16 +4846,24 @@ async fn drop_partition(
             }
 
             // Issue #2009: the export ran with no lock. `SHARE` now blocks every
-            // row change, so a matching hash proves that the export holds what
-            // the drop removes. Each page query is bounded like the exact scan.
+            // row change, so a matching checksum proves that the export holds
+            // what the drop removes. The check is one statement, bounded like
+            // the exact scan, so `SHARE` is held no longer than tier 3 holds it.
             if let Some(manifest) = manifest {
                 exec(
                     conn,
                     &format!("SET LOCAL statement_timeout = '{scan_ms}ms'"),
                 )
                 .await?;
-                let (rows, sha256) = crate::partition_archive::locked_digest(conn, &name).await?;
-                if rows != manifest.row_count || sha256 != manifest.sha256 {
+                let (rows, checksum) = crate::partition_archive::locked_checksum(conn, &name)
+                    .await
+                    .map_err(|e| match e {
+                        HarvestError::Database(msg) if is_statement_timeout(&msg) => {
+                            HarvestError::Database(format!("{EXPORT_CHECK_TIMEOUT_TAG}: {msg}"))
+                        }
+                        other => other,
+                    })?;
+                if rows != manifest.row_count || checksum != manifest.row_checksum {
                     return Ok(DropOutcome::Changed);
                 }
             }
@@ -4805,6 +4900,9 @@ async fn drop_partition(
     .await;
     match result {
         Ok(outcome) => Ok(outcome),
+        Err(HarvestError::Database(msg)) if msg.starts_with(EXPORT_CHECK_TIMEOUT_TAG) => {
+            Ok(DropOutcome::CheckBudget)
+        }
         Err(HarvestError::Database(msg)) if is_lock_timeout(&msg) || is_deadlock(&msg) => {
             Ok(DropOutcome::Recheck)
         }
@@ -4814,6 +4912,11 @@ async fn drop_partition(
         Err(e) => Err(e),
     }
 }
+
+/// Marks a `statement_timeout` in the export check, so the caller can tell
+/// it from a timeout in the ownership check.
+#[cfg(feature = "db")]
+const EXPORT_CHECK_TIMEOUT_TAG: &str = "harvest export check timed out";
 
 /// What one [`drop_partition`] attempt did.
 #[cfg(feature = "db")]
@@ -4827,6 +4930,22 @@ enum DropOutcome {
     Changed,
     /// A query under the lock ran past its `statement_timeout`.
     ScanBudget,
+    /// The export check under the lock ran past its `statement_timeout`
+    /// (issue #2009).
+    CheckBudget,
+}
+
+#[cfg(feature = "db")]
+impl DropOutcome {
+    /// The blocked reason of an attempt that did not drop.
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::Dropped | Self::Recheck => RECHECK_REASON,
+            Self::Changed => CHANGED_REASON,
+            Self::ScanBudget => SCAN_BUDGET_REASON,
+            Self::CheckBudget => EXPORT_CHECK_BUDGET_REASON,
+        }
+    }
 }
 
 /// Targeted removal of orphan rows from a cohort a straggler has pinned.

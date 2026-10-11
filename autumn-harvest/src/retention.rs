@@ -1798,8 +1798,13 @@ pub struct RetentionRuntime {
 }
 
 /// The optional hooks a [`RetentionRuntime`] calls.
+///
+/// Start from [`RetentionHooks::default`] and add hooks with the `with_*`
+/// calls. The struct is `non_exhaustive`, so a new hook is not a breaking
+/// change.
 #[cfg(feature = "db")]
 #[derive(Clone, Default)]
+#[non_exhaustive]
 pub struct RetentionHooks {
     /// Gets each run's history before retention deletes the run.
     pub archiver: Option<Arc<dyn HistoryArchiver>>,
@@ -1807,6 +1812,47 @@ pub struct RetentionHooks {
     pub offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
     /// Gets each aged event partition before the sweep drops it (issue #2009).
     pub partition_archiver: Option<Arc<dyn crate::partition_archive::PartitionArchiver>>,
+}
+
+#[cfg(feature = "db")]
+impl RetentionHooks {
+    /// Set the history archiver.
+    #[must_use]
+    pub fn with_archiver(mut self, archiver: Option<Arc<dyn HistoryArchiver>>) -> Self {
+        self.archiver = archiver;
+        self
+    }
+
+    /// Set the payload offloader.
+    #[must_use]
+    pub fn with_offloader(
+        mut self,
+        offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
+    ) -> Self {
+        self.offloader = offloader;
+        self
+    }
+
+    /// Set the partition archiver (issue #2009).
+    #[must_use]
+    pub fn with_partition_archiver(
+        mut self,
+        archiver: Option<Arc<dyn crate::partition_archive::PartitionArchiver>>,
+    ) -> Self {
+        self.partition_archiver = archiver;
+        self
+    }
+}
+
+#[cfg(feature = "db")]
+impl std::fmt::Debug for RetentionHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetentionHooks")
+            .field("archiver", &self.archiver.is_some())
+            .field("offloader", &self.offloader.is_some())
+            .field("partition_archiver", &self.partition_archiver.is_some())
+            .finish()
+    }
 }
 
 #[cfg(feature = "db")]
@@ -1819,17 +1865,6 @@ impl RetentionRuntime {
     /// unset is an ordinary, fully-supported state here: the history-retention
     /// phase is gated on `loosest_cutoff_age()` and is simply skipped. The
     /// terminal-task janitor (issue #1811) also spawns the runtime on its own.
-    /// The same as [`Self::spawn`], with every hook in one struct.
-    #[must_use]
-    pub fn spawn_with_hooks(
-        pools: ShardedDbPool,
-        config: RetentionConfig,
-        metrics: Arc<dyn MetricsRecorder>,
-        hooks: RetentionHooks,
-    ) -> Option<Self> {
-        Self::spawn_inner(pools, config, metrics, hooks)
-    }
-
     #[must_use]
     pub fn spawn(
         pools: ShardedDbPool,
@@ -1842,12 +1877,23 @@ impl RetentionRuntime {
             pools,
             config,
             metrics,
-            RetentionHooks {
-                archiver,
-                offloader,
-                partition_archiver: None,
-            },
+            RetentionHooks::default()
+                .with_archiver(archiver)
+                .with_offloader(offloader),
         )
+    }
+
+    /// The same as [`Self::spawn`], with every hook in one struct.
+    ///
+    /// Use it to set a partition archiver (issue #2009).
+    #[must_use]
+    pub fn spawn_with_hooks(
+        pools: ShardedDbPool,
+        config: RetentionConfig,
+        metrics: Arc<dyn MetricsRecorder>,
+        hooks: RetentionHooks,
+    ) -> Option<Self> {
+        Self::spawn_inner(pools, config, metrics, hooks)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1862,6 +1908,15 @@ impl RetentionRuntime {
             offloader,
             partition_archiver,
         } = hooks;
+        // Issue #2009: an export turns the straggler delete off, because no
+        // export holds the rows it removes. `try_build` refuses the pair, but
+        // a direct caller can still set both.
+        if partition_archiver.is_some() && config.partitions.straggler_grace_secs.is_some() {
+            tracing::warn!(
+                "partitions.straggler_grace_secs has no effect with a partition archiver; \
+                 the sweep skips straggler deletes while it exports"
+            );
+        }
         if !config.enabled() {
             return None;
         }

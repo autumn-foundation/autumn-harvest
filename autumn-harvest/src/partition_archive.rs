@@ -2,16 +2,26 @@
 //!
 //! The partition sweep drops a closed cohort partition when no live run owns
 //! a row in it. With a [`PartitionArchiver`] set, the sweep first exports the
-//! partition, reads the export back, and checks it. The drop then hashes the
-//! partition again under its `SHARE` lock. It drops only when that hash
-//! matches the manifest. See `DESIGN-2009.md`.
+//! partition, reads the export back, and checks it. The drop then computes a
+//! row checksum under its `SHARE` lock. It drops only when the checksum and
+//! the row count match the manifest. See `DESIGN-2009.md`.
+//!
+//! # Guards
+//!
+//! - **The marker.** A sweep with an archiver writes one row to
+//!   `harvest_partition_export`. A later sweep on that shard with no
+//!   archiver drops nothing.
+//! - **The lock.** One process at a time exports a shard. The others report
+//!   the shard as busy.
+//! - **Reuse.** A failed drop leaves its export in place. The next pass uses
+//!   it again when it still reads back clean.
 //!
 //! # Layout
 //!
 //! Each export is a set of segments and one manifest under one prefix:
 //!
 //! ```text
-//! harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/segment-000001.jsonl
+//! harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/segment-000001-<sha256:16>.jsonl
 //! harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/manifest.json
 //! ```
 //!
@@ -49,8 +59,15 @@ pub type ArchiveIo<'a, T> = Pin<Box<dyn Future<Output = Result<T, ArchiveError>>
 /// implementation only stores and returns bytes. A backend can compress in
 /// [`put`](Self::put) and expand in [`get`](Self::get). The checks cover the
 /// bytes that core gives and gets back, so they still match.
+///
+/// Give each deployment its own bucket prefix or root. Two deployments that
+/// share one namespace produce the same keys for `shard-0`.
 pub trait PartitionArchiver: Send + Sync + 'static {
     /// Store `bytes` at `key`. Replace an object that is already there.
+    ///
+    /// The object must be durable when this returns `Ok`. The drop can
+    /// commit right after it. A call that times out can still land later.
+    /// Segment keys name their content, so a late segment is harmless.
     fn put<'a>(&'a self, key: &'a str, bytes: Vec<u8>) -> ArchiveIo<'a, ()>;
 
     /// Return the bytes at `key`, or `None` when no object is there.
@@ -64,11 +81,11 @@ pub const FORMAT_VERSION: u32 = 1;
 pub const KEY_ROOT: &str = "harvest-partitions";
 
 /// A segment closes when it holds this many rows.
-pub const SEGMENT_MAX_ROWS: usize = 10_000;
+pub(crate) const SEGMENT_MAX_ROWS: usize = 10_000;
 
 /// A segment closes before a row that would take it past this many bytes.
 /// A single larger row gets a segment of its own.
-pub const SEGMENT_MAX_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const SEGMENT_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// The key prefix of one partition export.
 ///
@@ -91,10 +108,20 @@ pub fn archive_prefix(
 }
 
 /// One cohort bound as a key part. `MINVALUE` is `min`.
+///
+/// A cohort bound is whole seconds. The legacy upper bound is the conversion
+/// instant, so it keeps its microseconds.
 fn key_bound(bound: Option<DateTime<Utc>>) -> String {
+    use chrono::Timelike as _;
     bound.map_or_else(
         || "min".to_string(),
-        |ts| ts.format("%Y%m%dT%H%M%SZ").to_string(),
+        |ts| {
+            if ts.nanosecond() == 0 {
+                ts.format("%Y%m%dT%H%M%SZ").to_string()
+            } else {
+                ts.format("%Y%m%dT%H%M%S%.6fZ").to_string()
+            }
+        },
     )
 }
 
@@ -104,14 +131,21 @@ pub fn manifest_key(prefix: &str) -> String {
     format!("{prefix}/manifest.json")
 }
 
-/// The key of segment `n` under `prefix`. Segments count from 1.
+/// The key of segment `n` under `prefix`, with the first 16 hex digits of
+/// its SHA-256. Segments count from 1.
+///
+/// The hash in the key makes a segment key name its content. A late upload
+/// from a slow or timed-out attempt then writes its own key. It cannot
+/// replace a segment that a finished export names.
 #[must_use]
-pub fn segment_key(prefix: &str, n: usize) -> String {
-    format!("{prefix}/segment-{n:06}.jsonl")
+pub fn segment_key(prefix: &str, n: usize, sha256: &str) -> String {
+    let short = sha256.get(..16).unwrap_or(sha256);
+    format!("{prefix}/segment-{n:06}-{short}.jsonl")
 }
 
 /// One segment in a [`PartitionManifest`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SegmentEntry {
     /// The object key.
     pub key: String,
@@ -125,6 +159,7 @@ pub struct SegmentEntry {
 
 /// The index of one partition export.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PartitionManifest {
     /// The manifest format, [`FORMAT_VERSION`].
     pub format: u32,
@@ -142,6 +177,11 @@ pub struct PartitionManifest {
     pub row_count: u64,
     /// Lowercase hex SHA-256 of all segment bytes, in segment order.
     pub sha256: String,
+    /// The sum of the row hashes, in decimal. See [`row_hash`].
+    ///
+    /// Postgres computes the same sum in one statement under the drop lock.
+    /// The order of the rows does not change it.
+    pub row_checksum: String,
     /// The segments, in order.
     pub segments: Vec<SegmentEntry>,
 }
@@ -159,50 +199,62 @@ impl PartitionManifest {
     }
 }
 
-/// A streaming hash over row lines.
+/// The hash of one row line: the first 8 bytes of its SHA-256, as a
+/// big-endian `i64`.
 ///
-/// Export and the drop check feed the same lines, so the same rows give the
-/// same hash.
+/// Postgres computes the same value with
+/// `('x' || encode(substring(sha256(...) FROM 1 FOR 8), 'hex'))::bit(64)::bigint`.
+#[must_use]
+pub fn row_hash(line: &str) -> i64 {
+    let digest = Sha256::digest(line.as_bytes());
+    let mut head = [0_u8; 8];
+    head.copy_from_slice(&digest[..8]);
+    i64::from_be_bytes(head)
+}
+
+/// A streaming hash and checksum over row lines.
 #[derive(Debug, Clone, Default)]
-pub struct RowDigest {
+pub(crate) struct RowDigest {
     hasher: Sha256,
     rows: u64,
+    checksum: i128,
 }
 
 impl RowDigest {
-    /// Add one row line. The digest adds the line feed.
-    pub fn push(&mut self, line: &str) {
+    /// Add one row line. The hash adds the line feed.
+    pub(crate) fn push(&mut self, line: &str) {
         self.hasher.update(line.as_bytes());
         self.hasher.update(b"\n");
         self.rows += 1;
+        self.checksum += i128::from(row_hash(line));
     }
 
     /// Rows added so far.
-    #[must_use]
-    pub const fn rows(&self) -> u64 {
+    pub(crate) const fn rows(&self) -> u64 {
         self.rows
     }
 
-    /// The lowercase hex SHA-256 of every line added, each with its line feed.
-    #[must_use]
-    pub fn finish(self) -> String {
-        hex(&self.hasher.finalize())
+    /// The lowercase hex SHA-256 of every line with its line feed, and the
+    /// decimal sum of the row hashes.
+    pub(crate) fn finish(self) -> (String, String) {
+        (hex(&self.hasher.finalize()), self.checksum.to_string())
     }
 }
 
 /// Splits row lines into segments.
 #[derive(Debug)]
-pub struct SegmentWriter {
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+pub(crate) struct SegmentWriter {
     max_rows: usize,
     max_bytes: usize,
     buf: Vec<u8>,
     rows: usize,
 }
 
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
 impl SegmentWriter {
     /// A writer with the given limits. A zero limit counts as 1.
-    #[must_use]
-    pub fn new(max_rows: usize, max_bytes: usize) -> Self {
+    pub(crate) fn new(max_rows: usize, max_bytes: usize) -> Self {
         Self {
             max_rows: max_rows.max(1),
             max_bytes: max_bytes.max(1),
@@ -213,7 +265,7 @@ impl SegmentWriter {
 
     /// Add one row line. Returns the closed segment and its row count when
     /// this line starts a new one.
-    pub fn push(&mut self, line: &str) -> Option<(Vec<u8>, u64)> {
+    pub(crate) fn push(&mut self, line: &str) -> Option<(Vec<u8>, u64)> {
         let full = self.rows >= self.max_rows || self.buf.len() + line.len() + 1 > self.max_bytes;
         let closed = if full { self.finish() } else { None };
         self.buf.extend_from_slice(line.as_bytes());
@@ -223,7 +275,7 @@ impl SegmentWriter {
     }
 
     /// Return the open segment, if it holds a row.
-    pub fn finish(&mut self) -> Option<(Vec<u8>, u64)> {
+    pub(crate) fn finish(&mut self) -> Option<(Vec<u8>, u64)> {
         if self.rows == 0 {
             return None;
         }
@@ -234,8 +286,7 @@ impl SegmentWriter {
 }
 
 /// Lowercase hex SHA-256 of `bytes`.
-#[must_use]
-pub fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
 
@@ -269,10 +320,11 @@ pub struct ArchivedEventRow {
 
 /// A partition export, read back and checked.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ArchivedPartition {
     /// The manifest.
     pub manifest: PartitionManifest,
-    /// The rows, in `id` order.
+    /// The rows, in key order.
     pub rows: Vec<ArchivedEventRow>,
 }
 
@@ -325,14 +377,27 @@ pub enum ReadBackError {
     #[error("archive object missing: {0}")]
     Missing(String),
     /// The backend call failed.
-    #[error("archive backend error: {0}")]
-    Backend(String),
+    #[error("archive backend error at {key}: {source}")]
+    Backend {
+        /// The key of the call.
+        key: String,
+        /// The backend error.
+        #[source]
+        source: ArchiveError,
+    },
+    /// The backend call ran past its time limit.
+    #[error("archive backend call timed out at {0}")]
+    TimedOut(String),
     /// An object does not match its manifest, or does not parse.
     #[error("archive object corrupt: {0}")]
     Corrupt(String),
 }
 
 /// Read a partition export back and check every hash.
+///
+/// It checks each segment against the manifest, then the whole-partition
+/// hash, the row count and the row checksum. A backend call has no time
+/// limit here. Wrap the call in `tokio::time::timeout` to set one.
 ///
 /// # Errors
 ///
@@ -342,7 +407,21 @@ pub async fn read_back(
     archiver: &dyn PartitionArchiver,
     manifest_key: &str,
 ) -> Result<ArchivedPartition, ReadBackError> {
-    let raw = fetch(archiver, manifest_key).await?;
+    read_back_inner(archiver, manifest_key, None, true, None).await
+}
+
+/// The body of [`read_back`].
+///
+/// `keep_rows` false checks every row but keeps none, so memory stays at one
+/// segment. `progress` ticks once per segment.
+async fn read_back_inner(
+    archiver: &dyn PartitionArchiver,
+    manifest_key: &str,
+    io_timeout: Option<std::time::Duration>,
+    keep_rows: bool,
+    mut progress: Option<&mut (dyn FnMut() + Send)>,
+) -> Result<ArchivedPartition, ReadBackError> {
+    let raw = fetch(archiver, manifest_key, io_timeout).await?;
     let manifest: PartitionManifest = serde_json::from_slice(&raw)
         .map_err(|e| ReadBackError::Corrupt(format!("{manifest_key}: {e}")))?;
     if manifest.format != FORMAT_VERSION {
@@ -351,10 +430,20 @@ pub async fn read_back(
             manifest.format
         )));
     }
+    // A manifest copied to another key, or a segment outside its prefix,
+    // would read back another partition's rows with no error.
+    let key = manifest.key();
+    let prefix = key.trim_end_matches("manifest.json");
+    if key != manifest_key || manifest.segments.iter().any(|s| !s.key.starts_with(prefix)) {
+        return Err(ReadBackError::Corrupt(format!(
+            "{manifest_key}: the manifest names another partition"
+        )));
+    }
     let mut total = Sha256::new();
+    let mut digest = RowDigest::default();
     let mut rows = Vec::new();
     for seg in &manifest.segments {
-        let bytes = fetch(archiver, &seg.key).await?;
+        let bytes = fetch(archiver, &seg.key, io_timeout).await?;
         if bytes.len() as u64 != seg.bytes || sha256_hex(&bytes) != seg.sha256 {
             return Err(ReadBackError::Corrupt(format!(
                 "{}: the bytes do not match the manifest",
@@ -364,20 +453,31 @@ pub async fn read_back(
         total.update(&bytes);
         let text = std::str::from_utf8(&bytes)
             .map_err(|e| ReadBackError::Corrupt(format!("{}: {e}", seg.key)))?;
-        let before = rows.len();
+        let before = digest.rows();
         for line in text.split_terminator('\n') {
-            let row = serde_json::from_str(line)
+            let row: ArchivedEventRow = serde_json::from_str(line)
                 .map_err(|e| ReadBackError::Corrupt(format!("{}: {e}", seg.key)))?;
-            rows.push(row);
+            digest.push(line);
+            if keep_rows {
+                rows.push(row);
+            }
         }
-        if (rows.len() - before) as u64 != seg.rows {
+        if digest.rows() - before != seg.rows {
             return Err(ReadBackError::Corrupt(format!(
                 "{}: the row count does not match the manifest",
                 seg.key
             )));
         }
+        if let Some(cb) = progress.as_mut() {
+            cb();
+        }
     }
-    if rows.len() as u64 != manifest.row_count || hex(&total.finalize()) != manifest.sha256 {
+    let row_count = digest.rows();
+    let (_, row_checksum) = digest.finish();
+    if row_count != manifest.row_count
+        || hex(&total.finalize()) != manifest.sha256
+        || row_checksum != manifest.row_checksum
+    {
         return Err(ReadBackError::Corrupt(format!(
             "{manifest_key}: the segments do not match the manifest"
         )));
@@ -385,19 +485,31 @@ pub async fn read_back(
     Ok(ArchivedPartition { manifest, rows })
 }
 
-async fn fetch(archiver: &dyn PartitionArchiver, key: &str) -> Result<Vec<u8>, ReadBackError> {
-    archiver
-        .get(key)
-        .await
-        .map_err(|e| ReadBackError::Backend(format!("{key}: {e}")))?
-        .ok_or_else(|| ReadBackError::Missing(key.to_string()))
+async fn fetch(
+    archiver: &dyn PartitionArchiver,
+    key: &str,
+    io_timeout: Option<std::time::Duration>,
+) -> Result<Vec<u8>, ReadBackError> {
+    let got = match io_timeout {
+        Some(limit) => tokio::time::timeout(limit, archiver.get(key))
+            .await
+            .map_err(|_| ReadBackError::TimedOut(key.to_string()))?,
+        None => archiver.get(key).await,
+    };
+    got.map_err(|source| ReadBackError::Backend {
+        key: key.to_string(),
+        source,
+    })?
+    .ok_or_else(|| ReadBackError::Missing(key.to_string()))
 }
 
 /// A [`PartitionArchiver`] that writes each key as a file under a root
 /// directory.
 ///
-/// A write goes to a temporary file first, then a rename puts it in place.
-/// A key path part must match `[A-Za-z0-9._-]+` and must not be `.` or `..`.
+/// A write goes to a temporary file first. The file is synced, renamed into
+/// place, and then its directory is synced, so a crash cannot lose a write
+/// that returned `Ok`. A key path part must match `[A-Za-z0-9._-]+` and must
+/// not be `.` or `..`.
 #[derive(Debug, Clone)]
 pub struct DirectoryPartitionArchiver {
     root: PathBuf,
@@ -435,7 +547,8 @@ impl DirectoryPartitionArchiver {
     }
 }
 
-/// Write `bytes` to a temporary file next to `path`, sync it, then rename it.
+/// Write `bytes` to a temporary file next to `path`, sync it, rename it, and
+/// sync the directory.
 async fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt as _;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -450,13 +563,24 @@ async fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         file.write_all(bytes).await?;
         file.sync_all().await?;
         drop(file);
-        tokio::fs::rename(&tmp, path).await
+        tokio::fs::rename(&tmp, path).await?;
+        sync_dir(dir).await
     }
     .await;
     if written.is_err() {
         let _ = tokio::fs::remove_file(&tmp).await;
     }
     written
+}
+
+/// Sync a directory, so a rename in it survives a crash. A no-op off Unix,
+/// where a directory cannot be opened for a sync.
+async fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    tokio::fs::File::open(dir).await?.sync_all().await?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 impl PartitionArchiver for DirectoryPartitionArchiver {
@@ -489,6 +613,13 @@ pub struct PartitionExport {
     pub shard_id: i32,
     /// The limit on each backend call.
     pub io_timeout: std::time::Duration,
+    /// The most new exports one pass makes.
+    ///
+    /// An export reads, uploads and reads back a whole partition, inside the
+    /// fenced pass. This bound keeps one pass short. A pass that reaches it
+    /// reports `truncated`, and the next pass goes on. A reuse of an earlier
+    /// export does not count.
+    pub max_exports_per_pass: usize,
 }
 
 impl std::fmt::Debug for PartitionExport {
@@ -496,18 +627,24 @@ impl std::fmt::Debug for PartitionExport {
         f.debug_struct("PartitionExport")
             .field("shard_id", &self.shard_id)
             .field("io_timeout", &self.io_timeout)
+            .field("max_exports_per_pass", &self.max_exports_per_pass)
             .finish_non_exhaustive()
     }
 }
 
 impl PartitionExport {
-    /// An export to `archiver` for `shard_id`, with a 30 s call limit.
+    /// The default for [`Self::max_exports_per_pass`].
+    pub const DEFAULT_MAX_EXPORTS_PER_PASS: usize = 4;
+
+    /// An export to `archiver` for `shard_id`, with a 30 s call limit and
+    /// [`Self::DEFAULT_MAX_EXPORTS_PER_PASS`].
     #[must_use]
     pub fn new(archiver: std::sync::Arc<dyn PartitionArchiver>, shard_id: i32) -> Self {
         Self {
             archiver,
             shard_id,
             io_timeout: std::time::Duration::from_secs(30),
+            max_exports_per_pass: Self::DEFAULT_MAX_EXPORTS_PER_PASS,
         }
     }
 
@@ -517,13 +654,20 @@ impl PartitionExport {
         self.io_timeout = io_timeout;
         self
     }
+
+    /// Set the most new exports one pass makes. Zero counts as 1.
+    #[must_use]
+    pub const fn with_max_exports_per_pass(mut self, max: usize) -> Self {
+        self.max_exports_per_pass = if max == 0 { 1 } else { max };
+        self
+    }
 }
 
 // ── Export and the drop check (database) ──────────────────────────────────
 
-/// Rows one export or check query reads.
+/// Rows one export query reads. Small, because one row can be large.
 #[cfg(feature = "db")]
-const PAGE_ROWS: usize = 1_000;
+const PAGE_ROWS: usize = 256;
 
 #[cfg(feature = "db")]
 #[derive(diesel::QueryableByName)]
@@ -542,9 +686,7 @@ struct ExportRow {
 /// The position after the last row read, on the key `(id, cohort)`.
 ///
 /// The keyset uses the whole primary key. A keyset on `id` alone would skip a
-/// second row with the same `id`, in the export and in the check alike. The
-/// two hashes would then match over a partition that the export does not
-/// hold.
+/// second row with the same `id`.
 #[cfg(feature = "db")]
 type Keyset = Option<(i64, String)>;
 
@@ -552,7 +694,7 @@ type Keyset = Option<(i64, String)>;
 ///
 /// The caller must have set `TimeZone` to `UTC` in the open transaction.
 /// `to_jsonb` writes a `timestamptz` in the session zone, so the zone is part
-/// of the hash.
+/// of each line.
 #[cfg(feature = "db")]
 async fn read_page(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -582,36 +724,165 @@ async fn read_page(
     rows.map_err(crate::error::database_error)
 }
 
-/// Hash every row of partition `name`, in key order.
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct ChecksumRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    n: i64,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    s: String,
+}
+
+/// The row count and row checksum of partition `name`, in one statement.
 ///
-/// The drop calls this inside its transaction, under the `SHARE` lock, so no
-/// row can change during the scan. Each page query has the
-/// `statement_timeout` that the caller set.
+/// The drop calls this under the `SHARE` lock, so no row can change during
+/// the scan. It is one statement, so the caller's `statement_timeout` bounds
+/// the whole scan. No row leaves the server.
 ///
 /// # Errors
 ///
-/// [`crate::error::HarvestError::Database`] on a query failure.
+/// [`crate::error::HarvestError::Database`] on a query failure, a
+/// `statement_timeout` included.
 #[cfg(feature = "db")]
-pub(crate) async fn locked_digest(
+pub(crate) async fn locked_checksum(
     conn: &mut diesel_async::AsyncPgConnection,
     name: &str,
 ) -> crate::error::HarvestResult<(u64, String)> {
+    use diesel_async::RunQueryDsl as _;
     crate::partition::exec(conn, "SET LOCAL TimeZone = 'UTC'").await?;
-    let table = crate::partition::quote_ident(name);
-    let mut digest = RowDigest::default();
-    let mut after: Keyset = None;
-    loop {
-        let rows = read_page(conn, &table, &after).await?;
-        let last_page = rows.len() < PAGE_ROWS;
-        for row in rows {
-            digest.push(&row.v);
-            after = Some((row.id, row.c));
-        }
-        if last_page {
-            break;
+    let sql = format!(
+        "SELECT count(*)::bigint AS n,
+                COALESCE(sum(('x' || encode(substring(
+                    sha256(convert_to(to_jsonb(e)::text, 'UTF8')) FROM 1 FOR 8), 'hex'))
+                    ::bit(64)::bigint), 0)::text AS s
+           FROM {} e",
+        crate::partition::quote_ident(name)
+    );
+    let row = diesel::sql_query(sql)
+        .get_result::<ChecksumRow>(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok((u64::try_from(row.n).unwrap_or(0), row.s))
+}
+
+/// The session advisory lock that lets one process at a time export a shard.
+///
+/// Every runner sweeps every shard. Without this lock, two processes export
+/// the same partition at once, and each uploads the whole partition. The key
+/// shows in `pg_locks` as `objid` and `classid` of an `advisory` lock.
+pub const EXPORT_LOCK_KEY: i64 = 0x4856_5354_2009_0001;
+
+/// What an applying sweep may do with a droppable partition (issue #2009).
+#[cfg(feature = "db")]
+#[derive(Debug)]
+pub(crate) enum ExportGate<'a> {
+    /// No archiver and no export marker: drop as before.
+    Off,
+    /// The shard holds the export marker, but this sweep has no archiver.
+    Required,
+    /// This sweep has an archiver, but another process holds the export lock.
+    Busy,
+    /// This sweep has an archiver and holds the export lock.
+    Active(&'a PartitionExport),
+}
+
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct FlagRow {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    v: bool,
+}
+
+#[cfg(feature = "db")]
+async fn flag(
+    conn: &mut diesel_async::AsyncPgConnection,
+    sql: &str,
+) -> crate::error::HarvestResult<bool> {
+    use diesel_async::RunQueryDsl as _;
+    diesel::sql_query(sql)
+        .get_result::<FlagRow>(conn)
+        .await
+        .map(|r| r.v)
+        .map_err(crate::error::database_error)
+}
+
+#[cfg(feature = "db")]
+impl<'a> ExportGate<'a> {
+    /// Resolve the gate for one applying pass.
+    ///
+    /// With an archiver, this writes the export marker first. From then on a
+    /// sweep with no archiver on this shard drops nothing. Then it tries the
+    /// export lock, and does not wait for it.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::HarvestError::Database`] on a query failure. With an
+    /// archiver, a database without the marker table also fails, so no
+    /// export runs where the marker cannot protect it.
+    pub(crate) async fn resolve(
+        conn: &mut diesel_async::AsyncPgConnection,
+        export: Option<&'a PartitionExport>,
+    ) -> crate::error::HarvestResult<Self> {
+        let Some(export) = export else {
+            let marked = flag(
+                conn,
+                "SELECT to_regclass('harvest_partition_export') IS NOT NULL AS v",
+            )
+            .await?
+                && flag(
+                    conn,
+                    "SELECT EXISTS (SELECT 1 FROM harvest_partition_export) AS v",
+                )
+                .await?;
+            return Ok(if marked { Self::Required } else { Self::Off });
+        };
+        crate::partition::exec(
+            conn,
+            "INSERT INTO harvest_partition_export (singleton) VALUES (TRUE) ON CONFLICT DO NOTHING",
+        )
+        .await?;
+        let locked = flag(
+            conn,
+            &format!("SELECT pg_try_advisory_lock({EXPORT_LOCK_KEY}) AS v"),
+        )
+        .await?;
+        Ok(if locked {
+            Self::Active(export)
+        } else {
+            Self::Busy
+        })
+    }
+
+    /// The blocked reason when this gate allows no drop.
+    pub(crate) const fn blocks_drops(&self) -> Option<&'static str> {
+        match self {
+            Self::Required => Some(crate::partition::EXPORT_REQUIRED_REASON),
+            Self::Busy => Some(crate::partition::EXPORT_BUSY_REASON),
+            Self::Off | Self::Active(_) => None,
         }
     }
-    Ok((digest.rows(), digest.finish()))
+
+    /// Whether the straggler `DELETE` may run. It removes rows that no
+    /// export holds, so it runs only when no export is in use.
+    pub(crate) const fn allows_straggler_delete(&self) -> bool {
+        matches!(self, Self::Off)
+    }
+
+    /// Release the export lock, if this gate holds it.
+    ///
+    /// A failure is only logged. A broken connection ends its session, and
+    /// the session end releases the lock.
+    pub(crate) async fn release(&self, conn: &mut diesel_async::AsyncPgConnection) {
+        if matches!(self, Self::Active(_))
+            && let Err(e) = flag(
+                conn,
+                &format!("SELECT pg_advisory_unlock({EXPORT_LOCK_KEY}) AS v"),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "could not release the partition export lock");
+        }
+    }
 }
 
 /// Run one backend call under the export's time limit.
@@ -621,8 +892,8 @@ async fn bounded<T>(export: &PartitionExport, call: ArchiveIo<'_, T>) -> Result<
         Ok(Ok(value)) => Ok(value),
         Ok(Err(e)) => Err(e.to_string()),
         Err(_) => Err(format!(
-            "the backend call timed out after {}s",
-            export.io_timeout.as_secs()
+            "the backend call timed out after {:?}",
+            export.io_timeout
         )),
     }
 }
@@ -635,47 +906,53 @@ async fn upload_segment(
     segments: &mut Vec<SegmentEntry>,
     (bytes, rows): (Vec<u8>, u64),
 ) -> Result<(), String> {
-    let key = segment_key(prefix, segments.len() + 1);
+    let sha256 = sha256_hex(&bytes);
+    let key = segment_key(prefix, segments.len() + 1, &sha256);
     let entry = SegmentEntry {
         key: key.clone(),
         rows,
         bytes: bytes.len() as u64,
-        sha256: sha256_hex(&bytes),
+        sha256,
     };
     bounded(export, export.archiver.put(&key, bytes)).await?;
     segments.push(entry);
     Ok(())
 }
 
-/// Read back what [`export_partition`] wrote and compare it.
+/// An earlier export of partition `part` that still reads back clean.
+///
+/// A failed drop leaves its export in place. The next pass can use it, and
+/// the drop check under the lock still proves that it matches the partition.
+/// Returns `None` when there is no such export, or when any check fails.
 #[cfg(feature = "db")]
-async fn verify(
+pub(crate) async fn reusable_export(
     export: &PartitionExport,
-    manifest_key: &str,
-    manifest_bytes: &[u8],
-    segments: &[SegmentEntry],
-) -> Result<(), String> {
-    for seg in segments {
-        let bytes = bounded(export, export.archiver.get(&seg.key))
-            .await?
-            .ok_or_else(|| format!("{} is missing after the upload", seg.key))?;
-        if bytes.len() as u64 != seg.bytes || sha256_hex(&bytes) != seg.sha256 {
-            return Err(format!("{} differs from the upload", seg.key));
-        }
-    }
-    let read = bounded(export, export.archiver.get(manifest_key))
-        .await?
-        .ok_or_else(|| format!("{manifest_key} is missing after the upload"))?;
-    if read != manifest_bytes {
-        return Err(format!("{manifest_key} differs from the upload"));
-    }
-    Ok(())
+    part: &crate::partition::PartitionInfo,
+    upper: DateTime<Utc>,
+    progress: Option<&mut (dyn FnMut() + Send)>,
+) -> Option<PartitionManifest> {
+    let prefix = archive_prefix(export.shard_id, &part.name, part.lower, upper);
+    let back = read_back_inner(
+        export.archiver.as_ref(),
+        &manifest_key(&prefix),
+        Some(export.io_timeout),
+        false,
+        progress,
+    )
+    .await
+    .ok()?;
+    let m = back.manifest;
+    (m.shard_id == export.shard_id
+        && m.partition == part.name
+        && m.lower == part.lower
+        && m.upper == upper)
+        .then_some(m)
 }
 
 /// Export partition `part`, then read the export back and check it.
 ///
 /// Reads run in short transactions, one per page. No transaction stays open
-/// across a backend call. The drop hashes the partition again under its
+/// across a backend call. The drop checks the partition again under its
 /// lock, so a row that changes during the export blocks the drop.
 ///
 /// Returns the manifest, or the reason the drop must wait. A failure is a
@@ -722,6 +999,8 @@ pub(crate) async fn export_partition(
     if let Some(closed) = writer.finish() {
         upload_segment(export, &prefix, &mut segments, closed).await?;
     }
+    let row_count = digest.rows();
+    let (sha256, row_checksum) = digest.finish();
     let manifest = PartitionManifest {
         format: FORMAT_VERSION,
         shard_id: export.shard_id,
@@ -729,14 +1008,30 @@ pub(crate) async fn export_partition(
         lower: part.lower,
         upper,
         exported_at: Utc::now(),
-        row_count: digest.rows(),
-        sha256: digest.finish(),
+        row_count,
+        sha256,
+        row_checksum,
         segments,
     };
     let key = manifest_key(&prefix);
     let bytes = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
-    bounded(export, export.archiver.put(&key, bytes.clone())).await?;
-    verify(export, &key, &bytes, &manifest.segments).await?;
+    bounded(export, export.archiver.put(&key, bytes)).await?;
+    if let Some(cb) = progress.as_mut() {
+        cb();
+    }
+    // The verify step: read every object back and check every hash.
+    let back = read_back_inner(
+        export.archiver.as_ref(),
+        &key,
+        Some(export.io_timeout),
+        false,
+        progress,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    if back.manifest != manifest {
+        return Err(format!("{key} differs from the upload"));
+    }
     Ok(manifest)
 }
 
@@ -789,15 +1084,18 @@ mod tests {
         }
         closed.extend(writer.finish());
         for (n, (bytes, count)) in closed.into_iter().enumerate() {
-            let key = segment_key(&prefix, n + 1);
+            let sha256 = sha256_hex(&bytes);
+            let key = segment_key(&prefix, n + 1, &sha256);
             segments.push(SegmentEntry {
                 key: key.clone(),
                 rows: count,
                 bytes: bytes.len() as u64,
-                sha256: sha256_hex(&bytes),
+                sha256,
             });
             archiver.put(&key, bytes).await.unwrap();
         }
+        let row_count = digest.rows();
+        let (sha256, row_checksum) = digest.finish();
         let manifest = PartitionManifest {
             format: FORMAT_VERSION,
             shard_id: 0,
@@ -805,8 +1103,9 @@ mod tests {
             lower: Some(ts(2026, 1, 1)),
             upper: ts(2026, 1, 2),
             exported_at: ts(2026, 1, 3),
-            row_count: digest.rows(),
-            sha256: digest.finish(),
+            row_count,
+            sha256,
+            row_checksum,
             segments,
         };
         let key = manifest_key(&prefix);
@@ -815,6 +1114,27 @@ mod tests {
             .await
             .unwrap();
         key
+    }
+
+    fn segment_keys(archiver: &MemoryArchiver, manifest_key: &str) -> Vec<String> {
+        let raw = archiver.objects.lock().unwrap()[manifest_key].clone();
+        let manifest: PartitionManifest = serde_json::from_slice(&raw).unwrap();
+        manifest.segments.into_iter().map(|s| s.key).collect()
+    }
+
+    #[tokio::test]
+    async fn read_back_refuses_a_manifest_under_another_key() {
+        let archiver = MemoryArchiver::default();
+        let key = store(&archiver, &[ROW_A]).await;
+        let raw = archiver.objects.lock().unwrap()[&key].clone();
+        let other = "harvest-partitions/shard-9/elsewhere/min_20260102T000000Z/manifest.json";
+        archiver
+            .objects
+            .lock()
+            .unwrap()
+            .insert(other.to_string(), raw);
+        let err = read_back(&archiver, other).await.unwrap_err();
+        assert!(matches!(err, ReadBackError::Corrupt(_)), "{err}");
     }
 
     #[test]
@@ -830,10 +1150,30 @@ mod tests {
             "harvest-partitions/shard-3/harvest_events_p_20260101/20260101T000000Z_20260102T000000Z"
         );
         assert_eq!(manifest_key(&prefix), format!("{prefix}/manifest.json"));
+        let sha = sha256_hex(b"x");
         assert_eq!(
-            segment_key(&prefix, 7),
-            format!("{prefix}/segment-000007.jsonl")
+            segment_key(&prefix, 7, &sha),
+            format!("{prefix}/segment-000007-{}.jsonl", &sha[..16])
         );
+    }
+
+    #[test]
+    fn a_sub_second_bound_keeps_its_microseconds() {
+        let cutover = ts(2026, 1, 1) + chrono::Duration::microseconds(1_500_250);
+        let prefix = archive_prefix(0, "harvest_events_p_legacy", None, cutover);
+        assert!(prefix.ends_with("/min_20260101T000001.500250Z"), "{prefix}");
+    }
+
+    #[test]
+    fn the_row_hash_is_the_first_eight_digest_bytes_as_a_signed_integer() {
+        // SHA-256("a") starts with ca978112ca1bbdca.
+        let head = [0xca, 0x97, 0x81, 0x12, 0xca, 0x1b, 0xbd, 0xca];
+        assert_eq!(row_hash("a"), i64::from_be_bytes(head));
+        let mut digest = RowDigest::default();
+        digest.push("a");
+        digest.push("a");
+        let (_, checksum) = digest.finish();
+        assert_eq!(checksum, (2 * i128::from(row_hash("a"))).to_string());
     }
 
     #[test]
@@ -853,7 +1193,14 @@ mod tests {
         digest.push("a");
         digest.push("b");
         assert_eq!(digest.rows(), 2);
-        assert_eq!(digest.finish(), sha256_hex(b"a\nb\n"));
+        assert_eq!(
+            digest.finish().0,
+            sha256_hex(
+                b"a
+b
+"
+            )
+        );
         assert_eq!(
             sha256_hex(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -893,7 +1240,7 @@ mod tests {
             }
         }
         all.extend(writer.finish().unwrap().0);
-        assert_eq!(sha256_hex(&all), digest.finish());
+        assert_eq!(sha256_hex(&all), digest.finish().0);
     }
 
     #[tokio::test]
@@ -924,7 +1271,7 @@ mod tests {
     async fn read_back_refuses_a_changed_segment() {
         let archiver = MemoryArchiver::default();
         let key = store(&archiver, &[ROW_A, ROW_B]).await;
-        let seg = key.replace("manifest.json", "segment-000002.jsonl");
+        let seg = segment_keys(&archiver, &key)[1].clone();
         archiver
             .objects
             .lock()
@@ -943,7 +1290,7 @@ mod tests {
         assert!(matches!(err, ReadBackError::Missing(_)), "{err}");
 
         let key = store(&archiver, &[ROW_A, ROW_B]).await;
-        let seg = key.replace("manifest.json", "segment-000001.jsonl");
+        let seg = segment_keys(&archiver, &key)[0].clone();
         archiver.objects.lock().unwrap().remove(&seg);
         let err = read_back(&archiver, &key).await.unwrap_err();
         assert!(matches!(err, ReadBackError::Missing(_)), "{err}");

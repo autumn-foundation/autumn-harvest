@@ -44,8 +44,10 @@ envelope header.
   removes 52%. Deflate looks back 32 KiB, and a late transcript is about
   100 KB, so it misses most repeats.
 - Under the codec the delta saves nothing. Each payload field gets a fresh
-  nonce, so equal transcripts give different ciphertext. Compression saves
-  nothing either.
+  nonce, so equal transcripts give different ciphertext. The 75-byte shared
+  prefix is the upper bound on what a delta over stored bytes can save. The
+  test measures that bound, not a delta table. Compression saves nothing
+  either.
 
 ## Decision
 

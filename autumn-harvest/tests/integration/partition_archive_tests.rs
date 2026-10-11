@@ -25,7 +25,7 @@ use autumn_harvest::worker::DbPool;
 use chrono::{DateTime, TimeZone, Utc};
 use diesel::sql_types::{BigInt, Bool, Text, Timestamptz};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -72,6 +72,7 @@ async fn reset(conn: &mut AsyncPgConnection) {
         "DELETE FROM harvest_execution_summaries",
         "DELETE FROM harvest_workflow_executions",
         "DELETE FROM harvest_events",
+        "DELETE FROM harvest_partition_export",
     ] {
         diesel::sql_query(stmt).execute(conn).await.expect(stmt);
     }
@@ -251,7 +252,11 @@ struct Aged {
 }
 
 async fn seed_aged_partition(conn: &mut AsyncPgConnection, n: usize) -> Aged {
-    let at = Utc::now() - chrono::Duration::days(30);
+    seed_aged_partition_at(conn, n, 30).await
+}
+
+async fn seed_aged_partition_at(conn: &mut AsyncPgConnection, n: usize, days: i64) -> Aged {
+    let at = Utc::now() - chrono::Duration::days(days);
     let runs = seed_runs(conn, at, n).await;
     delete_runs(conn, &runs).await;
     let lower = partition::cohort_start(at, partition::DEFAULT_COHORT_WIDTH_SECS);
@@ -272,14 +277,24 @@ struct TestArchiver {
     fail_put: bool,
     lose_on_get: bool,
     corrupt_on_get: bool,
-    /// When set, the manifest upload changes one row of this partition.
+    /// Each upload waits this long first.
+    put_delay: Option<Duration>,
+    /// When set, the manifest upload runs this SQL once, as a superuser
+    /// with the append-only guard off: `(url, sql)`.
     change_row: Mutex<Option<(String, String)>>,
+    /// When set, each manifest read records whether this partition still
+    /// exists: `(url, partition)`.
+    probe: Mutex<Option<(String, String)>>,
+    existed_at_read: Mutex<Vec<bool>>,
 }
 
 impl PartitionArchiver for TestArchiver {
     fn put<'a>(&'a self, key: &'a str, bytes: Vec<u8>) -> ArchiveIo<'a, ()> {
         self.log.lock().unwrap().push(format!("put {key}"));
         Box::pin(async move {
+            if let Some(delay) = self.put_delay {
+                tokio::time::sleep(delay).await;
+            }
             if self.fail_put {
                 return Err("bucket unavailable".into());
             }
@@ -289,15 +304,10 @@ impl PartitionArchiver for TestArchiver {
             } else {
                 None
             };
-            if let Some((url, table)) = change {
+            if let Some((url, sql)) = change {
                 let mut conn = connect(&url).await;
                 autumn_harvest::append_only::with_guard_off(&mut conn, async |c| {
-                    diesel::sql_query(format!(
-                        "UPDATE {table} SET event_data = event_data || '{{\"rotated\": true}}'::jsonb
-                          WHERE id = (SELECT min(id) FROM {table})"
-                    ))
-                    .execute(c)
-                    .await
+                    diesel::sql_query(sql).execute(c).await
                 })
                 .await
                 .expect("change one row after the export");
@@ -308,6 +318,11 @@ impl PartitionArchiver for TestArchiver {
 
     fn get<'a>(&'a self, key: &'a str) -> ArchiveIo<'a, Option<Vec<u8>>> {
         self.log.lock().unwrap().push(format!("get {key}"));
+        let probe = if key.ends_with("manifest.json") {
+            self.probe.lock().unwrap().clone()
+        } else {
+            None
+        };
         let mut got = self.objects.lock().unwrap().get(key).cloned();
         if self.lose_on_get {
             got = None;
@@ -318,7 +333,14 @@ impl PartitionArchiver for TestArchiver {
         {
             *first ^= 0x01;
         }
-        Box::pin(async move { Ok(got) })
+        Box::pin(async move {
+            if let Some((url, table)) = probe {
+                let mut conn = connect(&url).await;
+                let still = exists(&mut conn, &table).await;
+                self.existed_at_read.lock().unwrap().push(still);
+            }
+            Ok(got)
+        })
     }
 }
 
@@ -366,6 +388,7 @@ async fn an_aged_partition_is_exported_verified_then_dropped_and_reads_back() {
 
     let dir = tempfile::tempdir().unwrap();
     let backend = Arc::new(TestArchiver::default());
+    *backend.probe.lock().unwrap() = Some((url.clone(), aged.name.clone()));
     let outcome = sweep_with(&mut conn, backend.clone()).await;
 
     let key = expected_manifest_key(&aged.name, Some(aged.lower), aged.upper);
@@ -376,22 +399,31 @@ async fn an_aged_partition_is_exported_verified_then_dropped_and_reads_back() {
         "the partition is dropped"
     );
 
-    // Order: every segment, then the manifest, then the read-back.
+    // Order: a reuse probe, every segment, the manifest, then the read-back.
     let log = backend.log.lock().unwrap().clone();
+    let first_put = log.iter().position(|l| l.starts_with("put ")).unwrap();
     let last_put = log.iter().rposition(|l| l.starts_with("put ")).unwrap();
-    let first_get = log.iter().position(|l| l.starts_with("get ")).unwrap();
     assert_eq!(
         log[last_put],
         format!("put {key}"),
         "the manifest goes last: {log:?}"
     );
     assert!(
-        first_get > last_put,
-        "verify reads back after the upload: {log:?}"
+        log[first_put..last_put]
+            .iter()
+            .all(|l| l.starts_with("put ")),
+        "the upload reads nothing back: {log:?}"
     );
     assert!(
-        log.contains(&format!("get {key}")),
-        "the manifest is read back: {log:?}"
+        log[last_put + 1..]
+            .iter()
+            .any(|l| l == &format!("get {key}")),
+        "verify reads the manifest back after the upload: {log:?}"
+    );
+    let reads = backend.existed_at_read.lock().unwrap().clone();
+    assert!(
+        reads.len() >= 2 && reads.iter().all(|still| *still),
+        "the partition still exists at every manifest read, verify included: {reads:?}"
     );
 
     // Copy the objects into a directory backend to read back through it.
@@ -526,7 +558,14 @@ async fn a_row_changed_after_the_export_keeps_the_partition_until_a_new_export()
     reset_partitioned(&mut conn).await;
     let aged = seed_aged_partition(&mut conn, 3).await;
     let backend = Arc::new(TestArchiver::default());
-    *backend.change_row.lock().unwrap() = Some((url.clone(), aged.name.clone()));
+    let table = &aged.name;
+    *backend.change_row.lock().unwrap() = Some((
+        url.clone(),
+        format!(
+            "UPDATE {table} SET event_data = event_data || '{{\"rotated\": true}}'::jsonb
+              WHERE id = (SELECT min(id) FROM {table})"
+        ),
+    ));
 
     let first = sweep_with(&mut conn, backend.clone()).await;
     assert_kept(&mut conn, &aged, &first, "changed since export").await;
@@ -560,9 +599,224 @@ async fn a_partition_a_live_run_owns_is_not_exported() {
     let outcome = sweep_with(&mut conn, backend.clone()).await;
     assert!(outcome.dropped.is_empty(), "{outcome:?}");
     assert!(
+        outcome
+            .blocked
+            .iter()
+            .any(|b| b.contains(partition::OWNED_REASON)),
+        "{outcome:?}"
+    );
+    assert!(
         backend.log.lock().unwrap().is_empty(),
         "the ownership gate runs before any upload"
     );
+}
+
+// ── Further failures and guards ───────────────────────────────────────────
+
+#[tokio::test]
+async fn a_slow_backend_times_out_and_keeps_the_partition() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_partitioned(&mut conn).await;
+    let aged = seed_aged_partition(&mut conn, 3).await;
+    let backend = Arc::new(TestArchiver {
+        put_delay: Some(Duration::from_millis(500)),
+        ..TestArchiver::default()
+    });
+    let export = PartitionExport::new(backend, 0).with_io_timeout(Duration::from_millis(100));
+    let outcome = partition::sweep_exporting(
+        &mut conn,
+        Utc::now(),
+        &SweepOptions::default(),
+        None,
+        &export,
+    )
+    .await
+    .expect("sweep");
+    assert_kept(&mut conn, &aged, &outcome, "export failed").await;
+    assert!(
+        outcome.blocked.iter().any(|b| b.contains("timed out")),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_row_deleted_after_the_export_keeps_the_partition() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_partitioned(&mut conn).await;
+    let aged = seed_aged_partition(&mut conn, 3).await;
+    let backend = Arc::new(TestArchiver::default());
+    let table = &aged.name;
+    *backend.change_row.lock().unwrap() = Some((
+        url.clone(),
+        format!("DELETE FROM {table} WHERE id = (SELECT min(id) FROM {table})"),
+    ));
+    let outcome = sweep_with(&mut conn, backend).await;
+    assert!(outcome.dropped.is_empty(), "{outcome:?}");
+    assert!(
+        outcome
+            .blocked
+            .iter()
+            .any(|b| b.contains(partition::CHANGED_REASON)),
+        "only the row count differs, and the check still sees it: {outcome:?}"
+    );
+    assert_eq!(row_count(&mut conn, &aged.name).await, 8);
+}
+
+#[tokio::test]
+async fn an_exporting_sweep_never_deletes_stragglers() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_partitioned(&mut conn).await;
+    let at = Utc::now() - chrono::Duration::days(30);
+    let runs = seed_runs(&mut conn, at, 2).await;
+    delete_runs(&mut conn, &runs[..1]).await;
+    let lower = partition::cohort_start(at, partition::DEFAULT_COHORT_WIDTH_SECS);
+    let name = partition::partition_name(lower);
+    let opts = SweepOptions {
+        straggler_grace: Some(Duration::ZERO),
+        ..SweepOptions::default()
+    };
+    let outcome = partition::sweep_exporting(
+        &mut conn,
+        Utc::now(),
+        &opts,
+        None,
+        &export_to(Arc::new(TestArchiver::default())),
+    )
+    .await
+    .expect("sweep");
+    assert_eq!(outcome.straggler_rows_deleted, 0, "{outcome:?}");
+    assert_eq!(row_count(&mut conn, &name).await, 6, "the orphan rows stay");
+}
+
+#[tokio::test]
+async fn a_sweep_without_an_archiver_drops_nothing_once_a_shard_exported() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_partitioned(&mut conn).await;
+    let first = seed_aged_partition_at(&mut conn, 1, 30).await;
+    let outcome = sweep_with(&mut conn, Arc::new(TestArchiver::default())).await;
+    assert_eq!(outcome.dropped, vec![first.name.clone()], "{outcome:?}");
+
+    // `harvest partition maintain` and `RetentionRuntime::spawn` take these
+    // paths. Neither has an archiver.
+    let second = seed_aged_partition_at(&mut conn, 1, 20).await;
+    let plain = partition::sweep(&mut conn, Utc::now(), &SweepOptions::default(), None)
+        .await
+        .expect("sweep");
+    assert!(plain.dropped.is_empty(), "{plain:?}");
+    assert!(
+        plain
+            .blocked
+            .iter()
+            .any(|b| b.starts_with(&second.name) && b.contains(partition::EXPORT_REQUIRED_REASON)),
+        "{plain:?}"
+    );
+    let maintained = partition::maintain(
+        &mut conn,
+        Utc::now(),
+        partition::DEFAULT_LOOKAHEAD_COHORTS,
+        &SweepOptions::default(),
+        None,
+        None,
+    )
+    .await
+    .expect("maintain");
+    assert!(maintained.sweep.dropped.is_empty(), "{maintained:?}");
+    assert!(exists(&mut conn, &second.name).await);
+
+    // Deleting the marker ends the requirement.
+    diesel::sql_query("DELETE FROM harvest_partition_export")
+        .execute(&mut conn)
+        .await
+        .expect("clear the marker");
+    let plain = partition::sweep(&mut conn, Utc::now(), &SweepOptions::default(), None)
+        .await
+        .expect("sweep");
+    assert_eq!(plain.dropped, vec![second.name], "{plain:?}");
+}
+
+#[tokio::test]
+async fn another_exporting_process_makes_the_shard_busy() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_partitioned(&mut conn).await;
+    let aged = seed_aged_partition(&mut conn, 3).await;
+    let mut other = connect(&url).await;
+    let key = partition_archive::EXPORT_LOCK_KEY;
+    other
+        .batch_execute(&format!("SELECT pg_advisory_lock({key})"))
+        .await
+        .expect("hold the export lock");
+
+    let backend = Arc::new(TestArchiver::default());
+    let outcome = sweep_with(&mut conn, backend.clone()).await;
+    assert_kept(&mut conn, &aged, &outcome, partition::EXPORT_BUSY_REASON).await;
+    assert!(
+        backend.log.lock().unwrap().is_empty(),
+        "no upload while busy"
+    );
+
+    other
+        .batch_execute(&format!("SELECT pg_advisory_unlock({key})"))
+        .await
+        .expect("release the export lock");
+    let outcome = sweep_with(&mut conn, backend).await;
+    assert_eq!(outcome.dropped, vec![aged.name], "{outcome:?}");
+}
+
+#[tokio::test]
+async fn a_failed_drop_reuses_the_export_on_the_next_pass() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_partitioned(&mut conn).await;
+    let aged = seed_aged_partition(&mut conn, 3).await;
+    // A reader that holds `ACCESS SHARE` makes the `DROP` upgrade time out.
+    let mut reader = connect(&url).await;
+    reader
+        .batch_execute(&format!("BEGIN; SELECT count(*) FROM {}", aged.name))
+        .await
+        .expect("hold a read lock");
+
+    let backend = Arc::new(TestArchiver::default());
+    let first = sweep_with(&mut conn, backend.clone()).await;
+    assert_kept(&mut conn, &aged, &first, partition::RECHECK_REASON).await;
+    reader.batch_execute("COMMIT").await.expect("release");
+
+    backend.log.lock().unwrap().clear();
+    let second = sweep_with(&mut conn, backend.clone()).await;
+    assert_eq!(second.dropped, vec![aged.name.clone()], "{second:?}");
+    let log = backend.log.lock().unwrap().clone();
+    assert!(
+        log.iter().all(|l| l.starts_with("get ")),
+        "the second pass uploads nothing: {log:?}"
+    );
+    let key = expected_manifest_key(&aged.name, Some(aged.lower), aged.upper);
+    assert_eq!(second.exported, vec![key]);
+}
+
+#[tokio::test]
+async fn the_export_budget_spreads_a_backlog_over_passes() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_partitioned(&mut conn).await;
+    let older = seed_aged_partition_at(&mut conn, 1, 30).await;
+    let newer = seed_aged_partition_at(&mut conn, 1, 20).await;
+    let export = export_to(Arc::new(TestArchiver::default())).with_max_exports_per_pass(1);
+    let opts = SweepOptions::default();
+    let first = partition::sweep_exporting(&mut conn, Utc::now(), &opts, None, &export)
+        .await
+        .expect("sweep");
+    assert_eq!(first.dropped, vec![older.name], "{first:?}");
+    assert!(first.truncated, "{first:?}");
+    assert!(exists(&mut conn, &newer.name).await);
+    let second =
+        partition::sweep_exporting(&mut conn, Utc::now(), &opts, first.next_resume, &export)
+            .await
+            .expect("sweep");
+    assert_eq!(second.dropped, vec![newer.name], "{second:?}");
 }
 
 // ── The retention runtime hands the partition to the archiver ────────────
@@ -589,10 +843,7 @@ async fn the_retention_runtime_exports_before_it_drops() {
         ShardedDbPool::single(build_pool(&url)),
         RetentionConfig::with_max_age(Duration::from_secs(86_400)),
         Arc::new(NoopMetrics),
-        RetentionHooks {
-            partition_archiver: Some(disk.clone()),
-            ..RetentionHooks::default()
-        },
+        RetentionHooks::default().with_partition_archiver(Some(disk.clone())),
     )
     .expect("retention runtime should spawn when enabled");
     runtime.run_now();

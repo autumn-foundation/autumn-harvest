@@ -1384,11 +1384,10 @@ impl HarvestRunner {
                 prepared.storage_pool.sharded_pool().clone(),
                 prepared.retention_config.clone(),
                 Arc::clone(&registry.telemetry().metrics),
-                autumn_harvest::retention::RetentionHooks {
-                    archiver: prepared.history_archiver,
-                    offloader: registry.payload_offloader_arc(),
-                    partition_archiver: prepared.partition_archiver,
-                },
+                autumn_harvest::retention::RetentionHooks::default()
+                    .with_archiver(prepared.history_archiver)
+                    .with_offloader(registry.payload_offloader_arc())
+                    .with_partition_archiver(prepared.partition_archiver),
             )
         } else {
             tracing::info!(
