@@ -264,46 +264,30 @@ impl HttpRemoteTasks {
             )));
         }
         let status = response.status();
-        let too_large = || {
-            RemoteTaskError::non_retryable(format!(
-                "{method}: the response is over {MAX_RESPONSE_BYTES} bytes"
-            ))
-        };
-        if response
-            .content_length()
-            .is_some_and(|n| n > MAX_RESPONSE_BYTES as u64)
-        {
-            return Err(too_large());
-        }
         let event_stream = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.starts_with("text/event-stream"));
-        let mut raw = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|e| {
-            RemoteTaskError::retryable(format!("{method}: read failed: {}", e.without_url()))
-        })? {
-            if raw.len() + chunk.len() > MAX_RESPONSE_BYTES {
-                return Err(too_large());
-            }
-            raw.extend_from_slice(&chunk);
-            // A server may keep an event stream open after the response, so
-            // the read stops at the first full response with this id.
-            if event_stream
-                && chunk.contains(&b'\n')
-                && std::str::from_utf8(&raw).is_ok_and(|text| sse_response(text, id).is_some())
-            {
-                break;
-            }
-        }
+        let raw = read_body(&mut response, method, id, event_stream).await?;
         let envelope = if event_stream {
             std::str::from_utf8(&raw)
                 .ok()
-                .and_then(|text| sse_response(text, id))
+                .and_then(|text| sse_response(text, id, false))
         } else {
             serde_json::from_slice::<Value>(&raw).ok()
         };
+        // A response for another request is a protocol error, not this
+        // request's result. An error with a null id passes, as JSON-RPC
+        // sends a parse error that way.
+        if let Some(envelope) = &envelope
+            && envelope.get("result").is_some()
+            && !is_response_to(envelope, id)
+        {
+            return Err(RemoteTaskError::non_retryable(format!(
+                "{method}: the response id does not match the request id"
+            )));
+        }
         let rpc_error = envelope.as_ref().and_then(|e| e.get("error")).map(|error| {
             let message = error
                 .get("message")
@@ -333,6 +317,45 @@ impl HttpRemoteTasks {
     }
 }
 
+/// Read the body of `response`, at most [`MAX_RESPONSE_BYTES`].
+///
+/// A server may keep an event stream open after the response. So the read
+/// of an event stream stops at the first full response with `id`.
+async fn read_body(
+    response: &mut reqwest::Response,
+    method: &str,
+    id: u64,
+    event_stream: bool,
+) -> Result<Vec<u8>, RemoteTaskError> {
+    let too_large = || {
+        RemoteTaskError::non_retryable(format!(
+            "{method}: the response is over {MAX_RESPONSE_BYTES} bytes"
+        ))
+    };
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(too_large());
+    }
+    let mut raw = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| {
+        RemoteTaskError::retryable(format!("{method}: read failed: {}", e.without_url()))
+    })? {
+        if raw.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(too_large());
+        }
+        raw.extend_from_slice(&chunk);
+        if event_stream
+            && chunk.contains(&b'\n')
+            && std::str::from_utf8(&raw).is_ok_and(|text| sse_response(text, id, true).is_some())
+        {
+            break;
+        }
+    }
+    Ok(raw)
+}
+
 /// `text`, cut to at most [`MAX_ERROR_TEXT`] bytes on a char boundary.
 fn clip(text: &str) -> &str {
     if text.len() <= MAX_ERROR_TEXT {
@@ -345,15 +368,49 @@ fn clip(text: &str) -> &str {
     &text[..end]
 }
 
+/// `true` when `message` is the JSON-RPC response to request `id`.
+fn is_response_to(message: &Value, id: u64) -> bool {
+    message.get("id").and_then(Value::as_u64) == Some(id)
+        && (message.get("result").is_some() || message.get("error").is_some())
+}
+
 /// The JSON-RPC response with `id` in a `text/event-stream` body.
-fn sse_response(body: &str, id: u64) -> Option<Value> {
-    body.lines()
-        .filter_map(|line| line.strip_prefix("data:"))
-        .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
-        .find(|message| {
-            message.get("id").and_then(Value::as_u64) == Some(id)
-                && (message.get("result").is_some() || message.get("error").is_some())
-        })
+///
+/// A blank line ends an event, and the `data` lines of one event join with
+/// a line feed. With `complete_only`, an event with no blank line after it
+/// does not count, because more of its data can still arrive.
+fn sse_response(body: &str, id: u64, complete_only: bool) -> Option<Value> {
+    let mut data: Vec<&str> = Vec::new();
+    let mut lines = body.split('\n').peekable();
+    while let Some(raw) = lines.next() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let at_end = lines.peek().is_none();
+        if line.is_empty() && !at_end {
+            if let Some(message) = decode_event(&data)
+                && is_response_to(&message, id)
+            {
+                return Some(message);
+            }
+            data.clear();
+        } else if let Some(field) = line.strip_prefix("data:") {
+            // A partial last line is not a field yet.
+            if !(at_end && complete_only) {
+                data.push(field.strip_prefix(' ').unwrap_or(field));
+            }
+        }
+    }
+    if complete_only {
+        return None;
+    }
+    decode_event(&data).filter(|message| is_response_to(message, id))
+}
+
+/// The JSON value of one event's joined `data` lines.
+fn decode_event(data: &[&str]) -> Option<Value> {
+    if data.is_empty() {
+        return None;
+    }
+    serde_json::from_str(&data.join("\n")).ok()
 }
 
 /// The `Mcp-Name` header value. A value that is not visible ASCII uses the
@@ -440,10 +497,33 @@ mod tests {
         let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n\
                     data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n\n";
         assert_eq!(
-            sse_response(body, 7),
+            sse_response(body, 7, false),
             Some(json!({"jsonrpc": "2.0", "id": 7, "result": {"ok": true}}))
         );
-        assert_eq!(sse_response(body, 8), None);
+        assert_eq!(sse_response(body, 8, false), None);
+    }
+
+    #[test]
+    fn sse_response_joins_the_data_lines_of_one_event() {
+        let body = "event: message\r\ndata: {\"jsonrpc\":\"2.0\",\r\ndata: \"id\":3,\r\ndata:\"result\":{\"ok\":true}}\r\n\r\n";
+        assert_eq!(
+            sse_response(body, 3, true),
+            Some(json!({"jsonrpc": "2.0", "id": 3, "result": {"ok": true}}))
+        );
+    }
+
+    #[test]
+    fn an_event_with_no_end_counts_only_at_the_end_of_the_body() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{}}";
+        assert_eq!(
+            sse_response(body, 4, true),
+            None,
+            "more data can still arrive"
+        );
+        assert_eq!(
+            sse_response(body, 4, false),
+            Some(json!({"jsonrpc": "2.0", "id": 4, "result": {}}))
+        );
     }
 
     #[test]

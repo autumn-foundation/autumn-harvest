@@ -408,3 +408,20 @@ async fn an_open_event_stream_returns_at_the_matching_response() {
     );
     assert!(began.elapsed() < std::time::Duration::from_secs(4));
 }
+
+/// A JSON response for another request id is a protocol error.
+#[tokio::test]
+async fn a_response_with_another_id_is_refused() {
+    let (url, _) = serve(Arc::new(|_| {
+        Json(json!({"jsonrpc": "2.0", "id": 999_999, "result": {"resultType": "task", "taskId": "stale"}}))
+            .into_response()
+    }))
+    .await;
+    let client = HttpRemoteTasks::new().server("reports", RemoteServer::mcp(&url));
+    let err = client
+        .start(&request(RemoteProtocol::Mcp, "export"), "k")
+        .await
+        .expect_err("mismatched id");
+    assert!(!err.retryable);
+    assert!(err.message.contains("id"), "got {}", err.message);
+}
