@@ -159,8 +159,9 @@ fn a_changelog_fragment_exists() {
         .expect("docs/changelog.d exists")
         .filter_map(Result::ok)
         .any(|entry| {
+            let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
-            name.starts_with("issue-2011-") && name.ends_with(".md")
+            name.starts_with("issue-2011-") && path.extension().is_some_and(|ext| ext == "md")
         });
     assert!(found, "issue #2011 needs docs/changelog.d/issue-2011-*.md");
 }

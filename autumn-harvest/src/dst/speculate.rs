@@ -223,13 +223,18 @@ pub struct Timing {
 
 impl Timing {
     /// The durations that `docs/rnd/speculative-execution-spike.md`
-    /// calibrates from the e2e bench.
+    /// measures on the e2e bench, with `fsync` on.
+    ///
+    /// The commit range is the persist p50 to p99. The dispatch hop is the
+    /// `dispatch_latency` p50. The decide time follows from replay
+    /// throughput. The wake hop closes the gap to the measured end-to-end
+    /// p50 of 470.5 ms.
     pub const BENCH: Self = Self {
-        decide_us: 200,
-        commit_us: (1_500, 4_000),
-        dispatch_us: 16_000,
+        decide_us: 2,
+        commit_us: (3_050, 6_190),
+        dispatch_us: 14_750,
         activity_us: (50, 150),
-        wake_us: 60_000,
+        wake_us: 135_800,
     };
 
     /// Durations with no spread.
@@ -468,7 +473,7 @@ pub struct SpecStats {
 
 impl SpecStats {
     /// Add the counters of `other`.
-    pub fn merge(&mut self, other: &Self) {
+    pub const fn merge(&mut self, other: &Self) {
         self.decisions += other.decisions;
         self.speculative += other.speculative;
         self.commits += other.commits;
@@ -891,7 +896,7 @@ impl<'a> Model<'a> {
         }
     }
 
-    fn draw(&mut self, (low, high): (u64, u64)) -> u64 {
+    const fn draw(&mut self, (low, high): (u64, u64)) -> u64 {
         low + self.rng.below(high.saturating_sub(low) + 1)
     }
 
@@ -1033,6 +1038,22 @@ impl<'a> Model<'a> {
             .filter(|resident| resident.generation == generation)
     }
 
+    /// [`Model::resident`], mutable.
+    fn resident_mut(
+        &mut self,
+        worker: Holder,
+        exec: usize,
+        generation: u64,
+    ) -> Option<&mut Resident> {
+        if !self.live(worker) {
+            return None;
+        }
+        self.workers[worker.0]
+            .resident
+            .get_mut(&exec)
+            .filter(|resident| resident.generation == generation)
+    }
+
     /// Build resident state for `exec` from the durable log, then decide.
     fn adopt(&mut self, worker: Holder, exec: usize, cold: bool) {
         self.next_generation += 1;
@@ -1082,15 +1103,11 @@ impl<'a> Model<'a> {
     }
 
     fn decided(&mut self, worker: Holder, exec: usize, generation: u64, upto: usize) {
-        if self.resident(worker, exec, generation).is_none() {
-            return;
-        }
         let workload = self.config.workload;
         let inputs = self.execs[exec].inputs.clone();
-        let resident = self.workers[worker.0]
-            .resident
-            .get_mut(&exec)
-            .expect("checked above");
+        let Some(resident) = self.resident_mut(worker, exec, generation) else {
+            return;
+        };
         resident.deciding = false;
         let read = inputs.get(resident.state.seen..upto).unwrap_or_default();
         let (state, writes, complete) = decide(workload, exec, &resident.state, read);
@@ -1117,7 +1134,7 @@ impl<'a> Model<'a> {
             ),
         );
         if self.config.mode == Mode::Eager {
-            for effect in decision.writes.clone() {
+            for effect in decision.writes {
                 self.release(effect);
             }
         }
@@ -1133,10 +1150,9 @@ impl<'a> Model<'a> {
         let room = self.faults < self.config.faults.max_faults;
         let draws = self.config.faults;
         let stall = faults && room && self.rng.chance(draws.stall_pct);
-        let resident = self.workers[worker.0]
-            .resident
-            .get(&exec)
-            .expect("the caller holds resident state");
+        let Some(resident) = self.workers[worker.0].resident.get(&exec) else {
+            return;
+        };
         let generation = resident.generation;
         if stall {
             self.faults += 1;
@@ -1209,10 +1225,9 @@ impl<'a> Model<'a> {
         }
         match outcome {
             CommitOutcome::Applied => {
-                let resident = self.workers[worker.0]
-                    .resident
-                    .get_mut(&exec)
-                    .expect("checked above");
+                let Some(resident) = self.resident_mut(worker, exec, generation) else {
+                    return;
+                };
                 resident.chain.pop_front();
                 resident.base += 1;
                 if resident.chain.is_empty() {
@@ -1253,10 +1268,11 @@ impl<'a> Model<'a> {
         if !owner {
             self.stats.stale_commits += 1;
             let detail = format!(
-                "e{exec} d{} from {} applied, but {} holds the claim",
+                "e{exec} d{} from {} at epoch {epoch} applied, but {} holds epoch {}",
                 decision.base,
                 Self::label(worker),
-                Self::label(durable.owner)
+                Self::label(durable.owner),
+                durable.epoch
             );
             self.fail(SpecInvariant::CommitByOwner, detail);
         }
@@ -1432,9 +1448,9 @@ impl<'a> Model<'a> {
                 continue;
             }
             let owner = durable.owner;
-            let state = &self.workers[owner.0];
-            let stale = state.stalled_until > self.now && self.now - state.stalled_since >= lease;
-            if self.live(owner) && !stale {
+            let held = &self.workers[owner.0];
+            let overdue = held.stalled_until > self.now && self.now - held.stalled_since >= lease;
+            if self.live(owner) && !overdue {
                 continue;
             }
             let candidates: Vec<Holder> = (0..self.workers.len())

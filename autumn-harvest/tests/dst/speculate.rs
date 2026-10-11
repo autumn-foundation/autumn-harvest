@@ -98,7 +98,11 @@ fn a_seed_replays_exactly_in_every_mode() {
                     .with_workload(workload)
                     .checking(&[]);
                 let report = speculate::run_twice(&config).unwrap_or_else(|e| panic!("{e}"));
-                assert!(!report.trace.is_empty());
+                assert!(
+                    report.trace.len() >= config.executions,
+                    "{:?}",
+                    report.trace
+                );
             }
         }
     }
@@ -126,9 +130,9 @@ fn run_twice_reports_a_difference() {
 #[test]
 fn golden_speculation_traces_are_equal_on_every_platform() {
     let golden = [
-        (0, Mode::Serial, Workload::Chain, 70, 0x709e_f91b_f855_05e7),
-        (1, Mode::Gated, Workload::FanOut, 102, 0x3755_e630_4806_e97d),
-        (2, Mode::Eager, Workload::Chain, 73, 0xd7b5_9d51_69cd_4020),
+        (0, Mode::Serial, Workload::Chain, 78, 0xae67_96ad_eb1b_e48d),
+        (1, Mode::Gated, Workload::FanOut, 102, 0xd8e4_5a76_6128_dd86),
+        (2, Mode::Eager, Workload::Chain, 64, 0xc82c_d871_328c_1072),
     ];
     for (seed, mode, workload, lines, hash) in golden {
         let config = SpecConfig::new(seed)
@@ -155,6 +159,22 @@ fn serial_chain_latency_has_a_closed_form() {
         report.latencies_us.iter().all(|&l| l == expected),
         "{:?} != {expected}",
         report.latencies_us
+    );
+}
+
+/// The end-to-end p50 of the bench workflow, unloaded, `fsync` on.
+const MEASURED_CHAIN_P50_US: u64 = 470_500;
+
+#[test]
+fn the_calibrated_model_matches_the_measured_bench() {
+    let summary = speculate::sweep(&SWEEP, |seed| {
+        SpecConfig::new(seed).with_faults(Faults::NONE)
+    })
+    .unwrap_or_else(|failure| panic!("{failure}"));
+    let mean = summary.latency.mean_us;
+    assert!(
+        mean.abs_diff(MEASURED_CHAIN_P50_US) * 50 < MEASURED_CHAIN_P50_US,
+        "model mean {mean} us is not within 2 % of the measured {MEASURED_CHAIN_P50_US} us"
     );
 }
 
