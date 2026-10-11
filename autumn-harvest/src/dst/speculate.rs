@@ -11,9 +11,9 @@
 //!
 //! [`Mode::Serial`] is the engine today. [`Mode::Gated`] speculates and
 //! releases effects only after their commit lands. [`Mode::Eager`] releases
-//! effects before the commit, as libDSE does. [`Fence::PrefixOnly`] is the
-//! check of the suspended commit path today. [`Logging::ReadsOnly`] is the
-//! asymmetric logging of Halfmoon.
+//! effects before the commit. It shows what the commit gate costs.
+//! [`Fence::PrefixOnly`] is the check of most suspended commit paths today.
+//! [`Logging::ReadsOnly`] is the asymmetric logging of Halfmoon.
 //!
 //! See `docs/rnd/speculative-execution-spike.md`.
 
@@ -34,7 +34,7 @@ pub const LOGGING_VAR: &str = "HARVEST_DST_SPEC_LOGGING";
 pub const PLANT_VAR: &str = "HARVEST_DST_SPEC_PLANT";
 /// The workload: `chain` or `fan-out`.
 pub const WORKLOAD_VAR: &str = "HARVEST_DST_SPEC_WORKLOAD";
-/// A comma list of invariant names. The default is all of them.
+/// A comma-separated list of invariant names. The default is all of them.
 pub const CHECKS_VAR: &str = "HARVEST_DST_SPEC_CHECKS";
 
 /// The most decisions that one execution can have in its commit chain.
@@ -137,6 +137,10 @@ named! {
         /// After a failed commit, the worker keeps its resident state. It
         /// drops the chain but does not reload from the durable log.
         KeepOnFailure => "keep-on-failure",
+        /// After a failed commit, the worker drops only the failed decision.
+        /// It sends the speculative decisions behind it, which were built on
+        /// the failed one.
+        KeepTail => "keep-tail",
     }
 }
 
@@ -217,7 +221,8 @@ pub struct Timing {
     pub dispatch_us: u64,
     /// One activity body.
     pub activity_us: (u64, u64),
-    /// From a durable input to the start of the next decision.
+    /// From the end of an activity, or a signal, to the start of the next
+    /// decision.
     pub wake_us: u64,
 }
 
@@ -255,7 +260,8 @@ impl Timing {
         }
     }
 
-    /// The longest time from one decision to the next one of a chain.
+    /// The longest time from one decision to the next decision of one
+    /// execution.
     #[must_use]
     pub const fn hop_us(&self) -> u64 {
         self.decide_us + self.commit_us.1 + self.dispatch_us + self.activity_us.1 + self.wake_us
@@ -272,7 +278,8 @@ pub struct Faults {
     pub stall_pct: u64,
     /// The chance in percent that the commit fails and applies nothing.
     pub commit_fail_pct: u64,
-    /// The most crashes and stalls of one run.
+    /// The most crashes and stalls of one seed, in total over its
+    /// executions. Failed commits have no cap.
     pub max_faults: u32,
 }
 
@@ -436,6 +443,9 @@ pub struct SpecStats {
     pub commits: u64,
     /// Decisions that a failed commit or a lost claim discarded.
     pub discarded: u64,
+    /// Speculative decisions that a failed commit discarded. They wait
+    /// behind the decision whose commit failed.
+    pub discarded_speculative: u64,
     /// Commits that the claim fence rejected.
     pub fenced: u64,
     /// Commits that the prefix check rejected.
@@ -450,7 +460,7 @@ pub struct SpecStats {
     pub stalls: u64,
     /// In-flight commits that a crash lost.
     pub lost_in_crash: u64,
-    /// In-flight commits that applied after their worker crashed.
+    /// Commits that applied at the store after their worker crashed.
     pub landed_in_crash: u64,
     /// Claims that the reclaimer moved.
     pub reclaims: u64,
@@ -478,6 +488,7 @@ impl SpecStats {
         self.speculative += other.speculative;
         self.commits += other.commits;
         self.discarded += other.discarded;
+        self.discarded_speculative += other.discarded_speculative;
         self.fenced += other.fenced;
         self.prefix_lost += other.prefix_lost;
         self.failed_commits += other.failed_commits;
@@ -652,6 +663,18 @@ fn expected_output(workload: Workload, exec: usize) -> u64 {
     acc
 }
 
+/// A value in the inclusive range `(low, high)`.
+const fn within(rng: &mut SplitMix64, (low, high): (u64, u64)) -> u64 {
+    low + rng.below(high.saturating_sub(low) + 1)
+}
+
+/// The salts of [`Model::keyed`], one for each kind of draw.
+const SALT_SEND: u64 = 0x5e4d;
+const SALT_CRASH: u64 = 0xc4a5;
+const SALT_RESTART: u64 = 0x4e57;
+const SALT_PICK: u64 = 0x91c7;
+const SALT_ACTIVITY: u64 = 0xac71;
+
 /// A worker identity: its index and its incarnation.
 type Holder = (usize, u32);
 
@@ -673,7 +696,8 @@ struct Exec {
 /// The resident state of one execution on one worker.
 #[derive(Debug, Clone)]
 struct Resident {
-    /// Bumped on each reload, so a stale event finds a mismatch.
+    /// Each reload sets a new value. A stale event then finds a different
+    /// generation and does nothing.
     generation: u64,
     epoch: u32,
     state: State,
@@ -724,6 +748,13 @@ enum Event {
         fail: bool,
         id: u64,
     },
+    /// The worker reads the outcome of its commit.
+    Respond {
+        worker: Holder,
+        exec: usize,
+        generation: u64,
+        outcome: CommitOutcome,
+    },
     /// An activity starts.
     EffectStart { effect: Effect },
     /// An activity finishes.
@@ -760,8 +791,8 @@ impl PartialOrd for Queued {
 }
 
 impl Ord for Queued {
-    /// The earliest event first. The heap is a max-heap, so this is
-    /// reversed.
+    /// `BinaryHeap` pops the greatest item first. This order reverses time,
+    /// so the earliest event pops first.
     fn cmp(&self, other: &Self) -> Ordering {
         (other.at, other.seq).cmp(&(self.at, self.seq))
     }
@@ -799,8 +830,12 @@ struct Model<'a> {
     ledger: BTreeMap<(usize, u32, u32), u32>,
     /// Commits that a crash lost.
     lost: BTreeSet<u64>,
-    /// Commits in flight, by worker.
-    in_flight: BTreeMap<u64, Holder>,
+    /// Commits that still reach the store after their worker crashed.
+    orphans: BTreeSet<u64>,
+    /// The worker and the draw key of each in-flight commit, by commit id.
+    in_flight: BTreeMap<u64, (Holder, [u64; 3])>,
+    /// The sends so far of each decision position.
+    sends: BTreeMap<(usize, usize), u64>,
     next_commit: u64,
     next_generation: u64,
     faults: u32,
@@ -812,7 +847,7 @@ struct Model<'a> {
 
 impl<'a> Model<'a> {
     fn new(config: &'a SpecConfig) -> Self {
-        let workers = (0..config.workers)
+        let workers = (0..config.workers.max(1))
             .map(|_| WorkerState {
                 incarnation: 0,
                 alive: true,
@@ -831,7 +866,9 @@ impl<'a> Model<'a> {
             workers,
             ledger: BTreeMap::new(),
             lost: BTreeSet::new(),
+            orphans: BTreeSet::new(),
             in_flight: BTreeMap::new(),
+            sends: BTreeMap::new(),
             next_commit: 0,
             next_generation: 0,
             faults: 0,
@@ -841,7 +878,7 @@ impl<'a> Model<'a> {
             latencies: Vec::new(),
         };
         let hop = config.timing.hop_us();
-        let workers = u64::try_from(config.workers).unwrap_or(1);
+        let workers = u64::try_from(config.workers.max(1)).unwrap_or(1);
         for exec in 0..config.executions {
             let started_at = model.rng.below(hop);
             let owner = usize::try_from(model.rng.below(workers)).unwrap_or(0);
@@ -896,14 +933,24 @@ impl<'a> Model<'a> {
         }
     }
 
-    const fn draw(&mut self, (low, high): (u64, u64)) -> u64 {
-        low + self.rng.below(high.saturating_sub(low) + 1)
+    /// A generator that depends only on the seed, `salt` and `key`.
+    ///
+    /// The event order does not change its values. So two modes draw equal
+    /// durations and faults for equal decisions, and their runs pair up.
+    const fn keyed(&self, salt: u64, key: [u64; 3]) -> SplitMix64 {
+        let mut mixed = SplitMix64::new(self.config.seed ^ salt).next_u64();
+        let mut index = 0;
+        while index < key.len() {
+            mixed = SplitMix64::new(mixed ^ key[index]).next_u64();
+            index += 1;
+        }
+        SplitMix64::new(mixed)
     }
 
     fn run(mut self) -> SpecReport {
         let mut events = 0;
         while let Some(queued) = self.queue.pop() {
-            if self.violation.is_some() || self.execs.iter().all(|e| e.done) {
+            if self.violation.is_some() {
                 break;
             }
             events += 1;
@@ -932,7 +979,7 @@ impl<'a> Model<'a> {
         }
     }
 
-    /// The worker that `holder` names, if that incarnation is alive.
+    /// Whether the incarnation that `holder` names is alive.
     fn live(&self, holder: Holder) -> bool {
         let worker = &self.workers[holder.0];
         worker.alive && worker.incarnation == holder.1
@@ -954,7 +1001,7 @@ impl<'a> Model<'a> {
             Event::Adopt { worker, .. }
             | Event::Decided { worker, .. }
             | Event::Send { worker, .. }
-            | Event::Commit { worker, .. } => Some(*worker),
+            | Event::Respond { worker, .. } => Some(*worker),
             Event::Arrive { exec } | Event::Start { exec } => Some(self.execs[*exec].owner),
             _ => None,
         };
@@ -965,7 +1012,9 @@ impl<'a> Model<'a> {
         match event {
             Event::Start { exec } => {
                 let owner = self.execs[exec].owner;
-                self.adopt(owner, exec, false);
+                if self.live(owner) {
+                    self.adopt(owner, exec, false);
+                }
             }
             Event::Arrive { exec } => {
                 let owner = self.execs[exec].owner;
@@ -1002,6 +1051,12 @@ impl<'a> Model<'a> {
                 fail,
                 id,
             } => self.commit(worker, exec, generation, epoch, &decision, fail, id),
+            Event::Respond {
+                worker,
+                exec,
+                generation,
+                outcome,
+            } => self.respond(worker, exec, generation, outcome),
             Event::EffectStart { effect } => self.effect_start(effect),
             Event::EffectDone { effect } => self.effect_done(effect),
             Event::Signal { exec, value } => {
@@ -1020,6 +1075,7 @@ impl<'a> Model<'a> {
                 let state = &mut self.workers[worker];
                 state.alive = true;
                 state.incarnation += 1;
+                state.stalled_until = 0;
                 let holder = (worker, state.incarnation);
                 self.log(&Self::label(holder), "restart");
             }
@@ -1144,49 +1200,55 @@ impl<'a> Model<'a> {
         self.try_decide(worker, exec);
     }
 
-    /// Send the head of the chain of `exec`. `faults` lets the send draw
-    /// faults.
+    /// Send the head of the commit chain of `exec`.
+    ///
+    /// `faults` allows a stall or a crash on this send. The send can always
+    /// draw a commit failure.
     fn send(&mut self, worker: Holder, exec: usize, faults: bool) {
-        let room = self.faults < self.config.faults.max_faults;
-        let draws = self.config.faults;
-        let stall = faults && room && self.rng.chance(draws.stall_pct);
         let Some(resident) = self.workers[worker.0].resident.get(&exec) else {
             return;
         };
+        let Some(decision) = resident.chain.front().cloned() else {
+            return;
+        };
         let generation = resident.generation;
+        let epoch = resident.epoch;
+        // The nth send of this decision position draws its own values.
+        let sends = self.sends.entry((exec, decision.base)).or_insert(0);
+        *sends += 1;
+        let key = [exec as u64, decision.base as u64, *sends];
+        let mut rng = self.keyed(SALT_SEND, key);
+        let room = faults && self.faults < self.config.faults.max_faults;
+        let draws = self.config.faults;
+        let stall = rng.chance(draws.stall_pct) && room;
+        let flight = within(&mut rng, self.config.timing.commit_us);
+        let fail = rng.chance(draws.commit_fail_pct);
+        let crash = rng.chance(draws.crash_pct) && room && !stall;
+        let lease = self.config.lease_us;
+        let pause = lease / 2 + rng.below(2 * lease);
+        let crash_at = rng.below(flight);
         if stall {
             self.faults += 1;
             self.stats.stalls += 1;
-            let lease = self.config.lease_us;
-            let until = self.now + lease / 2 + self.rng.below(2 * lease);
+            let until = self.now + pause;
             let state = &mut self.workers[worker.0];
             state.stalled_until = until;
             state.stalled_since = self.now;
             self.log(&Self::label(worker), &format!("stall until {until}"));
-            self.push(
-                until,
-                Event::Send {
-                    worker,
-                    exec,
-                    generation,
-                },
-            );
+            let event = Event::Send {
+                worker,
+                exec,
+                generation,
+            };
+            self.push(until, event);
             return;
         }
-        let Some(decision) = resident.chain.front().cloned() else {
-            return;
-        };
-        let epoch = resident.epoch;
-        let flight = self.draw(self.config.timing.commit_us);
-        let fail = self.rng.chance(draws.commit_fail_pct);
-        let crash = faults && room && self.rng.chance(draws.crash_pct);
         self.next_commit += 1;
         let id = self.next_commit;
-        self.in_flight.insert(id, worker);
+        self.in_flight.insert(id, (worker, key));
         if crash {
             self.faults += 1;
-            let at = self.now + self.rng.below(flight);
-            self.push(at, Event::Crash { worker: worker.0 });
+            self.push(self.now + crash_at, Event::Crash { worker: worker.0 });
         }
         let event = Event::Commit {
             worker,
@@ -1215,11 +1277,34 @@ impl<'a> Model<'a> {
         if self.lost.remove(&id) {
             return;
         }
+        // The store applies the commit now, even when the worker is stalled.
         let outcome = self.apply(worker, exec, epoch, decision, fail);
+        let orphan = self.orphans.remove(&id);
+        if orphan && outcome == CommitOutcome::Applied {
+            self.stats.landed_in_crash += 1;
+        }
         self.log(
             &Self::label(worker),
             &format!("e{exec} commit d{} {}", decision.base, outcome.as_str()),
         );
+        if orphan {
+            return;
+        }
+        let respond = Event::Respond {
+            worker,
+            exec,
+            generation,
+            outcome,
+        };
+        // Only the response waits for the end of a stall.
+        match self.stalled(worker) {
+            Some(until) => self.push(until, respond),
+            None => self.respond(worker, exec, generation, outcome),
+        }
+    }
+
+    /// The worker acts on the outcome of its commit.
+    fn respond(&mut self, worker: Holder, exec: usize, generation: u64, outcome: CommitOutcome) {
         if self.resident(worker, exec, generation).is_none() {
             return;
         }
@@ -1338,15 +1423,29 @@ impl<'a> Model<'a> {
     fn repair(&mut self, worker: Holder, exec: usize) {
         let owner = self.execs[exec].owner == worker;
         let keep = self.config.plant == Plant::KeepOnFailure;
+        let tail = self.config.plant == Plant::KeepTail;
         let durable_base = self.execs[exec].decisions;
         let state = &mut self.workers[worker.0];
         let Some(resident) = state.resident.get_mut(&exec) else {
             return;
         };
-        self.stats.discarded += u64::try_from(resident.chain.len()).unwrap_or(0);
+        let chain = u64::try_from(resident.chain.len()).unwrap_or(0);
+        self.stats.discarded += chain;
+        self.stats.discarded_speculative += chain.saturating_sub(1);
         if !owner {
             state.resident.remove(&exec);
             self.log(&Self::label(worker), &format!("e{exec} drop, claim lost"));
+            return;
+        }
+        if tail && resident.chain.len() > 1 {
+            // The plant: drop the failed head, and send the speculative tail
+            // that it built on.
+            resident.chain.pop_front();
+            for (offset, decision) in resident.chain.iter_mut().enumerate() {
+                decision.base = durable_base + offset;
+            }
+            resident.base = durable_base;
+            self.send(worker, exec, false);
             return;
         }
         if keep {
@@ -1384,7 +1483,15 @@ impl<'a> Model<'a> {
                 format!("{effect} ran {runs} times"),
             );
         }
-        let duration = self.draw(self.config.timing.activity_us);
+        let key = [
+            effect.exec as u64,
+            u64::from(effect.round) << 32 | u64::from(effect.index),
+            u64::from(runs),
+        ];
+        let duration = within(
+            &mut self.keyed(SALT_ACTIVITY, key),
+            self.config.timing.activity_us,
+        );
         self.push(self.now + duration, Event::EffectDone { effect });
     }
 
@@ -1419,15 +1526,15 @@ impl<'a> Model<'a> {
         let state = &mut self.workers[worker];
         state.alive = false;
         state.resident.clear();
-        let ids: Vec<u64> = self
+        let ids: Vec<(u64, [u64; 3])> = self
             .in_flight
             .iter()
-            .filter(|(_, owner)| **owner == holder)
-            .map(|(id, _)| *id)
+            .filter(|(_, (owner, _))| *owner == holder)
+            .map(|(id, (_, key))| (*id, *key))
             .collect();
-        for id in ids {
-            if self.rng.chance(50) {
-                self.stats.landed_in_crash += 1;
+        for (id, key) in ids {
+            if self.keyed(SALT_CRASH, key).chance(50) {
+                self.orphans.insert(id);
             } else {
                 self.stats.lost_in_crash += 1;
                 self.lost.insert(id);
@@ -1435,7 +1542,8 @@ impl<'a> Model<'a> {
         }
         self.log(&Self::label(holder), "crash");
         let lease = self.config.lease_us;
-        let at = self.now + lease / 2 + self.rng.below(lease);
+        let key = [worker as u64, u64::from(holder.1), 0];
+        let at = self.now + lease / 2 + self.keyed(SALT_RESTART, key).below(lease);
         self.push(at, Event::Restart { worker });
     }
 
@@ -1462,7 +1570,8 @@ impl<'a> Model<'a> {
                 continue;
             }
             let count = u64::try_from(candidates.len()).unwrap_or(1);
-            let pick = usize::try_from(self.rng.below(count)).unwrap_or(0);
+            let key = [exec as u64, u64::from(self.execs[exec].epoch), 0];
+            let pick = usize::try_from(self.keyed(SALT_PICK, key).below(count)).unwrap_or(0);
             let next = candidates[pick];
             let durable = &mut self.execs[exec];
             durable.owner = next;
@@ -1474,7 +1583,10 @@ impl<'a> Model<'a> {
             );
             self.push(self.now, Event::Adopt { worker: next, exec });
         }
-        self.push(self.now + lease / 2, Event::Scan);
+        // After the last completion the scans stop, and the run drains.
+        if !self.execs.iter().all(|exec| exec.done) {
+            self.push(self.now + lease / 2, Event::Scan);
+        }
     }
 }
 

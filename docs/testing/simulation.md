@@ -329,22 +329,22 @@ activity of its execution.
 
 Issue #2011 asks whether a worker can run the next decision while the
 previous commit flushes. `autumn_harvest::dst::speculate` models that
-question. It is an R&D spike with no database, and the engine does not
-use it. [The spike report](../rnd/speculative-execution-spike.md) gives
+question. It is an R&D spike with no database. The engine does not use
+it. [The spike report](../rnd/speculative-execution-spike.md) gives
 the results and the verdict.
 
 The model is a discrete-event simulation. Its clock counts virtual
 microseconds, so it can measure latency. A seed fixes every duration and
-fault, and every seed runs twice.
+fault. The sweep runs every seed twice and compares the traces.
 
 | Knob | Values |
 |---|---|
 | `HARVEST_DST_SPEC_MODE` | `serial` (the engine today), `gated`, `eager` |
 | `HARVEST_DST_SPEC_FENCE` | `epoch`, `prefix-only` |
 | `HARVEST_DST_SPEC_LOGGING` | `full`, `reads-only` |
-| `HARVEST_DST_SPEC_PLANT` | `none`, `keep-on-failure` |
+| `HARVEST_DST_SPEC_PLANT` | `none`, `keep-on-failure`, `keep-tail` |
 | `HARVEST_DST_SPEC_WORKLOAD` | `chain`, `fan-out` |
-| `HARVEST_DST_SPEC_CHECKS` | a comma list of invariant names |
+| `HARVEST_DST_SPEC_CHECKS` | a comma-separated list of invariant names |
 
 ```sh
 HARVEST_DST_SEEDS=1000 HARVEST_DST_SPEC_MODE=gated \

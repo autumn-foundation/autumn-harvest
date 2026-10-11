@@ -288,8 +288,8 @@ pub fn stats_dir_from(raw: Option<&str>) -> Option<std::path::PathBuf> {
 
 /// Set to `1` to record persist and claim durations (issue #2011).
 ///
-/// The scenario notes then give their percentiles. Unset keeps
-/// `NoOpMetrics`, so a published run pays nothing.
+/// The scenario notes then give their percentiles. Without it, the bench
+/// keeps `NoOpMetrics`, so a published run pays nothing.
 pub const COMMIT_PROBE_ENV_VAR: &str = "HARVEST_BENCH_COMMIT_PROBE";
 
 /// Whether the [`COMMIT_PROBE_ENV_VAR`] value turns the probe on.
@@ -332,7 +332,7 @@ pub fn commit_probe_notes(persist: &[f64], claim: &[f64], workflows: usize) -> V
     if !claim.is_empty() {
         let claim = sorted(claim);
         notes.push(format!(
-            "commit probe: {} claims, p50 {:.2} ms, p99 {:.2} ms",
+            "commit probe: {} claim attempts, empty polls included, p50 {:.2} ms, p99 {:.2} ms",
             claim.len(),
             percentile_ms(&claim, 50),
             percentile_ms(&claim, 99)
@@ -1781,7 +1781,8 @@ mod tests {
         assert!(notes[0].contains("p50 50.00 ms"), "{notes:?}");
         assert!(notes[0].contains("p99 99.00 ms"), "{notes:?}");
         assert!(notes[0].contains("4.00 per workflow"), "{notes:?}");
-        assert!(notes[1].contains("3 claims, p50 2.00 ms"), "{notes:?}");
+        assert!(notes[1].contains("3 claim attempts"), "{notes:?}");
+        assert!(notes[1].contains("p50 2.00 ms"), "{notes:?}");
         assert!(commit_probe_notes(&[], &[], 0)[0].contains("no samples"));
     }
 
@@ -3458,7 +3459,7 @@ pub mod db {
     }
 
     impl CommitProbe {
-        /// Take the samples, and start again from none.
+        /// Return the samples and clear them.
         pub fn take(&self) -> (Vec<f64>, Vec<f64>) {
             let take = |samples: &Mutex<Vec<f64>>| {
                 std::mem::take(&mut *samples.lock().unwrap_or_else(PoisonError::into_inner))
@@ -3468,6 +3469,13 @@ pub mod db {
     }
 
     impl MetricsRecorder for CommitProbe {
+        /// `false`, so the worker starts no metric sampler. A sampler issues
+        /// its own queries and adds load to the durations that the probe
+        /// measures. The worker records persist and claim durations anyway.
+        fn is_enabled(&self) -> bool {
+            false
+        }
+
         fn record_db_query_duration(&self, op: DbOp, _shard: u16, seconds: f64) {
             let samples = match op {
                 DbOp::Persist => &self.persist,
@@ -3499,9 +3507,9 @@ pub mod db {
         }
     }
 
-    /// The probe notes of a cell: commit and claim durations, and the
-    /// latency of each `cohort` run from its start to its completion.
-    pub async fn commit_probe_report(cluster: &ShardCluster, cohort: &str) -> Vec<String> {
+    /// The probe notes of a cell: persist and claim durations, and the
+    /// latency of each run whose workflow id starts with `{prefix}-`.
+    pub async fn commit_probe_report(cluster: &ShardCluster, prefix: &str) -> Vec<String> {
         let Some(probe) = commit_probe() else {
             return Vec::new();
         };
@@ -3509,17 +3517,16 @@ pub mod db {
         let mut latencies = Vec::new();
         for shard in cluster.shard_ids() {
             let mut conn = cluster.connect(shard).await;
-            latencies.extend(run_latencies(&mut conn, cohort).await);
+            latencies.extend(run_latencies(&mut conn, prefix).await);
         }
         let mut notes = super::commit_probe_notes(&persist, &claim, latencies.len());
         if !latencies.is_empty() {
             latencies.sort_by(f64::total_cmp);
-            let at = |percent: usize| latencies[(latencies.len() - 1) * percent / 100] * 1e3;
             notes.push(format!(
                 "commit probe: {} runs, start to completion p50 {:.2} ms, p99 {:.2} ms",
                 latencies.len(),
-                at(50),
-                at(99)
+                super::percentile_ms(&latencies, 50),
+                super::percentile_ms(&latencies, 99)
             ));
         }
         notes
@@ -3531,15 +3538,19 @@ pub mod db {
         secs: f64,
     }
 
-    /// The start-to-completion time of each completed `cohort` run, in
-    /// seconds, from the database clock.
-    async fn run_latencies(conn: &mut AsyncPgConnection, cohort: &str) -> Vec<f64> {
+    /// The start-to-completion time, in seconds, of each completed run whose
+    /// workflow id starts with `{prefix}-`.
+    ///
+    /// `started_at` is the database clock at the start, and `completed_at`
+    /// is the worker host clock. The host-to-database offset thus adds to
+    /// each value. The dispatch scenario measures that offset.
+    async fn run_latencies(conn: &mut AsyncPgConnection, prefix: &str) -> Vec<f64> {
         diesel::sql_query(
             "SELECT EXTRACT(EPOCH FROM (completed_at - started_at))::float8 AS secs \
              FROM harvest_workflow_executions \
              WHERE state = 'COMPLETED' AND completed_at IS NOT NULL AND workflow_id LIKE $1",
         )
-        .bind::<diesel::sql_types::Text, _>(format!("{cohort}-%"))
+        .bind::<diesel::sql_types::Text, _>(format!("{prefix}-%"))
         .load::<LatencyRow>(conn)
         .await
         .expect("load bench run latencies")

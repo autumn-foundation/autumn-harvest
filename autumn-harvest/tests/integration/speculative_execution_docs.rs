@@ -27,24 +27,6 @@ const SECTIONS: &[&str] = &[
     "## Reproduce",
 ];
 
-/// The tests that the report cites as evidence.
-const CITED_TESTS: &[&str] = &[
-    "serial_chain_latency_has_a_closed_form",
-    "gated_speculation_has_nothing_to_run_on_a_chain",
-    "bench_timing_gives_fan_out_no_speculation",
-    "gated_speculation_moves_fan_out_latency_by_under_one_percent",
-    "eager_release_hides_one_commit_per_hop_on_a_chain",
-    "eager_release_breaks_the_commit_gate",
-    "eager_release_runs_an_effect_twice_after_a_failed_commit",
-    "eager_release_can_strand_an_execution",
-    "a_prefix_only_fence_lets_a_stale_owner_commit",
-    "a_prefix_only_fence_keeps_every_other_invariant",
-    "serial_and_gated_keep_every_invariant_under_faults",
-    "a_planted_repair_defect_is_found_and_replays_from_its_seed",
-    "reads_only_logging_drops_exactly_the_write_rows",
-    "golden_speculation_traces_are_equal_on_every_platform",
-];
-
 /// Pages that must link the report.
 const LINKED_FROM: &[&str] = &["docs/testing/simulation.md", "docs/benchmarks.md"];
 
@@ -87,31 +69,102 @@ fn report_states_its_status_and_revision() {
     );
 }
 
+/// The word after `**Verdict: ` in `text`, such as `no-go`.
+fn verdict(text: &str) -> Option<&str> {
+    let rest = &text[text.find("**Verdict: ")? + "**Verdict: ".len()..];
+    rest.split(['*', ' ']).next().map(|word| word.trim_end_matches('.'))
+}
+
 #[test]
-fn report_reaches_an_explicit_verdict() {
+fn report_reaches_one_explicit_verdict() {
     let report = read(REPORT);
-    let verdict = section(&report, "\n## Go / no-go\n", "\n## ").expect("a verdict section");
+    let section = section(&report, "\n## Go / no-go\n", "\n## ").expect("a verdict section");
+    let summary = section_of(&report, "## Decision summary");
+    let stated = verdict(section).expect("the Go / no-go section states `**Verdict: `");
     assert!(
-        verdict.contains("**Verdict: no-go") || verdict.contains("**Verdict: go"),
-        "the Go / no-go section must state `**Verdict: go` or `**Verdict: no-go`"
+        matches!(stated, "go" | "no-go"),
+        "the verdict must be go or no-go: {stated:?}"
     );
-    let summary = section(&report, "\n## Decision summary\n", "\n## ").expect("a summary");
+    assert_eq!(
+        verdict(&summary),
+        Some(stated),
+        "the decision summary and the Go / no-go section must state one verdict"
+    );
+}
+
+/// The body of the section under `heading`.
+fn section_of(report: &str, heading: &str) -> String {
+    section(report, &format!("\n{heading}\n"), "\n## ")
+        .unwrap_or_else(|| panic!("{REPORT} needs `{heading}`"))
+        .to_string()
+}
+
+/// The backticked names in the first cell of each table row of `text`.
+fn first_cells(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("| `"))
+        .filter_map(|rest| rest.split('`').next())
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn every_cited_test_exists() {
+    let report = read(REPORT);
+    let tests = read(MODEL_TESTS);
+    let cited = first_cells(&section_of(&report, "### Cited tests"));
+    assert!(cited.len() >= 15, "the report cites only {} tests", cited.len());
+    for name in &cited {
+        assert!(
+            tests.contains(&format!("fn {name}(")),
+            "{REPORT} cites `{name}`, but {MODEL_TESTS} has no such test"
+        );
+    }
+}
+
+#[test]
+fn the_invariants_table_matches_the_model() {
+    let report = read(REPORT);
+    let model = read(MODEL);
+    let block = section(&model, "    SpecInvariant {\n", "\n    }\n").expect("the invariant list");
+    let names: Vec<&str> = block
+        .lines()
+        .filter_map(|line| line.trim().split_once(" => "))
+        .map(|(name, _)| name)
+        .collect();
+    let table = first_cells(&section_of(&report, "### Invariants"));
+    assert_eq!(table, names, "the invariants table must list SpecInvariant in order");
+}
+
+#[test]
+fn the_measured_p50_matches_the_model_tests() {
+    let tests = read(MODEL_TESTS);
+    let value = section(&tests, "const MEASURED_CHAIN_P50_US: u64 = ", ";")
+        .expect("the model tests pin the measured p50");
+    let micros: u64 = value.replace('_', "").parse().expect("a number");
+    let stated = format!("{}.{:02} ms", micros / 1_000, micros % 1_000 / 10);
     assert!(
-        summary.contains("**Verdict:"),
-        "the decision summary must repeat the verdict"
+        read(REPORT).contains(&stated),
+        "{REPORT} must state the measured p50 as {stated}"
     );
 }
 
 #[test]
-fn every_cited_test_exists_and_is_cited() {
+fn every_reproduce_command_names_a_real_test() {
     let report = read(REPORT);
     let tests = read(MODEL_TESTS);
-    for name in CITED_TESTS {
-        assert!(
-            tests.contains(&format!("fn {name}(")),
-            "{MODEL_TESTS} has no test `{name}`"
-        );
-        assert!(report.contains(name), "{REPORT} must cite `{name}`");
+    let reproduce = section_of(&report, "## Reproduce");
+    for (at, _) in reproduce.match_indices("speculate::") {
+        let name: String = reproduce[at + "speculate::".len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() {
+            assert!(
+                tests.contains(&format!("fn {name}(")),
+                "the Reproduce section names `{name}`, which is not a test"
+            );
+        }
     }
 }
 

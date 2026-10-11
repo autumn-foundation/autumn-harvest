@@ -521,8 +521,8 @@ jobs:
 
       # Issue #2011: the speculation spike report states measured numbers and
       # a verdict. A docs-only PR skips the `test` matrix, so its guards run
-      # here. Guarded by
-      # `speculative_execution_docs::guards_run_on_docs_only_changes`.
+      # here. `speculative_execution_docs::guards_run_on_docs_only_changes`
+      # checks that this step exists.
       - name: Run docs/rnd/speculative-execution-spike.md guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration speculative_execution_docs::"
 

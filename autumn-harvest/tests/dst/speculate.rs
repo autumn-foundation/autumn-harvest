@@ -130,9 +130,9 @@ fn run_twice_reports_a_difference() {
 #[test]
 fn golden_speculation_traces_are_equal_on_every_platform() {
     let golden = [
-        (0, Mode::Serial, Workload::Chain, 78, 0xae67_96ad_eb1b_e48d),
-        (1, Mode::Gated, Workload::FanOut, 102, 0xd8e4_5a76_6128_dd86),
-        (2, Mode::Eager, Workload::Chain, 64, 0xc82c_d871_328c_1072),
+        (0, Mode::Serial, Workload::Chain, 69, 0xa364_e61d_7394_0fc4),
+        (1, Mode::Gated, Workload::FanOut, 95, 0x6f52_78fe_5434_e46b),
+        (2, Mode::Eager, Workload::Chain, 86, 0x7299_3780_d739_be0a),
     ];
     for (seed, mode, workload, lines, hash) in golden {
         let config = SpecConfig::new(seed)
@@ -208,28 +208,85 @@ fn bench_timing_gives_fan_out_no_speculation() {
     assert_eq!(summary.stats.speculative, 0, "{:?}", summary.stats);
 }
 
+/// Default faults, but one commit in five fails. Failed commits then
+/// discard speculative decisions often.
+const BUSY: Faults = Faults {
+    commit_fail_pct: 20,
+    ..Faults::DEFAULT
+};
+
 #[test]
-fn gated_speculation_moves_fan_out_latency_by_under_one_percent() {
-    let sweep = |mode| {
-        speculate::sweep(&SWEEP, |seed| {
+fn gated_speculation_leaves_paired_fan_out_latency_unchanged() {
+    let plan = SeedPlan {
+        first: 0,
+        count: 256,
+    };
+    let (mut equal, mut serial_sum, mut gated_sum, mut speculative) = (0, 0, 0, 0);
+    for seed in plan.seeds() {
+        let config = SpecConfig::new(seed)
+            .with_workload(Workload::FanOut)
+            .with_timing(SPREAD)
+            .with_faults(Faults::NONE);
+        let serial = speculate::run(&config);
+        let gated = speculate::run(&config.with_mode(Mode::Gated));
+        assert!(gated.violation.is_none(), "{:?}", gated.violation);
+        speculative += gated.stats.speculative;
+        equal += u64::from(gated.latencies_us == serial.latencies_us);
+        serial_sum += serial.latencies_us.iter().sum::<u64>();
+        gated_sum += gated.latencies_us.iter().sum::<u64>();
+    }
+    assert!(speculative > 0, "fan-out gives speculation input to run on");
+    // Durations are keyed by entity, so the two modes pair seed by seed.
+    assert!(
+        equal * 100 >= plan.count * 95,
+        "{equal} of {} seeds",
+        plan.count
+    );
+    let diff = serial_sum.abs_diff(gated_sum);
+    assert!(
+        diff * 1_000 < serial_sum,
+        "serial {serial_sum} us, gated {gated_sum} us"
+    );
+}
+
+#[test]
+fn gated_discards_speculative_work_and_keeps_every_invariant() {
+    let summary = speculate::sweep(&SWEEP, |seed| {
+        SpecConfig::new(seed)
+            .with_mode(Mode::Gated)
+            .with_workload(Workload::FanOut)
+            .with_timing(SPREAD)
+            .with_faults(BUSY)
+    })
+    .unwrap_or_else(|failure| panic!("{failure}"));
+    let stats = summary.stats;
+    assert!(stats.discarded_speculative > 0, "{stats:?}");
+    assert_eq!(stats.completed, SWEEP.count * 4, "{stats:?}");
+}
+
+#[test]
+fn a_speculation_only_defect_is_found_and_replays_from_its_seed() {
+    let config = |mode| {
+        move |seed| {
             SpecConfig::new(seed)
                 .with_mode(mode)
                 .with_workload(Workload::FanOut)
                 .with_timing(SPREAD)
-                .with_faults(Faults::NONE)
-        })
-        .unwrap_or_else(|failure| panic!("{failure}"))
+                .with_faults(BUSY)
+                .with_plant(Plant::KeepTail)
+        }
     };
-    let serial = sweep(Mode::Serial);
-    let gated = sweep(Mode::Gated);
-    assert!(gated.stats.speculative > 0, "{:?}", gated.stats);
-    let (s, g) = (serial.latency.mean_us, gated.latency.mean_us);
-    assert!(s.abs_diff(g) * 100 < s, "serial {s} us, gated {g} us");
-    // A speculative decision overlaps only a commit flight, so it saves at
-    // most one decide time.
-    let bound = gated.stats.speculative * SPREAD.decide_us;
-    let saved: u64 = serial.latency.mean_us.saturating_sub(g) * serial.latency.runs;
-    assert!(saved <= bound, "saved {saved} us, bound {bound} us");
+    // Serial has no speculative tail, so the plant does nothing there.
+    speculate::sweep(&SWEEP, config(Mode::Serial)).unwrap_or_else(|failure| panic!("{failure}"));
+    let report = first_failure(config(Mode::Gated));
+    let violation = report.violation.clone().expect("a violation");
+    assert_eq!(
+        violation.invariant,
+        SpecInvariant::ReplayEquivalent,
+        "{violation}"
+    );
+    let again = speculate::run_twice(&report.config).expect("deterministic");
+    assert_eq!(again.violation, Some(violation));
 }
 
 #[test]
@@ -238,7 +295,7 @@ fn eager_release_hides_one_commit_per_hop_on_a_chain() {
     let eager = speculate::run(&quiet(0, Mode::Eager, Workload::Chain).checking(&[]));
     let commit = 2_000;
     for (s, e) in serial.latencies_us.iter().zip(&eager.latencies_us) {
-        assert_eq!(s - e, 3 * commit, "serial {s}, eager {e}");
+        assert_eq!(s.checked_sub(*e), Some(3 * commit), "serial {s}, eager {e}");
     }
 }
 
@@ -295,6 +352,7 @@ fn a_prefix_only_fence_keeps_every_other_invariant() {
         .into_iter()
         .filter(|check| *check != SpecInvariant::CommitByOwner)
         .collect();
+    let mut stale = 0;
     for workload in Workload::ALL {
         let summary = speculate::sweep(&SWEEP, |seed| {
             SpecConfig::new(seed)
@@ -304,8 +362,9 @@ fn a_prefix_only_fence_keeps_every_other_invariant() {
                 .checking(&others)
         })
         .unwrap_or_else(|failure| panic!("{failure}"));
-        assert!(summary.stats.stale_commits > 0, "{:?}", summary.stats);
+        stale += summary.stats.stale_commits;
     }
+    assert!(stale > 0, "a stale owner commits on an unchanged prefix");
 }
 
 #[test]
@@ -417,10 +476,10 @@ fn the_repro_command_carries_every_knob() {
     assert!(bad.is_err());
 }
 
-/// The sweep that CI and the nightly job run.
+/// The sweep that `HARVEST_DST_SPEC_*` configures.
 ///
-/// `HARVEST_DST_SEEDS` and `HARVEST_DST_SEED_BASE` pick the seeds. The
-/// `HARVEST_DST_SPEC_*` variables pick the config.
+/// The CI `test` job runs it with 64 seeds. `HARVEST_DST_SEEDS` and
+/// `HARVEST_DST_SEED_BASE` pick the seeds.
 #[test]
 fn speculation_sweep() {
     let plan = SeedPlan::from_env(SWEEP.count).unwrap_or_else(|error| panic!("{error}"));

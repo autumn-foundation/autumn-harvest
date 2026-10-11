@@ -204,7 +204,7 @@ HARVEST_BENCH_SCENARIOS=signal_roundtrip HARVEST_BENCH_SHARDS=1 ./benchmarks/run
 | `HARVEST_BENCH_CHECK` | also print the reproduction verdict |
 | `HARVEST_BENCH_KEEP` | leave the containers running afterwards |
 | `HARVEST_BENCH_OUT` | write the report somewhere other than `benchmarks/results/` |
-| `HARVEST_BENCH_COMMIT_PROBE` | `1` records the commit and claim durations of each workflow task. The `throughput` and `dispatch_latency` notes then give their p50 and p99 and the start-to-completion time of each run. Unset keeps the no-op metrics recorder. Issue #2011 uses it; see [the speculation spike](rnd/speculative-execution-spike.md) |
+| `HARVEST_BENCH_COMMIT_PROBE` | `1` records the persist duration of each workflow task and the duration of each claim attempt, empty polls included. The `throughput` and `dispatch_latency` notes then give their p50 and p99 and the start-to-completion time of each run. The probe starts no metric sampler. Without it, the bench keeps the no-op metrics recorder. Issue #2011 uses it; see [the speculation spike](rnd/speculative-execution-spike.md) |
 | `HARVEST_BENCH_STATS_DIR` | write each shard's `pg_stat_user_tables` and `pg_stat_statements` to this absolute path before teardown drops the shard database. The statements file needs `pg_stat_statements` in `shared_preload_libraries`; the compose shards do not set it |
 
 The two latency scenarios have no size knob; their populations are fixed so the

@@ -25,8 +25,8 @@ e2e bench gets one opt-in probe, `HARVEST_BENCH_COMMIT_PROBE`.
   timer or a signal. An activity starts only after the commit that schedules
   it. Its task row is written in that commit. Dispatch hints and `NOTIFY`
   go out after the commit (issue #1796).
-- So, on a chain of sequential activities, no input is ready while a commit
-  flushes. A gated speculation then has nothing to run.
+- So, on the `Chain` workload of sequential activities, no input is ready
+  while a commit is in flight. A gated speculation then has nothing to run.
 - Resident state already exists (issue #1798). A warm resume skips replay.
 - Terminal and paused commits check the claim epoch in the transaction
   (`claim_still_held_for_update`, issue #1789).
@@ -52,7 +52,7 @@ e2e bench gets one opt-in probe, `HARVEST_BENCH_COMMIT_PROBE`.
 | B4 | Three modes: `Serial` (today), `Gated` (speculate, release effects after commit), `Eager` (release effects before commit, as libDSE does). | **Adopted.** `Eager` shows what the commit gate costs and what it buys. |
 | B5 | Two fences: `Epoch` (prefix and owner) and `PrefixOnly` (today's suspended path). | **Adopted.** It tests whether speculation needs the owner check. |
 | B6 | Two logging modes: `Full` (reads and writes) and `ReadsOnly` (Halfmoon). Replay re-derives the writes. | **Adopted.** It counts the records that asymmetric logging saves. |
-| B7 | A planted defect: a worker keeps resident state after a failed commit. | **Adopted.** It proves the invariants catch the repair-semantics risk. |
+| B7 | Planted defects: a worker keeps resident state after a failed commit (`keep-on-failure`), or sends the speculative tail of a failed commit (`keep-tail`). | **Adopted.** They prove that the invariants catch the repair-semantics risk. |
 | B8 | Calibrate the model from the e2e bench. Measure commit time with a probe. | **Adopted.** The probe is opt-in and reports through the scenario notes. |
 | B9 | Measure decision time with timestamps around claim and persist. | Rejected. Concurrent empty polls make the pairing unreliable. Replay throughput gives a clean bound. |
 
@@ -60,13 +60,16 @@ e2e bench gets one opt-in probe, `HARVEST_BENCH_COMMIT_PROBE`.
 
 | # | How to make it misleading | Mitigation |
 |---|---------------------------|------------|
-| R1 | The model shows a gain that the engine cannot get. | The model takes its durations from the bench. Its `Serial` latency must match the measured unloaded latency within 15 %. |
+| R1 | The model shows a gain that the engine cannot get. | The model takes its durations from the bench. Its `Serial` latency must match the measured unloaded latency within 2 %. |
 | R2 | The model hides a safety bug. | Each invariant has a test that breaks it on purpose: the plant, `Eager` and `PrefixOnly`. |
 | R3 | The workload has no ready input, so `Gated` looks useless by design. | A second workload has fan-out and signals. Inputs then arrive while a commit flushes. |
 | R4 | A run is not a function of its seed. | Every seed runs twice. The traces must be equal. Golden hashes pin the model. |
+| R8 | One shared random stream makes a mode change reorder every later draw, so two modes do not pair. Review found it. | Each draw depends only on the seed and a key, such as the decision position or the effect. |
+| R9 | The sweep never discards speculative work, so the invariants pass by default. Review found it. | A `discarded_speculative` counter, a busy fault sweep, and the `keep-tail` plant, which only speculation can trigger. |
+| R10 | The probe starts the metric samplers, which load Postgres during the measurement. Review found it. | The probe recorder returns `false` from `is_enabled`. The bench numbers are measured again. |
 | R5 | The probe changes the published numbers. | It is off by default. With it off, the bench keeps `NoOpMetrics`. |
 | R6 | Measured numbers come from an untuned host. | The write-up names the host, the Postgres settings and both `fsync` modes. |
-| R7 | The verdict follows the numbers that I want. | Section 0.5 fixes the go criteria before the measurement. |
+| R7 | The verdict follows the numbers that the author wants. | Section 0.5 fixes the go criteria before the measurement. |
 
 ### 0.4 Six thinking hats
 
@@ -82,9 +85,11 @@ e2e bench gets one opt-in probe, `HARVEST_BENCH_COMMIT_PROBE`.
 - **Yellow (benefits).** A clean answer saves engine work. The model is
   reusable for later pipelining or batching ideas.
 - **Green (ideas).** Merge ready decisions into one commit, without
-  speculation. Cut the post-commit wake hops, which may dominate.
+  speculation. Cut the post-commit wake hops. They can be most of the
+  latency.
 - **Blue (process).** Plan, then red, green and refactor. Model first, with
-  no database. Then measure. Then the write-up, its guard and review.
+  no database. Then measure. Then write the report, its guard and the
+  review.
 
 ### 0.5 Go criteria, fixed before measurement
 
@@ -120,7 +125,6 @@ range.
 | `ReplayEquivalent` | Replay of the durable log from empty state gives each decision record that the log holds. |
 | `EffectAfterCommit` | An effect starts only after its schedule is durable. |
 | `EffectOnce` | An effect runs at most once. |
-| `ResultOnce` | The log holds at most one result for each effect. |
 | `ExpectedOutput` | A completed execution returns the value that its workload defines. |
 | `Converges` | Every execution completes before the event limit. |
 
