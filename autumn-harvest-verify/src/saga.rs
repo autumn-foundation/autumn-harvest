@@ -159,7 +159,10 @@ fn dangling_reference(workflow: &WorkflowStructure) -> Option<String> {
             _ => {}
         }
     }
-    let handlers = workflow.handlers.iter().flat_map(|h| &h.bodies);
+    let handlers = workflow
+        .handlers
+        .iter()
+        .flat_map(|h| h.bodies.iter().chain(&h.returns));
     let calls = workflow.bodies.iter().flat_map(|b| &b.calls);
     named
         .into_iter()
@@ -171,23 +174,13 @@ fn dangling_reference(workflow: &WorkflowStructure) -> Option<String> {
 }
 
 /// The bodies that start an execution: the workflow root, each handler
-/// body, and the coroutine a handler body returns. Their error exit ends
+/// body, and each coroutine a handler body returns. Their error exit ends
 /// that execution, so a pending step there is a gap.
-///
-/// The returned coroutine is a body nested under the handler that the
-/// handler calls. Its id starts with the handler id.
 fn entry_bodies(workflow: &WorkflowStructure) -> BTreeSet<&str> {
     let mut entries: BTreeSet<&str> = BTreeSet::from([workflow.root.as_str()]);
-    for handler in workflow.handlers.iter().flat_map(|h| &h.bodies) {
-        entries.insert(handler.as_str());
-        let nested = format!("{handler}::");
-        let returned = workflow
-            .bodies
-            .iter()
-            .filter(|b| b.id == *handler)
-            .flat_map(|b| &b.calls)
-            .filter(|call| call.callee.starts_with(&nested));
-        entries.extend(returned.map(|call| call.callee.as_str()));
+    for handler in &workflow.handlers {
+        entries.extend(handler.bodies.iter().map(String::as_str));
+        entries.extend(handler.returns.iter().map(String::as_str));
     }
     entries
 }
@@ -704,6 +697,7 @@ mod tests {
                 method: "register_signal_handler".to_string(),
                 name: None,
                 bodies: vec!["w::on_signal".to_string()],
+                returns: Vec::new(),
             });
         }
         let err = check(&handler).expect_err("a handler with a missing body");
@@ -841,7 +835,8 @@ mod tests {
     #[test]
     fn an_err_exit_of_a_handler_with_a_pending_step_is_a_gap() {
         // The root registers an update handler. Its closure returns a
-        // coroutine that owns a saga, completes a step, then fails.
+        // coroutine that owns a saga, completes a step, then fails. The
+        // manifest names that coroutine in the handler `returns`.
         let root = FlowGraph {
             nodes: vec![
                 node(FlowEvent::Entry),
@@ -883,6 +878,7 @@ mod tests {
             method: "register_update_handler".to_string(),
             name: None,
             bodies: vec![handler.to_string()],
+            returns: vec![future.to_string()],
         });
         w.bodies.push(BodyNode {
             id: handler.to_string(),

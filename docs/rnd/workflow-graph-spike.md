@@ -122,7 +122,7 @@ that runs code gives `unknown` beside a visible saga too. An
   which is why it is a note.
 
 The fixture `autumn-harvest-verify/tests/fixtures/saga_graph/` pins each
-case: 25 workflows, with 7 `covered`, 6 `gap`, 9 `unknown` and 3 `no-saga`.
+case: 26 workflows, with 7 `covered`, 7 `gap`, 9 `unknown` and 3 `no-saga`.
 
 ## 5. Where the analysis hits `unknown`, and why
 

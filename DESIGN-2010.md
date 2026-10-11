@@ -127,7 +127,9 @@ Four review agents read the first version. Each fix has a test.
     counts as a saga use, so the verdict is `unknown`.
 20. A handler body, and the coroutine it returns, start an execution of
     their own. Their error exit with a pending step is now a gap, as in
-    the root. A body with no flow graph is now refused.
+    the root. The analysis records each returned coroutine in the handler
+    `returns`, so `|v| handle(v)` counts too. A body with no flow graph is
+    now refused.
 
 ---
 
@@ -160,7 +162,7 @@ workflow does not hold.
 
 `WorkflowStructure.handlers` lists each handler registration: its kind
 (`signal`, `update`, `query` or `other`), its name when the MIR shows it,
-and its bodies.
+its bodies, and the coroutines those bodies return (`returns`).
 
 ## 2. Saga compensation coverage
 

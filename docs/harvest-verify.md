@@ -300,7 +300,9 @@ the workflow does not hold.
 
 The workflow `handlers` list each handler registration: its `kind`
 (`signal`, `update`, `query` or `other`), its model `method`, its `name`
-when the MIR shows it, and its closure `bodies`.
+when the MIR shows it, and its closure `bodies`. `returns` lists the
+coroutine bodies those closures return, such as the body of the `async fn`
+in `|v| handle(v)`.
 
 A closure that returns an `async` block hands that future to its caller.
 When the caller has no body in the analysis, as `Saga::step` has none, the
@@ -342,7 +344,7 @@ checked 2: covered 1, gap 1, unknown 0, no-saga 0
 | `saga-result-untracked` | The result of a step does not reach `?` through `.await` alone, as with `map_err` or `match`. |
 | `multiple-sagas` | One body builds two sagas. |
 | `saga-recreated` | A new saga starts while a step of the old one is pending. |
-| `saga-dropped-pending` | A body that starts no execution exits with a step pending. Its caller cannot unwind that step. The workflow root, each handler body and the coroutine a handler body returns start an execution: their error exit with a step pending is a gap. |
+| `saga-dropped-pending` | A body that starts no execution exits with a step pending. Its caller cannot unwind that step. The workflow root, each handler body and each coroutine in a handler `returns` start an execution: their error exit with a step pending is a gap. |
 | `no-flow-graph` | A body in the manifest has no flow graph. |
 | `boundary` | The workflow has a boundary that runs code. It can hide a saga and a gap, with or without a saga in sight. An `external-const` runs no code, so it does not count. |
 

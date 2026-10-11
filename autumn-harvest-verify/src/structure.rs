@@ -88,6 +88,11 @@ pub struct HandlerSite {
     /// The closure bodies the registration passes, such as a validator and a
     /// handler.
     pub bodies: Vec<String>,
+    /// The coroutine bodies those closures return, such as the `async` block
+    /// of `|v| async move { .. }` or the body of the `async fn` in
+    /// `|v| handle(v)`. Each one runs as an execution of its own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub returns: Vec<String>,
 }
 
 /// The condensed control-flow graph of one body (issue #2010).
@@ -251,6 +256,9 @@ pub struct Recorder {
     pub arguments: BTreeSet<ArgumentEdge>,
     /// Each handler registration it met (issue #2010).
     pub handlers: BTreeSet<HandlerCall>,
+    /// Each `(closure, coroutine)` pair where the closure returns that
+    /// coroutine's future (issue #2010).
+    pub returned: BTreeSet<(String, String)>,
 }
 
 /// A body passed as argument `index` of the call in `block`.
@@ -333,6 +341,7 @@ impl Recorder {
     /// the caller of the closure runs it to completion once per call.
     pub fn future_edge(&mut self, from: &str, block: &str, to: &str) {
         self.insert_edge(from, block, to, false, false);
+        self.returned.insert((from.to_string(), to.to_string()));
     }
 
     /// Record a handler registration in `block`.
@@ -579,15 +588,22 @@ impl<'p> StructureBuilder<'p> {
                 let markers = self.markers();
                 key_of_operand(markers, body, args.get(1)?, 0)
             });
-            let mut bodies: Vec<String> = recorder
+            let passed: BTreeSet<&str> = recorder
                 .arguments
                 .iter()
                 .filter(|a| a.caller == call.caller && a.block == call.block)
                 .filter(|a| display.contains_key(&a.body))
-                .map(|a| show(&a.body))
+                .map(|a| a.body.as_str())
                 .collect();
-            bodies.sort_unstable();
-            bodies.dedup();
+            let bodies: Vec<String> = passed.iter().map(|id| show(id)).collect();
+            let mut returns: Vec<String> = recorder
+                .returned
+                .iter()
+                .filter(|(from, to)| passed.contains(from.as_str()) && display.contains_key(to))
+                .map(|(_, to)| show(to))
+                .collect();
+            returns.sort_unstable();
+            returns.dedup();
             let kind = ["signal", "update", "query"]
                 .into_iter()
                 .find(|k| call.method.contains(k))
@@ -598,6 +614,7 @@ impl<'p> StructureBuilder<'p> {
                 method: call.method.clone(),
                 name,
                 bodies,
+                returns,
             });
         }
         (list, at)

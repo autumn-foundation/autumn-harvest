@@ -493,3 +493,26 @@ pub async fn wf_handler_gap(ctx: &WorkflowContext) -> Out {
     );
     ctx.receive_signal("go").await
 }
+
+/// The update handler of `wf_handler_delegate_gap`. It owns a saga, and a
+/// late error skips the unwind.
+pub async fn handle_book(v: u64) -> Out {
+    let mut saga = Saga::new(&HANDLER_CTX);
+    let a = saga
+        .step(
+            move || async move { HANDLER_CTX.execute_activity_raw("reserve", v).await },
+            |a| async move { HANDLER_CTX.execute_activity_raw("release", a).await.map(|_| ()) },
+        )
+        .await?;
+    Err(format!("late {a}"))
+}
+
+pub fn __autumn_workflow_info_wf_handler_delegate_gap() -> u8 {
+    0
+}
+
+/// An update handler delegates to an `async fn` that owns a saga.
+pub async fn wf_handler_delegate_gap(ctx: &WorkflowContext) -> Out {
+    ctx.register_update_handler("book", |_: &u64| Ok(()), |v: u64| handle_book(v));
+    ctx.receive_signal("go").await
+}
