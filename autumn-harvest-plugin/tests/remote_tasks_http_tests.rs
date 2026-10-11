@@ -425,3 +425,22 @@ async fn a_response_with_another_id_is_refused() {
     assert!(!err.retryable);
     assert!(err.message.contains("id"), "got {}", err.message);
 }
+
+/// A JSON-RPC error for another request id is not this request's failure.
+#[tokio::test]
+async fn an_error_with_another_id_is_not_this_requests_failure() {
+    let (url, _) = serve(Arc::new(|_| {
+        Json(
+            json!({"jsonrpc": "2.0", "id": 999_999, "error": {"code": -32602, "message": "stale"}}),
+        )
+        .into_response()
+    }))
+    .await;
+    let client = HttpRemoteTasks::new().server("reports", RemoteServer::mcp(&url));
+    let err = client
+        .start(&request(RemoteProtocol::Mcp, "export"), "k")
+        .await
+        .expect_err("mismatched id");
+    assert!(!err.message.contains("stale"), "got {}", err.message);
+    assert!(err.message.contains("request id"), "got {}", err.message);
+}

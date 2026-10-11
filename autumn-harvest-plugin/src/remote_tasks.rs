@@ -277,17 +277,10 @@ impl HttpRemoteTasks {
         } else {
             serde_json::from_slice::<Value>(&raw).ok()
         };
-        // A response for another request is a protocol error, not this
-        // request's result. An error with a null id passes, as JSON-RPC
-        // sends a parse error that way.
-        if let Some(envelope) = &envelope
-            && envelope.get("result").is_some()
-            && !is_response_to(envelope, id)
-        {
-            return Err(RemoteTaskError::non_retryable(format!(
-                "{method}: the response id does not match the request id"
-            )));
-        }
+        // A response for another request is a protocol error. Its result or
+        // its error is not about this request.
+        let envelope = envelope.filter(|e| belongs_to(e, id));
+        let mismatched = envelope.is_none() && !raw.is_empty();
         let rpc_error = envelope.as_ref().and_then(|e| e.get("error")).map(|error| {
             let message = error
                 .get("message")
@@ -305,6 +298,11 @@ impl HttpRemoteTasks {
                     RemoteTaskError::non_retryable(message)
                 },
             );
+        }
+        if mismatched {
+            return Err(RemoteTaskError::non_retryable(format!(
+                "{method}: no JSON-RPC response for this request id"
+            )));
         }
         if let Some(message) = rpc_error {
             return Err(RemoteTaskError::non_retryable(format!(
@@ -347,7 +345,7 @@ async fn read_body(
         }
         raw.extend_from_slice(&chunk);
         if event_stream
-            && chunk.contains(&b'\n')
+            && chunk.iter().any(|b| matches!(b, b'\n' | b'\r'))
             && std::str::from_utf8(&raw).is_ok_and(|text| sse_response(text, id, true).is_some())
         {
             break;
@@ -374,6 +372,44 @@ fn is_response_to(message: &Value, id: u64) -> bool {
         && (message.get("result").is_some() || message.get("error").is_some())
 }
 
+/// `true` when `envelope` can answer request `id`.
+///
+/// A non-null id must be the request id. A null or missing id passes on an
+/// error only, because JSON-RPC sends a parse error that way.
+fn belongs_to(envelope: &Value, id: u64) -> bool {
+    match envelope.get("id") {
+        None | Some(Value::Null) => envelope.get("error").is_some(),
+        Some(other) => other.as_u64() == Some(id),
+    }
+}
+
+/// The lines of an event stream, each with `true` when a line end follows.
+///
+/// CR, LF and CRLF each end a line, as the event-stream format requires.
+fn sse_lines(body: &str) -> Vec<(&str, bool)> {
+    let bytes = body.as_bytes();
+    let mut lines = Vec::new();
+    let (mut start, mut i) = (0, 0);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' | b'\r' => {
+                lines.push((&body[start..i], true));
+                i += if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    if start < bytes.len() {
+        lines.push((&body[start..], false));
+    }
+    lines
+}
+
 /// The JSON-RPC response with `id` in a `text/event-stream` body.
 ///
 /// A blank line ends an event, and the `data` lines of one event join with
@@ -381,11 +417,12 @@ fn is_response_to(message: &Value, id: u64) -> bool {
 /// does not count, because more of its data can still arrive.
 fn sse_response(body: &str, id: u64, complete_only: bool) -> Option<Value> {
     let mut data: Vec<&str> = Vec::new();
-    let mut lines = body.split('\n').peekable();
-    while let Some(raw) = lines.next() {
-        let line = raw.strip_suffix('\r').unwrap_or(raw);
-        let at_end = lines.peek().is_none();
-        if line.is_empty() && !at_end {
+    for (line, ended) in sse_lines(body) {
+        if !ended && complete_only {
+            // A partial last line is not a field yet.
+            break;
+        }
+        if line.is_empty() {
             if let Some(message) = decode_event(&data)
                 && is_response_to(&message, id)
             {
@@ -393,10 +430,7 @@ fn sse_response(body: &str, id: u64, complete_only: bool) -> Option<Value> {
             }
             data.clear();
         } else if let Some(field) = line.strip_prefix("data:") {
-            // A partial last line is not a field yet.
-            if !(at_end && complete_only) {
-                data.push(field.strip_prefix(' ').unwrap_or(field));
-            }
+            data.push(field.strip_prefix(' ').unwrap_or(field));
         }
     }
     if complete_only {
@@ -510,6 +544,25 @@ mod tests {
             sse_response(body, 3, true),
             Some(json!({"jsonrpc": "2.0", "id": 3, "result": {"ok": true}}))
         );
+    }
+
+    #[test]
+    fn a_lone_cr_ends_a_line() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\rdata: \"id\":5,\"result\":{}}\r\r";
+        assert_eq!(
+            sse_response(body, 5, true),
+            Some(json!({"jsonrpc": "2.0", "id": 5, "result": {}}))
+        );
+    }
+
+    #[test]
+    fn only_a_matching_or_null_error_id_belongs_to_the_request() {
+        assert!(belongs_to(&json!({"id": 9, "result": {}}), 9));
+        assert!(belongs_to(&json!({"id": 9, "error": {}}), 9));
+        assert!(belongs_to(&json!({"id": null, "error": {}}), 9));
+        assert!(!belongs_to(&json!({"id": 8, "error": {}}), 9));
+        assert!(!belongs_to(&json!({"id": 8, "result": {}}), 9));
+        assert!(!belongs_to(&json!({"id": null, "result": {}}), 9));
     }
 
     #[test]
