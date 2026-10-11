@@ -230,9 +230,14 @@ impl SourceIndex {
 
     /// Record what the field types of the type `name` hold.
     fn scan_fields<'f>(&mut self, name: &syn::Ident, fields: impl Iterator<Item = &'f syn::Field>) {
+        self.scan_types(name, fields.map(|field| &field.ty));
+    }
+
+    /// Record what the types `types` of the type `name` hold.
+    fn scan_types<'t>(&mut self, name: &syn::Ident, types: impl Iterator<Item = &'t syn::Type>) {
         let mut scan = FieldScan::default();
-        for field in fields {
-            syn::visit::Visit::visit_type(&mut scan, &field.ty);
+        for ty in types {
+            syn::visit::Visit::visit_type(&mut scan, ty);
         }
         let facts = self.type_fields.entry(name.to_string()).or_default();
         facts.mut_ref |= scan.0.mut_ref;
@@ -273,7 +278,12 @@ impl SourceIndex {
                     self.declare(module, &item.ident);
                     self.scan_fields(&item.ident, item.fields.named.iter());
                 }
-                syn::Item::Type(item) => self.declare(module, &item.ident),
+                syn::Item::Type(item) => {
+                    // A wrapper can reach interior-mutable state through an
+                    // alias, so the alias target counts as a field.
+                    self.declare(module, &item.ident);
+                    self.scan_types(&item.ident, std::iter::once(&*item.ty));
+                }
                 syn::Item::Mod(item) => {
                     if let Some((_, items)) = &item.content {
                         let mut inner = module.to_vec();
@@ -669,6 +679,26 @@ mod tests {
         assert!(index.type_fields.contains_key("Shared"), "{index:?}");
         assert!(index.type_paths.contains("state::Shared"), "{index:?}");
         assert!(index.type_paths.contains("outer::inner::Deep"), "{index:?}");
+    }
+
+    #[test]
+    fn a_type_alias_records_what_its_target_holds() {
+        // `Wrapper` reaches the mutex through the alias `Shared`. The
+        // writable fixpoint needs the alias target to see that.
+        let mut index = SourceIndex::default();
+        index.absorb_syn(
+            "type Shared = std::sync::Arc<std::sync::Mutex<u64>>;\nstruct Wrapper(Shared);\n",
+            &[],
+        );
+        let names = |ty: &str| index.type_fields.get(ty).map(|f| f.names.clone());
+        assert!(
+            names("Wrapper").is_some_and(|n| n.contains("Shared")),
+            "{index:?}"
+        );
+        assert!(
+            names("Shared").is_some_and(|n| n.contains("Mutex")),
+            "{index:?}"
+        );
     }
 
     #[test]
