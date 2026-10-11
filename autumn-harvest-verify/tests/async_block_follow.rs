@@ -62,6 +62,7 @@ fn a_case_the_analysis_cannot_follow_is_never_proven() {
         "wf_step_write",
         "wf_step_write_tuple",
         "wf_step_write_struct",
+        "wf_step_write_cell",
     ] {
         assert!(
             !matches!(verdict(&all, name), Verdict::ProvenDeterministic),

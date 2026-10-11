@@ -179,3 +179,27 @@ pub async fn wf_step_write_struct(ctx: &WorkflowContext) -> Out {
     }
     ctx.execute_activity_raw("b", seen).await
 }
+
+pub fn __autumn_workflow_info_wf_step_write_cell() -> u8 {
+    0
+}
+
+/// The same write, through a shared `&Cell` capture.
+pub async fn wf_step_write_cell(ctx: &WorkflowContext) -> Out {
+    let seen = std::cell::Cell::new(0_u64);
+    {
+        let mut saga = Saga::new(ctx);
+        saga.step(
+            || {
+                let cell = &seen;
+                async move {
+                    cell.set(now_nanos());
+                    ctx.execute_activity_raw("a", 1).await
+                }
+            },
+            |_| async { Ok(()) },
+        )
+        .await?;
+    }
+    ctx.execute_activity_raw("b", seen.get()).await
+}

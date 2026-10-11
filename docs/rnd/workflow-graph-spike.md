@@ -236,6 +236,11 @@ next step is that list, measured on the same examples.
   step.
 - The model version is now `2026.10.1`. Emit the two manifests of an
   upgrade check with the same `harvest-verify`.
+- The determinism model does not track a write through `&self` of an
+  interior-mutable local, such as `cell.set(now())` and a later
+  `cell.get()`. This gap predates the spike. A saga closure that captures
+  such a value now gets a boundary, but the same code in one body does
+  not.
 
 ## 9. Reproduce
 
