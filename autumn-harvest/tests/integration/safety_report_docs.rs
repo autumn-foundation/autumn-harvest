@@ -89,7 +89,7 @@ const LIMIT_SOURCES: &[LimitSource] = &[
             ),
             (
                 "Trace conformance of `CodecRotation`.",
-                "No check compares test traces with the `CodecRotation` model.",
+                "No trace check covers the `CodecRotation` model.",
             ),
         ],
     },
@@ -104,7 +104,7 @@ const LIMIT_SOURCES: &[LimitSource] = &[
             ),
             (
                 "A world crash falls between two steps.",
-                "No simulated worker dies inside a task body.",
+                "A world crash falls between two steps.",
             ),
             (
                 "The world workload never fails an activity",
@@ -112,7 +112,7 @@ const LIMIT_SOURCES: &[LimitSource] = &[
             ),
             (
                 "draws actions from fixed weights.",
-                "The simulator draws actions from fixed weights.",
+                "It draws actions from fixed weights.",
             ),
             (
                 "does not model the timeout sweeper, the `FAILED` state or the poison-pill \

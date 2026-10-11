@@ -3440,7 +3440,9 @@ and the quarantine limits (`workflow_panic_max_attempts`,
 `poison_pill_threshold`). So does `cancellation_grace_period`: a timed-out
 activity that ignores its cancellation runs that long before the timeout is
 recorded. So does `dr_fencing`: a fenced worker checks its shard generation
-in each claim query and before each history persist. So do the payload caps, the history policy, the
+in each claim query and before each history persist. So does
+`max_concurrent_claims`: more claim loops fill the slots faster under a
+backlog. So do the payload caps, the history policy, the
 payload offloader, the registered payload codecs and default codec, the
 registered and active codec keys, the activity interceptor chain
 and each activity's own caps, rate and concurrency limits and WASM binding.
@@ -3528,13 +3530,16 @@ that slow queries hold connections too long.
    longer, so slow queries and pool waits often rise together.
 3. Count connections on the database:
    `SELECT state, count(*) FROM pg_stat_activity GROUP BY state;`.
-4. Compare the pool size with the worker's slot counts. Each in-flight task
-   can hold a connection.
+4. Compare the pool size with the worker's slot counts plus its
+   `max_concurrent_claims`. Each in-flight task and each in-flight claim can
+   hold a connection.
 
 ### Likely causes
 
 - The worker pool size, `HarvestPoolConfig::worker_pool_size` per shard, is
-  smaller than the worker's concurrency needs.
+  smaller than the worker's concurrency needs. Count the claim loops too:
+  `max_concurrent_claims`, 2 by default. In embedded mode the worker shares
+  the application pool.
 - Slow queries or lock waits hold connections for longer than usual.
 - A connection leak in an activity that calls `run_transactional` and does
   not finish.
