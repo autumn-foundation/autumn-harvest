@@ -89,6 +89,7 @@ spike adds no engine code.
 | R9 | The prototype claims more than it proves. | Each claim names its test. A docs guard checks the names. |
 | R10 | A snapshot drops a completed effect. | The ledger check refuses a snapshot taken with an open effect. |
 | R11 | An old snapshot loads under new code with the wrong shape. | The load refuses an unknown version and upgrades a known one. |
+| R12 | A caller forges a snapshot in a start input and skips completed effects. | The stamp signs the snapshot with an engine key. The loader refuses a wrong signature. |
 
 ### 0.5 Six thinking hats
 

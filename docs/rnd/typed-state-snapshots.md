@@ -134,14 +134,20 @@ The cost is high:
 2. The worker stamps an effect ledger from the history when it persists the
    checkpoint. The ledger goes into the successor input, so no event
    changes. The author never writes the ledger.
-3. The stamp refuses an open effect. It also refuses a signal in history
+3. The worker signs the stamped snapshot with an engine key that callers
+   cannot read, such as a codec key. A caller can put any JSON into a start
+   input. Without the signature, a caller could forge a state and a ledger
+   that agree, and skip completed effects. The loader should also require
+   continue-as-new provenance, such as `continued_from_exec_id`.
+4. The stamp refuses an open effect. It also refuses a signal in history
    that the body has not taken. Continue-as-new moves only signals that the
    run did not ingest, so it would drop that signal. The worker reads this
    from the replay matcher, because history alone cannot show it.
-4. The successor loads the state. An older version passes through the
-   `upgrade` step of the state type. The loader refuses a newer version.
-   It then asks the state type whether the state covers the ledger.
-5. The successor has a new, empty history. So the code before the
+5. The successor loads the state. It first checks the signature. An older
+   version then passes through the `upgrade` step of the state type. The
+   loader refuses a newer version. It then asks the state type whether the
+   state covers the ledger.
+6. The successor has a new, empty history. So the code before the
    checkpoint never runs again, and it does not need to stay deterministic.
 
 Continue-as-new already carries the workflow id, unconsumed signals, memo,
@@ -173,6 +179,8 @@ Each claim names its test in `typed_snapshot_spike_tests.rs`.
 | A quiescent history gives a ledger of its completed effects. | `a_quiescent_history_gives_a_ledger_of_its_completed_effects` |
 | The stamp refuses an open activity, external activity, timer, child or update. | `a_checkpoint_with_an_open_effect_is_refused` |
 | The stamp refuses a signal that the body has not taken. | `a_checkpoint_with_an_unread_signal_is_refused` |
+| The loader refuses a snapshot with a wrong engine signature. | `a_forged_snapshot_is_refused` |
+| A forged start input cannot skip the charges. | `a_forged_start_input_cannot_skip_the_charges` |
 | A v1 snapshot loads under v2 code through its upgrade step. | `a_v1_snapshot_loads_under_v2_code` |
 | The loader refuses a snapshot from newer code. | `a_snapshot_from_newer_code_is_refused` |
 | The loader refuses a ledger that differs from its source history. | `a_ledger_that_differs_from_its_source_history_is_refused` |
@@ -180,8 +188,8 @@ Each claim names its test in `typed_snapshot_spike_tests.rs`.
 | Changed code before the checkpoint fails a full replay as non-deterministic. The same code resumes from the snapshot and runs no completed charge again. | `changed_code_before_the_checkpoint_resumes_from_the_snapshot` |
 | A new context restarts reserved names. An in-place resume must restore the counters. | `reserved_names_restart_in_each_new_context` |
 
-The machine check has three parts: quiescence, a ledger that matches its
-source history, and a state that covers its ledger. The state type must
+The machine check has four parts: quiescence, an engine signature, a
+ledger that matches its source history, and a state that covers its ledger. The state type must
 write the cover rule, because the trait has no default. The loader runs it
 on each load, so a wrong upgrade step fails to load.
 
@@ -194,7 +202,8 @@ What the prototype does not prove or cover:
 - Local activities, detached children, external workflow awaits, external
   signals, cancels and a held mutex. History has no release event for a mutex, so
   the context must report a hold.
-- The real persist path. The tests stamp the ledger outside the worker.
+- The real persist path. The tests stamp and sign outside the worker, with
+  a fixed test key. They do not check continue-as-new provenance.
 - A source history that is gone. Retention or PII erasure can remove the
   predecessor before a loader re-checks the ledger. The successor must then
   trust the stored ledger.
@@ -238,7 +247,8 @@ rest.
 3. A versioned state, an upgrade step and a cover rule for the keyed entity
    checkpoint. Its state type gets a schema through #1994.
 4. The quiescence and unread-signal check at the continue-as-new persist
-   step, with the ledger stamped into the successor input.
+   step. The worker stamps and signs the ledger into the successor input.
+   The loader checks the signature and the continue-as-new provenance.
 5. The upgrade verdict (#1995) already decodes stored payloads against the
    candidate schemas. Add the upgrade step and the cover rule to that check.
 

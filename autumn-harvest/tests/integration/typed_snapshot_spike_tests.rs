@@ -8,10 +8,13 @@
 //! the state and the version. The engine side stamps the ledger from the
 //! history when it persists the checkpoint, so the author never writes it.
 //!
-//! The machine check has three parts:
+//! The machine check has four parts:
 //!
 //! - The stamp refuses a checkpoint with an open effect or an unread signal.
 //!   A checkpoint then has no effect in flight to lose.
+//! - The stamp signs the snapshot with an engine key. The loader refuses a
+//!   snapshot with a wrong signature, so a caller cannot forge one in a
+//!   start input.
 //! - The loader refuses a ledger that differs from its source history.
 //! - The loader refuses a state that does not cover its ledger. The state
 //!   type states this rule. The rule catches a stale state, for example one
@@ -23,6 +26,7 @@
 //! The tests below back each claim in section 4 of the report.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use autumn_harvest::WorkflowContext;
 use autumn_harvest::context::WorkflowCommand;
@@ -30,9 +34,11 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::executor::{WorkflowOutcome, run_workflow};
 use autumn_harvest::info::WorkflowHandlerFn;
 use autumn_harvest::types::{ExecutionId, TimerId};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::Sha256;
 
 // ── The prototype ────────────────────────────────────────────────────────────
 
@@ -183,9 +189,16 @@ enum SnapshotError {
     LedgerMismatch,
     /// The loaded state does not reflect each completed effect.
     NotCovered,
+    /// The engine signature does not match, so no checkpoint wrote this
+    /// snapshot.
+    Forged,
     /// The state did not decode.
     Decode(String),
 }
+
+/// The key that signs each stamped snapshot. A worker would use a key that
+/// callers cannot read, such as a codec key.
+const ENGINE_KEY: &[u8] = b"issue-2013-spike-engine-key";
 
 /// The wire form of a snapshot: the continue-as-new input.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -193,6 +206,28 @@ struct Snapshot {
     version: u32,
     state: Value,
     ledger: EffectLedger,
+    /// HMAC-SHA256 of the other fields under [`ENGINE_KEY`], in hex.
+    mac: String,
+}
+
+/// The HMAC of one snapshot body.
+fn engine_mac(version: u32, state: &Value, ledger: &EffectLedger) -> Hmac<Sha256> {
+    let body = serde_json::to_vec(&(version, state, ledger)).expect("a snapshot body encodes");
+    let mut mac =
+        <Hmac<Sha256> as KeyInit>::new_from_slice(ENGINE_KEY).expect("HMAC takes any key length");
+    mac.update(&body);
+    mac
+}
+
+/// Decodes lowercase hex. Returns `None` for any other text.
+fn from_hex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 impl Snapshot {
@@ -230,10 +265,19 @@ impl Snapshot {
             .get("state")
             .cloned()
             .ok_or_else(|| SnapshotError::Decode("no state".into()))?;
+        let mac = engine_mac(version, &state, &ledger)
+            .finalize()
+            .into_bytes()
+            .iter()
+            .fold(String::new(), |mut hex, byte| {
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            });
         serde_json::to_value(Self {
             version,
             state,
             ledger,
+            mac,
         })
         .map_err(|e| SnapshotError::Decode(e.to_string()))
     }
@@ -265,6 +309,14 @@ impl Snapshot {
     ) -> Result<(S, EffectLedger), SnapshotError> {
         let snapshot: Self = serde_json::from_value(raw.clone())
             .map_err(|e| SnapshotError::Decode(e.to_string()))?;
+        let signed = from_hex(&snapshot.mac).is_some_and(|tag| {
+            engine_mac(snapshot.version, &snapshot.state, &snapshot.ledger)
+                .verify_slice(&tag)
+                .is_ok()
+        });
+        if !signed {
+            return Err(SnapshotError::Forged);
+        }
         if snapshot.version > S::VERSION {
             return Err(SnapshotError::UnknownVersion(snapshot.version));
         }
@@ -641,6 +693,52 @@ fn a_state_that_does_not_cover_its_ledger_is_refused() {
     assert_eq!(
         Snapshot::load::<Order>(&raw, Some(&history)),
         Err(SnapshotError::NotCovered)
+    );
+}
+
+/// A start input that claims two charges that never ran.
+fn forged_snapshot() -> Value {
+    json!({
+        "version": 2,
+        "state": { "charged": 2, "phase": "ship" },
+        "ledger": {
+            "activities": ["charge", "charge"],
+            "timers": [],
+            "children": [],
+            "side_effects": 0,
+            "signals": 0
+        },
+        "mac": "00"
+    })
+}
+
+#[test]
+fn a_forged_snapshot_is_refused() {
+    // State and ledger agree, so the cover rule passes. Only the engine
+    // signature shows that no checkpoint wrote this snapshot.
+    assert_eq!(
+        Snapshot::load::<Order>(&forged_snapshot(), None),
+        Err(SnapshotError::Forged)
+    );
+}
+
+#[tokio::test]
+async fn a_forged_start_input_cannot_skip_the_charges() {
+    let input = forged_snapshot();
+    let outcome = run_workflow(
+        ExecutionId::new(),
+        vec![started(input.clone())],
+        order_v2,
+        input,
+    )
+    .await;
+    assert!(
+        scheduled(&outcome).is_empty(),
+        "a forged snapshot must not reach the ship step: {outcome:?}"
+    );
+    assert!(
+        matches!(outcome, WorkflowOutcome::Failed { .. }),
+        "the load must fail the run: {outcome:?}"
     );
 }
 
