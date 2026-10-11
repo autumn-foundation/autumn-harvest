@@ -50,6 +50,8 @@ Walks through recorded `WorkflowEvent`s during replay:
 
 - Receives shutdown signal or polls task queue
 - Claims tasks via `SELECT ... FOR UPDATE SKIP LOCKED`
+- Runs up to `max_concurrent_claims` claims at once (default 2): a leader
+  poll loop plus followers that claim only while claims return work
 - Dispatches via bounded Tokio tasks:
   - `max_concurrent_workflows` for workflow tasks
   - `max_concurrent_activities` for activity tasks
