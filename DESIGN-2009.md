@@ -117,20 +117,28 @@ codec envelopes stay ciphertext.
 
 `autumn-harvest-agent/tests/history_delta_measure.rs` builds a 40-turn
 agent loop from the real `ModelTurnRequest` and `ModelTurn` types. Each
-model turn records the whole transcript, so history grows with the
-square of the turn count. The test prints and asserts the sizes.
-`docs/rnd/2026-10-11-agent-history-delta-encoding.md` records the
-numbers.
+model turn records the whole transcript, so history grows with the square
+of the turn count. `docs/rnd/2026-10-11-agent-history-delta-encoding.md`
+records the numbers:
+
+| Form | Vocabulary text | Random text |
+|---|---:|---:|
+| Plain, delta | 11.3% | 11.4% |
+| Plain, gzip | 12.6% | 47.9% |
+| AES-GCM codec | 134.2% | 134.2% |
+| AES-GCM, gzip | 101.0% | 101.0% |
 
 The decision is to decline delta encoding in the event log:
 
 - The codec encrypts each payload field with a fresh nonce. Two equal
-  context windows give different ciphertext, so a delta over stored
-  bytes saves nothing. A delta must run before the codec, inside the
-  payload path, on every read and every replay.
-- The repeat comes from the agent layer, which sends the whole
-  transcript in each activity input. The agent layer can record only
-  the new messages of each turn, and rebuild the window from history
-  it already has. That gets the same reduction with no engine change.
-- For cold history, a compressing `PartitionArchiver` backend gets most
-  of the gain on plaintext with no change to the stored form.
+  context windows give different ciphertext, so a delta over stored bytes
+  saves nothing. A delta must run before the codec, on every write, read
+  and replay.
+- The repeat comes from the agent layer, which sends the whole transcript
+  in each activity input. The agent layer can record only the new messages
+  of each turn, and rebuild the window from history it already has. That
+  gets the same reduction with no engine change, and it works under the
+  codec.
+- gzip matches the delta only on text that compresses well. Its 32 KiB
+  window misses repeats in a long transcript. A compressing archive backend
+  needs a long window, and it does not help under the codec.

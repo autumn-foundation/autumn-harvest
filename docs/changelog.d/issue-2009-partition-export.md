@@ -33,9 +33,12 @@ refuses a partition archiver together with
 `partitions.straggler_grace_secs`, because a straggler delete removes rows
 that no export holds. The sweep also skips straggler deletes when it exports.
 
-**Delta encoding: measured, declined.** The 40-turn agent-loop measurement in
-`autumn-harvest-agent/tests/history_delta_measure.rs` shows a large saving on
-plaintext and none on ciphertext. See
+**Delta encoding: measured, declined.** On a 40-turn agent loop
+(`autumn-harvest-agent/tests/history_delta_measure.rs`), a delta on the
+previous transcript stores 11.4% of the plain bytes. Under the AES-GCM codec
+it saves nothing, because each field gets a fresh nonce. gzip stores 12.6% to
+47.9%, by text entropy. The repeat comes from the agent layer, which can
+record only the new messages of each turn. See
 `docs/rnd/2026-10-11-agent-history-delta-encoding.md`.
 
 **Invariants.** No migration. No new `WorkflowEvent` variant. No new route.
