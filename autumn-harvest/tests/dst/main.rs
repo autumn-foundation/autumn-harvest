@@ -3,6 +3,7 @@
 //! These tests need no database. `docs/testing/simulation.md` lists the
 //! environment variables and the replay command.
 
+mod speculate;
 mod world;
 
 use autumn_harvest::dst::{
