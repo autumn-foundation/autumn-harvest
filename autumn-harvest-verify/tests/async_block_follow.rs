@@ -86,6 +86,7 @@ fn a_case_the_analysis_cannot_follow_is_never_proven() {
         "wf_step_named_shared_future",
         "wf_step_named_shared_ctor",
         "wf_step_write_newtype",
+        "wf_step_noext_module",
     ] {
         assert!(
             !matches!(verdict(&all, name), Verdict::ProvenDeterministic),

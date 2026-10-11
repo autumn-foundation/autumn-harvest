@@ -563,3 +563,6 @@ pub async fn wf_step_write_newtype(ctx: &WorkflowContext) -> Out {
     let read = seen.0.lock().map_or(0, |v| *v);
     ctx.execute_activity_raw("b", read).await
 }
+
+#[path = "noext"]
+mod noext;

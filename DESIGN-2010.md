@@ -159,6 +159,10 @@ Four review agents read the first version. Each fix has a test.
     a validator closure resolves.
 28. Each edge of a tracked step carries a label. The fixpoint reads an
     unlabeled step edge as success, so the check refuses one.
+29. The follow reads an `async` block by its source span, as
+    `{async block@noext:12:26: 12:31}`. A module file can lack the `.rs`
+    extension, so the test reads the `line:col` shape. A block of another
+    crate prints a def path, so it is still not followed.
 
 ---
 

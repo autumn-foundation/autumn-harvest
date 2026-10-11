@@ -1762,7 +1762,7 @@ impl<'a> Analyzer<'a> {
         let interior_names = self.interior_types();
         let interior: Vec<&str> = interior_names.iter().map(String::as_str).collect();
         let inner = brace_form(&body.return_ty)
-            .filter(|span| is_coroutine_span(span) && span.contains(".rs:"));
+            .filter(|span| is_coroutine_span(span) && has_source_span(span));
         // The block itself, behind `&mut`, `Pin` or `Box` at most, is polled
         // as it is. Any other type around it has a `poll` of its own.
         if is_coroutine_span(future_target(&body.return_ty)) {
@@ -3078,6 +3078,31 @@ fn source_hint(path: &str) -> Option<String> {
     (!head.is_empty()).then(|| head.to_string())
 }
 
+/// Does `span` end in a source span, as `{async block@a.rs:5:6: 5:9}` does?
+///
+/// A block of another crate prints its def path instead, as
+/// `{async block@dep::f::{closure#0}}`. A module file can lack the `.rs`
+/// extension, so the test reads the `line:col: line:col` shape.
+fn has_source_span(span: &str) -> bool {
+    let Some(inner) = span.strip_suffix('}') else {
+        return false;
+    };
+    let Some((start, end)) = inner.rsplit_once(": ") else {
+        return false;
+    };
+    let number = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+    // The last two `:` parts of `text` are a line and a column.
+    let ends_in_pair = |text: &str| {
+        text.rsplit_once(':').is_some_and(|(rest, col)| {
+            number(col) && rest.rsplit_once(':').is_some_and(|(_, line)| number(line))
+        })
+    };
+    let end_pair = end
+        .split_once(':')
+        .is_some_and(|(l, c)| number(l) && number(c));
+    end_pair && ends_in_pair(start)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3110,6 +3135,14 @@ mod tests {
         assert!(!may_write_through("&CellPhone", &interior));
         assert!(!may_write_through("u64", &interior));
         assert!(!may_write_through("std::string::String", &interior));
+    }
+
+    #[test]
+    fn a_source_span_needs_no_rs_extension() {
+        assert!(has_source_span("{async block@a.rs:5:6: 5:9}"));
+        assert!(has_source_span("{async block@src/noext:12:26: 12:31}"));
+        assert!(!has_source_span("{async block@dep::f::{closure#0}}"));
+        assert!(!has_source_span("{async block@a.rs:5:6}"));
     }
 
     #[test]
