@@ -457,7 +457,7 @@ impl RemoteTaskPoller {
             page.items
                 .into_iter()
                 .filter(|p| backoff.get(&p.token).is_none_or(|b| b.until <= now))
-                .filter(|p| self.first_read_due(p))
+                .filter(Self::first_read_due)
                 .collect()
         };
         let mut report = PollReport {
@@ -561,16 +561,10 @@ impl RemoteTaskPoller {
         );
     }
 
-    /// `false` while the start poll interval of `pending` runs, when it is
-    /// longer than ours. The token time is in the database, so a restart
-    /// keeps the wait.
-    fn first_read_due(&self, pending: &PendingRemoteTask) -> bool {
-        let Some(wait) = pending
-            .handle
-            .poll_interval_ms
-            .map(Duration::from_millis)
-            .filter(|w| *w > self.interval)
-        else {
+    /// `false` while the start poll interval of `pending` runs. The token
+    /// time is in the database, so a restart keeps the wait.
+    fn first_read_due(pending: &PendingRemoteTask) -> bool {
+        let Some(wait) = pending.handle.poll_interval_ms.map(Duration::from_millis) else {
             return true;
         };
         chrono::Duration::from_std(wait.min(MAX_SERVER_POLL_INTERVAL))

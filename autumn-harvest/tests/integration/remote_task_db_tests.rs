@@ -761,3 +761,20 @@ async fn the_first_read_waits_for_the_start_poll_interval() {
     assert!(server.reads().is_empty(), "reads: {:?}", server.reads());
     p.stop().await;
 }
+
+/// A start poll interval no longer than the poller's still delays the
+/// first read.
+#[tokio::test]
+async fn the_first_read_waits_for_a_short_start_poll_interval() {
+    let db = setup().await;
+    let url = &db.url;
+    let server = Arc::new(FakeServer::default());
+    *server.start_poll_interval.lock().expect("interval") = Some(Duration::from_secs(5));
+    let p = Process::start(url, "remote-task-short-interval", &server);
+
+    let exec_id = start_run(url, "report-14", json!({})).await;
+    wait_for_token(url, exec_id).await;
+    let report = p.poller.poll_once(&p.pool).await.expect("poll");
+    assert_eq!(report.polled, 0, "the start asked for 5 seconds");
+    p.stop().await;
+}

@@ -271,9 +271,7 @@ impl HttpRemoteTasks {
             .is_some_and(is_event_stream);
         let raw = read_body(&mut response, method, id, event_stream, status).await?;
         let envelope = if event_stream {
-            std::str::from_utf8(&raw)
-                .ok()
-                .and_then(|text| sse_response(text, id))
+            sse_response(utf8_prefix(&raw), id)
         } else {
             serde_json::from_slice::<Value>(&raw).ok()
         };
@@ -355,12 +353,21 @@ async fn read_body(
         raw.extend_from_slice(&chunk);
         if event_stream
             && chunk.iter().any(|b| matches!(b, b'\n' | b'\r'))
-            && std::str::from_utf8(&raw).is_ok_and(|text| sse_response(text, id).is_some())
+            && sse_response(utf8_prefix(&raw), id).is_some()
         {
             break;
         }
     }
     Ok(raw)
+}
+
+/// The valid UTF-8 start of `raw`. A chunk can end inside a character of
+/// the next event, and the events before it still count.
+fn utf8_prefix(raw: &[u8]) -> &str {
+    match std::str::from_utf8(raw) {
+        Ok(text) => text,
+        Err(e) => std::str::from_utf8(&raw[..e.valid_up_to()]).unwrap_or_default(),
+    }
 }
 
 /// `true` for a status that asks the client to try again: 429 or 5xx.

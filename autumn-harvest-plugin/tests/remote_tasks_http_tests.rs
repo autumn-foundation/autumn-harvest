@@ -477,6 +477,43 @@ async fn an_open_event_stream_returns_at_the_matching_response() {
     assert!(began.elapsed() < Duration::from_secs(4));
 }
 
+/// A chunk can end inside a UTF-8 character of the next event.
+#[tokio::test]
+async fn an_open_event_stream_returns_before_a_partial_character() {
+    use autumn_web::reexports::axum::body::Body;
+    let (url, _) = serve(Arc::new(|body| {
+        let mut chunk = format!(
+            "event: message\ndata: {}\n\n",
+            json!({"jsonrpc": "2.0", "id": body["id"], "result": {"resultType": "task", "taskId": "t-u"}})
+        )
+        .into_bytes();
+        // The first byte of "é". The rest never arrives.
+        chunk.push(0xC3);
+        let stream = futures::stream::iter([Ok::<_, std::io::Error>(chunk)])
+            .chain(futures::stream::pending());
+        Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(stream))
+            .expect("response")
+    }))
+    .await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client");
+    let client = HttpRemoteTasks::with_client(client).server("reports", RemoteServer::mcp(&url));
+
+    let start = client
+        .start(&request(RemoteProtocol::Mcp, "export"), "k")
+        .await
+        .expect("the full event arrived");
+    assert!(
+        matches!(start, RemoteTaskStart::Task(ref h) if h.task_id == "t-u"),
+        "{start:?}"
+    );
+}
+
 /// A JSON response for another request id is a protocol error.
 #[tokio::test]
 async fn a_response_with_another_id_is_refused() {
