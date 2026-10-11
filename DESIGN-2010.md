@@ -42,26 +42,56 @@ work is in `autumn-harvest-verify` only.
 | # | How to make it lie | Mitigation |
 |---|--------------------|------------|
 | R1 | Return a `Result` held in a variable. No `Err(..)` literal shows. | An exit with no literal `Ok` or `Err` has the outcome `unknown`. The check treats it as an error. |
-| R2 | Put `and_then` between `.await` and `?`. `Break` then means a later failure, not a step failure. | The walk accepts only await plumbing: `into_future`, `Pin` and `poll`. Any other call gives `saga-result-untracked`. |
-| R3 | Pass the saga to a helper that steps or unwinds. | A value of type `Saga` that reaches a call other than a `Saga` method gives `saga-escapes`. |
-| R4 | Use two sagas. An unwind of one clears the other. | Two or more `Saga::new` sites in one body give `multiple-sagas`. |
-| R5 | The coroutine dispatch adds false paths or hides real ones. | The entry is the target of state `0`. Each resume target jumps back into a poll loop that state `0` reaches. |
+| R2 | Put `map_err` between `.await` and `?`. `Break` then comes from another value. | The walk follows the value from the step call to `Try::branch`. Any other call gives `saga-result-untracked`. |
+| R3 | Pass the saga to a helper that steps or unwinds. | A `Saga` value that reaches a call or a capture other than a `Saga` method gives `saga-escapes`. |
+| R4 | Use two sagas. An unwind of one clears the other. | Two or more `saga-new` nodes in one body give `multiple-sagas`. |
+| R5 | The coroutine dispatch adds false paths or hides real ones. | The entry is the target of state `0`. In the fixture, each resume target jumps back into a poll loop that state `0` reaches. |
 | R6 | Read an old manifest with no flow graph. Every workflow then reads as "no saga". | The manifest names its flow format. The check refuses a manifest without it. |
 | R7 | A boundary hides the body that owns the saga. | A workflow with no saga and a boundary gets `unknown`, not `no-saga`. |
-| R8 | Ignore the result: `let _ = saga.step(..).await`. | No `Try::branch` follows, so the result is untracked. |
+| R8 | Ignore the result: `let _ = saga.step(..).await`. | No `Try::branch` reads it, so the result is untracked. |
 | R9 | A step sits in a loop, and a later iteration fails outside the saga. | The check is a fixpoint over cycles. |
 | R10 | A compensation emits no command. | It is a `noop-compensation` note. Some steps have nothing to undo. |
+| R11 | Build `compensate_all()` and never await it. | Only an awaited unwind clears the flag. |
+| R12 | Start a new saga while a step of the old one is pending. | `saga-recreated`. |
+| R13 | A helper owns a saga and returns `Ok` with a step pending. | `saga-dropped-pending`. |
 
 ### 0.3 Six thinking hats
 
 | Hat | Notes |
 |-----|-------|
 | White | #1995 records bodies, call edges and step sites. Optimized coroutine MIR returns `Pending` at each suspend point. `?` lowers to `Try::branch` and `from_residual`. The engine examples hold 58 workflows. Two have boundaries. Two workspace examples use `Saga`. |
-| Red | A check that finds a gap in our own examples is exciting. A false gap would cost trust fast. |
+| Red | A check that finds gaps in the repository examples has value. A false gap costs trust fast. |
 | Black | MIR text is not stable. A new rustc can change the `?` lowering. DAG compensation runs inside the engine, so the graph cannot see it. Third-party crates stay boundaries. |
 | Yellow | One artifact. No engine change. The check is a small fixpoint. It finds real defects. |
 | Green | The fault-injection simulator can drive the event graph. The handler nodes enable a signal race check. A TLA+ export can reuse the same JSON. |
 | Blue | Red phase: fixture and failing tests. Green phase: flow graph, handlers, check, CLI. Refactor phase: docs, examples run, review. |
+
+### 0.4 Corrections after the review
+
+Four review agents read the first version. Each fix has a test.
+
+1. The first version indexed every `Pin<&mut {async block}>` body by its
+   span. That let three former `unknown` verdicts become false
+   `proven-deterministic` ones. The lookup now stays inside the closure that
+   builds the block. A block that captures a `&mut` reference is a
+   boundary. Tests: `tests/async_block_follow.rs`.
+2. The `.await?` walk followed control flow only. A `?` on another value
+   could pass for the step result. The walk now follows the value.
+3. An unawaited `compensate_all()` cleared the flag. Now only an awaited
+   one does.
+4. A new saga over a pending step, and a helper that drops a pending saga,
+   each read as `covered`. They now give `saga-recreated` and
+   `saga-dropped-pending`.
+5. `Result::<(), E>::Ok(..)` read as an `unknown` exit, which gave a false
+   gap. Generics are now removed before the cut.
+6. A move of the saga into a coroutine state place read as an escape. A
+   capture of a state place was not seen. The type annotation of the place
+   now decides both.
+7. The CLI accepted build flags with `--check-structure` and ignored them.
+   They are now a usage error. `--strict` fails a manifest with no
+   workflow. The manifest format is checked before the full parse.
+8. The model version is now `2026.10.1`. The same MIR gives another
+   manifest than before, so the upgrade check must not compare the two.
 
 ---
 
@@ -75,19 +105,20 @@ ignores both fields, so the manifest format stays `harvest-structure/1`.
 |---|---|---|
 | `entry` | | The first block. For a coroutine, the target of state `0`. |
 | `step` | `step` | A sink call site. The value is its index in `steps`. |
-| `call` | `callee` | A call that starts another body of the graph. |
+| `call` | `callees` | A call that starts other bodies of the graph. |
 | `handler` | `handler` | A handler registration. The value is its index in `handlers`. |
-| `saga-new` | | `Saga::new`. |
+| `saga-new` | | `Saga::new`, or another call that returns a saga value. |
 | `saga-step` | `forward`, `compensate`, `tracked` | `Saga::step`, with the two closure bodies. |
-| `saga-compensate` | | `Saga::compensate_all`. |
+| `saga-compensate` | `tracked` | `Saga::compensate_all`. `tracked` is true when the body awaits it. |
+| `saga-escape` | `to` | A saga value reaches a call or a capture that is not a `Saga` method. |
 | `exit` | `outcome` | A write of the returned value: `ok`, `err` or `unknown`. |
 
 An edge has an optional `label`. Only a tracked `saga-step` labels its
 edges, `ok` or `err`. An exit node has no out-edge.
 
 `WorkflowStructure.handlers` lists each handler registration: its kind
-(`signal`, `update` or `query`), its name when the MIR shows it, and its
-bodies.
+(`signal`, `update`, `query` or `other`), its name when the MIR shows it,
+and its bodies.
 
 ## 2. Saga compensation coverage
 
@@ -99,17 +130,20 @@ completed and not been unwound.
 |---|---|
 | tracked `saga-step` | `ok` edges set the flag. `err` edges clear it, because the saga unwound. |
 | untracked `saga-step` | Every edge sets the flag. |
-| `saga-compensate` | Every edge clears the flag. |
+| tracked `saga-compensate` | Every edge clears the flag. |
 | any other node | The in-state. |
 
-An exit with the outcome `err` or `unknown` and a set flag is a **gap**.
+In the workflow root, an exit with the outcome `err` or `unknown` and a set
+flag is a **gap**. In any other body, an exit with a set flag gives
+`saga-dropped-pending`. A `saga-new` with a set flag gives
+`saga-recreated`.
 
 | Verdict | When |
 |---|---|
 | `no-saga` | No body has a saga node, and the workflow has no boundary. |
 | `covered` | No gap, and no reason for `unknown`. |
 | `gap` | At least one gap, and no reason for `unknown`. |
-| `unknown` | `saga-escapes`, `saga-result-untracked`, `multiple-sagas`, or a boundary with no saga in sight. The possible gaps are still listed. |
+| `unknown` | `saga-escapes`, `saga-result-untracked`, `multiple-sagas`, `saga-recreated`, `saga-dropped-pending`, `no-flow-graph`, or a boundary with no saga in sight. The report lists each gap as possible. |
 
 A `noop-compensation` note does not change the verdict.
 
@@ -117,9 +151,9 @@ A `noop-compensation` note does not change the verdict.
 
 | AC (issue #2010) | Red test first |
 |---|---|
-| Emit the graph for a representative set of example workflows | `every_body_has_a_flow_graph`; `a_saga_step_names_its_forward_and_compensation_bodies`; `a_signal_handler_and_a_signal_wait_are_in_the_graph` |
-| Run one property (saga compensation coverage) over it | `a_plain_step_after_the_saga_is_a_gap`; `two_saga_steps_are_covered`; `an_unwind_before_each_exit_is_covered`; `a_tail_result_after_the_saga_is_a_gap` |
-| Report where the analysis hits `unknown` | `a_saga_passed_to_a_helper_is_unknown`; `a_matched_step_result_is_unknown`; `a_manifest_without_flow_graphs_is_refused` |
+| Emit the graph for a representative set of example workflows | `every_body_has_a_flow_graph`; `a_saga_step_names_its_forward_and_compensation_bodies`; `a_signal_handler_and_a_signal_wait_are_in_the_graph`; `an_update_handler_and_its_validator_are_in_the_graph` |
+| Run one property (saga compensation coverage) over it | `every_fixture_workflow_gets_its_expected_verdict`; `a_plain_step_after_the_saga_is_a_gap`; `two_saga_steps_are_covered`; `an_unwind_that_is_never_awaited_is_a_gap` |
+| Report where the analysis hits `unknown` | `a_saga_passed_to_a_helper_is_unknown`; `a_step_result_that_is_not_the_question_mark_operand_is_untracked`; `a_new_saga_over_a_pending_step_is_unknown`; `a_case_the_analysis_cannot_follow_is_never_proven` |
 | A spike write-up under `docs/rnd/` with a go / no-go verdict and the `unknown` rate | `docs/rnd/workflow-graph-spike.md`; `the_write_up_states_a_verdict_and_an_unknown_rate` |
 
 ## 4. Known limits
@@ -127,9 +161,12 @@ A `noop-compensation` note does not change the verdict.
 - The check covers the `Saga` builder only. DAG compensation runs in the
   engine, outside the graph.
 - A panic is not an error exit. Unwind edges are not in the graph.
-- A saga value moved straight out of the coroutine state into a call is not
-  seen as an escape. The usual lowering copies it into a local first.
+- A saga in an `Option` or a struct field is not seen as a saga.
+- A saga value passed straight from a coroutine state place as a call
+  argument is not seen as an escape.
 - The check trusts the `Saga` contract: a failed step unwinds every earlier
   step.
-- MIR text is not a stable API. A rustc change to the `?` lowering moves
-  results from `covered` to `unknown`, never to a wrong `covered`.
+- MIR text is not a stable API. A rustc change that removes the
+  `Try::branch` shape moves a step to untracked. The walk hard-codes the
+  case values of `Poll` and `ControlFlow`. A change to them is not
+  detected, so run the fixture tests after each toolchain bump.

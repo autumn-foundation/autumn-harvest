@@ -304,6 +304,85 @@ fn the_manifest_is_deterministic() {
     assert_eq!(m, again, "two runs over one dump give one manifest");
 }
 
+#[test]
+fn every_resume_target_rejoins_code_that_state_zero_reaches() {
+    use autumn_harvest_verify::mir::ast::Terminator;
+    use std::collections::{BTreeSet, HashMap};
+
+    let text = std::fs::read_to_string(fixture_dir().join("flow.mir")).expect("read");
+    let doc = mir::parse("flow", "flow.mir", &text);
+    let mut checked = 0;
+    for body in &doc.bodies {
+        let coroutine = body
+            .params
+            .first()
+            .is_some_and(|(_, ty)| ty.contains("{async"));
+        let Some(Terminator::SwitchInt {
+            targets, values, ..
+        }) = body.blocks.first().map(|b| &b.terminator)
+        else {
+            continue;
+        };
+        if !coroutine {
+            continue;
+        }
+        let blocks: HashMap<&str, _> = body.blocks.iter().map(|b| (b.label.as_str(), b)).collect();
+        let reach = |start: &str| {
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            let mut queue = vec![start.to_string()];
+            while let Some(label) = queue.pop() {
+                if !seen.insert(label.clone()) {
+                    continue;
+                }
+                if let Some(block) = blocks.get(label.as_str()) {
+                    queue.extend(
+                        block
+                            .terminator
+                            .successors()
+                            .into_iter()
+                            .map(str::to_string),
+                    );
+                }
+            }
+            seen
+        };
+        let entry = values
+            .iter()
+            .position(|v| v == "0")
+            .and_then(|i| targets.get(i))
+            .expect("a state 0 target");
+        let from_entry = reach(entry);
+        for (value, target) in values.iter().zip(targets) {
+            let Some(block) = blocks.get(target.as_str()) else {
+                continue;
+            };
+            // `1` is returned, `2` is panicked, and `otherwise` is
+            // unreachable. Each of them asserts or stops.
+            let stops = matches!(
+                block.terminator,
+                Terminator::Assert { .. } | Terminator::Unreachable
+            );
+            if value == "0" || stops {
+                continue;
+            }
+            assert!(
+                block
+                    .terminator
+                    .successors()
+                    .iter()
+                    .all(|next| from_entry.contains(*next)),
+                "{}: resume state {value} at {target} leaves the state-0 graph",
+                body.path
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked > 20,
+        "the fixture has many suspend points: {checked}"
+    );
+}
+
 // ── the check ──────────────────────────────────────────────────────────────
 
 #[test]

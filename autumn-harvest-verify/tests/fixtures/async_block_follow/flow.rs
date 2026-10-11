@@ -2,16 +2,7 @@
 //!
 //! The analysis follows that block only when a bodyless callee polls it. It
 //! must not turn a former `unknown` into a false `proven-deterministic`.
-//! From this directory:
-//!
-//!   rustc --crate-type lib --edition 2024 --crate-name autumn_harvest \
-//!         -o libautumn_harvest.rlib harvest_stub.rs
-//!   rustc --crate-type lib --edition 2024 --crate-name other_crate \
-//!         -o libother_crate.rlib other_crate.rs
-//!   rustc --crate-type lib --edition 2024 --emit=mir \
-//!         --extern autumn_harvest=libautumn_harvest.rlib \
-//!         --extern other_crate=libother_crate.rlib -o flow.mir flow.rs
-//!   rm libautumn_harvest.rlib libother_crate.rlib
+//! `../RUSTC_VERSION.txt` gives the build commands.
 #![allow(dead_code, unused)]
 
 use std::future::Future;

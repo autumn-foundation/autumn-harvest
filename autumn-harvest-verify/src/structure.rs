@@ -330,7 +330,7 @@ impl Recorder {
     }
 
     /// Record the `async` block a closure returns. The closure builds it, and
-    /// the caller of the closure polls it once.
+    /// the caller of the closure runs it to completion once per call.
     pub fn future_edge(&mut self, from: &str, block: &str, to: &str) {
         self.insert_edge(from, block, to, false, false);
     }

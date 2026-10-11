@@ -17,7 +17,7 @@ fn now_nanos() -> u64 {
     }
 
     bb2: {
-        _0 = Result::<Duration, SystemTimeError>::map_or::<u64, {closure@flow.rs:26:20: 26:23}>(move _1, const 0_u64, const ZeroSized: {closure@flow.rs:26:20: 26:23}) -> [return: bb3, unwind continue];
+        _0 = Result::<Duration, SystemTimeError>::map_or::<u64, {closure@flow.rs:17:20: 17:23}>(move _1, const 0_u64, const ZeroSized: {closure@flow.rs:17:20: 17:23}) -> [return: bb3, unwind continue];
     }
 
     bb3: {
@@ -25,7 +25,7 @@ fn now_nanos() -> u64 {
     }
 }
 
-fn now_nanos::{closure#0}(_1: {closure@flow.rs:26:20: 26:23}, _2: Duration) -> u64 {
+fn now_nanos::{closure#0}(_1: {closure@flow.rs:17:20: 17:23}, _2: Duration) -> u64 {
     debug d => _2;
     let mut _0: u64;
     let mut _3: &std::time::Duration;
@@ -54,7 +54,7 @@ fn wf_saga_clock(_1: &WorkflowContext) -> {async fn body of wf_saga_clock()} {
     let mut _0: {async fn body of wf_saga_clock()};
 
     bb0: {
-        _0 = {coroutine@flow.rs:34:58: 41:2 (#0)} { ctx: copy _1 };
+        _0 = {coroutine@flow.rs:25:58: 32:2 (#0)} { ctx: copy _1 };
         return;
     }
 }
@@ -62,7 +62,7 @@ fn wf_saga_clock(_1: &WorkflowContext) -> {async fn body of wf_saga_clock()} {
 fn wf_saga_clock::{closure#0}(_1: Pin<&mut {async fn body of wf_saga_clock()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
     coroutine layout {
         field _s0: Saga<'_>;
-        field _s1: {async fn body of Saga<'_>::step<u64, {closure@flow.rs:37:9: 37:11}, {async block@flow.rs:37:12: 37:17}, {closure@flow.rs:38:9: 38:12}, {async block@flow.rs:38:13: 38:18}>()};
+        field _s1: {async fn body of Saga<'_>::step<u64, {closure@flow.rs:28:9: 28:11}, {async block@flow.rs:28:12: 28:17}, {closure@flow.rs:29:9: 29:12}, {async block@flow.rs:29:13: 29:18}>()};
         variant_fields = {
             Unresumed(0): [],
             Returned (1): [],
@@ -75,14 +75,14 @@ fn wf_saga_clock::{closure#0}(_1: Pin<&mut {async fn body of wf_saga_clock()}>, 
     debug ctx => ((*_18).0: &autumn_harvest::WorkflowContext);
     let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
     let _3: &autumn_harvest::WorkflowContext;
-    let mut _4: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:37:9: 37:11}, {async block@flow.rs:37:12: 37:17}, {closure@flow.rs:38:9: 38:12}, {async block@flow.rs:38:13: 38:18}>()};
-    let mut _5: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:37:9: 37:11}, {async block@flow.rs:37:12: 37:17}, {closure@flow.rs:38:9: 38:12}, {async block@flow.rs:38:13: 38:18}>()};
+    let mut _4: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:28:9: 28:11}, {async block@flow.rs:28:12: 28:17}, {closure@flow.rs:29:9: 29:12}, {async block@flow.rs:29:13: 29:18}>()};
+    let mut _5: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:28:9: 28:11}, {async block@flow.rs:28:12: 28:17}, {closure@flow.rs:29:9: 29:12}, {async block@flow.rs:29:13: 29:18}>()};
     let mut _6: &mut autumn_harvest::Saga<'_>;
-    let mut _7: {closure@flow.rs:37:9: 37:11};
-    let mut _8: {closure@flow.rs:38:9: 38:12};
+    let mut _7: {closure@flow.rs:28:9: 28:11};
+    let mut _8: {closure@flow.rs:29:9: 29:12};
     let mut _9: std::task::Poll<std::result::Result<u64, std::string::String>>;
-    let mut _10: std::pin::Pin<&mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:37:9: 37:11}, {async block@flow.rs:37:12: 37:17}, {closure@flow.rs:38:9: 38:12}, {async block@flow.rs:38:13: 38:18}>()}>;
-    let mut _11: &mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:37:9: 37:11}, {async block@flow.rs:37:12: 37:17}, {closure@flow.rs:38:9: 38:12}, {async block@flow.rs:38:13: 38:18}>()};
+    let mut _10: std::pin::Pin<&mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:28:9: 28:11}, {async block@flow.rs:28:12: 28:17}, {closure@flow.rs:29:9: 29:12}, {async block@flow.rs:29:13: 29:18}>()}>;
+    let mut _11: &mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:28:9: 28:11}, {async block@flow.rs:28:12: 28:17}, {closure@flow.rs:29:9: 29:12}, {async block@flow.rs:29:13: 29:18}>()};
     let mut _12: &mut std::task::Context<'_>;
     let mut _13: std::future::ResumeTy;
     let mut _14: isize;
@@ -98,7 +98,7 @@ fn wf_saga_clock::{closure#0}(_1: Pin<&mut {async fn body of wf_saga_clock()}>, 
             debug saga => (((*_18) as variant#3).0: autumn_harvest::Saga<'_>);
             coroutine debug __awaitee => _s1;
             scope 3 {
-                debug __awaitee => (((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:37:9: 37:11}, {async block@flow.rs:37:12: 37:17}, {closure@flow.rs:38:9: 38:12}, {async block@flow.rs:38:13: 38:18}>()});
+                debug __awaitee => (((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:28:9: 28:11}, {async block@flow.rs:28:12: 28:17}, {closure@flow.rs:29:9: 29:12}, {async block@flow.rs:29:13: 29:18}>()});
                 let _15: std::result::Result<u64, std::string::String>;
                 scope 4 {
                     debug result => _15;
@@ -117,29 +117,29 @@ fn wf_saga_clock::{closure#0}(_1: Pin<&mut {async fn body of wf_saga_clock()}>, 
 
     bb1: {
         _6 = &mut (((*_18) as variant#3).0: autumn_harvest::Saga<'_>);
-        _7 = {closure@flow.rs:37:9: 37:11} { ctx: copy _3 };
-        _8 = {closure@flow.rs:38:9: 38:12};
-        _5 = Saga::<'_>::step::<u64, {closure@flow.rs:37:9: 37:11}, {async block@flow.rs:37:12: 37:17}, {closure@flow.rs:38:9: 38:12}, {async block@flow.rs:38:13: 38:18}>(move _6, move _7, move _8) -> [return: bb2, unwind: bb12];
+        _7 = {closure@flow.rs:28:9: 28:11} { ctx: copy _3 };
+        _8 = {closure@flow.rs:29:9: 29:12};
+        _5 = Saga::<'_>::step::<u64, {closure@flow.rs:28:9: 28:11}, {async block@flow.rs:28:12: 28:17}, {closure@flow.rs:29:9: 29:12}, {async block@flow.rs:29:13: 29:18}>(move _6, move _7, move _8) -> [return: bb2, unwind: bb12];
     }
 
     bb2: {
-        _4 = <{async fn body of Saga<'_>::step<u64, {closure@flow.rs:37:9: 37:11}, {async block@flow.rs:37:12: 37:17}, {closure@flow.rs:38:9: 38:12}, {async block@flow.rs:38:13: 38:18}>()} as IntoFuture>::into_future(move _5) -> [return: bb3, unwind: bb12];
+        _4 = <{async fn body of Saga<'_>::step<u64, {closure@flow.rs:28:9: 28:11}, {async block@flow.rs:28:12: 28:17}, {closure@flow.rs:29:9: 29:12}, {async block@flow.rs:29:13: 29:18}>()} as IntoFuture>::into_future(move _5) -> [return: bb3, unwind: bb12];
     }
 
     bb3: {
-        (((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:37:9: 37:11}, {async block@flow.rs:37:12: 37:17}, {closure@flow.rs:38:9: 38:12}, {async block@flow.rs:38:13: 38:18}>()}) = move _4;
+        (((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:28:9: 28:11}, {async block@flow.rs:28:12: 28:17}, {closure@flow.rs:29:9: 29:12}, {async block@flow.rs:29:13: 29:18}>()}) = move _4;
         goto -> bb4;
     }
 
     bb4: {
-        _11 = &mut (((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:37:9: 37:11}, {async block@flow.rs:37:12: 37:17}, {closure@flow.rs:38:9: 38:12}, {async block@flow.rs:38:13: 38:18}>()});
-        _10 = Pin::<&mut {async fn body of Saga<'_>::step<u64, {closure@flow.rs:37:9: 37:11}, {async block@flow.rs:37:12: 37:17}, {closure@flow.rs:38:9: 38:12}, {async block@flow.rs:38:13: 38:18}>()}>::new_unchecked(copy _11) -> [return: bb5, unwind: bb11];
+        _11 = &mut (((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:28:9: 28:11}, {async block@flow.rs:28:12: 28:17}, {closure@flow.rs:29:9: 29:12}, {async block@flow.rs:29:13: 29:18}>()});
+        _10 = Pin::<&mut {async fn body of Saga<'_>::step<u64, {closure@flow.rs:28:9: 28:11}, {async block@flow.rs:28:12: 28:17}, {closure@flow.rs:29:9: 29:12}, {async block@flow.rs:29:13: 29:18}>()}>::new_unchecked(copy _11) -> [return: bb5, unwind: bb11];
     }
 
     bb5: {
         _13 = copy _19;
         _12 = copy (_13.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
-        _9 = <{async fn body of Saga<'_>::step<u64, {closure@flow.rs:37:9: 37:11}, {async block@flow.rs:37:12: 37:17}, {closure@flow.rs:38:9: 38:12}, {async block@flow.rs:38:13: 38:18}>()} as Future>::poll(move _10, copy _12) -> [return: bb6, unwind: bb11];
+        _9 = <{async fn body of Saga<'_>::step<u64, {closure@flow.rs:28:9: 28:11}, {async block@flow.rs:28:12: 28:17}, {closure@flow.rs:29:9: 29:12}, {async block@flow.rs:29:13: 29:18}>()} as Future>::poll(move _10, copy _12) -> [return: bb6, unwind: bb11];
     }
 
     bb6: {
@@ -159,7 +159,7 @@ fn wf_saga_clock::{closure#0}(_1: Pin<&mut {async fn body of wf_saga_clock()}>, 
 
     bb9: {
         _15 = move ((_9 as Ready).0: std::result::Result<u64, std::string::String>);
-        drop((((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:37:9: 37:11}, {async block@flow.rs:37:12: 37:17}, {closure@flow.rs:38:9: 38:12}, {async block@flow.rs:38:13: 38:18}>()})) -> [return: bb10, unwind: bb12];
+        drop((((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:28:9: 28:11}, {async block@flow.rs:28:12: 28:17}, {closure@flow.rs:29:9: 29:12}, {async block@flow.rs:29:13: 29:18}>()})) -> [return: bb10, unwind: bb12];
     }
 
     bb10: {
@@ -169,7 +169,7 @@ fn wf_saga_clock::{closure#0}(_1: Pin<&mut {async fn body of wf_saga_clock()}>, 
     }
 
     bb11 (cleanup): {
-        drop((((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:37:9: 37:11}, {async block@flow.rs:37:12: 37:17}, {closure@flow.rs:38:9: 38:12}, {async block@flow.rs:38:13: 38:18}>()})) -> [return: bb12, unwind terminate(cleanup)];
+        drop((((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:28:9: 28:11}, {async block@flow.rs:28:12: 28:17}, {closure@flow.rs:29:9: 29:12}, {async block@flow.rs:29:13: 29:18}>()})) -> [return: bb12, unwind terminate(cleanup)];
     }
 
     bb12 (cleanup): {
@@ -197,19 +197,19 @@ fn wf_saga_clock::{closure#0}(_1: Pin<&mut {async fn body of wf_saga_clock()}>, 
     }
 }
 
-fn wf_saga_clock::{closure#0}::{closure#0}(_1: {closure@flow.rs:37:9: 37:11}) -> {async block@flow.rs:37:12: 37:17} {
+fn wf_saga_clock::{closure#0}::{closure#0}(_1: {closure@flow.rs:28:9: 28:11}) -> {async block@flow.rs:28:12: 28:17} {
     debug ctx => const WorkflowContext;
-    let mut _0: {async block@flow.rs:37:12: 37:17};
+    let mut _0: {async block@flow.rs:28:12: 28:17};
     let mut _2: &autumn_harvest::WorkflowContext;
 
     bb0: {
         _2 = no_retag copy (_1.0: &autumn_harvest::WorkflowContext);
-        _0 = {coroutine@flow.rs:37:12: 37:17 (#0)} { ctx: copy _2 };
+        _0 = {coroutine@flow.rs:28:12: 28:17 (#0)} { ctx: copy _2 };
         return;
     }
 }
 
-fn wf_saga_clock::{closure#0}::{closure#0}::{closure#0}(_1: Pin<&mut {async block@flow.rs:37:12: 37:17}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+fn wf_saga_clock::{closure#0}::{closure#0}::{closure#0}(_1: Pin<&mut {async block@flow.rs:28:12: 28:17}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
     coroutine layout {
         field _s0: std::future::Ready<Result<u64, String>>;
         variant_fields = {
@@ -237,7 +237,7 @@ fn wf_saga_clock::{closure#0}::{closure#0}::{closure#0}(_1: Pin<&mut {async bloc
     let mut _14: std::future::ResumeTy;
     let mut _15: &autumn_harvest::WorkflowContext;
     let mut _16: u32;
-    let mut _17: &mut {async block@flow.rs:37:12: 37:17};
+    let mut _17: &mut {async block@flow.rs:28:12: 28:17};
     let mut _18: std::future::ResumeTy;
     let mut _19: std::ptr::NonNull<std::task::Context<'_>>;
     scope 1 {
@@ -251,7 +251,7 @@ fn wf_saga_clock::{closure#0}::{closure#0}::{closure#0}(_1: Pin<&mut {async bloc
     bb0: {
         _19 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
         _18 = std::future::ResumeTy(move _19);
-        _17 = copy (_1.0: &mut {async block@flow.rs:37:12: 37:17});
+        _17 = copy (_1.0: &mut {async block@flow.rs:28:12: 28:17});
         _16 = discriminant((*_17));
         switchInt(move _16) -> [0: bb16, 1: bb15, 2: bb14, 3: bb13, otherwise: bb7];
     }
@@ -340,16 +340,16 @@ alloc1 (size: 1, align: 1) {
     72                                              │ r
 }
 
-fn wf_saga_clock::{closure#0}::{closure#1}(_1: {closure@flow.rs:38:9: 38:12}, _2: u64) -> {async block@flow.rs:38:13: 38:18} {
-    let mut _0: {async block@flow.rs:38:13: 38:18};
+fn wf_saga_clock::{closure#0}::{closure#1}(_1: {closure@flow.rs:29:9: 29:12}, _2: u64) -> {async block@flow.rs:29:13: 29:18} {
+    let mut _0: {async block@flow.rs:29:13: 29:18};
 
     bb0: {
-        _0 = {coroutine@flow.rs:38:13: 38:18 (#0)};
+        _0 = {coroutine@flow.rs:29:13: 29:18 (#0)};
         return;
     }
 }
 
-fn wf_saga_clock::{closure#0}::{closure#1}::{closure#0}(_1: Pin<&mut {async block@flow.rs:38:13: 38:18}>, _2: &mut Context<'_>) -> Poll<Result<(), String>> {
+fn wf_saga_clock::{closure#0}::{closure#1}::{closure#0}(_1: Pin<&mut {async block@flow.rs:29:13: 29:18}>, _2: &mut Context<'_>) -> Poll<Result<(), String>> {
     coroutine layout {
         variant_fields = {
             Unresumed(0): [],
@@ -363,14 +363,14 @@ fn wf_saga_clock::{closure#0}::{closure#1}::{closure#0}(_1: Pin<&mut {async bloc
     let mut _3: ();
     let mut _4: std::result::Result<(), std::string::String>;
     let mut _5: u32;
-    let mut _6: &mut {async block@flow.rs:38:13: 38:18};
+    let mut _6: &mut {async block@flow.rs:29:13: 29:18};
     let mut _7: std::future::ResumeTy;
     let mut _8: std::ptr::NonNull<std::task::Context<'_>>;
 
     bb0: {
         _8 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
         _7 = std::future::ResumeTy(move _8);
-        _6 = copy (_1.0: &mut {async block@flow.rs:38:13: 38:18});
+        _6 = copy (_1.0: &mut {async block@flow.rs:29:13: 29:18});
         _5 = discriminant((*_6));
         switchInt(move _5) -> [0: bb3, 1: bb1, otherwise: bb2];
     }
@@ -397,7 +397,7 @@ fn reserve(_1: &WorkflowContext) -> {async fn body of reserve()} {
     let mut _0: {async fn body of reserve()};
 
     bb0: {
-        _0 = {coroutine@flow.rs:44:48: 46:2 (#0)} { ctx: copy _1 };
+        _0 = {coroutine@flow.rs:35:48: 37:2 (#0)} { ctx: copy _1 };
         return;
     }
 }
@@ -550,7 +550,7 @@ fn wf_saga_async_fn(_1: &WorkflowContext) -> {async fn body of wf_saga_async_fn(
     let mut _0: {async fn body of wf_saga_async_fn()};
 
     bb0: {
-        _0 = {coroutine@flow.rs:53:61: 56:2 (#0)} { ctx: copy _1 };
+        _0 = {coroutine@flow.rs:44:61: 47:2 (#0)} { ctx: copy _1 };
         return;
     }
 }
@@ -558,7 +558,7 @@ fn wf_saga_async_fn(_1: &WorkflowContext) -> {async fn body of wf_saga_async_fn(
 fn wf_saga_async_fn::{closure#0}(_1: Pin<&mut {async fn body of wf_saga_async_fn()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
     coroutine layout {
         field _s0: Saga<'_>;
-        field _s1: {async fn body of Saga<'_>::step<u64, {closure@flow.rs:55:15: 55:17}, {async fn body of reserve()}, {closure@flow.rs:55:32: 55:35}, {async block@flow.rs:55:36: 55:41}>()};
+        field _s1: {async fn body of Saga<'_>::step<u64, {closure@flow.rs:46:15: 46:17}, {async fn body of reserve()}, {closure@flow.rs:46:32: 46:35}, {async block@flow.rs:46:36: 46:41}>()};
         variant_fields = {
             Unresumed(0): [],
             Returned (1): [],
@@ -571,14 +571,14 @@ fn wf_saga_async_fn::{closure#0}(_1: Pin<&mut {async fn body of wf_saga_async_fn
     debug ctx => ((*_18).0: &autumn_harvest::WorkflowContext);
     let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
     let _3: &autumn_harvest::WorkflowContext;
-    let mut _4: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:55:15: 55:17}, {async fn body of reserve()}, {closure@flow.rs:55:32: 55:35}, {async block@flow.rs:55:36: 55:41}>()};
-    let mut _5: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:55:15: 55:17}, {async fn body of reserve()}, {closure@flow.rs:55:32: 55:35}, {async block@flow.rs:55:36: 55:41}>()};
+    let mut _4: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:46:15: 46:17}, {async fn body of reserve()}, {closure@flow.rs:46:32: 46:35}, {async block@flow.rs:46:36: 46:41}>()};
+    let mut _5: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:46:15: 46:17}, {async fn body of reserve()}, {closure@flow.rs:46:32: 46:35}, {async block@flow.rs:46:36: 46:41}>()};
     let mut _6: &mut autumn_harvest::Saga<'_>;
-    let mut _7: {closure@flow.rs:55:15: 55:17};
-    let mut _8: {closure@flow.rs:55:32: 55:35};
+    let mut _7: {closure@flow.rs:46:15: 46:17};
+    let mut _8: {closure@flow.rs:46:32: 46:35};
     let mut _9: std::task::Poll<std::result::Result<u64, std::string::String>>;
-    let mut _10: std::pin::Pin<&mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:55:15: 55:17}, {async fn body of reserve()}, {closure@flow.rs:55:32: 55:35}, {async block@flow.rs:55:36: 55:41}>()}>;
-    let mut _11: &mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:55:15: 55:17}, {async fn body of reserve()}, {closure@flow.rs:55:32: 55:35}, {async block@flow.rs:55:36: 55:41}>()};
+    let mut _10: std::pin::Pin<&mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:46:15: 46:17}, {async fn body of reserve()}, {closure@flow.rs:46:32: 46:35}, {async block@flow.rs:46:36: 46:41}>()}>;
+    let mut _11: &mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:46:15: 46:17}, {async fn body of reserve()}, {closure@flow.rs:46:32: 46:35}, {async block@flow.rs:46:36: 46:41}>()};
     let mut _12: &mut std::task::Context<'_>;
     let mut _13: std::future::ResumeTy;
     let mut _14: isize;
@@ -594,7 +594,7 @@ fn wf_saga_async_fn::{closure#0}(_1: Pin<&mut {async fn body of wf_saga_async_fn
             debug saga => (((*_18) as variant#3).0: autumn_harvest::Saga<'_>);
             coroutine debug __awaitee => _s1;
             scope 3 {
-                debug __awaitee => (((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:55:15: 55:17}, {async fn body of reserve()}, {closure@flow.rs:55:32: 55:35}, {async block@flow.rs:55:36: 55:41}>()});
+                debug __awaitee => (((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:46:15: 46:17}, {async fn body of reserve()}, {closure@flow.rs:46:32: 46:35}, {async block@flow.rs:46:36: 46:41}>()});
                 let _15: std::result::Result<u64, std::string::String>;
                 scope 4 {
                     debug result => _15;
@@ -613,29 +613,29 @@ fn wf_saga_async_fn::{closure#0}(_1: Pin<&mut {async fn body of wf_saga_async_fn
 
     bb1: {
         _6 = &mut (((*_18) as variant#3).0: autumn_harvest::Saga<'_>);
-        _7 = {closure@flow.rs:55:15: 55:17} { ctx: copy _3 };
-        _8 = {closure@flow.rs:55:32: 55:35};
-        _5 = Saga::<'_>::step::<u64, {closure@flow.rs:55:15: 55:17}, {async fn body of reserve()}, {closure@flow.rs:55:32: 55:35}, {async block@flow.rs:55:36: 55:41}>(move _6, move _7, move _8) -> [return: bb2, unwind: bb12];
+        _7 = {closure@flow.rs:46:15: 46:17} { ctx: copy _3 };
+        _8 = {closure@flow.rs:46:32: 46:35};
+        _5 = Saga::<'_>::step::<u64, {closure@flow.rs:46:15: 46:17}, {async fn body of reserve()}, {closure@flow.rs:46:32: 46:35}, {async block@flow.rs:46:36: 46:41}>(move _6, move _7, move _8) -> [return: bb2, unwind: bb12];
     }
 
     bb2: {
-        _4 = <{async fn body of Saga<'_>::step<u64, {closure@flow.rs:55:15: 55:17}, {async fn body of reserve()}, {closure@flow.rs:55:32: 55:35}, {async block@flow.rs:55:36: 55:41}>()} as IntoFuture>::into_future(move _5) -> [return: bb3, unwind: bb12];
+        _4 = <{async fn body of Saga<'_>::step<u64, {closure@flow.rs:46:15: 46:17}, {async fn body of reserve()}, {closure@flow.rs:46:32: 46:35}, {async block@flow.rs:46:36: 46:41}>()} as IntoFuture>::into_future(move _5) -> [return: bb3, unwind: bb12];
     }
 
     bb3: {
-        (((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:55:15: 55:17}, {async fn body of reserve()}, {closure@flow.rs:55:32: 55:35}, {async block@flow.rs:55:36: 55:41}>()}) = move _4;
+        (((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:46:15: 46:17}, {async fn body of reserve()}, {closure@flow.rs:46:32: 46:35}, {async block@flow.rs:46:36: 46:41}>()}) = move _4;
         goto -> bb4;
     }
 
     bb4: {
-        _11 = &mut (((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:55:15: 55:17}, {async fn body of reserve()}, {closure@flow.rs:55:32: 55:35}, {async block@flow.rs:55:36: 55:41}>()});
-        _10 = Pin::<&mut {async fn body of Saga<'_>::step<u64, {closure@flow.rs:55:15: 55:17}, {async fn body of reserve()}, {closure@flow.rs:55:32: 55:35}, {async block@flow.rs:55:36: 55:41}>()}>::new_unchecked(copy _11) -> [return: bb5, unwind: bb11];
+        _11 = &mut (((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:46:15: 46:17}, {async fn body of reserve()}, {closure@flow.rs:46:32: 46:35}, {async block@flow.rs:46:36: 46:41}>()});
+        _10 = Pin::<&mut {async fn body of Saga<'_>::step<u64, {closure@flow.rs:46:15: 46:17}, {async fn body of reserve()}, {closure@flow.rs:46:32: 46:35}, {async block@flow.rs:46:36: 46:41}>()}>::new_unchecked(copy _11) -> [return: bb5, unwind: bb11];
     }
 
     bb5: {
         _13 = copy _19;
         _12 = copy (_13.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
-        _9 = <{async fn body of Saga<'_>::step<u64, {closure@flow.rs:55:15: 55:17}, {async fn body of reserve()}, {closure@flow.rs:55:32: 55:35}, {async block@flow.rs:55:36: 55:41}>()} as Future>::poll(move _10, copy _12) -> [return: bb6, unwind: bb11];
+        _9 = <{async fn body of Saga<'_>::step<u64, {closure@flow.rs:46:15: 46:17}, {async fn body of reserve()}, {closure@flow.rs:46:32: 46:35}, {async block@flow.rs:46:36: 46:41}>()} as Future>::poll(move _10, copy _12) -> [return: bb6, unwind: bb11];
     }
 
     bb6: {
@@ -655,7 +655,7 @@ fn wf_saga_async_fn::{closure#0}(_1: Pin<&mut {async fn body of wf_saga_async_fn
 
     bb9: {
         _15 = move ((_9 as Ready).0: std::result::Result<u64, std::string::String>);
-        drop((((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:55:15: 55:17}, {async fn body of reserve()}, {closure@flow.rs:55:32: 55:35}, {async block@flow.rs:55:36: 55:41}>()})) -> [return: bb10, unwind: bb12];
+        drop((((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:46:15: 46:17}, {async fn body of reserve()}, {closure@flow.rs:46:32: 46:35}, {async block@flow.rs:46:36: 46:41}>()})) -> [return: bb10, unwind: bb12];
     }
 
     bb10: {
@@ -665,7 +665,7 @@ fn wf_saga_async_fn::{closure#0}(_1: Pin<&mut {async fn body of wf_saga_async_fn
     }
 
     bb11 (cleanup): {
-        drop((((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:55:15: 55:17}, {async fn body of reserve()}, {closure@flow.rs:55:32: 55:35}, {async block@flow.rs:55:36: 55:41}>()})) -> [return: bb12, unwind terminate(cleanup)];
+        drop((((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:46:15: 46:17}, {async fn body of reserve()}, {closure@flow.rs:46:32: 46:35}, {async block@flow.rs:46:36: 46:41}>()})) -> [return: bb12, unwind terminate(cleanup)];
     }
 
     bb12 (cleanup): {
@@ -693,7 +693,7 @@ fn wf_saga_async_fn::{closure#0}(_1: Pin<&mut {async fn body of wf_saga_async_fn
     }
 }
 
-fn wf_saga_async_fn::{closure#0}::{closure#0}(_1: {closure@flow.rs:55:15: 55:17}) -> {async fn body of reserve()} {
+fn wf_saga_async_fn::{closure#0}::{closure#0}(_1: {closure@flow.rs:46:15: 46:17}) -> {async fn body of reserve()} {
     debug ctx => const WorkflowContext;
     let mut _0: {async fn body of reserve()};
     let mut _2: &autumn_harvest::WorkflowContext;
@@ -708,16 +708,16 @@ fn wf_saga_async_fn::{closure#0}::{closure#0}(_1: {closure@flow.rs:55:15: 55:17}
     }
 }
 
-fn wf_saga_async_fn::{closure#0}::{closure#1}(_1: {closure@flow.rs:55:32: 55:35}, _2: u64) -> {async block@flow.rs:55:36: 55:41} {
-    let mut _0: {async block@flow.rs:55:36: 55:41};
+fn wf_saga_async_fn::{closure#0}::{closure#1}(_1: {closure@flow.rs:46:32: 46:35}, _2: u64) -> {async block@flow.rs:46:36: 46:41} {
+    let mut _0: {async block@flow.rs:46:36: 46:41};
 
     bb0: {
-        _0 = {coroutine@flow.rs:55:36: 55:41 (#0)};
+        _0 = {coroutine@flow.rs:46:36: 46:41 (#0)};
         return;
     }
 }
 
-fn wf_saga_async_fn::{closure#0}::{closure#1}::{closure#0}(_1: Pin<&mut {async block@flow.rs:55:36: 55:41}>, _2: &mut Context<'_>) -> Poll<Result<(), String>> {
+fn wf_saga_async_fn::{closure#0}::{closure#1}::{closure#0}(_1: Pin<&mut {async block@flow.rs:46:36: 46:41}>, _2: &mut Context<'_>) -> Poll<Result<(), String>> {
     coroutine layout {
         variant_fields = {
             Unresumed(0): [],
@@ -731,14 +731,14 @@ fn wf_saga_async_fn::{closure#0}::{closure#1}::{closure#0}(_1: Pin<&mut {async b
     let mut _3: ();
     let mut _4: std::result::Result<(), std::string::String>;
     let mut _5: u32;
-    let mut _6: &mut {async block@flow.rs:55:36: 55:41};
+    let mut _6: &mut {async block@flow.rs:46:36: 46:41};
     let mut _7: std::future::ResumeTy;
     let mut _8: std::ptr::NonNull<std::task::Context<'_>>;
 
     bb0: {
         _8 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
         _7 = std::future::ResumeTy(move _8);
-        _6 = copy (_1.0: &mut {async block@flow.rs:55:36: 55:41});
+        _6 = copy (_1.0: &mut {async block@flow.rs:46:36: 46:41});
         _5 = discriminant((*_6));
         switchInt(move _5) -> [0: bb3, 1: bb1, otherwise: bb2];
     }
@@ -774,14 +774,14 @@ fn wf_external(_1: &WorkflowContext) -> {async fn body of wf_external()} {
     let mut _0: {async fn body of wf_external()};
 
     bb0: {
-        _0 = {coroutine@flow.rs:63:56: 65:2 (#0)} { ctx: copy _1 };
+        _0 = {coroutine@flow.rs:54:56: 56:2 (#0)} { ctx: copy _1 };
         return;
     }
 }
 
 fn wf_external::{closure#0}(_1: Pin<&mut {async fn body of wf_external()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
     coroutine layout {
-        field _s0: {async block@flow.rs:64:23: 64:28};
+        field _s0: {async block@flow.rs:55:23: 55:28};
         variant_fields = {
             Unresumed(0): [],
             Returned (1): [],
@@ -794,12 +794,12 @@ fn wf_external::{closure#0}(_1: Pin<&mut {async fn body of wf_external()}>, _2: 
     debug ctx => ((*_16).0: &autumn_harvest::WorkflowContext);
     let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
     let _3: &autumn_harvest::WorkflowContext;
-    let mut _4: {async block@flow.rs:64:23: 64:28};
-    let mut _5: {async block@flow.rs:64:23: 64:28};
-    let mut _6: {async block@flow.rs:64:23: 64:28};
+    let mut _4: {async block@flow.rs:55:23: 55:28};
+    let mut _5: {async block@flow.rs:55:23: 55:28};
+    let mut _6: {async block@flow.rs:55:23: 55:28};
     let mut _7: std::task::Poll<std::result::Result<u64, std::string::String>>;
-    let mut _8: std::pin::Pin<&mut {async block@flow.rs:64:23: 64:28}>;
-    let mut _9: &mut {async block@flow.rs:64:23: 64:28};
+    let mut _8: std::pin::Pin<&mut {async block@flow.rs:55:23: 55:28}>;
+    let mut _9: &mut {async block@flow.rs:55:23: 55:28};
     let mut _10: &mut std::task::Context<'_>;
     let mut _11: std::future::ResumeTy;
     let mut _12: isize;
@@ -812,7 +812,7 @@ fn wf_external::{closure#0}(_1: Pin<&mut {async fn body of wf_external()}>, _2: 
         debug ctx => _3;
         coroutine debug __awaitee => _s0;
         scope 2 {
-            debug __awaitee => (((*_16) as variant#3).0: {async block@flow.rs:64:23: 64:28});
+            debug __awaitee => (((*_16) as variant#3).0: {async block@flow.rs:55:23: 55:28});
             let _13: std::result::Result<u64, std::string::String>;
             scope 3 {
                 debug result => _13;
@@ -829,23 +829,23 @@ fn wf_external::{closure#0}(_1: Pin<&mut {async fn body of wf_external()}>, _2: 
     }
 
     bb1: {
-        _4 = <{async block@flow.rs:64:23: 64:28} as IntoFuture>::into_future(move _5) -> [return: bb2, unwind: bb11];
+        _4 = <{async block@flow.rs:55:23: 55:28} as IntoFuture>::into_future(move _5) -> [return: bb2, unwind: bb11];
     }
 
     bb2: {
-        (((*_16) as variant#3).0: {async block@flow.rs:64:23: 64:28}) = move _4;
+        (((*_16) as variant#3).0: {async block@flow.rs:55:23: 55:28}) = move _4;
         goto -> bb3;
     }
 
     bb3: {
-        _9 = &mut (((*_16) as variant#3).0: {async block@flow.rs:64:23: 64:28});
-        _8 = Pin::<&mut {async block@flow.rs:64:23: 64:28}>::new_unchecked(copy _9) -> [return: bb4, unwind: bb10];
+        _9 = &mut (((*_16) as variant#3).0: {async block@flow.rs:55:23: 55:28});
+        _8 = Pin::<&mut {async block@flow.rs:55:23: 55:28}>::new_unchecked(copy _9) -> [return: bb4, unwind: bb10];
     }
 
     bb4: {
         _11 = copy _17;
         _10 = copy (_11.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
-        _7 = <{async block@flow.rs:64:23: 64:28} as Future>::poll(move _8, copy _10) -> [return: bb5, unwind: bb10];
+        _7 = <{async block@flow.rs:55:23: 55:28} as Future>::poll(move _8, copy _10) -> [return: bb5, unwind: bb10];
     }
 
     bb5: {
@@ -865,7 +865,7 @@ fn wf_external::{closure#0}(_1: Pin<&mut {async fn body of wf_external()}>, _2: 
 
     bb8: {
         _13 = move ((_7 as Ready).0: std::result::Result<u64, std::string::String>);
-        drop((((*_16) as variant#3).0: {async block@flow.rs:64:23: 64:28})) -> [return: bb9, unwind: bb11];
+        drop((((*_16) as variant#3).0: {async block@flow.rs:55:23: 55:28})) -> [return: bb9, unwind: bb11];
     }
 
     bb9: {
@@ -875,7 +875,7 @@ fn wf_external::{closure#0}(_1: Pin<&mut {async fn body of wf_external()}>, _2: 
     }
 
     bb10 (cleanup): {
-        drop((((*_16) as variant#3).0: {async block@flow.rs:64:23: 64:28})) -> [return: bb11, unwind terminate(cleanup)];
+        drop((((*_16) as variant#3).0: {async block@flow.rs:55:23: 55:28})) -> [return: bb11, unwind terminate(cleanup)];
     }
 
     bb11 (cleanup): {
@@ -899,12 +899,12 @@ fn wf_external::{closure#0}(_1: Pin<&mut {async fn body of wf_external()}>, _2: 
 
     bb15: {
         _3 = copy ((*_16).0: &autumn_harvest::WorkflowContext);
-        _6 = {coroutine@flow.rs:64:23: 64:28 (#0)} { ctx: copy _3 };
-        _5 = wrap::<{async block@flow.rs:64:23: 64:28}>(move _6) -> [return: bb1, unwind: bb11];
+        _6 = {coroutine@flow.rs:55:23: 55:28 (#0)} { ctx: copy _3 };
+        _5 = wrap::<{async block@flow.rs:55:23: 55:28}>(move _6) -> [return: bb1, unwind: bb11];
     }
 }
 
-fn wf_external::{closure#0}::{closure#0}(_1: Pin<&mut {async block@flow.rs:64:23: 64:28}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+fn wf_external::{closure#0}::{closure#0}(_1: Pin<&mut {async block@flow.rs:55:23: 55:28}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
     coroutine layout {
         field _s0: std::future::Ready<Result<u64, String>>;
         variant_fields = {
@@ -931,7 +931,7 @@ fn wf_external::{closure#0}::{closure#0}(_1: Pin<&mut {async block@flow.rs:64:23
     let mut _13: std::future::ResumeTy;
     let mut _14: &autumn_harvest::WorkflowContext;
     let mut _15: u32;
-    let mut _16: &mut {async block@flow.rs:64:23: 64:28};
+    let mut _16: &mut {async block@flow.rs:55:23: 55:28};
     let mut _17: std::future::ResumeTy;
     let mut _18: std::ptr::NonNull<std::task::Context<'_>>;
     scope 1 {
@@ -945,7 +945,7 @@ fn wf_external::{closure#0}::{closure#0}(_1: Pin<&mut {async block@flow.rs:64:23
     bb0: {
         _18 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
         _17 = std::future::ResumeTy(move _18);
-        _16 = copy (_1.0: &mut {async block@flow.rs:64:23: 64:28});
+        _16 = copy (_1.0: &mut {async block@flow.rs:55:23: 55:28});
         _15 = discriminant((*_16));
         switchInt(move _15) -> [0: bb15, 1: bb14, 2: bb13, 3: bb12, otherwise: bb6];
     }
@@ -1030,17 +1030,17 @@ alloc3 (size: 1, align: 1) {
     61                                              │ a
 }
 
-fn helper(_1: &WorkflowContext) -> {async block@flow.rs:69:9: 69:19} {
+fn helper(_1: &WorkflowContext) -> {async block@flow.rs:60:9: 60:19} {
     debug ctx => _1;
-    let mut _0: {async block@flow.rs:69:9: 69:19};
+    let mut _0: {async block@flow.rs:60:9: 60:19};
 
     bb0: {
-        _0 = {coroutine@flow.rs:69:9: 69:19 (#5)} { ctx: copy _1 };
+        _0 = {coroutine@flow.rs:60:9: 60:19 (#5)} { ctx: copy _1 };
         return;
     }
 }
 
-fn helper::{closure#0}(_1: Pin<&mut {async block@flow.rs:69:9: 69:19}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+fn helper::{closure#0}(_1: Pin<&mut {async block@flow.rs:60:9: 60:19}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
     coroutine layout {
         field _s0: std::future::Ready<Result<u64, String>>;
         variant_fields = {
@@ -1068,7 +1068,7 @@ fn helper::{closure#0}(_1: Pin<&mut {async block@flow.rs:69:9: 69:19}>, _2: &mut
     let mut _14: std::future::ResumeTy;
     let mut _15: &autumn_harvest::WorkflowContext;
     let mut _16: u32;
-    let mut _17: &mut {async block@flow.rs:69:9: 69:19};
+    let mut _17: &mut {async block@flow.rs:60:9: 60:19};
     let mut _18: std::future::ResumeTy;
     let mut _19: std::ptr::NonNull<std::task::Context<'_>>;
     scope 1 {
@@ -1082,7 +1082,7 @@ fn helper::{closure#0}(_1: Pin<&mut {async block@flow.rs:69:9: 69:19}>, _2: &mut
     bb0: {
         _19 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
         _18 = std::future::ResumeTy(move _19);
-        _17 = copy (_1.0: &mut {async block@flow.rs:69:9: 69:19});
+        _17 = copy (_1.0: &mut {async block@flow.rs:60:9: 60:19});
         _16 = discriminant((*_17));
         switchInt(move _16) -> [0: bb16, 1: bb15, 2: bb14, 3: bb13, otherwise: bb7];
     }
@@ -1185,7 +1185,7 @@ fn wf_shared_span(_1: &WorkflowContext) -> {async fn body of wf_shared_span()} {
     let mut _0: {async fn body of wf_shared_span()};
 
     bb0: {
-        _0 = {coroutine@flow.rs:82:59: 85:2 (#0)} { ctx: copy _1 };
+        _0 = {coroutine@flow.rs:73:59: 76:2 (#0)} { ctx: copy _1 };
         return;
     }
 }
@@ -1193,8 +1193,8 @@ fn wf_shared_span(_1: &WorkflowContext) -> {async fn body of wf_shared_span()} {
 fn wf_shared_span::{closure#0}(_1: Pin<&mut {async fn body of wf_shared_span()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
     coroutine layout {
         field _s0: &WorkflowContext;
-        field _s1: {async block@flow.rs:69:9: 69:19};
-        field _s2: {async block@flow.rs:69:9: 69:19};
+        field _s1: {async block@flow.rs:60:9: 60:19};
+        field _s2: {async block@flow.rs:60:9: 60:19};
         variant_fields = {
             Unresumed(0): [],
             Returned (1): [],
@@ -1209,21 +1209,21 @@ fn wf_shared_span::{closure#0}(_1: Pin<&mut {async fn body of wf_shared_span()}>
     coroutine debug ctx => _s0;
     let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
     let mut _3: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, std::string::String>, u64>;
-    let mut _4: {async block@flow.rs:69:9: 69:19};
-    let mut _5: {async block@flow.rs:69:9: 69:19};
+    let mut _4: {async block@flow.rs:60:9: 60:19};
+    let mut _5: {async block@flow.rs:60:9: 60:19};
     let mut _6: std::task::Poll<std::result::Result<u64, std::string::String>>;
-    let mut _7: std::pin::Pin<&mut {async block@flow.rs:69:9: 69:19}>;
-    let mut _8: &mut {async block@flow.rs:69:9: 69:19};
+    let mut _7: std::pin::Pin<&mut {async block@flow.rs:60:9: 60:19}>;
+    let mut _8: &mut {async block@flow.rs:60:9: 60:19};
     let mut _9: &mut std::task::Context<'_>;
     let mut _10: std::future::ResumeTy;
     let mut _11: isize;
     let mut _13: std::future::ResumeTy;
     let mut _14: isize;
-    let mut _17: {async block@flow.rs:69:9: 69:19};
-    let mut _18: {async block@flow.rs:69:9: 69:19};
+    let mut _17: {async block@flow.rs:60:9: 60:19};
+    let mut _18: {async block@flow.rs:60:9: 60:19};
     let mut _19: std::task::Poll<std::result::Result<u64, std::string::String>>;
-    let mut _20: std::pin::Pin<&mut {async block@flow.rs:69:9: 69:19}>;
-    let mut _21: &mut {async block@flow.rs:69:9: 69:19};
+    let mut _20: std::pin::Pin<&mut {async block@flow.rs:60:9: 60:19}>;
+    let mut _21: &mut {async block@flow.rs:60:9: 60:19};
     let mut _22: &mut std::task::Context<'_>;
     let mut _23: std::future::ResumeTy;
     let mut _24: isize;
@@ -1242,7 +1242,7 @@ fn wf_shared_span::{closure#0}(_1: Pin<&mut {async fn body of wf_shared_span()}>
         scope 2 {
             coroutine debug __awaitee => _s2;
             scope 9 {
-                debug __awaitee => (((*_29) as variant#4).0: {async block@flow.rs:69:9: 69:19});
+                debug __awaitee => (((*_29) as variant#4).0: {async block@flow.rs:60:9: 60:19});
                 let _25: std::result::Result<u64, std::string::String>;
                 scope 10 {
                     debug result => _25;
@@ -1250,7 +1250,7 @@ fn wf_shared_span::{closure#0}(_1: Pin<&mut {async fn body of wf_shared_span()}>
             }
         }
         scope 3 {
-            debug __awaitee => (((*_29) as variant#3).1: {async block@flow.rs:69:9: 69:19});
+            debug __awaitee => (((*_29) as variant#3).1: {async block@flow.rs:60:9: 60:19});
             let _12: std::result::Result<u64, std::string::String>;
             scope 4 {
                 debug result => _12;
@@ -1277,19 +1277,19 @@ fn wf_shared_span::{closure#0}(_1: Pin<&mut {async fn body of wf_shared_span()}>
     }
 
     bb1: {
-        (((*_29) as variant#3).1: {async block@flow.rs:69:9: 69:19}) = move _4;
+        (((*_29) as variant#3).1: {async block@flow.rs:60:9: 60:19}) = move _4;
         goto -> bb2;
     }
 
     bb2: {
-        _8 = &mut (((*_29) as variant#3).1: {async block@flow.rs:69:9: 69:19});
-        _7 = Pin::<&mut {async block@flow.rs:69:9: 69:19}>::new_unchecked(copy _8) -> [return: bb3, unwind: bb21];
+        _8 = &mut (((*_29) as variant#3).1: {async block@flow.rs:60:9: 60:19});
+        _7 = Pin::<&mut {async block@flow.rs:60:9: 60:19}>::new_unchecked(copy _8) -> [return: bb3, unwind: bb21];
     }
 
     bb3: {
         _10 = copy _31;
         _9 = copy (_10.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
-        _6 = <{async block@flow.rs:69:9: 69:19} as Future>::poll(move _7, copy _9) -> [return: bb4, unwind: bb21];
+        _6 = <{async block@flow.rs:60:9: 60:19} as Future>::poll(move _7, copy _9) -> [return: bb4, unwind: bb21];
     }
 
     bb4: {
@@ -1309,7 +1309,7 @@ fn wf_shared_span::{closure#0}(_1: Pin<&mut {async fn body of wf_shared_span()}>
 
     bb7: {
         _12 = move ((_6 as Ready).0: std::result::Result<u64, std::string::String>);
-        drop((((*_29) as variant#3).1: {async block@flow.rs:69:9: 69:19})) -> [return: bb8, unwind: bb22];
+        drop((((*_29) as variant#3).1: {async block@flow.rs:60:9: 60:19})) -> [return: bb8, unwind: bb22];
     }
 
     bb8: {
@@ -1333,23 +1333,23 @@ fn wf_shared_span::{closure#0}(_1: Pin<&mut {async fn body of wf_shared_span()}>
     }
 
     bb12: {
-        _17 = <{async block@flow.rs:69:9: 69:19} as IntoFuture>::into_future(move _18) -> [return: bb13, unwind: bb22];
+        _17 = <{async block@flow.rs:60:9: 60:19} as IntoFuture>::into_future(move _18) -> [return: bb13, unwind: bb22];
     }
 
     bb13: {
-        (((*_29) as variant#4).0: {async block@flow.rs:69:9: 69:19}) = move _17;
+        (((*_29) as variant#4).0: {async block@flow.rs:60:9: 60:19}) = move _17;
         goto -> bb14;
     }
 
     bb14: {
-        _21 = &mut (((*_29) as variant#4).0: {async block@flow.rs:69:9: 69:19});
-        _20 = Pin::<&mut {async block@flow.rs:69:9: 69:19}>::new_unchecked(copy _21) -> [return: bb15, unwind: bb20];
+        _21 = &mut (((*_29) as variant#4).0: {async block@flow.rs:60:9: 60:19});
+        _20 = Pin::<&mut {async block@flow.rs:60:9: 60:19}>::new_unchecked(copy _21) -> [return: bb15, unwind: bb20];
     }
 
     bb15: {
         _23 = copy _31;
         _22 = copy (_23.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
-        _19 = <{async block@flow.rs:69:9: 69:19} as Future>::poll(move _20, copy _22) -> [return: bb16, unwind: bb20];
+        _19 = <{async block@flow.rs:60:9: 60:19} as Future>::poll(move _20, copy _22) -> [return: bb16, unwind: bb20];
     }
 
     bb16: {
@@ -1366,7 +1366,7 @@ fn wf_shared_span::{closure#0}(_1: Pin<&mut {async fn body of wf_shared_span()}>
     bb18: {
         _25 = move ((_19 as Ready).0: std::result::Result<u64, std::string::String>);
         _27 = move _25;
-        drop((((*_29) as variant#4).0: {async block@flow.rs:69:9: 69:19})) -> [return: bb19, unwind: bb22];
+        drop((((*_29) as variant#4).0: {async block@flow.rs:60:9: 60:19})) -> [return: bb19, unwind: bb22];
     }
 
     bb19: {
@@ -1376,11 +1376,11 @@ fn wf_shared_span::{closure#0}(_1: Pin<&mut {async fn body of wf_shared_span()}>
     }
 
     bb20 (cleanup): {
-        drop((((*_29) as variant#4).0: {async block@flow.rs:69:9: 69:19})) -> [return: bb22, unwind terminate(cleanup)];
+        drop((((*_29) as variant#4).0: {async block@flow.rs:60:9: 60:19})) -> [return: bb22, unwind terminate(cleanup)];
     }
 
     bb21 (cleanup): {
-        drop((((*_29) as variant#3).1: {async block@flow.rs:69:9: 69:19})) -> [return: bb22, unwind terminate(cleanup)];
+        drop((((*_29) as variant#3).1: {async block@flow.rs:60:9: 60:19})) -> [return: bb22, unwind terminate(cleanup)];
     }
 
     bb22 (cleanup): {
@@ -1410,8 +1410,8 @@ fn wf_shared_span::{closure#0}(_1: Pin<&mut {async fn body of wf_shared_span()}>
 
     bb27: {
         (((*_29) as variant#3).0: &autumn_harvest::WorkflowContext) = copy ((*_29).0: &autumn_harvest::WorkflowContext);
-        _5 = {coroutine@flow.rs:69:9: 69:19 (#6)} { ctx: copy (((*_29) as variant#3).0: &autumn_harvest::WorkflowContext) };
-        _4 = <{async block@flow.rs:69:9: 69:19} as IntoFuture>::into_future(move _5) -> [return: bb1, unwind: bb22];
+        _5 = {coroutine@flow.rs:60:9: 60:19 (#6)} { ctx: copy (((*_29) as variant#3).0: &autumn_harvest::WorkflowContext) };
+        _4 = <{async block@flow.rs:60:9: 60:19} as IntoFuture>::into_future(move _5) -> [return: bb1, unwind: bb22];
     }
 
     bb28: {
@@ -1419,7 +1419,7 @@ fn wf_shared_span::{closure#0}(_1: Pin<&mut {async fn body of wf_shared_span()}>
     }
 }
 
-fn wf_shared_span::{closure#0}::{closure#0}(_1: Pin<&mut {async block@flow.rs:69:9: 69:19}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+fn wf_shared_span::{closure#0}::{closure#0}(_1: Pin<&mut {async block@flow.rs:60:9: 60:19}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
     coroutine layout {
         field _s0: std::future::Ready<Result<u64, String>>;
         variant_fields = {
@@ -1446,7 +1446,7 @@ fn wf_shared_span::{closure#0}::{closure#0}(_1: Pin<&mut {async block@flow.rs:69
     let mut _13: std::future::ResumeTy;
     let mut _14: &autumn_harvest::WorkflowContext;
     let mut _15: u32;
-    let mut _16: &mut {async block@flow.rs:69:9: 69:19};
+    let mut _16: &mut {async block@flow.rs:60:9: 60:19};
     let mut _17: std::future::ResumeTy;
     let mut _18: std::ptr::NonNull<std::task::Context<'_>>;
     scope 1 {
@@ -1460,7 +1460,7 @@ fn wf_shared_span::{closure#0}::{closure#0}(_1: Pin<&mut {async block@flow.rs:69
     bb0: {
         _18 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
         _17 = std::future::ResumeTy(move _18);
-        _16 = copy (_1.0: &mut {async block@flow.rs:69:9: 69:19});
+        _16 = copy (_1.0: &mut {async block@flow.rs:60:9: 60:19});
         _15 = discriminant((*_16));
         switchInt(move _15) -> [0: bb15, 1: bb14, 2: bb13, 3: bb12, otherwise: bb6];
     }
@@ -1559,7 +1559,7 @@ fn wf_block_write(_1: &WorkflowContext) -> {async fn body of wf_block_write()} {
     let mut _0: {async fn body of wf_block_write()};
 
     bb0: {
-        _0 = {coroutine@flow.rs:92:59: 99:2 (#0)} { ctx: copy _1 };
+        _0 = {coroutine@flow.rs:83:59: 90:2 (#0)} { ctx: copy _1 };
         return;
     }
 }
@@ -1568,7 +1568,7 @@ fn wf_block_write::{closure#0}(_1: Pin<&mut {async fn body of wf_block_write()}>
     coroutine layout {
         field _s0: &WorkflowContext;
         field _s1: u64;
-        field _s2: {async block@flow.rs:94:5: 94:10};
+        field _s2: {async block@flow.rs:85:5: 85:10};
         field _s3: std::future::Ready<Result<u64, String>>;
         variant_fields = {
             Unresumed(0): [],
@@ -1583,12 +1583,12 @@ fn wf_block_write::{closure#0}(_1: Pin<&mut {async fn body of wf_block_write()}>
     debug ctx => ((*_27).0: &autumn_harvest::WorkflowContext);
     coroutine debug ctx => _s0;
     let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
-    let mut _3: {async block@flow.rs:94:5: 94:10};
-    let mut _4: {async block@flow.rs:94:5: 94:10};
+    let mut _3: {async block@flow.rs:85:5: 85:10};
+    let mut _4: {async block@flow.rs:85:5: 85:10};
     let mut _5: &mut u64;
     let mut _6: std::task::Poll<()>;
-    let mut _7: std::pin::Pin<&mut {async block@flow.rs:94:5: 94:10}>;
-    let mut _8: &mut {async block@flow.rs:94:5: 94:10};
+    let mut _7: std::pin::Pin<&mut {async block@flow.rs:85:5: 85:10}>;
+    let mut _8: &mut {async block@flow.rs:85:5: 85:10};
     let mut _9: &mut std::task::Context<'_>;
     let mut _10: std::future::ResumeTy;
     let mut _11: isize;
@@ -1617,7 +1617,7 @@ fn wf_block_write::{closure#0}(_1: Pin<&mut {async fn body of wf_block_write()}>
             coroutine debug __awaitee => _s2;
             coroutine debug __awaitee => _s3;
             scope 3 {
-                debug __awaitee => (((*_27) as variant#3).2: {async block@flow.rs:94:5: 94:10});
+                debug __awaitee => (((*_27) as variant#3).2: {async block@flow.rs:85:5: 85:10});
                 let _12: ();
                 scope 4 {
                     debug result => _12;
@@ -1642,19 +1642,19 @@ fn wf_block_write::{closure#0}(_1: Pin<&mut {async fn body of wf_block_write()}>
     }
 
     bb1: {
-        (((*_27) as variant#3).2: {async block@flow.rs:94:5: 94:10}) = move _3;
+        (((*_27) as variant#3).2: {async block@flow.rs:85:5: 85:10}) = move _3;
         goto -> bb2;
     }
 
     bb2: {
-        _8 = &mut (((*_27) as variant#3).2: {async block@flow.rs:94:5: 94:10});
-        _7 = Pin::<&mut {async block@flow.rs:94:5: 94:10}>::new_unchecked(copy _8) -> [return: bb3, unwind: bb18];
+        _8 = &mut (((*_27) as variant#3).2: {async block@flow.rs:85:5: 85:10});
+        _7 = Pin::<&mut {async block@flow.rs:85:5: 85:10}>::new_unchecked(copy _8) -> [return: bb3, unwind: bb18];
     }
 
     bb3: {
         _10 = copy _29;
         _9 = copy (_10.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
-        _6 = <{async block@flow.rs:94:5: 94:10} as Future>::poll(move _7, copy _9) -> [return: bb4, unwind: bb18];
+        _6 = <{async block@flow.rs:85:5: 85:10} as Future>::poll(move _7, copy _9) -> [return: bb4, unwind: bb18];
     }
 
     bb4: {
@@ -1674,7 +1674,7 @@ fn wf_block_write::{closure#0}(_1: Pin<&mut {async fn body of wf_block_write()}>
 
     bb7: {
         _12 = copy ((_6 as Ready).0: ());
-        drop((((*_27) as variant#3).2: {async block@flow.rs:94:5: 94:10})) -> [return: bb8, unwind: bb19];
+        drop((((*_27) as variant#3).2: {async block@flow.rs:85:5: 85:10})) -> [return: bb8, unwind: bb19];
     }
 
     bb8: {
@@ -1731,7 +1731,7 @@ fn wf_block_write::{closure#0}(_1: Pin<&mut {async fn body of wf_block_write()}>
     }
 
     bb18 (cleanup): {
-        drop((((*_27) as variant#3).2: {async block@flow.rs:94:5: 94:10})) -> [return: bb19, unwind terminate(cleanup)];
+        drop((((*_27) as variant#3).2: {async block@flow.rs:85:5: 85:10})) -> [return: bb19, unwind terminate(cleanup)];
     }
 
     bb19 (cleanup): {
@@ -1763,8 +1763,8 @@ fn wf_block_write::{closure#0}(_1: Pin<&mut {async fn body of wf_block_write()}>
         (((*_27) as variant#3).0: &autumn_harvest::WorkflowContext) = copy ((*_27).0: &autumn_harvest::WorkflowContext);
         (((*_27) as variant#4).0: u64) = const 0_u64;
         _5 = &mut (((*_27) as variant#4).0: u64);
-        _4 = {coroutine@flow.rs:94:5: 94:10 (#0)} { seen: move _5 };
-        _3 = <{async block@flow.rs:94:5: 94:10} as IntoFuture>::into_future(move _4) -> [return: bb1, unwind: bb19];
+        _4 = {coroutine@flow.rs:85:5: 85:10 (#0)} { seen: move _5 };
+        _3 = <{async block@flow.rs:85:5: 85:10} as IntoFuture>::into_future(move _4) -> [return: bb1, unwind: bb19];
     }
 }
 
@@ -1772,7 +1772,7 @@ alloc5 (size: 1, align: 1) {
     62                                              │ b
 }
 
-fn wf_block_write::{closure#0}::{closure#0}(_1: Pin<&mut {async block@flow.rs:94:5: 94:10}>, _2: &mut Context<'_>) -> Poll<()> {
+fn wf_block_write::{closure#0}::{closure#0}(_1: Pin<&mut {async block@flow.rs:85:5: 85:10}>, _2: &mut Context<'_>) -> Poll<()> {
     coroutine layout {
         variant_fields = {
             Unresumed(0): [],
@@ -1787,14 +1787,14 @@ fn wf_block_write::{closure#0}::{closure#0}(_1: Pin<&mut {async block@flow.rs:94
     let mut _3: u64;
     let mut _4: &mut u64;
     let mut _5: u32;
-    let mut _6: &mut {async block@flow.rs:94:5: 94:10};
+    let mut _6: &mut {async block@flow.rs:85:5: 85:10};
     let mut _7: std::future::ResumeTy;
     let mut _8: std::ptr::NonNull<std::task::Context<'_>>;
 
     bb0: {
         _8 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
         _7 = std::future::ResumeTy(move _8);
-        _6 = copy (_1.0: &mut {async block@flow.rs:94:5: 94:10});
+        _6 = copy (_1.0: &mut {async block@flow.rs:85:5: 85:10});
         _5 = discriminant((*_6));
         switchInt(move _5) -> [0: bb6, 1: bb4, 2: bb3, otherwise: bb5];
     }
@@ -1843,7 +1843,7 @@ fn wf_step_write(_1: &WorkflowContext) -> {async fn body of wf_step_write()} {
     let mut _0: {async fn body of wf_step_write()};
 
     bb0: {
-        _0 = {coroutine@flow.rs:106:58: 123:2 (#0)} { ctx: copy _1 };
+        _0 = {coroutine@flow.rs:97:58: 114:2 (#0)} { ctx: copy _1 };
         return;
     }
 }
@@ -1853,7 +1853,7 @@ fn wf_step_write::{closure#0}(_1: Pin<&mut {async fn body of wf_step_write()}>, 
         field _s0: &WorkflowContext;
         field _s1: u64;
         field _s2: Saga<'_>;
-        field _s3: {async fn body of Saga<'_>::step<u64, {closure@flow.rs:111:13: 111:15}, {async block@flow.rs:113:17: 113:27}, {closure@flow.rs:118:13: 118:16}, {async block@flow.rs:118:17: 118:22}>()};
+        field _s3: {async fn body of Saga<'_>::step<u64, {closure@flow.rs:102:13: 102:15}, {async block@flow.rs:104:17: 104:27}, {closure@flow.rs:109:13: 109:16}, {async block@flow.rs:109:17: 109:22}>()};
         field _s4: std::future::Ready<Result<u64, String>>;
         variant_fields = {
             Unresumed(0): [],
@@ -1869,16 +1869,16 @@ fn wf_step_write::{closure#0}(_1: Pin<&mut {async fn body of wf_step_write()}>, 
     coroutine debug ctx => _s0;
     let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
     let mut _3: std::ops::ControlFlow<std::result::Result<std::convert::Infallible, std::string::String>, u64>;
-    let mut _4: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:111:13: 111:15}, {async block@flow.rs:113:17: 113:27}, {closure@flow.rs:118:13: 118:16}, {async block@flow.rs:118:17: 118:22}>()};
-    let mut _5: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:111:13: 111:15}, {async block@flow.rs:113:17: 113:27}, {closure@flow.rs:118:13: 118:16}, {async block@flow.rs:118:17: 118:22}>()};
+    let mut _4: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:102:13: 102:15}, {async block@flow.rs:104:17: 104:27}, {closure@flow.rs:109:13: 109:16}, {async block@flow.rs:109:17: 109:22}>()};
+    let mut _5: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:102:13: 102:15}, {async block@flow.rs:104:17: 104:27}, {closure@flow.rs:109:13: 109:16}, {async block@flow.rs:109:17: 109:22}>()};
     let mut _6: &mut autumn_harvest::Saga<'_>;
-    let mut _7: {closure@flow.rs:111:13: 111:15};
+    let mut _7: {closure@flow.rs:102:13: 102:15};
     let mut _8: &mut u64;
     let mut _9: &&autumn_harvest::WorkflowContext;
-    let mut _10: {closure@flow.rs:118:13: 118:16};
+    let mut _10: {closure@flow.rs:109:13: 109:16};
     let mut _11: std::task::Poll<std::result::Result<u64, std::string::String>>;
-    let mut _12: std::pin::Pin<&mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:111:13: 111:15}, {async block@flow.rs:113:17: 113:27}, {closure@flow.rs:118:13: 118:16}, {async block@flow.rs:118:17: 118:22}>()}>;
-    let mut _13: &mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:111:13: 111:15}, {async block@flow.rs:113:17: 113:27}, {closure@flow.rs:118:13: 118:16}, {async block@flow.rs:118:17: 118:22}>()};
+    let mut _12: std::pin::Pin<&mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:102:13: 102:15}, {async block@flow.rs:104:17: 104:27}, {closure@flow.rs:109:13: 109:16}, {async block@flow.rs:109:17: 109:22}>()}>;
+    let mut _13: &mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:102:13: 102:15}, {async block@flow.rs:104:17: 104:27}, {closure@flow.rs:109:13: 109:16}, {async block@flow.rs:109:17: 109:22}>()};
     let mut _14: &mut std::task::Context<'_>;
     let mut _15: std::future::ResumeTy;
     let mut _16: isize;
@@ -1915,7 +1915,7 @@ fn wf_step_write::{closure#0}(_1: Pin<&mut {async fn body of wf_step_write()}>, 
                 let _20: std::result::Result<std::convert::Infallible, std::string::String>;
                 let _21: u64;
                 scope 4 {
-                    debug __awaitee => (((*_36) as variant#3).3: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:111:13: 111:15}, {async block@flow.rs:113:17: 113:27}, {closure@flow.rs:118:13: 118:16}, {async block@flow.rs:118:17: 118:22}>()});
+                    debug __awaitee => (((*_36) as variant#3).3: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:102:13: 102:15}, {async block@flow.rs:104:17: 104:27}, {closure@flow.rs:109:13: 109:16}, {async block@flow.rs:109:17: 109:22}>()});
                     let _17: std::result::Result<u64, std::string::String>;
                     scope 5 {
                         debug result => _17;
@@ -1954,29 +1954,29 @@ fn wf_step_write::{closure#0}(_1: Pin<&mut {async fn body of wf_step_write()}>, 
         _6 = &mut (((*_36) as variant#3).2: autumn_harvest::Saga<'_>);
         _8 = &mut (((*_36) as variant#4).1: u64);
         _9 = &(((*_36) as variant#4).0: &autumn_harvest::WorkflowContext);
-        _7 = {closure@flow.rs:111:13: 111:15} { seen: move _8, ctx: move _9 };
-        _10 = {closure@flow.rs:118:13: 118:16};
-        _5 = Saga::<'_>::step::<u64, {closure@flow.rs:111:13: 111:15}, {async block@flow.rs:113:17: 113:27}, {closure@flow.rs:118:13: 118:16}, {async block@flow.rs:118:17: 118:22}>(move _6, move _7, move _10) -> [return: bb2, unwind: bb24];
+        _7 = {closure@flow.rs:102:13: 102:15} { seen: move _8, ctx: move _9 };
+        _10 = {closure@flow.rs:109:13: 109:16};
+        _5 = Saga::<'_>::step::<u64, {closure@flow.rs:102:13: 102:15}, {async block@flow.rs:104:17: 104:27}, {closure@flow.rs:109:13: 109:16}, {async block@flow.rs:109:17: 109:22}>(move _6, move _7, move _10) -> [return: bb2, unwind: bb24];
     }
 
     bb2: {
-        _4 = <{async fn body of Saga<'_>::step<u64, {closure@flow.rs:111:13: 111:15}, {async block@flow.rs:113:17: 113:27}, {closure@flow.rs:118:13: 118:16}, {async block@flow.rs:118:17: 118:22}>()} as IntoFuture>::into_future(move _5) -> [return: bb3, unwind: bb24];
+        _4 = <{async fn body of Saga<'_>::step<u64, {closure@flow.rs:102:13: 102:15}, {async block@flow.rs:104:17: 104:27}, {closure@flow.rs:109:13: 109:16}, {async block@flow.rs:109:17: 109:22}>()} as IntoFuture>::into_future(move _5) -> [return: bb3, unwind: bb24];
     }
 
     bb3: {
-        (((*_36) as variant#3).3: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:111:13: 111:15}, {async block@flow.rs:113:17: 113:27}, {closure@flow.rs:118:13: 118:16}, {async block@flow.rs:118:17: 118:22}>()}) = move _4;
+        (((*_36) as variant#3).3: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:102:13: 102:15}, {async block@flow.rs:104:17: 104:27}, {closure@flow.rs:109:13: 109:16}, {async block@flow.rs:109:17: 109:22}>()}) = move _4;
         goto -> bb4;
     }
 
     bb4: {
-        _13 = &mut (((*_36) as variant#3).3: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:111:13: 111:15}, {async block@flow.rs:113:17: 113:27}, {closure@flow.rs:118:13: 118:16}, {async block@flow.rs:118:17: 118:22}>()});
-        _12 = Pin::<&mut {async fn body of Saga<'_>::step<u64, {closure@flow.rs:111:13: 111:15}, {async block@flow.rs:113:17: 113:27}, {closure@flow.rs:118:13: 118:16}, {async block@flow.rs:118:17: 118:22}>()}>::new_unchecked(copy _13) -> [return: bb5, unwind: bb23];
+        _13 = &mut (((*_36) as variant#3).3: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:102:13: 102:15}, {async block@flow.rs:104:17: 104:27}, {closure@flow.rs:109:13: 109:16}, {async block@flow.rs:109:17: 109:22}>()});
+        _12 = Pin::<&mut {async fn body of Saga<'_>::step<u64, {closure@flow.rs:102:13: 102:15}, {async block@flow.rs:104:17: 104:27}, {closure@flow.rs:109:13: 109:16}, {async block@flow.rs:109:17: 109:22}>()}>::new_unchecked(copy _13) -> [return: bb5, unwind: bb23];
     }
 
     bb5: {
         _15 = copy _39;
         _14 = copy (_15.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
-        _11 = <{async fn body of Saga<'_>::step<u64, {closure@flow.rs:111:13: 111:15}, {async block@flow.rs:113:17: 113:27}, {closure@flow.rs:118:13: 118:16}, {async block@flow.rs:118:17: 118:22}>()} as Future>::poll(move _12, copy _14) -> [return: bb6, unwind: bb23];
+        _11 = <{async fn body of Saga<'_>::step<u64, {closure@flow.rs:102:13: 102:15}, {async block@flow.rs:104:17: 104:27}, {closure@flow.rs:109:13: 109:16}, {async block@flow.rs:109:17: 109:22}>()} as Future>::poll(move _12, copy _14) -> [return: bb6, unwind: bb23];
     }
 
     bb6: {
@@ -1996,7 +1996,7 @@ fn wf_step_write::{closure#0}(_1: Pin<&mut {async fn body of wf_step_write()}>, 
 
     bb9: {
         _17 = move ((_11 as Ready).0: std::result::Result<u64, std::string::String>);
-        drop((((*_36) as variant#3).3: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:111:13: 111:15}, {async block@flow.rs:113:17: 113:27}, {closure@flow.rs:118:13: 118:16}, {async block@flow.rs:118:17: 118:22}>()})) -> [return: bb10, unwind: bb24];
+        drop((((*_36) as variant#3).3: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:102:13: 102:15}, {async block@flow.rs:104:17: 104:27}, {closure@flow.rs:109:13: 109:16}, {async block@flow.rs:109:17: 109:22}>()})) -> [return: bb10, unwind: bb24];
     }
 
     bb10: {
@@ -2069,7 +2069,7 @@ fn wf_step_write::{closure#0}(_1: Pin<&mut {async fn body of wf_step_write()}>, 
     }
 
     bb23 (cleanup): {
-        drop((((*_36) as variant#3).3: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:111:13: 111:15}, {async block@flow.rs:113:17: 113:27}, {closure@flow.rs:118:13: 118:16}, {async block@flow.rs:118:17: 118:22}>()})) -> [return: bb24, unwind terminate(cleanup)];
+        drop((((*_36) as variant#3).3: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:102:13: 102:15}, {async block@flow.rs:104:17: 104:27}, {closure@flow.rs:109:13: 109:16}, {async block@flow.rs:109:17: 109:22}>()})) -> [return: bb24, unwind terminate(cleanup)];
     }
 
     bb24 (cleanup): {
@@ -2113,10 +2113,10 @@ alloc5 (size: 1, align: 1) {
     62                                              │ b
 }
 
-fn wf_step_write::{closure#0}::{closure#0}(_1: {closure@flow.rs:111:13: 111:15}) -> {async block@flow.rs:113:17: 113:27} {
+fn wf_step_write::{closure#0}::{closure#0}(_1: {closure@flow.rs:102:13: 102:15}) -> {async block@flow.rs:104:17: 104:27} {
     debug seen => (*(_1.0: &mut u64));
     debug ctx => (*(_1.1: &&autumn_harvest::WorkflowContext));
-    let mut _0: {async block@flow.rs:113:17: 113:27};
+    let mut _0: {async block@flow.rs:104:17: 104:27};
     let mut _2: &mut u64;
     let mut _3: &&autumn_harvest::WorkflowContext;
     scope 1 {
@@ -2126,12 +2126,12 @@ fn wf_step_write::{closure#0}::{closure#0}(_1: {closure@flow.rs:111:13: 111:15})
     bb0: {
         _2 = no_retag copy (_1.0: &mut u64);
         _3 = no_retag copy (_1.1: &&autumn_harvest::WorkflowContext);
-        _0 = {coroutine@flow.rs:113:17: 113:27 (#0)} { s: copy _2, ctx: copy (*_3) };
+        _0 = {coroutine@flow.rs:104:17: 104:27 (#0)} { s: copy _2, ctx: copy (*_3) };
         return;
     }
 }
 
-fn wf_step_write::{closure#0}::{closure#0}::{closure#0}(_1: Pin<&mut {async block@flow.rs:113:17: 113:27}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+fn wf_step_write::{closure#0}::{closure#0}::{closure#0}(_1: Pin<&mut {async block@flow.rs:104:17: 104:27}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
     coroutine layout {
         field _s0: std::future::Ready<Result<u64, String>>;
         variant_fields = {
@@ -2161,7 +2161,7 @@ fn wf_step_write::{closure#0}::{closure#0}::{closure#0}(_1: Pin<&mut {async bloc
     let mut _15: &mut u64;
     let mut _16: &autumn_harvest::WorkflowContext;
     let mut _17: u32;
-    let mut _18: &mut {async block@flow.rs:113:17: 113:27};
+    let mut _18: &mut {async block@flow.rs:104:17: 104:27};
     let mut _19: std::future::ResumeTy;
     let mut _20: std::ptr::NonNull<std::task::Context<'_>>;
     scope 1 {
@@ -2175,7 +2175,7 @@ fn wf_step_write::{closure#0}::{closure#0}::{closure#0}(_1: Pin<&mut {async bloc
     bb0: {
         _20 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
         _19 = std::future::ResumeTy(move _20);
-        _18 = copy (_1.0: &mut {async block@flow.rs:113:17: 113:27});
+        _18 = copy (_1.0: &mut {async block@flow.rs:104:17: 104:27});
         _17 = discriminant((*_18));
         switchInt(move _17) -> [0: bb16, 1: bb15, 2: bb14, 3: bb13, otherwise: bb7];
     }
@@ -2266,16 +2266,16 @@ alloc3 (size: 1, align: 1) {
     61                                              │ a
 }
 
-fn wf_step_write::{closure#0}::{closure#1}(_1: {closure@flow.rs:118:13: 118:16}, _2: u64) -> {async block@flow.rs:118:17: 118:22} {
-    let mut _0: {async block@flow.rs:118:17: 118:22};
+fn wf_step_write::{closure#0}::{closure#1}(_1: {closure@flow.rs:109:13: 109:16}, _2: u64) -> {async block@flow.rs:109:17: 109:22} {
+    let mut _0: {async block@flow.rs:109:17: 109:22};
 
     bb0: {
-        _0 = {coroutine@flow.rs:118:17: 118:22 (#0)};
+        _0 = {coroutine@flow.rs:109:17: 109:22 (#0)};
         return;
     }
 }
 
-fn wf_step_write::{closure#0}::{closure#1}::{closure#0}(_1: Pin<&mut {async block@flow.rs:118:17: 118:22}>, _2: &mut Context<'_>) -> Poll<Result<(), String>> {
+fn wf_step_write::{closure#0}::{closure#1}::{closure#0}(_1: Pin<&mut {async block@flow.rs:109:17: 109:22}>, _2: &mut Context<'_>) -> Poll<Result<(), String>> {
     coroutine layout {
         variant_fields = {
             Unresumed(0): [],
@@ -2289,14 +2289,14 @@ fn wf_step_write::{closure#0}::{closure#1}::{closure#0}(_1: Pin<&mut {async bloc
     let mut _3: ();
     let mut _4: std::result::Result<(), std::string::String>;
     let mut _5: u32;
-    let mut _6: &mut {async block@flow.rs:118:17: 118:22};
+    let mut _6: &mut {async block@flow.rs:109:17: 109:22};
     let mut _7: std::future::ResumeTy;
     let mut _8: std::ptr::NonNull<std::task::Context<'_>>;
 
     bb0: {
         _8 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
         _7 = std::future::ResumeTy(move _8);
-        _6 = copy (_1.0: &mut {async block@flow.rs:118:17: 118:22});
+        _6 = copy (_1.0: &mut {async block@flow.rs:109:17: 109:22});
         _5 = discriminant((*_6));
         switchInt(move _5) -> [0: bb3, 1: bb1, otherwise: bb2];
     }
@@ -2332,7 +2332,7 @@ fn wf_foreign_block(_1: &WorkflowContext) -> {async fn body of wf_foreign_block(
     let mut _0: {async fn body of wf_foreign_block()};
 
     bb0: {
-        _0 = {coroutine@flow.rs:130:61: 133:2 (#0)} { ctx: copy _1 };
+        _0 = {coroutine@flow.rs:121:61: 124:2 (#0)} { ctx: copy _1 };
         return;
     }
 }
@@ -2340,7 +2340,7 @@ fn wf_foreign_block(_1: &WorkflowContext) -> {async fn body of wf_foreign_block(
 fn wf_foreign_block::{closure#0}(_1: Pin<&mut {async fn body of wf_foreign_block()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
     coroutine layout {
         field _s0: Saga<'_>;
-        field _s1: {async fn body of Saga<'_>::step<u64, {closure@flow.rs:132:15: 132:17}, {async block@WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:132:37: 132:40}, {async block@flow.rs:132:41: 132:46}>()};
+        field _s1: {async fn body of Saga<'_>::step<u64, {closure@flow.rs:123:15: 123:17}, {async block@WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:123:37: 123:40}, {async block@flow.rs:123:41: 123:46}>()};
         variant_fields = {
             Unresumed(0): [],
             Returned (1): [],
@@ -2353,14 +2353,14 @@ fn wf_foreign_block::{closure#0}(_1: Pin<&mut {async fn body of wf_foreign_block
     debug ctx => ((*_18).0: &autumn_harvest::WorkflowContext);
     let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
     let _3: &autumn_harvest::WorkflowContext;
-    let mut _4: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:132:15: 132:17}, {async block@autumn_harvest::WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:132:37: 132:40}, {async block@flow.rs:132:41: 132:46}>()};
-    let mut _5: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:132:15: 132:17}, {async block@autumn_harvest::WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:132:37: 132:40}, {async block@flow.rs:132:41: 132:46}>()};
+    let mut _4: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:123:15: 123:17}, {async block@autumn_harvest::WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:123:37: 123:40}, {async block@flow.rs:123:41: 123:46}>()};
+    let mut _5: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:123:15: 123:17}, {async block@autumn_harvest::WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:123:37: 123:40}, {async block@flow.rs:123:41: 123:46}>()};
     let mut _6: &mut autumn_harvest::Saga<'_>;
-    let mut _7: {closure@flow.rs:132:15: 132:17};
-    let mut _8: {closure@flow.rs:132:37: 132:40};
+    let mut _7: {closure@flow.rs:123:15: 123:17};
+    let mut _8: {closure@flow.rs:123:37: 123:40};
     let mut _9: std::task::Poll<std::result::Result<u64, std::string::String>>;
-    let mut _10: std::pin::Pin<&mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:132:15: 132:17}, {async block@autumn_harvest::WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:132:37: 132:40}, {async block@flow.rs:132:41: 132:46}>()}>;
-    let mut _11: &mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:132:15: 132:17}, {async block@autumn_harvest::WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:132:37: 132:40}, {async block@flow.rs:132:41: 132:46}>()};
+    let mut _10: std::pin::Pin<&mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:123:15: 123:17}, {async block@autumn_harvest::WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:123:37: 123:40}, {async block@flow.rs:123:41: 123:46}>()}>;
+    let mut _11: &mut {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:123:15: 123:17}, {async block@autumn_harvest::WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:123:37: 123:40}, {async block@flow.rs:123:41: 123:46}>()};
     let mut _12: &mut std::task::Context<'_>;
     let mut _13: std::future::ResumeTy;
     let mut _14: isize;
@@ -2376,7 +2376,7 @@ fn wf_foreign_block::{closure#0}(_1: Pin<&mut {async fn body of wf_foreign_block
             debug saga => (((*_18) as variant#3).0: autumn_harvest::Saga<'_>);
             coroutine debug __awaitee => _s1;
             scope 3 {
-                debug __awaitee => (((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:132:15: 132:17}, {async block@autumn_harvest::WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:132:37: 132:40}, {async block@flow.rs:132:41: 132:46}>()});
+                debug __awaitee => (((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:123:15: 123:17}, {async block@autumn_harvest::WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:123:37: 123:40}, {async block@flow.rs:123:41: 123:46}>()});
                 let _15: std::result::Result<u64, std::string::String>;
                 scope 4 {
                     debug result => _15;
@@ -2395,29 +2395,29 @@ fn wf_foreign_block::{closure#0}(_1: Pin<&mut {async fn body of wf_foreign_block
 
     bb1: {
         _6 = &mut (((*_18) as variant#3).0: autumn_harvest::Saga<'_>);
-        _7 = {closure@flow.rs:132:15: 132:17} { ctx: copy _3 };
-        _8 = {closure@flow.rs:132:37: 132:40};
-        _5 = Saga::<'_>::step::<u64, {closure@flow.rs:132:15: 132:17}, {async block@WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:132:37: 132:40}, {async block@flow.rs:132:41: 132:46}>(move _6, move _7, move _8) -> [return: bb2, unwind: bb12];
+        _7 = {closure@flow.rs:123:15: 123:17} { ctx: copy _3 };
+        _8 = {closure@flow.rs:123:37: 123:40};
+        _5 = Saga::<'_>::step::<u64, {closure@flow.rs:123:15: 123:17}, {async block@WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:123:37: 123:40}, {async block@flow.rs:123:41: 123:46}>(move _6, move _7, move _8) -> [return: bb2, unwind: bb12];
     }
 
     bb2: {
-        _4 = <{async fn body of Saga<'_>::step<u64, {closure@flow.rs:132:15: 132:17}, {async block@WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:132:37: 132:40}, {async block@flow.rs:132:41: 132:46}>()} as IntoFuture>::into_future(move _5) -> [return: bb3, unwind: bb12];
+        _4 = <{async fn body of Saga<'_>::step<u64, {closure@flow.rs:123:15: 123:17}, {async block@WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:123:37: 123:40}, {async block@flow.rs:123:41: 123:46}>()} as IntoFuture>::into_future(move _5) -> [return: bb3, unwind: bb12];
     }
 
     bb3: {
-        (((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:132:15: 132:17}, {async block@autumn_harvest::WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:132:37: 132:40}, {async block@flow.rs:132:41: 132:46}>()}) = move _4;
+        (((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:123:15: 123:17}, {async block@autumn_harvest::WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:123:37: 123:40}, {async block@flow.rs:123:41: 123:46}>()}) = move _4;
         goto -> bb4;
     }
 
     bb4: {
-        _11 = &mut (((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:132:15: 132:17}, {async block@autumn_harvest::WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:132:37: 132:40}, {async block@flow.rs:132:41: 132:46}>()});
-        _10 = Pin::<&mut {async fn body of Saga<'_>::step<u64, {closure@flow.rs:132:15: 132:17}, {async block@WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:132:37: 132:40}, {async block@flow.rs:132:41: 132:46}>()}>::new_unchecked(copy _11) -> [return: bb5, unwind: bb11];
+        _11 = &mut (((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:123:15: 123:17}, {async block@autumn_harvest::WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:123:37: 123:40}, {async block@flow.rs:123:41: 123:46}>()});
+        _10 = Pin::<&mut {async fn body of Saga<'_>::step<u64, {closure@flow.rs:123:15: 123:17}, {async block@WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:123:37: 123:40}, {async block@flow.rs:123:41: 123:46}>()}>::new_unchecked(copy _11) -> [return: bb5, unwind: bb11];
     }
 
     bb5: {
         _13 = copy _19;
         _12 = copy (_13.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
-        _9 = <{async fn body of Saga<'_>::step<u64, {closure@flow.rs:132:15: 132:17}, {async block@WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:132:37: 132:40}, {async block@flow.rs:132:41: 132:46}>()} as Future>::poll(move _10, copy _12) -> [return: bb6, unwind: bb11];
+        _9 = <{async fn body of Saga<'_>::step<u64, {closure@flow.rs:123:15: 123:17}, {async block@WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:123:37: 123:40}, {async block@flow.rs:123:41: 123:46}>()} as Future>::poll(move _10, copy _12) -> [return: bb6, unwind: bb11];
     }
 
     bb6: {
@@ -2437,7 +2437,7 @@ fn wf_foreign_block::{closure#0}(_1: Pin<&mut {async fn body of wf_foreign_block
 
     bb9: {
         _15 = move ((_9 as Ready).0: std::result::Result<u64, std::string::String>);
-        drop((((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:132:15: 132:17}, {async block@autumn_harvest::WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:132:37: 132:40}, {async block@flow.rs:132:41: 132:46}>()})) -> [return: bb10, unwind: bb12];
+        drop((((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:123:15: 123:17}, {async block@autumn_harvest::WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:123:37: 123:40}, {async block@flow.rs:123:41: 123:46}>()})) -> [return: bb10, unwind: bb12];
     }
 
     bb10: {
@@ -2447,7 +2447,7 @@ fn wf_foreign_block::{closure#0}(_1: Pin<&mut {async fn body of wf_foreign_block
     }
 
     bb11 (cleanup): {
-        drop((((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:132:15: 132:17}, {async block@autumn_harvest::WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:132:37: 132:40}, {async block@flow.rs:132:41: 132:46}>()})) -> [return: bb12, unwind terminate(cleanup)];
+        drop((((*_18) as variant#3).1: {async fn body of autumn_harvest::Saga<'_>::step<u64, {closure@flow.rs:123:15: 123:17}, {async block@autumn_harvest::WorkflowContext::rpit_block::{closure#0}}, {closure@flow.rs:123:37: 123:40}, {async block@flow.rs:123:41: 123:46}>()})) -> [return: bb12, unwind terminate(cleanup)];
     }
 
     bb12 (cleanup): {
@@ -2475,7 +2475,7 @@ fn wf_foreign_block::{closure#0}(_1: Pin<&mut {async fn body of wf_foreign_block
     }
 }
 
-fn wf_foreign_block::{closure#0}::{closure#0}(_1: {closure@flow.rs:132:15: 132:17}) -> {async block@WorkflowContext::rpit_block::{closure#0}} {
+fn wf_foreign_block::{closure#0}::{closure#0}(_1: {closure@flow.rs:123:15: 123:17}) -> {async block@WorkflowContext::rpit_block::{closure#0}} {
     debug ctx => const WorkflowContext;
     let mut _0: {async block@autumn_harvest::WorkflowContext::rpit_block::{closure#0}};
     let mut _2: &autumn_harvest::WorkflowContext;
@@ -2490,16 +2490,16 @@ fn wf_foreign_block::{closure#0}::{closure#0}(_1: {closure@flow.rs:132:15: 132:1
     }
 }
 
-fn wf_foreign_block::{closure#0}::{closure#1}(_1: {closure@flow.rs:132:37: 132:40}, _2: u64) -> {async block@flow.rs:132:41: 132:46} {
-    let mut _0: {async block@flow.rs:132:41: 132:46};
+fn wf_foreign_block::{closure#0}::{closure#1}(_1: {closure@flow.rs:123:37: 123:40}, _2: u64) -> {async block@flow.rs:123:41: 123:46} {
+    let mut _0: {async block@flow.rs:123:41: 123:46};
 
     bb0: {
-        _0 = {coroutine@flow.rs:132:41: 132:46 (#0)};
+        _0 = {coroutine@flow.rs:123:41: 123:46 (#0)};
         return;
     }
 }
 
-fn wf_foreign_block::{closure#0}::{closure#1}::{closure#0}(_1: Pin<&mut {async block@flow.rs:132:41: 132:46}>, _2: &mut Context<'_>) -> Poll<Result<(), String>> {
+fn wf_foreign_block::{closure#0}::{closure#1}::{closure#0}(_1: Pin<&mut {async block@flow.rs:123:41: 123:46}>, _2: &mut Context<'_>) -> Poll<Result<(), String>> {
     coroutine layout {
         variant_fields = {
             Unresumed(0): [],
@@ -2513,14 +2513,14 @@ fn wf_foreign_block::{closure#0}::{closure#1}::{closure#0}(_1: Pin<&mut {async b
     let mut _3: ();
     let mut _4: std::result::Result<(), std::string::String>;
     let mut _5: u32;
-    let mut _6: &mut {async block@flow.rs:132:41: 132:46};
+    let mut _6: &mut {async block@flow.rs:123:41: 123:46};
     let mut _7: std::future::ResumeTy;
     let mut _8: std::ptr::NonNull<std::task::Context<'_>>;
 
     bb0: {
         _8 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
         _7 = std::future::ResumeTy(move _8);
-        _6 = copy (_1.0: &mut {async block@flow.rs:132:41: 132:46});
+        _6 = copy (_1.0: &mut {async block@flow.rs:123:41: 123:46});
         _5 = discriminant((*_6));
         switchInt(move _5) -> [0: bb3, 1: bb1, otherwise: bb2];
     }

@@ -591,7 +591,11 @@ fn check_structure_strict_fails_on_unknown() {
     let path = filtered_manifest(dir.path(), &["wf_escapes"]);
     let lenient = run(&["--check-structure", &path.to_string_lossy()]);
     assert_eq!(code(&lenient), 0, "{}", stdout(&lenient));
-    assert!(stdout(&lenient).contains("possible gap:"), "{}", stdout(&lenient));
+    assert!(
+        stdout(&lenient).contains("possible gap:"),
+        "{}",
+        stdout(&lenient)
+    );
     let strict = run(&["--check-structure", &path.to_string_lossy(), "--strict"]);
     assert_eq!(code(&strict), 1, "{}", stdout(&strict));
 }
@@ -622,7 +626,11 @@ fn check_structure_refuses_another_format_and_bad_json() {
     .expect("write");
     let out = run(&["--check-structure", &other.to_string_lossy()]);
     assert_eq!(code(&out), 2);
-    assert!(stderr(&out).contains("harvest-structure/2"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("harvest-structure/2"),
+        "{}",
+        stderr(&out)
+    );
     let bad = dir.path().join("bad.json");
     std::fs::write(&bad, "not json").expect("write");
     let out = run(&["--check-structure", &bad.to_string_lossy()]);

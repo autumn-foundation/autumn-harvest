@@ -178,7 +178,7 @@ struct InvokedArgument<'i> {
     has_env: bool,
     /// `[ambiguous closure (N candidates, unioned)]`, or empty.
     note: &'i str,
-    /// Boundaries are reported on this pass.
+    /// This pass reports boundaries.
     emit: bool,
 }
 

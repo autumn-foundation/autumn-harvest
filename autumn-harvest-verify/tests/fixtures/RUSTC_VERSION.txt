@@ -136,3 +136,21 @@ cargo 1.94.1 (29ea6fb6a 2026-03-24)
 # `saga.step(..).await?` still prints that shape:
 #
 #   grep -c 'as Try>::branch' saga_graph/flow.mir
+#
+# Expect 28, one per `?` in `saga_graph/flow.rs`. The walk also hard-codes
+# the case values: `0` is `Poll::Ready` and `ControlFlow::Continue`, and `1`
+# is `ControlFlow::Break`. A change to them is not detected by the count, so
+# run `cargo test -p autumn-harvest-verify --test saga_graph` after a re-emit.
+#
+# `async_block_follow/flow.mir` (issue #2010) was produced the same way, on
+# rustc 1.99.0, with a second stub crate that stands for an untrusted
+# dependency. From `async_block_follow/`:
+#
+#   rustc --crate-type lib --edition 2024 --crate-name autumn_harvest \
+#         -o libautumn_harvest.rlib harvest_stub.rs
+#   rustc --crate-type lib --edition 2024 --crate-name other_crate \
+#         -o libother_crate.rlib other_crate.rs
+#   rustc --crate-type lib --edition 2024 --emit=mir \
+#         --extern autumn_harvest=libautumn_harvest.rlib \
+#         --extern other_crate=libother_crate.rlib -o flow.mir flow.rs
+#   rm libautumn_harvest.rlib libother_crate.rlib
