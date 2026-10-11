@@ -124,8 +124,8 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          delayed_start_tests
 linux        autumn-harvest         integration                      -                          drain_release_tests
 linux        autumn-harvest         integration                      -                          dst_differential_tests
-linux        autumn-harvest         integration                      -                          durable_stream_tests
 linux        autumn-harvest         integration                      -                          dst_world_tests
+linux        autumn-harvest         integration                      -                          durable_stream_tests
 linux        autumn-harvest         integration                      -                          entity_tests
 linux        autumn-harvest         integration                      -                          event_batch_tests
 linux        autumn-harvest         integration                      -                          event_partitioning_tests
