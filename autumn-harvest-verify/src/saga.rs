@@ -120,8 +120,40 @@ pub fn check(manifest: &StructureManifest) -> Result<Vec<SagaReport>, CheckError
                 validate(graph).map_err(|e| CheckError(format!("{}: {e}", body.id)))?;
             }
         }
+        if let Some(missing) = missing_body(workflow) {
+            return Err(CheckError(format!(
+                "{}: a node or handler names `{missing}`, which has no body",
+                workflow.workflow
+            )));
+        }
     }
     Ok(manifest.workflows.iter().map(check_workflow).collect())
+}
+
+/// The first body that a call, a saga step or a handler names, and that
+/// the workflow does not hold. That code is never checked, so it could
+/// hide a saga or a gap.
+fn missing_body(workflow: &WorkflowStructure) -> Option<&str> {
+    let ids: BTreeSet<&str> = workflow.bodies.iter().map(|b| b.id.as_str()).collect();
+    let mut named: Vec<&String> = Vec::new();
+    let graphs = workflow.bodies.iter().filter_map(|b| b.flow.as_ref());
+    for node in graphs.flat_map(|graph| &graph.nodes) {
+        match &node.event {
+            FlowEvent::Call { callees } => named.extend(callees),
+            FlowEvent::SagaStep {
+                forward,
+                compensate,
+                ..
+            } => named.extend(forward.iter().chain(compensate)),
+            _ => {}
+        }
+    }
+    let handlers = workflow.handlers.iter().flat_map(|h| &h.bodies);
+    named
+        .into_iter()
+        .chain(handlers)
+        .map(String::as_str)
+        .find(|id| !ids.contains(id))
 }
 
 /// Refuse a graph the fixpoint would read wrong. A dropped edge or a
@@ -452,7 +484,7 @@ fn emits_a_step(workflow: &WorkflowStructure, start: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structure::{FlowEdge, FlowNode};
+    use crate::structure::{FlowEdge, FlowNode, HandlerSite};
 
     fn node(event: FlowEvent) -> FlowNode {
         FlowNode {
@@ -563,6 +595,37 @@ mod tests {
         };
         let err = check(&manifest(disconnected)).expect_err("unreachable nodes");
         assert!(err.to_string().contains("reach"), "{err}");
+    }
+
+    #[test]
+    fn a_reference_to_a_missing_body_is_refused() {
+        // The missing body could hold the only saga, or a gap.
+        let call = FlowGraph {
+            nodes: vec![
+                node(FlowEvent::Entry),
+                node(FlowEvent::Call {
+                    callees: vec!["w::helper".to_string()],
+                }),
+            ],
+            edges: vec![edge(0, 1, None)],
+        };
+        let err = check(&manifest(call)).expect_err("a call to a missing body");
+        assert!(err.to_string().contains("w::helper"), "{err}");
+
+        let mut handler = manifest(FlowGraph {
+            nodes: vec![node(FlowEvent::Entry)],
+            edges: Vec::new(),
+        });
+        if let Some(w) = handler.workflows.first_mut() {
+            w.handlers.push(HandlerSite {
+                kind: "signal".to_string(),
+                method: "register_signal_handler".to_string(),
+                name: None,
+                bodies: vec!["w::on_signal".to_string()],
+            });
+        }
+        let err = check(&handler).expect_err("a handler with a missing body");
+        assert!(err.to_string().contains("w::on_signal"), "{err}");
     }
 
     #[test]

@@ -104,6 +104,8 @@ Four review agents read the first version. Each fix has a test.
 12. A boundary counted only when no saga was in sight. A body outside the
     analysis can hold a second saga with a gap. Now each boundary that runs
     code gives `unknown`. An `external-const` does not count.
+13. A call to a body that the manifest omits was not checked. That body
+    could hold the only saga. Such a manifest is now refused.
 
 ---
 
@@ -130,7 +132,8 @@ edges, `ok` or `err`, and it has at least one of each. A step whose arm
 reaches no node, such as an arm that never returns, is untracked. An exit
 node has no out-edge. The check refuses a graph that breaks these rules,
 names a missing node, has other than one entry, or has a node that the entry
-cannot reach.
+cannot reach. It also refuses a call, a saga step or a handler that names a
+body the workflow does not hold.
 
 `WorkflowStructure.handlers` lists each handler registration: its kind
 (`signal`, `update`, `query` or `other`), its name when the MIR shows it,
