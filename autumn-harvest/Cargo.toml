@@ -320,6 +320,9 @@ proc-macro2 = { workspace = true }
 # version into the lockfile, so this dev-dependency adds no new crate. The crate
 # is deprecated upstream. It is dev-only, so it never ships.
 serde_yaml = "0.9"
+# Runs the real `agent_loop` on a Postgres worker to measure the resident hit
+# rate (issue #2007). Path only, so `cargo publish` drops it.
+autumn-harvest-agent = { path = "../autumn-harvest-agent" }
 
 # testcontainers pulls bollard -> hyper-util, which uses `tokio::net`. Under a
 # global `RUSTFLAGS="--cfg loom"` build tokio's `net` module is compiled out

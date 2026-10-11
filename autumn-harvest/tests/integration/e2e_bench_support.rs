@@ -2583,7 +2583,7 @@ pub mod db {
 
     use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
     use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
-    use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics, TelemetryConfig};
+    use autumn_harvest::telemetry::{MetricsRecorder, TelemetryConfig};
     use autumn_harvest::types::{ExecutionId, ShardId};
     use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
     use autumn_harvest::{
@@ -3197,9 +3197,75 @@ pub mod db {
         /// carried no task id. Counted rather than ignored, so the published
         /// population can be reconciled against the population that ran.
         unrecorded_dispatches: Mutex<usize>,
+        /// Resident outcomes of every decision (issue #2007).
+        resident: Arc<ResidentTally>,
+    }
+
+    /// Counts `harvest.workflow.resident` outcomes by `outcome/reason`
+    /// (issue #2007).
+    #[derive(Debug, Default)]
+    pub struct ResidentTally(Mutex<BTreeMap<String, u64>>);
+
+    impl ResidentTally {
+        /// A report note: the hit rate and each miss reason.
+        #[must_use]
+        pub fn note(&self) -> String {
+            let counts = self.0.lock().expect("poisoned");
+            let total: u64 = counts.values().sum();
+            let hits: u64 = counts
+                .iter()
+                .filter(|(key, _)| key.starts_with("hit/"))
+                .map(|(_, n)| n)
+                .sum();
+            let misses: Vec<String> = counts
+                .iter()
+                .filter_map(|(key, n)| {
+                    key.strip_prefix("miss/")
+                        .map(|reason| format!("{reason}={n}"))
+                })
+                .collect();
+            #[allow(clippy::cast_precision_loss)] // Counts stay far below 2^52.
+            let rate = if total == 0 {
+                "n/a".to_owned()
+            } else {
+                format!("{:.1}%", hits as f64 * 100.0 / total as f64)
+            };
+            format!(
+                "resident hit rate (issue #2007): {rate}, {hits} of {total} decisions; \
+                 misses: {}",
+                if misses.is_empty() {
+                    "none".to_owned()
+                } else {
+                    misses.join(", ")
+                }
+            )
+        }
+    }
+
+    impl MetricsRecorder for ResidentTally {
+        fn record_workflow_resident(
+            &self,
+            _workflow_name: &str,
+            _queue: &str,
+            outcome: &str,
+            reason: &str,
+        ) {
+            *self
+                .0
+                .lock()
+                .expect("poisoned")
+                .entry(format!("{outcome}/{reason}"))
+                .or_default() += 1;
+        }
     }
 
     impl BenchObservations {
+        /// The resident-outcome note of this run (issue #2007).
+        #[must_use]
+        pub fn resident_note(&self) -> String {
+            self.resident.note()
+        }
+
         #[must_use]
         pub fn activity_starts(&self) -> Vec<(Uuid, DateTime<Utc>)> {
             self.activity_starts.lock().expect("poisoned").clone()
@@ -3374,12 +3440,18 @@ pub mod db {
     /// Build the registry both bench workflows and all three activities share.
     #[must_use]
     pub fn build_registry() -> (Arc<HandlerRegistry>, Arc<BenchObservations>) {
+        // Issue #2007: count resident outcomes. Every other metric stays a
+        // no-op, as before.
+        let resident = Arc::new(ResidentTally::default());
         let telemetry = Arc::new(
             TelemetryConfig::builder()
-                .metrics(Arc::new(NoOpMetrics) as Arc<dyn MetricsRecorder>)
+                .metrics(Arc::clone(&resident) as Arc<dyn MetricsRecorder>)
                 .build(),
         );
-        let observations = Arc::new(BenchObservations::default());
+        let observations = Arc::new(BenchObservations {
+            resident,
+            ..BenchObservations::default()
+        });
         let mut state = std::collections::HashMap::new();
         state.insert(
             std::any::TypeId::of::<Arc<BenchObservations>>(),
@@ -4016,7 +4088,7 @@ pub mod db {
         let scenario_started = Instant::now();
         let cluster = Box::pin(setup_shards(shard_count)).await?;
         let sharded = cluster.sharded_pool();
-        let (registry, _observations) = build_registry();
+        let (registry, observations) = build_registry();
         let fleet = start_fleet(&cluster, &sharded, &registry, &census);
         let deadline = scenario_deadline();
         let shards = cluster.shard_ids();
@@ -4141,6 +4213,7 @@ pub mod db {
                 vec![
                     shard_note(&per_shard),
                     format!("topology: {}", topology.as_str()),
+                    observations.resident_note(),
                     format!(
                         "closed loop: {inflight} workflows in flight per shard, {requested} \
                          measured completions, warmup population {}",
@@ -4552,6 +4625,7 @@ pub mod db {
                 vec![
                     shard_note(&per_shard),
                     format!("topology: {}", topology.as_str()),
+                    observations.resident_note(),
                     format!("target pace: {target:.1} workflow starts/s"),
                     format!(
                         "host-to-database clock offset before the window: {} ms (per shard, \
@@ -4848,6 +4922,7 @@ pub mod db {
                 vec![
                     shard_note(&per_shard),
                     format!("topology: {}", topology.as_str()),
+                    observations.resident_note(),
                     format!(
                         "target pace: {PACED_STARTS_PER_SEC_PER_SHARD:.1} signals/s per shard, \
                          one paced sender per shard running concurrently; achieved {}/s",

@@ -115,6 +115,9 @@ pub enum NotKept {
     /// The cycle awaits the branches of a race, such as a signal with a
     /// deadline.
     Race,
+    /// The cycle tears down the losers of a race that ended earlier. A
+    /// replay re-issues this command, because it writes no event.
+    RaceTeardown,
     /// The cycle asks for a durable mutex, or holds one.
     Mutex,
     /// The cycle issues a command that the resident path does not read, such
@@ -147,6 +150,7 @@ impl NotKept {
         match self {
             Self::MultiAwait => "multi_await",
             Self::Race => "race",
+            Self::RaceTeardown => "race_teardown",
             Self::Mutex => "mutex",
             Self::Command => "command",
             Self::NoAwait => "no_await",
@@ -215,6 +219,7 @@ pub const RESIDENT_MISS_REASONS: &[&str] = &[
     "gap",
     "multi_await",
     "race",
+    "race_teardown",
     "mutex",
     "command",
     "no_await",
@@ -508,6 +513,7 @@ fn plan_suspension(
             WorkflowCommand::AcquireMutex { .. } | WorkflowCommand::ReleaseMutex { .. } => {
                 return Err(NotKept::Mutex);
             }
+            WorkflowCommand::CancelRaceLosers { .. } => return Err(NotKept::RaceTeardown),
             _ => return Err(NotKept::Command),
         };
         if awaits {
@@ -1318,6 +1324,47 @@ mod tests {
         }
     }
 
+    /// Waits for `approve` with a deadline, then runs an activity.
+    fn gate_then_activity_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            let _ = ctx
+                .wait_for_signal_timeout("approve", std::time::Duration::from_secs(60))
+                .await
+                .map_err(|e| e.to_string())?;
+            ctx.execute_activity_raw("a", json!({}), "default")
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    #[tokio::test]
+    async fn a_won_race_names_its_teardown_on_each_later_replay() {
+        let history = vec![
+            started(Value::Null),
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("__signal_timeout:1:approve"),
+                duration_secs: 60,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approve".into(),
+                payload: Value::Null,
+            },
+        ];
+        let (outcome, kept) = start_explained(
+            ExecutionId::new(),
+            history,
+            gate_then_activity_workflow,
+            Value::Null,
+        )
+        .await;
+        assert!(matches!(outcome, WorkflowOutcome::Suspended { .. }));
+        assert_eq!(
+            kept.err(),
+            Some(NotKept::RaceTeardown),
+            "the replay re-issues the teardown of the losing timer"
+        );
+    }
+
     #[tokio::test]
     async fn a_probed_signal_wait_names_the_probe() {
         let (_, kept) = start_explained(
@@ -1359,6 +1406,7 @@ mod tests {
             ResidentMiss::Gap,
             ResidentMiss::NotKept(NotKept::MultiAwait),
             ResidentMiss::NotKept(NotKept::Race),
+            ResidentMiss::NotKept(NotKept::RaceTeardown),
             ResidentMiss::NotKept(NotKept::Mutex),
             ResidentMiss::NotKept(NotKept::Command),
             ResidentMiss::NotKept(NotKept::NoAwait),

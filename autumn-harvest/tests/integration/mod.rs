@@ -267,6 +267,8 @@ mod replay_verifier_tests;
 mod replayer_integration_tests;
 #[cfg(feature = "testing")]
 mod replayer_tests;
+#[cfg(feature = "db")]
+mod resident_hit_rate_db_tests;
 mod resident_hit_rate_docs;
 mod retention_overrides_tests;
 mod retention_reclaim_support;

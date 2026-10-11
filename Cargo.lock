@@ -360,6 +360,7 @@ dependencies = [
  "aes-gcm",
  "arbitrary",
  "async-trait",
+ "autumn-harvest-agent",
  "autumn-harvest-macros",
  "base64 0.22.1",
  "chrono",
