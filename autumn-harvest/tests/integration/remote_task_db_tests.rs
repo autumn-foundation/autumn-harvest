@@ -552,16 +552,23 @@ async fn pending_handles_page_in_token_order() {
     let first = remote_task::pending_remote_tasks(&mut conn, &codecs, None, 1)
         .await
         .expect("page 1");
-    assert_eq!(first.len(), 1);
-    assert_eq!(first[0].token, tokens[0]);
-    assert_eq!(first[0].handle.server, "reports");
-    let second = remote_task::pending_remote_tasks(&mut conn, &codecs, Some(tokens[0]), 1)
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(first.items[0].token, tokens[0]);
+    assert_eq!(first.items[0].handle.server, "reports");
+    assert_eq!(first.next, Some(tokens[0]), "a full page gives a cursor");
+    let second = remote_task::pending_remote_tasks(&mut conn, &codecs, first.next, 1)
         .await
         .expect("page 2");
-    assert_eq!(second.len(), 1);
-    assert_eq!(second[0].token, tokens[1]);
-    let first_id = first[0].handle.task_id.clone();
-    let second_id = second[0].handle.task_id.clone();
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(second.items[0].token, tokens[1]);
+    let third = remote_task::pending_remote_tasks(&mut conn, &codecs, second.next, 1)
+        .await
+        .expect("page 3");
+    let rest: Vec<ExternalActivityToken> = third.items.iter().map(|p| p.token).collect();
+    assert_eq!(rest, Vec::<ExternalActivityToken>::new());
+    assert_eq!(third.next, None, "the end gives no cursor");
+    let first_id = first.items[0].handle.task_id.clone();
+    let second_id = second.items[0].handle.task_id.clone();
 
     let poller = RemoteTaskPoller::new(&RemoteTasks::new(FakeTransport(Arc::clone(&server))))
         .with_batch_size(1);

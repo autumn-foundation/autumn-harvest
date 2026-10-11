@@ -656,5 +656,5 @@ pub mod a2a {
 
 #[cfg(feature = "db")]
 pub use crate::remote_task_db::{
-    PendingRemoteTask, PollReport, RemoteTaskPoller, pending_remote_tasks, resolve,
+    PendingPage, PendingRemoteTask, PollReport, RemoteTaskPoller, pending_remote_tasks, resolve,
 };

@@ -95,7 +95,7 @@ implement `RemoteTaskTransport` for any other client.
 | Retryable start errors | network error, HTTP 429, HTTP 5xx |
 | Poll interval | 5 s, or the MCP `pollIntervalMs` of the start or the last read if longer, up to 1 h |
 | Page size | 100 tokens |
-| Remote reads at a time | 8, each with a limit of 30 s |
+| Remote reads at a time | 8, each with a limit of 30 s; the servers take turns |
 | Backoff of a failing read | doubles from the interval, up to 5 min |
 | Result limit | 2 MiB (`DEFAULT_MAX_ACTIVITY_RESULT_BYTES`) |
 | Failure message limit | 4 KiB |
@@ -136,7 +136,8 @@ A token is a capability: whoever holds it can settle the call. A relay must
 authenticate each push before it settles a token.
 `remote_task::pending_remote_tasks` lists each pending token with its
 handle. Match on the server and the task id together, because two servers
-can use the same task id.
+can use the same task id. Pass `PendingPage::next` as `after` for the next
+page.
 
 ## Durable promises
 

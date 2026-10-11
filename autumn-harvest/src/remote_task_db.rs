@@ -196,11 +196,22 @@ async fn load_handle(
     }
 }
 
+/// One page of [`pending_remote_tasks`].
+#[derive(Debug, Clone)]
+pub struct PendingPage {
+    /// The pending remote tasks whose handle decodes, in token order.
+    pub items: Vec<PendingRemoteTask>,
+    /// The `after` value for the next page, or `None` at the end. It moves
+    /// past the rows whose handle does not decode too.
+    pub next: Option<ExternalActivityToken>,
+}
+
 /// List pending remote tasks of live runs in token order, after `after`.
 ///
 /// The poller uses it. A push relay can use it to find the token of a
 /// remote task. Match on the server and the task id together. A row whose
-/// handle does not decode is skipped.
+/// handle does not decode is skipped. Page with [`PendingPage::next`], not
+/// with the last item, so a page of skipped rows does not stop the scan.
 ///
 /// # Errors
 ///
@@ -210,8 +221,12 @@ pub async fn pending_remote_tasks(
     codecs: &PayloadCodecs,
     after: Option<ExternalActivityToken>,
     limit: i64,
-) -> HarvestResult<Vec<PendingRemoteTask>> {
-    Ok(pending_page(conn, codecs, after, limit).await?.items)
+) -> HarvestResult<PendingPage> {
+    let page = pending_page(conn, codecs, after, limit).await?;
+    Ok(PendingPage {
+        items: page.items,
+        next: if page.full { page.last } else { None },
+    })
 }
 
 /// Settle a token from a remote task state.
@@ -360,6 +375,32 @@ fn record_wait(
     waits.insert(token, entry);
 }
 
+/// Order `due` so that the servers take turns: the first task of each
+/// server, then the second, and so on. A slow server then holds at most its
+/// share of the read slots, and the reads of other servers still start.
+fn interleave_by_server(due: Vec<PendingRemoteTask>) -> Vec<PendingRemoteTask> {
+    let mut queues: Vec<(String, std::collections::VecDeque<PendingRemoteTask>)> = Vec::new();
+    for pending in due {
+        match queues
+            .iter_mut()
+            .find(|(server, _)| *server == pending.handle.server)
+        {
+            Some((_, queue)) => queue.push_back(pending),
+            None => queues.push((pending.handle.server.clone(), [pending].into())),
+        }
+    }
+    let mut order = Vec::new();
+    while !queues.is_empty() {
+        queues.retain_mut(|(_, queue)| {
+            if let Some(pending) = queue.pop_front() {
+                order.push(pending);
+            }
+            !queue.is_empty()
+        });
+    }
+    order
+}
+
 /// Polls pending remote tasks and settles the ones that ended.
 ///
 /// Run one poller for each shard pool. Two pollers on one shard are safe:
@@ -502,7 +543,7 @@ impl RemoteTaskPoller {
             polled: due.len(),
             ..PollReport::default()
         };
-        let mut reads = futures::stream::iter(due)
+        let mut reads = futures::stream::iter(interleave_by_server(due))
             .map(|pending| async move {
                 let read =
                     tokio::time::timeout(self.get_timeout, self.transport.get(&pending.handle))
@@ -662,7 +703,7 @@ mod tests {
 
     use super::{
         Backoff, MAX_BACKOFF_ENTRIES, MAX_MESSAGE_BYTES, PendingRemoteTask, RemoteTaskPoller,
-        record_wait, truncate,
+        interleave_by_server, record_wait, truncate,
     };
     use crate::remote_task::{RemoteProtocol, RemoteTaskHandle};
     use crate::types::{ExecutionId, ExternalActivityToken};
@@ -699,6 +740,37 @@ mod tests {
         record_wait(&mut waits, token, entry, now);
         assert_eq!(waits.len(), 1);
         assert!(waits.contains_key(&token));
+    }
+
+    fn pending(server: &str, task_id: &str) -> PendingRemoteTask {
+        PendingRemoteTask {
+            token: ExternalActivityToken::new(),
+            execution_id: ExecutionId::new(),
+            handle: RemoteTaskHandle {
+                server: server.into(),
+                protocol: RemoteProtocol::Mcp,
+                task_id: task_id.into(),
+                poll_interval_ms: None,
+            },
+            recorded_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn reads_alternate_between_servers() {
+        let due = vec![
+            pending("slow", "s1"),
+            pending("slow", "s2"),
+            pending("slow", "s3"),
+            pending("fast", "f1"),
+            pending("other", "o1"),
+            pending("fast", "f2"),
+        ];
+        let order: Vec<String> = interleave_by_server(due)
+            .into_iter()
+            .map(|p| p.handle.task_id)
+            .collect();
+        assert_eq!(order, ["s1", "f1", "o1", "s2", "f2", "s3"]);
     }
 
     #[test]
