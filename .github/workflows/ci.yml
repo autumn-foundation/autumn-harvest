@@ -519,6 +519,13 @@ jobs:
       - name: Run docs/rnd/sqlite-feasibility.md guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration sqlite_feasibility_docs::"
 
+      # Issue #2011: the speculation spike report states measured numbers and
+      # a verdict. A docs-only PR skips the `test` matrix, so its guards run
+      # here. Guarded by
+      # `speculative_execution_docs::guards_run_on_docs_only_changes`.
+      - name: Run docs/rnd/speculative-execution-spike.md guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration speculative_execution_docs::"
+
       # Issue #1816: the SLO burn-rate pack lives under `docs/`, so a PR
       # that edits only the pack skips the `test` matrix. These guards pin
       # what promtool cannot see. Quoted for the trailing-`::` reason above.
