@@ -452,6 +452,9 @@ jobs:
         run: cargo clippy -p standalone-runner --all-targets -- -D warnings
       - name: "Clippy standalone-quickstart example (issue #1614)"
         run: cargo clippy -p standalone-quickstart --all-targets -- -D warnings
+      - name: "Clippy agent-loop-hit-rate example (issue #2007)"
+        # `--no-deps`: the engine has a dead-code warning without `testing`.
+        run: cargo clippy -p agent-loop-hit-rate --all-targets --no-deps -- -D warnings
       # Same issue #962 rule as the verify and redis crates below: a new
       # workspace member gets NO clippy coverage without its own step here.
       # `--no-deps` scopes the deny to the example, because it depends on

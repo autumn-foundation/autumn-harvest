@@ -2276,9 +2276,10 @@ pub(crate) struct DriveResult {
     /// The explicit context-local router, if any. See [`run_workflow_with_state`].
     pub(crate) router: Option<crate::shard::ShardRouter>,
     /// The suspended workflow, kept for the next decision (issue #1798).
+    /// Otherwise the reason the next decision replays cold (issue #2007).
     #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))]
     // Resident paths need the worker or the test harness.
-    pub(crate) resident: Option<crate::resident::ResidentWorkflow>,
+    pub(crate) resident: Result<crate::resident::ResidentWorkflow, crate::resident::ResidentMiss>,
 }
 
 impl DriveResult {
@@ -2413,7 +2414,9 @@ async fn drive_cycle(
         (Some(future), Some(key)) => {
             crate::resident::ResidentWorkflow::capture(&ctx, future, &mut outcome, key)
         }
-        _ => None,
+        // No next decision reads this reason: the path is off, or the run
+        // ended.
+        _ => Err(crate::resident::ResidentMiss::Cold),
     };
 
     // Issue #1263 items 11/15/17: carry the EXPLICIT context-local router

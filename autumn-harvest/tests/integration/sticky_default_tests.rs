@@ -21,6 +21,8 @@
 //!    replays from the top.
 //! 10. LRU eviction drops the resident workflow. The next decision is a miss
 //!     and replays cold.
+//! 11. A join or a race counts a resident miss with its reason. Each
+//!     decision records one resident sample (issue #2007).
 //!
 //! A queue-level test also proves which rows the shutdown release touches.
 //! Each test uses its own queue and worker ids, so the tests can share one
@@ -50,11 +52,14 @@ use crate::integration_e2e::{
 
 const WORKFLOW: &str = "sticky_default_wf";
 
-/// Counts cache hits and misses for one worker.
+/// Counts cache and resident hits and misses for one worker.
 #[derive(Debug, Default)]
 struct CacheCounts {
     hits: AtomicU64,
     misses: AtomicU64,
+    resident_hits: AtomicU64,
+    /// Resident misses by reason (issue #2007).
+    resident_misses: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
 }
 
 impl CacheCounts {
@@ -69,6 +74,32 @@ impl CacheCounts {
     fn decisions(&self) -> u64 {
         self.hits() + self.misses()
     }
+
+    fn resident_hits(&self) -> u64 {
+        AtomicU64::load(&self.resident_hits, Ordering::SeqCst)
+    }
+
+    /// Resident misses with `reason`.
+    fn resident_misses(&self, reason: &str) -> u64 {
+        self.resident_misses
+            .lock()
+            .expect("resident_misses lock")
+            .get(reason)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Resident samples of every kind. Each decision records one sample
+    /// while the resident path is on.
+    fn resident_samples(&self) -> u64 {
+        self.resident_hits()
+            + self
+                .resident_misses
+                .lock()
+                .expect("resident_misses lock")
+                .values()
+                .sum::<u64>()
+    }
 }
 
 impl MetricsRecorder for CacheCounts {
@@ -78,6 +109,19 @@ impl MetricsRecorder for CacheCounts {
 
     fn record_workflow_cache_miss(&self, _workflow_name: &str, _queue: &str) {
         self.misses.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn record_workflow_resident_hit(&self, _workflow_name: &str, _queue: &str) {
+        self.resident_hits.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn record_workflow_resident_miss(&self, _workflow_name: &str, _queue: &str, reason: &str) {
+        *self
+            .resident_misses
+            .lock()
+            .expect("resident_misses lock")
+            .entry(reason.to_owned())
+            .or_default() += 1;
     }
 }
 
@@ -288,6 +332,46 @@ fn evict_workflow<'a>(
     two_signal_workflow(ctx, input)
 }
 
+const JOIN_WORKFLOW: &str = "sticky_default_join_wf";
+
+/// Awaits two activities at once (issue #2007).
+fn join_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let queue = input["queue"].as_str().ok_or("missing queue")?;
+        let (a, b) = futures::join!(
+            ctx.execute_activity_raw(ECHO_ACTIVITY, serde_json::json!("a"), queue),
+            ctx.execute_activity_raw(ECHO_ACTIVITY, serde_json::json!("b"), queue),
+        );
+        Ok(serde_json::json!([
+            a.map_err(|e| e.to_string())?,
+            b.map_err(|e| e.to_string())?
+        ]))
+    })
+}
+
+const RACE_WORKFLOW: &str = "sticky_default_race_wf";
+
+/// Races two activities with `ctx.race()` (issue #2007).
+fn race_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let queue = input["queue"].as_str().ok_or("missing queue")?;
+        let winner = ctx
+            .race()
+            .activity_raw(ECHO_ACTIVITY, serde_json::json!("a"), queue)
+            .activity_raw(ECHO_ACTIVITY, serde_json::json!("b"), queue)
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!(winner.index))
+    })
+}
+
 fn echo_activity<'a>(
     _ctx: &'a ActivityContext,
     input: serde_json::Value,
@@ -360,6 +444,8 @@ fn build_worker(
             info_for(COLD_WORKFLOW, cold_workflow),
             info_for(OFF_WORKFLOW, off_workflow),
             info_for(EVICT_WORKFLOW, evict_workflow),
+            info_for(JOIN_WORKFLOW, join_workflow),
+            info_for(RACE_WORKFLOW, race_workflow),
         ])
         .activities(vec![slow_activity_info(), echo_activity_info()])
         .telemetry(TelemetryConfig {
@@ -978,6 +1064,10 @@ async fn warm_decisions_resume_the_resident_workflow() {
 
     assert_eq!(counts.misses(), 1, "only decision 1 is a cold load");
     assert_eq!(counts.hits(), 3, "decisions 2 to 4 are cache hits");
+    // Issue #2007: the resident counters agree with the body-start count.
+    assert_eq!(counts.resident_misses("cold"), 1, "decision 1 is cold");
+    assert_eq!(counts.resident_hits(), 3, "decisions 2 to 4 resume warm");
+    assert_eq!(counts.resident_samples(), counts.decisions());
     assert_eq!(
         AtomicU64::load(&RESIDENT_BODY_STARTS, Ordering::SeqCst),
         1,
@@ -1043,6 +1133,11 @@ async fn a_delta_the_resident_path_cannot_read_falls_back_to_a_cold_replay() {
         .await;
 
     assert_eq!(counts.hits(), 1, "decision 2 is still a cache hit");
+    // Issue #2007: the decline counts as a `delta` miss, not a hit.
+    assert_eq!(counts.resident_hits(), 0, "no decision resumes warm");
+    assert_eq!(counts.resident_misses("cold"), 1, "decision 1 is cold");
+    assert_eq!(counts.resident_misses("delta"), 1, "decision 2 declines");
+    assert_eq!(counts.resident_samples(), counts.decisions());
     assert_eq!(
         AtomicU64::load(&COUNTED_BODY_STARTS, Ordering::SeqCst),
         2,
@@ -1094,6 +1189,11 @@ async fn sticky_off_replays_every_decision() {
 
     assert_eq!(counts.hits(), 0, "a disabled cache never hits");
     assert_eq!(counts.misses(), 3, "every decision is a miss");
+    assert_eq!(
+        counts.resident_samples(),
+        0,
+        "no resident sample while the resident path is off (issue #2007)"
+    );
     assert_eq!(
         AtomicU64::load(&COLD_BODY_STARTS, Ordering::SeqCst),
         3,
@@ -1162,6 +1262,11 @@ async fn resident_workflows_off_keeps_the_cache_but_replays_every_decision() {
     assert_eq!(counts.misses(), 1, "only decision 1 is a cold load");
     assert_eq!(counts.hits(), 2, "the event cache still hits");
     assert_eq!(
+        counts.resident_samples(),
+        0,
+        "no resident sample while the resident path is off (issue #2007)"
+    );
+    assert_eq!(
         AtomicU64::load(&OFF_BODY_STARTS, Ordering::SeqCst),
         3,
         "with resident workflows off, every decision replays the body"
@@ -1229,11 +1334,51 @@ async fn lru_eviction_drops_the_resident_workflow_and_counts_a_miss() {
         "each first decision and each eviction is a miss"
     );
     assert_eq!(counts.hits(), 2, "each final decision is a warm hit");
+    assert_eq!(counts.resident_misses("cold"), 4, "an eviction is cold");
+    assert_eq!(counts.resident_hits(), 2, "each final decision resumes");
+    assert_eq!(counts.resident_samples(), counts.decisions());
     assert_eq!(
         AtomicU64::load(&EVICT_BODY_STARTS, Ordering::SeqCst),
         4,
         "an evicted run replays cold once, then resumes warm"
     );
+
+    worker.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+}
+
+/// AC (issue #2007): a join or a race is not resident. The next decision
+/// counts a miss with that reason. Each decision records one sample.
+#[tokio::test]
+async fn a_join_or_a_race_counts_a_resident_miss_with_its_reason() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let mut conn = connect(&url).await;
+    let queue = unique_id("reason-q");
+
+    let counts = Arc::new(CacheCounts::default());
+    let worker = build_default_worker(&queue, &unique_id("reason-a"), Arc::clone(&counts));
+    let handle = spawn(&worker, &pool);
+
+    for (workflow, reason) in [(JOIN_WORKFLOW, "multi_await"), (RACE_WORKFLOW, "race")] {
+        let exec_id = ExecutionId::new();
+        let workflow_id = unique_id("reason-wf");
+        let input = serde_json::json!({ "queue": queue });
+        start_or_load_workflow_execution(
+            &mut conn,
+            start_workflow(workflow, exec_id, &workflow_id, &queue, input),
+            None,
+        )
+        .await
+        .expect("start workflow");
+        wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", Duration::from_secs(30))
+            .await;
+        // The first decision captures the reason. The second reads it.
+        assert_eq!(counts.resident_misses(reason), 1, "{workflow}");
+    }
+
+    assert_eq!(counts.resident_misses("cold"), 2, "each first decision");
+    assert_eq!(counts.resident_samples(), counts.decisions());
 
     worker.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;

@@ -7267,6 +7267,10 @@ impl WorkflowContext {
 
     /// Returns why this context cannot stay resident, or `None` (issue #1798).
     ///
+    /// A held mutex reads as [`crate::resident::ResidentMiss::Mutex`]. Each
+    /// other state reads as [`crate::resident::ResidentMiss::Context`] (issue
+    /// #2007).
+    ///
     /// A resident workflow resumes its parked future with one new result. A
     /// warm decision must then equal a cold replay. Each state below can make
     /// a cold replay read the new events in a way that a parked future cannot:
@@ -7281,19 +7285,24 @@ impl WorkflowContext {
     /// # Panics
     ///
     /// Panics if an internal mutex is poisoned.
-    pub(crate) fn resident_blocker(&self) -> Option<&'static str> {
+    pub(crate) fn resident_blocker(&self) -> Option<crate::resident::ResidentMiss> {
+        use crate::resident::ResidentMiss;
         if self.parks.is_held() {
-            return Some("a park token is held");
+            // A park token is held.
+            return Some(ResidentMiss::Context);
         }
         if self.strict_replay || self.canary_mode {
-            return Some("strict or canary replay");
+            // Strict or canary replay.
+            return Some(ResidentMiss::Context);
         }
         #[cfg(any(test, feature = "testing"))]
         if self.timer_clock_elapsed_secs.is_some() {
-            return Some("the advancing test clock is on");
+            // The advancing test clock is on.
+            return Some(ResidentMiss::Context);
         }
         if self.cancellation_reason.is_some() {
-            return Some("the run is cancelled");
+            // The run is cancelled.
+            return Some(ResidentMiss::Context);
         }
         if !self
             .signal_registry
@@ -7302,7 +7311,8 @@ impl WorkflowContext {
             .list_names()
             .is_empty()
         {
-            return Some("a push signal handler is registered");
+            // A push signal handler is registered.
+            return Some(ResidentMiss::Context);
         }
         if !self
             .held_mutex_keys
@@ -7310,7 +7320,7 @@ impl WorkflowContext {
             .expect("held_mutex_keys lock poisoned")
             .is_empty()
         {
-            return Some("a durable mutex is held");
+            return Some(ResidentMiss::Mutex);
         }
         if self
             .nd_details
@@ -7323,7 +7333,8 @@ impl WorkflowContext {
                 .expect("deferred_nd_error lock poisoned")
                 .is_some()
         {
-            return Some("a non-determinism record is set");
+            // A non-determinism record is set.
+            return Some(ResidentMiss::Context);
         }
         if self
             .matcher
@@ -7331,7 +7342,8 @@ impl WorkflowContext {
             .expect("matcher lock poisoned")
             .has_buffered_history()
         {
-            return Some("history is not fully read");
+            // History is not fully read.
+            return Some(ResidentMiss::Context);
         }
         None
     }

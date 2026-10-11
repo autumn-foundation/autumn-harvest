@@ -87,6 +87,86 @@ pub enum ResumeDeclined {
     ReceiverDropped,
 }
 
+/// Why a decision replayed cold while resident workflows are on (issue
+/// #2007).
+///
+/// The worker labels `harvest.workflow.resident_miss` with
+/// [`Self::as_str`]. The set is closed, so the label is bounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ResidentMiss {
+    /// This worker holds no resident state for the run, for example on the
+    /// first decision or after an eviction.
+    Cold,
+    /// The last suspension awaited two or more commands.
+    MultiAwait,
+    /// The last suspension awaited a race, or dropped a wait.
+    Race,
+    /// The last suspension held or waited for a durable mutex.
+    Mutex,
+    /// The workflow runs in a hot-swapped module.
+    HotSwap,
+    /// The last suspension sent a command that the resident path does not
+    /// take, for example a child workflow.
+    Command,
+    /// Another context state blocked the capture, for example a push signal
+    /// handler.
+    Context,
+    /// A context input changed since the suspension.
+    KeyChanged,
+    /// The new events did not resolve the parked wait exactly.
+    Delta,
+    /// The awaited activity failed or timed out.
+    Failure,
+}
+
+impl ResidentMiss {
+    /// Every reason, in label order.
+    pub const ALL: [Self; 10] = [
+        Self::Cold,
+        Self::MultiAwait,
+        Self::Race,
+        Self::Mutex,
+        Self::HotSwap,
+        Self::Command,
+        Self::Context,
+        Self::KeyChanged,
+        Self::Delta,
+        Self::Failure,
+    ];
+
+    /// The `reason` label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cold => "cold",
+            Self::MultiAwait => "multi_await",
+            Self::Race => "race",
+            Self::Mutex => "mutex",
+            Self::HotSwap => "hot_swap",
+            Self::Command => "command",
+            Self::Context => "context",
+            Self::KeyChanged => "key_changed",
+            Self::Delta => "delta",
+            Self::Failure => "failure",
+        }
+    }
+}
+
+impl From<&ResumeDeclined> for ResidentMiss {
+    fn from(declined: &ResumeDeclined) -> Self {
+        match declined {
+            ResumeDeclined::KeyChanged => Self::KeyChanged,
+            ResumeDeclined::InexactResolution(_) => Self::Failure,
+            ResumeDeclined::OwnEventsMismatch
+            | ResumeDeclined::NoResolution
+            | ResumeDeclined::ExtraEvents
+            | ResumeDeclined::UnexpectedEvent(_)
+            | ResumeDeclined::ReceiverDropped => Self::Delta,
+        }
+    }
+}
+
 /// The context inputs that a resident workflow depends on (issue #1798).
 ///
 /// The worker builds this key at each decision, mostly from the execution
@@ -323,9 +403,9 @@ impl OwnEvent {
 }
 
 /// Reads one suspension's commands. Returns the index of the one awaited
-/// command and the events the worker writes, or `None` when the
-/// suspension cannot stay resident.
-fn plan_suspension(commands: &[WorkflowCommand]) -> Option<(usize, Vec<OwnEvent>)> {
+/// command and the events the worker writes, or why the suspension cannot
+/// stay resident.
+fn plan_suspension(commands: &[WorkflowCommand]) -> Result<(usize, Vec<OwnEvent>), ResidentMiss> {
     let mut awaited = None;
     let mut own_events = Vec::new();
     for (index, cmd) in commands.iter().enumerate() {
@@ -351,17 +431,50 @@ fn plan_suspension(commands: &[WorkflowCommand]) -> Option<(usize, Vec<OwnEvent>
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
             | WorkflowCommand::RecordLog { .. } => false,
-            _ => return None,
+            WorkflowCommand::AcquireMutex { .. } | WorkflowCommand::ReleaseMutex { .. } => {
+                return Err(ResidentMiss::Mutex);
+            }
+            _ => return Err(ResidentMiss::Command),
         };
         if awaits {
+            // A wait whose receiver is gone is what a `select!` leaves.
+            if !cmd.awaits_result() {
+                return Err(ResidentMiss::Race);
+            }
             // A second awaited command means a join or a race.
-            if awaited.is_some() || !cmd.awaits_result() {
-                return None;
+            if awaited.is_some() {
+                return Err(if is_race(commands) {
+                    ResidentMiss::Race
+                } else {
+                    ResidentMiss::MultiAwait
+                });
             }
             awaited = Some(index);
         }
     }
-    awaited.map(|index| (index, own_events))
+    awaited
+        .map(|index| (index, own_events))
+        .ok_or(ResidentMiss::Command)
+}
+
+/// Whether a suspension with several awaited commands is a race (issue
+/// #2007).
+///
+/// A `ctx.race()` cycle records its `race:{seq}` open marker. A race timer
+/// has a reserved id. A raw `select!` leaves neither, so it reads as a join.
+fn is_race(commands: &[WorkflowCommand]) -> bool {
+    commands.iter().any(|cmd| match cmd {
+        WorkflowCommand::RecordMarker { name, .. } => name
+            .strip_prefix("race:")
+            .is_some_and(|seq| seq.parse::<u32>().is_ok()),
+        WorkflowCommand::StartTimer { timer_id, .. } => {
+            let id = timer_id.as_str();
+            id.starts_with(crate::context::RACE_TIMER_PREFIX)
+                || crate::awaitables::reserved_signal_race_name(id).is_some()
+                || crate::awaitables::reserved_child_race_name(id).is_some()
+        }
+        _ => false,
+    })
 }
 
 /// A suspended workflow that stays in memory between decisions (issue #1798).
@@ -390,29 +503,30 @@ impl ResidentWorkflow {
     /// Keeps a suspended cycle resident when a warm decision can resume it.
     ///
     /// On success the awaited command in `outcome` gets a closed channel,
-    /// and the returned value holds the live one. On `None` the caller drops
-    /// `future` as on a cold cycle.
+    /// and the returned value holds the live one. On an error the caller
+    /// drops `future` as on a cold cycle. The error is the miss reason of the
+    /// next decision (issue #2007).
     pub(crate) fn capture(
         ctx: &Arc<WorkflowContext>,
         future: OwnedHandlerFuture,
         outcome: &mut WorkflowOutcome,
         key: ResidentKey,
-    ) -> Option<Self> {
+    ) -> Result<Self, ResidentMiss> {
         let WorkflowOutcome::Suspended { commands } = outcome else {
-            return None;
+            return Err(ResidentMiss::Command);
         };
-        if ctx.resident_blocker().is_some() {
-            return None;
+        if let Some(blocker) = ctx.resident_blocker() {
+            return Err(blocker);
         }
         let (index, own_events) = plan_suspension(commands)?;
         // A cold replay could hand the new signal to an earlier probe.
         if let WorkflowCommand::WaitForSignal { signal_name, .. } = &commands[index]
             && ctx.signal_probed_at_frontier(signal_name)
         {
-            return None;
+            return Err(ResidentMiss::Context);
         }
-        let awaiting = Awaiting::take_from(&mut commands[index])?;
-        Some(Self {
+        let awaiting = Awaiting::take_from(&mut commands[index]).ok_or(ResidentMiss::Command)?;
+        Ok(Self {
             future,
             awaiting,
             own_events,
@@ -486,7 +600,7 @@ pub async fn start(
     let ctx = crate::executor::default_task_context(exec_id, history);
     let key = ResidentKey::new(handler, None, &HashMap::new());
     let drive = crate::executor::drive_workflow_keep(ctx, handler, input, None, Some(key)).await;
-    (drive.outcome, drive.resident)
+    (drive.outcome, drive.resident.ok())
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -502,7 +616,7 @@ impl ResidentWorkflow {
         delta: &[WorkflowEvent],
     ) -> Result<(WorkflowOutcome, Option<Self>), ResumeDeclined> {
         let drive = self.resume_with(delta, None, None).await?;
-        Ok((drive.outcome, drive.resident))
+        Ok((drive.outcome, drive.resident.ok()))
     }
 }
 
@@ -1037,6 +1151,181 @@ mod tests {
             );
             assert!(resident.is_none(), "{name}: must not stay resident");
         }
+    }
+
+    // ── Miss reasons (issue #2007) ───────────────────────────────────
+
+    /// Runs one cold decision and returns why it cannot stay resident.
+    async fn capture_of(handler: WorkflowHandlerFn) -> Result<(), ResidentMiss> {
+        capture_after(vec![started(Value::Null)], handler).await
+    }
+
+    /// Runs one cold decision over `history` and returns why it cannot stay
+    /// resident.
+    async fn capture_after(
+        history: Vec<WorkflowEvent>,
+        handler: WorkflowHandlerFn,
+    ) -> Result<(), ResidentMiss> {
+        let ctx = crate::executor::default_task_context(ExecutionId::new(), history);
+        let key = ResidentKey::new(handler, None, &HashMap::new());
+        crate::executor::drive_workflow_keep(ctx, handler, Value::Null, None, Some(key))
+            .await
+            .resident
+            .map(drop)
+    }
+
+    /// Races two activities with `ctx.race()`.
+    fn activity_race_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            let winner = ctx
+                .race()
+                .activity_raw("a", json!({}), "default")
+                .activity_raw("b", json!({}), "default")
+                .run()
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(winner.index))
+        })
+    }
+
+    /// Races an activity against a timer with `ctx.race()`.
+    fn timer_race_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            let winner = ctx
+                .race()
+                .activity_raw("a", json!({}), "default")
+                .timer(std::time::Duration::from_secs(60))
+                .run()
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(winner.index))
+        })
+    }
+
+    /// Waits for a signal with a deadline.
+    fn signal_timeout_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            ctx.wait_for_signal_timeout("go", std::time::Duration::from_secs(60))
+                .await
+                .map_err(|e| e.to_string())
+                .map(|value| value.unwrap_or(Value::Null))
+        })
+    }
+
+    /// Waits for a durable mutex.
+    fn mutex_wait_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            let _guard = ctx
+                .mutex("ledger")
+                .acquire()
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(Value::Null)
+        })
+    }
+
+    /// Holds a durable mutex while it waits for an activity.
+    fn mutex_held_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            let _guard = ctx
+                .mutex("ledger")
+                .acquire()
+                .await
+                .map_err(|e| e.to_string())?;
+            ctx.execute_activity_raw("a", json!({}), "default")
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Starts a child workflow and waits for it.
+    fn child_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            ctx.spawn_child_workflow_raw("child", json!({}))
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    #[tokio::test]
+    async fn a_suspension_that_cannot_stay_resident_reports_why() {
+        let cases: [(&str, WorkflowHandlerFn, ResidentMiss); 8] = [
+            ("join", join_workflow, ResidentMiss::MultiAwait),
+            ("activity race", activity_race_workflow, ResidentMiss::Race),
+            ("timer race", timer_race_workflow, ResidentMiss::Race),
+            (
+                "signal deadline",
+                signal_timeout_workflow,
+                ResidentMiss::Race,
+            ),
+            ("mutex wait", mutex_wait_workflow, ResidentMiss::Mutex),
+            ("child workflow", child_workflow, ResidentMiss::Command),
+            ("signal handler", handler_workflow, ResidentMiss::Context),
+            ("condition", condition_workflow, ResidentMiss::Context),
+        ];
+        for (name, handler, expected) in cases {
+            assert_eq!(capture_of(handler).await, Err(expected), "{name}");
+        }
+        let granted = WorkflowEvent::MutexGranted {
+            key: "ledger".into(),
+            lock_seq: 1,
+            acquired_at: Utc
+                .with_ymd_and_hms(2026, 10, 3, 0, 0, 1)
+                .single()
+                .expect("valid timestamp"),
+        };
+        assert_eq!(
+            capture_after(vec![started(Value::Null), granted], mutex_held_workflow).await,
+            Err(ResidentMiss::Mutex),
+            "a held mutex"
+        );
+        assert_eq!(
+            capture_of(one_activity_workflow).await,
+            Ok(()),
+            "one awaited activity stays resident"
+        );
+    }
+
+    #[test]
+    fn each_decline_maps_to_one_miss_reason() {
+        let cases = [
+            (ResumeDeclined::KeyChanged, ResidentMiss::KeyChanged),
+            (ResumeDeclined::OwnEventsMismatch, ResidentMiss::Delta),
+            (ResumeDeclined::NoResolution, ResidentMiss::Delta),
+            (ResumeDeclined::ExtraEvents, ResidentMiss::Delta),
+            (
+                ResumeDeclined::UnexpectedEvent("TimerFired"),
+                ResidentMiss::Delta,
+            ),
+            (ResumeDeclined::ReceiverDropped, ResidentMiss::Delta),
+            (
+                ResumeDeclined::InexactResolution("ActivityFailed"),
+                ResidentMiss::Failure,
+            ),
+        ];
+        for (declined, expected) in cases {
+            assert_eq!(ResidentMiss::from(&declined), expected, "{declined:?}");
+        }
+    }
+
+    #[test]
+    fn miss_reasons_are_a_closed_label_set() {
+        let labels: Vec<&str> = ResidentMiss::ALL.iter().map(|m| m.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "cold",
+                "multi_await",
+                "race",
+                "mutex",
+                "hot_swap",
+                "command",
+                "context",
+                "key_changed",
+                "delta",
+                "failure",
+            ]
+        );
     }
 
     // ── Deltas that must decline ─────────────────────────────────────

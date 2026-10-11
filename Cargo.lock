@@ -55,6 +55,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-loop-hit-rate"
+version = "0.7.0"
+dependencies = [
+ "autumn-harvest",
+ "autumn-harvest-agent",
+ "deadpool",
+ "diesel-async",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "ahash"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -628,6 +628,21 @@ pub const METRIC_WORKFLOW_CACHE_HIT: &str = "harvest.workflow.cache_hit";
 /// the existing cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_CACHE_MISS: &str = "harvest.workflow.cache_miss";
 
+/// Counter: a decision resumed the parked workflow and replayed nothing
+/// (issue #2007).
+///
+/// Labeled by `workflow` and `queue`. While resident workflows are on, each
+/// decision records one sample of this counter or of
+/// [`METRIC_WORKFLOW_RESIDENT_MISS`].
+pub const METRIC_WORKFLOW_RESIDENT_HIT: &str = "harvest.workflow.resident_hit";
+
+/// Counter: a decision replayed cold while resident workflows are on (issue
+/// #2007).
+///
+/// Labeled by `workflow`, `queue` and [`METRIC_LABEL_REASON`]. The reason is
+/// [`crate::resident::ResidentMiss::as_str`], a closed set.
+pub const METRIC_WORKFLOW_RESIDENT_MISS: &str = "harvest.workflow.resident_miss";
+
 /// Counter: incremented once per `signal_external_workflow` call after the
 /// terminal outcome is recorded in `harvest_events`.
 ///
@@ -3843,6 +3858,23 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the counter `harvest.workflow.cache_miss{workflow}`.
     fn record_workflow_cache_miss(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
+    }
+
+    /// A decision resumed the parked workflow and replayed nothing (issue
+    /// #2007).
+    ///
+    /// Maps to the counter `harvest.workflow.resident_hit{workflow, queue}`.
+    fn record_workflow_resident_hit(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
+    /// A decision replayed cold while resident workflows are on (issue
+    /// #2007). `reason` is [`crate::resident::ResidentMiss::as_str`].
+    ///
+    /// Maps to the counter
+    /// `harvest.workflow.resident_miss{workflow, queue, reason}`.
+    fn record_workflow_resident_miss(&self, workflow_name: &str, queue: &str, reason: &str) {
+        let _ = (workflow_name, queue, reason);
     }
 
     /// A workflow execution was terminated because its `deadline_at` elapsed.
