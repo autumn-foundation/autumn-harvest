@@ -1107,3 +1107,59 @@ async fn marker_rows(conn: &mut AsyncPgConnection) -> i64 {
         .expect("count the marker")
         .n
 }
+
+/// A dry run must not change what later passes may do. With an archiver set,
+/// it uploads nothing and writes no marker, so turning the archiver off
+/// afterwards leaves ordinary maintenance free to drop.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dry_run_writes_no_marker() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_partitioned(&mut conn).await;
+    let at = Utc::now() - chrono::Duration::days(30);
+    seed_runs(&mut conn, at, 2).await;
+    let name = partition::partition_name(partition::cohort_start(
+        at,
+        partition::DEFAULT_COHORT_WIDTH_SECS,
+    ));
+
+    let backend = Arc::new(TestArchiver::default());
+    let mut config = RetentionConfig::with_max_age(Duration::from_secs(86_400));
+    config.dry_run = true;
+    let started = Utc::now();
+    let runtime = RetentionRuntime::spawn_with_hooks(
+        ShardedDbPool::single(build_pool(&url)),
+        config,
+        Arc::new(NoopMetrics),
+        RetentionHooks::default().with_partition_archiver(Some(backend.clone())),
+    )
+    .expect("retention runtime should spawn when enabled");
+    runtime.run_now();
+    let mut ran = false;
+    for _ in 0..400 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let snap = runtime.monitor().snapshot();
+        if snap.per_shard.iter().any(|r| {
+            r.shard == 0
+                && r.partition_maintenance
+                    .as_ref()
+                    .and_then(|m| m.at)
+                    .is_some_and(|t| t >= started)
+        }) {
+            ran = true;
+            break;
+        }
+    }
+    runtime.shutdown();
+    assert!(ran, "partition maintenance ran");
+    assert_eq!(
+        marker_rows(&mut conn).await,
+        0,
+        "a dry run writes no marker"
+    );
+    assert!(
+        backend.log.lock().unwrap().is_empty(),
+        "a dry run uploads nothing"
+    );
+    assert!(exists(&mut conn, &name).await, "a dry run drops nothing");
+}

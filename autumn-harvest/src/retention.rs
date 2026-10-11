@@ -1691,11 +1691,18 @@ async fn run_partition_maintenance_pass(
             // A lost guard then ends its backend.
             let _member = crate::replication::join_fenced_pass(pool, &mut conn).await;
             // Issue #2009: with an archiver, each drop waits for a checked
-            // export. The shard ID goes into each key.
-            let export = partition_archiver.map(|archiver| {
-                crate::partition_archive::PartitionExport::new(Arc::clone(archiver), shard.as_i32())
+            // export. The shard ID goes into each key. A dry run drops
+            // nothing, so it takes no archiver. An exporting pass would
+            // write the marker, and the marker outlives the dry run.
+            let export = partition_archiver
+                .filter(|_| !config.dry_run)
+                .map(|archiver| {
+                    crate::partition_archive::PartitionExport::new(
+                        Arc::clone(archiver),
+                        shard.as_i32(),
+                    )
                     .with_io_timeout(config.archival_timeout())
-            });
+                });
             crate::partition::maintain_exporting(
                 &mut conn,
                 now,

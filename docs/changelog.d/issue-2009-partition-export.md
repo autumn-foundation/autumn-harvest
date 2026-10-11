@@ -56,6 +56,8 @@ events.
   droppable partition as `export required`, the way a sweep with no
   archiver acts on it.
 - **Budget.** One pass makes at most 4 new exports.
+- **Dry run.** With `dry_run` set, the retention runtime ignores the
+  archiver. It uploads nothing and writes no marker.
 - **Stragglers.** `try_build` refuses a partition archiver together with
   `partitions.straggler_grace_secs`. The sweep skips straggler deletes when
   it exports or the shard holds the marker.
@@ -87,12 +89,13 @@ moved.
 
 **Tests.**
 
-- `partition_archive_tests`, 20 DB tests: export, verify, drop and read
+- `partition_archive_tests`, 21 DB tests: export, verify, drop and read
   back; the legacy partition; the retention runtime; a failed upload; a
   lost object; changed bytes; a slow backend; a row
   changed or deleted after the export; a live owner; no straggler deletes;
   the marker and the status report; the lock in both modes; reuse; the
-  export budget; a caller transaction, for its settings and the marker.
+  export budget; a caller transaction, for its settings and the marker; a
+  dry run.
 - 17 unit tests in `partition_archive::tests`.
 - The builder test
   `a_partition_archiver_with_straggler_deletes_fails_the_build`.

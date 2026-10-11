@@ -286,6 +286,8 @@ key of each dropped partition. Each backend call has the
   export in the same pass.
 - **Budget.** One pass makes at most 4 new exports. A pass that reaches the
   budget reports `truncated`, and the next pass goes on.
+- **Dry run.** With `dry_run` set, the retention runtime ignores the
+  archiver. It uploads nothing and writes no marker.
 
 ### Keys
 
