@@ -1029,6 +1029,68 @@ async fn a_fork_task_is_a_new_start() {
     assert_eq!(reset_flags, vec![false], "a reset task is a continuation");
 }
 
+/// A served outcome that is a fan-out stored result names a source blob. The
+/// fork takes its own reference to that blob, so retention of the source does
+/// not delete it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_served_stored_result_keeps_its_blob() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("stored");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1 });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    let key = format!("result-{}", Uuid::new_v4().simple());
+    let stored = autumn_harvest::fan_out::StoredResult::new("mem", key.clone(), 1, "c");
+    let charge = autumn_harvest::ActivityExecId::new();
+    store::append_events(
+        &mut conn,
+        source,
+        &[
+            WorkflowEvent::ActivityScheduled {
+                activity_id: charge,
+                name: "fork_charge".to_string(),
+                input: input.clone(),
+                queue: queue.clone(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: charge,
+                output: stored.to_recorded_value(),
+            },
+        ],
+        1,
+    )
+    .await
+    .expect("record the stored result");
+    store::insert_payload_refs(
+        &mut conn,
+        source,
+        &[autumn_harvest::payload_store::OffloadedRef {
+            blob_key: key.clone(),
+            store_id: "mem".to_string(),
+            byte_len: 1,
+        }],
+    )
+    .await
+    .expect("own the blob");
+
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let running = Running::start(&queue, &pool);
+    let mut shared = false;
+    for _ in 0..100 {
+        let refs = store::load_payload_refs(&mut conn, forked)
+            .await
+            .expect("refs");
+        if refs.iter().any(|blob| blob.blob_key == key) {
+            shared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    running.stop().await;
+    assert!(shared, "the fork references the served stored-result blob");
+}
+
 /// A live fork never reads the source history. A source blob that is gone
 /// does not stop the fork from running its activities.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

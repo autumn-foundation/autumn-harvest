@@ -552,13 +552,18 @@ fn shared_keys(
             .and_then(crate::payload_store::extract_offload_ref)
             .map(|blob| blob.blob_key),
     );
-    keys.extend(prefix.iter().filter_map(|event| match event {
+    keys.extend(prefix.iter().filter_map(stored_result_key));
+    keys
+}
+
+/// The blob key of a fan-out stored result that `event` records, if any.
+fn stored_result_key(event: &WorkflowEvent) -> Option<String> {
+    match event {
         WorkflowEvent::ActivityCompleted { output, .. } => {
             crate::fan_out::StoredResult::from_recorded_value(output).map(|stored| stored.key)
         }
         _ => None,
-    }));
-    keys
+    }
 }
 
 /// The blob keys that the offload envelopes in the stored `rows` name.
@@ -1855,6 +1860,7 @@ pub(crate) async fn serve_recorded_activities(
         .events;
     // A live fork takes no record, so it never reads the source. A fault in
     // the source history then cannot stop its dispatch.
+    let record_source = fork_marker(&fork_events).map(|(source_id, _)| source_id);
     let source_events = match fork_marker(&fork_events) {
         Some((source_id, ForkEffects::Recorded))
             if record_source_is_readable(conn, source_id).await? =>
@@ -1903,6 +1909,7 @@ pub(crate) async fn serve_recorded_activities(
         let Some(outcome) = outcome.filter(|_| cancelled > 0) else {
             continue;
         };
+        let stored_key = stored_result_key(&outcome);
         crate::store::append_events_offloaded_with_codecs(
             conn,
             exec_id,
@@ -1912,6 +1919,13 @@ pub(crate) async fn serve_recorded_activities(
             codecs,
         )
         .await?;
+        // A served stored result names a source blob. The offloader records
+        // only the blobs that it uploads, so the fork takes its own reference.
+        if let (Some(key), Some(source_id)) = (stored_key, record_source) {
+            let refs = crate::store::load_payload_refs(conn, source_id).await?;
+            let named = std::collections::HashSet::from([key]);
+            crate::store::insert_payload_refs(conn, exec_id, &refs_named_in(refs, &named)).await?;
+        }
         *next_event_id = next_event_id.saturating_add(1);
         settlement.served = true;
     }

@@ -96,7 +96,9 @@ marker. A fork is a new root, not a child of the source.
 blob key an offload envelope in its stored rows or kept input names, so
 retention of the source keeps the shared blobs. The key match is exact. An input override replaces only the stored `data.input`, so an
 offloaded carryover stays an envelope. Matching inflates offloaded payloads
-first.
+first. A fan-out stored result is a reference, not an envelope. The fork also
+takes a reference to its blob, both in the copied prefix and when the record
+serves it later.
 
 **Invariants.** Two new `WorkflowEvent` variants: `WorkflowForked` and
 `ForkActivityResultOverridden`. Replay skips both. The override `output` is a
