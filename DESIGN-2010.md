@@ -144,7 +144,9 @@ Four review agents read the first version. Each fix has a test.
     read too. It honors `#[path]`, and the declaring module gives the path.
     MIR can name the moved file too, so a file is read once per module
     path. A depth cap of 16 ends a `#[path]` cycle. A type declared in a
-    function body is indexed too, under the function path.
+    function body is indexed too, under the function path. A
+    `macro_rules!` arm that parses as items is indexed as items. Another
+    arm, or a type that a call names, gets every fact of the macro.
     A type alias counts its target as a field, so a wrapper of an alias of
     `Arc<Mutex<u64>>` is interior-mutable too. An associated type in an
     `impl` block counts the same way.
@@ -179,6 +181,10 @@ Four review agents read the first version. Each fix has a test.
     &T`. The follow does not read that `poll`, so such a return is an
     `unresolved-callback` boundary. A referent of an untrusted crate is an
     `external-crate-body` boundary.
+33. The check counts `compensate_all` only when the body awaits it in the
+    `.await` shape. A future passed to another call, as `Box::pin`, can still
+    run the unwind. That call is a `saga-escape`, so the verdict is
+    `unknown`. A dropped future does not unwind, so it is still a gap.
 
 ---
 

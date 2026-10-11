@@ -568,6 +568,7 @@ fn every_fixture_workflow_gets_its_expected_verdict() {
         ("wf_saga_in_block", Unknown),
         ("wf_unit", Covered),
         ("wf_untracked", Unknown),
+        ("wf_unwind_boxed", Unknown),
         ("wf_unwind_then_err", Covered),
         ("wf_update_handler", NoSaga),
     ];

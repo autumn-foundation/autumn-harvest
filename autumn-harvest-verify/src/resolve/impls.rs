@@ -18,6 +18,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use proc_macro2::{TokenStream, TokenTree};
+
 use crate::util::{matching_angle, split_top, split_top_trim};
 
 /// One `impl` block header, as written in the source.
@@ -52,11 +54,59 @@ impl<'ast> syn::visit::Visit<'ast> for BodyItems {
     fn visit_item(&mut self, item: &'ast syn::Item) {
         self.0.push(item.clone());
     }
+
+    // A macro call in a statement can declare a type, as an item can.
+    fn visit_stmt_macro(&mut self, stmt: &'ast syn::StmtMacro) {
+        self.0.push(syn::Item::Macro(syn::ItemMacro {
+            attrs: stmt.attrs.clone(),
+            ident: None,
+            mac: stmt.mac.clone(),
+            semi_token: stmt.semi_token,
+        }));
+    }
 }
 
 /// Collects [`FieldFacts`] from field types.
 #[derive(Default)]
 struct FieldScan(FieldFacts);
+
+impl FieldFacts {
+    fn absorb(&mut self, other: &Self) {
+        self.mut_ref |= other.mut_ref;
+        self.lifetime |= other.lifetime;
+        self.names.extend(other.names.iter().cloned());
+    }
+
+    /// What a token stream can hold, read without its grammar. A `&mut` or
+    /// `*mut` writes. A lifetime that is not `'static` counts, shared or not.
+    fn of_tokens(tokens: TokenStream) -> Self {
+        let mut facts = Self::default();
+        let mut last = String::new();
+        for tree in tokens {
+            let text = match tree {
+                TokenTree::Group(group) => {
+                    facts.absorb(&Self::of_tokens(group.stream()));
+                    String::new()
+                }
+                TokenTree::Ident(ident) => {
+                    let text = ident.to_string();
+                    if text == "mut" && (last == "&" || last == "*") {
+                        facts.mut_ref = true;
+                    } else if last == "'" {
+                        facts.lifetime |= text != "static";
+                    } else {
+                        facts.names.insert(text.clone());
+                    }
+                    text
+                }
+                TokenTree::Punct(punct) => punct.as_char().to_string(),
+                TokenTree::Literal(_) => String::new(),
+            };
+            last = text;
+        }
+        facts
+    }
+}
 
 impl<'ast> syn::visit::Visit<'ast> for FieldScan {
     fn visit_type_reference(&mut self, reference: &'ast syn::TypeReference) {
@@ -108,6 +158,12 @@ pub struct SourceIndex {
     /// Struct, enum and union name → what its field types hold. Two types of
     /// one name share an entry, which can only add to it.
     pub type_fields: BTreeMap<String, FieldFacts>,
+    /// Macro name → what its `macro_rules!` arms can hold.
+    macro_facts: BTreeMap<String, FieldFacts>,
+    /// The macros that declare a type by a metavariable, as `struct $name`.
+    named_by_caller: BTreeSet<String>,
+    /// Each macro call, by macro name, with the names it passes.
+    macro_calls: Vec<(String, BTreeSet<String>)>,
     /// Source file → why it could not be indexed.
     ///
     /// A file MIR named that the source roots could not produce, or that `syn`
@@ -182,7 +238,71 @@ impl SourceIndex {
                 .files
                 .insert(file.clone(), text.lines().map(str::to_string).collect());
         }
+        index.expand_macros();
         index
+    }
+
+    /// Give each type that a macro call names what the macro can hold.
+    ///
+    /// The index does not expand a macro. A macro that takes the type name
+    /// as an argument can declare any name the call passes. So each such name
+    /// gets every fact of the macro. That can only add to a type.
+    fn expand_macros(&mut self) {
+        for (macro_name, names) in &self.macro_calls {
+            if !self.named_by_caller.contains(macro_name) {
+                continue;
+            }
+            let Some(facts) = self.macro_facts.get(macro_name) else {
+                continue;
+            };
+            for name in names {
+                self.type_fields
+                    .entry(name.clone())
+                    .or_default()
+                    .absorb(facts);
+            }
+        }
+    }
+
+    /// Absorb a macro definition or a macro call at item position.
+    ///
+    /// Each `macro_rules!` arm body that parses as items is absorbed as
+    /// items. Another arm gives each type it names every fact of the macro.
+    /// A macro defined in a dependency has no facts here, so its call adds
+    /// nothing.
+    fn absorb_macro(&mut self, item: &syn::ItemMacro, depth: u32, module: &[String]) {
+        let tokens = &item.mac.tokens;
+        let Some(name) = item.mac.path.segments.last().map(|s| s.ident.to_string()) else {
+            return;
+        };
+        if name != "macro_rules" {
+            let names = passed_names(tokens.clone());
+            self.macro_calls.push((name, names));
+            if let Ok(file) = syn::parse2::<syn::File>(tokens.clone()) {
+                self.absorb_items(&file.items, depth.saturating_add(1), module);
+            }
+            return;
+        }
+        let Some(macro_name) = item.ident.as_ref().map(ToString::to_string) else {
+            return;
+        };
+        let facts = FieldFacts::of_tokens(tokens.clone());
+        for body in arm_bodies(tokens.clone()) {
+            if let Ok(file) = syn::parse2::<syn::File>(body.clone()) {
+                self.absorb_items(&file.items, depth.saturating_add(1), module);
+                continue;
+            }
+            for declared in declared_names(body.clone()) {
+                self.type_fields.entry(declared).or_default().absorb(&facts);
+            }
+            if declares_by_metavariable(body) {
+                self.named_by_caller.insert(macro_name.clone());
+            }
+        }
+        self.macro_facts
+            .entry(macro_name)
+            .or_default()
+            .absorb(&facts);
     }
 
     /// The `impl` header whose `impl` keyword sits at `line`:`column` (both 1-based).
@@ -362,10 +482,95 @@ impl SourceIndex {
                         }
                     }
                 }
+                syn::Item::Macro(item) => self.absorb_macro(item, depth, module),
                 _ => {}
             }
         }
     }
+}
+
+/// The body of each `macro_rules!` arm, as `{ ... }` in `() => { ... };`.
+fn arm_bodies(tokens: TokenStream) -> Vec<TokenStream> {
+    let mut bodies = Vec::new();
+    let mut arrow = false;
+    let mut last = ' ';
+    for tree in tokens {
+        match tree {
+            TokenTree::Group(group) if arrow => {
+                bodies.push(group.stream());
+                arrow = false;
+            }
+            TokenTree::Punct(punct) => {
+                arrow = last == '=' && punct.as_char() == '>';
+                last = punct.as_char();
+            }
+            _ => last = ' ',
+        }
+    }
+    bodies
+}
+
+/// The keywords that declare a type.
+const TYPE_KEYWORDS: [&str; 4] = ["struct", "enum", "union", "type"];
+
+/// Each name that follows `struct`, `enum`, `union` or `type`, at any depth.
+fn declared_names(tokens: TokenStream) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let mut keyword = false;
+    for tree in tokens {
+        match tree {
+            TokenTree::Ident(ident) => {
+                let text = ident.to_string();
+                if keyword {
+                    names.insert(text.clone());
+                }
+                keyword = TYPE_KEYWORDS.contains(&text.as_str());
+            }
+            TokenTree::Group(group) => {
+                names.extend(declared_names(group.stream()));
+                keyword = false;
+            }
+            _ => keyword = false,
+        }
+    }
+    names
+}
+
+/// Does a type keyword take a metavariable, as `struct $name`?
+fn declares_by_metavariable(tokens: TokenStream) -> bool {
+    let mut keyword = false;
+    for tree in tokens {
+        match tree {
+            TokenTree::Punct(punct) if keyword && punct.as_char() == '$' => return true,
+            TokenTree::Ident(ident) => {
+                keyword = TYPE_KEYWORDS.contains(&ident.to_string().as_str());
+            }
+            TokenTree::Group(group) => {
+                if declares_by_metavariable(group.stream()) {
+                    return true;
+                }
+                keyword = false;
+            }
+            TokenTree::Punct(_) | TokenTree::Literal(_) => keyword = false,
+        }
+    }
+    false
+}
+
+/// Each name a macro call passes, at any depth. A path such as `std::Arc`
+/// adds each of its parts.
+fn passed_names(tokens: TokenStream) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for tree in tokens {
+        match tree {
+            TokenTree::Ident(ident) => {
+                names.insert(ident.to_string());
+            }
+            TokenTree::Group(group) => names.extend(passed_names(group.stream())),
+            TokenTree::Punct(_) | TokenTree::Literal(_) => {}
+        }
+    }
+    names
 }
 
 fn generic_names(generics: &syn::Generics) -> Vec<String> {
@@ -817,6 +1022,38 @@ mod tests {
         );
         assert!(
             names("Shared").is_some_and(|n| n.contains("Mutex")),
+            "{index:?}"
+        );
+    }
+
+    #[test]
+    fn a_type_that_a_macro_declares_records_what_it_holds() {
+        // A macro arm can name the type, or take the name as an argument.
+        // Both macros run inside a function too.
+        let mut index = SourceIndex::default();
+        index.absorb_syn(
+            "macro_rules! shared { () => { struct Shared(Arc<Mutex<u64>>); }; }\n\
+             macro_rules! named { ($name:ident) => { struct $name(Arc<Mutex<u64>>); }; }\n\
+             macro_rules! plain { ($name:ident) => { struct $name(u64); }; }\n\
+             shared!();\n\
+             named!(Named);\n\
+             plain!(Plain);\n\
+             fn wf() {\n\
+                 macro_rules! inner { ($n:ident) => { struct $n(Cell<u8>); }; }\n\
+                 inner!(Inner);\n\
+             }\n",
+            &[],
+        );
+        index.expand_macros();
+        let names = |ty: &str| index.type_fields.get(ty).map(|f| f.names.clone());
+        for (ty, held) in [("Shared", "Mutex"), ("Named", "Mutex"), ("Inner", "Cell")] {
+            assert!(
+                names(ty).is_some_and(|n| n.contains(held)),
+                "{ty}: {index:?}"
+            );
+        }
+        assert!(
+            !names("Plain").is_some_and(|n| n.contains("Mutex")),
             "{index:?}"
         );
     }

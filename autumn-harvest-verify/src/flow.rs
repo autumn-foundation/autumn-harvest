@@ -60,21 +60,7 @@ pub fn build(body: &Body, facts: &BlockFacts) -> FlowGraph {
             let event = FlowEvent::Exit { outcome: *outcome };
             chain.push(push(&mut nodes, &block.label, event));
         } else if let Some(mut event) = block_event(body, block, facts) {
-            let pair = match &mut event {
-                FlowEvent::SagaStep { tracked, .. } => {
-                    let pair = match await_walk(&blocks, block, true) {
-                        Some(Awaited::Arms(ok, err)) => Some((ok, err)),
-                        _ => None,
-                    };
-                    *tracked = pair.is_some();
-                    pair
-                }
-                FlowEvent::SagaCompensate { tracked } => {
-                    *tracked = await_walk(&blocks, block, false).is_some();
-                    None
-                }
-                _ => None,
-            };
+            let pair = track(&blocks, block, &mut event, &mut nodes, &mut chain);
             let id = push(&mut nodes, &block.label, event);
             if let Some(pair) = pair {
                 arms.insert(id, pair);
@@ -145,6 +131,37 @@ pub fn build(body: &Body, facts: &BlockFacts) -> FlowGraph {
     FlowGraph {
         nodes,
         edges: edges.into_iter().collect(),
+    }
+}
+
+/// Set the `tracked` flag of a saga event. Return the arms of a tracked step.
+fn track(
+    blocks: &HashMap<&str, &BasicBlock>,
+    block: &BasicBlock,
+    event: &mut FlowEvent,
+    nodes: &mut Vec<FlowNode>,
+    chain: &mut Vec<usize>,
+) -> Option<(String, String)> {
+    match event {
+        FlowEvent::SagaStep { tracked, .. } => {
+            let pair = match await_walk(blocks, block, true) {
+                Some(Awaited::Arms(ok, err)) => Some((ok, err)),
+                _ => None,
+            };
+            *tracked = pair.is_some();
+            pair
+        }
+        FlowEvent::SagaCompensate { tracked } => {
+            *tracked = await_walk(blocks, block, false).is_some();
+            // A wrapper such as `Box::pin` can still run the unwind.
+            // The walk does not know it, so the unwind is unknown.
+            if !*tracked && let Some(to) = future_escape(blocks, block) {
+                let escape = FlowEvent::SagaEscape { to };
+                chain.push(push(nodes, &block.label, escape));
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -574,6 +591,50 @@ impl AwaitState {
 /// `Ready` payload. Its `switchInt` gives case `0` for `Continue` and case
 /// `1` for `Break`. Any other shape returns `None`. So a call such as
 /// `map_err`, or a `?` on another value, cannot pass for the step result.
+/// The callee that takes the future that `block` builds, when that future
+/// goes into a call other than drop glue. A dropped future gives `None`.
+fn future_escape(blocks: &HashMap<&str, &BasicBlock>, block: &BasicBlock) -> Option<String> {
+    let Terminator::Call {
+        dest,
+        target: Some(first),
+        ..
+    } = &block.terminator
+    else {
+        return None;
+    };
+    let mut state = AwaitState::default();
+    state.future.insert(dest.clone());
+    let mut at: &str = first;
+    for _ in 0..MAX_AWAIT_WALK {
+        let block = blocks.get(at)?;
+        state.read(block);
+        match &block.terminator {
+            Terminator::Goto { target } => at = target,
+            Terminator::Drop { place, target, .. } => {
+                if state.future.contains(place) {
+                    return None;
+                }
+                at = target;
+            }
+            Terminator::Call {
+                callee: Some(callee),
+                args,
+                target,
+                ..
+            } => {
+                if args.iter().any(|a| state.holds_future(Some(a))) {
+                    let bare = strip_generics_everywhere(callee);
+                    let dropped = bare.contains("drop_in_place") || bare.ends_with("::drop");
+                    return (!dropped).then(|| bare.clone());
+                }
+                at = target.as_deref()?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 fn await_walk(
     blocks: &HashMap<&str, &BasicBlock>,
     block: &BasicBlock,

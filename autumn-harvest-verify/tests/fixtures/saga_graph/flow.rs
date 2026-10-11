@@ -607,3 +607,24 @@ pub async fn wf_handler_local_call(ctx: &WorkflowContext) -> Out {
     ctx.register_update_handler("book", |_: &u64| Ok(()), h);
     h(1).await
 }
+
+pub fn __autumn_workflow_info_wf_unwind_boxed() -> u8 {
+    0
+}
+
+/// The unwind is awaited through `Box::pin`. The walk does not know that
+/// wrapper, so the unwind is unproven, not dropped.
+pub async fn wf_unwind_boxed(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let a = saga
+        .step(
+            || async { ctx.execute_activity_raw("reserve", 1).await },
+            |a| async move { ctx.execute_activity_raw("release", a).await.map(|_| ()) },
+        )
+        .await?;
+    if a > 10 {
+        Box::pin(saga.compensate_all()).await?;
+        return Err("too big".to_string());
+    }
+    Ok(a)
+}
