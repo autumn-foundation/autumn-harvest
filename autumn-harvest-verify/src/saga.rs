@@ -364,7 +364,7 @@ fn validate(graph: &FlowGraph, steps: usize) -> Result<(), String> {
         return Err(format!("node {id} cannot be reached from the entry"));
     }
     // A tracked step has an `ok` and an `err` edge, and only its edges carry
-    // a label. The emitter marks a step untracked when an arm reaches no
+    // a label. Each of its edges carries one. The emitter marks a step untracked when an arm reaches no
     // node, so a missing arm means the graph was changed after emission.
     for (id, node) in graph.nodes.iter().enumerate() {
         let tracked = matches!(node.event, FlowEvent::SagaStep { tracked: true, .. });
@@ -377,6 +377,12 @@ fn validate(graph: &FlowGraph, steps: usize) -> Result<(), String> {
         if !tracked && labels.iter().any(Option::is_some) {
             return Err(format!(
                 "node {id} has a labeled edge, but it is not a tracked step"
+            ));
+        }
+        // The fixpoint reads an unlabeled step edge as success.
+        if tracked && labels.contains(&None) {
+            return Err(format!(
+                "the tracked step at node {id} has an unlabeled edge"
             ));
         }
         for (arm, label) in [("`ok`", EdgeLabel::Ok), ("`err`", EdgeLabel::Err)] {
@@ -900,6 +906,34 @@ mod tests {
         };
         let err = check(&manifest(dangling)).expect_err("a handler index past the list");
         assert!(err.to_string().contains("handler 0"), "{err}");
+    }
+
+    #[test]
+    fn an_unlabeled_edge_from_a_tracked_step_is_refused() {
+        // The fixpoint reads an unlabeled edge from a step as success. The
+        // step already has both arms, so the extra edge can only mislead.
+        let graph = FlowGraph {
+            nodes: vec![
+                node(FlowEvent::Entry),
+                node(FlowEvent::SagaNew),
+                node(step()),
+                node(FlowEvent::Exit {
+                    outcome: ExitOutcome::Ok,
+                }),
+                node(FlowEvent::Exit {
+                    outcome: ExitOutcome::Err,
+                }),
+            ],
+            edges: vec![
+                edge(0, 1, None),
+                edge(1, 2, None),
+                edge(2, 3, Some(EdgeLabel::Ok)),
+                edge(2, 4, Some(EdgeLabel::Err)),
+                edge(2, 4, None),
+            ],
+        };
+        let err = check(&manifest(graph)).expect_err("an unlabeled step edge");
+        assert!(err.to_string().contains("unlabeled"), "{err}");
     }
 
     #[test]

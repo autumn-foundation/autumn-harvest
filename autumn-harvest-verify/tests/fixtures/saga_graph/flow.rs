@@ -540,3 +540,15 @@ pub async fn wf_handler_declarative(ctx: &WorkflowContext) -> Out {
     ctx.register_declarative_update_handler(&BOOK_INFO);
     ctx.receive_signal("go").await
 }
+
+pub fn __autumn_workflow_info_wf_handler_fn_pointer() -> u8 {
+    0
+}
+
+/// The validator is a closure, but the handler is a function pointer. Only
+/// the validator resolves, so the handler body is out of sight.
+pub async fn wf_handler_fn_pointer(ctx: &WorkflowContext) -> Out {
+    let handler: fn(u64) -> Pin<Box<dyn Future<Output = Out> + Send>> = dispatch_book;
+    ctx.register_update_handler("book", |_: &u64| Ok(()), handler);
+    ctx.receive_signal("go").await
+}

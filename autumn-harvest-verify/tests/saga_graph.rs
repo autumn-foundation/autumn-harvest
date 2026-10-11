@@ -528,6 +528,7 @@ fn every_fixture_workflow_gets_its_expected_verdict() {
         ("wf_gap_tail", Gap),
         ("wf_handler_declarative", Unknown),
         ("wf_handler_delegate_gap", Gap),
+        ("wf_handler_fn_pointer", Unknown),
         ("wf_handler_gap", Gap),
         ("wf_handlers", NoSaga),
         ("wf_helper_owns", Unknown),

@@ -153,9 +153,12 @@ Four review agents read the first version. Each fix has a test.
     is checked as an entry and as a helper, so a pending `Ok` exit is
     `saga-dropped-pending`. The future such a helper run returns is a
     helper too.
-27. A handler registration with no body in sight is a `handler-unresolved`
-    boundary. A declarative record carries its callback, so the call
-    passes no closure.
+27. A handler registration whose handler argument has no body in sight is
+    a `handler-unresolved` boundary. Each registration takes its handler
+    last. A declarative record or a function pointer hides it, even when
+    a validator closure resolves.
+28. Each edge of a tracked step carries a label. The fixpoint reads an
+    unlabeled step edge as success, so the check refuses one.
 
 ---
 

@@ -475,8 +475,8 @@ impl<'p> StructureBuilder<'p> {
             sinks.entry(site.body.as_str()).or_default().push(site);
         }
 
-        let (handlers, handler_at) = self.handlers(recorder, &display, &show);
-        boundaries.extend(unresolved_handlers(&handlers));
+        let (handlers, handler_at, unresolved) = self.handlers(recorder, &display, &show);
+        boundaries.extend(unresolved);
         let arguments = group_arguments(recorder, &display);
 
         let mut bodies = Vec::with_capacity(ids.len());
@@ -572,10 +572,11 @@ impl<'p> StructureBuilder<'p> {
         recorder: &Recorder,
         display: &BTreeMap<String, String>,
         show: &dyn Fn(&str) -> String,
-    ) -> (Vec<HandlerSite>, BTreeMap<(String, String), usize>) {
+    ) -> HandlerSites {
         let program = self.program;
         let mut list = Vec::new();
         let mut at = BTreeMap::new();
+        let mut unresolved = Vec::new();
         for call in &recorder.handlers {
             if !display.contains_key(&call.caller) {
                 continue;
@@ -589,13 +590,25 @@ impl<'p> StructureBuilder<'p> {
                 let markers = self.markers();
                 key_of_operand(markers, body, args.get(1)?, 0)
             });
-            let passed: BTreeSet<&str> = recorder
+            let arguments: Vec<&ArgumentEdge> = recorder
                 .arguments
                 .iter()
                 .filter(|a| a.caller == call.caller && a.block == call.block)
                 .filter(|a| display.contains_key(&a.body))
-                .map(|a| a.body.as_str())
                 .collect();
+            // Each registration takes its handler last. A resolved validator
+            // does not show the handler, so the last operand must resolve.
+            let handler_at = program.body(&call.caller).and_then(|body| {
+                let block = body.blocks.iter().find(|b| b.label == call.block)?;
+                let Terminator::Call { args, .. } = &block.terminator else {
+                    return None;
+                };
+                args.len().checked_sub(1)
+            });
+            if !arguments.iter().any(|a| Some(a.index) == handler_at) {
+                unresolved.push(format!("handler-unresolved: {}", call.method));
+            }
+            let passed: BTreeSet<&str> = arguments.iter().map(|a| a.body.as_str()).collect();
             let bodies: Vec<String> = passed.iter().map(|id| show(id)).collect();
             let mut returns: Vec<String> = recorder
                 .returned
@@ -618,7 +631,7 @@ impl<'p> StructureBuilder<'p> {
                 returns,
             });
         }
-        (list, at)
+        (list, at, unresolved)
     }
 
     /// Display ids, unique within the workflow, and a boundary per collision.
@@ -1452,14 +1465,13 @@ fn info_key(markers: &BTreeSet<String>, callee: &str) -> Option<String> {
     markers.contains(name).then(|| name.to_string())
 }
 
-/// A boundary per registration with no handler body in sight. A declarative
-/// record can carry the callback, and that code can own a saga.
-fn unresolved_handlers(handlers: &[HandlerSite]) -> impl Iterator<Item = String> + '_ {
-    handlers
-        .iter()
-        .filter(|h| h.bodies.is_empty())
-        .map(|h| format!("handler-unresolved: {}", h.method))
-}
+/// The handler sites of a workflow, the site index of each registration
+/// call, and a boundary per registration whose handler is out of sight.
+type HandlerSites = (
+    Vec<HandlerSite>,
+    BTreeMap<(String, String), usize>,
+    Vec<String>,
+);
 
 #[cfg(test)]
 mod tests {
