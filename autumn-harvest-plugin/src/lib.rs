@@ -106,6 +106,10 @@ pub mod mcp_tools;
 #[cfg(feature = "mcp")]
 pub mod mcp_tasks;
 
+/// JSON-RPC client for remote MCP and A2A tasks (issue #2006).
+#[cfg(feature = "mcp")]
+pub mod remote_tasks;
+
 /// OpenAPI 3.1 document for the management API (issue #694).
 ///
 /// Derived from `docs/api-contract.json` and served read-only at
