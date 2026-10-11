@@ -512,7 +512,6 @@ async fn reset_buffer_keeps_the_order_of_pending_signals() {
             operator_id: "op-1".to_string(),
             signal_reapply: ResetSignalReapplyPolicy::Buffer,
             allow_terminal_source: false,
-            refuse_erased_source: false,
         },
         None,
     )
@@ -582,7 +581,6 @@ async fn keyed_dedupe_after_a_buffered_reset_finds_the_fork() {
             operator_id: "op-1".to_string(),
             signal_reapply: ResetSignalReapplyPolicy::Buffer,
             allow_terminal_source: false,
-            refuse_erased_source: false,
         },
         None,
     )
