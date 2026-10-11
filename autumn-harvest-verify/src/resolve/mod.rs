@@ -776,6 +776,28 @@ impl Program {
         self.closures.get(span).map_or(&[], Vec::as_slice)
     }
 
+    /// The coroutine bodies nested under `owner` for the `async` block
+    /// `span` (issue #2010).
+    ///
+    /// A closure that builds an `async` block owns its coroutine body, as
+    /// `owner::{closure#N}`. The lookup never leaves `owner`. So a macro span
+    /// that two blocks share, or a block another function returns, cannot
+    /// resolve here to the wrong body.
+    #[must_use]
+    pub fn nested_coroutines(&self, owner: &str, span: &str) -> Vec<String> {
+        let prefix = format!("{owner}::");
+        self.order
+            .iter()
+            .filter(|path| path.starts_with(&prefix))
+            .filter(|path| {
+                self.body(path)
+                    .and_then(coroutine_param_span)
+                    .is_some_and(|found| found == span)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// [`Self::closure_bodies`], narrowed to the ones a call site inside
     /// `caller_body` can mean.
     ///
@@ -1506,16 +1528,20 @@ fn closure_param_span(body: &Body) -> Option<String> {
     let (_, ty) = body.params.first()?;
     let ty = peel_refs(ty).trim();
     let ty = ty.trim_start_matches("mut ").trim();
-    // The coroutine of an `async` block takes `Pin<&mut {async block@..}>`
-    // (issue #2010).
-    let ty = ty
-        .strip_prefix("Pin<")
-        .or_else(|| ty.strip_prefix("std::pin::Pin<"))
-        .and_then(|inner| inner.strip_suffix('>'))
-        .map_or(ty, |inner| {
-            peel_refs(inner).trim().trim_start_matches("mut ").trim()
-        });
     (ty.starts_with('{') && ty.contains('@') && ty.ends_with('}')).then(|| ty.to_string())
+}
+
+/// The `{async block@..}` span of a coroutine body, which takes
+/// `Pin<&mut {async block@..}>` as its first parameter (issue #2010).
+fn coroutine_param_span(body: &Body) -> Option<String> {
+    let (_, ty) = body.params.first()?;
+    let inner = ty
+        .trim()
+        .strip_prefix("Pin<")
+        .or_else(|| ty.trim().strip_prefix("std::pin::Pin<"))?
+        .strip_suffix('>')?;
+    let inner = peel_refs(inner).trim().trim_start_matches("mut ").trim();
+    (inner.starts_with("{async block@") && inner.ends_with('}')).then(|| inner.to_string())
 }
 
 /// `Box<dyn Jitter>` / `&dyn Jitter + Send` → `Jitter`.

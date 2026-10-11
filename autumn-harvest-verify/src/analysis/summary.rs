@@ -1741,6 +1741,11 @@ impl<'a> Analyzer<'a> {
     /// call reaches the coroutine body. So the body is analyzed here, as the
     /// poll would run it. Parameter 0 is the future, so it carries the taint
     /// of the closure result.
+    ///
+    /// Only a block in the closure itself is followed. A block built in
+    /// another crate has no body here, and its builder was already analyzed
+    /// or reported at its own call. A write through a `&mut` capture of the
+    /// block cannot reach the caller, so such a capture is a boundary.
     fn follow_returned_future(
         &mut self,
         closure: &str,
@@ -1753,16 +1758,13 @@ impl<'a> Analyzer<'a> {
         let Some(span) = brace_form(&body.return_ty) else {
             return;
         };
-        if !span.starts_with("{async block@") {
+        if !span.starts_with("{async block@") || !span.contains(".rs:") {
             return;
         }
         let block = returning_block(body);
-        let coroutines = self.program.closure_bodies_near(closure, &span);
-        if coroutines.is_empty() {
-            if emit {
-                self.push_boundary(BoundaryKind::UnresolvedCallback, &span, closure, &block);
-            }
-            return;
+        let coroutines = self.program.nested_coroutines(closure, &span);
+        if coroutines.is_empty() && emit {
+            self.push_boundary(BoundaryKind::UnresolvedCallback, &span, closure, &block);
         }
         for coroutine in coroutines {
             self.recorder.future_edge(closure, &block, &coroutine);
@@ -1771,6 +1773,10 @@ impl<'a> Analyzer<'a> {
             seeded.resize(params.max(1), TaintSet::new());
             let outcome = self.analyze_body(&coroutine, &Substitution::new(), &seeded, hops);
             out.absorb(&outcome.ret);
+        }
+        if emit && captures_mut_ref(body) {
+            let detail = format!("{span} captures a `&mut` reference");
+            self.push_boundary(BoundaryKind::UnresolvedCallback, &detail, closure, &block);
         }
     }
 
@@ -2718,6 +2724,26 @@ fn first_sentence(reason: &str) -> &str {
     )
 }
 
+/// The value `body` returns reads a local of a `&mut` type, such as an
+/// `async` block that captures `&mut seen`.
+fn captures_mut_ref(body: &Body) -> bool {
+    body.blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .filter_map(|statement| match statement {
+            Statement::Assign { dest, rvalue }
+                if dest.local == Local(0) && dest.projections.is_empty() =>
+            {
+                Some(rvalue)
+            }
+            _ => None,
+        })
+        .flat_map(|rvalue| &rvalue.reads)
+        .filter_map(operand_place)
+        .filter_map(|place| body.locals.get(&place.local))
+        .any(|ty| ty.trim_start().starts_with("&mut"))
+}
+
 /// The label of the block that writes the return place `_0`, or `bb0`.
 fn returning_block(body: &Body) -> String {
     body.blocks
@@ -2733,22 +2759,22 @@ fn returning_block(body: &Body) -> String {
 
 /// The `{closure@..}` / `{async block@..}` brace form inside a type, if any.
 ///
-/// A `{async fn body of f<..>}` group is skipped whole (issue #2010). It is
-/// the future of an `async fn`, and the closures in its generic arguments
-/// went to the call that built it. A naive cut there gave a broken span and
-/// a false `unresolved-callback` boundary.
+/// Each `{..}` group is read whole, nested groups included (issue #2010). A
+/// cut at the first `}` gives a broken span and a false
+/// `unresolved-callback` boundary. A `{async fn body of f<..>}` group is
+/// skipped. It is the future of an `async fn`, and the closures in its
+/// generic arguments went to the call that built it.
 fn brace_form(ty: &str) -> Option<String> {
     let mut rest = ty;
     loop {
         let at = rest.find('{')?;
         rest = rest.get(at..)?;
-        if rest.starts_with("{async fn body of ") {
-            rest = rest.get(balanced_group_len(rest)?..)?;
-            continue;
+        let len = balanced_group_len(rest)?;
+        let form = rest.get(..len)?;
+        if !form.starts_with("{async fn body of ") && form.contains('@') {
+            return Some(form.to_string());
         }
-        let end = rest.find('}')?;
-        let form = rest.get(..end.saturating_add(1))?;
-        return form.contains('@').then(|| form.to_string());
+        rest = rest.get(len..)?;
     }
 }
 
@@ -2815,6 +2841,10 @@ mod tests {
         assert_eq!(
             brace_form("Pin<&mut {async block@a.rs:5:6: 5:9}>").as_deref(),
             Some("{async block@a.rs:5:6: 5:9}")
+        );
+        assert_eq!(
+            brace_form("{async block@WorkflowContext::rpit_block::{closure#0}}").as_deref(),
+            Some("{async block@WorkflowContext::rpit_block::{closure#0}}")
         );
         assert_eq!(balanced_group_len("{a{b}c}d"), Some(7));
         assert_eq!(balanced_group_len("{a{b}"), None);
