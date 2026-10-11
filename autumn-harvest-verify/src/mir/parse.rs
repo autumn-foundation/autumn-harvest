@@ -50,7 +50,9 @@ pub fn parse(crate_name: &str, path: &str, text: &str) -> MirDoc {
             continue;
         }
         if !header.trim_end().ends_with('{') {
-            // A body-less item such as `const _: () = const ();`.
+            // A body-less item such as `const _: () = const ();`. The structure
+            // digest still reads a named one (issue #1995).
+            record_inline_const(&mut doc, header);
             idx += 1;
             continue;
         }
@@ -91,7 +93,7 @@ fn parse_item(doc: &mut MirDoc, header: &str, content: &[&str], line: usize) {
     let head = header.trim_end();
     let head = head.strip_suffix('{').unwrap_or(head).trim_end();
     if let Some(sig) = head.strip_prefix("fn ") {
-        push_body(doc, sig, content, line, false);
+        push_body(doc, sig, header, content, line);
     } else if let Some(sig) = head.strip_prefix("static ") {
         let (sig, is_mut) = sig
             .strip_prefix("mut ")
@@ -104,6 +106,7 @@ fn parse_item(doc: &mut MirDoc, header: &str, content: &[&str], line: usize) {
         push_const_body(doc, sig, header, content, line);
     } else if is_alloc_header(head) {
         parse_alloc_footer(doc, head, header, line);
+        record_alloc_text(doc, head, header, content);
     } else if lexer::find_type_colon(head).is_some() {
         // The keyword-less anonymous-constant form: `PATH: TY = { .. }`.
         push_const_body(doc, head, header, content, line);
@@ -120,21 +123,57 @@ fn fail(doc: &mut MirDoc, header: &str, reason: &str, line: usize) {
     });
 }
 
-fn push_body(doc: &mut MirDoc, sig: &str, content: &[&str], line: usize, is_const: bool) {
+fn push_body(doc: &mut MirDoc, sig: &str, header: &str, content: &[&str], line: usize) {
     match parse_fn_signature(sig) {
         Some((path, params, return_ty)) => {
-            doc.bodies
-                .push(build_body(path, is_const, params, return_ty, content, line));
+            let mut body = build_body(path, false, params, return_ty, content, line);
+            body.text = item_text(header, content);
+            doc.bodies.push(body);
         }
         None => fail(doc, sig, "malformed fn header", line),
+    }
+}
+
+/// The raw text of an item: its header line and its content lines.
+fn item_text(header: &str, content: &[&str]) -> String {
+    let mut text = String::with_capacity(content.iter().map(|l| l.len() + 1).sum::<usize>());
+    text.push_str(header);
+    for line in content {
+        text.push('\n');
+        text.push_str(line);
+    }
+    text
+}
+
+/// Keep a one-line `const PATH: TY = VALUE;` item, keyed by its path.
+fn record_inline_const(doc: &mut MirDoc, header: &str) {
+    let Some(sig) = header.trim().strip_prefix("const ") else {
+        return;
+    };
+    let Some(colon) = lexer::find_type_colon(sig) else {
+        return;
+    };
+    if let Some(path) = sig.get(..colon).map(str::trim).filter(|p| !p.is_empty()) {
+        doc.inline_consts
+            .insert(path.to_owned(), header.trim().to_owned());
+    }
+}
+
+/// Keep the raw text of an `allocN` footer, keyed by `allocN`.
+fn record_alloc_text(doc: &mut MirDoc, head: &str, header: &str, content: &[&str]) {
+    if let Some(name) = head.split_whitespace().next() {
+        doc.alloc_text
+            .entry(name.to_owned())
+            .or_insert_with(|| item_text(header, content));
     }
 }
 
 fn push_const_body(doc: &mut MirDoc, sig: &str, header: &str, content: &[&str], line: usize) {
     match split_typed(sig) {
         Some((path, ty)) => {
-            doc.bodies
-                .push(build_body(path, true, Vec::new(), ty, content, line));
+            let mut body = build_body(path, true, Vec::new(), ty, content, line);
+            body.text = item_text(header, content);
+            doc.bodies.push(body);
         }
         None => fail(doc, header, "malformed constant header", line),
     }
@@ -160,6 +199,7 @@ fn build_body(
         debug_names,
         blocks,
         line,
+        text: String::new(),
     }
 }
 

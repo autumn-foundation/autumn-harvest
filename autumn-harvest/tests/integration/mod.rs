@@ -364,6 +364,10 @@ mod typed_stub_deferred_admission_tests;
 mod typed_stubs_tests;
 mod typed_workflow_failure_tests;
 mod updt_with_start_tests;
+#[cfg(all(feature = "db", feature = "testing"))]
+mod upgrade_check_db_tests;
+#[cfg(feature = "testing")]
+mod upgrade_check_tests;
 mod usage_report_activity_lookback_tests;
 #[cfg(feature = "wasm-activities")]
 mod wasm_activities_tests;

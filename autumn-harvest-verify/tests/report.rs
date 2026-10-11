@@ -101,6 +101,7 @@ fn report(workflows: Vec<WorkflowVerdict>) -> Report {
         unused_allowlist: Vec::new(),
         warnings: Vec::new(),
         discovery_failed: false,
+        structure: None,
     }
 }
 

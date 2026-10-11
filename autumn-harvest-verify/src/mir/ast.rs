@@ -13,6 +13,13 @@ pub struct MirDoc {
     pub statics: Vec<StaticItem>,
     /// `allocN` → static name, from the `allocN (static: NAME, ...)` footer entries.
     pub alloc_statics: BTreeMap<String, String>,
+    /// Path → text of each one-line `const` item, such as
+    /// `const LIMIT: u64 = const 3_u64;` (issue #1995). It has no body, so
+    /// only the structure digest reads it.
+    pub inline_consts: BTreeMap<String, String>,
+    /// `allocN` → the raw text of its footer, contents included (issue #1995).
+    /// The structure digest hashes it, so a changed constant changes the digest.
+    pub alloc_text: BTreeMap<String, String>,
     /// Items that failed to parse, with the reason (surfaced as `mir-parse` boundaries).
     pub parse_failures: Vec<ParseFailure>,
 }
@@ -50,6 +57,10 @@ pub struct Body {
     pub blocks: Vec<BasicBlock>,
     /// 1-based line in the `.mir` file where the header sits.
     pub line: usize,
+    /// The raw MIR text of the item, header included (issue #1995). The
+    /// parsed form drops some text, such as `switchInt` case values, so the
+    /// structure digest hashes this instead.
+    pub text: String,
 }
 
 /// A MIR local `_N`.
