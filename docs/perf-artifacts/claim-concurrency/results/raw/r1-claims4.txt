@@ -1,0 +1,12 @@
+# Assay #14 — harvest arms, tree `claims4`, round 1
+
+Postgres: PostgreSQL 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+Durability: fsync = off, synchronous_commit = off.
+Pool: 1 worker, 8 workflow slots, 16 activity slots, 32 connections, 25 ms poll. Input `{"p":"0123456789abcdef0123456789abcdef"}`. Cap 900 s.
+
+Claim loops: 4.
+
+cell tree=claims4 arm=postgres depth=250 rep=1 wfps=46.841729 elapsed=5.337 completed=250 activities=750 valid=PASS truncated=false residue=none load1=6.73 claim_n=1920 claim_mean_ms=9.381 claim_p99_ms=34.472 persist_n=1035 persist_mean_ms=9.117 persist_p99_ms=28.352 scan_n=66 scan_mean_ms=51.627 scan_p99_ms=104.889 heartbeat_n=0 wait_n=1986 wait_p99_ms=3.372 wait_max_ms=9.237 in_use_mean=11.275 in_use_max=16
+cell tree=claims4 arm=postgres depth=500 rep=1 wfps=44.673236 elapsed=11.192 completed=500 activities=1500 valid=PASS truncated=false residue=none load1=6.85 claim_n=3888 claim_mean_ms=9.179 claim_p99_ms=27.793 persist_n=2029 persist_mean_ms=9.884 persist_p99_ms=26.448 scan_n=133 scan_mean_ms=54.678 scan_p99_ms=99.120 heartbeat_n=0 wait_n=4021 wait_p99_ms=3.178 wait_max_ms=14.080 in_use_mean=10.953 in_use_max=17
+cell tree=claims4 arm=postgres depth=1000 rep=1 wfps=47.018100 elapsed=21.268 completed=1000 activities=3000 valid=PASS truncated=false residue=none load1=6.89 claim_n=7827 claim_mean_ms=8.652 claim_p99_ms=24.722 persist_n=4073 persist_mean_ms=9.502 persist_p99_ms=26.731 scan_n=254 scan_mean_ms=54.238 scan_p99_ms=104.252 heartbeat_n=0 wait_n=8081 wait_p99_ms=3.238 wait_max_ms=15.864 in_use_mean=11.010 in_use_max=16
+cell tree=claims4 arm=postgres depth=2000 rep=1 wfps=46.898811 elapsed=42.645 completed=2000 activities=6000 valid=PASS truncated=false residue=none load1=8.21 claim_n=14915 claim_mean_ms=9.834 claim_p99_ms=23.804 persist_n=8168 persist_mean_ms=9.739 persist_p99_ms=27.505 scan_n=459 scan_mean_ms=63.000 scan_p99_ms=116.799 heartbeat_n=0 wait_n=15374 wait_p99_ms=3.931 wait_max_ms=26.968 in_use_mean=11.911 in_use_max=22

@@ -52,7 +52,7 @@ checks the grants on the table.
 **Migration.** `20261009050156_harvest_llm_ledger` adds the table and one
 index on `recorded_at`. No data migration, no `WorkflowEvent` variant, no
 replay impact. See
-[0.8.0 §1.5](../upgrading/0.8.0.md#15-the-usage-report-carries-the-agent-cost-ledger).
+[0.8.0 §1.6](../upgrading/0.8.0.md#16-the-usage-report-carries-the-agent-cost-ledger).
 
 **Also.** The `GET /admin/usage` contract text said that terminal counts
 use `completed_at`. It now says that they count terminal events, as the
