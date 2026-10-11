@@ -23,7 +23,7 @@ time. See [The change](#the-change).
 
 | Criterion | Text (pre-registered) | Result |
 |---|---|---|
-| G1 | `backout` has the highest goodput in both low-contention cells. | **Holds.** In the 20 ms cell, the `backout` and `hybrid` ranges overlap, so that cell is inconclusive against `hybrid`. `backout` beats `saga` there with no overlap. |
+| G1 | `backout` has the highest goodput in both low-contention cells. | **Inconclusive.** It holds at 0 ms. At 20 ms, `backout` has the best median, but its range overlaps the `hybrid` range. `backout` beats `saga` there with no overlap. |
 | G2 | `backout` does not have the highest goodput in the hot, long-step cell. | **Holds.** `saga` and `hybrid` give about 2.9x the goodput of `backout`. |
 | G3 | In every cell, the rule picks an arm within `TIE_BAND` = 10 % of the best goodput. | **Fails** in the hot, 0 ms cell. The rule picks `backout`, which gives 53 % of the best goodput. |
 | G4 | Every arm keeps both invariants in every cell. | **Holds.** All 36 runs: stock taken equals orders, money taken equals order totals. |
@@ -184,7 +184,8 @@ the time from the hot step's write to the commit.
 With a local Postgres in `HARVEST_TEST_DATABASE_URL`, or with Docker:
 
 ```text
-cargo test --release -p autumn-harvest --test integration \
+cargo test --release -p autumn-harvest --features atomicity-spike \
+  --test integration \
   atomicity_spike_tests::measure_the_full_matrix -- --ignored --nocapture
 ```
 
