@@ -304,7 +304,8 @@ list and the action result (the flash) are outside each region.
 
 A hidden tab closes its stream. When the tab shows again, the script connects
 again and fetches the page once. After a reconnect, the script also fetches
-the page once, so no change from the gap is lost.
+the page once, so no change from the gap is lost. When a page fetch fails, the
+script tries again after 10 s.
 
 When the stream is not available, the script fetches the page each 10 s. That
 occurs for a viewer without admin access, because both streams are

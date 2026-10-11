@@ -36,6 +36,7 @@
   var pollMs = 0;
   var retryTimer = null;
   var keptTimer = null;
+  var failTimer = null;
   var keptDoc = null;
   var backoff = 1000;
   var controller = null;
@@ -211,6 +212,14 @@
       })
       .catch(function () {
         setStatus("Live update failed. The page tries again.");
+        // The change is not on the page yet. The stream does not send it
+        // again, so the page tries again after the poll interval.
+        if (!failTimer && !stopped) {
+          failTimer = setTimeout(function () {
+            failTimer = null;
+            refresh();
+          }, pollEvery);
+        }
       })
       .then(function () {
         inFlight = false;
@@ -251,6 +260,10 @@
     if (retryTimer) {
       clearTimeout(retryTimer);
       retryTimer = null;
+    }
+    if (failTimer) {
+      clearTimeout(failTimer);
+      failTimer = null;
     }
     disconnect();
     setStatus(text);
