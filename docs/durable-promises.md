@@ -111,8 +111,9 @@ A rejection body is `{"outcome":"rejected","error":"budget exceeded"}`.
   point. That token names the source run. To settle the promise in the fork,
   use `PromiseId::new(fork_execution_id, id.key())`, or send the HTTP signal
   to the fork.
-- Make one handle for each key in a run. A second handle for the same key
-  waits for a second settlement, and none comes.
+- A run has one handle for each key. `ctx.promise(key)` refuses a second
+  handle for the same key, because it would wait for a second settlement
+  and none comes. Keep the first handle and wait on it again.
 - Do not register a push signal handler for a `harvest.promise:` name.
 
 ## Why signals, not external task tokens

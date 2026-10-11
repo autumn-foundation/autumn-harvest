@@ -2807,6 +2807,9 @@ pub struct WorkflowContext {
     commands: Mutex<Vec<WorkflowCommand>>,
     /// Harvest futures parked with no result channel (issue #1797).
     parks: ParkCounter,
+    /// Keys of the named promises this run has made (issue #1985). A key
+    /// settles once, so a second handle for it would wait forever.
+    promise_keys: Mutex<std::collections::HashSet<String>>,
     /// Deterministic "now" -- the timestamp from the `WorkflowStarted` event.
     start_time: DateTime<Utc>,
     /// History-size thresholds visible to author code.
@@ -3598,6 +3601,7 @@ impl WorkflowContext {
             matcher: Mutex::new(matcher),
             commands: Mutex::new(Vec::new()),
             parks: ParkCounter::default(),
+            promise_keys: Mutex::default(),
             start_time,
             history_policy,
             execution_timeout: None,
@@ -3771,6 +3775,7 @@ impl WorkflowContext {
             matcher: Mutex::new(crate::replay::HistoryMatcher::new(vec![])),
             commands: Mutex::new(Vec::new()),
             parks: ParkCounter::default(),
+            promise_keys: Mutex::default(),
             start_time,
             history_policy: WorkflowHistoryPolicy::default(),
             execution_timeout: None,
@@ -3842,6 +3847,7 @@ impl WorkflowContext {
             matcher: Mutex::new(HistoryMatcher::new(vec![])),
             commands: Mutex::new(Vec::new()),
             parks: ParkCounter::default(),
+            promise_keys: Mutex::default(),
             start_time,
             history_policy: WorkflowHistoryPolicy::default(),
             execution_timeout: None,
@@ -9368,8 +9374,10 @@ impl WorkflowContext {
     ///
     /// Returns [`HarvestError::Config`] if `key` is empty, longer than
     /// [`crate::durable_promise::MAX_PROMISE_KEY_LEN`] bytes, or holds a
-    /// character outside `[A-Za-z0-9._:-]`. Returns the errors of
-    /// [`side_effect`](Self::side_effect).
+    /// character outside `[A-Za-z0-9._:-]`. Also returns it if this run
+    /// already has a handle for `key`. A key settles once, so a second
+    /// handle would wait forever. Keep the first handle and wait on it again.
+    /// Returns the errors of [`side_effect`](Self::side_effect).
     ///
     /// # Panics
     ///
@@ -9380,6 +9388,18 @@ impl WorkflowContext {
     ) -> HarvestResult<crate::durable_promise::DurablePromise<'_>> {
         let fresh = crate::durable_promise::PromiseId::new(self.execution_id(), key)
             .map_err(|e| HarvestError::Config(e.to_string()))?;
+        // Refuse before the token is recorded, so the refusal leaves no event.
+        let first_handle = self
+            .promise_keys
+            .lock()
+            .expect("promise key set poisoned")
+            .insert(fresh.key().to_owned());
+        if !first_handle {
+            return Err(HarvestError::Config(format!(
+                "promise key '{}' already has a handle in this run; wait on that handle",
+                fresh.key()
+            )));
+        }
         self.record_promise(|| fresh)
     }
 

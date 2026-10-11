@@ -337,6 +337,34 @@ async fn test_durable_promise_handle_returns_its_settlement_to_every_wait() {
     );
 }
 
+/// Makes two handles for the named promise `approval`.
+fn duplicate_handle_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+    Box::pin(async move {
+        let _first = ctx.promise("approval").map_err(|e| e.to_string())?;
+        match ctx.promise("approval") {
+            Ok(_) => Ok(json!("second handle made")),
+            Err(e) => Ok(json!(e.to_string())),
+        }
+    })
+}
+
+/// A second handle for one key would wait for a second settlement, and none
+/// comes. So the context refuses it, before it records a token.
+#[tokio::test]
+async fn test_durable_promise_refuses_a_second_handle_for_one_key() {
+    let outcome = WorkflowTestEnv::new()
+        .run(duplicate_handle_workflow, Value::Null)
+        .await;
+    let message = outcome.result.clone().expect("the workflow completes");
+    assert!(
+        message
+            .as_str()
+            .is_some_and(|m| m.contains("already has a handle")),
+        "the second handle must be refused: {message}"
+    );
+    assert_succeeded(&outcome.replay_check(duplicate_handle_workflow).await);
+}
+
 #[tokio::test]
 async fn test_durable_promise_new_promise_token_names_this_run() {
     let outcome = WorkflowTestEnv::new()
