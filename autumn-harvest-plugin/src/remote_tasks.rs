@@ -268,12 +268,12 @@ impl HttpRemoteTasks {
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.starts_with("text/event-stream"));
+            .is_some_and(is_event_stream);
         let raw = read_body(&mut response, method, id, event_stream).await?;
         let envelope = if event_stream {
             std::str::from_utf8(&raw)
                 .ok()
-                .and_then(|text| sse_response(text, id, false))
+                .and_then(|text| sse_response(text, id))
         } else {
             serde_json::from_slice::<Value>(&raw).ok()
         };
@@ -346,7 +346,7 @@ async fn read_body(
         raw.extend_from_slice(&chunk);
         if event_stream
             && chunk.iter().any(|b| matches!(b, b'\n' | b'\r'))
-            && std::str::from_utf8(&raw).is_ok_and(|text| sse_response(text, id, true).is_some())
+            && std::str::from_utf8(&raw).is_ok_and(|text| sse_response(text, id).is_some())
         {
             break;
         }
@@ -410,16 +410,32 @@ fn sse_lines(body: &str) -> Vec<(&str, bool)> {
     lines
 }
 
+/// `true` when `content_type` names an event stream.
+///
+/// Media types are case-insensitive, and parameters follow a `;`.
+fn is_event_stream(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
 /// The JSON-RPC response with `id` in a `text/event-stream` body.
 ///
-/// A blank line ends an event, and the `data` lines of one event join with
-/// a line feed. With `complete_only`, an event with no blank line after it
-/// does not count, because more of its data can still arrive.
-fn sse_response(body: &str, id: u64, complete_only: bool) -> Option<Value> {
+/// The parse follows the event-stream interpretation rules:
+///
+/// - one leading BOM goes;
+/// - a line that starts with `:` is a comment;
+/// - a field is the text before the first `:`, and its value loses one
+///   leading space;
+/// - `data` values join with a line feed;
+/// - a blank line dispatches the event;
+/// - an event with no blank line after it is not dispatched.
+fn sse_response(body: &str, id: u64) -> Option<Value> {
+    let body = body.strip_prefix('\u{feff}').unwrap_or(body);
     let mut data: Vec<&str> = Vec::new();
     for (line, ended) in sse_lines(body) {
-        if !ended && complete_only {
-            // A partial last line is not a field yet.
+        if !ended {
             break;
         }
         if line.is_empty() {
@@ -429,14 +445,19 @@ fn sse_response(body: &str, id: u64, complete_only: bool) -> Option<Value> {
                 return Some(message);
             }
             data.clear();
-        } else if let Some(field) = line.strip_prefix("data:") {
-            data.push(field.strip_prefix(' ').unwrap_or(field));
+            continue;
+        }
+        if line.starts_with(':') {
+            continue;
+        }
+        let (field, value) = line.split_once(':').map_or((line, ""), |(field, value)| {
+            (field, value.strip_prefix(' ').unwrap_or(value))
+        });
+        if field == "data" {
+            data.push(value);
         }
     }
-    if complete_only {
-        return None;
-    }
-    decode_event(&data).filter(|message| is_response_to(message, id))
+    None
 }
 
 /// The JSON value of one event's joined `data` lines.
@@ -531,17 +552,17 @@ mod tests {
         let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n\
                     data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n\n";
         assert_eq!(
-            sse_response(body, 7, false),
+            sse_response(body, 7),
             Some(json!({"jsonrpc": "2.0", "id": 7, "result": {"ok": true}}))
         );
-        assert_eq!(sse_response(body, 8, false), None);
+        assert_eq!(sse_response(body, 8), None);
     }
 
     #[test]
     fn sse_response_joins_the_data_lines_of_one_event() {
         let body = "event: message\r\ndata: {\"jsonrpc\":\"2.0\",\r\ndata: \"id\":3,\r\ndata:\"result\":{\"ok\":true}}\r\n\r\n";
         assert_eq!(
-            sse_response(body, 3, true),
+            sse_response(body, 3),
             Some(json!({"jsonrpc": "2.0", "id": 3, "result": {"ok": true}}))
         );
     }
@@ -550,7 +571,7 @@ mod tests {
     fn a_lone_cr_ends_a_line() {
         let body = "data: {\"jsonrpc\":\"2.0\",\rdata: \"id\":5,\"result\":{}}\r\r";
         assert_eq!(
-            sse_response(body, 5, true),
+            sse_response(body, 5),
             Some(json!({"jsonrpc": "2.0", "id": 5, "result": {}}))
         );
     }
@@ -566,17 +587,31 @@ mod tests {
     }
 
     #[test]
-    fn an_event_with_no_end_counts_only_at_the_end_of_the_body() {
-        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{}}";
+    fn an_event_with_no_blank_line_is_not_dispatched() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{}}\n";
+        assert_eq!(sse_response(body, 4), None);
         assert_eq!(
-            sse_response(body, 4, true),
-            None,
-            "more data can still arrive"
-        );
-        assert_eq!(
-            sse_response(body, 4, false),
+            sse_response(&format!("{body}\n"), 4),
             Some(json!({"jsonrpc": "2.0", "id": 4, "result": {}}))
         );
+    }
+
+    #[test]
+    fn a_bom_comments_and_bare_fields_follow_the_event_stream_rules() {
+        let body =
+            "\u{feff}: keep-alive\nretry\ndata:{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{}}\n\n";
+        assert_eq!(
+            sse_response(body, 6),
+            Some(json!({"jsonrpc": "2.0", "id": 6, "result": {}}))
+        );
+    }
+
+    #[test]
+    fn the_event_stream_media_type_is_case_insensitive() {
+        assert!(is_event_stream("text/event-stream"));
+        assert!(is_event_stream("Text/Event-Stream; charset=utf-8"));
+        assert!(!is_event_stream("application/json"));
+        assert!(!is_event_stream("text/event-streams"));
     }
 
     #[test]
