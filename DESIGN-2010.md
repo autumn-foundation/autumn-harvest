@@ -140,6 +140,10 @@ Four review agents read the first version. Each fix has a test.
     `struct Shared(Arc<Mutex<u64>>)`. The source index records what each
     local type's fields hold. A type whose fields hold `&mut`, a lifetime,
     an interior-mutable type or another such type counts as interior-mutable.
+    The index follows each `mod x;` to its file, so a file of types only is
+    read too.
+24. A `handlers` entry that no registration node names is refused. Its
+    bodies would read as entries, so a helper could look covered.
 
 ---
 

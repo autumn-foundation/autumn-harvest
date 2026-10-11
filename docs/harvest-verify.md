@@ -296,7 +296,8 @@ a missing node, has other than one `entry`, or has a node that the `entry`
 cannot reach, an `exit` with an out-edge, or a `step` past the body
 `steps` list. It refuses a body with no flow graph. It also refuses a `call`, a
 `saga-step`, a handler or a body `calls` entry that names a body or handler
-the workflow does not hold.
+the workflow does not hold, and a handler entry that no `handler` node
+names.
 
 The workflow `handlers` list each handler registration: its `kind`
 (`signal`, `update`, `query` or `other`), its model `method`, its `name`

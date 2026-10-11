@@ -207,3 +207,13 @@ cargo 1.94.1 (29ea6fb6a 2026-03-24)
 #         --extern autumn_harvest=libautumn_harvest.rlib \
 #         --extern helpers=libhelpers.rlib -o flow.mir flow.rs
 #   rm libautumn_harvest.rlib libhelpers.rlib
+
+# `async_block_modfile/flow.mir` (issue #2010) declares a wrapper type in
+# `state/shared.rs`, a module file that MIR names no span in. From
+# `async_block_modfile/`:
+#
+#   rustc --crate-type lib --edition 2024 --crate-name autumn_harvest \
+#         -o libautumn_harvest.rlib ../async_block_follow/harvest_stub.rs
+#   rustc --crate-type lib --edition 2024 --emit=mir \
+#         --extern autumn_harvest=libautumn_harvest.rlib -o flow.mir flow.rs
+#   rm libautumn_harvest.rlib

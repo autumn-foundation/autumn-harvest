@@ -141,6 +141,7 @@ pub fn check(manifest: &StructureManifest) -> Result<Vec<SagaReport>, CheckError
 fn dangling_reference(workflow: &WorkflowStructure) -> Option<String> {
     let ids: BTreeSet<&str> = workflow.bodies.iter().map(|b| b.id.as_str()).collect();
     let mut named: Vec<&String> = Vec::new();
+    let mut registered: BTreeSet<usize> = BTreeSet::new();
     let graphs = workflow.bodies.iter().filter_map(|b| b.flow.as_ref());
     for node in graphs.flat_map(|graph| &graph.nodes) {
         match &node.event {
@@ -156,8 +157,18 @@ fn dangling_reference(workflow: &WorkflowStructure) -> Option<String> {
                     "a node names handler {handler}, but the workflow has {count} handlers"
                 ));
             }
+            FlowEvent::Handler { handler } => {
+                registered.insert(*handler);
+            }
             _ => {}
         }
+    }
+    // A handler entry runs as an entry. Only a registration node makes it
+    // one, or a helper listed there would read as covered.
+    if let Some(orphan) = (0..workflow.handlers.len()).find(|i| !registered.contains(i)) {
+        return Some(format!(
+            "the workflow lists handler {orphan}, but no node registers it"
+        ));
     }
     let handlers = workflow
         .handlers
@@ -688,8 +699,11 @@ mod tests {
         assert!(err.to_string().contains("w::helper"), "{err}");
 
         let mut handler = manifest(FlowGraph {
-            nodes: vec![node(FlowEvent::Entry)],
-            edges: Vec::new(),
+            nodes: vec![
+                node(FlowEvent::Entry),
+                node(FlowEvent::Handler { handler: 0 }),
+            ],
+            edges: vec![edge(0, 1, None)],
         });
         if let Some(w) = handler.workflows.first_mut() {
             w.handlers.push(HandlerSite {
@@ -736,6 +750,24 @@ mod tests {
         }
         let err = check(&graphless).expect_err("a body with no flow graph");
         assert!(err.to_string().contains("no flow graph"), "{err}");
+
+        // A handler entry that no registration node names is not a handler.
+        // Its bodies would read as entries, so a helper would look covered.
+        let mut orphan = manifest(FlowGraph {
+            nodes: vec![node(FlowEvent::Entry)],
+            edges: Vec::new(),
+        });
+        if let Some(w) = orphan.workflows.first_mut() {
+            w.handlers.push(HandlerSite {
+                kind: "update".to_string(),
+                method: "register_update_handler".to_string(),
+                name: None,
+                bodies: vec![w.root.clone()],
+                returns: Vec::new(),
+            });
+        }
+        let err = check(&orphan).expect_err("a handler entry with no node");
+        assert!(err.to_string().contains("handler 0"), "{err}");
 
         // A handler node names an entry of `handlers` that is not there.
         let dangling = FlowGraph {

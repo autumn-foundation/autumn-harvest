@@ -199,3 +199,18 @@ fn a_first_party_future_with_no_poll_body_is_a_boundary() {
         "{boundaries:?}"
     );
 }
+
+#[test]
+fn a_wrapper_in_a_nested_module_file_is_indexed() {
+    // MIR names no span in `state/shared.rs`. The source index follows
+    // `mod state;` and `pub mod shared;` to read the fields of `Shared`.
+    let all = verdicts_in(&fixture_dir().with_file_name("async_block_modfile"));
+    assert!(
+        !matches!(
+            verdict(&all, "wf_step_write_modfile"),
+            Verdict::ProvenDeterministic
+        ),
+        "{:?}",
+        verdict(&all, "wf_step_write_modfile")
+    );
+}

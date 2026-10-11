@@ -115,7 +115,12 @@ impl SourceIndex {
                 }
             }
         }
-        for file in &expanded {
+        // A `mod x;` declaration names a file that MIR may never name, such as
+        // a file with types only. Each one read adds its own to the queue.
+        let mut queue: Vec<String> = expanded.iter().cloned().collect();
+        let mut seen: BTreeSet<String> = expanded;
+        while let Some(file) = queue.pop() {
+            let file = &file;
             let Some(text) = read_relative(roots, file) else {
                 // Only the files MIR *named* are worth reporting; the siblings
                 // are a best-effort widening and their absence means nothing.
@@ -127,11 +132,21 @@ impl SourceIndex {
                 }
                 continue;
             };
-            if !index.absorb_syn(&text, &file_module(file)) && files.contains(file) {
-                index.unreadable.insert(
-                    file.clone(),
-                    "the source file could not be parsed as Rust".to_string(),
-                );
+            match index.absorb_syn(&text, &file_module(file)) {
+                Some(children) => {
+                    for child in module_files(roots, file, &children) {
+                        if seen.insert(child.clone()) {
+                            queue.push(child);
+                        }
+                    }
+                }
+                None if files.contains(file) => {
+                    index.unreadable.insert(
+                        file.clone(),
+                        "the source file could not be parsed as Rust".to_string(),
+                    );
+                }
+                None => {}
             }
             index
                 .files
@@ -195,14 +210,15 @@ impl SourceIndex {
         })
     }
 
-    /// `false` when `syn` rejected the file (its `extern` blocks and generic
-    /// parameter lists are then invisible).
-    fn absorb_syn(&mut self, text: &str, module: &[String]) -> bool {
-        let Ok(file) = syn::parse_file(text) else {
-            return false;
-        };
+    /// `None` when `syn` rejected the file (its `extern` blocks and generic
+    /// parameter lists are then invisible). Otherwise each `mod x;` it
+    /// declares, as the path of inline modules around it and its name.
+    fn absorb_syn(&mut self, text: &str, module: &[String]) -> Option<Vec<Vec<String>>> {
+        let file = syn::parse_file(text).ok()?;
         self.absorb_items(&file.items, 0, module);
-        true
+        let mut children = Vec::new();
+        declared_module_files(&file.items, &mut Vec::new(), &mut children);
+        Some(children)
     }
 
     /// Record what the field types of the type `name` hold.
@@ -312,6 +328,66 @@ fn future_self_type(item: &syn::ItemImpl) -> Option<String> {
     Some(self_ty.path.segments.last()?.ident.to_string())
 }
 
+/// Each `mod x;` in `items`, as the path of inline modules around it and its
+/// name. A `mod x { .. }` with a body adds its name to the path.
+fn declared_module_files(items: &[syn::Item], path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+    for item in items {
+        let syn::Item::Mod(item) = item else {
+            continue;
+        };
+        path.push(item.ident.to_string());
+        match &item.content {
+            Some((_, inner)) => declared_module_files(inner, path, out),
+            None => out.push(path.clone()),
+        }
+        path.pop();
+    }
+}
+
+/// The files of the modules `children` that `file` declares and that exist.
+///
+/// A target root and a `mod.rs` hold their modules in their own directory.
+/// Any other file holds them in a directory named after it, as rustc reads
+/// `src/a.rs` then `src/a/b.rs`. Each module is `x.rs` or `x/mod.rs`. In an
+/// unknown layout the file can be either kind, so both directories are read.
+/// An extra file only adds to the index.
+fn module_files(roots: &[PathBuf], file: &str, children: &[Vec<String>]) -> Vec<String> {
+    let path = Path::new(file);
+    let Some(parent) = path.parent() else {
+        return Vec::new();
+    };
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let bases = if matches!(stem, "mod" | "lib" | "main") {
+        vec![parent.to_path_buf()]
+    } else if layout_module(&file_parts(file)).is_empty() {
+        vec![parent.join(stem), parent.to_path_buf()]
+    } else {
+        vec![parent.join(stem)]
+    };
+    let mut out = Vec::new();
+    for child in children {
+        let Some((name, inline)) = child.split_last() else {
+            continue;
+        };
+        for base in &bases {
+            let dir = inline.iter().fold(base.clone(), |dir, part| dir.join(part));
+            for candidate in [
+                dir.join(format!("{name}.rs")),
+                dir.join(name).join("mod.rs"),
+            ] {
+                let candidate = candidate.to_string_lossy().into_owned();
+                if read_relative(roots, &candidate).is_some() {
+                    out.push(candidate);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The module path a source file stands for, from its path.
 ///
 /// `src/a/b.rs` and `src/a/b/mod.rs` give `a::b`. A target root, such as
@@ -319,11 +395,7 @@ fn future_self_type(item: &syn::ItemImpl) -> Option<String> {
 /// in another layout reads as a target root. A type of a submodule there
 /// then reads as foreign, which can only add a boundary.
 fn file_module(file: &str) -> Vec<String> {
-    let parts: Vec<&str> = file
-        .trim_end_matches(".rs")
-        .split('/')
-        .filter(|p| !p.is_empty())
-        .collect();
+    let parts = file_parts(file);
     let mut module: Vec<String> = layout_module(&parts)
         .iter()
         .map(|p| (*p).to_string())
@@ -335,6 +407,14 @@ fn file_module(file: &str) -> Vec<String> {
         module.pop();
     }
     module
+}
+
+/// The `/` parts of a source path, with no `.rs`.
+fn file_parts(file: &str) -> Vec<&str> {
+    file.trim_end_matches(".rs")
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .collect()
 }
 
 /// The parts of a source path below its target root.
