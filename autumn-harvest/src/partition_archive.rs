@@ -23,7 +23,7 @@
 //! ```text
 //! harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/segment-000001-<sha256:16>.jsonl
 //! harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/manifest-<sha256:16>.json
-//! harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/dropped.json
+//! harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/latest.json
 //! ```
 //!
 //! A segment holds one row per line, as `to_jsonb(row)::text`, in `id`
@@ -140,17 +140,6 @@ pub fn manifest_key(prefix: &str, sha256: &str) -> String {
     format!("{prefix}/manifest-{short}.json")
 }
 
-/// The key of the drop record under `prefix`.
-///
-/// It names the manifest of the export that the drop checks. The sweep writes
-/// it before each drop attempt, and a failed write keeps the partition. So a
-/// dropped partition always has a record. While the partition still exists,
-/// the drop has not happened yet.
-#[must_use]
-pub fn dropped_key(prefix: &str) -> String {
-    format!("{prefix}/dropped.json")
-}
-
 /// The key of the reuse hint under `prefix`.
 ///
 /// Each verified export writes it. The next pass reads it to find an export
@@ -161,33 +150,11 @@ fn latest_key(prefix: &str) -> String {
     format!("{prefix}/latest.json")
 }
 
-/// The body of a drop record or a reuse hint.
+/// The body of a reuse hint.
 #[derive(Debug, Serialize, Deserialize)]
 struct Pointer {
     /// A manifest key.
     manifest: String,
-}
-
-/// The manifest key that the drop record under `prefix` names.
-///
-/// Returns `None` when no drop record is there, so the partition was not
-/// dropped through an export. `SweepOutcome::exported` also names the key.
-///
-/// # Errors
-///
-/// [`ReadBackError`] when the backend fails or the record does not parse.
-pub async fn find_dropped(
-    archiver: &dyn PartitionArchiver,
-    prefix: &str,
-) -> Result<Option<String>, ReadBackError> {
-    let key = dropped_key(prefix);
-    match fetch(archiver, &key, None).await {
-        Ok(raw) => serde_json::from_slice::<Pointer>(&raw)
-            .map(|p| Some(p.manifest))
-            .map_err(|e| ReadBackError::Corrupt(format!("{key}: {e}"))),
-        Err(ReadBackError::Missing(_)) => Ok(None),
-        Err(e) => Err(e),
-    }
 }
 
 /// The key of segment `n` under `prefix`, with the first 16 hex digits of
@@ -649,7 +616,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         sync_dir(dir)?;
         for new_dir in &created {
             if let Some(parent) = new_dir.parent() {
-                sync_dir(parent)?;
+                sync_dir(dir_or_cwd(parent))?;
             }
         }
         Ok(())
@@ -658,6 +625,15 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     written
+}
+
+/// The current directory for the empty parent of a relative path.
+fn dir_or_cwd(dir: &Path) -> &Path {
+    if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    }
 }
 
 /// Sync a directory, so a rename in it survives a crash. A no-op off Unix,
@@ -1107,29 +1083,75 @@ pub(crate) async fn reusable_export(
     (back.manifest.prefix() == prefix).then_some(back.manifest)
 }
 
-/// Write the drop record of `manifest`, before the drop.
+/// Record the drop of `manifest` in `harvest_partition_exports`.
 ///
-/// The record goes first, so a dropped partition always has one. A failed
-/// write keeps the partition. If the drop then does not happen, the record
-/// names a verified export of a partition that still exists. The next
-/// attempt writes it again.
+/// The drop calls this inside its transaction, right before the
+/// `DROP TABLE`. So the row commits exactly when the drop commits. No late
+/// archive write can change it.
 ///
 /// # Errors
 ///
-/// The reason the drop must wait.
+/// [`crate::error::HarvestError::Database`] on a query failure.
 #[cfg(feature = "db")]
 pub(crate) async fn record_drop(
-    export: &PartitionExport,
+    conn: &mut diesel_async::AsyncPgConnection,
     manifest: &PartitionManifest,
-) -> Result<(), String> {
-    let key = dropped_key(&manifest.prefix());
-    let body = Pointer {
-        manifest: manifest.key(),
-    };
-    let bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
-    bounded(export, export.archiver.put(&key, bytes))
-        .await
-        .map_err(|e| format!("{key}: {e}"))
+) -> crate::error::HarvestResult<()> {
+    use diesel::sql_types::{BigInt, Nullable, Text, Timestamptz};
+    use diesel_async::RunQueryDsl as _;
+    diesel::sql_query(
+        "INSERT INTO harvest_partition_exports
+             (manifest_key, partition_name, lower_bound, upper_bound, row_count)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind::<Text, _>(manifest.key())
+    .bind::<Text, _>(&manifest.partition)
+    .bind::<Nullable<Timestamptz>, _>(manifest.lower)
+    .bind::<Timestamptz, _>(manifest.upper)
+    .bind::<BigInt, _>(i64::try_from(manifest.row_count).unwrap_or(i64::MAX))
+    .execute(conn)
+    .await
+    .map(|_| ())
+    .map_err(crate::error::database_error)
+}
+
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct KeyRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    manifest_key: String,
+}
+
+/// The manifest key of the export that the drop of partition `partition`,
+/// with upper bound `upper`, checked.
+///
+/// Reads `harvest_partition_exports` on the shard that held the partition.
+/// Returns `None` when the partition was not dropped through an export.
+/// Pass the key to [`read_back`].
+///
+/// # Errors
+///
+/// [`crate::error::HarvestError::Database`] on a query failure.
+#[cfg(feature = "db")]
+pub async fn dropped_manifest_key(
+    conn: &mut diesel_async::AsyncPgConnection,
+    partition: &str,
+    upper: DateTime<Utc>,
+) -> crate::error::HarvestResult<Option<String>> {
+    use diesel::sql_types::{Text, Timestamptz};
+    use diesel_async::RunQueryDsl as _;
+    let rows = diesel::sql_query(
+        "SELECT manifest_key FROM harvest_partition_exports
+          WHERE partition_name = $1 AND upper_bound = $2
+          ORDER BY dropped_at DESC
+          LIMIT 1",
+    )
+    .bind::<Text, _>(partition)
+    .bind::<Timestamptz, _>(upper)
+    .load::<KeyRow>(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(rows.into_iter().next().map(|r| r.manifest_key))
 }
 
 /// Export partition `part`, then read the export back and check it.
@@ -1325,18 +1347,14 @@ mod tests {
         assert_eq!(read_back(&archiver, &new).await.unwrap().rows.len(), 2);
     }
 
-    #[tokio::test]
-    async fn find_dropped_reads_the_drop_record() {
-        let archiver = MemoryArchiver::default();
-        let key = store(&archiver, &[ROW_A]).await;
-        let prefix = key.rsplit_once('/').unwrap().0.to_string();
-        assert_eq!(find_dropped(&archiver, &prefix).await.unwrap(), None);
-        let record = serde_json::to_vec(&Pointer {
-            manifest: key.clone(),
-        })
-        .unwrap();
-        archiver.put(&dropped_key(&prefix), record).await.unwrap();
-        assert_eq!(find_dropped(&archiver, &prefix).await.unwrap(), Some(key));
+    #[test]
+    fn the_empty_parent_of_a_relative_root_is_the_current_directory() {
+        assert_eq!(dir_or_cwd(Path::new("")), Path::new("."));
+        assert_eq!(dir_or_cwd(Path::new("a/b")), Path::new("a/b"));
+        assert_eq!(
+            Path::new("archive").parent().map(dir_or_cwd),
+            Some(Path::new("."))
+        );
     }
 
     #[tokio::test]
@@ -1371,7 +1389,6 @@ mod tests {
             manifest_key(&prefix, &sha),
             format!("{prefix}/manifest-{}.json", &sha[..16])
         );
-        assert_eq!(dropped_key(&prefix), format!("{prefix}/dropped.json"));
         assert_eq!(
             segment_key(&prefix, 7, &sha),
             format!("{prefix}/segment-000007-{}.jsonl", &sha[..16])

@@ -32,8 +32,8 @@ events.
 
 **Guards.**
 
-- **Marker.** Migration `20261011024658_harvest_partition_export_marker`
-  adds `harvest_partition_export`, one row at most. A sweep with an
+- **Marker.** Migration `20261011024658_harvest_partition_export` adds
+  `harvest_partition_export`, one row at most. A sweep with an
   archiver writes it. Then a sweep with no archiver on that shard drops
   nothing and reports `export required, but no archiver is set`. This
   covers `harvest partition maintain` and `RetentionRuntime::spawn`.
@@ -44,9 +44,11 @@ events.
   take it reports `another process holds the export lock of this shard`.
 - **Keys.** A key holds the shard and the cohort bounds. Segment and
   manifest keys hold a SHA-256 prefix of their content, so a late upload
-  cannot replace a finished object. `dropped.json` names the checked
-  manifest, and `partition_archive::find_dropped` reads it. The sweep
-  writes it before each drop attempt, so every dropped partition has one.
+  cannot replace a finished object.
+- **Drop log.** The same migration adds `harvest_partition_exports`. The
+  drop inserts a row in its own transaction, so a row exists exactly when
+  the partition was dropped. `partition_archive::dropped_manifest_key`
+  reads it.
 - **Status.** On a marked shard, `harvest partition status` reports a
   droppable partition as `export required`, the way a sweep with no
   archiver acts on it.
@@ -78,9 +80,9 @@ change removes the stale field from both tests.
 
 **Tests.**
 
-- `partition_archive_tests`, 18 DB tests: export, verify, drop and read
+- `partition_archive_tests`, 17 DB tests: export, verify, drop and read
   back; the legacy partition; the retention runtime; a failed upload; a
-  lost object; changed bytes; a failed drop record; a slow backend; a row
+  lost object; changed bytes; a slow backend; a row
   changed or deleted after the export; a live owner; no straggler deletes;
   the marker and the status report; the lock in both modes; reuse; the
   export budget.
@@ -90,5 +92,5 @@ change removes the stale field from both tests.
 - The preflight test
   `the_partition_export_marker_is_covered_by_the_privilege_probe`. A
   least-privilege runtime role needs `SELECT` and `INSERT` on
-  `harvest_partition_export`.
+  `harvest_partition_export` and `harvest_partition_exports`.
 - `history_delta_measure` in `autumn-harvest-agent`.

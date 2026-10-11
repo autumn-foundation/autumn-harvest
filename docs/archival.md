@@ -290,7 +290,6 @@ key of each dropped partition. Each backend call has the
 harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/segment-000001-<sha256:16>.jsonl
 harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/manifest-<sha256:16>.json
 harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/latest.json
-harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/dropped.json
 ```
 
 `<lower>` is `min` for the legacy partition. The bounds keep a later
@@ -300,11 +299,10 @@ partition with the same name from replacing an old export.
   SHA-256 of their content. An upload that lands late, after a timeout,
   writes its own key. It cannot replace an object that a finished export
   names.
-- `dropped.json` names the manifest of the export that the drop checks.
-  The sweep writes it before each drop attempt, and a failed write keeps
-  the partition. So every dropped partition has one. While the partition
-  still exists, the drop has not happened yet.
-  `partition_archive::find_dropped` reads it.
+- The drop log, `harvest_partition_exports` on the shard, names the
+  manifest of each export that a drop checked. The sweep inserts the row in
+  the drop transaction, so a row exists exactly when its partition was
+  dropped. `partition_archive::dropped_manifest_key` reads it.
 - `latest.json` names the last verified export. The next pass uses it to
   find an export to reuse. A stale hint costs one new export, because the
   drop checks the partition against the manifest under its lock.
@@ -312,11 +310,13 @@ partition with the same name from replacing an old export.
 ### Read-back
 
 ```rust
-use autumn_harvest::partition_archive::{archive_prefix, find_dropped, read_back};
+use autumn_harvest::partition_archive::{dropped_manifest_key, read_back};
 
-// `archiver` is an `Arc<dyn PartitionArchiver>`. The caller returns a boxed error.
-let prefix = archive_prefix(shard_id, &partition_name, lower, upper);
-let manifest_key = find_dropped(archiver.as_ref(), &prefix).await?.ok_or("no drop record")?;
+// `conn` is a connection to the shard. `archiver` is an `Arc<dyn PartitionArchiver>`.
+// The caller returns a boxed error.
+let manifest_key = dropped_manifest_key(&mut conn, &partition_name, upper)
+    .await?
+    .ok_or("not dropped through an export")?;
 let part = read_back(archiver.as_ref(), &manifest_key).await?;
 let events = part.history(execution_id)?;
 ```
@@ -337,7 +337,8 @@ partitions. `history_with_codecs` decodes payload fields with your codec keys.
 - **Older binaries ignore the marker.** Deploy the archiver to every process
   before you rely on it.
 - **Grants.** A least-privilege runtime role needs `SELECT` and `INSERT` on
-  `harvest_partition_export`. The startup preflight checks it.
+  `harvest_partition_export` and `harvest_partition_exports`. The startup
+  preflight checks them.
 - **No straggler deletes.** `try_build` refuses a partition archiver together
   with `partitions.straggler_grace_secs`. A straggler delete removes rows
   that no export holds. On a marked shard, the sweep skips straggler deletes.

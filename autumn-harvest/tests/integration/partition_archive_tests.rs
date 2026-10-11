@@ -73,6 +73,7 @@ async fn reset(conn: &mut AsyncPgConnection) {
         "DELETE FROM harvest_workflow_executions",
         "DELETE FROM harvest_events",
         "DELETE FROM harvest_partition_export",
+        "DELETE FROM harvest_partition_exports",
     ] {
         diesel::sql_query(stmt).execute(conn).await.expect(stmt);
     }
@@ -378,18 +379,16 @@ fn typed(rows: Vec<serde_json::Value>) -> Vec<partition_archive::ArchivedEventRo
         .collect()
 }
 
-/// The manifest key that the drop record of this partition names.
+/// The manifest key that the drop log names for this partition.
 async fn dropped_manifest(
-    archiver: &dyn PartitionArchiver,
+    conn: &mut AsyncPgConnection,
     name: &str,
-    lower: Option<DateTime<Utc>>,
     upper: DateTime<Utc>,
 ) -> String {
-    let prefix = partition_archive::archive_prefix(0, name, lower, upper);
-    partition_archive::find_dropped(archiver, &prefix)
+    partition_archive::dropped_manifest_key(conn, name, upper)
         .await
-        .expect("read the drop record")
-        .expect("a drop record after the drop")
+        .expect("read the drop log")
+        .expect("a drop log row after the drop")
 }
 
 // ── Done when: exported, verified, then dropped, and read back ────────────
@@ -408,7 +407,7 @@ async fn an_aged_partition_is_exported_verified_then_dropped_and_reads_back() {
     *backend.probe.lock().unwrap() = Some((url.clone(), aged.name.clone()));
     let outcome = sweep_with(&mut conn, backend.clone()).await;
 
-    let key = dropped_manifest(backend.as_ref(), &aged.name, Some(aged.lower), aged.upper).await;
+    let key = dropped_manifest(&mut conn, &aged.name, aged.upper).await;
     assert_eq!(outcome.dropped, vec![aged.name.clone()], "{outcome:?}");
     assert_eq!(outcome.exported, vec![key.clone()], "{outcome:?}");
     assert!(
@@ -416,7 +415,7 @@ async fn an_aged_partition_is_exported_verified_then_dropped_and_reads_back() {
         "the partition is dropped"
     );
 
-    // Order: segments, the manifest, the read-back, then the drop record.
+    // Order: segments, the manifest, then the read-back.
     let log = backend.log.lock().unwrap().clone();
     let pos = |entry: &str| {
         log.iter()
@@ -424,10 +423,6 @@ async fn an_aged_partition_is_exported_verified_then_dropped_and_reads_back() {
             .unwrap_or_else(|| panic!("{entry}: {log:?}"))
     };
     let manifest_put = pos(&format!("put {key}"));
-    let dropped = format!(
-        "put {}",
-        partition_archive::dropped_key(key.rsplit_once('/').unwrap().0)
-    );
     assert!(
         log[..manifest_put]
             .iter()
@@ -440,11 +435,6 @@ async fn an_aged_partition_is_exported_verified_then_dropped_and_reads_back() {
             .iter()
             .any(|l| l == &format!("get {key}")),
         "verify reads the manifest back after the upload: {log:?}"
-    );
-    assert_eq!(
-        log.iter().rfind(|l| l.starts_with("put ")),
-        Some(&dropped),
-        "the drop record is the last upload: {log:?}"
     );
     let reads = backend.existed_at_read.lock().unwrap().clone();
     assert!(
@@ -494,9 +484,8 @@ async fn the_legacy_partition_exports_under_a_min_lower_bound() {
     let outcome = sweep_with(&mut conn, backend.clone()).await;
 
     let key = dropped_manifest(
-        backend.as_ref(),
+        &mut conn,
         partition::LEGACY_PARTITION,
-        None,
         legacy.upper.unwrap(),
     )
     .await;
@@ -557,25 +546,6 @@ async fn a_failed_upload_keeps_the_partition() {
 }
 
 #[tokio::test]
-async fn a_failed_drop_record_keeps_the_partition() {
-    // The record goes before the drop, so a dropped partition always has one.
-    let (url, _c) = setup_db().await;
-    let mut conn = connect(&url).await;
-    reset_partitioned(&mut conn).await;
-    let aged = seed_aged_partition(&mut conn, 3).await;
-    let backend = Arc::new(TestArchiver {
-        fail_put_suffix: Some("/dropped.json"),
-        ..TestArchiver::default()
-    });
-    let outcome = sweep_with(&mut conn, backend).await;
-    assert_kept(&mut conn, &aged, &outcome, "export failed").await;
-    assert!(
-        outcome.blocked.iter().any(|b| b.contains("dropped.json")),
-        "{outcome:?}"
-    );
-}
-
-#[tokio::test]
 async fn a_lost_object_keeps_the_partition() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
@@ -625,7 +595,7 @@ async fn a_row_changed_after_the_export_keeps_the_partition_until_a_new_export()
     let current = rows_as_json(&mut conn, &aged.name).await;
     let second = sweep_with(&mut conn, backend.clone()).await;
     assert_eq!(second.dropped, vec![aged.name.clone()], "{second:?}");
-    let key = dropped_manifest(backend.as_ref(), &aged.name, Some(aged.lower), aged.upper).await;
+    let key = dropped_manifest(&mut conn, &aged.name, aged.upper).await;
     let archived = partition_archive::read_back(backend.as_ref(), &key)
         .await
         .expect("read back");
@@ -911,6 +881,13 @@ async fn a_failed_drop_reuses_the_export_on_the_next_pass() {
     let backend = Arc::new(TestArchiver::default());
     let first = sweep_with(&mut conn, backend.clone()).await;
     assert_kept(&mut conn, &aged, &first, partition::RECHECK_REASON).await;
+    let record = partition_archive::dropped_manifest_key(&mut conn, &aged.name, aged.upper)
+        .await
+        .expect("read the drop log");
+    assert_eq!(
+        record, None,
+        "the drop log row rolls back with the failed drop"
+    );
     reader.batch_execute("COMMIT").await.expect("release");
 
     backend.log.lock().unwrap().clear();
@@ -918,11 +895,10 @@ async fn a_failed_drop_reuses_the_export_on_the_next_pass() {
     assert_eq!(second.dropped, vec![aged.name.clone()], "{second:?}");
     let log = backend.log.lock().unwrap().clone();
     assert!(
-        log.iter()
-            .all(|l| l.starts_with("get ") || l.ends_with("/dropped.json")),
-        "the second pass uploads only the drop record: {log:?}"
+        log.iter().all(|l| l.starts_with("get ")),
+        "the second pass uploads nothing: {log:?}"
     );
-    let key = dropped_manifest(backend.as_ref(), &aged.name, Some(aged.lower), aged.upper).await;
+    let key = dropped_manifest(&mut conn, &aged.name, aged.upper).await;
     assert_eq!(second.exported, vec![key]);
 }
 
@@ -997,7 +973,7 @@ async fn the_retention_runtime_exports_before_it_drops() {
     let result = result.expect("partition maintenance ran");
     assert_eq!(result.deleted_count, 2, "retention collected both runs");
     let sweep = &result.partition_maintenance.as_ref().unwrap().sweep;
-    let key = dropped_manifest(disk.as_ref(), &name, Some(lower), upper).await;
+    let key = dropped_manifest(&mut conn, &name, upper).await;
     assert_eq!(sweep.exported, vec![key.clone()], "{sweep:?}");
     assert!(!exists(&mut conn, &name).await, "the partition is dropped");
     let archived = partition_archive::read_back(disk.as_ref(), &key)

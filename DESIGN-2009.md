@@ -7,7 +7,7 @@ back, checks it, and drops the partition only when the check passes.
 The issue also asks about delta encoding of agent context windows. §5
 gives the measurement and the decision.
 
-**One small migration** (`20261011024658_harvest_partition_export_marker`,
+**One small migration** (`20261011024658_harvest_partition_export`,
 §3.1). **No new `WorkflowEvent` variant. No new route.** The two sanctioned
 `event_data` writers do not change. The export reads rows and the drop is
 DDL, so the append-only trigger does not apply.
@@ -75,13 +75,15 @@ API and tests, and docs. These changes followed. Each has a test.
 | C6 | Verify checked bytes only, so an unparseable row could drop and then fail `read_back`. | Verify runs the read-back path, which parses every row. `read_back` also checks the manifest against its key. | `read_back_refuses_a_manifest_under_another_key` |
 | C7 | Pages of 1,000 large rows could use a lot of memory. | Pages hold 256 rows. | — |
 | C8 | Internal types were public, and core-built types were exhaustive. | `SegmentWriter`, `RowDigest` and `sha256_hex` are crate-private. The manifest, segment entry, archived partition and `RetentionHooks` are `non_exhaustive`. | Builds |
-| C9 | (Codex) The trait lets a timed-out `put` land later. A late manifest at the one fixed key could replace the manifest that the drop checked. | Manifest keys name their content. A reuse hint and a drop record replace the fixed key. | `exports_of_different_rows_have_different_manifest_keys`, `find_dropped_reads_the_drop_record` |
+| C9 | (Codex) The trait lets a timed-out `put` land later. A late manifest at the one fixed key could replace the manifest that the drop checked. | Manifest keys name their content. A reuse hint replaces the fixed key, and the drop log names the checked manifest (C16). | `exports_of_different_rows_have_different_manifest_keys` |
 | C10 | (Codex) The directory backend synced only the deepest new directory. | It syncs the parent of each directory that the write creates. | Unit tests of the backend |
 | C11 | (Codex) A sweep with no archiver could read "no marker" just before the first exporter wrote it, then drop. | Every applying sweep takes the export lock. An exporter takes it exclusive and writes the marker under it. A sweep with no archiver takes it shared and reads the marker under it. | `a_sweep_without_an_archiver_drops_nothing_while_an_exporter_holds_the_lock`, `an_exporter_writes_no_marker_while_a_sweep_without_an_archiver_holds_the_lock` |
 | C12 | (Codex) A least-privilege runtime role had no grant on the marker table. | The preflight probe requires `SELECT` and `INSERT` on it. The upgrade guide and `docs/archival.md` name the grant. | `the_partition_export_marker_is_covered_by_the_privilege_probe` |
-| C13 | (Codex) The drop record was written after the drop. A failed write left a dropped partition with no record. | The record goes before each drop attempt. A failed write keeps the partition. Two verified exports of one sealed, orphaned partition differ only in ciphertext, so a late record write still names the same plaintext. | `a_failed_drop_record_keeps_the_partition` |
+| C13 | (Codex) The drop record in the archive was written after the drop. A failed write left a dropped partition with no record. | Superseded by C16. | — |
 | C14 | (Codex) `harvest partition status` reported a marked shard's partitions as droppable, but a sweep with no archiver drops nothing there. | The read-only pass reads the marker and reports `export required`. | `a_sweep_without_an_archiver_drops_nothing_once_a_shard_exported` |
 | C15 | (Codex) A cancelled pass can keep the session lock on a pooled connection. | The cost is liveness, not data: other sweeps report busy. The retention runtime never cancels mid-shard, and it closes the connection when the fence is lost. The public sweep and maintain calls document that a cancelled pass must close its connection. | Docs |
+| C16 | (Codex) Any mutable pointer in the archive can be stale or replaced by a late write, because the trait has no conditional write. | The drop log moves to Postgres. `harvest_partition_exports` gets its row inside the drop transaction, so the row commits exactly with the drop. `dropped.json` is gone. | `a_failed_drop_reuses_the_export_on_the_next_pass` (no row after the failed drop), every drop test (`dropped_manifest_key`) |
+| C17 | (Codex) A new relative archive root synced an empty parent path. | The empty parent of a relative root is the current directory. | `the_empty_parent_of_a_relative_root_is_the_current_directory` |
 
 The row checksum detects a change. It is not a security boundary, the same
 as the append-only guard.
@@ -106,13 +108,12 @@ pub trait PartitionArchiver: Send + Sync + 'static {
 harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/segment-000001-<sha256:16>.jsonl
 harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/manifest-<sha256:16>.json
 harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/latest.json
-harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/dropped.json
 ```
 
 A segment or manifest key names its content, so a late upload writes its
-own key. `latest.json` is a reuse hint. `dropped.json` names the checked
-manifest. The sweep writes it before each drop attempt, so every dropped
-partition has one.
+own key. `latest.json` is a reuse hint. The drop log in Postgres,
+`harvest_partition_exports`, names the checked manifest. The drop
+transaction inserts its row.
 
 `<lower>` is `min` for a `MINVALUE` bound. Bounds use `%Y%m%dT%H%M%SZ`. A
 bound with a fraction, such as the legacy cutover, keeps its microseconds.
@@ -146,7 +147,10 @@ backend call has the `archival_timeout_secs` limit.
 `SweepOutcome::exported` lists the manifest key of each dropped
 partition.
 
-### 3.1 The marker
+### 3.1 The marker and the drop log
+
+`harvest_partition_exports` records each export that a drop checked. The
+drop inserts its row in the same transaction as the `DROP TABLE`.
 
 `harvest_partition_export` holds one row at most. Deleting the row ends the
 requirement. A binary older than this change ignores the row, so the

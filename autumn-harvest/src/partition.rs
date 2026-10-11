@@ -4419,7 +4419,7 @@ async fn export_and_drop(
     exports: &mut usize,
     mut progress: Option<&mut (dyn FnMut() + Send)>,
 ) -> HarvestResult<ExportStep> {
-    use crate::partition_archive::{export_partition, record_drop, reusable_export};
+    use crate::partition_archive::{export_partition, reusable_export};
     let failed = |cause: String| ExportStep::Blocked(format!("{EXPORT_FAILED_REASON}: {cause}"));
     let reused = reusable_export(export, part, upper, reborrow_progress(&mut progress)).await;
     let fresh = reused.is_none();
@@ -4437,11 +4437,6 @@ async fn export_and_drop(
         }
     };
     let mut manifest = manifest;
-    // The drop record goes before the drop, so a dropped partition always
-    // has one. A failed write keeps the partition.
-    if let Err(cause) = record_drop(export, &manifest).await {
-        return Ok(failed(cause));
-    }
     let mut result = drop_partition(conn, part, upper, opts, Some(&manifest)).await?;
     if result == DropOutcome::Changed && !fresh && *exports < export.max_exports_per_pass {
         *exports += 1;
@@ -4449,9 +4444,6 @@ async fn export_and_drop(
             Ok(m) => m,
             Err(cause) => return Ok(failed(cause)),
         };
-        if let Err(cause) = record_drop(export, &manifest).await {
-            return Ok(failed(cause));
-        }
         result = drop_partition(conn, part, upper, opts, Some(&manifest)).await?;
     }
     Ok(if result == DropOutcome::Dropped {
@@ -4913,6 +4905,8 @@ async fn drop_partition(
                 if rows != manifest.row_count || checksum != manifest.row_checksum {
                     return Ok(DropOutcome::Changed);
                 }
+                // The drop log row commits with the drop, or not at all.
+                crate::partition_archive::record_drop(conn, manifest).await?;
             }
 
             // A near-zero bound on the lock UPGRADE, separate from the bound on

@@ -443,6 +443,9 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     // exporting sweep writes it (issue #2009). A missing grant fails every
     // partition maintenance pass.
     ("harvest_partition_export", &["SELECT", "INSERT"]),
+    // The drop of an exported partition inserts its record here, in the
+    // drop transaction (issue #2009).
+    ("harvest_partition_exports", &["SELECT", "INSERT"]),
     // Claim-path gate tables. The claim CTE reads all four unconditionally on
     // every poll, so a storage role missing `SELECT` on any one of them makes
     // `claim_task` error and the worker claim *nothing* -- a missing grant
@@ -2449,6 +2452,11 @@ mod tests {
             .find(|(name, _)| *name == "harvest_partition_export")
             .map(|(_, privileges)| *privileges);
         assert_eq!(covered, Some(&["SELECT", "INSERT"][..]));
+        let log = HARVEST_WRITE_PRIVILEGE_REQUIREMENTS
+            .iter()
+            .find(|(name, _)| *name == "harvest_partition_exports")
+            .map(|(_, privileges)| *privileges);
+        assert_eq!(log, Some(&["SELECT", "INSERT"][..]));
     }
 
     #[test]
