@@ -255,6 +255,9 @@ same transaction as the decision cycle. The table is not `harvest_events`.
   deletes them and reports `stream_chunks_deleted`. An append after an
   erasure stores nothing, so a stale worker cannot restore erased output. A
   shard rebalance copies them.
+- **Tenant binding.** A tenant-bound token can read the durable stream of a
+  run of its own tenant. The route is in `TENANT_SCOPED_ROUTES`. Another
+  tenant's run answers `404`.
 
 [`DESIGN-1974.md`](../DESIGN-1974.md) records the decision.
 

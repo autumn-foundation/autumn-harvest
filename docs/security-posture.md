@@ -981,6 +981,7 @@ It can use only the routes in `TENANT_SCOPED_ROUTES`:
 - `POST /workflows/{id}/signal/{name}`.
 - `GET` and `POST /workflows/{id}/query/{name}`, and `GET /workflows/{id}/queries`.
 - `POST /workflows/{id}/update/{name}` and `GET /workflows/{id}/update/{update_id}/result`.
+- `GET /workflows/{id}/stream/durable`, the durable progress stream (#1974).
 
 Public routes such as `/health` also answer. The token scope still applies,
 so a `read` tenant token cannot cancel.
