@@ -114,7 +114,10 @@ ignores both fields, so the manifest format stays `harvest-structure/1`.
 | `exit` | `outcome` | A write of the returned value: `ok`, `err` or `unknown`. |
 
 An edge has an optional `label`. Only a tracked `saga-step` labels its
-edges, `ok` or `err`. An exit node has no out-edge.
+edges, `ok` or `err`, and it has at least one of each. A step whose arm
+reaches no node, such as an arm that never returns, is untracked. An exit
+node has no out-edge. The check refuses a graph that breaks these rules,
+names a missing node, or has other than one entry.
 
 `WorkflowStructure.handlers` lists each handler registration: its kind
 (`signal`, `update`, `query` or `other`), its name when the MIR shows it,

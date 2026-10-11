@@ -83,6 +83,21 @@ pub fn build(body: &Body, facts: &BlockFacts) -> FlowGraph {
         }
     }
 
+    // An arm that reaches no node, such as an arm that never returns, gives
+    // no labeled edge. The step is then untracked, so a checker can require
+    // both arms of every tracked step.
+    arms.retain(|id, (ok, err)| {
+        let both = !reach_nodes(&blocks, &chains, ok).is_empty()
+            && !reach_nodes(&blocks, &chains, err).is_empty();
+        if !both
+            && let Some(FlowEvent::SagaStep { tracked, .. }) =
+                nodes.get_mut(*id).map(|n| &mut n.event)
+        {
+            *tracked = false;
+        }
+        both
+    });
+
     let mut edges: BTreeSet<FlowEdge> = BTreeSet::new();
     let reach =
         |start: &str, from: usize, label: Option<EdgeLabel>, edges: &mut BTreeSet<FlowEdge>| {

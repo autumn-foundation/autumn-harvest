@@ -127,6 +127,28 @@ fn validate(graph: &FlowGraph) -> Result<(), String> {
             }
         }
     }
+    // A tracked step has an `ok` and an `err` edge, and only its edges carry
+    // a label. The emitter marks a step untracked when an arm reaches no
+    // node, so a missing arm means the graph was changed after emission.
+    for (id, node) in graph.nodes.iter().enumerate() {
+        let tracked = matches!(node.event, FlowEvent::SagaStep { tracked: true, .. });
+        let labels: Vec<Option<EdgeLabel>> = graph
+            .edges
+            .iter()
+            .filter(|e| e.from == id)
+            .map(|e| e.label)
+            .collect();
+        if !tracked && labels.iter().any(Option::is_some) {
+            return Err(format!(
+                "node {id} has a labeled edge, but it is not a tracked step"
+            ));
+        }
+        for (arm, label) in [("`ok`", EdgeLabel::Ok), ("`err`", EdgeLabel::Err)] {
+            if tracked && !labels.contains(&Some(label)) {
+                return Err(format!("the tracked step at node {id} has no {arm} edge"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -445,6 +467,31 @@ mod tests {
         };
         let err = check(&manifest(out_of_range)).expect_err("edge to node 7");
         assert!(err.to_string().contains("node 7"), "{err}");
+
+        let no_ok_arm = FlowGraph {
+            nodes: vec![
+                node(FlowEvent::Entry),
+                node(FlowEvent::SagaNew),
+                node(step()),
+                node(FlowEvent::Exit {
+                    outcome: ExitOutcome::Err,
+                }),
+            ],
+            edges: vec![
+                edge(0, 1, None),
+                edge(1, 2, None),
+                edge(2, 3, Some(EdgeLabel::Err)),
+            ],
+        };
+        let err = check(&manifest(no_ok_arm)).expect_err("a tracked step needs both arms");
+        assert!(err.to_string().contains("`ok`"), "{err}");
+
+        let stray_label = FlowGraph {
+            nodes: vec![node(FlowEvent::Entry), node(FlowEvent::SagaNew)],
+            edges: vec![edge(0, 1, Some(EdgeLabel::Ok))],
+        };
+        let err = check(&manifest(stray_label)).expect_err("a label off a tracked step");
+        assert!(err.to_string().contains("label"), "{err}");
 
         let no_entry = FlowGraph {
             nodes: vec![node(FlowEvent::SagaNew)],

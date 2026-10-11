@@ -289,7 +289,10 @@ events when a path joins them with no other event on it.
 | `saga-escape` | A `Saga` value reaches a call or a capture that is not a `Saga` method. |
 | `exit` | A write of the returned value. `outcome` is `ok` for a literal `Ok(..)`, `err` for a literal `Err(..)` or the error arm of `?`, and `unknown` for any other value. Only a body that returns a `Result` has exit nodes. |
 
-`at` names the MIR block of a node. It is for diagnostics only.
+`at` names the MIR block of a node. It is for diagnostics only. A tracked
+`saga-step` has at least one `ok` and one `err` edge, and no other node has
+a labeled edge. `--check-structure` refuses a graph that breaks this, names
+a missing node, or has other than one `entry`.
 
 The workflow `handlers` list each handler registration: its `kind`
 (`signal`, `update`, `query` or `other`), its model `method`, its `name`
