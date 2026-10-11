@@ -87,6 +87,155 @@ pub enum ResumeDeclined {
     ReceiverDropped,
 }
 
+impl ResumeDeclined {
+    /// The metric label of this decline (issue #2007).
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::KeyChanged => "key_changed",
+            Self::OwnEventsMismatch => "own_events_mismatch",
+            Self::NoResolution => "no_resolution",
+            Self::ExtraEvents => "extra_events",
+            Self::InexactResolution(_) => "inexact_resolution",
+            Self::UnexpectedEvent(_) => "unexpected_event",
+            Self::ReceiverDropped => "receiver_dropped",
+        }
+    }
+}
+
+/// Why a suspension did not stay resident (issue #2007).
+///
+/// The cache entry keeps the reason. The next decision of the run then
+/// counts it as its miss reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NotKept {
+    /// The cycle awaits more than one command, as in a join.
+    MultiAwait,
+    /// The cycle awaits the branches of a race, such as a signal with a
+    /// deadline.
+    Race,
+    /// The cycle asks for a durable mutex, or holds one.
+    Mutex,
+    /// The cycle issues a command that the resident path does not read, such
+    /// as a child workflow or an update result.
+    Command,
+    /// The cycle suspends with no awaited command.
+    NoAwait,
+    /// The context holds a park token, for example a condition wait.
+    ParkToken,
+    /// The cycle runs under strict or canary replay.
+    StrictReplay,
+    /// The advancing test clock is on.
+    TestClock,
+    /// The run is cancelled.
+    Cancelled,
+    /// A push signal handler is registered.
+    SignalHandler,
+    /// The context holds a non-determinism record.
+    Nondeterminism,
+    /// History holds events that the code has not read yet.
+    UnreadHistory,
+    /// A non-blocking claim probed the awaited signal at the end of history.
+    SignalProbe,
+}
+
+impl NotKept {
+    /// The metric label of this reason.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::MultiAwait => "multi_await",
+            Self::Race => "race",
+            Self::Mutex => "mutex",
+            Self::Command => "command",
+            Self::NoAwait => "no_await",
+            Self::ParkToken => "park_token",
+            Self::StrictReplay => "strict_replay",
+            Self::TestClock => "test_clock",
+            Self::Cancelled => "cancelled",
+            Self::SignalHandler => "signal_handler",
+            Self::Nondeterminism => "nondeterminism",
+            Self::UnreadHistory => "unread_history",
+            Self::SignalProbe => "signal_probe",
+        }
+    }
+}
+
+/// Why a decision replayed instead of resuming a resident workflow (issue
+/// #2007).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResidentMiss {
+    /// No cache entry: the first decision, an eviction, a restart, another
+    /// worker, or sticky routing off.
+    Cold,
+    /// The worker keeps no workflow resident.
+    Disabled,
+    /// The workflow runs in a hot-swapped module.
+    HotSwap,
+    /// The delta event ids do not run on from the cached snapshot.
+    Gap,
+    /// The last suspension did not stay resident.
+    NotKept(NotKept),
+    /// The resident workflow declined the delta.
+    Declined(ResumeDeclined),
+    /// The cache entry holds no resident workflow and no reason. This
+    /// should stay at zero. A rise means a path drops the reason.
+    Unrecorded,
+}
+
+impl ResidentMiss {
+    /// The metric label of this miss. Each label is in
+    /// [`RESIDENT_MISS_REASONS`].
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Cold => "cold",
+            Self::Disabled => "disabled",
+            Self::HotSwap => "hot_swap",
+            Self::Gap => "gap",
+            Self::NotKept(reason) => reason.label(),
+            Self::Declined(reason) => reason.label(),
+            Self::Unrecorded => "unrecorded",
+        }
+    }
+}
+
+/// The `reason` label of a resident hit (issue #2007).
+pub const RESIDENT_HIT_REASON: &str = "resumed";
+
+/// Every `reason` label of a resident miss (issue #2007).
+///
+/// The set is closed, so the counter has a bounded number of series.
+pub const RESIDENT_MISS_REASONS: &[&str] = &[
+    "cold",
+    "disabled",
+    "hot_swap",
+    "gap",
+    "multi_await",
+    "race",
+    "mutex",
+    "command",
+    "no_await",
+    "park_token",
+    "strict_replay",
+    "test_clock",
+    "cancelled",
+    "signal_handler",
+    "nondeterminism",
+    "unread_history",
+    "signal_probe",
+    "key_changed",
+    "own_events_mismatch",
+    "no_resolution",
+    "extra_events",
+    "inexact_resolution",
+    "unexpected_event",
+    "receiver_dropped",
+    "unrecorded",
+];
+
 /// The context inputs that a resident workflow depends on (issue #1798).
 ///
 /// The worker builds this key at each decision, mostly from the execution
@@ -323,9 +472,14 @@ impl OwnEvent {
 }
 
 /// Reads one suspension's commands. Returns the index of the one awaited
-/// command and the events the worker writes, or `None` when the
-/// suspension cannot stay resident.
-fn plan_suspension(commands: &[WorkflowCommand]) -> Option<(usize, Vec<OwnEvent>)> {
+/// command and the events the worker writes, or why the suspension cannot
+/// stay resident.
+///
+/// `racing` tells a race from a join when more than one command awaits.
+fn plan_suspension(
+    commands: &[WorkflowCommand],
+    racing: bool,
+) -> Result<(usize, Vec<OwnEvent>), NotKept> {
     let mut awaited = None;
     let mut own_events = Vec::new();
     for (index, cmd) in commands.iter().enumerate() {
@@ -351,17 +505,29 @@ fn plan_suspension(commands: &[WorkflowCommand]) -> Option<(usize, Vec<OwnEvent>
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
             | WorkflowCommand::RecordLog { .. } => false,
-            _ => return None,
+            WorkflowCommand::AcquireMutex { .. } | WorkflowCommand::ReleaseMutex { .. } => {
+                return Err(NotKept::Mutex);
+            }
+            _ => return Err(NotKept::Command),
         };
         if awaits {
             // A second awaited command means a join or a race.
-            if awaited.is_some() || !cmd.awaits_result() {
-                return None;
+            if awaited.is_some() {
+                return Err(if racing {
+                    NotKept::Race
+                } else {
+                    NotKept::MultiAwait
+                });
+            }
+            if !cmd.awaits_result() {
+                return Err(NotKept::NoAwait);
             }
             awaited = Some(index);
         }
     }
-    awaited.map(|index| (index, own_events))
+    awaited
+        .map(|index| (index, own_events))
+        .ok_or(NotKept::NoAwait)
 }
 
 /// A suspended workflow that stays in memory between decisions (issue #1798).
@@ -390,29 +556,29 @@ impl ResidentWorkflow {
     /// Keeps a suspended cycle resident when a warm decision can resume it.
     ///
     /// On success the awaited command in `outcome` gets a closed channel,
-    /// and the returned value holds the live one. On `None` the caller drops
-    /// `future` as on a cold cycle.
+    /// and the returned value holds the live one. On an error the caller
+    /// drops `future` as on a cold cycle. The error names the reason.
     pub(crate) fn capture(
         ctx: &Arc<WorkflowContext>,
         future: OwnedHandlerFuture,
         outcome: &mut WorkflowOutcome,
         key: ResidentKey,
-    ) -> Option<Self> {
+    ) -> Result<Self, NotKept> {
         let WorkflowOutcome::Suspended { commands } = outcome else {
-            return None;
+            return Err(NotKept::NoAwait);
         };
-        if ctx.resident_blocker().is_some() {
-            return None;
+        if let Some(reason) = ctx.resident_blocker() {
+            return Err(reason);
         }
-        let (index, own_events) = plan_suspension(commands)?;
+        let (index, own_events) = plan_suspension(commands, ctx.has_open_race())?;
         // A cold replay could hand the new signal to an earlier probe.
         if let WorkflowCommand::WaitForSignal { signal_name, .. } = &commands[index]
             && ctx.signal_probed_at_frontier(signal_name)
         {
-            return None;
+            return Err(NotKept::SignalProbe);
         }
-        let awaiting = Awaiting::take_from(&mut commands[index])?;
-        Some(Self {
+        let awaiting = Awaiting::take_from(&mut commands[index]).ok_or(NotKept::NoAwait)?;
+        Ok(Self {
             future,
             awaiting,
             own_events,
@@ -483,10 +649,28 @@ pub async fn start(
     handler: WorkflowHandlerFn,
     input: Value,
 ) -> (WorkflowOutcome, Option<ResidentWorkflow>) {
+    let (outcome, kept) = start_explained(exec_id, history, handler, input).await;
+    (outcome, kept.ok())
+}
+
+/// [`start`] that names why the suspension did not stay resident (issue
+/// #2007).
+///
+/// A cycle that does not suspend reports [`NotKept::NoAwait`].
+#[cfg(any(test, feature = "testing"))]
+pub async fn start_explained(
+    exec_id: ExecutionId,
+    history: Vec<WorkflowEvent>,
+    handler: WorkflowHandlerFn,
+    input: Value,
+) -> (WorkflowOutcome, Result<ResidentWorkflow, NotKept>) {
     let ctx = crate::executor::default_task_context(exec_id, history);
     let key = ResidentKey::new(handler, None, &HashMap::new());
     let drive = crate::executor::drive_workflow_keep(ctx, handler, input, None, Some(key)).await;
-    (drive.outcome, drive.resident)
+    let kept = drive
+        .resident
+        .ok_or(drive.not_kept.unwrap_or(NotKept::NoAwait));
+    (drive.outcome, kept)
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -1037,6 +1221,169 @@ mod tests {
             );
             assert!(resident.is_none(), "{name}: must not stay resident");
         }
+    }
+
+    // ── Why a suspension did not stay resident (issue #2007) ─────────
+
+    /// Races an activity against a timer.
+    fn race_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            let winner = ctx
+                .race()
+                .activity_raw("a", json!({}), "default")
+                .timer(std::time::Duration::from_secs(60))
+                .run()
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(winner.index))
+        })
+    }
+
+    /// Waits for a signal with a deadline: a timer and a signal at once.
+    fn signal_timeout_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            ctx.wait_for_signal_timeout("approve", std::time::Duration::from_secs(60))
+                .await
+                .map_err(|e| e.to_string())
+                .map(|payload| json!(payload))
+        })
+    }
+
+    /// Awaits a child workflow, which the resident path does not read.
+    fn child_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            ctx.spawn_child_workflow_raw("child", json!({}))
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Asks for a durable mutex.
+    fn mutex_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            let _guard = ctx
+                .mutex("ledger")
+                .acquire()
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(Value::Null)
+        })
+    }
+
+    #[tokio::test]
+    async fn each_suspension_that_is_not_kept_names_its_reason() {
+        let cases: [(&str, WorkflowHandlerFn, Vec<WorkflowEvent>, NotKept); 8] = [
+            ("join", join_workflow, Vec::new(), NotKept::MultiAwait),
+            ("race", race_workflow, Vec::new(), NotKept::Race),
+            (
+                "signal timeout",
+                signal_timeout_workflow,
+                Vec::new(),
+                NotKept::Race,
+            ),
+            ("child", child_workflow, Vec::new(), NotKept::Command),
+            ("mutex", mutex_workflow, Vec::new(), NotKept::Mutex),
+            (
+                "signal handler",
+                handler_workflow,
+                Vec::new(),
+                NotKept::SignalHandler,
+            ),
+            (
+                "condition",
+                condition_workflow,
+                Vec::new(),
+                NotKept::ParkToken,
+            ),
+            (
+                "unread history",
+                one_activity_workflow,
+                vec![WorkflowEvent::SignalReceived {
+                    signal_name: "early".into(),
+                    payload: Value::Null,
+                }],
+                NotKept::UnreadHistory,
+            ),
+        ];
+        for (name, handler, extra, expected) in cases {
+            let mut history = vec![started(Value::Null)];
+            history.extend(extra);
+            let (outcome, kept) =
+                start_explained(ExecutionId::new(), history, handler, Value::Null).await;
+            assert!(
+                matches!(outcome, WorkflowOutcome::Suspended { .. }),
+                "{name}: the fixture must suspend: {outcome:?}"
+            );
+            assert_eq!(kept.err(), Some(expected), "{name}: wrong reason");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_probed_signal_wait_names_the_probe() {
+        let (_, kept) = start_explained(
+            ExecutionId::new(),
+            vec![started(Value::Null)],
+            probe_then_wait_workflow,
+            Value::Null,
+        )
+        .await;
+        assert_eq!(kept.err(), Some(NotKept::SignalProbe));
+    }
+
+    #[tokio::test]
+    async fn a_kept_suspension_reports_no_reason() {
+        let (_, kept) = start_explained(
+            ExecutionId::new(),
+            vec![started(Value::Null)],
+            one_activity_workflow,
+            Value::Null,
+        )
+        .await;
+        assert!(kept.is_ok(), "one awaited activity must stay resident");
+    }
+
+    #[test]
+    fn miss_labels_are_unique_snake_case_and_listed() {
+        let mut seen = std::collections::BTreeSet::new();
+        for label in RESIDENT_MISS_REASONS {
+            assert!(
+                label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{label} is not snake case"
+            );
+            assert!(seen.insert(*label), "{label} is listed twice");
+        }
+        let misses = [
+            ResidentMiss::Cold,
+            ResidentMiss::Disabled,
+            ResidentMiss::HotSwap,
+            ResidentMiss::Gap,
+            ResidentMiss::NotKept(NotKept::MultiAwait),
+            ResidentMiss::NotKept(NotKept::Race),
+            ResidentMiss::NotKept(NotKept::Mutex),
+            ResidentMiss::NotKept(NotKept::Command),
+            ResidentMiss::NotKept(NotKept::NoAwait),
+            ResidentMiss::NotKept(NotKept::ParkToken),
+            ResidentMiss::NotKept(NotKept::StrictReplay),
+            ResidentMiss::NotKept(NotKept::TestClock),
+            ResidentMiss::NotKept(NotKept::Cancelled),
+            ResidentMiss::NotKept(NotKept::SignalHandler),
+            ResidentMiss::NotKept(NotKept::Nondeterminism),
+            ResidentMiss::NotKept(NotKept::UnreadHistory),
+            ResidentMiss::NotKept(NotKept::SignalProbe),
+            ResidentMiss::Declined(ResumeDeclined::KeyChanged),
+            ResidentMiss::Declined(ResumeDeclined::OwnEventsMismatch),
+            ResidentMiss::Declined(ResumeDeclined::NoResolution),
+            ResidentMiss::Declined(ResumeDeclined::ExtraEvents),
+            ResidentMiss::Declined(ResumeDeclined::InexactResolution("ActivityFailed")),
+            ResidentMiss::Declined(ResumeDeclined::UnexpectedEvent("TimerFired")),
+            ResidentMiss::Declined(ResumeDeclined::ReceiverDropped),
+            ResidentMiss::Unrecorded,
+        ];
+        let labels: std::collections::BTreeSet<&str> =
+            misses.iter().map(ResidentMiss::label).collect();
+        assert_eq!(labels.len(), misses.len(), "two misses share a label");
+        assert_eq!(labels, seen, "the list must hold each label once");
+        assert!(!seen.contains(RESIDENT_HIT_REASON), "a hit is not a miss");
     }
 
     // ── Deltas that must decline ─────────────────────────────────────

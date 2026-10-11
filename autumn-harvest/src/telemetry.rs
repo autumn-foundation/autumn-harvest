@@ -628,6 +628,16 @@ pub const METRIC_WORKFLOW_CACHE_HIT: &str = "harvest.workflow.cache_hit";
 /// the existing cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_CACHE_MISS: &str = "harvest.workflow.cache_miss";
 
+/// Counter: one per workflow decision that runs the workflow body (issue
+/// #2007).
+///
+/// `outcome` is `hit` when the decision resumed a resident workflow and
+/// `miss` when it replayed history. `reason` is
+/// [`crate::resident::RESIDENT_HIT_REASON`] on a hit and one of
+/// [`crate::resident::RESIDENT_MISS_REASONS`] on a miss. Also labeled by
+/// `workflow` and `queue`. The hit rate is `hit / (hit + miss)`.
+pub const METRIC_WORKFLOW_RESIDENT: &str = "harvest.workflow.resident";
+
 /// Counter: incremented once per `signal_external_workflow` call after the
 /// terminal outcome is recorded in `harvest_events`.
 ///
@@ -3843,6 +3853,24 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the counter `harvest.workflow.cache_miss{workflow}`.
     fn record_workflow_cache_miss(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
+    }
+
+    /// A workflow decision resumed a resident workflow, or replayed (issue
+    /// #2007).
+    ///
+    /// `outcome` is `hit` or `miss`. `reason` is a bounded label. See
+    /// [`METRIC_WORKFLOW_RESIDENT`].
+    ///
+    /// Maps to the counter
+    /// `harvest.workflow.resident{workflow, queue, outcome, reason}`.
+    fn record_workflow_resident(
+        &self,
+        workflow_name: &str,
+        queue: &str,
+        outcome: &str,
+        reason: &str,
+    ) {
+        let _ = (workflow_name, queue, outcome, reason);
     }
 
     /// A workflow execution was terminated because its `deadline_at` elapsed.

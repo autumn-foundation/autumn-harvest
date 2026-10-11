@@ -2038,6 +2038,9 @@ struct PreparedWorkflowTask {
     delta_start: usize,
     /// Whether this worker keeps workflows resident (issue #1798).
     resident_enabled: bool,
+    /// Why this decision has no resident workflow (issue #2007). The worker
+    /// counts it when `resident` is `None`.
+    resident_miss: crate::resident::ResidentMiss,
 }
 
 /// `#[doc(hidden)]`: test-support-reachable, not semver-stable surface --
@@ -21730,12 +21733,13 @@ async fn put_back_cache_entry(
     exec_uuid: uuid::Uuid,
     state: crate::cache::CachedWorkflowState,
     resident: Option<crate::resident::ResidentWorkflow>,
+    not_kept: Option<crate::resident::NotKept>,
     history_bytes: Option<crate::cache::HistoryBytesMark>,
 ) {
     let displaced = workflow_cache
         .lock()
         .await
-        .insert_resident_with_history_bytes(exec_uuid, state, resident, history_bytes);
+        .insert_resident_with_history_bytes(exec_uuid, state, resident, not_kept, history_bytes);
     drop(displaced);
 }
 
@@ -21793,7 +21797,13 @@ async fn prepare_workflow_task_with_cache(
 
     let execution = load_task_execution(conn, task, exec_id).await?;
 
-    if let Some((cached_state, mut resident, cached_history_bytes)) = cached {
+    if let Some(crate::cache::TakenEntry {
+        state: cached_state,
+        mut resident,
+        not_kept,
+        history_bytes: cached_history_bytes,
+    }) = cached
+    {
         // Cache hit path: first load any events already appended since the
         // cache snapshot (e.g. by timeout.rs/external_task.rs via
         // append_single_event), then ingest timers/signals at the REAL current
@@ -21831,6 +21841,7 @@ async fn prepare_workflow_task_with_cache(
                 exec_uuid,
                 cached_state,
                 resident,
+                not_kept,
                 cached_history_bytes,
             )
             .await;
@@ -21854,6 +21865,17 @@ async fn prepare_workflow_task_with_cache(
         // delta is not the plain run of events the snapshot expects.
         let contiguous = delta_is_contiguous(cached_state.next_event_id, &existing_delta)
             && delta_is_contiguous(existing_delta.next_event_id, &after_ingest);
+        // Issue #2007: why this hit has no resident workflow, if it has none.
+        let resident_miss = if !resident_enabled {
+            crate::resident::ResidentMiss::Disabled
+        } else if resident.is_some() && !contiguous {
+            crate::resident::ResidentMiss::Gap
+        } else {
+            not_kept.map_or(
+                crate::resident::ResidentMiss::Unrecorded,
+                crate::resident::ResidentMiss::NotKept,
+            )
+        };
         resident = resident.filter(|_| contiguous);
 
         // Reconstruct full history: cached snapshot + any pre-existing delta +
@@ -21877,6 +21899,7 @@ async fn prepare_workflow_task_with_cache(
             resident,
             delta_start,
             resident_enabled,
+            resident_miss,
         }))
     } else {
         // Cache miss path: full history load. A transient event-id conflict
@@ -21910,6 +21933,7 @@ async fn prepare_workflow_task_with_cache(
             resident: None,
             delta_start,
             resident_enabled,
+            resident_miss: crate::resident::ResidentMiss::Cold,
         }))
     }
 }
@@ -25386,6 +25410,8 @@ async fn process_workflow_task(
     let mut warm_resident = prepared.resident.take();
     // The resident workflow of the final cycle, kept for the next decision.
     let mut final_resident: Option<crate::resident::ResidentWorkflow> = None;
+    // Issue #2007: why the final cycle did not stay resident.
+    let mut final_not_kept: Option<crate::resident::NotKept>;
     // A module-hosted workflow binds its module around one drive only, so
     // it cannot stay resident.
     #[cfg(feature = "hot-code-swap")]
@@ -25393,6 +25419,17 @@ async fn process_workflow_task(
         prepared.resident_enabled && !crate::hot_swap::is_module_hosted(workflow.handler);
     #[cfg(not(feature = "hot-code-swap"))]
     let can_stay_resident = prepared.resident_enabled;
+    // Issue #2007: the resident outcome of this decision, counted once at
+    // its first drive. `None` after the count.
+    let mut resident_miss = Some(if prepared.was_cache_hit && !can_stay_resident {
+        if prepared.resident_enabled {
+            crate::resident::ResidentMiss::HotSwap
+        } else {
+            crate::resident::ResidentMiss::Disabled
+        }
+    } else {
+        prepared.resident_miss.clone()
+    });
 
     // Issue #678/#1034: external-op ids resolved INLINE during this decision
     // cycle. Set by the mixed-signal arm below (any suspension whose command
@@ -25518,6 +25555,16 @@ async fn process_workflow_task(
         )
         .await?;
         let workflow_drive = async {
+            // Issue #2007: count the first drive of the decision only.
+            let first_miss = resident_miss.take();
+            let record = |outcome: &str, reason: &str| {
+                telemetry.metrics.record_workflow_resident(
+                    wf_name,
+                    &task.queue_name,
+                    outcome,
+                    reason,
+                );
+            };
             if let Some(resident) = warm_resident.take() {
                 match resident
                     .resume_with(
@@ -25527,13 +25574,21 @@ async fn process_workflow_task(
                     )
                     .await
                 {
-                    Ok(drive) => return drive,
-                    Err(reason) => tracing::debug!(
-                        exec_id = %prepared.exec_id,
-                        ?reason,
-                        "resident workflow declined; replaying cold (issue #1798)"
-                    ),
+                    Ok(drive) => {
+                        record("hit", crate::resident::RESIDENT_HIT_REASON);
+                        return drive;
+                    }
+                    Err(reason) => {
+                        tracing::debug!(
+                            exec_id = %prepared.exec_id,
+                            ?reason,
+                            "resident workflow declined; replaying cold (issue #1798)"
+                        );
+                        record("miss", reason.label());
+                    }
                 }
+            } else if let Some(miss) = first_miss {
+                record("miss", miss.label());
             }
             let ctx = crate::executor::build_task_context(
                 prepared.exec_id,
@@ -25599,7 +25654,9 @@ async fn process_workflow_task(
             span: execute_span,
             router: resolved_router,
             resident: iter_resident,
+            not_kept: iter_not_kept,
         } = drive;
+        final_not_kept = iter_not_kept;
 
         match run_outcome {
             WorkflowOutcome::Suspended { commands }
@@ -27453,6 +27510,7 @@ async fn process_workflow_task(
                     next_event_id,
                 },
                 final_resident.take(),
+                final_not_kept,
                 history_bytes,
             )
             .await;
@@ -27683,6 +27741,8 @@ async fn store_cache_entry(
     suspended: Option<bool>,
     state: crate::cache::CachedWorkflowState,
     resident: Option<crate::resident::ResidentWorkflow>,
+    // Issue #2007: why the suspension did not stay resident.
+    not_kept: Option<crate::resident::NotKept>,
     // Issue #1804: the byte mark measured at the start of this decision.
     history_bytes: Option<crate::cache::HistoryBytesMark>,
 ) {
@@ -27692,7 +27752,13 @@ async fn store_cache_entry(
     let displaced = {
         let mut guard = workflow_cache.lock().await;
         if suspended {
-            guard.insert_resident_with_history_bytes(exec_uuid, state, resident, history_bytes)
+            guard.insert_resident_with_history_bytes(
+                exec_uuid,
+                state,
+                resident,
+                not_kept,
+                history_bytes,
+            )
         } else {
             guard.take(&exec_uuid)
         }

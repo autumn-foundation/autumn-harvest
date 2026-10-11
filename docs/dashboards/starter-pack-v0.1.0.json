@@ -3832,6 +3832,64 @@
           "description": "Warm-cache hit ratio on the worker hot path (issue #235). A low ratio with sticky routing enabled means affinity is not landing."
         },
         {
+          "id": 626280,
+          "type": "timeseries",
+          "title": "Resident hit rate and miss reasons",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 108
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum (rate(harvest_workflow_resident_total{workflow=~\"$workflow\",queue=~\"$queue\",outcome=\"hit\"}[$__rate_interval])) / sum (rate(harvest_workflow_resident_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "resident hit rate",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (reason) (rate(harvest_workflow_resident_total{workflow=~\"$workflow\",queue=~\"$queue\",outcome=\"miss\"}[$__rate_interval])) / ignoring (reason) group_left sum (rate(harvest_workflow_resident_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "miss: {{reason}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Share of decisions that resumed a resident workflow, and the share of each miss reason (issue #2007). A cache hit can still replay, so this rate is at most the cache hit ratio. `unrecorded` must stay at zero."
+        },
+        {
           "id": 63,
           "type": "timeseries",
           "title": "Retention deletions by workflow type",

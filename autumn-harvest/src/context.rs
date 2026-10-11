@@ -1818,6 +1818,22 @@ impl RaceBuilder<'_> {
     }
 }
 
+/// Counts one open race on its context while it lives (issue #2007).
+///
+/// A race future holds it across its suspension. A suspension with an open
+/// race is a race, not a join.
+pub(crate) struct RaceScope<'a> {
+    ctx: &'a WorkflowContext,
+}
+
+impl Drop for RaceScope<'_> {
+    fn drop(&mut self) {
+        self.ctx
+            .open_races
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// The live-mode receiving end of one race branch (issue #950).
 ///
 /// The four branch kinds park on channels of three different payload types
@@ -3002,6 +3018,10 @@ pub struct WorkflowContext {
     /// set — can run while the workflow task is unwinding under panic
     /// containment (issue #782), when the lock may already be poisoned.
     held_mutex_keys: Mutex<std::collections::HashSet<String>>,
+    /// Races that wait now (issue #2007). A [`RaceScope`] counts one race
+    /// from its start until it resolves or drops. The resident path reads it
+    /// to tell a race from a join.
+    open_races: std::sync::atomic::AtomicUsize,
     /// Whether the current decision cycle is suspending (parking) rather than
     /// completing (issue #691). Set to `true` by the executor's suspension arm
     /// *before* the handler future (and any [`MutexGuard`] it holds across the
@@ -3606,6 +3626,7 @@ impl WorkflowContext {
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
             held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
+            open_races: std::sync::atomic::AtomicUsize::new(0),
             suspending: std::sync::atomic::AtomicBool::new(false),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
@@ -3779,6 +3800,7 @@ impl WorkflowContext {
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
             held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
+            open_races: std::sync::atomic::AtomicUsize::new(0),
             suspending: std::sync::atomic::AtomicBool::new(false),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
@@ -3850,6 +3872,7 @@ impl WorkflowContext {
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
             held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
+            open_races: std::sync::atomic::AtomicUsize::new(0),
             suspending: std::sync::atomic::AtomicBool::new(false),
             state: empty_shared_state(),
             query_registry: Mutex::new(QueryRegistry::new()),
@@ -7265,6 +7288,18 @@ impl WorkflowContext {
         self.suspending.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Counts one race until the returned scope drops (issue #2007).
+    pub(crate) fn enter_race(&self) -> RaceScope<'_> {
+        self.open_races
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        RaceScope { ctx: self }
+    }
+
+    /// Whether a race waits now (issue #2007).
+    pub(crate) fn has_open_race(&self) -> bool {
+        self.open_races.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
     /// Returns why this context cannot stay resident, or `None` (issue #1798).
     ///
     /// A resident workflow resumes its parked future with one new result. A
@@ -7281,19 +7316,19 @@ impl WorkflowContext {
     /// # Panics
     ///
     /// Panics if an internal mutex is poisoned.
-    pub(crate) fn resident_blocker(&self) -> Option<&'static str> {
+    pub(crate) fn resident_blocker(&self) -> Option<crate::resident::NotKept> {
         if self.parks.is_held() {
-            return Some("a park token is held");
+            return Some(crate::resident::NotKept::ParkToken);
         }
         if self.strict_replay || self.canary_mode {
-            return Some("strict or canary replay");
+            return Some(crate::resident::NotKept::StrictReplay);
         }
         #[cfg(any(test, feature = "testing"))]
         if self.timer_clock_elapsed_secs.is_some() {
-            return Some("the advancing test clock is on");
+            return Some(crate::resident::NotKept::TestClock);
         }
         if self.cancellation_reason.is_some() {
-            return Some("the run is cancelled");
+            return Some(crate::resident::NotKept::Cancelled);
         }
         if !self
             .signal_registry
@@ -7302,7 +7337,7 @@ impl WorkflowContext {
             .list_names()
             .is_empty()
         {
-            return Some("a push signal handler is registered");
+            return Some(crate::resident::NotKept::SignalHandler);
         }
         if !self
             .held_mutex_keys
@@ -7310,7 +7345,7 @@ impl WorkflowContext {
             .expect("held_mutex_keys lock poisoned")
             .is_empty()
         {
-            return Some("a durable mutex is held");
+            return Some(crate::resident::NotKept::Mutex);
         }
         if self
             .nd_details
@@ -7323,7 +7358,7 @@ impl WorkflowContext {
                 .expect("deferred_nd_error lock poisoned")
                 .is_some()
         {
-            return Some("a non-determinism record is set");
+            return Some(crate::resident::NotKept::Nondeterminism);
         }
         if self
             .matcher
@@ -7331,7 +7366,7 @@ impl WorkflowContext {
             .expect("matcher lock poisoned")
             .has_buffered_history()
         {
-            return Some("history is not fully read");
+            return Some(crate::resident::NotKept::UnreadHistory);
         }
         None
     }
@@ -8601,6 +8636,7 @@ impl WorkflowContext {
         placement: &crate::shard::ChildPlacement,
     ) -> HarvestResult<Option<Value>> {
         use crate::replay::ChildOrTimerMatch;
+        let _race = self.enter_race();
 
         // Advance on every invocation, before any matching — see
         // `next_child_placement_seq`.
@@ -9300,6 +9336,7 @@ impl WorkflowContext {
         timeout: std::time::Duration,
     ) -> HarvestResult<(Option<Value>, String)> {
         use crate::replay::SignalOrTimerMatch;
+        let _race = self.enter_race();
 
         // Deterministic timer ID: the counter increments on every call (live
         // and replay alike), so the Nth race in workflow code always carries
@@ -11825,6 +11862,7 @@ impl WorkflowContext {
     #[allow(clippy::too_many_lines)]
     async fn race_impl(&self, branches: Vec<RaceBranch>) -> HarvestResult<RaceWinner> {
         self.check_cancellation()?;
+        let _race = self.enter_race();
 
         if branches.is_empty() {
             return Err(HarvestError::Config(

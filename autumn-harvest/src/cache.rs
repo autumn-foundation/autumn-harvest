@@ -28,7 +28,7 @@ use std::num::NonZeroUsize;
 use uuid::Uuid;
 
 use crate::event::WorkflowEvent;
-use crate::resident::ResidentWorkflow;
+use crate::resident::{NotKept, ResidentWorkflow};
 
 /// Cached state for a suspended workflow execution.
 ///
@@ -72,9 +72,23 @@ pub(crate) struct HistoryBytesMark {
 struct CacheEntry {
     state: CachedWorkflowState,
     resident: Option<ResidentWorkflow>,
+    /// Why the suspension did not stay resident (issue #2007).
+    // Only the `db` worker reads the reason.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
+    not_kept: Option<NotKept>,
     // Only the `db` worker reads the mark.
     #[cfg_attr(not(feature = "db"), allow(dead_code))]
     history_bytes: Option<HistoryBytesMark>,
+}
+
+/// An entry that [`WorkflowCache::take_with_history_bytes`] removed.
+#[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the db-gated worker takes entries.
+pub(crate) struct TakenEntry {
+    pub(crate) state: CachedWorkflowState,
+    pub(crate) resident: Option<ResidentWorkflow>,
+    /// Why the suspension did not stay resident (issue #2007).
+    pub(crate) not_kept: Option<NotKept>,
+    pub(crate) history_bytes: Option<HistoryBytesMark>,
 }
 
 /// The entries that [`WorkflowCache::close`] removed (issue #1798).
@@ -184,16 +198,18 @@ impl WorkflowCache {
         state: CachedWorkflowState,
         resident: Option<ResidentWorkflow>,
     ) -> Option<(CachedWorkflowState, Option<ResidentWorkflow>)> {
-        self.insert_resident_with_history_bytes(exec_id, state, resident, None)
+        self.insert_resident_with_history_bytes(exec_id, state, resident, None, None)
     }
 
     /// [`Self::insert_resident`] that also stores the stored-history byte
-    /// mark of the snapshot (issue #1804).
+    /// mark of the snapshot (issue #1804). `not_kept` says why the
+    /// suspension did not stay resident (issue #2007).
     pub(crate) fn insert_resident_with_history_bytes(
         &mut self,
         exec_id: Uuid,
         state: CachedWorkflowState,
         resident: Option<ResidentWorkflow>,
+        not_kept: Option<NotKept>,
         history_bytes: Option<HistoryBytesMark>,
     ) -> Option<(CachedWorkflowState, Option<ResidentWorkflow>)> {
         let resident = resident.filter(|_| self.resident_enabled);
@@ -210,6 +226,7 @@ impl WorkflowCache {
                 CacheEntry {
                     state,
                     resident,
+                    not_kept,
                     history_bytes,
                 },
             )
@@ -227,23 +244,19 @@ impl WorkflowCache {
         exec_id: &Uuid,
     ) -> Option<(CachedWorkflowState, Option<ResidentWorkflow>)> {
         self.take_with_history_bytes(exec_id)
-            .map(|(state, resident, _)| (state, resident))
+            .map(|entry| (entry.state, entry.resident))
     }
 
     /// [`Self::take`] that also returns the stored-history byte mark of the
     /// entry (issue #1804).
     #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the db-gated worker takes entries.
-    pub(crate) fn take_with_history_bytes(
-        &mut self,
-        exec_id: &Uuid,
-    ) -> Option<(
-        CachedWorkflowState,
-        Option<ResidentWorkflow>,
-        Option<HistoryBytesMark>,
-    )> {
-        self.inner
-            .pop(exec_id)
-            .map(|entry| (entry.state, entry.resident, entry.history_bytes))
+    pub(crate) fn take_with_history_bytes(&mut self, exec_id: &Uuid) -> Option<TakenEntry> {
+        self.inner.pop(exec_id).map(|entry| TakenEntry {
+            state: entry.state,
+            resident: entry.resident,
+            not_kept: entry.not_kept,
+            history_bytes: entry.history_bytes,
+        })
     }
 
     /// Closes the cache when the worker stops (issue #1798).
@@ -416,17 +429,36 @@ mod tests {
             warm_steps: 0,
         };
 
-        let _ = cache.insert_resident_with_history_bytes(id, make_state(7), None, Some(mark));
-        let (_, _, taken) = cache.take_with_history_bytes(&id).expect("entry");
-        assert_eq!(taken, Some(mark), "the take returns the mark");
+        let _ = cache.insert_resident_with_history_bytes(id, make_state(7), None, None, Some(mark));
+        let taken = cache.take_with_history_bytes(&id).expect("entry");
+        assert_eq!(taken.history_bytes, Some(mark), "the take returns the mark");
         assert!(
             cache.take_with_history_bytes(&id).is_none(),
             "the take removes the entry"
         );
 
         cache.insert(id, make_state(8));
-        let (_, _, taken) = cache.take_with_history_bytes(&id).expect("entry");
-        assert_eq!(taken, None, "a plain insert stores no mark");
+        let taken = cache.take_with_history_bytes(&id).expect("entry");
+        assert_eq!(taken.history_bytes, None, "a plain insert stores no mark");
+    }
+
+    #[test]
+    fn an_entry_keeps_why_its_suspension_was_not_resident() {
+        let mut cache = WorkflowCache::new(5);
+        let id = Uuid::new_v4();
+        let _ = cache.insert_resident_with_history_bytes(
+            id,
+            make_state(7),
+            None,
+            Some(NotKept::MultiAwait),
+            None,
+        );
+        let taken = cache.take_with_history_bytes(&id).expect("entry");
+        assert_eq!(taken.not_kept, Some(NotKept::MultiAwait));
+
+        cache.insert(id, make_state(8));
+        let taken = cache.take_with_history_bytes(&id).expect("entry");
+        assert_eq!(taken.not_kept, None, "a plain insert stores no reason");
     }
 
     #[test]

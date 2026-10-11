@@ -21,6 +21,8 @@
 //!    replays from the top.
 //! 10. LRU eviction drops the resident workflow. The next decision is a miss
 //!     and replays cold.
+//! 11. Each decision counts one `harvest.workflow.resident` outcome. A miss
+//!     names its reason (issue #2007).
 //!
 //! A queue-level test also proves which rows the shutdown release touches.
 //! Each test uses its own queue and worker ids, so the tests can share one
@@ -55,6 +57,8 @@ const WORKFLOW: &str = "sticky_default_wf";
 struct CacheCounts {
     hits: AtomicU64,
     misses: AtomicU64,
+    /// Each resident outcome as `outcome/reason`, in order (issue #2007).
+    resident: std::sync::Mutex<Vec<String>>,
 }
 
 impl CacheCounts {
@@ -69,6 +73,10 @@ impl CacheCounts {
     fn decisions(&self) -> u64 {
         self.hits() + self.misses()
     }
+
+    fn resident(&self) -> Vec<String> {
+        self.resident.lock().expect("resident lock").clone()
+    }
 }
 
 impl MetricsRecorder for CacheCounts {
@@ -79,6 +87,24 @@ impl MetricsRecorder for CacheCounts {
     fn record_workflow_cache_miss(&self, _workflow_name: &str, _queue: &str) {
         self.misses.fetch_add(1, Ordering::SeqCst);
     }
+
+    fn record_workflow_resident(
+        &self,
+        _workflow_name: &str,
+        _queue: &str,
+        outcome: &str,
+        reason: &str,
+    ) {
+        self.resident
+            .lock()
+            .expect("resident lock")
+            .push(format!("{outcome}/{reason}"));
+    }
+}
+
+/// `n` copies of `label`, for an expected outcome list.
+fn times(n: usize, label: &str) -> Vec<String> {
+    vec![label.to_owned(); n]
 }
 
 /// Waits for two signals, then completes.
@@ -288,6 +314,27 @@ fn evict_workflow<'a>(
     two_signal_workflow(ctx, input)
 }
 
+const JOIN_WORKFLOW: &str = "sticky_default_join_wf";
+
+/// Waits for `a` and `b` at once, then for `c`.
+///
+/// The join awaits two commands, so its suspension cannot stay resident.
+/// The wait for `b` alone after `a` arrives can.
+fn join_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let (a, b) = futures::join!(ctx.wait_for_signal("a"), ctx.wait_for_signal("b"));
+        let c = ctx.wait_for_signal("c").await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!([
+            a.map_err(|e| e.to_string())?,
+            b.map_err(|e| e.to_string())?,
+            c
+        ]))
+    })
+}
+
 fn echo_activity<'a>(
     _ctx: &'a ActivityContext,
     input: serde_json::Value,
@@ -360,6 +407,7 @@ fn build_worker(
             info_for(COLD_WORKFLOW, cold_workflow),
             info_for(OFF_WORKFLOW, off_workflow),
             info_for(EVICT_WORKFLOW, evict_workflow),
+            info_for(JOIN_WORKFLOW, join_workflow),
         ])
         .activities(vec![slow_activity_info(), echo_activity_info()])
         .telemetry(TelemetryConfig {
@@ -979,6 +1027,11 @@ async fn warm_decisions_resume_the_resident_workflow() {
     assert_eq!(counts.misses(), 1, "only decision 1 is a cold load");
     assert_eq!(counts.hits(), 3, "decisions 2 to 4 are cache hits");
     assert_eq!(
+        counts.resident(),
+        [times(1, "miss/cold"), times(3, "hit/resumed")].concat(),
+        "decisions 2 to 4 must count a resident hit"
+    );
+    assert_eq!(
         AtomicU64::load(&RESIDENT_BODY_STARTS, Ordering::SeqCst),
         1,
         "a warm decision must resume the parked future, not replay the body"
@@ -1044,6 +1097,11 @@ async fn a_delta_the_resident_path_cannot_read_falls_back_to_a_cold_replay() {
 
     assert_eq!(counts.hits(), 1, "decision 2 is still a cache hit");
     assert_eq!(
+        counts.resident(),
+        ["miss/cold", "miss/extra_events"],
+        "a decline must count its reason"
+    );
+    assert_eq!(
         AtomicU64::load(&COUNTED_BODY_STARTS, Ordering::SeqCst),
         2,
         "decision 2 must replay cold after the resident path declines"
@@ -1094,6 +1152,7 @@ async fn sticky_off_replays_every_decision() {
 
     assert_eq!(counts.hits(), 0, "a disabled cache never hits");
     assert_eq!(counts.misses(), 3, "every decision is a miss");
+    assert_eq!(counts.resident(), times(3, "miss/cold"));
     assert_eq!(
         AtomicU64::load(&COLD_BODY_STARTS, Ordering::SeqCst),
         3,
@@ -1161,6 +1220,11 @@ async fn resident_workflows_off_keeps_the_cache_but_replays_every_decision() {
 
     assert_eq!(counts.misses(), 1, "only decision 1 is a cold load");
     assert_eq!(counts.hits(), 2, "the event cache still hits");
+    assert_eq!(
+        counts.resident(),
+        [times(1, "miss/cold"), times(2, "miss/disabled")].concat(),
+        "a warm hit with resident workflows off must count `disabled`"
+    );
     assert_eq!(
         AtomicU64::load(&OFF_BODY_STARTS, Ordering::SeqCst),
         3,
@@ -1230,9 +1294,73 @@ async fn lru_eviction_drops_the_resident_workflow_and_counts_a_miss() {
     );
     assert_eq!(counts.hits(), 2, "each final decision is a warm hit");
     assert_eq!(
+        counts.resident(),
+        [
+            "miss/cold",
+            "miss/cold",
+            "miss/cold",
+            "hit/resumed",
+            "miss/cold",
+            "hit/resumed"
+        ],
+        "an eviction counts as a cold miss"
+    );
+    assert_eq!(
         AtomicU64::load(&EVICT_BODY_STARTS, Ordering::SeqCst),
         4,
         "an evicted run replays cold once, then resumes warm"
+    );
+
+    worker.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+}
+
+/// AC (issue #2007): the reason a suspension did not stay resident reaches
+/// the next decision, which counts it as its miss reason.
+#[tokio::test]
+async fn a_join_counts_a_multi_await_miss_on_the_next_decision() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let mut conn = connect(&url).await;
+    let queue = unique_id("join-q");
+
+    let counts = Arc::new(CacheCounts::default());
+    let worker = build_default_worker(&queue, &unique_id("join-a"), Arc::clone(&counts));
+    let handle = spawn(&worker, &pool);
+
+    let exec_id = ExecutionId::new();
+    let workflow_id = unique_id("join-wf");
+    start_or_load_workflow_execution(
+        &mut conn,
+        start_workflow(
+            JOIN_WORKFLOW,
+            exec_id,
+            &workflow_id,
+            &queue,
+            serde_json::json!({}),
+        ),
+        None,
+    )
+    .await
+    .expect("start workflow");
+    wait_parked_after(&mut conn, exec_id, &counts, 1).await;
+    signal(&mut conn, exec_id, "a").await;
+    wait_parked_after(&mut conn, exec_id, &counts, 2).await;
+    signal(&mut conn, exec_id, "b").await;
+    wait_parked_after(&mut conn, exec_id, &counts, 3).await;
+    signal(&mut conn, exec_id, "c").await;
+    wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", Duration::from_secs(30))
+        .await;
+
+    assert_eq!(
+        counts.resident(),
+        [
+            "miss/cold",
+            "miss/multi_await",
+            "hit/resumed",
+            "hit/resumed"
+        ],
+        "the join suspension must name its reason on the next decision"
     );
 
     worker.shutdown();
