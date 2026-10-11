@@ -100,7 +100,15 @@ const LIMIT_SOURCES: &[LimitSource] = &[
         limits: &[
             (
                 "drives the store statements, not the `worker.rs` loop.",
-                "The simulator drives store statements, not the `worker.rs` loop.",
+                "The oracle harness drives store statements, not the `worker.rs` loop.",
+            ),
+            (
+                "A world crash falls between two steps.",
+                "A world crash falls between two steps, never inside a task body.",
+            ),
+            (
+                "The world workload never fails an activity,",
+                "The world workload never fails an activity,",
             ),
             (
                 "draws actions from fixed weights.",
