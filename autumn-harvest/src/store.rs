@@ -2885,22 +2885,26 @@ async fn append_stream_chunks_in_tx(
 ) -> HarvestResult<usize> {
     use crate::schema::harvest_stream_chunks::dsl;
 
-    // Serialize with PII erasure. Erasure holds the run's row `FOR UPDATE`,
-    // so this `FOR KEY SHARE` read waits for it and then sees the tombstone.
-    // A stale inline write then stores nothing after an erasure commits. If
-    // this read wins, the erasure waits and then deletes these rows.
-    let input: Option<serde_json::Value> = harvest_workflow_executions::table
+    // Serialize with a terminal write and with PII erasure. Both hold the
+    // run's row `FOR UPDATE`, so this `FOR KEY SHARE` read waits for them.
+    // A terminal run takes no chunk: a reader of a terminal run sends
+    // `event: end`, so a later chunk would never reach it. An erased run is
+    // terminal too, so a stale write cannot restore erased output. The normal
+    // terminal cycle writes its chunks before its outcome, in one transaction.
+    let row: Option<(String, serde_json::Value)> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid()))
-        .select(harvest_workflow_executions::input)
+        .select((
+            harvest_workflow_executions::state,
+            harvest_workflow_executions::input,
+        ))
         .for_key_share()
         .first(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?;
-    if input
-        .as_ref()
-        .is_some_and(crate::erase::execution_input_is_erased)
-    {
+    if row.as_ref().is_some_and(|(state, input)| {
+        crate::erase::is_terminal_state(state) || crate::erase::execution_input_is_erased(input)
+    }) {
         return Ok(0);
     }
 

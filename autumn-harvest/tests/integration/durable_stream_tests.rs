@@ -340,15 +340,6 @@ async fn erase_workflow_payloads_deletes_stream_chunks_and_reports_the_count() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     let exec_id = ExecutionId::new();
     insert_execution(&mut conn, exec_id, "stream_erase").await;
-    diesel::sql_query(
-        "UPDATE harvest_workflow_executions
-            SET state = 'COMPLETED', completed_at = NOW()
-          WHERE id = $1",
-    )
-    .bind::<SqlUuid, _>(exec_id.as_uuid())
-    .execute(&mut conn)
-    .await
-    .expect("seal execution");
     store::append_stream_chunks(
         &mut conn,
         exec_id,
@@ -360,11 +351,46 @@ async fn erase_workflow_payloads_deletes_stream_chunks_and_reports_the_count() {
     )
     .await
     .expect("append");
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions
+            SET state = 'COMPLETED', completed_at = NOW()
+          WHERE id = $1",
+    )
+    .bind::<SqlUuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("seal execution");
 
     let outcome = autumn_harvest::erase::erase_workflow_payloads(&mut conn, exec_id, "gdpr-req-2")
         .await
         .expect("erase a terminal execution");
     assert_eq!(outcome.stream_chunks_deleted, 2, "{outcome:?}");
+    assert_eq!(read_all(&mut conn, exec_id).await, Vec::new());
+}
+
+/// An append to a terminal run stores nothing. A reader of a terminal run
+/// sends `event: end`, so a later chunk would never reach it.
+#[tokio::test]
+async fn an_append_to_a_terminal_run_stores_nothing() {
+    let (url, _c) = setup_database().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let exec_id = ExecutionId::new();
+    insert_execution(&mut conn, exec_id, "stream_terminal").await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions
+            SET state = 'TERMINATED', completed_at = NOW()
+          WHERE id = $1",
+    )
+    .bind::<SqlUuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("terminate");
+
+    let stored = store::append_stream_chunks(&mut conn, exec_id, &[chunk(0, json!("late"))], 100)
+        .await
+        .expect("append");
+
+    assert_eq!(stored, 0);
     assert_eq!(read_all(&mut conn, exec_id).await, Vec::new());
 }
 
