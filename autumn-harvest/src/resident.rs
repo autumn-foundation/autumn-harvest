@@ -172,6 +172,7 @@ impl NotKept {
 /// Why a decision replayed instead of resuming a resident workflow (issue
 /// #2007).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the db-gated worker counts misses.
 pub(crate) enum ResidentMiss {
     /// No cache entry: the first decision, an eviction, a restart, another
     /// worker, or sticky routing off.
@@ -195,6 +196,7 @@ pub(crate) enum ResidentMiss {
     Unrecorded,
 }
 
+#[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the db-gated worker counts misses.
 impl ResidentMiss {
     /// The metric label of this miss. Each label is in
     /// [`RESIDENT_MISS_REASONS`].
