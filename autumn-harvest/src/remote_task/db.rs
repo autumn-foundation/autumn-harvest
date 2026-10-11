@@ -458,23 +458,20 @@ impl RemoteTaskPoller {
             polled: due.len(),
             ..PollReport::default()
         };
-        let reads: Vec<(PendingRemoteTask, Result<RemoteTaskPoll, RemoteTaskError>)> =
-            futures::stream::iter(due)
-                .map(|pending| async move {
-                    let read =
-                        tokio::time::timeout(self.get_timeout, self.transport.get(&pending.handle))
-                            .await
-                            .unwrap_or_else(|_| {
-                                Err(RemoteTaskError::retryable("the remote read timed out"))
-                            });
-                    (pending, read)
-                })
-                .buffer_unordered(self.concurrency)
-                .collect()
-                .await;
-
-        let mut ended = Vec::new();
-        for (pending, read) in reads {
+        let mut reads = futures::stream::iter(due)
+            .map(|pending| async move {
+                let read =
+                    tokio::time::timeout(self.get_timeout, self.transport.get(&pending.handle))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(RemoteTaskError::retryable("the remote read timed out"))
+                        });
+                (pending, read)
+            })
+            .buffer_unordered(self.concurrency);
+        // Settle each ended task when its read lands. A slow read must not
+        // keep a result back until the token deadline passes.
+        while let Some((pending, read)) = reads.next().await {
             match read {
                 Ok(RemoteTaskPoll {
                     state,
@@ -482,7 +479,7 @@ impl RemoteTaskPoller {
                 }) => {
                     if state.is_terminal() {
                         self.clear_backoff(pending.token);
-                        ended.push((pending, state));
+                        self.settle_ended(pool, &pending, &state, &mut report).await;
                     } else {
                         self.wait_for_server(pending.token, poll_interval);
                     }
@@ -498,37 +495,43 @@ impl RemoteTaskPoller {
                 }
             }
         }
-        if ended.is_empty() {
-            return Ok(report);
-        }
-        let mut conn = pool
-            .get()
-            .await
-            .map_err(|e| HarvestError::Database(format!("remote task settle: {e}")))?;
-        for (pending, state) in ended {
-            let settled = settle(
-                &mut conn,
-                pending.token,
-                &state,
-                &self.codecs,
-                self.max_result_bytes,
-            )
-            .await;
-            match settled {
-                Ok(true) => report.settled += 1,
-                // Another poller, a push or the timeout scan settled it first.
-                Ok(false) | Err(HarvestError::NotFound(_)) => {}
-                Err(e) => {
-                    report.errors += 1;
-                    tracing::warn!(
-                        execution_id = %pending.execution_id,
-                        error = %e,
-                        "remote task: settle failed; the token stays pending"
-                    );
-                }
+        Ok(report)
+    }
+
+    /// Settle one ended task. The connection goes back to the pool at once.
+    async fn settle_ended(
+        &self,
+        pool: &DbPool,
+        pending: &PendingRemoteTask,
+        state: &RemoteTaskState,
+        report: &mut PollReport,
+    ) {
+        let settled = match pool.get().await {
+            Ok(mut conn) => {
+                settle(
+                    &mut conn,
+                    pending.token,
+                    state,
+                    &self.codecs,
+                    self.max_result_bytes,
+                )
+                .await
+            }
+            Err(e) => Err(HarvestError::Database(format!("remote task settle: {e}"))),
+        };
+        match settled {
+            Ok(true) => report.settled += 1,
+            // Another poller, a push or the timeout scan settled it first.
+            Ok(false) | Err(HarvestError::NotFound(_)) => {}
+            Err(e) => {
+                report.errors += 1;
+                tracing::warn!(
+                    execution_id = %pending.execution_id,
+                    error = %e,
+                    "remote task: settle failed; the token stays pending"
+                );
             }
         }
-        Ok(report)
     }
 
     fn back_off(&self, token: ExternalActivityToken) {

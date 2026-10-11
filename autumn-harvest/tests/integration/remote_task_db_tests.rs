@@ -103,6 +103,9 @@ struct FakeServer {
     reads: Mutex<Vec<String>>,
     /// The poll interval that each read asks for.
     poll_interval: Mutex<Option<Duration>>,
+    /// A read of this task waits for `release`.
+    held: Mutex<Option<String>>,
+    release: tokio::sync::Notify,
 }
 
 impl FakeServer {
@@ -164,6 +167,10 @@ impl RemoteTaskTransport for FakeTransport {
         handle: &'a RemoteTaskHandle,
     ) -> RemoteFuture<'a, Result<RemoteTaskPoll, RemoteTaskError>> {
         Box::pin(async move {
+            let held = self.0.held.lock().expect("held").clone();
+            if held.as_deref() == Some(handle.task_id.as_str()) {
+                self.0.release.notified().await;
+            }
             self.0
                 .reads
                 .lock()
@@ -696,5 +703,39 @@ async fn the_poller_respects_the_server_poll_interval() {
     assert_eq!(first.polled, 1);
     let second = p.poller.poll_once(&p.pool).await.expect("poll 2");
     assert_eq!(second.polled, 0, "the server asked for 10 minutes");
+    p.stop().await;
+}
+
+/// A slow read does not delay the settle of a task that already ended.
+#[tokio::test]
+async fn a_slow_read_does_not_delay_another_settle() {
+    let db = setup().await;
+    let url = &db.url;
+    let server = Arc::new(FakeServer::default());
+    let p = Process::start(url, "remote-task-slow", &server);
+
+    let fast = start_run(url, "report-11", json!({})).await;
+    wait_for_token(url, fast).await;
+    let slow = start_run(url, "report-12", json!({})).await;
+    wait_for_token(url, slow).await;
+    server.set(
+        "task-0",
+        RemoteTaskState::Completed(RemoteTaskOutcome {
+            result: json!({"content": []}),
+            is_error: false,
+        }),
+    );
+    *server.held.lock().expect("held") = Some("task-1".into());
+
+    // The read of task-1 waits until the fast run is complete. The read
+    // limit is 30 s, so the fast run must not wait for that read.
+    let check = async {
+        wait_for_execution_state_with_timeout(url, fast, "COMPLETED", Duration::from_secs(10))
+            .await;
+        server.release.notify_one();
+    };
+    let (report, ()) = tokio::join!(p.poller.poll_once(&p.pool), check);
+    let report = report.expect("poll");
+    assert_eq!((report.polled, report.settled), (2, 1));
     p.stop().await;
 }

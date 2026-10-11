@@ -332,6 +332,27 @@ async fn a_response_over_the_limit_is_refused() {
 }
 
 #[tokio::test]
+async fn an_oversized_busy_response_stays_retryable() {
+    for status in [
+        StatusCode::SERVICE_UNAVAILABLE,
+        StatusCode::TOO_MANY_REQUESTS,
+    ] {
+        let (url, _) = serve(Arc::new(move |_| {
+            let big = "x".repeat(autumn_harvest_plugin::remote_tasks::MAX_RESPONSE_BYTES + 1);
+            (status, big).into_response()
+        }))
+        .await;
+        let client = HttpRemoteTasks::new().server("reports", RemoteServer::mcp(&url));
+        let err = client
+            .start(&request(RemoteProtocol::Mcp, "export"), "k")
+            .await
+            .expect_err("too large");
+        assert!(err.retryable, "{status}: {}", err.message);
+        assert!(err.message.contains("bytes"), "got {}", err.message);
+    }
+}
+
+#[tokio::test]
 async fn a_redirect_to_another_origin_is_refused() {
     let (other, _) = serve(Arc::new(|body| {
         result(body, json!({"resultType": "task", "taskId": "t-9"}))

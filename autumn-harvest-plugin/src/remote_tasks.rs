@@ -291,13 +291,11 @@ impl HttpRemoteTasks {
         if !status.is_success() {
             let detail = rpc_error.map_or_else(String::new, |m| format!(": {m}"));
             let message = format!("{method}: the remote server answered HTTP {status}{detail}");
-            return Err(
-                if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    RemoteTaskError::retryable(message)
-                } else {
-                    RemoteTaskError::non_retryable(message)
-                },
-            );
+            return Err(if busy(status) {
+                RemoteTaskError::retryable(message)
+            } else {
+                RemoteTaskError::non_retryable(message)
+            });
         }
         if mismatched {
             return Err(RemoteTaskError::non_retryable(format!(
@@ -326,10 +324,15 @@ async fn read_body(
     event_stream: bool,
     status: reqwest::StatusCode,
 ) -> Result<Vec<u8>, RemoteTaskError> {
+    // The status is known before the body. A busy server stays retryable,
+    // and a refused request stays refused.
     let too_large = || {
-        RemoteTaskError::non_retryable(format!(
-            "{method}: the response is over {MAX_RESPONSE_BYTES} bytes"
-        ))
+        let message = format!("{method}: the response is over {MAX_RESPONSE_BYTES} bytes");
+        if busy(status) {
+            RemoteTaskError::retryable(message)
+        } else {
+            RemoteTaskError::non_retryable(message)
+        }
     };
     if response
         .content_length()
@@ -340,8 +343,7 @@ async fn read_body(
     let mut raw = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|e| {
         let message = format!("{method}: read failed: {}", e.without_url());
-        // The status is known already. A refused request stays refused.
-        if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        if status.is_client_error() && !busy(status) {
             RemoteTaskError::non_retryable(message)
         } else {
             RemoteTaskError::retryable(message)
@@ -359,6 +361,11 @@ async fn read_body(
         }
     }
     Ok(raw)
+}
+
+/// `true` for a status that asks the client to try again: 429 or 5xx.
+fn busy(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
 }
 
 /// `text`, cut to at most [`MAX_ERROR_TEXT`] bytes on a char boundary.
