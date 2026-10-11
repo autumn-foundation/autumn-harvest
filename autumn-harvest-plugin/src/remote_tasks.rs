@@ -366,19 +366,23 @@ fn clip(text: &str) -> &str {
     &text[..end]
 }
 
-/// `true` when `message` is the JSON-RPC response to request `id`.
-fn is_response_to(message: &Value, id: u64) -> bool {
-    message.get("id").and_then(Value::as_u64) == Some(id)
-        && (message.get("result").is_some() || message.get("error").is_some())
-}
-
-/// `true` when `envelope` can answer request `id`.
+/// `true` when `envelope` is a JSON-RPC 2.0 response to request `id`.
 ///
-/// A non-null id must be the request id. A null or missing id passes on an
-/// error only, because JSON-RPC sends a parse error that way.
+/// The one rule for every response, on the JSON and the event-stream path:
+///
+/// - `jsonrpc` is `"2.0"`;
+/// - exactly one of `result` and `error` is present;
+/// - a non-null id is the request id;
+/// - a null or missing id passes on an error only, because JSON-RPC sends
+///   an error that way when the server cannot read the request id.
 fn belongs_to(envelope: &Value, id: u64) -> bool {
+    let has_result = envelope.get("result").is_some();
+    let has_error = envelope.get("error").is_some();
+    if envelope.get("jsonrpc").and_then(Value::as_str) != Some("2.0") || has_result == has_error {
+        return false;
+    }
     match envelope.get("id") {
-        None | Some(Value::Null) => envelope.get("error").is_some(),
+        None | Some(Value::Null) => has_error,
         Some(other) => other.as_u64() == Some(id),
     }
 }
@@ -440,7 +444,7 @@ fn sse_response(body: &str, id: u64) -> Option<Value> {
         }
         if line.is_empty() {
             if let Some(message) = decode_event(&data)
-                && is_response_to(&message, id)
+                && belongs_to(&message, id)
             {
                 return Some(message);
             }
@@ -531,12 +535,12 @@ impl RemoteTaskTransport for HttpRemoteTasks {
                     let headers = mcp_headers("tasks/get", &handle.task_id);
                     let params = mcp::tasks_get_params(handle);
                     let result = self.rpc(server, "tasks/get", params, &headers).await?;
-                    mcp::parse_task(&result)
+                    mcp::parse_task(handle, &result)
                 }
                 RemoteProtocol::A2a => {
                     let params = a2a::tasks_get_params(handle);
                     let result = self.rpc(server, "tasks/get", params, &[]).await?;
-                    a2a::parse_task(&result)
+                    a2a::parse_task(handle, &result)
                 }
             }
         })
@@ -578,12 +582,43 @@ mod tests {
 
     #[test]
     fn only_a_matching_or_null_error_id_belongs_to_the_request() {
-        assert!(belongs_to(&json!({"id": 9, "result": {}}), 9));
-        assert!(belongs_to(&json!({"id": 9, "error": {}}), 9));
-        assert!(belongs_to(&json!({"id": null, "error": {}}), 9));
-        assert!(!belongs_to(&json!({"id": 8, "error": {}}), 9));
-        assert!(!belongs_to(&json!({"id": 8, "result": {}}), 9));
-        assert!(!belongs_to(&json!({"id": null, "result": {}}), 9));
+        let rpc = |id: Value, body: Value| {
+            let mut envelope = json!({"jsonrpc": "2.0", "id": id});
+            for (key, value) in body.as_object().expect("object") {
+                envelope[key] = value.clone();
+            }
+            envelope
+        };
+        assert!(belongs_to(&rpc(json!(9), json!({"result": {}})), 9));
+        assert!(belongs_to(&rpc(json!(9), json!({"error": {}})), 9));
+        assert!(belongs_to(&rpc(Value::Null, json!({"error": {}})), 9));
+        assert!(!belongs_to(&rpc(json!(8), json!({"error": {}})), 9));
+        assert!(!belongs_to(&rpc(json!(8), json!({"result": {}})), 9));
+        assert!(!belongs_to(&rpc(Value::Null, json!({"result": {}})), 9));
+        assert!(!belongs_to(
+            &rpc(json!(9), json!({"result": {}, "error": {}})),
+            9
+        ));
+        assert!(!belongs_to(&rpc(json!(9), json!({})), 9));
+        assert!(
+            !belongs_to(&json!({"id": 9, "result": {}}), 9),
+            "no jsonrpc"
+        );
+        assert!(!belongs_to(
+            &json!({"jsonrpc": "1.0", "id": 9, "result": {}}),
+            9
+        ));
+    }
+
+    #[test]
+    fn a_null_id_error_in_an_event_stream_is_the_response() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"parse\"}}\n\n";
+        assert_eq!(
+            sse_response(body, 7),
+            Some(
+                json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "parse"}})
+            )
+        );
     }
 
     #[test]

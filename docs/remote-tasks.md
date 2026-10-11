@@ -118,6 +118,9 @@ start. The engine rounds it up to whole seconds, with a minimum of 1 s.
   pollers can read one task. Only the first settlement counts.
 - The poller reads only tokens of live runs. It holds no database
   connection while it waits for a remote server.
+- The client accepts a reply only when it is JSON-RPC 2.0 with the request
+  id. A `tasks/get` reply must name the polled task. Anything else is a
+  protocol error, so a stale reply cannot settle the wrong call.
 
 ## Push
 

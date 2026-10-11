@@ -452,12 +452,21 @@ pub mod mcp {
         json!({"taskId": handle.task_id, "_meta": meta()})
     }
 
-    /// Read a `tasks/get` result.
+    /// Read the `tasks/get` result for `handle`.
     ///
     /// # Errors
     ///
-    /// Returns a non-retryable error for a result with no known status.
-    pub fn parse_task(task: &Value) -> Result<RemoteTaskState, RemoteTaskError> {
+    /// Returns a non-retryable error for a result of another task, or with no
+    /// known status.
+    pub fn parse_task(
+        handle: &RemoteTaskHandle,
+        task: &Value,
+    ) -> Result<RemoteTaskState, RemoteTaskError> {
+        if task.get("taskId").and_then(Value::as_str) != Some(handle.task_id.as_str()) {
+            return Err(RemoteTaskError::non_retryable(
+                "the tasks/get result is not for the polled task",
+            ));
+        }
         let status = task.get("status").and_then(Value::as_str).unwrap_or("");
         let message = || {
             task.get("statusMessage")
@@ -571,12 +580,21 @@ pub mod a2a {
         (!text.is_empty()).then(|| text.join(" "))
     }
 
-    /// Read a `tasks/get` result.
+    /// Read the `tasks/get` result for `handle`.
     ///
     /// # Errors
     ///
-    /// Returns a non-retryable error for a task with no known state.
-    pub fn parse_task(task: &Value) -> Result<RemoteTaskState, RemoteTaskError> {
+    /// Returns a non-retryable error for another task, or for a task with no
+    /// known state.
+    pub fn parse_task(
+        handle: &RemoteTaskHandle,
+        task: &Value,
+    ) -> Result<RemoteTaskState, RemoteTaskError> {
+        if task.get("id").and_then(Value::as_str) != Some(handle.task_id.as_str()) {
+            return Err(RemoteTaskError::non_retryable(
+                "the tasks/get result is not for the polled task",
+            ));
+        }
         let raw = task
             .pointer("/status/state")
             .and_then(Value::as_str)

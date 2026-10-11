@@ -39,6 +39,15 @@ fn handle() -> RemoteTaskHandle {
     }
 }
 
+/// The handle of the polled task `task_id`.
+fn polled(protocol: RemoteProtocol, task_id: &str) -> RemoteTaskHandle {
+    RemoteTaskHandle {
+        server: "reports".into(),
+        protocol,
+        task_id: task_id.into(),
+    }
+}
+
 // ── MCP wire format ─────────────────────────────────────────────────────────
 
 #[test]
@@ -118,30 +127,51 @@ fn mcp_tasks_get_names_the_task_and_declares_the_extension() {
 #[test]
 fn mcp_task_states_map_to_remote_states() {
     assert_eq!(
-        mcp::parse_task(&json!({"taskId": "t", "status": "working"})),
+        mcp::parse_task(
+            &polled(RemoteProtocol::Mcp, "t"),
+            &json!({"taskId": "t", "status": "working"})
+        ),
         Ok(RemoteTaskState::Working)
     );
     assert_eq!(
-        mcp::parse_task(&json!({"taskId": "t", "status": "input_required"})),
+        mcp::parse_task(
+            &polled(RemoteProtocol::Mcp, "t"),
+            &json!({"taskId": "t", "status": "input_required"})
+        ),
         Ok(RemoteTaskState::InputRequired)
     );
     let tool = json!({"content": [{"type": "text", "text": "no"}], "isError": true});
     assert_eq!(
-        mcp::parse_task(&json!({"taskId": "t", "status": "completed", "result": tool})),
+        mcp::parse_task(
+            &polled(RemoteProtocol::Mcp, "t"),
+            &json!({"taskId": "t", "status": "completed", "result": tool})
+        ),
         Ok(RemoteTaskState::Completed(RemoteTaskOutcome {
             result: tool,
             is_error: true,
         }))
     );
     assert_eq!(
-        mcp::parse_task(&json!({"taskId": "t", "status": "failed", "statusMessage": "boom"})),
+        mcp::parse_task(
+            &polled(RemoteProtocol::Mcp, "t"),
+            &json!({"taskId": "t", "status": "failed", "statusMessage": "boom"})
+        ),
         Ok(RemoteTaskState::Failed("boom".into()))
     );
     assert_eq!(
-        mcp::parse_task(&json!({"taskId": "t", "status": "cancelled", "statusMessage": "stop"})),
+        mcp::parse_task(
+            &polled(RemoteProtocol::Mcp, "t"),
+            &json!({"taskId": "t", "status": "cancelled", "statusMessage": "stop"})
+        ),
         Ok(RemoteTaskState::Cancelled("stop".into()))
     );
-    assert!(mcp::parse_task(&json!({"taskId": "t", "status": "odd"})).is_err());
+    assert!(
+        mcp::parse_task(
+            &polled(RemoteProtocol::Mcp, "t"),
+            &json!({"taskId": "t", "status": "odd"})
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -149,7 +179,7 @@ fn mcp_failed_task_reads_the_error_object() {
     let task =
         json!({"taskId": "t", "status": "failed", "error": {"code": -32603, "message": "x"}});
     assert_eq!(
-        mcp::parse_task(&task),
+        mcp::parse_task(&polled(RemoteProtocol::Mcp, "t"), &task),
         Ok(RemoteTaskState::Failed("x".into()))
     );
 }
@@ -199,42 +229,48 @@ fn a2a_message_result_is_an_outcome() {
 fn a2a_task_states_map_to_remote_states() {
     let task = |state: &str| json!({"id": "a", "status": {"state": state}});
     assert_eq!(
-        a2a::parse_task(&task("working")),
+        a2a::parse_task(&polled(RemoteProtocol::A2a, "a"), &task("working")),
         Ok(RemoteTaskState::Working)
     );
     assert_eq!(
-        a2a::parse_task(&task("submitted")),
+        a2a::parse_task(&polled(RemoteProtocol::A2a, "a"), &task("submitted")),
         Ok(RemoteTaskState::Working)
     );
     assert_eq!(
-        a2a::parse_task(&task("input-required")),
+        a2a::parse_task(&polled(RemoteProtocol::A2a, "a"), &task("input-required")),
         Ok(RemoteTaskState::InputRequired)
     );
     assert_eq!(
-        a2a::parse_task(&task("TASK_STATE_AUTH_REQUIRED")),
+        a2a::parse_task(
+            &polled(RemoteProtocol::A2a, "a"),
+            &task("TASK_STATE_AUTH_REQUIRED")
+        ),
         Ok(RemoteTaskState::InputRequired)
     );
     let done = task("completed");
     assert_eq!(
-        a2a::parse_task(&done),
+        a2a::parse_task(&polled(RemoteProtocol::A2a, "a"), &done),
         Ok(RemoteTaskState::Completed(RemoteTaskOutcome {
             result: done.clone(),
             is_error: false,
         }))
     );
     assert!(matches!(
-        a2a::parse_task(&task("TASK_STATE_FAILED")),
+        a2a::parse_task(
+            &polled(RemoteProtocol::A2a, "a"),
+            &task("TASK_STATE_FAILED")
+        ),
         Ok(RemoteTaskState::Failed(_))
     ));
     assert!(matches!(
-        a2a::parse_task(&task("rejected")),
+        a2a::parse_task(&polled(RemoteProtocol::A2a, "a"), &task("rejected")),
         Ok(RemoteTaskState::Failed(_))
     ));
     assert!(matches!(
-        a2a::parse_task(&task("canceled")),
+        a2a::parse_task(&polled(RemoteProtocol::A2a, "a"), &task("canceled")),
         Ok(RemoteTaskState::Cancelled(_))
     ));
-    assert!(a2a::parse_task(&json!({"id": "a"})).is_err());
+    assert!(a2a::parse_task(&polled(RemoteProtocol::A2a, "a"), &json!({"id": "a"})).is_err());
 }
 
 // ── The start activity ──────────────────────────────────────────────────────
@@ -573,8 +609,11 @@ async fn a_pushed_output_without_is_error_reads_as_false() {
 
 #[test]
 fn a_completed_mcp_task_with_no_result_is_an_error() {
-    let err =
-        mcp::parse_task(&json!({"taskId": "t", "status": "completed"})).expect_err("no result");
+    let err = mcp::parse_task(
+        &polled(RemoteProtocol::Mcp, "t"),
+        &json!({"taskId": "t", "status": "completed"}),
+    )
+    .expect_err("no result");
     assert!(!err.retryable);
 }
 
@@ -608,4 +647,15 @@ async fn the_timeout_rounds_up_to_whole_seconds() {
         assert_eq!(*schedule_to_close_secs, secs, "for {timeout:?}");
         task.abort();
     }
+}
+
+#[test]
+fn a_tasks_get_result_for_another_task_is_refused() {
+    let mcp_reply = json!({"taskId": "other", "status": "completed", "result": {"content": []}});
+    let err = mcp::parse_task(&polled(RemoteProtocol::Mcp, "t"), &mcp_reply).expect_err("mcp");
+    assert!(!err.retryable);
+    let missing = json!({"status": "completed", "result": {"content": []}});
+    assert!(mcp::parse_task(&polled(RemoteProtocol::Mcp, "t"), &missing).is_err());
+    let a2a_reply = json!({"id": "other", "status": {"state": "completed"}});
+    assert!(a2a::parse_task(&polled(RemoteProtocol::A2a, "a"), &a2a_reply).is_err());
 }
