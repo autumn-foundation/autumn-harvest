@@ -33,16 +33,16 @@
 //! journal, also after a failure.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
-use wasmtime::Module;
+use wasmtime::{Caller, Extern, Linker, Module};
 
 use crate::failure::ActivityFailure;
-use crate::wasm_activities::{WasmLimits, WasmModuleStore};
+use crate::wasm_activities::{HostState, WasmLimits, WasmModuleStore, invoke_wasm_activity_linked};
 
 /// Import module name of the host call.
 pub const HOST_CALL_MODULE: &str = "harvest";
@@ -196,7 +196,11 @@ pub struct JournaledRun {
 /// Run a WASM activity with journaled host calls.
 ///
 /// The run links only `harvest::host_call`, and only when `grants` is not
-/// empty. It first replays `prior`, then runs live.
+/// empty. It first replays `prior` in order, then runs live. The fuel, memory
+/// and wall-clock bounds of [`crate::wasm_activities`] apply unchanged.
+///
+/// The returned journal holds `prior` plus each new live entry. A divergence
+/// leaves it equal to `prior`.
 #[allow(clippy::too_many_arguments)]
 pub fn invoke_journaled(
     store: &WasmModuleStore,
@@ -208,15 +212,266 @@ pub fn invoke_journaled(
     prior: HostCallJournal,
     cancel: Option<&CancellationToken>,
 ) -> JournaledRun {
-    let _ = (store, module, input, grants, limits, deadline, cancel);
+    let prior_len = prior.entries.len();
+    let session = Arc::new(Mutex::new(Session {
+        entries: prior.entries,
+        ..Session::default()
+    }));
+    let link = |linker: &mut Linker<HostState>| -> Result<(), ActivityFailure> {
+        if grants.is_empty() {
+            return Ok(());
+        }
+        let session = Arc::clone(&session);
+        let grants = grants.clone();
+        let cancel = cancel.cloned();
+        linker
+            .func_wrap(
+                HOST_CALL_MODULE,
+                HOST_CALL_FUNCTION,
+                move |mut caller: Caller<'_, HostState>,
+                      name_ptr: i32,
+                      name_len: i32,
+                      req_ptr: i32,
+                      req_len: i32|
+                      -> wasmtime::Result<i64> {
+                    host_call(
+                        &mut caller,
+                        &session,
+                        &grants,
+                        cancel.as_ref(),
+                        [name_ptr, name_len, req_ptr, req_len],
+                    )
+                },
+            )
+            .map(|_| ())
+            .map_err(|e| {
+                ActivityFailure::wasm_trap(format!("failed to link harvest::host_call: {e}"))
+            })
+    };
+    let result = invoke_wasm_activity_linked(store, module, input, limits, deadline, cancel, &link);
+
+    let session = std::mem::take(&mut *lock(&session));
+    let result = match (result, session.abort) {
+        (_, Some(abort)) => Err(abort),
+        (Ok(_), None) if session.cursor < prior_len => {
+            Err(ActivityFailure::wasm_journal_divergence(format!(
+                "the guest finished after {} of {prior_len} journaled host calls",
+                session.cursor
+            )))
+        }
+        (result, None) => result,
+    };
     JournaledRun {
-        result: Err(ActivityFailure::wasm_trap(
-            "journaled host calls are not built",
-        )),
-        journal: prior,
-        replayed: 0,
-        live: 0,
+        result,
+        journal: HostCallJournal {
+            entries: session.entries,
+        },
+        replayed: session.replayed,
+        live: session.live,
     }
+}
+
+/// The journal state of one run.
+#[derive(Default)]
+struct Session {
+    /// The earlier entries, then each live entry.
+    entries: Vec<HostCallEntry>,
+    /// The index of the next call.
+    cursor: usize,
+    replayed: usize,
+    live: usize,
+    /// The failure that a host call stopped the run with.
+    abort: Option<ActivityFailure>,
+}
+
+/// Lock the session. A poisoned lock still holds valid data, because each
+/// update is one push and two increments.
+fn lock(session: &Mutex<Session>) -> MutexGuard<'_, Session> {
+    session.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The body of `harvest::host_call`.
+fn host_call(
+    caller: &mut Caller<'_, HostState>,
+    session: &Mutex<Session>,
+    grants: &HostCallGrants,
+    cancel: Option<&CancellationToken>,
+    args: [i32; 4],
+) -> wasmtime::Result<i64> {
+    let Some((name, request)) = read_call(caller, args) else {
+        return Ok(HOST_CALL_INVALID);
+    };
+    let outcome = match next_outcome(session, grants, cancel, name, request) {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => return Ok(HOST_CALL_LIMIT),
+        Err(abort) => {
+            lock(session).abort = Some(abort);
+            return Err(wasmtime::Error::msg(
+                "a journaled host call stopped the run",
+            ));
+        }
+    };
+    let envelope = match outcome {
+        HostCallOutcome::Denied => return Ok(HOST_CALL_DENIED),
+        HostCallOutcome::Ok { response } => serde_json::json!({ "ok": response }),
+        HostCallOutcome::Err { message } => serde_json::json!({ "err": message }),
+    };
+    write_response(caller, &envelope)
+}
+
+/// Read the name and the request of one call.
+///
+/// Each length is checked before the read, so a guest cannot make the host
+/// scan a large slice outside its fuel budget. `None` means a bad call.
+fn read_call(caller: &mut Caller<'_, HostState>, args: [i32; 4]) -> Option<(String, Value)> {
+    let [name_ptr, name_len, req_ptr, req_len] = args;
+    let name_len = usize::try_from(name_len).ok()?;
+    let req_len = usize::try_from(req_len).ok()?;
+    if name_len > MAX_HOST_CALL_NAME_BYTES || req_len > MAX_HOST_CALL_BYTES {
+        return None;
+    }
+    let Some(Extern::Memory(memory)) = caller.get_export("memory") else {
+        return None;
+    };
+    let data = memory.data(&*caller);
+    let name = std::str::from_utf8(guest_slice(data, name_ptr, name_len)?).ok()?;
+    let request = serde_json::from_slice(guest_slice(data, req_ptr, req_len)?).ok()?;
+    Some((name.to_owned(), request))
+}
+
+/// A bounds-checked slice of guest memory.
+fn guest_slice(data: &[u8], ptr: i32, len: usize) -> Option<&[u8]> {
+    let start = usize::try_from(ptr).ok()?;
+    data.get(start..start.checked_add(len)?)
+}
+
+/// Replay the next entry, or run the call live and journal it.
+///
+/// `Ok(None)` means the run reached [`MAX_HOST_CALLS`]. `Err` stops the run.
+fn next_outcome(
+    session: &Mutex<Session>,
+    grants: &HostCallGrants,
+    cancel: Option<&CancellationToken>,
+    name: String,
+    request: Value,
+) -> Result<Option<HostCallOutcome>, ActivityFailure> {
+    let seq = {
+        let mut s = lock(session);
+        let seq = match u32::try_from(s.cursor) {
+            Ok(seq) if seq < MAX_HOST_CALLS => seq,
+            _ => return Ok(None),
+        };
+        if let Some(entry) = s.entries.get(s.cursor) {
+            if entry.name != name || entry.request != request {
+                return Err(ActivityFailure::wasm_journal_divergence(format!(
+                    "host call {seq} is '{name}', but the journal holds '{}' or another request",
+                    entry.name
+                )));
+            }
+            let outcome = entry.outcome.clone();
+            s.cursor += 1;
+            s.replayed += 1;
+            return Ok(Some(outcome));
+        }
+        seq
+    };
+
+    // The lock is free here, so a handler panic cannot poison it.
+    let outcome = match grants.handler(&name) {
+        None => HostCallOutcome::Denied,
+        Some(handler) => {
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                return Err(ActivityFailure::resource_exhausted(
+                    "wasm activity cancelled before completion",
+                ));
+            }
+            let call = HostCall {
+                seq,
+                name: &name,
+                request: &request,
+            };
+            match handler(&call) {
+                Ok(response) => bounded_response(response),
+                Err(HostCallError::Fatal(message)) => HostCallOutcome::Err {
+                    message: bounded_message(message),
+                },
+                Err(HostCallError::Transient(message)) => {
+                    return Err(ActivityFailure::host_call_failed(format!(
+                        "host call '{name}' failed: {}",
+                        bounded_message(message)
+                    )));
+                }
+            }
+        }
+    };
+
+    // Journal the call before the response reaches the guest. A later trap
+    // then still leaves the side effect in the journal.
+    let mut s = lock(session);
+    s.entries.push(HostCallEntry {
+        seq,
+        name,
+        request,
+        outcome: outcome.clone(),
+    });
+    s.cursor += 1;
+    s.live += 1;
+    Ok(Some(outcome))
+}
+
+/// Keep a response within [`MAX_HOST_CALL_BYTES`], or turn it into an error.
+fn bounded_response(response: Value) -> HostCallOutcome {
+    match serde_json::to_vec(&response) {
+        Ok(bytes) if bytes.len() <= MAX_HOST_CALL_BYTES => HostCallOutcome::Ok { response },
+        Ok(bytes) => HostCallOutcome::Err {
+            message: format!(
+                "host call response ({} bytes) exceeds the {MAX_HOST_CALL_BYTES}-byte limit",
+                bytes.len()
+            ),
+        },
+        Err(e) => HostCallOutcome::Err {
+            message: format!("host call response is not JSON: {e}"),
+        },
+    }
+}
+
+/// Cut a message to [`MAX_HOST_CALL_BYTES`] on a character boundary.
+fn bounded_message(mut message: String) -> String {
+    if message.len() > MAX_HOST_CALL_BYTES {
+        let mut end = MAX_HOST_CALL_BYTES;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+    }
+    message
+}
+
+/// Place `envelope` in guest memory through the guest `alloc` export.
+///
+/// Returns the packed `(ptr << 32) | len`. A bad `alloc` traps the guest.
+fn write_response(caller: &mut Caller<'_, HostState>, envelope: &Value) -> wasmtime::Result<i64> {
+    let bytes = serde_json::to_vec(envelope)
+        .map_err(|e| wasmtime::Error::msg(format!("host call envelope is not JSON: {e}")))?;
+    let len = u32::try_from(bytes.len())
+        .ok()
+        .and_then(|len| i32::try_from(len).ok())
+        .ok_or_else(|| wasmtime::Error::msg("host call response exceeds the wasm abi"))?;
+    let Some(Extern::Func(alloc)) = caller.get_export("alloc") else {
+        return Err(wasmtime::Error::msg("wasm module does not export 'alloc'"));
+    };
+    let alloc = alloc.typed::<i32, i32>(&*caller)?;
+    let ptr = alloc.call(&mut *caller, len)?;
+    let Some(Extern::Memory(memory)) = caller.get_export("memory") else {
+        return Err(wasmtime::Error::msg("wasm module does not export 'memory'"));
+    };
+    let start = usize::try_from(ptr)
+        .map_err(|_| wasmtime::Error::msg("alloc returned a negative pointer"))?;
+    memory
+        .write(&mut *caller, start, &bytes)
+        .map_err(|_| wasmtime::Error::msg("alloc returned an out-of-bounds pointer"))?;
+    let packed = (u64::from(ptr.cast_unsigned()) << 32) | u64::from(len.cast_unsigned());
+    Ok(packed.cast_signed())
 }
 
 #[cfg(test)]
@@ -229,7 +484,6 @@ mod tests {
     };
     use crate::wasm_activities::DEFAULT_FUEL;
     use serde_json::json;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     /// Run until the guest gets a negative code.

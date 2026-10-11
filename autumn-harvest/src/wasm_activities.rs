@@ -210,7 +210,7 @@ impl Default for WasmLimits {
 /// Holds the store's resource limiter (required so `Store::limiter` can hand
 /// back a `&mut StoreLimits`) and the invocation-local RNG state used by the
 /// `env::random_u64` host function.
-struct HostState {
+pub(crate) struct HostState {
     limits: StoreLimits,
     rng: u64,
 }
@@ -687,6 +687,12 @@ fn link_host_functions(
     Ok(())
 }
 
+/// Extra host functions that a caller links after the granted capabilities.
+///
+/// The journaled host call of issue #2014 uses this hook. Each other caller
+/// passes `None`.
+pub(crate) type ExtraLink<'a> = dyn Fn(&mut Linker<HostState>) -> Result<(), ActivityFailure> + 'a;
+
 /// Invoke a compiled WASM activity module against a JSON input under the given
 /// capabilities and resource limits.
 ///
@@ -794,6 +800,7 @@ pub fn invoke_wasm_activity_cancellable(
             deadline,
             dispatch_start,
             cancel,
+            None,
         )
     }));
     match result {
@@ -850,10 +857,55 @@ pub(crate) fn invoke_wasm_guest_bytes(
             deadline,
             None,
             None,
+            None,
         )
     }));
     match result {
         Ok(inner) => inner,
+        Err(payload) => Err(ActivityFailure::wasm_trap(format!(
+            "host glue panicked during wasm invocation: {}",
+            crate::error::panic_message(payload)
+        ))),
+    }
+}
+
+/// Invoke a guest with no ambient capability and with `link` as its only
+/// host surface (issue #2014).
+///
+/// The input path, the bounds and the panic containment are those of
+/// [`invoke_wasm_activity_cancellable`].
+///
+/// # Errors
+///
+/// Returns an [`ActivityFailure`] for the same causes as
+/// [`invoke_wasm_activity_cancellable`].
+pub(crate) fn invoke_wasm_activity_linked(
+    store: &WasmModuleStore,
+    module: &Module,
+    input: &serde_json::Value,
+    limits: &WasmLimits,
+    deadline: Option<Duration>,
+    cancel: Option<&CancellationToken>,
+    link: &ExtraLink<'_>,
+) -> Result<serde_json::Value, ActivityFailure> {
+    let input_bytes = serde_json::to_vec(input).map_err(|e| {
+        ActivityFailure::wasm_trap(format!("failed to serialize activity input as JSON: {e}"))
+    })?;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        invoke_wasm_activity_inner(
+            store,
+            module,
+            &input_bytes,
+            &WasmCapabilities::default(),
+            limits,
+            deadline,
+            None,
+            cancel,
+            Some(link),
+        )
+    }));
+    match result {
+        Ok(inner) => inner.map(|(value, _fuel_consumed)| value),
         Err(payload) => Err(ActivityFailure::wasm_trap(format!(
             "host glue panicked during wasm invocation: {}",
             crate::error::panic_message(payload)
@@ -871,6 +923,7 @@ fn invoke_wasm_activity_inner(
     deadline: Option<Duration>,
     dispatch_start: Option<Instant>,
     cancel: Option<&CancellationToken>,
+    extra_link: Option<&ExtraLink<'_>>,
 ) -> Result<(serde_json::Value, u64), ActivityFailure> {
     let engine = store.engine();
 
@@ -1004,6 +1057,9 @@ fn invoke_wasm_activity_inner(
     // Deny-all linker; only granted capabilities are linked.
     let mut linker: Linker<HostState> = Linker::new(engine);
     link_host_functions(&mut linker, caps)?;
+    if let Some(link) = extra_link {
+        link(&mut linker)?;
+    }
 
     // An unsatisfied import (an ungranted host function) is denied here; a trap
     // or resource overrun in the module's start section is classified as the
