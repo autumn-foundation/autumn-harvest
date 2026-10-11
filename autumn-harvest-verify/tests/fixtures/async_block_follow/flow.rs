@@ -122,3 +122,27 @@ pub async fn wf_foreign_block(ctx: &WorkflowContext) -> Out {
     let mut saga = Saga::new(ctx);
     saga.step(|| ctx.rpit_block(1), |_| async { Ok(()) }).await
 }
+
+pub fn __autumn_workflow_info_wf_step_write_tuple() -> u8 {
+    0
+}
+
+/// The same write, through a `&mut` packed in a tuple.
+pub async fn wf_step_write_tuple(ctx: &WorkflowContext) -> Out {
+    let mut seen = 0_u64;
+    {
+        let mut saga = Saga::new(ctx);
+        saga.step(
+            || {
+                let refs = (&mut seen,);
+                async move {
+                    *refs.0 = now_nanos();
+                    ctx.execute_activity_raw("a", 1).await
+                }
+            },
+            |_| async { Ok(()) },
+        )
+        .await?;
+    }
+    ctx.execute_activity_raw("b", seen).await
+}

@@ -60,6 +60,7 @@ fn a_case_the_analysis_cannot_follow_is_never_proven() {
         "wf_shared_span",
         "wf_block_write",
         "wf_step_write",
+        "wf_step_write_tuple",
     ] {
         assert!(
             !matches!(verdict(&all, name), Verdict::ProvenDeterministic),

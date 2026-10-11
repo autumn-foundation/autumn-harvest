@@ -2724,8 +2724,9 @@ fn first_sentence(reason: &str) -> &str {
     )
 }
 
-/// The value `body` returns reads a local of a `&mut` type, such as an
-/// `async` block that captures `&mut seen`.
+/// The value `body` returns reads a local whose type holds a `&mut`, such as
+/// an `async` block that captures `&mut seen` or `(&mut seen,)`. A `&mut`
+/// inside a struct type of its own is not visible in the type text.
 fn captures_mut_ref(body: &Body) -> bool {
     body.blocks
         .iter()
@@ -2741,7 +2742,7 @@ fn captures_mut_ref(body: &Body) -> bool {
         .flat_map(|rvalue| &rvalue.reads)
         .filter_map(operand_place)
         .filter_map(|place| body.locals.get(&place.local))
-        .any(|ty| ty.trim_start().starts_with("&mut"))
+        .any(|ty| ty.contains("&mut"))
 }
 
 /// The label of the block that writes the return place `_0`, or `bb0`.
