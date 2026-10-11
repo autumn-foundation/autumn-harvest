@@ -88,7 +88,6 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          adaptive_limit_tests
 linux        autumn-harvest         integration                      -                          admission_gate_authoritative
 linux        autumn-harvest         integration                      -                          append_only_guard_tests
-linux        autumn-harvest         integration                      -                          atomicity_spike_tests
 linux        autumn-harvest         integration                      -                          audit_chain_tests
 linux        autumn-harvest         integration                      -                          audit_export_tests
 linux        autumn-harvest         integration                      -                          audit_tests
@@ -226,6 +225,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          workflow_reachability_samples_tests
 linux        autumn-harvest         integration                      -                          workflow_retry_tests
 linux        autumn-harvest         integration                      -                          workflow_task_timeout_tests
+linux        autumn-harvest         integration                      atomicity-spike            atomicity_spike_tests
 linux        autumn-harvest         integration                      hot-code-swap,testing      hot_code_swap_tests
 linux        autumn-harvest         integration                      testing                    backup_verify_refs_batch_perf
 linux        autumn-harvest         integration                      testing                    backup_verify_retention_batch_perf

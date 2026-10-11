@@ -120,7 +120,12 @@ fn the_measurement_setup_matches_the_harness() {
     let pins = [
         (harness.as_str(), "Self::Low => 1_000,", "1,000 SKUs"),
         (harness.as_str(), "Self::High => 1,", "1 SKU"),
-        (harness.as_str(), "fail_rate: 0.1,", "10 % of orders"),
+        (
+            harness.as_str(),
+            "pub const FAIL_RATE: f64 = 0.1;",
+            "10 % of orders",
+        ),
+        (harness.as_str(), "fail_rate: FAIL_RATE,", "10 % of orders"),
         (
             harness.as_str(),
             "for step_work in [Duration::ZERO, Duration::from_millis(20)]",
@@ -161,8 +166,10 @@ fn the_reproduce_command_names_a_real_test() {
         "the measurement test stays out of the default run"
     );
     assert!(
-        report()
-            .contains("atomicity_spike_tests::measure_the_full_matrix -- --ignored --nocapture"),
+        report().contains("--features atomicity-spike")
+            && report().contains(
+                "atomicity_spike_tests::measure_the_full_matrix -- --ignored --nocapture"
+            ),
         "the report gives the command that reproduces it"
     );
 }
@@ -172,5 +179,21 @@ fn the_saga_guide_links_the_report() {
     assert!(
         read("docs/saga.md").contains("(rnd/contention-adaptive-atomicity.md)"),
         "docs/saga.md links the report"
+    );
+}
+
+#[test]
+fn the_spike_stays_out_of_the_default_build() {
+    let manifest = read("autumn-harvest/Cargo.toml");
+    let default = manifest
+        .lines()
+        .find(|line| line.starts_with("default = "))
+        .expect("the crate has default features");
+    assert!(!default.contains("atomicity-spike"), "{default}");
+    assert!(manifest.contains("atomicity-spike = [\"db\"]"));
+    assert!(
+        read("autumn-harvest/src/lib.rs")
+            .contains("#[cfg(feature = \"atomicity-spike\")]\n#[doc(hidden)]\npub mod atomicity;"),
+        "the module is behind the feature"
     );
 }

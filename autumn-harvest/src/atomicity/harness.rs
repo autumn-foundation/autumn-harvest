@@ -42,6 +42,8 @@ pub const DECLINED: &str = "order declined";
 pub const STEPS: u32 = 3;
 /// The highest order amount.
 pub const MAX_AMOUNT: i64 = 100;
+/// The share of orders that the place step declines in the matrix.
+pub const FAIL_RATE: f64 = 0.1;
 
 /// How many SKUs the runs share.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -232,13 +234,13 @@ impl Workload {
         })
     }
 
-    /// Reserve one unit, then work.
+    /// Reserve one unit, then work. Returns the instant of the hot write.
     async fn reserve(
         &self,
         conn: &mut AsyncPgConnection,
         order: Order,
         work: Duration,
-    ) -> HarvestResult<()> {
+    ) -> HarvestResult<Instant> {
         let rows = diesel::sql_query(format!(
             "UPDATE {}_inventory SET qty = qty - 1 WHERE sku = $1 AND qty > 0",
             self.prefix
@@ -246,11 +248,12 @@ impl Workload {
         .bind::<BigInt, _>(order.sku)
         .execute(conn)
         .await?;
+        let written = Instant::now();
         if rows == 0 {
             return Err(declined());
         }
         do_work(work).await;
-        Ok(())
+        Ok(written)
     }
 
     /// Put the unit back. This is the compensation of [`Self::reserve`].
@@ -351,33 +354,41 @@ async fn do_work(work: Duration) {
 }
 
 /// Run `body` in its own transaction on a pooled connection, and commit it.
-async fn committed<F>(pool: &DbPool, body: F) -> HarvestResult<()>
+async fn committed<T, F>(pool: &DbPool, body: F) -> HarvestResult<T>
 where
-    for<'r> F: StepFn<&'r mut AsyncPgConnection, HarvestResult<()>, Fut: Send> + Send,
+    for<'r> F: StepFn<&'r mut AsyncPgConnection, HarvestResult<T>, Fut: Send> + Send,
+    T: Send,
 {
     let mut conn = acquire_within_pool_bound(pool).await?;
-    Box::pin(conn.transaction::<(), HarvestError, _>(async move |tx| body(tx).await)).await
+    Box::pin(conn.transaction::<T, HarvestError, _>(async move |tx| body(tx).await)).await
 }
 
 /// The backout transaction: reserve, debit and place, or only the last two.
+///
+/// With the reserve step, returns the hot-lock hold: the time from the hot
+/// write to the commit.
 async fn backout_run(
     pool: &DbPool,
     workload: &Workload,
     order: Order,
     work: Duration,
     with_reserve: bool,
-) -> HarvestResult<()> {
+) -> HarvestResult<Option<Duration>> {
     let mut conn = acquire_within_pool_bound(pool).await?;
-    run_backout(
+    let written = run_backout(
         &mut conn,
         &workload.retries,
         TxRetryPolicy::DEFAULT,
         async |steps| {
-            if with_reserve {
-                steps
-                    .step(async move |c| workload.reserve(c, order, work).await)
-                    .await?;
-            }
+            let written = if with_reserve {
+                Some(
+                    steps
+                        .step(async move |c| workload.reserve(c, order, work).await)
+                        .await?,
+                )
+            } else {
+                None
+            };
             steps
                 .step(async move |c| workload.debit(c, order, work).await)
                 .await?;
@@ -386,24 +397,30 @@ async fn backout_run(
                     workload.place(c, order, work).await?;
                     workload.record(c, "backout").await
                 })
-                .await
+                .await?;
+            Ok(written)
         },
     )
-    .await
+    .await?;
+    Ok(written.map(|at| at.elapsed()))
 }
 
 /// The reserve step in its own transaction: the escrow step.
+///
+/// Returns the hot-lock hold: the time from the hot write to the commit.
 async fn reserve_committed(
     pool: &DbPool,
     workload: &Workload,
     order: Order,
     work: Duration,
-) -> HarvestResult<()> {
-    committed(pool, async move |c| {
-        workload.reserve(c, order, work).await?;
-        workload.record(c, "reserve").await
+) -> HarvestResult<Duration> {
+    let written = committed(pool, async move |c| {
+        let written = workload.reserve(c, order, work).await?;
+        workload.record(c, "reserve").await?;
+        Ok(written)
     })
-    .await
+    .await?;
+    Ok(written.elapsed())
 }
 
 /// The restock compensation in its own transaction.
@@ -420,14 +437,15 @@ async fn saga_run(
     workload: &Workload,
     order: Order,
     work: Duration,
-) -> HarvestResult<()> {
+) -> HarvestResult<Duration> {
     let ctx = WorkflowContext::for_replay(ExecutionId::new(), Vec::new());
     let mut saga = Saga::new(&ctx);
-    saga.step(
-        || reserve_committed(pool, workload, order, work),
-        move |()| restock_committed(pool, workload, order),
-    )
-    .await?;
+    let hold = saga
+        .step(
+            || reserve_committed(pool, workload, order, work),
+            move |_| restock_committed(pool, workload, order),
+        )
+        .await?;
     saga.step(
         || {
             committed(pool, async move |c| {
@@ -452,7 +470,8 @@ async fn saga_run(
         },
         |()| async { Ok::<(), HarvestError>(()) },
     )
-    .await
+    .await?;
+    Ok(hold)
 }
 
 async fn hybrid_run(
@@ -460,19 +479,21 @@ async fn hybrid_run(
     workload: &Workload,
     order: Order,
     work: Duration,
-) -> HarvestResult<()> {
+) -> HarvestResult<Duration> {
     let ctx = WorkflowContext::for_replay(ExecutionId::new(), Vec::new());
     let mut saga = Saga::new(&ctx);
-    saga.step(
-        || reserve_committed(pool, workload, order, work),
-        move |()| restock_committed(pool, workload, order),
-    )
-    .await?;
+    let hold = saga
+        .step(
+            || reserve_committed(pool, workload, order, work),
+            move |_| restock_committed(pool, workload, order),
+        )
+        .await?;
     saga.step(
         || backout_run(pool, workload, order, work, false),
-        |()| async { Ok::<(), HarvestError>(()) },
+        |_| async { Ok::<(), HarvestError>(()) },
     )
-    .await
+    .await?;
+    Ok(hold)
 }
 
 /// Run one order under `arm`.
@@ -487,14 +508,30 @@ pub async fn run_order(
     order: Order,
     step_work: Duration,
 ) -> HarvestResult<RunOutcome> {
+    Ok(run_order_timed(pool, workload, arm, order, step_work)
+        .await?
+        .0)
+}
+
+/// Run one order under `arm`, and time its hot-lock hold.
+///
+/// The hold is the time from the hot write to the commit that releases the
+/// hot row. Only a committed run reports it.
+async fn run_order_timed(
+    pool: &DbPool,
+    workload: &Workload,
+    arm: Atomicity,
+    order: Order,
+    step_work: Duration,
+) -> HarvestResult<(RunOutcome, Option<Duration>)> {
     let result = match arm {
         Atomicity::Backout => backout_run(pool, workload, order, step_work, true).await,
-        Atomicity::Saga => saga_run(pool, workload, order, step_work).await,
-        Atomicity::Hybrid => hybrid_run(pool, workload, order, step_work).await,
+        Atomicity::Saga => saga_run(pool, workload, order, step_work).await.map(Some),
+        Atomicity::Hybrid => hybrid_run(pool, workload, order, step_work).await.map(Some),
     };
     match result {
-        Ok(()) => Ok(RunOutcome::Committed),
-        Err(error) if is_declined(&error) => Ok(RunOutcome::RolledBack),
+        Ok(hold) => Ok((RunOutcome::Committed, hold)),
+        Err(error) if is_declined(&error) => Ok((RunOutcome::RolledBack, None)),
         Err(error) => Err(error),
     }
 }
@@ -519,6 +556,27 @@ pub struct CellConfig {
 }
 
 impl CellConfig {
+    /// Check the config before a run.
+    ///
+    /// # Errors
+    ///
+    /// Returns a config error for a `fail_rate` outside `[0, 1]` or zero
+    /// clients.
+    pub fn validate(&self) -> HarvestResult<()> {
+        if !(0.0..=1.0).contains(&self.fail_rate) {
+            return Err(HarvestError::Config(format!(
+                "fail_rate must be in [0, 1], got {}",
+                self.fail_rate
+            )));
+        }
+        if self.clients == 0 {
+            return Err(HarvestError::Config(
+                "a cell needs one client or more".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// The number of runs that want the hottest SKU at once.
     ///
     /// The clients form a closed loop, and the SKU draw is uniform. Each
@@ -570,6 +628,8 @@ pub struct CellResult {
     pub p90: Duration,
     /// The 90th percentile latency of a declined run, its undo included.
     pub declined_p90: Duration,
+    /// The median hot-lock hold of a committed run: hot write to commit.
+    pub hot_hold_p50: Duration,
     /// The invariant sums after the drain.
     pub totals: Totals,
 }
@@ -599,6 +659,7 @@ struct ClientStats {
     errors: u64,
     latencies: Vec<Duration>,
     declined_latencies: Vec<Duration>,
+    hot_holds: Vec<Duration>,
 }
 
 impl ClientStats {
@@ -609,6 +670,7 @@ impl ClientStats {
         self.errors += other.errors;
         self.latencies.extend(other.latencies);
         self.declined_latencies.extend(other.declined_latencies);
+        self.hot_holds.extend(other.hot_holds);
     }
 }
 
@@ -638,17 +700,18 @@ async fn drive(
                 };
                 let began = Instant::now();
                 let outcome =
-                    run_order(&pool, &workload, config.arm, order, config.step_work).await;
+                    run_order_timed(&pool, &workload, config.arm, order, config.step_work).await;
                 let ended = Instant::now();
                 match outcome {
-                    Ok(RunOutcome::Committed) => {
+                    Ok((RunOutcome::Committed, hold)) => {
                         stats.committed += 1;
                         if ended <= deadline {
                             stats.committed_in_window += 1;
                         }
                         stats.latencies.push(ended - began);
+                        stats.hot_holds.extend(hold);
                     }
-                    Ok(RunOutcome::RolledBack) => {
+                    Ok((RunOutcome::RolledBack, _)) => {
                         stats.rolled_back += 1;
                         stats.declined_latencies.push(ended - began);
                     }
@@ -683,27 +746,21 @@ async fn drive(
 
 /// Run one cell on fresh tables, then drop them.
 ///
-/// `run_cell` drops the tables on every path, an error path included.
+/// `run_cell` keeps one connection from the setup to the drop. So an error
+/// after the setup still drops the tables. A cancelled future does not.
+/// The clients share the rest of the pool.
 ///
 /// # Errors
 ///
-/// Returns a config error for a `fail_rate` outside `[0, 1]`. Returns a
-/// database or pool error from the setup, a client or the totals. A failed
-/// run counts in [`CellResult::errors`].
+/// Returns a config error from [`CellConfig::validate`]. Returns a database
+/// or pool error from the setup, a client or the totals. A failed run counts
+/// in [`CellResult::errors`].
 pub async fn run_cell(pool: &DbPool, config: CellConfig) -> HarvestResult<CellResult> {
-    if !(0.0..=1.0).contains(&config.fail_rate) {
-        return Err(HarvestError::Config(format!(
-            "fail_rate must be in [0, 1], got {}",
-            config.fail_rate
-        )));
-    }
-    let workload = {
-        let mut conn = acquire_within_pool_bound(pool).await?;
-        Arc::new(Workload::create(&mut conn, config.contention).await?)
-    };
+    config.validate()?;
+    let mut conn = acquire_within_pool_bound(pool).await?;
+    let workload = Arc::new(Workload::create(&mut conn, config.contention).await?);
 
     let driven = drive(pool, &workload, config).await;
-    let mut conn = acquire_within_pool_bound(pool).await?;
     let totals = match driven {
         Ok(_) => workload.totals(&mut conn).await,
         Err(_) => Ok(Totals::default()),
@@ -714,6 +771,7 @@ pub async fn run_cell(pool: &DbPool, config: CellConfig) -> HarvestResult<CellRe
 
     total.latencies.sort_unstable();
     total.declined_latencies.sort_unstable();
+    total.hot_holds.sort_unstable();
     Ok(CellResult {
         config,
         committed: total.committed,
@@ -725,6 +783,7 @@ pub async fn run_cell(pool: &DbPool, config: CellConfig) -> HarvestResult<CellRe
         p50: percentile(&total.latencies, 50.0),
         p90: percentile(&total.latencies, 90.0),
         declined_p90: percentile(&total.declined_latencies, 90.0),
+        hot_hold_p50: percentile(&total.hot_holds, 50.0),
         totals,
     })
 }
@@ -779,7 +838,7 @@ pub fn matrix(clients: usize, duration: Duration, seed: u64) -> Vec<CellConfig> 
                     clients,
                     duration,
                     step_work,
-                    fail_rate: 0.1,
+                    fail_rate: FAIL_RATE,
                     seed,
                 });
             }
@@ -823,6 +882,26 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_a_bad_fail_rate_or_no_clients() {
+        assert!(config(Contention::Low).validate().is_ok());
+        for fail_rate in [f64::NAN, -0.1, 1.5] {
+            let bad = CellConfig {
+                fail_rate,
+                ..config(Contention::Low)
+            };
+            assert!(
+                matches!(bad.validate(), Err(HarvestError::Config(_))),
+                "{fail_rate}"
+            );
+        }
+        let idle = CellConfig {
+            clients: 0,
+            ..config(Contention::Low)
+        };
+        assert!(matches!(idle.validate(), Err(HarvestError::Config(_))));
+    }
+
+    #[test]
     fn hot_key_concurrency_is_clients_over_skus() {
         assert!((config(Contention::Low).hot_key_concurrency() - 0.016).abs() < 1e-9);
         assert!((config(Contention::High).hot_key_concurrency() - 16.0).abs() < 1e-9);
@@ -857,7 +936,7 @@ mod tests {
                             && cell.step_work == work
                             && cell.arm == arm
                             && cell.clients == 16
-                            && (cell.fail_rate - 0.1).abs() < 1e-9),
+                            && (cell.fail_rate - FAIL_RATE).abs() < 1e-9),
                         "missing {contention:?} {work:?} {arm:?}"
                     );
                 }
@@ -887,6 +966,7 @@ mod tests {
             p50: Duration::ZERO,
             p90: Duration::ZERO,
             declined_p90: Duration::ZERO,
+            hot_hold_p50: Duration::ZERO,
             totals: Totals::default(),
         };
         assert!(

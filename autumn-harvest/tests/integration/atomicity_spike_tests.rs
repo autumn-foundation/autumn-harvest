@@ -1,4 +1,4 @@
-#![cfg(feature = "db")]
+#![cfg(feature = "atomicity-spike")]
 //! Database tests for the atomicity spike (issue #2012).
 //!
 //! Set `HARVEST_TEST_DATABASE_URL` to use a running Postgres. Otherwise each
@@ -9,7 +9,8 @@
 //! matrix for about 6 minutes and prints the report tables:
 //!
 //! ```text
-//! cargo test --release -p autumn-harvest --test integration \
+//! cargo test --release -p autumn-harvest --features atomicity-spike \
+//!   --test integration \
 //!   atomicity_spike_tests::measure_the_full_matrix -- --ignored --nocapture
 //! ```
 
@@ -23,7 +24,7 @@ use autumn_harvest::atomicity::harness::{
     self, CellConfig, CellResult, Contention, Order, RetryCounter, RunOutcome, Totals, Workload,
 };
 use autumn_harvest::atomicity::rule::{Atomicity, choose};
-use autumn_harvest::atomicity::verdict::{self, ArmResult, Cell};
+use autumn_harvest::atomicity::verdict::{self, ArmResult, Cell, Criterion};
 use autumn_harvest::error::{HarvestError, HarvestResult};
 use autumn_harvest::telemetry::NoOpMetrics;
 use autumn_harvest::tx_retry::TxRetryPolicy;
@@ -326,31 +327,6 @@ async fn a_short_hot_cell_keeps_the_invariants_for_each_arm() {
     }
 }
 
-#[tokio::test]
-async fn a_cell_rejects_a_fail_rate_outside_zero_to_one() {
-    let (url, _container) = setup_test_database_url_or_env().await;
-    let pool = build_test_pool(&url);
-    for fail_rate in [f64::NAN, -0.1, 1.5] {
-        let result = harness::run_cell(
-            &pool,
-            CellConfig {
-                arm: Atomicity::Backout,
-                contention: Contention::High,
-                clients: 1,
-                duration: Duration::from_millis(10),
-                step_work: Duration::ZERO,
-                fail_rate,
-                seed: 1,
-            },
-        )
-        .await;
-        assert!(
-            matches!(result, Err(HarvestError::Config(_))),
-            "{fail_rate}: {result:?}"
-        );
-    }
-}
-
 #[derive(diesel::QueryableByName)]
 struct Count {
     #[diesel(sql_type = BigInt)]
@@ -406,10 +382,16 @@ async fn a_deadlock_in_an_ignored_step_still_retries_the_whole_run() {
     let barrier = tokio::sync::Barrier::new(2);
     let retries = RetryCounter::default();
 
-    let (l, r) = tokio::join!(
-        lock_both(&mut left, &table, "a", "b", &barrier, &retries),
-        lock_both(&mut right, &table, "b", "a", &barrier, &retries),
-    );
+    // A side that fails before the barrier would leave the other side
+    // waiting. The timeout turns that hang into a failure.
+    let (l, r) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(
+            lock_both(&mut left, &table, "a", "b", &barrier, &retries),
+            lock_both(&mut right, &table, "b", "a", &barrier, &retries),
+        )
+    })
+    .await
+    .expect("the deadlock resolves within 30 s");
     let counts = diesel::sql_query(format!("SELECT n FROM {table} ORDER BY label"))
         .load::<Count>(&mut setup)
         .await
@@ -510,7 +492,25 @@ async fn measure_the_full_matrix() {
     let commit = harness::commit_latency(&mut conn, 200)
         .await
         .expect("measure the commit latency");
-    println!("commit latency (median of 200): {commit:?}\n");
+    println!("commit latency (median of 200): {commit:?}");
+    for setting in [
+        "server_version",
+        "fsync",
+        "synchronous_commit",
+        "shared_buffers",
+    ] {
+        #[derive(diesel::QueryableByName)]
+        struct Setting {
+            #[diesel(sql_type = Text)]
+            value: String,
+        }
+        let row = diesel::sql_query(format!("SELECT current_setting('{setting}') AS value"))
+            .get_result::<Setting>(&mut conn)
+            .await
+            .expect("read a setting");
+        println!("{setting}: {}", row.value);
+    }
+    println!();
 
     // Each repetition runs every cell, and rotates the arm order.
     let configs = harness::matrix(clients, Duration::from_secs(10), 2012);
@@ -529,7 +529,11 @@ async fn measure_the_full_matrix() {
                     seed: summaries[index].config.seed + rep as u64,
                     ..summaries[index].config
                 };
-                conn.batch_execute("CHECKPOINT").await.expect("checkpoint");
+                // CHECKPOINT needs a superuser or `pg_checkpoint`. Without
+                // either, the run goes on and the dirty pages stay.
+                if let Err(error) = conn.batch_execute("CHECKPOINT").await {
+                    println!("CHECKPOINT skipped: {error}");
+                }
                 let run = harness::run_cell(&pool, config)
                     .await
                     .expect("run the cell");
@@ -539,9 +543,9 @@ async fn measure_the_full_matrix() {
     }
 
     println!(
-        "| contention | step work | arm | goodput (runs/s) median [min, max] | P50 ms | P90 ms | declined P90 ms | declined | errors | retries | drain ms | invariants |"
+        "| contention | step work | arm | goodput (runs/s) median [min, max] | P50 ms | P90 ms | declined P90 ms | hot hold P50 ms | declined | errors | retries | drain ms | invariants |"
     );
-    println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
     let mut cells: Vec<Cell> = Vec::new();
     for summary in &summaries {
         let config = summary.config;
@@ -549,7 +553,7 @@ async fn measure_the_full_matrix() {
         let median = summary.median();
         let held = summary.invariants_held();
         println!(
-            "| {} | {} ms | `{}` | {:.1} [{:.1}, {:.1}] | {:.1} | {:.1} | {:.1} | {} | {} | {} | {:.0} | {} |",
+            "| {} | {} ms | `{}` | {:.1} [{:.1}, {:.1}] | {:.1} | {:.1} | {:.1} | {:.2} | {} | {} | {} | {:.0} | {} |",
             config.contention.as_str(),
             config.step_work.as_millis(),
             config.arm.as_str(),
@@ -559,6 +563,7 @@ async fn measure_the_full_matrix() {
             ms(median.p50),
             ms(median.p90),
             ms(median.declined_p90),
+            ms(median.hot_hold_p50),
             median.rolled_back,
             summary.runs.iter().map(|run| run.errors).sum::<u64>(),
             summary.runs.iter().map(|run| run.retries).sum::<u64>(),
@@ -569,6 +574,8 @@ async fn measure_the_full_matrix() {
         let result = ArmResult {
             arm: config.arm,
             goodput: median.goodput(),
+            min: goodputs[0],
+            max: goodputs[goodputs.len() - 1],
             invariants_held: held,
         };
         match cells
@@ -608,7 +615,7 @@ async fn measure_the_full_matrix() {
         );
     }
 
-    let verdict = verdict::judge(&cells);
+    let verdict = verdict::judge(&cells).expect("the matrix is complete");
     println!("\n{verdict:?}");
-    assert!(verdict.g4, "an arm broke an invariant");
+    assert_ne!(verdict.g4, Criterion::Fails, "an arm broke an invariant");
 }

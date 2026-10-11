@@ -10,7 +10,9 @@
 //! savepoint in Postgres. [`Steps`] still records the conflict. After the
 //! body returns, [`run_backout`] rolls back the whole transaction and runs
 //! the body again from the start, through [`run_with_conflict_retry`]. This
-//! holds even when the body ignores the step error. The runner never
+//! holds even when the body ignores the step error. A step itself must
+//! return the database error as it is. A step that catches it or maps it
+//! hides the conflict, and the run commits without a retry. The runner never
 //! retries a step in place. The outer locks stay held, so the same cycle
 //! could form again.
 //!

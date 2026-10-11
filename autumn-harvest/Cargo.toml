@@ -55,6 +55,11 @@ schema = ["dep:schemars"]
 # --workspace`, default features, never compiles wasmtime). See
 # docs/rnd/wasm-activities-spike.md.
 wasm-activities = ["dep:wasmtime", "dep:wat", "db", "dep:ed25519-dalek"]
+# Contention-adaptive atomicity R&D spike (issue #2012). Physical backout,
+# a saga or a hybrid per workflow, with a measurement harness. Off by
+# default. No production path calls it. It adds no dependency.
+# See docs/rnd/contention-adaptive-atomicity.md.
+atomicity-spike = ["db"]
 # Hot code swap for workflow definitions via runtime modules (issue #967).
 #
 # R&D spike. Hosts `#[workflow]` logic as a runtime-loaded WebAssembly module

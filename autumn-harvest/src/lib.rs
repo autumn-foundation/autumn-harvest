@@ -213,9 +213,9 @@ pub mod api_token;
 pub mod append_only;
 /// R&D spike: physical backout, saga or a hybrid per workflow (issue #2012).
 ///
-/// The module has no stability guarantee. See
-/// `docs/rnd/contention-adaptive-atomicity.md`.
-#[cfg(feature = "db")]
+/// The `atomicity-spike` feature turns it on. The module has no stability
+/// guarantee. See `docs/rnd/contention-adaptive-atomicity.md`.
+#[cfg(feature = "atomicity-spike")]
 #[doc(hidden)]
 pub mod atomicity;
 /// Audit trail for management API mutations (issue #158).
