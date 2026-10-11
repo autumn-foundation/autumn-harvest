@@ -2960,7 +2960,8 @@ fn annotated_types(text: &str) -> impl Iterator<Item = &str> {
 /// [`captures_mut_ref`].
 fn may_write_through(ty: &str, interior: &[&str]) -> bool {
     let ty = ty.trim();
-    if ty.contains("&mut") {
+    // A raw `*mut` pointer writes as a `&mut` reference does.
+    if ty.contains("&mut") || ty.contains("*mut") {
         return true;
     }
     let names_interior = ty

@@ -566,3 +566,26 @@ pub async fn wf_step_write_newtype(ctx: &WorkflowContext) -> Out {
 
 #[path = "noext"]
 mod noext;
+
+pub fn __autumn_workflow_info_wf_step_raw_ptr_write() -> u8 {
+    0
+}
+
+/// A saga step block writes the clock through a captured raw pointer.
+pub async fn wf_step_raw_ptr_write(ctx: &WorkflowContext) -> Out {
+    let mut seen = 0_u64;
+    let p: *mut u64 = &raw mut seen;
+    {
+        let mut saga = Saga::new(ctx);
+        saga.step(
+            || async move {
+                // SAFETY: `seen` outlives the step, and nothing else holds it.
+                unsafe { *p = now_nanos() };
+                ctx.execute_activity_raw("a", 1).await
+            },
+            |_| async { Ok(()) },
+        )
+        .await?;
+    }
+    ctx.execute_activity_raw("b", seen).await
+}

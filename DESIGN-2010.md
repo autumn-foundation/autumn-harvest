@@ -163,6 +163,8 @@ Four review agents read the first version. Each fix has a test.
     `{async block@noext:12:26: 12:31}`. A module file can lack the `.rs`
     extension, so the test reads the `line:col` shape. A block of another
     crate prints a def path, so it is still not followed.
+30. A raw `*mut` pointer writes as a `&mut` reference does. A capture of one
+    is a boundary, as a `&mut` capture is.
 
 ---
 

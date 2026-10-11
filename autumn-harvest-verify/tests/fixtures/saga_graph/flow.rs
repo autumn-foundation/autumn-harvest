@@ -552,3 +552,27 @@ pub async fn wf_handler_fn_pointer(ctx: &WorkflowContext) -> Out {
     ctx.register_update_handler("book", |_: &u64| Ok(()), handler);
     ctx.receive_signal("go").await
 }
+
+/// The handler of `wf_handler_shared_call`. It returns `Ok` with its step
+/// pending, which is fine for a handler run only.
+pub async fn handle_ok_pending(v: u64) -> Out {
+    let mut saga = Saga::new(&HANDLER_CTX);
+    let a = saga
+        .step(
+            move || async move { HANDLER_CTX.execute_activity_raw("reserve", v).await },
+            |a| async move { HANDLER_CTX.execute_activity_raw("release", a).await.map(|_| ()) },
+        )
+        .await?;
+    Ok(a)
+}
+
+pub fn __autumn_workflow_info_wf_handler_shared_call() -> u8 {
+    0
+}
+
+/// The handler closure delegates to `handle_ok_pending`, and the workflow
+/// also awaits it as an ordinary helper.
+pub async fn wf_handler_shared_call(ctx: &WorkflowContext) -> Out {
+    ctx.register_update_handler("book", |_: &u64| Ok(()), |v: u64| handle_ok_pending(v));
+    handle_ok_pending(1).await
+}

@@ -516,6 +516,23 @@ fn a_matched_step_result_is_unknown() {
 }
 
 #[test]
+fn a_handler_future_that_the_workflow_also_awaits_is_checked_as_a_helper() {
+    // The handler closure and an ordinary call both reach the coroutine of
+    // `handle_ok_pending`. The ordinary run drops a pending step.
+    let reports = check();
+    let r = reports
+        .iter()
+        .find(|r| r.name == "wf_handler_shared_call")
+        .expect("the fixture has the workflow");
+    assert!(
+        r.unknown
+            .iter()
+            .any(|u| u.starts_with("saga-dropped-pending") && u.contains("handle_ok_pending")),
+        "{r:#?}"
+    );
+}
+
+#[test]
 fn every_fixture_workflow_gets_its_expected_verdict() {
     use SagaVerdict::{Covered, Gap, NoSaga, Unknown};
     let expected = [
@@ -530,6 +547,7 @@ fn every_fixture_workflow_gets_its_expected_verdict() {
         ("wf_handler_delegate_gap", Gap),
         ("wf_handler_fn_pointer", Unknown),
         ("wf_handler_gap", Gap),
+        ("wf_handler_shared_call", Unknown),
         ("wf_handlers", NoSaga),
         ("wf_helper_owns", Unknown),
         ("wf_loop", Covered),
