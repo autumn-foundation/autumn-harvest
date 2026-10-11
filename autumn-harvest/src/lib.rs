@@ -302,7 +302,8 @@ pub mod diagnostic;
 /// Task dispatch channel seam (issue #1312): Postgres stays the source of
 /// truth, a [`dispatch::TaskDispatch`] carries task references.
 pub mod dispatch;
-/// Deterministic simulation of the activity claim protocol (issue #1830).
+/// Deterministic simulation of the activity claim protocol (issue #1830),
+/// and of the real worker loop (issue #2002).
 pub mod dst;
 /// Effective runtime-configuration introspection (issue #695).
 ///
@@ -336,6 +337,7 @@ pub mod external_target_location;
 #[cfg(feature = "db")]
 pub mod external_task;
 pub mod failure;
+pub mod fan_out;
 /// Replay fuzz harness (issue #1835). Not a stable API.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
@@ -725,7 +727,7 @@ pub use replay::{
 pub use reset::{
     BatchResetItem, BatchResetOutcome, ResetInvalidPoint, ResetPlan, ResetPoint, ResetResult,
     ResetSignalReapplyPolicy, ResetSkipReason, ResetUnresolvedSideEffect, WorkflowResetError,
-    WorkflowResetRequest, preview_workflow_reset, reset_workflow_execution,
+    WorkflowResetRequest, batch_skip_reason, preview_workflow_reset, reset_workflow_execution,
     resolve_batch_reset_one, resolve_reset_point, validate_reset_point,
 };
 pub use retention::{

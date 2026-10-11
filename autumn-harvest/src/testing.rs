@@ -4951,8 +4951,9 @@ async fn replay_fixture_file(
 // `UpdateAdmitted` and its result event. `run` is `start(..).finish()`, so
 // both APIs share one loop.
 
-/// Maximum number of executor iterations before declaring an infinite loop.
-const MAX_TEST_ITERATIONS: usize = 1_000;
+/// The default cap on executor iterations before a run counts as an infinite
+/// loop. [`WorkflowTestEnv::with_max_iterations`] changes it.
+pub const MAX_TEST_ITERATIONS: usize = 1_000;
 
 /// Synthetic host worker id auto-resolved for the internal worker-session
 /// acquire activity (issue #606) when no explicit mock/`attempt_result` is
@@ -5435,7 +5436,7 @@ impl WorkflowTestRun<'_> {
             return TestRunStatus::Blocked;
         }
         let span_meta = self.env.span_meta();
-        for _iter in 0..MAX_TEST_ITERATIONS {
+        for _iter in 0..self.env.max_iterations {
             // Task-prep ingest (issue #775): production's
             // `worker::ingest_due_timers_and_signals` appends every pending
             // signal before the handler runs. It does not wait for a
@@ -5507,8 +5508,9 @@ impl WorkflowTestRun<'_> {
                 }
             }
         }
+        let cap = self.env.max_iterations;
         self.end_with_error(format!(
-            "WorkflowTestEnv: workflow exceeded {MAX_TEST_ITERATIONS} iterations \
+            "WorkflowTestEnv: workflow exceeded {cap} iterations \
              (possible infinite loop or unresolvable suspension)"
         ));
         TestRunStatus::Finished
@@ -5779,6 +5781,8 @@ impl WorkflowTestRun<'_> {
 /// # }
 /// ```
 pub struct WorkflowTestEnv {
+    /// The cap on executor iterations of one run.
+    max_iterations: usize,
     /// Fallback mocks: activity name → closure(input) → result.
     activity_mocks: HashMap<String, MockFn>,
     /// Per-call-count mocks: (name, 1-based call number) → result.
@@ -5895,6 +5899,7 @@ impl WorkflowTestEnv {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            max_iterations: MAX_TEST_ITERATIONS,
             activity_mocks: HashMap::new(),
             attempt_results: HashMap::new(),
             retry_sequences: HashMap::new(),
@@ -6231,6 +6236,23 @@ impl WorkflowTestEnv {
     pub fn with_workflow_name(mut self, name: impl Into<String>) -> Self {
         self.workflow_name = name.into();
         self
+    }
+
+    /// Set the cap on executor iterations of one run (issue #2001).
+    ///
+    /// Each sequential await costs one iteration. A run that passes the cap
+    /// ends with an error. The default is [`MAX_TEST_ITERATIONS`]. Raise it
+    /// to drive a long recorded run.
+    #[must_use]
+    pub const fn with_max_iterations(mut self, max_iterations: usize) -> Self {
+        self.max_iterations = max_iterations;
+        self
+    }
+
+    /// The cap on executor iterations of one run.
+    #[must_use]
+    pub const fn max_iterations(&self) -> usize {
+        self.max_iterations
     }
 
     /// Set the business-level `workflow_id` for the contexts this env builds

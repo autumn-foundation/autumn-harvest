@@ -335,7 +335,6 @@ async fn reset_and_rerun_copy_the_tenant() {
                 operator_id: "test-operator".to_string(),
                 signal_reapply: autumn_harvest::ResetSignalReapplyPolicy::default(),
                 allow_terminal_source: false,
-                refuse_erased_source: false,
             },
             None,
         )

@@ -58,3 +58,26 @@ and no claim epoch.
   timers.
 
 See [`docs/testing/simulation.md`](../testing/simulation.md).
+
+## Amendment: the world simulation (issue #2002)
+
+The oracle harness stays as decided above. Issue #2002 adds a second
+harness, `autumn_harvest::dst::world`. It takes two ideas of option (b):
+one thread and a seed that picks each step. It drops the oracle, so it runs
+`worker.rs` on a real Postgres.
+
+- One step is one whole action, such as one iteration of the worker poll
+  loop. Steps never overlap, so the seed fixes the order of every write.
+- The clock is virtual. A shift moves the stored instants of each
+  `harvest_*` table back: one minute per step, and one day plus 1 ms per
+  advance. No clock seam enters production code.
+- Each run uses a fresh database. Each seed runs twice, and the reports must
+  be equal.
+- The scope is the resident path, timers, signals, the scheduler fire
+  claim, the reclaimer and the timeout sweeper. The faults are worker
+  stalls, crashes and abandoned claims.
+
+This closes the first consequence above for the poll loop. A race between
+two statements of one cycle is still out of scope. Next scope: a crash
+inside a step, statement-level interleaving through the chaos holds, and
+the quarantine and `FAILED` paths.

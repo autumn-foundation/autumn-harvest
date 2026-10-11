@@ -397,3 +397,7 @@ Temporal-style Schedule object.
 - **[Why Harvest keeps deterministic replay](why-deterministic-replay.md)**
   ([#1993](https://github.com/autumn-foundation/autumn-harvest/issues/1993)):
   what replay buys over checkpoint-only steps, and how Harvest lowers its cost.
+- **[Safety report](safety-report.md)**
+  ([#2004](https://github.com/autumn-foundation/autumn-harvest/issues/2004)):
+  the claim, tests, results and known limits for leases, fencing,
+  exactly-once completion and signal ordering.

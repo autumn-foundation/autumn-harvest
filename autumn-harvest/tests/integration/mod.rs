@@ -140,9 +140,11 @@ mod delayed_start_tests;
 mod det_check_tests;
 mod determinism_static_analysis_docs;
 mod dispatch_tests;
+mod docs_guard_support;
 mod drain_release_tests;
 #[cfg(feature = "db")]
 mod dst_differential_tests;
+mod dst_world_tests;
 mod e2e_bench_cell_timeout_tests;
 mod e2e_bench_support;
 #[cfg(feature = "db")]
@@ -153,9 +155,13 @@ mod executor_span_tests;
 #[cfg(feature = "testing")]
 mod external_completion_tests;
 mod external_outbox_scan_tests;
+#[cfg(feature = "db")]
+mod fanout_result_writer_db_tests;
 mod fanout_tests;
+mod fanout_tolerance_tests;
 mod force_fail_tests;
 mod formal_models_coverage;
+mod formal_trace_coverage;
 mod fuzz_nightly_wiring;
 mod guardrail_catalog_tests;
 mod havoc_reentrancy;
@@ -271,6 +277,7 @@ mod retry_budget_tests;
 mod retry_chain_routing_tests;
 mod retry_clock_skew_tests;
 mod retry_now_tests;
+mod safety_report_docs;
 mod saga_tests;
 mod scanner_lease_tests;
 mod scanner_liveness_tests;
@@ -340,6 +347,10 @@ mod throttle_bucket_prelock_batch_perf;
 mod throttle_tests;
 #[cfg(feature = "db")]
 mod throwaway_db;
+// The recorder is used by the chaos suite only. Its unit tests run in
+// every build, so the exporter is checked on each PR (issue #2003).
+#[cfg_attr(not(feature = "chaos"), allow(dead_code))]
+mod tla_trace;
 #[cfg(feature = "db")]
 mod transactional_activity_tests;
 #[cfg(feature = "db")]
