@@ -19,8 +19,8 @@ other activity gets a `WaitForActivity` command again, with its live
 sender. A cold replay emits the same command, and it writes no event.
 
 A cycle that re-parks a sibling is a speculation. It must only wait, and
-it must not read the replay position. It fires no side effect that replay
-suppresses. Otherwise the resume declines with
+it must not read history state, such as the replay position. It fires no
+side effect that replay suppresses. Otherwise the resume declines with
 `ResumeDeclined::SiblingStillParked`, and the worker drops the future and
 replays cold. A delta with several results runs as one cycle per result,
 in history order, because a cold replay matches them in that order.

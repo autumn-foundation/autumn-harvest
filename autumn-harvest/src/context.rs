@@ -3404,6 +3404,10 @@ impl WorkflowContext {
     where
         F: FnOnce(&mut HistoryMatcher) -> R,
     {
+        // Every public history read and every command match passes here. In
+        // a speculative cycle each one counts as a position read (issue
+        // #2008).
+        self.note_position_read();
         let result = {
             let mut matcher = self.matcher.lock().expect("matcher lock poisoned");
             f(&mut matcher)

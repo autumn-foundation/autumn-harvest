@@ -49,9 +49,9 @@
 //! resume therefore checks that the cycle suspends with only its re-parked
 //! waits. Otherwise it declines with [`ResumeDeclined::SiblingStillParked`].
 //!
-//! A cold replay can stop its cursor at a sibling command, so a read of the
-//! replay position can differ too. Such a cycle is a speculation: it fires
-//! no side effect that replay suppresses, and a position read declines it.
+//! A cold replay can stop its cursor at a sibling command, so a read of
+//! history state can differ too. Such a cycle is a speculation: it fires no
+//! side effect that replay suppresses, and any history read declines it.
 //!
 //! A delta with several results runs as one cycle per result, in history
 //! order. A cold replay matches the results in that order. A branch that
@@ -2284,6 +2284,7 @@ mod tests {
                 position_in_branch_workflow,
                 Arrival::All,
             ),
+            ("unread read", unread_in_branch_workflow, Arrival::Oldest),
         ] {
             for progress in [false, true] {
                 let warm =
@@ -2309,6 +2310,25 @@ mod tests {
                         "position": ctx.replay_position(),
                         "replaying": ctx.is_replaying(),
                     }))
+                },
+                ctx.execute_activity_raw("b", json!({}), "default"),
+            );
+            let seen = seen.map_err(|e| e.to_string())?;
+            b.map_err(|e| e.to_string())?;
+            ctx.execute_activity_raw("c", seen, "default")
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Asks whether history is unread in a branch while `b` is parked, then
+    /// passes the answer to `c`.
+    fn unread_in_branch_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            let (seen, b) = futures::join!(
+                async {
+                    ctx.execute_activity_raw("a", json!({}), "default").await?;
+                    Ok::<_, crate::error::HarvestError>(json!(ctx.history_has_unconsumed_events()))
                 },
                 ctx.execute_activity_raw("b", json!({}), "default"),
             );

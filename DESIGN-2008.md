@@ -62,7 +62,7 @@ counter, `harvest.workflow.resident`. `ResumeDeclined` gains one variant.
 | R8 | The extended path is never exercised under faults. | The DST world workload gains a join. A seeded test pins a warm partial resume through the real worker. |
 | R9 | The change lowers the hit rate of today's shapes. | All existing resident tests stay green. The measurement covers a single-await workload too. |
 | R10 | Two results land in one delta, and the earlier branch runs on. A cold replay fails, but the warm cycle accepts. Review found it. | A delta with several results runs as one cycle per result, in history order. Each cycle but the last must only wait. |
-| R11 | A branch reads `ctx.info()`, `replay_position()` or `is_replaying()` while a sibling is parked. A cold replay can stop its cursor at the sibling command and read another value. Review found it. | Such a cycle is a speculation. A position read declines it. |
+| R11 | A branch reads `ctx.info()`, `replay_position()`, `is_replaying()` or `history_has_unconsumed_events()` while a sibling is parked. A cold replay can stop its cursor at the sibling command and read another value. Review and Codex found it. | Such a cycle is a speculation. Every history read and match passes `match_history` or a guarded direct read, and any one declines the cycle. |
 | R12 | A post-poll decline repeats a log line or a business metric, because the cold replay fires it again. Review found it. | A speculative cycle fires no side effect that replay suppresses. |
 
 ### 0.4 Six thinking hats
