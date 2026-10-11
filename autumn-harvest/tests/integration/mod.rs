@@ -21,6 +21,7 @@ mod activity_timeout_retry_tests;
 mod adaptive_limit_tests;
 mod admission_gate_authoritative_tests;
 mod admission_gate_tests;
+mod agent_code_journal_docs;
 mod alert_pack_docs;
 #[cfg(feature = "db")]
 mod append_only_guard_tests;

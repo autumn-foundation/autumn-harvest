@@ -569,6 +569,9 @@ pub mod store;
 pub mod timeout;
 #[cfg(feature = "wasm-activities")]
 pub mod wasm_activities;
+/// Journaled, capability-gated host calls for WASM activities (issue #2014).
+#[cfg(feature = "wasm-activities")]
+pub mod wasm_journal;
 /// Ed25519 publisher signatures for WASM modules (issue #1838).
 #[cfg(feature = "wasm-activities")]
 pub mod wasm_signing;
