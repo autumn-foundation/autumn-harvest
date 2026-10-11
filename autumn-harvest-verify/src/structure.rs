@@ -39,6 +39,9 @@ const INFO_MARKERS: [&str; 2] = ["__autumn_activity_info_", "__autumn_workflow_i
 /// The longest chain of locals that step-key resolution follows.
 const MAX_KEY_DEPTH: u8 = 8;
 
+/// The flow graph format this module writes (issue #2010).
+pub const FLOW_FORMAT: &str = "harvest-flow/1";
+
 /// The structure of every analyzed workflow in one build.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StructureManifest {
@@ -46,6 +49,10 @@ pub struct StructureManifest {
     pub format: String,
     pub model_version: String,
     pub rustc_version: String,
+    /// [`FLOW_FORMAT`] when each body carries a flow graph. A manifest from
+    /// an older build has none, so a check over flow graphs refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow: Option<String>,
     pub workflows: Vec<WorkflowStructure>,
 }
 
@@ -63,6 +70,106 @@ pub struct WorkflowStructure {
     pub boundaries: Vec<String>,
     /// Each body reachable from the root, sorted by id.
     pub bodies: Vec<BodyNode>,
+    /// Each signal, update or query handler the workflow registers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handlers: Vec<HandlerSite>,
+}
+
+/// One handler registration (issue #2010).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandlerSite {
+    /// `signal`, `update` or `query`.
+    pub kind: String,
+    /// The model row, such as `register_signal_handler`.
+    pub method: String,
+    /// The handler name, when the MIR shows it.
+    pub name: Option<String>,
+    /// The closure bodies the registration passes, such as a validator and a
+    /// handler.
+    pub bodies: Vec<String>,
+}
+
+/// The condensed control-flow graph of one body (issue #2010).
+///
+/// A node is an event. An edge joins two events when a path joins them with
+/// no other event on it. A node id is its index in `nodes`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowGraph {
+    pub nodes: Vec<FlowNode>,
+    pub edges: Vec<FlowEdge>,
+}
+
+/// One event in a body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowNode {
+    /// The MIR block of the event. It is for diagnostics only, because block
+    /// labels change from build to build.
+    pub at: String,
+    #[serde(flatten)]
+    pub event: FlowEvent,
+}
+
+/// What happens at a flow node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum FlowEvent {
+    /// The first block. For a coroutine, the target of state `0`.
+    Entry,
+    /// A step site. The value is its index in [`BodyNode::steps`].
+    Step { step: usize },
+    /// A call that starts other bodies of the graph.
+    Call { callees: Vec<String> },
+    /// A handler registration. The value is its index in
+    /// [`WorkflowStructure::handlers`].
+    Handler { handler: usize },
+    /// `Saga::new`.
+    SagaNew,
+    /// `Saga::step`, with its forward and compensation closure bodies.
+    /// `tracked` is true when its `ok` and `err` edges are labeled.
+    SagaStep {
+        forward: Vec<String>,
+        compensate: Vec<String>,
+        tracked: bool,
+    },
+    /// `Saga::compensate_all`.
+    SagaCompensate,
+    /// A value of type `Saga` reaches a call or a value that is not a
+    /// `Saga` method. The value names the call or the statement.
+    SagaEscape { to: String },
+    /// A write of the value the body returns.
+    Exit { outcome: ExitOutcome },
+}
+
+/// What an exit returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExitOutcome {
+    /// A literal `Ok(..)`.
+    Ok,
+    /// A literal `Err(..)`, or the error arm of `?`.
+    Err,
+    /// Any other value, such as a call result. It can be an error.
+    Unknown,
+}
+
+/// One edge of a flow graph.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct FlowEdge {
+    pub from: usize,
+    pub to: usize,
+    /// Set only on the out-edges of a tracked `Saga::step`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<EdgeLabel>,
+}
+
+/// The arm of a `Saga::step` result that an edge follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EdgeLabel {
+    /// The step completed, so its compensation is pending.
+    Ok,
+    /// The step failed, so the saga unwound every earlier step.
+    Err,
 }
 
 /// One body in a workflow graph.
@@ -78,6 +185,9 @@ pub struct BodyNode {
     /// One entry per sink call site, sorted.
     #[serde(default)]
     pub steps: Vec<StepSite>,
+    /// The flow graph of the body (issue #2010). The digest does not read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow: Option<FlowGraph>,
 }
 
 /// One call from a body to another body in the graph.
@@ -209,6 +319,7 @@ pub fn manifest(
         format: STRUCTURE_FORMAT.to_string(),
         model_version: model_version.to_string(),
         rustc_version: rustc_version.to_string(),
+        flow: None,
         workflows,
     }
 }
@@ -331,6 +442,7 @@ impl<'p> StructureBuilder<'p> {
                 digest: self.digests.get(id.as_str()).cloned().unwrap_or_default(),
                 calls,
                 steps,
+                flow: None,
             });
         }
         bodies.sort_by(|a, b| a.id.cmp(&b.id));
@@ -347,6 +459,7 @@ impl<'p> StructureBuilder<'p> {
             root: show(root),
             boundaries,
             bodies,
+            handlers: Vec::new(),
         }
     }
 

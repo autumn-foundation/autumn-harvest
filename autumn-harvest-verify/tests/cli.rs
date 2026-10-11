@@ -485,3 +485,76 @@ fn help_documents_emit_structure() {
         stdout(&out)
     );
 }
+
+// ── saga coverage over a manifest (issue #2010) ────────────────────────────
+
+/// Write the manifest of the saga fixture into `dir`.
+fn saga_manifest(dir: &Path) -> PathBuf {
+    let out_path = dir.join("saga.structure.json");
+    let mir_dir = fixtures_dir().join("saga_graph");
+    let out = run(&[
+        "--mir",
+        &mir_dir.join("flow.mir").to_string_lossy(),
+        "--source-root",
+        &mir_dir.to_string_lossy(),
+        "--emit-structure",
+        &out_path.to_string_lossy(),
+    ]);
+    assert_ne!(code(&out), 2, "stderr:\n{}", stderr(&out));
+    out_path
+}
+
+#[test]
+fn check_structure_prints_a_verdict_per_workflow_and_fails_on_a_gap() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = saga_manifest(dir.path());
+    let out = run(&["--check-structure", &path.to_string_lossy()]);
+    assert_eq!(code(&out), 1, "a gap fails the run:\n{}", stdout(&out));
+    let text = stdout(&out);
+    assert!(text.contains("gap  flow::wf_gap_after_step"), "{text}");
+    assert!(text.contains("covered  flow::wf_covered"), "{text}");
+    assert!(text.contains("no-saga  flow::wf_no_saga"), "{text}");
+    assert!(text.contains("unknown  flow::wf_escapes"), "{text}");
+}
+
+#[test]
+fn check_structure_writes_json() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = saga_manifest(dir.path());
+    let out = run(&[
+        "--check-structure",
+        &path.to_string_lossy(),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&out), 1);
+    let reports: Vec<autumn_harvest_verify::saga::SagaReport> =
+        serde_json::from_str(&stdout(&out))
+            .unwrap_or_else(|e| panic!("stdout is not JSON: {e}\n{}", stdout(&out)));
+    assert!(reports.iter().any(|r| r.name == "wf_gap_tail"));
+}
+
+#[test]
+fn check_structure_refuses_a_manifest_without_flow_graphs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("old.structure.json");
+    std::fs::write(
+        &path,
+        r#"{"format":"harvest-structure/1","model_version":"m","rustc_version":"r","workflows":[]}"#,
+    )
+    .expect("write");
+    let out = run(&["--check-structure", &path.to_string_lossy()]);
+    assert_eq!(code(&out), 2, "a tool error:\n{}", stderr(&out));
+    assert!(stderr(&out).contains("harvest-flow/1"), "{}", stderr(&out));
+}
+
+#[test]
+fn help_documents_check_structure() {
+    let out = run(&["--help"]);
+    assert_eq!(code(&out), 0);
+    assert!(
+        stdout(&out).contains("--check-structure"),
+        "{}",
+        stdout(&out)
+    );
+}

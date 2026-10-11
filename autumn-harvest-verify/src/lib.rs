@@ -22,6 +22,7 @@ pub mod model;
 pub mod pipeline;
 pub mod report;
 pub mod resolve;
+pub mod saga;
 pub mod structure;
 mod util;
 pub mod verdict;
