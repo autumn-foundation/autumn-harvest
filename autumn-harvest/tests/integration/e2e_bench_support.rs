@@ -3210,7 +3210,7 @@ pub mod db {
         /// A report note: the hit rate and each miss reason.
         #[must_use]
         pub fn note(&self) -> String {
-            let counts = self.0.lock().expect("poisoned");
+            let counts = self.0.lock().expect("poisoned").clone();
             let total: u64 = counts.values().sum();
             let hits: u64 = counts
                 .iter()

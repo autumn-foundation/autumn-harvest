@@ -675,7 +675,7 @@ pub async fn start_explained(
     let drive = crate::executor::drive_workflow_keep(ctx, handler, input, None, Some(key)).await;
     let kept = drive
         .resident
-        .ok_or(drive.not_kept.unwrap_or(NotKept::NoAwait));
+        .ok_or_else(|| drive.not_kept.unwrap_or(NotKept::NoAwait));
     (drive.outcome, kept)
 }
 
