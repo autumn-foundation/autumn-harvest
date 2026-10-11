@@ -158,6 +158,7 @@ fn build_worker() -> Arc<Worker> {
                 shard_notification_database_urls: Vec::new(),
                 max_concurrent_workflows: 4,
                 max_concurrent_activities: 4,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
