@@ -2733,6 +2733,17 @@ impl HarvestBuilder {
         self.retention
             .validate()
             .map_err(HarvestBuilderError::InvalidRetention)?;
+        // Issue #2009: a straggler delete removes orphan rows that no export
+        // holds, so the pair would lose history with an archiver set.
+        if self.partition_archiver.is_some()
+            && self.retention.partitions.straggler_grace_secs.is_some()
+        {
+            return Err(HarvestBuilderError::InvalidRetention(
+                "partitions.straggler_grace_secs cannot be set with a partition archiver: \
+                 a straggler delete removes rows that no export holds"
+                    .to_string(),
+            ));
+        }
         validate_retention_overrides(
             &self.retention,
             &self.workflows,

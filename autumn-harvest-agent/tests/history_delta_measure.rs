@@ -33,8 +33,8 @@ const TOOL_RESULT_WORDS: usize = 220;
 /// Deterministic filler text, so every run measures the same bytes.
 fn words(seed: u64, n: usize) -> String {
     const WORDS: [&str; 16] = [
-        "harvest", "cohort", "replay", "ledger", "tenant", "signal", "worker", "fence",
-        "payload", "codec", "shard", "commit", "event", "history", "queue", "timer",
+        "harvest", "cohort", "replay", "ledger", "tenant", "signal", "worker", "fence", "payload",
+        "codec", "shard", "commit", "event", "history", "queue", "timer",
     ];
     let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
     let mut out = String::new();
@@ -213,10 +213,19 @@ fn delta_encoding_shrinks_plaintext_but_not_ciphertext() {
     println!("| Form | Bytes | Share of plain |");
     println!("|---|---:|---:|");
     println!("| Plain JSON | {raw_len} | 100.0% |");
-    println!("| Plain, delta | {delta_len} | {:.1}% |", pct(delta_len, raw_len));
+    println!(
+        "| Plain, delta | {delta_len} | {:.1}% |",
+        pct(delta_len, raw_len)
+    );
     println!("| Plain, gzip | {raw_gz} | {:.1}% |", pct(raw_gz, raw_len));
-    println!("| AES-GCM codec | {enc_len} | {:.1}% |", pct(enc_len, raw_len));
-    println!("| AES-GCM, gzip | {enc_gz} | {:.1}% |", pct(enc_gz, raw_len));
+    println!(
+        "| AES-GCM codec | {enc_len} | {:.1}% |",
+        pct(enc_len, raw_len)
+    );
+    println!(
+        "| AES-GCM, gzip | {enc_gz} | {:.1}% |",
+        pct(enc_gz, raw_len)
+    );
     println!("Shared prefix of the last two encoded transcripts: {cipher_shared} bytes");
 
     assert!(

@@ -109,13 +109,11 @@ struct BoolRow {
 }
 
 async fn exists(conn: &mut AsyncPgConnection, table: &str) -> bool {
-    diesel::sql_query(format!(
-        "SELECT to_regclass('{table}') IS NOT NULL AS v"
-    ))
-    .get_result::<BoolRow>(conn)
-    .await
-    .expect("to_regclass")
-    .v
+    diesel::sql_query(format!("SELECT to_regclass('{table}') IS NOT NULL AS v"))
+        .get_result::<BoolRow>(conn)
+        .await
+        .expect("to_regclass")
+        .v
 }
 
 async fn row_count(conn: &mut AsyncPgConnection, table: &str) -> i64 {
@@ -205,7 +203,16 @@ fn as_json(events: &[WorkflowEvent]) -> Vec<serde_json::Value> {
 }
 
 /// Seed `n` terminal runs whose history sits in the cohort of `at`.
-async fn seed_runs(
+async fn seed_runs(conn: &mut AsyncPgConnection, at: DateTime<Utc>, n: usize) -> Vec<uuid::Uuid> {
+    let ids = seed_runs_in_place(conn, at, n).await;
+    for exec in &ids {
+        backdate_events(conn, *exec, at).await;
+    }
+    ids
+}
+
+/// Seed `n` terminal runs created at `at`. Their rows keep the default cohort.
+async fn seed_runs_in_place(
     conn: &mut AsyncPgConnection,
     at: DateTime<Utc>,
     n: usize,
@@ -221,7 +228,6 @@ async fn seed_runs(
         )
         .await
         .expect("seed history");
-        backdate_events(conn, exec, at).await;
         ids.push(exec);
     }
     ids
@@ -335,6 +341,14 @@ async fn sweep_with(
     .expect("sweep")
 }
 
+/// Rows as the archive types them. The manifest hash already proves the
+/// bytes, so the tests compare values.
+fn typed(rows: Vec<serde_json::Value>) -> Vec<partition_archive::ArchivedEventRow> {
+    rows.into_iter()
+        .map(|r| serde_json::from_value(r).expect("row parses"))
+        .collect()
+}
+
 fn expected_manifest_key(name: &str, lower: Option<DateTime<Utc>>, upper: DateTime<Utc>) -> String {
     partition_archive::manifest_key(&partition_archive::archive_prefix(0, name, lower, upper))
 }
@@ -357,15 +371,28 @@ async fn an_aged_partition_is_exported_verified_then_dropped_and_reads_back() {
     let key = expected_manifest_key(&aged.name, Some(aged.lower), aged.upper);
     assert_eq!(outcome.dropped, vec![aged.name.clone()], "{outcome:?}");
     assert_eq!(outcome.exported, vec![key.clone()], "{outcome:?}");
-    assert!(!exists(&mut conn, &aged.name).await, "the partition is dropped");
+    assert!(
+        !exists(&mut conn, &aged.name).await,
+        "the partition is dropped"
+    );
 
     // Order: every segment, then the manifest, then the read-back.
     let log = backend.log.lock().unwrap().clone();
     let last_put = log.iter().rposition(|l| l.starts_with("put ")).unwrap();
     let first_get = log.iter().position(|l| l.starts_with("get ")).unwrap();
-    assert_eq!(log[last_put], format!("put {key}"), "the manifest goes last: {log:?}");
-    assert!(first_get > last_put, "verify reads back after the upload: {log:?}");
-    assert!(log.contains(&format!("get {key}")), "the manifest is read back: {log:?}");
+    assert_eq!(
+        log[last_put],
+        format!("put {key}"),
+        "the manifest goes last: {log:?}"
+    );
+    assert!(
+        first_get > last_put,
+        "verify reads back after the upload: {log:?}"
+    );
+    assert!(
+        log.contains(&format!("get {key}")),
+        "the manifest is read back: {log:?}"
+    );
 
     // Copy the objects into a directory backend to read back through it.
     let disk = DirectoryPartitionArchiver::new(dir.path());
@@ -380,12 +407,7 @@ async fn an_aged_partition_is_exported_verified_then_dropped_and_reads_back() {
     assert_eq!(archived.manifest.lower, Some(aged.lower));
     assert_eq!(archived.manifest.upper, aged.upper);
     assert_eq!(archived.manifest.row_count, 9);
-    let after: Vec<serde_json::Value> = archived
-        .rows
-        .iter()
-        .map(|r| serde_json::to_value(r).unwrap())
-        .collect();
-    assert_eq!(after, before, "the archive holds every row, byte for byte");
+    assert_eq!(archived.rows, typed(before), "the archive holds every row");
     for run in &aged.runs {
         let history = archived.history(ExecutionId::from_uuid(*run)).unwrap();
         assert_eq!(as_json(&history), as_json(&sample_events()));
@@ -397,7 +419,7 @@ async fn the_legacy_partition_exports_under_a_min_lower_bound() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     reset(&mut conn).await;
-    let runs = seed_runs(&mut conn, Utc::now() - chrono::Duration::days(3), 2).await;
+    let runs = seed_runs_in_place(&mut conn, Utc::now() - chrono::Duration::days(3), 2).await;
     partition::enable_partitioning(&mut conn, &EnableOptions::default())
         .await
         .expect("enable on a populated table");
@@ -432,7 +454,12 @@ async fn the_legacy_partition_exports_under_a_min_lower_bound() {
 
 // ── Each failure keeps the partition ──────────────────────────────────────
 
-async fn assert_kept(conn: &mut AsyncPgConnection, aged: &Aged, outcome: &partition::SweepOutcome, why: &str) {
+async fn assert_kept(
+    conn: &mut AsyncPgConnection,
+    aged: &Aged,
+    outcome: &partition::SweepOutcome,
+    why: &str,
+) {
     assert!(outcome.dropped.is_empty(), "{why}: {outcome:?}");
     assert!(outcome.exported.is_empty(), "{why}: {outcome:?}");
     assert!(
@@ -443,7 +470,11 @@ async fn assert_kept(conn: &mut AsyncPgConnection, aged: &Aged, outcome: &partit
         "{why}: the reason is reported: {outcome:?}"
     );
     assert!(exists(conn, &aged.name).await, "{why}: the partition stays");
-    assert_eq!(row_count(conn, &aged.name).await, 9, "{why}: every row stays");
+    assert_eq!(
+        row_count(conn, &aged.name).await,
+        9,
+        "{why}: every row stays"
+    );
 }
 
 #[tokio::test]
@@ -507,13 +538,15 @@ async fn a_row_changed_after_the_export_keeps_the_partition_until_a_new_export()
     let archived = partition_archive::read_back(backend.as_ref(), &key)
         .await
         .expect("read back");
-    let rows: Vec<serde_json::Value> = archived
-        .rows
-        .iter()
-        .map(|r| serde_json::to_value(r).unwrap())
-        .collect();
-    assert_eq!(rows, current, "the new export holds the changed row");
-    assert_eq!(rows[0]["event_data"]["rotated"], serde_json::json!(true));
+    assert_eq!(
+        archived.rows,
+        typed(current),
+        "the new export holds the changed row"
+    );
+    assert_eq!(
+        archived.rows[0].event_data["rotated"],
+        serde_json::json!(true)
+    );
 }
 
 #[tokio::test]
@@ -567,7 +600,10 @@ async fn the_retention_runtime_exports_before_it_drops() {
     for _ in 0..400 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let snap = runtime.monitor().snapshot();
+        // The history phase replaces the shard result, which clears the
+        // maintenance outcome. Both set means this tick's maintenance ran.
         if let Some(r) = snap.per_shard.iter().find(|r| r.shard == 0)
+            && r.ran_at.is_some()
             && r.partition_maintenance
                 .as_ref()
                 .and_then(|m| m.at)

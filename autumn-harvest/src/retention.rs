@@ -1564,6 +1564,7 @@ async fn run_partition_maintenance_pass(
     owner: crate::scanner_health::ScannerOwner,
     shutdown: &CancellationToken,
     tick_fenced: bool,
+    partition_archiver: Option<&Arc<dyn crate::partition_archive::PartitionArchiver>>,
 ) {
     if !config.partitions.enabled {
         return;
@@ -1689,13 +1690,20 @@ async fn run_partition_maintenance_pass(
             // Issue #1823: the connection predates the pass, so it joins it.
             // A lost guard then ends its backend.
             let _member = crate::replication::join_fenced_pass(pool, &mut conn).await;
-            crate::partition::maintain_with_progress(
+            // Issue #2009: with an archiver, each drop waits for a checked
+            // export. The shard ID goes into each key.
+            let export = partition_archiver.map(|archiver| {
+                crate::partition_archive::PartitionExport::new(Arc::clone(archiver), shard.as_i32())
+                    .with_io_timeout(config.archival_timeout())
+            });
+            crate::partition::maintain_exporting(
                 &mut conn,
                 now,
                 config.partitions.lookahead_cohorts,
                 &sweep_opts,
                 cursor.resume_after,
                 cursor.catch_up_target,
+                export.as_ref(),
                 &mut tick_partition,
             )
             .await
@@ -1819,11 +1827,10 @@ impl RetentionRuntime {
         metrics: Arc<dyn MetricsRecorder>,
         hooks: RetentionHooks,
     ) -> Option<Self> {
-        Self::spawn(pools, config, metrics, hooks.archiver, hooks.offloader)
+        Self::spawn_inner(pools, config, metrics, hooks)
     }
 
     #[must_use]
-    #[allow(clippy::too_many_lines)]
     pub fn spawn(
         pools: ShardedDbPool,
         config: RetentionConfig,
@@ -1831,6 +1838,30 @@ impl RetentionRuntime {
         archiver: Option<Arc<dyn HistoryArchiver>>,
         offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
     ) -> Option<Self> {
+        Self::spawn_inner(
+            pools,
+            config,
+            metrics,
+            RetentionHooks {
+                archiver,
+                offloader,
+                partition_archiver: None,
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn spawn_inner(
+        pools: ShardedDbPool,
+        config: RetentionConfig,
+        metrics: Arc<dyn MetricsRecorder>,
+        hooks: RetentionHooks,
+    ) -> Option<Self> {
+        let RetentionHooks {
+            archiver,
+            offloader,
+            partition_archiver,
+        } = hooks;
         if !config.enabled() {
             return None;
         }
@@ -1926,6 +1957,7 @@ impl RetentionRuntime {
                 owner,
                 &shutdown_task,
                 false,
+                partition_archiver.as_ref(),
             )
             .await;
             if shutdown_task.is_cancelled() {
@@ -2102,6 +2134,7 @@ impl RetentionRuntime {
                         owner,
                         &shutdown_task,
                         true,
+                        partition_archiver.as_ref(),
                     )
                     .await;
 

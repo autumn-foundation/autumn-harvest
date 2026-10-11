@@ -419,6 +419,7 @@ dependencies = [
  "autumn-harvest",
  "autumn-harvest-sqlite",
  "chrono",
+ "flate2",
  "futures",
  "proptest",
  "serde",
