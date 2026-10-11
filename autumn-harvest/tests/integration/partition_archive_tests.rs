@@ -1202,3 +1202,48 @@ async fn a_failed_marker_write_in_a_caller_transaction_releases_the_lock() {
     .expect("count advisory locks");
     assert_eq!(held.n, 0, "the session lock is released");
 }
+
+/// In a caller transaction, the sweep holds only transaction locks. The
+/// caller's commit or rollback releases them, even when the pass never
+/// reaches its unlock: an error, or a cancelled future as here.
+#[tokio::test]
+async fn a_cancelled_sweep_in_a_caller_transaction_leaves_no_lock() {
+    use diesel_async::{AnsiTransactionManager, TransactionManager};
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_partitioned(&mut conn).await;
+    seed_aged_partition(&mut conn, 2).await;
+
+    AnsiTransactionManager::begin_transaction(&mut conn)
+        .await
+        .expect("begin the caller transaction");
+    let slow = Arc::new(TestArchiver {
+        put_delay: Some(Duration::from_secs(30)),
+        ..TestArchiver::default()
+    });
+    let export = export_to(slow);
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(500),
+        partition::sweep_exporting(
+            &mut conn,
+            Utc::now(),
+            &SweepOptions::default(),
+            None,
+            &export,
+        ),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the pass is cancelled mid-upload");
+    AnsiTransactionManager::rollback_transaction(&mut conn)
+        .await
+        .expect("roll back the caller transaction");
+
+    let held = diesel::sql_query(
+        "SELECT count(*) AS n FROM pg_locks \
+          WHERE locktype = 'advisory' AND pid = pg_backend_pid()",
+    )
+    .get_result::<CountRow>(&mut conn)
+    .await
+    .expect("count advisory locks");
+    assert_eq!(held.n, 0, "the rollback releases every export lock");
+}

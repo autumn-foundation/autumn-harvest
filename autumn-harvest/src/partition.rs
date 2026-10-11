@@ -4098,10 +4098,12 @@ pub async fn evaluate(
 ///
 /// # Cancellation
 ///
-/// An applying pass holds a session advisory lock on `conn` (issue #2009).
-/// If you cancel the pass, close the connection too. A pooled connection that
-/// keeps the lock makes other sweeps on the shard report
-/// [`EXPORT_BUSY_REASON`] until its session ends.
+/// With no transaction open on `conn`, an applying pass holds a session
+/// advisory lock (issue #2009). If you cancel the pass, close the connection
+/// too. A pooled connection that keeps the lock makes other sweeps on the
+/// shard report [`EXPORT_BUSY_REASON`] until its session ends. Inside a
+/// Diesel transaction, the pass holds a transaction lock only, and your
+/// commit or rollback releases it.
 ///
 /// # Errors
 ///
@@ -4125,10 +4127,12 @@ pub async fn sweep(
 ///
 /// # Cancellation
 ///
-/// An applying pass holds a session advisory lock on `conn` (issue #2009).
-/// If you cancel the pass, close the connection too. A pooled connection that
-/// keeps the lock makes other sweeps on the shard report
-/// [`EXPORT_BUSY_REASON`] until its session ends.
+/// With no transaction open on `conn`, an applying pass holds a session
+/// advisory lock (issue #2009). If you cancel the pass, close the connection
+/// too. A pooled connection that keeps the lock makes other sweeps on the
+/// shard report [`EXPORT_BUSY_REASON`] until its session ends. Inside a
+/// Diesel transaction, the pass holds a transaction lock only, and your
+/// commit or rollback releases it.
 ///
 /// # Errors
 ///
@@ -5499,10 +5503,12 @@ async fn maintenance_owner_gap(
 ///
 /// # Cancellation
 ///
-/// An applying pass holds a session advisory lock on `conn` (issue #2009).
-/// If you cancel the pass, close the connection too. A pooled connection that
-/// keeps the lock makes other sweeps on the shard report
-/// [`EXPORT_BUSY_REASON`] until its session ends.
+/// With no transaction open on `conn`, an applying pass holds a session
+/// advisory lock (issue #2009). If you cancel the pass, close the connection
+/// too. A pooled connection that keeps the lock makes other sweeps on the
+/// shard report [`EXPORT_BUSY_REASON`] until its session ends. Inside a
+/// Diesel transaction, the pass holds a transaction lock only, and your
+/// commit or rollback releases it.
 ///
 /// # Errors
 ///
@@ -5544,10 +5550,12 @@ pub async fn maintain(
 ///
 /// # Cancellation
 ///
-/// An applying pass holds a session advisory lock on `conn` (issue #2009).
-/// If you cancel the pass, close the connection too. A pooled connection that
-/// keeps the lock makes other sweeps on the shard report
-/// [`EXPORT_BUSY_REASON`] until its session ends.
+/// With no transaction open on `conn`, an applying pass holds a session
+/// advisory lock (issue #2009). If you cancel the pass, close the connection
+/// too. A pooled connection that keeps the lock makes other sweeps on the
+/// shard report [`EXPORT_BUSY_REASON`] until its session ends. Inside a
+/// Diesel transaction, the pass holds a transaction lock only, and your
+/// commit or rollback releases it.
 ///
 /// # Errors
 ///
@@ -5583,10 +5591,12 @@ pub async fn maintain_with_progress(
 ///
 /// # Cancellation
 ///
-/// An applying pass holds a session advisory lock on `conn` (issue #2009).
-/// If you cancel the pass, close the connection too. A pooled connection that
-/// keeps the lock makes other sweeps on the shard report
-/// [`EXPORT_BUSY_REASON`] until its session ends.
+/// With no transaction open on `conn`, an applying pass holds a session
+/// advisory lock (issue #2009). If you cancel the pass, close the connection
+/// too. A pooled connection that keeps the lock makes other sweeps on the
+/// shard report [`EXPORT_BUSY_REASON`] until its session ends. Inside a
+/// Diesel transaction, the pass holds a transaction lock only, and your
+/// commit or rollback releases it.
 ///
 /// # Errors
 ///

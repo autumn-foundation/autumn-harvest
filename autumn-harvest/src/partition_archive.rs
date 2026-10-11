@@ -1020,6 +1020,11 @@ impl<'a> ExportGate<'a> {
 
     /// Resolve the gate for one applying pass. It never waits for the lock.
     ///
+    /// With no caller transaction, the lock is a session lock, and
+    /// [`Self::release`] ends it. In a caller's transaction, the lock is a
+    /// transaction lock only. The caller's commit or rollback ends it, so an
+    /// error or a cancelled pass cannot leave it held.
+    ///
     /// # Errors
     ///
     /// [`crate::error::HarvestError::Database`] on a query failure. With an
@@ -1031,76 +1036,87 @@ impl<'a> ExportGate<'a> {
         export: Option<&'a PartitionExport>,
     ) -> crate::error::HarvestResult<Self> {
         use diesel_async::AsyncConnection as _;
+        let scoped = crate::notify::in_transaction(conn);
         let Some(export) = export else {
-            let shared = flag(
-                conn,
-                &format!("SELECT pg_try_advisory_lock_shared({EXPORT_LOCK_KEY}) AS v"),
-            )
-            .await?;
-            if !shared {
+            if !scoped
+                && !flag(
+                    conn,
+                    &format!("SELECT pg_try_advisory_lock_shared({EXPORT_LOCK_KEY}) AS v"),
+                )
+                .await?
+            {
                 return Ok(Self::Busy);
             }
-            // In a caller's transaction, a drop stays pending after the pass
-            // ends. The transaction lock keeps an exporter out until that
-            // transaction ends. This session holds the lock shared, so the
-            // call never waits. The savepoint keeps a failure here from
-            // aborting the caller's transaction, so the unlock still runs.
+            // The transaction lock keeps an exporter out until a pending drop
+            // commits. With a session lock held, it never waits. The
+            // savepoint keeps a failure here from aborting the caller's
+            // transaction.
             let read = Box::pin(
                 conn.transaction::<_, crate::error::HarvestError, _>(async |c| {
-                    crate::partition::exec(
-                        c,
-                        &format!("SELECT pg_advisory_xact_lock_shared({EXPORT_LOCK_KEY})"),
-                    )
-                    .await?;
-                    marked(c).await
+                    let sql =
+                        format!("SELECT pg_try_advisory_xact_lock_shared({EXPORT_LOCK_KEY}) AS v");
+                    if !flag(c, &sql).await? {
+                        return Ok(None);
+                    }
+                    marked(c).await.map(Some)
                 }),
             )
             .await;
-            let gate = match read {
-                Ok(true) => Self::Required,
-                Ok(false) => Self::Plain,
+            return match read {
+                Ok(Some(true)) => Ok(Self::Required),
+                Ok(Some(false)) => Ok(Self::Plain),
+                Ok(None) => {
+                    Self::Plain.release(conn).await;
+                    Ok(Self::Busy)
+                }
                 Err(e) => {
                     Self::Plain.release(conn).await;
-                    return Err(e);
+                    Err(e)
                 }
             };
-            return Ok(gate);
         };
-        let exclusive = flag(
-            conn,
-            &format!("SELECT pg_try_advisory_lock({EXPORT_LOCK_KEY}) AS v"),
-        )
-        .await?;
-        if !exclusive {
+        if !scoped
+            && !flag(
+                conn,
+                &format!("SELECT pg_try_advisory_lock({EXPORT_LOCK_KEY}) AS v"),
+            )
+            .await?
+        {
             return Ok(Self::Busy);
         }
         let gate = Self::Active(export);
-        // In a caller's transaction, the marker stays invisible until that
-        // transaction commits, but the session lock ends with the pass. The
-        // transaction lock holds until the marker commits or rolls back. With
-        // no caller transaction, the insert commits under the session lock.
-        // The savepoint keeps a failed insert from aborting the caller's
-        // transaction, so the unlock still runs.
+        // The transaction lock holds until the marker commits or rolls back.
+        // With a session lock held, it never waits. With no caller
+        // transaction, the insert commits under the session lock. The
+        // savepoint keeps a failed insert from aborting the caller's
+        // transaction.
         let marked = Box::pin(
             conn.transaction::<_, crate::error::HarvestError, _>(async |c| {
-                crate::partition::exec(
-                    c,
-                    &format!("SELECT pg_advisory_xact_lock({EXPORT_LOCK_KEY})"),
-                )
-                .await?;
+                let sql = format!("SELECT pg_try_advisory_xact_lock({EXPORT_LOCK_KEY}) AS v");
+                if !flag(c, &sql).await? {
+                    return Ok(false);
+                }
                 crate::partition::exec(
                     c,
                     "INSERT INTO harvest_partition_export (singleton) VALUES (TRUE) \
                      ON CONFLICT DO NOTHING",
                 )
-                .await
+                .await?;
+                Ok(true)
             }),
-        );
-        if let Err(e) = marked.await {
-            gate.release(conn).await;
-            return Err(e);
+        )
+        .await;
+        match marked {
+            Ok(true) => Ok(gate),
+            Ok(false) => {
+                gate.release(conn).await;
+                Ok(Self::Busy)
+            }
+            Err(e) => {
+                gate.release(conn).await;
+                Err(e)
+            }
         }
-        Ok(gate)
     }
 
     /// The blocked reason when this gate allows no drop.
@@ -1123,6 +1139,11 @@ impl<'a> ExportGate<'a> {
     /// A failure is only logged. A broken connection ends its session, and
     /// the session end releases the lock.
     pub(crate) async fn release(&self, conn: &mut diesel_async::AsyncPgConnection) {
+        // In a caller's transaction, the gate holds a transaction lock only,
+        // and the caller's commit or rollback ends it.
+        if crate::notify::in_transaction(conn) {
+            return;
+        }
         let sql = match self {
             Self::Plain | Self::Required => {
                 format!("SELECT pg_advisory_unlock_shared({EXPORT_LOCK_KEY}) AS v")
