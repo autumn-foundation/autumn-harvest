@@ -674,7 +674,8 @@ with `=` or `IN`. Each `OR` branch can hold one, and Postgres then joins the
 index scans with `BitmapOr`. One predicate on the whole filter is also
 enough, as in `attrs.tenant = 'acme' AND (state = 'FAILED' OR owner = 'x')`.
 `attrs.a = 1 OR state = 'RUNNING'` gets `400`, because it costs a full scan
-of the table. A filter with no `OR` needs no index predicate.
+of the table. A filter with no `OR` needs no index predicate. The rule reads
+all `filter` values of a request together, joined with `AND`.
 
 **Limits.** A filter value holds at most 2048 bytes, 8 levels of parentheses
 and 100 `IN` values. All `filter` values of a request hold at most 32

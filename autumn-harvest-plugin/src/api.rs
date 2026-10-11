@@ -10913,7 +10913,8 @@ pub(crate) fn parse_workflow_filters(
                 if value.trim().is_empty() {
                     continue;
                 }
-                let expr = crate::visibility_query::parse(value).map_err(|message| {
+                // The index rule reads all values together, after the loop.
+                let expr = crate::visibility_query::parse_unanchored(value).map_err(|message| {
                     AutumnError::bad_request_msg(format!("invalid filter: {message}"))
                 })?;
                 // The predicate limit applies to the request, not to each value.
@@ -11061,6 +11062,9 @@ pub(crate) fn parse_workflow_filters(
             }
         }
     }
+
+    crate::visibility_query::check_anchor(&filters.filter)
+        .map_err(|message| AutumnError::bad_request_msg(format!("invalid filter: {message}")))?;
 
     // `page_size` takes precedence over `limit` whenever it is present, so the
     // documented "page_size overrides limit" contract holds independent of the

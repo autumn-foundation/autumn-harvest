@@ -1792,6 +1792,22 @@ async fn filter_errors_return_400() {
         assert!(body.to_string().contains(needle), "{filter:?}: {body}");
     }
 
+    // The anchor rule reads every `filter` value of the request together.
+    let uri = format!(
+        "/workflows?filter={}&filter={}",
+        enc("attrs.tenant = 'x'"),
+        enc("state = 'RUNNING' OR owner = 'alice'")
+    );
+    let (status, body) = get_json(&app, uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let uri = format!(
+        "/workflows?filter={}&filter={}",
+        enc("state = 'RUNNING'"),
+        enc("state = 'RUNNING' OR owner = 'alice'")
+    );
+    let (status, body) = get_json(&app, uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
     // An empty value is absent, the same as `state=`.
     let (status, body) = get_json(&app, "/workflows?filter=%20").await;
     assert_eq!(status, StatusCode::OK, "{body}");

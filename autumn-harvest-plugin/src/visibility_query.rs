@@ -65,6 +65,20 @@ pub enum SystemTest {
 ///
 /// Returns a message for the caller when the text is not a valid filter.
 pub fn parse(raw: &str) -> Result<Expr, String> {
+    let expr = parse_unanchored(raw)?;
+    check_anchor(std::slice::from_ref(&expr))?;
+    Ok(expr)
+}
+
+/// Parses `raw` into a filter. It does not check the index rule.
+///
+/// The list API joins all `filter` values with `AND`, then calls
+/// [`check_anchor`] once on the result.
+///
+/// # Errors
+///
+/// Returns a message for the caller when the text is not a valid filter.
+pub fn parse_unanchored(raw: &str) -> Result<Expr, String> {
     if raw.len() > MAX_FILTER_LEN {
         return Err(format!(
             "filter is {} bytes; the limit is {MAX_FILTER_LEN} bytes",
@@ -90,16 +104,27 @@ pub fn parse(raw: &str) -> Result<Expr, String> {
             token.at
         ));
     }
-    // An `OR` that no index can serve forces a full scan. So a filter with
-    // an `OR` must find each row that it matches through an index.
-    if has_or(&expr) && !anchored(&expr) {
+    Ok(expr)
+}
+
+/// Checks the index rule on the `AND` of `exprs`.
+///
+/// An `OR` that no index can serve forces a full scan. So a filter with an
+/// `OR` must find each row that it matches through an index.
+///
+/// # Errors
+///
+/// Returns a message for the caller when the rule fails.
+pub fn check_anchor(exprs: &[Expr]) -> Result<(), String> {
+    let whole = Expr::And(exprs.to_vec());
+    if has_or(&whole) && !anchored(&whole) {
         return Err(
             "a filter with OR needs an indexed predicate on each OR branch, \
              or on the whole filter: an attrs.* predicate, or workflow_name with = or IN"
                 .to_string(),
         );
     }
-    Ok(expr)
+    Ok(())
 }
 
 /// The number of predicates in `expr`.
@@ -1057,6 +1082,24 @@ mod tests {
         parse("(attrs.a = 1 OR attrs.b = 1) AND state = 'RUNNING'").unwrap();
         // With no OR, no anchor is needed.
         parse("state = 'RUNNING' AND owner = 'x'").unwrap();
+    }
+
+    #[test]
+    fn the_anchor_rule_reads_all_filter_values_together() {
+        let tenant = parse_unanchored("attrs.tenant = 'x'").unwrap();
+        let or = parse_unanchored("state = 'RUNNING' OR owner = 'alice'").unwrap();
+        // One value alone has no anchor.
+        assert!(
+            check_anchor(std::slice::from_ref(&or))
+                .unwrap_err()
+                .contains("index")
+        );
+        // With a second value that holds one, the whole filter is anchored.
+        check_anchor(&[tenant, or.clone()]).unwrap();
+        // A value with no OR does not need an anchor.
+        let state = parse_unanchored("state = 'RUNNING'").unwrap();
+        check_anchor(std::slice::from_ref(&state)).unwrap();
+        assert!(check_anchor(&[state, or]).unwrap_err().contains("index"));
     }
 
     #[test]
