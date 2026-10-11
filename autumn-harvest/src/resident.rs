@@ -133,7 +133,10 @@ pub(crate) enum Residency {
     Parked(ResidentWorkflow),
     /// The suspension did not stay resident, for this reason. The reason is
     /// never `Hit` or `Cold`.
-    Missed(ResidentOutcome),
+    Missed(
+        // Only the db-gated worker reads the reason.
+        #[cfg_attr(not(feature = "db"), allow(dead_code))] ResidentOutcome,
+    ),
 }
 
 impl Residency {
