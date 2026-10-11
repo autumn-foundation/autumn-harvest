@@ -152,6 +152,7 @@ fn latest_key(prefix: &str) -> String {
 
 /// The body of a reuse hint.
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
 struct Pointer {
     /// A manifest key.
     manifest: String,
