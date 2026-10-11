@@ -861,19 +861,29 @@ impl Program {
 
     /// Generic parameter names in scope inside `body`, in declaration order when known.
     #[must_use]
+    ///
+    /// A closure or coroutine sees the generics of each function around it,
+    /// as `make_step::{closure#0}` sees `StepFuture` of `make_step`.
     pub fn generic_params(&self, body_path: &str) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
-        if let Some(header) = self.impl_headers.get(body_path) {
-            names.extend(header.generics.iter().cloned());
-        }
-        let name = split_last(body_path).map_or(body_path, |(_, last)| last);
-        if let Some(extra) = self.sources.fn_generics.get(name) {
-            for param in extra {
-                if !names.contains(param) {
-                    names.push(param.clone());
-                }
+        let mut path = body_path;
+        loop {
+            if let Some(header) = self.impl_headers.get(path) {
+                names.extend(header.generics.iter().cloned());
             }
+            let (parent, name) = split_last(path).unwrap_or(("", path));
+            if let Some(extra) = self.sources.fn_generics.get(name) {
+                names.extend(extra.iter().cloned());
+            }
+            // Only a `{closure#0}` or `{coroutine#0}` segment has a parent
+            // whose generics are in scope.
+            if parent.is_empty() || !name.starts_with('{') {
+                break;
+            }
+            path = parent;
         }
+        let mut seen = BTreeSet::new();
+        names.retain(|n| seen.insert(n.clone()));
         names
     }
 
@@ -1364,7 +1374,8 @@ impl Program {
     /// The local types whose fields can write to state another clone sees.
     ///
     /// A field qualifies when it holds `&mut`, takes a lifetime argument, or
-    /// names a type of `interior` or another such local type. So
+    /// names a type of `interior` or another such local type. An opaque
+    /// type, made by a macro with no body here, qualifies too. So
     /// `struct Shared(Arc<Mutex<u64>>)` qualifies, and so does a type that
     /// holds a `Shared`.
     #[must_use]
@@ -1378,6 +1389,7 @@ impl Program {
                 .filter(|(name, _)| !writable.contains(*name))
                 .filter(|(_, facts)| {
                     facts.mut_ref
+                        || facts.opaque
                         || facts.lifetime
                         || facts
                             .names

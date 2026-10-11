@@ -770,3 +770,19 @@ pub async fn wf_step_ref_ref_future(ctx: &WorkflowContext) -> Out {
     let a = saga.step(|| &REF_REF_CLOCK, |_| async { Ok(()) }).await?;
     ctx.execute_activity_raw("b", a).await
 }
+
+/// A step closure that returns a generic of the function that builds it.
+fn make_step<StepFuture: Future<Output = Out>>(future: StepFuture) -> impl FnOnce() -> StepFuture {
+    move || future
+}
+
+pub fn __autumn_workflow_info_wf_step_generic_future() -> u8 {
+    0
+}
+
+/// The forward step returns `StepFuture`, a generic of `make_step`.
+pub async fn wf_step_generic_future(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let a = saga.step(make_step(ClockFuture), |_| async { Ok(()) }).await?;
+    ctx.execute_activity_raw("b", a).await
+}

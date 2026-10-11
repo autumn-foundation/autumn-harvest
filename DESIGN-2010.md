@@ -143,12 +143,16 @@ Four review agents read the first version. Each fix has a test.
     The index follows each `mod x;` to its file, so a file of types only is
     read too. It honors `#[path]`, and the declaring module gives the path.
     MIR can name the moved file too, so a file is read once per module
-    path. A depth cap of 16 ends a `#[path]` cycle. A type declared in a
+    path. A `#[path]` cycle ends when a file returns to a file that
+    declares it. There is no depth cap. A type declared in a
     function body is indexed too, under the function path. So is a type
     in a default trait method body. The item walk in a file has no depth
     cap, so it skips no nested type. A `macro_rules!` arm that parses as
     items is indexed as items. Another arm, or a type that a call names,
-    gets every fact of the macro.
+    gets every fact of the macro. A macro with no definition here, as a
+    dependency or procedural macro, can declare any type. Each type its
+    call declares, and each bare type name it takes, is opaque and counts
+    as writable. The std macros that declare no type are exempt.
     A type alias counts its target as a field, so a wrapper of an alias of
     `Arc<Mutex<u64>>` is interior-mutable too. An associated type in an
     `impl` block counts the same way.
@@ -190,6 +194,9 @@ Four review agents read the first version. Each fix has a test.
     `unknown`. A future moved into an aggregate, as `Some(..)`, is an escape
     too. So is a future held across a branch, as the walk does not follow
     one. A dropped future does not unwind, so it is still a gap.
+34. A closure sees the generics of each function around it. So a step
+    closure that returns `StepFuture` of its enclosing function is an
+    `unresolved-generic` boundary, not a value that is not a future.
 
 ---
 
