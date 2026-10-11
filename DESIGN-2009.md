@@ -75,10 +75,13 @@ API and tests, and docs. These changes followed. Each has a test.
 | C6 | Verify checked bytes only, so an unparseable row could drop and then fail `read_back`. | Verify runs the read-back path, which parses every row. `read_back` also checks the manifest against its key. | `read_back_refuses_a_manifest_under_another_key` |
 | C7 | Pages of 1,000 large rows could use a lot of memory. | Pages hold 256 rows. | — |
 | C8 | Internal types were public, and core-built types were exhaustive. | `SegmentWriter`, `RowDigest` and `sha256_hex` are crate-private. The manifest, segment entry, archived partition and `RetentionHooks` are `non_exhaustive`. | Builds |
-| C9 | (Codex) The trait lets a timed-out `put` land later. A late manifest at the one fixed key could replace the manifest that the drop checked. | Manifest keys name their content. A reuse hint and a drop record replace the fixed key. Only the dropping attempt writes the record. | `exports_of_different_rows_have_different_manifest_keys`, `find_dropped_reads_the_drop_record` |
+| C9 | (Codex) The trait lets a timed-out `put` land later. A late manifest at the one fixed key could replace the manifest that the drop checked. | Manifest keys name their content. A reuse hint and a drop record replace the fixed key. | `exports_of_different_rows_have_different_manifest_keys`, `find_dropped_reads_the_drop_record` |
 | C10 | (Codex) The directory backend synced only the deepest new directory. | It syncs the parent of each directory that the write creates. | Unit tests of the backend |
 | C11 | (Codex) A sweep with no archiver could read "no marker" just before the first exporter wrote it, then drop. | Every applying sweep takes the export lock. An exporter takes it exclusive and writes the marker under it. A sweep with no archiver takes it shared and reads the marker under it. | `a_sweep_without_an_archiver_drops_nothing_while_an_exporter_holds_the_lock`, `an_exporter_writes_no_marker_while_a_sweep_without_an_archiver_holds_the_lock` |
 | C12 | (Codex) A least-privilege runtime role had no grant on the marker table. | The preflight probe requires `SELECT` and `INSERT` on it. The upgrade guide and `docs/archival.md` name the grant. | `the_partition_export_marker_is_covered_by_the_privilege_probe` |
+| C13 | (Codex) The drop record was written after the drop. A failed write left a dropped partition with no record. | The record goes before each drop attempt. A failed write keeps the partition. Two verified exports of one sealed, orphaned partition differ only in ciphertext, so a late record write still names the same plaintext. | `a_failed_drop_record_keeps_the_partition` |
+| C14 | (Codex) `harvest partition status` reported a marked shard's partitions as droppable, but a sweep with no archiver drops nothing there. | The read-only pass reads the marker and reports `export required`. | `a_sweep_without_an_archiver_drops_nothing_once_a_shard_exported` |
+| C15 | (Codex) A cancelled pass can keep the session lock on a pooled connection. | The cost is liveness, not data: other sweeps report busy. The retention runtime never cancels mid-shard, and it closes the connection when the fence is lost. The public sweep and maintain calls document that a cancelled pass must close its connection. | Docs |
 
 The row checksum detects a change. It is not a security boundary, the same
 as the append-only guard.
@@ -108,7 +111,8 @@ harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/dropped.json
 
 A segment or manifest key names its content, so a late upload writes its
 own key. `latest.json` is a reuse hint. `dropped.json` names the checked
-manifest, and only the attempt that dropped writes it.
+manifest. The sweep writes it before each drop attempt, so every dropped
+partition has one.
 
 `<lower>` is `min` for a `MINVALUE` bound. Bounds use `%Y%m%dT%H%M%SZ`. A
 bound with a fraction, such as the legacy cutover, keeps its microseconds.

@@ -300,8 +300,10 @@ partition with the same name from replacing an old export.
   SHA-256 of their content. An upload that lands late, after a timeout,
   writes its own key. It cannot replace an object that a finished export
   names.
-- `dropped.json` names the manifest of the export that the drop checked.
-  Only the attempt that dropped the partition writes it, after the drop.
+- `dropped.json` names the manifest of the export that the drop checks.
+  The sweep writes it before each drop attempt, and a failed write keeps
+  the partition. So every dropped partition has one. While the partition
+  still exists, the drop has not happened yet.
   `partition_archive::find_dropped` reads it.
 - `latest.json` names the last verified export. The next pass uses it to
   find an export to reuse. A stale hint costs one new export, because the

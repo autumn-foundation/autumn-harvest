@@ -142,8 +142,10 @@ pub fn manifest_key(prefix: &str, sha256: &str) -> String {
 
 /// The key of the drop record under `prefix`.
 ///
-/// Only the attempt that dropped the partition writes it, once, after the
-/// drop commits. It names the manifest of the export that the drop checked.
+/// It names the manifest of the export that the drop checks. The sweep writes
+/// it before each drop attempt, and a failed write keeps the partition. So a
+/// dropped partition always has a record. While the partition still exists,
+/// the drop has not happened yet.
 #[must_use]
 pub fn dropped_key(prefix: &str) -> String {
     format!("{prefix}/dropped.json")
@@ -168,9 +170,8 @@ struct Pointer {
 
 /// The manifest key that the drop record under `prefix` names.
 ///
-/// Returns `None` when no drop record is there: the partition was not
-/// dropped through an export, or the record write failed after the drop.
-/// `SweepOutcome::exported` also names the key.
+/// Returns `None` when no drop record is there, so the partition was not
+/// dropped through an export. `SweepOutcome::exported` also names the key.
 ///
 /// # Errors
 ///
@@ -883,6 +884,10 @@ pub const EXPORT_LOCK_KEY: i64 = 0x4856_5354_2009_0001;
 pub(crate) enum ExportGate<'a> {
     /// A read-only pass. It holds no lock and drops nothing.
     Off,
+    /// A read-only pass on a shard that holds the marker. It holds no lock.
+    /// It reports a droppable partition as `export required`, the way a
+    /// sweep with no archiver acts on it.
+    OffMarked,
     /// No archiver and no marker: drop as before. Holds the lock shared.
     Plain,
     /// No archiver, but the shard holds the marker. Holds the lock shared.
@@ -931,6 +936,27 @@ async fn marked(conn: &mut diesel_async::AsyncPgConnection) -> crate::error::Har
 
 #[cfg(feature = "db")]
 impl<'a> ExportGate<'a> {
+    /// Resolve the gate for one read-only pass. It takes no lock.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::HarvestError::Database`] on a query failure.
+    pub(crate) async fn read_only(
+        conn: &mut diesel_async::AsyncPgConnection,
+    ) -> crate::error::HarvestResult<Self> {
+        Ok(if marked(conn).await? {
+            Self::OffMarked
+        } else {
+            Self::Off
+        })
+    }
+
+    /// Whether a read-only pass must report droppable partitions as
+    /// `export required`.
+    pub(crate) const fn marked(&self) -> bool {
+        matches!(self, Self::OffMarked)
+    }
+
     /// Resolve the gate for one applying pass. It never waits for the lock.
     ///
     /// # Errors
@@ -988,7 +1014,7 @@ impl<'a> ExportGate<'a> {
         match self {
             Self::Required => Some(crate::partition::EXPORT_REQUIRED_REASON),
             Self::Busy => Some(crate::partition::EXPORT_BUSY_REASON),
-            Self::Off | Self::Plain | Self::Active(_) => None,
+            Self::Off | Self::OffMarked | Self::Plain | Self::Active(_) => None,
         }
     }
 
@@ -1008,7 +1034,7 @@ impl<'a> ExportGate<'a> {
                 format!("SELECT pg_advisory_unlock_shared({EXPORT_LOCK_KEY}) AS v")
             }
             Self::Active(_) => format!("SELECT pg_advisory_unlock({EXPORT_LOCK_KEY}) AS v"),
-            Self::Off | Self::Busy => return,
+            Self::Off | Self::OffMarked | Self::Busy => return,
         };
         if let Err(e) = flag(conn, &sql).await {
             tracing::warn!(error = %e, "could not release the partition export lock");
@@ -1081,23 +1107,29 @@ pub(crate) async fn reusable_export(
     (back.manifest.prefix() == prefix).then_some(back.manifest)
 }
 
-/// Write the drop record of `manifest`, after the drop commits.
+/// Write the drop record of `manifest`, before the drop.
 ///
-/// A failure is only logged. The export is complete and verified, and
-/// `SweepOutcome::exported` still names it.
+/// The record goes first, so a dropped partition always has one. A failed
+/// write keeps the partition. If the drop then does not happen, the record
+/// names a verified export of a partition that still exists. The next
+/// attempt writes it again.
+///
+/// # Errors
+///
+/// The reason the drop must wait.
 #[cfg(feature = "db")]
-pub(crate) async fn record_drop(export: &PartitionExport, manifest: &PartitionManifest) {
+pub(crate) async fn record_drop(
+    export: &PartitionExport,
+    manifest: &PartitionManifest,
+) -> Result<(), String> {
     let key = dropped_key(&manifest.prefix());
     let body = Pointer {
         manifest: manifest.key(),
     };
-    let written = match serde_json::to_vec(&body) {
-        Ok(bytes) => bounded(export, export.archiver.put(&key, bytes)).await,
-        Err(e) => Err(e.to_string()),
-    };
-    if let Err(error) = written {
-        tracing::warn!(key, error, "could not write the partition drop record");
-    }
+    let bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+    bounded(export, export.archiver.put(&key, bytes))
+        .await
+        .map_err(|e| format!("{key}: {e}"))
 }
 
 /// Export partition `part`, then read the export back and check it.

@@ -279,6 +279,8 @@ struct TestArchiver {
     corrupt_on_get: bool,
     /// Each upload waits this long first.
     put_delay: Option<Duration>,
+    /// An upload to a key with this suffix fails.
+    fail_put_suffix: Option<&'static str>,
     /// When set, the manifest upload runs this SQL once, as a superuser
     /// with the append-only guard off: `(url, sql)`.
     change_row: Mutex<Option<(String, String)>>,
@@ -295,7 +297,11 @@ impl PartitionArchiver for TestArchiver {
             if let Some(delay) = self.put_delay {
                 tokio::time::sleep(delay).await;
             }
-            if self.fail_put {
+            if self.fail_put
+                || self
+                    .fail_put_suffix
+                    .is_some_and(|suffix| key.ends_with(suffix))
+            {
                 return Err("bucket unavailable".into());
             }
             self.objects.lock().unwrap().insert(key.to_string(), bytes);
@@ -551,6 +557,25 @@ async fn a_failed_upload_keeps_the_partition() {
 }
 
 #[tokio::test]
+async fn a_failed_drop_record_keeps_the_partition() {
+    // The record goes before the drop, so a dropped partition always has one.
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_partitioned(&mut conn).await;
+    let aged = seed_aged_partition(&mut conn, 3).await;
+    let backend = Arc::new(TestArchiver {
+        fail_put_suffix: Some("/dropped.json"),
+        ..TestArchiver::default()
+    });
+    let outcome = sweep_with(&mut conn, backend).await;
+    assert_kept(&mut conn, &aged, &outcome, "export failed").await;
+    assert!(
+        outcome.blocked.iter().any(|b| b.contains("dropped.json")),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_lost_object_keeps_the_partition() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
@@ -740,6 +765,19 @@ async fn a_sweep_without_an_archiver_drops_nothing_once_a_shard_exported() {
             .iter()
             .any(|b| b.starts_with(&second.name) && b.contains(partition::EXPORT_REQUIRED_REASON)),
         "{plain:?}"
+    );
+    // The status report predicts the same: it reports the partition as
+    // waiting for an export, not as droppable.
+    let status = partition::evaluate(&mut conn, Utc::now(), &SweepOptions::default(), None)
+        .await
+        .expect("evaluate");
+    assert!(status.dropped.is_empty(), "{status:?}");
+    assert!(
+        status
+            .blocked
+            .iter()
+            .any(|b| b.starts_with(&second.name) && b.contains(partition::EXPORT_REQUIRED_REASON)),
+        "{status:?}"
     );
     let maintained = partition::maintain(
         &mut conn,

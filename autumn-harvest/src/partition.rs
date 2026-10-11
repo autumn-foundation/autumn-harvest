@@ -4096,6 +4096,13 @@ pub async fn evaluate(
 /// it back in. That way a permanently blocked oldest run cannot starve
 /// every later partition of ever being attempted.
 ///
+/// # Cancellation
+///
+/// An applying pass holds a session advisory lock on `conn` (issue #2009).
+/// If you cancel the pass, close the connection too. A pooled connection that
+/// keeps the lock makes other sweeps on the shard report
+/// [`EXPORT_BUSY_REASON`] until its session ends.
+///
 /// # Errors
 ///
 /// [`HarvestError::Database`] on a catalog failure. A per-partition lock
@@ -4115,6 +4122,13 @@ pub async fn sweep(
 /// (issue #2009).
 ///
 /// See [`crate::partition_archive`] for the order of the steps.
+///
+/// # Cancellation
+///
+/// An applying pass holds a session advisory lock on `conn` (issue #2009).
+/// If you cancel the pass, close the connection too. A pooled connection that
+/// keeps the lock makes other sweeps on the shard report
+/// [`EXPORT_BUSY_REASON`] until its session ends.
 ///
 /// # Errors
 ///
@@ -4196,7 +4210,7 @@ async fn sweep_inner(
     let gate = if apply {
         crate::partition_archive::ExportGate::resolve(conn, export).await?
     } else {
-        crate::partition_archive::ExportGate::Off
+        crate::partition_archive::ExportGate::read_only(conn).await?
     };
     let mut exports = 0usize;
     let looped: HarvestResult<()> = async {
@@ -4297,8 +4311,15 @@ async fn sweep_inner(
 
             if !apply {
                 // Read-only: report the partition as droppable without taking a
-                // lock or issuing DDL.
-                outcome.dropped.push(part.name);
+                // lock or issuing DDL. On a marked shard a sweep with no
+                // archiver drops nothing, so the report says so (issue #2009).
+                if gate.marked() {
+                    outcome
+                        .blocked
+                        .push(format!("{} ({EXPORT_REQUIRED_REASON})", part.name));
+                } else {
+                    outcome.dropped.push(part.name);
+                }
                 continue;
             }
             let crate::partition_archive::ExportGate::Active(export) = &gate else {
@@ -4398,7 +4419,7 @@ async fn export_and_drop(
     exports: &mut usize,
     mut progress: Option<&mut (dyn FnMut() + Send)>,
 ) -> HarvestResult<ExportStep> {
-    use crate::partition_archive::{export_partition, reusable_export};
+    use crate::partition_archive::{export_partition, record_drop, reusable_export};
     let failed = |cause: String| ExportStep::Blocked(format!("{EXPORT_FAILED_REASON}: {cause}"));
     let reused = reusable_export(export, part, upper, reborrow_progress(&mut progress)).await;
     let fresh = reused.is_none();
@@ -4416,6 +4437,11 @@ async fn export_and_drop(
         }
     };
     let mut manifest = manifest;
+    // The drop record goes before the drop, so a dropped partition always
+    // has one. A failed write keeps the partition.
+    if let Err(cause) = record_drop(export, &manifest).await {
+        return Ok(failed(cause));
+    }
     let mut result = drop_partition(conn, part, upper, opts, Some(&manifest)).await?;
     if result == DropOutcome::Changed && !fresh && *exports < export.max_exports_per_pass {
         *exports += 1;
@@ -4423,10 +4449,12 @@ async fn export_and_drop(
             Ok(m) => m,
             Err(cause) => return Ok(failed(cause)),
         };
+        if let Err(cause) = record_drop(export, &manifest).await {
+            return Ok(failed(cause));
+        }
         result = drop_partition(conn, part, upper, opts, Some(&manifest)).await?;
     }
     Ok(if result == DropOutcome::Dropped {
-        crate::partition_archive::record_drop(export, &manifest).await;
         ExportStep::Dropped(manifest.key())
     } else {
         ExportStep::Blocked(result.reason().to_string())
@@ -5475,6 +5503,13 @@ async fn maintenance_owner_gap(
 /// [`SweepOutcome::catch_up_target`] for what they do and who should persist
 /// them across calls.
 ///
+/// # Cancellation
+///
+/// An applying pass holds a session advisory lock on `conn` (issue #2009).
+/// If you cancel the pass, close the connection too. A pooled connection that
+/// keeps the lock makes other sweeps on the shard report
+/// [`EXPORT_BUSY_REASON`] until its session ends.
+///
 /// # Errors
 ///
 /// [`HarvestError::Database`] on a catalog or DDL failure.
@@ -5513,6 +5548,13 @@ pub async fn maintain(
 /// can then space its proofs of life by one partition attempt, not one
 /// whole pass.
 ///
+/// # Cancellation
+///
+/// An applying pass holds a session advisory lock on `conn` (issue #2009).
+/// If you cancel the pass, close the connection too. A pooled connection that
+/// keeps the lock makes other sweeps on the shard report
+/// [`EXPORT_BUSY_REASON`] until its session ends.
+///
 /// # Errors
 ///
 /// [`HarvestError::Database`] on a catalog or DDL failure.
@@ -5544,6 +5586,13 @@ pub async fn maintain_with_progress(
 /// partition before it drops it (issue #2009).
 ///
 /// `export` `None` is the same as [`maintain_with_progress`].
+///
+/// # Cancellation
+///
+/// An applying pass holds a session advisory lock on `conn` (issue #2009).
+/// If you cancel the pass, close the connection too. A pooled connection that
+/// keeps the lock makes other sweeps on the shard report
+/// [`EXPORT_BUSY_REASON`] until its session ends.
 ///
 /// # Errors
 ///

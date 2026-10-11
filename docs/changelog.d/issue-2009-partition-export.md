@@ -45,7 +45,11 @@ events.
 - **Keys.** A key holds the shard and the cohort bounds. Segment and
   manifest keys hold a SHA-256 prefix of their content, so a late upload
   cannot replace a finished object. `dropped.json` names the checked
-  manifest, and `partition_archive::find_dropped` reads it.
+  manifest, and `partition_archive::find_dropped` reads it. The sweep
+  writes it before each drop attempt, so every dropped partition has one.
+- **Status.** On a marked shard, `harvest partition status` reports a
+  droppable partition as `export required`, the way a sweep with no
+  archiver acts on it.
 - **Budget.** One pass makes at most 4 new exports.
 - **Stragglers.** `try_build` refuses a partition archiver together with
   `partitions.straggler_grace_secs`. The sweep skips straggler deletes when
@@ -74,11 +78,12 @@ change removes the stale field from both tests.
 
 **Tests.**
 
-- `partition_archive_tests`, 17 DB tests: export, verify, drop and read
+- `partition_archive_tests`, 18 DB tests: export, verify, drop and read
   back; the legacy partition; the retention runtime; a failed upload; a
-  lost object; changed bytes; a slow backend; a row changed or deleted
-  after the export; a live owner; no straggler deletes; the marker; the
-  lock in both modes; reuse; the export budget.
+  lost object; changed bytes; a failed drop record; a slow backend; a row
+  changed or deleted after the export; a live owner; no straggler deletes;
+  the marker and the status report; the lock in both modes; reuse; the
+  export budget.
 - 17 unit tests in `partition_archive::tests`.
 - The builder test
   `a_partition_archiver_with_straggler_deletes_fails_the_build`.
