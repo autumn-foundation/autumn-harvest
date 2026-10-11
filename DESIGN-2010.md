@@ -169,7 +169,9 @@ Four review agents read the first version. Each fix has a test.
     crate prints a def path, so it is still not followed.
 30. A raw `*mut` pointer writes as a `&mut` reference does. A capture of one
     is a boundary, as a `&mut` capture is. A local type with a `*mut` field
-    is interior-mutable, as one with a `&mut` field is.
+    is interior-mutable, as one with a `&mut` field is. `UnsafeCell` and
+    `SyncUnsafeCell` are roots of that check too, as the model lists only
+    the safe wrappers.
 31. A captured closure, `async` closure or `async` block hides its own
     captures, and they can write. So a block that captures one is a boundary. A read of a field
     of the closure self, as `(_1.0: u64)`, takes the field type instead.

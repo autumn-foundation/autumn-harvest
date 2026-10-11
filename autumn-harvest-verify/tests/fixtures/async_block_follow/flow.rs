@@ -711,3 +711,35 @@ pub async fn wf_step_inner_async_closure(ctx: &WorkflowContext) -> Out {
     let seen = *kept.lock().unwrap();
     ctx.execute_activity_raw("b", seen).await
 }
+
+/// A shared slot that writes through `UnsafeCell`.
+pub struct Slot(std::cell::UnsafeCell<u64>);
+
+// SAFETY: the fixture never writes from two threads at once.
+unsafe impl Sync for Slot {}
+
+pub fn __autumn_workflow_info_wf_step_unsafe_cell() -> u8 {
+    0
+}
+
+/// A saga step block writes the clock through an `UnsafeCell` in a shared
+/// `Arc`. A clone of that `Arc` feeds a later command.
+pub async fn wf_step_unsafe_cell(ctx: &WorkflowContext) -> Out {
+    let shared = std::sync::Arc::new(Slot(std::cell::UnsafeCell::new(0)));
+    let mut kept = std::sync::Arc::clone(&shared);
+    {
+        let mut saga = Saga::new(ctx);
+        saga.step(
+            move || async move {
+                // SAFETY: no other reference to the slot is live here.
+                unsafe { *shared.0.get() = now_nanos() };
+                ctx.execute_activity_raw("a", 1).await
+            },
+            |_| async { Ok(()) },
+        )
+        .await?;
+    }
+    // The step dropped its clone, so `kept` is unique and reads safely.
+    let seen = std::sync::Arc::get_mut(&mut kept).map_or(0, |slot| *slot.0.get_mut());
+    ctx.execute_activity_raw("b", seen).await
+}

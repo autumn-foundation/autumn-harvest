@@ -93,6 +93,7 @@ fn a_case_the_analysis_cannot_follow_is_never_proven() {
         "wf_step_dep_ref_future",
         "wf_step_inner_block",
         "wf_step_inner_async_closure",
+        "wf_step_unsafe_cell",
     ] {
         assert!(
             !matches!(verdict(&all, name), Verdict::ProvenDeterministic),

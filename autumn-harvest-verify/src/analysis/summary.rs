@@ -1839,11 +1839,14 @@ impl<'a> Analyzer<'a> {
         if let Some(names) = &self.interior {
             return names.clone();
         }
+        // `UnsafeCell` is the root of all interior mutability. The model lists
+        // only the safe wrappers, so it is added here.
         let model: Vec<&str> = self
             .model
             .ambient_type
             .iter()
             .map(|rule| rule.name.as_str())
+            .chain(["UnsafeCell", "SyncUnsafeCell"])
             .collect();
         let local = self.program.writable_types(&model);
         let names: Vec<String> = model
