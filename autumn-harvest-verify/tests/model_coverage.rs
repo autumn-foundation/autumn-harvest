@@ -463,6 +463,64 @@ fn every_pub_method_on_workflow_context_is_classified() {
     );
 }
 
+/// Issue #1985: a `DurablePromise` wait pushes `WaitForSignal`, and a timed
+/// wait also arms a timer. Each public async method on the handle must be a
+/// sink on that receiver, as the `MutexHandle` and `TimerHandle` methods are.
+/// Otherwise a nondeterministic branch around a wait passes verification.
+#[test]
+fn every_pub_async_method_on_durable_promise_is_a_sink() {
+    let path = repo_root().join("autumn-harvest/src/durable_promise.rs");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
+    let file = syn::parse_file(&text)
+        .unwrap_or_else(|err| panic!("cannot parse {}: {err}", path.display()));
+
+    let mut methods: BTreeSet<String> = BTreeSet::new();
+    for item in &file.items {
+        let syn::Item::Impl(item_impl) = item else {
+            continue;
+        };
+        let syn::Type::Path(type_path) = item_impl.self_ty.as_ref() else {
+            continue;
+        };
+        let is_promise = type_path
+            .path
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "DurablePromise");
+        if item_impl.trait_.is_some() || !is_promise {
+            continue;
+        }
+        for impl_item in &item_impl.items {
+            let syn::ImplItem::Fn(method) = impl_item else {
+                continue;
+            };
+            if matches!(method.vis, syn::Visibility::Public(_)) && method.sig.asyncness.is_some() {
+                methods.insert(method.sig.ident.to_string());
+            }
+        }
+    }
+    assert!(
+        methods.contains("wait"),
+        "expected `impl DurablePromise` to expose `wait`; found {methods:?}"
+    );
+
+    let model = builtin();
+    let missing: Vec<&String> = methods
+        .iter()
+        .filter(|name| {
+            !model
+                .sink
+                .iter()
+                .any(|r| r.receiver == "DurablePromise" && r.path == name.as_str())
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "add a `[[sink]]` row with `receiver = \"DurablePromise\"` for: {missing:?}"
+    );
+}
+
 /// A `[[trusted]]` crate is modelled as a pure taint-propagator. That is what
 /// makes `format!` tractable — and it is also how a source could be silently
 /// swallowed: `chrono` is trusted, so if `Utc::now` were not *also* a source row

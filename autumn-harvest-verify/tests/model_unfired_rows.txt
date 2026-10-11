@@ -171,10 +171,14 @@ sink:start_timer@WorkflowContext
 sink:system_time_now@WorkflowContext
 sink:time_until_deadline@WorkflowContext
 sink:timer_business_days@WorkflowContext
+# Issue #1985: no corpus crate calls this new handle method yet.
+sink:wait@DurablePromise
 sink:wait_for_signal@WorkflowContext
 # Issue #1985: no corpus crate calls this new method yet.
 sink:wait_for_signal_matching@WorkflowContext
 sink:wait_for_signal_timeout@WorkflowContext
+# Issue #1985: no corpus crate calls this new handle method yet.
+sink:wait_timeout@DurablePromise
 source:Cell::into_inner@Cell
 source:Cell::replace@Cell
 source:Cell::take@Cell

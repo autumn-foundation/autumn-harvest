@@ -1329,6 +1329,14 @@ path = "await_fire"
 receiver = "TimerHandle"
 reason = "context.rs:1147 -> `WorkflowContext::await_timer_fire`; suspends on a recorded timer."
 [[sink]]
+path = "wait"
+receiver = "DurablePromise"
+reason = "durable_promise.rs:321 -> `WorkflowContext::wait_for_signal` (context.rs:9164), which pushes `WaitForSignal` and matches `SignalReceived` history (issue #1985)."
+[[sink]]
+path = "wait_timeout"
+receiver = "DurablePromise"
+reason = "durable_promise.rs:338 -> `WorkflowContext::wait_for_signal_timeout` (context.rs:9552), which arms a timer and races `WaitForSignal` against it (issue #1985)."
+[[sink]]
 path = "run"
 receiver = "RaceBuilder"
 reason = "context.rs:1600 -> `WorkflowContext::race_impl`, which pushes `StartChildWorkflow`/`StartTimer`/`WaitForSignal`/`CancelRaceLosers` (context.rs:8217-8356). The branch set and its order are recorded."
