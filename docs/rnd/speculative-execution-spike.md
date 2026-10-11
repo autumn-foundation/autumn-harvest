@@ -28,13 +28,13 @@ The prototype files are:
 
 | Question | Answer |
 |---|---|
-| What share of end-to-end latency is commit time? | 2.4 % unloaded and 1.6 % under load, on the bench workflow. |
+| What share of end-to-end latency is commit time? | About 2.4 % unloaded and 1.6 % under load, as a ratio of medians. With every commit at the persist p99, it is 5.9 % unloaded. |
 | How much does gated speculation save? | Nothing measurable. Paired runs give equal mean latency. |
 | Is gated speculation safe? | Yes, in the model. It keeps every invariant over 1,000 seeds under faults. |
 | Does early release of effects save more? | About 3 % in the model, or 1.8 % at the measured commit p50. |
 | What does early release break? | The commit gate of issue #1796. An effect can run twice, and some runs never complete. |
 | Does speculation need the claim fence? | Not for the safety invariants of the model. A prefix check alone keeps them. |
-| Is asymmetric logging worth it? | Not now. It saves 30 % to 39 % of log rows. The engine needs those rows. |
+| Is asymmetric logging worth it? | Not now. It saves 30 % to 37 % of log rows. The engine needs those rows. |
 | Where is the latency? | In the wake hop, from the end of an activity to the next decision. It takes about 88 % of unloaded latency. |
 
 ## The question
@@ -124,7 +124,9 @@ equal decisions, and their runs pair seed by seed.
 
 The workloads are `Chain` and `FanOut`. `Chain` is the bench workflow:
 three activities in sequence. `FanOut` has two rounds of four parallel
-activities, and two signals.
+activities, and two signals. It completes only after both signals, and
+its output adds their values. So a wrong signal state in a speculative
+decision breaks `ReplayEquivalent` or `ExpectedOutput`.
 
 ### Invariants
 
@@ -161,8 +163,13 @@ in flight. Loaded means the bench default of 32.
 | Loaded, 600 runs | off | 37.43 | 823.01 / 969.57 ms | 3.26 / 9.07 ms | 4.00 | 1.6 % |
 
 The commit share is four persist p50 values divided by the run p50. It is
-the upper limit on what hiding every commit can save. The `fsync` setting
-moves the persist p50 by less than 0.5 ms on this host.
+a ratio of medians, not a bound. The probe does not tie a persist to its
+run, so it cannot give the share of each run.
+
+A pessimistic case gives a firmer limit. If all four commits of a run took
+the persist p99, they would be 4 x 6.95 ms = 27.8 ms. That is 5.9 % of the
+unloaded run p50, and 4.3 % of the loaded one at 9.81 ms each. The `fsync`
+setting moves the persist p50 by less than 0.5 ms on this host.
 
 A loaded run includes the time that a run waits in the closed loop before
 its first claim. So its latency is mostly queueing, not engine hops.
@@ -223,12 +230,12 @@ unless a row says otherwise.
 | Config | Result |
 |---|---|
 | `Serial` and `Gated`, `Chain` and `FanOut`, `Full` and `ReadsOnly` | Pass. Every invariant holds in all 8 configs. |
-| `Gated`, `FanOut`, spread timing, busy faults | Pass. 278 speculative decisions were discarded and repaired. |
+| `Gated`, `FanOut`, spread timing, busy faults | Pass. 297 speculative decisions were discarded and repaired. |
 | `Gated` with the `keep-tail` plant, the config above | Fail on seed 41: `ReplayEquivalent`. |
 | `Serial` with the `keep-tail` plant, the same config | Pass. `Serial` has no speculative tail. |
 | `Gated` with the `keep-on-failure` plant | Fail on seed 0: `Converges` on `Chain`, `ReplayEquivalent` on `FanOut`. |
 | `Gated`, `PrefixOnly` fence, all checks | Fail on seed 18 (`Chain`) and seed 24 (`FanOut`): `CommitByOwner`. |
-| `Gated`, `PrefixOnly` fence, all other checks | Pass. 50 stale commits on `Chain` and 62 on `FanOut` do no harm. |
+| `Gated`, `PrefixOnly` fence, all other checks | Pass. 50 stale commits on `Chain` and 74 on `FanOut` do no harm. |
 | `Eager`, `EffectAfterCommit` | Fail on seed 0. An effect leaves before its commit, by design. |
 | `Eager`, `EffectOnce` | Fail on seed 0. |
 | `Eager`, `Converges` | Fail on seed 3. |
@@ -255,8 +262,8 @@ The `Eager` failures have two causes:
   nothing runs the effect again. The run never completes.
 
 Over 1,000 seeds, `Eager` stranded 219 of 4,000 `Chain` runs (5.5 %) and
-150 of 4,000 `FanOut` runs (3.8 %). It ran 1,189 more effects than
-`Serial` on `Chain`, and 3,540 more on `FanOut`.
+151 of 4,000 `FanOut` runs (3.8 %). It ran 1,189 more effects than
+`Serial` on `Chain`, and 3,536 more on `FanOut`.
 
 ### Latency
 
@@ -266,10 +273,13 @@ Mean latency over 4,000 runs, in milliseconds.
 |---|---|---|--:|--:|--:|
 | Bench | `Chain` | none | 473.254 | 473.254 | 458.614 |
 | Bench | `Chain` | default | 607.281 | 607.281 | 576.264 |
-| Bench | `FanOut` | none | 287.543 | 287.543 | 278.532 |
-| Bench | `FanOut` | default | 391.183 | 391.183 | 372.370 |
-| Spread | `FanOut` | none | 344.042 | 344.042 | 332.913 |
-| Spread | `FanOut` | default | 573.406 | 573.407 | 550.157 |
+| Bench | `FanOut` | none | 527.961 | 527.961 | 527.744 |
+| Bench | `FanOut` | default | 589.908 | 589.913 | 585.475 |
+| Spread | `FanOut` | none | 811.571 | 811.571 | 811.660 |
+| Spread | `FanOut` | default | 927.384 | 927.386 | 922.480 |
+
+A `FanOut` run waits for its last signal, so signal times set most of its
+latency.
 
 The `Eager` rows with faults average only the runs that completed.
 
@@ -278,9 +288,10 @@ of 4.885 ms. At the measured commit p50 of 2.82 ms, three commits are
 1.8 % of 473.26 ms.
 
 `Gated` runs few speculative decisions, and they save nothing. With no
-faults, it made none on bench `FanOut` and 14 on spread `FanOut`. Paired
-runs gave equal latency on all 1,000 seeds of both workloads. Four facts
-explain this:
+faults, it made none on bench `FanOut` and 20 on spread `FanOut`. Paired
+runs gave equal latency on all 1,000 `Chain` seeds and on 996 of 1,000
+spread `FanOut` seeds. With faults, the `Gated` mean is at most 0.005 ms
+above the `Serial` mean. Four facts explain this:
 
 - On the `Chain` workload, the next input needs an activity. The activity
   needs the commit. So no input is ready while a commit is in flight.
@@ -327,7 +338,7 @@ the scheduled effects. Every invariant holds, with the same latency.
 | Workload | `Full` rows | `ReadsOnly` rows | Saved |
 |---|--:|--:|--:|
 | `Chain`, 1,000 seeds with faults | 40,000 | 28,000 | 30 % |
-| `FanOut`, 1,000 seeds with faults | 81,066 | 49,066 | 39 % |
+| `FanOut`, 1,000 seeds with faults | 86,919 | 54,919 | 37 % |
 
 The saving does not carry over to Harvest for three reasons:
 
@@ -337,7 +348,7 @@ The saving does not carry over to Harvest for three reasons:
   replayer also compares the input.
 - The task row that releases an effect is a write in the same commit. It
   stays.
-- Persist is 1.6 % to 2.4 % of latency. Fewer rows in that commit cannot
+- Persist is about 1.6 % to 2.4 % of median latency. Fewer rows in that commit cannot
   move the end-to-end number much.
 
 ## Go / no-go
@@ -348,7 +359,7 @@ The saving does not carry over to Harvest for three reasons:
 
 | Criterion | Result |
 |---|---|
-| 1. `Gated` cuts unloaded latency of the bench workflow by 20 % or more. | **Not met.** It cuts 0 %. The ceiling is 2.4 %. |
+| 1. `Gated` cuts unloaded latency of the bench workflow by 20 % or more. | **Not met.** It cuts 0 %. All four commits at the persist p99 would still be only 5.9 %. |
 | 2. `Gated` keeps every invariant under faults. | **Met.** Every invariant holds in 8 configs and a busy sweep, at 1,000 seeds each. |
 | 3. The gain does not need `Eager`. | **Not met.** Only `Eager` gains, and it breaks three invariants. |
 

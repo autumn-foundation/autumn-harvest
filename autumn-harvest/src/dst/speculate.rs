@@ -153,7 +153,8 @@ named! {
     Workload {
         /// Three activities in sequence, as in the e2e bench workflow.
         Chain => "chain",
-        /// Two rounds of four parallel activities, and two signals.
+        /// Two rounds of four parallel activities, and two signals. The
+        /// workflow completes after both signals, and its output adds them.
         FanOut => "fan-out",
     }
 }
@@ -596,6 +597,7 @@ struct State {
     pending: BTreeSet<(u32, u32)>,
     acc: u64,
     signals: u64,
+    signals_seen: u32,
     seen: usize,
     done: Option<u64>,
 }
@@ -629,7 +631,10 @@ fn decide(
                     next.acc = next.acc.wrapping_add(value);
                 }
             }
-            Input::Signal { value } => next.signals = next.signals.wrapping_add(value),
+            Input::Signal { value } => {
+                next.signals = next.signals.wrapping_add(value);
+                next.signals_seen += 1;
+            }
         }
     }
     next.seen += inputs.len();
@@ -648,16 +653,18 @@ fn decide(
                 next.pending.insert((next.round, index));
                 writes.push(effect);
             }
-        } else {
-            next.done = Some(next.acc);
+        } else if next.signals_seen == workload.signals() {
+            // The workflow waits for every signal, and its output holds them.
+            next.done = Some(next.acc.wrapping_add(next.signals));
             complete = next.done;
         }
     }
     (next, writes, complete)
 }
 
-/// The output that `workload` defines for `exec`.
-fn expected_output(workload: Workload, exec: usize) -> u64 {
+/// The output that `workload` defines for `exec`, whose signals sum to
+/// `signals`.
+fn expected_output(workload: Workload, exec: usize, signals: u64) -> u64 {
     let mut acc = 0_u64;
     for round in 1..=workload.rounds() {
         let input = acc;
@@ -671,7 +678,7 @@ fn expected_output(workload: Workload, exec: usize) -> u64 {
             acc = acc.wrapping_add(effect.value());
         }
     }
-    acc
+    acc.wrapping_add(signals)
 }
 
 /// A value in the inclusive range `(low, high)`.
@@ -700,6 +707,8 @@ struct Exec {
     replayed: State,
     scheduled: BTreeSet<Effect>,
     results: BTreeSet<(u32, u32)>,
+    /// The sum of the signal values that the execution gets.
+    signal_sum: u64,
     /// The commits in flight. Each holds the row lock of the execution.
     locks: BTreeSet<u64>,
     /// Results that wait for the row lock.
@@ -919,6 +928,7 @@ impl<'a> Model<'a> {
                 replayed: State::default(),
                 scheduled: BTreeSet::new(),
                 results: BTreeSet::new(),
+                signal_sum: 0,
                 locks: BTreeSet::new(),
                 blocked: Vec::new(),
                 started_at,
@@ -928,6 +938,7 @@ impl<'a> Model<'a> {
             for _ in 0..config.workload.signals() {
                 let at = started_at + model.rng.below(4 * hop);
                 let value = model.rng.next_u64() >> 16;
+                model.execs[exec].signal_sum = model.execs[exec].signal_sum.wrapping_add(value);
                 model.push(at, Event::Signal { exec, value });
             }
         }
@@ -1480,7 +1491,7 @@ impl<'a> Model<'a> {
             self.latencies.push(latency);
             self.stats.completed += 1;
             self.log("store", &format!("e{exec} complete in {latency}"));
-            let expected = expected_output(workload, exec);
+            let expected = expected_output(workload, exec, self.execs[exec].signal_sum);
             if output != expected {
                 let detail = format!("e{exec} returned {output}, the workload defines {expected}");
                 self.fail(SpecInvariant::ExpectedOutput, detail);
@@ -1895,7 +1906,7 @@ mod tests {
             let (next, writes, complete) = decide(workload, 0, &state, read);
             state = next;
             if let Some(output) = complete {
-                assert_eq!(output, expected_output(workload, 0));
+                assert_eq!(output, expected_output(workload, 0, 0));
                 break;
             }
             assert_eq!(writes.len(), 1);
@@ -1906,6 +1917,37 @@ mod tests {
             });
         }
         assert_eq!(state.round, 3);
+    }
+
+    #[test]
+    fn fan_out_waits_for_every_signal_and_its_output_holds_them() {
+        let workload = Workload::FanOut;
+        let mut state = State::default();
+        let mut inputs = Vec::new();
+        for _ in 0..workload.rounds() {
+            let (next, writes, complete) = decide(workload, 2, &state, &inputs[state.seen..]);
+            assert_eq!(complete, None);
+            state = next;
+            for effect in writes {
+                inputs.push(Input::Result {
+                    effect,
+                    value: effect.value(),
+                });
+            }
+        }
+        // Every round is done, but no signal has arrived.
+        let (next, writes, complete) = decide(workload, 2, &state, &inputs[state.seen..]);
+        assert_eq!(writes, Vec::new());
+        assert_eq!(complete, None);
+        state = next;
+        inputs.push(Input::Signal { value: 5 });
+        let (next, _, complete) = decide(workload, 2, &state, &inputs[state.seen..]);
+        assert_eq!(complete, None, "one signal is still missing");
+        state = next;
+        inputs.push(Input::Signal { value: 7 });
+        let (_, _, complete) = decide(workload, 2, &state, &inputs[state.seen..]);
+        assert_eq!(complete, Some(expected_output(workload, 2, 12)));
+        assert_ne!(complete, Some(expected_output(workload, 2, 0)));
     }
 
     #[test]

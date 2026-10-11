@@ -131,7 +131,7 @@ fn run_twice_reports_a_difference() {
 fn golden_speculation_traces_are_equal_on_every_platform() {
     let golden = [
         (0, Mode::Serial, Workload::Chain, 76, 0x0d63_b689_7faa_32ff),
-        (1, Mode::Gated, Workload::FanOut, 93, 0x6259_370d_4818_7586),
+        (1, Mode::Gated, Workload::FanOut, 110, 0x5e89_4935_a7f8_0570),
         (2, Mode::Eager, Workload::Chain, 86, 0x8a70_57dc_fc21_251b),
     ];
     for (seed, mode, workload, lines, hash) in golden {
