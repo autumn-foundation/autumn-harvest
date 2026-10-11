@@ -1361,6 +1361,13 @@ impl Program {
             .unwrap_or_else(|| path.to_string())
     }
 
+    /// Do the sources implement `Future` for the type `path` names?
+    #[must_use]
+    pub fn sources_impl_future(&self, path: &str) -> bool {
+        let bare = strip_generics_everywhere(path);
+        self.sources.future_impls.contains(last_segment(&bare))
+    }
+
     /// Is the rooted type path `path` first-party?
     ///
     /// MIR prints a local type without its crate name, as `models::Order`. It

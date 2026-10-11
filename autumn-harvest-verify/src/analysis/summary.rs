@@ -1778,7 +1778,13 @@ impl<'a> Analyzer<'a> {
             if let Some(span) = &inner {
                 self.follow_block(closure, span, &block, ret, hops, emit, out);
             }
-            if emit && followed && may_write_through(&body.return_ty, &interior) {
+            // The type name can hide what the future holds, as `SharedFuture`
+            // hides an `Arc<Mutex<_>>`. So the values that build it count too.
+            if emit
+                && followed
+                && (may_write_through(&body.return_ty, &interior)
+                    || captures_mut_ref(body, &interior))
+            {
                 let detail = format!("{} can write through its fields", body.return_ty.trim());
                 self.push_boundary(BoundaryKind::UnresolvedCallback, &detail, closure, &block);
             }
@@ -1874,6 +1880,11 @@ impl<'a> Analyzer<'a> {
             Resolution::Body(target) => vec![target],
             Resolution::Bodies(targets, _) => targets,
             Resolution::Boundary(kind, detail) => return Err((kind, detail)),
+            // The sources implement `Future` for it, but no `poll` body is
+            // here, as with a partial MIR input.
+            Resolution::External(_) if self.program.sources_impl_future(ty) => {
+                return Err((BoundaryKind::MissingBody, poll));
+            }
             Resolution::External(_) => return Ok(false),
         };
         for target in targets {

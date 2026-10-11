@@ -83,6 +83,7 @@ fn a_case_the_analysis_cannot_follow_is_never_proven() {
         "wf_step_async_closure",
         "wf_step_identity_write",
         "wf_step_moved_write",
+        "wf_step_named_shared_future",
     ] {
         assert!(
             !matches!(verdict(&all, name), Verdict::ProvenDeterministic),
@@ -166,6 +167,33 @@ fn a_dependency_named_like_a_local_module_is_still_a_boundary() {
             .iter()
             .any(|b| b.kind.name() == "external-crate-body"
                 && b.detail == "<helpers::ClockFuture as std::future::Future>::poll"),
+        "{boundaries:?}"
+    );
+}
+
+#[test]
+fn a_first_party_future_with_no_poll_body_is_a_boundary() {
+    // A partial MIR input can lack the `poll` of a local future. The source
+    // shows that `ClockFuture` implements `Future`, so its `poll` exists.
+    let dir = fixture_dir();
+    let text = std::fs::read_to_string(dir.join("flow.mir")).expect("read");
+    let start = text
+        .find("fn <impl at flow.rs:237:1: 237:28>::poll(")
+        .expect("the ClockFuture poll body");
+    let end = start + text[start..].find("\n}\n").expect("its end") + 3;
+    let cut = format!("{}{}", &text[..start], &text[end..]);
+    let docs = vec![mir::parse("flow", "flow.mir", &cut)];
+    let entries = entry::discover(&docs);
+    let program = Program::build(docs, &SourceRoots { roots: vec![dir] }).expect("build");
+    let model = Model::builtin().expect("the embedded model must parse");
+    let all = analysis::analyze(&program, &model, &entries);
+    let Verdict::Unknown { boundaries } = verdict(&all, "wf_step_named_future") else {
+        panic!("{:?}", verdict(&all, "wf_step_named_future"));
+    };
+    assert!(
+        boundaries
+            .iter()
+            .any(|b| b.kind.name() == "missing-body" && b.detail.contains("ClockFuture")),
         "{boundaries:?}"
     );
 }

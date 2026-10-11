@@ -464,3 +464,42 @@ pub async fn wf_step_moved_write(ctx: &WorkflowContext) -> Out {
     }
     ctx.execute_activity_raw("b", seen).await
 }
+
+/// A first-party future that holds shared state and writes it in `poll`.
+pub struct SharedFuture {
+    shared: std::sync::Arc<std::sync::Mutex<u64>>,
+}
+
+impl Future for SharedFuture {
+    type Output = Out;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Out> {
+        if let Ok(mut seen) = self.shared.lock() {
+            *seen = now_nanos();
+        }
+        std::task::Poll::Ready(Ok(1))
+    }
+}
+
+pub fn __autumn_workflow_info_wf_step_named_shared_future() -> u8 {
+    0
+}
+
+/// The named future writes the clock into shared state the caller reads.
+pub async fn wf_step_named_shared_future(ctx: &WorkflowContext) -> Out {
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(0_u64));
+    {
+        let mut saga = Saga::new(ctx);
+        let handle = shared.clone();
+        saga.step(
+            move || SharedFuture { shared: handle },
+            |_| async { Ok(()) },
+        )
+        .await?;
+    }
+    let seen = shared.lock().map_or(0, |v| *v);
+    ctx.execute_activity_raw("b", seen).await
+}

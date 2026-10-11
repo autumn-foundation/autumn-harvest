@@ -46,6 +46,9 @@ pub struct SourceIndex {
     /// the item. It is the full path from the target root, as MIR prints a
     /// local type that it does not trim to its bare name.
     pub type_paths: BTreeSet<String>,
+    /// The self type name of each `impl Future for T` in the sources, as
+    /// `T` with no generics.
+    pub future_impls: BTreeSet<String>,
     /// Source file → why it could not be indexed.
     ///
     /// A file MIR named that the source roots could not produce, or that `syn`
@@ -201,6 +204,9 @@ impl SourceIndex {
                     }
                 }
                 syn::Item::Impl(item) => {
+                    if let Some(name) = future_self_type(item) {
+                        self.future_impls.insert(name);
+                    }
                     for member in &item.items {
                         if let syn::ImplItem::Fn(f) = member {
                             let mut generics = generic_names(&item.generics);
@@ -232,6 +238,18 @@ fn generic_names(generics: &syn::Generics) -> Vec<String> {
 }
 
 /// Every `.rs` file directly under `dir` (relative to whichever root holds it).
+/// The self type name of an `impl Future for T` block, with no generics.
+fn future_self_type(item: &syn::ItemImpl) -> Option<String> {
+    let (_, trait_path, _) = item.trait_.as_ref()?;
+    if trait_path.segments.last()?.ident != "Future" {
+        return None;
+    }
+    let syn::Type::Path(self_ty) = item.self_ty.as_ref() else {
+        return None;
+    };
+    Some(self_ty.path.segments.last()?.ident.to_string())
+}
+
 /// The module path a source file stands for, from its path.
 ///
 /// `src/a/b.rs` and `src/a/b/mod.rs` give `a::b`. A target root, such as

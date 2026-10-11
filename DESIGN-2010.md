@@ -130,6 +130,10 @@ Four review agents read the first version. Each fix has a test.
     the root. The analysis records each returned coroutine in the handler
     `returns`, so `|v| handle(v)` counts too. A body with no flow graph is
     now refused.
+21. A followed named future also gets the capture check. Its type name can
+    hide a writable field, as `SharedFuture` hides an `Arc<Mutex<_>>`.
+22. A local type that the sources implement `Future` for, but whose `poll`
+    has no body in the MIR, is a `missing-body` boundary.
 
 ---
 
