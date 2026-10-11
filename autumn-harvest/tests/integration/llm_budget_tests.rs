@@ -669,7 +669,6 @@ async fn a_reset_fork_counts_toward_the_tenant_budget() {
             operator_id: "op".into(),
             signal_reapply: ResetSignalReapplyPolicy::default(),
             allow_terminal_source: true,
-            refuse_erased_source: false,
         },
         None,
     )
