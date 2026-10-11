@@ -2807,8 +2807,9 @@ pub struct WorkflowContext {
     commands: Mutex<Vec<WorkflowCommand>>,
     /// Harvest futures parked with no result channel (issue #1797).
     parks: ParkCounter,
-    /// Keys of the named promises this run has made (issue #1985). A key
-    /// settles once, so a second handle for it would wait forever.
+    /// Keys of the promises this run has made, named or generated (issue
+    /// #1985). A key settles once, so a second handle for it would wait
+    /// forever.
     promise_keys: Mutex<std::collections::HashSet<String>>,
     /// Deterministic "now" -- the timestamp from the `WorkflowStarted` event.
     start_time: DateTime<Utc>,
@@ -9418,9 +9419,16 @@ impl WorkflowContext {
     /// Panics if the internal matcher or commands mutex is poisoned.
     pub fn new_promise(&self) -> HarvestResult<crate::durable_promise::DurablePromise<'_>> {
         let execution_id = self.execution_id();
-        self.record_promise(|| {
+        let promise = self.record_promise(|| {
             crate::durable_promise::PromiseId::from_uuid(execution_id, uuid::Uuid::now_v7())
-        })
+        })?;
+        // Register the recorded key, so `promise` refuses a second handle for
+        // it. Replay records the same key, so the set is the same.
+        self.promise_keys
+            .lock()
+            .expect("promise key set poisoned")
+            .insert(promise.id().key().to_owned());
+        Ok(promise)
     }
 
     /// Records a promise token once and returns the recorded token on replay.

@@ -365,6 +365,40 @@ async fn test_durable_promise_refuses_a_second_handle_for_one_key() {
     assert_succeeded(&outcome.replay_check(duplicate_handle_workflow).await);
 }
 
+/// Makes a promise with a generated key, then asks for a second handle with
+/// that key.
+fn duplicate_generated_handle_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+    Box::pin(async move {
+        let first = ctx.new_promise().map_err(|e| e.to_string())?;
+        let key = first.id().key().to_owned();
+        match ctx.promise(key) {
+            Ok(_) => Ok(json!("second handle made")),
+            Err(e) => Ok(json!(e.to_string())),
+        }
+    })
+}
+
+/// A generated key settles once too. So the context refuses a second handle
+/// for it, as for a named key.
+#[tokio::test]
+async fn test_durable_promise_refuses_a_second_handle_for_a_generated_key() {
+    let outcome = WorkflowTestEnv::new()
+        .run(duplicate_generated_handle_workflow, Value::Null)
+        .await;
+    let message = outcome.result.clone().expect("the workflow completes");
+    assert!(
+        message
+            .as_str()
+            .is_some_and(|m| m.contains("already has a handle")),
+        "the second handle must be refused: {message}"
+    );
+    assert_succeeded(
+        &outcome
+            .replay_check(duplicate_generated_handle_workflow)
+            .await,
+    );
+}
+
 #[tokio::test]
 async fn test_durable_promise_new_promise_token_names_this_run() {
     let outcome = WorkflowTestEnv::new()
