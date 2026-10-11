@@ -338,6 +338,9 @@ pub mod external_target_location;
 pub mod external_task;
 pub mod failure;
 pub mod fan_out;
+/// Non-destructive fork of a workflow run (issue #2000).
+#[cfg(feature = "db")]
+pub mod fork;
 /// Replay fuzz harness (issue #1835). Not a stable API.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]

@@ -2121,6 +2121,7 @@ const ENGINE_MINTED_ID_FIELDS: &[&str] = &[
     "cancel_id",
     "child_id",
     "dead_letter_id",
+    "forked_from_exec_id",
     "new_exec_id",
     "reset_from_exec_id",
     "reset_to_exec_id",

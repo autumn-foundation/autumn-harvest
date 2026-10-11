@@ -875,7 +875,9 @@ pub const NEW_START_HANDICAP_SECS: u32 = 30;
 /// Every other task is a continuation. That includes an activity task and a
 /// woken workflow task. It also includes the first task of a child, a
 /// continue-as-new, a reset fork, a workflow retry or a DLQ redrive. Each of
-/// these extends admitted work. The admission gate uses a similar split.
+/// these extends admitted work. The admission gate uses a similar split. A
+/// non-destructive fork (issue #2000) is admitted as a fresh start, so its
+/// first task is a new start.
 ///
 /// A new start sorts as if it were due [`NEW_START_HANDICAP_SECS`] later. So
 /// at equal priority, a continuation goes first under a backlog. The
@@ -4422,6 +4424,9 @@ pub async fn cancel_open_tasks_for_execution(
 /// is still open (`PENDING`/`RUNNING`) — the loser-cancellation primitive for
 /// `ctx.race()` (issue #600).
 ///
+/// A loser that a recorded fork holds is already `CANCELLED` with the hold
+/// mark of issue #2000. It counts as open here.
+///
 /// Returns `Some((activity_name, queue_name))` if a still-open row was
 /// transitioned to `CANCELLED` (the caller should then record a synthetic
 /// terminal event for it so replay never re-observes it as in-progress, and
@@ -4444,7 +4449,11 @@ pub async fn cancel_activity_task(
     let cancelled = diesel::update(
         dsl::harvest_task_queue
             .filter(dsl::activity_id.eq(Some(activity_id.as_uuid())))
-            .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
+            .filter(
+                dsl::state.eq_any(["PENDING", "RUNNING"]).or(dsl::state
+                    .eq("CANCELLED")
+                    .and(dsl::error.eq(Some(crate::fork::FORK_HOLD_ERROR)))),
+            ),
     )
     .set((
         dsl::state.eq("CANCELLED"),

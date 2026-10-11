@@ -781,12 +781,16 @@ pub async fn insert_payload_refs(
             byte_len: i64::try_from(r.byte_len).unwrap_or(i64::MAX),
         })
         .collect();
-    diesel::insert_into(harvest_payload_refs::table)
-        .values(&rows)
-        .on_conflict_do_nothing()
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    // Each row binds four parameters. Chunks keep a statement far below the
+    // Postgres limit of 65,535, so a long fork prefix still inserts.
+    for chunk in rows.chunks(1_000) {
+        diesel::insert_into(harvest_payload_refs::table)
+            .values(chunk)
+            .on_conflict_do_nothing()
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
     Ok(())
 }
 

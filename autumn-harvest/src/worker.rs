@@ -10977,11 +10977,15 @@ async fn persist_activity_wait_park(
 ///
 /// Extracted from [`persist_scheduled_activities`] (issue #950) so the
 /// generalized mixed-batch path enforces the identical guarantee.
+///
+/// The check skips each activity in `settled`. A fork record settled it, so
+/// no host runs it (issue #2000).
 async fn fail_activities_for_broken_sessions(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     scheduled_activities: &[ScheduledActivityCommand],
     activity_task_ids: &[uuid::Uuid],
+    settled: &std::collections::HashSet<ActivityExecId>,
     next_event_id: &mut i32,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<bool> {
@@ -11016,6 +11020,9 @@ async fn fail_activities_for_broken_sessions(
 
     let mut synthesized = false;
     for (scheduled, activity_task_id) in scheduled_activities.iter().zip(activity_task_ids.iter()) {
+        if settled.contains(&scheduled.activity_id) {
+            continue;
+        }
         let Some(session_uuid) = scheduled.session_id.map(|id| id.as_uuid()) else {
             continue;
         };
@@ -11037,6 +11044,11 @@ async fn fail_activities_for_broken_sessions(
         synthesized = true;
     }
     Ok(synthesized)
+}
+
+/// The activity ids of `scheduled`, in command order.
+fn scheduled_activity_ids(scheduled: &[ScheduledActivityCommand]) -> Vec<ActivityExecId> {
+    scheduled.iter().map(|s| s.activity_id).collect()
 }
 
 /// The pre-transaction plan for a batch of `ScheduleActivity` commands:
@@ -11457,6 +11469,9 @@ async fn persist_scheduled_activities(
     parent_priority: i32,
     context_headers: Option<&serde_json::Value>,
     workflow_input: &serde_json::Value,
+    // Issue #2000: `true` when the run is a fork, so a recorded fork serves
+    // each activity from its record instead of running it.
+    is_fork: bool,
 ) -> HarvestResult<()> {
     let ActivityEnqueuePlan {
         activity_events,
@@ -11483,7 +11498,7 @@ async fn persist_scheduled_activities(
     // activity-completion races, this is a *fresh* dispatch (the activities
     // being scheduled here cannot have completed yet), so no other in-band
     // check exists to catch it.
-    let (deferred, had_wake_requested, synthesized_broken_session_failure) =
+    let (deferred, had_wake_requested, synthesized_outcome) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             // Cancellable/renewable timer bookkeeping (issue #768): resolve
             // the ArmTimer/CancelTimer row mutations FIRST, then build the
@@ -11542,6 +11557,18 @@ async fn persist_scheduled_activities(
             )
             .await?;
 
+            // Issue #2000: a fork resolves each activity from its record
+            // here. It runs before the session check, which skips each
+            // settled activity.
+            let fork = crate::fork::serve_recorded_activities(
+                conn,
+                exec_id,
+                is_fork,
+                &scheduled_activity_ids(scheduled_activities),
+                &mut race_next_event_id,
+                registry,
+            )
+            .await?;
             // Worker sessions (issue #606): fail any member activity whose
             // session already left ACTIVE, so the workflow observes
             // SessionBroken on its next decision cycle instead of hanging on a
@@ -11551,16 +11578,18 @@ async fn persist_scheduled_activities(
                 exec_id,
                 scheduled_activities,
                 &activity_task_ids,
+                &fork.settled,
                 &mut race_next_event_id,
                 registry.payload_codecs(),
             )
             .await?;
+            let served_from_fork = fork.served;
 
             let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
             Ok((
                 deferred,
                 had_wake_requested,
-                synthesized_broken_session_failure,
+                synthesized_broken_session_failure || served_from_fork,
             ))
         }))
         .await?;
@@ -11569,12 +11598,10 @@ async fn persist_scheduled_activities(
         start.spawn();
     }
 
-    // The synthesized SessionBroken failure(s) above are not tied to any
-    // external wake source (they were resolved entirely within this
-    // transaction), so the workflow must be woken unconditionally to
-    // observe them on its next decision cycle -- `had_wake_requested` alone
-    // would miss this case.
-    if had_wake_requested || synthesized_broken_session_failure {
+    // The transaction above resolved SessionBroken failures and fork outcomes
+    // itself. No external source wakes the workflow for them. So wake it
+    // here. `had_wake_requested` alone misses this case.
+    if had_wake_requested || synthesized_outcome {
         queue::wake_workflow_task(conn, exec_id).await?;
     }
 
@@ -13943,18 +13970,31 @@ async fn persist_mixed_suspension_batch(
             .await?;
         }
 
+        // Issue #2000: a fork resolves each activity from its record here,
+        // before the session check, exactly as on the plain path.
+        let fork = crate::fork::serve_recorded_activities(
+            conn,
+            exec_id,
+            crate::fork::is_fork(parent_execution),
+            &scheduled_activity_ids(&batch.scheduled_activities),
+            &mut next_event_id,
+            registry,
+        )
+        .await?;
         // Worker sessions (issue #606): fail any member activity whose session
         // already left ACTIVE so the workflow observes SessionBroken on its next
         // decision cycle instead of hanging on a task pinned to a dead host.
-        let synthesized_broken_session_failure = fail_activities_for_broken_sessions(
+        let broken_session_failure = fail_activities_for_broken_sessions(
             conn,
             exec_id,
             &batch.scheduled_activities,
             &activity_task_ids,
+            &fork.settled,
             &mut next_event_id,
             registry.payload_codecs(),
         )
         .await?;
+        let synthesized_broken_session_failure = broken_session_failure || fork.served;
 
         // ── park ────────────────────────────────────────────────────────────
         let deadline = timer_fire_instants
@@ -21096,6 +21136,7 @@ async fn handle_suspended_workflow(
             context.persistence.task.priority,
             context.execution.context_headers.as_ref(),
             &context.execution.input,
+            crate::fork::is_fork(context.execution),
         )
         .await
     } else if let Some(activity_ids) = extract_all_activity_waits(commands) {
@@ -25600,6 +25641,27 @@ async fn process_workflow_task(
             router: resolved_router,
             resident: iter_resident,
         } = drive;
+
+        // Issue #2000: a recorded fork never runs an effect that it cannot
+        // serve from the record. It fails here, before any persist path.
+        if crate::fork::history_is_recorded_fork(&prepared.execution, &history_events)
+            && let Some(command) =
+                crate::fork::recorded_outcome_refusal(&run_outcome, &pending_cmds)
+        {
+            return fail_workflow_execution_clearing_strikes(
+                conn,
+                task,
+                worker_id,
+                Err::<(), _>(HarvestError::Config(format!(
+                    "recorded fork refused {command}: recorded mode cannot serve it, so \
+                     fork with effects = live to run it"
+                ))),
+                workflow_panic_strikes,
+                prepared.exec_id.as_uuid(),
+                registry.payload_codecs(),
+            )
+            .await;
+        }
 
         match run_outcome {
             WorkflowOutcome::Suspended { commands }
@@ -40742,7 +40804,13 @@ mod tests {
             interval,
         );
 
-        advance_sampler_ticks(interval, 5).await;
+        // The accept is real loopback I/O, not paused time. A slow runner can
+        // land it after a fixed tick count. So the test ticks until the
+        // accept lands, under a deadline in real time.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while listener.touch_count() == 0 && std::time::Instant::now() < deadline {
+            advance_sampler_ticks(interval, 1).await;
+        }
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
         listener.stop();

@@ -790,7 +790,7 @@ fn evaluate_start_gate(
 /// The manual gate runs first and returns [`HarvestError::AdmissionBlocked`].
 /// Load shedding (issue #1794) runs second and returns
 /// [`HarvestError::LoadShed`]. Each refusal records its metric once.
-fn admit_fresh_start(
+pub(crate) fn admit_fresh_start(
     mode: crate::admission_gate::GateMode,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     workflow_name: &str,
@@ -7634,7 +7634,7 @@ pub struct RerunOutcome {
 /// matches the fail-closed posture the pre-#1308 hash rejection took for
 /// every divergent override. So an embedder that never wires one up sees no
 /// behavior change.
-async fn rerun_cross_shard_occupancy(
+pub(crate) async fn rerun_cross_shard_occupancy(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     target_wf_id: &str,

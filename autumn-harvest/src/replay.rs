@@ -1608,7 +1608,7 @@ impl HistoryMatcher {
     /// they are skipped during activity/timer/signal/child-workflow matching
     /// and are consumed by the `match_update` / `drain_admitted_updates` APIs.
     /// `WorkflowResetFork` is informational and likewise has no workflow
-    /// command counterpart.
+    /// command counterpart. So are the two fork events of issue #2000.
     const fn is_update_event(event: &WorkflowEvent) -> bool {
         matches!(
             event,
@@ -1616,6 +1616,8 @@ impl HistoryMatcher {
                 | WorkflowEvent::UpdateCompleted { .. }
                 | WorkflowEvent::UpdateFailed { .. }
                 | WorkflowEvent::WorkflowResetFork { .. }
+                | WorkflowEvent::WorkflowForked { .. }
+                | WorkflowEvent::ForkActivityResultOverridden { .. }
         )
     }
 

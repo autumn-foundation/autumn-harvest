@@ -7772,7 +7772,7 @@
             }
           },
           {
-            "description": "Filter by workflow-start provenance (issue #740). One of the bounded StartSource set: api, schedule, backfill, signal_with_start, update_with_start, completion_trigger, webhook, child, batch, continue_as_new, reset, outbox, or 'unknown' (matches NULL / pre-upgrade rows). Any other value returns 400.",
+            "description": "Filter by workflow-start provenance (issue #740). One of the bounded StartSource set: api, schedule, backfill, signal_with_start, update_with_start, completion_trigger, webhook, broker, child, batch, continue_as_new, reset, rerun, outbox, transactional, fork, or 'unknown' (matches NULL / pre-upgrade rows). Any other value returns 400.",
             "in": "query",
             "name": "start_source",
             "required": false,
@@ -10984,6 +10984,107 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Idempotent: re-running on an already-erased execution returns fields_tombstoned=0, no error.",
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
+      }
+    },
+    "/workflows/{id}/fork": {
+      "post": {
+        "description": "Non-destructive fork of a workflow execution (issue #2000). Copy a history prefix of the source to a NEW execution with a NEW workflow id. The source is never changed, so a run in any state can be forked, including COMPLETED and TERMINATED. Admin-only. Provenance on the fork is start_source='fork', start_source_ref=<source execution id>; its history holds a WorkflowForked marker that names the source. effects defaults to recorded: a remote activity takes a caller override, or the result that the source recorded for the same name, occurrence and input; with neither it fails non-retryably with error_type ForkEffectUnavailable and never runs. In recorded mode, a local activity, a child workflow, an external activity, an external signal, an external cancel, a continue-as-new or a mutex acquire fails the fork run before it runs; a race branch that lost in the source stays pending; and the fork sends no completion callback and fires no completion trigger. A reset of a fork keeps start_source='fork'. Erasure of a source does not reach its forks. effects=live runs effects for real.",
+        "operationId": "post_workflows_by_id_fork",
+        "parameters": [
+          {
+            "description": "Execution UUID of the source run.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "activity_overrides": {
+                    "description": "Array of {activity_name, occurrence, output}. occurrence is the 1-based count of ActivityScheduled events with that name. The activity returns output and never runs, in both effects modes. The occurrence must come after the fork point. At most 1,000 entries; more returns 400. Each output must pass the result byte cap of its activity, unless a payload store offloads it, or the request returns 400."
+                  },
+                  "effects": {
+                    "description": "recorded (the default) or live. live runs activities and other effects for real."
+                  },
+                  "fork_point": {
+                    "description": "Where the fork starts, as a reset_point: {\"type\":\"event_id\",\"event_id\":N}, {\"type\":\"first_activity_run\",\"activity_name\":\"name\"} or {\"type\":\"last_workflow_task\"}. Omitted = event 0 (WorkflowStarted). The point must be a clean decision boundary before any terminal event, and the carried history must hold no MutexGranted."
+                  },
+                  "input": {
+                    "description": "Replacement input for the fork. Needs fork point 0. It must pass the workflow input schema and byte cap. A JSON null means no override."
+                  },
+                  "operator_id": {
+                    "description": "Identity of the operator."
+                  },
+                  "reason": {
+                    "description": "Reason for the fork, recorded in the marker and the audit log."
+                  },
+                  "workflow_id": {
+                    "description": "Business key of the fork. Omitted = <source workflow_id>-fork-<uuid>. The source key is refused with 400. A key that another run holds returns 409; a run holds its key unless it continued as new or was terminated."
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "effects": {},
+                    "events_carried_over": {},
+                    "fork_event_id": {},
+                    "forked_from_exec_id": {},
+                    "new_exec_id": {},
+                    "workflow_id": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "description": "Malformed execution id or body; invalid fork point; continue-as-new history; an input override that needs fork point 0 or fails the input schema or byte cap; an invalid activity override."
+          },
+          "401": {
+            "description": "Admin authentication required."
+          },
+          "404": {
+            "description": "Execution not found."
+          },
+          "409": {
+            "description": "The source, or a run in its fork lineage, had its payloads erased (issue #495); recorded mode cannot serve an effect after the fork point (fork with effects=live); the carried history holds a mutex grant; the workflow id is in use on any shard, or a shard it routes to cannot be checked; the source shard is draining; the fork lineage is deeper than 64 links or reaches a run that no longer exists on this shard, after retention or a shard migration; or the fork history reaches the history event or byte cap of the worker."
+          },
+          "413": {
+            "description": "The quota key that the fork input resolves exceeds its byte cap (issue #946)."
+          },
+          "429": {
+            "description": "The fork would exceed the tenant quota of its workflow type (issue #946), or load shedding refuses new starts on its queue (issue #1794). A fork counts as an active run of its quota key."
+          },
+          "500": {
+            "description": "Database error."
+          },
+          "503": {
+            "description": "An admission gate blocks new starts for the fork (issue #618), a shard migration moved the source during the fork (retry; the retry follows the forwarding pointer), the node has not finished start-up, or the fork succeeded but its audit record could not be written. In the last case the message names the new execution. Retry is not needed."
+          }
+        },
+        "summary": "Non-destructive fork of a workflow execution (issue #2000).",
+        "tags": [
+          "workflow"
+        ],
+        "x-harvest-idempotency": "Not idempotent: each call creates a distinct new execution.",
         "x-harvest-read-only": false,
         "x-harvest-route-class": "mutating"
       }

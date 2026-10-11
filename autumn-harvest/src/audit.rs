@@ -53,6 +53,11 @@ pub const OP_WORKFLOW_RESET: &str = "workflow.reset";
 /// a re-run starts a brand-new execution of the whole workflow. The audit
 /// row's `target_id` is the SOURCE execution id.
 pub const OP_WORKFLOW_RERUN: &str = "workflow.rerun";
+/// Audit operation: Non-destructive fork of a workflow execution (issue #2000).
+///
+/// The source stays unchanged. The audit row's `target_id` is the SOURCE
+/// execution id.
+pub const OP_WORKFLOW_FORK: &str = "workflow.fork";
 /// Audit operation: Paused an individual workflow execution (issue #383).
 pub const OP_WORKFLOW_PAUSE: &str = "workflow.pause";
 /// Audit operation: Resumed a paused workflow execution (issue #383).
@@ -573,6 +578,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("POST /workflows/{id}/resume", RouteClass::Mutating),
     ("PATCH /workflows/{id}/triage", RouteClass::Mutating),
     ("POST /workflows/{id}/reset", RouteClass::Mutating),
+    ("POST /workflows/{id}/fork", RouteClass::Mutating),
     (
         "POST /workflows/{id}/signal/{signal_name}",
         RouteClass::Mutating,
@@ -886,6 +892,7 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_WORKFLOW_ANNOTATE,
     OP_WORKFLOW_RESET,
     OP_WORKFLOW_RERUN,
+    OP_WORKFLOW_FORK,
     OP_DAG_TRIGGER,
     OP_DAG_PATCH,
     OP_SCHEDULE_CREATE,
@@ -1176,6 +1183,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("POST /workflows/{id}/resume", Some(OP_WORKFLOW_RESUME)),
     ("PATCH /workflows/{id}/triage", Some(OP_WORKFLOW_ANNOTATE)),
     ("POST /workflows/{id}/reset", Some(OP_WORKFLOW_RESET)),
+    ("POST /workflows/{id}/fork", Some(OP_WORKFLOW_FORK)),
     (
         "POST /workflows/{id}/signal/{signal_name}",
         Some(OP_WORKFLOW_SIGNAL),
@@ -2358,6 +2366,23 @@ mod tests {
             EXCLUDED_ROUTES.contains(&get_route),
             "{get_route} should be listed in EXCLUDED_ROUTES, matching its GET /admin/circuits/{{activity_name}} sibling (issue #945)"
         );
+    }
+
+    #[test]
+    fn fork_route_is_classified_and_audited() {
+        // Issue #2000: a fork starts a new run, so it is a mutation.
+        let route = "POST /workflows/{id}/fork";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::Mutating)
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == route && *op == Some(OP_WORKFLOW_FORK))
+        );
+        assert!(AUDITED_OPERATIONS.contains(&OP_WORKFLOW_FORK));
     }
 
     #[test]

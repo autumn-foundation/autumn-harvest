@@ -158,6 +158,7 @@ mod fanout_result_writer_db_tests;
 mod fanout_tests;
 mod fanout_tolerance_tests;
 mod force_fail_tests;
+mod fork_tests;
 mod formal_models_coverage;
 mod formal_trace_coverage;
 mod fuzz_nightly_wiring;

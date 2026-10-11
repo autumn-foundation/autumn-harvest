@@ -131,6 +131,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          external_outbox_scan_tests
 linux        autumn-harvest         integration                      -                          fanout_result_writer_db_tests
 linux        autumn-harvest         integration                      -                          force_fail
+linux        autumn-harvest         integration                      -                          fork_tests
 linux        autumn-harvest         integration                      -                          history_ceiling_claim_tests
 linux        autumn-harvest         integration                      -                          history_crash_tests
 linux        autumn-harvest         integration                      -                          history_default_caps_tests
@@ -338,6 +339,7 @@ linux        autumn-harvest-plugin  worker_shard_filter_integration  -          
 linux        autumn-harvest-plugin  workflow_children_traversal_perf -                          -
 linux        autumn-harvest-plugin  workflow_count_integration       -                          -
 linux        autumn-harvest-plugin  workflow_filter_integration      -                          -
+linux        autumn-harvest-plugin  workflow_fork_integration        -                          -
 linux        autumn-harvest-plugin  workflow_history_pagination_integration  -                          -
 linux        autumn-harvest-plugin  workflow_logs_integration        -                          -
 linux        autumn-harvest-plugin  workflow_reachability_integration  -                          -
