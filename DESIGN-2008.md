@@ -187,8 +187,47 @@ Red first, then green. Each row names the test that pins it.
 
 ## 3. Acceptance criteria
 
-FILLED_IN_LATER
+| Criterion | Evidence |
+|-----------|----------|
+| Depends on the hit-rate sibling (#2007). | The counter part of #2007 ships first, in its own commit: `harvest.workflow.resident` with a bounded miss reason, listed in `docs/telemetry.md`. Section 4 measures with it. The e2e bench run of #2007 stays open there. |
+| The dominant miss reason is covered, and the hit rate on the same workload rises. | Before the change, the agent loop misses with `multi_await`, and then with `blocked` on the wait that the cold replay leaves. A join of activities now stays resident. Section 4: 3 of 10 hits before, 10 of 11 after, on the same workload. |
+| The extended path runs under DST. | The DST world's scheduled workflow joins two activities. `a_join_resumes_warm_through_the_worker` pins a warm partial resume through the real worker. The seeded sweep passes every invariant, with more warm decisions than before. |
 
 ## 4. Measurement
 
-FILLED_IN_LATER
+Both runs use the same code for the workload and the measurement. The
+"before" run is the red commit, which has the counter and the workload
+but not the extension.
+
+**Agent loop on a real worker.**
+`resident_outcome_tests::an_agent_loop_with_parallel_tool_calls_hits_after_the_first_decision`
+runs three rounds of one model call and four parallel tool calls. The
+test prints the outcome of each decision.
+
+| Run | Hits | Decisions | Outcomes |
+|-----|------|-----------|----------|
+| Before | 3 | 10 | `cold, hit, multi_await, blocked, hit, multi_await, blocked, hit, multi_await, blocked` |
+| After | 10 | 11 | `cold`, then 10 `hit` |
+
+The before run shows a second miss. A cold replay of a partial join
+leaves the `ActivityStarted` event of a running tool unread. Capture then
+refuses the last wait as `blocked`, so the next decision replays too. A
+throwaway test confirmed this: the same partial history with no
+`ActivityStarted` event stays resident. A resident join does not replay,
+so that miss goes away as well. The number of decisions depends on how
+the tool results arrive.
+
+**DST world sweep, seeds 0 to 11.**
+`HARVEST_DST_SEEDS=12 cargo test -p autumn-harvest --test integration
+dst_world_tests::world_seed_sweep -- --nocapture --test-threads=1`
+
+| Run | Warm | Cold | Declined (a cache hit that replayed) |
+|-----|------|------|--------------------------------------|
+| Before | 33 | 170 | 30 |
+| After | 44 | 170 | 19 |
+
+A cold decision follows a crash, a restart or a first decision, so its
+count does not change. Every invariant holds in both runs.
+
+**Reproduce.** Point `HARVEST_TEST_DATABASE_URL` at a migrated Postgres
+and run the two commands above, at the red commit and at the head.

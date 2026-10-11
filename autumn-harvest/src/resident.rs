@@ -584,6 +584,9 @@ impl ResidentWorkflow {
     /// Matches `delta` to the parked awaits. Returns the resolving event of
     /// each parked await, or `None` for one that stays parked.
     ///
+    /// This checks the order of events only. [`Awaiting::deliver`] checks
+    /// that the live channel can carry each payload exactly.
+    ///
     /// Decision boundaries (issue #1833) are skipped. Replay never reads them.
     fn resolutions<'a>(
         &self,
@@ -622,12 +625,6 @@ impl ResidentWorkflow {
             };
             if resolved[index].is_some() {
                 return Err(ResumeDeclined::ExtraEvents);
-            }
-            if matches!(
-                event,
-                WorkflowEvent::ActivityFailed { .. } | WorkflowEvent::ActivityTimedOut { .. }
-            ) {
-                return Err(ResumeDeclined::InexactResolution(event.type_name()));
             }
             resolved[index] = Some(event);
         }
