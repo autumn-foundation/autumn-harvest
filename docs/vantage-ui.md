@@ -1,6 +1,6 @@
 # Vantage UI
 
-Vantage is the embedded, server-rendered dashboard bundled with `autumn-harvest-plugin`. It mounts at the path configured by `HarvestPlugin::api` (e.g. `/api/harvest/ui`) and requires no external assets or CDN — all CSS is inlined.
+Vantage is the embedded, server-rendered dashboard bundled with `autumn-harvest-plugin`. It mounts at the path configured by `HarvestPlugin::api` (e.g. `/api/harvest/ui`) and requires no external assets or CDN — all CSS is inlined. The workflow list and detail pages load one same-origin script for live refresh (see [Live refresh](#live-refresh)). No other page loads a script.
 
 ## Pages
 
@@ -17,6 +17,7 @@ Displays a paginated table of workflow executions across all configured shards.
 | Started after | `started_after` | ISO-8601 datetime string (e.g. `2026-01-01T00:00:00Z`) |
 | Started before | `started_before` | ISO-8601 datetime string |
 | Execution ID search | `exec_id_search` | Prefix match on the execution UUID |
+| Filter | `filter` | An expression with `AND`, `OR` and parentheses, for example `attrs.phase = 'blocked' OR attrs.amount > 1000` (issue #1982). A bad expression is not applied, and its error shows below the field. See [Filter expressions](management-api.md#filter-expressions-get-workflows). |
 
 Combine any number of filters in a single URL. Hitting **Reset** clears all filters and returns to the default view.
 
@@ -281,18 +282,48 @@ Event fields are extracted from the inner `data` object of the adjacently-tagged
 
 ## Auto-refresh
 
-`/workers`, `/schedules`, `/dlq`, and `/dags/{dag_name}` (DAG detail) take a `refresh` query parameter (`30` or `60` seconds, or a custom value) that emits a `<meta http-equiv="refresh">` tag — the page reloads itself over plain HTTP at that interval. Other pages, including `/workflows`, `/workflows/{exec_id}`, and `/dags` (the DAG list), have no `refresh` parameter and never auto-refresh — `?refresh=30` on one of those is silently ignored. There is no client-side JavaScript or live-streaming connection anywhere in Vantage; every page, including auto-refresh, is server-rendered HTML. The engine does expose a real SSE execution-event stream (`GET /executions/{exec_id}/events/stream`, documented in [`docs/management-api.md`](management-api.md#sse-execution-event-stream)), but no Vantage page currently consumes it — a browser client wanting real-time events talks to that endpoint directly.
+`/workers`, `/schedules`, `/dlq`, and `/dags/{dag_name}` (DAG detail) take a `refresh` query parameter (`30` or `60` seconds, or a custom value) that emits a `<meta http-equiv="refresh">` tag — the page reloads itself over plain HTTP at that interval. `/dags` (the DAG list) has no `refresh` parameter — `?refresh=30` there is silently ignored. The workflow list and detail pages use live refresh instead.
+
+## Live refresh
+
+> Issue #1982.
+
+The workflow list and the detail page of a live run update without a reload.
+They load `assets/live.js` with `defer`. The script:
+
+1. Reads an SSE stream with `fetch`:
+   - The list reads [`GET /workflows/changes/stream`](management-api.md#workflow-change-stream).
+   - The detail page reads [`GET /executions/{exec_id}/events/stream`](management-api.md#sse-execution-event-stream). It sends `Last-Event-ID` with the newest event that the page shows, so the stream sends no backfill.
+2. On a frame, fetches the same page as HTML. Then it swaps each region that has the `data-live-region` attribute. The server stays the only renderer.
+3. Fetches at most once each 2 s (list) or 3 s (detail). It does not fetch while the tab is hidden.
+
+A region does not change while a form in it has focus or typed text. The
+filter form of the list is outside each region. An action result (the flash)
+is outside each region too.
+
+When the stream is not available, the script fetches the page each 10 s. That
+occurs for a viewer without admin access, because both streams are
+admin-gated. It also occurs when no notification URL is set.
+
+The detail page of a run that ended has no live script. When a live run ends,
+the stream sends `stream-end`, the script fetches the page one last time, and
+then it stops. A page rendered after a rejected action has no live script, so
+the values that the operator typed stay.
+
+A browser without JavaScript gets the same server-rendered pages. It reloads
+by hand.
 
 ## Accessibility
 
 - Status badges on the detail page include `aria-label` and `role="status"`.
 - All filter and action forms use standard `<form>` / `<button>` elements navigable by keyboard.
-- The dashboard has no client-side JavaScript; every interaction is a plain HTTP form submission or link navigation, including auto-refresh (see above).
+- Every action is a plain HTTP form submission or link navigation. The live-refresh script only reads; it never submits a form.
+- The live status line has no `aria-live` attribute, so a refresh does not interrupt a screen reader.
 
 ## Security
 
 - All user-controlled values are HTML-escaped by Maud before rendering.
-- The dashboard never emits `<script>` tags.
+- The dashboard emits no inline script. The workflow list and detail pages load one same-origin script, `assets/live.js`, served with `X-Content-Type-Options: nosniff`. A `script-src 'self'` Content Security Policy allows it. The script inserts only HTML that the server rendered and escaped.
 - The `require_harvest_admin` middleware (configured via `HarvestBuilder`) can gate Vantage behind token authentication in production.
 - **Cross-site mutation rejection (#1278).** Every `POST` Vantage renders a `<form>` against — every route on this router, plus the two dead-letter bulk routes those forms submit to directly on the sibling management-API router — rejects a request with no same-origin evidence. The DLQ page's per-row buttons post to these same two bulk routes with a single-id filter, so no separate route is needed for them. `POST /dead-letters/{id}/replay` and `POST /dlq/redrive` are bodyless API-only operations no Vantage form targets, so they stay outside this guard. `Sec-Fetch-Site: same-origin` is checked first and, when present, is always decisive; only when it is absent does the request fall back to a matching `Origin`/`Host` pair (default ports normalized, `X-Forwarded-Host` preferred over `Host` when a reverse proxy reports one). That fallback also requires a proxy-confirmed `X-Forwarded-Proto` matching `Origin`'s claimed scheme exactly — `Origin` alone proves only the requesting page's scheme, never this connection's, so an unconfirmed claim is rejected regardless of which scheme it names. Failing all of that, a `Content-Type` a bare cross-site form cannot send (`application/json`, chiefly) is the last resort. Checking `Sec-Fetch-Site` first, ahead of `Content-Type`, matters: hyperlink auditing (`<a ping>`) and `navigator.sendBeacon` can reach a server with a non-CORS-simple content type and no preflight, so content type alone is never proof of safety. `GET`/`HEAD`/`OPTIONS`/`TRACE` and `PUT`/`PATCH`/`DELETE` are exempt outright, since a bare cross-site form or `no-cors` fetch cannot send those methods at all. So is the `harvest` CLI's own `X-Harvest-Source: cli` header, and a request carrying a verified scoped API token. The rest of the management API — the documented, headerless `curl`-and-CLI operator surface in `docs/runbooks/` — is out of scope; see `same_origin.rs` for the full rationale.
 - **Embedder responsibility.** Set `SameSite=Lax` or stricter on the session cookie. Modern browsers already block a cross-site form `POST` under `Lax`. Treat this as a second, independent layer; the guard above does not depend on it.

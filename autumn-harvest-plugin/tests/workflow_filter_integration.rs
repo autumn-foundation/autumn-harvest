@@ -1652,3 +1652,345 @@ async fn stalled_workflow_path_applies_search_attr_predicate() {
         ]
     );
 }
+
+// ── Issue #1982: the `filter` grammar and the change stream ──────────────────
+
+/// Percent-encodes a filter for a query string.
+fn enc(raw: &str) -> String {
+    let mut out = String::new();
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn sorted_ids(value: &Value) -> Vec<String> {
+    let mut ids = workflow_ids(value);
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn filter_or_precedence_and_grouping() {
+    let (database_url, _container) = setup_single_database().await;
+    let pool = build_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state);
+
+    for (id, attrs) in [
+        ("w-a", json!({ "a": 1 })),
+        ("w-ac", json!({ "a": 1, "c": 1 })),
+        ("w-b", json!({ "b": 1 })),
+        ("w-bc", json!({ "b": 1, "c": 1 })),
+        ("w-c", json!({ "c": 1 })),
+    ] {
+        seed_workflow(&database_url, ShardId::new(0), "flow", id, Some(attrs)).await;
+    }
+    seed_workflow(&database_url, ShardId::new(0), "other", "w-other", None).await;
+
+    let ids = |body: &Value| sorted_ids(body);
+    let list = |filter: &str| format!("/workflows?filter={}", enc(filter));
+
+    // AND binds tighter than OR: a OR (b AND c).
+    let (status, body) = get_json(&app, list("attrs.a = 1 OR attrs.b = 1 AND attrs.c = 1")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(ids(&body), ["w-a", "w-ac", "w-bc"]);
+
+    // (a AND c) OR b.
+    let (_, body) = get_json(&app, list("attrs.a = 1 AND attrs.c = 1 OR attrs.b = 1")).await;
+    assert_eq!(ids(&body), ["w-ac", "w-b", "w-bc"]);
+
+    // A group changes the result: (a OR b) AND c.
+    let (_, body) = get_json(&app, list("(attrs.a = 1 OR attrs.b = 1) AND attrs.c = 1")).await;
+    assert_eq!(ids(&body), ["w-ac", "w-bc"]);
+
+    // A system field in an OR branch.
+    let (_, body) = get_json(&app, list("workflow_name = 'other' OR attrs.b = 1")).await;
+    assert_eq!(ids(&body), ["w-b", "w-bc", "w-other"]);
+
+    // IN, EXISTS and != on attributes.
+    let (_, body) = get_json(&app, list("attrs.c EXISTS AND attrs.a != 2")).await;
+    assert_eq!(ids(&body), ["w-ac"]);
+    let (_, body) = get_json(&app, list("workflow_name IN ('other') OR attrs.a IN (1)")).await;
+    assert_eq!(ids(&body), ["w-a", "w-ac", "w-other"]);
+
+    // Quotes decide the type: the string "1" matches no number.
+    let (_, body) = get_json(&app, list("attrs.a = '1'")).await;
+    assert_eq!(ids(&body), Vec::<String>::new());
+
+    // Repeated filters, and other parameters, join with AND.
+    let uri = format!(
+        "{}&filter={}&workflow_name=flow",
+        list("attrs.a = 1 OR attrs.b = 1"),
+        enc("attrs.c = 1")
+    );
+    let (_, body) = get_json(&app, uri).await;
+    assert_eq!(ids(&body), ["w-ac", "w-bc"]);
+
+    // The filter composes with `state` and with pagination.
+    let (_, body) = get_json(
+        &app,
+        format!(
+            "{}&state=RUNNING&page_size=2",
+            list("attrs.c = 1 OR attrs.a = 1")
+        ),
+    )
+    .await;
+    assert_eq!(
+        body["workflows"].as_array().map(Vec::len),
+        Some(2),
+        "{body}"
+    );
+    let cursor = body["next_cursor"]
+        .as_str()
+        .expect("a second page")
+        .to_string();
+    let (_, next) = get_json(
+        &app,
+        format!(
+            "{}&state=RUNNING&page_size=2&cursor={}",
+            list("attrs.c = 1 OR attrs.a = 1"),
+            enc(&cursor)
+        ),
+    )
+    .await;
+    let mut both: Vec<String> = body["workflows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(next["workflows"].as_array().into_iter().flatten())
+        .map(|row| row["workflow_id"].as_str().unwrap_or_default().to_string())
+        .collect();
+    both.sort();
+    assert_eq!(both, ["w-a", "w-ac", "w-bc", "w-c"]);
+}
+
+#[tokio::test]
+async fn filter_errors_return_400() {
+    let (database_url, _container) = setup_single_database().await;
+    let pool = build_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state);
+
+    for (filter, needle) in [
+        ("attrs.a = 1 OR state = 'RUNNING'", "index"),
+        ("(attrs.a = 1", "')'"),
+        ("attrs.a.b = 1", "nested"),
+        ("phase = 'x'", "unknown field"),
+        ("", "empty"),
+    ] {
+        let (status, body) = get_json(&app, format!("/workflows?filter={}", enc(filter))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{filter:?}: {body}");
+        assert!(body.to_string().contains(needle), "{filter:?}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn filter_applies_on_the_stalled_path_and_across_shards() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_databases().await;
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
+    let app = harvest_api_router(api_state);
+
+    let blocked = seed_workflow(
+        &shard0_url,
+        ShardId::new(0),
+        "payment",
+        "s0-blocked",
+        Some(json!({ "phase": "blocked" })),
+    )
+    .await;
+    let big = seed_workflow(
+        &shard1_url,
+        ShardId::new(1),
+        "payment",
+        "s1-big",
+        Some(json!({ "amount": 50_000 })),
+    )
+    .await;
+    let small = seed_workflow(
+        &shard1_url,
+        ShardId::new(1),
+        "payment",
+        "s1-small",
+        Some(json!({ "amount": 10 })),
+    )
+    .await;
+    backdate_events(&shard0_url, blocked, 10).await;
+    backdate_events(&shard1_url, big, 10).await;
+    backdate_events(&shard1_url, small, 10).await;
+
+    let filter = enc("attrs.phase = 'blocked' OR attrs.amount > 1000");
+    let (status, body) = get_json(&app, format!("/workflows?filter={filter}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(sorted_ids(&body), ["s0-blocked", "s1-big"]);
+
+    let (status, body) = get_json(
+        &app,
+        format!("/workflows?no_progress_minutes=5&filter={filter}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(sorted_ids(&body), ["s0-blocked", "s1-big"]);
+}
+
+#[tokio::test]
+async fn filter_or_explain_uses_the_search_index() {
+    let (database_url, _container) = setup_single_database().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect for the fixture");
+    // 20 000 rows. Few rows match either branch, so the planner must find
+    // them through the GIN index, not through a scan in `created_at` order.
+    conn.batch_execute(
+        "INSERT INTO harvest_workflow_executions
+            (workflow_name, workflow_id, shard_id, state, input, started_at, search_attrs)
+         SELECT 'payment', 'fx-' || g, 0, 'RUNNING', '{}'::jsonb, NOW(),
+                CASE
+                    WHEN g % 1000 = 0 THEN jsonb_build_object('phase', 'blocked')
+                    WHEN g % 997 = 0 THEN jsonb_build_object('phase', 'open', 'amount', g)
+                    ELSE jsonb_build_object('phase', 'p' || (g % 50))
+                END
+         FROM generate_series(1, 20000) AS g;
+         ANALYZE harvest_workflow_executions;",
+    )
+    .await
+    .expect("seed the fixture");
+
+    let filter = enc("attrs.phase = 'blocked' OR attrs.amount > 10000");
+    let plan =
+        autumn_harvest_plugin::api::explain_workflow_list(&mut conn, &format!("filter={filter}"))
+            .await
+            .expect("EXPLAIN of the list query")
+            .join("\n");
+    assert!(
+        plan.contains("BitmapOr"),
+        "the OR must join index scans:\n{plan}"
+    );
+    assert!(
+        plan.contains("idx_harvest_we_search"),
+        "the OR branches must use idx_harvest_we_search:\n{plan}"
+    );
+    assert!(!plan.contains("Seq Scan"), "no full scan:\n{plan}");
+}
+
+/// Reads SSE frames until one has `event: <name>`, or the deadline passes.
+async fn wait_for_sse_event(
+    response: axum::response::Response,
+    name: &str,
+    deadline: std::time::Duration,
+) -> Option<String> {
+    use futures::StreamExt as _;
+    let mut stream = response.into_body().into_data_stream();
+    let mut buf = String::new();
+    let sleep = tokio::time::sleep(deadline);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            () = &mut sleep => return None,
+            chunk = stream.next() => match chunk {
+                Some(Ok(bytes)) => {
+                    buf.push_str(&String::from_utf8_lossy(&bytes));
+                    while let Some(idx) = buf.find("\n\n") {
+                        let frame: String = buf[..idx].to_string();
+                        buf.drain(..idx + 2);
+                        if frame.lines().any(|l| l.trim_end() == format!("event: {name}")) {
+                            return Some(frame);
+                        }
+                    }
+                }
+                Some(Err(_)) | None => return None,
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn change_stream_sends_changed_after_an_event() {
+    let (database_url, _container) = setup_single_database().await;
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::from(build_pool(&database_url)));
+    api_state
+        .set_workflow_result_notification_database_urls([(ShardId::new(0), database_url.clone())]);
+    let app = harvest_api_router(api_state);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/workflows/changes/stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("open the change stream");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/event-stream"))
+    );
+
+    // The stream listens before it returns, so this NOTIFY is not lost.
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect to notify");
+    let payload = json!({
+        "workflow_exec_id": uuid::Uuid::new_v4(),
+        "event_count": 1,
+        "last_event_type": "TimerFired",
+    });
+    diesel::sql_query("SELECT pg_notify('harvest_events', $1)")
+        .bind::<diesel::sql_types::Text, _>(payload.to_string())
+        .execute(&mut conn)
+        .await
+        .expect("notify");
+
+    let frame = wait_for_sse_event(response, "changed", std::time::Duration::from_secs(10))
+        .await
+        .expect("a changed frame after the NOTIFY");
+    assert!(frame.contains("\"notifications\":"), "{frame}");
+    // The frame names no run and holds no payload.
+    assert!(!frame.contains("TimerFired"), "{frame}");
+    assert!(
+        !frame.contains(
+            &payload["workflow_exec_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        ),
+        "{frame}"
+    );
+}
+
+#[tokio::test]
+async fn change_stream_needs_admin_and_a_notification_url() {
+    let (database_url, _container) = setup_single_database().await;
+
+    // No admin boundary and no session: 401.
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(build_pool(&database_url)));
+    api_state
+        .set_workflow_result_notification_database_urls([(ShardId::new(0), database_url.clone())]);
+    let app = harvest_api_router(api_state);
+    let (status, _) = get_json(&app, "/workflows/changes/stream").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Admin, but no notification URL: 503.
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::from(build_pool(&database_url)));
+    let app = harvest_api_router(api_state);
+    let (status, body) = get_json(&app, "/workflows/changes/stream").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+}

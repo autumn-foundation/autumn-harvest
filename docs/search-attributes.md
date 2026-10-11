@@ -192,6 +192,22 @@ The predicates reuse the existing `idx_harvest_we_search` GIN index (no
 migration). See `docs/management-api.md` for the full grammar and
 `docs/sharding.md` for the cross-shard pushdown contract.
 
+### OR and groups (issue #1982)
+
+The `filter` parameter joins predicates with `AND`, `OR` and parentheses.
+`AND` binds tighter than `OR`:
+
+```bash
+# Blocked runs, or payments over $10k:
+curl -G /workflows --data-urlencode \
+  "filter=attrs.phase = 'blocked' OR (workflow_name = 'payment' AND attrs.amount > 10000)"
+```
+
+Each `OR` branch must hold an `attrs.*` predicate, or `workflow_name` with `=`
+or `IN`. Postgres then joins the index scans with `BitmapOr`. See
+[Filter expressions](management-api.md#filter-expressions-get-workflows) for
+the grammar.
+
 ## Durability
 
 Search attributes are stored in the `search_attrs JSONB` column of
