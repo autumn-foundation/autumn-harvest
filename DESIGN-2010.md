@@ -204,6 +204,10 @@ A `noop-compensation` note does not change the verdict.
   interior-mutable local, such as `Cell::set` or a write through
   `Mutex::lock`. This gap predates #2010. A followed `async` block that
   captures such a value, owned or shared, adds a boundary.
+- MIR prints a type by its path alone, with no crate. A local
+  `helpers::Clock` and a `Clock` from a dependency crate named `helpers`
+  print the same. The analysis then reads the dependency type as local. A
+  fix needs the dependency names from `cargo metadata`.
 - MIR text is not a stable API. A rustc change that removes the
   `Try::branch` shape moves a step to untracked. The walk hard-codes the
   case values of `Poll` and `ControlFlow`. A change to them is not

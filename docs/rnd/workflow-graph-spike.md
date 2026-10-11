@@ -263,6 +263,10 @@ next step is that list, measured on the same examples.
   `cell.get()`. This gap predates the spike. A saga closure that captures
   such a value now gets a boundary, but the same code in one body does
   not.
+- A local `helpers::Clock` and a `Clock` from a dependency crate named
+  `helpers` print the same in MIR. The analysis then reads the dependency
+  type as local, and can follow the wrong `poll`. It needs a local module
+  named like a dependency and a type named like a dependency type.
 
 ## 9. Reproduce
 
