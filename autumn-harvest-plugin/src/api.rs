@@ -3002,7 +3002,7 @@ struct CreateWorkflowScheduleRequest {
     #[serde(default)]
     jitter_secs: Option<u64>,
     /// Overlap policy string (e.g. `"skip"`, `"buffer_one"`, `"buffer_all"`,
-    /// `"cancel_other"`, `"terminate_other"`). Defaults to `"skip"`.
+    /// `"cancel_other"`, `"terminate_other"`, `"allow_all"`). Defaults to `"skip"`.
     #[serde(default = "default_overlap_policy")]
     overlap_policy: String,
     /// Maximum buffered slots under `BufferAll`. Defaults to `100`.
@@ -21777,6 +21777,21 @@ pub(crate) async fn signal_with_start_workflow(
     let start_input = request.start_input.unwrap_or(Value::Null);
     let signal_payload = request.signal_payload.unwrap_or(Value::Null);
 
+    // Issue #1985: apply the promise settlement rules before the replay probe
+    // below. A mismatched key can match an unrelated row and report a false
+    // replay. A promise belongs to one run, but the probe looks across runs.
+    // So a promise signal skips the probe, as the engine does.
+    if let Err(e) = autumn_harvest::durable_promise::settlement_idempotency_key(
+        &request.signal_name,
+        &signal_payload,
+        request.idempotency_key.as_deref(),
+    ) {
+        return map_error(e).into_response();
+    }
+    let promise_signal = request
+        .signal_name
+        .starts_with(autumn_harvest::durable_promise::PROMISE_SIGNAL_PREFIX);
+
     // INVARIANT (this PR): keyed committed-replay short-circuit. A retry of an
     // already-committed keyed signal-with-start must replay to its documented
     // `200 signal_delivered: false` no-op BEFORE any fresh-start-only validation
@@ -21790,7 +21805,8 @@ pub(crate) async fn signal_with_start_workflow(
     // concurrent-first-delivery race — this probe is an additive fast path for
     // COMMITTED replays only, never a replacement. Mirrors #808 (plain start)
     // and #1092 (plain signal route).
-    if let Some(key) = request.idempotency_key.as_deref()
+    if !promise_signal
+        && let Some(key) = request.idempotency_key.as_deref()
         && let Some(resp) = probe_committed_sws_replay(
             &api_state,
             &workflow_name,
@@ -26093,6 +26109,18 @@ pub(crate) async fn signal_workflow(
         return resp;
     }
 
+    // Issue #1985: apply the promise settlement rules before the keyed dedupe
+    // probe below. A mismatched key can match an unrelated row. The probe then
+    // reports success, and the promise stays unsettled.
+    let idempotency_key = match autumn_harvest::durable_promise::settlement_idempotency_key(
+        &signal_name,
+        &payload,
+        idempotency_key.as_deref(),
+    ) {
+        Ok(key) => key.map(str::to_owned),
+        Err(e) => return map_error(e).into_response(),
+    };
+
     let exec_id = match parse_execution_id(&id) {
         Ok(eid) => eid,
         Err(e) => {
@@ -28051,26 +28079,26 @@ async fn create_workflow_schedule(
 
     // Reject unknown overlap_policy strings with 400 before storing.
     // `from_db` is lenient for backward compat; user input is validated strictly.
-    let overlap_policy = match autumn_harvest::OverlapPolicy::from_user_input(
-        &request.overlap_policy,
-    ) {
-        Ok(p) => p,
-        Err(v) => {
-            let err_summary = format!(
-                "invalid overlap_policy '{v}'; valid values: skip, buffer_one, buffer_all, cancel_other, terminate_other"
-            );
-            schedule_create_audit_failed(
-                &api_state,
-                &actor,
-                &source,
-                request_id.as_deref(),
-                &request.workflow_name,
-                &err_summary,
-            )
-            .await;
-            return Err(AutumnError::bad_request_msg(err_summary));
-        }
-    };
+    let overlap_policy =
+        match autumn_harvest::OverlapPolicy::from_user_input(&request.overlap_policy) {
+            Ok(p) => p,
+            Err(v) => {
+                let err_summary = format!(
+                    "invalid overlap_policy '{v}'; valid values: {}",
+                    autumn_harvest::OverlapPolicy::VALID_VALUES
+                );
+                schedule_create_audit_failed(
+                    &api_state,
+                    &actor,
+                    &source,
+                    request_id.as_deref(),
+                    &request.workflow_name,
+                    &err_summary,
+                )
+                .await;
+                return Err(AutumnError::bad_request_msg(err_summary));
+            }
+        };
     let skip_policy = match SkipPolicy::from_user_input(&request.skip_policy) {
         Ok(p) => p,
         Err(v) => {
@@ -28764,7 +28792,8 @@ async fn update_schedule_handler(
             Ok(p) => Some(p),
             Err(v) => {
                 let err_summary = format!(
-                    "invalid overlap_policy '{v}'; valid values: skip, buffer_one, buffer_all, cancel_other, terminate_other"
+                    "invalid overlap_policy '{v}'; valid values: {}",
+                    autumn_harvest::OverlapPolicy::VALID_VALUES
                 );
                 schedule_update_audit_failed(
                     &api_state,
@@ -30884,6 +30913,20 @@ async fn schedule_backfill(
     .map(Json)
 }
 
+/// The run cap that a backfill enforces for `schedule`.
+///
+/// `AllowAll` ignores `max_active_runs` (issue #1985), so its backfill has no
+/// run cap. The `max_runs` budget and the backfill count limit still apply.
+fn backfill_max_active(schedule: &autumn_harvest::models::HarvestSchedule) -> i64 {
+    if autumn_harvest::OverlapPolicy::from_db(&schedule.overlap_policy)
+        == autumn_harvest::OverlapPolicy::AllowAll
+    {
+        i64::MAX
+    } else {
+        i64::from(schedule.max_active_runs)
+    }
+}
+
 /// The backfill implementation, with the audited `route_or_command` supplied by
 /// the caller.
 ///
@@ -31025,7 +31068,11 @@ pub(crate) async fn schedule_backfill_inner(
         )));
     }
 
-    let max_active = i64::from(schedule.max_active_runs);
+    let max_active = backfill_max_active(&schedule);
+    // `AllowAll` has no run cap, so the shard-wide counts below are not
+    // needed. Skipping them also stops a shard outage from failing the
+    // whole backfill (issue #1985).
+    let uncapped = max_active == i64::MAX;
 
     if schedule.is_paused && request.include_paused && kind == ScheduleKind::Dag && !request.dry_run
     {
@@ -31159,57 +31206,61 @@ pub(crate) async fn schedule_backfill_inner(
     // Count running executions once before the loop; track dispatched_this_call separately
     // so we don't re-query on every timestamp. This value gates max_active_runs,
     // so non-dry-run dispatch must not treat count failures as zero.
-    let running_at_start = match query_running_count(&pool, &kind, &name, schedule_id).await {
-        Ok(count) => count,
-        Err(count_failures) => {
-            let status = "partial";
-            let error_summary = Some("one or more shard failures");
-            write_backfill_log(
-                &pool,
-                schedule_id,
-                &actor,
-                &source,
-                request.from,
-                request.to,
-                false,
-                total,
-                0,
-                0,
-                total,
-                status,
-                error_summary,
-                started_at,
-            )
-            .await;
-            let id_str = schedule_id.to_string();
-            write_audit(
-                &pool,
-                &actor,
-                &source,
-                req_id.as_deref(),
-                route,
-                &id_str,
-                STATUS_FAILED,
-                error_summary,
-            )
-            .await;
+    let running_at_start = if uncapped {
+        0
+    } else {
+        match query_running_count(&pool, &kind, &name, schedule_id).await {
+            Ok(count) => count,
+            Err(count_failures) => {
+                let status = "partial";
+                let error_summary = Some("one or more shard failures");
+                write_backfill_log(
+                    &pool,
+                    schedule_id,
+                    &actor,
+                    &source,
+                    request.from,
+                    request.to,
+                    false,
+                    total,
+                    0,
+                    0,
+                    total,
+                    status,
+                    error_summary,
+                    started_at,
+                )
+                .await;
+                let id_str = schedule_id.to_string();
+                write_audit(
+                    &pool,
+                    &actor,
+                    &source,
+                    req_id.as_deref(),
+                    route,
+                    &id_str,
+                    STATUS_FAILED,
+                    error_summary,
+                )
+                .await;
 
-            return Ok(ScheduleBackfillResponse {
-                status: status.to_string(),
-                schedule_id,
-                kind,
-                name,
-                from: request.from,
-                to: request.to,
-                planned_timestamps: fire_times.clone(),
-                total,
-                dispatched: 0,
-                skipped: 0,
-                failed: total,
-                skipped_reasons,
-                partial_shard_failures: count_failures,
-                paused_schedule_warning,
-            });
+                return Ok(ScheduleBackfillResponse {
+                    status: status.to_string(),
+                    schedule_id,
+                    kind,
+                    name,
+                    from: request.from,
+                    to: request.to,
+                    planned_timestamps: fire_times.clone(),
+                    total,
+                    dispatched: 0,
+                    skipped: 0,
+                    failed: total,
+                    skipped_reasons,
+                    partial_shard_failures: count_failures,
+                    paused_schedule_warning,
+                });
+            }
         }
     };
     // A throttled scheduled/backfill fire (issue #607) durably defers before any
@@ -31225,7 +31276,7 @@ pub(crate) async fn schedule_backfill_inner(
     // matching the earlier fix's precedent of scoping throttle-aware overlap
     // counting (`tick_one_workflow_schedule`/`drain_buffered_schedule_runs` in
     // scheduler.rs) to workflows only.
-    let running_at_start = if kind == ScheduleKind::Workflow {
+    let running_at_start = if kind == ScheduleKind::Workflow && !uncapped {
         match query_pending_throttle_count(&pool, &name).await {
             Ok(pending) => running_at_start + pending,
             Err(count_failures) => {
@@ -46527,7 +46578,10 @@ async fn preview_candidate_schedule_handler(
         return Ok((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": format!("unknown overlap_policy '{bad}'; valid: skip, buffer_one, buffer_all, cancel_other, terminate_other"),
+                "error": format!(
+                    "unknown overlap_policy '{bad}'; valid: {}",
+                    autumn_harvest::OverlapPolicy::VALID_VALUES
+                ),
                 "field": "overlap_policy"
             })),
         ));
@@ -56354,6 +56408,23 @@ mod tests {
             last_catchup_dropped: 0,
             last_catchup_at: None,
             retry_policy: None,
+        }
+    }
+
+    #[test]
+    fn backfill_capacity_is_unbounded_only_for_allow_all() {
+        for (policy, expected) in [
+            ("skip", 2),
+            ("buffer_all", 2),
+            ("cancel_other", 2),
+            ("allow_all", i64::MAX),
+        ] {
+            let schedule = autumn_harvest::models::HarvestSchedule {
+                max_active_runs: 2,
+                overlap_policy: policy.to_string(),
+                ..test_harvest_schedule()
+            };
+            assert_eq!(backfill_max_active(&schedule), expected, "{policy}");
         }
     }
 

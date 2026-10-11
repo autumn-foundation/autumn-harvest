@@ -7936,7 +7936,7 @@
   "name": "overlap_policy",
   "type": "string",
   "required": false,
-  "description": "What to do when a fire lands while the previous run is still going: skip, buffer_one, buffer_all, or allow_all."
+  "description": "What to do when a fire lands while the previous run is still going: skip, buffer_one, buffer_all, cancel_other, terminate_other or allow_all."
           },
           {
   "name": "buffer_all_max",
@@ -8069,7 +8069,7 @@
           {
             "name": "overlap_policy",
             "required": false,
-            "description": "New overlap policy: skip, buffer_one, buffer_all, cancel_other, terminate_other (issue #241)."
+            "description": "New overlap policy: skip, buffer_one, buffer_all, cancel_other, terminate_other or allow_all (issues #241, #1985)."
           },
           {
             "name": "buffer_all_max",
@@ -8670,7 +8670,7 @@
           {
             "name": "overlap_policy",
             "type": "string",
-            "description": "One of: skip, buffer_one, buffer_all, cancel_other, terminate_other. Defaults to skip."
+            "description": "One of: skip, buffer_one, buffer_all, cancel_other, terminate_other, allow_all. Defaults to skip."
           },
           {
             "name": "buffer_all_max",

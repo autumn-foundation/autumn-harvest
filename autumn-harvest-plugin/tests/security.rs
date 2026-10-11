@@ -1836,6 +1836,91 @@ async fn eris_a_near_miss_idempotency_key_is_not_refused_as_reserved() {
     }
 }
 
+/// Posts a signal through the real router with no storage configured.
+async fn post_signal_without_storage(
+    signal_name: &str,
+    key: Option<&str>,
+    body: &'static str,
+) -> (StatusCode, String) {
+    let app = unauthenticated_app();
+    let mut req = Request::builder()
+        .method(Method::POST)
+        .uri(format!(
+            "/workflows/00000000-0000-0000-0000-000000000001/signal/{signal_name}"
+        ))
+        .header("Content-Type", "application/json");
+    if let Some(key) = key {
+        req = req.header("Idempotency-Key", key);
+    }
+    let res = app
+        .oneshot(req.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = res.status();
+    let body = autumn_web::reexports::axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Issue #1985: the signal route applies the promise settlement rules at the
+/// request boundary.
+///
+/// The keyed dedupe fast path reads `harvest_signals` before the insert. A
+/// mismatched key that an unrelated signal already used would match that row.
+/// The route would then report success, and the promise would stay unsettled.
+/// No storage is configured, so a 400 proves that the rules run before any
+/// database read.
+#[tokio::test]
+async fn a_promise_settlement_breaking_the_rules_is_refused_before_the_dedupe_probe() {
+    let resolved = r#"{"outcome":"resolved","value":1}"#;
+    let cases = [
+        (
+            "harvest.promise:k",
+            Some("unrelated-key"),
+            resolved,
+            "idempotency key",
+        ),
+        (
+            "harvest.promise:k",
+            None,
+            r#"{"value":1}"#,
+            "not a promise settlement",
+        ),
+        ("order_event", Some("harvest.promise:k"), "{}", "reserved"),
+    ];
+    for (signal_name, key, body, needle) in cases {
+        let (status, text) = post_signal_without_storage(signal_name, key, body).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{signal_name} with key {key:?} must be refused: {text}"
+        );
+        assert!(
+            text.contains(needle),
+            "the refusal must name the promise rule ({needle}): {text}"
+        );
+    }
+}
+
+/// A valid settlement passes the boundary. Without storage, it then fails
+/// later, for a reason that is not a promise rule.
+#[tokio::test]
+async fn a_valid_promise_settlement_passes_the_request_boundary() {
+    for key in [None, Some("harvest.promise:k")] {
+        let (status, text) = post_signal_without_storage(
+            "harvest.promise:k",
+            key,
+            r#"{"outcome":"rejected","error":"no"}"#,
+        )
+        .await;
+        assert!(
+            !text.contains("promise settlement") && !text.contains("idempotency key"),
+            "a valid settlement must pass the promise rules (status {status}): {text}"
+        );
+    }
+}
+
 // ── Audit export to a SIEM sink (issue #953) ─────────────────────────────────
 //
 // Both routes must sit in the SAME auth chain as every other admin-gated

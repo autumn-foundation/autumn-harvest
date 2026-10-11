@@ -3366,8 +3366,22 @@ impl WorkflowContext {
     /// The frontier question that actually holds for a signal wait is whether
     /// any matching signal remains available at all. Mirrors the #779 fix, which
     /// exempted the child-timeout race's `InProgress` arm for the same reason.
-    fn check_strict_replay_signal_no_match(&self, signal_name: &str) -> HarvestResult<()> {
-        if self.canary_mode && !self.match_history(|m| m.has_unconsumed_signal(signal_name)) {
+    ///
+    /// For a payload-matching wait (issue #1985), only a signal whose event
+    /// index is in `accepted` counts as available.
+    fn check_strict_replay_signal_no_match(
+        &self,
+        signal_name: &str,
+        accepted: Option<&std::collections::HashSet<usize>>,
+    ) -> HarvestResult<()> {
+        if self.canary_mode
+            && !self.match_history(|m| {
+                accepted.map_or_else(
+                    || m.has_unconsumed_signal(signal_name),
+                    |set| m.has_unconsumed_signal_accepting(signal_name, set),
+                )
+            })
+        {
             return Ok(());
         }
         self.check_strict_replay_no_match(&format!("WaitForSignal({signal_name})"))
@@ -9148,10 +9162,135 @@ impl WorkflowContext {
     ///
     /// Panics if the internal replay matcher mutex is poisoned.
     pub async fn wait_for_signal(&self, signal_name: &str) -> HarvestResult<Value> {
-        let history_match = self.match_history(|m| m.match_signal(signal_name));
+        match self.begin_signal_wait(signal_name, None)? {
+            Ok(payload) => Ok(payload),
+            Err(rx) => Self::finish_signal_wait(signal_name, rx).await,
+        }
+    }
+
+    /// Wait for the first `signal_name` signal whose payload satisfies
+    /// `predicate` (issue #1985).
+    ///
+    /// This is the payload-matching event wait, like Cloudflare
+    /// `step.waitForEvent`. A same-name signal that fails the predicate is
+    /// not consumed. It stays buffered, and a later wait for that name can
+    /// take it. Signals keep their recorded order.
+    ///
+    /// # Determinism contract
+    ///
+    /// `predicate` must be a pure function of the payload. Replay runs it
+    /// again over the recorded `SignalReceived` events. A changed predicate
+    /// can take a different event, and replay then reports drift.
+    ///
+    /// Do not register a push signal handler for the same name. The handler
+    /// claims every buffered signal of that name.
+    ///
+    /// ```rust,no_run
+    /// # async fn example(ctx: &autumn_harvest::WorkflowContext) -> autumn_harvest::HarvestResult<()> {
+    /// let order = ctx
+    ///     .wait_for_signal_matching("order", |p| p["id"] == 42)
+    ///     .await?;
+    /// # let _ = order;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Same as [`wait_for_signal`](Self::wait_for_signal).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn wait_for_signal_matching<F>(
+        &self,
+        signal_name: &str,
+        predicate: F,
+    ) -> HarvestResult<Value>
+    where
+        F: Fn(&Value) -> bool + Send,
+    {
+        match self.begin_signal_wait(signal_name, Some(&predicate))? {
+            Ok(payload) => Ok(payload),
+            Err(rx) => Self::finish_signal_wait(signal_name, rx).await,
+        }
+    }
+
+    /// Typed form of [`wait_for_signal_matching`](Self::wait_for_signal_matching)
+    /// (issue #1985).
+    ///
+    /// A payload that does not decode into `O` is a non-match. It stays
+    /// buffered, as a payload that fails `predicate` does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if the matched payload cannot
+    /// be decoded. Propagates all errors from
+    /// [`wait_for_signal`](Self::wait_for_signal).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn receive_signal_matching<O, F>(
+        &self,
+        signal_name: &str,
+        predicate: F,
+    ) -> HarvestResult<O>
+    where
+        O: serde::de::DeserializeOwned,
+        F: Fn(&O) -> bool + Send,
+    {
+        let raw = self
+            .wait_for_signal_matching(signal_name, move |payload| {
+                serde_json::from_value::<O>(payload.clone()).is_ok_and(|typed| predicate(&typed))
+            })
+            .await?;
+        Ok(serde_json::from_value(raw)?)
+    }
+
+    /// Matches a signal wait against history (issue #1985).
+    ///
+    /// Returns `Ok(Ok(payload))` for a recorded match. Returns `Ok(Err(rx))`
+    /// after it pushes `WaitForSignal`. The caller then awaits `rx`. The
+    /// predicate is not held across the await, so it needs no `Sync` bound.
+    ///
+    /// The predicate runs with no matcher lock held. It may call back into
+    /// the context, and a panic in it does not poison the matcher lock.
+    #[allow(clippy::type_complexity)]
+    fn begin_signal_wait(
+        &self,
+        signal_name: &str,
+        predicate: Option<&dyn Fn(&Value) -> bool>,
+    ) -> HarvestResult<Result<Value, oneshot::Receiver<Value>>> {
+        // Candidates are in match order. The predicate stops at the first
+        // accepted payload, so it never sees a later signal. Each candidate is
+        // cloned under the lock and tested after the lock is released.
+        let accepted: Option<std::collections::HashSet<usize>> = predicate.map(|accepts| {
+            (0..)
+                .map_while(|n| {
+                    self.matcher
+                        .lock()
+                        .expect("matcher lock poisoned")
+                        .signal_candidate_nth(signal_name, n)
+                })
+                .find(|(_, payload)| accepts(payload))
+                .map(|(index, _)| index)
+                .into_iter()
+                .collect()
+        });
+        let history_match = self.match_history(|m| match &accepted {
+            Some(set) => {
+                let found = m.match_signal_accepting(signal_name, set);
+                if matches!(found, HistoryMatch::NoMatch) {
+                    m.note_predicate_signal_wait(signal_name);
+                }
+                found
+            }
+            None => m.match_signal(signal_name),
+        });
 
         match history_match {
-            HistoryMatch::Matched { output } => Ok(output),
+            HistoryMatch::Matched { output } => Ok(Ok(output)),
             HistoryMatch::Diverged {
                 expected,
                 actual,
@@ -9184,20 +9323,152 @@ impl WorkflowContext {
                 ))
             }
             HistoryMatch::NoMatch => {
-                self.check_strict_replay_signal_no_match(signal_name)?;
+                self.check_strict_replay_signal_no_match(signal_name, accepted.as_ref())?;
 
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::WaitForSignal {
                     signal_name: signal_name.to_string(),
                     result_tx: tx,
                 });
-                rx.await.map_err(|_| {
-                    HarvestError::Cancelled(format!(
-                        "signal '{signal_name}' cancelled: result channel dropped"
-                    ))
-                })
+                Ok(Err(rx))
             }
         }
+    }
+
+    /// Awaits the result channel of a parked signal wait.
+    async fn finish_signal_wait(
+        signal_name: &str,
+        rx: oneshot::Receiver<Value>,
+    ) -> HarvestResult<Value> {
+        rx.await.map_err(|_| {
+            HarvestError::Cancelled(format!(
+                "signal '{signal_name}' cancelled: result channel dropped"
+            ))
+        })
+    }
+
+    // ── Durable promises (issue #1985) ─────────────────────────────────────
+
+    /// A durable promise with the key `key` in this run.
+    ///
+    /// The key is part of the token, so a caller that knows the run can build
+    /// the token. Use [`new_promise`](Self::new_promise) for a key that
+    /// nobody can guess. A key settles once per run. See
+    /// [`crate::durable_promise`].
+    ///
+    /// Each call records the token in one `SideEffectRecorded` event. Replay
+    /// reads the token from history, so it does not depend on the execution
+    /// id of the replaying run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Config`] if `key` is empty, longer than
+    /// [`crate::durable_promise::MAX_PROMISE_KEY_LEN`] bytes, or holds a
+    /// character outside `[A-Za-z0-9._:-]`. Returns the errors of
+    /// [`side_effect`](Self::side_effect).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub fn promise(
+        &self,
+        key: impl Into<String>,
+    ) -> HarvestResult<crate::durable_promise::DurablePromise<'_>> {
+        let fresh = crate::durable_promise::PromiseId::new(self.execution_id(), key)
+            .map_err(|e| HarvestError::Config(e.to_string()))?;
+        self.record_promise(|| fresh)
+    }
+
+    /// A durable promise with a new `UUIDv7` key.
+    ///
+    /// This is the Restate awakeable shape. Send `promise.id().to_string()`
+    /// to the caller that settles it. The token is recorded as for
+    /// [`promise`](Self::promise).
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`side_effect`](Self::side_effect).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub fn new_promise(&self) -> HarvestResult<crate::durable_promise::DurablePromise<'_>> {
+        let execution_id = self.execution_id();
+        self.record_promise(|| {
+            crate::durable_promise::PromiseId::from_uuid(execution_id, uuid::Uuid::now_v7())
+        })
+    }
+
+    /// Records a promise token once and returns the recorded token on replay.
+    ///
+    /// A reset fork replays the carried history under a new execution id.
+    /// The recorded token keeps its activity inputs byte-identical.
+    fn record_promise<F>(
+        &self,
+        mint: F,
+    ) -> HarvestResult<crate::durable_promise::DurablePromise<'_>>
+    where
+        F: FnOnce() -> crate::durable_promise::PromiseId,
+    {
+        let id = self.side_effect(crate::durable_promise::PROMISE_SIDE_EFFECT_NAME, mint)?;
+        Ok(crate::durable_promise::DurablePromise::new(self, id))
+    }
+
+    /// Resolves a durable promise that another run created.
+    ///
+    /// The settlement is a signal to that run with the promise idempotency
+    /// key, so only the first settlement wins. See
+    /// [`signal_external_workflow_with_idempotency`](Self::signal_external_workflow_with_idempotency).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if `value` cannot be
+    /// serialized. Same as
+    /// [`signal_external_workflow`](Self::signal_external_workflow) otherwise.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn resolve_promise<P: serde::Serialize>(
+        &self,
+        id: &crate::durable_promise::PromiseId,
+        value: P,
+    ) -> HarvestResult<()> {
+        let settlement =
+            crate::durable_promise::PromiseSettlement::resolved(serde_json::to_value(value)?);
+        self.settle_promise(id, &settlement).await
+    }
+
+    /// Rejects a durable promise that another run created.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`resolve_promise`](Self::resolve_promise).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn reject_promise(
+        &self,
+        id: &crate::durable_promise::PromiseId,
+        error: impl Into<String>,
+    ) -> HarvestResult<()> {
+        let settlement = crate::durable_promise::PromiseSettlement::rejected(error);
+        self.settle_promise(id, &settlement).await
+    }
+
+    async fn settle_promise(
+        &self,
+        id: &crate::durable_promise::PromiseId,
+        settlement: &crate::durable_promise::PromiseSettlement,
+    ) -> HarvestResult<()> {
+        self.signal_external_workflow_with_idempotency(
+            id.execution_id(),
+            &id.signal_name(),
+            settlement.to_value(),
+            id.idempotency_key(),
+        )
+        .await
     }
 
     /// Wait for a named signal, but give up after `timeout` and return `None`.
@@ -23022,6 +23293,128 @@ mod tests {
             .await
             .expect("signal should replay");
         assert_eq!(payload, serde_json::json!({"ok": true}));
+    }
+
+    // ── wait_for_signal_matching / receive_signal_matching (issue #1985) ──
+
+    fn order_signal(payload: Value) -> WorkflowEvent {
+        WorkflowEvent::SignalReceived {
+            signal_name: "order".to_string(),
+            payload,
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_matching_returns_the_first_matching_payload() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started_event(),
+                order_signal(serde_json::json!({"id": 41})),
+                order_signal(serde_json::json!({"id": 42})),
+            ],
+        );
+        let payload = ctx
+            .wait_for_signal_matching("order", |p| p["id"] == 42)
+            .await
+            .expect("the matching signal replays");
+        assert_eq!(payload, serde_json::json!({"id": 42}));
+        let skipped = ctx.wait_for_signal("order").await.expect("still buffered");
+        assert_eq!(skipped, serde_json::json!({"id": 41}));
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_matching_parks_without_a_match() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![started_event(), order_signal(serde_json::json!({"id": 41}))],
+        );
+        let parked = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            ctx.wait_for_signal_matching("order", |p| p["id"] == 42),
+        )
+        .await;
+        assert!(parked.is_err(), "the wait must park: {parked:?}");
+        let commands = ctx.drain_commands();
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::WaitForSignal { signal_name, .. } if signal_name == "order"
+            )),
+            "the park reuses WaitForSignal: {commands:?}"
+        );
+        assert!(
+            ctx.signal_probed_at_frontier("order"),
+            "a predicate wait must stop a warm resume"
+        );
+        assert!(
+            !ctx.history_has_unconsumed_events(),
+            "the rejected signal is not drift"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_matching_predicate_may_call_the_context() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started_event(),
+                order_signal(serde_json::json!({"id": 41})),
+                order_signal(serde_json::json!({"id": 42})),
+            ],
+        );
+        let matched = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.wait_for_signal_matching("order", |p| !ctx.is_replaying() || p["id"] == 42),
+        )
+        .await
+        .expect("a predicate that reads the context must not deadlock")
+        .expect("the matching signal replays");
+        assert_eq!(matched, serde_json::json!({"id": 42}));
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_matching_stops_at_the_first_match() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started_event(),
+                order_signal(serde_json::json!({"id": 42})),
+                order_signal(serde_json::json!("not an order")),
+            ],
+        );
+        let matched = ctx
+            .wait_for_signal_matching("order", |p| {
+                p["id"]
+                    .as_u64()
+                    .expect("the predicate never sees a later payload")
+                    == 42
+            })
+            .await
+            .expect("the first signal matches");
+        assert_eq!(matched, serde_json::json!({"id": 42}));
+    }
+
+    #[derive(Debug, serde::Deserialize, PartialEq)]
+    struct Order {
+        id: u64,
+    }
+
+    #[tokio::test]
+    async fn receive_signal_matching_skips_a_payload_that_does_not_decode() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started_event(),
+                order_signal(serde_json::json!("not an order")),
+                order_signal(serde_json::json!({"id": 42})),
+            ],
+        );
+        let order: Order = ctx
+            .receive_signal_matching("order", |o: &Order| o.id == 42)
+            .await
+            .expect("the decodable match replays");
+        assert_eq!(order, Order { id: 42 });
     }
 
     // ── wait_for_signal_timeout / receive_signal_timeout (issue #476) ──────

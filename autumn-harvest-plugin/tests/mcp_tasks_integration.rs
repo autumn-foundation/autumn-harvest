@@ -638,7 +638,6 @@ async fn a_reset_leaves_a_failed_task_settled() {
             operator_id: "op-1".to_string(),
             signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::default(),
             allow_terminal_source: true,
-            refuse_erased_source: false,
         },
         None,
     )

@@ -97,12 +97,35 @@ sourcing doc and flag anything unverified.
 
 | Engine | Model |
 |---|---|
-| **autumn-harvest** | Code-first async Rust with event-sourced deterministic replay. Also a first-class DAG surface (`#[dag]`, [unified DAG execution #256](https://github.com/autumn-foundation/autumn-harvest/issues/256)); [signals/queries/updates](https://github.com/autumn-foundation/autumn-harvest/issues/234) ([#140](https://github.com/autumn-foundation/autumn-harvest/issues/140), [#346](https://github.com/autumn-foundation/autumn-harvest/issues/346)); [Saga compensation](saga.md) ([#238](https://github.com/autumn-foundation/autumn-harvest/issues/238)); inbound [webhook triggers (#344)](https://github.com/autumn-foundation/autumn-harvest/issues/344); [keyed entities](adr/0006-keyed-entity.md) ([#1975](https://github.com/autumn-foundation/autumn-harvest/issues/1975)) with one handler at a time for each key. |
+| **autumn-harvest** | Code-first async Rust with event-sourced deterministic replay. Also a first-class DAG surface (`#[dag]`, [unified DAG execution #256](https://github.com/autumn-foundation/autumn-harvest/issues/256)); [signals/queries/updates](https://github.com/autumn-foundation/autumn-harvest/issues/234) ([#140](https://github.com/autumn-foundation/autumn-harvest/issues/140), [#346](https://github.com/autumn-foundation/autumn-harvest/issues/346)); [Saga compensation](saga.md) ([#238](https://github.com/autumn-foundation/autumn-harvest/issues/238)); inbound [webhook triggers (#344)](https://github.com/autumn-foundation/autumn-harvest/issues/344); [keyed entities](adr/0006-keyed-entity.md) ([#1975](https://github.com/autumn-foundation/autumn-harvest/issues/1975)) with one handler at a time for each key; a payload-matching signal wait and [durable promises](durable-promises.md) ([#1985](https://github.com/autumn-foundation/autumn-harvest/issues/1985)). |
 | Temporal | Code-first imperative durable Workflows + Activities (side effects isolated in Activities). ([docs](https://docs.temporal.io/)) |
 | DBOS | Code-first — ordinary functions annotated as durable **workflows** and **steps** via decorators/annotations. ([docs](https://docs.dbos.dev/)) |
 | Inngest | Event-driven step functions — functions triggered by events / cron / webhooks, logic split into memoized `step` calls. ([docs](https://www.inngest.com/docs/learn/how-functions-are-executed)) |
 | Hatchet | Multi-paradigm — general-purpose task queue, DAG orchestrator, and durable-execution engine (DAGs can be built at runtime). ([docs](https://docs.hatchet.run/v1)) |
 | Restate | Durable handlers across Services, **Virtual Objects** (per-key consistent state), and Workflows, with durable RPC/queuing built in. ([docs](https://docs.restate.dev/foundations/key-concepts)) |
+
+#### Small primitives (issue #1985)
+
+Issue [#1985](https://github.com/autumn-foundation/autumn-harvest/issues/1985)
+lists four small primitives that peer engines ship. Each has a decision.
+
+| Primitive | Peer | Decision | Reason |
+|---|---|---|---|
+| Payload-matching event wait | Cloudflare `step.waitForEvent` | **Shipped.** `ctx.wait_for_signal_matching` and `ctx.receive_signal_matching` ([signals chapter](getting-started/04-signals.md)). | A signal that fails the predicate stays buffered. There is no timeout form yet. |
+| Durable promise | Restate awakeables | **Shipped.** `ctx.new_promise`, `ctx.promise` and `durable_promise::resolve` / `reject` ([durable promises](durable-promises.md)). | Built on signals, not external task tokens, so a promise can race a timer and settles once. |
+| Counting semaphore | No built-in peer primitive | **Declined.** | See below. |
+| `AllowAll` overlap | Temporal Schedules | **Shipped.** `OverlapPolicy::AllowAll`. | It ignores `max_active_runs`, as Temporal does. Each tick phase starts at most 100 catch-up runs. |
+
+**Why the counting semaphore is declined.** Two shipped features cover the
+common needs. The per-key concurrency limit
+([#247](https://github.com/autumn-foundation/autumn-harvest/issues/247)) caps
+how many runs of one key are active across the fleet. The durable mutex
+([#691](https://github.com/autumn-foundation/autumn-harvest/issues/691)) gives
+one holder for a region of a workflow. An N-permit region lock needs its own
+permit tables, a new event, lease renewal and reclaim, a terminal sweep, and
+reset and rebalance hooks. That work is the size of the mutex itself. The
+issue asks for small changes. Open a new issue with a use case that the two
+features above cannot serve.
 
 ### 5. Determinism guarantees & tooling
 
@@ -130,7 +153,7 @@ sourcing doc and flag anything unverified.
 
 | Engine | Capabilities |
 |---|---|
-| **autumn-harvest** | Cron + interval, with [jitter (#240)](https://github.com/autumn-foundation/autumn-harvest/issues/240), [overlap policy (#241)](https://github.com/autumn-foundation/autumn-harvest/issues/241), [calendars + backfill (#337)](https://github.com/autumn-foundation/autumn-harvest/issues/337), [bounded catchup window (#484)](https://github.com/autumn-foundation/autumn-harvest/issues/484), bounded/finite runs ([#478](https://github.com/autumn-foundation/autumn-harvest/issues/478) / [#543](https://github.com/autumn-foundation/autumn-harvest/issues/543)), [HA-safe multi-replica ticks (#350)](https://github.com/autumn-foundation/autumn-harvest/issues/350), [schedule run history (#534)](https://github.com/autumn-foundation/autumn-harvest/issues/534), [in-place schedule update (#771)](https://github.com/autumn-foundation/autumn-harvest/issues/771), [last-completion carryover (#488)](https://github.com/autumn-foundation/autumn-harvest/issues/488), plus start-shaping via [debounce (#499)](https://github.com/autumn-foundation/autumn-harvest/issues/499) and [throttle (#607)](https://github.com/autumn-foundation/autumn-harvest/issues/607). |
+| **autumn-harvest** | Cron + interval, with [jitter (#240)](https://github.com/autumn-foundation/autumn-harvest/issues/240), [overlap policy (#241)](https://github.com/autumn-foundation/autumn-harvest/issues/241) with every Temporal mode, `AllowAll` included ([#1985](https://github.com/autumn-foundation/autumn-harvest/issues/1985)), [calendars + backfill (#337)](https://github.com/autumn-foundation/autumn-harvest/issues/337), [bounded catchup window (#484)](https://github.com/autumn-foundation/autumn-harvest/issues/484), bounded/finite runs ([#478](https://github.com/autumn-foundation/autumn-harvest/issues/478) / [#543](https://github.com/autumn-foundation/autumn-harvest/issues/543)), [HA-safe multi-replica ticks (#350)](https://github.com/autumn-foundation/autumn-harvest/issues/350), [schedule run history (#534)](https://github.com/autumn-foundation/autumn-harvest/issues/534), [in-place schedule update (#771)](https://github.com/autumn-foundation/autumn-harvest/issues/771), [last-completion carryover (#488)](https://github.com/autumn-foundation/autumn-harvest/issues/488), plus start-shaping via [debounce (#499)](https://github.com/autumn-foundation/autumn-harvest/issues/499) and [throttle (#607)](https://github.com/autumn-foundation/autumn-harvest/issues/607). |
 | Temporal | Schedules with interval and calendar/cron spec; Catchup Window (default 1 year, min 10s); overlap policies (Skip, BufferOne, BufferAll, AllowAll, CancelOther, TerminateOther); Backfill. ([docs](https://docs.temporal.io/schedule)) |
 | DBOS | Cron-scheduled workflows (stored in DB, runtime create/pause/resume/delete), time zones, and automatic backfill of missed runs after downtime. Calendar-holiday / overlap-policy depth **(unverified)**. ([docs](https://docs.dbos.dev/python/tutorials/scheduled-workflows)) |
 | Inngest | Cron/scheduled functions with per-step retries. Calendar, catchup/backfill, and overlap-policy depth **(unverified)** from official docs in this pass. ([docs](https://www.inngest.com/uses/scheduled-jobs)) |

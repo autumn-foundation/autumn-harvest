@@ -1076,6 +1076,10 @@ path = "mutex"
 receiver = "WorkflowContext"
 reason = "context.rs:6893 returns a `MutexHandle`; `MutexHandle::acquire` (context.rs:1194) pushes `WorkflowCommand::AcquireMutex` at context.rs:1232. The builder itself emits nothing, but the handle it hands back is only useful by emitting, so the builder call is the sink site the author writes."
 [[sink]]
+path = "new_promise"
+receiver = "WorkflowContext"
+reason = "context.rs `new_promise` -> `record_promise` -> `side_effect`* (`*` = the `push_command` site, issue #1985). Every argument is recorded into history and matched on replay. DUAL ROLE (see `[[sanctioned]]`)."
+[[sink]]
 path = "new_uuid"
 receiver = "WorkflowContext"
 reason = "context.rs:5109; emits a command transitively: new_uuid -> capture_builtin -> capture_builtin_validated* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
@@ -1084,6 +1088,10 @@ path = "patched"
 receiver = "WorkflowContext"
 step = "patch"
 reason = "context.rs:5420 pushes `WorkflowCommand::RecordMarker` (context.rs:5438) and matches it. DUAL ROLE (see `[[sanctioned]]`)."
+[[sink]]
+path = "promise"
+receiver = "WorkflowContext"
+reason = "context.rs `promise` -> `record_promise` -> `side_effect`* (`*` = the `push_command` site, issue #1985). A tainted key is still a finding: the key names the signal that the workflow waits on. DUAL ROLE (see `[[sanctioned]]`)."
 [[sink]]
 path = "race"
 receiver = "WorkflowContext"
@@ -1110,10 +1118,18 @@ receiver = "WorkflowContext"
 step = "signal"
 reason = "context.rs:8448; emits a command transitively: receive_signal -> wait_for_signal* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
 [[sink]]
+path = "receive_signal_matching"
+receiver = "WorkflowContext"
+reason = "context.rs `receive_signal_matching` -> `wait_for_signal_matching` -> `begin_signal_wait`* (`*` = the `push_command` site, issue #1985). Every argument is recorded or matched on replay. The predicate closure is analysed: a non-deterministic predicate takes a different signal on replay."
+[[sink]]
 path = "receive_signal_timeout"
 receiver = "WorkflowContext"
 step = "signal"
 reason = "context.rs:8992; emits a command transitively: receive_signal_timeout -> wait_for_signal_timeout -> wait_for_signal_timeout_with_timer_id* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "reject_promise"
+receiver = "WorkflowContext"
+reason = "context.rs `reject_promise` -> `settle_promise` -> `signal_external_workflow_with_idempotency` -> `dispatch_signal_command`* (`*` = the `push_command` site, issue #1985). Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "request_cancel_external_workflow"
 receiver = "WorkflowContext"
@@ -1122,6 +1138,10 @@ reason = "context.rs:9381; emits a command transitively: request_cancel_external
 path = "request_cancel_external_workflow_by_id"
 receiver = "WorkflowContext"
 reason = "context.rs:9447; emits a command transitively: request_cancel_external_workflow_by_id -> request_cancel_external_target -> dispatch_cancel_command* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "resolve_promise"
+receiver = "WorkflowContext"
+reason = "context.rs `resolve_promise` -> `settle_promise` -> `signal_external_workflow_with_idempotency` -> `dispatch_signal_command`* (`*` = the `push_command` site, issue #1985). Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "reset_timer"
 receiver = "WorkflowContext"
@@ -1275,6 +1295,10 @@ receiver = "WorkflowContext"
 step = "signal"
 reason = "context.rs:8684; calls `push_command` directly. Every argument is recorded into history and matched on replay."
 [[sink]]
+path = "wait_for_signal_matching"
+receiver = "WorkflowContext"
+reason = "context.rs `wait_for_signal_matching` -> `begin_signal_wait`* (`*` = the `push_command` site, issue #1985). Every argument is recorded or matched on replay. The predicate closure is analysed: a non-deterministic predicate takes a different signal on replay."
+[[sink]]
 path = "wait_for_signal_timeout"
 receiver = "WorkflowContext"
 step = "signal"
@@ -1305,6 +1329,14 @@ path = "await_fire"
 receiver = "TimerHandle"
 reason = "context.rs:1147 -> `WorkflowContext::await_timer_fire`; suspends on a recorded timer."
 [[sink]]
+path = "wait"
+receiver = "DurablePromise"
+reason = "durable_promise.rs:321 -> `WorkflowContext::wait_for_signal` (context.rs:9164), which pushes `WaitForSignal` and matches `SignalReceived` history (issue #1985)."
+[[sink]]
+path = "wait_timeout"
+receiver = "DurablePromise"
+reason = "durable_promise.rs:338 -> `WorkflowContext::wait_for_signal_timeout` (context.rs:9553), which arms a timer and races `WaitForSignal` against it (issue #1985)."
+[[sink]]
 path = "run"
 receiver = "RaceBuilder"
 reason = "context.rs:1600 -> `WorkflowContext::race_impl`, which pushes `StartChildWorkflow`/`StartTimer`/`WaitForSignal`/`CancelRaceLosers` (context.rs:8217-8356). The branch set and its order are recorded."
@@ -1326,7 +1358,7 @@ reason = "context.rs:2517 -> `execute_activity_raw_full`; closing a session is i
 # ═══════════════════════════════════════════════════════════════════════════
 #
 # AC4's list, plus the members of the deadline family that the audit found to be
-# replay-stable. Thirteen of these rows are DUAL ROLE: they also appear in
+# replay-stable. Fifteen of these rows are DUAL ROLE: they also appear in
 # `[[sink]]`, because the primitive records its result and a tainted decision to
 # call it still diverges the command stream. Modelling `side_effect` as sanctioned
 # only (return clean, call ignored) would silently drop the control-taint finding
@@ -1345,9 +1377,17 @@ path = "now"
 receiver = "WorkflowContext"
 reason = "context.rs:3892 returns the recorded `WorkflowStarted` timestamp (`self.start_time`), not a live clock. Replay-stable by construction."
 [[sanctioned]]
+path = "new_promise"
+receiver = "WorkflowContext"
+reason = "issue #1985. The token is recorded through `side_effect` and replays verbatim, so the returned promise handle is clean."
+[[sanctioned]]
 path = "new_uuid"
 receiver = "WorkflowContext"
 reason = "context.rs:5109 \"Deterministic UUID (version 7), captured once and replayed verbatim.\" AC4 replacement for `Uuid::new_v4`."
+[[sanctioned]]
+path = "promise"
+receiver = "WorkflowContext"
+reason = "issue #1985. The token is recorded through `side_effect` and replays verbatim, so the returned promise handle is clean."
 [[sanctioned]]
 path = "random_u64"
 receiver = "WorkflowContext"

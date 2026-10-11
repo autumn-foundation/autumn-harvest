@@ -1589,7 +1589,10 @@ pub async fn trigger_unified_dag(
         // trigger must not double-dispatch a schedule whose active run has
         // already changed type mid-chain.
         let running: i64 = schedule_running_basis(conn, dag_name, schedule.id).await?;
-        if running >= i64::from(schedule.max_active_runs) {
+        // `AllowAll` ignores `max_active_runs` here too (issue #1985).
+        let allow_all =
+            OverlapPolicy::from_db(&schedule.overlap_policy) == OverlapPolicy::AllowAll;
+        if !allow_all && running >= i64::from(schedule.max_active_runs) {
             return Err(HarvestError::UpdateRejected {
                 reason: format!(
                     "DAG '{dag_name}' max_active_runs reached ({running}/{}); manual trigger is deferred",
@@ -4275,9 +4278,10 @@ async fn tick_one_workflow_schedule(
     // cross-type successors included per issue #1160, plus the #607 pending-
     // throttle backlog) -- see `schedule_running_basis`.
     let mut running: i64 = schedule_running_basis(conn, wf_name, schedule.id).await?;
+    let overlap_policy = OverlapPolicy::from_db(&schedule.overlap_policy);
+    let allow_all = overlap_policy == OverlapPolicy::AllowAll;
 
     if running >= i64::from(schedule.max_active_runs) {
-        let overlap_policy = OverlapPolicy::from_db(&schedule.overlap_policy);
         let mut buffered = parse_buffered_runs(&schedule.buffered_runs);
         let buffer_all_max = usize::try_from(schedule.buffer_all_max.max(1)).unwrap_or(usize::MAX);
 
@@ -4453,6 +4457,9 @@ async fn tick_one_workflow_schedule(
                 .await?;
                 running -= i64::from(terminated);
             }
+            // `AllowAll` keeps the in-flight runs. The dispatch loop below
+            // also skips its `max_active_runs` check for this policy.
+            OverlapAction::Proceed => {}
         }
     }
 
@@ -4505,12 +4512,26 @@ async fn tick_one_workflow_schedule(
         };
         let scheduled_for = &effective_scheduled_for;
 
-        if running + i64::from(dispatched) >= i64::from(schedule.max_active_runs) {
+        // `AllowAll` ignores `max_active_runs`. Its own per-tick limit stops
+        // one tick from starting every slot of a long outage (issue #1985).
+        let (at_limit, limit_reason) = if allow_all {
+            (
+                dispatched >= ALLOW_ALL_MAX_STARTS_PER_TICK,
+                "allow_all_tick_limit",
+            )
+        } else {
+            (
+                running + i64::from(dispatched) >= i64::from(schedule.max_active_runs),
+                "max_active_runs_reached",
+            )
+        };
+        if at_limit {
             deferred_next_run_at = Some(*original_slot);
             tracing::info!(
                 workflow_name = %wf_name,
                 max_active_runs = schedule.max_active_runs,
-                "harvest workflow schedule: max_active_runs reached during catchup; deferring remaining"
+                reason = limit_reason,
+                "harvest workflow schedule: start limit reached during catchup; deferring remaining"
             );
             crate::schedule_decision::record_decision_graceful(
                 conn,
@@ -4519,7 +4540,7 @@ async fn tick_one_workflow_schedule(
                 wf_name,
                 "workflow",
                 "skipped",
-                "max_active_runs_reached",
+                limit_reason,
                 Some(serde_json::json!({
                     "running_runs": running,
                     "dispatched_runs": dispatched,
@@ -5317,7 +5338,8 @@ pub struct OverdueInputs<'a> {
 /// `retain_for_retry = catchup && reason == "max_active_runs_reached"`, and only
 /// `OverlapPolicy::Skip` produces that reason. Every other config *advances*
 /// `next_run_at`: non-catchup Skip drops-and-advances, BufferOne/BufferAll
-/// advance, CancelOther/TerminateOther cancel/terminate and proceed. So the
+/// advance, CancelOther/TerminateOther cancel/terminate and proceed.
+/// `AllowAll` proceeds too (issue #1985). So the
 /// `at_capacity` suppression applies **only** when
 /// `overlap_policy == Skip && catchup && at_capacity` — for every other config a
 /// past `next_run_at` while at capacity is a GENUINE stall the gauge must flag.
@@ -6238,7 +6260,21 @@ pub(crate) enum OverlapAction {
     CancelAndProceed,
     /// Terminate all in-flight runs for this workflow, then start the new firing.
     TerminateAndProceed,
+    /// Start the new firing and keep the in-flight runs (`AllowAll`).
+    Proceed,
 }
+
+/// Most runs that one dispatch phase starts for an
+/// [`OverlapPolicy::AllowAll`] schedule (issue #1985).
+///
+/// `AllowAll` ignores `max_active_runs`. After an outage, an unbounded
+/// catch-up can list one slot per missed interval. This limit defers the
+/// rest to the next tick, as the `max_active_runs` gate does.
+///
+/// A tick has two dispatch phases: the buffered drain and the fire. Each
+/// phase takes its own fire claim, and each applies this limit. The limit
+/// keeps each phase well inside its claim lease.
+pub const ALLOW_ALL_MAX_STARTS_PER_TICK: u32 = 100;
 
 /// Decide what to do with a new firing that can't run immediately.
 ///
@@ -6275,6 +6311,7 @@ pub(crate) fn apply_overlap_policy(
         }
         OverlapPolicy::CancelOther => OverlapAction::CancelAndProceed,
         OverlapPolicy::TerminateOther => OverlapAction::TerminateAndProceed,
+        OverlapPolicy::AllowAll => OverlapAction::Proceed,
     }
 }
 
@@ -6403,6 +6440,7 @@ async fn drain_buffered_schedule_runs(
 /// Return the free run slots of a buffered row, or `None` if it cannot drain.
 ///
 /// A row cannot drain when its buffer is empty or it is at `max_active_runs`.
+/// An `AllowAll` row always drains.
 #[cfg(feature = "db")]
 async fn buffered_drain_capacity(
     conn: &mut AsyncPgConnection,
@@ -6411,6 +6449,12 @@ async fn buffered_drain_capacity(
 ) -> HarvestResult<Option<i64>> {
     if parse_buffered_runs(&schedule.buffered_runs).is_empty() {
         return Ok(None);
+    }
+    // `AllowAll` ignores `max_active_runs` (issue #1985). A policy switch
+    // clears the buffer, but a tick that races the switch can still leave a
+    // slot in it. Drain it under the per-tick limit.
+    if OverlapPolicy::from_db(&schedule.overlap_policy) == OverlapPolicy::AllowAll {
+        return Ok(Some(i64::from(ALLOW_ALL_MAX_STARTS_PER_TICK)));
     }
     // Tick-exact running basis (RUNNING/PAUSED count, `schedule_id`-scoped
     // cross-type successors included per issue #1160, plus the #607
@@ -8377,6 +8421,15 @@ mod tests {
     }
 
     #[test]
+    fn overlap_allow_all_returns_proceed_even_with_a_full_buffer() {
+        let fire = parse_utc("2026-05-01T10:00:00Z");
+        let existing = [parse_utc("2026-05-01T09:00:00Z")];
+        let action =
+            apply_overlap_policy(crate::policy::OverlapPolicy::AllowAll, fire, &existing, 1);
+        assert_eq!(action, OverlapAction::Proceed);
+    }
+
+    #[test]
     fn parse_buffered_runs_parses_json_array_of_timestamps() {
         let json = serde_json::json!(["2026-05-01T08:00:00Z", "2026-05-01T09:00:00Z",]);
         let parsed = parse_buffered_runs(&json);
@@ -9006,6 +9059,8 @@ mod tests {
             (OverlapPolicy::BufferOne, false),
             (OverlapPolicy::BufferAll, true),
             (OverlapPolicy::BufferAll, false),
+            (OverlapPolicy::AllowAll, true), // proceed past the cap
+            (OverlapPolicy::AllowAll, false),
         ];
         for (policy, catchup) in non_deferring {
             let v = schedule_overdue(&OverdueInputs {

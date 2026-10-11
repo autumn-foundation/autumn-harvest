@@ -62,6 +62,65 @@ The workflow wakes up, runs `fulfill_order`, and completes.
 
 ---
 
+## Waiting for a matching payload (issue #1985)
+
+`ctx.wait_for_signal_matching` waits for the first signal of a name whose
+payload satisfies a predicate. This is the Cloudflare `step.waitForEvent`
+shape.
+
+```rust
+#[workflow]
+async fn ship(ctx: &WorkflowContext, order_id: u64) -> HarvestResult<serde_json::Value> {
+    // Wait for the update about this order. Updates for other orders stay buffered.
+    let update = ctx
+        .wait_for_signal_matching("order_update", |p| p["order_id"] == order_id)
+        .await?;
+    Ok(update)
+}
+```
+
+- A same-name signal that fails the predicate is not consumed. It stays
+  buffered, and a later wait for that name can take it.
+- `ctx.receive_signal_matching::<T, _>` is the typed form. A payload that
+  does not decode into `T` is a non-match.
+- The predicate must be a pure function of the payload. Replay runs it
+  again over the recorded signals. A changed predicate can take a different
+  signal, and replay then reports drift.
+- Do not register a push handler for the same name. The handler claims every
+  buffered signal of that name.
+- There is no timeout form yet. Do not join it with a `receive_signal_timeout`
+  for the same name: the timeout can win over a signal that arrived in time.
+- A rejected signal stays buffered, so the run replays cold on each new
+  signal. It does not stay resident in worker memory.
+- Replay cannot see a removed wait that would have taken a rejected signal.
+  Consuming a signal records no event.
+
+## Durable promises (issue #1985)
+
+A durable promise is a handle that any caller settles once, like a Restate
+awakeable. The workflow sends the token to another system, then waits:
+
+```rust
+#[workflow]
+async fn approve(ctx: &WorkflowContext, request: String) -> HarvestResult<String> {
+    let mut promise = ctx.new_promise()?;
+    ctx.execute_activity_raw(
+        "send_for_approval",
+        serde_json::json!({ "request": request, "token": promise.id().to_string() }),
+        "default",
+    )
+    .await?;
+    match promise.wait::<String>().await? {
+        Ok(approver) => Ok(approver),
+        Err(rejected) => Ok(format!("rejected: {}", rejected.error)),
+    }
+}
+```
+
+The caller settles it with `durable_promise::resolve` or
+`durable_promise::reject`. See [Durable promises](../durable-promises.md) for
+the token format, the HTTP path and the guarantees.
+
 ## Condition Waiting: `await_condition` and `await_condition_timeout`
 
 Often, a workflow needs to wait until a complex combination of local state changes (e.g., collecting a quorum of approvals) is met. Instead of writing tedious manual loops, you can use the `await_condition` and `await_condition_timeout` primitives.

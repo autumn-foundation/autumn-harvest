@@ -305,6 +305,8 @@ pub mod dispatch;
 /// Deterministic simulation of the activity claim protocol (issue #1830),
 /// and of the real worker loop (issue #2002).
 pub mod dst;
+/// Durable promises that any caller settles once (issue #1985).
+pub mod durable_promise;
 /// Effective runtime-configuration introspection (issue #695).
 ///
 /// [`effective_config::EffectiveConfigView`] is the serialisable, secret-free

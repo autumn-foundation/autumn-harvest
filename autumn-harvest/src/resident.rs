@@ -1017,12 +1017,25 @@ mod tests {
         })
     }
 
+    /// Parks on a payload-matching signal wait (issue #1985).
+    ///
+    /// A warm resume sends any same-name payload to the parked future. It
+    /// does not run the predicate.
+    fn predicate_wait_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            ctx.wait_for_signal_matching("order", |p| p["id"] == 42)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
     #[tokio::test]
     async fn ineligible_suspensions_are_not_resident() {
         for (name, handler) in [
             ("join", join_workflow as WorkflowHandlerFn),
             ("signal handler", handler_workflow),
             ("condition", condition_workflow),
+            ("signal predicate", predicate_wait_workflow),
         ] {
             let (outcome, resident) = start(
                 ExecutionId::new(),

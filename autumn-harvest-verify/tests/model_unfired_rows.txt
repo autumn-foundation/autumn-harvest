@@ -124,15 +124,25 @@ sink:execute_local_activity@WorkflowContext
 sink:execute_local_activity_raw@WorkflowContext
 sink:execute_local_activity_with_opts@WorkflowContext
 sink:mutex@WorkflowContext
+# Issue #1985: no corpus crate calls this new method yet.
+sink:new_promise@WorkflowContext
 sink:patched@WorkflowContext
+# Issue #1985: no corpus crate calls this new method yet.
+sink:promise@WorkflowContext
 sink:race@WorkflowContext
 sink:random_f64@WorkflowContext
+# Issue #1985: no corpus crate calls this new method yet.
+sink:receive_signal_matching@WorkflowContext
 sink:receive_signal_timeout@WorkflowContext
+# Issue #1985: no corpus crate calls this new method yet.
+sink:reject_promise@WorkflowContext
 sink:release@MutexGuard
 sink:request_cancel_external_workflow@WorkflowContext
 sink:request_cancel_external_workflow_by_id@WorkflowContext
 sink:reset@TimerHandle
 sink:reset_timer@WorkflowContext
+# Issue #1985: no corpus crate calls this new method yet.
+sink:resolve_promise@WorkflowContext
 sink:run@RaceBuilder
 sink:should_continue_as_new@WorkflowContext
 sink:signal_external_workflow@WorkflowContext
@@ -161,8 +171,14 @@ sink:start_timer@WorkflowContext
 sink:system_time_now@WorkflowContext
 sink:time_until_deadline@WorkflowContext
 sink:timer_business_days@WorkflowContext
+# Issue #1985: no corpus crate calls this new handle method yet.
+sink:wait@DurablePromise
 sink:wait_for_signal@WorkflowContext
+# Issue #1985: no corpus crate calls this new method yet.
+sink:wait_for_signal_matching@WorkflowContext
 sink:wait_for_signal_timeout@WorkflowContext
+# Issue #1985: no corpus crate calls this new handle method yet.
+sink:wait_timeout@DurablePromise
 source:Cell::into_inner@Cell
 source:Cell::replace@Cell
 source:Cell::take@Cell

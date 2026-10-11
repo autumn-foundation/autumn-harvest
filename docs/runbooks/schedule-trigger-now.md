@@ -70,7 +70,7 @@ curl -X POST 'https://example.com/api/harvest/admin/schedules/<UUID>/trigger?for
 |--------|-------|------------|
 | 404 | Schedule UUID not found | Verify the UUID with `GET /admin/schedules` |
 | 409 | Schedule is paused and `?force=true` was not passed | Append `?force=true` to override |
-| 400 | Invalid `overlap_policy` value in the request body | Use one of: `skip`, `buffer_one`, `buffer_all`, `cancel_other`, `terminate_other` |
+| 400 | Invalid `overlap_policy` value in the request body | Use one of: `skip`, `buffer_one`, `buffer_all`, `cancel_other`, `terminate_other`, `allow_all` |
 | 500 | Database error starting the workflow execution | Check Postgres connectivity and worker logs |
 
 ## Important notes

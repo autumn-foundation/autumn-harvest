@@ -2871,7 +2871,8 @@ enum ScheduleCommand {
         /// New task queue name for scheduled runs.
         #[arg(long)]
         queue: Option<String>,
-        /// New overlap policy: skip, `buffer_one`, `buffer_all`, `cancel_other`, `terminate_other`.
+        /// New overlap policy: skip, `buffer_one`, `buffer_all`, `cancel_other`, `terminate_other`,
+        /// `allow_all`.
         #[arg(long)]
         overlap_policy: Option<String>,
         /// New maximum buffered slots under `buffer_all`.
