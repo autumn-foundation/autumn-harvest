@@ -17160,3 +17160,192 @@ fn wf_reused_result::{closure#0}::{closure#1}::{closure#0}::{closure#0}(_1: {clo
         return;
     }
 }
+
+fn __autumn_workflow_info_wf_handler_local_call() -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = const 0_u8;
+        return;
+    }
+}
+
+fn wf_handler_local_call(_1: &WorkflowContext) -> {async fn body of wf_handler_local_call()} {
+    debug ctx => _1;
+    let mut _0: {async fn body of wf_handler_local_call()};
+
+    bb0: {
+        _0 = {coroutine@flow.rs:605:66: 609:2 (#0)} { ctx: copy _1 };
+        return;
+    }
+}
+
+fn wf_handler_local_call::{closure#0}(_1: Pin<&mut {async fn body of wf_handler_local_call()}>, _2: &mut Context<'_>) -> Poll<Result<u64, String>> {
+    coroutine layout {
+        field _s0: {closure@flow.rs:606:13: 606:21};
+        field _s1: {async fn body of handle_ok_pending()};
+        variant_fields = {
+            Unresumed(0): [],
+            Returned (1): [],
+            Panicked (2): [],
+            Suspend0 (3): [_s0, _s1],
+        }
+        storage_conflicts = BitMatrix(2x2) {(_s0, _s0), (_s0, _s1), (_s1, _s0), (_s1, _s1)}
+    }
+    debug _task_context => _22;
+    debug ctx => ((*_21).0: &autumn_harvest::WorkflowContext);
+    let mut _0: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let _3: &autumn_harvest::WorkflowContext;
+    let _4: ();
+    let mut _5: &str;
+    let mut _6: {closure@flow.rs:607:41: 607:50};
+    let mut _7: {closure@flow.rs:606:13: 606:21};
+    let mut _8: {async fn body of handle_ok_pending()};
+    let mut _9: {async fn body of handle_ok_pending()};
+    let mut _10: &{closure@flow.rs:606:13: 606:21};
+    let mut _11: (u64,);
+    let mut _12: std::task::Poll<std::result::Result<u64, std::string::String>>;
+    let mut _13: std::pin::Pin<&mut {async fn body of handle_ok_pending()}>;
+    let mut _14: &mut {async fn body of handle_ok_pending()};
+    let mut _15: &mut std::task::Context<'_>;
+    let mut _16: std::future::ResumeTy;
+    let mut _17: isize;
+    let mut _19: std::future::ResumeTy;
+    let mut _20: u32;
+    let mut _21: &mut {async fn body of wf_handler_local_call()};
+    let mut _22: std::future::ResumeTy;
+    let mut _23: std::ptr::NonNull<std::task::Context<'_>>;
+    scope 1 {
+        debug ctx => _3;
+        coroutine debug h => _s0;
+        scope 2 {
+            debug h => (((*_21) as variant#3).0: {closure@flow.rs:606:13: 606:21});
+            coroutine debug __awaitee => _s1;
+            scope 3 {
+                debug __awaitee => (((*_21) as variant#3).1: {async fn body of handle_ok_pending()});
+                let _18: std::result::Result<u64, std::string::String>;
+                scope 4 {
+                    debug result => _18;
+                }
+            }
+        }
+    }
+
+    bb0: {
+        _23 = move _2 as std::ptr::NonNull<std::task::Context<'_>> (Transmute);
+        _22 = std::future::ResumeTy(move _23);
+        _21 = copy (_1.0: &mut {async fn body of wf_handler_local_call()});
+        _20 = discriminant((*_21));
+        switchInt(move _20) -> [0: bb16, 1: bb15, 2: bb14, 3: bb13, otherwise: bb7];
+    }
+
+    bb1: {
+        _10 = &(((*_21) as variant#3).0: {closure@flow.rs:606:13: 606:21});
+        _11 = (const 1_u64,);
+        _9 = <{closure@flow.rs:606:13: 606:21} as Fn<(u64,)>>::call(move _10, move _11) -> [return: bb2, unwind: bb12];
+    }
+
+    bb2: {
+        _8 = <{async fn body of handle_ok_pending()} as IntoFuture>::into_future(move _9) -> [return: bb3, unwind: bb12];
+    }
+
+    bb3: {
+        (((*_21) as variant#3).1: {async fn body of handle_ok_pending()}) = move _8;
+        goto -> bb4;
+    }
+
+    bb4: {
+        _14 = &mut (((*_21) as variant#3).1: {async fn body of handle_ok_pending()});
+        _13 = Pin::<&mut {async fn body of handle_ok_pending()}>::new_unchecked(copy _14) -> [return: bb5, unwind: bb11];
+    }
+
+    bb5: {
+        _16 = copy _22;
+        _15 = copy (_16.0: std::ptr::NonNull<std::task::Context<'_>>) as &mut std::task::Context<'_> (Transmute);
+        _12 = <{async fn body of handle_ok_pending()} as Future>::poll(move _13, copy _15) -> [return: bb6, unwind: bb11];
+    }
+
+    bb6: {
+        _17 = discriminant(_12);
+        switchInt(move _17) -> [0: bb9, 1: bb8, otherwise: bb7];
+    }
+
+    bb7: {
+        unreachable;
+    }
+
+    bb8: {
+        _0 = Poll::<Result<u64, String>>::Pending;
+        discriminant((*_21)) = 3;
+        return;
+    }
+
+    bb9: {
+        _18 = move ((_12 as Ready).0: std::result::Result<u64, std::string::String>);
+        drop((((*_21) as variant#3).1: {async fn body of handle_ok_pending()})) -> [return: bb10, unwind: bb12];
+    }
+
+    bb10: {
+        _0 = Poll::<Result<u64, String>>::Ready(copy _18);
+        discriminant((*_21)) = 1;
+        return;
+    }
+
+    bb11 (cleanup): {
+        drop((((*_21) as variant#3).1: {async fn body of handle_ok_pending()})) -> [return: bb12, unwind terminate(cleanup)];
+    }
+
+    bb12 (cleanup): {
+        discriminant((*_21)) = 2;
+        resume;
+    }
+
+    bb13: {
+        _19 = move _22;
+        _22 = move _19;
+        goto -> bb4;
+    }
+
+    bb14: {
+        assert(const false, "`async fn` resumed after panicking") -> [success: bb14, unwind continue];
+    }
+
+    bb15: {
+        assert(const false, "`async fn` resumed after completion") -> [success: bb15, unwind continue];
+    }
+
+    bb16: {
+        _3 = copy ((*_21).0: &autumn_harvest::WorkflowContext);
+        (((*_21) as variant#3).0: {closure@flow.rs:606:13: 606:21}) = {closure@flow.rs:606:13: 606:21};
+        _5 = const "book";
+        _6 = {closure@flow.rs:607:41: 607:50};
+        _7 = copy (((*_21) as variant#3).0: {closure@flow.rs:606:13: 606:21});
+        _4 = WorkflowContext::register_update_handler::<{closure@flow.rs:607:41: 607:50}, {closure@flow.rs:606:13: 606:21}, {async fn body of handle_ok_pending()}>(copy _3, move _5, move _6, move _7) -> [return: bb1, unwind: bb12];
+    }
+}
+
+alloc21 (size: 4, align: 1) {
+    62 6f 6f 6b                                     │ book
+}
+
+fn wf_handler_local_call::{closure#0}::{closure#0}(_1: &{closure@flow.rs:606:13: 606:21}, _2: u64) -> {async fn body of handle_ok_pending()} {
+    debug v => _2;
+    let mut _0: {async fn body of handle_ok_pending()};
+
+    bb0: {
+        _0 = handle_ok_pending(copy _2) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+
+fn wf_handler_local_call::{closure#0}::{closure#1}(_1: &{closure@flow.rs:607:41: 607:50}, _2: &u64) -> Result<(), String> {
+    let mut _0: std::result::Result<(), std::string::String>;
+
+    bb0: {
+        _0 = Result::<(), String>::Ok(const ());
+        return;
+    }
+}

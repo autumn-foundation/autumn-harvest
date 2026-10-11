@@ -596,3 +596,14 @@ pub async fn wf_reused_result(ctx: &WorkflowContext) -> Out {
     out = Err(format!("late {a}"));
     out
 }
+
+pub fn __autumn_workflow_info_wf_handler_local_call() -> u8 {
+    0
+}
+
+/// One closure value is registered and also called directly.
+pub async fn wf_handler_local_call(ctx: &WorkflowContext) -> Out {
+    let h = |v: u64| handle_ok_pending(v);
+    ctx.register_update_handler("book", |_: &u64| Ok(()), h);
+    h(1).await
+}
