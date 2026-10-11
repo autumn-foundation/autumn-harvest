@@ -4424,6 +4424,7 @@ async fn export_and_drop(
         result = drop_partition(conn, part, upper, opts, Some(&manifest)).await?;
     }
     Ok(if result == DropOutcome::Dropped {
+        crate::partition_archive::record_drop(export, &manifest).await;
         ExportStep::Dropped(manifest.key())
     } else {
         ExportStep::Blocked(result.reason().to_string())

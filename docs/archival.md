@@ -284,20 +284,33 @@ key of each dropped partition. Each backend call has the
 
 ```text
 harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/segment-000001-<sha256:16>.jsonl
-harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/manifest.json
+harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/manifest-<sha256:16>.json
+harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/latest.json
+harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/dropped.json
 ```
 
 `<lower>` is `min` for the legacy partition. The bounds keep a later
-partition with the same name from replacing an old export. A segment key
-holds the first 16 hex digits of its SHA-256, so an upload that lands late
-cannot replace a segment that a finished export names.
+partition with the same name from replacing an old export.
+
+- A segment key and a manifest key hold the first 16 hex digits of a
+  SHA-256 of their content. An upload that lands late, after a timeout,
+  writes its own key. It cannot replace an object that a finished export
+  names.
+- `dropped.json` names the manifest of the export that the drop checked.
+  Only the attempt that dropped the partition writes it, after the drop.
+  `partition_archive::find_dropped` reads it.
+- `latest.json` names the last verified export. The next pass uses it to
+  find an export to reuse. A stale hint costs one new export, because the
+  drop checks the partition against the manifest under its lock.
 
 ### Read-back
 
 ```rust
-use autumn_harvest::partition_archive::read_back;
+use autumn_harvest::partition_archive::{archive_prefix, find_dropped, read_back};
 
 // `archiver` is an `Arc<dyn PartitionArchiver>`. The caller returns a boxed error.
+let prefix = archive_prefix(shard_id, &partition_name, lower, upper);
+let manifest_key = find_dropped(archiver.as_ref(), &prefix).await?.ok_or("no drop record")?;
 let part = read_back(archiver.as_ref(), &manifest_key).await?;
 let events = part.history(execution_id)?;
 ```

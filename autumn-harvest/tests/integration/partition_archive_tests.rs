@@ -299,7 +299,7 @@ impl PartitionArchiver for TestArchiver {
                 return Err("bucket unavailable".into());
             }
             self.objects.lock().unwrap().insert(key.to_string(), bytes);
-            let change = if key.ends_with("manifest.json") {
+            let change = if key.contains("/manifest-") {
                 self.change_row.lock().unwrap().take()
             } else {
                 None
@@ -318,7 +318,7 @@ impl PartitionArchiver for TestArchiver {
 
     fn get<'a>(&'a self, key: &'a str) -> ArchiveIo<'a, Option<Vec<u8>>> {
         self.log.lock().unwrap().push(format!("get {key}"));
-        let probe = if key.ends_with("manifest.json") {
+        let probe = if key.contains("/manifest-") {
             self.probe.lock().unwrap().clone()
         } else {
             None
@@ -372,8 +372,18 @@ fn typed(rows: Vec<serde_json::Value>) -> Vec<partition_archive::ArchivedEventRo
         .collect()
 }
 
-fn expected_manifest_key(name: &str, lower: Option<DateTime<Utc>>, upper: DateTime<Utc>) -> String {
-    partition_archive::manifest_key(&partition_archive::archive_prefix(0, name, lower, upper))
+/// The manifest key that the drop record of this partition names.
+async fn dropped_manifest(
+    archiver: &dyn PartitionArchiver,
+    name: &str,
+    lower: Option<DateTime<Utc>>,
+    upper: DateTime<Utc>,
+) -> String {
+    let prefix = partition_archive::archive_prefix(0, name, lower, upper);
+    partition_archive::find_dropped(archiver, &prefix)
+        .await
+        .expect("read the drop record")
+        .expect("a drop record after the drop")
 }
 
 // ── Done when: exported, verified, then dropped, and read back ────────────
@@ -392,7 +402,7 @@ async fn an_aged_partition_is_exported_verified_then_dropped_and_reads_back() {
     *backend.probe.lock().unwrap() = Some((url.clone(), aged.name.clone()));
     let outcome = sweep_with(&mut conn, backend.clone()).await;
 
-    let key = expected_manifest_key(&aged.name, Some(aged.lower), aged.upper);
+    let key = dropped_manifest(backend.as_ref(), &aged.name, Some(aged.lower), aged.upper).await;
     assert_eq!(outcome.dropped, vec![aged.name.clone()], "{outcome:?}");
     assert_eq!(outcome.exported, vec![key.clone()], "{outcome:?}");
     assert!(
@@ -400,30 +410,39 @@ async fn an_aged_partition_is_exported_verified_then_dropped_and_reads_back() {
         "the partition is dropped"
     );
 
-    // Order: a reuse probe, every segment, the manifest, then the read-back.
+    // Order: segments, the manifest, the read-back, then the drop record.
     let log = backend.log.lock().unwrap().clone();
-    let first_put = log.iter().position(|l| l.starts_with("put ")).unwrap();
-    let last_put = log.iter().rposition(|l| l.starts_with("put ")).unwrap();
-    assert_eq!(
-        log[last_put],
-        format!("put {key}"),
-        "the manifest goes last: {log:?}"
+    let pos = |entry: &str| {
+        log.iter()
+            .position(|l| l == entry)
+            .unwrap_or_else(|| panic!("{entry}: {log:?}"))
+    };
+    let manifest_put = pos(&format!("put {key}"));
+    let dropped = format!(
+        "put {}",
+        partition_archive::dropped_key(key.rsplit_once('/').unwrap().0)
     );
     assert!(
-        log[first_put..last_put]
+        log[..manifest_put]
             .iter()
-            .all(|l| l.starts_with("put ")),
-        "the upload reads nothing back: {log:?}"
+            .filter(|l| l.starts_with("put "))
+            .all(|l| l.contains("/segment-")),
+        "every segment goes before the manifest: {log:?}"
     );
     assert!(
-        log[last_put + 1..]
+        log[manifest_put + 1..]
             .iter()
             .any(|l| l == &format!("get {key}")),
         "verify reads the manifest back after the upload: {log:?}"
     );
+    assert_eq!(
+        log.iter().rfind(|l| l.starts_with("put ")),
+        Some(&dropped),
+        "the drop record is the last upload: {log:?}"
+    );
     let reads = backend.existed_at_read.lock().unwrap().clone();
     assert!(
-        reads.len() >= 2 && reads.iter().all(|still| *still),
+        !reads.is_empty() && reads.iter().all(|still| *still),
         "the partition still exists at every manifest read, verify included: {reads:?}"
     );
 
@@ -468,7 +487,13 @@ async fn the_legacy_partition_exports_under_a_min_lower_bound() {
     let backend = Arc::new(TestArchiver::default());
     let outcome = sweep_with(&mut conn, backend.clone()).await;
 
-    let key = expected_manifest_key(partition::LEGACY_PARTITION, None, legacy.upper.unwrap());
+    let key = dropped_manifest(
+        backend.as_ref(),
+        partition::LEGACY_PARTITION,
+        None,
+        legacy.upper.unwrap(),
+    )
+    .await;
     assert!(key.contains("/min_"), "{key}");
     assert!(outcome.exported.contains(&key), "{outcome:?}");
     assert!(!exists(&mut conn, partition::LEGACY_PARTITION).await);
@@ -575,7 +600,7 @@ async fn a_row_changed_after_the_export_keeps_the_partition_until_a_new_export()
     let current = rows_as_json(&mut conn, &aged.name).await;
     let second = sweep_with(&mut conn, backend.clone()).await;
     assert_eq!(second.dropped, vec![aged.name.clone()], "{second:?}");
-    let key = expected_manifest_key(&aged.name, Some(aged.lower), aged.upper);
+    let key = dropped_manifest(backend.as_ref(), &aged.name, Some(aged.lower), aged.upper).await;
     let archived = partition_archive::read_back(backend.as_ref(), &key)
         .await
         .expect("read back");
@@ -792,10 +817,11 @@ async fn a_failed_drop_reuses_the_export_on_the_next_pass() {
     assert_eq!(second.dropped, vec![aged.name.clone()], "{second:?}");
     let log = backend.log.lock().unwrap().clone();
     assert!(
-        log.iter().all(|l| l.starts_with("get ")),
-        "the second pass uploads nothing: {log:?}"
+        log.iter()
+            .all(|l| l.starts_with("get ") || l.ends_with("/dropped.json")),
+        "the second pass uploads only the drop record: {log:?}"
     );
-    let key = expected_manifest_key(&aged.name, Some(aged.lower), aged.upper);
+    let key = dropped_manifest(backend.as_ref(), &aged.name, Some(aged.lower), aged.upper).await;
     assert_eq!(second.exported, vec![key]);
 }
 
@@ -870,7 +896,7 @@ async fn the_retention_runtime_exports_before_it_drops() {
     let result = result.expect("partition maintenance ran");
     assert_eq!(result.deleted_count, 2, "retention collected both runs");
     let sweep = &result.partition_maintenance.as_ref().unwrap().sweep;
-    let key = expected_manifest_key(&name, Some(lower), upper);
+    let key = dropped_manifest(disk.as_ref(), &name, Some(lower), upper).await;
     assert_eq!(sweep.exported, vec![key.clone()], "{sweep:?}");
     assert!(!exists(&mut conn, &name).await, "the partition is dropped");
     let archived = partition_archive::read_back(disk.as_ref(), &key)

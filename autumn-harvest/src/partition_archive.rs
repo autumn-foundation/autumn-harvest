@@ -22,7 +22,8 @@
 //!
 //! ```text
 //! harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/segment-000001-<sha256:16>.jsonl
-//! harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/manifest.json
+//! harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/manifest-<sha256:16>.json
+//! harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/dropped.json
 //! ```
 //!
 //! A segment holds one row per line, as `to_jsonb(row)::text`, in `id`
@@ -127,10 +128,64 @@ fn key_bound(bound: Option<DateTime<Utc>>) -> String {
     )
 }
 
-/// The manifest key under `prefix`.
+/// The key of a manifest under `prefix`, with the first 16 hex digits of
+/// its whole-partition SHA-256.
+///
+/// The hash in the key makes a manifest key name its content. A late upload
+/// from a timed-out attempt then writes its own key. It cannot replace the
+/// manifest of the export that the drop checked.
 #[must_use]
-pub fn manifest_key(prefix: &str) -> String {
-    format!("{prefix}/manifest.json")
+pub fn manifest_key(prefix: &str, sha256: &str) -> String {
+    let short = sha256.get(..16).unwrap_or(sha256);
+    format!("{prefix}/manifest-{short}.json")
+}
+
+/// The key of the drop record under `prefix`.
+///
+/// Only the attempt that dropped the partition writes it, once, after the
+/// drop commits. It names the manifest of the export that the drop checked.
+#[must_use]
+pub fn dropped_key(prefix: &str) -> String {
+    format!("{prefix}/dropped.json")
+}
+
+/// The key of the reuse hint under `prefix`.
+///
+/// Each verified export writes it. The next pass reads it to find an export
+/// to use again. A stale hint costs one new export, not data, because the
+/// drop checks the partition against the manifest under its lock.
+fn latest_key(prefix: &str) -> String {
+    format!("{prefix}/latest.json")
+}
+
+/// The body of a drop record or a reuse hint.
+#[derive(Debug, Serialize, Deserialize)]
+struct Pointer {
+    /// A manifest key.
+    manifest: String,
+}
+
+/// The manifest key that the drop record under `prefix` names.
+///
+/// Returns `None` when no drop record is there: the partition was not
+/// dropped through an export, or the record write failed after the drop.
+/// `SweepOutcome::exported` also names the key.
+///
+/// # Errors
+///
+/// [`ReadBackError`] when the backend fails or the record does not parse.
+pub async fn find_dropped(
+    archiver: &dyn PartitionArchiver,
+    prefix: &str,
+) -> Result<Option<String>, ReadBackError> {
+    let key = dropped_key(prefix);
+    match fetch(archiver, &key, None).await {
+        Ok(raw) => serde_json::from_slice::<Pointer>(&raw)
+            .map(|p| Some(p.manifest))
+            .map_err(|e| ReadBackError::Corrupt(format!("{key}: {e}"))),
+        Err(ReadBackError::Missing(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// The key of segment `n` under `prefix`, with the first 16 hex digits of
@@ -189,15 +244,16 @@ pub struct PartitionManifest {
 }
 
 impl PartitionManifest {
+    /// The key prefix of this export.
+    #[must_use]
+    pub fn prefix(&self) -> String {
+        archive_prefix(self.shard_id, &self.partition, self.lower, self.upper)
+    }
+
     /// The key of this manifest.
     #[must_use]
     pub fn key(&self) -> String {
-        manifest_key(&archive_prefix(
-            self.shard_id,
-            &self.partition,
-            self.lower,
-            self.upper,
-        ))
+        manifest_key(&self.prefix(), &self.sha256)
     }
 }
 
@@ -434,9 +490,13 @@ async fn read_back_inner(
     }
     // A manifest copied to another key, or a segment outside its prefix,
     // would read back another partition's rows with no error.
-    let key = manifest.key();
-    let prefix = key.trim_end_matches("manifest.json");
-    if key != manifest_key || manifest.segments.iter().any(|s| !s.key.starts_with(prefix)) {
+    let prefix = format!("{}/", manifest.prefix());
+    if manifest.key() != manifest_key
+        || manifest
+            .segments
+            .iter()
+            .any(|s| !s.key.starts_with(&prefix))
+    {
         return Err(ReadBackError::Corrupt(format!(
             "{manifest_key}: the manifest names another partition"
         )));
@@ -509,8 +569,9 @@ async fn fetch(
 /// directory.
 ///
 /// A write goes to a temporary file first. The file is synced, renamed into
-/// place, and then its directory is synced, so a crash cannot lose a write
-/// that returned `Ok`. A key path part must match `[A-Za-z0-9._-]+` and must
+/// place, and then its directory is synced. The parent of each directory
+/// that the write creates is synced too. So a crash cannot lose a write that
+/// returned `Ok`. A key path part must match `[A-Za-z0-9._-]+` and must
 /// not be `.` or `..`.
 #[derive(Debug, Clone)]
 pub struct DirectoryPartitionArchiver {
@@ -554,6 +615,20 @@ impl DirectoryPartitionArchiver {
 async fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt as _;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    // A new directory's entry lives in its parent. List the directories that
+    // `create_dir_all` makes, so their parents can be synced after the write.
+    let mut created = Vec::new();
+    let mut probe = dir;
+    while let Err(e) = tokio::fs::metadata(probe).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e);
+        }
+        created.push(probe.to_path_buf());
+        match probe.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => probe = parent,
+            _ => break,
+        }
+    }
     tokio::fs::create_dir_all(dir).await?;
     let name = path
         .file_name()
@@ -566,7 +641,13 @@ async fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         file.sync_all().await?;
         drop(file);
         tokio::fs::rename(&tmp, path).await?;
-        sync_dir(dir).await
+        sync_dir(dir).await?;
+        for new_dir in &created {
+            if let Some(parent) = new_dir.parent() {
+                sync_dir(parent).await?;
+            }
+        }
+        Ok(())
     }
     .await;
     if written.is_err() {
@@ -933,19 +1014,42 @@ pub(crate) async fn reusable_export(
     upper: DateTime<Utc>,
     progress: Option<&mut (dyn FnMut() + Send)>,
 ) -> Option<PartitionManifest> {
-    // `read_back_inner` checks that the manifest names this key, so a match
-    // is this shard, this partition and these bounds.
     let prefix = archive_prefix(export.shard_id, &part.name, part.lower, upper);
-    read_back_inner(
+    let raw = bounded(export, export.archiver.get(&latest_key(&prefix)))
+        .await
+        .ok()??;
+    let hint: Pointer = serde_json::from_slice(&raw).ok()?;
+    // `read_back_inner` checks that the manifest names its own key. The
+    // prefix check then ties it to this shard, partition and bounds.
+    let back = read_back_inner(
         export.archiver.as_ref(),
-        &manifest_key(&prefix),
+        &hint.manifest,
         Some(export.io_timeout),
         false,
         progress,
     )
     .await
-    .ok()
-    .map(|back| back.manifest)
+    .ok()?;
+    (back.manifest.prefix() == prefix).then_some(back.manifest)
+}
+
+/// Write the drop record of `manifest`, after the drop commits.
+///
+/// A failure is only logged. The export is complete and verified, and
+/// `SweepOutcome::exported` still names it.
+#[cfg(feature = "db")]
+pub(crate) async fn record_drop(export: &PartitionExport, manifest: &PartitionManifest) {
+    let key = dropped_key(&manifest.prefix());
+    let body = Pointer {
+        manifest: manifest.key(),
+    };
+    let written = match serde_json::to_vec(&body) {
+        Ok(bytes) => bounded(export, export.archiver.put(&key, bytes)).await,
+        Err(e) => Err(e.to_string()),
+    };
+    if let Err(error) = written {
+        tracing::warn!(key, error, "could not write the partition drop record");
+    }
 }
 
 /// Export partition `part`, then read the export back and check it.
@@ -1012,7 +1116,7 @@ pub(crate) async fn export_partition(
         row_checksum,
         segments,
     };
-    let key = manifest_key(&prefix);
+    let key = manifest.key();
     let bytes = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
     bounded(export, export.archiver.put(&key, bytes)).await?;
     if let Some(cb) = progress.as_mut() {
@@ -1030,6 +1134,13 @@ pub(crate) async fn export_partition(
     .map_err(|e| e.to_string())?;
     if back.manifest != manifest {
         return Err(format!("{key} differs from the upload"));
+    }
+    // The hint only helps the next pass find this export. A failed write
+    // costs a new export then, so it does not fail this one.
+    if let Ok(hint) = serde_json::to_vec(&Pointer {
+        manifest: key.clone(),
+    }) {
+        let _ = bounded(export, export.archiver.put(&latest_key(&prefix), hint)).await;
     }
     Ok(manifest)
 }
@@ -1107,7 +1218,8 @@ mod tests {
             row_checksum,
             segments,
         };
-        let key = manifest_key(&prefix);
+        let key = manifest.key();
+        assert!(key.starts_with(&prefix));
         archiver
             .put(&key, serde_json::to_vec(&manifest).unwrap())
             .await
@@ -1119,6 +1231,32 @@ mod tests {
         let raw = archiver.objects.lock().unwrap()[manifest_key].clone();
         let manifest: PartitionManifest = serde_json::from_slice(&raw).unwrap();
         manifest.segments.into_iter().map(|s| s.key).collect()
+    }
+
+    #[tokio::test]
+    async fn exports_of_different_rows_have_different_manifest_keys() {
+        // A late manifest from an older attempt then writes its own key and
+        // cannot replace the export that a drop checked.
+        let archiver = MemoryArchiver::default();
+        let old = store(&archiver, &[ROW_A]).await;
+        let new = store(&archiver, &[ROW_A, ROW_B]).await;
+        assert_ne!(old, new);
+        assert_eq!(read_back(&archiver, &old).await.unwrap().rows.len(), 1);
+        assert_eq!(read_back(&archiver, &new).await.unwrap().rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn find_dropped_reads_the_drop_record() {
+        let archiver = MemoryArchiver::default();
+        let key = store(&archiver, &[ROW_A]).await;
+        let prefix = key.rsplit_once('/').unwrap().0.to_string();
+        assert_eq!(find_dropped(&archiver, &prefix).await.unwrap(), None);
+        let record = serde_json::to_vec(&Pointer {
+            manifest: key.clone(),
+        })
+        .unwrap();
+        archiver.put(&dropped_key(&prefix), record).await.unwrap();
+        assert_eq!(find_dropped(&archiver, &prefix).await.unwrap(), Some(key));
     }
 
     #[tokio::test]
@@ -1148,8 +1286,12 @@ mod tests {
             prefix,
             "harvest-partitions/shard-3/harvest_events_p_20260101/20260101T000000Z_20260102T000000Z"
         );
-        assert_eq!(manifest_key(&prefix), format!("{prefix}/manifest.json"));
         let sha = sha256_hex(b"x");
+        assert_eq!(
+            manifest_key(&prefix, &sha),
+            format!("{prefix}/manifest-{}.json", &sha[..16])
+        );
+        assert_eq!(dropped_key(&prefix), format!("{prefix}/dropped.json"));
         assert_eq!(
             segment_key(&prefix, 7, &sha),
             format!("{prefix}/segment-000007-{}.jsonl", &sha[..16])
@@ -1316,6 +1458,14 @@ b
         let dir = tempfile::tempdir().unwrap();
         let archiver = DirectoryPartitionArchiver::new(dir.path().join("cold"));
         archiver.put("a/b/c.json", b"one".to_vec()).await.unwrap();
+        archiver
+            .put("x/y/z/new.json", b"deep".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            archiver.get("x/y/z/new.json").await.unwrap(),
+            Some(b"deep".to_vec())
+        );
         archiver.put("a/b/c.json", b"two".to_vec()).await.unwrap();
         assert_eq!(
             archiver.get("a/b/c.json").await.unwrap(),

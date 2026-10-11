@@ -39,14 +39,17 @@ events.
   covers `harvest partition maintain` and `RetentionRuntime::spawn`.
 - **Lock.** A session advisory lock lets one process at a time export a
   shard. The others report `another process is exporting this shard`.
-- **Keys.** A key holds the shard and the cohort bounds. A segment key holds
-  its SHA-256 prefix, so a late upload cannot replace a finished segment.
+- **Keys.** A key holds the shard and the cohort bounds. Segment and
+  manifest keys hold a SHA-256 prefix of their content, so a late upload
+  cannot replace a finished object. `dropped.json` names the checked
+  manifest, and `partition_archive::find_dropped` reads it.
 - **Budget.** One pass makes at most 4 new exports.
 - **Stragglers.** `try_build` refuses a partition archiver together with
   `partitions.straggler_grace_secs`. The sweep skips straggler deletes when
   it exports or the shard holds the marker.
-- **Durability.** `DirectoryPartitionArchiver` syncs the file and its
-  directory before `put` returns.
+- **Durability.** `DirectoryPartitionArchiver` syncs the file, its
+  directory, and the parent of each directory it creates before `put`
+  returns.
 
 **Delta encoding: measured, declined.** On a 40-turn agent loop
 (`autumn-harvest-agent/tests/history_delta_measure.rs`), a delta on the
@@ -73,7 +76,7 @@ change removes the stale field from both tests.
   lost object; changed bytes; a slow backend; a row changed or deleted
   after the export; a live owner; no straggler deletes; the marker; the
   lock; reuse; the export budget.
-- 15 unit tests in `partition_archive::tests`.
+- 17 unit tests in `partition_archive::tests`.
 - The builder test
   `a_partition_archiver_with_straggler_deletes_fails_the_build`.
 - `history_delta_measure` in `autumn-harvest-agent`.

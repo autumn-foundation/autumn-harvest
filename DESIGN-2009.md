@@ -75,6 +75,8 @@ API and tests, and docs. These changes followed. Each has a test.
 | C6 | Verify checked bytes only, so an unparseable row could drop and then fail `read_back`. | Verify runs the read-back path, which parses every row. `read_back` also checks the manifest against its key. | `read_back_refuses_a_manifest_under_another_key` |
 | C7 | Pages of 1,000 large rows could use a lot of memory. | Pages hold 256 rows. | — |
 | C8 | Internal types were public, and core-built types were exhaustive. | `SegmentWriter`, `RowDigest` and `sha256_hex` are crate-private. The manifest, segment entry, archived partition and `RetentionHooks` are `non_exhaustive`. | Builds |
+| C9 | (Codex) The trait lets a timed-out `put` land later. A late manifest at the one fixed key could replace the manifest that the drop checked. | Manifest keys name their content. A reuse hint and a drop record replace the fixed key. Only the dropping attempt writes the record. | `exports_of_different_rows_have_different_manifest_keys`, `find_dropped_reads_the_drop_record` |
+| C10 | (Codex) The directory backend synced only the deepest new directory. | It syncs the parent of each directory that the write creates. | Unit tests of the backend |
 
 The row checksum detects a change. It is not a security boundary, the same
 as the append-only guard.
@@ -97,8 +99,14 @@ pub trait PartitionArchiver: Send + Sync + 'static {
 
 ```
 harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/segment-000001-<sha256:16>.jsonl
-harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/manifest.json
+harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/manifest-<sha256:16>.json
+harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/latest.json
+harvest-partitions/shard-<id>/<partition>/<lower>_<upper>/dropped.json
 ```
+
+A segment or manifest key names its content, so a late upload writes its
+own key. `latest.json` is a reuse hint. `dropped.json` names the checked
+manifest, and only the attempt that dropped writes it.
 
 `<lower>` is `min` for a `MINVALUE` bound. Bounds use `%Y%m%dT%H%M%SZ`. A
 bound with a fraction, such as the legacy cutover, keeps its microseconds.
