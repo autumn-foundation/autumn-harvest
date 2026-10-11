@@ -43,6 +43,17 @@ pub struct FieldFacts {
     pub names: BTreeSet<String>,
 }
 
+/// Collects the items declared in a function body, at any block depth. It
+/// does not enter an item, as `absorb_items` reads each one.
+#[derive(Default)]
+struct BodyItems(Vec<syn::Item>);
+
+impl<'ast> syn::visit::Visit<'ast> for BodyItems {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        self.0.push(item.clone());
+    }
+}
+
 /// Collects [`FieldFacts`] from field types.
 #[derive(Default)]
 struct FieldScan(FieldFacts);
@@ -264,6 +275,24 @@ impl SourceIndex {
         self.type_paths.insert(path.join("::"));
     }
 
+    /// Absorb the items declared in the body of the function `name`. A
+    /// workflow can declare a wrapper type there.
+    fn absorb_body(
+        &mut self,
+        block: &syn::Block,
+        name: &syn::Ident,
+        depth: u32,
+        module: &[String],
+    ) {
+        let mut found = BodyItems::default();
+        syn::visit::Visit::visit_block(&mut found, block);
+        if !found.0.is_empty() {
+            let mut inner = module.to_vec();
+            inner.push(name.to_string());
+            self.absorb_items(&found.0, depth.saturating_add(1), &inner);
+        }
+    }
+
     fn absorb_items(&mut self, items: &[syn::Item], depth: u32, module: &[String]) {
         if depth > 8 {
             return;
@@ -276,6 +305,7 @@ impl SourceIndex {
                         self.fn_generics
                             .insert(item.sig.ident.to_string(), generics);
                     }
+                    self.absorb_body(&item.block, &item.sig.ident, depth, module);
                 }
                 syn::Item::Struct(item) => {
                     self.declare(module, &item.ident);
@@ -323,6 +353,7 @@ impl SourceIndex {
                                     .entry(f.sig.ident.to_string())
                                     .or_insert(generics);
                             }
+                            self.absorb_body(&f.block, &f.sig.ident, depth, module);
                         }
                     }
                 }
@@ -722,6 +753,27 @@ mod tests {
         ]);
         let index = SourceIndex::build(&[dir.path().to_path_buf()], &files);
         assert!(index.type_paths.contains("state::Shared"), "{index:?}");
+    }
+
+    #[test]
+    fn a_type_declared_inside_a_function_is_indexed() {
+        // A workflow can declare its wrapper in its own body.
+        let mut index = SourceIndex::default();
+        index.absorb_syn(
+            "fn wf() { struct Shared(std::sync::Arc<std::sync::Mutex<u64>>); }\n\
+             impl Ctx { fn run(&self) { struct Inner(std::cell::Cell<u8>); } }\n",
+            &[],
+        );
+        let names = |ty: &str| index.type_fields.get(ty).map(|f| f.names.clone());
+        assert!(
+            names("Shared").is_some_and(|n| n.contains("Mutex")),
+            "{index:?}"
+        );
+        assert!(
+            names("Inner").is_some_and(|n| n.contains("Cell")),
+            "{index:?}"
+        );
+        assert!(index.type_paths.contains("wf::Shared"), "{index:?}");
     }
 
     #[test]

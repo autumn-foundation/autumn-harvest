@@ -143,7 +143,8 @@ Four review agents read the first version. Each fix has a test.
     The index follows each `mod x;` to its file, so a file of types only is
     read too. It honors `#[path]`, and the declaring module gives the path.
     MIR can name the moved file too, so a file is read once per module
-    path. A depth cap of 16 ends a `#[path]` cycle.
+    path. A depth cap of 16 ends a `#[path]` cycle. A type declared in a
+    function body is indexed too, under the function path.
     A type alias counts its target as a field, so a wrapper of an alias of
     `Arc<Mutex<u64>>` is interior-mutable too.
 24. A `handlers` entry that no registration node names is refused. Its
