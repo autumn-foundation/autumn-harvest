@@ -149,6 +149,8 @@ rejects the writes of the stale worker.
   fails, scanners run without it.
 - The simulator drives store statements, not the `worker.rs` loop. See
   [`simulation.md`](testing/simulation.md#limits).
+- The world simulation crashes a worker only between two steps. No worker
+  dies inside a task body.
 
 ## Fencing
 
@@ -203,8 +205,9 @@ The partition test fails with the fence off ([`chaos.md`](testing/chaos.md)).
 
 - No model covers shard-generation fencing or the rebalance cutover. See
   [`formal-methods.md`](testing/formal-methods.md#not-modelled-yet).
-- No check compares test traces with the models. A code change can leave a
-  model out of date, and no check detects it.
+- Issue #2003 checks chaos traces against `ActivityClaim` and
+  `WorkflowTaskClaim` only. No check compares test traces with the
+  `CodecRotation` model. A code change can leave that model out of date.
 - The models are bounded. `ActivityClaim` has 3 workers and 5 claims.
   `WorkflowTaskClaim` has 2 workers, 5 claims and 2 strikes.
 - The model `SelfRelease` uses a stronger guard than the code.
@@ -216,6 +219,8 @@ The partition test fails with the fence off ([`chaos.md`](testing/chaos.md)).
 - The simulator does not model the timeout sweeper, the `FAILED` state or
   quarantine. It draws actions from fixed weights. It does not use PCT
   (probabilistic concurrency testing).
+- The world simulation never fails an activity, and its reclaimer never
+  quarantines. So it does not reach the `FAILED` state.
 - A 0.6 worker has no claim fence. A mixed 0.6 and 0.7 fleet must keep
   timeouts terminal until the upgrade ends
   ([ADR 0005](adr/0005-activity-timeout-retry-and-open-circuit.md)).
