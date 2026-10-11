@@ -346,7 +346,7 @@ checked 2: covered 1, gap 1, unknown 0, no-saga 0
 | `saga-result-untracked` | The result of a step does not reach `?` through `.await` alone, as with `map_err` or `match`. |
 | `multiple-sagas` | One body builds two sagas. |
 | `saga-recreated` | A new saga starts while a step of the old one is pending. |
-| `saga-dropped-pending` | A body that starts no execution exits with a step pending. Its caller cannot unwind that step. The workflow root, each handler body and each coroutine in a handler `returns` start an execution: their error exit with a step pending is a gap. |
+| `saga-dropped-pending` | A body that starts no execution exits with a step pending. Its caller cannot unwind that step. The workflow root, each handler body and each coroutine in a handler `returns` start an execution: their error exit with a step pending is a gap. A body that is an entry and also the callee of an ordinary call is checked both ways. |
 | `no-flow-graph` | A body in the manifest has no flow graph. |
 | `boundary` | The workflow has a boundary that runs code. It can hide a saga and a gap, with or without a saga in sight. An `external-const` runs no code, so it does not count. |
 

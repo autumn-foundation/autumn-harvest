@@ -247,6 +247,48 @@ fn entry_bodies(workflow: &WorkflowStructure) -> BTreeSet<&str> {
     entries
 }
 
+/// The bodies that an ordinary call runs as a helper.
+///
+/// Two edges start no helper run. A handler body builds the coroutine it
+/// returns, and the engine runs that coroutine as an entry. A registration
+/// passes a handler body as an argument, which shows only in `calls`.
+fn helper_calls(workflow: &WorkflowStructure) -> BTreeSet<&str> {
+    let mut helpers = BTreeSet::new();
+    for body in &workflow.bodies {
+        let returned: BTreeSet<&str> = workflow
+            .handlers
+            .iter()
+            .filter(|h| h.bodies.contains(&body.id))
+            .flat_map(|h| &h.returns)
+            .map(String::as_str)
+            .collect();
+        let mut registered: BTreeSet<&str> = BTreeSet::new();
+        let mut callees: Vec<&String> = Vec::new();
+        for node in body.flow.iter().flat_map(|graph| &graph.nodes) {
+            match &node.event {
+                FlowEvent::Call { callees: named } => callees.extend(named),
+                FlowEvent::SagaStep {
+                    forward,
+                    compensate,
+                    ..
+                } => callees.extend(forward.iter().chain(compensate)),
+                FlowEvent::Handler { handler } => {
+                    let site = workflow.handlers.get(*handler);
+                    registered.extend(site.into_iter().flat_map(|h| &h.bodies).map(String::as_str));
+                }
+                _ => {}
+            }
+        }
+        let calls = body.calls.iter().filter(|c| !c.resume);
+        let calls = calls
+            .map(|c| c.callee.as_str())
+            .filter(|c| !registered.contains(c));
+        let nodes = callees.into_iter().map(String::as_str);
+        helpers.extend(nodes.chain(calls).filter(|c| !returned.contains(c)));
+    }
+    helpers
+}
+
 /// Refuse a graph the fixpoint would read wrong. A dropped edge or a
 /// missing entry would hide an exit, and so give a false `covered`.
 fn validate(graph: &FlowGraph, steps: usize) -> Result<(), String> {
@@ -370,6 +412,7 @@ pub fn check_workflow(workflow: &WorkflowStructure) -> SagaReport {
     let mut notes: BTreeSet<String> = BTreeSet::new();
     let mut uses_saga = false;
     let entries = entry_bodies(workflow);
+    let helpers = helper_calls(workflow);
 
     for body in &workflow.bodies {
         let Some(graph) = &body.flow else {
@@ -418,9 +461,20 @@ pub fn check_workflow(workflow: &WorkflowStructure) -> SagaReport {
                 _ => {}
             }
         }
-        let (found, reasons) = body_gaps(body, graph, entries.contains(body.id.as_str()));
-        gaps.extend(found);
-        unknown.extend(reasons);
+        // A body can run as an entry and as a helper. Each way is checked.
+        let id = body.id.as_str();
+        let entry = entries.contains(id);
+        let ways = [entry, !entry || helpers.contains(id)];
+        for root in [true, false]
+            .into_iter()
+            .zip(ways)
+            .filter(|w| w.1)
+            .map(|w| w.0)
+        {
+            let (found, reasons) = body_gaps(body, graph, root);
+            gaps.extend(found);
+            unknown.extend(reasons);
+        }
     }
 
     // A body outside the analysis can hold a saga and a gap, whether or not
@@ -1029,6 +1083,82 @@ mod tests {
         let r = check_workflow(&w);
         assert_eq!(r.verdict, SagaVerdict::Gap, "{r:#?}");
         assert!(r.gaps.iter().any(|g| g.body == future), "{r:#?}");
+    }
+
+    #[test]
+    fn a_handler_body_that_a_helper_call_also_runs_is_checked_both_ways() {
+        // The root registers `h` and also calls it. `h` returns `Ok` with a
+        // step pending. As a handler that is fine. As a helper, the caller
+        // cannot unwind that step.
+        let h = "w::wf::{closure#0}::{closure#0}";
+        let root = FlowGraph {
+            nodes: vec![
+                node(FlowEvent::Entry),
+                node(FlowEvent::Handler { handler: 0 }),
+                node(FlowEvent::Call {
+                    callees: vec![h.to_string()],
+                }),
+            ],
+            edges: vec![edge(0, 1, None), edge(1, 2, None)],
+        };
+        let body = FlowGraph {
+            nodes: vec![
+                node(FlowEvent::Entry),
+                node(FlowEvent::SagaNew),
+                node(step()),
+                node(FlowEvent::Exit {
+                    outcome: ExitOutcome::Ok,
+                }),
+                node(FlowEvent::Exit {
+                    outcome: ExitOutcome::Err,
+                }),
+            ],
+            edges: vec![
+                edge(0, 1, None),
+                edge(1, 2, None),
+                edge(2, 3, Some(EdgeLabel::Ok)),
+                edge(2, 4, Some(EdgeLabel::Err)),
+            ],
+        };
+        let mut w = workflow(root);
+        w.handlers.push(HandlerSite {
+            kind: "signal".to_string(),
+            method: "register_signal_handler".to_string(),
+            name: None,
+            bodies: vec![h.to_string()],
+            returns: Vec::new(),
+        });
+        // The registration passes `h` as an argument. That edge alone is not
+        // a helper call.
+        let registration = |id: &str| CallSite {
+            callee: id.to_string(),
+            in_loop: true,
+            resume: false,
+        };
+        if let Some(root) = w.bodies.first_mut() {
+            root.calls.push(registration(h));
+        }
+        w.bodies.push(BodyNode {
+            id: h.to_string(),
+            flow: Some(body),
+            ..BodyNode::default()
+        });
+        let r = check_workflow(&w);
+        assert_eq!(r.verdict, SagaVerdict::Unknown, "{r:#?}");
+        assert!(
+            r.unknown
+                .iter()
+                .any(|u| u.starts_with("saga-dropped-pending")),
+            "{r:#?}"
+        );
+
+        // With the registration alone, `h` runs only as a handler.
+        if let Some(graph) = w.bodies.first_mut().and_then(|b| b.flow.as_mut()) {
+            graph.nodes.truncate(2);
+            graph.edges.truncate(1);
+        }
+        let r = check_workflow(&w);
+        assert_eq!(r.verdict, SagaVerdict::Covered, "{r:#?}");
     }
 
     #[test]

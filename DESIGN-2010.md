@@ -149,6 +149,9 @@ Four review agents read the first version. Each fix has a test.
 25. A body that no reference reaches from the root is refused. The check
     reads every body, so its gap would mark a workflow with no saga. Two
     bodies of one id are refused too, as a reference to them is ambiguous.
+26. A handler body can also be the callee of an ordinary call. Such a body
+    is checked as an entry and as a helper, so a pending `Ok` exit is
+    `saga-dropped-pending`.
 
 ---
 
