@@ -437,7 +437,11 @@ async fn a_remote_mcp_task_survives_a_worker_restart() {
         }
     );
     assert_eq!(task_state(&url, token).await, "COMPLETED");
-    assert_eq!(server.starts(), 1, "the restart does not start the task again");
+    assert_eq!(
+        server.starts(),
+        1,
+        "the restart does not start the task again"
+    );
     b.stop().await;
 
     assert_replays_clean(&url, exec_id).await;
@@ -517,7 +521,10 @@ async fn pending_handles_page_in_token_order() {
 
     let one = start_run(&url, "report-4", json!({})).await;
     let two = start_run(&url, "report-5", json!({})).await;
-    let mut tokens = vec![wait_for_token(&url, one).await, wait_for_token(&url, two).await];
+    let mut tokens = vec![
+        wait_for_token(&url, one).await,
+        wait_for_token(&url, two).await,
+    ];
     tokens.sort_by_key(ExternalActivityToken::as_uuid);
     let codecs = PayloadCodecs::default();
     let mut conn = connect(&url).await;
@@ -533,7 +540,10 @@ async fn pending_handles_page_in_token_order() {
         .expect("page 2");
     assert_eq!(second.len(), 1);
     assert_eq!(second[0].token, tokens[1]);
-    let mut ids = vec![first[0].handle.task_id.clone(), second[0].handle.task_id.clone()];
+    let mut ids = vec![
+        first[0].handle.task_id.clone(),
+        second[0].handle.task_id.clone(),
+    ];
     ids.sort();
     assert_eq!(ids, vec!["task-0", "task-1"]);
 

@@ -1,7 +1,22 @@
 //! Durable outbound calls to a remote MCP or A2A task (issue #2006).
 //!
 //! A workflow starts a remote task and suspends until the task ends. The
-//! wait holds no worker slot and no open connection. See `DESIGN-2006.md`.
+//! wait holds no worker slot and no open connection. See `DESIGN-2006.md`
+//! and `docs/remote-tasks.md`.
+//!
+//! [`call`] runs two durable steps:
+//!
+//! 1. The activity [`START_ACTIVITY`] starts the remote task. It records a
+//!    [`RemoteTaskHandle`], or the result when the server answers at once.
+//! 2. The external activity [`AWAIT_ACTIVITY`] journals the handle as an
+//!    external task token. The workflow suspends.
+//!
+//! A [`RemoteTaskPoller`] reads the handle back from history and asks the
+//! remote server for its state. It settles the token when the task ends.
+//! Replay reads both steps from history and never calls the server.
+//!
+//! A tool result with `isError: true` is a completed result. The workflow
+//! gets `Ok` with [`RemoteTaskOutcome::is_error`] set, and nothing retries.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -11,9 +26,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::context::WorkflowContext;
+use crate::context::{ActivityContext, WorkflowContext};
 use crate::error::HarvestResult;
+use crate::failure::{ActivityFailure, IntoActivityErrorString as _};
 use crate::info::ActivityInfo;
+use crate::policy::RetryPolicy;
 
 /// The activity that starts a remote task.
 pub const START_ACTIVITY: &str = "harvest_remote_task_start";
@@ -42,7 +59,7 @@ pub struct RemoteTaskRequest {
     pub protocol: RemoteProtocol,
     /// The MCP tool name, or the A2A skill name.
     pub tool: String,
-    /// The tool arguments, or the A2A message.
+    /// The tool arguments, or the A2A message data.
     pub arguments: Value,
 }
 
@@ -61,22 +78,39 @@ impl RemoteTaskCall {
     /// Call the MCP tool `tool` on `server`.
     #[must_use]
     pub fn mcp(server: &str, tool: &str, arguments: Value, timeout: Duration) -> Self {
-        let _ = (server, tool, arguments, timeout);
-        todo!("issue #2006")
+        Self::new(server, RemoteProtocol::Mcp, tool, arguments, timeout)
     }
 
     /// Send a message for the A2A skill `skill` to `server`.
     #[must_use]
     pub fn a2a(server: &str, skill: &str, arguments: Value, timeout: Duration) -> Self {
-        let _ = (server, skill, arguments, timeout);
-        todo!("issue #2006")
+        Self::new(server, RemoteProtocol::A2a, skill, arguments, timeout)
+    }
+
+    fn new(
+        server: &str,
+        protocol: RemoteProtocol,
+        tool: &str,
+        arguments: Value,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            request: RemoteTaskRequest {
+                server: server.to_string(),
+                protocol,
+                tool: tool.to_string(),
+                arguments,
+            },
+            queue: "default".to_string(),
+            timeout,
+        }
     }
 
     /// Run the start activity on `queue`.
     #[must_use]
-    pub fn on_queue(self, queue: &str) -> Self {
-        let _ = queue;
-        todo!("issue #2006")
+    pub fn on_queue(mut self, queue: &str) -> Self {
+        self.queue = queue.to_string();
+        self
     }
 }
 
@@ -94,7 +128,7 @@ pub struct RemoteTaskHandle {
 /// The result of a remote task that ended with a result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RemoteTaskOutcome {
-    /// The tool result, or the A2A task.
+    /// The tool result, or the A2A task or message.
     pub result: Value,
     /// `true` when the tool result has `isError: true`.
     pub is_error: bool,
@@ -125,6 +159,17 @@ pub enum RemoteTaskState {
     Cancelled(String),
 }
 
+impl RemoteTaskState {
+    /// `true` for a state that never changes again.
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Completed(_) | Self::Failed(_) | Self::Cancelled(_)
+        )
+    }
+}
+
 /// A transport error.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{message}")]
@@ -135,7 +180,29 @@ pub struct RemoteTaskError {
     pub retryable: bool,
 }
 
+impl RemoteTaskError {
+    /// An error that a retry can fix, such as a network error.
+    #[must_use]
+    pub fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    /// An error that a retry cannot fix, such as a protocol error.
+    #[must_use]
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+        }
+    }
+}
+
 /// A client that starts and reads remote tasks.
+///
+/// Implement it with `Box::pin(async move { ... })`.
 pub trait RemoteTaskTransport: Send + Sync {
     /// Start a remote task. Send `idempotency_key` with the request.
     fn start<'a>(
@@ -152,6 +219,8 @@ pub trait RemoteTaskTransport: Send + Sync {
 }
 
 /// The worker state that holds the transport.
+///
+/// Pass it to `HarvestBuilder::state`. The start activity reads it.
 #[derive(Clone)]
 pub struct RemoteTasks {
     transport: Arc<dyn RemoteTaskTransport>,
@@ -178,106 +247,341 @@ impl RemoteTasks {
     }
 }
 
-/// The activities to register.
+/// The activities to register: the start activity.
+///
+/// The start activity retries a network error five times. A retry sends the
+/// same idempotency key, so a server that honours the key starts one task.
 #[must_use]
 pub fn activities() -> Vec<ActivityInfo> {
-    todo!("issue #2006")
+    vec![ActivityInfo {
+        name: START_ACTIVITY,
+        module: module_path!(),
+        default_retry_policy: Some(RetryPolicy::exponential(5, Duration::from_secs(1))),
+        default_start_to_close: Some(Duration::from_secs(60)),
+        default_heartbeat_timeout: None,
+        default_schedule_to_start: None,
+        default_schedule_to_close: None,
+        default_queue: None,
+        max_concurrent: None,
+        concurrency_key: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
+        rate_limit_key_expr: None,
+        circuit_breaker: None,
+        is_local: false,
+        max_input_bytes: None,
+        max_result_bytes: None,
+        requires: None,
+        handler: start_handler,
+    }]
+}
+
+fn permanent_failure(error_type: &str, message: impl Into<String>) -> String {
+    ActivityFailure::non_retryable(error_type, message).into_error_payload()
+}
+
+fn start_handler(
+    ctx: &ActivityContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
+    Box::pin(async move {
+        let remote = ctx.state::<RemoteTasks>().ok_or_else(|| {
+            permanent_failure(
+                "RemoteTasksMissing",
+                "no RemoteTasks is installed: pass one to HarvestBuilder::state",
+            )
+        })?;
+        let request: RemoteTaskRequest = serde_json::from_value(input)
+            .map_err(|e| permanent_failure("RemoteTaskInput", e.to_string()))?;
+        let key = ctx
+            .idempotency_key()
+            .map_err(|e| permanent_failure("RemoteTaskKey", e.to_string()))?
+            .as_str()
+            .to_string();
+        let start = remote.transport.start(&request, &key).await.map_err(|e| {
+            let failure = if e.retryable {
+                ActivityFailure::retryable("RemoteTaskStart", e.message)
+            } else {
+                ActivityFailure::non_retryable("RemoteTaskStart", e.message)
+            };
+            failure.into_error_payload()
+        })?;
+        serde_json::to_value(start)
+            .map_err(|e| permanent_failure("RemoteTaskOutput", e.to_string()))
+    })
 }
 
 /// Call a remote task and wait for it to end.
 ///
+/// The call holds no worker slot while the remote task runs. A
+/// [`RemoteTaskPoller`] or a push settles the wait.
+///
 /// # Errors
 ///
-/// Returns an error when the start fails, the task fails or the timeout
-/// ends.
-pub async fn call(ctx: &WorkflowContext, call: &RemoteTaskCall) -> HarvestResult<RemoteTaskOutcome> {
-    let _ = (ctx, call);
-    todo!("issue #2006")
+/// - [`HarvestError::ActivityFailed`](crate::error::HarvestError::ActivityFailed)
+///   when the start fails, or the remote task fails or is cancelled.
+/// - [`HarvestError::Timeout`](crate::error::HarvestError::Timeout) when the
+///   task does not end within [`RemoteTaskCall::timeout`].
+/// - [`HarvestError::Serialization`](crate::error::HarvestError::Serialization)
+///   when a recorded value does not decode.
+pub async fn call(
+    ctx: &WorkflowContext,
+    call: &RemoteTaskCall,
+) -> HarvestResult<RemoteTaskOutcome> {
+    let input = serde_json::to_value(&call.request)?;
+    let started = ctx
+        .execute_activity_raw(START_ACTIVITY, input, &call.queue)
+        .await?;
+    let handle = match serde_json::from_value::<RemoteTaskStart>(started)? {
+        RemoteTaskStart::Completed(outcome) => return Ok(outcome),
+        RemoteTaskStart::Task(handle) => handle,
+    };
+    let output = ctx
+        .execute_activity_external(
+            AWAIT_ACTIVITY,
+            serde_json::to_value(&handle)?,
+            &call.queue,
+            call.timeout.as_secs().max(1),
+        )
+        .await?;
+    Ok(serde_json::from_value(output)?)
 }
 
-/// MCP Tasks wire format.
+/// The text of a JSON value: a string as it is, anything else as JSON.
+fn text_of(value: &Value) -> String {
+    value
+        .as_str()
+        .map_or_else(|| value.to_string(), ToString::to_string)
+}
+
+/// MCP Tasks wire format, revision `2026-07-28`.
 pub mod mcp {
-    use super::{RemoteTaskError, RemoteTaskHandle, RemoteTaskRequest, RemoteTaskStart, RemoteTaskState};
-    use serde_json::Value;
+    use serde_json::{Value, json};
+
+    use super::{
+        RemoteProtocol, RemoteTaskError, RemoteTaskHandle, RemoteTaskOutcome, RemoteTaskRequest,
+        RemoteTaskStart, RemoteTaskState, text_of,
+    };
+
+    /// The protocol revision that defines the Tasks extension.
+    pub const PROTOCOL_VERSION: &str = "2026-07-28";
+    /// The extension id of MCP Tasks.
+    pub const TASKS_EXTENSION: &str = "io.modelcontextprotocol/tasks";
+    /// The `_meta` key of the protocol version.
+    pub const PROTOCOL_VERSION_META: &str = "io.modelcontextprotocol/protocolVersion";
+    /// The `_meta` key of the client capabilities.
+    pub const CLIENT_CAPABILITIES_META: &str = "io.modelcontextprotocol/clientCapabilities";
+    /// The `_meta` key of the start key that a Harvest server reads (#2005).
+    pub const IDEMPOTENCY_KEY_META: &str = "io.autumn-harvest/idempotencyKey";
+
+    fn meta() -> serde_json::Map<String, Value> {
+        let mut meta = serde_json::Map::new();
+        meta.insert(PROTOCOL_VERSION_META.into(), json!(PROTOCOL_VERSION));
+        meta.insert(
+            CLIENT_CAPABILITIES_META.into(),
+            json!({"extensions": {TASKS_EXTENSION: {}}}),
+        );
+        meta
+    }
 
     /// The `params` of a `tools/call` that asks for a task.
     #[must_use]
     pub fn tools_call_params(request: &RemoteTaskRequest, idempotency_key: &str) -> Value {
-        let _ = (request, idempotency_key);
-        todo!("issue #2006")
+        let mut meta = meta();
+        meta.insert(IDEMPOTENCY_KEY_META.into(), json!(idempotency_key));
+        json!({
+            "name": request.tool,
+            "arguments": request.arguments,
+            "_meta": meta,
+        })
     }
 
     /// Read a `tools/call` result.
     ///
+    /// A `resultType: "task"` result is a handle. A `CallToolResult` is an
+    /// outcome, also with `isError: true`.
+    ///
     /// # Errors
     ///
-    /// Returns an error for a result with no task id and no content.
+    /// Returns a permanent error for a result with no task id and no content.
     pub fn parse_tools_call_result(
         request: &RemoteTaskRequest,
         result: &Value,
     ) -> Result<RemoteTaskStart, RemoteTaskError> {
-        let _ = (request, result);
-        todo!("issue #2006")
+        if result.get("resultType").and_then(Value::as_str) == Some("task") {
+            let task_id = result
+                .get("taskId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RemoteTaskError::permanent("the task result has no taskId"))?;
+            return Ok(RemoteTaskStart::Task(RemoteTaskHandle {
+                server: request.server.clone(),
+                protocol: RemoteProtocol::Mcp,
+                task_id: task_id.to_string(),
+            }));
+        }
+        if result.get("content").is_some() || result.get("structuredContent").is_some() {
+            return Ok(RemoteTaskStart::Completed(outcome(result)));
+        }
+        Err(RemoteTaskError::permanent(
+            "the tools/call result is not a task and not a tool result",
+        ))
+    }
+
+    fn outcome(result: &Value) -> RemoteTaskOutcome {
+        RemoteTaskOutcome {
+            result: result.clone(),
+            is_error: result.get("isError").and_then(Value::as_bool) == Some(true),
+        }
     }
 
     /// The `params` of a `tasks/get`.
     #[must_use]
     pub fn tasks_get_params(handle: &RemoteTaskHandle) -> Value {
-        let _ = handle;
-        todo!("issue #2006")
+        json!({"taskId": handle.task_id, "_meta": meta()})
     }
 
     /// Read a `tasks/get` result.
     ///
     /// # Errors
     ///
-    /// Returns an error for a result with no known status.
+    /// Returns a permanent error for a result with no known status.
     pub fn parse_task(task: &Value) -> Result<RemoteTaskState, RemoteTaskError> {
-        let _ = task;
-        todo!("issue #2006")
+        let status = task.get("status").and_then(Value::as_str).unwrap_or("");
+        let message = || {
+            task.get("statusMessage")
+                .or_else(|| task.pointer("/error/message"))
+                .or_else(|| task.get("error"))
+                .map(text_of)
+        };
+        match status {
+            "working" => Ok(RemoteTaskState::Working),
+            "input_required" => Ok(RemoteTaskState::InputRequired),
+            "completed" => Ok(RemoteTaskState::Completed(outcome(
+                task.get("result").unwrap_or(&Value::Null),
+            ))),
+            "failed" => Ok(RemoteTaskState::Failed(
+                message().unwrap_or_else(|| "the remote task failed".into()),
+            )),
+            "cancelled" => Ok(RemoteTaskState::Cancelled(
+                message().unwrap_or_else(|| "the remote task was cancelled".into()),
+            )),
+            other => Err(RemoteTaskError::permanent(format!(
+                "unknown MCP task status '{other}'"
+            ))),
+        }
     }
 }
 
-/// A2A wire format.
+/// A2A wire format: `message/send` and `tasks/get`.
+///
+/// The state parser reads the `v0.3` names, such as `input-required`, and
+/// the `v1` names, such as `TASK_STATE_INPUT_REQUIRED`.
 pub mod a2a {
-    use super::{RemoteTaskError, RemoteTaskHandle, RemoteTaskRequest, RemoteTaskStart, RemoteTaskState};
-    use serde_json::Value;
+    use serde_json::{Value, json};
+
+    use super::{
+        RemoteProtocol, RemoteTaskError, RemoteTaskHandle, RemoteTaskOutcome, RemoteTaskRequest,
+        RemoteTaskStart, RemoteTaskState,
+    };
 
     /// The `params` of a `message/send`.
+    ///
+    /// The message id is the idempotency key, so a retry sends the same
+    /// message. One data part holds the skill name and the arguments.
     #[must_use]
     pub fn message_send_params(request: &RemoteTaskRequest, idempotency_key: &str) -> Value {
-        let _ = (request, idempotency_key);
-        todo!("issue #2006")
+        json!({
+            "message": {
+                "kind": "message",
+                "role": "user",
+                "messageId": idempotency_key,
+                "parts": [{
+                    "kind": "data",
+                    "data": {"skill": request.tool, "arguments": request.arguments},
+                }],
+            },
+        })
     }
 
     /// Read a `message/send` result.
     ///
+    /// A task is a handle. A message is an outcome.
+    ///
     /// # Errors
     ///
-    /// Returns an error for a result that is not a task or a message.
+    /// Returns a permanent error for a result that is not a task or a message.
     pub fn parse_send_result(
         request: &RemoteTaskRequest,
         result: &Value,
     ) -> Result<RemoteTaskStart, RemoteTaskError> {
-        let _ = (request, result);
-        todo!("issue #2006")
+        let kind = result.get("kind").and_then(Value::as_str);
+        if kind == Some("message") {
+            return Ok(RemoteTaskStart::Completed(RemoteTaskOutcome {
+                result: result.clone(),
+                is_error: false,
+            }));
+        }
+        let task_id = result.get("id").and_then(Value::as_str);
+        match (kind, task_id) {
+            (Some("task") | None, Some(task_id)) if result.get("status").is_some() => {
+                Ok(RemoteTaskStart::Task(RemoteTaskHandle {
+                    server: request.server.clone(),
+                    protocol: RemoteProtocol::A2a,
+                    task_id: task_id.to_string(),
+                }))
+            }
+            _ => Err(RemoteTaskError::permanent(
+                "the message/send result is not a task and not a message",
+            )),
+        }
     }
 
     /// The `params` of a `tasks/get`.
     #[must_use]
     pub fn tasks_get_params(handle: &RemoteTaskHandle) -> Value {
-        let _ = handle;
-        todo!("issue #2006")
+        json!({"id": handle.task_id})
+    }
+
+    /// The text parts of the status message, joined.
+    fn status_text(task: &Value) -> Option<String> {
+        let parts = task.pointer("/status/message/parts")?.as_array()?;
+        let text: Vec<&str> = parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect();
+        (!text.is_empty()).then(|| text.join(" "))
     }
 
     /// Read a `tasks/get` result.
     ///
     /// # Errors
     ///
-    /// Returns an error for a task with no known state.
+    /// Returns a permanent error for a task with no known state.
     pub fn parse_task(task: &Value) -> Result<RemoteTaskState, RemoteTaskError> {
-        let _ = task;
-        todo!("issue #2006")
+        let raw = task
+            .pointer("/status/state")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RemoteTaskError::permanent("the A2A task has no status.state"))?;
+        let lower = raw.to_ascii_lowercase();
+        let state = lower
+            .strip_prefix("task_state_")
+            .unwrap_or(&lower)
+            .replace('_', "-");
+        let message = || status_text(task).unwrap_or_else(|| format!("the remote task is {state}"));
+        match state.as_str() {
+            "submitted" | "working" => Ok(RemoteTaskState::Working),
+            "input-required" | "auth-required" => Ok(RemoteTaskState::InputRequired),
+            "completed" => Ok(RemoteTaskState::Completed(RemoteTaskOutcome {
+                result: task.clone(),
+                is_error: false,
+            })),
+            "failed" | "rejected" => Ok(RemoteTaskState::Failed(message())),
+            "canceled" | "cancelled" => Ok(RemoteTaskState::Cancelled(message())),
+            _ => Err(RemoteTaskError::permanent(format!(
+                "unknown A2A task state '{raw}'"
+            ))),
+        }
     }
 }
 

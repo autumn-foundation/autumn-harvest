@@ -47,7 +47,10 @@ fn mcp_tools_call_declares_the_tasks_extension_and_the_key() {
     assert_eq!(params["name"], "export");
     assert_eq!(params["arguments"], json!({"year": 2026}));
     let meta = &params["_meta"];
-    assert_eq!(meta["io.modelcontextprotocol/protocolVersion"], "2026-07-28");
+    assert_eq!(
+        meta["io.modelcontextprotocol/protocolVersion"],
+        "2026-07-28"
+    );
     assert!(
         meta["io.modelcontextprotocol/clientCapabilities"]["extensions"]
             ["io.modelcontextprotocol/tasks"]
@@ -101,7 +104,10 @@ fn mcp_tasks_get_names_the_task_and_declares_the_extension() {
     let params = mcp::tasks_get_params(&handle());
     assert_eq!(params["taskId"], "task-7");
     let meta = &params["_meta"];
-    assert_eq!(meta["io.modelcontextprotocol/protocolVersion"], "2026-07-28");
+    assert_eq!(
+        meta["io.modelcontextprotocol/protocolVersion"],
+        "2026-07-28"
+    );
     assert!(
         meta["io.modelcontextprotocol/clientCapabilities"]["extensions"]
             ["io.modelcontextprotocol/tasks"]
@@ -140,8 +146,12 @@ fn mcp_task_states_map_to_remote_states() {
 
 #[test]
 fn mcp_failed_task_reads_the_error_object() {
-    let task = json!({"taskId": "t", "status": "failed", "error": {"code": -32603, "message": "x"}});
-    assert_eq!(mcp::parse_task(&task), Ok(RemoteTaskState::Failed("x".into())));
+    let task =
+        json!({"taskId": "t", "status": "failed", "error": {"code": -32603, "message": "x"}});
+    assert_eq!(
+        mcp::parse_task(&task),
+        Ok(RemoteTaskState::Failed("x".into()))
+    );
 }
 
 // ── A2A wire format ─────────────────────────────────────────────────────────
@@ -188,8 +198,14 @@ fn a2a_message_result_is_an_outcome() {
 #[test]
 fn a2a_task_states_map_to_remote_states() {
     let task = |state: &str| json!({"id": "a", "status": {"state": state}});
-    assert_eq!(a2a::parse_task(&task("working")), Ok(RemoteTaskState::Working));
-    assert_eq!(a2a::parse_task(&task("submitted")), Ok(RemoteTaskState::Working));
+    assert_eq!(
+        a2a::parse_task(&task("working")),
+        Ok(RemoteTaskState::Working)
+    );
+    assert_eq!(
+        a2a::parse_task(&task("submitted")),
+        Ok(RemoteTaskState::Working)
+    );
     assert_eq!(
         a2a::parse_task(&task("input-required")),
         Ok(RemoteTaskState::InputRequired)
@@ -293,7 +309,10 @@ async fn the_start_activity_sends_the_stable_idempotency_key() {
     assert_eq!(start, RemoteTaskStart::Task(handle()));
     // A retry of the same activity sends the same key.
     (start_handler())(&ctx, input).await.expect("retry");
-    assert_eq!(*keys.lock().expect("keys"), vec![expected.clone(), expected]);
+    assert_eq!(
+        *keys.lock().expect("keys"),
+        vec![expected.clone(), expected]
+    );
 }
 
 #[tokio::test]
@@ -324,7 +343,12 @@ async fn the_start_activity_needs_the_worker_state() {
 // ── The workflow call ───────────────────────────────────────────────────────
 
 fn call() -> RemoteTaskCall {
-    RemoteTaskCall::mcp("reports", "export", json!({"year": 2026}), Duration::from_secs(600))
+    RemoteTaskCall::mcp(
+        "reports",
+        "export",
+        json!({"year": 2026}),
+        Duration::from_secs(600),
+    )
 }
 
 fn started() -> WorkflowEvent {
@@ -438,7 +462,9 @@ async fn replay_returns_an_is_error_outcome_as_ok() {
         },
     ];
     let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
-    let got = remote_task::call(&ctx, &call()).await.expect("isError is Ok");
+    let got = remote_task::call(&ctx, &call())
+        .await
+        .expect("isError is Ok");
     assert_eq!(got, outcome);
     assert!(ctx.drain_commands().is_empty(), "replay calls nothing");
 }

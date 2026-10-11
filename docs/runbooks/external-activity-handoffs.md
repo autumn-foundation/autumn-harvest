@@ -7,6 +7,11 @@ Handoff list/detail responses expose
 identity, state, token, and timing metadata only; raw workflow inputs, activity
 inputs, outputs, signal bodies, and secrets stay redacted.
 
+A handoff named `harvest_remote_task_await` is a remote MCP or A2A task
+(issue #2006). A `RemoteTaskPoller` settles it. See
+[`docs/remote-tasks.md`](../remote-tasks.md) before you complete or fail one
+by hand.
+
 ## Find pending handoffs
 
 ```bash

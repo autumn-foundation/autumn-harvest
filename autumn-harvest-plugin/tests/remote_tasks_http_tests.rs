@@ -89,8 +89,8 @@ async fn mcp_start_sends_a_task_tools_call_with_its_headers() {
         )
     }))
     .await;
-    let client = HttpRemoteTasks::new()
-        .server("reports", RemoteServer::mcp(&url).bearer_token("secret"));
+    let client =
+        HttpRemoteTasks::new().server("reports", RemoteServer::mcp(&url).bearer_token("secret"));
 
     let start = client
         .start(&request(RemoteProtocol::Mcp, "export"), "key-1")
@@ -138,7 +138,10 @@ async fn mcp_name_that_is_not_ascii_uses_the_base64_sentinel() {
         .expect("start");
     let seen = seen.lock().expect("seen")[0].clone();
     let name = header(&seen, "mcp-name").expect("mcp-name");
-    assert!(name.starts_with("=?base64?") && name.ends_with("?="), "got {name}");
+    assert!(
+        name.starts_with("=?base64?") && name.ends_with("?="),
+        "got {name}"
+    );
 }
 
 #[tokio::test]
@@ -192,7 +195,10 @@ async fn a_json_rpc_error_on_start_is_not_retryable() {
 
 #[tokio::test]
 async fn a_server_error_status_is_retryable() {
-    let (url, _) = serve(Arc::new(|_| StatusCode::SERVICE_UNAVAILABLE.into_response())).await;
+    let (url, _) = serve(Arc::new(|_| {
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
+    }))
+    .await;
     let client = HttpRemoteTasks::new().server("reports", RemoteServer::mcp(&url));
     let err = client
         .start(&request(RemoteProtocol::Mcp, "export"), "k")
@@ -261,12 +267,18 @@ async fn a2a_start_and_get_use_message_send_and_tasks_get() {
     };
     assert_eq!(handle.task_id, "a-1");
     let state = client.get(&handle).await.expect("get");
-    assert!(matches!(state, RemoteTaskState::Failed(ref m) if m.contains("no")), "got {state:?}");
+    assert!(
+        matches!(state, RemoteTaskState::Failed(ref m) if m.contains("no")),
+        "got {state:?}"
+    );
 
     let seen = seen.lock().expect("seen").clone();
     assert_eq!(seen[0].body["method"], "message/send");
     assert_eq!(seen[0].body["params"]["message"]["messageId"], "key-3");
-    assert_eq!(header(&seen[0], "idempotency-key").as_deref(), Some("key-3"));
+    assert_eq!(
+        header(&seen[0], "idempotency-key").as_deref(),
+        Some("key-3")
+    );
     assert_eq!(seen[1].body["method"], "tasks/get");
     assert_eq!(seen[1].body["params"]["id"], "a-1");
 }
