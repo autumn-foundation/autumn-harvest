@@ -417,6 +417,15 @@ pub enum WorkflowResetError {
          tombstones, so a fork would resume on unreadable state"
     )]
     ErasedSource { exec_id: ExecutionId },
+    /// The source is a fork (issue #2000), and its lineage cannot be proven
+    /// free of erasure. An ancestor is gone or sealed by a shard migration, or
+    /// the lineage is too deep to walk. A reset makes another descendant of
+    /// that lineage, so it fails closed, as a fork does.
+    #[error("the fork lineage of workflow execution {exec_id} cannot be checked: {reason}")]
+    ForkLineage {
+        exec_id: ExecutionId,
+        reason: String,
+    },
     /// An underlying storage or database error occurred during the reset operation.
     #[error(transparent)]
     Harvest(#[from] HarvestError),
@@ -814,6 +823,10 @@ pub async fn reset_workflow_execution(
             // The refusal also keeps tombstoned node outputs out of an
             // `input_from` binding (issue #702).
             reject_if_source_erased(exec_id, &source)?;
+            // A reset of a fork makes another descendant of its lineage (issue
+            // #2000). It walks the lineage as a fork does, under the same
+            // locks, so an erased ancestor refuses it too.
+            reject_unclean_fork_lineage(conn, exec_id, &source).await?;
 
             let rows = load_event_rows(conn, exec_id).await?;
             let events = decode_events(&rows)?;
@@ -1079,6 +1092,27 @@ pub fn batch_skip_reason(error: &WorkflowResetError) -> ResetSkipReason {
         other => ResetSkipReason::InfrastructureError {
             message: format!("reset failed: {other}"),
         },
+    }
+}
+
+/// Refuse a fork whose lineage reaches an erased run, or cannot be walked.
+///
+/// An erased ancestor maps to [`WorkflowResetError::ErasedSource`] for that
+/// ancestor. A gap, a migration seal or a lineage past the scan bound maps to
+/// [`WorkflowResetError::ForkLineage`].
+async fn reject_unclean_fork_lineage(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    source: &WorkflowExecution,
+) -> Result<(), WorkflowResetError> {
+    match crate::fork::erased_fork_ancestor(conn, source).await {
+        Ok(None) => Ok(()),
+        Ok(Some(ancestor)) => Err(WorkflowResetError::ErasedSource { exec_id: ancestor }),
+        Err(crate::fork::WorkflowForkError::Harvest(error)) => Err(error.into()),
+        Err(error) => Err(WorkflowResetError::ForkLineage {
+            exec_id,
+            reason: error.to_string(),
+        }),
     }
 }
 

@@ -649,7 +649,7 @@ const MAX_FORK_LINEAGE: usize = 64;
 /// exists, because retention can delete an erased run. Returns
 /// [`WorkflowForkError::LineageTooDeep`] past [`MAX_FORK_LINEAGE`] links. The
 /// walk fails closed in both cases.
-async fn erased_fork_ancestor(
+pub(crate) async fn erased_fork_ancestor(
     conn: &mut AsyncPgConnection,
     source: &WorkflowExecution,
 ) -> Result<Option<ExecutionId>, WorkflowForkError> {

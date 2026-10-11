@@ -25662,6 +25662,17 @@ fn reset_error_response(error: WorkflowResetError) -> axum::response::Response {
             }),
         )
             .into_response(),
+        // A reset of a fork walks its lineage as a fork does (issue #2000).
+        WorkflowResetError::ForkLineage { exec_id, reason } => (
+            axum::http::StatusCode::CONFLICT,
+            Json(ResetErrorResponse {
+                message: format!(
+                    "the fork lineage of workflow execution {exec_id} cannot be checked for \
+                     erasure ({reason}); start a fresh run instead"
+                ),
+            }),
+        )
+            .into_response(),
         WorkflowResetError::Harvest(error) => map_error(error).into_response(),
     }
 }

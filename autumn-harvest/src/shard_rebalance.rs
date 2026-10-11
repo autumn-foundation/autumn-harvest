@@ -725,6 +725,10 @@ mod db {
     /// links. A reset of a fork names the sealed fork as its source, but its
     /// marker names the original source. So the walk must reach past the
     /// sealed fork. A macro, so both predicates use one literal.
+    ///
+    /// The partial index `idx_harvest_we_fork_source` serves the seed, so it
+    /// reads only fork rows. The step joins on the primary key. A reference
+    /// that is not a UUID ends the walk instead of failing the cast.
     macro_rules! live_fork_lineage_sql {
         () => {
             "WITH RECURSIVE lineage(source_ref, depth) AS ( \
@@ -733,7 +737,10 @@ mod db {
                    AND f.state IN ('RUNNING', 'PAUSED', 'MIGRATING', 'MIGRATED') \
                 UNION \
                 SELECT p.start_source_ref, l.depth + 1 FROM lineage l \
-                  JOIN harvest_workflow_executions p ON p.id::text = l.source_ref \
+                  JOIN harvest_workflow_executions p ON p.id = CASE \
+                    WHEN l.source_ref ~* \
+                      '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+                    THEN l.source_ref::uuid END \
                  WHERE p.start_source = 'fork' AND l.depth < 64 \
              ) SELECT 1 FROM lineage l WHERE l.source_ref = e.id::text"
         };

@@ -108,7 +108,19 @@ payload field, so the codec encodes it and erasure tombstones it. A fork
 inserts new event rows only. It is not an exception to the append-only rule
 of `harvest_events`. New `StartSource::Fork` and audit operation
 `workflow.fork`. A fork is audited on the shard of its source, as a reset
-is. No migration.
+is.
+
+**Migration.** `20261011200537_harvest_we_fork_source_index` adds one
+partial index, `idx_harvest_we_fork_source`, on `harvest_workflow_executions
+(start_source_ref) WHERE start_source = 'fork'`. Shard rebalance walks the
+lineage of each live fork for every candidate it observes. The index keeps
+that walk to fork rows. No column change and no data migration. On a large
+table, build the index `CONCURRENTLY` first, as the migration header shows.
+
+**Reset of a fork.** A reset of a fork walks its lineage as a fork does. An
+erased ancestor refuses it with `ErasedSource`. A missing or sealed
+ancestor, or a lineage past 64 links, refuses it with the new
+`WorkflowResetError::ForkLineage` (`409`).
 
 **Rolling deploy.** A worker that predates this change cannot decode the new
 events. Fork a run only after every worker runs this version.

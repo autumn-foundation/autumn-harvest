@@ -23,7 +23,9 @@ use autumn_harvest::fork::{
 use autumn_harvest::models::{NewWorkflowExecution, WorkflowExecution};
 use autumn_harvest::prelude::*;
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
-use autumn_harvest::reset::{ResetPoint, WorkflowResetRequest, reset_workflow_execution};
+use autumn_harvest::reset::{
+    ResetPoint, WorkflowResetError, WorkflowResetRequest, reset_workflow_execution,
+};
 use autumn_harvest::schema::{harvest_events, harvest_workflow_executions};
 use autumn_harvest::store;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker};
@@ -555,6 +557,54 @@ async fn a_fork_of_a_fork_of_an_erased_source_is_refused() {
         matches!(error, WorkflowForkError::ErasedSource { exec_id } if exec_id == source),
         "unexpected error: {error}"
     );
+}
+
+/// A reset of a fork makes another descendant of its lineage. So it walks
+/// the lineage as a fork does, and refuses an erased or missing ancestor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reset_of_a_fork_checks_its_lineage() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("reset-lineage");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+    let erased_lineage = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let mut conn = connect(&url).await;
+    autumn_harvest::erase::erase_workflow_payloads(&mut conn, source, "gdpr")
+        .await
+        .expect("erase the source");
+    let error = reset_workflow_execution(&mut conn, erased_lineage, reset_request(), None)
+        .await
+        .expect_err("the lineage reaches an erased run");
+    assert!(
+        matches!(error, WorkflowResetError::ErasedSource { exec_id } if exec_id == source),
+        "unexpected error: {error}"
+    );
+
+    let root = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 2 })).await;
+    let gap_lineage = fork(&url, root, request(ForkEffects::Recorded)).await;
+    diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(root.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("retain the root");
+    let error = reset_workflow_execution(&mut conn, gap_lineage, reset_request(), None)
+        .await
+        .expect_err("a missing ancestor fails closed");
+    assert!(
+        matches!(error, WorkflowResetError::ForkLineage { exec_id, .. } if exec_id == gap_lineage),
+        "unexpected error: {error}"
+    );
+}
+
+fn reset_request() -> WorkflowResetRequest {
+    WorkflowResetRequest {
+        reset_to_event_id: Some(0),
+        reset_point: None,
+        reason: "retry".to_string(),
+        operator_id: "tester".to_string(),
+        signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::Drop,
+        allow_terminal_source: false,
+    }
 }
 
 /// A fork lineage deeper than the scan bound is refused. The walk cannot
