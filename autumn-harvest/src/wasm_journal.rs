@@ -212,6 +212,14 @@ pub fn invoke_journaled(
     prior: HostCallJournal,
     cancel: Option<&CancellationToken>,
 ) -> JournaledRun {
+    if let Some(defect) = journal_defect(&prior) {
+        return JournaledRun {
+            result: Err(ActivityFailure::wasm_journal_divergence(defect)),
+            journal: prior,
+            replayed: 0,
+            live: 0,
+        };
+    }
     let prior_len = prior.entries.len();
     let session = Arc::new(Mutex::new(Session {
         entries: prior.entries,
@@ -271,6 +279,25 @@ pub fn invoke_journaled(
     }
 }
 
+/// A shape defect of an earlier journal, or `None`.
+///
+/// Each `seq` must equal its position, and the journal must fit the call
+/// budget. A replay keys on the position, so a gap would serve a wrong entry.
+fn journal_defect(journal: &HostCallJournal) -> Option<String> {
+    if journal.entries.len() > MAX_HOST_CALLS as usize {
+        return Some(format!(
+            "the journal holds {} entries, over the {MAX_HOST_CALLS}-call budget",
+            journal.entries.len()
+        ));
+    }
+    journal
+        .entries
+        .iter()
+        .enumerate()
+        .find(|(index, entry)| usize::try_from(entry.seq).ok() != Some(*index))
+        .map(|(index, entry)| format!("journal entry {index} has seq {}", entry.seq))
+}
+
 /// The journal state of one run.
 #[derive(Default)]
 struct Session {
@@ -282,6 +309,46 @@ struct Session {
     live: usize,
     /// The failure that a host call stopped the run with.
     abort: Option<ActivityFailure>,
+}
+
+/// The next step of a call, as the session sees it.
+enum Next {
+    /// The run reached [`MAX_HOST_CALLS`].
+    Limit,
+    /// A recorded outcome, or a divergence.
+    Replay(Result<HostCallOutcome, ActivityFailure>),
+    /// No recorded entry is left. Run the call live with this `seq`.
+    Live(u32),
+}
+
+impl Session {
+    /// Decide the next step of a call to `name` with `request`.
+    fn next(&mut self, name: &str, request: &Value) -> Next {
+        let seq = match u32::try_from(self.cursor) {
+            Ok(seq) if seq < MAX_HOST_CALLS => seq,
+            _ => return Next::Limit,
+        };
+        let Some(entry) = self.entries.get(self.cursor) else {
+            return Next::Live(seq);
+        };
+        if entry.name != name || entry.request != *request {
+            return Next::Replay(Err(ActivityFailure::wasm_journal_divergence(format!(
+                "host call {seq} is '{name}', but the journal holds '{}' or another request",
+                entry.name
+            ))));
+        }
+        let outcome = entry.outcome.clone();
+        self.cursor += 1;
+        self.replayed += 1;
+        Next::Replay(Ok(outcome))
+    }
+
+    /// Append a live entry.
+    fn record(&mut self, entry: HostCallEntry) {
+        self.entries.push(entry);
+        self.cursor += 1;
+        self.live += 1;
+    }
 }
 
 /// Lock the session. A poisoned lock still holds valid data, because each
@@ -355,25 +422,11 @@ fn next_outcome(
     name: String,
     request: Value,
 ) -> Result<Option<HostCallOutcome>, ActivityFailure> {
-    let seq = {
-        let mut s = lock(session);
-        let seq = match u32::try_from(s.cursor) {
-            Ok(seq) if seq < MAX_HOST_CALLS => seq,
-            _ => return Ok(None),
-        };
-        if let Some(entry) = s.entries.get(s.cursor) {
-            if entry.name != name || entry.request != request {
-                return Err(ActivityFailure::wasm_journal_divergence(format!(
-                    "host call {seq} is '{name}', but the journal holds '{}' or another request",
-                    entry.name
-                )));
-            }
-            let outcome = entry.outcome.clone();
-            s.cursor += 1;
-            s.replayed += 1;
-            return Ok(Some(outcome));
-        }
-        seq
+    let next = lock(session).next(&name, &request);
+    let seq = match next {
+        Next::Limit => return Ok(None),
+        Next::Replay(outcome) => return outcome.map(Some),
+        Next::Live(seq) => seq,
     };
 
     // The lock is free here, so a handler panic cannot poison it.
@@ -407,15 +460,12 @@ fn next_outcome(
 
     // Journal the call before the response reaches the guest. A later trap
     // then still leaves the side effect in the journal.
-    let mut s = lock(session);
-    s.entries.push(HostCallEntry {
+    lock(session).record(HostCallEntry {
         seq,
         name,
         request,
         outcome: outcome.clone(),
     });
-    s.cursor += 1;
-    s.live += 1;
     Ok(Some(outcome))
 }
 
@@ -485,6 +535,7 @@ mod tests {
     use crate::wasm_activities::DEFAULT_FUEL;
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::time::Instant;
 
     /// Run until the guest gets a negative code.
     const UNTIL_CODE: u32 = u32::MAX;
@@ -700,7 +751,7 @@ mod tests {
         let failure = out.result.unwrap_err();
         assert_eq!(failure.error_type, ERROR_TYPE_SANDBOX_DENIED);
         assert!(failure.non_retryable);
-        assert!(out.journal.entries.is_empty());
+        assert_eq!(out.journal.entries, []);
     }
 
     #[test]
@@ -737,6 +788,23 @@ mod tests {
         let failure = out.result.unwrap_err();
         assert_eq!(failure.error_type, ERROR_TYPE_WASM_JOURNAL_DIVERGENCE);
         assert!(failure.non_retryable);
+    }
+
+    #[test]
+    fn a_malformed_journal_is_rejected_before_the_guest_runs() {
+        let runs = Arc::new(AtomicU32::new(0));
+        let grants = upper_grant(&runs);
+        let guest = Guest::new("text.upper", UPPER_REQ, 1);
+        let mut journal = run(&guest, &grants, HostCallJournal::default()).journal;
+        journal.entries[0].seq = 5;
+
+        let out = run(&guest, &grants, journal.clone());
+        let failure = out.result.unwrap_err();
+        assert_eq!(failure.error_type, ERROR_TYPE_WASM_JOURNAL_DIVERGENCE);
+        assert!(failure.non_retryable);
+        assert_eq!((out.replayed, out.live), (0, 0));
+        assert_eq!(out.journal, journal);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -786,7 +854,7 @@ mod tests {
         assert_eq!(failure.error_type, ERROR_TYPE_HOST_CALL_FAILED);
         assert!(!failure.non_retryable);
         assert!(failure.message.contains("broker unavailable"));
-        assert!(out.journal.entries.is_empty());
+        assert_eq!(out.journal.entries, []);
     }
 
     #[test]
@@ -798,7 +866,7 @@ mod tests {
 
         assert_eq!(out.result.unwrap(), json!({ "code": HOST_CALL_INVALID }));
         assert_eq!(runs.load(Ordering::SeqCst), 0);
-        assert!(out.journal.entries.is_empty());
+        assert_eq!(out.journal.entries, []);
     }
 
     #[test]
@@ -837,7 +905,7 @@ mod tests {
 
         let failure = out.result.unwrap_err();
         assert_eq!(failure.error_type, ERROR_TYPE_WASM_TRAP);
-        assert!(out.journal.entries.is_empty());
+        assert_eq!(out.journal.entries, []);
     }
 
     #[test]
@@ -883,7 +951,7 @@ mod tests {
         assert_eq!(failure.error_type, ERROR_TYPE_RESOURCE_EXHAUSTED);
         assert!(!failure.non_retryable);
         assert_eq!(runs.load(Ordering::SeqCst), 0);
-        assert!(out.journal.entries.is_empty());
+        assert_eq!(out.journal.entries, []);
     }
 
     #[test]
@@ -897,6 +965,58 @@ mod tests {
         assert_eq!(out.result.unwrap_err().error_type, ERROR_TYPE_WASM_TRAP);
         assert_eq!(out.journal.entries.len(), 2);
         assert_eq!(out.live, 2);
+    }
+
+    /// Measure one journaled host call, live and replayed. Not a CI gate.
+    #[test]
+    #[ignore = "microbenchmark: run with --ignored --nocapture"]
+    fn host_call_overhead_microbenchmark() {
+        const CALLS: u32 = 200;
+        const RUNS: usize = 31;
+        let grants = HostCallGrants::new().grant("noop", |_call| Ok(json!({})));
+        let store = WasmModuleStore::new();
+        let one = compile(&store, &Guest::new("noop", "{}", 1));
+        let many = compile(&store, &Guest::new("noop", "{}", CALLS));
+        let invoke = |module: &Module, prior: HostCallJournal| {
+            invoke_journaled(
+                &store,
+                module,
+                &Value::Null,
+                &grants,
+                &limits(),
+                None,
+                prior,
+                None,
+            )
+        };
+        let median = |module: &Module, prior: &HostCallJournal| {
+            let mut samples: Vec<Duration> = (0..RUNS)
+                .map(|_| {
+                    let prior = prior.clone();
+                    let start = Instant::now();
+                    let out = invoke(module, prior);
+                    let elapsed = start.elapsed();
+                    out.result.expect("a benchmark run must succeed");
+                    elapsed
+                })
+                .collect();
+            samples.sort();
+            samples[RUNS / 2]
+        };
+        let empty = HostCallJournal::default();
+        let one_journal = invoke(&one, empty.clone()).journal;
+        let many_journal = invoke(&many, empty.clone()).journal;
+        let per_call = |many: Duration, one: Duration| many.saturating_sub(one) / (CALLS - 1);
+
+        let live_one = median(&one, &empty);
+        let live = per_call(median(&many, &empty), live_one);
+        let replay = per_call(median(&many, &many_journal), median(&one, &one_journal));
+        println!("one-call run {live_one:?}; live call {live:?}; replayed call {replay:?}");
+        assert!(live < Duration::from_millis(1), "a live call took {live:?}");
+        assert!(
+            replay < Duration::from_millis(1),
+            "a replayed call took {replay:?}"
+        );
     }
 
     #[test]

@@ -102,6 +102,7 @@ database.** The prototype is a new `wasm_journal` module behind the existing
 | Red → green | `no_grant_means_the_host_call_import_is_not_linked` | R2. |
 | Red → green | `a_divergent_request_on_replay_is_non_retryable` | R4. |
 | Red → green | `an_unconsumed_journal_entry_is_a_divergence` | R5. |
+| Refactor: red → green | `a_malformed_journal_is_rejected_before_the_guest_runs` | R4 for a journal with a gap in `seq`. |
 | Red → green | `a_journaled_run_links_no_ambient_import` | R6. |
 | Red → green | `a_fatal_handler_error_is_journaled_and_replayed` | R7, the journaled half. |
 | Red → green | `a_transient_handler_error_is_retryable_and_not_journaled` | R7, the retry half. |
@@ -113,7 +114,8 @@ database.** The prototype is a new `wasm_journal` module behind the existing
 | Red → green | `a_cancelled_run_skips_the_handler` | R13. |
 | Red → green | `a_guest_trap_keeps_the_calls_it_made_in_the_journal` | Resume after a guest crash. |
 | Red → green | `the_journal_round_trips_through_json` | The journal can be persisted as heartbeat details. |
-| Refactor | `wasm_journal_docs` guard suite | The write-up cites live tests, states a verdict and keeps short sentences. |
+| Refactor | `host_call_overhead_microbenchmark` (ignored) | The cost of one call, live and replayed. |
+| Refactor | `agent_code_journal_docs` guard suite | The write-up cites each test and each bound, states a verdict and keeps short sentences. |
 
 ## 2. Acceptance criteria
 
@@ -121,4 +123,4 @@ database.** The prototype is a new `wasm_journal` module behind the existing
 |----|----------|
 | Spike write-up under `docs/rnd/` | `docs/rnd/agent-code-host-call-journal.md`. |
 | Prototype of one journaled host call | `harvest::host_call` in `autumn-harvest/src/wasm_journal.rs` and its unit tests. |
-| Go / no-go verdict | The verdict section of the write-up, pinned by `wasm_journal_docs`. |
+| Go / no-go verdict | The verdict section of the write-up, pinned by `agent_code_journal_docs`. |
