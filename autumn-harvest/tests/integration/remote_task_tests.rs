@@ -73,7 +73,7 @@ fn mcp_complete_result_is_an_outcome() {
     assert_eq!(
         start,
         Ok(RemoteTaskStart::Completed(RemoteTaskOutcome {
-            result: result.clone(),
+            result,
             is_error: false,
         }))
     );
@@ -86,7 +86,7 @@ fn mcp_is_error_result_is_completed_not_failed() {
     assert_eq!(
         start,
         Ok(RemoteTaskStart::Completed(RemoteTaskOutcome {
-            result: result.clone(),
+            result,
             is_error: true,
         }))
     );
@@ -129,7 +129,7 @@ fn mcp_task_states_map_to_remote_states() {
     assert_eq!(
         mcp::parse_task(&json!({"taskId": "t", "status": "completed", "result": tool})),
         Ok(RemoteTaskState::Completed(RemoteTaskOutcome {
-            result: tool.clone(),
+            result: tool,
             is_error: true,
         }))
     );
@@ -189,7 +189,7 @@ fn a2a_message_result_is_an_outcome() {
     assert_eq!(
         start,
         Ok(RemoteTaskStart::Completed(RemoteTaskOutcome {
-            result: result.clone(),
+            result,
             is_error: false,
         }))
     );
@@ -392,7 +392,7 @@ fn awaiting(id: ActivityExecId, token: ExternalActivityToken) -> WorkflowEvent {
 async fn the_first_call_schedules_the_start_activity() {
     let ctx = Arc::new(WorkflowContext::new_test());
     let ctx2 = Arc::clone(&ctx);
-    let task = tokio::spawn(async move { remote_task::call(&ctx2, &call()).await });
+    let task = tokio::spawn(async move { ctx2.call_remote_task(&call()).await });
     tokio::task::yield_now().await;
 
     let commands = ctx.drain_commands();
@@ -420,7 +420,7 @@ async fn a_recorded_handle_suspends_on_the_external_token() {
     ];
     let ctx = Arc::new(WorkflowContext::for_replay(ExecutionId::new(), events));
     let ctx2 = Arc::clone(&ctx);
-    let task = tokio::spawn(async move { remote_task::call(&ctx2, &call()).await });
+    let task = tokio::spawn(async move { ctx2.call_remote_task(&call()).await });
     tokio::task::yield_now().await;
 
     let commands = ctx.drain_commands();
@@ -462,9 +462,7 @@ async fn replay_returns_an_is_error_outcome_as_ok() {
         },
     ];
     let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
-    let got = remote_task::call(&ctx, &call())
-        .await
-        .expect("isError is Ok");
+    let got = ctx.call_remote_task(&call()).await.expect("isError is Ok");
     assert_eq!(got, outcome);
     assert!(ctx.drain_commands().is_empty(), "replay calls nothing");
 }
@@ -482,7 +480,7 @@ async fn a_start_that_completes_at_once_needs_no_token() {
         completed_start(start_id, &RemoteTaskStart::Completed(outcome.clone())),
     ];
     let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
-    let got = remote_task::call(&ctx, &call()).await.expect("ok");
+    let got = ctx.call_remote_task(&call()).await.expect("ok");
     assert_eq!(got, outcome);
     assert!(ctx.drain_commands().is_empty());
 }
@@ -505,7 +503,7 @@ async fn replay_returns_a_remote_failure_as_activity_failed() {
         },
     ];
     let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
-    let err = remote_task::call(&ctx, &call()).await.expect_err("fails");
+    let err = ctx.call_remote_task(&call()).await.expect_err("fails");
     assert!(
         matches!(&err, HarvestError::ActivityFailed { name, .. } if name == AWAIT_ACTIVITY),
         "got {err:?}"
@@ -519,4 +517,95 @@ fn call_builders_set_the_protocol_and_the_queue() {
     assert_eq!(a2a_call.request.protocol, RemoteProtocol::A2a);
     assert_eq!(a2a_call.queue, "q");
     assert_eq!(call().queue, "default");
+}
+
+#[tokio::test]
+async fn replay_returns_a_deadline_as_a_timeout() {
+    let start_id = ActivityExecId::new();
+    let await_id = ActivityExecId::new();
+    let token = ExternalActivityToken::new();
+    let events = vec![
+        started(),
+        scheduled_start(start_id),
+        completed_start(start_id, &RemoteTaskStart::Task(handle())),
+        awaiting(await_id, token),
+        WorkflowEvent::ActivityTimedOut {
+            activity_id: await_id,
+            timeout_type: autumn_harvest::error::TimeoutType::ScheduleToClose,
+        },
+    ];
+    let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+    let err = ctx.call_remote_task(&call()).await.expect_err("times out");
+    assert!(
+        matches!(&err, HarvestError::Timeout { task_name, .. } if task_name == AWAIT_ACTIVITY),
+        "got {err:?}"
+    );
+}
+
+/// A push through `/activities/external/{token}/complete` may send only
+/// `{"output": {"result": ...}}`. A missing `is_error` reads as `false`.
+#[tokio::test]
+async fn a_pushed_output_without_is_error_reads_as_false() {
+    let start_id = ActivityExecId::new();
+    let await_id = ActivityExecId::new();
+    let token = ExternalActivityToken::new();
+    let events = vec![
+        started(),
+        scheduled_start(start_id),
+        completed_start(start_id, &RemoteTaskStart::Task(handle())),
+        awaiting(await_id, token),
+        WorkflowEvent::ActivityCompletedExternally {
+            activity_id: await_id,
+            token,
+            output: json!({"result": {"rows": 3}}),
+        },
+    ];
+    let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+    let got = ctx.call_remote_task(&call()).await.expect("ok");
+    assert_eq!(
+        got,
+        RemoteTaskOutcome {
+            result: json!({"rows": 3}),
+            is_error: false,
+        }
+    );
+}
+
+#[test]
+fn a_completed_mcp_task_with_no_result_is_an_error() {
+    let err =
+        mcp::parse_task(&json!({"taskId": "t", "status": "completed"})).expect_err("no result");
+    assert!(!err.retryable);
+}
+
+#[tokio::test]
+async fn the_timeout_rounds_up_to_whole_seconds() {
+    for (timeout, secs) in [
+        (Duration::from_millis(1500), 2),
+        (Duration::ZERO, 1),
+        (Duration::from_secs(600), 600),
+    ] {
+        let start_id = ActivityExecId::new();
+        let events = vec![
+            started(),
+            scheduled_start(start_id),
+            completed_start(start_id, &RemoteTaskStart::Task(handle())),
+        ];
+        let ctx = Arc::new(WorkflowContext::for_replay(ExecutionId::new(), events));
+        let ctx2 = Arc::clone(&ctx);
+        let mut c = call();
+        c.timeout = timeout;
+        let task = tokio::spawn(async move { ctx2.call_remote_task(&c).await });
+        tokio::task::yield_now().await;
+        let commands = ctx.drain_commands();
+        let Some(WorkflowCommand::ScheduleExternalActivity {
+            schedule_to_close_secs,
+            ..
+        }) = commands.first()
+        else {
+            panic!("expected ScheduleExternalActivity, got {commands:?}");
+        };
+        assert_eq!(*schedule_to_close_secs, secs, "for {timeout:?}");
+        task.abort();
+    }
 }

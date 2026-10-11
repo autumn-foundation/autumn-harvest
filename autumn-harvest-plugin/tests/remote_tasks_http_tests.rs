@@ -62,7 +62,9 @@ async fn serve(reply: Reply) -> (String, Arc<Mutex<Vec<Seen>>>) {
 }
 
 fn result(body: &Value, result: Value) -> Response {
-    Json(json!({"jsonrpc": "2.0", "id": body["id"], "result": result})).into_response()
+    let mut reply = json!({"jsonrpc": "2.0", "id": body["id"]});
+    reply["result"] = result;
+    Json(reply).into_response()
 }
 
 fn request(protocol: RemoteProtocol, tool: &str) -> RemoteTaskRequest {
@@ -218,21 +220,107 @@ async fn a_client_error_status_is_not_retryable() {
     assert!(!err.retryable);
 }
 
+/// A loopback URL with no listener: bind a port, then free it.
+async fn closed_port_url() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    drop(listener);
+    format!("http://{addr}/rpc")
+}
+
 #[tokio::test]
 async fn an_unreachable_server_is_retryable() {
-    // Port 9 (discard) on loopback has no listener in the test environment.
-    let client =
-        HttpRemoteTasks::new().server("reports", RemoteServer::mcp("http://127.0.0.1:9/rpc"));
+    let url = closed_port_url().await;
+    let client = HttpRemoteTasks::new().server("reports", RemoteServer::mcp(&url));
     let err = client
         .start(&request(RemoteProtocol::Mcp, "export"), "k")
         .await
         .expect_err("refused");
     assert!(err.retryable);
+    assert!(
+        !err.message.contains("127.0.0.1"),
+        "no URL in {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn a_json_rpc_error_behind_http_400_keeps_its_message() {
+    let (url, _) = serve(Arc::new(|body| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"jsonrpc": "2.0", "id": body["id"], "error": {"code": -32602, "message": "arguments.body is required"}})),
+        )
+            .into_response()
+    }))
+    .await;
+    let client = HttpRemoteTasks::new().server("reports", RemoteServer::mcp(&url));
+    let err = client
+        .start(&request(RemoteProtocol::Mcp, "export"), "k")
+        .await
+        .expect_err("400");
+    assert!(!err.retryable);
+    assert!(
+        err.message.contains("arguments.body is required"),
+        "got {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn a_response_over_the_limit_is_refused() {
+    let (url, _) = serve(Arc::new(|_| {
+        let big = "x".repeat(autumn_harvest_plugin::remote_tasks::MAX_RESPONSE_BYTES + 1);
+        Json(json!({"jsonrpc": "2.0", "id": 1, "result": big})).into_response()
+    }))
+    .await;
+    let client = HttpRemoteTasks::new().server("reports", RemoteServer::mcp(&url));
+    let err = client
+        .start(&request(RemoteProtocol::Mcp, "export"), "k")
+        .await
+        .expect_err("too large");
+    assert!(!err.retryable);
+    assert!(err.message.contains("bytes"), "got {}", err.message);
+}
+
+#[tokio::test]
+async fn a_redirect_to_another_origin_is_refused() {
+    let (other, _) = serve(Arc::new(|body| {
+        result(body, json!({"resultType": "task", "taskId": "t-9"}))
+    }))
+    .await;
+    let target = other.clone();
+    let (url, _) = serve(Arc::new(move |_| {
+        (
+            StatusCode::TEMPORARY_REDIRECT,
+            [(
+                autumn_web::reexports::axum::http::header::LOCATION,
+                target.clone(),
+            )],
+        )
+            .into_response()
+    }))
+    .await;
+    // A caller client that follows redirects.
+    let client = HttpRemoteTasks::with_client(reqwest::Client::new())
+        .server("reports", RemoteServer::mcp(&url));
+    let err = client
+        .start(&request(RemoteProtocol::Mcp, "export"), "k")
+        .await
+        .expect_err("other origin");
+    assert!(
+        err.message.contains("another origin"),
+        "got {}",
+        err.message
+    );
 }
 
 #[tokio::test]
 async fn an_unknown_server_or_a_protocol_mismatch_is_not_retryable() {
-    let client = HttpRemoteTasks::new().server("reports", RemoteServer::a2a("http://127.0.0.1:9/"));
+    let url = closed_port_url().await;
+    let client = HttpRemoteTasks::new().server("reports", RemoteServer::a2a(&url));
     let mut unknown = request(RemoteProtocol::Mcp, "export");
     unknown.server = "other".into();
     let err = client.start(&unknown, "k").await.expect_err("unknown");

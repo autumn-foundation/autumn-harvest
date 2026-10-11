@@ -957,6 +957,10 @@ path = "business_days_from_now"
 receiver = "WorkflowContext"
 reason = "context.rs:6417 -> `freeze_business_day` -> `side_effect`, freezing the resolved business day into history. DUAL ROLE (see `[[sanctioned]]`)."
 [[sink]]
+path = "call_remote_task"
+receiver = "WorkflowContext"
+reason = "context.rs:12948 -> `remote_task::call` -> `execute_activity_raw` (the start activity), then `execute_activity_external` (the token wait). Both push a history-matched command, and the call is recorded into history (issue #2006)."
+[[sink]]
 path = "cancel_timer"
 receiver = "WorkflowContext"
 reason = "context.rs:6970; calls `push_command` directly. Every argument is recorded into history and matched on replay."

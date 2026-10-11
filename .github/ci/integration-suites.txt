@@ -300,6 +300,7 @@ linux        autumn-harvest-plugin  queue_pause_integration          -          
 linux        autumn-harvest-plugin  quota_admin_integration          -                          -
 linux        autumn-harvest-plugin  rate_limit_key_admin_integration  -                          -
 linux        autumn-harvest-plugin  read_path_decode_integration     -                          -
+linux        autumn-harvest-plugin  remote_tasks_integration         mcp,unified-dag-execution  -
 linux        autumn-harvest-plugin  replay_canary_integration        -                          -
 linux        autumn-harvest-plugin  replay_diagnosis_integration     -                          -
 linux        autumn-harvest-plugin  replay_sample_export_integration  -                          -

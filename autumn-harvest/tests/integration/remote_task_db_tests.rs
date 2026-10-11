@@ -5,16 +5,17 @@
 //! - A tool result with `isError: true` completes the run. It does not retry.
 //! - A failed remote task fails the run.
 //! - The first settlement wins. A later one returns `false`.
+//! - The poller reads live runs only, backs off a failing read, caps the
+//!   result and pages through every token.
 //!
 //! Each test that runs a worker also replays the recorded history. When
 //! `HARVEST_TEST_DATABASE_URL` is set, it is an admin URL and each test gets
-//! a fresh database. Otherwise a testcontainer starts.
+//! a throwaway database. Otherwise a testcontainer starts.
 #![cfg(feature = "db")]
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,9 +32,9 @@ use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::types::{
     ExecutionId, ExternalActivityToken, Priority, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
 };
-use autumn_harvest::worker::HandlerRegistry;
+use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::{StartSource, StartWorkflowParams, start_or_load_workflow_execution};
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use diesel_async::{AsyncConnection, AsyncPgConnection, SimpleAsyncConnection};
 use serde_json::{Value, json};
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
@@ -43,6 +44,7 @@ use crate::integration_e2e::{
     build_runtime_worker, build_test_pool, load_execution_from_url, spawn_test_worker,
     wait_for_execution_state_with_timeout,
 };
+use crate::throwaway_db::ThrowawayDb;
 
 type HandlerFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
 
@@ -50,36 +52,20 @@ const WAIT: Duration = Duration::from_secs(30);
 
 // ── Setup ────────────────────────────────────────────────────────────────
 
-static DB_SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn with_db_name(url: &str, db: &str) -> String {
-    let (base, query) = match url.split_once('?') {
-        Some((b, q)) => (b, Some(q)),
-        None => (url, None),
-    };
-    let prefix = base.rsplit_once('/').map_or(base, |(p, _)| p);
-    query.map_or_else(
-        || format!("{prefix}/{db}"),
-        |q| format!("{prefix}/{db}?{q}"),
-    )
+/// A fresh, migrated database. The guards drop it at the end of the test.
+struct Db {
+    url: String,
+    _throwaway: Option<ThrowawayDb>,
+    _container: Option<ContainerAsync<Postgres>>,
 }
 
-/// Returns the URL of a fresh, migrated database.
-async fn setup() -> (String, Option<ContainerAsync<Postgres>>) {
-    if let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
-        let mut admin = connect(&admin_url).await;
-        let n = DB_SEQ.fetch_add(1, Ordering::SeqCst);
-        let db = format!("remote_task_{}_{}", std::process::id(), n);
-        diesel::sql_query(format!("CREATE DATABASE {db}"))
-            .execute(&mut admin)
-            .await
-            .expect("create per-test database");
-        let url = with_db_name(&admin_url, &db);
-        let mut conn = connect(&url).await;
-        conn.batch_execute(&autumn_harvest::test_init_sql())
-            .await
-            .expect("apply migrations");
-        return (url, None);
+async fn setup() -> Db {
+    if let Some(db) = ThrowawayDb::create("remote_task").await {
+        return Db {
+            url: db.url(),
+            _throwaway: Some(db),
+            _container: None,
+        };
     }
     let container = Postgres::default()
         .with_tag("16")
@@ -93,7 +79,11 @@ async fn setup() -> (String, Option<ContainerAsync<Postgres>>) {
     conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("apply migrations");
-    (url, Some(container))
+    Db {
+        url,
+        _throwaway: None,
+        _container: Some(container),
+    }
 }
 
 async fn connect(url: &str) -> AsyncPgConnection {
@@ -109,7 +99,8 @@ struct FakeServer {
     by_key: Mutex<HashMap<String, String>>,
     states: Mutex<HashMap<String, RemoteTaskState>>,
     starts: Mutex<u32>,
-    gets: Mutex<u32>,
+    /// The task id of each read, in order.
+    reads: Mutex<Vec<String>>,
 }
 
 impl FakeServer {
@@ -120,12 +111,16 @@ impl FakeServer {
             .insert(task_id.to_string(), state);
     }
 
+    fn forget(&self, task_id: &str) {
+        self.states.lock().expect("states").remove(task_id);
+    }
+
     fn starts(&self) -> u32 {
         *self.starts.lock().expect("starts")
     }
 
-    fn gets(&self) -> u32 {
-        *self.gets.lock().expect("gets")
+    fn reads(&self) -> Vec<String> {
+        self.reads.lock().expect("reads").clone()
     }
 }
 
@@ -140,12 +135,14 @@ impl RemoteTaskTransport for FakeTransport {
     ) -> RemoteFuture<'a, Result<RemoteTaskStart, RemoteTaskError>> {
         Box::pin(async move {
             *self.0.starts.lock().expect("starts") += 1;
-            let mut by_key = self.0.by_key.lock().expect("keys");
-            let next = by_key.len();
-            let task_id = by_key
-                .entry(idempotency_key.to_string())
-                .or_insert_with(|| format!("task-{next}"))
-                .clone();
+            let task_id = {
+                let mut by_key = self.0.by_key.lock().expect("keys");
+                let next = by_key.len();
+                by_key
+                    .entry(idempotency_key.to_string())
+                    .or_insert_with(|| format!("task-{next}"))
+                    .clone()
+            };
             self.0
                 .states
                 .lock()
@@ -165,17 +162,18 @@ impl RemoteTaskTransport for FakeTransport {
         handle: &'a RemoteTaskHandle,
     ) -> RemoteFuture<'a, Result<RemoteTaskState, RemoteTaskError>> {
         Box::pin(async move {
-            *self.0.gets.lock().expect("gets") += 1;
+            self.0
+                .reads
+                .lock()
+                .expect("reads")
+                .push(handle.task_id.clone());
             self.0
                 .states
                 .lock()
                 .expect("states")
                 .get(&handle.task_id)
                 .cloned()
-                .ok_or_else(|| RemoteTaskError {
-                    message: "Task not found".into(),
-                    retryable: false,
-                })
+                .ok_or_else(|| RemoteTaskError::non_retryable("Task not found"))
         })
     }
 }
@@ -188,7 +186,8 @@ const WORKFLOW: &str = "remote_report_wf";
 fn remote_report_workflow(ctx: &WorkflowContext, input: Value) -> HandlerFuture<'_> {
     Box::pin(async move {
         let call = RemoteTaskCall::mcp("reports", "export", input, Duration::from_secs(600));
-        let outcome = remote_task::call(ctx, &call)
+        let outcome = ctx
+            .call_remote_task(&call)
             .await
             .map_err(|e| e.to_string())?;
         serde_json::to_value(outcome).map_err(|e| e.to_string())
@@ -234,7 +233,7 @@ struct Process {
     worker: Arc<autumn_harvest::worker::Worker>,
     handle: tokio::task::JoinHandle<()>,
     poller: RemoteTaskPoller,
-    pool: autumn_harvest::worker::DbPool,
+    pool: DbPool,
 }
 
 impl Process {
@@ -345,11 +344,10 @@ async fn wait_for_token(url: &str, exec_id: ExecutionId) -> ExternalActivityToke
 }
 
 /// Polls until a poll settles a token.
-async fn poll_until_settled(url: &str, poller: &RemoteTaskPoller) {
+async fn poll_until_settled(pool: &DbPool, poller: &RemoteTaskPoller) {
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
-        let mut conn = connect(url).await;
-        let report = poller.poll_once(&mut conn).await.expect("poll");
+        let report = poller.poll_once(pool).await.expect("poll");
         if report.settled > 0 {
             return;
         }
@@ -394,19 +392,19 @@ async fn assert_replays_clean(url: &str, exec_id: ExecutionId) {
 /// `is_error`, and the history replays clean.
 #[tokio::test]
 async fn a_remote_mcp_task_survives_a_worker_restart() {
-    let (url, _container) = setup().await;
+    let db = setup().await;
+    let url = &db.url;
     let server = Arc::new(FakeServer::default());
 
-    let a = Process::start(&url, "remote-task-a", &server);
-    let exec_id = start_run(&url, "report-1", json!({"year": 2026})).await;
-    let token = wait_for_token(&url, exec_id).await;
+    let a = Process::start(url, "remote-task-a", &server);
+    let exec_id = start_run(url, "report-1", json!({"year": 2026})).await;
+    let token = wait_for_token(url, exec_id).await;
 
     // The task still runs, so a poll settles nothing.
-    let mut conn = connect(&url).await;
-    let report = a.poller.poll_once(&mut conn).await.expect("poll");
+    let report = a.poller.poll_once(&a.pool).await.expect("poll");
     assert_eq!(report.polled, 1);
     assert_eq!(report.settled, 0);
-    assert_eq!(task_state(&url, token).await, "PENDING");
+    assert_eq!(task_state(url, token).await, "PENDING");
     a.stop().await;
 
     // The remote task ends while no Harvest process runs.
@@ -419,14 +417,14 @@ async fn a_remote_mcp_task_survives_a_worker_restart() {
         }),
     );
     assert_eq!(
-        load_execution_from_url(&url, exec_id).await.state,
+        load_execution_from_url(url, exec_id).await.state,
         "RUNNING",
         "nothing settles the token while no process runs"
     );
 
-    let b = Process::start(&url, "remote-task-b", &server);
-    poll_until_settled(&url, &b.poller).await;
-    let done = wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", WAIT).await;
+    let b = Process::start(url, "remote-task-b", &server);
+    poll_until_settled(&b.pool, &b.poller).await;
+    let done = wait_for_execution_state_with_timeout(url, exec_id, "COMPLETED", WAIT).await;
     let outcome: RemoteTaskOutcome =
         serde_json::from_value(done.output.expect("output")).expect("decode outcome");
     assert_eq!(
@@ -436,7 +434,7 @@ async fn a_remote_mcp_task_survives_a_worker_restart() {
             is_error: true,
         }
     );
-    assert_eq!(task_state(&url, token).await, "COMPLETED");
+    assert_eq!(task_state(url, token).await, "COMPLETED");
     assert_eq!(
         server.starts(),
         1,
@@ -444,28 +442,29 @@ async fn a_remote_mcp_task_survives_a_worker_restart() {
     );
     b.stop().await;
 
-    assert_replays_clean(&url, exec_id).await;
+    assert_replays_clean(url, exec_id).await;
 }
 
 /// A failed remote task fails the run with the remote message.
 #[tokio::test]
 async fn a_failed_remote_task_fails_the_run() {
-    let (url, _container) = setup().await;
+    let db = setup().await;
+    let url = &db.url;
     let server = Arc::new(FakeServer::default());
-    let p = Process::start(&url, "remote-task-fail", &server);
+    let p = Process::start(url, "remote-task-fail", &server);
 
-    let exec_id = start_run(&url, "report-2", json!({})).await;
-    let token = wait_for_token(&url, exec_id).await;
+    let exec_id = start_run(url, "report-2", json!({})).await;
+    let token = wait_for_token(url, exec_id).await;
     server.set("task-0", RemoteTaskState::Failed("export crashed".into()));
-    poll_until_settled(&url, &p.poller).await;
+    poll_until_settled(&p.pool, &p.poller).await;
 
-    let done = wait_for_execution_state_with_timeout(&url, exec_id, "FAILED", WAIT).await;
+    let done = wait_for_execution_state_with_timeout(url, exec_id, "FAILED", WAIT).await;
     let error = done.error.expect("error");
     assert!(error.contains("export crashed"), "got {error}");
-    assert_eq!(task_state(&url, token).await, "FAILED");
+    assert_eq!(task_state(url, token).await, "FAILED");
     p.stop().await;
 
-    assert_replays_clean(&url, exec_id).await;
+    assert_replays_clean(url, exec_id).await;
 }
 
 /// AC2 alignment: the first settlement wins. A later one returns `false`,
@@ -473,20 +472,21 @@ async fn a_failed_remote_task_fails_the_run() {
 /// settles nothing.
 #[tokio::test]
 async fn the_first_settlement_wins() {
-    let (url, _container) = setup().await;
+    let db = setup().await;
+    let url = &db.url;
     let server = Arc::new(FakeServer::default());
-    let p = Process::start(&url, "remote-task-settle", &server);
+    let p = Process::start(url, "remote-task-settle", &server);
 
-    let exec_id = start_run(&url, "report-3", json!({})).await;
-    let token = wait_for_token(&url, exec_id).await;
+    let exec_id = start_run(url, "report-3", json!({})).await;
+    let token = wait_for_token(url, exec_id).await;
     let codecs = PayloadCodecs::default();
-    let mut conn = connect(&url).await;
+    let mut conn = connect(url).await;
 
     let working = remote_task::resolve(&mut conn, token, &RemoteTaskState::Working, &codecs)
         .await
         .expect("resolve working");
     assert!(!working, "a working task settles nothing");
-    assert_eq!(task_state(&url, token).await, "PENDING");
+    assert_eq!(task_state(url, token).await, "PENDING");
 
     let done = RemoteTaskState::Completed(RemoteTaskOutcome {
         result: json!({"content": [], "isError": false}),
@@ -506,28 +506,30 @@ async fn the_first_settlement_wins() {
     assert!(first, "the first settlement wins");
     assert!(!second, "a later settlement is a no-op");
 
-    wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", WAIT).await;
-    assert_eq!(task_state(&url, token).await, "COMPLETED");
+    wait_for_execution_state_with_timeout(url, exec_id, "COMPLETED", WAIT).await;
+    assert_eq!(task_state(url, token).await, "COMPLETED");
     p.stop().await;
 }
 
 /// The poller reads each pending handle from history, one page at a time.
-/// A push relay can use the same list to find a token.
+/// A small batch still reaches every token: the cursor advances, then
+/// wraps.
 #[tokio::test]
 async fn pending_handles_page_in_token_order() {
-    let (url, _container) = setup().await;
+    let db = setup().await;
+    let url = &db.url;
     let server = Arc::new(FakeServer::default());
-    let p = Process::start(&url, "remote-task-page", &server);
+    let p = Process::start(url, "remote-task-page", &server);
 
-    let one = start_run(&url, "report-4", json!({})).await;
-    let two = start_run(&url, "report-5", json!({})).await;
-    let mut tokens = vec![
-        wait_for_token(&url, one).await,
-        wait_for_token(&url, two).await,
+    let one = start_run(url, "report-4", json!({})).await;
+    let two = start_run(url, "report-5", json!({})).await;
+    let mut tokens = [
+        wait_for_token(url, one).await,
+        wait_for_token(url, two).await,
     ];
     tokens.sort_by_key(ExternalActivityToken::as_uuid);
     let codecs = PayloadCodecs::default();
-    let mut conn = connect(&url).await;
+    let mut conn = connect(url).await;
 
     let first = remote_task::pending_remote_tasks(&mut conn, &codecs, None, 1)
         .await
@@ -540,20 +542,110 @@ async fn pending_handles_page_in_token_order() {
         .expect("page 2");
     assert_eq!(second.len(), 1);
     assert_eq!(second[0].token, tokens[1]);
-    let mut ids = vec![
-        first[0].handle.task_id.clone(),
-        second[0].handle.task_id.clone(),
-    ];
-    ids.sort();
-    assert_eq!(ids, vec!["task-0", "task-1"]);
+    let first_id = first[0].handle.task_id.clone();
+    let second_id = second[0].handle.task_id.clone();
 
-    // A small batch still reaches every token: the cursor wraps.
     let poller = RemoteTaskPoller::new(&RemoteTasks::new(FakeTransport(Arc::clone(&server))))
         .with_batch_size(1);
-    let before = server.gets();
-    poller.poll_once(&mut conn).await.expect("poll 1");
-    poller.poll_once(&mut conn).await.expect("poll 2");
-    poller.poll_once(&mut conn).await.expect("poll 3");
-    assert_eq!(server.gets() - before, 3);
+    let before = server.reads().len();
+    for _ in 0..3 {
+        poller.poll_once(&p.pool).await.expect("poll");
+    }
+    assert_eq!(
+        server.reads()[before..],
+        [first_id.clone(), second_id, first_id],
+        "the cursor advances, then wraps"
+    );
+    p.stop().await;
+}
+
+/// The poller skips a run that has ended. A late remote result does not
+/// write after the terminal event.
+#[tokio::test]
+async fn the_poller_skips_a_run_that_has_ended() {
+    let db = setup().await;
+    let url = &db.url;
+    let server = Arc::new(FakeServer::default());
+    let p = Process::start(url, "remote-task-ended", &server);
+
+    let exec_id = start_run(url, "report-6", json!({})).await;
+    let token = wait_for_token(url, exec_id).await;
+    let mut conn = connect(url).await;
+    autumn_harvest::execution::terminate_workflow_execution(
+        &mut conn,
+        exec_id,
+        "operator stop",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("terminate");
+    server.set(
+        "task-0",
+        RemoteTaskState::Completed(RemoteTaskOutcome {
+            result: json!({"content": []}),
+            is_error: false,
+        }),
+    );
+
+    let report = p.poller.poll_once(&p.pool).await.expect("poll");
+    assert_eq!(report.polled, 0, "an ended run is not polled");
+    let settled = remote_task::resolve(
+        &mut conn,
+        token,
+        &RemoteTaskState::Failed("late".into()),
+        &PayloadCodecs::default(),
+    )
+    .await
+    .expect("resolve");
+    assert!(!settled, "a push for an ended run settles nothing");
+    assert_eq!(task_state(url, token).await, "PENDING");
+    p.stop().await;
+}
+
+/// A failing remote read backs off: the next poll skips the token. The
+/// token stays pending.
+#[tokio::test]
+async fn a_failing_read_backs_off() {
+    let db = setup().await;
+    let url = &db.url;
+    let server = Arc::new(FakeServer::default());
+    let p = Process::start(url, "remote-task-backoff", &server);
+
+    let exec_id = start_run(url, "report-7", json!({})).await;
+    let token = wait_for_token(url, exec_id).await;
+    server.forget("task-0");
+
+    let first = p.poller.poll_once(&p.pool).await.expect("poll 1");
+    assert_eq!((first.polled, first.errors), (1, 1));
+    let second = p.poller.poll_once(&p.pool).await.expect("poll 2");
+    assert_eq!(second.polled, 0, "the failing token backs off");
+    assert_eq!(task_state(url, token).await, "PENDING");
+    p.stop().await;
+}
+
+/// A remote result over the limit fails the run. It does not reach history.
+#[tokio::test]
+async fn a_result_over_the_limit_fails_the_run() {
+    let db = setup().await;
+    let url = &db.url;
+    let server = Arc::new(FakeServer::default());
+    let p = Process::start(url, "remote-task-cap", &server);
+
+    let exec_id = start_run(url, "report-8", json!({})).await;
+    wait_for_token(url, exec_id).await;
+    server.set(
+        "task-0",
+        RemoteTaskState::Completed(RemoteTaskOutcome {
+            result: json!({"content": [{"type": "text", "text": "x".repeat(4096)}]}),
+            is_error: false,
+        }),
+    );
+    let poller = RemoteTaskPoller::new(&RemoteTasks::new(FakeTransport(Arc::clone(&server))))
+        .with_max_result_bytes(1024);
+    poll_until_settled(&p.pool, &poller).await;
+
+    let done = wait_for_execution_state_with_timeout(url, exec_id, "FAILED", WAIT).await;
+    let error = done.error.expect("error");
+    assert!(error.contains("the limit is 1024"), "got {error}");
     p.stop().await;
 }

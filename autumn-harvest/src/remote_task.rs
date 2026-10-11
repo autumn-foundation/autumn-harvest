@@ -4,7 +4,7 @@
 //! wait holds no worker slot and no open connection. See `DESIGN-2006.md`
 //! and `docs/remote-tasks.md`.
 //!
-//! [`call`] runs two durable steps:
+//! [`WorkflowContext::call_remote_task`] runs two durable steps:
 //!
 //! 1. The activity [`START_ACTIVITY`] starts the remote task. It records a
 //!    [`RemoteTaskHandle`], or the result when the server answers at once.
@@ -46,12 +46,12 @@ pub type RemoteFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub enum RemoteProtocol {
     /// MCP Tasks.
     Mcp,
-    /// Agent2Agent.
+    /// The A2A (`Agent2Agent`) protocol.
     A2a,
 }
 
 /// The start request that the start activity records.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteTaskRequest {
     /// The server name that the transport resolves.
     pub server: String,
@@ -64,13 +64,16 @@ pub struct RemoteTaskRequest {
 }
 
 /// A remote task call from a workflow.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteTaskCall {
     /// The start request.
     pub request: RemoteTaskRequest,
     /// The queue of the start activity.
     pub queue: String,
     /// The longest time to wait for the remote task.
+    ///
+    /// The wait starts when the token is recorded, after the start. The
+    /// engine rounds it up to whole seconds, with a minimum of 1 s.
     pub timeout: Duration,
 }
 
@@ -126,16 +129,18 @@ pub struct RemoteTaskHandle {
 }
 
 /// The result of a remote task that ended with a result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteTaskOutcome {
     /// The tool result, or the A2A task or message.
+    #[serde(default)]
     pub result: Value,
     /// `true` when the tool result has `isError: true`.
+    #[serde(default)]
     pub is_error: bool,
 }
 
 /// What a start returns.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RemoteTaskStart {
     /// The server made a task.
@@ -145,7 +150,7 @@ pub enum RemoteTaskStart {
 }
 
 /// The state of a remote task.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteTaskState {
     /// The task runs.
     Working,
@@ -155,7 +160,7 @@ pub enum RemoteTaskState {
     Completed(RemoteTaskOutcome),
     /// The task failed.
     Failed(String),
-    /// The task was cancelled.
+    /// Something cancelled the task.
     Cancelled(String),
 }
 
@@ -192,7 +197,7 @@ impl RemoteTaskError {
 
     /// An error that a retry cannot fix, such as a protocol error.
     #[must_use]
-    pub fn permanent(message: impl Into<String>) -> Self {
+    pub fn non_retryable(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             retryable: false,
@@ -234,6 +239,7 @@ impl std::fmt::Debug for RemoteTasks {
 
 impl RemoteTasks {
     /// Wrap a transport.
+    #[must_use]
     pub fn new(transport: impl RemoteTaskTransport + 'static) -> Self {
         Self {
             transport: Arc::new(transport),
@@ -249,8 +255,10 @@ impl RemoteTasks {
 
 /// The activities to register: the start activity.
 ///
-/// The start activity retries a network error five times. A retry sends the
-/// same idempotency key, so a server that honours the key starts one task.
+/// The start activity makes at most five attempts, each with a limit of 60
+/// s. It retries a retryable transport error, such as a network error, HTTP
+/// 429 or HTTP 5xx. A retry sends the same idempotency key, so a server
+/// that honours the key starts one task.
 #[must_use]
 pub fn activities() -> Vec<ActivityInfo> {
     vec![ActivityInfo {
@@ -277,7 +285,7 @@ pub fn activities() -> Vec<ActivityInfo> {
     }]
 }
 
-fn permanent_failure(error_type: &str, message: impl Into<String>) -> String {
+fn non_retryable_failure(error_type: &str, message: impl Into<String>) -> String {
     ActivityFailure::non_retryable(error_type, message).into_error_payload()
 }
 
@@ -287,16 +295,16 @@ fn start_handler(
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
     Box::pin(async move {
         let remote = ctx.state::<RemoteTasks>().ok_or_else(|| {
-            permanent_failure(
+            non_retryable_failure(
                 "RemoteTasksMissing",
                 "no RemoteTasks is installed: pass one to HarvestBuilder::state",
             )
         })?;
         let request: RemoteTaskRequest = serde_json::from_value(input)
-            .map_err(|e| permanent_failure("RemoteTaskInput", e.to_string()))?;
+            .map_err(|e| non_retryable_failure("RemoteTaskInput", e.to_string()))?;
         let key = ctx
             .idempotency_key()
-            .map_err(|e| permanent_failure("RemoteTaskKey", e.to_string()))?
+            .map_err(|e| non_retryable_failure("RemoteTaskKey", e.to_string()))?
             .as_str()
             .to_string();
         let start = remote.transport.start(&request, &key).await.map_err(|e| {
@@ -308,24 +316,16 @@ fn start_handler(
             failure.into_error_payload()
         })?;
         serde_json::to_value(start)
-            .map_err(|e| permanent_failure("RemoteTaskOutput", e.to_string()))
+            .map_err(|e| non_retryable_failure("RemoteTaskOutput", e.to_string()))
     })
 }
 
-/// Call a remote task and wait for it to end.
+/// The body of [`WorkflowContext::call_remote_task`].
 ///
-/// The call holds no worker slot while the remote task runs. A
-/// [`RemoteTaskPoller`] or a push settles the wait.
-///
-/// # Errors
-///
-/// - [`HarvestError::ActivityFailed`](crate::error::HarvestError::ActivityFailed)
-///   when the start fails, or the remote task fails or is cancelled.
-/// - [`HarvestError::Timeout`](crate::error::HarvestError::Timeout) when the
-///   task does not end within [`RemoteTaskCall::timeout`].
-/// - [`HarvestError::Serialization`](crate::error::HarvestError::Serialization)
-///   when a recorded value does not decode.
-pub async fn call(
+/// It is crate-private so that a workflow calls the context method, which
+/// `harvest-verify` classifies as a sink. A free function in this crate is a
+/// trusted propagator to the analyzer, so it would hide both steps.
+pub(crate) async fn call(
     ctx: &WorkflowContext,
     call: &RemoteTaskCall,
 ) -> HarvestResult<RemoteTaskOutcome> {
@@ -342,10 +342,21 @@ pub async fn call(
             AWAIT_ACTIVITY,
             serde_json::to_value(&handle)?,
             &call.queue,
-            call.timeout.as_secs().max(1),
+            timeout_secs(call.timeout),
         )
         .await?;
     Ok(serde_json::from_value(output)?)
+}
+
+/// `timeout` in whole seconds, rounded up, with a minimum of 1.
+fn timeout_secs(timeout: Duration) -> u64 {
+    let secs = timeout.as_secs();
+    let up = if timeout.subsec_nanos() > 0 {
+        secs.saturating_add(1)
+    } else {
+        secs
+    };
+    up.max(1)
 }
 
 /// The text of a JSON value: a string as it is, anything else as JSON.
@@ -404,7 +415,7 @@ pub mod mcp {
     ///
     /// # Errors
     ///
-    /// Returns a permanent error for a result with no task id and no content.
+    /// Returns a non-retryable error for a result with no task id and no content.
     pub fn parse_tools_call_result(
         request: &RemoteTaskRequest,
         result: &Value,
@@ -413,7 +424,7 @@ pub mod mcp {
             let task_id = result
                 .get("taskId")
                 .and_then(Value::as_str)
-                .ok_or_else(|| RemoteTaskError::permanent("the task result has no taskId"))?;
+                .ok_or_else(|| RemoteTaskError::non_retryable("the task result has no taskId"))?;
             return Ok(RemoteTaskStart::Task(RemoteTaskHandle {
                 server: request.server.clone(),
                 protocol: RemoteProtocol::Mcp,
@@ -423,7 +434,7 @@ pub mod mcp {
         if result.get("content").is_some() || result.get("structuredContent").is_some() {
             return Ok(RemoteTaskStart::Completed(outcome(result)));
         }
-        Err(RemoteTaskError::permanent(
+        Err(RemoteTaskError::non_retryable(
             "the tools/call result is not a task and not a tool result",
         ))
     }
@@ -445,7 +456,7 @@ pub mod mcp {
     ///
     /// # Errors
     ///
-    /// Returns a permanent error for a result with no known status.
+    /// Returns a non-retryable error for a result with no known status.
     pub fn parse_task(task: &Value) -> Result<RemoteTaskState, RemoteTaskError> {
         let status = task.get("status").and_then(Value::as_str).unwrap_or("");
         let message = || {
@@ -457,26 +468,33 @@ pub mod mcp {
         match status {
             "working" => Ok(RemoteTaskState::Working),
             "input_required" => Ok(RemoteTaskState::InputRequired),
-            "completed" => Ok(RemoteTaskState::Completed(outcome(
-                task.get("result").unwrap_or(&Value::Null),
-            ))),
+            "completed" => task
+                .get("result")
+                .filter(|result| result.is_object())
+                .map(|result| RemoteTaskState::Completed(outcome(result)))
+                .ok_or_else(|| {
+                    RemoteTaskError::non_retryable("the completed MCP task has no result")
+                }),
             "failed" => Ok(RemoteTaskState::Failed(
                 message().unwrap_or_else(|| "the remote task failed".into()),
             )),
-            "cancelled" => Ok(RemoteTaskState::Cancelled(
-                message().unwrap_or_else(|| "the remote task was cancelled".into()),
-            )),
-            other => Err(RemoteTaskError::permanent(format!(
+            "cancelled" => {
+                Ok(RemoteTaskState::Cancelled(message().unwrap_or_else(|| {
+                    "the remote server cancelled the task".into()
+                })))
+            }
+            other => Err(RemoteTaskError::non_retryable(format!(
                 "unknown MCP task status '{other}'"
             ))),
         }
     }
 }
 
-/// A2A wire format: `message/send` and `tasks/get`.
+/// A2A `v0.3` wire format: `message/send` and `tasks/get`.
 ///
-/// The state parser reads the `v0.3` names, such as `input-required`, and
-/// the `v1` names, such as `TASK_STATE_INPUT_REQUIRED`.
+/// The state parser also reads the `v1` state names, such as
+/// `TASK_STATE_INPUT_REQUIRED`. The `{"skill", "arguments"}` data part is a
+/// Harvest convention, not an A2A rule.
 pub mod a2a {
     use serde_json::{Value, json};
 
@@ -510,7 +528,7 @@ pub mod a2a {
     ///
     /// # Errors
     ///
-    /// Returns a permanent error for a result that is not a task or a message.
+    /// Returns a non-retryable error for a result that is not a task or a message.
     pub fn parse_send_result(
         request: &RemoteTaskRequest,
         result: &Value,
@@ -531,7 +549,7 @@ pub mod a2a {
                     task_id: task_id.to_string(),
                 }))
             }
-            _ => Err(RemoteTaskError::permanent(
+            _ => Err(RemoteTaskError::non_retryable(
                 "the message/send result is not a task and not a message",
             )),
         }
@@ -557,12 +575,12 @@ pub mod a2a {
     ///
     /// # Errors
     ///
-    /// Returns a permanent error for a task with no known state.
+    /// Returns a non-retryable error for a task with no known state.
     pub fn parse_task(task: &Value) -> Result<RemoteTaskState, RemoteTaskError> {
         let raw = task
             .pointer("/status/state")
             .and_then(Value::as_str)
-            .ok_or_else(|| RemoteTaskError::permanent("the A2A task has no status.state"))?;
+            .ok_or_else(|| RemoteTaskError::non_retryable("the A2A task has no status.state"))?;
         let lower = raw.to_ascii_lowercase();
         let state = lower
             .strip_prefix("task_state_")
@@ -578,7 +596,7 @@ pub mod a2a {
             })),
             "failed" | "rejected" => Ok(RemoteTaskState::Failed(message())),
             "canceled" | "cancelled" => Ok(RemoteTaskState::Cancelled(message())),
-            _ => Err(RemoteTaskError::permanent(format!(
+            _ => Err(RemoteTaskError::non_retryable(format!(
                 "unknown A2A task state '{raw}'"
             ))),
         }

@@ -9,11 +9,15 @@
 //! - MCP: `tools/call` with the Tasks extension, then `tasks/get`. Each
 //!   request sends the `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name`
 //!   headers that a `2026-07-28` server needs.
-//! - A2A: `message/send`, then `tasks/get`.
+//! - A2A `v0.3`: `message/send`, then `tasks/get`.
 //!
 //! The start sends the idempotency key in the `Idempotency-Key` header too.
 //! A network error, HTTP 429 and HTTP 5xx are retryable. Any other HTTP
 //! error and a JSON-RPC error are not.
+//!
+//! The client reads at most [`MAX_RESPONSE_BYTES`] of a response. It refuses
+//! a response from another origin than the endpoint. Its error messages
+//! hold no URL, so a secret in the endpoint query stays out of history.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,14 +28,22 @@ use autumn_harvest::remote_task::{
     RemoteFuture, RemoteProtocol, RemoteTaskError, RemoteTaskHandle, RemoteTaskRequest,
     RemoteTaskStart, RemoteTaskState, RemoteTaskTransport, a2a, mcp,
 };
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
 /// The time limit of one HTTP request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The largest response body that the client reads, in bytes.
+pub const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// The largest remote error text in an error message, in bytes.
+const MAX_ERROR_TEXT: usize = 1024;
+
 /// One remote server.
 ///
-/// `Debug` prints the endpoint and the header names only, never a value.
+/// `Debug` prints the endpoint with no user info and no query, and the
+/// header names only.
 #[derive(Clone)]
 pub struct RemoteServer {
     endpoint: String,
@@ -39,11 +51,25 @@ pub struct RemoteServer {
     headers: Vec<(String, String)>,
 }
 
+/// `endpoint` with no user info, no query and no fragment.
+fn redacted(endpoint: &str) -> String {
+    reqwest::Url::parse(endpoint).map_or_else(
+        |_| "<not a URL>".to_string(),
+        |mut url| {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        },
+    )
+}
+
 impl std::fmt::Debug for RemoteServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let names: Vec<&str> = self.headers.iter().map(|(n, _)| n.as_str()).collect();
         f.debug_struct("RemoteServer")
-            .field("endpoint", &self.endpoint)
+            .field("endpoint", &redacted(&self.endpoint))
             .field("protocol", &self.protocol)
             .field("headers", &names)
             .finish()
@@ -78,6 +104,10 @@ impl RemoteServer {
     }
 
     /// Send the header `name` with `value` on each request.
+    ///
+    /// The client marks the value as sensitive. A protocol header that the
+    /// client sets itself, such as `mcp-method` or `idempotency-key`,
+    /// replaces a header with the same name.
     #[must_use]
     pub fn header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_string(), value.to_string()));
@@ -115,6 +145,10 @@ impl HttpRemoteTasks {
     ///
     /// Panics when the TLS backend fails to start.
     #[must_use]
+    #[expect(
+        clippy::expect_used,
+        reason = "the static client configuration is valid"
+    )]
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
@@ -125,6 +159,11 @@ impl HttpRemoteTasks {
     }
 
     /// A client that sends its requests with `client`.
+    ///
+    /// Set a timeout and turn off redirects on `client`. A redirect can send
+    /// custom headers and the arguments to another host. The client refuses
+    /// the response of a redirect to another origin, but the request has
+    /// gone out by then.
     #[must_use]
     pub fn with_client(client: reqwest::Client) -> Self {
         Self {
@@ -134,7 +173,7 @@ impl HttpRemoteTasks {
         }
     }
 
-    /// Add the server `name`.
+    /// Add the server `name`. It replaces a server with the same name.
     #[must_use]
     pub fn server(mut self, name: &str, server: RemoteServer) -> Self {
         self.servers.insert(name.to_string(), server);
@@ -146,16 +185,46 @@ impl HttpRemoteTasks {
         name: &str,
         protocol: RemoteProtocol,
     ) -> Result<&RemoteServer, RemoteTaskError> {
-        let server = self
-            .servers
-            .get(name)
-            .ok_or_else(|| RemoteTaskError::permanent(format!("unknown remote server '{name}'")))?;
+        let server = self.servers.get(name).ok_or_else(|| {
+            RemoteTaskError::non_retryable(format!("unknown remote server '{name}'"))
+        })?;
         if server.protocol != protocol {
-            return Err(RemoteTaskError::permanent(format!(
+            return Err(RemoteTaskError::non_retryable(format!(
                 "remote server '{name}' does not speak {protocol:?}"
             )));
         }
         Ok(server)
+    }
+
+    /// The headers of one request: the server headers, then `extra`.
+    fn headers(
+        server: &RemoteServer,
+        method: &str,
+        extra: &[(&'static str, String)],
+    ) -> Result<HeaderMap, RemoteTaskError> {
+        let invalid = |what: &str| {
+            RemoteTaskError::non_retryable(format!("{method}: an invalid header {what}"))
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT,
+            HeaderValue::from_static("application/json, text/event-stream"),
+        );
+        for (name, value) in &server.headers {
+            let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| invalid("name"))?;
+            let mut value = HeaderValue::from_str(value).map_err(|_| invalid("value"))?;
+            value.set_sensitive(true);
+            headers.append(name, value);
+        }
+        for (name, value) in extra {
+            let value = HeaderValue::from_str(value).map_err(|_| invalid("value"))?;
+            headers.insert(HeaderName::from_static(name), value);
+        }
+        Ok(headers)
     }
 
     /// Send one JSON-RPC request and return its `result`.
@@ -164,73 +233,108 @@ impl HttpRemoteTasks {
         server: &RemoteServer,
         method: &str,
         params: Value,
-        headers: &[(&str, String)],
+        extra: &[(&'static str, String)],
     ) -> Result<Value, RemoteTaskError> {
+        let endpoint = reqwest::Url::parse(&server.endpoint).map_err(|_| {
+            RemoteTaskError::non_retryable(format!("{method}: the server endpoint is not a URL"))
+        })?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        let mut request = self
-            .client
-            .post(&server.endpoint)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(
-                reqwest::header::ACCEPT,
-                "application/json, text/event-stream",
-            );
-        for (name, value) in &server.headers {
-            request = request.header(name.as_str(), value.as_str());
-        }
-        for (name, value) in headers {
-            request = request.header(*name, value.as_str());
-        }
         let bytes = serde_json::to_vec(&body)
-            .map_err(|e| RemoteTaskError::permanent(format!("encode {method}: {e}")))?;
-        let response = request.body(bytes).send().await.map_err(|e| {
-            if e.is_builder() {
-                RemoteTaskError::permanent(format!("{method}: invalid request: {e}"))
-            } else {
-                RemoteTaskError::retryable(format!("{method}: request failed: {e}"))
-            }
-        })?;
-        let status = response.status();
-        if !status.is_success() {
-            let message = format!("{method}: the remote server answered HTTP {status}");
-            return Err(
-                if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    RemoteTaskError::retryable(message)
+            .map_err(|e| RemoteTaskError::non_retryable(format!("encode {method}: {e}")))?;
+        let mut response = self
+            .client
+            .post(endpoint.clone())
+            .headers(Self::headers(server, method, extra)?)
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|e| {
+                let retryable = !e.is_builder();
+                let e = e.without_url();
+                if retryable {
+                    RemoteTaskError::retryable(format!("{method}: request failed: {e}"))
                 } else {
-                    RemoteTaskError::permanent(message)
-                },
-            );
+                    RemoteTaskError::non_retryable(format!("{method}: invalid request: {e}"))
+                }
+            })?;
+        if response.url().origin() != endpoint.origin() {
+            return Err(RemoteTaskError::non_retryable(format!(
+                "{method}: the response came from another origin"
+            )));
+        }
+        let status = response.status();
+        let too_large = || {
+            RemoteTaskError::non_retryable(format!(
+                "{method}: the response is over {MAX_RESPONSE_BYTES} bytes"
+            ))
+        };
+        if response
+            .content_length()
+            .is_some_and(|n| n > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(too_large());
+        }
+        let mut raw = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| {
+            RemoteTaskError::retryable(format!("{method}: read failed: {}", e.without_url()))
+        })? {
+            if raw.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                return Err(too_large());
+            }
+            raw.extend_from_slice(&chunk);
         }
         let event_stream = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.starts_with("text/event-stream"));
-        let text = response
-            .text()
-            .await
-            .map_err(|e| RemoteTaskError::retryable(format!("{method}: read failed: {e}")))?;
         let envelope = if event_stream {
-            sse_response(&text, id)
+            std::str::from_utf8(&raw)
+                .ok()
+                .and_then(|text| sse_response(text, id))
         } else {
-            serde_json::from_str(&text).ok()
-        }
-        .ok_or_else(|| RemoteTaskError::permanent(format!("{method}: no JSON-RPC response")))?;
-        if let Some(error) = envelope.get("error") {
+            serde_json::from_slice::<Value>(&raw).ok()
+        };
+        let rpc_error = envelope.as_ref().and_then(|e| e.get("error")).map(|error| {
             let message = error
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("no message");
-            return Err(RemoteTaskError::permanent(format!(
+            clip(message).to_string()
+        });
+        if !status.is_success() {
+            let detail = rpc_error.map_or_else(String::new, |m| format!(": {m}"));
+            let message = format!("{method}: the remote server answered HTTP {status}{detail}");
+            return Err(
+                if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    RemoteTaskError::retryable(message)
+                } else {
+                    RemoteTaskError::non_retryable(message)
+                },
+            );
+        }
+        if let Some(message) = rpc_error {
+            return Err(RemoteTaskError::non_retryable(format!(
                 "{method}: JSON-RPC error: {message}"
             )));
         }
         envelope
-            .get("result")
-            .cloned()
-            .ok_or_else(|| RemoteTaskError::permanent(format!("{method}: no result")))
+            .and_then(|mut e| e.get_mut("result").map(Value::take))
+            .ok_or_else(|| RemoteTaskError::non_retryable(format!("{method}: no JSON-RPC result")))
     }
+}
+
+/// `text`, cut to at most [`MAX_ERROR_TEXT`] bytes on a char boundary.
+fn clip(text: &str) -> &str {
+    if text.len() <= MAX_ERROR_TEXT {
+        return text;
+    }
+    let mut end = MAX_ERROR_TEXT;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// The JSON-RPC response with `id` in a `text/event-stream` body.
@@ -342,10 +446,32 @@ mod tests {
     }
 
     #[test]
-    fn debug_hides_header_values() {
-        let server = RemoteServer::mcp("https://x.example/mcp").bearer_token("secret");
+    fn debug_hides_header_values_and_endpoint_secrets() {
+        let server =
+            RemoteServer::mcp("https://user:pw@x.example/mcp?api_key=k1").bearer_token("secret");
         let shown = format!("{server:?}");
         assert!(shown.contains("authorization"));
-        assert!(!shown.contains("secret"));
+        assert!(shown.contains("x.example/mcp"));
+        for secret in ["secret", "pw", "user", "k1"] {
+            assert!(!shown.contains(secret), "{secret} in {shown}");
+        }
+    }
+
+    #[test]
+    fn a_protocol_header_replaces_a_server_header() {
+        let server = RemoteServer::mcp("https://x.example/mcp").header("mcp-method", "ping");
+        let headers =
+            HttpRemoteTasks::headers(&server, "tools/call", &mcp_headers("tools/call", "t"))
+                .expect("headers");
+        let methods: Vec<_> = headers.get_all("mcp-method").iter().collect();
+        assert_eq!(methods, vec!["tools/call"]);
+        assert!(headers.get("mcp-method").is_some_and(|v| !v.is_sensitive()));
+    }
+
+    #[test]
+    fn clip_cuts_on_a_char_boundary() {
+        let long = "é".repeat(MAX_ERROR_TEXT);
+        assert!(clip(&long).len() <= MAX_ERROR_TEXT);
+        assert_eq!(clip("short"), "short");
     }
 }

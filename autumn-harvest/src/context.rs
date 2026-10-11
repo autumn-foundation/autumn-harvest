@@ -12924,6 +12924,34 @@ impl WorkflowContext {
         }
     }
 
+    /// Call a task on a remote MCP or A2A server and wait for it to end
+    /// (issue #2006).
+    ///
+    /// The start activity records the remote task handle. An external
+    /// activity then journals the handle as a task token, and the workflow
+    /// suspends with no worker slot. A
+    /// [`RemoteTaskPoller`](crate::remote_task::RemoteTaskPoller) or a push
+    /// settles the token. Replay reads both steps from history.
+    ///
+    /// A tool result with `isError: true` returns `Ok` with
+    /// [`is_error`](crate::remote_task::RemoteTaskOutcome::is_error) set.
+    /// See `docs/remote-tasks.md`.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::ActivityFailed`] when the start fails, or when the
+    ///   remote server fails or cancels the task.
+    /// - [`HarvestError::Timeout`] when the task does not end within
+    ///   [`RemoteTaskCall::timeout`](crate::remote_task::RemoteTaskCall::timeout).
+    /// - [`HarvestError::NonDeterministic`] when history does not match.
+    /// - [`HarvestError::Serialization`] when a recorded value does not decode.
+    pub async fn call_remote_task(
+        &self,
+        call: &crate::remote_task::RemoteTaskCall,
+    ) -> HarvestResult<crate::remote_task::RemoteTaskOutcome> {
+        crate::remote_task::call(self, call).await
+    }
+
     // ── Continue-as-new ───────────────────────────────────────────────
 
     /// Atomically end the current execution and start a fresh one with the

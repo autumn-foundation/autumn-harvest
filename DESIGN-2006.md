@@ -65,21 +65,25 @@ token. Then it suspends until a poll or a push resolves the token.
 | R3 | A restart starts the remote task again. | The start result is in history. Replay returns it. The DB test counts one start. |
 | R4 | `isError: true` triggers a retry. | The token completes. The workflow gets `Ok` with `is_error: true`. Unit and DB tests pin it. |
 | R5 | Two pollers settle one token twice. | `complete_externally` locks the row. The second settle returns `false`. A DB test proves it. |
-| R6 | A transport error fails the token. | A `get` error leaves the token `PENDING`. The `schedule_to_close` deadline still ends it. |
-| R7 | The poller reads every pending row on each tick. | It reads one page by token order, with a cursor. It reads only rows named `harvest_remote_task_await`. |
-| R8 | The poller logs a task id or a result. | It logs counts and the token only. The task id can be a bearer handle. |
+| R6 | A transport error fails the token, or floods the log. | A `get` error leaves the token `PENDING`. The poller backs that token off, up to 5 minutes. The `schedule_to_close` deadline still ends it. |
+| R7 | The poller reads every pending row on each tick, or polls runs that have ended. | It reads one page by token order, with a cursor. It reads only rows named `harvest_remote_task_await` of `RUNNING`, `SUSPENDED` or `PAUSED` runs. |
+| R8 | The poller logs a token, a task id or a result. | It logs counts and the execution id only. The token is a capability, and the task id can be a bearer handle. |
 | R9 | A codec deployment cannot read the handle. | The poller decodes with the worker codecs. It skips a row that it cannot decode, and logs a warning. |
-| R10 | The remote result is too large for the event. | The external output follows the same cap and codec path as any `ActivityCompletedExternally`. |
+| R10 | The remote result is too large for the event. | The settle fails the token above `DEFAULT_MAX_ACTIVITY_RESULT_BYTES`, or the poller cap. It cuts a failure message to 4 KiB. The client reads at most 4 MiB of a response. |
 | R11 | A remote `input_required` blocks the run forever. | The token stays `PENDING`. The deadline ends it. The docs say that Harvest does not answer remote input. |
 | R12 | A JSON-RPC error on `tools/call` is retried forever. | A protocol error is non-retryable. A network error is retryable. The start activity retry policy bounds both. |
 | R13 | A replay under a new codec or binary sees a different handle. | Replay reads the recorded start output and the recorded external outcome. It never calls the transport. |
+| R14 | A secret in the endpoint query reaches history through an error message. | The client strips the URL from each reqwest error. `Debug` redacts the user info and the query. Header values are sensitive. |
+| R15 | One slow server stalls every other token and holds a database connection. | The poller reads the page, frees the connection, then sends 8 reads at a time, each with a 30 s limit. A failed settle of one token does not stop the page. |
+| R16 | A remote result settles a run that has ended. | `resolve` returns `false` for a run that is not live. The poller skips such a run. |
+| R17 | `harvest-verify` treats the call as pure. | The call is the context method `call_remote_task`, which the model classifies as a sink. The free function is crate-private. |
 
 ### 0.4 Six thinking hats
 
 | Hat | Notes |
 |-----|-------|
 | White | Tokens, the timeout scan and idempotent settlement are shipped. MCP Tasks and A2A both have a task id and a `tasks/get`. The core crate has no HTTP client. |
-| Red | One call, `remote_task::call`, feels right. Two activity names in history feel heavy, but they are honest. |
+| Red | One call, `ctx.call_remote_task`, feels right. Two activity names in history feel heavy, but they are honest. |
 | Black | The spec is a draft. A remote server can ignore the idempotency key. The poller is a new loop to run. A push needs a relay. A solo suspension cannot race a timer. |
 | Yellow | No migration, no new event, no new route. The wait holds no slot. Replay never calls out. The plugin gets a real MCP and A2A client. |
 | Green | Later: `tasks/cancel` on a Harvest cancel. A shard-aware poller in the worker loop. Remote `input_required` answered through a signal. A promise resolved from a remote task. |
@@ -89,7 +93,8 @@ token. Then it suspends until a poll or a push resolves the token.
 
 1. Module `autumn_harvest::remote_task`. `RemoteTaskCall` names the server,
    the protocol, the tool and the arguments, and sets `timeout`.
-2. `remote_task::call(ctx, &call)` runs two durable steps:
+2. `ctx.call_remote_task(&call)` runs two durable steps. It is a
+   `WorkflowContext` method, so `harvest-verify` classifies it as a sink:
    1. Activity `harvest_remote_task_start`. It returns a `Task` handle or a
       `Completed` result.
    2. On a handle, external activity `harvest_remote_task_await`. Its input
@@ -104,7 +109,7 @@ token. Then it suspends until a poll or a push resolves the token.
    | `cancelled` (MCP), `canceled` (A2A) | `fail_externally`, not retryable | `ActivityFailed` |
    | `working`, `input_required`, other | none | still waits |
 
-5. `RemoteTaskPoller::poll_once(conn)` settles one page.
+5. `RemoteTaskPoller::poll_once(pool)` settles one page.
    `RemoteTaskPoller::run(pool, cancel)` loops on an interval. Run one per
    shard pool.
 6. `remote_task::resolve(conn, token, state, codecs)` is the push form. It
@@ -148,4 +153,5 @@ suits a wait that races a timer. `docs/remote-tasks.md` states this choice.
 | `remote_task` unit tests: MCP and A2A parse, state map, `isError` | 1 | No DB |
 | `tests/integration/remote_task_tests.rs`: context replay, a start that completes at once, `isError` replay, a failed replay | 1 | No DB |
 | `tests/integration/remote_task_db_tests.rs`: restart survival, one start, `isError` completes, failure, double settle | 1, 2 | DB |
-| Plugin `remote_tasks` tests: JSON-RPC client against a stub server | 1 | No DB |
+| Plugin `remote_tasks_http_tests`: JSON-RPC client against a stub server | 1 | No DB |
+| Plugin `remote_tasks_integration`: a workflow calls a real Harvest MCP Tasks route over TCP | 1 | DB |
