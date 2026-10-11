@@ -1864,30 +1864,31 @@ async fn render_workflow_detail_page(
     let exec_id = parse_execution_id(id)?;
     let exec_uuid = exec_id.as_uuid();
     let mut conn = db_conn_for_execution(api_state, exec_id).await?;
+
+    // The newest event id (issue #1982). Only a live page needs it. It is read
+    // before the run row and the events. So an event that lands after this
+    // read is past the cursor, and the stream sends it. A failed read makes
+    // the page static. It does not fail the page.
+    let last_event_id: Option<i32> = if rendered_at_action_url {
+        None
+    } else {
+        harvest_events::table
+            .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
+            .select(diesel::dsl::max(harvest_events::event_id))
+            .first(&mut conn)
+            .await
+            .unwrap_or_else(|e| {
+                warn!(
+                    error = %e,
+                    "workflow detail: newest event id read failed; the page is not live"
+                );
+                None
+            })
+    };
+
     let execution = load_execution(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
-
-    // The newest event id (issue #1982). Only a live page needs it. It is read
-    // before the events, so the stream sends an event that lands later. A
-    // failed read makes the page static. It does not fail the page.
-    let last_event_id: Option<i32> =
-        if rendered_at_action_url || is_terminal_workflow_state(&execution.state) {
-            None
-        } else {
-            harvest_events::table
-                .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
-                .select(diesel::dsl::max(harvest_events::event_id))
-                .first(&mut conn)
-                .await
-                .unwrap_or_else(|e| {
-                    warn!(
-                        error = %e,
-                        "workflow detail: newest event id read failed; the page is not live"
-                    );
-                    None
-                })
-        };
 
     // Resolve event_page before any DB queries so we can use OFFSET/LIMIT directly.
     let page_size = DETAIL_EVENT_PAGE_SIZE;

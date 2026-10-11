@@ -310,7 +310,9 @@ When the stream is not available, the script fetches the page each 10 s. That
 occurs for a viewer without admin access, because both streams are
 admin-gated. It also occurs when no notification URL is set. While the stream
 is open, the script also fetches the page each 60 s. That covers a
-connection that stops with no error.
+connection that stops with no error. It also covers a change that appends no
+event. The list hears a triage update at once. An open detail page shows it at
+the next 60 s fetch, because the execution stream sends events only.
 
 The detail page of a run that ended has no live script. When a live run ends,
 the stream sends `stream-end`, the script fetches the page one last time, and
