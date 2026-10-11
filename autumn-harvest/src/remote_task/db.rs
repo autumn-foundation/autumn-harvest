@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use diesel::{ExpressionMethods, QueryDsl};
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection as _, AsyncPgConnection, RunQueryDsl};
 use futures::StreamExt as _;
 
 use super::{
@@ -228,45 +228,72 @@ async fn settle(
     codecs: &PayloadCodecs,
     max_result_bytes: u64,
 ) -> HarvestResult<bool> {
-    if !state.is_terminal() {
-        return Ok(false);
-    }
-    let task = crate::external_task::find_by_token(conn, token)
-        .await?
-        .ok_or_else(|| HarvestError::NotFound(format!("external task token {token}")))?;
-    if task.name != AWAIT_ACTIVITY {
-        return Err(HarvestError::Config(format!(
-            "external task {token} is not a remote task token"
-        )));
-    }
-    let run_state: Option<String> = harvest_workflow_executions::table
-        .find(task.workflow_exec_id)
-        .select(harvest_workflow_executions::state)
-        .first(conn)
-        .await
-        .optional_row()?;
-    if !run_state.is_some_and(|s| LIVE_STATES.contains(&s.as_str())) {
-        return Ok(false);
-    }
-    let message = match state {
+    let action = match state {
         RemoteTaskState::Working | RemoteTaskState::InputRequired => return Ok(false),
         RemoteTaskState::Completed(outcome) => {
             let output = serde_json::to_value(outcome)?;
             let size = serde_json::to_vec(&output).map_or(u64::MAX, |b| b.len() as u64);
-            if size <= max_result_bytes {
-                return crate::external_task::complete_externally_with_codecs(
-                    conn, token, output, codecs,
-                )
-                .await;
+            // A cap of 0 means no cap, as on the worker result paths.
+            if max_result_bytes > 0 && size > max_result_bytes {
+                Settle::Fail(format!(
+                    "remote task result is {size} bytes; the limit is {max_result_bytes}"
+                ))
+            } else {
+                Settle::Complete(output)
             }
-            format!("remote task result is {size} bytes; the limit is {max_result_bytes}")
         }
-        RemoteTaskState::Failed(message) => format!("remote task failed: {}", truncate(message)),
+        RemoteTaskState::Failed(message) => {
+            Settle::Fail(format!("remote task failed: {}", truncate(message)))
+        }
         RemoteTaskState::Cancelled(message) => {
-            format!("remote task cancelled: {}", truncate(message))
+            Settle::Fail(format!("remote task cancelled: {}", truncate(message)))
         }
     };
-    crate::external_task::fail_externally(conn, token, message, false).await
+    // One transaction holds the token row and the execution row, so a cancel
+    // cannot commit between the run check and the settle. The lock order is
+    // the token row, then the execution row, as in `docs/architecture.md`.
+    // The settle wakes the workflow, so the dispatch hint waits for this
+    // commit. The inner buffering scope passes its hints to this one.
+    crate::dispatch::buffered_settled(Box::pin(conn.transaction::<bool, HarvestError, _>(
+        async |conn| {
+            let task = crate::external_task::find_by_token_locked(conn, token)
+                .await?
+                .ok_or_else(|| HarvestError::NotFound(format!("external task token {token}")))?;
+            if task.name != AWAIT_ACTIVITY {
+                return Err(HarvestError::Config(format!(
+                    "external task {token} is not a remote task token"
+                )));
+            }
+            let run_state: Option<String> = harvest_workflow_executions::table
+                .find(task.workflow_exec_id)
+                .select(harvest_workflow_executions::state)
+                .for_update()
+                .first(conn)
+                .await
+                .optional_row()?;
+            if !run_state.is_some_and(|s| LIVE_STATES.contains(&s.as_str())) {
+                return Ok(false);
+            }
+            match action {
+                Settle::Complete(output) => {
+                    crate::external_task::complete_externally_with_codecs(
+                        conn, token, output, codecs,
+                    )
+                    .await
+                }
+                Settle::Fail(message) => {
+                    crate::external_task::fail_externally(conn, token, message, false).await
+                }
+            }
+        },
+    )))
+    .await
+}
+
+/// What a settle writes.
+enum Settle {
+    Complete(serde_json::Value),
+    Fail(String),
 }
 
 /// `message`, cut to at most [`MAX_MESSAGE_BYTES`] on a char boundary.
@@ -380,7 +407,7 @@ impl RemoteTaskPoller {
     }
 
     /// Fail a token whose remote result is over `bytes`. Set it to the
-    /// worker `max_activity_result_bytes`.
+    /// worker `max_activity_result_bytes`. A value of 0 means no cap.
     #[must_use]
     pub const fn with_max_result_bytes(mut self, bytes: u64) -> Self {
         self.max_result_bytes = bytes;

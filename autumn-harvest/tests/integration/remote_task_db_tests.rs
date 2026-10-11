@@ -649,3 +649,28 @@ async fn a_result_over_the_limit_fails_the_run() {
     assert!(error.contains("the limit is 1024"), "got {error}");
     p.stop().await;
 }
+
+/// A cap of 0 means no cap, as on the worker result paths.
+#[tokio::test]
+async fn a_zero_result_cap_means_no_cap() {
+    let db = setup().await;
+    let url = &db.url;
+    let server = Arc::new(FakeServer::default());
+    let p = Process::start(url, "remote-task-nocap", &server);
+
+    let exec_id = start_run(url, "report-9", json!({})).await;
+    wait_for_token(url, exec_id).await;
+    server.set(
+        "task-0",
+        RemoteTaskState::Completed(RemoteTaskOutcome {
+            result: json!({"content": [{"type": "text", "text": "x".repeat(4096)}]}),
+            is_error: false,
+        }),
+    );
+    let poller = RemoteTaskPoller::new(&RemoteTasks::new(FakeTransport(Arc::clone(&server))))
+        .with_max_result_bytes(0);
+    poll_until_settled(&p.pool, &poller).await;
+
+    wait_for_execution_state_with_timeout(url, exec_id, "COMPLETED", WAIT).await;
+    p.stop().await;
+}
