@@ -2303,9 +2303,7 @@ async fn change_stream_signals_a_search_attribute_update() {
         .await
         .expect("connect");
     let patch: std::collections::HashMap<String, Option<Value>> =
-        [("phase".to_string(), Some(json!("blocked")))]
-            .into_iter()
-            .collect();
+        std::iter::once(("phase".to_string(), Some(json!("blocked")))).collect();
     autumn_harvest::store::update_search_attrs(&mut conn, exec_id, &patch)
         .await
         .expect("update search attributes");
