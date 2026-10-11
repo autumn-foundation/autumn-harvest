@@ -1959,6 +1959,16 @@ pub(crate) struct SignalQuery {
     idempotency_key: Option<String>,
 }
 
+impl SignalQuery {
+    /// A query that carries `key`, for the MCP Tasks route (issue #2005).
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub(crate) fn with_key(key: impl Into<String>) -> Self {
+        Self {
+            idempotency_key: Some(key.into()),
+        }
+    }
+}
+
 /// Response for the standalone signal route.
 ///
 /// `signal_delivered` is `true` when a signal row was freshly queued and
@@ -2023,7 +2033,7 @@ struct ReplayDeadLetterResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct CancelWorkflowResponse {
+pub(crate) struct CancelWorkflowResponse {
     ok: bool,
     execution_id: String,
     state: String,
@@ -2736,8 +2746,18 @@ impl DagTriggerRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct CancelWorkflowRequest {
+pub(crate) struct CancelWorkflowRequest {
     reason: Option<String>,
+}
+
+impl CancelWorkflowRequest {
+    /// A cancel request with `reason`, for the MCP Tasks route (issue #2005).
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub(crate) fn with_reason(reason: impl Into<String>) -> Self {
+        Self {
+            reason: Some(reason.into()),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -23356,7 +23376,7 @@ async fn update_with_start_workflow(
     }
 }
 
-async fn cancel_workflow(
+pub(crate) async fn cancel_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,

@@ -245,6 +245,7 @@ linux        autumn-harvest         integration                      testing    
 linux        autumn-harvest         integration                      testing                    scheduler_carryover_tests
 linux        autumn-harvest         integration                      testing                    shard_rebalance_db_tests
 linux        autumn-harvest         integration                      testing                    transactional_activity_tests
+linux        autumn-harvest         integration                      testing                    upgrade_check_db_tests
 linux        autumn-harvest         integration                      testing                    worker_session_tests
 linux        autumn-harvest         integration                      wasm-activities            wasm_activities_tests
 linux        autumn-harvest-plugin  activity_info_api_integration    -                          -
@@ -286,6 +287,7 @@ linux        autumn-harvest-plugin  interface_schema_integration     -          
 linux        autumn-harvest-plugin  legal_hold_integration           -                          -
 linux        autumn-harvest-plugin  lineage_tree_integration         -                          -
 linux        autumn-harvest-plugin  load_shed_localpg                -                          -
+linux        autumn-harvest-plugin  mcp_tasks_integration            mcp,unified-dag-execution  -
 linux        autumn-harvest-plugin  mcp_tools_integration            mcp,unified-dag-execution  -
 linux        autumn-harvest-plugin  openapi_response_conformance     -                          -
 linux        autumn-harvest-plugin  outbox_integration               -                          -

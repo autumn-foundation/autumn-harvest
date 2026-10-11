@@ -166,7 +166,8 @@ For a support/on-call/status-dashboard principal that should **read but not
 mutate**, mount with `api_with_role_auth` instead of `api_with_auth` — a single
 call that adds a class-aware enforcement layer giving `403 Forbidden` on every
 mutating management route (and every mutating [MCP tool](./mcp-tools.md), when
-`mcp_tools()` is enabled) to any principal your middleware marks read-only,
+`mcp_tools()` is enabled, and the whole [MCP Tasks route](./mcp-tools.md#mcp-tasks-issue-2005)
+when `mcp_tasks()` is enabled) to any principal your middleware marks read-only,
 while leaving 100% of the read surface reachable. See **[the read-only operator
 role guide](./operator-role.md)** for the Session claim contract, the
 fail-closed guarantee, the MCP-tool coverage, and the `/ui` limitation.

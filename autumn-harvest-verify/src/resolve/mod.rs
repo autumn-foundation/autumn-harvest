@@ -302,6 +302,34 @@ impl Program {
         matches!(root, "std" | "core" | "alloc") || self.trusted_crates.contains(root)
     }
 
+    /// A trusted crate, or a primitive type, as the first segment of a path.
+    ///
+    /// A `const` such as `u64::MAX` comes from `core`, whatever the path
+    /// prints.
+    #[must_use]
+    pub fn is_trusted_root(&self, root: &str) -> bool {
+        self.is_trusted_crate(root)
+            || matches!(
+                root,
+                "u8" | "u16"
+                    | "u32"
+                    | "u64"
+                    | "u128"
+                    | "usize"
+                    | "i8"
+                    | "i16"
+                    | "i32"
+                    | "i64"
+                    | "i128"
+                    | "isize"
+                    | "f32"
+                    | "f64"
+                    | "bool"
+                    | "char"
+                    | "str"
+            )
+    }
+
     // ── indexing ────────────────────────────────────────────────────────────
 
     fn index_bodies(&mut self) {

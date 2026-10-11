@@ -29,8 +29,11 @@ use std::rc::Rc;
 
 use crate::mir::ast::{BasicBlock, Body, Local, Operand, Place, Projection, Statement, Terminator};
 use crate::model::callee::CalleePath;
-use crate::model::{CallClass, ForbiddenRule, Model, SanitizerRule, SinkRule, SourceRule};
+use crate::model::{
+    CallClass, CtxMethodRule, ForbiddenRule, Model, SanitizerRule, SinkRule, SourceRule,
+};
 use crate::resolve::{Ambiguity, Program, Resolution, Substitution};
+use crate::structure::{Recorder, SinkSite};
 use crate::util::{last_segment, peel_refs, strip_generics_everywhere};
 use crate::verdict::{Boundary, BoundaryKind, Finding, FindingKind, Hop, Site, TaintKind};
 
@@ -208,6 +211,17 @@ impl<'m> CallClasses<'m> {
         })
     }
 
+    /// A clean ctx method that can suspend the workflow without a command
+    /// (issue #1995): its row carries a `step`.
+    fn suspending_ctx_method(&self) -> Option<&'m CtxMethodRule> {
+        self.classes.iter().find_map(|c| match c {
+            CallClass::Sanctioned(rule) | CallClass::NonSink(rule) if rule.step.is_some() => {
+                Some(*rule)
+            }
+            _ => None,
+        })
+    }
+
     /// The `[[source]]` row, if the model attached one.
     fn source(&self) -> Option<&'m SourceRule> {
         self.classes.iter().find_map(|c| match c {
@@ -294,6 +308,8 @@ pub struct Analyzer<'a> {
     /// Report warnings: name collisions the analysis had to resolve
     /// conservatively. Deduplicated, because the fixpoint revisits a block.
     pub warnings: BTreeSet<String>,
+    /// The bodies, call edges and sink sites this walk visited (issue #1995).
+    pub recorder: Recorder,
 }
 
 impl<'a> Analyzer<'a> {
@@ -310,6 +326,7 @@ impl<'a> Analyzer<'a> {
             findings: Vec::new(),
             boundaries: Vec::new(),
             warnings: BTreeSet::new(),
+            recorder: Recorder::default(),
         }
     }
 
@@ -321,6 +338,7 @@ impl<'a> Analyzer<'a> {
         args: &[TaintSet],
         hops: &[Hop],
     ) -> BodyOutcome {
+        self.recorder.bodies.insert(path.to_string());
         let key = memo_key(path, subst, args);
         if let Some(cached) = self.memo.get(&key) {
             return cached.clone();
@@ -725,6 +743,7 @@ impl<'a> Analyzer<'a> {
 
         if let Some(rule) = site.sink() {
             let offset = usize::from(site.parsed.receiver.is_some());
+            self.record_step_site(frame, rule, offset);
             if emit {
                 let at = Self::site(frame.path, &frame.block.label, &site.printed);
                 self.record_sink(rule, offset, call.args, &arg_taints, &at);
@@ -750,6 +769,7 @@ impl<'a> Analyzer<'a> {
             return false;
         }
 
+        self.record_ctx_step(frame, site.suspending_ctx_method());
         if site.is_clean_ctx_call() {
             return false;
         }
@@ -793,6 +813,32 @@ impl<'a> Analyzer<'a> {
 
         // Nothing in the model decides this call: follow it.
         self.follow_call(frame, call, &site.printed, &arg_taints, state, report)
+    }
+
+    /// Keep a suspending ctx call for the structure manifest (issue #1995). It
+    /// has no step key.
+    fn record_ctx_step(&mut self, frame: Frame<'_>, rule: Option<&CtxMethodRule>) {
+        let Some(rule) = rule else {
+            return;
+        };
+        self.recorder.sinks.insert(SinkSite {
+            body: frame.path.to_string(),
+            block: frame.block.label.clone(),
+            sink: rule.path.clone(),
+            step: rule.step.clone(),
+            key_arg: None,
+        });
+    }
+
+    /// Keep a sink call site for the structure manifest (issue #1995).
+    fn record_step_site(&mut self, frame: Frame<'_>, rule: &SinkRule, offset: usize) {
+        self.recorder.sinks.insert(SinkSite {
+            body: frame.path.to_string(),
+            block: frame.block.label.clone(),
+            sink: rule.path.clone(),
+            step: rule.step.clone(),
+            key_arg: Some(rule.step_key_arg.saturating_add(offset)),
+        });
     }
 
     /// A `[[forbidden]]` effect is a finding on reachability alone, and it also
@@ -1015,6 +1061,8 @@ impl<'a> Analyzer<'a> {
         let mut inner_hops = frame.hops.to_vec();
         inner_hops.push(hop.clone());
         let seeded: Vec<TaintSet> = arg_taints.iter().map(|set| set.with_hop(&hop)).collect();
+        self.recorder
+            .edge(frame.path, &frame.block.label, target, printed);
         let outcome = self.analyze_body(target, subst, &seeded, &inner_hops);
         let mut changed = state.add(call.dest, &outcome.ret);
         changed |= Self::write_back_refs(
@@ -1395,6 +1443,8 @@ impl<'a> Analyzer<'a> {
                     .read_at(place, false, &frame.block.label, frame.graph)
                     .with_hop(&hop),
             ];
+            self.recorder
+                .drop_edge(frame.path, &frame.block.label, target);
             let outcome = self.analyze_body(target, &Substitution::new(), &seeded, &inner_hops);
             changed |= state.add(place, &outcome.ret);
             if let Some(written) = outcome.out.get(&0) {
@@ -1652,6 +1702,8 @@ impl<'a> Analyzer<'a> {
             while seeded.len() < callee_body.params.len() {
                 seeded.push(others.with_hop(&hop));
             }
+            self.recorder
+                .closure_edge(frame.path, &frame.block.label, target);
             let outcome = self.analyze_body(target, &Substitution::new(), &seeded, &inner_hops);
             out.absorb(&outcome.ret);
             // What the closure wrote through its environment is written back
