@@ -125,6 +125,9 @@ Four review agents read the first version. Each fix has a test.
     coroutine the closure builds is now read.
 19. A body with only a `saga-escape` node read as `no-saga`. An escape now
     counts as a saga use, so the verdict is `unknown`.
+20. A handler body, and the coroutine it returns, start an execution of
+    their own. Their error exit with a pending step is now a gap, as in
+    the root. A body with no flow graph is now refused.
 
 ---
 
@@ -172,8 +175,9 @@ completed and not been unwound.
 | tracked `saga-compensate` | Every edge clears the flag. |
 | any other node | The in-state. |
 
-In the workflow root, an exit with the outcome `err` or `unknown` and a set
-flag is a **gap**. In any other body, an exit with a set flag gives
+In the workflow root, a handler body, or the coroutine a handler body
+returns, an exit with the outcome `err` or `unknown` and a set flag is a
+**gap**. In any other body, an exit with a set flag gives
 `saga-dropped-pending`. A `saga-new` with a set flag gives
 `saga-recreated`.
 

@@ -467,3 +467,29 @@ pub async fn wf_saga_in_block(ctx: &WorkflowContext) -> Out {
     let k = keep.await;
     Ok(a + k)
 }
+
+/// A context that outlives the workflow, for a `'static` handler future.
+static HANDLER_CTX: WorkflowContext = WorkflowContext;
+
+pub fn __autumn_workflow_info_wf_handler_gap() -> u8 {
+    0
+}
+
+/// An update handler owns a saga. A late error skips the unwind.
+pub async fn wf_handler_gap(ctx: &WorkflowContext) -> Out {
+    ctx.register_update_handler(
+        "book",
+        |_: &u64| Ok(()),
+        |v: u64| async move {
+            let mut saga = Saga::new(&HANDLER_CTX);
+            let a = saga
+                .step(
+                    move || async move { HANDLER_CTX.execute_activity_raw("reserve", v).await },
+                    |a| async move { HANDLER_CTX.execute_activity_raw("release", a).await.map(|_| ()) },
+                )
+                .await?;
+            Err(format!("late {a}"))
+        },
+    );
+    ctx.receive_signal("go").await
+}

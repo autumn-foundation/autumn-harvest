@@ -294,7 +294,7 @@ events when a path joins them with no other event on it.
 a labeled edge. `--check-structure` refuses a graph that breaks this, names
 a missing node, has other than one `entry`, or has a node that the `entry`
 cannot reach, an `exit` with an out-edge, or a `step` past the body
-`steps` list. It also refuses a `call`, a
+`steps` list. It refuses a body with no flow graph. It also refuses a `call`, a
 `saga-step`, a handler or a body `calls` entry that names a body or handler
 the workflow does not hold.
 
@@ -342,7 +342,7 @@ checked 2: covered 1, gap 1, unknown 0, no-saga 0
 | `saga-result-untracked` | The result of a step does not reach `?` through `.await` alone, as with `map_err` or `match`. |
 | `multiple-sagas` | One body builds two sagas. |
 | `saga-recreated` | A new saga starts while a step of the old one is pending. |
-| `saga-dropped-pending` | A body other than the workflow root exits with a step pending. Its caller cannot unwind that step. |
+| `saga-dropped-pending` | A body that starts no execution exits with a step pending. Its caller cannot unwind that step. The workflow root, each handler body and the coroutine a handler body returns start an execution: their error exit with a step pending is a gap. |
 | `no-flow-graph` | A body in the manifest has no flow graph. |
 | `boundary` | The workflow has a boundary that runs code. It can hide a saga and a gap, with or without a saga in sight. An `external-const` runs no code, so it does not count. |
 

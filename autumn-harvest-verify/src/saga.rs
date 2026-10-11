@@ -115,11 +115,17 @@ pub fn check(manifest: &StructureManifest) -> Result<Vec<SagaReport>, CheckError
                 workflow.workflow, workflow.root
             )));
         }
+        // The manifest names a flow format, so each body must carry a graph.
+        // A body without one checked no code.
         for body in &workflow.bodies {
-            if let Some(graph) = &body.flow {
-                validate(graph, body.steps.len())
-                    .map_err(|e| CheckError(format!("{}: {e}", body.id)))?;
-            }
+            let Some(graph) = &body.flow else {
+                return Err(CheckError(format!(
+                    "{}: the body has no flow graph",
+                    body.id
+                )));
+            };
+            validate(graph, body.steps.len())
+                .map_err(|e| CheckError(format!("{}: {e}", body.id)))?;
         }
         if let Some(problem) = dangling_reference(workflow) {
             return Err(CheckError(format!("{}: {problem}", workflow.workflow)));
@@ -162,6 +168,28 @@ fn dangling_reference(workflow: &WorkflowStructure) -> Option<String> {
         .map(String::as_str)
         .find(|id| !ids.contains(id))
         .map(|missing| format!("a node or handler names `{missing}`, which has no body"))
+}
+
+/// The bodies that start an execution: the workflow root, each handler
+/// body, and the coroutine a handler body returns. Their error exit ends
+/// that execution, so a pending step there is a gap.
+///
+/// The returned coroutine is a body nested under the handler that the
+/// handler calls. Its id starts with the handler id.
+fn entry_bodies(workflow: &WorkflowStructure) -> BTreeSet<&str> {
+    let mut entries: BTreeSet<&str> = BTreeSet::from([workflow.root.as_str()]);
+    for handler in workflow.handlers.iter().flat_map(|h| &h.bodies) {
+        entries.insert(handler.as_str());
+        let nested = format!("{handler}::");
+        let returned = workflow
+            .bodies
+            .iter()
+            .filter(|b| b.id == *handler)
+            .flat_map(|b| &b.calls)
+            .filter(|call| call.callee.starts_with(&nested));
+        entries.extend(returned.map(|call| call.callee.as_str()));
+    }
+    entries
 }
 
 /// Refuse a graph the fixpoint would read wrong. A dropped edge or a
@@ -286,6 +314,7 @@ pub fn check_workflow(workflow: &WorkflowStructure) -> SagaReport {
     let mut unknown: BTreeSet<String> = BTreeSet::new();
     let mut notes: BTreeSet<String> = BTreeSet::new();
     let mut uses_saga = false;
+    let entries = entry_bodies(workflow);
 
     for body in &workflow.bodies {
         let Some(graph) = &body.flow else {
@@ -334,7 +363,7 @@ pub fn check_workflow(workflow: &WorkflowStructure) -> SagaReport {
                 _ => {}
             }
         }
-        let (found, reasons) = body_gaps(body, graph, body.id == workflow.root);
+        let (found, reasons) = body_gaps(body, graph, entries.contains(body.id.as_str()));
         gaps.extend(found);
         unknown.extend(reasons);
     }
@@ -699,6 +728,21 @@ mod tests {
         let err = check(&body_call).expect_err("a body call to a missing body");
         assert!(err.to_string().contains("w::hidden"), "{err}");
 
+        // A body with no graph checked no code.
+        let mut graphless = manifest(FlowGraph {
+            nodes: vec![node(FlowEvent::Entry)],
+            edges: Vec::new(),
+        });
+        if let Some(body) = graphless
+            .workflows
+            .first_mut()
+            .and_then(|w| w.bodies.first_mut())
+        {
+            body.flow = None;
+        }
+        let err = check(&graphless).expect_err("a body with no flow graph");
+        assert!(err.to_string().contains("no flow graph"), "{err}");
+
         // A handler node names an entry of `handlers` that is not there.
         let dangling = FlowGraph {
             nodes: vec![
@@ -792,6 +836,72 @@ mod tests {
             check_workflow(&workflow(graph)).verdict,
             SagaVerdict::Covered
         );
+    }
+
+    #[test]
+    fn an_err_exit_of_a_handler_with_a_pending_step_is_a_gap() {
+        // The root registers an update handler. Its closure returns a
+        // coroutine that owns a saga, completes a step, then fails.
+        let root = FlowGraph {
+            nodes: vec![
+                node(FlowEvent::Entry),
+                node(FlowEvent::Handler { handler: 0 }),
+                node(FlowEvent::Exit {
+                    outcome: ExitOutcome::Ok,
+                }),
+            ],
+            edges: vec![edge(0, 1, None), edge(1, 2, None)],
+        };
+        let closure = FlowGraph {
+            nodes: vec![node(FlowEvent::Entry)],
+            edges: Vec::new(),
+        };
+        let coroutine = FlowGraph {
+            nodes: vec![
+                node(FlowEvent::Entry),
+                node(FlowEvent::SagaNew),
+                node(step()),
+                node(FlowEvent::Exit {
+                    outcome: ExitOutcome::Err,
+                }),
+                node(FlowEvent::Exit {
+                    outcome: ExitOutcome::Err,
+                }),
+            ],
+            edges: vec![
+                edge(0, 1, None),
+                edge(1, 2, None),
+                edge(2, 3, Some(EdgeLabel::Ok)),
+                edge(2, 4, Some(EdgeLabel::Err)),
+            ],
+        };
+        let mut w = workflow(root);
+        let handler = "w::wf::{closure#0}::{closure#0}";
+        let future = "w::wf::{closure#0}::{closure#0}::{closure#0}";
+        w.handlers.push(HandlerSite {
+            kind: "update".to_string(),
+            method: "register_update_handler".to_string(),
+            name: None,
+            bodies: vec![handler.to_string()],
+        });
+        w.bodies.push(BodyNode {
+            id: handler.to_string(),
+            calls: vec![CallSite {
+                callee: future.to_string(),
+                in_loop: false,
+                resume: false,
+            }],
+            flow: Some(closure),
+            ..BodyNode::default()
+        });
+        w.bodies.push(BodyNode {
+            id: future.to_string(),
+            flow: Some(coroutine),
+            ..BodyNode::default()
+        });
+        let r = check_workflow(&w);
+        assert_eq!(r.verdict, SagaVerdict::Gap, "{r:#?}");
+        assert!(r.gaps.iter().any(|g| g.body == future), "{r:#?}");
     }
 
     #[test]

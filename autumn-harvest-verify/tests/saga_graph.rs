@@ -526,6 +526,7 @@ fn every_fixture_workflow_gets_its_expected_verdict() {
         ("wf_gap_explicit", Gap),
         ("wf_gap_helper", Gap),
         ("wf_gap_tail", Gap),
+        ("wf_handler_gap", Gap),
         ("wf_handlers", NoSaga),
         ("wf_helper_owns", Unknown),
         ("wf_loop", Covered),

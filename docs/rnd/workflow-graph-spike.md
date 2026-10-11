@@ -122,7 +122,7 @@ that runs code gives `unknown` beside a visible saga too. An
   which is why it is a note.
 
 The fixture `autumn-harvest-verify/tests/fixtures/saga_graph/` pins each
-case: 24 workflows, with 7 `covered`, 5 `gap`, 9 `unknown` and 3 `no-saga`.
+case: 25 workflows, with 7 `covered`, 6 `gap`, 9 `unknown` and 3 `no-saga`.
 
 ## 5. Where the analysis hits `unknown`, and why
 
@@ -200,6 +200,9 @@ each fix has a test:
 - A boundary counted only when no saga was in sight. A body outside the
   analysis can hold a second saga with a gap. Each boundary that runs code
   now gives `unknown`.
+- A handler that owns a saga and fails after a step read as `unknown`.
+  Each handler body, and the coroutine it returns, is now an entry like
+  the root, so that failure is a gap.
 - The check accepted a call to a body that the manifest omits. It now
   refuses such a manifest, a handler index past the list, and an edge out
   of an exit.
