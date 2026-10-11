@@ -15786,6 +15786,26 @@ fn wf_step_generic_future::{closure#0}::{closure#0}::{closure#0}(_1: Pin<&mut {a
     }
 }
 
+fn other_steps::make_step(_1: OtherFuture) -> {closure@flow.rs:799:9: 799:16} {
+    debug future => _1;
+    let mut _0: {closure@flow.rs:799:9: 799:16};
+
+    bb0: {
+        _0 = {closure@flow.rs:799:9: 799:16} { future: move _1 };
+        return;
+    }
+}
+
+fn other_steps::make_step::{closure#0}(_1: {closure@flow.rs:799:9: 799:16}) -> OtherFuture {
+    debug future => (_1.0: OtherFuture);
+    let mut _0: OtherFuture;
+
+    bb0: {
+        _0 = move (_1.0: OtherFuture);
+        return;
+    }
+}
+
 fn wf_step_inner_async_closure::{closure#0}::{closure#0}::{closure#0}::{synthetic#0}(_1: Pin<&mut {async closure body@flow.rs:701:43: 701:80}>, _2: &mut Context<'_>) -> Poll<()> {
     coroutine layout {
         variant_fields = {

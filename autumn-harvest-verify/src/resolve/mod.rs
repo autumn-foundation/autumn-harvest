@@ -889,8 +889,26 @@ impl Program {
 
     /// True when `name`, used as a type inside `body_path`, is a type parameter.
     #[must_use]
+    ///
+    /// The source index keys generics by bare function name. So a name that
+    /// any function of that name declares counts, in this body and in each
+    /// function around it.
     pub fn is_generic_param(&self, body_path: &str, name: &str) -> bool {
-        self.generic_params(body_path).iter().any(|p| p == name) || looks_like_type_param(name)
+        if self.generic_params(body_path).iter().any(|p| p == name) || looks_like_type_param(name) {
+            return true;
+        }
+        let mut path = body_path;
+        loop {
+            let (parent, last) = split_last(path).unwrap_or(("", path));
+            let declared = self.sources.fn_generic_names.get(last);
+            if declared.is_some_and(|names| names.contains(name)) {
+                return true;
+            }
+            if parent.is_empty() || !last.starts_with('{') {
+                return false;
+            }
+            path = parent;
+        }
     }
 
     /// Resolve a printed callee path as seen from `caller_body`.

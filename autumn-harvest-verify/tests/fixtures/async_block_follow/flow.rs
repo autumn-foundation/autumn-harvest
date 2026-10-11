@@ -786,3 +786,16 @@ pub async fn wf_step_generic_future(ctx: &WorkflowContext) -> Out {
     let a = saga.step(make_step(ClockFuture), |_| async { Ok(()) }).await?;
     ctx.execute_activity_raw("b", a).await
 }
+
+/// A second `make_step`, with another parameter name. Its generics must not
+/// hide the generics of the first.
+pub mod other_steps {
+    use super::Out;
+    use std::future::Future;
+
+    pub fn make_step<OtherFuture: Future<Output = Out>>(
+        future: OtherFuture,
+    ) -> impl FnOnce() -> OtherFuture {
+        move || future
+    }
+}

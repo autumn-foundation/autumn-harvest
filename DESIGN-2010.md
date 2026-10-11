@@ -196,7 +196,10 @@ Four review agents read the first version. Each fix has a test.
     one. A dropped future does not unwind, so it is still a gap.
 34. A closure sees the generics of each function around it. So a step
     closure that returns `StepFuture` of its enclosing function is an
-    `unresolved-generic` boundary, not a value that is not a future.
+    `unresolved-generic` boundary, not a value that is not a future. The
+    index keys generics by bare function name. A name that any function of
+    that name declares counts as generic, so a same-named function cannot
+    hide one.
 
 ---
 
@@ -283,6 +286,12 @@ A `noop-compensation` note does not change the verdict.
   `Mutex::lock`. This gap predates #2010. A followed `async` block that
   captures such a value, owned or shared, adds a boundary. So does a local
   wrapper of one, as `struct Shared(Arc<Mutex<u64>>)`.
+- The source index sees only the type definitions written in the
+  sources. A local type that a dependency macro makes without naming it,
+  or that `include!` adds, has unknown fields. A capture of it adds no
+  boundary when the block writes through its methods. A field read shows
+  its type, so that still adds one. A fix must tell such a type from a
+  std type that MIR prints bare, as `Arc`.
 - MIR prints a type by its path alone, with no crate. A local
   `helpers::Clock` and a `Clock` from a dependency crate named `helpers`
   print the same. The analysis then reads the dependency type as local. A

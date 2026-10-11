@@ -149,6 +149,10 @@ pub struct SourceIndex {
     pub foreign_fns: BTreeSet<String>,
     /// Function name → generic parameter names, in declaration order.
     pub fn_generics: BTreeMap<String, Vec<String>>,
+    /// Function name → each generic parameter name of every function of
+    /// that name. Two functions of one name keep both sets, so a parameter
+    /// is never hidden.
+    pub fn_generic_names: BTreeMap<String, BTreeSet<String>>,
     /// The structs, enums, unions and type aliases the sources declare, each
     /// by its module path and name, such as `helpers::Clock`.
     ///
@@ -416,6 +420,16 @@ impl SourceIndex {
         facts.names.extend(scan.0.names);
     }
 
+    /// Add the generic parameter names of the function `name`.
+    fn record_generics(&mut self, name: &syn::Ident, generics: &[String]) {
+        if !generics.is_empty() {
+            self.fn_generic_names
+                .entry(name.to_string())
+                .or_default()
+                .extend(generics.iter().cloned());
+        }
+    }
+
     /// Record the type `name`, declared in `module`.
     fn declare(&mut self, module: &[String], name: &syn::Ident) {
         let mut path = module.to_vec();
@@ -443,6 +457,7 @@ impl SourceIndex {
             match item {
                 syn::Item::Fn(item) => {
                     let generics = generic_names(&item.sig.generics);
+                    self.record_generics(&item.sig.ident, &generics);
                     if !generics.is_empty() {
                         self.fn_generics
                             .insert(item.sig.ident.to_string(), generics);
@@ -490,6 +505,7 @@ impl SourceIndex {
                         if let syn::ImplItem::Fn(f) = member {
                             let mut generics = generic_names(&item.generics);
                             generics.extend(generic_names(&f.sig.generics));
+                            self.record_generics(&f.sig.ident, &generics);
                             if !generics.is_empty() {
                                 self.fn_generics
                                     .entry(f.sig.ident.to_string())
