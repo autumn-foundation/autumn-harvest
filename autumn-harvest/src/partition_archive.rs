@@ -613,7 +613,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&tmp, path)?;
+        rename_durable(&tmp, path)?;
         sync_dir(dir)?;
         for new_dir in &created {
             if let Some(parent) = new_dir.parent() {
@@ -637,8 +637,44 @@ fn dir_or_cwd(dir: &Path) -> &Path {
     }
 }
 
-/// Sync a directory, so a rename in it survives a crash. A no-op off Unix,
-/// where a directory cannot be opened for a sync.
+/// Rename `from` to `to`. On Windows, the call returns only when the move is
+/// on disk, because a directory there cannot be opened for a sync.
+fn rename_durable(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+        }
+        let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain([0]).collect() };
+        let (from, to) = (wide(from), wide(to));
+        // SAFETY: each pointer names a NUL-terminated UTF-16 buffer that lives
+        // until the call returns. The call keeps no pointer.
+        let moved = unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    std::fs::rename(from, to)
+}
+
+/// Sync a directory, so a rename in it survives a crash. A no-op off Unix.
+/// On Windows, [`rename_durable`] writes the move through instead.
+#[cfg_attr(
+    not(unix),
+    allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)
+)]
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     std::fs::File::open(dir)?.sync_all()?;
@@ -801,6 +837,54 @@ async fn read_page(
     rows.map_err(crate::error::database_error)
 }
 
+/// Run `body` with each `(name, value)` set for the transaction, then put
+/// back the prior values.
+///
+/// Inside a caller's transaction, Diesel runs a transaction as a savepoint.
+/// `RELEASE SAVEPOINT` keeps a `SET LOCAL`, so a success restores each value.
+/// An error aborts the transaction, and its rollback restores them.
+#[cfg(feature = "db")]
+pub(crate) async fn with_local_settings<T>(
+    conn: &mut diesel_async::AsyncPgConnection,
+    settings: &[(&str, &str)],
+    body: impl AsyncFnOnce(&mut diesel_async::AsyncPgConnection) -> crate::error::HarvestResult<T>,
+) -> crate::error::HarvestResult<T> {
+    use diesel::sql_types::Text;
+    use diesel_async::RunQueryDsl as _;
+    let mut prior = Vec::with_capacity(settings.len());
+    for (name, value) in settings {
+        let row = diesel::sql_query("SELECT current_setting($1) AS v")
+            .bind::<Text, _>(*name)
+            .get_result::<SettingRow>(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        prior.push((*name, row.v));
+        diesel::sql_query("SELECT set_config($1, $2, true)")
+            .bind::<Text, _>(*name)
+            .bind::<Text, _>(*value)
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
+    let value = body(conn).await?;
+    for (name, old) in prior.iter().rev() {
+        diesel::sql_query("SELECT set_config($1, $2, true)")
+            .bind::<Text, _>(*name)
+            .bind::<Text, _>(old)
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
+    Ok(value)
+}
+
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct SettingRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    v: String,
+}
+
 #[cfg(feature = "db")]
 #[derive(diesel::QueryableByName)]
 struct ChecksumRow {
@@ -814,7 +898,8 @@ struct ChecksumRow {
 ///
 /// The drop calls this under the `SHARE` lock, so no row can change during
 /// the scan. It is one statement, so the caller's `statement_timeout` bounds
-/// the whole scan. No row leaves the server.
+/// the whole scan. No row leaves the server. Call it with `TimeZone` set to
+/// UTC, as the export reads rows.
 ///
 /// # Errors
 ///
@@ -826,7 +911,6 @@ pub(crate) async fn locked_checksum(
     name: &str,
 ) -> crate::error::HarvestResult<(u64, String)> {
     use diesel_async::RunQueryDsl as _;
-    crate::partition::exec(conn, "SET LOCAL TimeZone = 'UTC'").await?;
     let sql = format!(
         "SELECT count(*)::bigint AS n,
                 COALESCE(sum(('x' || encode(substring(
@@ -1181,8 +1265,10 @@ pub(crate) async fn export_partition(
     loop {
         let page = Box::pin(
             conn.transaction::<_, crate::error::HarvestError, _>(async |c| {
-                crate::partition::exec(c, "SET LOCAL TimeZone = 'UTC'").await?;
-                read_page(c, &table, &after).await
+                with_local_settings(c, &[("TimeZone", "UTC")], async |c| {
+                    read_page(c, &table, &after).await
+                })
+                .await
             }),
         )
         .await

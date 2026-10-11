@@ -4889,19 +4889,19 @@ async fn drop_partition(
             // what the drop removes. The check is one statement, bounded like
             // the exact scan, so `SHARE` is held no longer than tier 3 holds it.
             if let Some(manifest) = manifest {
-                exec(
+                let bound = format!("{scan_ms}ms");
+                let (rows, checksum) = crate::partition_archive::with_local_settings(
                     conn,
-                    &format!("SET LOCAL statement_timeout = '{scan_ms}ms'"),
+                    &[("statement_timeout", &bound), ("TimeZone", "UTC")],
+                    async |conn| crate::partition_archive::locked_checksum(conn, &name).await,
                 )
-                .await?;
-                let (rows, checksum) = crate::partition_archive::locked_checksum(conn, &name)
-                    .await
-                    .map_err(|e| match e {
-                        HarvestError::Database(msg) if is_statement_timeout(&msg) => {
-                            HarvestError::Database(format!("{EXPORT_CHECK_TIMEOUT_TAG}: {msg}"))
-                        }
-                        other => other,
-                    })?;
+                .await
+                .map_err(|e| match e {
+                    HarvestError::Database(msg) if is_statement_timeout(&msg) => {
+                        HarvestError::Database(format!("{EXPORT_CHECK_TIMEOUT_TAG}: {msg}"))
+                    }
+                    other => other,
+                })?;
                 if rows != manifest.row_count || checksum != manifest.row_checksum {
                     return Ok(DropOutcome::Changed);
                 }

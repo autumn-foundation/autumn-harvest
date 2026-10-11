@@ -58,7 +58,10 @@ events.
   it exports or the shard holds the marker.
 - **Durability.** `DirectoryPartitionArchiver` syncs the file, its
   directory, and the parent of each directory it creates before `put`
-  returns.
+  returns. On Windows, a directory cannot be synced, so the rename uses
+  `MOVEFILE_WRITE_THROUGH`.
+- **Caller settings.** In a caller's transaction, the export restores
+  `TimeZone` and `statement_timeout` after it sets them.
 
 **Delta encoding: measured, declined.** On a 40-turn agent loop
 (`autumn-harvest-agent/tests/history_delta_measure.rs`), a delta on the
@@ -89,12 +92,12 @@ and reports no wait when it moved.
 
 **Tests.**
 
-- `partition_archive_tests`, 17 DB tests: export, verify, drop and read
+- `partition_archive_tests`, 18 DB tests: export, verify, drop and read
   back; the legacy partition; the retention runtime; a failed upload; a
   lost object; changed bytes; a slow backend; a row
   changed or deleted after the export; a live owner; no straggler deletes;
   the marker and the status report; the lock in both modes; reuse; the
-  export budget.
+  export budget; the settings of a caller transaction.
 - 17 unit tests in `partition_archive::tests`.
 - The builder test
   `a_partition_archiver_with_straggler_deletes_fails_the_build`.

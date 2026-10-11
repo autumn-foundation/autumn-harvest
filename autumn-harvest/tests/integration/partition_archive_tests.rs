@@ -984,3 +984,44 @@ async fn the_retention_runtime_exports_before_it_drops() {
         assert_eq!(as_json(&history), as_json(&sample_events()));
     }
 }
+
+/// Inside a caller's transaction, the sweep runs its transactions as
+/// savepoints. `RELEASE SAVEPOINT` keeps a `SET LOCAL`, so the export must
+/// restore `TimeZone` and `statement_timeout` for the caller.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_export_inside_a_caller_transaction_keeps_its_settings() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_partitioned(&mut conn).await;
+    let aged = seed_aged_partition(&mut conn, 2).await;
+    let backend = Arc::new(TestArchiver::default());
+
+    let (outcome, zone, timeout) =
+        Box::pin(conn.transaction::<_, diesel::result::Error, _>(async |c| {
+            c.batch_execute(
+                "SET LOCAL TimeZone = 'Pacific/Auckland'; \
+                 SET LOCAL statement_timeout = '123456ms'",
+            )
+            .await?;
+            let outcome = sweep_with(c, backend.clone()).await;
+            let setting = async |c: &mut AsyncPgConnection, name: &str| {
+                diesel::sql_query("SELECT current_setting($1) AS v")
+                    .bind::<Text, _>(name)
+                    .get_result::<TextRow>(c)
+                    .await
+                    .map(|r| r.v)
+            };
+            let zone = setting(c, "TimeZone").await?;
+            let timeout = setting(c, "statement_timeout").await?;
+            Ok((outcome, zone, timeout))
+        }))
+        .await
+        .expect("caller transaction");
+
+    assert_eq!(outcome.dropped, vec![aged.name.clone()], "{outcome:?}");
+    assert_eq!(zone, "Pacific/Auckland", "the caller keeps its TimeZone");
+    assert_eq!(
+        timeout, "123456ms",
+        "the caller keeps its statement_timeout"
+    );
+}
