@@ -427,6 +427,8 @@ pub mod quota_reconcile;
 /// Automatic resume of a shard rebalance stalled after its cutover (issue
 /// #1839).
 pub mod rebalance_resume;
+/// Durable outbound calls to a remote MCP or A2A task (issue #2006).
+pub mod remote_task;
 pub mod replay;
 /// Stratified in-flight history sampling for the replay-drift gate (issue #798).
 ///

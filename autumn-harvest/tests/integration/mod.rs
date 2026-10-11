@@ -254,6 +254,10 @@ mod rate_limit_bucket_gc_tests;
 mod rate_limit_key_tests;
 mod redrive_tests;
 #[cfg(all(feature = "testing", feature = "db"))]
+mod remote_task_db_tests;
+#[cfg(feature = "testing")]
+mod remote_task_tests;
+#[cfg(all(feature = "testing", feature = "db"))]
 mod replay_canary_tests;
 #[cfg(feature = "testing")]
 mod replay_drift_tests;

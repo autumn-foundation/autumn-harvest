@@ -94,6 +94,9 @@ sink:await_external_workflow@WorkflowContext
 sink:await_external_workflow_value@WorkflowContext
 sink:await_fire@TimerHandle
 sink:business_days_from_now@WorkflowContext
+# Issue #2006: no corpus crate calls this new method yet. It needs a live
+# remote MCP or A2A server, so the corpus examples do not use it.
+sink:call_remote_task@WorkflowContext
 sink:cancel@TimerHandle
 sink:cancel_timer@WorkflowContext
 sink:complete@Session

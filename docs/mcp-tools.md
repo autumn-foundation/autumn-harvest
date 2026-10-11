@@ -385,6 +385,12 @@ the `signal_{wf}` tool. The id is unguessable, but the management API shows
 it. Two callers with mutate rights on one run can also block each other's
 answers, for example with a signal that claims the next input key.
 
+## Calling a remote MCP task (issue #2006)
+
+The sections above serve Harvest workflows to MCP clients. The other
+direction, a workflow that calls a task on a remote MCP or A2A server, is
+in [Remote MCP and A2A tasks](remote-tasks.md).
+
 ## Testing
 
 - No-DB JSON-RPC surface tests: `autumn-harvest-plugin/tests/mcp_tools_http_tests.rs`.
