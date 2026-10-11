@@ -146,3 +146,36 @@ pub async fn wf_step_write_tuple(ctx: &WorkflowContext) -> Out {
     }
     ctx.execute_activity_raw("b", seen).await
 }
+
+/// A named type that hides a `&mut`.
+pub struct Refs<'a> {
+    seen: &'a mut u64,
+}
+
+fn record(refs: Refs<'_>) {
+    *refs.seen = now_nanos();
+}
+
+pub fn __autumn_workflow_info_wf_step_write_struct() -> u8 {
+    0
+}
+
+/// The same write, through a `&mut` inside a named struct.
+pub async fn wf_step_write_struct(ctx: &WorkflowContext) -> Out {
+    let mut seen = 0_u64;
+    {
+        let mut saga = Saga::new(ctx);
+        saga.step(
+            || {
+                let refs = Refs { seen: &mut seen };
+                async move {
+                    record(refs);
+                    ctx.execute_activity_raw("a", 1).await
+                }
+            },
+            |_| async { Ok(()) },
+        )
+        .await?;
+    }
+    ctx.execute_activity_raw("b", seen).await
+}

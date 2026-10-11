@@ -2724,9 +2724,13 @@ fn first_sentence(reason: &str) -> &str {
     )
 }
 
-/// The value `body` returns reads a local whose type holds a `&mut`, such as
-/// an `async` block that captures `&mut seen` or `(&mut seen,)`. A `&mut`
-/// inside a struct type of its own is not visible in the type text.
+/// The value `body` returns reads a local that can write through a
+/// reference, such as an `async` block that captures `&mut seen`.
+///
+/// A capture can write back only through a reference. A `&mut` can hide in a
+/// named type, as in `Refs<'_>`, so any capture type that holds a lifetime
+/// counts. A shared `&T` does not, because no write goes through it to a
+/// `&mut` inside. An owned type with no lifetime holds no reference.
 fn captures_mut_ref(body: &Body) -> bool {
     body.blocks
         .iter()
@@ -2742,7 +2746,18 @@ fn captures_mut_ref(body: &Body) -> bool {
         .flat_map(|rvalue| &rvalue.reads)
         .filter_map(operand_place)
         .filter_map(|place| body.locals.get(&place.local))
-        .any(|ty| ty.contains("&mut"))
+        .any(|ty| may_write_through(ty))
+}
+
+/// A value of type `ty` can hold a reference that writes. See
+/// [`captures_mut_ref`].
+fn may_write_through(ty: &str) -> bool {
+    let ty = ty.trim();
+    if ty.contains("&mut") {
+        return true;
+    }
+    let shared_ref = ty.starts_with('&');
+    !shared_ref && ty.contains('\'')
 }
 
 /// The label of the block that writes the return place `_0`, or `bb0`.
@@ -2828,6 +2843,17 @@ fn source_hint(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_capture_that_can_hold_a_mut_ref_may_write_through() {
+        assert!(may_write_through("&mut u64"));
+        assert!(may_write_through("(&mut u64,)"));
+        assert!(may_write_through("Refs<'_>"));
+        assert!(!may_write_through("&WorkflowContext"));
+        assert!(!may_write_through("&Refs<'_>"));
+        assert!(!may_write_through("u64"));
+        assert!(!may_write_through("std::string::String"));
+    }
 
     #[test]
     fn brace_form_skips_an_async_fn_body_group() {
