@@ -111,20 +111,24 @@ pub fn run(build: &BuildRequest, opts: &Options) -> crate::Result<Report> {
     }
     let parse_failures = parse_failure_boundaries(&docs);
     let program = resolve::Program::build_with_model(docs, &roots, &model)?;
-    let (mut workflows, analysis_warnings) =
-        analysis::analyze_with_warnings(&program, &model, &entries);
+    let analysis::Analysis {
+        verdicts: mut workflows,
+        warnings: analysis_warnings,
+        structures: mut workflow_structures,
+    } = analyze(&program, &model, &entries, opts.emit_structure);
     warnings.extend(analysis_warnings);
 
-    for (verdict, entry) in workflows.iter_mut().zip(&entries) {
-        verdict.workflow = qualified_workflow(&program, entry);
-        if let Some(extra) = parse_failures.get(&entry.crate_name) {
-            // Re-derive rather than append: a boundary added after `assemble`
-            // must still downgrade `proven-deterministic` to `unknown`, which is
-            // the whole content of AC2.
-            analysis::verdict::attach_boundaries(verdict, extra.clone());
-        }
-    }
+    finish_verdicts(
+        &program,
+        &entries,
+        &parse_failures,
+        &mut workflows,
+        &mut workflow_structures,
+    );
     workflows.sort_by(|a, b| a.workflow.cmp(&b.workflow));
+    let structure = opts
+        .emit_structure
+        .then(|| crate::structure::manifest(&model.version, &rustc_version, workflow_structures));
 
     let mut unused_allowlist = Vec::new();
     if let Some(path) = &opts.allowlist {
@@ -139,7 +143,59 @@ pub fn run(build: &BuildRequest, opts: &Options) -> crate::Result<Report> {
         unused_allowlist,
         warnings,
         discovery_failed,
+        structure,
     })
+}
+
+/// Analyze every entry. Build the structure manifest only when asked, because
+/// it costs time on a large target.
+fn analyze(
+    program: &resolve::Program,
+    model: &Model,
+    entries: &[entry::Entry],
+    emit_structure: bool,
+) -> analysis::Analysis {
+    if emit_structure {
+        return analysis::analyze_full(program, model, entries);
+    }
+    let (verdicts, warnings) = analysis::analyze_with_warnings(program, model, entries);
+    analysis::Analysis {
+        verdicts,
+        warnings,
+        structures: Vec::new(),
+    }
+}
+
+/// Qualify each verdict, attach the parse-failure boundaries, and copy both
+/// onto the workflow's structure, if any. The slices are in entry order.
+fn finish_verdicts(
+    program: &resolve::Program,
+    entries: &[entry::Entry],
+    parse_failures: &std::collections::BTreeMap<String, Vec<Boundary>>,
+    workflows: &mut [WorkflowVerdict],
+    structures: &mut [crate::structure::WorkflowStructure],
+) {
+    for (verdict, entry) in workflows.iter_mut().zip(entries) {
+        verdict.workflow = qualified_workflow(program, entry);
+        if let Some(extra) = parse_failures.get(&entry.crate_name) {
+            // Re-derive rather than append: a boundary added after `assemble`
+            // must still downgrade `proven-deterministic` to `unknown`, which is
+            // the whole content of AC2.
+            analysis::verdict::attach_boundaries(verdict, extra.clone());
+        }
+    }
+    // The manifest names a workflow and its boundaries as the verdict does.
+    // It is empty unless the run asked for it.
+    for (shape, verdict) in structures.iter_mut().zip(workflows.iter()) {
+        shape.workflow.clone_from(&verdict.workflow);
+        // Keep the boundaries the structure adds itself, such as an
+        // ambiguous body id.
+        shape
+            .boundaries
+            .extend(analysis::structure_boundaries(&verdict.boundaries));
+        shape.boundaries.sort_unstable();
+        shape.boundaries.dedup();
+    }
 }
 
 /// Suppress the verdicts an allowlist entry covers, and report the entries that

@@ -441,3 +441,47 @@ fn an_unknown_flag_is_a_usage_error() {
     assert_ne!(code(&out), 0);
     assert_ne!(stderr(&out), "");
 }
+
+// ── structure manifest (issue #1995) ───────────────────────────────────────
+
+#[test]
+fn emit_structure_writes_a_manifest_next_to_the_report() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out_path = dir.path().join("flow.structure.json");
+    let mir_dir = fixtures_dir().join("upgrade_baseline");
+    let out = run(&[
+        "--mir",
+        &mir_dir.join("flow.mir").to_string_lossy(),
+        "--source-root",
+        &mir_dir.to_string_lossy(),
+        "--emit-structure",
+        &out_path.to_string_lossy(),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&out), 0, "stderr:\n{}", stderr(&out));
+    let report: autumn_harvest_verify::Report = serde_json::from_str(&stdout(&out))
+        .unwrap_or_else(|e| panic!("stdout is not a Report: {e}\n{}", stdout(&out)));
+    let text = std::fs::read_to_string(&out_path).expect("the manifest is written");
+    let manifest: autumn_harvest_verify::structure::StructureManifest =
+        serde_json::from_str(&text).expect("the manifest parses");
+    assert_eq!(manifest.format, "harvest-structure/1");
+    assert_eq!(manifest.model_version, report.model_version);
+    assert_eq!(manifest.rustc_version, report.rustc_version);
+    assert_eq!(manifest.workflows.len(), report.workflows.len());
+    assert!(
+        !stdout(&out).contains("\"bodies\""),
+        "the report on stdout does not carry the manifest"
+    );
+}
+
+#[test]
+fn help_documents_emit_structure() {
+    let out = run(&["--help"]);
+    assert_eq!(code(&out), 0);
+    assert!(
+        stdout(&out).contains("--emit-structure"),
+        "{}",
+        stdout(&out)
+    );
+}
