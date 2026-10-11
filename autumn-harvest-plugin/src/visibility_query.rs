@@ -15,17 +15,17 @@ use serde_json::Value;
 use crate::api::{CmpOp, SearchAttrPredicate};
 
 /// The longest filter text, in bytes.
-pub(crate) const MAX_FILTER_LEN: usize = 2048;
+pub const MAX_FILTER_LEN: usize = 2048;
 /// The deepest parenthesis nesting.
-pub(crate) const MAX_DEPTH: usize = 8;
+pub const MAX_DEPTH: usize = 8;
 /// The most predicates in one filter.
-pub(crate) const MAX_PREDICATES: usize = 32;
+pub const MAX_PREDICATES: usize = 32;
 /// The most values in one `IN` list.
-pub(crate) const MAX_IN_VALUES: usize = 100;
+pub const MAX_IN_VALUES: usize = 100;
 
 /// A parsed filter.
 #[derive(Debug, Clone)]
-pub(crate) enum Expr {
+pub enum Expr {
     And(Vec<Self>),
     Or(Vec<Self>),
     Leaf(Leaf),
@@ -33,7 +33,7 @@ pub(crate) enum Expr {
 
 /// One predicate.
 #[derive(Debug, Clone)]
-pub(crate) enum Leaf {
+pub enum Leaf {
     /// An `attrs.<key>` predicate. It uses the SQL of issue #506.
     Attr(SearchAttrPredicate),
     /// A predicate on a column of `harvest_workflow_executions`.
@@ -42,7 +42,7 @@ pub(crate) enum Leaf {
 
 /// A column that the grammar can filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SystemField {
+pub enum SystemField {
     State,
     WorkflowName,
     Owner,
@@ -52,7 +52,7 @@ pub(crate) enum SystemField {
 
 /// The test on a system column.
 #[derive(Debug, Clone)]
-pub(crate) enum SystemTest {
+pub enum SystemTest {
     Eq(String),
     Ne(String),
     In(Vec<String>),
@@ -64,7 +64,7 @@ pub(crate) enum SystemTest {
 /// # Errors
 ///
 /// Returns a message for the caller when the text is not a valid filter.
-pub(crate) fn parse(raw: &str) -> Result<Expr, String> {
+pub fn parse(raw: &str) -> Result<Expr, String> {
     if raw.len() > MAX_FILTER_LEN {
         return Err(format!(
             "filter is {} bytes; the limit is {MAX_FILTER_LEN} bytes",
@@ -365,12 +365,12 @@ impl Parser {
             return Err(format!("filter has more than {MAX_PREDICATES} predicates"));
         }
         let at = self.at();
-        let field = match self.next() {
-            Some(Token {
-                kind: TokenKind::Word(word),
-                ..
-            }) => word,
-            _ => return Err(format!("expected a field name at byte {at}")),
+        let Some(Token {
+            kind: TokenKind::Word(field),
+            ..
+        }) = self.next()
+        else {
+            return Err(format!("expected a field name at byte {at}"));
         };
         if let Some(key) = field.strip_prefix("attrs.") {
             let key = if key.is_empty() {
@@ -603,27 +603,27 @@ enum Part {
 
 /// A compiled filter: SQL text with bound values.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct SqlFilter {
+pub struct SqlFilter {
     parts: Vec<Part>,
 }
 
 impl SqlFilter {
     /// Compiles a parsed filter.
-    pub(crate) fn from_expr(expr: &Expr) -> Self {
+    pub fn from_expr(expr: &Expr) -> Self {
         let mut filter = Self::default();
         filter.push_expr(expr);
         filter
     }
 
     /// Compiles one #506 predicate.
-    pub(crate) fn from_attr(predicate: &SearchAttrPredicate) -> Self {
+    pub fn from_attr(predicate: &SearchAttrPredicate) -> Self {
         let mut filter = Self::default();
         filter.push_attr(predicate);
         filter
     }
 
     /// Compiles one `search_attr=key:value` containment object.
-    pub(crate) fn contains(object: Value) -> Self {
+    pub fn contains(object: Value) -> Self {
         Self {
             parts: vec![Part::Sql(SEARCH_ATTRS_CONTAINS), Part::Jsonb(object)],
         }

@@ -1662,7 +1662,7 @@ fn enc(raw: &str) -> String {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
             out.push(char::from(byte));
         } else {
-            out.push_str(&format!("%{byte:02X}"));
+            let _ = std::fmt::Write::write_fmt(&mut out, format_args!("%{byte:02X}"));
         }
     }
     out

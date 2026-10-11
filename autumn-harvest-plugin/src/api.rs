@@ -45340,18 +45340,15 @@ async fn stream_workflow_changes(
             let signal = signal.clone();
             tokio::spawn(async move {
                 loop {
-                    match listener.wait_for_notification().await {
-                        Ok(WorkflowEventWaitOutcome::ChannelClosed) => {
-                            signal.closed.store(true, Ordering::Release);
-                            signal.notify.notify_one();
-                            return;
-                        }
-                        // A payload that does not parse is still a change.
-                        Ok(_) | Err(_) => {
-                            signal.count.fetch_add(1, Ordering::Relaxed);
-                            signal.notify.notify_one();
-                        }
+                    let outcome = listener.wait_for_notification().await;
+                    if matches!(outcome, Ok(WorkflowEventWaitOutcome::ChannelClosed)) {
+                        signal.closed.store(true, Ordering::Release);
+                        signal.notify.notify_one();
+                        return;
                     }
+                    // A payload that does not parse is still a change.
+                    signal.count.fetch_add(1, Ordering::Relaxed);
+                    signal.notify.notify_one();
                 }
             })
         })
