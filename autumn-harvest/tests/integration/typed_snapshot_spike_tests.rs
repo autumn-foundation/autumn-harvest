@@ -7,18 +7,20 @@
 //! typed state, a schema version and an effect ledger. The workflow writes
 //! the state and the version. The engine side stamps the ledger from the
 //! history when it persists the checkpoint, so the author never writes it.
-//! The ledger lists each effect that completed before the checkpoint. A
-//! checkpoint with an open effect is refused, so a resume can never lose or
-//! repeat one.
 //!
-//! The tests show four claims:
+//! The machine check has three parts:
 //!
-//! 1. A checkpoint with an open activity, timer, child or update is refused.
-//! 2. A v1 snapshot loads under v2 code. An unknown version is refused.
-//! 3. Changed code before the checkpoint fails a full replay. The same code
-//!    resumes from the snapshot, and it runs no completed activity again.
-//! 4. Reserved names restart in each new context. An in-place snapshot
-//!    must therefore carry the context counters.
+//! - The stamp refuses a checkpoint with an open effect or an unread signal.
+//!   A checkpoint then has no effect in flight to lose.
+//! - The loader refuses a ledger that differs from its source history.
+//! - The loader refuses a state that does not cover its ledger. The state
+//!   type states this rule. The rule catches a stale state, for example one
+//!   that a wrong upgrade step builds.
+//!
+//! The ledger proves that an effect completed. It cannot prove that the
+//! state holds the right result of that effect.
+//!
+//! The tests below back each claim in section 4 of the report.
 
 use std::collections::BTreeMap;
 
@@ -41,6 +43,8 @@ enum OpenEffect {
     Timer(String),
     Child(String),
     Update(String),
+    /// A signal in history that the body has not taken yet.
+    Signal(String),
 }
 
 /// The effects that completed in a history prefix, by kind and key.
@@ -152,6 +156,15 @@ trait VersionedState: Serialize + DeserializeOwned {
     ///
     /// Returns an error when no upgrade path exists.
     fn upgrade(version: u32, raw: Value) -> Result<Value, String>;
+
+    /// Whether this state reflects each completed effect in `ledger`.
+    ///
+    /// The loader calls it after the upgrade. The author states the rule,
+    /// and the engine checks it on each load.
+    fn covers(&self, ledger: &EffectLedger) -> bool {
+        let _ = ledger;
+        true
+    }
 }
 
 /// Why a snapshot did not load.
@@ -163,6 +176,8 @@ enum SnapshotError {
     UnknownVersion(u32),
     /// The stored ledger differs from the ledger of the source history.
     LedgerMismatch,
+    /// The loaded state does not reflect each completed effect.
+    NotCovered,
     /// The state did not decode.
     Decode(String),
 }
@@ -184,11 +199,22 @@ impl Snapshot {
     /// Stamps the ledger of `history` on an unstamped snapshot.
     ///
     /// The engine side calls this when it persists the checkpoint.
+    /// `unread_signals` names the signals in history that the body has not
+    /// taken. The worker reads them from the replay matcher. History alone
+    /// cannot show them.
     ///
     /// # Errors
     ///
-    /// Refuses a history with an open effect, or a bad wire form.
-    fn stamp(unstamped: &Value, history: &[WorkflowEvent]) -> Result<Value, SnapshotError> {
+    /// Refuses a history with an open effect or an unread signal, or a bad
+    /// wire form.
+    fn stamp(
+        unstamped: &Value,
+        history: &[WorkflowEvent],
+        unread_signals: &[String],
+    ) -> Result<Value, SnapshotError> {
+        if let Some(name) = unread_signals.first() {
+            return Err(SnapshotError::Open(OpenEffect::Signal(name.clone())));
+        }
         let ledger = EffectLedger::from_history(history).map_err(SnapshotError::Open)?;
         let version = unstamped
             .get("version")
@@ -216,16 +242,18 @@ impl Snapshot {
         state: &S,
         history: &[WorkflowEvent],
     ) -> Result<Value, SnapshotError> {
-        Self::stamp(&Self::unstamped(state), history)
+        Self::stamp(&Self::unstamped(state), history, &[])
     }
 
     /// Loads a snapshot under this code.
     ///
-    /// With `source`, the ledger must equal the ledger of that history.
+    /// With `source`, the ledger must equal the ledger of that history. The
+    /// loaded state must then cover the ledger.
     ///
     /// # Errors
     ///
-    /// Refuses an unknown version, a ledger mismatch or a bad state.
+    /// Refuses an unknown version, a ledger mismatch, a state that does not
+    /// cover its ledger, or a bad state.
     fn load<S: VersionedState>(
         raw: &Value,
         source: Option<&[WorkflowEvent]>,
@@ -246,8 +274,11 @@ impl Snapshot {
         } else {
             S::upgrade(snapshot.version, snapshot.state).map_err(SnapshotError::Decode)?
         };
-        let state =
+        let state: S =
             serde_json::from_value(state).map_err(|e| SnapshotError::Decode(e.to_string()))?;
+        if !state.covers(&snapshot.ledger) {
+            return Err(SnapshotError::NotCovered);
+        }
         Ok((state, snapshot.ledger))
     }
 }
@@ -287,6 +318,13 @@ impl VersionedState for Order {
             }
             other => Err(format!("no upgrade from version {other}")),
         }
+    }
+
+    /// Each completed charge is in `charged`. The phase moves on after two.
+    fn covers(&self, ledger: &EffectLedger) -> bool {
+        let charges = ledger.activities.iter().filter(|a| *a == "charge").count();
+        usize::try_from(self.charged).is_ok_and(|c| c == charges)
+            && (self.charged >= 2) == (self.phase == "ship")
     }
 }
 
@@ -499,6 +537,24 @@ fn a_checkpoint_with_an_open_effect_is_refused() {
     }
 }
 
+#[test]
+fn a_checkpoint_with_an_unread_signal_is_refused() {
+    // The signal is in history, but the body has not taken it. The worker
+    // reads this from the replay matcher. Continue-as-new would drop it.
+    let history = vec![
+        started(Value::Null),
+        WorkflowEvent::SignalReceived {
+            signal_name: "cancel".into(),
+            payload: Value::Null,
+        },
+    ];
+    let unstamped = Snapshot::unstamped(&OrderV1 { charged: 0 });
+    assert_eq!(
+        Snapshot::stamp(&unstamped, &history, &["cancel".to_owned()]),
+        Err(SnapshotError::Open(OpenEffect::Signal("cancel".into())))
+    );
+}
+
 // ── Claim 2: versioned save and load ─────────────────────────────────────────
 
 #[test]
@@ -550,6 +606,20 @@ fn a_ledger_that_differs_from_its_source_history_is_refused() {
     );
 }
 
+#[test]
+fn a_state_that_does_not_cover_its_ledger_is_refused() {
+    // A true ledger with two charges, and a state that claims one. A resume
+    // from this state would charge again.
+    let mut history = vec![started(Value::Null)];
+    history.extend(activity_events("charge", true));
+    history.extend(activity_events("charge", true));
+    let raw = Snapshot::save(&OrderV1 { charged: 1 }, &history).expect("quiescent");
+    assert_eq!(
+        Snapshot::load::<Order>(&raw, Some(&history)),
+        Err(SnapshotError::NotCovered)
+    );
+}
+
 // ── Claim 3: no determinism needed before the checkpoint ─────────────────────
 
 #[tokio::test]
@@ -562,7 +632,7 @@ async fn changed_code_before_the_checkpoint_resumes_from_the_snapshot() {
     else {
         panic!("v1 must checkpoint: {v1_end:?}");
     };
-    let raw = Snapshot::stamp(&unstamped, &v1_history).expect("the checkpoint is quiescent");
+    let raw = Snapshot::stamp(&unstamped, &v1_history, &[]).expect("the checkpoint is quiescent");
 
     // A full replay of the v1 history under v2 code diverges at the audit.
     let replayed = run_workflow(
@@ -573,8 +643,14 @@ async fn changed_code_before_the_checkpoint_resumes_from_the_snapshot() {
     )
     .await;
     assert!(
-        !matches!(replayed, WorkflowOutcome::Suspended { .. }),
-        "v2 must not replay the v1 history: {replayed:?}"
+        matches!(
+            replayed,
+            WorkflowOutcome::Failed {
+                non_deterministic_details: Some(_),
+                ..
+            }
+        ),
+        "v2 must fail the replay of the v1 history as non-deterministic: {replayed:?}"
     );
 
     // The successor runs v2 from the snapshot. It runs no charge again.

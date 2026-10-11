@@ -29,7 +29,7 @@ use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentModel, AgentTask, ChatRequest, ChatResponse, ContentPart,
     ErrorKind, FnTool, RunInfo, StopReason, TokenUsage, Tool, ToolCall, ToolDecision, ToolPolicy,
 };
-use diesel_async::{AsyncConnection, AsyncPgConnection};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde_json::{Value, json};
 
 use crate::integration_e2e::{
@@ -158,8 +158,9 @@ fn build_worker(queue: &str, log: Arc<ResidentLog>) -> Arc<Worker> {
             propagator: Arc::new(NoOpPropagator),
             metrics: log as Arc<dyn MetricsRecorder>,
         })
-        // The agent activities run on the `default` queue. CI runs this
-        // suite serially on its own database, so no other worker polls it.
+        // The agent activities run on the `default` queue. In CI each test
+        // gets its own database, so no other worker polls that queue. A
+        // shared local database can hold tasks of other suites there.
         .worker(WorkerConfig::default().with_queues([queue, "default"]))
         .build();
     let (registry, _dags, _schedules, worker_config) = built.into_worker_parts();
@@ -228,10 +229,37 @@ fn start_workflow<'a>(
     }
 }
 
-/// Waits until `log` holds `n` outcomes.
-async fn wait_for_outcomes(log: &ResidentLog, n: usize) {
+#[derive(diesel::QueryableByName)]
+struct Count {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    n: i64,
+}
+
+/// Whether the history of `exec_id` holds a committed `TimerStarted`.
+async fn has_timer_started(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> bool {
+    diesel::sql_query(
+        "SELECT count(*) AS n FROM harvest_events \
+         WHERE workflow_exec_id = $1 AND event_type = 'TimerStarted'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result::<Count>(conn)
+    .await
+    .is_ok_and(|row| row.n > 0)
+}
+
+/// Waits until `log` holds `n` outcomes and the approval deadline timer is
+/// in history.
+///
+/// An outcome counts at the start of a decision. The timer shows that the
+/// decision with the gate committed its suspension.
+async fn wait_for_gate(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    log: &ResidentLog,
+    n: usize,
+) {
     let deadline = Instant::now() + Duration::from_secs(30);
-    while log.outcomes().len() < n {
+    while log.outcomes().len() < n || !has_timer_started(conn, exec_id).await {
         assert!(
             Instant::now() < deadline,
             "only {:?} after 30 s",
@@ -266,7 +294,7 @@ async fn agent_loop_resumes_every_sequential_turn_and_replays_after_a_gate() {
     .expect("start the agent loop");
 
     // Turns 1 and 2 call a tool each. Turn 3 asks for the gated call.
-    wait_for_outcomes(&log, 6).await;
+    wait_for_gate(&mut conn, exec_id, &log, 6).await;
     let approval = serde_json::to_value(Approval::Approve).expect("approval encodes");
     autumn_harvest::signal::send_signal(&mut conn, exec_id, &approval_signal(2, 0, "c3"), approval)
         .await

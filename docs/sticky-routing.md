@@ -34,7 +34,7 @@ A warm decision resumes only on an exact delta. The delta holds the events of th
 
 Any other delta declines. A decline drops the resident workflow and runs a cold replay, which is always correct. Joins, races, activity failures, updates, cancels and child workflows therefore still replay cold.
 
-**Observing it.** The cache metrics do not tell a resume from a replay. `harvest.workflow.resident` does (issue #2007). Each decision counts one `outcome`: `hit` when it resumed, `miss` when it replayed. A miss names its `reason`, for example `cold`, `multi_await`, `race` or `extra_events`. [`docs/telemetry.md`](telemetry.md) lists every reason. A resumed cycle also records `harvest.replay = false` on its `harvest.workflow.execute` span. A decline logs `resident workflow declined; replaying cold (issue #1798)` at `debug` level, with the `ResumeDeclined` reason.
+**Observing it.** The cache metrics do not tell a resume from a replay. `harvest.workflow.resident` does (issue #2007). Each decision counts one `outcome`: `hit` when it resumed, `miss` when it replayed. A miss names its `reason`, for example `cold`, `multi_await`, `race` or `extra_events`. [`docs/telemetry.md`](telemetry.md) lists every reason. A `hit` means that the first cycle of the decision resumed the parked future. A later cycle of the same decision can still replay, for example after an inline local activity. A decision that does not commit, such as an ND block or a pause park, counts again when its task re-runs, as `cold`. A resumed cycle also records `harvest.replay = false` on its `harvest.workflow.execute` span. A decline logs `resident workflow declined; replaying cold (issue #1798)` at `debug` level, with the `ResumeDeclined` reason.
 
 **Limits.**
 
@@ -96,7 +96,7 @@ The cache metrics carry a `workflow` label (the workflow name). `execution.id` i
 
 Monitor the **hit ratio** (`cache_hit / (cache_hit + cache_miss)`) per worker. With sticky routing on, the ratio climbs toward 1 for long-running workflows that suspend many times. A ratio that stays near 0 may indicate the lease TTL is shorter than the median inter-task delay.
 
-The **resident hit rate** is `resident{outcome="hit"} / resident`. A cache hit can still replay, so this rate is at most the cache hit ratio. Group the misses by `reason` to see which workflow shape replays. `docs/rnd/typed-state-snapshots.md` records two measured rates.
+The **resident hit rate** is `resident{outcome="hit"} / resident`. A cache hit can still replay, so this rate is normally below the cache hit ratio. The two counters count at different points, so a task that fails before the drive counts only in the cache metrics. Group the misses by `reason` to see which workflow shape replays. `docs/rnd/typed-state-snapshots.md` records two measured rates.
 
 ## Decision cost
 

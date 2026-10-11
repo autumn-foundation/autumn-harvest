@@ -49,80 +49,72 @@ fn the_report_has_every_required_section() {
     }
 }
 
+/// The text of the section that starts at `heading`, up to the next `## `.
+fn section(body: &str, heading: &str) -> String {
+    let start = body
+        .find(&format!("\n{heading}\n"))
+        .unwrap_or_else(|| panic!("the report lacks {heading:?}"));
+    let rest = &body[start + heading.len() + 2..];
+    rest.find("\n## ")
+        .map_or(rest, |end| &rest[..end])
+        .to_owned()
+}
+
 #[test]
 fn the_report_states_one_verdict() {
     let body = report();
     let verdicts: Vec<&str> = body
         .lines()
-        .filter(|line| line.starts_with("**Verdict:"))
+        .filter_map(|line| line.strip_prefix("**Verdict: "))
         .collect();
     assert_eq!(
         verdicts.len(),
         1,
         "the report must state exactly one verdict"
     );
-    let verdict = verdicts[0].to_ascii_lowercase();
     assert!(
-        verdict.contains("go"),
-        "the verdict must say go or no-go: {}",
+        verdicts[0].starts_with("go") || verdicts[0].starts_with("no-go"),
+        "the verdict must start with go or no-go: {}",
         verdicts[0]
     );
 }
 
 #[test]
-fn the_report_cites_the_gate_counter_and_both_measurements() {
-    let body = report();
-    assert!(
-        body.contains(&format!("`{METRIC_WORKFLOW_RESIDENT}`")),
-        "the report must name the gate counter"
-    );
-    for workload in ["e2e bench", "agent loop"] {
-        assert!(
-            body.contains(workload),
-            "the report must record the {workload} measurement"
-        );
+fn the_gate_section_cites_the_counter_and_both_measurements() {
+    let gate = section(&report(), "## 2. The gate: resident hit rate");
+    for needle in [
+        format!("`{METRIC_WORKFLOW_RESIDENT}`"),
+        "#2007".to_owned(),
+        "e2e bench".to_owned(),
+        "agent loop".to_owned(),
+    ] {
+        assert!(gate.contains(&needle), "section 2 must cite {needle}");
     }
 }
 
 #[test]
-fn every_prototype_test_the_report_names_exists() {
-    let body = report();
+fn every_test_that_section_4_names_exists() {
+    let claims = section(&report(), "## 4. What the prototype shows");
     let spike = read("autumn-harvest/tests/integration/typed_snapshot_spike_tests.rs");
-    let named: Vec<&str> = body
+    let named: Vec<&str> = claims
         .split('`')
+        .skip(1)
+        .step_by(2)
         .filter(|token| {
-            token.len() > 8
+            token.contains('_')
                 && token
                     .chars()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-                && token.contains('_')
         })
-        .filter(|token| spike.contains(&format!("fn {token}(")))
         .collect();
     assert!(
-        named.len() >= 5,
-        "the report must name the prototype tests, found {named:?}"
+        named.len() >= 7,
+        "section 4 must cite each prototype test, found {named:?}"
     );
-    for test in [
-        "a_checkpoint_with_an_open_effect_is_refused",
-        "a_v1_snapshot_loads_under_v2_code",
-        "a_ledger_that_differs_from_its_source_history_is_refused",
-        "changed_code_before_the_checkpoint_resumes_from_the_snapshot",
-        "reserved_names_restart_in_each_new_context",
-    ] {
+    for test in named {
         assert!(
-            body.contains(&format!("`{test}`")),
-            "the report must cite {test}"
+            spike.contains(&format!("fn {test}(")),
+            "section 4 cites `{test}`, but typed_snapshot_spike_tests.rs has no such test"
         );
-        assert!(spike.contains(&format!("fn {test}(")), "{test} must exist");
     }
-}
-
-#[test]
-fn the_issue_gate_is_recorded_as_met() {
-    let body = report();
-    assert!(
-        body.contains("#2007"),
-        "the report must name the gate issue"
-    );
 }

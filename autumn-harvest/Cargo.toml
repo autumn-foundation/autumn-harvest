@@ -320,9 +320,6 @@ proc-macro2 = { workspace = true }
 # version into the lockfile, so this dev-dependency adds no new crate. The crate
 # is deprecated upstream. It is dev-only, so it never ships.
 serde_yaml = "0.9"
-# Runs the real `agent_loop` on a Postgres worker to measure the resident hit
-# rate (issue #2007). Path only, so `cargo publish` drops it.
-autumn-harvest-agent = { path = "../autumn-harvest-agent" }
 
 # testcontainers pulls bollard -> hyper-util, which uses `tokio::net`. Under a
 # global `RUSTFLAGS="--cfg loom"` build tokio's `net` module is compiled out
@@ -333,6 +330,12 @@ autumn-harvest-agent = { path = "../autumn-harvest-agent" }
 [target.'cfg(not(loom))'.dev-dependencies]
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+
+# Runs the real `agent_loop` on a Postgres worker to measure the resident hit
+# rate (issue #2007). Path only, so `cargo publish` drops it. The loom and
+# shuttle models never use it.
+[target.'cfg(not(any(loom, shuttle)))'.dev-dependencies]
+autumn-harvest-agent = { path = "../autumn-harvest-agent" }
 
 # loom is only pulled in under `RUSTFLAGS="--cfg loom"`. It must live under a
 # `cfg(loom)` target dependency rather than `[dev-dependencies]` because the

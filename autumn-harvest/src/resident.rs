@@ -64,7 +64,7 @@ use crate::types::{ActivityExecId, ExecutionId, TimerId};
 ///
 /// A decline is never an error. The worker drops the resident state and runs
 /// a cold replay, which is always correct.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ResumeDeclined {
     /// The context inputs changed since the suspension, for example the
@@ -90,7 +90,7 @@ pub enum ResumeDeclined {
 impl ResumeDeclined {
     /// The metric label of this decline (issue #2007).
     #[must_use]
-    pub const fn label(&self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::KeyChanged => "key_changed",
             Self::OwnEventsMismatch => "own_events_mismatch",
@@ -110,7 +110,9 @@ impl ResumeDeclined {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NotKept {
-    /// The cycle awaits more than one command, as in a join.
+    /// The cycle awaits more than one command, as in a join. A user-level
+    /// `select!` over two commands also counts here, because only the
+    /// engine race primitives mark a race.
     MultiAwait,
     /// The cycle awaits the branches of a race, such as a signal with a
     /// deadline.
@@ -123,7 +125,8 @@ pub enum NotKept {
     /// The cycle issues a command that the resident path does not read, such
     /// as a child workflow or an update result.
     Command,
-    /// The cycle suspends with no awaited command.
+    /// The cycle suspends with no awaited command, or the awaited command
+    /// has a closed channel because its handle was dropped.
     NoAwait,
     /// The context holds a park token, for example a condition wait.
     ParkToken,
@@ -168,11 +171,14 @@ impl NotKept {
 
 /// Why a decision replayed instead of resuming a resident workflow (issue
 /// #2007).
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ResidentMiss {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResidentMiss {
     /// No cache entry: the first decision, an eviction, a restart, another
     /// worker, or sticky routing off.
+    ///
+    /// A decision that took the entry and did not commit also leaves no
+    /// entry. Examples are an ND block, a pause park, a lost claim and a
+    /// persist rollback. Its re-drive then counts a second outcome, `cold`.
     Cold,
     /// The worker keeps no workflow resident.
     Disabled,
@@ -193,7 +199,7 @@ impl ResidentMiss {
     /// The metric label of this miss. Each label is in
     /// [`RESIDENT_MISS_REASONS`].
     #[must_use]
-    pub const fn label(&self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Cold => "cold",
             Self::Disabled => "disabled",
@@ -206,40 +212,7 @@ impl ResidentMiss {
     }
 }
 
-/// The `reason` label of a resident hit (issue #2007).
-pub const RESIDENT_HIT_REASON: &str = "resumed";
-
-/// Every `reason` label of a resident miss (issue #2007).
-///
-/// The set is closed, so the counter has a bounded number of series.
-pub const RESIDENT_MISS_REASONS: &[&str] = &[
-    "cold",
-    "disabled",
-    "hot_swap",
-    "gap",
-    "multi_await",
-    "race",
-    "race_teardown",
-    "mutex",
-    "command",
-    "no_await",
-    "park_token",
-    "strict_replay",
-    "test_clock",
-    "cancelled",
-    "signal_handler",
-    "nondeterminism",
-    "unread_history",
-    "signal_probe",
-    "key_changed",
-    "own_events_mismatch",
-    "no_resolution",
-    "extra_events",
-    "inexact_resolution",
-    "unexpected_event",
-    "receiver_dropped",
-    "unrecorded",
-];
+pub use crate::telemetry::{RESIDENT_HIT_REASON, RESIDENT_MISS_REASONS};
 
 /// The context inputs that a resident workflow depends on (issue #1798).
 ///
@@ -485,10 +458,12 @@ fn plan_suspension(
     commands: &[WorkflowCommand],
     racing: bool,
 ) -> Result<(usize, Vec<OwnEvent>), NotKept> {
-    let mut awaited = None;
+    let mut awaited = Vec::new();
     let mut own_events = Vec::new();
+    // The first command that the resident path cannot read, if any.
+    let mut unsupported = None;
     for (index, cmd) in commands.iter().enumerate() {
-        let awaits = match cmd {
+        let readable = match cmd {
             WorkflowCommand::ScheduleActivity { activity_id, .. } => {
                 own_events.push(OwnEvent::ActivityScheduled(*activity_id));
                 true
@@ -497,42 +472,64 @@ fn plan_suspension(
                 own_events.push(OwnEvent::TimerStarted(timer_id.clone()));
                 true
             }
-            WorkflowCommand::WaitForActivity { .. } | WorkflowCommand::WaitForSignal { .. } => true,
+            WorkflowCommand::WaitForActivity { .. }
+            | WorkflowCommand::WaitForSignal { .. }
+            | WorkflowCommand::UpsertSearchAttributes { .. }
+            | WorkflowCommand::SetCurrentDetails { .. }
+            | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::RecordLog { .. } => true,
             WorkflowCommand::RecordMarker { name, .. } => {
                 own_events.push(OwnEvent::MarkerRecorded(name.clone()));
-                false
+                true
             }
             WorkflowCommand::RecordSideEffect { kind, name, .. } => {
                 own_events.push(OwnEvent::SideEffectRecorded(*kind, name.clone()));
+                true
+            }
+            WorkflowCommand::AcquireMutex { .. } | WorkflowCommand::ReleaseMutex { .. } => {
+                unsupported.get_or_insert(NotKept::Mutex);
                 false
             }
-            WorkflowCommand::UpsertSearchAttributes { .. }
-            | WorkflowCommand::SetCurrentDetails { .. }
-            | WorkflowCommand::PublishProgress { .. }
-            | WorkflowCommand::RecordLog { .. } => false,
-            WorkflowCommand::AcquireMutex { .. } | WorkflowCommand::ReleaseMutex { .. } => {
-                return Err(NotKept::Mutex);
+            WorkflowCommand::CancelRaceLosers { .. } => {
+                unsupported.get_or_insert(NotKept::RaceTeardown);
+                false
             }
-            WorkflowCommand::CancelRaceLosers { .. } => return Err(NotKept::RaceTeardown),
-            _ => return Err(NotKept::Command),
+            _ => {
+                unsupported.get_or_insert(NotKept::Command);
+                false
+            }
         };
-        if awaits {
-            // A second awaited command means a join or a race.
-            if awaited.is_some() {
-                return Err(if racing {
-                    NotKept::Race
-                } else {
-                    NotKept::MultiAwait
-                });
-            }
-            if !cmd.awaits_result() {
-                return Err(NotKept::NoAwait);
-            }
-            awaited = Some(index);
+        // Count every live awaited command, also one the path cannot read.
+        // A race with a child branch is then still a race.
+        if cmd.awaits_result() {
+            awaited.push(index);
+        } else if readable
+            && matches!(
+                cmd,
+                WorkflowCommand::ScheduleActivity { .. }
+                    | WorkflowCommand::StartTimer { .. }
+                    | WorkflowCommand::WaitForActivity { .. }
+                    | WorkflowCommand::WaitForSignal { .. }
+            )
+        {
+            // An awaiting command whose handle was dropped.
+            unsupported.get_or_insert(NotKept::NoAwait);
         }
     }
+    // A second awaited command means a join or a race.
+    if awaited.len() > 1 {
+        return Err(if racing {
+            NotKept::Race
+        } else {
+            NotKept::MultiAwait
+        });
+    }
+    if let Some(reason) = unsupported {
+        return Err(reason);
+    }
     awaited
-        .map(|index| (index, own_events))
+        .first()
+        .map(|index| (*index, own_events))
         .ok_or(NotKept::NoAwait)
 }
 
@@ -618,15 +615,19 @@ impl ResidentWorkflow {
         }
     }
 
-    /// Resumes this workflow with the events written since it suspended.
+    /// Sends the result in `delta` to the parked future. It does not poll
+    /// the future.
     ///
-    /// `key` is the key of this decision. `None` skips the key check.
-    pub(crate) async fn resume_with(
+    /// `key` is the key of this decision. `None` skips the key check. The
+    /// worker counts a hit here, before the drive, so a body timeout during
+    /// the drive cannot drop the count (issue #2007).
+    #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))]
+    // Resident paths need the worker or the test harness.
+    pub(crate) fn deliver_delta(
         self,
         delta: &[WorkflowEvent],
         key: Option<&ResidentKey>,
-        span_meta: Option<&WorkflowExecuteSpanMeta>,
-    ) -> Result<DriveResult, ResumeDeclined> {
+    ) -> Result<Delivered, ResumeDeclined> {
         if key.is_some_and(|key| *key != self.key) {
             return Err(ResumeDeclined::KeyChanged);
         }
@@ -640,7 +641,39 @@ impl ResidentWorkflow {
         } = self;
         awaiting.deliver(event)?;
         ctx.begin_resident_cycle(delta);
-        Ok(crate::executor::drive_resumed(ctx, future, span_meta, key).await)
+        Ok(Delivered { future, key, ctx })
+    }
+
+    /// Resumes this workflow with the events written since it suspended.
+    ///
+    /// `key` is the key of this decision. `None` skips the key check.
+    #[cfg(any(test, feature = "testing"))]
+    async fn resume_with(
+        self,
+        delta: &[WorkflowEvent],
+        key: Option<&ResidentKey>,
+        span_meta: Option<&WorkflowExecuteSpanMeta>,
+    ) -> Result<DriveResult, ResumeDeclined> {
+        Ok(self.deliver_delta(delta, key)?.drive(span_meta).await)
+    }
+}
+
+/// A resident workflow that holds its new result and waits for its drive
+/// (issue #2007).
+#[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))]
+// Resident paths need the worker or the test harness.
+pub(crate) struct Delivered {
+    future: OwnedHandlerFuture,
+    key: ResidentKey,
+    ctx: Arc<WorkflowContext>,
+}
+
+#[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))]
+// Resident paths need the worker or the test harness.
+impl Delivered {
+    /// Polls the parked future for the next cycle.
+    pub(crate) async fn drive(self, span_meta: Option<&WorkflowExecuteSpanMeta>) -> DriveResult {
+        crate::executor::drive_resumed(self.ctx, self.future, span_meta, self.key).await
     }
 }
 
@@ -1245,6 +1278,20 @@ mod tests {
         })
     }
 
+    /// Races a child workflow against a timer.
+    fn child_race_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            let winner = ctx
+                .race()
+                .child_workflow_raw("child", json!({}))
+                .timer(std::time::Duration::from_secs(60))
+                .run()
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(winner.index))
+        })
+    }
+
     /// Waits for a signal with a deadline: a timer and a signal at once.
     fn signal_timeout_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
         Box::pin(async move {
@@ -1278,9 +1325,10 @@ mod tests {
 
     #[tokio::test]
     async fn each_suspension_that_is_not_kept_names_its_reason() {
-        let cases: [(&str, WorkflowHandlerFn, Vec<WorkflowEvent>, NotKept); 8] = [
+        let cases: [(&str, WorkflowHandlerFn, Vec<WorkflowEvent>, NotKept); 9] = [
             ("join", join_workflow, Vec::new(), NotKept::MultiAwait),
             ("race", race_workflow, Vec::new(), NotKept::Race),
+            ("child race", child_race_workflow, Vec::new(), NotKept::Race),
             (
                 "signal timeout",
                 signal_timeout_workflow,
@@ -1428,7 +1476,7 @@ mod tests {
             ResidentMiss::Unrecorded,
         ];
         let labels: std::collections::BTreeSet<&str> =
-            misses.iter().map(ResidentMiss::label).collect();
+            misses.iter().map(|miss| miss.label()).collect();
         assert_eq!(labels.len(), misses.len(), "two misses share a label");
         assert_eq!(labels, seen, "the list must hold each label once");
         assert!(!seen.contains(RESIDENT_HIT_REASON), "a hit is not a miss");

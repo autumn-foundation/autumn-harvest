@@ -1,7 +1,7 @@
 # Design — Issue #2013: typed state snapshots (R&D spike)
 
-Issue #2013 asks one question. If a run resumes from a typed state snapshot
-and not from a full replay, the code before the snapshot point no longer
+Issue #2013 asks one question. A run can resume from a typed state snapshot
+instead of a full replay. Then the code before the snapshot point no longer
 needs to be deterministic. Is that worth building?
 
 The issue gates the spike on the resident-state hit-rate data of issue
@@ -150,8 +150,8 @@ spike adds no engine code.
 | Resident off counts `miss/disabled`. | Disabled misses. |
 | A join counts `miss/multi_await` on the next decision. | The capture reason reaches the next decision. |
 | `agent_loop` counts a hit for each sequential turn and `miss/race` after an approval gate. | The agent-loop measurement. |
-| A snapshot with an open activity, timer or child is refused. | R10. |
-| A v1 snapshot loads under v2. An unknown version is refused. | R11. |
+| The stamp refuses a snapshot with an open activity, timer, child or update, or with an unread signal. | R10. |
+| A v1 snapshot loads under v2. The loader refuses an unknown version and a state that does not cover its ledger. | R11. |
 | Changed code before the checkpoint fails a full replay but resumes from the snapshot. | The spike claim. |
 | A resume runs no completed activity again. | Preservation. |
 | The write-up holds a verdict, the measured rates and the test names. | R9. |

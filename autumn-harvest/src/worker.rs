@@ -25428,7 +25428,7 @@ async fn process_workflow_task(
             crate::resident::ResidentMiss::Disabled
         }
     } else {
-        prepared.resident_miss.clone()
+        prepared.resident_miss
     });
 
     // Issue #678/#1034: external-op ids resolved INLINE during this decision
@@ -25566,17 +25566,18 @@ async fn process_workflow_task(
                 );
             };
             if let Some(resident) = warm_resident.take() {
-                match resident
-                    .resume_with(
-                        &history_events[prepared.delta_start..],
-                        resident_key.as_ref(),
-                        Some(&span_meta),
-                    )
-                    .await
-                {
-                    Ok(drive) => {
-                        record("hit", crate::resident::RESIDENT_HIT_REASON);
-                        return drive;
+                match resident.deliver_delta(
+                    &history_events[prepared.delta_start..],
+                    resident_key.as_ref(),
+                ) {
+                    Ok(delivered) => {
+                        // Count before the drive. A body timeout can drop
+                        // the drive, but not the count.
+                        record(
+                            crate::telemetry::RESIDENT_OUTCOME_HIT,
+                            crate::telemetry::RESIDENT_HIT_REASON,
+                        );
+                        return delivered.drive(Some(&span_meta)).await;
                     }
                     Err(reason) => {
                         tracing::debug!(
@@ -25584,11 +25585,14 @@ async fn process_workflow_task(
                             ?reason,
                             "resident workflow declined; replaying cold (issue #1798)"
                         );
-                        record("miss", reason.label());
+                        record(
+                            crate::telemetry::RESIDENT_OUTCOME_MISS,
+                            crate::resident::ResidentMiss::Declined(reason).label(),
+                        );
                     }
                 }
             } else if let Some(miss) = first_miss {
-                record("miss", miss.label());
+                record(crate::telemetry::RESIDENT_OUTCOME_MISS, miss.label());
             }
             let ctx = crate::executor::build_task_context(
                 prepared.exec_id,

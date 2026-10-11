@@ -1830,7 +1830,7 @@ impl Drop for RaceScope<'_> {
     fn drop(&mut self) {
         self.ctx
             .open_races
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -3020,7 +3020,8 @@ pub struct WorkflowContext {
     held_mutex_keys: Mutex<std::collections::HashSet<String>>,
     /// Races that wait now (issue #2007). A [`RaceScope`] counts one race
     /// from its start until it resolves or drops. The resident path reads it
-    /// to tell a race from a join.
+    /// to tell a race from a join. One task polls a context, so `Relaxed`
+    /// ordering is enough.
     open_races: std::sync::atomic::AtomicUsize,
     /// Whether the current decision cycle is suspending (parking) rather than
     /// completing (issue #691). Set to `true` by the executor's suspension arm
@@ -7291,13 +7292,13 @@ impl WorkflowContext {
     /// Counts one race until the returned scope drops (issue #2007).
     pub(crate) fn enter_race(&self) -> RaceScope<'_> {
         self.open_races
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         RaceScope { ctx: self }
     }
 
     /// Whether a race waits now (issue #2007).
     pub(crate) fn has_open_race(&self) -> bool {
-        self.open_races.load(std::sync::atomic::Ordering::SeqCst) > 0
+        self.open_races.load(std::sync::atomic::Ordering::Relaxed) > 0
     }
 
     /// Returns why this context cannot stay resident, or `None` (issue #1798).

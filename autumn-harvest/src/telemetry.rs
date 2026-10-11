@@ -631,12 +631,53 @@ pub const METRIC_WORKFLOW_CACHE_MISS: &str = "harvest.workflow.cache_miss";
 /// Counter: one per workflow decision that runs the workflow body (issue
 /// #2007).
 ///
-/// `outcome` is `hit` when the decision resumed a resident workflow and
-/// `miss` when it replayed history. `reason` is
-/// [`crate::resident::RESIDENT_HIT_REASON`] on a hit and one of
-/// [`crate::resident::RESIDENT_MISS_REASONS`] on a miss. Also labeled by
-/// `workflow` and `queue`. The hit rate is `hit / (hit + miss)`.
+/// `outcome` is [`RESIDENT_OUTCOME_HIT`] when the decision resumed a
+/// resident workflow, and [`RESIDENT_OUTCOME_MISS`] when it replayed history.
+/// `reason` is [`RESIDENT_HIT_REASON`] on a hit and one of
+/// [`RESIDENT_MISS_REASONS`] on a miss. Also labeled by `workflow` and
+/// `queue`. The hit rate is `hit / (hit + miss)`.
 pub const METRIC_WORKFLOW_RESIDENT: &str = "harvest.workflow.resident";
+
+/// The `outcome` label of a resident hit (issue #2007).
+pub const RESIDENT_OUTCOME_HIT: &str = "hit";
+
+/// The `outcome` label of a resident miss (issue #2007).
+pub const RESIDENT_OUTCOME_MISS: &str = "miss";
+
+/// The `reason` label of a resident hit (issue #2007).
+pub const RESIDENT_HIT_REASON: &str = "resumed";
+
+/// Every `reason` label of a resident miss (issue #2007).
+///
+/// The set is closed, so the counter has a bounded number of series.
+pub const RESIDENT_MISS_REASONS: &[&str] = &[
+    "cold",
+    "disabled",
+    "hot_swap",
+    "gap",
+    "multi_await",
+    "race",
+    "race_teardown",
+    "mutex",
+    "command",
+    "no_await",
+    "park_token",
+    "strict_replay",
+    "test_clock",
+    "cancelled",
+    "signal_handler",
+    "nondeterminism",
+    "unread_history",
+    "signal_probe",
+    "key_changed",
+    "own_events_mismatch",
+    "no_resolution",
+    "extra_events",
+    "inexact_resolution",
+    "unexpected_event",
+    "receiver_dropped",
+    "unrecorded",
+];
 
 /// Counter: incremented once per `signal_external_workflow` call after the
 /// terminal outcome is recorded in `harvest_events`.
@@ -3858,8 +3899,9 @@ pub trait MetricsRecorder: Send + Sync {
     /// A workflow decision resumed a resident workflow, or replayed (issue
     /// #2007).
     ///
-    /// `outcome` is `hit` or `miss`. `reason` is a bounded label. See
-    /// [`METRIC_WORKFLOW_RESIDENT`].
+    /// `outcome` is [`RESIDENT_OUTCOME_HIT`] or [`RESIDENT_OUTCOME_MISS`].
+    /// `reason` is [`RESIDENT_HIT_REASON`] or one of
+    /// [`RESIDENT_MISS_REASONS`]. See [`METRIC_WORKFLOW_RESIDENT`].
     ///
     /// Maps to the counter
     /// `harvest.workflow.resident{workflow, queue, outcome, reason}`.

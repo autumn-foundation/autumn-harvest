@@ -6,8 +6,10 @@
 
 use std::path::{Path, PathBuf};
 
-use autumn_harvest::resident::{RESIDENT_HIT_REASON, RESIDENT_MISS_REASONS};
-use autumn_harvest::telemetry::METRIC_WORKFLOW_RESIDENT;
+use autumn_harvest::telemetry::{
+    METRIC_WORKFLOW_RESIDENT, RESIDENT_HIT_REASON, RESIDENT_MISS_REASONS, RESIDENT_OUTCOME_HIT,
+    RESIDENT_OUTCOME_MISS,
+};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -39,12 +41,13 @@ fn the_counter_has_its_documented_name() {
 }
 
 #[test]
-fn the_telemetry_row_names_every_reason() {
+fn the_telemetry_row_names_every_outcome_and_reason() {
     let row = telemetry_row();
-    for reason in RESIDENT_MISS_REASONS
-        .iter()
-        .chain(std::iter::once(&RESIDENT_HIT_REASON))
-    {
+    for reason in RESIDENT_MISS_REASONS.iter().chain([
+        &RESIDENT_HIT_REASON,
+        &RESIDENT_OUTCOME_HIT,
+        &RESIDENT_OUTCOME_MISS,
+    ]) {
         assert!(
             row.contains(&format!("`{reason}`")),
             "the {METRIC_WORKFLOW_RESIDENT} row does not name the reason `{reason}`"

@@ -21,11 +21,13 @@ Labels: `workflow`, `queue`, `outcome`, `reason`. The hit rate is
 
 - `MetricsRecorder::record_workflow_resident` is new. It has a no-op
   default, so a custom recorder still compiles.
-- `resident.rs`: `NotKept`, `ResidentMiss`, `RESIDENT_HIT_REASON` and
-  `RESIDENT_MISS_REASONS`. `ResidentWorkflow::capture` returns the reason
-  instead of `None`. `resident::start_explained` (`testing`) returns it too.
-- `context.rs`: a `RaceScope` counts open races, so a race is told from a
-  join.
+- `telemetry.rs`: `RESIDENT_OUTCOME_HIT`, `RESIDENT_OUTCOME_MISS`,
+  `RESIDENT_HIT_REASON` and `RESIDENT_MISS_REASONS`.
+- `resident.rs`: `NotKept` names why a suspension did not stay resident.
+  `ResidentWorkflow::capture` returns it instead of `None`.
+  `resident::start_explained` (`testing`) returns it too.
+- `context.rs`: a `RaceScope` counts open races, so the worker can tell a
+  race from a join.
 - `cache.rs`: an entry keeps the `NotKept` reason of its suspension. The
   next decision counts it.
 - The starter dashboard has a "Resident hit rate and miss reasons" panel.
@@ -35,14 +37,22 @@ decisions, and `signal_roundtrip` 50.0%. Both are the ceiling for their
 shape: only the first decision of each run missed. The real `agent_loop`
 resumed 5 of 9 decisions. Each decision after an approval gate replays with
 `race_teardown`, because a won signal-with-deadline race re-issues
-`CancelRaceLosers` on each cold replay. That is a narrow fix for #2008.
+`CancelRaceLosers` on each cold replay. That points to a narrow fix for
+#2008, which still needs its proof.
 
 **The spike (#2013).** `docs/rnd/typed-state-snapshots.md` holds the design
-sketch and the verdict: no-go on an in-place snapshot now, go on typed
-checkpoints over continue-as-new. The prototype is test-only, in
-`tests/integration/typed_snapshot_spike_tests.rs`. It shows an effect ledger
-that refuses a checkpoint with an open effect, a versioned load with an
-upgrade step, and a resume under changed code that a full replay rejects.
+sketch and a provisional verdict: no-go on an in-place snapshot now, go on
+typed checkpoints over continue-as-new. The prototype is test-only, in
+`tests/integration/typed_snapshot_spike_tests.rs`. It shows these points:
+
+- The stamp refuses a checkpoint with an open effect or an unread signal.
+- The loader has an upgrade step. It refuses a newer version, a changed
+  ledger and a state that does not cover its ledger.
+- Code that changed before the checkpoint fails a full replay. It resumes
+  from the snapshot.
+
+The report also finds a gap: continue-as-new carries the assigned build, so
+a pinned run needs a build re-resolve at the checkpoint.
 `tests/integration/typed_snapshot_docs.rs` guards the report.
 
 **Other.** The core crate takes `autumn-harvest-agent` as a path
@@ -54,10 +64,11 @@ No migration. No new `WorkflowEvent` variant. No change to `harvest_events`.
 
 **Tests.**
 
-- `resident.rs` unit tests name the reason of each ineligible shape: join,
-  race, signal with a deadline, child workflow, mutex, push handler,
-  condition, unread history, signal probe and race teardown. A label test
-  checks that the reason set is closed and unique.
+- `resident.rs` unit tests name the reason of each ineligible shape. The
+  shapes are a join, a race, a signal with a deadline, a child workflow, a
+  mutex, a push handler, a condition, unread history, a signal probe and a
+  race teardown.
+- A label test checks that the reason set is closed and unique.
 - `cache.rs`: an entry keeps its reason.
 - `sticky_default_tests.rs`: each real-worker test asserts the outcome of
   each decision. A new join test shows a capture reason reaching the next

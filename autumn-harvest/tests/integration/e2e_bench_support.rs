@@ -2583,7 +2583,9 @@ pub mod db {
 
     use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
     use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
-    use autumn_harvest::telemetry::{MetricsRecorder, TelemetryConfig};
+    use autumn_harvest::telemetry::{
+        MetricsRecorder, RESIDENT_MISS_REASONS, RESIDENT_OUTCOME_HIT, TelemetryConfig,
+    };
     use autumn_harvest::types::{ExecutionId, ShardId};
     use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
     use autumn_harvest::{
@@ -3201,43 +3203,58 @@ pub mod db {
         resident: Arc<ResidentTally>,
     }
 
-    /// Counts `harvest.workflow.resident` outcomes by `outcome/reason`
-    /// (issue #2007).
-    #[derive(Debug, Default)]
-    pub struct ResidentTally(Mutex<BTreeMap<String, u64>>);
+    /// Counts `harvest.workflow.resident` outcomes (issue #2007).
+    ///
+    /// One atomic counter per reason, so a decision takes no lock and makes
+    /// no allocation. Slot 0 counts hits. Slot `1 + i` counts the miss
+    /// reason `RESIDENT_MISS_REASONS[i]`.
+    #[derive(Debug)]
+    pub struct ResidentTally(Vec<std::sync::atomic::AtomicU64>);
+
+    impl Default for ResidentTally {
+        fn default() -> Self {
+            Self(
+                (0..=RESIDENT_MISS_REASONS.len())
+                    .map(|_| std::sync::atomic::AtomicU64::new(0))
+                    .collect(),
+            )
+        }
+    }
 
     impl ResidentTally {
+        fn count(&self, slot: usize) -> u64 {
+            std::sync::atomic::AtomicU64::load(&self.0[slot], std::sync::atomic::Ordering::Relaxed)
+        }
+
         /// A report note: the hit rate and each miss reason.
         #[must_use]
         pub fn note(&self) -> String {
-            let counts = self.0.lock().expect("poisoned").clone();
-            let total: u64 = counts.values().sum();
-            let hits: u64 = counts
+            let hits = self.count(0);
+            let misses: Vec<(&str, u64)> = RESIDENT_MISS_REASONS
                 .iter()
-                .filter(|(key, _)| key.starts_with("hit/"))
-                .map(|(_, n)| n)
-                .sum();
-            let misses: Vec<String> = counts
-                .iter()
-                .filter_map(|(key, n)| {
-                    key.strip_prefix("miss/")
-                        .map(|reason| format!("{reason}={n}"))
-                })
+                .enumerate()
+                .map(|(i, reason)| (*reason, self.count(i + 1)))
+                .filter(|(_, n)| *n > 0)
                 .collect();
+            let total = hits + misses.iter().map(|(_, n)| n).sum::<u64>();
             #[allow(clippy::cast_precision_loss)] // Counts stay far below 2^52.
             let rate = if total == 0 {
                 "n/a".to_owned()
             } else {
                 format!("{:.1}%", hits as f64 * 100.0 / total as f64)
             };
+            let misses = if misses.is_empty() {
+                "none".to_owned()
+            } else {
+                misses
+                    .iter()
+                    .map(|(reason, n)| format!("{reason}={n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
             format!(
                 "resident hit rate (issue #2007): {rate}, {hits} of {total} decisions; \
-                 misses: {}",
-                if misses.is_empty() {
-                    "none".to_owned()
-                } else {
-                    misses.join(", ")
-                }
+                 misses: {misses}"
             )
         }
     }
@@ -3250,12 +3267,19 @@ pub mod db {
             outcome: &str,
             reason: &str,
         ) {
-            *self
-                .0
-                .lock()
-                .expect("poisoned")
-                .entry(format!("{outcome}/{reason}"))
-                .or_default() += 1;
+            let slot = if outcome == RESIDENT_OUTCOME_HIT {
+                Some(0)
+            } else {
+                RESIDENT_MISS_REASONS
+                    .iter()
+                    .position(|known| *known == reason)
+                    .map(|i| i + 1)
+            };
+            // Every reason is in the list. A unit test in `resident.rs`
+            // checks this, so the tally can drop an unknown one.
+            if let Some(slot) = slot {
+                self.0[slot].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 
