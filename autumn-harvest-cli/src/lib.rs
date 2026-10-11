@@ -8808,6 +8808,11 @@ fn format_usage_table(value: &Value) -> String {
         "ACT_EXEC",
         "ACT_FAILED",
         "COMPUTE_S",
+        "LLM_CALLS",
+        "LLM_IN",
+        "LLM_OUT",
+        "LLM_COST_USD",
+        "LLM_UNPRICED",
     ]
     .iter()
     .map(ToString::to_string)
@@ -8825,6 +8830,11 @@ fn format_usage_table(value: &Value) -> String {
             cell_number(group.get("activity_executions")),
             cell_number(group.get("activity_executions_failed")),
             format_f64(group.get("activity_compute_seconds")),
+            cell_number(group.get("llm_calls")),
+            cell_number(group.get("llm_input_tokens")),
+            cell_number(group.get("llm_output_tokens")),
+            format_usd_micros(group.get("llm_cost_usd_micros")),
+            cell_number(group.get("llm_unpriced_calls")),
         ]);
     }
 
@@ -8981,6 +8991,19 @@ fn format_rate_limit_table(value: &Value) -> String {
     }
 
     render_table(&rows)
+}
+
+/// Millionths of a US dollar as dollars with six decimals (issue #1996).
+///
+/// An absent field, as from an older server, stays blank.
+fn format_usd_micros(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_i64)
+        .map_or_else(String::new, |micros| {
+            let sign = if micros < 0 { "-" } else { "" };
+            let abs = micros.unsigned_abs();
+            format!("{sign}{}.{:06}", abs / 1_000_000, abs % 1_000_000)
+        })
 }
 
 fn format_f64(value: Option<&Value>) -> String {
@@ -16728,6 +16751,76 @@ mod usage_cli_tests {
         assert!(rendered.contains("group_by: workflow_name"));
         assert!(rendered.contains("onboarding"));
         assert!(rendered.contains("123.46"));
+    }
+
+    #[test]
+    fn format_usage_table_renders_the_llm_ledger_columns() {
+        let value = serde_json::json!({
+            "status": "complete",
+            "from": "2026-01-01T00:00:00Z",
+            "to": "2026-02-01T00:00:00Z",
+            "group_by": "search_attr:tenant_id",
+            "groups": [
+                {
+                    "group": "acme",
+                    "workflow_starts": 1,
+                    "completed": 1,
+                    "failed": 0,
+                    "cancelled": 0,
+                    "timed_out": 0,
+                    "activity_executions": 2,
+                    "activity_executions_failed": 0,
+                    "activity_compute_seconds": 1.0,
+                    "llm_calls": 3,
+                    "llm_input_tokens": 1_250,
+                    "llm_output_tokens": 340,
+                    "llm_cost_usd_micros": 1_234_567,
+                    "llm_unpriced_calls": 0,
+                    "llm_latency_ms": 900
+                }
+            ],
+            "unavailable_shards": []
+        });
+        let rendered = format_usage_table(&value);
+        for column in [
+            "LLM_CALLS",
+            "LLM_IN",
+            "LLM_OUT",
+            "LLM_COST_USD",
+            "LLM_UNPRICED",
+        ] {
+            assert!(rendered.contains(column), "{column}: {rendered}");
+        }
+        assert!(rendered.contains("1250"), "{rendered}");
+        assert!(rendered.contains("340"), "{rendered}");
+        assert!(rendered.contains("1.234567"), "{rendered}");
+    }
+
+    #[test]
+    fn format_usage_table_leaves_llm_cells_blank_for_an_older_server() {
+        let value = serde_json::json!({
+            "status": "complete",
+            "from": "2026-01-01T00:00:00Z",
+            "to": "2026-02-01T00:00:00Z",
+            "group_by": "workflow_name",
+            "groups": [{"group": "onboarding", "workflow_starts": 1}],
+            "unavailable_shards": []
+        });
+        let rendered = format_usage_table(&value);
+        assert!(rendered.contains("LLM_COST_USD"), "{rendered}");
+        assert!(!rendered.contains("0.000000"), "{rendered}");
+    }
+
+    #[test]
+    fn format_usd_micros_prints_dollars_with_six_decimals() {
+        let cell = |v: serde_json::Value| format_usd_micros(Some(&v));
+        assert_eq!(cell(serde_json::json!(0)), "0.000000");
+        assert_eq!(cell(serde_json::json!(5)), "0.000005");
+        assert_eq!(cell(serde_json::json!(1_234_567)), "1.234567");
+        assert_eq!(cell(serde_json::json!(-1_500_000)), "-1.500000");
+        assert_eq!(cell(serde_json::json!(i64::MAX)), "9223372036854.775807");
+        assert_eq!(cell(serde_json::json!(u64::MAX)), "", "not an i64");
+        assert_eq!(format_usd_micros(None), "");
     }
 
     #[test]

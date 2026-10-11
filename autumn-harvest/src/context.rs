@@ -14949,6 +14949,11 @@ pub struct ActivityContext {
     /// is available, so the first liveness ping (before any manual heartbeat)
     /// preserves the durable checkpoint (issue #151).
     last_heartbeat_payload: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    /// The LLM calls this attempt recorded (issue #1996).
+    ///
+    /// The engine takes them when the attempt completes and writes them to
+    /// `harvest_llm_ledger` in the completion transaction.
+    llm_calls: crate::llm_ledger::LlmCallSlot,
 }
 
 /// RAII guard returned by [`ActivityContext::start_auto_heartbeat`] /
@@ -15045,6 +15050,7 @@ impl ActivityContext {
             deadline: None,
             heartbeat_timeout: None,
             last_heartbeat_payload: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            llm_calls: crate::llm_ledger::LlmCallSlot::new(),
         }
     }
 
@@ -15101,6 +15107,7 @@ impl ActivityContext {
             deadline: None,
             heartbeat_timeout: None,
             last_heartbeat_payload,
+            llm_calls: crate::llm_ledger::LlmCallSlot::new(),
         }
     }
 
@@ -15140,6 +15147,7 @@ impl ActivityContext {
             deadline: None,
             heartbeat_timeout: None,
             last_heartbeat_payload: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            llm_calls: crate::llm_ledger::LlmCallSlot::new(),
         }
     }
 
@@ -15455,6 +15463,49 @@ impl ActivityContext {
     pub(crate) fn transactional_commit_occurred(&self) -> bool {
         self.transactional_commit_occurred
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    // ── Agent cost ledger (issue #1996) ───────────────────────────────────────
+
+    /// Record one model call for the agent cost ledger (issue #1996).
+    ///
+    /// The engine writes the call to `harvest_llm_ledger` when this attempt
+    /// completes. The row commits with the completion event. A failed attempt
+    /// writes no row. The ledger is outside the event payload, so the codec
+    /// does not encrypt it.
+    ///
+    /// A call with no latency gets the time since the previous call, or
+    /// since the attempt started.
+    ///
+    /// In a [`Self::run_transactional`] activity, record the calls before the
+    /// commit. The commit writes the calls that exist at that time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::llm_ledger::LlmCallError`] when the call fails its
+    /// check, or when this attempt already recorded
+    /// [`crate::llm_ledger::MAX_LLM_CALLS_PER_ATTEMPT`] calls. The error
+    /// converts to a non-retryable activity failure, so `?` in an activity
+    /// fails the attempt without a retry.
+    pub fn record_llm_call(
+        &self,
+        call: crate::llm_ledger::LlmCall,
+    ) -> Result<(), crate::llm_ledger::LlmCallError> {
+        self.llm_calls.record(call)
+    }
+
+    /// The LLM calls this attempt recorded so far (issue #1996).
+    #[must_use]
+    pub fn llm_calls(&self) -> Vec<crate::llm_ledger::LlmCall> {
+        self.llm_calls.snapshot()
+    }
+
+    /// Take the recorded calls and empty the slot.
+    ///
+    /// The engine calls this when it writes the completion.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
+    pub(crate) fn take_llm_calls(&self) -> Vec<crate::llm_ledger::LlmCall> {
+        self.llm_calls.take()
     }
 
     /// The stable idempotency key for this logical activity invocation.
@@ -16358,6 +16409,8 @@ impl ActivityContext {
         // to a no-op passthrough when nested. So a nested transaction's
         // hint would flush with the outer task's outcome, instead of this
         // transaction's own.
+        // Issue #1996: how many recorded LLM calls the commit writes.
+        let committed_llm_calls = std::sync::atomic::AtomicUsize::new(0);
         let result = crate::dispatch::buffered_checkpoint(Box::pin(
             conn.transaction::<T, TxError, _>(async |conn| {
                 // Run user domain writes.
@@ -16490,6 +16543,20 @@ impl ActivityContext {
                 )
                 .await?;
 
+                // Issue #1996: the recorded LLM calls commit with the event.
+                // A copy, so a rollback keeps them in the slot. The slot is
+                // emptied only after the commit.
+                let llm_calls = self.llm_calls();
+                crate::llm_ledger::insert_ledger_rows(
+                    conn,
+                    exec_id,
+                    history.next_event_id,
+                    &self.identity.activity_type,
+                    &llm_calls,
+                )
+                .await?;
+                committed_llm_calls.store(llm_calls.len(), std::sync::atomic::Ordering::SeqCst);
+
                 // Mark the task COMPLETED. The row lock above keeps the claim
                 // current, so a lost lease here is a bug, and the error rolls
                 // back.
@@ -16516,6 +16583,11 @@ impl ActivityContext {
                 // leaves it false so the failure flows through the normal path.
                 self.transactional_commit_occurred
                     .store(true, std::sync::atomic::Ordering::SeqCst);
+                // The commit wrote the first calls of the slot (issue #1996).
+                // A call recorded during the commit stays, so the worker logs
+                // it as dropped.
+                self.llm_calls
+                    .remove_first(committed_llm_calls.load(std::sync::atomic::Ordering::SeqCst));
                 Ok(value)
             }
             Err(e) => Err(match e {

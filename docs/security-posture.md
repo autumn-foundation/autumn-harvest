@@ -1307,6 +1307,9 @@ the codec encrypts. Set it with `WorkflowFailure::with_details` or
 `ActivityFailure::with_details`. A plain `Err(String)` sets no `details`. The
 other variants have no encrypted field for failure data.
 
+The agent cost ledger stays in clear too. See
+[LLM cost ledger](#llm-cost-ledger-issue-1996).
+
 Event types, ids, timestamps and workflow names also stay in clear. So do the
 build id and the worker id in `DecisionCommitted` (issue #1833). A worker id
 often holds a host name or a pod name. The redacted export keeps both. Do not put
@@ -1415,6 +1418,37 @@ a `JSONB` column has no row here. Gaps marked #2043 are follow-up work.
 
 The SQLite and Redis backends do not use the codec. The connector dead-letter
 table, `harvest_connector_dead_letters`, stores raw message bytes in clear.
+
+### LLM cost ledger (issue #1996)
+
+The [agent cost ledger](llm-cost-ledger.md) stores one row per LLM call in
+`harvest_llm_ledger`. The codec does not cover this table. Every column is
+in clear:
+
+| Column | Holds |
+|---|---|
+| `workflow_exec_id`, `event_id`, `call_index` | The run, its completion event and the call order. |
+| `activity_name` | The activity type of the step. |
+| `model` | The model id that the activity or the agent model names. |
+| `input_tokens`, `output_tokens` | The token counts. |
+| `cost_usd_micros` | The cost in millionths of a US dollar, or `NULL`. |
+| `latency_ms` | The call latency. |
+| `recorded_at` | The completion time, equal to the completion event's `timestamp`. |
+
+The fields are in clear by design. SQL usage reports sum them without a key,
+so a report never decrypts an event. An operator who reads the database
+sees which models a tenant uses, how many tokens it spends and what it
+costs. Accept that before your activities record calls.
+
+The ledger holds no prompt and no answer. Those stay in the encrypted
+`input` and `output` fields. The model id is the only free-form text. The
+engine accepts only a token of 1 to 200 bytes: ASCII letters, digits and
+`._:/@+-`. A prompt or a sentence does not fit, but the engine cannot detect
+PII. Keep PII out of the model id.
+
+Erasure (issue #495) keeps the rows, because they hold no payload.
+Retention deletes them with the run. The cross-region DR publication copies
+them to the standby. The history archive does not hold them.
 
 ### Key providers
 

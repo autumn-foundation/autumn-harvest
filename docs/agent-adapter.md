@@ -153,6 +153,21 @@ no memory tool.
 A tool error is cut to fit the result cap too, so a huge error message
 cannot fail the run.
 
+### The cost ledger
+
+On Postgres, each model turn writes one row to the
+[agent cost ledger](llm-cost-ledger.md) (issue #1996). The row holds the
+model id, the tokens, the cost and the call latency. It is outside the
+encrypted turn output, so the usage report can sum it per tenant. Two
+`AgentModel` methods fill it in:
+
+- `model_id()` — the model id. The default is `"unknown"`. The ledger
+  stores it in clear, so do not put PII in it. It must be a token of ASCII
+  letters, digits and `._:/@+-`. The ledger records any other id as
+  `"unknown"`.
+- `cost_usd_micros(usage)` — the cost of one call, in millionths of a US
+  dollar. The default is `None`, which counts the call as unpriced.
+
 `AgentTask` sets the run. Its bounds are `max_steps` (default 8, per
 segment), `max_total_tokens` (per run), `max_output_tokens`,
 `approval_timeout` (default one hour, rounded up to whole seconds) and
@@ -263,8 +278,9 @@ strict replay compares each recorded input as it was written.
   list changes only later turns. Recorded turns replay as they were.
 - **A follow-up chain shares one workflow history.** Each segment adds to
   it. Keep `max_chain` low, or start a new run from the report.
-- **The session entity is separate.** It is a sibling issue. Per-step token
-  cost belongs to the agent cost ledger (#1970).
+- **The session entity is separate.** It is a sibling issue.
+- **The cost ledger needs Postgres.** The SQLite path calls the model
+  directly, with no activity context, so it writes no ledger rows.
 
 ## 10. Always-on agents
 

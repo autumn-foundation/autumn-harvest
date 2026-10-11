@@ -50,4 +50,25 @@ pub trait AgentModel: Send + Sync + std::fmt::Debug {
         &'a self,
         request: &'a ChatRequest,
     ) -> BoxFuture<'a, Result<ChatResponse, AgentError>>;
+
+    /// The model id that the agent cost ledger records (issue #1996).
+    ///
+    /// The ledger stores the id in clear, so do not put PII in it. It must be
+    /// a token of at most 200 bytes: ASCII letters, digits and `._:/@+-`. The
+    /// ledger records any other id as [`UNKNOWN_MODEL_ID`].
+    fn model_id(&self) -> &str {
+        UNKNOWN_MODEL_ID
+    }
+
+    /// The cost of one call, in millionths of a US dollar (issue #1996).
+    ///
+    /// Return `None` when the price is not known. The ledger then counts the
+    /// call as unpriced.
+    fn cost_usd_micros(&self, usage: &TokenUsage) -> Option<u64> {
+        let _ = usage;
+        None
+    }
 }
+
+/// The ledger model id of a model that does not name itself.
+pub const UNKNOWN_MODEL_ID: &str = "unknown";

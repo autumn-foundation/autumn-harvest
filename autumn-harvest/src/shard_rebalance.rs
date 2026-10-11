@@ -507,6 +507,7 @@ pub const COPIED_RELATIONS: &[&str] = &[
     "harvest_signals",
     "harvest_payload_refs",
     "harvest_workflow_logs",
+    "harvest_llm_ledger",
 ];
 
 /// Relations whose schemas must match between source and target before a
@@ -526,6 +527,7 @@ pub const SCHEMA_PARITY_RELATIONS: &[&str] = &[
     "harvest_signals",
     "harvest_payload_refs",
     "harvest_workflow_logs",
+    "harvest_llm_ledger",
     "harvest_task_queue",
 ];
 
@@ -1351,6 +1353,16 @@ mod db {
         )
         .await?;
 
+        // Issue #1996: the agent cost ledger moves with the run. The usage
+        // report skips the sealed source, so a row left there drops out.
+        let llm_ledger = read_json(
+            source,
+            "SELECT COALESCE(jsonb_agg(to_jsonb(l)), '[]'::jsonb) AS payload \
+             FROM harvest_llm_ledger l WHERE l.workflow_exec_id = $1",
+            exec_id,
+        )
+        .await?;
+
         // The parked workflow task, captured but NOT staged (see the doc
         // comment). `to_jsonb` keeps every column, including the sticky hint and
         // the concurrency key, so the restored row is the one that was parked.
@@ -1521,6 +1533,7 @@ mod db {
                 ("harvest_timers", &timers),
                 ("harvest_signals", &signals),
                 ("harvest_payload_refs", &payload_refs),
+                ("harvest_llm_ledger", &llm_ledger),
             ] {
                 diesel::sql_query(format!(
                     "INSERT INTO {table} SELECT * FROM \
@@ -1694,6 +1707,7 @@ mod db {
         "DELETE FROM harvest_signals WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_payload_refs WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_workflow_logs WHERE workflow_exec_id = $1",
+        "DELETE FROM harvest_llm_ledger WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_task_queue WHERE workflow_exec_id = $1",
     ];
 

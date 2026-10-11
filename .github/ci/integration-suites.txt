@@ -237,6 +237,7 @@ linux        autumn-harvest         integration                      testing    
 linux        autumn-harvest         integration                      testing                    dag_unified_tests
 linux        autumn-harvest         integration                      testing                    decision_boundary_db_tests
 linux        autumn-harvest         integration                      testing                    dispatch_tests
+linux        autumn-harvest         integration                      testing                    llm_ledger_tests
 linux        autumn-harvest         integration                      testing                    nd_block
 linux        autumn-harvest         integration                      testing                    replay_canary_tests
 linux        autumn-harvest         integration                      testing                    replayer_integration_tests

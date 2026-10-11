@@ -12,8 +12,8 @@ use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::error::AgentError;
 use crate::heartbeat::{HeartbeatTask, Precheck};
 use crate::memory::{MEMORY_TOOL, MemoryScope, MemoryStore, MemoryTool, render_snapshot};
-use crate::message::{ContentPart, RunId, ToolDefinition};
-use crate::model::{AgentModel, BoxFuture, ChatRequest};
+use crate::message::{ContentPart, RunId, TokenUsage, ToolDefinition};
+use crate::model::{AgentModel, BoxFuture, ChatRequest, UNKNOWN_MODEL_ID};
 use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
 use crate::tool::{Tool, ToolContext, ToolEffect};
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
@@ -228,6 +228,17 @@ impl AgentHarness {
         request: ModelTurnRequest,
         prepare: impl FnOnce(&mut Vec<ContentPart>),
     ) -> Result<ModelTurn, String> {
+        self.model_turn_timed(request, prepare)
+            .await
+            .map(|(turn, _)| turn)
+    }
+
+    /// [`Self::model_turn_with`], plus the latency of the model call alone.
+    pub(crate) async fn model_turn_timed(
+        &self,
+        request: ModelTurnRequest,
+        prepare: impl FnOnce(&mut Vec<ContentPart>),
+    ) -> Result<(ModelTurn, Duration), String> {
         let builtins = self.builtins(
             request.memory_scope.as_ref(),
             request.extra_tools.iter().cloned(),
@@ -239,6 +250,7 @@ impl AgentHarness {
             max_tokens: request.max_output_tokens,
             temperature: self.temperature,
         };
+        let started = std::time::Instant::now();
         let response = match tokio::time::timeout(self.model_timeout, self.client.chat(&chat)).await
         {
             Ok(response) => response.map_err(|err| model_failure(&err))?,
@@ -250,6 +262,7 @@ impl AgentHarness {
                 .into_error_payload());
             }
         };
+        let latency = started.elapsed();
         let mut content = response.content;
         prepare(&mut content);
         let mut turn = ModelTurn {
@@ -294,7 +307,58 @@ impl AgentHarness {
                 });
             turn.decisions.push(decision);
         }
-        Ok(turn)
+        Ok((turn, latency))
+    }
+
+    /// Record one model turn in the agent cost ledger (issue #1996).
+    ///
+    /// A ledger refusal does not fail the turn, because the reply is already
+    /// paid for. The turn records its tokens even when the model metadata is
+    /// bad:
+    /// - a model id that the ledger refuses becomes [`UNKNOWN_MODEL_ID`];
+    /// - a cost that the ledger refuses is dropped, so the call is unpriced.
+    ///
+    /// Each fallback logs a warning.
+    pub(crate) fn record_turn(
+        &self,
+        ctx: &autumn_harvest::context::ActivityContext,
+        usage: &TokenUsage,
+        latency: Duration,
+    ) {
+        use autumn_harvest::llm_ledger::LlmCall;
+
+        let mut model = self.client.model_id();
+        if let Err(err) = LlmCall::new(model, 0, 0).validate() {
+            tracing::warn!(
+                error = %err,
+                "the agent cost ledger refused the model id; recording the turn as {UNKNOWN_MODEL_ID:?}"
+            );
+            model = UNKNOWN_MODEL_ID;
+        }
+        let cost = self.client.cost_usd_micros(usage).filter(|&cost| {
+            let check = LlmCall::new(UNKNOWN_MODEL_ID, 0, 0)
+                .with_cost_usd_micros(cost)
+                .validate();
+            if let Err(err) = &check {
+                tracing::warn!(
+                    error = %err,
+                    "the agent cost ledger refused the cost; recording the turn as unpriced"
+                );
+            }
+            check.is_ok()
+        });
+        let mut call = LlmCall::new(
+            model,
+            u64::from(usage.input_tokens),
+            u64::from(usage.output_tokens),
+        )
+        .with_latency(latency);
+        if let Some(cost) = cost {
+            call = call.with_cost_usd_micros(cost);
+        }
+        if let Err(err) = ctx.record_llm_call(call) {
+            tracing::warn!(error = %err, "the agent cost ledger refused a model turn");
+        }
     }
 
     /// Run one tool call.
