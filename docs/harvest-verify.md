@@ -97,6 +97,7 @@ $ cargo harvest-verify --list-boundaries
 | `--report` | **Also** print the `analyzed/proven/unknown/found/allowed` counts on **stderr**. The `text` renderer already ends with that same line plus the boundary set on stdout, so this flag exists to get the counts onto a separate stream (a CI step summary, say) — it does not add information. |
 | `--list-boundaries` | Print every boundary name, one per line, and exit `0`. |
 | `--emit-structure <FILE>` | Also write the structure manifest of each workflow to `FILE`. The report on stdout does not change. See [Structure manifest](#structure-manifest). |
+| `--check-structure <FILE>` | Read a structure manifest and run the saga compensation coverage check over it. It builds nothing, and only `--format` and `--strict` combine with it. Exit `1` on a gap, `2` on a bad manifest. With `--strict`, an `unknown` verdict or a manifest with no workflow also exits `1`. See [Saga compensation coverage](#saga-compensation-coverage). |
 
 **There is no `--release` flag, and optimized builds are refused.** MIR inlining
 is on at `opt-level ≥ 1`, and an inlined helper leaves no `Call` terminator — the
@@ -118,6 +119,10 @@ runs always ends in `-- --emit=mir -C opt-level=0`.
 
 Findings are always printed to stdout *before* the non-zero exit, so CI logs are
 self-explanatory. This mirrors `harvest det-check`'s contract.
+
+`--check-structure` keeps the same codes. `0` means no gap. `1` means a
+`gap`, or under `--strict` an `unknown` verdict or a manifest with no
+workflow. `2` means a bad manifest, or a build flag given with it.
 
 ---
 
@@ -141,7 +146,7 @@ counts and the boundary set. Verbatim, from a real run over this repo's examples
 $ cargo run -p autumn-harvest-verify --bin cargo-harvest-verify -- harvest-verify \
     -p autumn-harvest --all-examples --no-default-features --features testing \
     --allowlist harvest-verify.allow.toml --report
-harvest-verify: model 2026.10.0, rustc 1.98.0 (88d9e12ae 2026-08-18)
+harvest-verify: model 2026.10.1, rustc 1.98.0 (88d9e12ae 2026-08-18)
 
 proven-deterministic  workflow_logs::import_batch
 ... one line per workflow ...
@@ -149,7 +154,7 @@ proven-deterministic  workflow_logs::import_batch
 warning: skipping example wasm_activity: required feature(s) not enabled: wasm-activities
 
 analyzed 57: proven 56, unknown 0, found 0, allowed 1
-verdicts hold under model 2026.10.0; boundaries not analyzed: dyn-dispatch, indirect-call, ffi, unsafe-raw-pointer, inline-asm, external-crate-body, unmodeled-ctx-method, unresolved-generic, recursion, mir-parse, missing-body, drop-glue
+verdicts hold under model 2026.10.1; boundaries not analyzed: dyn-dispatch, indirect-call, ffi, unsafe-raw-pointer, inline-asm, external-crate-body, unmodeled-ctx-method, unresolved-generic, recursion, mir-parse, missing-body, drop-glue
 ```
 
 Three things about that footer are worth knowing before you quote it:
@@ -265,6 +270,92 @@ because a change to its value does not change the reader's MIR. An activity
 body is not in
 the graph: a workflow names an activity through its `X_info()` function and
 never calls the body.
+
+### Flow graphs and handlers
+
+Each body also has a `flow` graph (issue #2010). The manifest names its
+format in `flow`, as `harvest-flow/1`. A node is an event. An edge joins two
+events when a path joins them with no other event on it.
+
+| Node `kind` | Meaning |
+|---|---|
+| `entry` | The first block. For a coroutine, the target of state `0`. |
+| `step` | A step site. `step` is its index in `steps`. |
+| `call` | A call that starts other bodies of the graph, in `callees`. |
+| `handler` | A handler registration. `handler` is its index in the workflow `handlers`. |
+| `saga-new` | `Saga::new`, or another call that returns a saga value. |
+| `saga-step` | `Saga::step`. `forward` and `compensate` name its closure bodies. `tracked` is true when its out-edges carry the label `ok` or `err`. |
+| `saga-compensate` | `Saga::compensate_all`. `tracked` is true when the body awaits it. |
+| `saga-escape` | A `Saga` value reaches a call or a capture that is not a `Saga` method. |
+| `exit` | A write of the returned value. `outcome` is `ok` for a literal `Ok(..)`, `err` for a literal `Err(..)` or the error arm of `?`, and `unknown` for any other value. Only a body that returns a `Result` has exit nodes. |
+
+`at` names the MIR block of a node. It is for diagnostics only. A tracked
+`saga-step` has at least one `ok` and one `err` edge, and no other node has
+a labeled edge. `--check-structure` refuses a graph that breaks this, names
+a missing node, has other than one `entry`, or has a node that the `entry`
+cannot reach, an `exit` with an out-edge, or a `step` past the body
+`steps` list. It also refuses a `call`, a
+`saga-step`, a handler or a body `calls` entry that names a body or handler
+the workflow does not hold.
+
+The workflow `handlers` list each handler registration: its `kind`
+(`signal`, `update`, `query` or `other`), its model `method`, its `name`
+when the MIR shows it, and its closure `bodies`.
+
+A closure that returns an `async` block hands that future to its caller.
+When the caller has no body in the analysis, as `Saga::step` has none, the
+analysis follows the `async` block itself. It follows the body of an
+`async` closure the same way. So the steps inside a saga closure are in the
+graph. The analysis follows only a block that the
+closure itself builds. A block that captures a `&mut` reference adds an
+`unresolved-callback` boundary, because its writes cannot reach the
+caller.
+
+## Saga compensation coverage
+
+`--check-structure FILE` reads a manifest and runs one property over the
+flow graphs. It reads no MIR. The question is: can a completed forward step
+of a `Saga` reach an error exit with no unwind on the way?
+
+```console
+$ cargo harvest-verify -p my-workflows --lib --emit-structure wf.json
+$ cargo harvest-verify --check-structure wf.json
+gap  my_workflows::order::place_order
+  gap: my_workflows::order::place_order::{closure#0} at bb24 returns err
+covered  my_workflows::order::refund
+
+checked 2: covered 1, gap 1, unknown 0, no-saga 0
+```
+
+`--format json` prints one report per workflow instead.
+
+| Verdict | Meaning |
+|---|---|
+| `no-saga` | No body uses a `Saga`, and no boundary can hide one. |
+| `covered` | Each error exit after a completed forward step unwinds first. |
+| `gap` | An error exit can follow a completed forward step with no unwind. The usual cause is a `?` on a call outside the saga. |
+| `unknown` | The graph cannot show the answer. The report lists each gap as `possible gap`. |
+
+| `unknown` reason | Cause |
+|---|---|
+| `saga-escapes` | A saga value reaches a call, a capture or a body that does not own it. |
+| `saga-result-untracked` | The result of a step does not reach `?` through `.await` alone, as with `map_err` or `match`. |
+| `multiple-sagas` | One body builds two sagas. |
+| `saga-recreated` | A new saga starts while a step of the old one is pending. |
+| `saga-dropped-pending` | A body other than the workflow root exits with a step pending. Its caller cannot unwind that step. |
+| `no-flow-graph` | A body in the manifest has no flow graph. |
+| `boundary` | The workflow has a boundary that runs code. It can hide a saga and a gap, with or without a saga in sight. An `external-const` runs no code, so it does not count. |
+
+A `noop-compensation` note marks a compensation that emits no command. It
+does not change the verdict.
+
+The check follows `saga.step(..).await?` exactly. It follows the value,
+not only the control flow. The check counts `compensate_all` only when the
+body awaits it. The check trusts the `Saga` contract: a failed step unwinds
+every earlier step. A panic is not an error exit. DAG compensation runs in
+the engine, so the graph cannot see it. See
+[`docs/rnd/workflow-graph-spike.md`](rnd/workflow-graph-spike.md) for the
+measured `unknown` rate.
 
 ## The allowlist
 

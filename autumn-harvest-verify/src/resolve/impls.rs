@@ -39,6 +39,13 @@ pub struct SourceIndex {
     pub foreign_fns: BTreeSet<String>,
     /// Function name → generic parameter names, in declaration order.
     pub fn_generics: BTreeMap<String, Vec<String>>,
+    /// The structs, enums, unions and type aliases the sources declare, each
+    /// by its module path and name, such as `helpers::Clock`.
+    ///
+    /// The module path comes from the file path and any inline `mod` around
+    /// the item. It is the full path from the target root, as MIR prints a
+    /// local type that it does not trim to its bare name.
+    pub type_paths: BTreeSet<String>,
     /// Source file → why it could not be indexed.
     ///
     /// A file MIR named that the source roots could not produce, or that `syn`
@@ -77,7 +84,7 @@ impl SourceIndex {
                 }
                 continue;
             };
-            if !index.absorb_syn(&text) && files.contains(file) {
+            if !index.absorb_syn(&text, &file_module(file)) && files.contains(file) {
                 index.unreadable.insert(
                     file.clone(),
                     "the source file could not be parsed as Rust".to_string(),
@@ -147,15 +154,22 @@ impl SourceIndex {
 
     /// `false` when `syn` rejected the file (its `extern` blocks and generic
     /// parameter lists are then invisible).
-    fn absorb_syn(&mut self, text: &str) -> bool {
+    fn absorb_syn(&mut self, text: &str, module: &[String]) -> bool {
         let Ok(file) = syn::parse_file(text) else {
             return false;
         };
-        self.absorb_items(&file.items, 0);
+        self.absorb_items(&file.items, 0, module);
         true
     }
 
-    fn absorb_items(&mut self, items: &[syn::Item], depth: u32) {
+    /// Record the type `name`, declared in `module`.
+    fn declare(&mut self, module: &[String], name: &syn::Ident) {
+        let mut path = module.to_vec();
+        path.push(name.to_string());
+        self.type_paths.insert(path.join("::"));
+    }
+
+    fn absorb_items(&mut self, items: &[syn::Item], depth: u32, module: &[String]) {
         if depth > 8 {
             return;
         }
@@ -168,9 +182,15 @@ impl SourceIndex {
                             .insert(item.sig.ident.to_string(), generics);
                     }
                 }
+                syn::Item::Struct(item) => self.declare(module, &item.ident),
+                syn::Item::Enum(item) => self.declare(module, &item.ident),
+                syn::Item::Union(item) => self.declare(module, &item.ident),
+                syn::Item::Type(item) => self.declare(module, &item.ident),
                 syn::Item::Mod(item) => {
                     if let Some((_, items)) = &item.content {
-                        self.absorb_items(items, depth.saturating_add(1));
+                        let mut inner = module.to_vec();
+                        inner.push(item.ident.to_string());
+                        self.absorb_items(items, depth.saturating_add(1), &inner);
                     }
                 }
                 syn::Item::ForeignMod(item) => {
@@ -212,6 +232,51 @@ fn generic_names(generics: &syn::Generics) -> Vec<String> {
 }
 
 /// Every `.rs` file directly under `dir` (relative to whichever root holds it).
+/// The module path a source file stands for, from its path.
+///
+/// `src/a/b.rs` and `src/a/b/mod.rs` give `a::b`. A target root, such as
+/// `src/lib.rs`, `src/bin/x.rs` or `examples/x.rs`, gives no segment. A file
+/// in another layout reads as a target root. A type of a submodule there
+/// then reads as foreign, which can only add a boundary.
+fn file_module(file: &str) -> Vec<String> {
+    let parts: Vec<&str> = file
+        .trim_end_matches(".rs")
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .collect();
+    let mut module: Vec<String> = layout_module(&parts)
+        .iter()
+        .map(|p| (*p).to_string())
+        .collect();
+    if module
+        .last()
+        .is_some_and(|p| matches!(p.as_str(), "mod" | "lib" | "main"))
+    {
+        module.pop();
+    }
+    module
+}
+
+/// The parts of a source path below its target root.
+fn layout_module<'p>(parts: &'p [&'p str]) -> &'p [&'p str] {
+    // `x.rs` and `x/main.rs` are the root of target `x`. `x/y.rs` is `y`.
+    let below_target = |rest: &'p [&'p str]| rest.get(1..).unwrap_or_default();
+    if let Some(at) = parts.iter().rposition(|p| *p == "src") {
+        let rest = parts.get(at.saturating_add(1)..).unwrap_or_default();
+        if rest.first() == Some(&"bin") {
+            return below_target(rest.get(1..).unwrap_or_default());
+        }
+        return rest;
+    }
+    if let Some(at) = parts
+        .iter()
+        .rposition(|p| matches!(*p, "examples" | "tests" | "benches"))
+    {
+        return below_target(parts.get(at.saturating_add(1)..).unwrap_or_default());
+    }
+    &[]
+}
+
 fn siblings(roots: &[PathBuf], dir: &Path) -> Vec<String> {
     for root in roots {
         let full = root.join(dir);
@@ -344,6 +409,24 @@ fn generic_param_name(param: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_file_path_gives_its_module_path() {
+        let none = Vec::<String>::new();
+        assert_eq!(super::file_module("src/lib.rs"), none);
+        assert_eq!(super::file_module("src/a/b.rs"), ["a", "b"]);
+        assert_eq!(super::file_module("crates/x/src/a/mod.rs"), ["a"]);
+        assert_eq!(super::file_module("src/bin/tool.rs"), none);
+        assert_eq!(super::file_module("src/bin/tool/main.rs"), none);
+        assert_eq!(super::file_module("src/bin/tool/cli.rs"), ["cli"]);
+        assert_eq!(
+            super::file_module("autumn-harvest/examples/ctx_info.rs"),
+            none
+        );
+        assert_eq!(super::file_module("examples/demo/flows.rs"), ["flows"]);
+        assert_eq!(super::file_module("flow.rs"), none);
+    }
+
     use super::*;
 
     #[test]

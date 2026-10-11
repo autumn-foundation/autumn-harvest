@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::entry::Entry;
+use crate::flow::BlockFacts;
 use crate::mir::MirDoc;
 use crate::mir::ast::{Body, Operand, Place, Statement, Terminator};
 use crate::resolve::Program;
@@ -39,6 +40,9 @@ const INFO_MARKERS: [&str; 2] = ["__autumn_activity_info_", "__autumn_workflow_i
 /// The longest chain of locals that step-key resolution follows.
 const MAX_KEY_DEPTH: u8 = 8;
 
+/// The flow graph format this module writes (issue #2010).
+pub const FLOW_FORMAT: &str = "harvest-flow/1";
+
 /// The structure of every analyzed workflow in one build.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StructureManifest {
@@ -46,6 +50,10 @@ pub struct StructureManifest {
     pub format: String,
     pub model_version: String,
     pub rustc_version: String,
+    /// [`FLOW_FORMAT`] when each body carries a flow graph. A manifest from
+    /// an older build has none, so a check over flow graphs refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow: Option<String>,
     pub workflows: Vec<WorkflowStructure>,
 }
 
@@ -63,6 +71,118 @@ pub struct WorkflowStructure {
     pub boundaries: Vec<String>,
     /// Each body reachable from the root, sorted by id.
     pub bodies: Vec<BodyNode>,
+    /// Each signal, update or query handler the workflow registers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handlers: Vec<HandlerSite>,
+}
+
+/// One handler registration (issue #2010).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandlerSite {
+    /// `signal`, `update` or `query`.
+    pub kind: String,
+    /// The model row, such as `register_signal_handler`.
+    pub method: String,
+    /// The handler name, when the MIR shows it.
+    pub name: Option<String>,
+    /// The closure bodies the registration passes, such as a validator and a
+    /// handler.
+    pub bodies: Vec<String>,
+}
+
+/// The condensed control-flow graph of one body (issue #2010).
+///
+/// A node is an event. An edge joins two events when a path joins them with
+/// no other event on it. A node id is its index in `nodes`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowGraph {
+    pub nodes: Vec<FlowNode>,
+    pub edges: Vec<FlowEdge>,
+}
+
+/// One event in a body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowNode {
+    /// The MIR block of the event. It is for diagnostics only, because block
+    /// labels change from build to build.
+    pub at: String,
+    #[serde(flatten)]
+    pub event: FlowEvent,
+}
+
+/// What happens at a flow node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum FlowEvent {
+    /// The first block. For a coroutine, the target of state `0`.
+    Entry,
+    /// A step site. The value is its index in [`BodyNode::steps`].
+    Step { step: usize },
+    /// A call that starts other bodies of the graph.
+    Call { callees: Vec<String> },
+    /// A handler registration. The value is its index in
+    /// [`WorkflowStructure::handlers`].
+    Handler { handler: usize },
+    /// `Saga::new`, or another call that returns a saga value.
+    SagaNew,
+    /// `Saga::step`, with its forward and compensation closure bodies.
+    /// `tracked` is true when its `ok` and `err` edges are labeled.
+    SagaStep {
+        forward: Vec<String>,
+        compensate: Vec<String>,
+        tracked: bool,
+    },
+    /// `Saga::compensate_all`. `tracked` is true when the body awaits it.
+    SagaCompensate { tracked: bool },
+    /// A value of type `Saga` reaches a call or a value that is not a
+    /// `Saga` method. The value names the call or the statement.
+    SagaEscape { to: String },
+    /// A write of the value the body returns.
+    Exit { outcome: ExitOutcome },
+}
+
+/// What an exit returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExitOutcome {
+    /// A literal `Ok(..)`.
+    Ok,
+    /// A literal `Err(..)`, or the error arm of `?`.
+    Err,
+    /// Any other value, such as a call result. It can be an error.
+    Unknown,
+}
+
+impl ExitOutcome {
+    /// The outcome as the manifest spells it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Err => "err",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One edge of a flow graph.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct FlowEdge {
+    pub from: usize,
+    pub to: usize,
+    /// Set only on the out-edges of a tracked `Saga::step`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<EdgeLabel>,
+}
+
+/// The arm of a `Saga::step` result that an edge follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EdgeLabel {
+    /// The step completed, so its compensation is pending.
+    Ok,
+    /// The step failed, so the saga unwound every earlier step.
+    Err,
 }
 
 /// One body in a workflow graph.
@@ -78,6 +198,9 @@ pub struct BodyNode {
     /// One entry per sink call site, sorted.
     #[serde(default)]
     pub steps: Vec<StepSite>,
+    /// The flow graph of the body (issue #2010). The digest does not read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow: Option<FlowGraph>,
 }
 
 /// One call from a body to another body in the graph.
@@ -123,6 +246,30 @@ pub struct Recorder {
     pub edges: BTreeSet<Edge>,
     /// Each step site it classified.
     pub sinks: BTreeSet<SinkSite>,
+    /// Each closure or fn item passed as an argument, with its index
+    /// (issue #2010).
+    pub arguments: BTreeSet<ArgumentEdge>,
+    /// Each handler registration it met (issue #2010).
+    pub handlers: BTreeSet<HandlerCall>,
+}
+
+/// A body passed as argument `index` of the call in `block`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ArgumentEdge {
+    pub caller: String,
+    pub block: String,
+    /// The call operand index, `self` included.
+    pub index: usize,
+    pub body: String,
+}
+
+/// A handler registration call.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct HandlerCall {
+    pub caller: String,
+    pub block: String,
+    /// The model row path, such as `register_signal_handler`.
+    pub method: String,
 }
 
 /// A call edge between two body ids.
@@ -172,6 +319,31 @@ impl Recorder {
         self.insert_edge(from, block, to, false, true);
     }
 
+    /// Record that `body` is argument `index` of the call in `block`.
+    pub fn argument(&mut self, from: &str, block: &str, index: usize, body: &str) {
+        self.arguments.insert(ArgumentEdge {
+            caller: from.to_string(),
+            block: block.to_string(),
+            index,
+            body: body.to_string(),
+        });
+    }
+
+    /// Record the `async` block a closure returns. The closure builds it, and
+    /// the caller of the closure runs it to completion once per call.
+    pub fn future_edge(&mut self, from: &str, block: &str, to: &str) {
+        self.insert_edge(from, block, to, false, false);
+    }
+
+    /// Record a handler registration in `block`.
+    pub fn handler(&mut self, body: &str, block: &str, method: &str) {
+        self.handlers.insert(HandlerCall {
+            caller: body.to_string(),
+            block: block.to_string(),
+            method: method.to_string(),
+        });
+    }
+
     fn insert_edge(&mut self, from: &str, block: &str, to: &str, resume: bool, many: bool) {
         self.edges.insert(Edge {
             caller: from.to_string(),
@@ -209,6 +381,7 @@ pub fn manifest(
         format: STRUCTURE_FORMAT.to_string(),
         model_version: model_version.to_string(),
         rustc_version: rustc_version.to_string(),
+        flow: Some(FLOW_FORMAT.to_string()),
         workflows,
     }
 }
@@ -293,6 +466,9 @@ impl<'p> StructureBuilder<'p> {
             sinks.entry(site.body.as_str()).or_default().push(site);
         }
 
+        let (handlers, handler_at) = self.handlers(recorder, &display, &show);
+        let arguments = group_arguments(recorder, &display);
+
         let mut bodies = Vec::with_capacity(ids.len());
         for id in ids {
             let cyclic = self.cyclic_blocks(id);
@@ -310,27 +486,28 @@ impl<'p> StructureBuilder<'p> {
             calls.sort_by(|a, b| {
                 (&a.callee, a.resume, a.in_loop).cmp(&(&b.callee, b.resume, b.in_loop))
             });
-            let mut steps: Vec<StepSite> = Vec::new();
-            for site in sinks.get(id.as_str()).into_iter().flatten() {
-                let key = match (&site.step, site.key_arg, body) {
-                    (Some(_), Some(arg), Some(body)) => self.step_key(body, &site.block, arg),
-                    _ => None,
-                };
-                steps.push(StepSite {
-                    sink: site.sink.clone(),
-                    kind: site.step.clone().unwrap_or_else(|| "other".to_string()),
-                    key,
-                    in_loop: cyclic.contains(&site.block),
-                });
-            }
-            steps.sort_by(|a, b| {
-                (&a.kind, &a.key, &a.sink, a.in_loop).cmp(&(&b.kind, &b.key, &b.sink, b.in_loop))
-            });
+            let sited = self.step_sites(
+                sinks.get(id.as_str()).map_or(&[][..], Vec::as_slice),
+                body,
+                &cyclic,
+            );
+            let blocks: Vec<&str> = sited.iter().map(|(_, block)| *block).collect();
+            let in_engine = |id: &str| program.qualified_name(id).starts_with("autumn_harvest::");
+            let mut facts = block_facts(
+                &blocks,
+                edges.get(id.as_str()).map_or(&[][..], Vec::as_slice),
+                arguments.get(id.as_str()).map_or(&[][..], Vec::as_slice),
+                &show,
+                &in_engine,
+            );
+            facts.handlers = handler_blocks(&handler_at, id);
+            let flow = flow_graph(body, &facts);
             bodies.push(BodyNode {
                 id: show(id),
                 digest: self.digests.get(id.as_str()).cloned().unwrap_or_default(),
                 calls,
-                steps,
+                steps: sited.into_iter().map(|(step, _)| step).collect(),
+                flow: Some(flow),
             });
         }
         bodies.sort_by(|a, b| a.id.cmp(&b.id));
@@ -347,7 +524,83 @@ impl<'p> StructureBuilder<'p> {
             root: show(root),
             boundaries,
             bodies,
+            handlers,
         }
+    }
+
+    /// The step sites of one body, sorted, each with its block.
+    fn step_sites<'s>(
+        &mut self,
+        sites: &[&'s SinkSite],
+        body: Option<&Body>,
+        cyclic: &BTreeSet<String>,
+    ) -> Vec<(StepSite, &'s str)> {
+        let mut out: Vec<(StepSite, &str)> = Vec::new();
+        for site in sites {
+            let key = match (&site.step, site.key_arg, body) {
+                (Some(_), Some(arg), Some(body)) => self.step_key(body, &site.block, arg),
+                _ => None,
+            };
+            let step = StepSite {
+                sink: site.sink.clone(),
+                kind: site.step.clone().unwrap_or_else(|| "other".to_string()),
+                key,
+                in_loop: cyclic.contains(&site.block),
+            };
+            out.push((step, site.block.as_str()));
+        }
+        out.sort_by(|(a, x), (b, y)| {
+            (&a.kind, &a.key, &a.sink, a.in_loop, x).cmp(&(&b.kind, &b.key, &b.sink, b.in_loop, y))
+        });
+        out
+    }
+
+    /// The handler list of one workflow, and the index of each registration
+    /// by `(body, block)`.
+    fn handlers(
+        &mut self,
+        recorder: &Recorder,
+        display: &BTreeMap<String, String>,
+        show: &dyn Fn(&str) -> String,
+    ) -> (Vec<HandlerSite>, BTreeMap<(String, String), usize>) {
+        let program = self.program;
+        let mut list = Vec::new();
+        let mut at = BTreeMap::new();
+        for call in &recorder.handlers {
+            if !display.contains_key(&call.caller) {
+                continue;
+            }
+            // Operand 0 is the context, and operand 1 is the handler name.
+            let name = program.body(&call.caller).and_then(|body| {
+                let block = body.blocks.iter().find(|b| b.label == call.block)?;
+                let Terminator::Call { args, .. } = &block.terminator else {
+                    return None;
+                };
+                let markers = self.markers();
+                key_of_operand(markers, body, args.get(1)?, 0)
+            });
+            let mut bodies: Vec<String> = recorder
+                .arguments
+                .iter()
+                .filter(|a| a.caller == call.caller && a.block == call.block)
+                .filter(|a| display.contains_key(&a.body))
+                .map(|a| show(&a.body))
+                .collect();
+            bodies.sort_unstable();
+            bodies.dedup();
+            let kind = ["signal", "update", "query"]
+                .into_iter()
+                .find(|k| call.method.contains(k))
+                .unwrap_or("other");
+            at.insert((call.caller.clone(), call.block.clone()), list.len());
+            list.push(HandlerSite {
+                kind: kind.to_string(),
+                method: call.method.clone(),
+                name,
+                bodies,
+            });
+        }
+        (list, at)
     }
 
     /// Display ids, unique within the workflow, and a boundary per collision.
@@ -555,6 +808,86 @@ impl<'p> StructureBuilder<'p> {
                 .collect()
         })
     }
+}
+
+/// Each recorded argument whose body is in the graph, by caller.
+fn group_arguments<'r>(
+    recorder: &'r Recorder,
+    display: &BTreeMap<String, String>,
+) -> BTreeMap<&'r str, Vec<&'r ArgumentEdge>> {
+    let mut out: BTreeMap<&str, Vec<&ArgumentEdge>> = BTreeMap::new();
+    for argument in &recorder.arguments {
+        if display.contains_key(&argument.body) {
+            out.entry(argument.caller.as_str())
+                .or_default()
+                .push(argument);
+        }
+    }
+    out
+}
+
+/// Block → handler index, for the registrations in body `id`.
+fn handler_blocks(at: &BTreeMap<(String, String), usize>, id: &str) -> BTreeMap<String, usize> {
+    at.iter()
+        .filter(|((caller, _), _)| caller == id)
+        .map(|((_, block), index)| (block.clone(), *index))
+        .collect()
+}
+
+/// The flow graph of `body`. A body with no MIR gets only its entry.
+fn flow_graph(body: Option<&Body>, facts: &BlockFacts) -> FlowGraph {
+    body.map_or_else(
+        || FlowGraph {
+            nodes: vec![FlowNode {
+                at: String::new(),
+                event: FlowEvent::Entry,
+            }],
+            edges: Vec::new(),
+        },
+        |body| crate::flow::build(body, facts),
+    )
+}
+
+/// What the flow graph needs to know of each block of one body.
+///
+/// `steps` holds the block of each step site, in the sorted step order.
+fn block_facts(
+    steps: &[&str],
+    edges: &[&Edge],
+    arguments: &[&ArgumentEdge],
+    show: &dyn Fn(&str) -> String,
+    in_engine: &dyn Fn(&str) -> bool,
+) -> BlockFacts {
+    let mut facts = BlockFacts::default();
+    for (index, block) in steps.iter().enumerate() {
+        facts.steps.insert((*block).to_string(), index);
+    }
+    // A closure argument edge (`many`) starts a closure, not the callee. A
+    // body of the engine crate is the engine method itself.
+    for edge in edges.iter().filter(|e| !e.many && !in_engine(&e.callee)) {
+        facts.bodied.insert(edge.block.clone());
+    }
+    for edge in edges.iter().filter(|e| !e.resume) {
+        facts
+            .calls
+            .entry(edge.block.clone())
+            .or_default()
+            .push(show(&edge.callee));
+    }
+    for callees in facts.calls.values_mut() {
+        callees.sort_unstable();
+        callees.dedup();
+    }
+    for argument in arguments {
+        let bodies = facts
+            .arguments
+            .entry((argument.block.clone(), argument.index))
+            .or_default();
+        bodies.push(show(&argument.body));
+        bodies.sort_unstable();
+        bodies.dedup();
+    }
+    facts
 }
 
 fn hex(bytes: &[u8]) -> String {

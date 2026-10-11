@@ -776,6 +776,28 @@ impl Program {
         self.closures.get(span).map_or(&[], Vec::as_slice)
     }
 
+    /// The coroutine bodies nested under `owner` for the `async` block
+    /// `span` (issue #2010).
+    ///
+    /// A closure that builds an `async` block owns its coroutine body, as
+    /// `owner::{closure#N}`. The lookup never leaves `owner`. So a macro span
+    /// that two blocks share, or a block another function returns, cannot
+    /// resolve here to the wrong body.
+    #[must_use]
+    pub fn nested_coroutines(&self, owner: &str, span: &str) -> Vec<String> {
+        let prefix = format!("{owner}::");
+        self.order
+            .iter()
+            .filter(|path| path.starts_with(&prefix))
+            .filter(|path| {
+                self.body(path)
+                    .and_then(coroutine_param_span)
+                    .is_some_and(|found| found == span)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// [`Self::closure_bodies`], narrowed to the ones a call site inside
     /// `caller_body` can mean.
     ///
@@ -1339,6 +1361,22 @@ impl Program {
             .unwrap_or_else(|| path.to_string())
     }
 
+    /// Is the rooted type path `path` first-party?
+    ///
+    /// MIR prints a local type without its crate name, as `models::Order`. It
+    /// prints a dependency type the same way, as `helpers::Clock`. A local
+    /// type prints by its bare name or its full path, never by a part. So the
+    /// sources must declare exactly that path. An analyzed crate name is
+    /// proof alone.
+    #[must_use]
+    pub fn is_first_party_type(&self, path: &str) -> bool {
+        let bare = strip_generics_everywhere(path);
+        let Some(root) = crate_root(&bare) else {
+            return false;
+        };
+        self.crates.contains(root) || self.sources.type_paths.contains(bare.trim())
+    }
+
     /// `crate::path` for a body id — the spelling every report uses.
     #[must_use]
     pub fn qualified_name(&self, id: &str) -> String {
@@ -1507,6 +1545,27 @@ fn closure_param_span(body: &Body) -> Option<String> {
     let ty = peel_refs(ty).trim();
     let ty = ty.trim_start_matches("mut ").trim();
     (ty.starts_with('{') && ty.contains('@') && ty.ends_with('}')).then(|| ty.to_string())
+}
+
+/// The `{async block@..}` or `{async closure body@..}` span of a coroutine
+/// body, which takes `Pin<&mut ..>` of it as its first parameter (issue
+/// #2010).
+fn coroutine_param_span(body: &Body) -> Option<String> {
+    let (_, ty) = body.params.first()?;
+    let inner = ty
+        .trim()
+        .strip_prefix("Pin<")
+        .or_else(|| ty.trim().strip_prefix("std::pin::Pin<"))?
+        .strip_suffix('>')?;
+    let inner = peel_refs(inner).trim().trim_start_matches("mut ").trim();
+    (is_coroutine_span(inner) && inner.ends_with('}')).then(|| inner.to_string())
+}
+
+/// The span of a coroutine that a closure can return: an `async` block, or
+/// the body of an `async` closure.
+#[must_use]
+pub fn is_coroutine_span(span: &str) -> bool {
+    span.starts_with("{async block@") || span.starts_with("{async closure body@")
 }
 
 /// `Box<dyn Jitter>` / `&dyn Jitter + Send` → `Jitter`.

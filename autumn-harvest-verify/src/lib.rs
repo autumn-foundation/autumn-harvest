@@ -17,11 +17,13 @@ pub mod allowlist;
 pub mod analysis;
 pub mod driver;
 pub mod entry;
+mod flow;
 pub mod mir;
 pub mod model;
 pub mod pipeline;
 pub mod report;
 pub mod resolve;
+pub mod saga;
 pub mod structure;
 mod util;
 pub mod verdict;
@@ -136,6 +138,20 @@ pub struct Cli {
     /// `autumn_harvest::upgrade_check` diffs two of them, one per build.
     #[arg(long, value_name = "FILE")]
     pub emit_structure: Option<std::path::PathBuf>,
+    /// Read a structure manifest and run the saga compensation coverage
+    /// check over it, with no build (issue #2010). Exit 1 on a gap, or with
+    /// `--strict` on an `unknown` verdict or no workflow. Exit 2 on a bad
+    /// manifest. Only `--format` and `--strict` combine with it.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = [
+            "manifest_path", "package", "lib", "example", "all_examples", "bin", "test",
+            "features", "no_default_features", "target_dir", "mir", "source_root", "model",
+            "allowlist", "report", "list_boundaries", "emit_structure",
+        ]
+    )]
+    pub check_structure: Option<std::path::PathBuf>,
 }
 
 /// CLI entry: parses `argv` (tolerating the `harvest-verify` subcommand token cargo inserts),
@@ -164,6 +180,10 @@ pub fn cli_main(argv: Vec<String>) -> i32 {
             println!("{}", kind.name());
         }
         return 0;
+    }
+
+    if let Some(path) = &cli.check_structure {
+        return check_structure(path, cli.format, cli.strict);
     }
 
     match run(&cli) {
@@ -203,6 +223,51 @@ pub fn cli_main(argv: Vec<String>) -> i32 {
             2
         }
     }
+}
+
+/// Run the saga coverage check over the manifest at `path`, and print the
+/// result. The exit code is 0 when clean, 1 on a gap and 2 on a tool error.
+/// With `strict`, an `unknown` verdict or a manifest with no workflow also
+/// fails the run. A gate must not pass on a run that checked nothing.
+fn check_structure(path: &std::path::Path, format: Format, strict: bool) -> i32 {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("error: cannot read {}: {e}", path.display());
+            return 2;
+        }
+    };
+    let manifest = match saga::parse_manifest(&text) {
+        Ok(manifest) => manifest,
+        Err(e) => {
+            eprintln!("error: {}: {e}", path.display());
+            return 2;
+        }
+    };
+    let reports = match saga::check(&manifest) {
+        Ok(reports) => reports,
+        Err(e) => {
+            eprintln!("error: {}: {e}", path.display());
+            return 2;
+        }
+    };
+    match format {
+        Format::Text => println!("{}", saga::render_text(&reports)),
+        Format::Json => match serde_json::to_string_pretty(&reports) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 2;
+            }
+        },
+    }
+    if reports.is_empty() {
+        eprintln!("warning: {} holds no workflow", path.display());
+    }
+    let failed = |verdict: saga::SagaVerdict| {
+        verdict == saga::SagaVerdict::Gap || (strict && verdict == saga::SagaVerdict::Unknown)
+    };
+    i32::from(reports.iter().any(|r| failed(r.verdict)) || (strict && reports.is_empty()))
 }
 
 /// Write the structure manifest of `report` to `path`.

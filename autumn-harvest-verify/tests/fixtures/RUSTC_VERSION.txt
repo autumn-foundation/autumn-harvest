@@ -118,3 +118,92 @@ cargo 1.94.1 (29ea6fb6a 2026-03-24)
 # Its `<impl at ...>` headers are relative to the WORKSPACE ROOT
 # (`autumn-harvest/examples/deterministic_primitives.rs`), not to this
 # directory, so resolution tests must use the workspace root as a source root.
+
+# `saga_graph/flow.mir` (issue #2010) was produced on rustc 1.99.0
+# (b940084d7 2026-09-28), the toolchain `rust-toolchain.toml` pins. It needs
+# TWO steps, like `bodyless_dependency.mir`: the stub `autumn_harvest` crate
+# must have no body in the analyzed set, and its crate name makes it trusted.
+# From `saga_graph/`:
+#
+#   rustc --crate-type lib --edition 2024 --crate-name autumn_harvest \
+#         -o libautumn_harvest.rlib harvest_stub.rs
+#   rustc --crate-type lib --edition 2024 --emit=mir \
+#         --extern autumn_harvest=libautumn_harvest.rlib -o flow.mir flow.rs
+#   rm libautumn_harvest.rlib
+#
+# The flow graph reads the `?` lowering: `Try::branch`, a `switchInt` with
+# cases `0` and `1`, and `from_residual`. After a re-emit, check that each
+# `saga.step(..).await?` still prints that shape:
+#
+#   grep -c 'as Try>::branch' saga_graph/flow.mir
+#
+# Expect 28, one per `?` in `saga_graph/flow.rs`. The walk also hard-codes
+# the case values: `0` is `Poll::Ready` and `ControlFlow::Continue`, and `1`
+# is `ControlFlow::Break`. A change to them is not detected by the count, so
+# run `cargo test -p autumn-harvest-verify --test saga_graph` after a re-emit.
+#
+# `async_block_follow/flow.mir` (issue #2010) was produced the same way, on
+# rustc 1.99.0, with a second stub crate that stands for an untrusted
+# dependency. Its source sits in `dep/`, so the source index does not read
+# it as first-party code. From `async_block_follow/`:
+#
+#   rustc --crate-type lib --edition 2024 --crate-name autumn_harvest \
+#         -o libautumn_harvest.rlib harvest_stub.rs
+#   rustc --crate-type lib --edition 2024 --crate-name other_crate \
+#         -o libother_crate.rlib dep/other_crate.rs
+#   rustc --crate-type lib --edition 2024 --emit=mir \
+#         --extern autumn_harvest=libautumn_harvest.rlib \
+#         --extern other_crate=libother_crate.rlib -o flow.mir flow.rs
+#   rm libautumn_harvest.rlib libother_crate.rlib
+
+# `saga_graph_own/flow.mir` (issue #2010) holds a workflow crate's own type
+# named `Saga`. It uses the stub of `saga_graph/` and the same two steps,
+# from `saga_graph_own/`:
+#
+#   rustc --crate-type lib --edition 2024 --crate-name autumn_harvest \
+#         -o libautumn_harvest.rlib harvest_stub.rs
+#   rustc --crate-type lib --edition 2024 --emit=mir \
+#         --extern autumn_harvest=libautumn_harvest.rlib -o flow.mir flow.rs
+#   rm libautumn_harvest.rlib
+#
+# It is a fixture of its own on purpose. In one dump with the engine's
+# `Saga`, the resolver maps the trimmed `Saga::<'_>::new` to the local impl
+# by name. That adds a conservative `external-const` boundary, not a wrong
+# verdict, and it is outside the scope of issue #2010. The type has a field
+# for a like reason: MIR prints a unit struct value as `const own::Saga`, and
+# the structure digest reads that as an `external-const` boundary.
+
+# `saga_graph_renamed/flow.mir` (issue #2010) reaches the engine through a
+# renamed crate and through a facade crate. MIR prints the defining crate,
+# `autumn_harvest::Saga`, for both. From `saga_graph_renamed/`:
+#
+#   rustc --crate-type lib --edition 2024 --crate-name autumn_harvest \
+#         -o libautumn_harvest.rlib ../saga_graph/harvest_stub.rs
+#   rustc --crate-type lib --edition 2024 --crate-name facade \
+#         --extern autumn_harvest=libautumn_harvest.rlib \
+#         -o libfacade.rlib facade.rs
+#   rustc --crate-type lib --edition 2024 --emit=mir \
+#         --extern ah=libautumn_harvest.rlib \
+#         --extern facade=libfacade.rlib -L . -o flow.mir flow.rs
+#   rm libautumn_harvest.rlib libfacade.rlib
+
+# `saga_graph/harvest_stub.mir` (issue #2010) is the MIR of the stub engine
+# crate itself. A test analyzes it beside a workflow crate, as a run with
+# `-p autumn-harvest` does. From `saga_graph/`:
+#
+#   rustc --crate-type lib --edition 2024 --crate-name autumn_harvest \
+#         --emit=mir -o harvest_stub.mir harvest_stub.rs
+
+# `async_block_collide/flow.mir` (issue #2010) uses a dependency crate named
+# `helpers`, and the workflow crate has a `helpers` module. MIR prints both as
+# `helpers::..`. The dependency source sits in `dep/`, so the source index
+# does not read it as a sibling of `flow.rs`. From `async_block_collide/`:
+#
+#   rustc --crate-type lib --edition 2024 --crate-name autumn_harvest \
+#         -o libautumn_harvest.rlib ../async_block_follow/harvest_stub.rs
+#   rustc --crate-type lib --edition 2024 --crate-name helpers \
+#         -o libhelpers.rlib dep/helpers.rs
+#   rustc --crate-type lib --edition 2024 --emit=mir \
+#         --extern autumn_harvest=libautumn_harvest.rlib \
+#         --extern helpers=libhelpers.rlib -o flow.mir flow.rs
+#   rm libautumn_harvest.rlib libhelpers.rlib
