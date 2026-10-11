@@ -31,6 +31,43 @@ pub struct ImplHeader {
     pub generics: Vec<String>,
 }
 
+/// What the field types of one declared type hold (issue #2010).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FieldFacts {
+    /// A field type holds `&mut`.
+    pub mut_ref: bool,
+    /// A field type takes a lifetime argument, as `Refs<'a>`. A shared
+    /// `&'a T` does not count.
+    pub lifetime: bool,
+    /// Each path segment a field type names, as `Arc` and `Mutex`.
+    pub names: BTreeSet<String>,
+}
+
+/// Collects [`FieldFacts`] from field types.
+#[derive(Default)]
+struct FieldScan(FieldFacts);
+
+impl<'ast> syn::visit::Visit<'ast> for FieldScan {
+    fn visit_type_reference(&mut self, reference: &'ast syn::TypeReference) {
+        if reference.mutability.is_some() {
+            self.0.mut_ref = true;
+        }
+        // The lifetime of a shared reference cannot write. Skip it.
+        self.visit_type(&reference.elem);
+    }
+
+    fn visit_lifetime(&mut self, lifetime: &'ast syn::Lifetime) {
+        if lifetime.ident != "static" {
+            self.0.lifetime = true;
+        }
+    }
+
+    fn visit_path_segment(&mut self, segment: &'ast syn::PathSegment) {
+        self.0.names.insert(segment.ident.to_string());
+        syn::visit::visit_path_segment(self, segment);
+    }
+}
+
 /// Source files indexed for impl-header, foreign-fn and generics lookups.
 #[derive(Debug, Default)]
 pub struct SourceIndex {
@@ -49,6 +86,9 @@ pub struct SourceIndex {
     /// The self type name of each `impl Future for T` in the sources, as
     /// `T` with no generics.
     pub future_impls: BTreeSet<String>,
+    /// Struct, enum and union name → what its field types hold. Two types of
+    /// one name share an entry, which can only add to it.
+    pub type_fields: BTreeMap<String, FieldFacts>,
     /// Source file → why it could not be indexed.
     ///
     /// A file MIR named that the source roots could not produce, or that `syn`
@@ -165,6 +205,18 @@ impl SourceIndex {
         true
     }
 
+    /// Record what the field types of the type `name` hold.
+    fn scan_fields<'f>(&mut self, name: &syn::Ident, fields: impl Iterator<Item = &'f syn::Field>) {
+        let mut scan = FieldScan::default();
+        for field in fields {
+            syn::visit::Visit::visit_type(&mut scan, &field.ty);
+        }
+        let facts = self.type_fields.entry(name.to_string()).or_default();
+        facts.mut_ref |= scan.0.mut_ref;
+        facts.lifetime |= scan.0.lifetime;
+        facts.names.extend(scan.0.names);
+    }
+
     /// Record the type `name`, declared in `module`.
     fn declare(&mut self, module: &[String], name: &syn::Ident) {
         let mut path = module.to_vec();
@@ -185,9 +237,19 @@ impl SourceIndex {
                             .insert(item.sig.ident.to_string(), generics);
                     }
                 }
-                syn::Item::Struct(item) => self.declare(module, &item.ident),
-                syn::Item::Enum(item) => self.declare(module, &item.ident),
-                syn::Item::Union(item) => self.declare(module, &item.ident),
+                syn::Item::Struct(item) => {
+                    self.declare(module, &item.ident);
+                    self.scan_fields(&item.ident, item.fields.iter());
+                }
+                syn::Item::Enum(item) => {
+                    self.declare(module, &item.ident);
+                    let fields = item.variants.iter().flat_map(|v| v.fields.iter());
+                    self.scan_fields(&item.ident, fields);
+                }
+                syn::Item::Union(item) => {
+                    self.declare(module, &item.ident);
+                    self.scan_fields(&item.ident, item.fields.named.iter());
+                }
                 syn::Item::Type(item) => self.declare(module, &item.ident),
                 syn::Item::Mod(item) => {
                     if let Some((_, items)) = &item.content {

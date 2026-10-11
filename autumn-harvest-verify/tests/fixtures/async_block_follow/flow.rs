@@ -527,3 +527,39 @@ pub async fn wf_step_named_shared_ctor(ctx: &WorkflowContext) -> Out {
     let seen = shared.lock().map_or(0, |v| *v);
     ctx.execute_activity_raw("b", seen).await
 }
+
+/// A lifetime-free newtype that hides its interior mutability.
+#[derive(Clone)]
+pub struct Shared(std::sync::Arc<std::sync::Mutex<u64>>);
+
+impl Shared {
+    /// Writes `value` into the shared state.
+    pub fn set(&self, value: u64) {
+        if let Ok(mut v) = self.0.lock() {
+            *v = value;
+        }
+    }
+}
+
+pub fn __autumn_workflow_info_wf_step_write_newtype() -> u8 {
+    0
+}
+
+/// A saga step block writes the clock through a captured newtype clone.
+pub async fn wf_step_write_newtype(ctx: &WorkflowContext) -> Out {
+    let seen = Shared(std::sync::Arc::new(std::sync::Mutex::new(0_u64)));
+    {
+        let mut saga = Saga::new(ctx);
+        let handle = seen.clone();
+        saga.step(
+            move || async move {
+                handle.set(now_nanos());
+                ctx.execute_activity_raw("a", 1).await
+            },
+            |_| async { Ok(()) },
+        )
+        .await?;
+    }
+    let read = seen.0.lock().map_or(0, |v| *v);
+    ctx.execute_activity_raw("b", read).await
+}

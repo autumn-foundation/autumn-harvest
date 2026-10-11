@@ -1361,6 +1361,38 @@ impl Program {
             .unwrap_or_else(|| path.to_string())
     }
 
+    /// The local types whose fields can write to state another clone sees.
+    ///
+    /// A field qualifies when it holds `&mut`, takes a lifetime argument, or
+    /// names a type of `interior` or another such local type. So
+    /// `struct Shared(Arc<Mutex<u64>>)` qualifies, and so does a type that
+    /// holds a `Shared`.
+    #[must_use]
+    pub fn writable_types(&self, interior: &[&str]) -> BTreeSet<String> {
+        let mut writable: BTreeSet<String> = BTreeSet::new();
+        loop {
+            let found: Vec<&String> = self
+                .sources
+                .type_fields
+                .iter()
+                .filter(|(name, _)| !writable.contains(*name))
+                .filter(|(_, facts)| {
+                    facts.mut_ref
+                        || facts.lifetime
+                        || facts
+                            .names
+                            .iter()
+                            .any(|n| interior.contains(&n.as_str()) || writable.contains(n))
+                })
+                .map(|(name, _)| name)
+                .collect();
+            if found.is_empty() {
+                return writable;
+            }
+            writable.extend(found.into_iter().cloned());
+        }
+    }
+
     /// Do the sources implement `Future` for the type `path` names?
     #[must_use]
     pub fn sources_impl_future(&self, path: &str) -> bool {

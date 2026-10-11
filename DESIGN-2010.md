@@ -136,6 +136,10 @@ Four review agents read the first version. Each fix has a test.
     `SharedFuture::new(handle)`.
 22. A local type that the sources implement `Future` for, but whose `poll`
     has no body in the MIR, is a `missing-body` boundary.
+23. A local wrapper can hide interior mutability, as
+    `struct Shared(Arc<Mutex<u64>>)`. The source index records what each
+    local type's fields hold. A type whose fields hold `&mut`, a lifetime,
+    an interior-mutable type or another such type counts as interior-mutable.
 
 ---
 
@@ -220,7 +224,8 @@ A `noop-compensation` note does not change the verdict.
 - The determinism model does not track a write through `&self` of an
   interior-mutable local, such as `Cell::set` or a write through
   `Mutex::lock`. This gap predates #2010. A followed `async` block that
-  captures such a value, owned or shared, adds a boundary.
+  captures such a value, owned or shared, adds a boundary. So does a local
+  wrapper of one, as `struct Shared(Arc<Mutex<u64>>)`.
 - MIR prints a type by its path alone, with no crate. A local
   `helpers::Clock` and a `Clock` from a dependency crate named `helpers`
   print the same. The analysis then reads the dependency type as local. A

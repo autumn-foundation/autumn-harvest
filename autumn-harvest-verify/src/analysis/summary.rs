@@ -305,6 +305,8 @@ pub struct Analyzer<'a> {
     targets: HashMap<String, Rc<CallTarget>>,
     stack: Vec<String>,
     budget: u32,
+    /// The interior-mutable type names, computed on first use (issue #2010).
+    interior: Option<Vec<String>>,
     /// Findings collected across every body reached from this entry.
     pub findings: Vec<Finding>,
     /// Boundaries collected across every body reached from this entry.
@@ -327,6 +329,7 @@ impl<'a> Analyzer<'a> {
             targets: HashMap::new(),
             stack: Vec::new(),
             budget: BUDGET,
+            interior: None,
             findings: Vec::new(),
             boundaries: Vec::new(),
             warnings: BTreeSet::new(),
@@ -1756,7 +1759,8 @@ impl<'a> Analyzer<'a> {
         out: &mut TaintSet,
     ) {
         let block = returning_block(body);
-        let interior = self.interior_types();
+        let interior_names = self.interior_types();
+        let interior: Vec<&str> = interior_names.iter().map(String::as_str).collect();
         let inner = brace_form(&body.return_ty)
             .filter(|span| is_coroutine_span(span) && span.contains(".rs:"));
         // The block itself, behind `&mut`, `Pin` or `Box` at most, is polled
@@ -1829,14 +1833,26 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    /// The names of the model's interior-mutable types.
-    fn interior_types(&self) -> Vec<&'a str> {
-        let model: &'a Model = self.model;
-        model
+    /// The names of the model's interior-mutable types, and of each local
+    /// type whose fields can write, as `struct Shared(Arc<Mutex<u64>>)`.
+    fn interior_types(&mut self) -> Vec<String> {
+        if let Some(names) = &self.interior {
+            return names.clone();
+        }
+        let model: Vec<&str> = self
+            .model
             .ambient_type
             .iter()
             .map(|rule| rule.name.as_str())
-            .collect()
+            .collect();
+        let local = self.program.writable_types(&model);
+        let names: Vec<String> = model
+            .iter()
+            .map(|n| (*n).to_string())
+            .chain(local)
+            .collect();
+        self.interior = Some(names.clone());
+        names
     }
 
     /// Analyze the `Future::poll` impl of a named type that an invoked
