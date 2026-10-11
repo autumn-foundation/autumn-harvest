@@ -576,3 +576,23 @@ pub async fn wf_handler_shared_call(ctx: &WorkflowContext) -> Out {
     ctx.register_update_handler("book", |_: &u64| Ok(()), |v: u64| handle_ok_pending(v));
     handle_ok_pending(1).await
 }
+
+pub fn __autumn_workflow_info_wf_reused_result() -> u8 {
+    0
+}
+
+/// The result local is written early and again after a step, then returned.
+/// Only the last write is the exit.
+#[allow(unused_assignments)]
+pub async fn wf_reused_result(ctx: &WorkflowContext) -> Out {
+    let mut out: Out = Ok(0);
+    let mut saga = Saga::new(ctx);
+    let a = saga
+        .step(
+            || async { ctx.execute_activity_raw("reserve", 1).await },
+            |a| async move { ctx.execute_activity_raw("release", a).await.map(|_| ()) },
+        )
+        .await?;
+    out = Err(format!("late {a}"));
+    out
+}

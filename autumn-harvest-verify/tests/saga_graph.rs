@@ -560,6 +560,7 @@ fn every_fixture_workflow_gets_its_expected_verdict() {
         ("wf_prebuilt", Unknown),
         ("wf_reassign", Unknown),
         ("wf_rebind", Covered),
+        ("wf_reused_result", Gap),
         ("wf_saga_in_block", Unknown),
         ("wf_unit", Covered),
         ("wf_untracked", Unknown),
