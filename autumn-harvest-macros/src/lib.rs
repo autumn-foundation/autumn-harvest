@@ -24,6 +24,12 @@ mod workflow;
 /// as a `u64` literal in the generated `WorkflowInfo`/`ActivityInfo`.
 ///
 /// Returns `None` for empty strings or strings with unrecognised suffixes.
+///
+/// Mirrors (but does not call) the runtime parser,
+/// `autumn_harvest::parse_byte_size` in `autumn-harvest/src/lib.rs`. A
+/// proc-macro crate cannot depend on its own dependent crate, so this
+/// compile-time copy cannot call the runtime one. Keep the two suffix
+/// tables in sync by hand.
 #[allow(clippy::option_if_let_else)]
 pub(crate) fn parse_byte_size_macro(s: &str) -> Option<u64> {
     let s = s.trim();
