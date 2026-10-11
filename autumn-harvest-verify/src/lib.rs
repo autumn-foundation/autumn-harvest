@@ -139,8 +139,18 @@ pub struct Cli {
     #[arg(long, value_name = "FILE")]
     pub emit_structure: Option<std::path::PathBuf>,
     /// Read a structure manifest and run the saga compensation coverage
-    /// check over it, with no build (issue #2010). Exit 1 on a gap.
-    #[arg(long, value_name = "FILE")]
+    /// check over it, with no build (issue #2010). Exit 1 on a gap, or with
+    /// `--strict` on an `unknown` verdict or no workflow. Exit 2 on a bad
+    /// manifest. Only `--format` and `--strict` combine with it.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = [
+            "manifest_path", "package", "lib", "example", "all_examples", "bin", "test",
+            "features", "no_default_features", "target_dir", "mir", "source_root", "model",
+            "allowlist", "report", "list_boundaries", "emit_structure",
+        ]
+    )]
     pub check_structure: Option<std::path::PathBuf>,
 }
 
@@ -217,15 +227,20 @@ pub fn cli_main(argv: Vec<String>) -> i32 {
 
 /// Run the saga coverage check over the manifest at `path`, and print the
 /// result. The exit code is 0 when clean, 1 on a gap and 2 on a tool error.
-/// With `strict`, an `unknown` verdict also fails the run.
+/// With `strict`, an `unknown` verdict or a manifest with no workflow also
+/// fails the run. A gate must not pass on a run that checked nothing.
 fn check_structure(path: &std::path::Path, format: Format, strict: bool) -> i32 {
-    let manifest: structure::StructureManifest = match std::fs::read_to_string(path)
-        .map_err(|e| e.to_string())
-        .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()))
-    {
-        Ok(manifest) => manifest,
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
         Err(e) => {
             eprintln!("error: cannot read {}: {e}", path.display());
+            return 2;
+        }
+    };
+    let manifest = match saga::parse_manifest(&text) {
+        Ok(manifest) => manifest,
+        Err(e) => {
+            eprintln!("error: {}: {e}", path.display());
             return 2;
         }
     };
@@ -246,10 +261,13 @@ fn check_structure(path: &std::path::Path, format: Format, strict: bool) -> i32 
             }
         },
     }
+    if reports.is_empty() {
+        eprintln!("warning: {} holds no workflow", path.display());
+    }
     let failed = |verdict: saga::SagaVerdict| {
         verdict == saga::SagaVerdict::Gap || (strict && verdict == saga::SagaVerdict::Unknown)
     };
-    i32::from(reports.iter().any(|r| failed(r.verdict)))
+    i32::from(reports.iter().any(|r| failed(r.verdict)) || (strict && reports.is_empty()))
 }
 
 /// Write the structure manifest of `report` to `path`.

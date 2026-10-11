@@ -123,7 +123,7 @@ pub enum FlowEvent {
     /// A handler registration. The value is its index in
     /// [`WorkflowStructure::handlers`].
     Handler { handler: usize },
-    /// `Saga::new`.
+    /// `Saga::new`, or another call that returns a saga value.
     SagaNew,
     /// `Saga::step`, with its forward and compensation closure bodies.
     /// `tracked` is true when its `ok` and `err` edges are labeled.
@@ -132,8 +132,8 @@ pub enum FlowEvent {
         compensate: Vec<String>,
         tracked: bool,
     },
-    /// `Saga::compensate_all`.
-    SagaCompensate,
+    /// `Saga::compensate_all`. `tracked` is true when the body awaits it.
+    SagaCompensate { tracked: bool },
     /// A value of type `Saga` reaches a call or a value that is not a
     /// `Saga` method. The value names the call or the statement.
     SagaEscape { to: String },

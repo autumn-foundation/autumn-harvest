@@ -204,6 +204,22 @@ fn a_tracked_saga_step_labels_its_ok_and_err_edges() {
     assert!(labels.contains(&Some(EdgeLabel::Ok)), "{graph:#?}");
     assert!(labels.contains(&Some(EdgeLabel::Err)), "{graph:#?}");
     assert!(!labels.contains(&None), "{graph:#?}");
+    // The `err` edge is the `?` on the step itself.
+    for edge in graph
+        .edges
+        .iter()
+        .filter(|e| e.from == step && e.label == Some(EdgeLabel::Err))
+    {
+        assert!(
+            matches!(
+                graph.nodes.get(edge.to).map(|n| &n.event),
+                Some(FlowEvent::Exit {
+                    outcome: ExitOutcome::Err
+                })
+            ),
+            "{graph:#?}"
+        );
+    }
 }
 
 #[test]
@@ -266,14 +282,24 @@ fn a_signal_handler_and_a_signal_wait_are_in_the_graph() {
 }
 
 #[test]
-fn the_graph_does_not_change_the_body_digests() {
-    // The upgrade check diffs digests. The flow graph must not feed them.
+fn an_update_handler_and_its_validator_are_in_the_graph() {
     let m = manifest();
-    for w in &m.workflows {
-        for b in &w.bodies {
-            assert_eq!(b.digest.len(), 64, "{}", b.id);
-        }
-    }
+    let w = workflow(&m, "wf_update_handler");
+    let [handler] = w.handlers.as_slice() else {
+        panic!("one handler: {:?}", w.handlers);
+    };
+    assert_eq!(handler.kind, "update");
+    assert_eq!(handler.name.as_deref(), Some("set_limit"));
+    assert_eq!(
+        handler.bodies.len(),
+        2,
+        "a validator and a handler: {handler:?}"
+    );
+}
+
+#[test]
+fn the_manifest_is_deterministic() {
+    let m = manifest();
     let again = manifest();
     assert_eq!(m, again, "two runs over one dump give one manifest");
 }
@@ -292,8 +318,23 @@ fn a_workflow_with_no_saga_is_no_saga() {
     }
 }
 
+/// The root of `name` has an error exit, so a `covered` verdict is not
+/// vacuous.
+fn has_an_error_exit(name: &str) -> bool {
+    let m = manifest();
+    flow(root(workflow(&m, name))).nodes.iter().any(|n| {
+        matches!(
+            n.event,
+            FlowEvent::Exit {
+                outcome: ExitOutcome::Err
+            }
+        )
+    })
+}
+
 #[test]
 fn two_saga_steps_are_covered() {
+    assert!(has_an_error_exit("wf_covered"));
     let reports = check();
     let r = report(&reports, "wf_covered");
     assert_eq!(r.verdict, SagaVerdict::Covered, "{r:#?}");
@@ -302,6 +343,15 @@ fn two_saga_steps_are_covered() {
 
 #[test]
 fn an_unwind_before_each_exit_is_covered() {
+    assert!(has_an_error_exit("wf_compensated"));
+    let m = manifest();
+    assert!(
+        flow(root(workflow(&m, "wf_compensated")))
+            .nodes
+            .iter()
+            .any(|n| matches!(n.event, FlowEvent::SagaCompensate { tracked: true })),
+        "an awaited unwind node"
+    );
     let reports = check();
     let r = report(&reports, "wf_compensated");
     assert_eq!(r.verdict, SagaVerdict::Covered, "{r:#?}");
@@ -387,9 +437,116 @@ fn a_matched_step_result_is_unknown() {
 }
 
 #[test]
-fn every_fixture_workflow_gets_a_report() {
+fn every_fixture_workflow_gets_its_expected_verdict() {
+    use SagaVerdict::{Covered, Gap, NoSaga, Unknown};
+    let expected = [
+        ("wf_compensated", Covered),
+        ("wf_covered", Covered),
+        ("wf_escapes", Unknown),
+        ("wf_gap_after_step", Gap),
+        ("wf_gap_explicit", Gap),
+        ("wf_gap_helper", Gap),
+        ("wf_gap_tail", Gap),
+        ("wf_handlers", NoSaga),
+        ("wf_helper_owns", Unknown),
+        ("wf_loop", Covered),
+        ("wf_loop_new", Unknown),
+        ("wf_map_err", Unknown),
+        ("wf_no_saga", NoSaga),
+        ("wf_noop_compensation", Covered),
+        ("wf_not_awaited", Gap),
+        ("wf_pre_err", Unknown),
+        ("wf_prebuilt", Unknown),
+        ("wf_reassign", Unknown),
+        ("wf_rebind", Covered),
+        ("wf_saga_in_block", Unknown),
+        ("wf_unit", Covered),
+        ("wf_untracked", Unknown),
+        ("wf_unwind_then_err", Covered),
+        ("wf_update_handler", NoSaga),
+    ];
     let reports = check();
-    assert_eq!(reports.len(), manifest().workflows.len());
+    let mut have: Vec<(&str, SagaVerdict)> = reports
+        .iter()
+        .map(|r| (r.name.as_str(), r.verdict))
+        .collect();
+    have.sort_unstable_by_key(|(name, _)| *name);
+    assert_eq!(have, expected, "{reports:#?}");
+}
+
+#[test]
+fn a_unit_result_is_an_ok_exit() {
+    let reports = check();
+    let r = report(&reports, "wf_unit");
+    assert_eq!(r.verdict, SagaVerdict::Covered, "{r:#?}");
+}
+
+#[test]
+fn a_moved_saga_binding_stays_in_view() {
+    let reports = check();
+    for name in ["wf_rebind", "wf_unwind_then_err"] {
+        let r = report(&reports, name);
+        assert_eq!(r.verdict, SagaVerdict::Covered, "{r:#?}");
+    }
+}
+
+#[test]
+fn an_unwind_that_is_never_awaited_is_a_gap() {
+    let reports = check();
+    let r = report(&reports, "wf_not_awaited");
+    assert_eq!(r.verdict, SagaVerdict::Gap, "{r:#?}");
+}
+
+#[test]
+fn a_new_saga_over_a_pending_step_is_unknown() {
+    let reports = check();
+    for name in ["wf_loop_new", "wf_reassign"] {
+        let r = report(&reports, name);
+        assert_eq!(r.verdict, SagaVerdict::Unknown, "{r:#?}");
+        assert!(
+            r.unknown.iter().any(|u| u.starts_with("saga-recreated: ")),
+            "{r:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_helper_that_drops_a_pending_saga_is_unknown() {
+    let reports = check();
+    let r = report(&reports, "wf_helper_owns");
+    assert_eq!(r.verdict, SagaVerdict::Unknown, "{r:#?}");
+    assert!(
+        r.unknown
+            .iter()
+            .any(|u| u.starts_with("saga-dropped-pending: ")),
+        "{r:#?}"
+    );
+}
+
+#[test]
+fn a_step_result_that_is_not_the_question_mark_operand_is_untracked() {
+    let reports = check();
+    for name in ["wf_prebuilt", "wf_pre_err", "wf_map_err"] {
+        let r = report(&reports, name);
+        assert_eq!(r.verdict, SagaVerdict::Unknown, "{name}: {r:#?}");
+        assert!(
+            r.unknown
+                .iter()
+                .any(|u| u.starts_with("saga-result-untracked: ")),
+            "{name}: {r:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_saga_moved_into_an_async_block_escapes() {
+    let reports = check();
+    let r = report(&reports, "wf_saga_in_block");
+    assert_eq!(r.verdict, SagaVerdict::Unknown, "{r:#?}");
+    assert!(
+        r.unknown.iter().any(|u| u.starts_with("saga-escapes: ")),
+        "{r:#?}"
+    );
 }
 
 #[test]
@@ -467,4 +624,5 @@ fn the_write_up_states_a_verdict_and_an_unknown_rate() {
         "states a go / no-go verdict"
     );
     assert!(text.contains("`unknown` rate"), "states the unknown rate");
+    assert!(!text.contains("TBD"), "every measurement is filled in");
 }

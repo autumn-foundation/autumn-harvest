@@ -28,8 +28,8 @@ use std::fmt::Write as _;
 use serde::{Deserialize, Serialize};
 
 use crate::structure::{
-    BodyNode, EdgeLabel, ExitOutcome, FLOW_FORMAT, FlowEvent, FlowGraph, StructureManifest,
-    WorkflowStructure,
+    BodyNode, EdgeLabel, ExitOutcome, FLOW_FORMAT, FlowEvent, FlowGraph, STRUCTURE_FORMAT,
+    StructureManifest, WorkflowStructure,
 };
 
 /// The coverage verdict of one workflow.
@@ -99,14 +99,40 @@ pub struct CheckError(String);
 /// build before issue #2010. Without them every workflow would read as
 /// `no-saga`.
 pub fn check(manifest: &StructureManifest) -> Result<Vec<SagaReport>, CheckError> {
-    if manifest.flow.as_deref() != Some(FLOW_FORMAT) {
+    check_header(Some(&manifest.format), manifest.flow.as_deref())?;
+    Ok(manifest.workflows.iter().map(check_workflow).collect())
+}
+
+/// Parse a manifest from JSON text.
+///
+/// The format fields are read first. So a manifest from another version gets
+/// a clear error, not a message about a field it does not know.
+///
+/// # Errors
+/// When the text is not JSON, names another format, or does not parse.
+pub fn parse_manifest(text: &str) -> Result<StructureManifest, CheckError> {
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| CheckError(format!("cannot parse the manifest as JSON: {e}")))?;
+    check_header(
+        value.get("format").and_then(serde_json::Value::as_str),
+        value.get("flow").and_then(serde_json::Value::as_str),
+    )?;
+    serde_json::from_value(value).map_err(|e| CheckError(format!("cannot parse the manifest: {e}")))
+}
+
+fn check_header(format: Option<&str>, flow: Option<&str>) -> Result<(), CheckError> {
+    if format != Some(STRUCTURE_FORMAT) {
         return Err(CheckError(format!(
-            "the manifest has no `{FLOW_FORMAT}` flow graphs (flow: {:?}); \
-             emit it again with this version of harvest-verify",
-            manifest.flow
+            "the manifest format is {format:?}, not `{STRUCTURE_FORMAT}`"
         )));
     }
-    Ok(manifest.workflows.iter().map(check_workflow).collect())
+    if flow != Some(FLOW_FORMAT) {
+        return Err(CheckError(format!(
+            "the manifest has no `{FLOW_FORMAT}` flow graphs (flow: {flow:?}); \
+             emit it again with this version of harvest-verify"
+        )));
+    }
+    Ok(())
 }
 
 /// Check one workflow.
@@ -124,7 +150,10 @@ pub fn check_workflow(workflow: &WorkflowStructure) -> SagaReport {
         };
         let owners = count(graph, |e| matches!(e, FlowEvent::SagaNew));
         let operations = count(graph, |e| {
-            matches!(e, FlowEvent::SagaStep { .. } | FlowEvent::SagaCompensate)
+            matches!(
+                e,
+                FlowEvent::SagaStep { .. } | FlowEvent::SagaCompensate { .. }
+            )
         });
         if owners == 0 && operations == 0 {
             continue;
@@ -158,7 +187,9 @@ pub fn check_workflow(workflow: &WorkflowStructure) -> SagaReport {
                 _ => {}
             }
         }
-        gaps.extend(body_gaps(body, graph));
+        let (found, reasons) = body_gaps(body, graph, body.id == workflow.root);
+        gaps.extend(found);
+        unknown.extend(reasons);
     }
 
     if !uses_saga {
@@ -201,10 +232,16 @@ pub fn render_text(reports: &[SagaReport]) -> String {
             *count = count.saturating_add(1);
         }
         let _ = writeln!(out, "{}  {}", report.verdict.name(), report.workflow);
+        // Under `unknown`, a gap is possible, not proven.
+        let label = if report.verdict == SagaVerdict::Unknown {
+            "possible gap"
+        } else {
+            "gap"
+        };
         for gap in &report.gaps {
             let _ = writeln!(
                 out,
-                "  gap: {} at {} returns {}",
+                "  {label}: {} at {} returns {}",
                 gap.body,
                 gap.at,
                 gap.outcome.name()
@@ -230,8 +267,16 @@ fn count(graph: &FlowGraph, pick: impl Fn(&FlowEvent) -> bool) -> usize {
     graph.nodes.iter().filter(|n| pick(&n.event)).count()
 }
 
-/// The exits of `body` that a set flag reaches.
-fn body_gaps(body: &BodyNode, graph: &FlowGraph) -> Vec<Gap> {
+/// The exits of `body` that a set flag reaches, and the reasons for
+/// `unknown` that the fixpoint finds.
+///
+/// Two states hide a pending step from the check:
+///
+/// - `saga-recreated`: a new saga starts while a step of the old one is
+///   pending. The old saga can no longer unwind it.
+/// - `saga-dropped-pending`: a body other than the workflow root exits while
+///   a step is pending, even with `Ok`. Its caller cannot unwind that step.
+fn body_gaps(body: &BodyNode, graph: &FlowGraph, root: bool) -> (Vec<Gap>, BTreeSet<String>) {
     let size = graph.nodes.len();
     // `reached[n]` holds each flag value seen on entry to node `n`.
     let mut reached: Vec<[bool; 2]> = vec![[false; 2]; size];
@@ -256,30 +301,40 @@ fn body_gaps(body: &BodyNode, graph: &FlowGraph) -> Vec<Gap> {
         for edge in graph.edges.iter().filter(|e| e.from == id) {
             let out = match (event, edge.label) {
                 (Some(FlowEvent::SagaStep { tracked: true, .. }), Some(EdgeLabel::Err))
-                | (Some(FlowEvent::SagaCompensate), _) => false,
+                | (Some(FlowEvent::SagaCompensate { tracked: true }), _) => false,
                 (Some(FlowEvent::SagaStep { .. }), _) => true,
                 _ => flag,
             };
             queue.push((edge.to, out));
         }
     }
-    graph
-        .nodes
-        .iter()
-        .zip(&reached)
-        .filter_map(|(node, seen)| match node.event {
-            FlowEvent::Exit { outcome }
-                if outcome != ExitOutcome::Ok && seen.get(1).copied().unwrap_or(false) =>
-            {
-                Some(Gap {
-                    body: body.id.clone(),
-                    at: node.at.clone(),
-                    outcome,
-                })
+    let mut gaps = Vec::new();
+    let mut reasons = BTreeSet::new();
+    for (node, seen) in graph.nodes.iter().zip(&reached) {
+        if !seen.get(1).copied().unwrap_or(false) {
+            continue;
+        }
+        match node.event {
+            FlowEvent::SagaNew => {
+                reasons.insert(format!("saga-recreated: {} at {}", body.id, node.at));
             }
-            _ => None,
-        })
-        .collect()
+            FlowEvent::Exit { outcome } if !root => {
+                reasons.insert(format!(
+                    "saga-dropped-pending: {} at {} returns {}",
+                    body.id,
+                    node.at,
+                    outcome.name()
+                ));
+            }
+            FlowEvent::Exit { outcome } if outcome != ExitOutcome::Ok => gaps.push(Gap {
+                body: body.id.clone(),
+                at: node.at.clone(),
+                outcome,
+            }),
+            _ => {}
+        }
+    }
+    (gaps, reasons)
 }
 
 /// `start` or a body it calls emits a step.
@@ -306,4 +361,126 @@ fn emits_a_step(workflow: &WorkflowStructure, start: &str) -> bool {
         );
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::structure::{FlowEdge, FlowNode};
+
+    fn node(event: FlowEvent) -> FlowNode {
+        FlowNode {
+            at: String::new(),
+            event,
+        }
+    }
+
+    fn edge(from: usize, to: usize, label: Option<EdgeLabel>) -> FlowEdge {
+        FlowEdge { from, to, label }
+    }
+
+    fn workflow(graph: FlowGraph) -> WorkflowStructure {
+        WorkflowStructure {
+            workflow: "w::wf".to_string(),
+            name: "wf".to_string(),
+            root: "w::wf::{closure#0}".to_string(),
+            bodies: vec![BodyNode {
+                id: "w::wf::{closure#0}".to_string(),
+                flow: Some(graph),
+                ..BodyNode::default()
+            }],
+            ..WorkflowStructure::default()
+        }
+    }
+
+    fn step() -> FlowEvent {
+        FlowEvent::SagaStep {
+            forward: Vec::new(),
+            compensate: Vec::new(),
+            tracked: true,
+        }
+    }
+
+    #[test]
+    fn a_gap_reached_only_through_a_back_edge_is_found() {
+        // entry -> new -> call -> step; step -ok-> call (the loop);
+        // call -> err exit. The first pass reaches the exit with the flag
+        // clear. Only the back edge carries the set flag to it.
+        let graph = FlowGraph {
+            nodes: vec![
+                node(FlowEvent::Entry),
+                node(FlowEvent::SagaNew),
+                node(FlowEvent::Call {
+                    callees: Vec::new(),
+                }),
+                node(step()),
+                node(FlowEvent::Exit {
+                    outcome: ExitOutcome::Err,
+                }),
+            ],
+            edges: vec![
+                edge(0, 1, None),
+                edge(1, 2, None),
+                edge(2, 3, None),
+                edge(2, 4, None),
+                edge(3, 2, Some(EdgeLabel::Ok)),
+                edge(3, 4, Some(EdgeLabel::Err)),
+            ],
+        };
+        let report = check_workflow(&workflow(graph));
+        assert_eq!(report.verdict, SagaVerdict::Gap, "{report:#?}");
+        assert_eq!(report.gaps.len(), 1);
+    }
+
+    #[test]
+    fn an_unwind_that_is_not_awaited_clears_nothing() {
+        let graph = |tracked: bool| FlowGraph {
+            nodes: vec![
+                node(FlowEvent::Entry),
+                node(FlowEvent::SagaNew),
+                node(step()),
+                node(FlowEvent::SagaCompensate { tracked }),
+                node(FlowEvent::Exit {
+                    outcome: ExitOutcome::Err,
+                }),
+            ],
+            edges: vec![
+                edge(0, 1, None),
+                edge(1, 2, None),
+                edge(2, 3, Some(EdgeLabel::Ok)),
+                edge(3, 4, None),
+            ],
+        };
+        assert_eq!(
+            check_workflow(&workflow(graph(true))).verdict,
+            SagaVerdict::Covered
+        );
+        assert_eq!(
+            check_workflow(&workflow(graph(false))).verdict,
+            SagaVerdict::Gap
+        );
+    }
+
+    #[test]
+    fn an_ok_exit_of_the_root_with_a_pending_step_is_not_a_gap() {
+        let graph = FlowGraph {
+            nodes: vec![
+                node(FlowEvent::Entry),
+                node(FlowEvent::SagaNew),
+                node(step()),
+                node(FlowEvent::Exit {
+                    outcome: ExitOutcome::Ok,
+                }),
+            ],
+            edges: vec![
+                edge(0, 1, None),
+                edge(1, 2, None),
+                edge(2, 3, Some(EdgeLabel::Ok)),
+            ],
+        };
+        assert_eq!(
+            check_workflow(&workflow(graph)).verdict,
+            SagaVerdict::Covered
+        );
+    }
 }

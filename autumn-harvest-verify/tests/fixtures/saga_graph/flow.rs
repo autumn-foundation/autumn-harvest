@@ -233,3 +233,237 @@ pub async fn wf_handlers(ctx: &WorkflowContext) -> Out {
     });
     ctx.receive_signal("go").await
 }
+
+pub fn __autumn_workflow_info_wf_update_handler() -> u8 {
+    0
+}
+
+/// An update handler with a validator.
+pub async fn wf_update_handler(ctx: &WorkflowContext) -> Out {
+    ctx.register_update_handler(
+        "set_limit",
+        |v: &u64| if *v > 0 { Ok(()) } else { Err("zero".to_string()) },
+        |v: u64| async move { Ok(v) },
+    );
+    ctx.receive_signal("go").await
+}
+
+pub fn __autumn_workflow_info_wf_unit() -> u8 {
+    0
+}
+
+/// A covered saga that returns `Result<(), _>`.
+pub async fn wf_unit(ctx: &WorkflowContext) -> Result<(), String> {
+    let mut saga = Saga::new(ctx);
+    saga.step(
+        || async { ctx.execute_activity_raw("reserve", 1).await },
+        |a| async move { ctx.execute_activity_raw("release", a).await.map(|_| ()) },
+    )
+    .await?;
+    Ok(())
+}
+
+pub fn __autumn_workflow_info_wf_rebind() -> u8 {
+    0
+}
+
+/// The saga moves to a second binding before its first step.
+pub async fn wf_rebind(ctx: &WorkflowContext) -> Out {
+    let first = Saga::new(ctx);
+    let mut saga = first;
+    let a = saga
+        .step(
+            || async { ctx.execute_activity_raw("reserve", 1).await },
+            |a| async move { ctx.execute_activity_raw("release", a).await.map(|_| ()) },
+        )
+        .await?;
+    Ok(a)
+}
+
+pub fn __autumn_workflow_info_wf_unwind_then_err() -> u8 {
+    0
+}
+
+/// The usual shape: unwind, then return the original error.
+pub async fn wf_unwind_then_err(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let a = saga
+        .step(
+            || async { ctx.execute_activity_raw("reserve", 1).await },
+            |a| async move { ctx.execute_activity_raw("release", a).await.map(|_| ()) },
+        )
+        .await?;
+    match ctx.execute_activity_raw("ship", a).await {
+        Ok(b) => Ok(b),
+        Err(e) => {
+            let _ = saga.compensate_all().await;
+            Err(e)
+        }
+    }
+}
+
+pub fn __autumn_workflow_info_wf_not_awaited() -> u8 {
+    0
+}
+
+/// The unwind future is built but never awaited, so nothing unwinds.
+pub async fn wf_not_awaited(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let a = saga
+        .step(
+            || async { ctx.execute_activity_raw("reserve", 1).await },
+            |a| async move { ctx.execute_activity_raw("release", a).await.map(|_| ()) },
+        )
+        .await?;
+    if a > 10 {
+        let _ = saga.compensate_all();
+        return Err("too big".to_string());
+    }
+    Ok(a)
+}
+
+pub fn __autumn_workflow_info_wf_loop_new() -> u8 {
+    0
+}
+
+/// A new saga in each iteration. A later failure leaves the earlier step.
+pub async fn wf_loop_new(ctx: &WorkflowContext) -> Out {
+    for i in 0..3_u64 {
+        let mut saga = Saga::new(ctx);
+        saga.step(
+            || async move { ctx.execute_activity_raw("reserve", i).await },
+            |a| async move { ctx.execute_activity_raw("release", a).await.map(|_| ()) },
+        )
+        .await?;
+    }
+    Ok(1)
+}
+
+/// Builds a saga that does not reach a caller.
+fn fresh(ctx: &WorkflowContext) -> Saga<'_> {
+    Saga::new(ctx)
+}
+
+pub fn __autumn_workflow_info_wf_reassign() -> u8 {
+    0
+}
+
+/// A second saga replaces the first after a step.
+pub async fn wf_reassign(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let a = saga
+        .step(
+            || async { ctx.execute_activity_raw("reserve", 1).await },
+            |a| async move { ctx.execute_activity_raw("release", a).await.map(|_| ()) },
+        )
+        .await?;
+    saga = fresh(ctx);
+    let b = saga
+        .step(
+            || async move { ctx.execute_activity_raw("charge", a).await },
+            |b| async move { ctx.execute_activity_raw("refund", b).await.map(|_| ()) },
+        )
+        .await?;
+    Ok(b)
+}
+
+/// A helper that owns a saga and drops it on success.
+async fn reserve_all(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let a = saga
+        .step(
+            || async { ctx.execute_activity_raw("reserve", 1).await },
+            |a| async move { ctx.execute_activity_raw("release", a).await.map(|_| ()) },
+        )
+        .await?;
+    Ok(a)
+}
+
+pub fn __autumn_workflow_info_wf_helper_owns() -> u8 {
+    0
+}
+
+/// The workflow fails after the helper dropped its saga.
+pub async fn wf_helper_owns(ctx: &WorkflowContext) -> Out {
+    let a = reserve_all(ctx).await?;
+    let b = ctx.execute_activity_raw("ship", a).await?;
+    Ok(b)
+}
+
+pub fn __autumn_workflow_info_wf_prebuilt() -> u8 {
+    0
+}
+
+/// A future built before the step, and a step result read by `match`.
+pub async fn wf_prebuilt(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let ship = ctx.execute_activity_raw("ship", 2);
+    let a = match saga
+        .step(
+            || async { ctx.execute_activity_raw("reserve", 1).await },
+            |a| async move { ctx.execute_activity_raw("release", a).await.map(|_| ()) },
+        )
+        .await
+    {
+        Ok(a) => a,
+        Err(e) => return Err(e),
+    };
+    let b = ship.await?;
+    Ok(a + b)
+}
+
+pub fn __autumn_workflow_info_wf_pre_err() -> u8 {
+    0
+}
+
+/// A result built before the step, read by `?` after it.
+pub async fn wf_pre_err(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let pre: Out = Err("later failure".to_string());
+    let _step = saga
+        .step(
+            || async { ctx.execute_activity_raw("reserve", 1).await },
+            |a| async move { ctx.execute_activity_raw("release", a).await.map(|_| ()) },
+        )
+        .await;
+    let v = pre?;
+    Ok(v)
+}
+
+pub fn __autumn_workflow_info_wf_map_err() -> u8 {
+    0
+}
+
+/// `map_err` sits between the step and `?`.
+pub async fn wf_map_err(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let a = saga
+        .step(
+            || async { ctx.execute_activity_raw("reserve", 1).await },
+            |a| async move { ctx.execute_activity_raw("release", a).await.map(|_| ()) },
+        )
+        .await
+        .map_err(|e| format!("reserve: {e}"))?;
+    Ok(a)
+}
+
+pub fn __autumn_workflow_info_wf_saga_in_block() -> u8 {
+    0
+}
+
+/// The saga moves into an `async` block.
+pub async fn wf_saga_in_block(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let a = saga
+        .step(
+            || async { ctx.execute_activity_raw("reserve", 1).await },
+            |a| async move { ctx.execute_activity_raw("release", a).await.map(|_| ()) },
+        )
+        .await?;
+    let keep = async move {
+        let _held = saga;
+        0_u64
+    };
+    let k = keep.await;
+    Ok(a + k)
+}

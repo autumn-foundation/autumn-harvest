@@ -557,3 +557,90 @@ fn help_documents_check_structure() {
         stdout(&out)
     );
 }
+
+/// Write `manifest` with only the workflows in `keep`.
+fn filtered_manifest(dir: &Path, keep: &[&str]) -> PathBuf {
+    let full = saga_manifest(dir);
+    let mut value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&full).expect("read")).expect("json");
+    let workflows = value
+        .get_mut("workflows")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("a workflow list");
+    workflows.retain(|w| {
+        w.get("name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| keep.contains(&name))
+    });
+    let path = dir.join(format!("{}.structure.json", keep.join("-")));
+    std::fs::write(&path, value.to_string()).expect("write");
+    path
+}
+
+#[test]
+fn check_structure_exits_zero_when_every_saga_is_covered() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = filtered_manifest(dir.path(), &["wf_covered", "wf_no_saga"]);
+    let out = run(&["--check-structure", &path.to_string_lossy()]);
+    assert_eq!(code(&out), 0, "{}", stdout(&out));
+}
+
+#[test]
+fn check_structure_strict_fails_on_unknown() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = filtered_manifest(dir.path(), &["wf_escapes"]);
+    let lenient = run(&["--check-structure", &path.to_string_lossy()]);
+    assert_eq!(code(&lenient), 0, "{}", stdout(&lenient));
+    assert!(stdout(&lenient).contains("possible gap:"), "{}", stdout(&lenient));
+    let strict = run(&["--check-structure", &path.to_string_lossy(), "--strict"]);
+    assert_eq!(code(&strict), 1, "{}", stdout(&strict));
+}
+
+#[test]
+fn check_structure_strict_fails_on_a_manifest_with_no_workflow() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("empty.structure.json");
+    std::fs::write(
+        &path,
+        r#"{"format":"harvest-structure/1","model_version":"m","rustc_version":"r","flow":"harvest-flow/1","workflows":[]}"#,
+    )
+    .expect("write");
+    let lenient = run(&["--check-structure", &path.to_string_lossy()]);
+    assert_eq!(code(&lenient), 0);
+    let strict = run(&["--check-structure", &path.to_string_lossy(), "--strict"]);
+    assert_eq!(code(&strict), 1, "a gate that checked nothing fails");
+}
+
+#[test]
+fn check_structure_refuses_another_format_and_bad_json() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let other = dir.path().join("other.structure.json");
+    std::fs::write(
+        &other,
+        r#"{"format":"harvest-structure/2","flow":"harvest-flow/1","workflows":[{"bodies":[{"flow":{"nodes":[{"kind":"new-kind"}]}}]}]}"#,
+    )
+    .expect("write");
+    let out = run(&["--check-structure", &other.to_string_lossy()]);
+    assert_eq!(code(&out), 2);
+    assert!(stderr(&out).contains("harvest-structure/2"), "{}", stderr(&out));
+    let bad = dir.path().join("bad.json");
+    std::fs::write(&bad, "not json").expect("write");
+    let out = run(&["--check-structure", &bad.to_string_lossy()]);
+    assert_eq!(code(&out), 2);
+    assert!(stderr(&out).contains("cannot parse"), "{}", stderr(&out));
+}
+
+#[test]
+fn check_structure_conflicts_with_build_flags() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = filtered_manifest(dir.path(), &["wf_covered"]);
+    let out = run(&[
+        "--check-structure",
+        &path.to_string_lossy(),
+        "--emit-structure",
+        &path.to_string_lossy(),
+    ]);
+    assert_eq!(code(&out), 2, "a conflict is a usage error");
+    let out = run(&["--check-structure", &path.to_string_lossy(), "-p", "x"]);
+    assert_eq!(code(&out), 2, "a conflict is a usage error");
+}

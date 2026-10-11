@@ -142,7 +142,7 @@ counts and the boundary set. Verbatim, from a real run over this repo's examples
 $ cargo run -p autumn-harvest-verify --bin cargo-harvest-verify -- harvest-verify \
     -p autumn-harvest --all-examples --no-default-features --features testing \
     --allowlist harvest-verify.allow.toml --report
-harvest-verify: model 2026.10.0, rustc 1.98.0 (88d9e12ae 2026-08-18)
+harvest-verify: model 2026.10.1, rustc 1.98.0 (88d9e12ae 2026-08-18)
 
 proven-deterministic  workflow_logs::import_batch
 ... one line per workflow ...
@@ -150,7 +150,7 @@ proven-deterministic  workflow_logs::import_batch
 warning: skipping example wasm_activity: required feature(s) not enabled: wasm-activities
 
 analyzed 57: proven 56, unknown 0, found 0, allowed 1
-verdicts hold under model 2026.10.0; boundaries not analyzed: dyn-dispatch, indirect-call, ffi, unsafe-raw-pointer, inline-asm, external-crate-body, unmodeled-ctx-method, unresolved-generic, recursion, mir-parse, missing-body, drop-glue
+verdicts hold under model 2026.10.1; boundaries not analyzed: dyn-dispatch, indirect-call, ffi, unsafe-raw-pointer, inline-asm, external-crate-body, unmodeled-ctx-method, unresolved-generic, recursion, mir-parse, missing-body, drop-glue
 ```
 
 Three things about that footer are worth knowing before you quote it:

@@ -21,6 +21,13 @@ impl WorkflowContext {
         H: Fn(u64) + Send + Sync + 'static,
     {
     }
+    pub fn register_update_handler<V, H, F>(&self, name: &str, validator: V, handler: H)
+    where
+        V: Fn(&u64) -> Result<(), String> + Send + Sync + 'static,
+        H: Fn(u64) -> F + Send + Sync + 'static,
+        F: Future<Output = Result<u64, String>> + Send + 'static,
+    {
+    }
 }
 
 /// Stand-in for `autumn_harvest::Saga`. Its methods are `async`, as the

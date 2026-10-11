@@ -56,12 +56,19 @@ pub fn build(body: &Body, facts: &BlockFacts) -> FlowGraph {
         if let Some(outcome) = exits.get(block.label.as_str()) {
             let event = FlowEvent::Exit { outcome: *outcome };
             chain.push(push(&mut nodes, &block.label, event));
-        } else if let Some(mut event) = block_event(block, facts) {
+        } else if let Some(mut event) = block_event(body, block, facts) {
             let pair = match &mut event {
                 FlowEvent::SagaStep { tracked, .. } => {
-                    let pair = await_try_arms(&blocks, block);
+                    let pair = match await_walk(&blocks, block, true) {
+                        Some(Awaited::Arms(ok, err)) => Some((ok, err)),
+                        _ => None,
+                    };
                     *tracked = pair.is_some();
                     pair
+                }
+                FlowEvent::SagaCompensate { tracked } => {
+                    *tracked = await_walk(&blocks, block, false).is_some();
+                    None
                 }
                 _ => None,
             };
@@ -184,16 +191,18 @@ fn is_coroutine(body: &Body) -> bool {
 // ── events ──────────────────────────────────────────────────────────────────
 
 /// The event of the terminator of `block`, if it has one.
-fn block_event(block: &BasicBlock, facts: &BlockFacts) -> Option<FlowEvent> {
+fn block_event(body: &Body, block: &BasicBlock, facts: &BlockFacts) -> Option<FlowEvent> {
     let label = &block.label;
     if let Terminator::Call {
         callee: Some(callee),
+        dest,
+        dest_ty,
         ..
     } = &block.terminator
     {
         match saga_method(callee) {
             Some("new") => return Some(FlowEvent::SagaNew),
-            Some("compensate_all") => return Some(FlowEvent::SagaCompensate),
+            Some("compensate_all") => return Some(FlowEvent::SagaCompensate { tracked: false }),
             Some("step") => {
                 let bodies = |index: usize| {
                     facts
@@ -209,7 +218,18 @@ fn block_event(block: &BasicBlock, facts: &BlockFacts) -> Option<FlowEvent> {
                     tracked: false,
                 });
             }
-            _ => {}
+            Some(_) => {}
+            // Another call that returns a saga value, such as a helper that
+            // builds one, brings a new saga into this body.
+            None => {
+                let ty = dest_ty
+                    .as_deref()
+                    .or_else(|| body.locals.get(&dest.local).map(String::as_str))
+                    .unwrap_or_default();
+                if !ty.trim_start().starts_with('&') && is_saga_type(ty) {
+                    return Some(FlowEvent::SagaNew);
+                }
+            }
         }
     }
     if let Some(&handler) = facts.handlers.get(label) {
@@ -270,7 +290,7 @@ const fn operand_place(operand: &Operand) -> Option<&Place> {
 fn escapes(body: &Body, block: &BasicBlock) -> Vec<FlowEvent> {
     let mut out = Vec::new();
     for statement in &block.statements {
-        let Statement::Assign { dest, rvalue } = statement else {
+        let Statement::Assign { rvalue, .. } = statement else {
             continue;
         };
         let reads_saga = rvalue
@@ -278,8 +298,16 @@ fn escapes(body: &Body, block: &BasicBlock) -> Vec<FlowEvent> {
             .iter()
             .filter_map(operand_place)
             .chain(rvalue.ref_of.as_ref().map(|(place, _)| place))
-            .any(|place| saga_local(body, place));
-        if reads_saga && !saga_local(body, dest) {
+            .any(|place| saga_local(body, place))
+            || annotates_a_saga(&rvalue.text);
+        // A move, copy or borrow hands the saga to another binding of this
+        // body. Any other read, such as a closure or `async` block capture,
+        // takes it out of view.
+        let text = rvalue.text.trim_start();
+        let keeps = rvalue.ref_of.is_some()
+            || ((text.starts_with("move ") || text.starts_with("copy "))
+                && rvalue.reads.len() == 1);
+        if reads_saga && !keeps {
             out.push(FlowEvent::SagaEscape {
                 to: rvalue.text.trim().to_string(),
             });
@@ -303,6 +331,17 @@ fn escapes(body: &Body, block: &BasicBlock) -> Vec<FlowEvent> {
         }
     }
     out
+}
+
+/// `text` reads a place whose printed type is `Saga`, such as
+/// `move (((*_9) as variant#3).1: Saga<'_>)`. A place in a coroutine state
+/// has no local of its own, so only this annotation shows its type.
+fn annotates_a_saga(text: &str) -> bool {
+    text.match_indices(": ").any(|(at, _)| {
+        let ty = text.get(at.saturating_add(2)..).unwrap_or_default();
+        let end = ty.find([')', ',', '}']).unwrap_or(ty.len());
+        is_saga_type(ty.get(..end).unwrap_or_default())
+    })
 }
 
 /// A std call that hands back the same place, such as `deref_mut`.
@@ -382,9 +421,10 @@ fn exit_outcomes(body: &Body) -> BTreeMap<&str, ExitOutcome> {
 
 /// `Result::<T, E>::Ok(..)` is `ok`, `Result::<T, E>::Err(..)` is `err`.
 fn literal_outcome(text: &str) -> ExitOutcome {
-    let text = text.trim();
-    let head = text.split('(').next().unwrap_or(text);
-    let bare = strip_generics_everywhere(head);
+    // Generics can hold a `(`, as `Result::<(), E>::Ok(..)` does. So they go
+    // before the cut at the argument list.
+    let bare = strip_generics_everywhere(text.trim());
+    let bare = bare.split('(').next().unwrap_or(&bare).trim();
     if bare == "Ok" || bare.ends_with("Result::Ok") {
         ExitOutcome::Ok
     } else if bare == "Err" || bare.ends_with("Result::Err") {
@@ -394,57 +434,147 @@ fn literal_outcome(text: &str) -> ExitOutcome {
     }
 }
 
-// ── `.await?` after `Saga::step` ────────────────────────────────────────────
+// ── `.await` after a saga call ─────────────────────────────────────────────
 
-/// The `Continue` and `Break` targets of the `?` that reads the result of the
-/// `Saga::step` call in `block`.
+/// What the walk after a saga call found.
+enum Awaited {
+    /// The future reached its `Ready` arm.
+    Ready,
+    /// The `Continue` and `Break` targets of the `?` that reads the result.
+    Arms(String, String),
+}
+
+/// The value flow of one `.await` and its `?`, as the walk sees it.
+#[derive(Default)]
+struct AwaitState {
+    /// Places that hold the saga future, or a pin or borrow of it.
+    future: BTreeSet<Place>,
+    /// The result of `poll` on that future.
+    polled: Option<Place>,
+    /// Locals that hold the `Ready` payload of that result.
+    ready: BTreeSet<Place>,
+    /// The result of `Try::branch` on that payload.
+    branched: Option<Place>,
+    /// The locals that hold the discriminant of `polled` and of `branched`.
+    poll_discriminant: Option<Place>,
+    branch_discriminant: Option<Place>,
+}
+
+impl AwaitState {
+    fn holds_future(&self, operand: Option<&Operand>) -> bool {
+        operand
+            .and_then(operand_place)
+            .is_some_and(|place| self.future.contains(place))
+    }
+
+    /// Follow the statements of one block.
+    fn read(&mut self, block: &BasicBlock) {
+        for statement in &block.statements {
+            let Statement::Assign { dest, rvalue } = statement else {
+                continue;
+            };
+            if let Some(of) = &rvalue.discriminant_of {
+                if self.polled.as_ref() == Some(of) {
+                    self.poll_discriminant = Some(dest.clone());
+                }
+                if self.branched.as_ref() == Some(of) {
+                    self.branch_discriminant = Some(dest.clone());
+                }
+                continue;
+            }
+            if let Some((referent, _)) = &rvalue.ref_of {
+                if self.future.contains(referent) {
+                    self.future.insert(dest.clone());
+                }
+                continue;
+            }
+            let text = rvalue.text.trim_start();
+            if !(text.starts_with("move ") || text.starts_with("copy ")) {
+                continue;
+            }
+            let Some(read) = rvalue.reads.first().and_then(operand_place) else {
+                continue;
+            };
+            let payload = self
+                .polled
+                .as_ref()
+                .is_some_and(|p| p.local == read.local && !read.projections.is_empty());
+            if self.future.contains(read) {
+                self.future.insert(dest.clone());
+            } else if payload || self.ready.contains(read) {
+                self.ready.insert(dest.clone());
+            }
+        }
+    }
+}
+
+/// Follow the `.await` of the saga call in `block`, and its `?` when
+/// `want_arms` is set.
 ///
-/// The walk accepts only await plumbing: `into_future`, the `Pin`
-/// constructors, `poll`, gotos and drops. After `poll`, it takes the
-/// `Ready` arm, case `0`. After `Try::branch`, case `0` is `Continue` and
-/// case `1` is `Break`. Any other shape returns `None`, so a call such as
-/// `and_then` cannot turn a later failure into a step failure.
-fn await_try_arms(
+/// The walk follows the value, not only the control flow. The call result
+/// must reach `poll` through `into_future`, the `Pin` constructors, moves
+/// and borrows. The `switchInt` after `poll` must read the discriminant of
+/// that `poll` result, and case `0` is `Ready`. `Try::branch` must read the
+/// `Ready` payload. Its `switchInt` gives case `0` for `Continue` and case
+/// `1` for `Break`. Any other shape returns `None`. So a call such as
+/// `map_err`, or a `?` on another value, cannot pass for the step result.
+fn await_walk(
     blocks: &HashMap<&str, &BasicBlock>,
     block: &BasicBlock,
-) -> Option<(String, String)> {
+    want_arms: bool,
+) -> Option<Awaited> {
     let Terminator::Call {
-        callee: Some(callee),
+        dest,
         target: Some(first),
         ..
     } = &block.terminator
     else {
         return None;
     };
-    if saga_method(callee) != Some("step") {
-        return None;
-    }
+    let mut state = AwaitState::default();
+    state.future.insert(dest.clone());
     let mut at: &str = first;
-    let mut polled = false;
-    let mut branched = false;
     for _ in 0..MAX_AWAIT_WALK {
         let block = blocks.get(at)?;
+        state.read(block);
         match &block.terminator {
             Terminator::Goto { target } | Terminator::Drop { target, .. } => at = target,
             Terminator::Call {
                 callee: Some(callee),
+                args,
+                dest,
                 target: Some(target),
                 ..
             } => {
                 let bare = strip_generics_everywhere(callee);
                 let last = bare.rsplit("::").next().unwrap_or(&bare);
                 let pin = bare.starts_with("Pin::") || bare.contains("pin::Pin::");
+                let first_arg = args.first();
                 match last {
-                    "poll" => polled = true,
-                    "branch" if polled => branched = true,
-                    "into_future" => {}
-                    "new_unchecked" | "new" if pin => {}
+                    "into_future" if state.holds_future(first_arg) => {
+                        state.future.insert(dest.clone());
+                    }
+                    "new_unchecked" | "new" if pin && state.holds_future(first_arg) => {
+                        state.future.insert(dest.clone());
+                    }
+                    "poll" if state.holds_future(first_arg) => {
+                        state.polled = Some(dest.clone());
+                    }
+                    "branch"
+                        if first_arg
+                            .and_then(operand_place)
+                            .is_some_and(|p| state.ready.contains(p)) =>
+                    {
+                        state.branched = Some(dest.clone());
+                    }
                     _ => return None,
                 }
                 at = target;
             }
             Terminator::SwitchInt {
-                targets, values, ..
+                operand,
+                targets,
+                values,
             } => {
                 let case = |value: &str| {
                     values
@@ -453,13 +583,18 @@ fn await_try_arms(
                         .and_then(|i| targets.get(i))
                         .cloned()
                 };
-                if branched {
-                    return Some((case("0")?, case("1")?));
+                let on = operand_place(operand);
+                if on.is_some() && on == state.branch_discriminant.as_ref() {
+                    return Some(Awaited::Arms(case("0")?, case("1")?));
                 }
-                if !polled {
+                if on.is_none() || on != state.poll_discriminant.as_ref() {
                     return None;
                 }
-                at = blocks.get(case("0")?.as_str()).map(|b| b.label.as_str())?;
+                if !want_arms {
+                    return Some(Awaited::Ready);
+                }
+                let ready = case("0")?;
+                at = blocks.get(ready.as_str()).map(|b| b.label.as_str())?;
             }
             _ => return None,
         }
@@ -502,6 +637,16 @@ mod tests {
     }
 
     #[test]
+    fn a_saga_annotation_is_found_in_a_place_type() {
+        assert!(annotates_a_saga(
+            "{coroutine} { s: move (((*_4) as variant#5).1: Saga<'_>) }"
+        ));
+        assert!(!annotates_a_saga(
+            "move (((*_4) as variant#3).2: {async fn body of Saga<'_>::step<u64>()})"
+        ));
+    }
+
+    #[test]
     fn a_literal_result_has_an_outcome() {
         assert_eq!(
             literal_outcome("Result::<u64, String>::Ok(copy _3)"),
@@ -510,6 +655,10 @@ mod tests {
         assert_eq!(
             literal_outcome("std::result::Result::<u64, String>::Err(move _4)"),
             ExitOutcome::Err
+        );
+        assert_eq!(
+            literal_outcome("Result::<(), E>::Ok(const ())"),
+            ExitOutcome::Ok
         );
         assert_eq!(literal_outcome("move _5"), ExitOutcome::Unknown);
         assert_eq!(
