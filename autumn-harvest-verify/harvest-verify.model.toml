@@ -84,10 +84,10 @@
 # model error, not a warning, because an unexplained rule is how a model rots.
 #
 # The version string is printed with every verdict ("no non-determinism found,
-# under model 2026.09.0, up to boundaries ..."), so a verdict can always be
+# under model 2026.10.0, up to boundaries ..."), so a verdict can always be
 # traced to the rules that produced it. Bump the date component when rows change.
 
-version = "2026.09.0"
+version = "2026.10.0"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # AMBIENT TYPES — statics of these types are taint roots
@@ -935,6 +935,11 @@ reason = "`hashbrown::HashTable`; see `HashTable::iter`."
 # `args` is omitted (= all arguments checked) on every row: for a command-emitting
 # call there is no argument whose non-determinism is harmless. `side_effect` is the
 # single exception and is commented at its row.
+#
+# `step` names the history record a sink writes (issue #1995). The structure
+# manifest uses it to match a step site against a run's history. The step key
+# is the argument at `step_key_arg`, zero-based without `self`. A row without
+# `step` writes a step that no run can prove complete.
 [[sink]]
 path = "await_condition_timeout"
 receiver = "WorkflowContext"
@@ -978,6 +983,7 @@ reason = "context.rs:9893 pushes `WorkflowCommand::RecordMarker` and returns `Hi
 [[sink]]
 path = "execute_activity"
 receiver = "WorkflowContext"
+step = "activity"
 reason = "context.rs:7859; emits a command transitively: execute_activity -> execute_activity_with_opts -> execute_activity_raw_with_opts -> execute_activity_raw_full* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "execute_activity_external"
@@ -1026,14 +1032,17 @@ reason = "context.rs:11121; emits a command transitively: execute_activity_fan_o
 [[sink]]
 path = "execute_activity_raw"
 receiver = "WorkflowContext"
+step = "activity"
 reason = "context.rs:5671; emits a command transitively: execute_activity_raw -> execute_activity_raw_full* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "execute_activity_raw_with_opts"
 receiver = "WorkflowContext"
+step = "activity"
 reason = "context.rs:5686; emits a command transitively: execute_activity_raw_with_opts -> execute_activity_raw_full* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "execute_activity_with_opts"
 receiver = "WorkflowContext"
+step = "activity"
 reason = "context.rs:7882; emits a command transitively: execute_activity_with_opts -> execute_activity_raw_with_opts -> execute_activity_raw_full* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "execute_admitted_update"
@@ -1050,14 +1059,17 @@ reason = "context.rs:8414; emits a command transitively: execute_child_workflow_
 [[sink]]
 path = "execute_local_activity"
 receiver = "WorkflowContext"
+step = "local-activity"
 reason = "context.rs:7921; emits a command transitively: execute_local_activity -> execute_local_activity_with_opts -> execute_local_activity_raw_resolved* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "execute_local_activity_raw"
 receiver = "WorkflowContext"
+step = "local-activity"
 reason = "context.rs:5879; emits a command transitively: execute_local_activity_raw -> execute_local_activity_raw_resolved* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "execute_local_activity_with_opts"
 receiver = "WorkflowContext"
+step = "local-activity"
 reason = "context.rs:7949; emits a command transitively: execute_local_activity_with_opts -> execute_local_activity_raw_resolved* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "mutex"
@@ -1074,6 +1086,7 @@ reason = "context.rs:5109; emits a command transitively: new_uuid -> capture_bui
 [[sink]]
 path = "patched"
 receiver = "WorkflowContext"
+step = "patch"
 reason = "context.rs:5420 pushes `WorkflowCommand::RecordMarker` (context.rs:5438) and matches it. DUAL ROLE (see `[[sanctioned]]`)."
 [[sink]]
 path = "promise"
@@ -1102,6 +1115,7 @@ reason = "context.rs:5259; emits a command transitively: random_uuid -> side_eff
 [[sink]]
 path = "receive_signal"
 receiver = "WorkflowContext"
+step = "signal"
 reason = "context.rs:8448; emits a command transitively: receive_signal -> wait_for_signal* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "receive_signal_matching"
@@ -1110,6 +1124,7 @@ reason = "context.rs `receive_signal_matching` -> `wait_for_signal_matching` -> 
 [[sink]]
 path = "receive_signal_timeout"
 receiver = "WorkflowContext"
+step = "signal"
 reason = "context.rs:8992; emits a command transitively: receive_signal_timeout -> wait_for_signal_timeout -> wait_for_signal_timeout_with_timer_id* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "reject_promise"
@@ -1138,6 +1153,7 @@ reason = "context.rs:4361 -> `deadline_fraction_reached` (4382) -> `deadline_clo
 [[sink]]
 path = "side_effect"
 receiver = "WorkflowContext"
+step = "side-effect"
 args = [0]
 opaque_closure_args = [1]
 reason = "context.rs:4842 pushes `WorkflowCommand::RecordSideEffect` at context.rs:4506 and matches it against history. DUAL ROLE: also a `[[sanctioned]]` row - the recorded *result* replays verbatim, so its return is clean while a tainted *decision to call it* is still a finding. Its closure is `opaque_closure_args = [1]`: laundering non-determinism inside the closure is the whole point of the primitive."
@@ -1160,26 +1176,32 @@ reason = "context.rs:9072; emits a command transitively: signal_external_workflo
 [[sink]]
 path = "sleep_until"
 receiver = "WorkflowContext"
+step = "timer"
 reason = "context.rs:6344; emits a command transitively: sleep_until -> timer* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "spawn_child_workflow"
 receiver = "WorkflowContext"
+step = "child"
 reason = "context.rs:7994; emits a command transitively: spawn_child_workflow -> spawn_child_workflow_placed -> spawn_child_workflow_raw_placed* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "spawn_child_workflow_detached"
 receiver = "WorkflowContext"
+step = "child"
 reason = "context.rs:7794; emits a command transitively: spawn_child_workflow_detached -> spawn_child_workflow_detached_placed -> spawn_child_workflow_detached_raw_placed* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "spawn_child_workflow_detached_placed"
 receiver = "WorkflowContext"
+step = "child"
 reason = "context.rs:7820; emits a command transitively: spawn_child_workflow_detached_placed -> spawn_child_workflow_detached_raw_placed* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "spawn_child_workflow_detached_raw"
 receiver = "WorkflowContext"
+step = "child"
 reason = "context.rs:7675; emits a command transitively: spawn_child_workflow_detached_raw -> spawn_child_workflow_detached_raw_placed* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "spawn_child_workflow_detached_raw_placed"
 receiver = "WorkflowContext"
+step = "child"
 reason = "context.rs:7715; calls `push_command` directly. Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "spawn_child_workflow_fan_out"
@@ -1216,14 +1238,17 @@ reason = "context.rs:10730; emits a command transitively: spawn_child_workflow_f
 [[sink]]
 path = "spawn_child_workflow_placed"
 receiver = "WorkflowContext"
+step = "child"
 reason = "context.rs:8016; emits a command transitively: spawn_child_workflow_placed -> spawn_child_workflow_raw_placed* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "spawn_child_workflow_raw"
 receiver = "WorkflowContext"
+step = "child"
 reason = "context.rs:7420; emits a command transitively: spawn_child_workflow_raw -> spawn_child_workflow_raw_placed* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "spawn_child_workflow_raw_placed"
 receiver = "WorkflowContext"
+step = "child"
 reason = "context.rs:7465; calls `push_command` directly. Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "spawn_child_workflow_timeout"
@@ -1236,6 +1261,7 @@ reason = "context.rs:8133; calls `push_command` directly. Every argument is reco
 [[sink]]
 path = "start_timer"
 receiver = "WorkflowContext"
+step = "timer"
 reason = "context.rs:6691; calls `push_command` directly. Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "system_now"
@@ -1252,6 +1278,7 @@ reason = "context.rs:3993 = `deadline()? - system_now()`; `system_now` records a
 [[sink]]
 path = "timer"
 receiver = "WorkflowContext"
+step = "timer"
 reason = "context.rs:6179; calls `push_command` directly. Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "timer_business_days"
@@ -1260,10 +1287,12 @@ reason = "context.rs:6492; emits a command transitively: timer_business_days -> 
 [[sink]]
 path = "version"
 receiver = "WorkflowContext"
+step = "version"
 reason = "context.rs:5280 pushes `WorkflowCommand::RecordMarker` (context.rs:5296) and matches it. DUAL ROLE (see `[[sanctioned]]`): the recorded version replays verbatim, which is what makes it the sanctioned way to branch on a code change."
 [[sink]]
 path = "wait_for_signal"
 receiver = "WorkflowContext"
+step = "signal"
 reason = "context.rs:8684; calls `push_command` directly. Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "wait_for_signal_matching"
@@ -1272,6 +1301,7 @@ reason = "context.rs `wait_for_signal_matching` -> `begin_signal_wait`* (`*` = t
 [[sink]]
 path = "wait_for_signal_timeout"
 receiver = "WorkflowContext"
+step = "signal"
 reason = "context.rs:8816; emits a command transitively: wait_for_signal_timeout -> wait_for_signal_timeout_with_timer_id* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
 
 # ── Sinks reached through a handle `WorkflowContext` hands back ─────────────
@@ -1421,6 +1451,7 @@ reason = "context.rs:4150; reconstructed from the admitted-update state the hist
 [[non_sink]]
 path = "await_condition"
 receiver = "WorkflowContext"
+step = "other"
 reason = "context.rs:8642 returns `AwaitConditionFut`, a pure predicate poll loop over workflow-local state. No command; contrast `await_condition_timeout`, which arms a durable timer."
 [[non_sink]]
 path = "build_id"

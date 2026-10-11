@@ -73,7 +73,6 @@ reduction:index@HashMap
 reduction:insert@HashSet
 reduction:is_empty
 reduction:len@HashSet
-reduction:min
 reduction:product
 reduction:remove@HashMap
 reduction:remove@HashSet
@@ -132,7 +131,6 @@ sink:patched@WorkflowContext
 sink:promise@WorkflowContext
 sink:race@WorkflowContext
 sink:random_f64@WorkflowContext
-sink:receive_signal@WorkflowContext
 # Issue #1985: no corpus crate calls this new method yet.
 sink:receive_signal_matching@WorkflowContext
 sink:receive_signal_timeout@WorkflowContext
