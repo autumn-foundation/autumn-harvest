@@ -1944,6 +1944,44 @@ impl HistoryMatcher {
         }
     }
 
+    /// Whether [`Self::prepare_match`] would report replay, without moving
+    /// the cursor or filling a stash (issue #1974).
+    ///
+    /// It skips the same events as `prepare_match`: consumed events, and the
+    /// signal, external and update events that `drain_early_signals` takes.
+    /// A caller that only asks "is this call live?" uses it, so the answer
+    /// cannot change what later code sees from [`Self::is_replaying`].
+    #[must_use]
+    pub(crate) fn would_replay_after_prepare(&self) -> bool {
+        self.events
+            .iter()
+            .enumerate()
+            .skip(self.cursor)
+            .any(|(index, event)| {
+                !self.is_consumed(index)
+                    && !Self::is_transparent_external_event(event)
+                    && !Self::is_update_event(event)
+            })
+    }
+
+    /// The events that `drain_early_signals` moves to a stash: signals and
+    /// the external signal, cancel and await events.
+    const fn is_transparent_external_event(event: &WorkflowEvent) -> bool {
+        matches!(
+            event,
+            WorkflowEvent::SignalReceived { .. }
+                | WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. }
+        )
+    }
+
     /// Advances the cursor past already-consumed events, drains any signals
     /// (and update/external-signal/external-cancel events) sitting at the
     /// current cursor into their pending stashes, and resolves any external
@@ -2358,16 +2396,7 @@ impl HistoryMatcher {
                 // by their own primitives regardless of where they fall in
                 // history relative to ActivityScheduled / TimerStarted events
                 // (mixed batches).
-                WorkflowEvent::SignalReceived { .. }
-                | WorkflowEvent::ExternalSignalRequested { .. }
-                | WorkflowEvent::ExternalSignalDelivered { .. }
-                | WorkflowEvent::ExternalSignalFailed { .. }
-                | WorkflowEvent::ExternalCancelRequested { .. }
-                | WorkflowEvent::ExternalCancelDelivered { .. }
-                | WorkflowEvent::ExternalCancelFailed { .. }
-                | WorkflowEvent::ExternalAwaitRequested { .. }
-                | WorkflowEvent::ExternalAwaitResolved { .. }
-                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                ev if Self::is_transparent_external_event(ev) => {
                     self.stash_transparent_external_event(self.cursor);
                     self.cursor += 1;
                     self.advance_to_next_unconsumed_event();

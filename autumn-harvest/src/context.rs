@@ -4949,12 +4949,13 @@ impl WorkflowContext {
     /// on its first run, and its chunks are never stored. A best-effort side
     /// effect can accept that loss. A durable chunk cannot.
     ///
-    /// So this gate first runs `prepare_match`. It moves such events into
-    /// their stashes, exactly as the next history match does. It does not run
-    /// the signal-handler pump, so it changes no workflow-visible state.
+    /// So this gate asks whether `prepare_match` would still report replay.
+    /// It skips the same signal and update events, but it only reads the
+    /// matcher. It moves no cursor and fills no stash. Thus later code sees
+    /// the same `ctx.is_replaying()` value with or without a durable call.
     pub(crate) fn durable_replay_suppresses(&self) -> bool {
-        let mut matcher = self.matcher.lock().expect("matcher lock poisoned");
-        matcher.prepare_match() || matcher.has_terminal_failure_tail()
+        let matcher = self.matcher.lock().expect("matcher lock poisoned");
+        matcher.would_replay_after_prepare() || matcher.has_terminal_failure_tail()
     }
 
     /// Cursor-only "is there recorded history left to consume?" — the
@@ -26516,6 +26517,32 @@ mod tests {
             durable_chunks(&ctx.drain_commands()),
             vec![(0, serde_json::json!("first"))],
             "a buffered signal is not replayed history, so the chunk is live"
+        );
+    }
+
+    #[test]
+    fn durable_progress_does_not_change_is_replaying() {
+        // Regression (issue #1974 review). The durable gate must only read
+        // the matcher. A gate that moves the cursor makes later code see
+        // `is_replaying() == false` early, so a guarded side effect runs twice.
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let signal = WorkflowEvent::SignalReceived {
+            signal_name: "go".to_string(),
+            payload: serde_json::json!({}),
+        };
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started, signal]);
+        let before = ctx.is_replaying();
+        ctx.publish_durable_progress(serde_json::json!("first"))
+            .expect("publish");
+        assert_eq!(
+            ctx.is_replaying(),
+            before,
+            "the durable call moved the cursor"
+        );
+        assert_eq!(
+            durable_chunks(&ctx.drain_commands()),
+            vec![(0, serde_json::json!("first"))],
+            "the chunk is still live"
         );
     }
 
