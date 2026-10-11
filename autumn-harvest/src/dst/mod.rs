@@ -16,6 +16,9 @@
 //! operation then breaks the build of the Postgres replay until it gets a
 //! replay step.
 //!
+//! The [`world`] module drives whole actors instead (issue #2002). Its
+//! Postgres world runs the real `worker.rs` poll loop.
+//!
 //! See `docs/testing/simulation.md` and
 //! `docs/adr/0004-deterministic-simulation-testing.md`.
 
@@ -24,6 +27,7 @@ mod rng;
 mod sim;
 mod store;
 mod sweep;
+pub mod world;
 
 pub use invariant::{Invariant, Violation};
 pub use rng::SplitMix64;

@@ -26,6 +26,7 @@ cargo run -p autumn-harvest-agent --features sqlite --example sqlite_agent
 | Feature | Contents |
 |---|---|
 | `sqlite` | `sqlite::register`, `start`, `start_heartbeat` and `decide` for the embedded backend |
+| `eval` | `eval::evaluate`: re-drive a recorded run with a candidate model or prompt, and diff the decisions (issue #2001) |
 
 Read [`docs/agent-adapter.md`](../docs/agent-adapter.md) for the whole
 pattern, and [ADR 0006](../docs/adr/0006-agent-adapter-framework.md) for the

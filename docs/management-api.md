@@ -369,6 +369,9 @@ would signal the sealed predecessor. The business-id form always resolves to the
 **live successor** (the active run), so `POST P/signal/...` reaches the current
 run 100% of the time across a fork.
 
+[Workflow reset](workflow-reset.md) lists every fork surface and the rules
+they share, such as the refusal of a PII-erased source.
+
 **Resolve-then-act is a best-effort snapshot.** A by-id mutate resolves
 `(workflow_name, workflow_id)` to an `exec_id` and then delegates to the exec-id
 handler as two steps. Between resolution and the delegated action the run can

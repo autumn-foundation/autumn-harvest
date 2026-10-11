@@ -30,7 +30,8 @@ pub enum ResetSignalReapplyPolicy {
     /// Discard undelivered source signals.
     #[default]
     Drop,
-    /// Re-enqueue undelivered source signals onto the fork as fresh rows.
+    /// Re-enqueue undelivered source signals onto the fork as fresh rows. Each
+    /// row keeps its source `received_at`, so the fork reads them in time order.
     Buffer,
 }
 
@@ -117,10 +118,12 @@ pub enum ResetSkipReason {
     ChildWorkflow,
     /// The execution has no history at all (no `WorkflowStarted` event).
     EmptyHistory,
-    /// An infrastructure failure (UUID parse, DB connection, or reset engine
-    /// error) prevented the execution from being processed. This is distinct
-    /// from a domain skip — the execution was not examined and should be
-    /// retried once the underlying issue is resolved.
+    /// The execution's payloads were PII-erased (issue #495). A fork would
+    /// resume on tombstones, so no fork path accepts it (issue #1999).
+    ErasedSource,
+    /// A database error, or a fork-time refusal that has no typed skip reason,
+    /// such as a held durable mutex. `message` names the cause. Read it before
+    /// a retry, because a fork-time refusal does not clear by itself.
     InfrastructureError { message: String },
 }
 
@@ -287,26 +290,6 @@ pub struct WorkflowResetRequest {
     /// set it via struct construction.
     #[serde(skip)]
     pub allow_terminal_source: bool,
-    /// When `true`, a source execution whose payloads were PII-erased (issue
-    /// #495) is rejected with [`WorkflowResetError::ErasedSource`], checked
-    /// **under the same `FOR UPDATE` row lock the fork itself takes** and before
-    /// any event is copied.
-    ///
-    /// Used by the DAG retry-from-failed-node surface (issue #366), whose issue
-    /// #780 compensated-run guard reads payload fields: erasure tombstones them,
-    /// so an already-rolled-back run would look retryable. Its pre-flight check
-    /// runs on an *unlocked* read and then releases the connection to do blob
-    /// I/O, so `POST /workflows/{id}/erase-payloads` — which takes its own
-    /// `FOR UPDATE` lock — can commit tombstones in that window. This flag is
-    /// the recheck that closes the race, and it independently protects the fork
-    /// from carrying over tombstoned node outputs into an `input_from` binding
-    /// (issue #702).
-    ///
-    /// **Not settable from the wire** (`#[serde(skip)]`), like
-    /// `allow_terminal_source`: the failure posture belongs to the in-process
-    /// caller. Left `false`, the plain reset endpoint is byte-for-byte unchanged.
-    #[serde(skip)]
-    pub refuse_erased_source: bool,
 }
 
 impl WorkflowResetRequest {
@@ -423,12 +406,12 @@ pub enum WorkflowResetError {
         "workflow execution {exec_id} holds durable mutex '{key}'; release it before resetting"
     )]
     HolderHoldsMutex { exec_id: ExecutionId, key: String },
-    /// The source execution's payloads were PII-erased (issue #495) and the
-    /// caller opted into refusing such a source (`refuse_erased_source`).
+    /// The source execution's payloads were PII-erased (issue #495).
     ///
-    /// Raised under the fork's own `FOR UPDATE` row lock, before any event is
-    /// copied, so an erasure that commits between a caller's pre-flight check
-    /// and the fork cannot slip through.
+    /// Every fork path raises it, with no opt-out (issue #1999). The reset
+    /// raises it under the fork's own `FOR UPDATE` row lock, before it copies
+    /// an event. So the fork never copies events that an erasure tombstoned
+    /// after a pre-flight check.
     #[error(
         "workflow execution {exec_id} had its payloads erased; its recorded outputs are \
          tombstones, so a fork would resume on unreadable state"
@@ -765,6 +748,8 @@ pub async fn preview_workflow_reset(
     let mut request = request.normalized();
     let execution = load_source_execution(conn, exec_id, false).await?;
     validate_source_execution(exec_id, &execution, request.allow_terminal_source)?;
+    // A preview must return the refusal that the reset returns (issue #1999).
+    reject_if_source_erased(exec_id, &execution)?;
     // A reset while the source holds a durable mutex would phantom-grant the
     // lock to the fork; surface that in the preview so the operator sees the
     // same rejection the actual reset would return (issue #691).
@@ -813,24 +798,22 @@ pub async fn reset_workflow_execution(
             let source = load_source_execution(conn, exec_id, true).await?;
             validate_source_execution(exec_id, &source, request.allow_terminal_source)?;
 
-            // Recheck PII erasure (issue #495) HERE — under the `FOR UPDATE`
-            // lock taken just above, and before a single event is copied.
+            // Recheck PII erasure (issue #495) here, under the `FOR UPDATE`
+            // lock taken above, before the fork copies an event. Every fork
+            // path runs this check, with no opt-out (issue #1999).
             //
-            // A caller's own pre-flight check cannot stand in for this. The DAG
-            // retry surface (issue #366/#780) reads the execution row without a
-            // lock, then deliberately releases its connection to inflate blobs
-            // off the pool, and only afterwards opens this transaction — a wide
-            // window in which `erase_workflow_payloads` can take its own
-            // `FOR UPDATE` lock and commit tombstones over the row and its
-            // events. Re-reading here, on the locked row, is what makes the
-            // decision consistent with the fork it guards: erasure either
-            // committed before this lock (we see it and refuse) or must wait
-            // behind it (the fork completes on intact events).
-            if request.refuse_erased_source
-                && crate::erase::execution_input_is_erased(&source.input)
-            {
-                return Err(WorkflowResetError::ErasedSource { exec_id });
-            }
+            // A pre-flight check by the caller cannot replace it. The DAG retry
+            // surface (issue #366/#780) reads the row without a lock. It then
+            // releases its connection to inflate blobs before this transaction
+            // opens. In that window, `erase_workflow_payloads` can take its own
+            // `FOR UPDATE` lock and commit tombstones. The locked read makes the
+            // decision match the fork. Either the erasure committed before this
+            // lock, and the fork refuses, or it waits behind the lock, and the
+            // fork copies intact events.
+            //
+            // The refusal also keeps tombstoned node outputs out of an
+            // `input_from` binding (issue #702).
+            reject_if_source_erased(exec_id, &source)?;
 
             let rows = load_event_rows(conn, exec_id).await?;
             let events = decode_events(&rows)?;
@@ -1044,6 +1027,7 @@ fn skip_reason_to_error(exec_id: ExecutionId, reason: ResetSkipReason) -> Workfl
             nearest_valid_before,
             nearest_valid_after,
         }),
+        ResetSkipReason::ErasedSource => WorkflowResetError::ErasedSource { exec_id },
         ResetSkipReason::InfrastructureError { message } => {
             WorkflowResetError::InvalidPoint(ResetInvalidPoint {
                 message,
@@ -1055,6 +1039,35 @@ fn skip_reason_to_error(exec_id: ExecutionId, reason: ResetSkipReason) -> Workfl
             })
         }
     }
+}
+
+/// Map a failed batch fork to the skip reason of its item.
+///
+/// An erasure can commit after the batch resolve and before the fork lock.
+/// The fork then refuses, and the item keeps the typed `ErasedSource`
+/// reason (issue #1999). Any other failure is an `InfrastructureError`.
+#[must_use]
+pub fn batch_skip_reason(error: &WorkflowResetError) -> ResetSkipReason {
+    match error {
+        WorkflowResetError::ErasedSource { .. } => ResetSkipReason::ErasedSource,
+        other => ResetSkipReason::InfrastructureError {
+            message: format!("reset failed: {other}"),
+        },
+    }
+}
+
+/// Refuse a PII-erased source (issue #495).
+///
+/// Every fork path calls this, with no opt-out (issue #1999). The check is
+/// O(1): erasure always tombstones the row's own `input` column.
+fn reject_if_source_erased(
+    exec_id: ExecutionId,
+    execution: &WorkflowExecution,
+) -> Result<(), WorkflowResetError> {
+    if crate::erase::execution_input_is_erased(&execution.input) {
+        return Err(WorkflowResetError::ErasedSource { exec_id });
+    }
+    Ok(())
 }
 
 /// Read-only per-execution resolver for batch reset.
@@ -1108,6 +1121,12 @@ pub async fn resolve_batch_reset_one(
     // Skip child workflows in v1.
     if execution.parent_id.is_some() {
         return Ok(Err(ResetSkipReason::ChildWorkflow));
+    }
+
+    // Skip an erased source, so a preview predicts the fork (issue #1999).
+    // The fork rechecks under its row lock.
+    if crate::erase::execution_input_is_erased(&execution.input) {
+        return Ok(Err(ResetSkipReason::ErasedSource));
     }
 
     let rows = load_event_rows(conn, exec_id).await?;
@@ -1558,8 +1577,16 @@ struct SignalForReset {
     signal_name: String,
     payload: Value,
     idempotency_key: Option<String>,
+    received_at: chrono::DateTime<Utc>,
 }
 
+/// A buffered signal on the fork.
+///
+/// It keeps the source `received_at`, because the ingest sorts by that
+/// column. One INSERT writes every row, so a default `NOW()` would give each
+/// row the same time. The random row id would then set the order (issue
+/// #2004). Source rows that share one `received_at` have no defined order on
+/// the source either, so the fork keeps none.
 #[derive(Insertable)]
 #[diesel(table_name = harvest_signals)]
 struct NewSignalForReset {
@@ -1567,6 +1594,7 @@ struct NewSignalForReset {
     signal_name: String,
     payload: Value,
     idempotency_key: Option<String>,
+    received_at: chrono::DateTime<Utc>,
 }
 
 async fn reapply_or_drop_signals(
@@ -1587,6 +1615,7 @@ async fn reapply_or_drop_signals(
             harvest_signals::signal_name,
             harvest_signals::payload,
             harvest_signals::idempotency_key,
+            harvest_signals::received_at,
         ))
         .load(conn)
         .await
@@ -1600,6 +1629,7 @@ async fn reapply_or_drop_signals(
                 signal_name: signal.signal_name.clone(),
                 payload: signal.payload.clone(),
                 idempotency_key: signal.idempotency_key.clone(),
+                received_at: signal.received_at,
             })
             .collect::<Vec<_>>();
         diesel::insert_into(harvest_signals::table)
@@ -2143,27 +2173,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn refuse_erased_source_is_not_settable_from_the_wire() {
-        // Same escape-hatch discipline as `allow_terminal_source`, in the other
-        // direction: this flag makes the reset REFUSE an erased source, so the
-        // public endpoint must not be able to turn it on either. Its posture is
-        // the caller's to choose in-process — the DAG retry handler (issue #780)
-        // sets it, the plain reset endpoint stays byte-for-byte unchanged.
-        let body = serde_json::json!({
-            "reset_to_event_id": 1,
-            "reason": "x",
-            "operator_id": "y",
-            "refuse_erased_source": true
-        });
-        let request: super::WorkflowResetRequest =
-            serde_json::from_value(body).expect("body deserializes");
-        assert!(
-            !request.refuse_erased_source,
-            "refuse_erased_source must remain false when set via the request body"
-        );
-    }
-
     // ── ResetPoint resolver unit tests (issue #538, pure / no-DB) ────────────
 
     use super::{BatchResetOutcome, ResetPoint, ResetSkipReason, resolve_reset_point};
@@ -2514,6 +2523,7 @@ mod tests {
             ResetSkipReason::ContinueAsNew,
             ResetSkipReason::EmptyHistory,
             ResetSkipReason::ChildWorkflow,
+            ResetSkipReason::ErasedSource,
             ResetSkipReason::TerminalSource {
                 state: "COMPLETED".to_string(),
             },
@@ -2531,5 +2541,51 @@ mod tests {
             let back: ResetSkipReason = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(reason, back, "round-trip failed for {json}");
         }
+    }
+
+    // ── Erased sources in batch reset (issue #1999, pure / no-DB) ────────────
+
+    #[test]
+    fn erased_source_skip_reason_has_a_typed_wire_tag() {
+        let json = serde_json::to_value(ResetSkipReason::ErasedSource).expect("serialize");
+        assert_eq!(json, serde_json::json!({ "type": "erased_source" }));
+        let back: ResetSkipReason = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, ResetSkipReason::ErasedSource);
+    }
+
+    #[test]
+    fn batch_skip_reason_keeps_an_erasure_typed() {
+        // An erasure can commit between the batch resolve and the fork lock.
+        // The fork then refuses. The item must still say why.
+        let exec_id = crate::types::ExecutionId::new_for_shard(crate::types::ShardId::new(0));
+        let reason = super::batch_skip_reason(&super::WorkflowResetError::ErasedSource { exec_id });
+        assert_eq!(reason, ResetSkipReason::ErasedSource);
+    }
+
+    #[test]
+    fn batch_skip_reason_reports_other_failures_as_infrastructure() {
+        let exec_id = crate::types::ExecutionId::new_for_shard(crate::types::ShardId::new(0));
+        let reason = super::batch_skip_reason(&super::WorkflowResetError::HolderHoldsMutex {
+            exec_id,
+            key: "k".to_string(),
+        });
+        assert!(
+            matches!(
+                &reason,
+                ResetSkipReason::InfrastructureError { message }
+                    if message.starts_with("reset failed: ") && message.contains("mutex")
+            ),
+            "got: {reason:?}"
+        );
+    }
+
+    #[test]
+    fn erased_source_skip_maps_to_the_erased_source_error() {
+        let exec_id = crate::types::ExecutionId::new_for_shard(crate::types::ShardId::new(0));
+        let error = super::skip_reason_to_error(exec_id, ResetSkipReason::ErasedSource);
+        assert!(
+            matches!(error, super::WorkflowResetError::ErasedSource { exec_id: id } if id == exec_id),
+            "got: {error:?}"
+        );
     }
 }

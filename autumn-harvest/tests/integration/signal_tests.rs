@@ -394,3 +394,209 @@ async fn plain_send_signal_still_appends_each_call() {
     let signals = load_pending_signals(&mut conn, exec_id).await.unwrap();
     assert_eq!(signals.len(), 2);
 }
+
+// ── Signal order (issue #2004) ────────────────────────────────────────────
+
+/// Sends that commit one after another reach history in send order.
+///
+/// Each `send_signal` call commits on its own. The ingest sorts by
+/// `received_at`, the start time of the send transaction, so a later send
+/// sorts later. The test ingests twice, so it also checks the order across two
+/// wake cycles. `docs/safety-report.md` cites this test.
+#[tokio::test]
+async fn committed_sends_are_recorded_in_send_order() {
+    let (mut conn, _container) = setup_test_db().await;
+    let exec_id = insert_running_execution(&mut conn).await;
+    let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+
+    let mut next_event_id = autumn_harvest::store::load_history(&mut conn, exec_id)
+        .await
+        .unwrap()
+        .next_event_id;
+    for batch in [0..4, 4..8] {
+        for n in batch {
+            send_signal(&mut conn, exec_id, "seq", serde_json::json!({ "n": n }))
+                .await
+                .unwrap();
+        }
+        let pending = load_pending_signals(&mut conn, exec_id).await.unwrap();
+        assert!(
+            pending
+                .windows(2)
+                .all(|pair| pair[0].received_at < pair[1].received_at),
+            "each send must start after the previous send commits, so no two \
+             received_at values may tie"
+        );
+        autumn_harvest::worker::ingest_due_timers_and_signals(
+            &mut conn,
+            exec_id,
+            next_event_id,
+            &codecs,
+        )
+        .await
+        .unwrap();
+        next_event_id = autumn_harvest::store::load_history(&mut conn, exec_id)
+            .await
+            .unwrap()
+            .next_event_id;
+    }
+
+    let history = autumn_harvest::store::load_history(&mut conn, exec_id)
+        .await
+        .unwrap();
+    let recorded: Vec<i64> = history
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            autumn_harvest::event::WorkflowEvent::SignalReceived { payload, .. } => {
+                payload["n"].as_i64()
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        (0..8).collect::<Vec<i64>>(),
+        "SignalReceived events must follow the send order"
+    );
+    assert!(
+        load_pending_signals(&mut conn, exec_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the ingest must consume every pending signal"
+    );
+}
+
+/// A reset with the `Buffer` policy keeps the order of pending signals.
+///
+/// The fork gets a new row for each pending signal. One INSERT writes all the
+/// rows, so a default `received_at` gives each row the same `NOW()`. The random
+/// row id then sets the order. The fork must keep the source `received_at`.
+#[tokio::test]
+async fn reset_buffer_keeps_the_order_of_pending_signals() {
+    use autumn_harvest::execution::{StartWorkflowParams, start_or_load_workflow_execution};
+    use autumn_harvest::reset::{
+        ResetSignalReapplyPolicy, WorkflowResetRequest, reset_workflow_execution,
+    };
+
+    let (mut conn, _container) = setup_test_db().await;
+    let source = ExecutionId::new();
+    let workflow_id = source.to_string();
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams::new(
+            "reset_order",
+            &workflow_id,
+            source,
+            serde_json::json!(null),
+            "default",
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    for n in 0..8 {
+        send_signal(&mut conn, source, "seq", serde_json::json!({ "n": n }))
+            .await
+            .unwrap();
+    }
+
+    let result = reset_workflow_execution(
+        &mut conn,
+        source,
+        WorkflowResetRequest {
+            reset_to_event_id: Some(0),
+            reset_point: None,
+            reason: "signal order".to_string(),
+            operator_id: "op-1".to_string(),
+            signal_reapply: ResetSignalReapplyPolicy::Buffer,
+            allow_terminal_source: false,
+            refuse_erased_source: false,
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.source_signals_buffered, 8);
+
+    let order: Vec<i64> = load_pending_signals(&mut conn, result.new_exec_id)
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|signal| signal.payload["n"].as_i64())
+        .collect();
+    assert_eq!(
+        order,
+        (0..8).collect::<Vec<i64>>(),
+        "the fork must read buffered signals in the order the source received them"
+    );
+}
+
+/// A reset with the `Buffer` policy copies a keyed signal onto the fork, with
+/// the source `received_at`. The source row stays, so two rows share the key
+/// and the time. A keyed dedupe lookup must then pick the fork, not the source
+/// that the reset ended (issue #2004).
+#[tokio::test]
+async fn keyed_dedupe_after_a_buffered_reset_finds_the_fork() {
+    use autumn_harvest::execution::{
+        StartWorkflowParams, lookup_idempotent_signal_dedupe, start_or_load_workflow_execution,
+    };
+    use autumn_harvest::reset::{
+        ResetSignalReapplyPolicy, WorkflowResetRequest, reset_workflow_execution,
+    };
+
+    let (mut conn, _container) = setup_test_db().await;
+    let source = ExecutionId::new();
+    let workflow_id = source.to_string();
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams::new(
+            "reset_dedupe",
+            &workflow_id,
+            source,
+            serde_json::json!(null),
+            "default",
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    send_signal_idempotent(
+        &mut conn,
+        source,
+        "approval",
+        serde_json::json!({"ok": true}),
+        Some("evt_7"),
+    )
+    .await
+    .unwrap();
+
+    let result = reset_workflow_execution(
+        &mut conn,
+        source,
+        WorkflowResetRequest {
+            reset_to_event_id: Some(0),
+            reset_point: None,
+            reason: "keyed dedupe".to_string(),
+            operator_id: "op-1".to_string(),
+            signal_reapply: ResetSignalReapplyPolicy::Buffer,
+            allow_terminal_source: false,
+            refuse_erased_source: false,
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.source_signals_buffered, 1);
+
+    let found = lookup_idempotent_signal_dedupe(&mut conn, "reset_dedupe", &workflow_id, "evt_7")
+        .await
+        .unwrap()
+        .expect("the key must match a row");
+    assert_eq!(
+        found.id,
+        result.new_exec_id.as_uuid(),
+        "a keyed dedupe must return the fork, not the source that the reset ended"
+    );
+}
