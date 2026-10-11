@@ -175,6 +175,24 @@ pub const ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED: &str = "WasmModuleLookupFailed";
 #[cfg(feature = "wasm-activities")]
 pub const ERROR_TYPE_WASM_OUTPUT_TOO_LARGE: &str = "WasmOutputTooLarge";
 
+/// Stable error-type name for a journal that does not match its re-run
+/// (issue #2014).
+///
+/// A journaled WASM activity replays its host-call journal on a retry. The
+/// re-run made a different call, or finished with recorded calls left over.
+/// **Non-retryable**: the same journal diverges in the same way on each
+/// attempt.
+#[cfg(feature = "wasm-activities")]
+pub const ERROR_TYPE_WASM_JOURNAL_DIVERGENCE: &str = "WasmJournalDivergence";
+
+/// Stable error-type name for a transient host-call failure (issue #2014).
+///
+/// A granted host-call handler reported a transient failure. The host does
+/// not journal it. **Retryable**: the next attempt replays the journal and
+/// calls the handler again.
+#[cfg(feature = "wasm-activities")]
+pub const ERROR_TYPE_HOST_CALL_FAILED: &str = "HostCallFailed";
+
 /// Typed failure carrier for activity handlers.
 ///
 /// ## Backward compatibility
@@ -443,6 +461,26 @@ impl ActivityFailure {
     #[must_use]
     pub fn wasm_module_lookup_failed(detail: impl Into<String>) -> Self {
         Self::retryable(ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED, detail)
+    }
+
+    /// Construct the non-retryable failure for a journal that does not match
+    /// its re-run (issue #2014).
+    ///
+    /// The `error_type` is always [`ERROR_TYPE_WASM_JOURNAL_DIVERGENCE`].
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn wasm_journal_divergence(detail: impl Into<String>) -> Self {
+        Self::non_retryable(ERROR_TYPE_WASM_JOURNAL_DIVERGENCE, detail)
+    }
+
+    /// Construct the retryable failure for a transient host-call failure
+    /// (issue #2014).
+    ///
+    /// The `error_type` is always [`ERROR_TYPE_HOST_CALL_FAILED`].
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn host_call_failed(detail: impl Into<String>) -> Self {
+        Self::retryable(ERROR_TYPE_HOST_CALL_FAILED, detail)
     }
 }
 
