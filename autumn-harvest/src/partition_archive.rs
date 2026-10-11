@@ -1058,12 +1058,21 @@ impl<'a> ExportGate<'a> {
             return Ok(Self::Busy);
         }
         let gate = Self::Active(export);
-        if let Err(e) = crate::partition::exec(
-            conn,
-            "INSERT INTO harvest_partition_export (singleton) VALUES (TRUE) ON CONFLICT DO NOTHING",
-        )
-        .await
-        {
+        // In a caller's transaction, the marker stays invisible until that
+        // transaction commits, but the session lock ends with the pass. The
+        // transaction lock holds until the marker commits or rolls back. With
+        // no caller transaction, the insert commits under the session lock.
+        let xact_lock = format!("SELECT pg_advisory_xact_lock({EXPORT_LOCK_KEY})");
+        let marked = async {
+            crate::partition::exec(conn, &xact_lock).await?;
+            crate::partition::exec(
+                conn,
+                "INSERT INTO harvest_partition_export (singleton) VALUES (TRUE) \
+                 ON CONFLICT DO NOTHING",
+            )
+            .await
+        };
+        if let Err(e) = marked.await {
             gate.release(conn).await;
             return Err(e);
         }

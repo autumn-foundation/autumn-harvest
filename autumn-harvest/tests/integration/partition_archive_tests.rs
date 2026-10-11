@@ -1025,3 +1025,39 @@ async fn an_export_inside_a_caller_transaction_keeps_its_settings() {
         "the caller keeps its statement_timeout"
     );
 }
+
+/// An exporter in a caller transaction writes a marker that no other session
+/// sees until that transaction commits. Until then, a sweep with no archiver
+/// must drop nothing.
+#[tokio::test]
+async fn a_sweep_without_an_archiver_waits_for_an_uncommitted_marker() {
+    use diesel_async::{AnsiTransactionManager, TransactionManager};
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_partitioned(&mut conn).await;
+    let aged = seed_aged_partition(&mut conn, 3).await;
+
+    let mut exporter = connect(&url).await;
+    AnsiTransactionManager::begin_transaction(&mut exporter)
+        .await
+        .expect("begin the caller transaction");
+    let failing = Arc::new(TestArchiver {
+        fail_put: true,
+        ..TestArchiver::default()
+    });
+    let outcome = sweep_with(&mut exporter, failing).await;
+    assert!(outcome.dropped.is_empty(), "{outcome:?}");
+
+    let plain = partition::sweep(&mut conn, Utc::now(), &SweepOptions::default(), None)
+        .await
+        .expect("sweep");
+    assert_kept(&mut conn, &aged, &plain, partition::EXPORT_BUSY_REASON).await;
+
+    AnsiTransactionManager::commit_transaction(&mut exporter)
+        .await
+        .expect("commit the caller transaction");
+    let plain = partition::sweep(&mut conn, Utc::now(), &SweepOptions::default(), None)
+        .await
+        .expect("sweep");
+    assert_kept(&mut conn, &aged, &plain, partition::EXPORT_REQUIRED_REASON).await;
+}

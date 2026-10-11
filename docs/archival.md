@@ -278,6 +278,8 @@ key of each dropped partition. Each backend call has the
   no sweep with no archiver can miss a marker that an exporter is writing. A
   sweep that cannot take the lock reports
   `another process holds the export lock of this shard` and drops nothing.
+  An exporter in a caller's transaction also holds a transaction lock on
+  the same key, so the protection lasts until its marker commits.
 - **Reuse.** A failed drop leaves its export in place. The next pass reads it
   back and uses it when it still checks clean. A stale export gets one new
   export in the same pass.
