@@ -216,6 +216,16 @@ impl ResidentMiss {
 
 pub use crate::telemetry::{RESIDENT_HIT_REASON, RESIDENT_MISS_REASONS};
 
+/// Whether a decision of `workflow_name` counts toward the resident hit rate
+/// (issue #2007).
+///
+/// A liveness canary probe emits only `harvest.canary.*` metrics (issue
+/// #796), so its decisions do not count.
+#[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the db-gated worker counts.
+pub(crate) fn counts_toward_resident_rate(workflow_name: &str) -> bool {
+    !crate::canary::is_canary_workflow(workflow_name)
+}
+
 /// The context inputs that a resident workflow depends on (issue #1798).
 ///
 /// The worker builds this key at each decision, mostly from the execution
@@ -1437,6 +1447,13 @@ mod tests {
         )
         .await;
         assert!(kept.is_ok(), "one awaited activity must stay resident");
+    }
+
+    #[test]
+    fn a_canary_probe_does_not_count_toward_the_resident_rate() {
+        let probe = format!("{}__default", crate::canary::CANARY_WORKFLOW_NAME_PREFIX);
+        assert!(!counts_toward_resident_rate(&probe));
+        assert!(counts_toward_resident_rate("order_workflow"));
     }
 
     #[test]

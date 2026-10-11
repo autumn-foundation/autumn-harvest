@@ -25558,12 +25558,14 @@ async fn process_workflow_task(
             // Issue #2007: count the first drive of the decision only.
             let first_miss = resident_miss.take();
             let record = |outcome: &str, reason: &str| {
-                telemetry.metrics.record_workflow_resident(
-                    wf_name,
-                    &task.queue_name,
-                    outcome,
-                    reason,
-                );
+                if crate::resident::counts_toward_resident_rate(wf_name) {
+                    telemetry.metrics.record_workflow_resident(
+                        wf_name,
+                        &task.queue_name,
+                        outcome,
+                        reason,
+                    );
+                }
             };
             if let Some(resident) = warm_resident.take() {
                 match resident.deliver_delta(
