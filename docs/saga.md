@@ -909,3 +909,7 @@ example with embedded self-checks lives in
 - Cross-shard saga semantics — a `Saga` is scoped to a single workflow execution
   and therefore a single shard via `ExecutionId::shard()`.
 - Saga + Update (#140) or saga + child-workflow interaction — separate specs.
+- Physical backout in place of a saga, for a workflow whose effects stay in
+  the Harvest Postgres. The R&D spike
+  [`rnd/contention-adaptive-atomicity.md`](rnd/contention-adaptive-atomicity.md)
+  (issue #2012) measures both and sketches a selection rule.
