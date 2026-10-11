@@ -9264,19 +9264,23 @@ impl WorkflowContext {
     ) -> HarvestResult<Result<Value, oneshot::Receiver<Value>>> {
         // Candidates are in match order. The predicate stops at the first
         // accepted payload, so it never sees a later signal. Each candidate is
-        // cloned under the lock and tested after the lock is released.
+        // cloned under the lock and tested after the lock is released. The
+        // cursor resumes each lookup, so the scan stays linear.
         let accepted: Option<std::collections::HashSet<usize>> = predicate.map(|accepts| {
-            (0..)
-                .map_while(|n| {
-                    self.matcher
-                        .lock()
-                        .expect("matcher lock poisoned")
-                        .signal_candidate_nth(signal_name, n)
-                })
-                .find(|(_, payload)| accepts(payload))
-                .map(|(index, _)| index)
-                .into_iter()
-                .collect()
+            let mut cursor = crate::replay::SignalCandidateCursor::default();
+            std::iter::from_fn(|| {
+                let (next, index, payload) = self
+                    .matcher
+                    .lock()
+                    .expect("matcher lock poisoned")
+                    .next_signal_candidate(signal_name, cursor)?;
+                cursor = next;
+                Some((index, payload))
+            })
+            .find(|(_, payload)| accepts(payload))
+            .map(|(index, _)| index)
+            .into_iter()
+            .collect()
         });
         let history_match = self.match_history(|m| match &accepted {
             Some(set) => {
