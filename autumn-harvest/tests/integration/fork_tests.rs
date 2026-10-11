@@ -1270,6 +1270,55 @@ async fn a_fork_lineage_with_a_deleted_ancestor_is_refused() {
     );
 }
 
+/// A source or an ancestor that a shard migration sealed is not the live run.
+/// Its erasure and its later outcomes live on another shard. A sealed source
+/// is refused as retryable, so a retry follows the forwarding pointer. A
+/// sealed ancestor fails closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_migration_seal_is_not_a_fork_source() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("seal");
+    let mut conn = connect(&url).await;
+    let root = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let first = fork(&url, root, request(ForkEffects::Recorded)).await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'MIGRATED', migrated_to_shard = 1, \
+         migrated_at = NOW() WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(root.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("seal the root");
+
+    let sealed_source = fork_workflow_execution(
+        &mut conn,
+        root,
+        request(ForkEffects::Recorded),
+        Some(&registry()),
+    )
+    .await;
+    assert!(
+        matches!(
+            sealed_source,
+            Err(WorkflowForkError::Harvest(
+                autumn_harvest::error::HarvestError::ShardUnavailable { .. }
+            ))
+        ),
+        "a sealed source is retryable: {sealed_source:?}"
+    );
+    let sealed_ancestor = fork_workflow_execution(
+        &mut conn,
+        first,
+        request(ForkEffects::Recorded),
+        Some(&registry()),
+    )
+    .await;
+    assert!(
+        matches!(sealed_ancestor, Err(WorkflowForkError::LineageGap { exec_id }) if exec_id == root),
+        "a sealed ancestor fails closed: {sealed_ancestor:?}"
+    );
+}
+
 /// A fork is a fresh admission. An admission gate on its queue refuses it,
 /// as the gate refuses a start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

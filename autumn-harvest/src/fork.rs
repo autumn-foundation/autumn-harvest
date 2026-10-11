@@ -171,9 +171,12 @@ pub enum WorkflowForkError {
         /// The workflow id.
         workflow_id: String,
     },
-    /// A run in the fork lineage no longer exists, so its erasure cannot be
-    /// ruled out.
-    #[error("fork lineage ancestor {exec_id} no longer exists, so its erasure cannot be ruled out")]
+    /// A run in the fork lineage no longer exists, or a shard migration sealed
+    /// it. Its erasure cannot be ruled out.
+    #[error(
+        "fork lineage ancestor {exec_id} no longer exists on this shard, so its erasure cannot \
+         be ruled out"
+    )]
     LineageGap {
         /// The missing ancestor.
         exec_id: ExecutionId,
@@ -378,6 +381,20 @@ async fn load_fork_source(
         .await
         .optional()?
         .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {source_id}")))?;
+    // A shard cutover can seal the source between the routing and this lock.
+    // The seal is not the live run, so the fork would miss its later outcomes.
+    // The refusal is retryable, and a retry follows the forwarding pointer.
+    if is_migration_seal(&source.state) {
+        return Err(HarvestError::ShardUnavailable {
+            shard_id: source.migrated_to_shard.unwrap_or(source.shard_id),
+            reason: format!(
+                "workflow execution {source_id} was rebalanced onto another shard (state {}); \
+                 this row is a forwarding seal, so retry the fork",
+                source.state
+            ),
+        }
+        .into());
+    }
     // Issue #495: an erased source is refused in every effects mode. The
     // check reads the locked row, before any event is read.
     if crate::erase::execution_input_is_erased(&source.input) {
@@ -619,7 +636,7 @@ async fn erased_fork_ancestor(
         let Ok(parent) = parent.parse::<Uuid>() else {
             return Ok(None);
         };
-        let row: Option<(Value, Option<String>, Option<String>)> =
+        let row: Option<(Value, Option<String>, Option<String>, String)> =
             harvest_workflow_executions::table
                 .find(parent)
                 .for_share()
@@ -627,14 +644,19 @@ async fn erased_fork_ancestor(
                     harvest_workflow_executions::input,
                     harvest_workflow_executions::start_source,
                     harvest_workflow_executions::start_source_ref,
+                    harvest_workflow_executions::state,
                 ))
                 .first(conn)
                 .await
                 .optional()
                 .map_err(database_error)?;
         // Retention can delete an erased run. A missing link therefore cannot
-        // prove that the lineage is clean, so the walk fails closed.
-        let Some((input, start_source, start_source_ref)) = row else {
+        // prove that the lineage is clean, so the walk fails closed. A
+        // migration seal is not the live run either. An erasure of the run on
+        // its new shard leaves the seal as it was, so the walk fails closed.
+        let Some((input, start_source, start_source_ref, _)) =
+            row.filter(|(_, _, _, state)| !is_migration_seal(state))
+        else {
             return Err(WorkflowForkError::LineageGap {
                 exec_id: ExecutionId::from_uuid(parent),
             });
@@ -653,6 +675,12 @@ async fn erased_fork_ancestor(
         }),
         _ => Ok(None),
     }
+}
+
+/// Whether `state` marks a row that a shard migration sealed (issue #964).
+/// The live run is on another shard.
+fn is_migration_seal(state: &str) -> bool {
+    matches!(state, "MIGRATED" | "MIGRATING")
 }
 
 /// Admit the fork as a fresh start. Return its tenant quota key and the

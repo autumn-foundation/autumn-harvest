@@ -171,6 +171,8 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | An input override skips the offloader. | Encode, then offload the new input as an appended field is, and record its blob reference. |
 | A copied fan-out stored result loses its blob reference. | Share the keys of stored results in the decoded prefix too. |
 | An activity failure with the abandon text is taken for an engine record. | Match the whole engine shape and the absence of a start, as `replay.rs` does. |
+| A fork's first task skips the new-start handicap of issue #1824. | Enqueue it with `new_start`, as a start. A reset stays a continuation. |
+| A migration seal passes as a source or as a clean ancestor. | Refuse a sealed source as retryable. A sealed ancestor fails the lineage walk closed. |
 
 ## 2. Tests
 

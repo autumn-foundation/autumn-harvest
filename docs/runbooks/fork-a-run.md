@@ -114,12 +114,13 @@ not show it under the source (see
 | `409` | The workflow id is in use on any shard. A run holds its key unless it continued as new or was terminated. | Choose another `workflow_id`. |
 | `409` | The source shard is draining, or a shard that the key routes to cannot be checked. | Retry after the drain or the outage. |
 | `409` | The fork lineage is deeper than 64 links. | Fork a run nearer the root. |
-| `409` | A run in the fork lineage no longer exists, for example after retention. Its erasure cannot be ruled out. | Fork a run whose lineage still exists, or start a new run. |
+| `409` | A run in the fork lineage no longer exists on this shard, for example after retention or a shard migration. Its erasure cannot be ruled out. | Fork a run whose lineage still exists on one shard, or start a new run. |
 | `409` | The fork history reaches the history event cap or byte cap (issue #1804). The fork could not run one workflow task. | Fork at an earlier point or with fewer overrides. |
 | `429` | The fork would exceed the tenant quota of its workflow type (issue #946). A fork counts as an active run of its quota key. | Wait for a run of the key to finish, or fork with an input for another key. |
 | `429` | Load shedding refuses new starts on the queue of the fork (issue #1794). | Retry after the backlog drains. |
 | `422` | An unknown field or a bad `effects` value. | Fix the body. |
 | `503` | An admission gate blocks new starts for the fork (issue #618). The body names the gate. | Retry after the gate is lifted. |
+| `503` | A shard migration moved the source during the fork. | Retry. The retry follows the forwarding pointer. |
 | `503` | The node has not finished start-up, or the fork exists but its audit row failed. | Retry in the first case. In the second, the message names the fork. Do not retry. |
 
 ## Scope

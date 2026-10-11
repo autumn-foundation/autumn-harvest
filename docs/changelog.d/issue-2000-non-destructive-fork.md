@@ -58,7 +58,10 @@ event, a carried `MutexGranted` and a continue-as-new history are refused.
 As for a rerun, a draining source shard and a business key held on any
 shard are refused. The erased-lineage walk locks each ancestor and fails
 closed past 64 links. A lineage that reaches a deleted run fails closed
-too, because retention can delete an erased run.
+too, because retention can delete an erased run. So does a lineage that
+reaches a migration seal: an erasure on the new shard leaves the seal as it
+was. A source that a shard cutover sealed during the fork is refused with a
+retryable `503`, and the retry follows the forwarding pointer.
 In recorded mode, a source suffix with an effect that the mode cannot serve
 is refused with `409`. A mutex grant after the fork point counts as one. A
 fork history that reaches the worker history event cap or byte cap (issue
