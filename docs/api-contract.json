@@ -3543,7 +3543,7 @@
         },
         {
           "status": 404,
-          "description": "Execution not found."
+          "description": "Execution not found, or the workflow type of the source is not registered on this node (a fork would fail on every worker, as for a rerun)."
         },
         {
           "status": 409,
@@ -3563,7 +3563,7 @@
         },
         {
           "status": 503,
-          "description": "An admission gate blocks new starts for the fork (issue #618), a shard migration moved the source during the fork (retry; the retry follows the forwarding pointer), the node has not finished start-up, or the fork succeeded but its audit record could not be written. In the last case the message names the new execution. Retry is not needed."
+          "description": "An admission gate blocks new starts for the fork (issue #618), a shard migration moved the source during the fork (retry; the retry follows the forwarding pointer), the node has not finished start-up, or the audit insert failed. The fork commits with its audit row, so no fork exists after a 503, and a retry is safe."
         }
       ]
     },

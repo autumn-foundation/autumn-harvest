@@ -79,7 +79,9 @@ use autumn_harvest::executor::{
     history_reached_terminal_seal,
 };
 use autumn_harvest::external_task;
-use autumn_harvest::fork::{WorkflowForkError, WorkflowForkRequest, fork_workflow_execution};
+use autumn_harvest::fork::{
+    WorkflowForkError, WorkflowForkRequest, fork_workflow_execution_audited,
+};
 use autumn_harvest::history_export::{
     DEFAULT_HISTORY_EXPORT_MAX_BYTES, HistoryExportDocument, HistoryExportError,
     HistoryExportRequest, HistoryPayloadPolicy, export_history_decoded,
@@ -25497,28 +25499,21 @@ async fn fork_workflow(
         Ok(conn) => conn,
         Err(e) => return e.into_response(),
     };
-    let result = fork_workflow_execution(
+    // The fork commits on the source shard, with its success audit row in
+    // the same transaction. A fork leaves its source as it was, so a retry
+    // makes another fork. So a failed audit insert must roll the fork back,
+    // not report a retryable error for a fork that exists.
+    let result = fork_workflow_execution_audited(
         &mut conn,
         exec_id,
         request,
         Some(runtime.registry().as_ref()),
+        &fork_audit_record(&context, &exec_id_str, None),
     )
     .await;
 
-    // The fork commits on the source shard. Its audit row goes there too.
     match result {
-        Ok(result) => {
-            // A committed fork must have its audit row, as a reset must.
-            if let Err(audit_err) = audit_fork(&mut conn, &context, &exec_id_str, None).await {
-                tracing::error!(error = %audit_err, new_exec_id = %result.new_exec_id, "audit insert failed for workflow.fork");
-                return AutumnError::service_unavailable_msg(format!(
-                    "the fork {} exists, but its audit insert failed: {audit_err}",
-                    result.new_exec_id
-                ))
-                .into_response();
-            }
-            (axum::http::StatusCode::CREATED, Json(result)).into_response()
-        }
+        Ok(result) => (axum::http::StatusCode::CREATED, Json(result)).into_response(),
         Err(error) => {
             let failure = error.to_string();
             let _ = audit_fork(&mut conn, &context, &exec_id_str, Some(&failure)).await;
@@ -25546,11 +25541,23 @@ async fn audit_fork_on_default(
 /// `failure` is the error summary of a refused fork, or `None` on success.
 async fn audit_fork(
     conn: &mut AsyncPgConnection,
-    (actor, source, request_id): &(String, String, Option<String>),
+    context: &(String, String, Option<String>),
     target_id: &str,
     failure: Option<&str>,
 ) -> Result<(), String> {
-    let ar = NewAuditRecord {
+    audit::insert_audit(conn, &fork_audit_record(context, target_id, failure))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// The `workflow.fork` audit row of one request.
+fn fork_audit_record<'a>(
+    (actor, source, request_id): &'a (String, String, Option<String>),
+    target_id: &'a str,
+    failure: Option<&'a str>,
+) -> NewAuditRecord<'a> {
+    NewAuditRecord {
         actor,
         operation: OP_WORKFLOW_FORK,
         target_type: TARGET_WORKFLOW,
@@ -25566,11 +25573,7 @@ async fn audit_fork(
         error_summary: failure,
         shard_id: None,
         source,
-    };
-    audit::insert_audit(conn, &ar)
-        .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    }
 }
 
 fn fork_error_response(error: WorkflowForkError) -> axum::response::Response {
@@ -25595,6 +25598,8 @@ fn fork_error_response(error: WorkflowForkError) -> axum::response::Response {
         WorkflowForkError::ContinueAsNew | WorkflowForkError::InvalidOverride { .. } => {
             axum::http::StatusCode::BAD_REQUEST
         }
+        // As for a rerun: the fork would fail on every worker.
+        WorkflowForkError::WorkflowNotRegistered { .. } => axum::http::StatusCode::NOT_FOUND,
         WorkflowForkError::ErasedSource { .. }
         | WorkflowForkError::UnservableEffect { .. }
         | WorkflowForkError::CarriedMutex { .. }

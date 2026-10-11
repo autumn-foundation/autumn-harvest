@@ -175,6 +175,9 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | A fork's first task skips the new-start handicap of issue #1824. | Enqueue it with `new_start`, as a start. A reset stays a continuation. |
 | A migration seal passes as a source or as a clean ancestor. | Refuse a sealed source as retryable. A sealed ancestor fails the lineage walk closed. |
 | A stored result that the record serves later loses its blob reference. | Share the source reference when the outcome is appended. |
+| A failed audit insert after the commit reports `503` for a fork that exists, and a retry makes another fork. | Insert the success audit row in the fork transaction. |
+| A fork of an unregistered workflow type fails on every worker. | Refuse it with `404`, as a rerun does. |
+| A reset preview does not predict a lineage refusal. | Both previews run the same lineage walk. |
 | A reset of a fork skips the lineage check. | The reset walks the fork lineage under its lock. An erased ancestor is `ErasedSource`; a gap, a seal or a deep lineage is `ForkLineage` (`409`). |
 | The `LiveFork` lineage walk scans every execution for each rebalance candidate. | A partial index on `start_source_ref WHERE start_source = 'fork'` serves the seed, and the step joins on the primary key. |
 | A fork of an old run is pinned to a retired source build. | A fork at point 0 resolves its build like a fresh start. A carried prefix keeps the source build; the runbook gives the compatibility remedy. |

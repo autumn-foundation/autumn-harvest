@@ -60,6 +60,37 @@ fn build_pool(url: &str) -> DbPool {
         .expect("pool should build")
 }
 
+/// A registry that holds the workflow type of the seeded runs. A fork of a
+/// type that the node does not register is refused (issue #2000).
+fn fork_registry() -> HandlerRegistry {
+    let info = autumn_harvest::info::WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
+        mcp: false,
+        name: "fork_http_wf",
+        module: "tests",
+        handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        execution_timeout: None,
+        chain_execution_timeout: None,
+        sla: None,
+        concurrency: None,
+        debounce: None,
+        batch: None,
+        throttle: None,
+        max_input_bytes: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+    };
+    HandlerRegistry::new(vec![info], vec![])
+}
+
 fn build_app(pool: &DbPool, admin_boundary: bool) -> axum::Router {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(admin_boundary);
@@ -68,7 +99,7 @@ fn build_app(pool: &DbPool, admin_boundary: bool) -> axum::Router {
     api_state.set_allow_unauthenticated_mutations(!admin_boundary);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
-        Arc::new(HandlerRegistry::new(vec![], vec![])),
+        Arc::new(fork_registry()),
         Arc::new(DagCatalog::default()),
         Arc::new(Vec::new()),
         Some("fork-test".to_string()),
@@ -356,7 +387,7 @@ async fn fork_route_audits_on_the_source_shard() {
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(storage);
     api_state.install(HarvestApiRuntime::new(
-        Arc::new(HandlerRegistry::new(vec![], vec![])),
+        Arc::new(fork_registry()),
         Arc::new(DagCatalog::default()),
         Arc::new(Vec::new()),
         Some("fork-shard-test".to_string()),

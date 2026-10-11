@@ -115,6 +115,7 @@ not show it under the source (see
 | `400` | The history holds a continue-as-new. | Fork the latest run of the chain. |
 | `400` | An input override with a fork point other than `0`, an input that fails the workflow schema or byte cap, a bad override, or the source workflow id. | Fix the request. |
 | `404` | No such execution. | Check the id. |
+| `404` | The workflow type of the source is not registered on this node. A fork would fail on every worker. | Fork from a node that registers the type, or start a new run. |
 | `409` | The source, or a run in its fork lineage, had its payloads erased (issue #495). | You cannot fork it. Start a new run. |
 | `409` | Recorded mode cannot serve an effect after the fork point. | Fork after that effect, or use `"effects": "live"`. |
 | `409` | The carried history holds a mutex grant. | Fork before the grant. |
@@ -128,7 +129,7 @@ not show it under the source (see
 | `422` | An unknown field or a bad `effects` value. | Fix the body. |
 | `503` | An admission gate blocks new starts for the fork (issue #618). The body names the gate. | Retry after the gate is lifted. |
 | `503` | A shard migration moved the source during the fork. | Retry. The retry follows the forwarding pointer. |
-| `503` | The node has not finished start-up, or the fork exists but its audit row failed. | Retry in the first case. In the second, the message names the fork. Do not retry. |
+| `503` | The node has not finished start-up, or the audit insert failed. The fork commits with its audit row, so in both cases no fork exists. | Retry. |
 
 ## Scope
 

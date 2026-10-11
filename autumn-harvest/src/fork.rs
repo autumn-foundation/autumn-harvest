@@ -165,6 +165,14 @@ pub enum WorkflowForkError {
         /// What is wrong.
         message: String,
     },
+    /// The workflow type of the source is not registered on this node. A
+    /// fork of it would fail on every worker, so it is refused, as a rerun
+    /// is.
+    #[error("workflow type '{workflow_name}' is not registered on this node")]
+    WorkflowNotRegistered {
+        /// The workflow type of the source.
+        workflow_name: String,
+    },
     /// Another live run holds the workflow id.
     #[error("workflow id '{workflow_id}' is in use by another run")]
     WorkflowIdInUse {
@@ -246,6 +254,39 @@ pub async fn fork_workflow_execution(
     crate::dispatch::buffered_settled(Box::pin(
         conn.transaction::<ForkResult, WorkflowForkError, _>(async |conn| {
             fork_in_transaction(conn, source_id, &request, registry, codecs).await
+        }),
+    ))
+    .await
+}
+
+/// [`fork_workflow_execution`], with its success audit row in the same
+/// transaction.
+///
+/// A fork leaves its source as it was, so a retry of the request makes
+/// another fork. An audit insert after the commit could fail and report a
+/// retryable error for a fork that exists. Here the audit row and the fork
+/// commit together, or neither does.
+///
+/// # Errors
+///
+/// As [`fork_workflow_execution`]. A failed audit insert returns
+/// [`WorkflowForkError::Harvest`], and the fork rolls back.
+pub async fn fork_workflow_execution_audited(
+    conn: &mut AsyncPgConnection,
+    source_id: ExecutionId,
+    request: WorkflowForkRequest,
+    registry: Option<&HandlerRegistry>,
+    audit: &crate::models::NewAuditRecord<'_>,
+) -> Result<ForkResult, WorkflowForkError> {
+    let request = request.normalized();
+    let codecs = registry.map_or(&*crate::store::DEFAULT_PAYLOAD_CODECS, |reg| {
+        reg.payload_codecs()
+    });
+    crate::dispatch::buffered_settled(Box::pin(
+        conn.transaction::<ForkResult, WorkflowForkError, _>(async |conn| {
+            let result = fork_in_transaction(conn, source_id, &request, registry, codecs).await?;
+            crate::audit::insert_audit(conn, audit).await?;
+            Ok(result)
         }),
     ))
     .await
@@ -424,6 +465,13 @@ async fn load_fork_source(
     // of an erased run is refused too.
     if let Some(erased) = erased_fork_ancestor(conn, &source).await? {
         return Err(WorkflowForkError::ErasedSource { exec_id: erased });
+    }
+    if let Some(registry) = registry
+        && !registry.workflows.contains_key(&source.workflow_name)
+    {
+        return Err(WorkflowForkError::WorkflowNotRegistered {
+            workflow_name: source.workflow_name,
+        });
     }
     if let (Some(input), Some(registry)) = (&request.input, registry) {
         check_input_override(registry, &source.workflow_name, input)?;

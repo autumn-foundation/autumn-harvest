@@ -759,6 +759,8 @@ pub async fn preview_workflow_reset(
     validate_source_execution(exec_id, &execution, request.allow_terminal_source)?;
     // A preview must return the refusal that the reset returns (issue #1999).
     reject_if_source_erased(exec_id, &execution)?;
+    // The same holds for the fork lineage of a fork (issue #2000).
+    reject_unclean_fork_lineage(conn, exec_id, &execution).await?;
     // A reset while the source holds a durable mutex would phantom-grant the
     // lock to the fork; surface that in the preview so the operator sees the
     // same rejection the actual reset would return (issue #691).
@@ -1187,6 +1189,13 @@ pub async fn resolve_batch_reset_one(
     // The fork rechecks under its row lock.
     if crate::erase::execution_input_is_erased(&execution.input) {
         return Ok(Err(ResetSkipReason::ErasedSource));
+    }
+    // A fork whose lineage the reset refuses is skipped with the reason that
+    // the reset reports (issue #2000).
+    match reject_unclean_fork_lineage(conn, exec_id, &execution).await {
+        Ok(()) => {}
+        Err(WorkflowResetError::Harvest(error)) => return Err(error.into()),
+        Err(error) => return Ok(Err(batch_skip_reason(&error))),
     }
 
     let rows = load_event_rows(conn, exec_id).await?;

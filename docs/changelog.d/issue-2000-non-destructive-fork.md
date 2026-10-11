@@ -117,7 +117,16 @@ lineage of each live fork for every candidate it observes. The index keeps
 that walk to fork rows. No column change and no data migration. On a large
 table, build the index `CONCURRENTLY` first, as the migration header shows.
 
-**Reset of a fork.** A reset of a fork walks its lineage as a fork does. An
+**Audit.** The success audit row of a fork commits in the fork transaction.
+A failed audit insert rolls the fork back, so a retry after a `503` cannot
+make a second fork.
+
+**Unregistered type.** A source whose workflow type is not registered on
+the node is refused with `404`, as a rerun is.
+
+**Reset of a fork.** A reset of a fork walks its lineage as a fork does. A
+reset preview and a batch reset preview run the same walk, so they predict
+the refusal. An
 erased ancestor refuses it with `ErasedSource`. A missing or sealed
 ancestor, or a lineage past 64 links, refuses it with the new
 `WorkflowResetError::ForkLineage` (`409`).

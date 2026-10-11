@@ -572,6 +572,28 @@ async fn a_reset_of_a_fork_checks_its_lineage() {
     autumn_harvest::erase::erase_workflow_payloads(&mut conn, source, "gdpr")
         .await
         .expect("erase the source");
+    // Both previews predict the refusal.
+    let preview =
+        autumn_harvest::reset::preview_workflow_reset(&mut conn, erased_lineage, reset_request())
+            .await
+            .expect_err("the preview refuses too");
+    assert!(
+        matches!(preview, WorkflowResetError::ErasedSource { exec_id } if exec_id == source),
+        "unexpected preview: {preview}"
+    );
+    let batch = autumn_harvest::reset::resolve_batch_reset_one(
+        &mut conn,
+        erased_lineage,
+        &ResetPoint::EventId { event_id: 0 },
+        autumn_harvest::reset::ResetSignalReapplyPolicy::Drop,
+    )
+    .await
+    .expect("the batch preview reads the run");
+    assert_eq!(
+        batch.err(),
+        Some(autumn_harvest::reset::ResetSkipReason::ErasedSource),
+        "the batch preview skips the fork"
+    );
     let error = reset_workflow_execution(&mut conn, erased_lineage, reset_request(), None)
         .await
         .expect_err("the lineage reaches an erased run");
@@ -1197,6 +1219,100 @@ async fn build_of(url: &str, exec_id: ExecutionId) -> (Option<String>, Option<St
         .await
         .expect("fork task");
     (row, task)
+}
+
+/// A source whose workflow type is not registered is refused. Its fork would
+/// fail on every worker, so the route refuses it, as a rerun does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_of_an_unregistered_workflow_is_refused() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("unregistered");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
+        .set(harvest_workflow_executions::workflow_name.eq("retired_wf"))
+        .execute(&mut conn)
+        .await
+        .expect("retire the workflow type");
+    let error = fork_workflow_execution(
+        &mut conn,
+        source,
+        request(ForkEffects::Recorded),
+        Some(&registry()),
+    )
+    .await
+    .expect_err("an unregistered workflow type is refused");
+    assert!(
+        matches!(&error, WorkflowForkError::WorkflowNotRegistered { workflow_name } if workflow_name == "retired_wf"),
+        "unexpected error: {error}"
+    );
+}
+
+/// The success audit commits with the fork. An audit insert that fails
+/// rolls the fork back, so a retry cannot make a second fork.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_commits_with_its_audit_row() {
+    use autumn_harvest::audit::OP_WORKFLOW_FORK;
+    use autumn_harvest::models::NewAuditRecord;
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("audited");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let target = source.to_string();
+    let record = |source: &'static str| NewAuditRecord {
+        actor: "tester",
+        operation: OP_WORKFLOW_FORK,
+        target_type: "workflow",
+        target_id: Some(target.as_str()),
+        route_or_command: "POST /workflows/{id}/fork",
+        request_id: None,
+        idempotency_key: None,
+        status: "succeeded",
+        error_summary: None,
+        shard_id: None,
+        source,
+    };
+    // The audit table accepts only api, cli or ui as a source.
+    autumn_harvest::fork::fork_workflow_execution_audited(
+        &mut conn,
+        source,
+        request(ForkEffects::Recorded),
+        None,
+        &record("bogus"),
+    )
+    .await
+    .expect_err("a failed audit insert fails the fork");
+    assert_eq!(forks_of(&mut conn, source).await, 0, "the fork rolled back");
+
+    autumn_harvest::fork::fork_workflow_execution_audited(
+        &mut conn,
+        source,
+        request(ForkEffects::Recorded),
+        None,
+        &record("api"),
+    )
+    .await
+    .expect("an audited fork");
+    assert_eq!(forks_of(&mut conn, source).await, 1);
+    let audits: i64 = autumn_harvest::schema::harvest_audit_log::table
+        .filter(autumn_harvest::schema::harvest_audit_log::operation.eq(OP_WORKFLOW_FORK))
+        .filter(autumn_harvest::schema::harvest_audit_log::target_id.eq(Some(target.clone())))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("audit rows");
+    assert_eq!(audits, 1, "the audit row committed with the fork");
+}
+
+/// The number of forks that name `source`.
+async fn forks_of(conn: &mut AsyncPgConnection, source: ExecutionId) -> i64 {
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::start_source.eq(Some("fork")))
+        .filter(harvest_workflow_executions::start_source_ref.eq(Some(source.to_string())))
+        .count()
+        .get_result(conn)
+        .await
+        .expect("count forks")
 }
 
 /// A live fork never reads the source history. A source blob that is gone
