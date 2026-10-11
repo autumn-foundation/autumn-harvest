@@ -686,7 +686,7 @@ A number that Postgres cannot hold, such as `1e400`, also gets `400`. So does
 a string with a control character. An empty `filter` value is ignored.
 
 **States.** The default list hides `MIGRATED` rows, so `state = 'MIGRATED'`
-gets `400`. Use the `state=MIGRATED` parameter. The stalled list
+and an `IN` list with `MIGRATED` get `400`. `state != 'MIGRATED'` is valid. Use the `state=MIGRATED` parameter. The stalled list
 (`no_progress_minutes`) shows `RUNNING` and `SUSPENDED` rows. The `state=PAUSED`
 parameter adds paused rows. A `state` predicate in `filter` cannot widen that
 set.

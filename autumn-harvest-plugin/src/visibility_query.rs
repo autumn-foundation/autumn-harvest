@@ -555,14 +555,15 @@ impl Parser {
                 .map_err(|_| format!("started_at at byte {value_at} needs an RFC 3339 time"))?;
             return Ok(SystemTest::Cmp(cmp, ts.with_timezone(&chrono::Utc)));
         }
-        let check = |value: String, value_at: usize| -> Result<String, String> {
+        // `selects` is true for `=` and `IN`. The default list hides `MIGRATED`
+        // rows, so such a test could never match. The `state` parameter shows
+        // them. `!=` selects nothing hidden, so it may name `MIGRATED`.
+        let check = |value: String, value_at: usize, selects: bool| -> Result<String, String> {
             if field != SystemField::State {
                 return Ok(value);
             }
             let upper = value.to_ascii_uppercase();
-            // The default list hides `MIGRATED` rows, so this filter could
-            // never match. The `state` parameter shows them.
-            if upper == "MIGRATED" {
+            if selects && upper == "MIGRATED" {
                 return Err(format!(
                     "state MIGRATED at byte {value_at} is not filterable here; use state=MIGRATED"
                 ));
@@ -576,7 +577,7 @@ impl Parser {
         match op {
             "=" | "!=" => {
                 let value_at = self.at();
-                let value = check(self.string_literal(name)?, value_at)?;
+                let value = check(self.string_literal(name)?, value_at, op == "=")?;
                 Ok(if op == "=" {
                     SystemTest::Eq(value)
                 } else {
@@ -588,7 +589,7 @@ impl Parser {
                 let mut values = Vec::new();
                 for literal in self.in_list()? {
                     match literal {
-                        Literal::Str(text) => values.push(check(text, value_at)?),
+                        Literal::Str(text) => values.push(check(text, value_at, true)?),
                         _ => return Err(format!("{name} at byte {value_at} needs string values")),
                     }
                 }
@@ -1112,6 +1113,8 @@ mod tests {
         assert_eq!(parsed("attrs.a = 0.0e5"), "a=0.0");
         assert!(rejected("state = 'MIGRATED'").contains("state=MIGRATED"));
         assert!(rejected("state IN ('RUNNING', 'migrated')").contains("state=MIGRATED"));
+        // `!=` cannot show a hidden row, so it is allowed.
+        assert_eq!(parsed("state != 'MIGRATED'"), "State:Ne(\"MIGRATED\")");
     }
 
     #[test]
