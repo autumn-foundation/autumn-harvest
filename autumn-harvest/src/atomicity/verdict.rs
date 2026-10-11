@@ -63,14 +63,62 @@ pub struct Verdict {
 /// Apply the criteria to `cells`.
 #[must_use]
 pub fn judge(cells: &[Cell]) -> Verdict {
-    let _ = cells;
+    let low: Vec<&Cell> = cells
+        .iter()
+        .filter(|cell| cell.contention == Contention::Low)
+        .collect();
+    let g1 = !low.is_empty() && low.iter().all(|cell| backout_is_best(cell));
+
+    let hot_long: Vec<&Cell> = cells
+        .iter()
+        .filter(|cell| cell.contention == Contention::High && cell.long_steps)
+        .collect();
+    let g2 = !hot_long.is_empty() && hot_long.iter().all(|cell| !backout_is_best(cell));
+
+    let g3 = cells.iter().all(pick_is_near_best);
+    let g4 = cells
+        .iter()
+        .flat_map(|cell| &cell.arms)
+        .all(|result| result.invariants_held);
+
+    let outcome = if !g1 || !g4 {
+        Outcome::NoGo
+    } else if g2 && g3 {
+        Outcome::Go
+    } else {
+        Outcome::GoWithChanges
+    };
     Verdict {
-        g1: false,
-        g2: false,
-        g3: false,
-        g4: false,
-        outcome: Outcome::NoGo,
+        g1,
+        g2,
+        g3,
+        g4,
+        outcome,
     }
+}
+
+fn goodput_of(cell: &Cell, arm: Atomicity) -> Option<f64> {
+    cell.arms
+        .iter()
+        .find(|result| result.arm == arm)
+        .map(|result| result.goodput)
+}
+
+fn best_goodput(cell: &Cell) -> f64 {
+    cell.arms
+        .iter()
+        .map(|result| result.goodput)
+        .fold(f64::NEG_INFINITY, f64::max)
+}
+
+/// Backout has a result, and no arm beats it.
+fn backout_is_best(cell: &Cell) -> bool {
+    goodput_of(cell, Atomicity::Backout).is_some_and(|backout| backout >= best_goodput(cell))
+}
+
+/// The picked arm has a result within [`TIE_BAND`] of the best goodput.
+fn pick_is_near_best(cell: &Cell) -> bool {
+    goodput_of(cell, cell.pick).is_some_and(|pick| pick >= (1.0 - TIE_BAND) * best_goodput(cell))
 }
 
 #[cfg(test)]
@@ -101,10 +149,30 @@ mod tests {
     /// Four cells where every criterion holds.
     fn passing() -> Vec<Cell> {
         vec![
-            cell(Contention::Low, false, [300.0, 150.0, 200.0], Atomicity::Backout),
-            cell(Contention::Low, true, [200.0, 120.0, 150.0], Atomicity::Backout),
-            cell(Contention::High, false, [250.0, 100.0, 180.0], Atomicity::Backout),
-            cell(Contention::High, true, [20.0, 40.0, 45.0], Atomicity::Hybrid),
+            cell(
+                Contention::Low,
+                false,
+                [300.0, 150.0, 200.0],
+                Atomicity::Backout,
+            ),
+            cell(
+                Contention::Low,
+                true,
+                [200.0, 120.0, 150.0],
+                Atomicity::Backout,
+            ),
+            cell(
+                Contention::High,
+                false,
+                [250.0, 100.0, 180.0],
+                Atomicity::Backout,
+            ),
+            cell(
+                Contention::High,
+                true,
+                [20.0, 41.0, 45.0],
+                Atomicity::Hybrid,
+            ),
         ]
     }
 
@@ -154,7 +222,7 @@ mod tests {
     fn a_pick_inside_the_tie_band_counts_as_right() {
         let mut cells = passing();
         cells[3].pick = Atomicity::Saga;
-        assert!(judge(&cells).g3, "40 is within 10 % of 45");
+        assert!(judge(&cells).g3, "41 is within 10 % of 45");
     }
 
     #[test]
@@ -169,13 +237,18 @@ mod tests {
     #[test]
     fn a_missing_cell_fails_its_criterion() {
         assert!(!judge(&[]).g1, "G1 needs a low-contention cell");
-        assert!(!judge(&passing()[..3]).g2, "G2 needs the hot, long-step cell");
+        assert!(
+            !judge(&passing()[..3]).g2,
+            "G2 needs the hot, long-step cell"
+        );
     }
 
     #[test]
     fn a_pick_with_no_result_fails_g3() {
         let mut cells = passing();
-        cells[0].arms.retain(|result| result.arm != Atomicity::Backout);
+        cells[0]
+            .arms
+            .retain(|result| result.arm != Atomicity::Backout);
         assert!(!judge(&cells).g3);
     }
 }

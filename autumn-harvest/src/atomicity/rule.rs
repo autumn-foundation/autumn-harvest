@@ -92,11 +92,21 @@ pub struct Choice {
 /// Pick an arm for `profile`. The first matching branch wins.
 #[must_use]
 pub fn choose(profile: &WorkloadProfile) -> Choice {
-    let _ = profile;
-    Choice {
-        atomicity: Atomicity::Saga,
-        reason: Reason::Fallback,
-    }
+    let (atomicity, reason) = if profile.effects_outside_database {
+        (Atomicity::Saga, Reason::ExternalEffects)
+    } else if profile.total_hold > MAX_HOLD {
+        (Atomicity::Saga, Reason::LongHold)
+    } else if profile.hot_key_concurrency < COLD_KEY_CONCURRENCY {
+        // A NaN fails this test, so an unknown concurrency counts as hot.
+        (Atomicity::Backout, Reason::ColdKey)
+    } else if profile.hold_after_hot_step <= profile.commit_latency {
+        (Atomicity::Backout, Reason::CheapHold)
+    } else if profile.hot_step_commutative {
+        (Atomicity::Hybrid, Reason::CommutativeHotStep)
+    } else {
+        (Atomicity::Saga, Reason::Fallback)
+    };
+    Choice { atomicity, reason }
 }
 
 #[cfg(test)]

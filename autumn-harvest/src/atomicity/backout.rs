@@ -1,11 +1,61 @@
 //! Physical backout: one transaction, one savepoint per step (issue #2012).
+//!
+//! [`run_backout`] opens one transaction and passes the body a [`Steps`].
+//! [`Steps::step`] runs each step in a nested `diesel-async` transaction, so
+//! Diesel issues the `SAVEPOINT`. A step error rolls back to that savepoint
+//! only. The body then decides: it can propagate the error, which rolls back
+//! the whole run, or it can go on with the next step.
+//!
+//! A deadlock or a serialization abort ends the whole transaction. The runner
+//! then runs the body again from the start, through
+//! [`run_with_conflict_retry`]. It never retries a step in place. The outer
+//! locks stay held, so the same cycle could form again.
+//!
+//! Inside an open transaction, such as the one that `run_transactional`
+//! gives, the run becomes one savepoint of the outer transaction. The owner
+//! of the outer transaction then owns the retry.
 
-use diesel_async::AsyncPgConnection;
-use futures::future::BoxFuture;
+use std::future::Future;
+
+use diesel_async::{AsyncConnection, AsyncPgConnection};
 
 use crate::error::{HarvestError, HarvestResult};
 use crate::telemetry::MetricsRecorder;
-use crate::tx_retry::TxRetryPolicy;
+use crate::tx_retry::{TxRetryPolicy, run_with_conflict_retry};
+
+/// The `site` label of a backout run in the retry metrics.
+pub const SITE_BACKOUT: &str = "atomicity_backout";
+
+/// One step: an async closure that runs once on the savepoint connection.
+///
+/// The bound names the future type, so a caller can require `Send` on it.
+/// It mirrors [`crate::tx_retry::TxAttempt`].
+pub trait StepFn<A, R>: AsyncFnOnce(A) -> R + FnOnce(A) -> <Self as StepFn<A, R>>::Fut {
+    /// The future of the step.
+    type Fut: Future<Output = R>;
+}
+
+impl<F, A, Fut, R> StepFn<A, R> for F
+where
+    F: AsyncFnOnce(A) -> R + FnOnce(A) -> Fut,
+    Fut: Future<Output = R>,
+{
+    type Fut = Fut;
+}
+
+/// The body of one run. A conflict retry runs it again, so it is `Fn`.
+pub trait BodyFn<A, R>: AsyncFn(A) -> R + Fn(A) -> <Self as BodyFn<A, R>>::Fut {
+    /// The future of one run of the body.
+    type Fut: Future<Output = R>;
+}
+
+impl<F, A, Fut, R> BodyFn<A, R> for F
+where
+    F: AsyncFn(A) -> R + Fn(A) -> Fut,
+    Fut: Future<Output = R>,
+{
+    type Fut = Fut;
+}
 
 /// The steps of one run, inside its open transaction.
 pub struct Steps<'c> {
@@ -20,19 +70,26 @@ impl Steps<'_> {
     /// Returns the step error after the rollback to the savepoint.
     pub async fn step<T, F>(&mut self, step: F) -> HarvestResult<T>
     where
-        F: for<'r> FnOnce(&'r mut AsyncPgConnection) -> BoxFuture<'r, HarvestResult<T>> + Send,
+        for<'r> F: StepFn<&'r mut AsyncPgConnection, HarvestResult<T>, Fut: Send> + Send,
         T: Send,
     {
-        let _ = (&mut self.conn, step);
-        Err(HarvestError::Config("not implemented".into()))
+        Box::pin(
+            self.conn
+                .transaction::<T, HarvestError, _>(async move |savepoint| step(savepoint).await),
+        )
+        .await
     }
 }
 
-/// Run `body` as one transaction.
+/// Run `body` as one transaction, and run it again after a conflict abort.
+///
+/// `body` can run more than once, so it must not have an effect outside the
+/// database.
 ///
 /// # Errors
 ///
-/// Returns the body error after the rollback.
+/// Returns the body error after the rollback. After the last conflict
+/// retry, returns the conflict error.
 pub async fn run_backout<T, F>(
     conn: &mut AsyncPgConnection,
     metrics: &(dyn MetricsRecorder + Send + Sync),
@@ -40,9 +97,21 @@ pub async fn run_backout<T, F>(
     body: F,
 ) -> HarvestResult<T>
 where
-    F: for<'s> FnMut(&'s mut Steps<'_>) -> BoxFuture<'s, HarvestResult<T>> + Send,
+    for<'s, 'c> F: BodyFn<&'s mut Steps<'c>, HarvestResult<T>, Fut: Send> + Send + Sync,
     T: Send,
 {
-    let _ = (conn, metrics, policy, body);
-    Err(HarvestError::Config("not implemented".into()))
+    Box::pin(run_with_conflict_retry(
+        conn,
+        SITE_BACKOUT,
+        metrics,
+        policy,
+        async |conn| {
+            Box::pin(conn.transaction::<T, HarvestError, _>(async |tx| {
+                let mut steps = Steps { conn: tx };
+                body(&mut steps).await
+            }))
+            .await
+        },
+    ))
+    .await
 }

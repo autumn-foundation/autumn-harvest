@@ -51,9 +51,10 @@ async fn connect(url: &str) -> AsyncPgConnection {
 }
 
 fn make_pool(url: &str, size: usize) -> DbPool {
-    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
-        AsyncPgConnection,
-    >::new(url);
+    let manager =
+        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            url,
+        );
     deadpool::managed::Pool::builder(manager)
         .max_size(size)
         .build()
@@ -69,11 +70,9 @@ struct Label {
 /// A scratch table for the savepoint tests, with a unique name.
 async fn scratch_table(conn: &mut AsyncPgConnection) -> String {
     let name = format!("atomicity_scratch_{}", uuid::Uuid::new_v4().simple());
-    conn.batch_execute(&format!(
-        "CREATE TABLE {name} (label TEXT PRIMARY KEY)"
-    ))
-    .await
-    .expect("create the scratch table");
+    conn.batch_execute(&format!("CREATE TABLE {name} (label TEXT PRIMARY KEY)"))
+        .await
+        .expect("create the scratch table");
     name
 }
 
@@ -104,30 +103,22 @@ async fn a_failed_step_rolls_back_to_its_savepoint_only() {
     let (url, _container) = setup_db().await;
     let mut conn = connect(&url).await;
     let table = scratch_table(&mut conn).await;
+    let t = table.as_str();
 
-    let t = table.clone();
     let result = run_backout(
         &mut conn,
         &NoOpMetrics,
         TxRetryPolicy::DEFAULT,
-        move |steps| {
-            let t = t.clone();
-            Box::pin(async move {
-                let t1 = t.clone();
-                steps.step(move |c| Box::pin(async move { insert(c, &t1, "a").await })).await?;
-                let t2 = t.clone();
-                let failed = steps
-                    .step(move |c| {
-                        Box::pin(async move {
-                            insert(c, &t2, "b").await?;
-                            Err::<(), _>(declined())
-                        })
-                    })
-                    .await;
-                assert!(failed.is_err(), "the step error reaches the body");
-                let t3 = t.clone();
-                steps.step(move |c| Box::pin(async move { insert(c, &t3, "c").await })).await
-            })
+        async |steps| {
+            steps.step(async |c| insert(c, t, "a").await).await?;
+            let failed = steps
+                .step(async |c| {
+                    insert(c, t, "b").await?;
+                    Err::<(), _>(declined())
+                })
+                .await;
+            assert!(failed.is_err(), "the step error reaches the body");
+            steps.step(async |c| insert(c, t, "c").await).await
         },
     )
     .await;
@@ -141,27 +132,20 @@ async fn a_failed_run_leaves_no_row() {
     let (url, _container) = setup_db().await;
     let mut conn = connect(&url).await;
     let table = scratch_table(&mut conn).await;
+    let t = table.as_str();
 
-    let t = table.clone();
     let result = run_backout(
         &mut conn,
         &NoOpMetrics,
         TxRetryPolicy::DEFAULT,
-        move |steps| {
-            let t = t.clone();
-            Box::pin(async move {
-                let t1 = t.clone();
-                steps.step(move |c| Box::pin(async move { insert(c, &t1, "a").await })).await?;
-                let t2 = t.clone();
-                steps
-                    .step(move |c| {
-                        Box::pin(async move {
-                            insert(c, &t2, "b").await?;
-                            Err::<(), _>(declined())
-                        })
-                    })
-                    .await
-            })
+        async |steps| {
+            steps.step(async |c| insert(c, t, "a").await).await?;
+            steps
+                .step(async |c| {
+                    insert(c, t, "b").await?;
+                    Err::<(), _>(declined())
+                })
+                .await
         },
     )
     .await;
@@ -178,23 +162,17 @@ async fn a_sql_error_in_a_step_does_not_poison_the_run() {
     let (url, _container) = setup_db().await;
     let mut conn = connect(&url).await;
     let table = scratch_table(&mut conn).await;
+    let t = table.as_str();
 
-    let t = table.clone();
     run_backout(
         &mut conn,
         &NoOpMetrics,
         TxRetryPolicy::DEFAULT,
-        move |steps| {
-            let t = t.clone();
-            Box::pin(async move {
-                let t1 = t.clone();
-                steps.step(move |c| Box::pin(async move { insert(c, &t1, "a").await })).await?;
-                let t2 = t.clone();
-                let duplicate = steps.step(move |c| Box::pin(async move { insert(c, &t2, "a").await })).await;
-                assert!(duplicate.is_err(), "a duplicate key fails the step");
-                let t3 = t.clone();
-                steps.step(move |c| Box::pin(async move { insert(c, &t3, "b").await })).await
-            })
+        async |steps| {
+            steps.step(async |c| insert(c, t, "a").await).await?;
+            let duplicate = steps.step(async |c| insert(c, t, "a").await).await;
+            assert!(duplicate.is_err(), "a duplicate key fails the step");
+            steps.step(async |c| insert(c, t, "b").await).await
         },
     )
     .await
@@ -203,45 +181,38 @@ async fn a_sql_error_in_a_step_does_not_poison_the_run() {
     assert_eq!(labels(&mut conn, &table).await, ["a", "b"]);
 }
 
+#[derive(diesel::QueryableByName)]
+struct Txid {
+    #[diesel(sql_type = BigInt)]
+    id: i64,
+}
+
+async fn txid(conn: &mut AsyncPgConnection) -> HarvestResult<i64> {
+    let row = diesel::sql_query("SELECT txid_current() AS id")
+        .get_result::<Txid>(conn)
+        .await?;
+    Ok(row.id)
+}
+
 #[tokio::test]
 async fn a_body_runs_inside_one_transaction() {
     let (url, _container) = setup_db().await;
     let mut conn = connect(&url).await;
 
-    #[derive(diesel::QueryableByName)]
-    struct Txid {
-        #[diesel(sql_type = BigInt)]
-        id: i64,
-    }
-
     let ids = run_backout(
         &mut conn,
         &NoOpMetrics,
         TxRetryPolicy::DEFAULT,
-        |steps| {
-            Box::pin(async move {
-                let mut ids = Vec::new();
-                for _ in 0..2 {
-                    let id = steps
-                        .step(|c| {
-                            Box::pin(async move {
-                                let row = diesel::sql_query("SELECT txid_current() AS id")
-                                    .get_result::<Txid>(c)
-                                    .await?;
-                                Ok(row.id)
-                            })
-                        })
-                        .await?;
-                    ids.push(id);
-                }
-                Ok(ids)
-            })
+        async |steps| {
+            let first = steps.step(async |c| txid(c).await).await?;
+            let second = steps.step(async |c| txid(c).await).await?;
+            Ok((first, second))
         },
     )
     .await
     .expect("the run commits");
 
-    assert_eq!(ids[0], ids[1], "both steps see one top-level transaction");
+    assert_eq!(ids.0, ids.1, "both steps see one top-level transaction");
 }
 
 /// The history rows that one run writes under each arm.
@@ -294,7 +265,12 @@ async fn each_arm_commits_an_order() {
     for arm in Atomicity::ALL {
         let totals = one_order(arm, false).await;
         assert_eq!(
-            (totals.stock_taken, totals.orders, totals.money_taken, totals.order_total),
+            (
+                totals.stock_taken,
+                totals.orders,
+                totals.money_taken,
+                totals.order_total
+            ),
             (1, 1, 125, 125),
             "{arm:?}"
         );
@@ -306,7 +282,12 @@ async fn each_arm_undoes_a_declined_order() {
     for arm in Atomicity::ALL {
         let totals = one_order(arm, true).await;
         assert_eq!(
-            (totals.stock_taken, totals.orders, totals.money_taken, totals.order_total),
+            (
+                totals.stock_taken,
+                totals.orders,
+                totals.money_taken,
+                totals.order_total
+            ),
             (0, 0, 0, 0),
             "{arm:?}"
         );
@@ -371,7 +352,9 @@ async fn measure_the_full_matrix() {
         .expect("measure the commit latency");
     println!("commit latency (median of 200): {commit:?}\n");
 
-    println!("| contention | step work | arm | goodput (runs/s) median [min, max] | P50 ms | P90 ms | declined | errors | invariants |");
+    println!(
+        "| contention | step work | arm | goodput (runs/s) median [min, max] | P50 ms | P90 ms | declined | errors | invariants |"
+    );
     println!("|---|---|---|---|---|---|---|---|---|");
     let mut cells: Vec<Cell> = Vec::new();
     let configs = harness::matrix(clients, Duration::from_secs(10), 2012);
@@ -382,7 +365,11 @@ async fn measure_the_full_matrix() {
                 seed: config.seed + rep as u64,
                 ..*config
             };
-            runs.push(harness::run_cell(&pool, seeded).await.expect("run the cell"));
+            runs.push(
+                harness::run_cell(&pool, seeded)
+                    .await
+                    .expect("run the cell"),
+            );
         }
         runs.sort_by(|a, b| a.goodput().total_cmp(&b.goodput()));
         let median = runs[REPETITIONS / 2];
@@ -431,7 +418,8 @@ async fn measure_the_full_matrix() {
         let cell = cells
             .iter()
             .find(|cell| {
-                cell.contention == config.contention && cell.long_steps == !config.step_work.is_zero()
+                cell.contention == config.contention
+                    && cell.long_steps == !config.step_work.is_zero()
             })
             .expect("cell");
         let best = cell
