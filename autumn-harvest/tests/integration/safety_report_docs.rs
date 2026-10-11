@@ -88,8 +88,8 @@ const LIMIT_SOURCES: &[LimitSource] = &[
                 "No model covers shard-generation fencing or the rebalance cutover.",
             ),
             (
-                "Trace conformance.",
-                "No check compares test traces with the models.",
+                "Trace conformance of `CodecRotation`.",
+                "No check compares test traces with the `CodecRotation` model.",
             ),
         ],
     },
@@ -101,6 +101,14 @@ const LIMIT_SOURCES: &[LimitSource] = &[
             (
                 "drives the store statements, not the `worker.rs` loop.",
                 "The simulator drives store statements, not the `worker.rs` loop.",
+            ),
+            (
+                "A world crash falls between two steps.",
+                "The world simulation crashes a worker only between two steps.",
+            ),
+            (
+                "The world workload never fails an activity",
+                "The world simulation never fails an activity",
             ),
             (
                 "draws actions from fixed weights.",
