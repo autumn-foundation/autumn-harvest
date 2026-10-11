@@ -7,6 +7,9 @@
 //!
 //! 1. A sequential run is cold once, then hits on every decision.
 //! 2. A join of an activity and a signal wait is a `multi_await` miss.
+//! 3. A join of activities stays resident. Each tool result is a hit.
+//! 4. An agent loop with parallel tool calls hits on every decision after
+//!    the first. The test prints the hit rate, which the design records.
 //!
 //! Each test uses its own queue and worker id, so the tests can share one
 //! database.
@@ -354,6 +357,73 @@ async fn a_join_of_an_activity_and_a_signal_is_a_multi_await_miss() {
         outcomes.get(1),
         Some(&ResidentOutcome::MultiAwait),
         "the decision after a mixed join replays: {outcomes:?}"
+    );
+    stop(&worker, handle).await;
+}
+
+/// AC (issue #2008): a join of activities stays resident. Every decision
+/// after the first resumes it, and the body runs once.
+#[tokio::test]
+async fn a_join_of_activities_hits_on_every_tool_result() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    JOIN_BODY_STARTS.store(0, Ordering::SeqCst);
+    let (exec_id, _conn, log, worker, handle) = start_run(&url, ACTIVITY_JOIN).await;
+
+    wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", Duration::from_secs(30))
+        .await;
+
+    let outcomes = log.of(ACTIVITY_JOIN);
+    assert_eq!(
+        outcomes.first(),
+        Some(&ResidentOutcome::Cold),
+        "{outcomes:?}"
+    );
+    assert!(
+        outcomes.len() >= 2 && outcomes[1..].iter().all(|o| *o == ResidentOutcome::Hit),
+        "each tool result must resume the join: {outcomes:?}"
+    );
+    assert_eq!(JOIN_BODY_STARTS.load(Ordering::SeqCst), 1, "{outcomes:?}");
+    stop(&worker, handle).await;
+}
+
+/// AC (issue #2008): the hit rate of an agent loop with parallel tool calls.
+///
+/// Three rounds of one model call and four tool calls. Every decision after
+/// the first must hit. The printed line is the measurement in
+/// `DESIGN-2008.md`.
+#[tokio::test]
+async fn an_agent_loop_with_parallel_tool_calls_hits_after_the_first_decision() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    TOOL_LOOP_BODY_STARTS.store(0, Ordering::SeqCst);
+    let (exec_id, _conn, log, worker, handle) = start_run(&url, TOOL_LOOP).await;
+
+    wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", Duration::from_secs(60))
+        .await;
+
+    let outcomes = log.of(TOOL_LOOP);
+    let hits = outcomes
+        .iter()
+        .filter(|o| **o == ResidentOutcome::Hit)
+        .count();
+    println!(
+        "agent loop: {hits} hits of {} decisions; outcomes {:?}",
+        outcomes.len(),
+        outcomes
+    );
+    assert_eq!(
+        outcomes.first(),
+        Some(&ResidentOutcome::Cold),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        hits,
+        outcomes.len() - 1,
+        "every decision after the first must hit: {outcomes:?}"
+    );
+    assert_eq!(
+        TOOL_LOOP_BODY_STARTS.load(Ordering::SeqCst),
+        1,
+        "{outcomes:?}"
     );
     stop(&worker, handle).await;
 }

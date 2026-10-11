@@ -164,7 +164,10 @@ fn chain_workflow<'a>(
     })
 }
 
-/// One activity. The schedule starts this workflow.
+/// Two activities at once. The schedule starts this workflow.
+///
+/// The join stays resident (issue #2008). A decision that reads one of the
+/// two results resumes it and parks the other.
 fn tick_workflow<'a>(
     ctx: &'a WorkflowContext,
     input: Value,
@@ -173,13 +176,19 @@ fn tick_workflow<'a>(
         if let Some(tag) = ctx.state::<Arc<WorkerTag>>() {
             tag.body_starts.fetch_add(1, Ordering::SeqCst);
         }
-        let b = ctx
-            .execute_activity_raw(ADD, json!({ "x": input["x"] }), QUEUE)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(json!({ "result": b }))
+        let x = input["x"].as_i64().ok_or("missing x")?;
+        let (b, c) = futures::join!(
+            ctx.execute_activity_raw(ADD, json!({ "x": x }), QUEUE),
+            ctx.execute_activity_raw(ADD, json!({ "x": x + 10 }), QUEUE),
+        );
+        let b = b.map_err(|e| e.to_string())?.as_i64().ok_or("bad b")?;
+        let c = c.map_err(|e| e.to_string())?.as_i64().ok_or("bad c")?;
+        Ok(json!({ "result": b + c }))
     })
 }
+
+/// The output of a scheduled run: `(100 + 1) + (110 + 1)`.
+const TICK_OUTPUT: i64 = 212;
 
 /// The output of chain `i`: `a = i + 1`, `v = 10 i`, `b = a + v + 1`.
 fn chain_output(i: usize) -> Value {
@@ -765,7 +774,10 @@ impl PgWorld {
                 .entry(id)
                 .or_insert_with(|| {
                     self.scheduled += 1;
-                    (format!("s{}", self.scheduled - 1), json!({ "result": 101 }))
+                    (
+                        format!("s{}", self.scheduled - 1),
+                        json!({ "result": TICK_OUTPUT }),
+                    )
                 })
                 .clone();
             let history =
@@ -983,6 +995,56 @@ async fn dst_poll_once_runs_the_claimed_task_to_completion() {
         timer: "nap".to_string(),
     };
     assert!(fired.contains(&fire), "{fired:?}");
+}
+
+/// A join resumes warm through the real worker (issue #2008).
+///
+/// The scheduled workflow joins two activities. Each decision after the
+/// first resumes the resident workflow, also the one that reads a partial
+/// result.
+#[tokio::test]
+async fn a_join_resumes_warm_through_the_worker() {
+    let harness = Harness::new().await;
+    let config = WorldConfig {
+        workflows: 0,
+        workers: 1,
+        schedulers: 1,
+        ..WorldConfig::new(0)
+    };
+    let mut world = harness.world(&config).await;
+
+    // Move the clock until the schedule fires its first run.
+    let mut tick = 0;
+    loop {
+        if let Effect::Scanned(due) = world.apply(WorldAction::ScheduleScan(0), tick).await
+            && due > 0
+        {
+            let fired = world.apply(WorldAction::ScheduleFire(0), tick).await;
+            assert!(matches!(fired, Effect::Fired(Some(_))), "{fired}");
+            break;
+        }
+        tick += 1;
+        assert!(tick < 8, "the schedule never came due");
+        world.apply(WorldAction::Advance, tick).await;
+    }
+
+    // Poll until the run completes. Keep the effect of each decision.
+    let mut decisions = Vec::new();
+    for _ in 0..12 {
+        match world.poll(0).await {
+            Effect::Polled(Ran::Activity) | Effect::Idle => {}
+            Effect::Polled(ran) => decisions.push(ran),
+            other => panic!("unexpected effect {other}"),
+        }
+    }
+    let snapshot = world.read_snapshot().await;
+    let run = &snapshot.executions[0];
+    assert_eq!(run.status, "COMPLETED", "{:?}", run.events);
+    assert_eq!(decisions.as_slice().first(), Some(&Ran::Cold), "{decisions:?}");
+    assert!(
+        decisions.len() >= 2 && decisions[1..].iter().all(|ran| *ran == Ran::Warm),
+        "each decision after the first must resume the join: {decisions:?}"
+    );
 }
 
 /// An abandoned claim comes back through the reclaimer or the sweeper.
