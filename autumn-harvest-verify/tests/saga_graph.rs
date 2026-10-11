@@ -580,6 +580,13 @@ fn a_local_type_named_saga_is_not_the_engine_saga() {
         report(&reports, "wf_own_saga_type").verdict,
         SagaVerdict::NoSaga
     );
+    // An engine saga handed to a method of the local type escapes.
+    let r = report(&reports, "wf_own_type_takes_engine_saga");
+    assert_eq!(r.verdict, SagaVerdict::Unknown, "{r:#?}");
+    assert!(
+        r.unknown.iter().any(|u| u.starts_with("saga-escapes: ")),
+        "{r:#?}"
+    );
 }
 
 #[test]

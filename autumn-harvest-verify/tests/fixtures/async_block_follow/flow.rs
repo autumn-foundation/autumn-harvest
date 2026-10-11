@@ -255,3 +255,35 @@ pub async fn wf_step_named_future(ctx: &WorkflowContext) -> Out {
     let a = saga.step(|| ClockFuture, |_| async { Ok(()) }).await?;
     ctx.execute_activity_raw("b", a).await
 }
+
+/// A first-party future that holds caller state and writes it in `poll`.
+pub struct WriteFuture<'a> {
+    seen: &'a mut u64,
+}
+
+impl Future for WriteFuture<'_> {
+    type Output = Out;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Out> {
+        *self.seen = now_nanos();
+        std::task::Poll::Ready(Ok(1))
+    }
+}
+
+pub fn __autumn_workflow_info_wf_step_named_write_future() -> u8 {
+    0
+}
+
+/// The named future writes the clock into caller state.
+pub async fn wf_step_named_write_future(ctx: &WorkflowContext) -> Out {
+    let mut seen = 0_u64;
+    {
+        let mut saga = Saga::new(ctx);
+        saga.step(|| WriteFuture { seen: &mut seen }, |_| async { Ok(()) })
+            .await?;
+    }
+    ctx.execute_activity_raw("b", seen).await
+}

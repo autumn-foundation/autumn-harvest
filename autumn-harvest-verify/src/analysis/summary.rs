@@ -1757,7 +1757,11 @@ impl<'a> Analyzer<'a> {
     ) {
         let block = returning_block(body);
         let Some(span) = brace_form(&body.return_ty) else {
-            self.follow_named_future(closure, body, ret, hops, &block, out);
+            let followed = self.follow_named_future(closure, body, ret, hops, &block, out);
+            if followed && emit && may_write_through(&body.return_ty, &self.interior_types()) {
+                let detail = format!("{} can write through its fields", body.return_ty.trim());
+                self.push_boundary(BoundaryKind::UnresolvedCallback, &detail, closure, &block);
+            }
             return;
         };
         if !span.starts_with("{async block@") || !span.contains(".rs:") {
@@ -1775,20 +1779,25 @@ impl<'a> Analyzer<'a> {
             let outcome = self.analyze_body(&coroutine, &Substitution::new(), &seeded, hops);
             out.absorb(&outcome.ret);
         }
-        let interior: Vec<&str> = self
-            .model
-            .ambient_type
-            .iter()
-            .map(|rule| rule.name.as_str())
-            .collect();
-        if emit && captures_mut_ref(body, &interior) {
+        if emit && captures_mut_ref(body, &self.interior_types()) {
             let detail = format!("{span} captures a `&mut` reference");
             self.push_boundary(BoundaryKind::UnresolvedCallback, &detail, closure, &block);
         }
     }
 
+    /// The names of the model's interior-mutable types.
+    fn interior_types(&self) -> Vec<&'a str> {
+        let model: &'a Model = self.model;
+        model
+            .ambient_type
+            .iter()
+            .map(|rule| rule.name.as_str())
+            .collect()
+    }
+
     /// Analyze the `Future::poll` impl of a named type that an invoked
-    /// closure returns, when that impl has a body here (issue #2010).
+    /// closure returns, when that impl has a body here (issue #2010). Return
+    /// true when one was followed.
     ///
     /// A type with no such impl is not a first-party future, so nothing is
     /// followed. A future of another crate was built by a call that was
@@ -1801,16 +1810,16 @@ impl<'a> Analyzer<'a> {
         hops: &[Hop],
         block: &str,
         out: &mut TaintSet,
-    ) {
+    ) -> bool {
         let ty = body.return_ty.trim();
         if ty.is_empty() || ty.starts_with('&') || ty.starts_with('(') {
-            return;
+            return false;
         }
         let poll = format!("<{ty} as std::future::Future>::poll");
         let targets = match self.program.resolve_call(closure, &poll) {
             Resolution::Body(target) => vec![target],
             Resolution::Bodies(targets, _) => targets,
-            Resolution::Boundary(..) | Resolution::External(_) => return,
+            Resolution::Boundary(..) | Resolution::External(_) => return false,
         };
         for target in targets {
             self.recorder.future_edge(closure, block, &target);
@@ -1820,6 +1829,7 @@ impl<'a> Analyzer<'a> {
             let outcome = self.analyze_body(&target, &Substitution::new(), &seeded, hops);
             out.absorb(&outcome.ret);
         }
+        true
     }
 
     /// The callee path a bare `fn` item argument names, and where it

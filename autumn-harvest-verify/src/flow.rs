@@ -264,7 +264,18 @@ fn block_event(body: &Body, block: &BasicBlock, facts: &BlockFacts) -> Option<Fl
         })
 }
 
-/// The method name when `callee` is a method of `Saga`.
+/// The public methods of the engine's `Saga`.
+const SAGA_METHODS: [&str; 5] = [
+    "new",
+    "step",
+    "compensate_all",
+    "context",
+    "pending_compensation_count",
+];
+
+/// The method name when `callee` names one of [`SAGA_METHODS`] on a type
+/// named `Saga`. The caller still checks the operand or result type, because
+/// a workflow crate can have its own `Saga`.
 fn saga_method(callee: &str) -> Option<&'static str> {
     let bare = strip_generics_everywhere(callee);
     let mut segments = bare.rsplit("::");
@@ -273,10 +284,7 @@ fn saga_method(callee: &str) -> Option<&'static str> {
     if owner != "Saga" {
         return None;
     }
-    ["new", "step", "compensate_all"]
-        .into_iter()
-        .find(|m| *m == method)
-        .or(Some("other"))
+    SAGA_METHODS.into_iter().find(|m| *m == method)
 }
 
 /// The engine's `Saga` type, behind any references.
@@ -353,7 +361,10 @@ fn escapes(body: &Body, block: &BasicBlock) -> Vec<FlowEvent> {
             .any(|place| saga_local(body, place));
         let callee = callee.as_deref().unwrap_or("<indirect call>");
         let bare = strip_generics_everywhere(callee);
-        let kept = saga_method(callee).is_some()
+        // A saga stays in view only through an engine method that takes it
+        // as operand 0, such as `step`. Any other callee can keep it.
+        let saga_call = saga_method(callee).is_some() && args_saga(body, &block.terminator);
+        let kept = saga_call
             || bare.ends_with("drop_in_place")
             || (saga_local(body, dest) && is_reborrow(&bare));
         if passes_saga && !kept {
@@ -649,8 +660,9 @@ mod tests {
         );
         assert_eq!(
             saga_method("Saga::<'_>::pending_compensation_count"),
-            Some("other")
+            Some("pending_compensation_count")
         );
+        assert_eq!(saga_method("own::Saga::consume"), None);
         assert_eq!(saga_method("Sagas::new"), None);
         assert_eq!(saga_method("new"), None);
     }

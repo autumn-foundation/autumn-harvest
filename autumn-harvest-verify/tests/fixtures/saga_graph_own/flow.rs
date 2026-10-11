@@ -26,6 +26,11 @@ mod own {
         pub async fn compensate_all(&mut self) -> Result<(), String> {
             Ok(())
         }
+
+        /// Takes the engine's saga away, out of the check's sight.
+        pub fn consume(saga: autumn_harvest::Saga<'_>) {
+            drop(saga);
+        }
     }
 }
 
@@ -38,5 +43,22 @@ pub async fn wf_own_saga_type(ctx: &WorkflowContext) -> Out {
     let mut saga = own::Saga::new();
     let a = saga.step(1).await?;
     saga.compensate_all().await?;
+    ctx.execute_activity_raw("ship", a).await
+}
+
+pub fn __autumn_workflow_info_wf_own_type_takes_engine_saga() -> u8 {
+    0
+}
+
+/// An engine saga passed to a method of the local `own::Saga`.
+pub async fn wf_own_type_takes_engine_saga(ctx: &WorkflowContext) -> Out {
+    let mut saga = autumn_harvest::Saga::new(ctx);
+    let a = saga
+        .step(
+            || async { ctx.execute_activity_raw("reserve", 1).await },
+            |a| async move { ctx.execute_activity_raw("release", a).await.map(|_| ()) },
+        )
+        .await?;
+    own::Saga::consume(saga);
     ctx.execute_activity_raw("ship", a).await
 }
