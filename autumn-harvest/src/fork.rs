@@ -294,16 +294,31 @@ async fn fork_in_transaction(
         Err(error) => return Err(error.into()),
     };
 
+    let start_input = match &request.input {
+        Some(input) => Some(
+            stored_start_input(
+                &events,
+                input,
+                codecs,
+                registry.and_then(HandlerRegistry::payload_offloader),
+            )
+            .await?,
+        ),
+        None => None,
+    };
     let copied = copy_prefix(
         conn,
         new_exec_id,
         &rows,
-        &events,
         fork_event_id,
-        request,
-        codecs,
+        start_input.as_ref().map(|(input, _)| input),
     )
     .await?;
+    if let Some((_, refs)) = &start_input
+        && !refs.is_empty()
+    {
+        crate::store::insert_payload_refs(conn, new_exec_id, refs).await?;
+    }
     let kept_input = request.input.is_none().then_some(&source.input);
     share_payload_refs(conn, source_id, new_exec_id, &copied, kept_input).await?;
     let tail = fork_tail(source_id, fork_event_id, request);
@@ -895,23 +910,17 @@ async fn copy_prefix(
     conn: &mut AsyncPgConnection,
     new_exec_id: ExecutionId,
     rows: &[HarvestEvent],
-    events: &[WorkflowEvent],
     fork_event_id: i64,
-    request: &WorkflowForkRequest,
-    codecs: &PayloadCodecs,
+    start_input: Option<&Value>,
 ) -> HarvestResult<Vec<Value>> {
     let mut copied = Vec::new();
-    for (row, event) in rows.iter().zip(events) {
+    for row in rows {
         if i64::from(row.event_id) > fork_event_id {
             break;
         }
-        let event_data = match (event, &request.input) {
-            (WorkflowEvent::WorkflowStarted { .. }, Some(input)) => {
-                let mut started = event.clone();
-                if let WorkflowEvent::WorkflowStarted { input: field, .. } = &mut started {
-                    field.clone_from(input);
-                }
-                with_start_input(&row.event_data, &codecs.encode_event(&started)?)
+        let event_data = match start_input {
+            Some(input) if row.event_type == "WorkflowStarted" => {
+                with_start_input(&row.event_data, input)
             }
             _ => row.event_data.clone(),
         };
@@ -936,19 +945,50 @@ async fn copy_prefix(
 /// one chunk stays far below the limit of 65,535.
 const COPY_CHUNK_ROWS: usize = 1_000;
 
-/// The stored start row with the `data.input` of `encoded` in place.
+/// The stored start row with `input` as its `data.input`.
 ///
 /// The other fields keep their stored bytes. So an offloaded
 /// `last_completion_result` stays an envelope and does not become a payload.
-fn with_start_input(stored: &Value, encoded: &Value) -> Value {
+fn with_start_input(stored: &Value, input: &Value) -> Value {
     let mut row = stored.clone();
-    if let (Some(data), Some(input)) = (
-        row.get_mut("data").and_then(Value::as_object_mut),
-        encoded.pointer("/data/input"),
-    ) {
+    if let Some(data) = row.get_mut("data").and_then(Value::as_object_mut) {
         data.insert("input".to_string(), input.clone());
     }
     row
+}
+
+/// The stored form of a new start input, and the blobs that it uploaded.
+///
+/// The input is encoded as the `WorkflowStarted` event encodes it. Then it is
+/// offloaded as an appended event field is. Only the input goes through the
+/// offloader, because the other start fields keep their stored bytes.
+async fn stored_start_input(
+    events: &[WorkflowEvent],
+    input: &Value,
+    codecs: &PayloadCodecs,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
+) -> HarvestResult<(Value, Vec<crate::payload_store::OffloadedRef>)> {
+    let mut started = events
+        .iter()
+        .find(|event| matches!(event, WorkflowEvent::WorkflowStarted { .. }))
+        .cloned()
+        .ok_or_else(|| HarvestError::Database("the source has no WorkflowStarted".to_string()))?;
+    if let WorkflowEvent::WorkflowStarted { input: field, .. } = &mut started {
+        field.clone_from(input);
+    }
+    let encoded = codecs.encode_event(&started)?;
+    let mut only_input = serde_json::json!({
+        "data": { "input": encoded.pointer("/data/input").cloned().unwrap_or(Value::Null) }
+    });
+    let refs = match offloader {
+        Some(offloader) => offloader.offload_event_value(&mut only_input).await?,
+        None => Vec::new(),
+    };
+    let stored = only_input
+        .pointer("/data/input")
+        .cloned()
+        .unwrap_or(Value::Null);
+    Ok((stored, refs))
 }
 
 #[derive(Insertable)]
@@ -1286,39 +1326,26 @@ pub fn resolve_activity(
 /// Settle the race losers of one scheduling batch.
 ///
 /// A held loser waits for its race to cancel it again. That needs the winner
-/// of that race to wake the workflow. So the loser is held only when the
-/// source winner is provable and the fork repeats it. An activity winner must
-/// be served in the same batch. A timer winner must be the matching timer of
-/// the same fork decision, and it must still be pending. Otherwise nothing
-/// would cancel the loser, so it fails closed as unavailable.
+/// of that race to wake the workflow. So a loser is held only when the fork
+/// repeats the source race and its winner. Otherwise nothing would cancel the
+/// loser, so it fails closed as unavailable. See [`held_for_its_winner`].
 #[must_use]
 pub fn settle_holds(
     fork_events: &[WorkflowEvent],
     source_events: &[WorkflowEvent],
     batch: Vec<(ActivityExecId, ForkResolution)>,
 ) -> Vec<(ActivityExecId, ForkResolution)> {
-    let source_index = |id: ActivityExecId| {
-        let (name, occurrence, _) = scheduled_occurrence(fork_events, |own| own == id)?;
-        nth_scheduled(source_events, name, occurrence)
-    };
     let served = batch
         .iter()
         .filter(|(_, resolution)| matches!(resolution, ForkResolution::Serve(_)))
-        .filter_map(|(id, _)| source_index(*id))
+        .map(|(id, _)| *id)
         .collect::<HashSet<_>>();
     batch
         .into_iter()
         .map(|(id, resolution)| {
-            if !matches!(resolution, ForkResolution::Hold) {
-                return (id, resolution);
-            }
-            let winner_waits = source_index(id)
-                .and_then(|index| source_race_winner(source_events, index))
-                .is_some_and(|winner| match winner {
-                    RaceWinner::Activity(sibling) => served.contains(&sibling),
-                    RaceWinner::Timer(ordinal) => pending_timer_beside(fork_events, id, ordinal),
-                });
-            if winner_waits {
+            if !matches!(resolution, ForkResolution::Hold)
+                || held_for_its_winner(fork_events, source_events, id, &served)
+            {
                 return (id, resolution);
             }
             let settled = scheduled_occurrence(fork_events, |own| own == id)
@@ -1328,6 +1355,92 @@ pub fn settle_holds(
             (id, settled)
         })
         .collect()
+}
+
+/// Whether the fork repeats the source race that `id` lost, and its winner
+/// will wake the fork.
+///
+/// The fork decision must schedule the same commands as the source decision,
+/// in the same order. Then each source branch maps to the fork command at the
+/// same position. An override can change the code path, so a different
+/// decision does not repeat the race. The source winner must be provable, see
+/// [`source_race_winner`]. An activity winner must be served in this batch. A
+/// timer winner must still be pending in the fork.
+fn held_for_its_winner(
+    fork_events: &[WorkflowEvent],
+    source_events: &[WorkflowEvent],
+    id: ActivityExecId,
+    served: &HashSet<ActivityExecId>,
+) -> bool {
+    let Some(fork_index) = fork_events.iter().position(|event| {
+        matches!(event, WorkflowEvent::ActivityScheduled { activity_id, .. } if *activity_id == id)
+    }) else {
+        return false;
+    };
+    let Some(source_index) = scheduled_occurrence(fork_events, |own| own == id)
+        .and_then(|(name, occurrence, _)| nth_scheduled(source_events, name, occurrence))
+    else {
+        return false;
+    };
+    let source_batch = decision_siblings(source_events, source_index);
+    let fork_batch = decision_siblings(fork_events, fork_index);
+    let same_decision = source_batch.len() == fork_batch.len()
+        && source_index - source_batch.start == fork_index - fork_batch.start
+        && source_events[source_batch.clone()]
+            .iter()
+            .zip(&fork_events[fork_batch.clone()])
+            .all(|(source, fork)| same_command(source, fork));
+    if !same_decision {
+        return false;
+    }
+    let Some(winner) = source_race_winner(source_events, source_index) else {
+        return false;
+    };
+    let fork_winner = fork_batch.start + (winner - source_batch.start);
+    match &fork_events[fork_winner] {
+        WorkflowEvent::ActivityScheduled { activity_id, .. } => served.contains(activity_id),
+        WorkflowEvent::TimerStarted { timer_id, .. } => {
+            !timer_ended(fork_events, fork_winner, timer_id)
+        }
+        _ => false,
+    }
+}
+
+/// Whether two command events schedule the same work: the same activity name
+/// and input, or the same timer id and duration.
+fn same_command(source: &WorkflowEvent, fork: &WorkflowEvent) -> bool {
+    match (source, fork) {
+        (
+            WorkflowEvent::ActivityScheduled {
+                name: a, input: x, ..
+            },
+            WorkflowEvent::ActivityScheduled {
+                name: b, input: y, ..
+            },
+        ) => a == b && x == y,
+        (
+            WorkflowEvent::TimerStarted {
+                timer_id: a,
+                duration_secs: x,
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: b,
+                duration_secs: y,
+            },
+        ) => a == b && x == y,
+        _ => false,
+    }
+}
+
+/// Whether the timer that `events[started]` started has fired or been
+/// cancelled. Only later events count, so an earlier timer with the same id
+/// does not.
+fn timer_ended(events: &[WorkflowEvent], started: usize, timer_id: &crate::types::TimerId) -> bool {
+    events[started + 1..].iter().any(|event| match event {
+        WorkflowEvent::TimerFired { timer_id: done }
+        | WorkflowEvent::TimerCancelled { timer_id: done } => done == timer_id,
+        _ => false,
+    })
 }
 
 /// The index of the `occurrence`-th `ActivityScheduled` event named `name`.
@@ -1370,22 +1483,15 @@ fn decision_siblings(events: &[WorkflowEvent], index: usize) -> std::ops::Range<
     start..end
 }
 
-/// The branch that won a source race.
-enum RaceWinner {
-    /// The source index of the winning `ActivityScheduled`.
-    Activity(usize),
-    /// The position of the winning timer among the timers of the decision.
-    Timer(usize),
-}
-
-/// The provable winner of the race that the source loser at `index` lost.
+/// The source index of the provable winner of the race that the source loser
+/// at `index` lost.
 ///
 /// A race schedules its branches in one decision. The source cancels a loser
 /// only after a branch resolves. So the winner is a sibling whose outcome
 /// comes before the loser terminal. A sibling of an enclosing join can also
 /// resolve in that window. With more than one such sibling, the winner is not
 /// provable, and the result is `None`.
-fn source_race_winner(source_events: &[WorkflowEvent], index: usize) -> Option<RaceWinner> {
+fn source_race_winner(source_events: &[WorkflowEvent], index: usize) -> Option<usize> {
     let WorkflowEvent::ActivityScheduled {
         activity_id: loser, ..
     } = source_events.get(index)?
@@ -1395,61 +1501,22 @@ fn source_race_winner(source_events: &[WorkflowEvent], index: usize) -> Option<R
     let cancelled = source_events
         .iter()
         .position(|event| terminal_activity_id(event) == Some(*loser))?;
-    let before = &source_events[..cancelled];
-    let mut timers = 0;
-    let mut winners = Vec::new();
-    for sibling in decision_siblings(source_events, index) {
+    let resolved_before = |sibling: usize| {
         match &source_events[sibling] {
-            WorkflowEvent::ActivityScheduled { activity_id, .. } if sibling != index => {
-                if before.iter().any(|event| {
-                    terminal_activity_id(event) == Some(*activity_id) && !is_race_loser(event)
-                }) {
-                    winners.push(RaceWinner::Activity(sibling));
-                }
-            }
-            WorkflowEvent::TimerStarted { timer_id, .. } => {
-                if before.iter().any(|event| {
-                    matches!(event, WorkflowEvent::TimerFired { timer_id: fired } if fired == timer_id)
-                }) {
-                    winners.push(RaceWinner::Timer(timers));
-                }
-                timers += 1;
-            }
-            _ => {}
-        }
+        WorkflowEvent::ActivityScheduled { activity_id, .. } => source_events[..cancelled]
+            .iter()
+            .any(|event| terminal_activity_id(event) == Some(*activity_id) && !is_race_loser(event)),
+        // A cancelled timer lost, so only a fired timer can win.
+        WorkflowEvent::TimerStarted { timer_id, .. } => source_events[sibling + 1..cancelled]
+            .iter()
+            .any(|event| matches!(event, WorkflowEvent::TimerFired { timer_id: fired } if fired == timer_id)),
+        _ => false,
     }
-    if winners.len() == 1 {
-        winners.pop()
-    } else {
-        None
-    }
-}
-
-/// Whether the `ordinal`-th timer that the fork decision of `id` started has
-/// not fired or been cancelled.
-///
-/// That timer wakes the workflow later. A source race that the matching timer
-/// won then resolves the same way in the fork.
-fn pending_timer_beside(fork_events: &[WorkflowEvent], id: ActivityExecId, ordinal: usize) -> bool {
-    let Some(index) = fork_events.iter().position(|event| {
-        matches!(event, WorkflowEvent::ActivityScheduled { activity_id, .. } if *activity_id == id)
-    }) else {
-        return false;
     };
-    fork_events[decision_siblings(fork_events, index)]
-        .iter()
-        .filter_map(|event| match event {
-            WorkflowEvent::TimerStarted { timer_id, .. } => Some(timer_id),
-            _ => None,
-        })
-        .nth(ordinal)
-        .is_some_and(|timer_id| {
-            !fork_events.iter().any(|later| match later {
-                WorkflowEvent::TimerFired { timer_id: done }
-                | WorkflowEvent::TimerCancelled { timer_id: done } => done == timer_id,
-                _ => false,
-            })
-        })
+    let mut winners = decision_siblings(source_events, index)
+        .filter(|sibling| *sibling != index && resolved_before(*sibling));
+    let winner = winners.next()?;
+    winners.next().is_none().then_some(winner)
 }
 
 /// The task error of a race loser that a recorded fork holds.
@@ -2093,12 +2160,54 @@ mod tests {
             marker(ForkEffects::Recorded),
             scheduled(id, "slow", json!({})),
             WorkflowEvent::TimerStarted {
-                timer_id: crate::types::TimerId::new("t-2"),
+                timer_id: crate::types::TimerId::new("t-1"),
                 duration_secs: 5,
             },
         ];
         let batch = vec![(id, resolve_activity(&fork, &source, id))];
         let settled = settle_holds(&fork, &source, batch);
+        assert!(
+            matches!(settled[0].1, ForkResolution::Hold),
+            "{:?}",
+            settled[0].1
+        );
+
+        // A fork decision with another timer does not repeat the race.
+        let other = ActivityExecId::new();
+        let changed = vec![
+            started(json!({})),
+            marker(ForkEffects::Recorded),
+            scheduled(other, "slow", json!({})),
+            WorkflowEvent::TimerStarted {
+                timer_id: crate::types::TimerId::new("t-join"),
+                duration_secs: 5,
+            },
+        ];
+        let batch = vec![(other, resolve_activity(&changed, &source, other))];
+        let settled = settle_holds(&changed, &source, batch);
+        assert!(is_unavailable(&settled[0].1), "{:?}", settled[0].1);
+
+        // An earlier timer with the same id fired before this decision. The
+        // timer of this decision is still pending, so the loser waits.
+        let again = ActivityExecId::new();
+        let reused = vec![
+            started(json!({})),
+            marker(ForkEffects::Recorded),
+            WorkflowEvent::TimerStarted {
+                timer_id: crate::types::TimerId::new("t-1"),
+                duration_secs: 1,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: crate::types::TimerId::new("t-1"),
+            },
+            scheduled(again, "slow", json!({})),
+            WorkflowEvent::TimerStarted {
+                timer_id: crate::types::TimerId::new("t-1"),
+                duration_secs: 5,
+            },
+        ];
+        let batch = vec![(again, resolve_activity(&reused, &source, again))];
+        let settled = settle_holds(&reused, &source, batch);
         assert!(
             matches!(settled[0].1, ForkResolution::Hold),
             "{:?}",
@@ -2319,11 +2428,7 @@ mod tests {
             "type": "WorkflowStarted",
             "data": { "input": { "old": 1 }, "last_completion_result": carryover },
         });
-        let encoded = json!({
-            "type": "WorkflowStarted",
-            "data": { "input": { "new": 2 }, "last_completion_result": { "inflated": true } },
-        });
-        let row = with_start_input(&stored, &encoded);
+        let row = with_start_input(&stored, &json!({ "new": 2 }));
         assert_eq!(row["data"]["input"], json!({ "new": 2 }));
         assert_eq!(row["data"]["last_completion_result"], carryover);
         assert_eq!(row["type"], json!("WorkflowStarted"));

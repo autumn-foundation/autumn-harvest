@@ -16,12 +16,13 @@ is never written, so a run in any state can be forked, `COMPLETED` and
   signal, an external cancel, a continue-as-new or a mutex acquire fails the
   fork run before it runs. A successor run would hold no fork marker.
 - A race branch that lost in the source stays pending, so the same branch
-  wins again. It stays pending only when the source winner of that race is
-  provable and the fork repeats it. The winner is the one sibling that
-  resolved before the source cancelled the loser. Otherwise nothing would
-  wake the run, so the branch fails with `ForkEffectUnavailable`. A timer
-  can win a race too. Then the matching timer of the same fork decision must
-  still be pending. A race loser is the exact terminal that the engine
+  wins again. It stays pending only when the fork repeats that race and its
+  winner. The fork decision must schedule the same commands as the source
+  decision, in the same order. The source winner is the one sibling that
+  resolved before the source cancelled the loser. An activity winner must be
+  served in the same batch. A timer winner must still be pending in the fork.
+  Otherwise nothing would wake the run, so the branch fails with
+  `ForkEffectUnavailable`. A race loser is the exact terminal that the engine
   writes, not any failure with the same text. A held loser keeps a mark on
   its task, so the race still records its loser terminal when the winner
   resolves.
@@ -42,7 +43,8 @@ is never written, so a run in any state can be forked, `COMPLETED` and
 A live fork never reads the source history after the fork exists.
 
 **Overrides.** `input` replaces the workflow input at fork point `0`. It
-passes the input schema (issue #373) and the byte cap (issue #252).
+passes the input schema (issue #373) and the byte cap (issue #252). It is
+encoded and offloaded as an appended event field is.
 `activity_overrides` sets the result of one activity occurrence after the
 fork point. A request sets at most 1,000 overrides
 (`fork::MAX_ACTIVITY_OVERRIDES`). Each output passes the result byte cap of

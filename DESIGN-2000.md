@@ -167,6 +167,8 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | A fork history at the worker event cap or byte cap dead-letters on its first task. | Refuse the fork with `409`. The check reads the stored rows, and the refusal rolls the fork back. |
 | A loser is held beside a served sibling of an enclosing join, so nothing cancels it. | Hold only for the provable winner of the same race: the one sibling that resolved before the cancel. |
 | A fork audit goes to the default shard, not the source shard. | Audit on the source-shard connection, as a reset does. |
+| A timer at the same position in a changed fork decision is taken for the source winner. | Hold only when the fork decision schedules the same commands as the source decision. Judge a timer only by its own later events. |
+| An input override skips the offloader. | Encode, then offload the new input as an appended field is, and record its blob reference. |
 
 ## 2. Tests
 

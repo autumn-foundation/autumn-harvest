@@ -947,6 +947,45 @@ async fn an_input_override_keeps_an_offloaded_carryover() {
     );
 }
 
+/// A large input override is offloaded, as an appended event is. The fork
+/// stores an envelope and references its blob.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_large_input_override_is_offloaded() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("big-input");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "n": 1 })).await;
+    let offloader = Arc::new(autumn_harvest::payload_store::PayloadOffloader::new(
+        Arc::new(MemStore::default()),
+        64,
+        Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+    ));
+    let offloading = Arc::new(
+        HandlerRegistry::new(
+            vec![fork_pay_wf_info()],
+            activities![fork_charge, fork_receipt],
+        )
+        .with_payload_offloader(Some(offloader)),
+    );
+    let mut large = request(ForkEffects::Live);
+    large.input = Some(json!({ "n": 2, "note": "X".repeat(512) }));
+    let forked = fork_workflow_execution(&mut conn, source, large, Some(&offloading))
+        .await
+        .expect("fork")
+        .new_exec_id;
+
+    let (_, fork_events) = snapshot(&url, forked).await;
+    let stored = &fork_events[0].2["data"]["input"];
+    assert!(
+        autumn_harvest::payload_store::is_offload_envelope(stored),
+        "the input is stored as an envelope: {stored}"
+    );
+    let fork_refs = store::load_payload_refs(&mut conn, forked)
+        .await
+        .expect("refs");
+    assert_eq!(fork_refs.len(), 1, "the fork references the input blob");
+}
+
 /// A live fork never reads the source history. A source blob that is gone
 /// does not stop the fork from running its activities.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
