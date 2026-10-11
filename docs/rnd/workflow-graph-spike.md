@@ -122,7 +122,7 @@ that runs code gives `unknown` beside a visible saga too. An
   which is why it is a note.
 
 The fixture `autumn-harvest-verify/tests/fixtures/saga_graph/` pins each
-case: 26 workflows, with 7 `covered`, 7 `gap`, 9 `unknown` and 3 `no-saga`.
+case: 27 workflows, with 7 `covered`, 7 `gap`, 10 `unknown` and 3 `no-saga`.
 
 ## 5. Where the analysis hits `unknown`, and why
 
@@ -136,6 +136,7 @@ case: 26 workflows, with 7 `covered`, 7 `gap`, 9 `unknown` and 3 `no-saga`.
 | Step result not read by `?` | Fixture only (`match`, `map_err`, a prebuilt future) | `saga-result-untracked`. |
 | A new saga over a pending step | Fixture only | `saga-recreated`. |
 | A helper drops a pending saga | Fixture only | `saga-dropped-pending`. |
+| A handler registration with no body in sight, such as a declarative record | Fixture only | `handler-unresolved` boundary. |
 
 ### Soundness across async state machines
 
@@ -311,6 +312,7 @@ crate its own `--target-dir`, and delete it after the run.
 | A local type named `Saga` is not the engine saga | `saga_graph::a_local_type_named_saga_is_not_the_engine_saga` |
 | The engine MIR in the same run changes no verdict | `saga_graph::the_engine_mir_in_the_same_run_changes_no_verdict` |
 | A renamed or re-exported engine saga is still seen | `saga_graph::a_renamed_or_re_exported_engine_saga_is_still_seen` |
+| A declarative handler record is a boundary, not `no-saga` | `saga_graph::every_fixture_workflow_gets_its_expected_verdict` (`wf_handler_declarative`) |
 | A handler gap is found, and a handler body that a call also runs is checked as a helper | `saga::tests::an_err_exit_of_a_handler_with_a_pending_step_is_a_gap`; `saga::tests::a_handler_body_that_a_helper_call_also_runs_is_checked_both_ways`; `saga::tests::the_future_of_a_handler_body_that_a_helper_call_runs_is_a_helper`; `saga_graph` rows `wf_handler_gap` and `wf_handler_delegate_gap` |
 | The check refuses a reference to a missing body or handler, a body the root cannot reach, or a doubled body id | `saga::tests::a_reference_to_a_missing_body_is_refused`; `saga::tests::a_stray_or_doubled_body_is_refused` |
 | A clock read in an `async` closure step is found | `async_block_follow::a_clock_read_in_a_saga_step_block_is_found` (`wf_step_async_closure`) |

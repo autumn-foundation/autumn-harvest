@@ -153,6 +153,9 @@ Four review agents read the first version. Each fix has a test.
     is checked as an entry and as a helper, so a pending `Ok` exit is
     `saga-dropped-pending`. The future such a helper run returns is a
     helper too.
+27. A handler registration with no body in sight is a `handler-unresolved`
+    boundary. A declarative record carries its callback, so the call
+    passes no closure.
 
 ---
 

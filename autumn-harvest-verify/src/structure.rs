@@ -476,6 +476,7 @@ impl<'p> StructureBuilder<'p> {
         }
 
         let (handlers, handler_at) = self.handlers(recorder, &display, &show);
+        boundaries.extend(unresolved_handlers(&handlers));
         let arguments = group_arguments(recorder, &display);
 
         let mut bodies = Vec::with_capacity(ids.len());
@@ -1449,6 +1450,15 @@ fn info_key(markers: &BTreeSet<String>, callee: &str) -> Option<String> {
         .find_map(|marker| last.strip_prefix(marker))
         .or_else(|| last.strip_suffix("_info"))?;
     markers.contains(name).then(|| name.to_string())
+}
+
+/// A boundary per registration with no handler body in sight. A declarative
+/// record can carry the callback, and that code can own a saga.
+fn unresolved_handlers(handlers: &[HandlerSite]) -> impl Iterator<Item = String> + '_ {
+    handlers
+        .iter()
+        .filter(|h| h.bodies.is_empty())
+        .map(|h| format!("handler-unresolved: {}", h.method))
 }
 
 #[cfg(test)]

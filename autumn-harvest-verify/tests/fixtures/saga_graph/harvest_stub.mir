@@ -1,7 +1,7 @@
 // WARNING: This output format is intended for human consumers only
 // and is subject to change without notice. Knock yourself out.
 // HINT: See also -Z dump-mir for MIR at specific points during compilation.
-fn <impl at harvest_stub.rs:12:1: 12:21>::execute_activity_raw(_1: &WorkflowContext, _2: &str, _3: u64) -> std::future::Ready<Result<u64, String>> {
+fn <impl at harvest_stub.rs:13:1: 13:21>::execute_activity_raw(_1: &WorkflowContext, _2: &str, _3: u64) -> std::future::Ready<Result<u64, String>> {
     debug self => _1;
     debug name => _2;
     debug input => _3;
@@ -18,7 +18,7 @@ fn <impl at harvest_stub.rs:12:1: 12:21>::execute_activity_raw(_1: &WorkflowCont
     }
 }
 
-fn <impl at harvest_stub.rs:12:1: 12:21>::receive_signal(_1: &WorkflowContext, _2: &str) -> std::future::Ready<Result<u64, String>> {
+fn <impl at harvest_stub.rs:13:1: 13:21>::receive_signal(_1: &WorkflowContext, _2: &str) -> std::future::Ready<Result<u64, String>> {
     debug self => _1;
     debug name => _2;
     let mut _0: std::future::Ready<std::result::Result<u64, std::string::String>>;
@@ -34,7 +34,7 @@ fn <impl at harvest_stub.rs:12:1: 12:21>::receive_signal(_1: &WorkflowContext, _
     }
 }
 
-fn <impl at harvest_stub.rs:12:1: 12:21>::register_signal_handler(_1: &WorkflowContext, _2: &str, _3: H) -> () {
+fn <impl at harvest_stub.rs:13:1: 13:21>::register_signal_handler(_1: &WorkflowContext, _2: &str, _3: H) -> () {
     debug self => _1;
     debug name => _2;
     debug handler => _3;
@@ -49,7 +49,17 @@ fn <impl at harvest_stub.rs:12:1: 12:21>::register_signal_handler(_1: &WorkflowC
     }
 }
 
-fn <impl at harvest_stub.rs:12:1: 12:21>::register_update_handler(_1: &WorkflowContext, _2: &str, _3: V, _4: H) -> () {
+fn <impl at harvest_stub.rs:13:1: 13:21>::register_declarative_update_handler(_1: &WorkflowContext, _2: &UpdateHandlerInfo) -> () {
+    debug self => _1;
+    debug info => _2;
+    let mut _0: ();
+
+    bb0: {
+        return;
+    }
+}
+
+fn <impl at harvest_stub.rs:13:1: 13:21>::register_update_handler(_1: &WorkflowContext, _2: &str, _3: V, _4: H) -> () {
     debug self => _1;
     debug name => _2;
     debug validator => _3;
@@ -77,7 +87,7 @@ fn <impl at harvest_stub.rs:12:1: 12:21>::register_update_handler(_1: &WorkflowC
     }
 }
 
-fn <impl at harvest_stub.rs:40:1: 40:22>::new(_1: &WorkflowContext) -> Saga<'_> {
+fn <impl at harvest_stub.rs:49:1: 49:22>::new(_1: &WorkflowContext) -> Saga<'_> {
     debug ctx => _1;
     let mut _0: Saga<'_>;
 
@@ -88,7 +98,7 @@ fn <impl at harvest_stub.rs:40:1: 40:22>::new(_1: &WorkflowContext) -> Saga<'_> 
 }
 
 // MIR FOR CTFE
-fn <impl at harvest_stub.rs:40:1: 40:22>::new(_1: &WorkflowContext) -> Saga<'_> {
+fn <impl at harvest_stub.rs:49:1: 49:22>::new(_1: &WorkflowContext) -> Saga<'_> {
     debug ctx => _1;
     let mut _0: Saga<'_>;
     let mut _2: &WorkflowContext;
@@ -102,19 +112,19 @@ fn <impl at harvest_stub.rs:40:1: 40:22>::new(_1: &WorkflowContext) -> Saga<'_> 
     }
 }
 
-fn <impl at harvest_stub.rs:40:1: 40:22>::step(_1: &mut Saga<'_>, _2: Step, _3: Compensate) -> {async fn body of Saga<'_>::step<T, Step, StepFuture, Compensate, CompensationFuture>()} {
+fn <impl at harvest_stub.rs:49:1: 49:22>::step(_1: &mut Saga<'_>, _2: Step, _3: Compensate) -> {async fn body of Saga<'_>::step<T, Step, StepFuture, Compensate, CompensationFuture>()} {
     debug self => _1;
     debug step => _2;
     debug compensate => _3;
     let mut _0: {async fn body of Saga<'_>::step<T, Step, StepFuture, Compensate, CompensationFuture>()};
 
     bb0: {
-        _0 = {coroutine@harvest_stub.rs:55:5: 61:6 (#0)} { self: move _1, step: move _2, compensate: move _3 };
+        _0 = {coroutine@harvest_stub.rs:64:5: 70:6 (#0)} { self: move _1, step: move _2, compensate: move _3 };
         return;
     }
 }
 
-fn <impl at harvest_stub.rs:40:1: 40:22>::step::{closure#0}(_1: Pin<&mut {async fn body of Saga<'_>::step<T, Step, StepFuture, Compensate, CompensationFuture>()}>, _2: &mut Context<'_>) -> Poll<Result<T, String>> {
+fn <impl at harvest_stub.rs:49:1: 49:22>::step::{closure#0}(_1: Pin<&mut {async fn body of Saga<'_>::step<T, Step, StepFuture, Compensate, CompensationFuture>()}>, _2: &mut Context<'_>) -> Poll<Result<T, String>> {
     coroutine layout {
         field _s0: &mut Saga<'_>;
         field _s1: Compensate;
@@ -300,17 +310,17 @@ fn <impl at harvest_stub.rs:40:1: 40:22>::step::{closure#0}(_1: Pin<&mut {async 
     }
 }
 
-fn <impl at harvest_stub.rs:40:1: 40:22>::compensate_all(_1: &mut Saga<'_>) -> {async fn body of Saga<'_>::compensate_all()} {
+fn <impl at harvest_stub.rs:49:1: 49:22>::compensate_all(_1: &mut Saga<'_>) -> {async fn body of Saga<'_>::compensate_all()} {
     debug self => _1;
     let mut _0: {async fn body of Saga<'_>::compensate_all()};
 
     bb0: {
-        _0 = {coroutine@harvest_stub.rs:63:66: 66:6 (#0)} { self: move _1 };
+        _0 = {coroutine@harvest_stub.rs:72:66: 75:6 (#0)} { self: move _1 };
         return;
     }
 }
 
-fn <impl at harvest_stub.rs:40:1: 40:22>::compensate_all::{closure#0}(_1: Pin<&mut {async fn body of Saga<'_>::compensate_all()}>, _2: &mut Context<'_>) -> Poll<Result<(), String>> {
+fn <impl at harvest_stub.rs:49:1: 49:22>::compensate_all::{closure#0}(_1: Pin<&mut {async fn body of Saga<'_>::compensate_all()}>, _2: &mut Context<'_>) -> Poll<Result<(), String>> {
     coroutine layout {
         variant_fields = {
             Unresumed(0): [],

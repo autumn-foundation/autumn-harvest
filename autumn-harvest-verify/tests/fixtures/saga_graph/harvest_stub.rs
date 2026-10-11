@@ -5,6 +5,7 @@
 #![allow(dead_code, unused_variables)]
 
 use std::future::{Future, Ready, ready};
+use std::pin::Pin;
 
 /// Stand-in for `autumn_harvest::WorkflowContext`.
 pub struct WorkflowContext;
@@ -21,6 +22,7 @@ impl WorkflowContext {
         H: Fn(u64) + Send + Sync + 'static,
     {
     }
+    pub fn register_declarative_update_handler(&self, info: &UpdateHandlerInfo) {}
     pub fn register_update_handler<V, H, F>(&self, name: &str, validator: V, handler: H)
     where
         V: Fn(&u64) -> Result<(), String> + Send + Sync + 'static,
@@ -28,6 +30,13 @@ impl WorkflowContext {
         F: Future<Output = Result<u64, String>> + Send + 'static,
     {
     }
+}
+
+/// Stand-in for `autumn_harvest::UpdateHandlerInfo`. The record carries the
+/// handler, so the registration call passes no closure.
+pub struct UpdateHandlerInfo {
+    pub name: &'static str,
+    pub handler: fn(u64) -> Pin<Box<dyn Future<Output = Result<u64, String>> + Send>>,
 }
 
 /// Stand-in for `autumn_harvest::Saga`. Its methods are `async`, as the

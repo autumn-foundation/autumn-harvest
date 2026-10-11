@@ -11,7 +11,9 @@
 //!   rm libautumn_harvest.rlib
 #![allow(dead_code)]
 
-use autumn_harvest::{Saga, WorkflowContext};
+use autumn_harvest::{Saga, UpdateHandlerInfo, WorkflowContext};
+use std::future::Future;
+use std::pin::Pin;
 
 type Out = Result<u64, String>;
 
@@ -514,5 +516,27 @@ pub fn __autumn_workflow_info_wf_handler_delegate_gap() -> u8 {
 /// An update handler delegates to an `async fn` that owns a saga.
 pub async fn wf_handler_delegate_gap(ctx: &WorkflowContext) -> Out {
     ctx.register_update_handler("book", |_: &u64| Ok(()), |v: u64| handle_book(v));
+    ctx.receive_signal("go").await
+}
+
+/// The dispatch function of `wf_handler_declarative`. It runs a handler
+/// that owns a saga.
+fn dispatch_book(v: u64) -> Pin<Box<dyn Future<Output = Out> + Send>> {
+    Box::pin(handle_book(v))
+}
+
+static BOOK_INFO: UpdateHandlerInfo = UpdateHandlerInfo {
+    name: "book",
+    handler: dispatch_book,
+};
+
+pub fn __autumn_workflow_info_wf_handler_declarative() -> u8 {
+    0
+}
+
+/// A declarative record carries the handler. The registration call passes
+/// no closure, so the handler body is out of sight.
+pub async fn wf_handler_declarative(ctx: &WorkflowContext) -> Out {
+    ctx.register_declarative_update_handler(&BOOK_INFO);
     ctx.receive_signal("go").await
 }
