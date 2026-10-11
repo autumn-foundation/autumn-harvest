@@ -2954,9 +2954,14 @@ fn captures_mut_ref(body: &Body, interior: &[&str]) -> bool {
 /// A closure, `async` closure or `async` block type hides its own captures,
 /// and they can write.
 fn hides_captures(ty: &str) -> bool {
-    ["{closure@", "{async closure@", "{async block@", "{coroutine@"]
-        .iter()
-        .any(|spelling| ty.contains(spelling))
+    [
+        "{closure@",
+        "{async closure@",
+        "{async block@",
+        "{coroutine@",
+    ]
+    .iter()
+    .any(|spelling| ty.contains(spelling))
 }
 
 /// The type of `place` in `body`, when MIR prints it.
