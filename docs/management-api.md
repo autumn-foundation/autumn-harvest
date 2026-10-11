@@ -292,6 +292,11 @@ data: {"notifications":3}
 last frame. One notification can cover more than one event of a run. A frame
 names no execution and holds no payload. A client fetches the list again.
 
+A triage update (`PATCH /workflows/{id}/triage`) appends no event, but it
+sends a notification too, because `owner` and `severity` are list filters.
+Some other row changes send no notification, for example a legal hold. The
+Vantage list shows them at its next 60 s safety fetch.
+
 When a shard listener closes, the stream sends one frame and ends. The client
 then connects again:
 

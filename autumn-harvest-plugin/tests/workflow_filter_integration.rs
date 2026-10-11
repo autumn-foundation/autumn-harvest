@@ -2213,3 +2213,47 @@ async fn filter_that_names_a_canary_workflow_shows_it() {
     let (_, body) = get_json(&app, format!("/workflows?filter={}", enc(&filter))).await;
     assert_eq!(sorted_ids(&body), ["c-1", "f-1"]);
 }
+
+#[tokio::test]
+async fn change_stream_signals_a_triage_update() {
+    let (database_url, _container) = setup_single_database().await;
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::from(build_pool(&database_url)));
+    api_state
+        .set_workflow_result_notification_database_urls([(ShardId::new(0), database_url.clone())]);
+    let app = harvest_api_router(api_state);
+    let exec_id = seed_workflow(&database_url, ShardId::new(0), "flow", "t-1", None).await;
+
+    let stream = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/workflows/changes/stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("open the change stream");
+    assert_eq!(stream.status(), StatusCode::OK);
+
+    // A triage update appends no event. It still changes `owner`, a
+    // filterable field, so the list must hear about it.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/workflows/{exec_id}/triage"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "owner": "alice" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("triage");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    wait_for_sse_event(stream, "changed", std::time::Duration::from_secs(10))
+        .await
+        .expect("a changed frame after the triage update");
+}
