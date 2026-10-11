@@ -657,3 +657,57 @@ pub async fn wf_step_dep_ref_future(ctx: &WorkflowContext) -> Out {
     let a = saga.step(|| &DEP_TICK, |_| async { Ok(()) }).await?;
     ctx.execute_activity_raw("b", a).await
 }
+
+pub fn __autumn_workflow_info_wf_step_inner_block() -> u8 {
+    0
+}
+
+/// A saga step block awaits an inner `async` block that writes the clock
+/// into shared state. A clone of that state feeds a later command.
+pub async fn wf_step_inner_block(ctx: &WorkflowContext) -> Out {
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(0_u64));
+    let kept = std::sync::Arc::clone(&shared);
+    {
+        let mut saga = Saga::new(ctx);
+        saga.step(
+            move || {
+                let inner = async move { *shared.lock().unwrap() = now_nanos() };
+                async move {
+                    inner.await;
+                    ctx.execute_activity_raw("a", 1).await
+                }
+            },
+            |_| async { Ok(()) },
+        )
+        .await?;
+    }
+    let seen = *kept.lock().unwrap();
+    ctx.execute_activity_raw("b", seen).await
+}
+
+pub fn __autumn_workflow_info_wf_step_inner_async_closure() -> u8 {
+    0
+}
+
+/// A saga step block calls a captured `async` closure that writes the
+/// clock into shared state. A clone of that state feeds a later command.
+pub async fn wf_step_inner_async_closure(ctx: &WorkflowContext) -> Out {
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(0_u64));
+    let kept = std::sync::Arc::clone(&shared);
+    {
+        let mut saga = Saga::new(ctx);
+        saga.step(
+            move || {
+                let inner = async move || *shared.lock().unwrap() = now_nanos();
+                async move {
+                    inner().await;
+                    ctx.execute_activity_raw("a", 1).await
+                }
+            },
+            |_| async { Ok(()) },
+        )
+        .await?;
+    }
+    let seen = *kept.lock().unwrap();
+    ctx.execute_activity_raw("b", seen).await
+}

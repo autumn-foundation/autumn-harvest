@@ -169,8 +169,8 @@ Four review agents read the first version. Each fix has a test.
 30. A raw `*mut` pointer writes as a `&mut` reference does. A capture of one
     is a boundary, as a `&mut` capture is. A local type with a `*mut` field
     is interior-mutable, as one with a `&mut` field is.
-31. A captured closure hides its own captures, and they can write. So a
-    block that captures a closure value is a boundary. A read of a field
+31. A captured closure, `async` closure or `async` block hides its own
+    captures, and they can write. So a block that captures one is a boundary. A read of a field
     of the closure self, as `(_1.0: u64)`, takes the field type instead.
 32. A shared reference `&T` is a future only by a local `impl Future for
     &T`. The follow does not read that `poll`, so such a return is an
