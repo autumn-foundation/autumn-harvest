@@ -202,6 +202,12 @@ Four review agents read the first version. Each fix has a test.
     index keys generics by bare function name. A name that any function of
     that name declares counts as generic, so a same-named function cannot
     hide one. A trait method records the trait and method generics too.
+35. A captured trait object, as `Arc<dyn Writer>`, hides its type. Its
+    methods can write through `&self`, so its capture is a boundary.
+36. A result built before an `.await` lives in the coroutine state. The
+    exit moves it out of a field. The exit check follows each plain move
+    back to the assignments of its source. When each gives one literal
+    outcome, the exit takes it. Otherwise the exit is unknown.
 
 ---
 

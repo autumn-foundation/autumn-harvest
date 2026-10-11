@@ -799,3 +799,44 @@ pub mod other_steps {
         move || future
     }
 }
+
+/// A writer that hides its `Mutex` behind a trait object.
+pub trait Writer: Send + Sync {
+    fn write(&self, value: u64);
+    fn read(&self) -> u64;
+}
+
+pub struct MutexWriter(std::sync::Mutex<u64>);
+
+impl Writer for MutexWriter {
+    fn write(&self, value: u64) {
+        *self.0.lock().unwrap() = value;
+    }
+    fn read(&self) -> u64 {
+        *self.0.lock().unwrap()
+    }
+}
+
+pub fn __autumn_workflow_info_wf_step_dyn_writer() -> u8 {
+    0
+}
+
+/// A saga step block writes the clock through an `Arc<dyn Writer>`. A
+/// clone of that `Arc` feeds a later command.
+pub async fn wf_step_dyn_writer(ctx: &WorkflowContext) -> Out {
+    let shared: std::sync::Arc<dyn Writer> =
+        std::sync::Arc::new(MutexWriter(std::sync::Mutex::new(0)));
+    let kept = std::sync::Arc::clone(&shared);
+    {
+        let mut saga = Saga::new(ctx);
+        saga.step(
+            move || async move {
+                shared.write(now_nanos());
+                ctx.execute_activity_raw("a", 1).await
+            },
+            |_| async { Ok(()) },
+        )
+        .await?;
+    }
+    ctx.execute_activity_raw("b", kept.read()).await
+}

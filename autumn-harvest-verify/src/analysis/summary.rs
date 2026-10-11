@@ -3012,6 +3012,13 @@ fn may_write_through(ty: &str, interior: &[&str]) -> bool {
     if ty.contains("&mut") || ty.contains("*mut") {
         return true;
     }
+    // A trait object hides its type. Its methods can write through `&self`.
+    if ty
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|w| w == "dyn")
+    {
+        return true;
+    }
     let names_interior = ty
         .split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .any(|word| interior.contains(&word));
@@ -3202,6 +3209,8 @@ mod tests {
     #[test]
     fn a_capture_that_can_hold_a_mut_ref_may_write_through() {
         let interior = ["Cell", "RefCell", "Mutex"];
+        assert!(may_write_through("std::sync::Arc<dyn Writer>", &interior));
+        assert!(!may_write_through("Dynamo", &interior));
         assert!(may_write_through("&mut u64", &interior));
         assert!(may_write_through("(&mut u64,)", &interior));
         assert!(may_write_through("Refs<'_>", &interior));

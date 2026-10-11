@@ -702,3 +702,20 @@ pub async fn wf_unwind_user_drop(ctx: &WorkflowContext) -> Out {
     }
     Ok(a)
 }
+
+pub fn __autumn_workflow_info_wf_ok_preset() -> u8 {
+    0
+}
+
+/// The `Ok` result is built before the step and returned after it. The
+/// exit moves it out of the coroutine state, so the walk must trace it.
+pub async fn wf_ok_preset(ctx: &WorkflowContext) -> Out {
+    let done: Out = Ok(0);
+    let mut saga = Saga::new(ctx);
+    saga.step(
+        || async { ctx.execute_activity_raw("reserve", 1).await },
+        |a| async move { ctx.execute_activity_raw("release", a).await.map(|_| ()) },
+    )
+    .await?;
+    done
+}

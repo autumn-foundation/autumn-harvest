@@ -478,7 +478,7 @@ fn exit_outcomes(body: &Body) -> BTreeMap<&str, ExitOutcome> {
             if let Statement::Assign { dest, rvalue } = statement
                 && returned.contains(dest)
             {
-                last = Some(literal_outcome(&rvalue.text));
+                last = Some(rvalue_outcome(body, rvalue, 0));
             }
         }
         if let Terminator::Call { dest, callee, .. } = &block.terminator
@@ -498,6 +498,54 @@ fn exit_outcomes(body: &Body) -> BTreeMap<&str, ExitOutcome> {
         }
     }
     out
+}
+
+/// The longest chain of moves that [`rvalue_outcome`] follows.
+const MAX_MOVE_CHAIN: usize = 8;
+
+/// The outcome of a value that `rvalue` gives. A literal gives its own. A
+/// plain move or copy gives the outcome of its source place.
+///
+/// A result built before an `.await` lives in the coroutine state, so the
+/// exit moves it out of a field. The source can have more than one
+/// assignment. Each must give one outcome, or the result is unknown.
+fn rvalue_outcome(body: &Body, rvalue: &crate::mir::ast::Rvalue, depth: usize) -> ExitOutcome {
+    let text = rvalue.text.trim_start();
+    let plain = text.starts_with("move ") || text.starts_with("copy ");
+    let source = rvalue.reads.first().and_then(operand_place);
+    match source {
+        Some(source) if plain && rvalue.reads.len() == 1 => place_outcome(body, source, depth),
+        _ => literal_outcome(text),
+    }
+}
+
+/// The one outcome that every assignment of `place` in `body` gives.
+fn place_outcome(body: &Body, place: &Place, depth: usize) -> ExitOutcome {
+    if depth >= MAX_MOVE_CHAIN {
+        return ExitOutcome::Unknown;
+    }
+    let mut found: Option<ExitOutcome> = None;
+    for block in &body.blocks {
+        let assigned = block
+            .statements
+            .iter()
+            .filter_map(|statement| match statement {
+                Statement::Assign { dest, rvalue } if dest == place => {
+                    Some(rvalue_outcome(body, rvalue, depth.saturating_add(1)))
+                }
+                _ => None,
+            });
+        // A call result is not a literal.
+        let called = matches!(&block.terminator, Terminator::Call { dest, .. } if dest == place)
+            .then_some(ExitOutcome::Unknown);
+        for outcome in assigned.chain(called) {
+            match found {
+                Some(seen) if seen != outcome => return ExitOutcome::Unknown,
+                _ => found = Some(outcome),
+            }
+        }
+    }
+    found.unwrap_or(ExitOutcome::Unknown)
 }
 
 /// `Result::<T, E>::Ok(..)` is `ok`, `Result::<T, E>::Err(..)` is `err`.

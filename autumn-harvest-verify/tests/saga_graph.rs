@@ -560,6 +560,7 @@ fn every_fixture_workflow_gets_its_expected_verdict() {
         ("wf_no_saga", NoSaga),
         ("wf_noop_compensation", Covered),
         ("wf_not_awaited", Gap),
+        ("wf_ok_preset", Covered),
         ("wf_pre_err", Unknown),
         ("wf_prebuilt", Unknown),
         ("wf_reassign", Unknown),

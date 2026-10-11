@@ -96,6 +96,7 @@ fn a_case_the_analysis_cannot_follow_is_never_proven() {
         "wf_step_unsafe_cell",
         "wf_step_ref_ref_future",
         "wf_step_generic_future",
+        "wf_step_dyn_writer",
     ] {
         assert!(
             !matches!(verdict(&all, name), Verdict::ProvenDeterministic),
