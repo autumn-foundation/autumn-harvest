@@ -368,6 +368,88 @@ async fn erase_workflow_payloads_deletes_stream_chunks_and_reports_the_count() {
     assert_eq!(read_all(&mut conn, exec_id).await, Vec::new());
 }
 
+/// An append after an erasure stores nothing. A stale inline write must not
+/// restore author output that the erasure destroyed.
+#[tokio::test]
+async fn an_append_after_an_erasure_stores_nothing() {
+    let (url, _c) = setup_database().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let exec_id = ExecutionId::new();
+    insert_execution(&mut conn, exec_id, "stream_erased").await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions
+            SET state = 'TERMINATED', completed_at = NOW()
+          WHERE id = $1",
+    )
+    .bind::<SqlUuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("terminate");
+    autumn_harvest::erase::erase_workflow_payloads(&mut conn, exec_id, "gdpr-req-3")
+        .await
+        .expect("erase");
+
+    let stored = store::append_stream_chunks(
+        &mut conn,
+        exec_id,
+        &[chunk(0, json!("alice@example.com"))],
+        100,
+    )
+    .await
+    .expect("append");
+
+    assert_eq!(stored, 0);
+    assert_eq!(read_all(&mut conn, exec_id).await, Vec::new());
+}
+
+/// An append that races an erasure waits for it, then stores nothing.
+#[tokio::test]
+async fn an_append_that_races_an_erasure_waits_and_stores_nothing() {
+    let (url, _c) = setup_database().await;
+    let mut eraser = AsyncPgConnection::establish(&url).await.expect("connect");
+    let exec_id = ExecutionId::new();
+    insert_execution(&mut eraser, exec_id, "stream_race").await;
+
+    // Hold the erasure gate lock, as `erase_workflow_payloads` does.
+    eraser.batch_execute("BEGIN").await.expect("begin");
+    diesel::sql_query("SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE")
+        .bind::<SqlUuid, _>(exec_id.as_uuid())
+        .execute(&mut eraser)
+        .await
+        .expect("lock");
+
+    let writer_url = url.clone();
+    let writer = tokio::spawn(async move {
+        let mut conn = AsyncPgConnection::establish(&writer_url)
+            .await
+            .expect("connect");
+        store::append_stream_chunks(&mut conn, exec_id, &[chunk(0, json!("secret"))], 100)
+            .await
+            .expect("append")
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !writer.is_finished(),
+        "the append must wait for the erasure"
+    );
+
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions
+            SET state = 'TERMINATED', completed_at = NOW(),
+                input = jsonb_build_object($2::text, true)
+          WHERE id = $1",
+    )
+    .bind::<SqlUuid, _>(exec_id.as_uuid())
+    .bind::<Text, _>(autumn_harvest::erase::ERASURE_TOMBSTONE_KEY)
+    .execute(&mut eraser)
+    .await
+    .expect("tombstone");
+    eraser.batch_execute("COMMIT").await.expect("commit");
+
+    assert_eq!(writer.await.expect("writer"), 0);
+    assert_eq!(read_all(&mut eraser, exec_id).await, Vec::new());
+}
+
 // ── Worker end to end ───────────────────────────────────────────────────────
 
 /// Publishes two durable chunks, parks on a timer, then publishes two more.
@@ -553,22 +635,29 @@ async fn the_listener_wakes_on_commit_only_and_merges_wakes() {
         "a rolled-back cycle must not wake a reader"
     );
 
-    for _ in 0..3 {
-        autumn_harvest::notify::notify_durable_stream(&mut conn, exec_id.as_uuid())
-            .await
-            .expect("notify");
-    }
+    // Three wakes in one transaction reach the listener as one. Postgres
+    // merges equal notifications of a transaction. The post-commit sender
+    // merges per channel too. Separate transactions can each wake the
+    // reader, so the test does not use them.
+    Box::pin(
+        conn.transaction::<(), autumn_harvest::HarvestError, _>(async |c| {
+            for _ in 0..3 {
+                autumn_harvest::notify::notify_durable_stream(c, exec_id.as_uuid()).await?;
+            }
+            Ok(())
+        }),
+    )
+    .await
+    .expect("commit");
     assert_eq!(
         listener.wait_timeout(Duration::from_secs(5)).await,
         DurableStreamWait::Woken
     );
-    // The forwarder can see the three wakes in separate reads. At most one
-    // more wake can then be pending, never three.
-    let mut extra = 0;
-    while listener.wait_timeout(Duration::from_millis(300)).await == DurableStreamWait::Woken {
-        extra += 1;
-    }
-    assert!(extra <= 1, "wakes must merge, got {extra} extra");
+    assert_eq!(
+        listener.wait_timeout(Duration::from_millis(500)).await,
+        DurableStreamWait::TimedOut,
+        "three wakes in one commit must merge into one"
+    );
 }
 
 /// SQL that installs a `pg_notify` that always fails (issue #1796 pattern).

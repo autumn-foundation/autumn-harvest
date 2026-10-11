@@ -252,7 +252,9 @@ same transaction as the decision cycle. The table is not `harvest_events`.
 - **Append-only invariant.** The change does not write `harvest_events`. No new
   `WorkflowEvent` variant.
 - **Retention.** Rows have `ON DELETE CASCADE` on the execution. PII erasure
-  deletes them and reports `stream_chunks_deleted`. A shard rebalance copies them.
+  deletes them and reports `stream_chunks_deleted`. An append after an
+  erasure stores nothing, so a stale worker cannot restore erased output. A
+  shard rebalance copies them.
 
 [`DESIGN-1974.md`](../DESIGN-1974.md) records the decision.
 

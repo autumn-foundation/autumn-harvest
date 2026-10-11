@@ -34,7 +34,7 @@ an opt-in durable mode. The best-effort mode stays the default.
 | R6 | Fill the disk with a publish loop. | A per-execution cap of 10,000 chunks, at most about 70 MB. Overflow drops the newest and stores one terminal marker. |
 | R7 | Exceed the Postgres limit of 65,535 bind parameters. | The store inserts in batches of 1,000 rows. |
 | R8 | Hold a pooled connection while a slow client reads. | The producer releases the connection before it sends a page. |
-| R9 | Leave rows after retention, erasure or a shard move. | `ON DELETE CASCADE`, an erasure delete, and the shard-rebalance copy list. |
+| R9 | Leave rows after retention, erasure or a shard move. | `ON DELETE CASCADE`, an erasure delete, and the shard-rebalance copy list. The append locks the run row `FOR KEY SHARE` and stores nothing after an erasure, so a stale inline write cannot restore erased output. |
 | R10 | Change replay. | The context reads nothing back. During replay the call claims an offset and pushes no command. |
 | R11 | Mix offsets of the two modes in one SSE stream. | Each mode has its own route and its own `NOTIFY` channel. |
 | R12 | Break today's best-effort callers. | `publish_progress` and `GET /stream` do not change. |

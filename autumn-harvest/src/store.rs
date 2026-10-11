@@ -2885,6 +2885,25 @@ async fn append_stream_chunks_in_tx(
 ) -> HarvestResult<usize> {
     use crate::schema::harvest_stream_chunks::dsl;
 
+    // Serialize with PII erasure. Erasure holds the run's row `FOR UPDATE`,
+    // so this `FOR KEY SHARE` read waits for it and then sees the tombstone.
+    // A stale inline write then stores nothing after an erasure commits. If
+    // this read wins, the erasure waits and then deletes these rows.
+    let input: Option<serde_json::Value> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid()))
+        .select(harvest_workflow_executions::input)
+        .for_key_share()
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    if input
+        .as_ref()
+        .is_some_and(crate::erase::execution_input_is_erased)
+    {
+        return Ok(0);
+    }
+
     let truncated: bool = diesel::select(diesel::dsl::exists(
         dsl::harvest_stream_chunks
             .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
