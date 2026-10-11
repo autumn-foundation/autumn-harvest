@@ -89,7 +89,7 @@ const LIMIT_SOURCES: &[LimitSource] = &[
             ),
             (
                 "Trace conformance of `CodecRotation`.",
-                "No check compares test traces with the `CodecRotation` model.",
+                "No trace check covers the `CodecRotation` model.",
             ),
         ],
     },
@@ -104,11 +104,11 @@ const LIMIT_SOURCES: &[LimitSource] = &[
             ),
             (
                 "A world crash falls between two steps.",
-                "A world crash falls between two steps, never inside a task body.",
+                "A world crash falls between two steps.",
             ),
             (
-                "The world workload never fails an activity,",
-                "The world workload never fails an activity,",
+                "The world workload never fails an activity",
+                "The world workload never fails an activity.",
             ),
             (
                 "draws actions from fixed weights.",
