@@ -244,6 +244,7 @@ linux        autumn-harvest         integration                      testing    
 linux        autumn-harvest         integration                      testing                    scheduler_carryover_tests
 linux        autumn-harvest         integration                      testing                    shard_rebalance_db_tests
 linux        autumn-harvest         integration                      testing                    transactional_activity_tests
+linux        autumn-harvest         integration                      testing                    upgrade_check_db_tests
 linux        autumn-harvest         integration                      testing                    worker_session_tests
 linux        autumn-harvest         integration                      wasm-activities            wasm_activities_tests
 linux        autumn-harvest-plugin  activity_info_api_integration    -                          -

@@ -32,6 +32,10 @@ pub struct Report {
     /// `--strict`, so a CI gate cannot go green on a run that verified nothing.
     #[serde(default)]
     pub discovery_failed: bool,
+    /// The call graph of each workflow (issue #1995). `--emit-structure`
+    /// writes it to its own file, so the report JSON never carries it.
+    #[serde(skip)]
+    pub structure: Option<crate::structure::StructureManifest>,
 }
 
 /// Counts for the success-metric triple.
