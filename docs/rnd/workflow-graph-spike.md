@@ -187,6 +187,11 @@ each fix has a test:
   flag. A new saga over a pending step read as `covered`. Each is closed.
 - `Result<(), E>` exits read as `unknown`, which gave false gaps. That fix
   cut the `unknown` exits of the engine examples from 12 to 4.
+- A closure can return a future of an untrusted crate that it builds with
+  no call, such as a unit struct. Its `poll` has no body here, so it is a
+  boundary. A same-named local impl no longer stands in for it.
+- The check skipped a node that the entry cannot reach. It now refuses such
+  a graph.
 
 ### Generics and third-party crates
 
@@ -274,6 +279,8 @@ crate its own `--target-dir`, and delete it after the run.
 | Every fixture case gets its verdict | `saga_graph::every_fixture_workflow_gets_its_expected_verdict` |
 | A back edge carries a pending step to an exit | `saga::tests::a_gap_reached_only_through_a_back_edge_is_found` |
 | The `async` block follow never gives a false proof | `async_block_follow::a_case_the_analysis_cannot_follow_is_never_proven` |
+| A future of an untrusted crate is a boundary | `async_block_follow::a_future_of_an_untrusted_crate_is_a_boundary` |
+| The check refuses a malformed or disconnected graph | `saga::tests::a_malformed_graph_is_refused` |
 | The check refuses an old manifest | `saga_graph::a_manifest_without_flow_graphs_is_refused`; `cli::check_structure_refuses_a_manifest_without_flow_graphs` |
 | The CLI exit codes | `cli::check_structure_prints_a_verdict_per_workflow_and_fails_on_a_gap`; `cli::check_structure_strict_fails_on_unknown` |
 | A bin target is analyzable | `driver::tests::an_uplifted_bin_is_resolved_through_its_hard_link_in_deps` |

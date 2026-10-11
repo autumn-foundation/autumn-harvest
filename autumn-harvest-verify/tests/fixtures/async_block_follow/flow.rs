@@ -366,3 +366,16 @@ pub async fn wf_step_wrapped_block(ctx: &WorkflowContext) -> Out {
         .await?;
     ctx.execute_activity_raw("b", a).await
 }
+
+pub fn __autumn_workflow_info_wf_step_external_future() -> u8 {
+    0
+}
+
+/// The step closure builds an untrusted crate's future with no call.
+pub async fn wf_step_external_future(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let a = saga
+        .step(|| other_crate::ClockFuture, |_| async { Ok(()) })
+        .await?;
+    ctx.execute_activity_raw("b", a).await
+}

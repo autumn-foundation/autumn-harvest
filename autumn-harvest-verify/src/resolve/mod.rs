@@ -1361,6 +1361,17 @@ impl Program {
             .unwrap_or_else(|| path.to_string())
     }
 
+    /// Is `root` the first segment of a first-party path?
+    ///
+    /// A first-party root names an analyzed crate, or a module that holds an
+    /// analyzed body. MIR prints a local type without its crate name, so a
+    /// module such as `models` must not read as a dependency.
+    #[must_use]
+    pub fn is_first_party_root(&self, root: &str) -> bool {
+        let prefix = format!("{root}::");
+        self.crates.contains(root) || self.ambiguous.keys().any(|path| path.starts_with(&prefix))
+    }
+
     /// `crate::path` for a body id — the spelling every report uses.
     #[must_use]
     pub fn qualified_name(&self, id: &str) -> String {

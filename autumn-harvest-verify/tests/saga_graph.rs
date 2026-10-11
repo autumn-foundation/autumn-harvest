@@ -14,8 +14,8 @@ use autumn_harvest_verify::model::Model;
 use autumn_harvest_verify::resolve::{Program, SourceRoots};
 use autumn_harvest_verify::saga::{self, SagaReport, SagaVerdict};
 use autumn_harvest_verify::structure::{
-    self, BodyNode, EdgeLabel, ExitOutcome, FLOW_FORMAT, FlowEvent, FlowGraph, StructureManifest,
-    WorkflowStructure,
+    self, BodyNode, EdgeLabel, ExitOutcome, FLOW_FORMAT, FlowEdge, FlowEvent, FlowGraph,
+    StructureManifest, WorkflowStructure,
 };
 
 fn fixture_dir() -> PathBuf {
@@ -712,7 +712,14 @@ fn two_sagas_in_one_body_are_unknown() {
         .find(|n| matches!(n.event, FlowEvent::SagaNew))
         .cloned()
         .expect("a saga-new node");
+    // The entry reaches the copy, so the graph stays valid.
+    let copy = graph.nodes.len();
     graph.nodes.push(first);
+    graph.edges.push(FlowEdge {
+        from: 0,
+        to: copy,
+        label: None,
+    });
     let reports = saga::check(&m).expect("check");
     let r = report(&reports, "wf_covered");
     assert_eq!(r.verdict, SagaVerdict::Unknown, "{r:#?}");

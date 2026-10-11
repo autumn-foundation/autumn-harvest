@@ -292,7 +292,8 @@ events when a path joins them with no other event on it.
 `at` names the MIR block of a node. It is for diagnostics only. A tracked
 `saga-step` has at least one `ok` and one `err` edge, and no other node has
 a labeled edge. `--check-structure` refuses a graph that breaks this, names
-a missing node, or has other than one `entry`.
+a missing node, has other than one `entry`, or has a node that the `entry`
+cannot reach.
 
 The workflow `handlers` list each handler registration: its `kind`
 (`signal`, `update`, `query` or `other`), its model `method`, its `name`

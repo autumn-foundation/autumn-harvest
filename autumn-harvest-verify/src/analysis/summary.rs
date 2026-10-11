@@ -34,7 +34,7 @@ use crate::model::{
 };
 use crate::resolve::{Ambiguity, Program, Resolution, Substitution};
 use crate::structure::{Recorder, SinkSite};
-use crate::util::{last_segment, peel_refs, strip_generics_everywhere};
+use crate::util::{crate_root, last_segment, peel_refs, strip_generics_everywhere};
 use crate::verdict::{Boundary, BoundaryKind, Finding, FindingKind, Hop, Site, TaintKind};
 
 use super::control::ControlGraph;
@@ -1766,7 +1766,15 @@ impl<'a> Analyzer<'a> {
                 self.follow_block(closure, span, &block, ret, hops, emit, out);
             }
         } else {
-            let followed = self.follow_named_future(closure, body, ret, hops, &block, out);
+            let followed = match self.follow_named_future(closure, body, ret, hops, &block, out) {
+                Ok(followed) => followed,
+                Err((kind, detail)) => {
+                    if emit {
+                        self.push_boundary(kind, &detail, closure, &block);
+                    }
+                    false
+                }
+            };
             if let Some(span) = &inner {
                 self.follow_block(closure, span, &block, ret, hops, emit, out);
             }
@@ -1829,9 +1837,10 @@ impl<'a> Analyzer<'a> {
     /// closure returns, when that impl has a body here (issue #2010). Return
     /// true when one was followed.
     ///
-    /// A type with no such impl is not a first-party future, so nothing is
-    /// followed. A future of another crate was built by a call that was
-    /// analyzed or reported on its own.
+    /// A first-party type with no such impl is not a future, so nothing is
+    /// followed. A type of an untrusted crate can be built with no call, as
+    /// a unit struct is. Its `poll` has no body here, so it is an error that
+    /// carries the boundary. A `poll` that resolves to a boundary is one too.
     fn follow_named_future(
         &mut self,
         closure: &str,
@@ -1840,17 +1849,32 @@ impl<'a> Analyzer<'a> {
         hops: &[Hop],
         block: &str,
         out: &mut TaintSet,
-    ) -> bool {
+    ) -> Result<bool, (BoundaryKind, String)> {
         // `&mut F`, `Pin<&mut F>` and `Box<F>` forward `Future` to `F`.
         let ty = future_target(body.return_ty.trim());
         if ty.is_empty() || ty.starts_with('&') || ty.starts_with('(') {
-            return false;
+            return Ok(false);
+        }
+        // The signature trims a dependency type to `Tick`. The `_0` local
+        // prints it in full, as `dep::Tick`. A same-named local impl must not
+        // stand in for the `poll` of that dependency.
+        let full = body
+            .locals
+            .get(&Local(0))
+            .map_or(ty, |local| future_target(local));
+        if let Some(root) = crate_root(full)
+            && !self.is_trusted_root(root)
+            && !self.program.is_first_party_root(root)
+        {
+            let detail = format!("<{full} as std::future::Future>::poll");
+            return Err((BoundaryKind::ExternalCrateBody, detail));
         }
         let poll = format!("<{ty} as std::future::Future>::poll");
         let targets = match self.program.resolve_call(closure, &poll) {
             Resolution::Body(target) => vec![target],
             Resolution::Bodies(targets, _) => targets,
-            Resolution::Boundary(..) | Resolution::External(_) => return false,
+            Resolution::Boundary(kind, detail) => return Err((kind, detail)),
+            Resolution::External(_) => return Ok(false),
         };
         for target in targets {
             self.recorder.future_edge(closure, block, &target);
@@ -1860,7 +1884,7 @@ impl<'a> Analyzer<'a> {
             let outcome = self.analyze_body(&target, &Substitution::new(), &seeded, hops);
             out.absorb(&outcome.ret);
         }
-        true
+        Ok(true)
     }
 
     /// The callee path a bare `fn` item argument names, and where it

@@ -92,6 +92,11 @@ Four review agents read the first version. Each fix has a test.
    workflow. The manifest format is checked before the full parse.
 8. The model version is now `2026.10.1`. The same MIR gives another
    manifest than before, so the upgrade check must not compare the two.
+9. A closure can build a future of an untrusted crate with no call, as a
+   unit struct. Its `poll` has no body here, so it is now a boundary. A
+   same-named local impl no longer stands in for it.
+10. The check ignored a node that the entry cannot reach. A saga or a gap
+    there was silent. Such a graph is now refused.
 
 ---
 
@@ -117,7 +122,8 @@ An edge has an optional `label`. Only a tracked `saga-step` labels its
 edges, `ok` or `err`, and it has at least one of each. A step whose arm
 reaches no node, such as an arm that never returns, is untracked. An exit
 node has no out-edge. The check refuses a graph that breaks these rules,
-names a missing node, or has other than one entry.
+names a missing node, has other than one entry, or has a node that the entry
+cannot reach.
 
 `WorkflowStructure.handlers` lists each handler registration: its kind
 (`signal`, `update`, `query` or `other`), its name when the MIR shows it,

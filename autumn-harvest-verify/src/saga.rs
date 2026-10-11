@@ -139,6 +139,27 @@ fn validate(graph: &FlowGraph) -> Result<(), String> {
             }
         }
     }
+    // The fixpoint starts at the entry. A node it cannot reach is never
+    // checked, so a saga or a gap there would be silent.
+    let entry = graph
+        .nodes
+        .iter()
+        .position(|n| matches!(n.event, FlowEvent::Entry))
+        .unwrap_or_default();
+    let mut seen = vec![false; size];
+    let mut work = vec![entry];
+    while let Some(id) = work.pop() {
+        if seen.get(id).copied().unwrap_or(true) {
+            continue;
+        }
+        if let Some(slot) = seen.get_mut(id) {
+            *slot = true;
+        }
+        work.extend(graph.edges.iter().filter(|e| e.from == id).map(|e| e.to));
+    }
+    if let Some(id) = seen.iter().position(|reached| !reached) {
+        return Err(format!("node {id} cannot be reached from the entry"));
+    }
     // A tracked step has an `ok` and an `err` edge, and only its edges carry
     // a label. The emitter marks a step untracked when an arm reaches no
     // node, so a missing arm means the graph was changed after emission.
@@ -521,6 +542,23 @@ mod tests {
         };
         let err = check(&manifest(no_entry)).expect_err("no entry node");
         assert!(err.to_string().contains("entry"), "{err}");
+
+        // A disconnected saga and gap would read as `no-saga`.
+        let disconnected = FlowGraph {
+            nodes: vec![
+                node(FlowEvent::Entry),
+                node(FlowEvent::Exit {
+                    outcome: ExitOutcome::Ok,
+                }),
+                node(FlowEvent::SagaNew),
+                node(FlowEvent::Exit {
+                    outcome: ExitOutcome::Err,
+                }),
+            ],
+            edges: vec![edge(0, 1, None), edge(2, 3, None)],
+        };
+        let err = check(&manifest(disconnected)).expect_err("unreachable nodes");
+        assert!(err.to_string().contains("reach"), "{err}");
     }
 
     #[test]

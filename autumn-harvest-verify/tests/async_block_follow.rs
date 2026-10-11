@@ -73,6 +73,7 @@ fn a_case_the_analysis_cannot_follow_is_never_proven() {
         "wf_step_move_mut",
         "wf_step_boxed_dyn",
         "wf_step_wrapped_block",
+        "wf_step_external_future",
     ] {
         assert!(
             !matches!(verdict(&all, name), Verdict::ProvenDeterministic),
@@ -92,6 +93,26 @@ fn a_future_built_in_another_crate_is_not_an_unresolved_callback() {
         boundaries
             .iter()
             .all(|b| b.kind.name() != "unresolved-callback"),
+        "{boundaries:?}"
+    );
+}
+
+#[test]
+fn a_future_of_an_untrusted_crate_is_a_boundary() {
+    // The fixture also has a local `ClockFuture`. Its `poll` must not stand
+    // in for the `poll` of `other_crate::ClockFuture`.
+    let all = verdicts();
+    let Verdict::Unknown { boundaries } = verdict(&all, "wf_step_external_future") else {
+        panic!(
+            "the dependency `poll` has no body here: {:?}",
+            verdict(&all, "wf_step_external_future")
+        );
+    };
+    assert!(
+        boundaries
+            .iter()
+            .any(|b| b.kind.name() == "external-crate-body"
+                && b.detail.contains("other_crate::ClockFuture")),
         "{boundaries:?}"
     );
 }
