@@ -268,22 +268,24 @@ fn lex_string(raw: &str, start: usize) -> Result<(String, usize), String> {
     let quote = raw.as_bytes()[start];
     let mut text = String::new();
     let mut chars = raw[start + 1..].char_indices();
-    while let Some((offset, c)) = chars.next() {
-        if c == '\\' {
+    while let Some((offset, mut c)) = chars.next() {
+        let escaped = c == '\\';
+        if escaped {
             match chars.next() {
-                Some((_, escaped)) => text.push(escaped),
+                Some((_, next)) => c = next,
                 None => break,
             }
         } else if c as u32 == u32::from(quote) {
             return Ok((text, start + 1 + offset + 1));
-        } else if c.is_control() {
-            // Postgres rejects a NUL byte in text and in `jsonb`.
+        }
+        // Postgres rejects a NUL byte in text and in `jsonb`. An escaped
+        // control character is checked too.
+        if c.is_control() {
             return Err(format!(
                 "the string at byte {start} holds a control character"
             ));
-        } else {
-            text.push(c);
         }
+        text.push(c);
     }
     Err(format!("the string at byte {start} has no closing quote"))
 }
@@ -1063,6 +1065,7 @@ mod tests {
         assert!(rejected("attrs.a = 1e400").contains("out of range"));
         assert!(rejected("owner = 'a\u{0}b'").contains("control character"));
         assert!(rejected("attrs.a = 'x\u{1}'").contains("control character"));
+        assert!(rejected("owner = 'a\\\u{0}b'").contains("control character"));
         assert_eq!(parsed("attrs.a = 0.0e5"), "a=0.0");
         assert!(rejected("state = 'MIGRATED'").contains("state=MIGRATED"));
         assert!(rejected("state IN ('RUNNING', 'migrated')").contains("state=MIGRATED"));
