@@ -1039,6 +1039,19 @@ impl<'a> ExportGate<'a> {
             if !shared {
                 return Ok(Self::Busy);
             }
+            // In a caller's transaction, a drop stays pending after the pass
+            // ends. The transaction lock keeps an exporter out until that
+            // transaction ends. This session holds the lock shared, so the
+            // call never waits.
+            let held = crate::partition::exec(
+                conn,
+                &format!("SELECT pg_advisory_xact_lock_shared({EXPORT_LOCK_KEY})"),
+            )
+            .await;
+            if let Err(e) = held {
+                Self::Plain.release(conn).await;
+                return Err(e);
+            }
             let gate = match marked(conn).await {
                 Ok(true) => Self::Required,
                 Ok(false) => Self::Plain,

@@ -42,8 +42,9 @@ events.
   sweep with no archiver holds it shared and reads the marker under it, so
   the first export cannot race a drop without an export. A sweep that cannot
   take it reports `another process holds the export lock of this shard`. In
-  a caller's transaction, a transaction lock on the same key holds until the
-  marker commits.
+  a caller's transaction, each sweep also takes a transaction lock on the
+  same key. It holds until that transaction ends, so a pending marker or a
+  pending drop cannot race the other kind of sweep.
 - **Keys.** A key holds the shard and the cohort bounds. Segment and
   manifest keys hold a SHA-256 prefix of their content, so a late upload
   cannot replace a finished object.
@@ -94,7 +95,7 @@ and reports no wait when it moved.
 
 **Tests.**
 
-- `partition_archive_tests`, 19 DB tests: export, verify, drop and read
+- `partition_archive_tests`, 20 DB tests: export, verify, drop and read
   back; the legacy partition; the retention runtime; a failed upload; a
   lost object; changed bytes; a slow backend; a row
   changed or deleted after the export; a live owner; no straggler deletes;

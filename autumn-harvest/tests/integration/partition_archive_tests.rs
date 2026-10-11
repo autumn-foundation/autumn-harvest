@@ -1061,3 +1061,49 @@ async fn a_sweep_without_an_archiver_waits_for_an_uncommitted_marker() {
         .expect("sweep");
     assert_kept(&mut conn, &aged, &plain, partition::EXPORT_REQUIRED_REASON).await;
 }
+
+/// A sweep with no archiver in a caller transaction can leave a drop
+/// pending. Until that transaction ends, no exporter may turn the marker on,
+/// or the caller could commit a drop with no export after it. Here the pass
+/// drops nothing, so the gate alone keeps the exporter out.
+#[tokio::test]
+async fn an_exporter_waits_for_a_plain_sweep_in_a_caller_transaction() {
+    use diesel_async::{AnsiTransactionManager, TransactionManager};
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_partitioned(&mut conn).await;
+
+    AnsiTransactionManager::begin_transaction(&mut conn)
+        .await
+        .expect("begin the caller transaction");
+    let plain = partition::sweep(&mut conn, Utc::now(), &SweepOptions::default(), None)
+        .await
+        .expect("sweep");
+    assert!(plain.dropped.is_empty(), "{plain:?}");
+
+    let mut exporter = connect(&url).await;
+    sweep_with(&mut exporter, Arc::new(TestArchiver::default())).await;
+    assert_eq!(
+        marker_rows(&mut exporter).await,
+        0,
+        "no marker while the caller transaction is open"
+    );
+
+    AnsiTransactionManager::commit_transaction(&mut conn)
+        .await
+        .expect("commit the caller transaction");
+    sweep_with(&mut exporter, Arc::new(TestArchiver::default())).await;
+    assert_eq!(
+        marker_rows(&mut exporter).await,
+        1,
+        "the exporter writes the marker once the caller transaction ends"
+    );
+}
+
+async fn marker_rows(conn: &mut AsyncPgConnection) -> i64 {
+    diesel::sql_query("SELECT count(*) AS n FROM harvest_partition_export")
+        .get_result::<CountRow>(conn)
+        .await
+        .expect("count the marker")
+        .n
+}
