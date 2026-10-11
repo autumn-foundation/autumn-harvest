@@ -88,8 +88,8 @@ const LIMIT_SOURCES: &[LimitSource] = &[
                 "No model covers shard-generation fencing or the rebalance cutover.",
             ),
             (
-                "Trace conformance.",
-                "No check compares test traces with the models.",
+                "Trace conformance of `CodecRotation`.",
+                "No check compares test traces with the `CodecRotation` model.",
             ),
         ],
     },

@@ -203,8 +203,9 @@ The partition test fails with the fence off ([`chaos.md`](testing/chaos.md)).
 
 - No model covers shard-generation fencing or the rebalance cutover. See
   [`formal-methods.md`](testing/formal-methods.md#not-modelled-yet).
-- No check compares test traces with the models. A code change can leave a
-  model out of date, and no check detects it.
+- Trace conformance covers `ActivityClaim` and `WorkflowTaskClaim` only
+  (#2003). No check compares test traces with the `CodecRotation` model. A
+  code change can leave that model out of date, and no check detects it.
 - The models are bounded. `ActivityClaim` has 3 workers and 5 claims.
   `WorkflowTaskClaim` has 2 workers, 5 claims and 2 strikes.
 - The model `SelfRelease` uses a stronger guard than the code.
