@@ -174,7 +174,8 @@ Four review agents read the first version. Each fix has a test.
     of the closure self, as `(_1.0: u64)`, takes the field type instead.
 32. A shared reference `&T` is a future only by a local `impl Future for
     &T`. The follow does not read that `poll`, so such a return is an
-    `unresolved-callback` boundary.
+    `unresolved-callback` boundary. A referent of an untrusted crate is an
+    `external-crate-body` boundary.
 
 ---
 
@@ -232,8 +233,8 @@ returns, an exit with the outcome `err` or `unknown` and a set flag is a
 |---|---|
 | `no-saga` | No body has a saga node, and no boundary runs code. |
 | `covered` | No gap, and no reason for `unknown`. |
-| `gap` | At least one gap, and no reason for `unknown`. |
-| `unknown` | `saga-escapes`, `saga-result-untracked`, `multiple-sagas`, `saga-recreated`, `saga-dropped-pending`, `no-flow-graph`, or a boundary that runs code. The report lists each gap as possible. |
+| `gap` | At least one gap, and no reason for `unknown` other than a boundary. A boundary cannot clear a step pending in sight, so the gap is proven. |
+| `unknown` | `saga-escapes`, `saga-result-untracked`, `multiple-sagas`, `saga-recreated`, `saga-dropped-pending`, `no-flow-graph`, or a boundary that runs code and no gap. The report lists each gap as possible. |
 
 A `noop-compensation` note does not change the verdict.
 

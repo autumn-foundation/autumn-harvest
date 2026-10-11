@@ -90,6 +90,7 @@ fn a_case_the_analysis_cannot_follow_is_never_proven() {
         "wf_step_raw_ptr_write",
         "wf_step_closure_capture",
         "wf_step_ref_future",
+        "wf_step_dep_ref_future",
     ] {
         assert!(
             !matches!(verdict(&all, name), Verdict::ProvenDeterministic),
@@ -216,5 +217,22 @@ fn a_wrapper_in_a_nested_module_file_is_indexed() {
         ),
         "{:?}",
         verdict(&all, "wf_step_write_modfile")
+    );
+}
+
+#[test]
+fn a_shared_reference_future_of_an_untrusted_crate_is_a_boundary() {
+    // The `&` impl of `other_crate::RefTick` has no body here. The boundary
+    // must name it, not only the generic `Saga::step` it passes through.
+    let all = verdicts();
+    let Verdict::Unknown { boundaries } = verdict(&all, "wf_step_dep_ref_future") else {
+        panic!("{:?}", verdict(&all, "wf_step_dep_ref_future"));
+    };
+    assert!(
+        boundaries
+            .iter()
+            .any(|b| b.kind.name() == "external-crate-body"
+                && b.detail.contains("RefTick as std::future::Future>::poll")),
+        "{boundaries:?}"
     );
 }

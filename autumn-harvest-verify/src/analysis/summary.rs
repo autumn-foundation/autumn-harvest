@@ -1874,15 +1874,22 @@ impl<'a> Analyzer<'a> {
     ) -> Result<bool, (BoundaryKind, String)> {
         // `&mut F`, `Pin<&mut F>` and `Box<F>` forward `Future` to `F`.
         let ty = future_target(body.return_ty.trim());
-        // A shared reference is a future only by a local `impl Future for &T`.
-        // That `poll` is not followed, so it is a boundary.
-        if let Some(referent) = ty.strip_prefix('&') {
-            // `&'a T` names its lifetime first.
-            let referent = referent.trim_start();
-            let referent = referent.strip_prefix('\'').map_or(referent, |rest| {
-                rest.split_once(' ').map_or("", |(_, ty)| ty)
-            });
-            let referent = strip_generics_everywhere(referent.trim());
+        // A shared reference is a future only by an `impl Future for &T`.
+        // A local impl is not followed, and an untrusted crate has no body.
+        // Either way it is a boundary.
+        if let Some(referent) = shared_referent(ty) {
+            let full = body
+                .locals
+                .get(&Local(0))
+                .and_then(|local| shared_referent(future_target(local)))
+                .unwrap_or_else(|| referent.clone());
+            if let Some(root) = crate_root(&full)
+                && !self.is_trusted_root(root)
+                && !self.program.is_first_party_type(&full)
+            {
+                let detail = format!("<&{full} as std::future::Future>::poll");
+                return Err((BoundaryKind::ExternalCrateBody, detail));
+            }
             let name = last_segment(&referent);
             if self.program.sources_impl_future(&format!("&{name}")) {
                 let detail = format!("<{ty} as std::future::Future>::poll");
@@ -3107,6 +3114,17 @@ fn source_hint(path: &str) -> Option<String> {
         .trim_start_matches('@');
     let head = rest.split(": ").next()?;
     (!head.is_empty()).then(|| head.to_string())
+}
+
+/// The referent of a shared reference type, as `dep::Tick` for
+/// `&'a dep::Tick<u8>`, with no lifetime and no generics.
+fn shared_referent(ty: &str) -> Option<String> {
+    let referent = ty.trim().strip_prefix('&')?.trim_start();
+    // `&'a T` names its lifetime first.
+    let referent = referent.strip_prefix('\'').map_or(referent, |rest| {
+        rest.split_once(' ').map_or("", |(_, ty)| ty)
+    });
+    Some(strip_generics_everywhere(referent.trim()))
 }
 
 /// Does `span` end in a source span, as `{async block@a.rs:5:6: 5:9}` does?

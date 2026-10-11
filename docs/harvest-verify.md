@@ -337,8 +337,8 @@ checked 2: covered 1, gap 1, unknown 0, no-saga 0
 |---|---|
 | `no-saga` | No body uses a `Saga`, and no boundary can hide one. |
 | `covered` | Each error exit after a completed forward step unwinds first. |
-| `gap` | An error exit can follow a completed forward step with no unwind. The usual cause is a `?` on a call outside the saga. |
-| `unknown` | The graph cannot show the answer. The report lists each gap as `possible gap`. |
+| `gap` | An error exit can follow a completed forward step with no unwind. The usual cause is a `?` on a call outside the saga. A boundary beside the gap does not change it, as the saga cannot reach the boundary. The report still lists the boundary. |
+| `unknown` | The graph cannot show the answer. A `saga-` reason can unwind or hide a step, so with one the report lists each gap as `possible gap`. |
 
 | `unknown` reason | Cause |
 |---|---|

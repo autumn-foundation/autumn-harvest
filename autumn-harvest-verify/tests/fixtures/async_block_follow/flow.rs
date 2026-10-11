@@ -643,3 +643,17 @@ pub async fn wf_step_ref_future(ctx: &WorkflowContext) -> Out {
     let a = saga.step(|| &REF_CLOCK, |_| async { Ok(()) }).await?;
     ctx.execute_activity_raw("b", a).await
 }
+
+static DEP_TICK: other_crate::RefTick = other_crate::RefTick;
+
+pub fn __autumn_workflow_info_wf_step_dep_ref_future() -> u8 {
+    0
+}
+
+/// The forward step returns `&other_crate::RefTick`, a future by the `&`
+/// impl of an untrusted crate.
+pub async fn wf_step_dep_ref_future(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let a = saga.step(|| &DEP_TICK, |_| async { Ok(()) }).await?;
+    ctx.execute_activity_raw("b", a).await
+}

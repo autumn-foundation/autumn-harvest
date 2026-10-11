@@ -506,7 +506,13 @@ pub fn check_workflow(workflow: &WorkflowStructure) -> SagaReport {
             unknown.insert(format!("boundary: {boundary}"));
         }
     }
-    let verdict = if !unknown.is_empty() {
+    // A boundary cannot clear a step pending in sight, as the saga does not
+    // reach it. Only a `saga-` reason can. So a visible gap beside boundaries
+    // alone is proven.
+    let proven_gap = !gaps.is_empty() && unknown.iter().all(|u| u.starts_with("boundary: "));
+    let verdict = if proven_gap {
+        SagaVerdict::Gap
+    } else if !unknown.is_empty() {
         SagaVerdict::Unknown
     } else if !uses_saga {
         SagaVerdict::NoSaga
@@ -1338,5 +1344,49 @@ mod tests {
         let mut constant = workflow(graph);
         constant.boundaries = vec!["external-const: dep::LIMIT".to_string()];
         assert_eq!(check_workflow(&constant).verdict, SagaVerdict::Covered);
+    }
+
+    #[test]
+    fn a_visible_gap_beside_a_boundary_is_a_gap() {
+        // A boundary cannot clear a step pending here, as the saga does not
+        // reach it. So the gap is proven, and the boundary is still listed.
+        let graph = FlowGraph {
+            nodes: vec![
+                node(FlowEvent::Entry),
+                node(FlowEvent::SagaNew),
+                node(step()),
+                node(FlowEvent::Exit {
+                    outcome: ExitOutcome::Err,
+                }),
+                node(FlowEvent::Exit {
+                    outcome: ExitOutcome::Err,
+                }),
+            ],
+            edges: vec![
+                edge(0, 1, None),
+                edge(1, 2, None),
+                edge(2, 3, Some(EdgeLabel::Ok)),
+                edge(2, 4, Some(EdgeLabel::Err)),
+            ],
+        };
+        let mut w = workflow(graph.clone());
+        w.boundaries = vec!["external-crate-body: dep::log".to_string()];
+        let r = check_workflow(&w);
+        assert_eq!(r.verdict, SagaVerdict::Gap, "{r:#?}");
+        assert!(
+            r.unknown.iter().any(|u| u.starts_with("boundary: ")),
+            "{r:#?}"
+        );
+
+        // An escape can hand the saga to code that unwinds it. Then the gap
+        // is only possible.
+        let mut escaped = graph;
+        escaped.nodes.push(node(FlowEvent::SagaEscape {
+            to: "dep::finish".to_string(),
+        }));
+        escaped.edges.push(edge(1, 5, None));
+        escaped.edges.push(edge(5, 2, None));
+        let r = check_workflow(&workflow(escaped));
+        assert_eq!(r.verdict, SagaVerdict::Unknown, "{r:#?}");
     }
 }
