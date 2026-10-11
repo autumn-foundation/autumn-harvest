@@ -82,6 +82,13 @@ impl EffectLedger {
         let mut open: Vec<(String, OpenEffect)> = Vec::new();
         for event in history {
             match event {
+                // An external activity may skip `ActivityScheduled`, so it
+                // opens here unless it is open already.
+                WorkflowEvent::ActivityAwaitingExternal {
+                    activity_id, name, ..
+                } if !open.iter().any(|(key, _)| *key == activity_id.to_string()) => {
+                    open.push((activity_id.to_string(), OpenEffect::Activity(name.clone())));
+                }
                 WorkflowEvent::ActivityScheduled {
                     activity_id, name, ..
                 } => open.push((activity_id.to_string(), OpenEffect::Activity(name.clone()))),
@@ -160,11 +167,9 @@ trait VersionedState: Serialize + DeserializeOwned {
     /// Whether this state reflects each completed effect in `ledger`.
     ///
     /// The loader calls it after the upgrade. The author states the rule,
-    /// and the engine checks it on each load.
-    fn covers(&self, ledger: &EffectLedger) -> bool {
-        let _ = ledger;
-        true
-    }
+    /// and the engine checks it on each load. It has no default, so no state
+    /// type can skip the check.
+    fn covers(&self, ledger: &EffectLedger) -> bool;
 }
 
 /// Why a snapshot did not load.
@@ -303,6 +308,12 @@ impl VersionedState for OrderV1 {
 
     fn upgrade(version: u32, _raw: Value) -> Result<Value, String> {
         Err(format!("no upgrade from version {version}"))
+    }
+
+    /// Each completed charge is in `charged`.
+    fn covers(&self, ledger: &EffectLedger) -> bool {
+        let charges = ledger.activities.iter().filter(|a| *a == "charge").count();
+        usize::try_from(self.charged).is_ok_and(|c| c == charges)
     }
 }
 
@@ -486,7 +497,20 @@ fn a_quiescent_history_gives_a_ledger_of_its_completed_effects() {
 fn a_checkpoint_with_an_open_effect_is_refused() {
     let child = ExecutionId::new();
     let update = autumn_harvest::types::UpdateId::new();
-    let cases: [(&str, Vec<WorkflowEvent>, OpenEffect); 4] = [
+    let external = autumn_harvest::types::ActivityExecId::new();
+    let cases: [(&str, Vec<WorkflowEvent>, OpenEffect); 5] = [
+        (
+            "external activity",
+            vec![WorkflowEvent::ActivityAwaitingExternal {
+                activity_id: external,
+                token: autumn_harvest::types::ExternalActivityToken::new(),
+                name: "approve_invoice".into(),
+                input: Value::Null,
+                queue: "default".into(),
+                schedule_to_close_secs: 60,
+            }],
+            OpenEffect::Activity("approve_invoice".into()),
+        ),
         (
             "activity",
             activity_events("charge", false),

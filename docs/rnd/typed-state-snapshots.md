@@ -171,7 +171,7 @@ Each claim names its test in `typed_snapshot_spike_tests.rs`.
 | Claim | Test |
 |---|---|
 | A quiescent history gives a ledger of its completed effects. | `a_quiescent_history_gives_a_ledger_of_its_completed_effects` |
-| The stamp refuses an open activity, timer, child or update. | `a_checkpoint_with_an_open_effect_is_refused` |
+| The stamp refuses an open activity, external activity, timer, child or update. | `a_checkpoint_with_an_open_effect_is_refused` |
 | The stamp refuses a signal that the body has not taken. | `a_checkpoint_with_an_unread_signal_is_refused` |
 | A v1 snapshot loads under v2 code through its upgrade step. | `a_v1_snapshot_loads_under_v2_code` |
 | The loader refuses a snapshot from newer code. | `a_snapshot_from_newer_code_is_refused` |
@@ -181,9 +181,9 @@ Each claim names its test in `typed_snapshot_spike_tests.rs`.
 | A new context restarts reserved names. An in-place resume must restore the counters. | `reserved_names_restart_in_each_new_context` |
 
 The machine check has three parts: quiescence, a ledger that matches its
-source history, and a state that covers its ledger. The state type writes
-the cover rule. The loader runs it on each load, so a wrong upgrade step
-fails to load.
+source history, and a state that covers its ledger. The state type must
+write the cover rule, because the trait has no default. The loader runs it
+on each load, so a wrong upgrade step fails to load.
 
 What the prototype does not prove or cover:
 
@@ -191,8 +191,8 @@ What the prototype does not prove or cover:
   completed. The cover rule checks only what the author writes into it.
 - Which effect completed. The ledger keys activities by name, so two
   charges look the same.
-- Local activities, detached children, external awaits, external signals,
-  cancels and a held mutex. History has no release event for a mutex, so
+- Local activities, detached children, external workflow awaits, external
+  signals, cancels and a held mutex. History has no release event for a mutex, so
   the context must report a hold.
 - The real persist path. The tests stamp the ledger outside the worker.
 - A source history that is gone. Retention or PII erasure can remove the
