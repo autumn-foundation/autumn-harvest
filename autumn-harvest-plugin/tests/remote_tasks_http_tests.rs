@@ -105,6 +105,7 @@ async fn mcp_start_sends_a_task_tools_call_with_its_headers() {
             server: "reports".into(),
             protocol: RemoteProtocol::Mcp,
             task_id: "t-1".into(),
+            poll_interval_ms: None,
         }))
     );
 
@@ -165,6 +166,7 @@ async fn mcp_get_reads_an_is_error_result_as_completed() {
         server: "reports".into(),
         protocol: RemoteProtocol::Mcp,
         task_id: "t-1".into(),
+        poll_interval_ms: None,
     };
 
     let poll = client.get(&handle).await;

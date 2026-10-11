@@ -103,6 +103,8 @@ struct FakeServer {
     reads: Mutex<Vec<String>>,
     /// The poll interval that each read asks for.
     poll_interval: Mutex<Option<Duration>>,
+    /// The poll interval that each start asks for.
+    start_poll_interval: Mutex<Option<Duration>>,
     /// A read of this task waits for `release`.
     held: Mutex<Option<String>>,
     release: tokio::sync::Notify,
@@ -154,10 +156,13 @@ impl RemoteTaskTransport for FakeTransport {
                 .expect("states")
                 .entry(task_id.clone())
                 .or_insert(RemoteTaskState::Working);
+            let interval = *self.0.start_poll_interval.lock().expect("interval");
             Ok(RemoteTaskStart::Task(RemoteTaskHandle {
                 server: request.server.clone(),
                 protocol: request.protocol,
                 task_id,
+                poll_interval_ms: interval
+                    .map(|i| u64::try_from(i.as_millis()).unwrap_or(u64::MAX)),
             }))
         })
     }
@@ -737,5 +742,22 @@ async fn a_slow_read_does_not_delay_another_settle() {
     let (report, ()) = tokio::join!(p.poller.poll_once(&p.pool), check);
     let report = report.expect("poll");
     assert_eq!((report.polled, report.settled), (2, 1));
+    p.stop().await;
+}
+
+/// The first read waits for the poll interval of the start result.
+#[tokio::test]
+async fn the_first_read_waits_for_the_start_poll_interval() {
+    let db = setup().await;
+    let url = &db.url;
+    let server = Arc::new(FakeServer::default());
+    *server.start_poll_interval.lock().expect("interval") = Some(Duration::from_secs(600));
+    let p = Process::start(url, "remote-task-first-interval", &server);
+
+    let exec_id = start_run(url, "report-13", json!({})).await;
+    wait_for_token(url, exec_id).await;
+    let report = p.poller.poll_once(&p.pool).await.expect("poll");
+    assert_eq!(report.polled, 0, "the start asked for 10 minutes");
+    assert!(server.reads().is_empty(), "reads: {:?}", server.reads());
     p.stop().await;
 }

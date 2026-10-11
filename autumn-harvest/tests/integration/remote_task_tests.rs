@@ -36,6 +36,7 @@ fn handle() -> RemoteTaskHandle {
         server: "reports".into(),
         protocol: RemoteProtocol::Mcp,
         task_id: "task-7".into(),
+        poll_interval_ms: None,
     }
 }
 
@@ -45,6 +46,7 @@ fn polled(protocol: RemoteProtocol, task_id: &str) -> RemoteTaskHandle {
         server: "reports".into(),
         protocol,
         task_id: task_id.into(),
+        poll_interval_ms: None,
     }
 }
 
@@ -208,6 +210,7 @@ fn a2a_task_result_is_a_handle() {
             server: "reports".into(),
             protocol: RemoteProtocol::A2a,
             task_id: "a2a-1".into(),
+            poll_interval_ms: None,
         }))
     );
 }
@@ -658,6 +661,15 @@ fn a_tasks_get_result_for_another_task_is_refused() {
     assert!(mcp::parse_task(&polled(RemoteProtocol::Mcp, "t"), &missing).is_err());
     let a2a_reply = json!({"id": "other", "status": {"state": "completed"}});
     assert!(a2a::parse_task(&polled(RemoteProtocol::A2a, "a"), &a2a_reply).is_err());
+}
+
+#[test]
+fn mcp_task_result_keeps_the_first_poll_interval() {
+    let result = json!({"resultType": "task", "taskId": "task-7", "pollIntervalMs": 30_000});
+    let start = mcp::parse_tools_call_result(&request(RemoteProtocol::Mcp), &result);
+    let mut expected = handle();
+    expected.poll_interval_ms = Some(30_000);
+    assert_eq!(start, Ok(RemoteTaskStart::Task(expected)));
 }
 
 #[test]

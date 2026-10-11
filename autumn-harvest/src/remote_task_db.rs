@@ -13,13 +13,13 @@ use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::{AsyncConnection as _, AsyncPgConnection, RunQueryDsl};
 use futures::StreamExt as _;
 
-use super::{
-    AWAIT_ACTIVITY, RemoteTaskError, RemoteTaskHandle, RemoteTaskPoll, RemoteTaskState,
-    RemoteTaskTransport, RemoteTasks,
-};
 use crate::error::{HarvestError, HarvestResult, database_error};
 use crate::event::WorkflowEvent;
 use crate::payload_codec::PayloadCodecs;
+use crate::remote_task::{
+    AWAIT_ACTIVITY, RemoteTaskError, RemoteTaskHandle, RemoteTaskPoll, RemoteTaskState,
+    RemoteTaskTransport, RemoteTasks,
+};
 use crate::schema::{harvest_events, harvest_external_tasks, harvest_workflow_executions};
 use crate::types::{ExecutionId, ExternalActivityToken};
 use crate::worker::DbPool;
@@ -48,6 +48,8 @@ pub struct PendingRemoteTask {
     pub execution_id: ExecutionId,
     /// The remote task handle.
     pub handle: RemoteTaskHandle,
+    /// When the token was recorded.
+    pub recorded_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// What one poll did.
@@ -96,6 +98,7 @@ async fn pending_page(
         .select((
             harvest_external_tasks::token,
             harvest_external_tasks::workflow_exec_id,
+            harvest_external_tasks::created_at,
         ))
         .order(harvest_external_tasks::token.asc())
         .limit(limit)
@@ -103,13 +106,14 @@ async fn pending_page(
     if let Some(after) = after {
         query = query.filter(harvest_external_tasks::token.gt(after.as_uuid()));
     }
-    let rows: Vec<(uuid::Uuid, uuid::Uuid)> = query.load(conn).await.map_err(database_error)?;
+    let rows: Vec<(uuid::Uuid, uuid::Uuid, chrono::DateTime<chrono::Utc>)> =
+        query.load(conn).await.map_err(database_error)?;
     let full = i64::try_from(rows.len()).is_ok_and(|n| n >= limit);
     let last = rows
         .last()
-        .map(|(token, _)| ExternalActivityToken::from_uuid(*token));
+        .map(|(token, _, _)| ExternalActivityToken::from_uuid(*token));
     let mut items = Vec::with_capacity(rows.len());
-    for (token, exec) in rows {
+    for (token, exec, recorded_at) in rows {
         let token = ExternalActivityToken::from_uuid(token);
         let execution_id = ExecutionId::from_uuid(exec);
         match load_handle(conn, codecs, execution_id, token).await {
@@ -117,6 +121,7 @@ async fn pending_page(
                 token,
                 execution_id,
                 handle,
+                recorded_at,
             }),
             Ok(None) => {
                 tracing::warn!(
@@ -192,7 +197,7 @@ pub async fn pending_remote_tasks(
 /// Settle a token from a remote task state.
 ///
 /// - A completed task completes the token with its
-///   [`RemoteTaskOutcome`](super::RemoteTaskOutcome). An outcome over
+///   [`RemoteTaskOutcome`](crate::remote_task::RemoteTaskOutcome). An outcome over
 ///   [`DEFAULT_MAX_ACTIVITY_RESULT_BYTES`](crate::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES)
 ///   fails the token instead.
 /// - A failed or cancelled task fails the token, not retryable. The message
@@ -452,6 +457,7 @@ impl RemoteTaskPoller {
             page.items
                 .into_iter()
                 .filter(|p| backoff.get(&p.token).is_none_or(|b| b.until <= now))
+                .filter(|p| self.first_read_due(p))
                 .collect()
         };
         let mut report = PollReport {
@@ -553,6 +559,24 @@ impl RemoteTaskPoller {
                 until: Instant::now() + delay,
             },
         );
+    }
+
+    /// `false` while the start poll interval of `pending` runs, when it is
+    /// longer than ours. The token time is in the database, so a restart
+    /// keeps the wait.
+    fn first_read_due(&self, pending: &PendingRemoteTask) -> bool {
+        let Some(wait) = pending
+            .handle
+            .poll_interval_ms
+            .map(Duration::from_millis)
+            .filter(|w| *w > self.interval)
+        else {
+            return true;
+        };
+        chrono::Duration::from_std(wait.min(MAX_SERVER_POLL_INTERVAL))
+            .ok()
+            .and_then(|wait| pending.recorded_at.checked_add_signed(wait))
+            .is_none_or(|due| chrono::Utc::now() >= due)
     }
 
     /// Respect the poll interval of the server, when it is longer than ours.

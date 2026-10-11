@@ -126,6 +126,10 @@ pub struct RemoteTaskHandle {
     pub protocol: RemoteProtocol,
     /// The remote task id.
     pub task_id: String,
+    /// The poll interval that the start result asks for, in milliseconds.
+    /// The first read waits for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_interval_ms: Option<u64>,
 }
 
 /// The result of a remote task that ended with a result.
@@ -448,6 +452,7 @@ pub mod mcp {
                 server: request.server.clone(),
                 protocol: RemoteProtocol::Mcp,
                 task_id: task_id.to_string(),
+                poll_interval_ms: result.get("pollIntervalMs").and_then(Value::as_u64),
             }));
         }
         if result.get("content").is_some() || result.get("structuredContent").is_some() {
@@ -583,6 +588,7 @@ pub mod a2a {
                     server: request.server.clone(),
                     protocol: RemoteProtocol::A2a,
                     task_id: task_id.to_string(),
+                    poll_interval_ms: None,
                 }))
             }
             _ => Err(RemoteTaskError::non_retryable(
@@ -649,6 +655,6 @@ pub mod a2a {
 }
 
 #[cfg(feature = "db")]
-mod db;
-#[cfg(feature = "db")]
-pub use db::{PendingRemoteTask, PollReport, RemoteTaskPoller, pending_remote_tasks, resolve};
+pub use crate::remote_task_db::{
+    PendingRemoteTask, PollReport, RemoteTaskPoller, pending_remote_tasks, resolve,
+};
