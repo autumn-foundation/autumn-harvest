@@ -6472,8 +6472,7 @@ impl HistoryMatcher {
         signal_name: &str,
         predicate: &dyn Fn(&Value) -> bool,
     ) -> bool {
-        self.signal_candidates(signal_name)
-            .iter()
+        self.signal_candidate_iter(signal_name)
             .any(|(_, payload)| predicate(payload))
     }
 
@@ -6485,9 +6484,8 @@ impl HistoryMatcher {
         signal_name: &str,
         accepted: &HashSet<usize>,
     ) -> bool {
-        self.signal_candidates(signal_name)
-            .iter()
-            .any(|(index, _)| accepted.contains(index))
+        self.signal_candidate_iter(signal_name)
+            .any(|(index, _)| accepted.contains(&index))
     }
 
     /// Every unclaimed `signal_name` signal, as `(event index, payload)`
@@ -6499,23 +6497,52 @@ impl HistoryMatcher {
     /// payload-matching wait runs its predicate over this list. A pure read.
     #[must_use]
     pub fn signal_candidates(&self, signal_name: &str) -> Vec<(usize, Value)> {
+        self.signal_candidate_iter(signal_name)
+            .map(|(index, payload)| (index, payload.clone()))
+            .collect()
+    }
+
+    /// The `n`th candidate of [`signal_candidates`](Self::signal_candidates),
+    /// or `None` past the end (issue #1985).
+    ///
+    /// It clones one payload. A payload-matching wait takes candidates one at
+    /// a time, so it stops cloning at the first payload that its predicate
+    /// accepts. A pure read.
+    #[must_use]
+    pub(crate) fn signal_candidate_nth(
+        &self,
+        signal_name: &str,
+        n: usize,
+    ) -> Option<(usize, Value)> {
+        self.signal_candidate_iter(signal_name)
+            .nth(n)
+            .map(|(index, payload)| (index, payload.clone()))
+    }
+
+    /// The candidates of [`signal_candidates`](Self::signal_candidates),
+    /// borrowed and in the same order. It clones nothing.
+    fn signal_candidate_iter<'s>(
+        &'s self,
+        signal_name: &'s str,
+    ) -> impl Iterator<Item = (usize, &'s Value)> + 's {
         let buffered = self
             .pending_signals
             .iter()
-            .filter(|(name, _, _)| name == signal_name)
-            .map(|(_, payload, index)| (*index, payload.clone()));
-        let recorded = self.events.iter().enumerate().skip(self.cursor).filter_map(
-            |(index, event)| match event {
-                WorkflowEvent::SignalReceived {
-                    signal_name: name,
-                    payload,
-                } if name == signal_name && !self.is_consumed(index) => {
-                    Some((index, payload.clone()))
-                }
-                _ => None,
-            },
-        );
-        buffered.chain(recorded).collect()
+            .filter(move |(name, _, _)| name == signal_name)
+            .map(|(_, payload, index)| (*index, payload));
+        let recorded =
+            self.events
+                .iter()
+                .enumerate()
+                .skip(self.cursor)
+                .filter_map(move |(index, event)| match event {
+                    WorkflowEvent::SignalReceived {
+                        signal_name: name,
+                        payload,
+                    } if name == signal_name && !self.is_consumed(index) => Some((index, payload)),
+                    _ => None,
+                });
+        buffered.chain(recorded)
     }
 
     /// Position in `pending_signals` of the first buffered `signal_name`
@@ -14372,6 +14399,25 @@ mod tests {
 
     fn order_id_is(id: u64) -> impl Fn(&Value) -> bool {
         move |payload: &Value| payload["id"] == id
+    }
+
+    #[test]
+    fn signal_candidate_nth_walks_candidates_in_match_order() {
+        let mut matcher = HistoryMatcher::new(vec![order_signal(7), order_signal(8)]);
+        // A rejected 7 is buffered, so it comes before the recorded 8.
+        let _ = matcher.match_signal_where("order", &order_id_is(99));
+        let ids: Vec<Option<serde_json::Value>> = (0..3)
+            .map(|n| {
+                matcher
+                    .signal_candidate_nth("order", n)
+                    .map(|(_, p)| p["id"].clone())
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![Some(serde_json::json!(7)), Some(serde_json::json!(8)), None]
+        );
+        assert_eq!(matcher.signal_candidate_nth("other", 0), None);
     }
 
     #[test]

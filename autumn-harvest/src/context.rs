@@ -9263,15 +9263,16 @@ impl WorkflowContext {
         predicate: Option<&dyn Fn(&Value) -> bool>,
     ) -> HarvestResult<Result<Value, oneshot::Receiver<Value>>> {
         // Candidates are in match order. The predicate stops at the first
-        // accepted payload, so it never sees a later signal.
+        // accepted payload, so it never sees a later signal. Each candidate is
+        // cloned under the lock and tested after the lock is released.
         let accepted: Option<std::collections::HashSet<usize>> = predicate.map(|accepts| {
-            let candidates = self
-                .matcher
-                .lock()
-                .expect("matcher lock poisoned")
-                .signal_candidates(signal_name);
-            candidates
-                .into_iter()
+            (0..)
+                .map_while(|n| {
+                    self.matcher
+                        .lock()
+                        .expect("matcher lock poisoned")
+                        .signal_candidate_nth(signal_name, n)
+                })
                 .find(|(_, payload)| accepts(payload))
                 .map(|(index, _)| index)
                 .into_iter()

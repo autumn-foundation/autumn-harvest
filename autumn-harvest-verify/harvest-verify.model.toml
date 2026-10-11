@@ -1335,7 +1335,7 @@ reason = "durable_promise.rs:321 -> `WorkflowContext::wait_for_signal` (context.
 [[sink]]
 path = "wait_timeout"
 receiver = "DurablePromise"
-reason = "durable_promise.rs:338 -> `WorkflowContext::wait_for_signal_timeout` (context.rs:9552), which arms a timer and races `WaitForSignal` against it (issue #1985)."
+reason = "durable_promise.rs:338 -> `WorkflowContext::wait_for_signal_timeout` (context.rs:9553), which arms a timer and races `WaitForSignal` against it (issue #1985)."
 [[sink]]
 path = "run"
 receiver = "RaceBuilder"
