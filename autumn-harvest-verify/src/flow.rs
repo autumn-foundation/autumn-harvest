@@ -540,6 +540,37 @@ impl AwaitState {
             .is_some_and(|place| self.future.contains(place))
     }
 
+    /// The value that a statement of `block` moves the future into, as
+    /// `Option::Some` or a tuple. `read` follows only a plain move, a copy
+    /// or a borrow, so the future is lost there.
+    fn wrapper(&self, block: &BasicBlock) -> Option<String> {
+        block.statements.iter().find_map(|statement| {
+            let Statement::Assign { dest, rvalue } = statement else {
+                return None;
+            };
+            if rvalue.ref_of.is_some() || rvalue.discriminant_of.is_some() {
+                return None;
+            }
+            let text = rvalue.text.trim_start();
+            let plain = text.starts_with("move ") || text.starts_with("copy ");
+            if plain && dest.projections.is_empty() {
+                return None;
+            }
+            let reads_future = rvalue
+                .reads
+                .iter()
+                .any(|read| self.holds_future(Some(read)));
+            // Generics can hold `()`, so they go before the split.
+            let bare = strip_generics_everywhere(text);
+            let head = bare.split('(').next().unwrap_or_default().trim();
+            reads_future.then(|| match head {
+                "" => "an aggregate".to_string(),
+                _ if plain => "an aggregate".to_string(),
+                head => head.to_string(),
+            })
+        })
+    }
+
     /// Follow the statements of one block.
     fn read(&mut self, block: &BasicBlock) {
         for statement in &block.statements {
@@ -607,6 +638,9 @@ fn future_escape(blocks: &HashMap<&str, &BasicBlock>, block: &BasicBlock) -> Opt
     let mut at: &str = first;
     for _ in 0..MAX_AWAIT_WALK {
         let block = blocks.get(at)?;
+        if let Some(to) = state.wrapper(block) {
+            return Some(to);
+        }
         state.read(block);
         match &block.terminator {
             Terminator::Goto { target } => at = target,

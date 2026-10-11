@@ -743,3 +743,30 @@ pub async fn wf_step_unsafe_cell(ctx: &WorkflowContext) -> Out {
     let seen = std::sync::Arc::get_mut(&mut kept).map_or(0, |slot| *slot.0.get_mut());
     ctx.execute_activity_raw("b", seen).await
 }
+
+/// A future that only a reference to a reference implements. Its `poll`
+/// reads the clock.
+pub struct RefRefClock;
+
+impl Future for &&RefRefClock {
+    type Output = Out;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::task::Poll::Ready(Ok(now_nanos()))
+    }
+}
+
+static REF_REF_CLOCK: &RefRefClock = &RefRefClock;
+
+pub fn __autumn_workflow_info_wf_step_ref_ref_future() -> u8 {
+    0
+}
+
+/// The forward step returns `&&RefRefClock`, a future by its `&&` impl.
+pub async fn wf_step_ref_ref_future(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let a = saga.step(|| &REF_REF_CLOCK, |_| async { Ok(()) }).await?;
+    ctx.execute_activity_raw("b", a).await
+}

@@ -1880,21 +1880,21 @@ impl<'a> Analyzer<'a> {
         // A shared reference is a future only by an `impl Future for &T`.
         // A local impl is not followed, and an untrusted crate has no body.
         // Either way it is a boundary.
-        if let Some(referent) = shared_referent(ty) {
+        if let Some((layers, referent)) = shared_referent(ty) {
             let full = body
                 .locals
                 .get(&Local(0))
                 .and_then(|local| shared_referent(future_target(local)))
-                .unwrap_or_else(|| referent.clone());
+                .map_or_else(|| referent.clone(), |(_, full)| full);
             if let Some(root) = crate_root(&full)
                 && !self.is_trusted_root(root)
                 && !self.program.is_first_party_type(&full)
             {
-                let detail = format!("<&{full} as std::future::Future>::poll");
+                let detail = format!("<{layers}{full} as std::future::Future>::poll");
                 return Err((BoundaryKind::ExternalCrateBody, detail));
             }
             let name = last_segment(&referent);
-            if self.program.sources_impl_future(&format!("&{name}")) {
+            if self.program.sources_impl_future(&format!("{layers}{name}")) {
                 let detail = format!("<{ty} as std::future::Future>::poll");
                 return Err((BoundaryKind::UnresolvedCallback, detail));
             }
@@ -3127,15 +3127,27 @@ fn source_hint(path: &str) -> Option<String> {
     (!head.is_empty()).then(|| head.to_string())
 }
 
-/// The referent of a shared reference type, as `dep::Tick` for
-/// `&'a dep::Tick<u8>`, with no lifetime and no generics.
-fn shared_referent(ty: &str) -> Option<String> {
-    let referent = ty.trim().strip_prefix('&')?.trim_start();
-    // `&'a T` names its lifetime first.
-    let referent = referent.strip_prefix('\'').map_or(referent, |rest| {
-        rest.split_once(' ').map_or("", |(_, ty)| ty)
-    });
-    Some(strip_generics_everywhere(referent.trim()))
+/// The shared reference layers of a type and its referent, as `&&` and
+/// `dep::Tick` for `&'a &dep::Tick<u8>`. No lifetime and no generics stay.
+fn shared_referent(ty: &str) -> Option<(String, String)> {
+    let mut layers = String::new();
+    let mut referent = ty.trim();
+    while let Some(rest) = referent.strip_prefix('&') {
+        let rest = rest.trim_start();
+        // `&'a T` names its lifetime first.
+        let rest = rest
+            .strip_prefix('\'')
+            .map_or(rest, |r| r.split_once(' ').map_or("", |(_, ty)| ty));
+        if rest.starts_with("mut ") {
+            break;
+        }
+        layers.push('&');
+        referent = rest.trim_start();
+    }
+    if layers.is_empty() {
+        return None;
+    }
+    Some((layers, strip_generics_everywhere(referent.trim())))
 }
 
 /// Does `span` end in a source span, as `{async block@a.rs:5:6: 5:9}` does?
@@ -3176,6 +3188,15 @@ mod tests {
             "ClockFuture"
         );
         assert_eq!(future_target("Result<u64, String>"), "Result<u64, String>");
+    }
+
+    #[test]
+    fn a_shared_reference_keeps_each_layer() {
+        let pair = |l: &str, r: &str| Some((l.to_string(), r.to_string()));
+        assert_eq!(shared_referent("&dep::Tick<u8>"), pair("&", "dep::Tick"));
+        assert_eq!(shared_referent("&'a &Tick"), pair("&&", "Tick"));
+        assert_eq!(shared_referent("& &'static Tick"), pair("&&", "Tick"));
+        assert_eq!(shared_referent("Tick"), None);
     }
 
     #[test]

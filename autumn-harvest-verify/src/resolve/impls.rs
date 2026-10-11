@@ -592,10 +592,15 @@ fn future_self_type(item: &syn::ItemImpl) -> Option<String> {
     if trait_path.segments.last()?.ident != "Future" {
         return None;
     }
-    let (prefix, self_ty) = match item.self_ty.as_ref() {
-        syn::Type::Reference(r) if r.mutability.is_none() => ("&", r.elem.as_ref()),
-        other => ("", other),
-    };
+    // Each shared reference layer stays, as `&&T` for `&&T`.
+    let mut prefix = String::new();
+    let mut self_ty = item.self_ty.as_ref();
+    while let syn::Type::Reference(r) = self_ty
+        && r.mutability.is_none()
+    {
+        prefix.push('&');
+        self_ty = r.elem.as_ref();
+    }
     let syn::Type::Path(self_ty) = self_ty else {
         return None;
     };
@@ -1056,6 +1061,18 @@ mod tests {
             !names("Plain").is_some_and(|n| n.contains("Mutex")),
             "{index:?}"
         );
+    }
+
+    #[test]
+    fn a_future_impl_for_a_reference_keeps_each_layer() {
+        let mut index = SourceIndex::default();
+        index.absorb_syn(
+            "impl Future for &Tick {}\nimpl Future for &&Tock {}\nimpl Future for Tuck {}\n",
+            &[],
+        );
+        for name in ["&Tick", "&&Tock", "Tuck"] {
+            assert!(index.future_impls.contains(name), "{name}: {index:?}");
+        }
     }
 
     #[test]

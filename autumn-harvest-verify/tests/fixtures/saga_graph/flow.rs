@@ -628,3 +628,24 @@ pub async fn wf_unwind_boxed(ctx: &WorkflowContext) -> Out {
     }
     Ok(a)
 }
+
+pub fn __autumn_workflow_info_wf_unwind_wrapped() -> u8 {
+    0
+}
+
+/// The unwind future is moved into an `Option` first. The walk does not
+/// follow that aggregate, so the unwind is unproven, not dropped.
+pub async fn wf_unwind_wrapped(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let a = saga
+        .step(
+            || async { ctx.execute_activity_raw("reserve", 1).await },
+            |a| async move { ctx.execute_activity_raw("release", a).await.map(|_| ()) },
+        )
+        .await?;
+    if a > 10 {
+        Some(saga.compensate_all()).unwrap().await?;
+        return Err("too big".to_string());
+    }
+    Ok(a)
+}

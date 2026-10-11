@@ -178,13 +178,15 @@ Four review agents read the first version. Each fix has a test.
     captures, and they can write. So a block that captures one is a boundary. A read of a field
     of the closure self, as `(_1.0: u64)`, takes the field type instead.
 32. A shared reference `&T` is a future only by a local `impl Future for
-    &T`. The follow does not read that `poll`, so such a return is an
+    &T`. The index keeps each layer, so `&&T` matches only `impl Future for
+    &&T`. The follow does not read that `poll`, so such a return is an
     `unresolved-callback` boundary. A referent of an untrusted crate is an
     `external-crate-body` boundary.
 33. The check counts `compensate_all` only when the body awaits it in the
     `.await` shape. A future passed to another call, as `Box::pin`, can still
     run the unwind. That call is a `saga-escape`, so the verdict is
-    `unknown`. A dropped future does not unwind, so it is still a gap.
+    `unknown`. A future moved into an aggregate, as `Some(..)`, is an escape
+    too. A dropped future does not unwind, so it is still a gap.
 
 ---
 
