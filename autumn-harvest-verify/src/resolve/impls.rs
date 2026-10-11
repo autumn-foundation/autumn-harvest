@@ -43,7 +43,8 @@ pub struct SourceIndex {
     /// by its module path and name, such as `helpers::Clock`.
     ///
     /// The module path comes from the file path and any inline `mod` around
-    /// the item. It can be longer than the path MIR prints, never shorter.
+    /// the item. It is the full path from the target root, as MIR prints a
+    /// local type that it does not trim to its bare name.
     pub type_paths: BTreeSet<String>,
     /// Source file → why it could not be indexed.
     ///
@@ -233,25 +234,47 @@ fn generic_names(generics: &syn::Generics) -> Vec<String> {
 /// Every `.rs` file directly under `dir` (relative to whichever root holds it).
 /// The module path a source file stands for, from its path.
 ///
-/// `src/a/b.rs` and `src/a/b/mod.rs` give `a::b`. A crate root, `lib.rs` or
-/// `main.rs`, gives no segment. A file outside `src/` keeps its whole path,
-/// which is longer than MIR prints, so a suffix match still holds.
+/// `src/a/b.rs` and `src/a/b/mod.rs` give `a::b`. A target root, such as
+/// `src/lib.rs`, `src/bin/x.rs` or `examples/x.rs`, gives no segment. A file
+/// in another layout reads as a target root. A type of a submodule there
+/// then reads as foreign, which can only add a boundary.
 fn file_module(file: &str) -> Vec<String> {
-    let mut parts: Vec<&str> = file.trim_end_matches(".rs").split('/').collect();
-    if let Some(at) = parts.iter().rposition(|p| *p == "src") {
-        parts.drain(..=at);
-    }
-    if parts
-        .last()
-        .is_some_and(|p| matches!(*p, "mod" | "lib" | "main"))
-    {
-        parts.pop();
-    }
-    parts
-        .into_iter()
+    let parts: Vec<&str> = file
+        .trim_end_matches(".rs")
+        .split('/')
         .filter(|p| !p.is_empty())
-        .map(str::to_string)
-        .collect()
+        .collect();
+    let mut module: Vec<String> = layout_module(&parts)
+        .iter()
+        .map(|p| (*p).to_string())
+        .collect();
+    if module
+        .last()
+        .is_some_and(|p| matches!(p.as_str(), "mod" | "lib" | "main"))
+    {
+        module.pop();
+    }
+    module
+}
+
+/// The parts of a source path below its target root.
+fn layout_module<'p>(parts: &'p [&'p str]) -> &'p [&'p str] {
+    // `x.rs` and `x/main.rs` are the root of target `x`. `x/y.rs` is `y`.
+    let below_target = |rest: &'p [&'p str]| rest.get(1..).unwrap_or_default();
+    if let Some(at) = parts.iter().rposition(|p| *p == "src") {
+        let rest = parts.get(at.saturating_add(1)..).unwrap_or_default();
+        if rest.first() == Some(&"bin") {
+            return below_target(rest.get(1..).unwrap_or_default());
+        }
+        return rest;
+    }
+    if let Some(at) = parts
+        .iter()
+        .rposition(|p| matches!(*p, "examples" | "tests" | "benches"))
+    {
+        return below_target(parts.get(at.saturating_add(1)..).unwrap_or_default());
+    }
+    &[]
 }
 
 fn siblings(roots: &[PathBuf], dir: &Path) -> Vec<String> {
@@ -389,10 +412,19 @@ mod tests {
 
     #[test]
     fn a_file_path_gives_its_module_path() {
-        assert_eq!(super::file_module("src/lib.rs"), Vec::<String>::new());
+        let none = Vec::<String>::new();
+        assert_eq!(super::file_module("src/lib.rs"), none);
         assert_eq!(super::file_module("src/a/b.rs"), ["a", "b"]);
         assert_eq!(super::file_module("crates/x/src/a/mod.rs"), ["a"]);
-        assert_eq!(super::file_module("flow.rs"), ["flow"]);
+        assert_eq!(super::file_module("src/bin/tool.rs"), none);
+        assert_eq!(super::file_module("src/bin/tool/main.rs"), none);
+        assert_eq!(super::file_module("src/bin/tool/cli.rs"), ["cli"]);
+        assert_eq!(
+            super::file_module("autumn-harvest/examples/ctx_info.rs"),
+            none
+        );
+        assert_eq!(super::file_module("examples/demo/flows.rs"), ["flows"]);
+        assert_eq!(super::file_module("flow.rs"), none);
     }
 
     use super::*;

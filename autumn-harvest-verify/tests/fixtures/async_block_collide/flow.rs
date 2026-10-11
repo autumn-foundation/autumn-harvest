@@ -38,6 +38,27 @@ impl std::future::Future for ClockFuture {
     }
 }
 
+/// A nested local module whose path ends like the dependency type path.
+pub mod outer {
+    pub mod helpers {
+        /// Its `poll` reads no clock either.
+        pub struct ClockFuture {
+            pub n: u64,
+        }
+
+        impl std::future::Future for ClockFuture {
+            type Output = Result<u64, String>;
+
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                std::task::Poll::Ready(Ok(self.n))
+            }
+        }
+    }
+}
+
 pub fn __autumn_workflow_info_wf_colliding_crate() -> u8 {
     0
 }

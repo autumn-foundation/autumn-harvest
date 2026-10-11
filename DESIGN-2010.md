@@ -115,8 +115,9 @@ Four review agents read the first version. Each fix has a test.
     list. Such a manifest is now refused.
 16. MIR prints a dependency type as `helpers::Clock`, the same as a type of
     a local `helpers` module. A local module name is no proof alone. The
-    sources must declare that type in that module: the printed path must be
-    a suffix of a declared module path and name.
+    sources must declare exactly that path. rustc prints a local type by its
+    bare name or its full path, never by a part. The module path comes from
+    the file layout and any inline `mod`.
 17. A `step` node could name an index past the body `steps` list. Such a
     manifest is now refused.
 
