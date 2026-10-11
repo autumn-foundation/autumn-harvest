@@ -208,7 +208,8 @@ each fix has a test:
   saga inside a generic helper, but it does not specialize the helper per
   caller.
 - The graph finds the saga by its type: a local whose type starts at
-  `autumn_harvest::` and ends in `::Saga`. A method counts as a saga
+  `autumn_harvest::` and ends in `::Saga`. MIR prints that defining crate
+  even through a crate rename or a facade re-export. A method counts as a saga
   operation only when its path is the engine `Saga` and it has no body
   here. The graph does not see a saga in an `Option` or a struct field.
 - A body in a crate outside the analysis is a boundary. A saga passed into
@@ -290,9 +291,10 @@ crate its own `--target-dir`, and delete it after the run.
 | Every fixture case gets its verdict | `saga_graph::every_fixture_workflow_gets_its_expected_verdict` |
 | A back edge carries a pending step to an exit | `saga::tests::a_gap_reached_only_through_a_back_edge_is_found` |
 | The `async` block follow never gives a false proof | `async_block_follow::a_case_the_analysis_cannot_follow_is_never_proven` |
-| A future of an untrusted crate is a boundary | `async_block_follow::a_future_of_an_untrusted_crate_is_a_boundary` |
+| A future of an untrusted crate is a boundary | `async_block_follow::a_future_of_an_untrusted_crate_is_a_boundary`; `async_block_follow::an_erased_future_of_an_untrusted_crate_is_a_boundary` |
 | The check refuses a malformed or disconnected graph | `saga::tests::a_malformed_graph_is_refused` |
 | A local type named `Saga` is not the engine saga | `saga_graph::a_local_type_named_saga_is_not_the_engine_saga` |
+| A renamed or re-exported engine saga is still seen | `saga_graph::a_renamed_or_re_exported_engine_saga_is_still_seen` |
 | The check refuses a reference to a missing body | `saga::tests::a_reference_to_a_missing_body_is_refused` |
 | A boundary that runs code is `unknown` beside a saga | `saga::tests::a_boundary_that_runs_code_is_unknown_beside_a_visible_saga` |
 | The check refuses an old manifest | `saga_graph::a_manifest_without_flow_graphs_is_refused`; `cli::check_structure_refuses_a_manifest_without_flow_graphs` |

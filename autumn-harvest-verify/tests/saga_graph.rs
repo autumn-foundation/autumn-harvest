@@ -598,6 +598,26 @@ fn a_local_type_named_saga_is_not_the_engine_saga() {
 }
 
 #[test]
+fn a_renamed_or_re_exported_engine_saga_is_still_seen() {
+    // MIR prints the defining crate, `autumn_harvest::Saga`, whatever name
+    // the source uses. A crate rename or a facade must not hide a gap.
+    let dir = fixture_dir().with_file_name("saga_graph_renamed");
+    let text = std::fs::read_to_string(dir.join("flow.mir")).expect("read");
+    assert!(!text.contains("ah::Saga") && !text.contains("facade::Saga"));
+    let docs = vec![mir::parse("flow", "flow.mir", &text)];
+    let entries = entry::discover(&docs);
+    let program = Program::build(docs, &SourceRoots { roots: vec![dir] }).expect("build");
+    let model = Model::builtin().expect("the embedded model must parse");
+    let outcome = analysis::analyze_full(&program, &model, &entries);
+    let m = structure::manifest(&model.version, "rustc test", outcome.structures);
+    let reports = saga::check(&m).expect("check");
+    for name in ["wf_renamed_crate", "wf_facade_crate"] {
+        let r = report(&reports, name);
+        assert_eq!(r.verdict, SagaVerdict::Gap, "{name}: {r:#?}");
+    }
+}
+
+#[test]
 fn a_unit_result_is_an_ok_exit() {
     let reports = check();
     let r = report(&reports, "wf_unit");

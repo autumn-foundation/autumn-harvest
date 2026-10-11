@@ -74,6 +74,7 @@ fn a_case_the_analysis_cannot_follow_is_never_proven() {
         "wf_step_boxed_dyn",
         "wf_step_wrapped_block",
         "wf_step_external_future",
+        "wf_step_boxed_external",
     ] {
         assert!(
             !matches!(verdict(&all, name), Verdict::ProvenDeterministic),
@@ -113,6 +114,32 @@ fn a_future_of_an_untrusted_crate_is_a_boundary() {
             .iter()
             .any(|b| b.kind.name() == "external-crate-body"
                 && b.detail.contains("other_crate::ClockFuture")),
+        "{boundaries:?}"
+    );
+}
+
+#[test]
+fn an_erased_future_of_an_untrusted_crate_is_a_boundary() {
+    // `Box::pin(other_crate::ClockFuture)` coerces to `dyn Future`. The
+    // untrusted constant is a boundary at `Box::pin`. The erased `poll` is
+    // a boundary of its own, so the case holds if either one goes.
+    let all = verdicts();
+    let Verdict::Unknown { boundaries } = verdict(&all, "wf_step_boxed_external") else {
+        panic!(
+            "the erased `poll` has no body here: {:?}",
+            verdict(&all, "wf_step_boxed_external")
+        );
+    };
+    assert!(
+        boundaries
+            .iter()
+            .any(|b| b.detail.contains("other_crate::ClockFuture")),
+        "{boundaries:?}"
+    );
+    assert!(
+        boundaries
+            .iter()
+            .any(|b| b.kind.name() == "dyn-dispatch" && b.detail.contains("dyn Future")),
         "{boundaries:?}"
     );
 }

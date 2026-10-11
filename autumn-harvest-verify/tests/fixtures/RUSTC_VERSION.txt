@@ -171,3 +171,17 @@ cargo 1.94.1 (29ea6fb6a 2026-03-24)
 # verdict, and it is outside the scope of issue #2010. The type has a field
 # for a like reason: MIR prints a unit struct value as `const own::Saga`, and
 # the structure digest reads that as an `external-const` boundary.
+
+# `saga_graph_renamed/flow.mir` (issue #2010) reaches the engine through a
+# renamed crate and through a facade crate. MIR prints the defining crate,
+# `autumn_harvest::Saga`, for both. From `saga_graph_renamed/`:
+#
+#   rustc --crate-type lib --edition 2024 --crate-name autumn_harvest \
+#         -o libautumn_harvest.rlib ../saga_graph/harvest_stub.rs
+#   rustc --crate-type lib --edition 2024 --crate-name facade \
+#         --extern autumn_harvest=libautumn_harvest.rlib \
+#         -o libfacade.rlib facade.rs
+#   rustc --crate-type lib --edition 2024 --emit=mir \
+#         --extern ah=libautumn_harvest.rlib \
+#         --extern facade=libfacade.rlib -L . -o flow.mir flow.rs
+#   rm libautumn_harvest.rlib libfacade.rlib

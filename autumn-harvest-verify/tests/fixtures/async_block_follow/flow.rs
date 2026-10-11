@@ -379,3 +379,19 @@ pub async fn wf_step_external_future(ctx: &WorkflowContext) -> Out {
         .await?;
     ctx.execute_activity_raw("b", a).await
 }
+
+pub fn __autumn_workflow_info_wf_step_boxed_external() -> u8 {
+    0
+}
+
+/// The step closure erases an untrusted unit future behind `dyn Future`.
+pub async fn wf_step_boxed_external(ctx: &WorkflowContext) -> Out {
+    let mut saga = Saga::new(ctx);
+    let a = saga
+        .step(
+            || -> BoxedOut<'_> { Box::pin(other_crate::ClockFuture) },
+            |_| async { Ok(()) },
+        )
+        .await?;
+    ctx.execute_activity_raw("b", a).await
+}
