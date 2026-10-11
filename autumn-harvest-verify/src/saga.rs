@@ -177,6 +177,15 @@ fn validate(graph: &FlowGraph) -> Result<(), String> {
             }
         }
     }
+    // An exit returns, so nothing runs after it.
+    if let Some(edge) = graph.edges.iter().find(|e| {
+        graph
+            .nodes
+            .get(e.from)
+            .is_some_and(|n| matches!(n.event, FlowEvent::Exit { .. }))
+    }) {
+        return Err(format!("the exit at node {} has an out-edge", edge.from));
+    }
     // The fixpoint starts at the entry. A node it cannot reach is never
     // checked, so a saga or a gap there would be silent.
     let entry = graph
@@ -599,6 +608,20 @@ mod tests {
         };
         let err = check(&manifest(disconnected)).expect_err("unreachable nodes");
         assert!(err.to_string().contains("reach"), "{err}");
+
+        // Nodes after a return never run, so a gap there would be hidden.
+        let past_exit = FlowGraph {
+            nodes: vec![
+                node(FlowEvent::Entry),
+                node(FlowEvent::Exit {
+                    outcome: ExitOutcome::Ok,
+                }),
+                node(FlowEvent::SagaNew),
+            ],
+            edges: vec![edge(0, 1, None), edge(1, 2, None)],
+        };
+        let err = check(&manifest(past_exit)).expect_err("an edge out of an exit");
+        assert!(err.to_string().contains("exit"), "{err}");
     }
 
     #[test]

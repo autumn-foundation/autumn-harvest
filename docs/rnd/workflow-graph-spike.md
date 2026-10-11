@@ -200,7 +200,8 @@ each fix has a test:
   analysis can hold a second saga with a gap. Each boundary that runs code
   now gives `unknown`.
 - The check accepted a call to a body that the manifest omits. It now
-  refuses such a manifest, and a handler index past the list too.
+  refuses such a manifest, a handler index past the list, and an edge out
+  of an exit.
 - The follow read only `{async block@..}`. An `async` closure step, whose
   future is `{async closure body@..}`, was a false `proven-deterministic`.
   It is now followed.
