@@ -1344,17 +1344,23 @@ fn hashed_mir_candidates(path: &Path) -> Vec<PathBuf> {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return Vec::new();
     };
-    let base = name.split('.').next().unwrap_or(name);
-    let base = base.strip_prefix("lib").unwrap_or(base);
-    if base.is_empty() {
-        return Vec::new();
-    }
     // A bin is uplifted from `deps/`, and rustc spells its crate name with
     // `_` where the bin name has `-` (issue #2010). A library is never
     // searched there, because its `.rmeta` already names the hash.
     let bin = path
         .extension()
         .is_none_or(|e| e.eq_ignore_ascii_case("exe"));
+    let base = name.split('.').next().unwrap_or(name);
+    // Only a library file gets the `lib` prefix. A bin such as `libworker`
+    // keeps it in its `.mir` name.
+    let base = if bin {
+        base
+    } else {
+        base.strip_prefix("lib").unwrap_or(base)
+    };
+    if base.is_empty() {
+        return Vec::new();
+    }
     let crate_base = base.replace('-', "_");
     let mut dirs = vec![dir.to_path_buf()];
     if bin {
@@ -2154,6 +2160,24 @@ mod tests {
         assert_eq!(
             mir_for_artifact(std::slice::from_ref(&uplifted)).expect("identity is unambiguous"),
             Some(deps.join("standalone_runner-1fe9236c6b192898.mir"))
+        );
+    }
+
+    #[test]
+    fn a_copied_bin_named_lib_keeps_its_prefix() {
+        // A bin named `libworker` is not a library. Its `.mir` keeps the
+        // `lib` prefix.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = dir.path().join("debug");
+        let deps = profile.join("deps");
+        std::fs::create_dir_all(&deps).expect("mkdir");
+        std::fs::write(deps.join("libworker-1fe9236c6b192898.mir"), "// mir").expect("write");
+        let uplifted = profile.join("libworker");
+        std::fs::write(&uplifted, "ELF").expect("a copy, not a link");
+
+        assert_eq!(
+            mir_for_artifact(&[uplifted]).expect("one candidate"),
+            Some(deps.join("libworker-1fe9236c6b192898.mir"))
         );
     }
 
