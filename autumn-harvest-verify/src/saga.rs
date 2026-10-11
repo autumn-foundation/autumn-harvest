@@ -250,7 +250,8 @@ fn entry_bodies(workflow: &WorkflowStructure) -> BTreeSet<&str> {
 /// The bodies that an ordinary call runs as a helper.
 ///
 /// Two edges start no helper run. A handler body builds the coroutine it
-/// returns, and the engine runs that coroutine as an entry. A registration
+/// returns, and the engine runs that coroutine as an entry. A helper run of
+/// that body is the exception. A registration
 /// passes a handler body as an argument, which shows only in `calls`.
 fn helper_calls(workflow: &WorkflowStructure) -> BTreeSet<&str> {
     let mut helpers = BTreeSet::new();
@@ -286,7 +287,22 @@ fn helper_calls(workflow: &WorkflowStructure) -> BTreeSet<&str> {
         let nodes = callees.into_iter().map(String::as_str);
         helpers.extend(nodes.chain(calls).filter(|c| !returned.contains(c)));
     }
-    helpers
+    // A helper run of a handler body hands its future to the caller, which
+    // awaits it as a helper too. That await shows only as a resume edge.
+    loop {
+        let more: Vec<&str> = workflow
+            .handlers
+            .iter()
+            .filter(|h| h.bodies.iter().any(|b| helpers.contains(b.as_str())))
+            .flat_map(|h| &h.returns)
+            .map(String::as_str)
+            .filter(|f| !helpers.contains(f))
+            .collect();
+        if more.is_empty() {
+            return helpers;
+        }
+        helpers.extend(more);
+    }
 }
 
 /// Refuse a graph the fixpoint would read wrong. A dropped edge or a
@@ -1083,6 +1099,84 @@ mod tests {
         let r = check_workflow(&w);
         assert_eq!(r.verdict, SagaVerdict::Gap, "{r:#?}");
         assert!(r.gaps.iter().any(|g| g.body == future), "{r:#?}");
+    }
+
+    #[test]
+    fn the_future_of_a_handler_body_that_a_helper_call_runs_is_a_helper() {
+        // The root registers `h` and also calls it. `h` returns the future
+        // `f`, and the root awaits it. Only a resume edge reaches `f`.
+        let h = "w::wf::{closure#0}::{closure#0}";
+        let f = "w::wf::{closure#0}::{closure#0}::{closure#0}";
+        let root = FlowGraph {
+            nodes: vec![
+                node(FlowEvent::Entry),
+                node(FlowEvent::Handler { handler: 0 }),
+                node(FlowEvent::Call {
+                    callees: vec![h.to_string()],
+                }),
+            ],
+            edges: vec![edge(0, 1, None), edge(1, 2, None)],
+        };
+        let future = FlowGraph {
+            nodes: vec![
+                node(FlowEvent::Entry),
+                node(FlowEvent::SagaNew),
+                node(step()),
+                node(FlowEvent::Exit {
+                    outcome: ExitOutcome::Ok,
+                }),
+                node(FlowEvent::Exit {
+                    outcome: ExitOutcome::Err,
+                }),
+            ],
+            edges: vec![
+                edge(0, 1, None),
+                edge(1, 2, None),
+                edge(2, 3, Some(EdgeLabel::Ok)),
+                edge(2, 4, Some(EdgeLabel::Err)),
+            ],
+        };
+        let mut w = workflow(root);
+        w.handlers.push(HandlerSite {
+            kind: "update".to_string(),
+            method: "register_update_handler".to_string(),
+            name: None,
+            bodies: vec![h.to_string()],
+            returns: vec![f.to_string()],
+        });
+        if let Some(root) = w.bodies.first_mut() {
+            root.calls.push(CallSite {
+                callee: f.to_string(),
+                in_loop: false,
+                resume: true,
+            });
+        }
+        w.bodies.push(BodyNode {
+            id: h.to_string(),
+            calls: vec![CallSite {
+                callee: f.to_string(),
+                in_loop: false,
+                resume: false,
+            }],
+            flow: Some(FlowGraph {
+                nodes: vec![
+                    node(FlowEvent::Entry),
+                    node(FlowEvent::Call {
+                        callees: vec![f.to_string()],
+                    }),
+                ],
+                edges: vec![edge(0, 1, None)],
+            }),
+            ..BodyNode::default()
+        });
+        w.bodies.push(BodyNode {
+            id: f.to_string(),
+            flow: Some(future),
+            ..BodyNode::default()
+        });
+        let r = check_workflow(&w);
+        assert_eq!(r.verdict, SagaVerdict::Unknown, "{r:#?}");
+        assert!(r.unknown.iter().any(|u| u.contains(f)), "{r:#?}");
     }
 
     #[test]

@@ -151,7 +151,8 @@ Four review agents read the first version. Each fix has a test.
     bodies of one id are refused too, as a reference to them is ambiguous.
 26. A handler body can also be the callee of an ordinary call. Such a body
     is checked as an entry and as a helper, so a pending `Ok` exit is
-    `saga-dropped-pending`.
+    `saga-dropped-pending`. The future such a helper run returns is a
+    helper too.
 
 ---
 
