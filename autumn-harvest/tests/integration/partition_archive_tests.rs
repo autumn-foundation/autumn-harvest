@@ -323,10 +323,11 @@ impl PartitionArchiver for TestArchiver {
         } else {
             None
         };
-        let mut got = self.objects.lock().unwrap().get(key).cloned();
-        if self.lose_on_get {
-            got = None;
-        }
+        let mut got = if self.lose_on_get {
+            None
+        } else {
+            self.objects.lock().unwrap().get(key).cloned()
+        };
         if self.corrupt_on_get
             && let Some(bytes) = got.as_mut()
             && let Some(first) = bytes.first_mut()
@@ -428,7 +429,8 @@ async fn an_aged_partition_is_exported_verified_then_dropped_and_reads_back() {
 
     // Copy the objects into a directory backend to read back through it.
     let disk = DirectoryPartitionArchiver::new(dir.path());
-    for (k, v) in backend.objects.lock().unwrap().clone() {
+    let objects = backend.objects.lock().unwrap().clone();
+    for (k, v) in objects {
         disk.put(&k, v).await.unwrap();
     }
     let archived = partition_archive::read_back(&disk, &key)

@@ -81,10 +81,12 @@ pub const FORMAT_VERSION: u32 = 1;
 pub const KEY_ROOT: &str = "harvest-partitions";
 
 /// A segment closes when it holds this many rows.
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
 pub(crate) const SEGMENT_MAX_ROWS: usize = 10_000;
 
 /// A segment closes before a row that would take it past this many bytes.
 /// A single larger row gets a segment of its own.
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
 pub(crate) const SEGMENT_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// The key prefix of one partition export.
@@ -299,7 +301,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// One archived `harvest_events` row.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchivedEventRow {
     /// The row id.
     pub id: i64,
@@ -931,8 +933,10 @@ pub(crate) async fn reusable_export(
     upper: DateTime<Utc>,
     progress: Option<&mut (dyn FnMut() + Send)>,
 ) -> Option<PartitionManifest> {
+    // `read_back_inner` checks that the manifest names this key, so a match
+    // is this shard, this partition and these bounds.
     let prefix = archive_prefix(export.shard_id, &part.name, part.lower, upper);
-    let back = read_back_inner(
+    read_back_inner(
         export.archiver.as_ref(),
         &manifest_key(&prefix),
         Some(export.io_timeout),
@@ -940,13 +944,8 @@ pub(crate) async fn reusable_export(
         progress,
     )
     .await
-    .ok()?;
-    let m = back.manifest;
-    (m.shard_id == export.shard_id
-        && m.partition == part.name
-        && m.lower == part.lower
-        && m.upper == upper)
-        .then_some(m)
+    .ok()
+    .map(|back| back.manifest)
 }
 
 /// Export partition `part`, then read the export back and check it.

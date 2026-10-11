@@ -5180,12 +5180,13 @@ mod tests {
     fn a_partition_archiver_with_straggler_deletes_fails_the_build() {
         let mut retention = RetentionConfig::with_max_age(std::time::Duration::from_secs(3600));
         retention.partitions.straggler_grace_secs = Some(3600);
-        let err = HarvestBuilder::new()
+        let Err(err) = HarvestBuilder::new()
             .retention(retention.clone())
             .partition_archiver(NullPartitionArchiver)
             .try_build()
-            .err()
-            .expect("the build must refuse the pair");
+        else {
+            panic!("the build must refuse the pair");
+        };
         assert!(
             matches!(&err, HarvestBuilderError::InvalidRetention(m) if m.contains("straggler_grace_secs")),
             "{err:?}"

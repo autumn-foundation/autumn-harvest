@@ -4159,7 +4159,7 @@ pub async fn sweep_exporting(
 /// (issue #2009). It also turns off the straggler `DELETE`, because no export
 /// holds the rows that delete removes.
 #[cfg(feature = "db")]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn sweep_inner(
     conn: &mut AsyncPgConnection,
     now: DateTime<Utc>,
@@ -4310,78 +4310,32 @@ async fn sweep_inner(
                 }
                 continue;
             };
-            // Issue #2009: export, read back and check before the drop. An
-            // earlier export that still reads back clean is used again. A
-            // failure keeps the partition and retries next pass.
-            let mut fresh = false;
-            let mut manifest = crate::partition_archive::reusable_export(
+            // Issue #2009: export, read back and check before the drop.
+            let step = export_and_drop(
+                conn,
                 export,
                 &part,
                 upper,
+                opts,
+                &mut exports,
                 reborrow_progress(&mut progress),
             )
-            .await;
-            if manifest.is_none() {
-                if exports >= export.max_exports_per_pass {
+            .await?;
+            match step {
+                ExportStep::Budget => {
                     // Not attempted after all, so the next pass resumes here.
                     last_attempted = prev_attempted;
                     outcome.truncated = true;
                     reached_end = false;
                     break;
                 }
-                exports += 1;
-                fresh = true;
-                match crate::partition_archive::export_partition(
-                    conn,
-                    export,
-                    &part,
-                    upper,
-                    reborrow_progress(&mut progress),
-                )
-                .await
-                {
-                    Ok(m) => manifest = Some(m),
-                    Err(cause) => {
-                        outcome
-                            .blocked
-                            .push(format!("{} ({EXPORT_FAILED_REASON}: {cause})", part.name));
-                        continue;
-                    }
+                ExportStep::Dropped(key) => {
+                    outcome.exported.push(key);
+                    outcome.dropped.push(part.name);
                 }
-            }
-            let mut result = drop_partition(conn, &part, upper, opts, manifest.as_ref()).await?;
-            // A reused export can be stale. Export once more in the same pass,
-            // so a stale export cannot block the partition forever.
-            if result == DropOutcome::Changed && !fresh && exports < export.max_exports_per_pass {
-                exports += 1;
-                match crate::partition_archive::export_partition(
-                    conn,
-                    export,
-                    &part,
-                    upper,
-                    reborrow_progress(&mut progress),
-                )
-                .await
-                {
-                    Ok(m) => {
-                        result = drop_partition(conn, &part, upper, opts, Some(&m)).await?;
-                        manifest = Some(m);
-                    }
-                    Err(cause) => {
-                        outcome
-                            .blocked
-                            .push(format!("{} ({EXPORT_FAILED_REASON}: {cause})", part.name));
-                        continue;
-                    }
+                ExportStep::Blocked(reason) => {
+                    outcome.blocked.push(format!("{} ({reason})", part.name));
                 }
-            }
-            if result == DropOutcome::Dropped {
-                outcome.exported.extend(manifest.map(|m| m.key()));
-                outcome.dropped.push(part.name);
-            } else {
-                outcome
-                    .blocked
-                    .push(format!("{} ({})", part.name, result.reason()));
             }
         }
         Ok(())
@@ -4412,6 +4366,68 @@ async fn sweep_inner(
     outcome.next_resume = if caught_up { None } else { last_attempted };
     outcome.catch_up_target = if caught_up { None } else { Some(target) };
     Ok(outcome)
+}
+
+/// What [`export_and_drop`] did with one partition.
+#[cfg(feature = "db")]
+enum ExportStep {
+    /// The pass has no export budget left. Nothing was tried.
+    Budget,
+    /// The partition is gone. Its export is at this manifest key.
+    Dropped(String),
+    /// The partition stays, for this reason.
+    Blocked(String),
+}
+
+/// Export partition `part`, or reuse an earlier export, then drop it
+/// (issue #2009).
+///
+/// An earlier export that still reads back clean is used again. A failed
+/// drop leaves its export in place for the next pass. A reused export that
+/// is stale gets one new export in the same pass, so it cannot block the
+/// partition forever. `exports` counts the new exports of this pass.
+#[cfg(feature = "db")]
+async fn export_and_drop(
+    conn: &mut AsyncPgConnection,
+    export: &crate::partition_archive::PartitionExport,
+    part: &PartitionInfo,
+    upper: DateTime<Utc>,
+    opts: &SweepOptions,
+    exports: &mut usize,
+    mut progress: Option<&mut (dyn FnMut() + Send)>,
+) -> HarvestResult<ExportStep> {
+    use crate::partition_archive::{export_partition, reusable_export};
+    let failed = |cause: String| ExportStep::Blocked(format!("{EXPORT_FAILED_REASON}: {cause}"));
+    let reused = reusable_export(export, part, upper, reborrow_progress(&mut progress)).await;
+    let fresh = reused.is_none();
+    let manifest = match reused {
+        Some(m) => m,
+        None if *exports >= export.max_exports_per_pass => return Ok(ExportStep::Budget),
+        None => {
+            *exports += 1;
+            match export_partition(conn, export, part, upper, reborrow_progress(&mut progress))
+                .await
+            {
+                Ok(m) => m,
+                Err(cause) => return Ok(failed(cause)),
+            }
+        }
+    };
+    let mut manifest = manifest;
+    let mut result = drop_partition(conn, part, upper, opts, Some(&manifest)).await?;
+    if result == DropOutcome::Changed && !fresh && *exports < export.max_exports_per_pass {
+        *exports += 1;
+        manifest = match export_partition(conn, export, part, upper, progress).await {
+            Ok(m) => m,
+            Err(cause) => return Ok(failed(cause)),
+        };
+        result = drop_partition(conn, part, upper, opts, Some(&manifest)).await?;
+    }
+    Ok(if result == DropOutcome::Dropped {
+        ExportStep::Dropped(manifest.key())
+    } else {
+        ExportStep::Blocked(result.reason().to_string())
+    })
 }
 
 /// Where an occupancy proof looks for events.
