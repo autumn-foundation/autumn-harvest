@@ -350,6 +350,7 @@ fn plan_suspension(commands: &[WorkflowCommand]) -> Option<(usize, Vec<OwnEvent>
             WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. } => false,
             _ => return None,
         };
@@ -629,6 +630,9 @@ mod tests {
             }
             WorkflowCommand::PublishProgress { seq, chunk } => {
                 format!("PublishProgress({seq}, {chunk})")
+            }
+            WorkflowCommand::PublishDurableProgress { offset, chunk } => {
+                format!("PublishDurableProgress({offset}, {chunk})")
             }
             WorkflowCommand::RecordMarker { name, .. } => format!("RecordMarker({name})"),
             WorkflowCommand::RecordSideEffect { kind, name, .. } => {

@@ -147,7 +147,9 @@ rejects the writes of the stale worker.
   external side effects of that holder.
 - The scanner lease is a load control, not a fence. If the lease query
   fails, scanners run without it.
-- The simulator drives store statements, not the `worker.rs` loop. See
+- The oracle harness drives store statements, not the `worker.rs` loop. The
+  world simulation runs the loop, but one step is one whole poll. A world
+  crash falls between two steps. No worker dies inside a task body. See
   [`simulation.md`](testing/simulation.md#limits).
 
 ## Fencing
@@ -203,8 +205,10 @@ The partition test fails with the fence off ([`chaos.md`](testing/chaos.md)).
 
 - No model covers shard-generation fencing or the rebalance cutover. See
   [`formal-methods.md`](testing/formal-methods.md#not-modelled-yet).
-- No check compares test traces with the models. A code change can leave a
-  model out of date, and no check detects it.
+- No check compares test traces with the `CodecRotation` model. A code
+  change can leave that model out of date, and no check detects it. Chaos
+  traces are checked against `ActivityClaim` and `WorkflowTaskClaim` (issue
+  #2003).
 - The models are bounded. `ActivityClaim` has 3 workers and 5 claims.
   `WorkflowTaskClaim` has 2 workers, 5 claims and 2 strikes.
 - The model `SelfRelease` uses a stronger guard than the code.
@@ -213,9 +217,11 @@ The partition test fails with the fence off ([`chaos.md`](testing/chaos.md)).
 - `fail_task`, `requeue_for_retry` and `defer_rate_limited_task` have no
   fence by design. The timeout sweeper acts only on the claim it scanned
   (#1809). The model `TimeoutFail` has no such check.
-- The simulator does not model the timeout sweeper, the `FAILED` state or
-  quarantine. It draws actions from fixed weights. It does not use PCT
-  (probabilistic concurrency testing).
+- The oracle harness does not model the timeout sweeper, the `FAILED` state or
+  quarantine. The world workload never fails an activity. So the world
+  simulation does not reach quarantine or the `FAILED` state either. It draws
+  actions from fixed weights. It does not use PCT (probabilistic concurrency
+  testing).
 - A 0.6 worker has no claim fence. A mixed 0.6 and 0.7 fleet must keep
   timeouts terminal until the upgrade ends
   ([ADR 0005](adr/0005-activity-timeout-retry-and-open-circuit.md)).

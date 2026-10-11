@@ -4913,6 +4913,12 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
         // inherits the general management API auth middleware (api_with_auth)
         // like the other non-admin `/workflows/{id}/…` read routes.
         .route("/workflows/{id}/stream", get(stream_workflow_progress))
+        // Durable, resumable output stream (issue #1974). Same auth posture
+        // as `/stream`: not admin-gated.
+        .route(
+            "/workflows/{id}/stream/durable",
+            get(stream_workflow_progress_durable),
+        )
         .route("/workflows/{workflow_name}/start", post(start_workflow))
         .route(
             "/workflows/{workflow_name}/signal-with-start",
@@ -6932,6 +6938,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         // Ephemeral workflow progress SSE stream (issue #791). Read-only,
         // text/event-stream; NOT admin-gated (AC5). See docs/api-contract.json.
         ("GET", "/workflows/{id}/stream"),
+        // Durable output stream (issue #1974): text/event-stream, NOT admin-gated.
+        ("GET", "/workflows/{id}/stream/durable"),
         ("POST", "/workflows/{workflow_name}/start"),
         ("POST", "/workflows/{workflow_name}/signal-with-start"),
         ("POST", "/workflows/{workflow_name}/update-with-start"),
@@ -7860,6 +7868,8 @@ pub const fn management_api_response_fields()
         // no JSON body. Frames: `event: progress` (data = the chunk JSON, `id:` =
         // monotonic seq), a terminal `event: end`, or `event: error`.
         ("GET", "/workflows/{id}/stream", None),
+        // Durable output stream (issue #1974): text/event-stream, free-form.
+        ("GET", "/workflows/{id}/stream/durable", None),
         (
             "POST",
             "/workflows/{workflow_name}/start",
@@ -7989,6 +7999,7 @@ pub const fn management_api_response_fields()
                 "summary_scrubbed",
                 "signals_scrubbed",
                 "logs_deleted",
+                "stream_chunks_deleted",
                 "completion_deliveries_scrubbed",
                 "dead_letters_scrubbed",
                 "children",
@@ -45581,6 +45592,345 @@ async fn stream_workflow_progress(
         .into_response()
 }
 
+/// Rows that one table read of the durable stream returns (issue #1974).
+///
+/// The producer reads the next page only when the send buffer has room. One
+/// stream therefore holds at most this page and the buffer in memory.
+const DURABLE_STREAM_PAGE: i64 = 256;
+
+/// Longest wait for a client to take one durable stream frame (issue #1974).
+///
+/// A client that reads nothing for this long loses its stream. Nothing is
+/// lost: the client resumes with `Last-Event-ID`. Without this bound, a
+/// stalled client holds its producer task and connections forever.
+const DURABLE_STREAM_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Sender half of an SSE frame channel.
+type SseSender =
+    futures::channel::mpsc::Sender<Result<axum::response::sse::Event, std::convert::Infallible>>;
+
+/// Query of `GET /workflows/{id}/stream/durable` (issue #1974).
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct DurableStreamQuery {
+    /// Exclusive resume offset. It wins over the `Last-Event-ID` header.
+    #[serde(default)]
+    after: Option<u64>,
+}
+
+/// Resolve the resume cursor of a durable stream (issue #1974).
+///
+/// `?after=` wins over `Last-Event-ID`, which a browser `EventSource` sends
+/// on reconnect. `None` reads from the first chunk. An offset above
+/// `i64::MAX` clamps to it, so the reader gets nothing more.
+fn durable_stream_cursor(
+    after: Option<u64>,
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<i64>, AutumnError> {
+    let raw = match (after, headers.get("last-event-id")) {
+        (Some(after), _) => Some(after),
+        (None, None) => None,
+        (None, Some(value)) => Some(
+            value
+                .to_str()
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .ok_or_else(|| {
+                    AutumnError::bad_request_msg(
+                        "Last-Event-ID must be a non-negative integer offset",
+                    )
+                })?,
+        ),
+    };
+    Ok(raw.map(|offset| i64::try_from(offset).unwrap_or(i64::MAX)))
+}
+
+/// Send one frame, and wait at most [`DURABLE_STREAM_SEND_TIMEOUT`].
+///
+/// Returns `false` when the client is gone or too slow. The caller then ends
+/// the stream.
+async fn send_durable_frame(tx: &mut SseSender, event: axum::response::sse::Event) -> bool {
+    use futures::SinkExt as _;
+    matches!(
+        tokio::time::timeout(DURABLE_STREAM_SEND_TIMEOUT, tx.send(Ok(event))).await,
+        Ok(Ok(()))
+    )
+}
+
+/// Result of one drain of the durable stream table.
+enum DurableDrain {
+    /// Every stored chunk above the cursor went to the client.
+    Done,
+    /// A read failed for a transient reason. The next tick retries.
+    Incomplete,
+    /// The client disconnected or stopped reading.
+    ClientGone,
+    /// The run left the request's shard fence (issue #1803).
+    LeftFence,
+}
+
+/// Send every stored chunk above `cursor`, in pages, and move the cursor.
+///
+/// The send waits while the client is slow. Nothing is dropped, because the
+/// next page comes from the table. No pooled connection is held during a
+/// send.
+async fn drain_durable_stream(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+    cursor: &mut Option<i64>,
+    tx: &mut SseSender,
+) -> DurableDrain {
+    loop {
+        let rows = match stream_conn_for_execution(api_state, exec_id).await {
+            FencedCheckout::Ready(mut conn) => match autumn_harvest::store::load_stream_chunks(
+                &mut conn,
+                exec_id,
+                *cursor,
+                DURABLE_STREAM_PAGE,
+            )
+            .await
+            {
+                Ok(rows) => rows,
+                Err(_) => return DurableDrain::Incomplete,
+            },
+            FencedCheckout::Retry => return DurableDrain::Incomplete,
+            FencedCheckout::LeftFence => return DurableDrain::LeftFence,
+        };
+        let full = i64::try_from(rows.len()).unwrap_or(i64::MAX) >= DURABLE_STREAM_PAGE;
+        for row in rows {
+            let event = axum::response::sse::Event::default()
+                .id(row.stream_offset.to_string())
+                .event("progress")
+                .data(row.chunk.to_string());
+            if !send_durable_frame(tx, event).await {
+                return DurableDrain::ClientGone;
+            }
+            *cursor = Some(row.stream_offset);
+        }
+        if !full {
+            return DurableDrain::Done;
+        }
+    }
+}
+
+/// Send the terminal `event: end` frame of a durable stream.
+async fn send_durable_end(tx: &mut SseSender, reason: &str) {
+    let data = serde_json::json!({ "reason": reason }).to_string();
+    let _ = send_durable_frame(
+        tx,
+        axum::response::sse::Event::default()
+            .event("end")
+            .data(data),
+    )
+    .await;
+}
+
+/// What the durable producer knows about the run when it starts.
+enum DurableStart {
+    /// The run was terminal at connect. No listener is needed.
+    Terminal(String),
+    /// The run is live. The listener opened before the first read.
+    Live {
+        listener: autumn_harvest::notify::DurableStreamListener,
+        shard: ShardId,
+    },
+}
+
+/// Producer task of a durable stream (issue #1974).
+///
+/// A terminal run needs no listener: its chunks are all committed. The
+/// producer drains them and ends. A live run drains on each wake and each
+/// keepalive tick. After a tick sees a terminal state, one more drain reads
+/// the chunks of the terminal cycle, which commit with that state.
+async fn durable_stream_producer(
+    api_state: HarvestApiState,
+    exec_id: ExecutionId,
+    mut cursor: Option<i64>,
+    start: DurableStart,
+    keepalive: std::time::Duration,
+    mut tx: SseSender,
+) {
+    use autumn_harvest::notify::{DurableStreamListener, DurableStreamWait};
+
+    let (mut listener, mut listener_shard, mut end_reason) = match start {
+        DurableStart::Terminal(reason) => {
+            // Retry a transient read failure once per keepalive.
+            loop {
+                match drain_durable_stream(&api_state, exec_id, &mut cursor, &mut tx).await {
+                    DurableDrain::Done => {
+                        send_durable_end(&mut tx, &reason).await;
+                        return;
+                    }
+                    DurableDrain::Incomplete => tokio::time::sleep(keepalive).await,
+                    DurableDrain::ClientGone => return,
+                    DurableDrain::LeftFence => {
+                        let _ = send_durable_frame(&mut tx, shard_fence_error_event()).await;
+                        return;
+                    }
+                }
+                if tx.is_closed() {
+                    return;
+                }
+            }
+        }
+        DurableStart::Live { listener, shard } => (listener, shard, None::<String>),
+    };
+
+    loop {
+        match drain_durable_stream(&api_state, exec_id, &mut cursor, &mut tx).await {
+            DurableDrain::Done => {
+                if let Some(reason) = end_reason.take() {
+                    send_durable_end(&mut tx, &reason).await;
+                    return;
+                }
+            }
+            DurableDrain::Incomplete => {}
+            DurableDrain::ClientGone => return,
+            DurableDrain::LeftFence => {
+                let _ = send_durable_frame(&mut tx, shard_fence_error_event()).await;
+                return;
+            }
+        }
+
+        // Rebind the listener after a shard move, as `/stream` does.
+        match stream_live_shard(&api_state, exec_id).await {
+            FencedCheckout::Ready(current) if current != listener_shard => {
+                if let Ok(url) = api_state.sse_notification_url(current)
+                    && let Ok(l) = DurableStreamListener::connect(&url, exec_id.as_uuid()).await
+                {
+                    listener = l;
+                    listener_shard = current;
+                }
+            }
+            FencedCheckout::LeftFence => {
+                let _ = send_durable_frame(&mut tx, shard_fence_error_event()).await;
+                return;
+            }
+            FencedCheckout::Ready(_) | FencedCheckout::Retry => {}
+        }
+
+        match listener.wait_timeout(keepalive).await {
+            DurableStreamWait::Woken => {}
+            DurableStreamWait::TimedOut => {
+                if tx.is_closed() {
+                    return;
+                }
+                // The tick also reads the table, so a lost wake only delays
+                // a chunk by one keepalive.
+                match progress_stream_end_reason(&api_state, exec_id).await {
+                    ProgressPoll::End(reason) => end_reason = Some(reason),
+                    ProgressPoll::Wait => {}
+                    ProgressPoll::LeftFence => {
+                        let _ = send_durable_frame(&mut tx, shard_fence_error_event()).await;
+                        return;
+                    }
+                }
+            }
+            DurableStreamWait::ChannelClosed => {
+                let data = serde_json::json!({ "error": "listen_connection_closed" }).to_string();
+                let _ = send_durable_frame(
+                    &mut tx,
+                    axum::response::sse::Event::default()
+                        .event("error")
+                        .data(data),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+}
+
+/// `GET /workflows/{id}/stream/durable`
+///
+/// Durable, resumable output stream (issue #1974). It streams the chunks that
+/// [`WorkflowContext::publish_durable_progress`](autumn_harvest::context::WorkflowContext::publish_durable_progress)
+/// stored in `harvest_stream_chunks`, in offset order.
+///
+/// - **Resume**: `?after=<offset>` or `Last-Event-ID` sets an exclusive
+///   cursor. The query parameter wins. With neither, the stream starts at the
+///   first chunk.
+/// - **No gap, no duplicate**: for a live run, `LISTEN` opens before the
+///   first read. Each wake and each keepalive tick reads the rows above the
+///   cursor.
+/// - **No drop**: the producer waits for a slow client and loses nothing. A
+///   client that reads nothing for 60 s loses the stream and resumes.
+/// - **End**: a run that is terminal at connect streams its stored chunks,
+///   then `event: end`, with no `LISTEN`. A live run sends `event: end` after
+///   the drain that follows its terminal state.
+///
+/// The frames are the `/stream` frames, and the SSE `id:` is the offset.
+/// Auth and the 400 and 404 responses are the same as for `/stream`. The 503
+/// for a missing or unreachable LISTEN database applies to a live run only.
+/// A live stream holds one `LISTEN` connection. A pooled connection is held
+/// for one page read only.
+async fn stream_workflow_progress_durable(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(exec_id_raw): Path<String>,
+    Query(query): Query<DurableStreamQuery>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use autumn_harvest::notify::DurableStreamListener;
+    use axum::response::sse::{Event, KeepAlive, Sse};
+
+    let exec_id = match parse_execution_id(&exec_id_raw) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    let cursor = match durable_stream_cursor(query.after, &headers) {
+        Ok(cursor) => cursor,
+        Err(e) => return e.into_response(),
+    };
+    let state = {
+        let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+        match load_execution(&mut conn, exec_id).await {
+            Ok(execution) => execution.state,
+            Err(e) => return map_error(e).into_response(),
+        }
+    };
+    // A terminal run reads stored rows only, so it needs no LISTEN URL. A
+    // deployment without live streaming can still read finished runs.
+    let start = if is_terminal_state(&state) {
+        DurableStart::Terminal(state.to_lowercase().replace('_', "-"))
+    } else {
+        let Some(shard) = resolve_shard_best_effort(&api_state, exec_id).await else {
+            return AutumnError::service_unavailable_msg(
+                "progress streaming is not configured (no LISTEN/NOTIFY database URL)",
+            )
+            .into_response();
+        };
+        let Ok(notification_url) = api_state.sse_notification_url(shard) else {
+            return AutumnError::service_unavailable_msg(
+                "progress streaming is not configured (no LISTEN/NOTIFY database URL)",
+            )
+            .into_response();
+        };
+        // LISTEN before the first read, so no commit falls between the two.
+        match DurableStreamListener::connect(&notification_url, exec_id.as_uuid()).await {
+            Ok(listener) => DurableStart::Live { listener, shard },
+            Err(e) => return map_error(e).into_response(),
+        }
+    };
+
+    let keepalive = api_state
+        .sse_keepalive_interval()
+        .min(PROGRESS_STREAM_KEEPALIVE);
+    let (tx, rx) = futures::channel::mpsc::channel::<Result<Event, std::convert::Infallible>>(
+        PROGRESS_STREAM_CHANNEL_CAPACITY,
+    );
+    let fence = ::autumn_harvest::shard_fence::current();
+    tokio::spawn(::autumn_harvest::shard_fence::scoped(
+        fence,
+        durable_stream_producer(api_state.clone(), exec_id, cursor, start, keepalive, tx),
+    ));
+
+    Sse::new(rx)
+        .keep_alive(KeepAlive::new().interval(keepalive).text("ping"))
+        .into_response()
+}
+
 /// Shared flat JSON body for a `HarvestError::QuotaExceeded` 429 response
 /// (issue #946, AC4) -- the single source of truth for the wire shape used
 /// by every bespoke route arm (`start_workflow`, `signal_with_start_workflow`,
@@ -51035,6 +51385,47 @@ mod reserved_idempotency_key_tests {
 
 #[cfg(test)]
 mod tests {
+
+    // ── issue #1974: durable stream resume cursor ──────────────────────────
+
+    fn last_event_id(value: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "last-event-id",
+            axum::http::HeaderValue::from_str(value).expect("header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn durable_stream_cursor_reads_the_query_then_the_header() {
+        let none = axum::http::HeaderMap::new();
+        assert_eq!(durable_stream_cursor(None, &none).ok(), Some(None));
+        assert_eq!(
+            durable_stream_cursor(None, &last_event_id(" 41 ")).ok(),
+            Some(Some(41))
+        );
+        assert_eq!(
+            durable_stream_cursor(Some(7), &last_event_id("41")).ok(),
+            Some(Some(7)),
+            "the query parameter wins over the header"
+        );
+        assert_eq!(
+            durable_stream_cursor(Some(u64::MAX), &none).ok(),
+            Some(Some(i64::MAX)),
+            "an offset above i64::MAX clamps, so the reader gets nothing more"
+        );
+    }
+
+    #[test]
+    fn durable_stream_cursor_rejects_a_malformed_header() {
+        for bad in ["abc", "-1", "1.5", ""] {
+            assert!(
+                durable_stream_cursor(None, &last_event_id(bad)).is_err(),
+                "{bad:?} must be a 400"
+            );
+        }
+    }
 
     // ── issue #1814: one ramp id per keyed build-routing fan-out ────────────
 

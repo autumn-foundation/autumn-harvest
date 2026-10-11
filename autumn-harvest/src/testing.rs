@@ -5014,9 +5014,43 @@ fn accumulate_recorded_logs(
     }
 }
 
+/// Side-table output that a test run would have stored (issues #790 and
+/// #1974). Each map is keyed by its dedup key, like the store's unique index.
+#[derive(Default)]
+struct RecordedSideOutput {
+    logs: std::collections::BTreeMap<u64, RecordedLogLine>,
+    durable_progress: std::collections::BTreeMap<u64, RecordedDurableChunk>,
+}
+
+impl RecordedSideOutput {
+    /// Record one cycle's log lines and durable chunks. The first copy wins.
+    fn accumulate(&mut self, commands: &[WorkflowCommand]) {
+        accumulate_recorded_logs(commands, &mut self.logs);
+        for cmd in commands {
+            if let WorkflowCommand::PublishDurableProgress { offset, chunk } = cmd {
+                self.durable_progress
+                    .entry(*offset)
+                    .or_insert_with(|| RecordedDurableChunk {
+                        offset: *offset,
+                        chunk: chunk.clone(),
+                    });
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
+
+/// One durable stream chunk that a test run would have stored (issue #1974).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedDurableChunk {
+    /// The 0-based call ordinal. Production uses it as the SSE `id:`.
+    pub offset: u64,
+    /// The chunk, size-capped by the context.
+    pub chunk: Value,
+}
 
 /// One durable workflow log line a test run would have persisted (issue #790).
 ///
@@ -5104,6 +5138,9 @@ pub struct TestRunOutcome {
     /// `UNIQUE (workflow_exec_id, seq)` + `ON CONFLICT DO NOTHING` produces.
     /// Empty unless the env opted in via [`WorkflowTestEnv::with_log_policy`].
     recorded_logs: Vec<RecordedLogLine>,
+    /// The durable stream chunks this run would have stored (issue #1974),
+    /// in offset order, first copy kept.
+    durable_progress: Vec<RecordedDurableChunk>,
     /// The declarative handlers the live cycles registered (issue #1991).
     /// `replay_check` registers the same ones.
     declarative_queries: Vec<crate::info::QueryHandlerInfo>,
@@ -5211,6 +5248,15 @@ impl TestRunOutcome {
     #[must_use]
     pub fn recorded_logs(&self) -> &[RecordedLogLine] {
         &self.recorded_logs
+    }
+
+    /// The durable stream chunks this run would have stored (issue #1974).
+    ///
+    /// The harness models the keep-first dedup by offset. It does not model
+    /// the per-execution cap. The database tests cover the cap.
+    #[must_use]
+    pub fn recorded_durable_progress(&self) -> &[RecordedDurableChunk] {
+        &self.durable_progress
     }
 
     /// The virtual "now" at the end of the run (issue #526).
@@ -5413,7 +5459,7 @@ pub struct WorkflowTestRun<'env> {
     /// Signals not yet in history. The next cycle ingests them at task-prep.
     pending_signals: Vec<(String, Value)>,
     retry_sequences: HashMap<String, std::collections::VecDeque<Vec<Result<Value, String>>>>,
-    recorded_logs: std::collections::BTreeMap<u64, RecordedLogLine>,
+    side_output: RecordedSideOutput,
     /// History length at the last `Blocked`. A drive with no new event and
     /// no pending signal returns `Blocked` again without running the body.
     blocked_at: Option<usize>,
@@ -5493,9 +5539,9 @@ impl WorkflowTestRun<'_> {
             // `outcome.commands`. A terminal cycle carries them on
             // `pending_cmds`. Collecting from both covers every cycle shape.
             if let WorkflowOutcome::Suspended { commands } = &outcome {
-                accumulate_recorded_logs(commands, &mut self.recorded_logs);
+                self.side_output.accumulate(commands);
             }
-            accumulate_recorded_logs(&pending_cmds, &mut self.recorded_logs);
+            self.side_output.accumulate(&pending_cmds);
 
             match outcome {
                 WorkflowOutcome::Suspended { commands } => {
@@ -5517,14 +5563,13 @@ impl WorkflowTestRun<'_> {
                     }
                 }
                 terminal => {
-                    let logs = std::mem::take(&mut self.recorded_logs);
                     self.outcome = Some(self.env.finish_terminal_outcome(
                         terminal,
                         &pending_cmds,
                         std::mem::take(&mut self.history),
                         self.exec_id,
                         self.start_time,
-                        logs.into_values().collect(),
+                        std::mem::take(&mut self.side_output),
                     ));
                     return TestRunStatus::Finished;
                 }
@@ -5760,13 +5805,12 @@ impl WorkflowTestRun<'_> {
 
     /// Move the history so far into an outcome that carries `error`.
     fn error_outcome(&mut self, error: String) -> TestRunOutcome {
-        let logs = std::mem::take(&mut self.recorded_logs);
         self.env.outcome(
             Err(error),
             std::mem::take(&mut self.history),
             self.exec_id,
             self.start_time,
-            logs.into_values().collect(),
+            std::mem::take(&mut self.side_output),
         )
     }
 }
@@ -6458,7 +6502,7 @@ impl WorkflowTestEnv {
             // Issue #790: the durable log lines this run would have persisted,
             // accumulated across every decision cycle and de-duplicated by `seq`
             // exactly the way the store's unique index does.
-            recorded_logs: std::collections::BTreeMap::new(),
+            side_output: RecordedSideOutput::default(),
             blocked_at: None,
             outcome: None,
         }
@@ -6566,7 +6610,7 @@ impl WorkflowTestEnv {
         events: Vec<WorkflowEvent>,
         exec_id: ExecutionId,
         start_time: DateTime<Utc>,
-        recorded_logs: Vec<RecordedLogLine>,
+        side_output: RecordedSideOutput,
     ) -> TestRunOutcome {
         TestRunOutcome {
             result,
@@ -6587,7 +6631,8 @@ impl WorkflowTestEnv {
             // Issue #798: likewise carry the env's build id, so a build-gated
             // workflow's self-check replays under the same build the live run saw.
             build_id: self.build_id.clone(),
-            recorded_logs,
+            recorded_logs: side_output.logs.into_values().collect(),
+            durable_progress: side_output.durable_progress.into_values().collect(),
             declarative_queries: self.replay_handlers(&self.declarative_queries),
             declarative_updates: self.replay_handlers(&self.declarative_updates),
         }
@@ -6619,7 +6664,7 @@ impl WorkflowTestEnv {
         mut history: Vec<WorkflowEvent>,
         exec_id: ExecutionId,
         start_time: DateTime<Utc>,
-        recorded_logs: Vec<RecordedLogLine>,
+        side_output: RecordedSideOutput,
     ) -> TestRunOutcome {
         Self::record_terminal_pending_commands(pending_cmds, &mut history);
         let should_record_cascades = matches!(
@@ -6668,7 +6713,7 @@ impl WorkflowTestEnv {
         if should_record_cascades {
             Self::record_terminal_parent_close_cascades(&mut history);
         }
-        self.outcome(result, history, exec_id, start_time, recorded_logs)
+        self.outcome(result, history, exec_id, start_time, side_output)
     }
 
     fn record_terminal_pending_commands(
@@ -7281,6 +7326,7 @@ impl WorkflowTestEnv {
             // Ephemeral progress (issue #791): a bookkeeping no-op in the test
             // harness — appends no event, changes no history, drives no wait.
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             // Durable per-execution logs (issue #790): event-less bookkeeping
             // (mirrors `SetCurrentDetails`). The worker persists it to
             // `harvest_workflow_logs` in production; the harness has no DB, so
@@ -7537,6 +7583,34 @@ mod tests {
     use chrono::Utc;
     use std::future::Future;
     use std::pin::Pin;
+
+    /// Issue #1974: two cycles that offer the same offset keep the first
+    /// chunk, as the store's `ON CONFLICT DO NOTHING` does.
+    #[test]
+    fn recorded_durable_chunks_keep_the_first_copy_of_an_offset() {
+        let publish = |offset: u64, chunk: Value| {
+            crate::context::WorkflowCommand::PublishDurableProgress { offset, chunk }
+        };
+        let mut side = RecordedSideOutput::default();
+        side.accumulate(&[publish(0, Value::from("a")), publish(1, Value::from("b"))]);
+        side.accumulate(&[
+            publish(1, Value::from("changed")),
+            publish(2, Value::from("c")),
+        ]);
+        let recorded: Vec<(u64, Value)> = side
+            .durable_progress
+            .into_values()
+            .map(|c| (c.offset, c.chunk))
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![
+                (0, Value::from("a")),
+                (1, Value::from("b")),
+                (2, Value::from("c")),
+            ]
+        );
+    }
 
     /// Awaits a foreign 3 s sleep, past the deadlock timeout (issue #1797).
     fn deadlocking_workflow(

@@ -18,8 +18,8 @@ use crate::schema::{
     harvest_events, harvest_execution_summaries, harvest_external_tasks, harvest_mutex_locks,
     harvest_mutex_waiters, harvest_payload_refs, harvest_rate_limit_buckets,
     harvest_schedule_decisions, harvest_schedules, harvest_sessions, harvest_signals,
-    harvest_task_queue, harvest_timers, harvest_wasm_modules, harvest_workers,
-    harvest_workflow_executions, harvest_workflow_logs,
+    harvest_stream_chunks, harvest_task_queue, harvest_timers, harvest_wasm_modules,
+    harvest_workers, harvest_workflow_executions, harvest_workflow_logs,
 };
 use crate::shared_json::SharedJson;
 
@@ -1938,6 +1938,29 @@ pub struct NewHarvestWorkflowLog {
     pub seq: i64,
     pub level: String,
     pub message: String,
+}
+
+/// One stored durable output-stream chunk (issue #1974).
+#[derive(Debug, Clone, Queryable, Selectable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_stream_chunks)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestStreamChunk {
+    pub id: i64,
+    pub workflow_exec_id: Uuid,
+    pub stream_offset: i64,
+    pub chunk: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insert struct for one durable output-stream chunk (issue #1974).
+///
+/// Postgres fills `id` and `created_at`.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_stream_chunks)]
+pub struct NewHarvestStreamChunk<'a> {
+    pub workflow_exec_id: Uuid,
+    pub stream_offset: i64,
+    pub chunk: &'a serde_json::Value,
 }
 
 #[cfg(test)]

@@ -596,6 +596,7 @@ fn erase_outcome_serialized_fields_are_all_declared() {
         summary_scrubbed: true,
         signals_scrubbed: 1,
         logs_deleted: 1,
+        stream_chunks_deleted: 1,
         completion_deliveries_scrubbed: 1,
         dead_letters_scrubbed: 1,
         children: vec![],

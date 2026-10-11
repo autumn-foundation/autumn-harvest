@@ -143,6 +143,44 @@ fn progress_multicycle_workflow<'a>(
     })
 }
 
+/// Publishes five durable chunks, waits for the `go` signal, then publishes
+/// five more (issue #1974). The signal lets a test hold the run live.
+fn durable_stream_workflow<'a>(
+    ctx: &'a autumn_harvest::context::WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        for i in 0..5 {
+            ctx.publish_durable_progress(json!({"token": i}))
+                .map_err(|e| e.to_string())?;
+        }
+        ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+        for i in 5..10 {
+            ctx.publish_durable_progress(json!({"token": i}))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(input)
+    })
+}
+
+/// Number of chunks [`durable_burst_workflow`] publishes. It is larger than
+/// the SSE channel capacity and the read page size.
+const BURST_CHUNKS: u64 = 1_000;
+
+/// Publishes [`BURST_CHUNKS`] durable chunks in one decision cycle.
+fn durable_burst_workflow<'a>(
+    ctx: &'a autumn_harvest::context::WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        for i in 0..BURST_CHUNKS {
+            ctx.publish_durable_progress(json!({"token": i}))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(input)
+    })
+}
+
 fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
         quota: None,
@@ -176,19 +214,33 @@ fn test_registry() -> Arc<HandlerRegistry> {
         vec![
             wf_info("progress_wf", progress_workflow),
             wf_info("progress_multicycle_wf", progress_multicycle_workflow),
+            wf_info("durable_stream_wf", durable_stream_workflow),
+            wf_info("durable_burst_wf", durable_burst_workflow),
         ],
         vec![],
     ))
 }
 
 fn build_app(pool: &DbPool, url: &str) -> axum::Router {
+    // Shorten the terminal-close poll cadence so `event: end` follows the last
+    // chunk quickly (bounded by min(keepalive, PROGRESS_STREAM_KEEPALIVE)).
+    build_app_with_keepalive(pool, url, Duration::from_millis(150))
+}
+
+fn build_app_with_keepalive(pool: &DbPool, url: &str, keepalive: Duration) -> axum::Router {
+    build_app_inner(pool, Some(url), keepalive)
+}
+
+/// `notify_url` is the LISTEN/NOTIFY database URL. `None` models a
+/// deployment with no live streaming configured.
+fn build_app_inner(pool: &DbPool, notify_url: Option<&str>, keepalive: Duration) -> axum::Router {
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     // Required so the stream handler can open a LISTEN connection for the shard.
-    api_state.set_workflow_result_notification_database_url(url.to_string());
-    // Shorten the terminal-close poll cadence so `event: end` follows the last
-    // chunk quickly (bounded by min(keepalive, PROGRESS_STREAM_KEEPALIVE)).
-    api_state.set_sse_keepalive_interval(Duration::from_millis(150));
+    if let Some(url) = notify_url {
+        api_state.set_workflow_result_notification_database_url(url.to_string());
+    }
+    api_state.set_sse_keepalive_interval(keepalive);
     api_state.install(HarvestApiRuntime::new(
         test_registry(),
         Arc::new(DagCatalog::default()),
@@ -303,6 +355,17 @@ async fn read_sse(
     resp: axum::response::Response,
     deadline: Duration,
 ) -> (Vec<SseFrame>, Option<Duration>) {
+    read_sse_limit(resp, deadline, usize::MAX).await
+}
+
+/// [`read_sse`], but stop after `max_progress` progress frames. Dropping the
+/// body afterwards is a client disconnect.
+async fn read_sse_limit(
+    resp: axum::response::Response,
+    deadline: Duration,
+    max_progress: usize,
+) -> (Vec<SseFrame>, Option<Duration>) {
+    let mut progress_seen = 0usize;
     let mut stream = resp.into_body().into_data_stream();
     let mut buf = String::new();
     let mut frames: Vec<SseFrame> = Vec::new();
@@ -326,8 +389,11 @@ async fn read_sse(
                             first_progress_at = Some(start.elapsed());
                         }
                         let terminal = matches!(frame.event.as_deref(), Some("end" | "error"));
+                        if frame.event.as_deref() == Some("progress") {
+                            progress_seen += 1;
+                        }
                         frames.push(frame);
-                        if terminal {
+                        if terminal || progress_seen >= max_progress {
                             return (frames, first_progress_at);
                         }
                     }
@@ -592,4 +658,324 @@ async fn progress_stream_unknown_execution_returns_404() {
         StatusCode::NOT_FOUND,
         "an unknown execution id must return 404"
     );
+}
+
+// ── Durable mode (issue #1974) ────────────────────────────────────────────────
+
+/// Open the durable stream, with an optional `Last-Event-ID` header.
+async fn durable_response(
+    app: &axum::Router,
+    exec_id: ExecutionId,
+    query: &str,
+    last_event_id: Option<&str>,
+) -> axum::response::Response {
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(format!("/workflows/{exec_id}/stream/durable{query}"));
+    if let Some(id) = last_event_id {
+        builder = builder.header("last-event-id", id);
+    }
+    app.clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .expect("durable stream request")
+}
+
+/// Start a worker on shard 0 for the test registry.
+fn spawn_worker(pool: &DbPool, worker_id: &str) -> (Arc<Worker>, tokio::task::JoinHandle<()>) {
+    let mut runtime_config = WorkerRuntimeConfig::from(WorkerConfig::default());
+    runtime_config.worker_id = worker_id.to_string();
+    runtime_config.queues = vec!["default".to_string()];
+    runtime_config.poll_interval = Duration::from_millis(20);
+    runtime_config.shard_assignments = vec![ShardId::new(0)];
+    let worker = Arc::new(Worker::new(runtime_config, test_registry()).unwrap());
+    let handle = {
+        let worker = worker.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            worker.run(&pool).await;
+        })
+    };
+    (worker, handle)
+}
+
+/// The `(offset, chunk)` pairs of the progress frames.
+fn durable_progress(frames: &[SseFrame]) -> Vec<(u64, Value)> {
+    frames
+        .iter()
+        .filter(|f| f.event.as_deref() == Some("progress"))
+        .map(|f| {
+            let offset =
+                f.id.as_deref()
+                    .expect("a durable frame carries its offset")
+                    .parse::<u64>()
+                    .expect("the offset is a u64");
+            let chunk = serde_json::from_str(&f.data).expect("chunk data is JSON");
+            (offset, chunk)
+        })
+        .collect()
+}
+
+fn expected_tokens(range: std::ops::Range<u64>) -> Vec<(u64, Value)> {
+    range.map(|i| (i, json!({"token": i}))).collect()
+}
+
+/// Send the `go` signal of [`durable_stream_workflow`].
+async fn send_go_signal(pool: &DbPool, exec_id: ExecutionId) {
+    let mut conn = pool.get().await.unwrap();
+    autumn_harvest::signal::send_signal(&mut conn, exec_id, "go", json!({}))
+        .await
+        .expect("signal");
+}
+
+async fn wait_for_state(pool: &DbPool, exec_id: ExecutionId, want: &str) {
+    let mut conn = pool.get().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let state: String = harvest_workflow_executions::table
+                .find(exec_id.as_uuid())
+                .select(harvest_workflow_executions::state)
+                .first(&mut conn)
+                .await
+                .unwrap();
+            if state == want {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("execution reaches the wanted state");
+}
+
+/// AC: a reader that disconnects and reconnects with its last offset receives
+/// every later chunk, with no gap and no duplicate.
+///
+/// The run waits for a signal, so it is still live at the reconnect. The
+/// second reader therefore gets chunks 3 and 4 from the table and chunks 5 to
+/// 9 from the live tail.
+#[tokio::test]
+async fn durable_stream_resume_has_no_gap_and_no_duplicate() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, &url);
+    let mut conn = pool.get().await.unwrap();
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        start_params_named(exec_id, "durable_stream_wf", "durable-resume"),
+        None,
+    )
+    .await
+    .unwrap();
+    let (worker, worker_handle) = spawn_worker(&pool, "durable-resume-worker");
+
+    // First connection: read three chunks, then disconnect.
+    let resp = durable_response(&app, exec_id, "", None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (first_frames, _) = read_sse_limit(resp, Duration::from_secs(20), 3).await;
+    let first = durable_progress(&first_frames);
+    assert_eq!(first, expected_tokens(0..3), "frames: {first_frames:#?}");
+    let last_seen = first.last().map(|(o, _)| o.to_string()).unwrap();
+
+    // Second connection resumes from the last offset. The run waits for the
+    // signal, so it is live.
+    let resp = durable_response(&app, exec_id, "", Some(&last_seen)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let reader = tokio::spawn(read_sse(resp, Duration::from_secs(20)));
+    let state: String = harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(harvest_workflow_executions::state)
+        .first(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(state, "RUNNING", "the reconnect must hit a live run");
+    send_go_signal(&pool, exec_id).await;
+    let (second_frames, _) = reader.await.expect("reader task");
+    worker.shutdown();
+    let _ = worker_handle.await;
+
+    assert_eq!(
+        durable_progress(&second_frames),
+        expected_tokens(3..10),
+        "the resumed reader gets every later chunk once: {second_frames:#?}"
+    );
+    assert_eq!(
+        second_frames.last().and_then(|f| f.event.as_deref()),
+        Some("end"),
+        "the stream ends after the terminal state"
+    );
+}
+
+/// The `LISTEN` wake delivers a live chunk long before the keepalive tick.
+/// The tick also reads the table, so with a short keepalive a broken wake
+/// would go unseen.
+#[tokio::test]
+async fn durable_stream_wakes_on_notify_before_the_keepalive_tick() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app_with_keepalive(&pool, &url, Duration::from_secs(30));
+    let mut conn = pool.get().await.unwrap();
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        start_params_named(exec_id, "durable_stream_wf", "durable-wake"),
+        None,
+    )
+    .await
+    .unwrap();
+    let resp = durable_response(&app, exec_id, "", None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (worker, worker_handle) = spawn_worker(&pool, "durable-wake-worker");
+
+    let started = std::time::Instant::now();
+    let (frames, _) = read_sse_limit(resp, Duration::from_secs(20), 5).await;
+    let elapsed = started.elapsed();
+    send_go_signal(&pool, exec_id).await;
+    worker.shutdown();
+    let _ = worker_handle.await;
+
+    assert_eq!(durable_progress(&frames), expected_tokens(0..5));
+    // The route caps the tick at 5 s, so 3 s proves that the wake came first.
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the wake must deliver the chunks, not the keepalive tick: {elapsed:?}"
+    );
+}
+
+/// After the run ends, a reader still gets the stored chunks above its
+/// offset. The `after` query parameter wins over `Last-Event-ID`.
+#[tokio::test]
+async fn durable_stream_backfills_a_terminal_run_from_any_offset() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, &url);
+    let mut conn = pool.get().await.unwrap();
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        start_params_named(exec_id, "durable_stream_wf", "durable-terminal"),
+        None,
+    )
+    .await
+    .unwrap();
+    let (worker, worker_handle) = spawn_worker(&pool, "durable-terminal-worker");
+    send_go_signal(&pool, exec_id).await;
+    wait_for_state(&pool, exec_id, "COMPLETED").await;
+    worker.shutdown();
+    let _ = worker_handle.await;
+
+    let resp = durable_response(&app, exec_id, "", None).await;
+    let (all, _) = read_sse(resp, Duration::from_secs(10)).await;
+    assert_eq!(durable_progress(&all), expected_tokens(0..10));
+    assert_eq!(all.last().and_then(|f| f.event.as_deref()), Some("end"));
+
+    let resp = durable_response(&app, exec_id, "?after=6", Some("1")).await;
+    let (tail, _) = read_sse(resp, Duration::from_secs(10)).await;
+    assert_eq!(durable_progress(&tail), expected_tokens(7..10));
+    assert_eq!(tail.last().and_then(|f| f.event.as_deref()), Some("end"));
+}
+
+/// A finished run needs no LISTEN connection, so its stored chunks stay
+/// readable where live streaming is not configured.
+#[tokio::test]
+async fn durable_stream_reads_a_terminal_run_without_a_notification_url() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let live_app = build_app(&pool, &url);
+    let mut conn = pool.get().await.unwrap();
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        start_params_named(exec_id, "durable_stream_wf", "durable-no-notify"),
+        None,
+    )
+    .await
+    .unwrap();
+    let (worker, worker_handle) = spawn_worker(&pool, "durable-no-notify-worker");
+    send_go_signal(&pool, exec_id).await;
+    wait_for_state(&pool, exec_id, "COMPLETED").await;
+    worker.shutdown();
+    let _ = worker_handle.await;
+    drop(live_app);
+
+    let app = build_app_inner(&pool, None, Duration::from_millis(150));
+    let resp = durable_response(&app, exec_id, "", None).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a finished run needs no LISTEN URL"
+    );
+    let (frames, _) = read_sse(resp, Duration::from_secs(10)).await;
+    assert_eq!(durable_progress(&frames), expected_tokens(0..10));
+    assert_eq!(frames.last().and_then(|f| f.event.as_deref()), Some("end"));
+}
+
+/// AC: back-pressure does not drop chunks in durable mode. The client reads
+/// nothing until the run ends, then it gets all chunks.
+#[tokio::test]
+async fn durable_stream_slow_reader_receives_every_chunk() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, &url);
+    let mut conn = pool.get().await.unwrap();
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        start_params_named(exec_id, "durable_burst_wf", "durable-burst"),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Open the stream before the run. Do not read it until the run ends.
+    let resp = durable_response(&app, exec_id, "", None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (worker, worker_handle) = spawn_worker(&pool, "durable-burst-worker");
+    wait_for_state(&pool, exec_id, "COMPLETED").await;
+    worker.shutdown();
+    let _ = worker_handle.await;
+
+    let (frames, _) = read_sse(resp, Duration::from_secs(30)).await;
+    assert_eq!(
+        durable_progress(&frames),
+        expected_tokens(0..BURST_CHUNKS),
+        "a slow reader must receive every chunk, in order, once"
+    );
+    assert_eq!(frames.last().and_then(|f| f.event.as_deref()), Some("end"));
+}
+
+#[tokio::test]
+async fn durable_stream_rejects_a_bad_offset_and_an_unknown_execution() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, &url);
+    let mut conn = pool.get().await.unwrap();
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        start_params_named(exec_id, "durable_stream_wf", "durable-bad"),
+        None,
+    )
+    .await
+    .unwrap();
+
+    for (query, header) in [("?after=-1", None), ("?after=x", None), ("", Some("abc"))] {
+        let resp = durable_response(&app, exec_id, query, header).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "query {query:?}, header {header:?}"
+        );
+    }
+
+    let unknown = ExecutionId::new_for_shard(ShardId::new(0));
+    let resp = durable_response(&app, unknown, "", None).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

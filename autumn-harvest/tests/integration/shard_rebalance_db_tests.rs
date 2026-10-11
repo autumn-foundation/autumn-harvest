@@ -647,6 +647,119 @@ async fn a_timer_parked_execution_migrates_end_to_end() {
     assert_eq!(attrs.value.as_deref(), Some("acme"));
 }
 
+/// Issue #1974: a decision between verification and cutover can store
+/// durable stream chunks and park again with no new event. The history guard
+/// then still passes. Activation copies such chunks from the sealed source,
+/// so the target misses none.
+#[tokio::test]
+async fn activation_copies_stream_chunks_written_after_verification() {
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "entity-stream").await;
+    let mut source = shards.source().await;
+    let mut target = shards.target().await;
+    let chunk = |offset: i64| store::DurableStreamChunk {
+        offset,
+        chunk: json!({ "token": offset }),
+    };
+    // Offset 1 failed to serialize in its first run, so the stream has a hole.
+    store::append_stream_chunks(&mut source, exec_id, &[chunk(0), chunk(2)], 100)
+        .await
+        .expect("chunks before staging");
+
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+
+    // An eventless decision on the source after verification. Its re-run
+    // fills the hole at offset 1 and adds offset 3.
+    store::append_stream_chunks(&mut source, exec_id, &[chunk(1), chunk(3)], 100)
+        .await
+        .expect("chunks after verification");
+
+    assert!(
+        commit_cutover(&mut source, exec_id, TARGET)
+            .await
+            .expect("cutover"),
+        "no event was appended, so the history guard passes"
+    );
+    activate_target(&mut source, &mut target, exec_id)
+        .await
+        .expect("activate");
+
+    let offsets: Vec<i64> = store::load_stream_chunks(&mut target, exec_id, None, 100)
+        .await
+        .expect("target chunks")
+        .into_iter()
+        .map(|row| row.stream_offset)
+        .collect();
+    assert_eq!(
+        offsets,
+        vec![0, 1, 2, 3],
+        "the target must miss no chunk, also one below its highest offset"
+    );
+}
+
+/// Issue #1974: activation must not copy stream chunks over a staged target
+/// that an operator terminated, because erasure can have scrubbed it since.
+/// The chunks stay on the sealed source, where erasure also reaches them.
+#[tokio::test]
+async fn activation_copies_no_stream_chunks_over_a_force_terminated_target() {
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "entity-stream-terminated").await;
+    let (mut source, mut target) = (shards.source().await, shards.target().await);
+    let chunk = |offset: i64| store::DurableStreamChunk {
+        offset,
+        chunk: json!({ "email": "alice@example.com", "n": offset }),
+    };
+
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+    store::append_stream_chunks(&mut source, exec_id, &[chunk(0)], 100)
+        .await
+        .expect("chunk after verification");
+    assert!(
+        commit_cutover(&mut source, exec_id, TARGET)
+            .await
+            .expect("cutover")
+    );
+
+    // Terminate the staged copy, then erase it, before activation runs.
+    diesel::sql_query("UPDATE harvest_workflow_executions SET state = 'TERMINATED' WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut target)
+        .await
+        .expect("force-terminate the staged copy");
+    store::delete_stream_chunks(&mut target, exec_id)
+        .await
+        .expect("erase the target's chunks");
+
+    activate_target(&mut source, &mut target, exec_id)
+        .await
+        .expect("activation is a no-op over a terminated target");
+
+    assert_eq!(
+        store::load_stream_chunks(&mut target, exec_id, None, 100)
+            .await
+            .expect("target chunks")
+            .len(),
+        0,
+        "activation must not restore chunks over a terminated, erased target"
+    );
+}
+
 /// Issue #1317 review, P1: a retained terminal copy of an UNRELATED
 /// execution can already occupy the target's active-uniqueness slot for
 /// this business key. Reconciliation lets a fresh run start on the shard a

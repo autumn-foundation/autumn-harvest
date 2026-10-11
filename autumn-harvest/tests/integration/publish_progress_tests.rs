@@ -205,3 +205,108 @@ async fn publish_progress_replays_with_zero_divergence() {
         "events_replayed must be positive"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Durable mode (issue #1974). The chunks go to a side table, so the event
+// history and replay stay the same as for the best-effort mode.
+// ---------------------------------------------------------------------------
+
+/// The `publish_progress_workflow` shape with durable chunks.
+fn durable_progress_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.publish_durable_progress(json!({"phase": "starting"}))
+            .map_err(|e| e.to_string())?;
+        let r1 = ctx
+            .execute_activity_raw("step_one", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.publish_durable_progress(json!({"phase": "mid"}))
+            .map_err(|e| e.to_string())?;
+        let r2 = ctx
+            .execute_activity_raw("step_two", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.publish_durable_progress(json!({"phase": "done"}))
+            .map_err(|e| e.to_string())?;
+        Ok(json!({"first": r1, "second": r2}))
+    })
+}
+
+#[tokio::test]
+async fn durable_progress_leaves_zero_event_footprint() {
+    let durable = WorkflowTestEnv::new()
+        .mock_activity("step_one", |_| Ok(json!("result_one")))
+        .mock_activity("step_two", |_| Ok(json!("result_two")))
+        .run(durable_progress_workflow, json!(null))
+        .await;
+    let plain = WorkflowTestEnv::new()
+        .mock_activity("step_one", |_| Ok(json!("result_one")))
+        .mock_activity("step_two", |_| Ok(json!("result_two")))
+        .run(no_progress_workflow, json!(null))
+        .await;
+
+    assert_eq!(durable.result, plain.result);
+    let types = |o: &autumn_harvest::testing::TestRunOutcome| {
+        o.events()
+            .iter()
+            .map(WorkflowEvent::type_name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        types(&durable),
+        types(&plain),
+        "durable chunks must not add events to the history"
+    );
+}
+
+#[tokio::test]
+async fn durable_progress_harness_records_each_chunk_once_in_offset_order() {
+    // Three decision cycles. Each later cycle replays the earlier calls and
+    // pushes no command for them, so each chunk is recorded once at its call
+    // ordinal. `testing.rs` unit-tests the keep-first dedup itself.
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("step_one", |_| Ok(json!("result_one")))
+        .mock_activity("step_two", |_| Ok(json!("result_two")))
+        .run(durable_progress_workflow, json!(null))
+        .await;
+    let recorded: Vec<(u64, Value)> = outcome
+        .recorded_durable_progress()
+        .iter()
+        .map(|c| (c.offset, c.chunk.clone()))
+        .collect();
+    assert_eq!(
+        recorded,
+        vec![
+            (0, json!({"phase": "starting"})),
+            (1, json!({"phase": "mid"})),
+            (2, json!({"phase": "done"})),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn durable_progress_replays_with_zero_divergence() {
+    let (exec_id, events) = two_activity_history();
+    let replayer =
+        WorkflowReplayer::new().register_fn("durable_progress_workflow", durable_progress_workflow);
+    let report = replayer
+        .replay_from_snapshot(autumn_harvest::testing::HistorySnapshot {
+            workflow_name: "durable_progress_workflow".to_string(),
+            execution_id: exec_id,
+            events,
+            context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
+            queue_name: None,
+        })
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "durable chunks are replay-neutral, got: {report}"
+    );
+}

@@ -10,8 +10,9 @@
 //! A transaction that calls `pg_notify` takes a database-wide lock at commit,
 //! so these commits run one at a time. A full notification queue also fails
 //! the commit (issue #1796). Thus [`notify_task_enqueued`],
-//! [`notify_tasks_enqueued`] and [`notify_workflow_events_appended`] never
-//! send inside the write transaction, and never fail the write.
+//! [`notify_tasks_enqueued`], [`notify_workflow_events_appended`] and
+//! [`notify_durable_stream`] never send inside the write transaction, and
+//! never fail the write.
 //!
 //! Each call stages a note with the transaction id of the write. The sender
 //! of a pool from [`register_pool`] reads `txid_status` on its own connection.
@@ -121,6 +122,31 @@ pub const fn workflow_events_channel() -> &'static str {
 #[must_use]
 pub fn workflow_progress_channel(exec_id: Uuid) -> String {
     format!("harvest_progress_{}", exec_id.simple())
+}
+
+/// Postgres NOTIFY channel that wakes the readers of one execution's durable
+/// output stream (issue #1974).
+///
+/// The name is `harvest_stream_{exec_hex}`, which is 47 characters. The
+/// payload is a wake only. A reader reads the chunks from
+/// `harvest_stream_chunks`, so a lost wake delays a chunk but never loses it.
+/// The best-effort channel [`workflow_progress_channel`] is separate, so the
+/// two offset namespaces never mix.
+///
+/// # Examples
+///
+/// ```
+/// # use autumn_harvest::notify::durable_stream_channel;
+/// # use uuid::Uuid;
+/// let id = Uuid::parse_str("0191c1a2-3b4c-7d5e-8f60-112233445566").unwrap();
+/// assert_eq!(
+///     durable_stream_channel(id),
+///     "harvest_stream_0191c1a23b4c7d5e8f60112233445566"
+/// );
+/// ```
+#[must_use]
+pub fn durable_stream_channel(exec_id: Uuid) -> String {
+    format!("harvest_stream_{}", exec_id.simple())
 }
 
 #[must_use]
@@ -397,13 +423,19 @@ pub(crate) enum Note {
         /// Type name to report when no note before them names one.
         event_type: String,
     },
+    /// New chunks of one durable stream (issue #1974). The wake has an empty
+    /// payload, because a reader reads the table.
+    Stream {
+        /// The channel from [`durable_stream_channel`].
+        channel: String,
+    },
 }
 
 impl Note {
     /// The channel the note goes to.
     fn channel(&self) -> &str {
         match self {
-            Self::Task { channel, .. } => channel,
+            Self::Task { channel, .. } | Self::Stream { channel } => channel,
             Self::Events { .. } | Self::Trailing { .. } => workflow_events_channel(),
         }
     }
@@ -419,12 +451,13 @@ const fn valid_channel(channel: &str) -> bool {
 ///
 /// Task notes merge per channel. One task keeps its id. Several tasks give
 /// the nil id, as [`notify_tasks_enqueued`] does. Event notes merge per
-/// execution: the counts add up, and the last type wins. A note on a channel
-/// that Postgres rejects is dropped.
+/// execution: the counts add up, and the last type wins. Stream notes merge
+/// per channel. A note on a channel that Postgres rejects is dropped.
 fn coalesce(notes: Vec<Note>) -> Vec<(String, String)> {
     enum Merged {
         Task(String, Uuid),
         Events(Uuid, usize, String),
+        Stream(String),
     }
     let mut merged: Vec<Merged> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
@@ -474,6 +507,12 @@ fn coalesce(notes: Vec<Note>) -> Vec<(String, String)> {
                     merged.push(Merged::Events(exec_id, count, event_type));
                 }
             }
+            Note::Stream { channel } => {
+                if !index.contains_key(&channel) {
+                    index.insert(channel.clone(), merged.len());
+                    merged.push(Merged::Stream(channel));
+                }
+            }
         }
     }
     merged
@@ -491,6 +530,7 @@ fn coalesce(notes: Vec<Note>) -> Vec<(String, String)> {
                 .ok()
                 .map(|payload| (workflow_events_channel().to_string(), payload))
             }
+            Merged::Stream(channel) => Some((channel, String::new())),
         })
         .collect()
 }
@@ -1570,6 +1610,30 @@ pub async fn notify_workflow_progress(
     Ok(())
 }
 
+/// Wake the readers of `workflow_exec_id`'s durable stream, after the write
+/// commits (issue #1974).
+///
+/// Call this in the transaction that wrote the chunks. See
+/// [post-commit delivery](crate::notify#post-commit-delivery) for how the wake
+/// is sent. A reader never wakes for chunks that roll back. A lost wake costs
+/// latency only, because a reader also reads the table on each keepalive tick.
+///
+/// # Errors
+///
+/// Same as [`notify_task_enqueued`].
+pub async fn notify_durable_stream(
+    conn: &mut AsyncPgConnection,
+    workflow_exec_id: Uuid,
+) -> HarvestResult<()> {
+    stage(
+        conn,
+        vec![Note::Stream {
+            channel: durable_stream_channel(workflow_exec_id),
+        }],
+    )
+    .await
+}
+
 // ---------------------------------------------------------------------------
 // Listener connections (TLS: issue #1717)
 // ---------------------------------------------------------------------------
@@ -1976,6 +2040,119 @@ impl WorkflowProgressListener {
     }
 }
 
+/// Outcome of waiting on a [`DurableStreamListener`] (issue #1974).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableStreamWait {
+    /// At least one wake arrived. New chunks can be in the table.
+    Woken,
+    /// No wake arrived before the timeout.
+    TimedOut,
+    /// The `LISTEN` connection closed.
+    ChannelClosed,
+}
+
+/// Wake state that the forwarder task shares with a [`DurableStreamListener`].
+struct DurableStreamWakes {
+    /// Holds one permit after one or more wakes. Wakes merge into it.
+    notify: tokio::sync::Notify,
+    /// Set when the `LISTEN` connection closes.
+    closed: std::sync::atomic::AtomicBool,
+}
+
+/// Listener for one execution's durable stream wakes (issue #1974).
+///
+/// The `GET /workflows/{id}/stream/durable` route opens it before its first
+/// read. Postgres then sends a wake for each later commit, so the read loop
+/// misses no chunk.
+///
+/// **It never stalls the connection.** A forwarder task reads every
+/// notification at once and merges it into one pending wake. A reader that
+/// waits for a slow client therefore never stops the driver from reading the
+/// socket. A stopped driver would hold back the shared Postgres NOTIFY queue
+/// for the whole cluster.
+pub struct DurableStreamListener {
+    /// Client handle kept alive so the LISTEN connection stays open.
+    _client: tokio_postgres::Client,
+    /// Wake state shared with the forwarder task.
+    wakes: std::sync::Arc<DurableStreamWakes>,
+    /// Background connection driver handle kept alive for the connection's lifetime.
+    _connection_handle: tokio::task::JoinHandle<()>,
+    /// Forwarder task. Aborted on drop.
+    forwarder: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for DurableStreamListener {
+    fn drop(&mut self) {
+        self.forwarder.abort();
+    }
+}
+
+impl DurableStreamListener {
+    /// Connect to Postgres and `LISTEN` on [`durable_stream_channel`].
+    ///
+    /// TLS follows the `sslmode` rules of [`WorkflowProgressListener::connect`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Database`] if the connection or LISTEN fails.
+    /// Returns [`HarvestError::Config`] if the URL or its TLS settings are
+    /// not valid.
+    pub async fn connect(database_url: &str, exec_id: Uuid) -> HarvestResult<Self> {
+        let ListenConnection {
+            client,
+            mut rx,
+            driver,
+        } = open_listen_connection(database_url, "postgres durable stream listener error").await?;
+        let channel = quote_pg_identifier(&durable_stream_channel(exec_id));
+        client
+            .batch_execute(&format!("LISTEN {channel}"))
+            .await
+            .map_err(|e| {
+                HarvestError::Database(format!("LISTEN {channel} failed: {}", error_chain(&e)))
+            })?;
+        let wakes = std::sync::Arc::new(DurableStreamWakes {
+            notify: tokio::sync::Notify::new(),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let forwarder_wakes = std::sync::Arc::clone(&wakes);
+        let forwarder = tokio::spawn(async move {
+            while rx.recv().await.is_some() {
+                forwarder_wakes.notify.notify_one();
+            }
+            forwarder_wakes
+                .closed
+                .store(true, std::sync::atomic::Ordering::Release);
+            forwarder_wakes.notify.notify_one();
+        });
+        Ok(Self {
+            _client: client,
+            wakes,
+            _connection_handle: driver,
+            forwarder,
+        })
+    }
+
+    /// Wait up to `timeout` for a wake. All wakes since the last call merge
+    /// into one, because one table read serves all of them.
+    pub async fn wait_timeout(&self, timeout: Duration) -> DurableStreamWait {
+        if self.is_closed() {
+            return DurableStreamWait::ChannelClosed;
+        }
+        match tokio::time::timeout(timeout, self.wakes.notify.notified()).await {
+            Err(_elapsed) => DurableStreamWait::TimedOut,
+            Ok(()) if self.is_closed() => DurableStreamWait::ChannelClosed,
+            Ok(()) => DurableStreamWait::Woken,
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        std::sync::atomic::AtomicBool::load(
+            &self.wakes.closed,
+            std::sync::atomic::Ordering::Acquire,
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2194,6 +2371,25 @@ mod tests {
         ]);
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, "harvest_queue_default");
+    }
+
+    /// Issue #1974: durable stream wakes merge per execution, with an empty
+    /// payload. A reader reads the table, so the payload carries nothing.
+    #[test]
+    fn coalesce_merges_durable_stream_wakes_per_execution() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let stream = |exec_id| Note::Stream {
+            channel: durable_stream_channel(exec_id),
+        };
+        let sent = coalesce(vec![stream(a), stream(b), stream(a)]);
+        assert_eq!(
+            sent,
+            vec![
+                (durable_stream_channel(a), String::new()),
+                (durable_stream_channel(b), String::new()),
+            ]
+        );
     }
 
     #[test]
