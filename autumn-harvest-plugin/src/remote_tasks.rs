@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use autumn_harvest::remote_task::{
-    RemoteFuture, RemoteProtocol, RemoteTaskError, RemoteTaskHandle, RemoteTaskRequest,
-    RemoteTaskStart, RemoteTaskState, RemoteTaskTransport, a2a, mcp,
+    RemoteFuture, RemoteProtocol, RemoteTaskError, RemoteTaskHandle, RemoteTaskPoll,
+    RemoteTaskRequest, RemoteTaskStart, RemoteTaskTransport, a2a, mcp,
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
@@ -269,7 +269,7 @@ impl HttpRemoteTasks {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .is_some_and(is_event_stream);
-        let raw = read_body(&mut response, method, id, event_stream).await?;
+        let raw = read_body(&mut response, method, id, event_stream, status).await?;
         let envelope = if event_stream {
             std::str::from_utf8(&raw)
                 .ok()
@@ -324,6 +324,7 @@ async fn read_body(
     method: &str,
     id: u64,
     event_stream: bool,
+    status: reqwest::StatusCode,
 ) -> Result<Vec<u8>, RemoteTaskError> {
     let too_large = || {
         RemoteTaskError::non_retryable(format!(
@@ -338,7 +339,13 @@ async fn read_body(
     }
     let mut raw = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|e| {
-        RemoteTaskError::retryable(format!("{method}: read failed: {}", e.without_url()))
+        let message = format!("{method}: read failed: {}", e.without_url());
+        // The status is known already. A refused request stays refused.
+        if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+            RemoteTaskError::non_retryable(message)
+        } else {
+            RemoteTaskError::retryable(message)
+        }
     })? {
         if raw.len() + chunk.len() > MAX_RESPONSE_BYTES {
             return Err(too_large());
@@ -527,7 +534,7 @@ impl RemoteTaskTransport for HttpRemoteTasks {
     fn get<'a>(
         &'a self,
         handle: &'a RemoteTaskHandle,
-    ) -> RemoteFuture<'a, Result<RemoteTaskState, RemoteTaskError>> {
+    ) -> RemoteFuture<'a, Result<RemoteTaskPoll, RemoteTaskError>> {
         Box::pin(async move {
             let server = self.server_for(&handle.server, handle.protocol)?;
             match handle.protocol {
@@ -535,12 +542,15 @@ impl RemoteTaskTransport for HttpRemoteTasks {
                     let headers = mcp_headers("tasks/get", &handle.task_id);
                     let params = mcp::tasks_get_params(handle);
                     let result = self.rpc(server, "tasks/get", params, &headers).await?;
-                    mcp::parse_task(handle, &result)
+                    Ok(RemoteTaskPoll {
+                        state: mcp::parse_task(handle, &result)?,
+                        poll_interval: mcp::poll_interval(&result),
+                    })
                 }
                 RemoteProtocol::A2a => {
                     let params = a2a::tasks_get_params(handle);
                     let result = self.rpc(server, "tasks/get", params, &[]).await?;
-                    a2a::parse_task(handle, &result)
+                    a2a::parse_task(handle, &result).map(Into::into)
                 }
             }
         })

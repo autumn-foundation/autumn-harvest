@@ -175,6 +175,24 @@ impl RemoteTaskState {
     }
 }
 
+/// One read of a remote task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteTaskPoll {
+    /// The state of the task.
+    pub state: RemoteTaskState,
+    /// The wait that the server asks for before the next read, if any.
+    pub poll_interval: Option<Duration>,
+}
+
+impl From<RemoteTaskState> for RemoteTaskPoll {
+    fn from(state: RemoteTaskState) -> Self {
+        Self {
+            state,
+            poll_interval: None,
+        }
+    }
+}
+
 /// A transport error.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{message}")]
@@ -216,11 +234,12 @@ pub trait RemoteTaskTransport: Send + Sync {
         idempotency_key: &'a str,
     ) -> RemoteFuture<'a, Result<RemoteTaskStart, RemoteTaskError>>;
 
-    /// Read the state of a remote task.
+    /// Read the state of a remote task, and the poll interval that the
+    /// server asks for.
     fn get<'a>(
         &'a self,
         handle: &'a RemoteTaskHandle,
-    ) -> RemoteFuture<'a, Result<RemoteTaskState, RemoteTaskError>>;
+    ) -> RemoteFuture<'a, Result<RemoteTaskPoll, RemoteTaskError>>;
 }
 
 /// The worker state that holds the transport.
@@ -450,6 +469,14 @@ pub mod mcp {
     #[must_use]
     pub fn tasks_get_params(handle: &RemoteTaskHandle) -> Value {
         json!({"taskId": handle.task_id, "_meta": meta()})
+    }
+
+    /// The `pollIntervalMs` that a task asks the client to respect.
+    #[must_use]
+    pub fn poll_interval(task: &Value) -> Option<std::time::Duration> {
+        task.get("pollIntervalMs")
+            .and_then(Value::as_u64)
+            .map(std::time::Duration::from_millis)
     }
 
     /// Read the `tasks/get` result for `handle`.

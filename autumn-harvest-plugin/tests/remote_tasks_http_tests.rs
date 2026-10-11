@@ -5,10 +5,11 @@
 #![cfg(feature = "mcp")]
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use autumn_harvest::remote_task::{
-    RemoteProtocol, RemoteTaskHandle, RemoteTaskOutcome, RemoteTaskRequest, RemoteTaskStart,
-    RemoteTaskState, RemoteTaskTransport,
+    RemoteProtocol, RemoteTaskHandle, RemoteTaskOutcome, RemoteTaskPoll, RemoteTaskRequest,
+    RemoteTaskStart, RemoteTaskState, RemoteTaskTransport,
 };
 use autumn_harvest_plugin::remote_tasks::{HttpRemoteTasks, RemoteServer};
 use autumn_web::reexports::axum::extract::State;
@@ -154,7 +155,8 @@ async fn mcp_get_reads_an_is_error_result_as_completed() {
     let (url, seen) = serve(Arc::new(move |body| {
         result(
             body,
-            json!({"resultType": "complete", "taskId": "t-1", "status": "completed", "result": reply}),
+            json!({"resultType": "complete", "taskId": "t-1", "status": "completed",
+                "pollIntervalMs": 2500, "result": reply}),
         )
     }))
     .await;
@@ -165,13 +167,16 @@ async fn mcp_get_reads_an_is_error_result_as_completed() {
         task_id: "t-1".into(),
     };
 
-    let state = client.get(&handle).await;
+    let poll = client.get(&handle).await;
     assert_eq!(
-        state,
-        Ok(RemoteTaskState::Completed(RemoteTaskOutcome {
-            result: tool,
-            is_error: true,
-        }))
+        poll,
+        Ok(RemoteTaskPoll {
+            state: RemoteTaskState::Completed(RemoteTaskOutcome {
+                result: tool,
+                is_error: true,
+            }),
+            poll_interval: Some(Duration::from_millis(2500)),
+        })
     );
     let seen = seen.lock().expect("seen")[0].clone();
     assert_eq!(seen.body["method"], "tasks/get");
@@ -229,6 +234,46 @@ async fn closed_port_url() -> String {
     let addr = listener.local_addr().expect("addr");
     drop(listener);
     format!("http://{addr}/rpc")
+}
+
+/// Sends `status` with a body shorter than its `Content-Length`, then closes.
+async fn truncated_body_url(status: &'static str) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut buf = [0_u8; 4096];
+        let _ = socket.read(&mut buf).await;
+        let head = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{{"
+        );
+        let _ = socket.write_all(head.as_bytes()).await;
+    });
+    format!("http://{addr}/rpc")
+}
+
+#[tokio::test]
+async fn a_body_read_failure_follows_the_status() {
+    for (status, retryable) in [
+        ("400 Bad Request", false),
+        ("503 Service Unavailable", true),
+    ] {
+        let url = truncated_body_url(status).await;
+        let client = HttpRemoteTasks::new().server("reports", RemoteServer::mcp(&url));
+        let err = client
+            .start(&request(RemoteProtocol::Mcp, "export"), "k")
+            .await
+            .expect_err("truncated");
+        assert!(
+            err.message.contains("read failed"),
+            "{status}: {}",
+            err.message
+        );
+        assert_eq!(err.retryable, retryable, "{status}: {}", err.message);
+    }
 }
 
 #[tokio::test]
@@ -355,7 +400,7 @@ async fn a2a_start_and_get_use_message_send_and_tasks_get() {
         panic!("expected a task, got {start:?}");
     };
     assert_eq!(handle.task_id, "a-1");
-    let state = client.get(&handle).await.expect("get");
+    let state = client.get(&handle).await.expect("get").state;
     assert!(
         matches!(state, RemoteTaskState::Failed(ref m) if m.contains("no")),
         "got {state:?}"
@@ -391,7 +436,7 @@ async fn an_open_event_stream_returns_at_the_matching_response() {
     }))
     .await;
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("client");
@@ -406,7 +451,7 @@ async fn an_open_event_stream_returns_at_the_matching_response() {
         matches!(start, RemoteTaskStart::Task(ref h) if h.task_id == "t-s"),
         "{start:?}"
     );
-    assert!(began.elapsed() < std::time::Duration::from_secs(4));
+    assert!(began.elapsed() < Duration::from_secs(4));
 }
 
 /// A JSON response for another request id is a protocol error.

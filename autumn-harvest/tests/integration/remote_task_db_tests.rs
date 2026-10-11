@@ -25,8 +25,8 @@ use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest::remote_task::{
     self, RemoteFuture, RemoteTaskCall, RemoteTaskError, RemoteTaskHandle, RemoteTaskOutcome,
-    RemoteTaskPoller, RemoteTaskRequest, RemoteTaskStart, RemoteTaskState, RemoteTaskTransport,
-    RemoteTasks,
+    RemoteTaskPoll, RemoteTaskPoller, RemoteTaskRequest, RemoteTaskStart, RemoteTaskState,
+    RemoteTaskTransport, RemoteTasks,
 };
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::types::{
@@ -101,6 +101,8 @@ struct FakeServer {
     starts: Mutex<u32>,
     /// The task id of each read, in order.
     reads: Mutex<Vec<String>>,
+    /// The poll interval that each read asks for.
+    poll_interval: Mutex<Option<Duration>>,
 }
 
 impl FakeServer {
@@ -160,7 +162,7 @@ impl RemoteTaskTransport for FakeTransport {
     fn get<'a>(
         &'a self,
         handle: &'a RemoteTaskHandle,
-    ) -> RemoteFuture<'a, Result<RemoteTaskState, RemoteTaskError>> {
+    ) -> RemoteFuture<'a, Result<RemoteTaskPoll, RemoteTaskError>> {
         Box::pin(async move {
             self.0
                 .reads
@@ -173,6 +175,10 @@ impl RemoteTaskTransport for FakeTransport {
                 .expect("states")
                 .get(&handle.task_id)
                 .cloned()
+                .map(|state| RemoteTaskPoll {
+                    state,
+                    poll_interval: *self.0.poll_interval.lock().expect("interval"),
+                })
                 .ok_or_else(|| RemoteTaskError::non_retryable("Task not found"))
         })
     }
@@ -672,5 +678,23 @@ async fn a_zero_result_cap_means_no_cap() {
     poll_until_settled(&p.pool, &poller).await;
 
     wait_for_execution_state_with_timeout(url, exec_id, "COMPLETED", WAIT).await;
+    p.stop().await;
+}
+
+/// A server poll interval longer than the poller's delays the next read.
+#[tokio::test]
+async fn the_poller_respects_the_server_poll_interval() {
+    let db = setup().await;
+    let url = &db.url;
+    let server = Arc::new(FakeServer::default());
+    *server.poll_interval.lock().expect("interval") = Some(Duration::from_secs(600));
+    let p = Process::start(url, "remote-task-interval", &server);
+
+    let exec_id = start_run(url, "report-10", json!({})).await;
+    wait_for_token(url, exec_id).await;
+    let first = p.poller.poll_once(&p.pool).await.expect("poll 1");
+    assert_eq!(first.polled, 1);
+    let second = p.poller.poll_once(&p.pool).await.expect("poll 2");
+    assert_eq!(second.polled, 0, "the server asked for 10 minutes");
     p.stop().await;
 }

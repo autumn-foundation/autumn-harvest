@@ -14,8 +14,8 @@ use diesel_async::{AsyncConnection as _, AsyncPgConnection, RunQueryDsl};
 use futures::StreamExt as _;
 
 use super::{
-    AWAIT_ACTIVITY, RemoteTaskError, RemoteTaskHandle, RemoteTaskState, RemoteTaskTransport,
-    RemoteTasks,
+    AWAIT_ACTIVITY, RemoteTaskError, RemoteTaskHandle, RemoteTaskPoll, RemoteTaskState,
+    RemoteTaskTransport, RemoteTasks,
 };
 use crate::error::{HarvestError, HarvestResult, database_error};
 use crate::event::WorkflowEvent;
@@ -32,6 +32,9 @@ pub const MAX_MESSAGE_BYTES: usize = 4096;
 
 /// The longest wait before the poller reads a failing task again.
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
+
+/// The longest poll interval that the poller takes from a server.
+const MAX_SERVER_POLL_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// The most tokens that the poller tracks with a backoff.
 const MAX_BACKOFF_ENTRIES: usize = 10_000;
@@ -330,7 +333,8 @@ pub struct RemoteTaskPoller {
     max_result_bytes: u64,
     /// The last token of the previous page. `None` starts from the first.
     cursor: Mutex<Option<ExternalActivityToken>>,
-    /// Tokens whose last remote read failed.
+    /// Tokens that wait: after a failed read, or for the poll interval of
+    /// the server.
     backoff: Mutex<HashMap<ExternalActivityToken, Backoff>>,
 }
 
@@ -418,8 +422,9 @@ impl RemoteTaskPoller {
     ///
     /// The poll holds no database connection while it waits for a remote
     /// server. A failed remote read leaves its token pending, and the next
-    /// reads of that token back off up to 5 minutes. The deadline of the
-    /// token still ends the wait.
+    /// reads of that token back off up to 5 minutes. A server poll interval
+    /// longer than ours delays the next read, up to 1 hour. The deadline of
+    /// the token still ends the wait.
     ///
     /// # Errors
     ///
@@ -453,7 +458,7 @@ impl RemoteTaskPoller {
             polled: due.len(),
             ..PollReport::default()
         };
-        let reads: Vec<(PendingRemoteTask, Result<RemoteTaskState, RemoteTaskError>)> =
+        let reads: Vec<(PendingRemoteTask, Result<RemoteTaskPoll, RemoteTaskError>)> =
             futures::stream::iter(due)
                 .map(|pending| async move {
                     let read =
@@ -471,10 +476,15 @@ impl RemoteTaskPoller {
         let mut ended = Vec::new();
         for (pending, read) in reads {
             match read {
-                Ok(state) => {
-                    self.clear_backoff(pending.token);
+                Ok(RemoteTaskPoll {
+                    state,
+                    poll_interval,
+                }) => {
                     if state.is_terminal() {
+                        self.clear_backoff(pending.token);
                         ended.push((pending, state));
+                    } else {
+                        self.wait_for_server(pending.token, poll_interval);
                     }
                 }
                 Err(e) => {
@@ -538,6 +548,25 @@ impl RemoteTaskPoller {
             Backoff {
                 errors,
                 until: Instant::now() + delay,
+            },
+        );
+    }
+
+    /// Respect the poll interval of the server, when it is longer than ours.
+    fn wait_for_server(&self, token: ExternalActivityToken, interval: Option<Duration>) {
+        let Some(interval) = interval.filter(|i| *i > self.interval) else {
+            self.clear_backoff(token);
+            return;
+        };
+        let mut waits = self.backoff.lock().unwrap_or_else(PoisonError::into_inner);
+        if waits.len() >= MAX_BACKOFF_ENTRIES {
+            waits.clear();
+        }
+        waits.insert(
+            token,
+            Backoff {
+                errors: 0,
+                until: Instant::now() + interval.min(MAX_SERVER_POLL_INTERVAL),
             },
         );
     }

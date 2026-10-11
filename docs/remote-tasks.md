@@ -93,7 +93,7 @@ implement `RemoteTaskTransport` for any other client.
 |---|---|
 | Start activity | 5 attempts, exponential from 1 s, 60 s each |
 | Retryable start errors | network error, HTTP 429, HTTP 5xx |
-| Poll interval | 5 s |
+| Poll interval | 5 s, or the MCP `pollIntervalMs` if longer, up to 1 h |
 | Page size | 100 tokens |
 | Remote reads at a time | 8, each with a limit of 30 s |
 | Backoff of a failing read | doubles from the interval, up to 5 min |

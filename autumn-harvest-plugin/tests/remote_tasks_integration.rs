@@ -313,7 +313,7 @@ async fn a_retried_start_gets_the_same_task() {
 
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
-        match served.transport.get(&handle).await.expect("get") {
+        match served.transport.get(&handle).await.expect("get").state {
             RemoteTaskState::Completed(outcome) => {
                 assert!(!outcome.is_error, "{outcome:?}");
                 break;

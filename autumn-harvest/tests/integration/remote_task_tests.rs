@@ -15,8 +15,8 @@ use autumn_harvest::error::HarvestError;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::remote_task::{
     self, AWAIT_ACTIVITY, RemoteFuture, RemoteProtocol, RemoteTaskCall, RemoteTaskError,
-    RemoteTaskHandle, RemoteTaskOutcome, RemoteTaskRequest, RemoteTaskStart, RemoteTaskState,
-    RemoteTaskTransport, RemoteTasks, START_ACTIVITY, a2a, mcp,
+    RemoteTaskHandle, RemoteTaskOutcome, RemoteTaskPoll, RemoteTaskRequest, RemoteTaskStart,
+    RemoteTaskState, RemoteTaskTransport, RemoteTasks, START_ACTIVITY, a2a, mcp,
 };
 use autumn_harvest::types::{ActivityExecId, ExecutionId, ExternalActivityToken};
 use chrono::Utc;
@@ -298,8 +298,8 @@ impl RemoteTaskTransport for RecordingTransport {
     fn get<'a>(
         &'a self,
         _handle: &'a RemoteTaskHandle,
-    ) -> RemoteFuture<'a, Result<RemoteTaskState, RemoteTaskError>> {
-        Box::pin(async { Ok(RemoteTaskState::Working) })
+    ) -> RemoteFuture<'a, Result<RemoteTaskPoll, RemoteTaskError>> {
+        Box::pin(async { Ok(RemoteTaskState::Working.into()) })
     }
 }
 
@@ -658,4 +658,13 @@ fn a_tasks_get_result_for_another_task_is_refused() {
     assert!(mcp::parse_task(&polled(RemoteProtocol::Mcp, "t"), &missing).is_err());
     let a2a_reply = json!({"id": "other", "status": {"state": "completed"}});
     assert!(a2a::parse_task(&polled(RemoteProtocol::A2a, "a"), &a2a_reply).is_err());
+}
+
+#[test]
+fn mcp_poll_interval_reads_poll_interval_ms() {
+    assert_eq!(
+        mcp::poll_interval(&json!({"pollIntervalMs": 30_000})),
+        Some(Duration::from_secs(30))
+    );
+    assert_eq!(mcp::poll_interval(&json!({})), None);
 }
