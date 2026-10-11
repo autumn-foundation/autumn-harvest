@@ -90,8 +90,8 @@ Each release is one `UPDATE` per pool. At worst it scans all `RUNNING` rows of t
 |--------|------|-------------|
 | `harvest.workflow.cache_hit` | counter | Task served from in-process LRU cache (delta load). The task resumes the resident workflow or replays the cached history. |
 | `harvest.workflow.cache_miss` | counter | Task required a full history reload from Postgres. |
-| `harvest.workflow.resident_hit` | counter | Task resumed the parked workflow and replayed nothing (issue #2007). |
-| `harvest.workflow.resident_miss` | counter | Task replayed cold while resident workflows are on. The `reason` label says why (issue #2007). |
+| `harvest.workflow.resident_hit` | counter | The task resumes the parked workflow and replays nothing (issue #2007). |
+| `harvest.workflow.resident_miss` | counter | The task replays cold while resident workflows are on. The `reason` label says why (issue #2007). |
 
 Each metric carries the `workflow` and `queue` labels. `resident_miss` also carries `reason`. `execution.id` is deliberately excluded per ADR-0001 §7 (cardinality).
 

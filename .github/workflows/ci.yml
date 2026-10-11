@@ -453,8 +453,7 @@ jobs:
       - name: "Clippy standalone-quickstart example (issue #1614)"
         run: cargo clippy -p standalone-quickstart --all-targets -- -D warnings
       - name: "Clippy agent-loop-hit-rate example (issue #2007)"
-        # `--no-deps`: the engine has a dead-code warning without `testing`.
-        run: cargo clippy -p agent-loop-hit-rate --all-targets --no-deps -- -D warnings
+        run: cargo clippy -p agent-loop-hit-rate --all-targets -- -D warnings
       # Same issue #962 rule as the verify and redis crates below: a new
       # workspace member gets NO clippy coverage without its own step here.
       # `--no-deps` scopes the deny to the example, because it depends on
@@ -1205,6 +1204,11 @@ jobs:
       - name: "Run standalone-quickstart example tests (issue #1614)"
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p standalone-quickstart
+      # Issue #2007. `--bins` runs the unit tests. The measurement itself
+      # needs Postgres and runs by hand (see the crate README).
+      - name: "Run agent-loop-hit-rate example tests (issue #2007)"
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo test -p agent-loop-hit-rate --bins
       - name: Run business_metrics example tests (issue #758)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics

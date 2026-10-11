@@ -2,8 +2,8 @@
 //!
 //! The binary runs `autumn_harvest_agent::agent_loop` on one Postgres
 //! worker with sticky routing and resident workflows on. An offline model
-//! asks for one tool call per turn, then answers. No API key and no network
-//! are needed. At the end the binary prints the resident hits and the
+//! asks for one tool call per turn, then answers. The binary needs no API
+//! key and no network. At the end the binary prints the resident hits and the
 //! resident misses by reason.
 //!
 //! ```sh

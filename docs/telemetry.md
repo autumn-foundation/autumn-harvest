@@ -340,7 +340,7 @@ metric is emitted in the source code.
 | `harvest.workflow.cache_hit` | Counter | `worker.rs` — `process_workflow_task`, once per decision that loads only the delta from the in-process cache |
 | `harvest.workflow.cache_miss` | Counter | `worker.rs` — `process_workflow_task`, once per decision that loads the full history |
 | `harvest.workflow.resident_hit` | Counter | `worker.rs` — `process_workflow_task`, once per decision that resumes the parked workflow and replays nothing (issue #2007). See [Resident hit rate](#resident-hit-rate-issue-2007) |
-| `harvest.workflow.resident_miss` | Counter | `worker.rs` — `process_workflow_task`, once per decision that replays cold while resident workflows are on. Labelled with the reason (issue #2007) |
+| `harvest.workflow.resident_miss` | Counter | `worker.rs` — `process_workflow_task`, once per decision that replays cold while resident workflows are on. Labels: `workflow`, `queue`, `reason` (issue #2007) |
 | `harvest.activity.duration` | Histogram | `worker.rs` — `dispatch_activity_handler`, on activity completion (success or failure) |
 | `harvest.activity.failed` | Counter | `worker.rs` — `dispatch_activity_handler`, on each failed attempt; richer labels than `harvest.activity.attempts` (`workflow.type`, `error.type`, `non_retryable`) |
 | `harvest.activity.attempts` | Counter | `worker.rs` — `dispatch_activity_handler`, once per attempt for **both** outcomes; use for success-rate SLOs: `rate(attempts{outcome="completed"}[5m]) / rate(attempts[5m])` (issue #528) |
@@ -438,7 +438,7 @@ metric is emitted in the source code.
 | `harvest.workflow.cache_hit` | `workflow`, `queue` |
 | `harvest.workflow.cache_miss` | `workflow`, `queue` |
 | `harvest.workflow.resident_hit` | `workflow`, `queue` |
-| `harvest.workflow.resident_miss` | `workflow`, `queue`, `reason` (`cold\|multi_await\|race\|mutex\|hot_swap\|command\|context\|key_changed\|delta\|failure` — `ResidentMiss::as_str`, closed set) |
+| `harvest.workflow.resident_miss` | `workflow`, `queue`, `reason` (`cold\|multi_await\|race\|mutex\|hot_swap\|command\|condition\|signal_handler\|context\|key_changed\|delta\|failure` — `ResidentMiss::as_str`, closed set) |
 | `harvest.activity.duration` | `activity`, `queue`, `status` (`completed\|failed`), `build_id` — capped, see [`build_id` label](#build_id-label) (issue #1814) |
 | `harvest.activity.failed` | `activity`, `workflow.type`, `error.type`, `non_retryable` |
 | `harvest.activity.attempts` | `activity`, `queue`, `outcome` (`completed\|failed`), `build_id` — capped, see [`build_id` label](#build_id-label) (issue #1814) |
@@ -560,35 +560,39 @@ The ramp guard does not read these metrics. It counts runs in the database by
 
 A warm decision can resume the parked workflow and replay nothing (issue
 #1798). Two counters show how often that happens. While resident workflows
-are on, each decision records exactly one sample:
+are on, each decision that drives the workflow records exactly one sample:
 
 - `harvest.workflow.resident_hit` when the decision resumes the parked
   workflow.
 - `harvest.workflow.resident_miss{reason}` when the decision replays cold.
 
-No sample is recorded while sticky routing or `resident_workflows` is off,
-or after the cache closes at shutdown. A local-activity re-drive inside one
-decision does not record a second sample.
+The worker records no sample while sticky routing or `resident_workflows`
+is off, or after the cache closes at shutdown. A local-activity re-drive
+inside one decision does not record a second sample. A decision that fails
+before it drives the workflow records no sample, for example on an input it
+cannot decode.
 
 A miss has exactly one `reason`:
 
-| `reason` | The decision replayed cold because |
-|----------|-------------------------------------|
-| `cold` | This worker held no resident state for the run: the first decision, a cache miss, an LRU eviction or a restart. |
+| `reason` | The decision replays cold because |
+|----------|-----------------------------------|
+| `cold` | This worker holds no resident state for the run: the first decision, a cache miss, an LRU eviction or a restart. |
 | `multi_await` | The last suspension awaited two or more commands, for example a `futures::join!`. |
-| `race` | The last suspension awaited a race: `ctx.race()`, `wait_for_signal_timeout` or a child with a deadline. A dropped wait also counts here. |
+| `race` | The last suspension was part of a race: `ctx.race()`, `wait_for_signal_timeout` or a child with a deadline. Work that cancels race losers also counts here. |
 | `mutex` | The last suspension held or waited for a durable mutex. |
 | `hot_swap` | The workflow runs in a hot-swapped module. |
 | `command` | The last suspension sent a command that the resident path does not take, for example a child workflow or a local activity. |
-| `context` | Another context state blocked the capture: a park token, a push signal handler, a cancel request, a non-determinism record, unread history or a probed signal. |
+| `condition` | The last suspension waited for a condition (`await_condition`). |
+| `signal_handler` | The workflow has a push signal handler. |
+| `context` | Another context state blocked the capture, for example a cancel request or a non-determinism record. |
 | `key_changed` | A context input changed since the suspension, for example the deadline or the shard. |
-| `delta` | The new events did not resolve the parked wait exactly, for example two results in one delta, or a gap in the event ids. |
+| `delta` | The new events did not resolve the parked wait exactly. Examples: two results in one delta, or a gap in the event ids. |
 | `failure` | The awaited activity failed or timed out. |
 
-A raw `select!` over two Harvest futures records no race marker, so it
-counts as `multi_await`. Each reason is a class of suspension that a wider
-resident path could take. The `reason` set is closed, so the label is
-bounded.
+A raw `select!` over two Harvest futures records no race marker. It counts
+as `multi_await` while both sides wait, and as `race` after it drops one
+side. Each reason is a class of suspension that a wider resident path could
+take. The closed set bounds the `reason` label.
 
 The hit rate per workflow type:
 
@@ -601,7 +605,7 @@ sum by (workflow) (rate(harvest_workflow_resident_hit_total[5m]))
 
 `harvest.workflow.cache_hit` counts delta loads. A cache hit can still
 replay cold, so the cache hit rate is an upper bound of the resident hit
-rate. Recorded measurements are in
+rate. The recorded measurements are in
 [`docs/rnd/2026-10-11-resident-hit-rate.md`](rnd/2026-10-11-resident-hit-rate.md).
 
 ### Saga compensation metrics (issue #801)

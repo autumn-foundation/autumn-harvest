@@ -616,19 +616,19 @@ pub const METRIC_QUERY_DURATION: &str = "harvest.query.duration";
 /// Counter: incremented when a workflow task is picked up by the worker that
 /// already holds that execution's replay state in its in-process LRU cache.
 ///
-/// Labeled by `workflow` (workflow name). `execution.id` stays span-only per
-/// the existing cardinality rule (ADR-0001 §7).
+/// Labeled by `workflow` (workflow name) and `queue`. `execution.id` stays
+/// span-only per the existing cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_CACHE_HIT: &str = "harvest.workflow.cache_hit";
 
 /// Counter: incremented when a workflow task is picked up by a worker that
 /// does NOT hold that execution's replay state in its in-process LRU cache,
 /// causing a full event-history reload from Postgres.
 ///
-/// Labeled by `workflow` (workflow name). `execution.id` stays span-only per
-/// the existing cardinality rule (ADR-0001 §7).
+/// Labeled by `workflow` (workflow name) and `queue`. `execution.id` stays
+/// span-only per the existing cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_CACHE_MISS: &str = "harvest.workflow.cache_miss";
 
-/// Counter: a decision resumed the parked workflow and replayed nothing
+/// Counter: a decision resumes the parked workflow and replays nothing
 /// (issue #2007).
 ///
 /// Labeled by `workflow` and `queue`. While resident workflows are on, each
@@ -636,11 +636,11 @@ pub const METRIC_WORKFLOW_CACHE_MISS: &str = "harvest.workflow.cache_miss";
 /// [`METRIC_WORKFLOW_RESIDENT_MISS`].
 pub const METRIC_WORKFLOW_RESIDENT_HIT: &str = "harvest.workflow.resident_hit";
 
-/// Counter: a decision replayed cold while resident workflows are on (issue
+/// Counter: a decision replays cold while resident workflows are on (issue
 /// #2007).
 ///
 /// Labeled by `workflow`, `queue` and [`METRIC_LABEL_REASON`]. The reason is
-/// [`crate::resident::ResidentMiss::as_str`], a closed set.
+/// [`crate::resident::ResidentMiss::as_str`]. The closed set bounds the label.
 pub const METRIC_WORKFLOW_RESIDENT_MISS: &str = "harvest.workflow.resident_miss";
 
 /// Counter: incremented once per `signal_external_workflow` call after the
@@ -3844,7 +3844,7 @@ pub trait MetricsRecorder: Send + Sync {
     /// `WorkflowCache`, so only delta events (new timer firings / signals) need
     /// to be fetched from Postgres rather than the full history.
     ///
-    /// Maps to the counter `harvest.workflow.cache_hit{workflow}`.
+    /// Maps to the counter `harvest.workflow.cache_hit{workflow, queue}`.
     fn record_workflow_cache_hit(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
     }
@@ -3855,12 +3855,12 @@ pub trait MetricsRecorder: Send + Sync {
     /// either because this is the first task for this execution on this worker,
     /// the entry was evicted by LRU pressure, or sticky routing is disabled.
     ///
-    /// Maps to the counter `harvest.workflow.cache_miss{workflow}`.
+    /// Maps to the counter `harvest.workflow.cache_miss{workflow, queue}`.
     fn record_workflow_cache_miss(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
     }
 
-    /// A decision resumed the parked workflow and replayed nothing (issue
+    /// A decision resumes the parked workflow and replays nothing (issue
     /// #2007).
     ///
     /// Maps to the counter `harvest.workflow.resident_hit{workflow, queue}`.
@@ -3868,7 +3868,7 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow_name, queue);
     }
 
-    /// A decision replayed cold while resident workflows are on (issue
+    /// A decision replays cold while resident workflows are on (issue
     /// #2007). `reason` is [`crate::resident::ResidentMiss::as_str`].
     ///
     /// Maps to the counter

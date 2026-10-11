@@ -25547,20 +25547,18 @@ async fn process_workflow_task(
         let workflow_drive = async {
             if let Some(warm) = warm_resident.take() {
                 let miss = match warm {
-                    Ok(resident) => match resident
-                        .resume_with(
-                            &history_events[prepared.delta_start..],
-                            resident_key.as_ref(),
-                            Some(&span_meta),
-                        )
-                        .await
-                    {
-                        Ok(drive) => {
+                    Ok(resident) => match resident.wake(
+                        &history_events[prepared.delta_start..],
+                        resident_key.as_ref(),
+                    ) {
+                        // The wake is the commit point, so a drive that
+                        // times out still counts its hit.
+                        Ok(woken) => {
                             telemetry.metrics.record_workflow_resident_hit(
                                 &prepared.execution.workflow_name,
                                 &task.queue_name,
                             );
-                            return drive;
+                            return woken.drive(Some(&span_meta)).await;
                         }
                         Err(reason) => {
                             tracing::debug!(

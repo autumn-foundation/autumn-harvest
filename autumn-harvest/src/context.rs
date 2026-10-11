@@ -3010,6 +3010,10 @@ pub struct WorkflowContext {
     /// still-parked holder. A guard dropped mid-poll or at genuine completion
     /// sees this `false` and releases normally.
     suspending: std::sync::atomic::AtomicBool,
+    /// Whether a `ctx.race()` in this cycle waits for an open branch (issue
+    /// #2007). A race that is still open on a later cycle records no race
+    /// marker, so the resident miss reason reads this flag.
+    race_waiting: std::sync::atomic::AtomicBool,
     /// Shared typed state map (same `AppState` extras as the web server).
     state: SharedState,
     /// In-memory query handlers (not persisted to history).
@@ -3607,6 +3611,7 @@ impl WorkflowContext {
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
             held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
             suspending: std::sync::atomic::AtomicBool::new(false),
+            race_waiting: std::sync::atomic::AtomicBool::new(false),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -3780,6 +3785,7 @@ impl WorkflowContext {
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
             held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
             suspending: std::sync::atomic::AtomicBool::new(false),
+            race_waiting: std::sync::atomic::AtomicBool::new(false),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -3851,6 +3857,7 @@ impl WorkflowContext {
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
             held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
             suspending: std::sync::atomic::AtomicBool::new(false),
+            race_waiting: std::sync::atomic::AtomicBool::new(false),
             state: empty_shared_state(),
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -7267,9 +7274,9 @@ impl WorkflowContext {
 
     /// Returns why this context cannot stay resident, or `None` (issue #1798).
     ///
-    /// A held mutex reads as [`crate::resident::ResidentMiss::Mutex`]. Each
-    /// other state reads as [`crate::resident::ResidentMiss::Context`] (issue
-    /// #2007).
+    /// The reason names the state (issue #2007). A park token reads as
+    /// `Condition`, a push handler as `SignalHandler` and a held mutex as
+    /// `Mutex`. Each other state reads as `Context`.
     ///
     /// A resident workflow resumes its parked future with one new result. A
     /// warm decision must then equal a cold replay. Each state below can make
@@ -7288,8 +7295,7 @@ impl WorkflowContext {
     pub(crate) fn resident_blocker(&self) -> Option<crate::resident::ResidentMiss> {
         use crate::resident::ResidentMiss;
         if self.parks.is_held() {
-            // A park token is held.
-            return Some(ResidentMiss::Context);
+            return Some(ResidentMiss::Condition);
         }
         if self.strict_replay || self.canary_mode {
             // Strict or canary replay.
@@ -7311,8 +7317,7 @@ impl WorkflowContext {
             .list_names()
             .is_empty()
         {
-            // A push signal handler is registered.
-            return Some(ResidentMiss::Context);
+            return Some(ResidentMiss::SignalHandler);
         }
         if !self
             .held_mutex_keys
@@ -7367,6 +7372,8 @@ impl WorkflowContext {
     #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
     pub(crate) fn begin_resident_cycle(&self, delta: &[WorkflowEvent]) {
         self.set_suspending(false);
+        self.race_waiting
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.log_commands_queued
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.progress_local_index
@@ -7375,6 +7382,12 @@ impl WorkflowContext {
             .lock()
             .expect("matcher lock poisoned")
             .append_consumed(delta);
+    }
+
+    /// Whether a `ctx.race()` in this cycle waits for an open branch (issue
+    /// #2007).
+    pub(crate) fn race_waiting(&self) -> bool {
+        self.race_waiting.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether a non-blocking signal claim probed `signal_name` with a scan
@@ -12416,6 +12429,9 @@ impl WorkflowContext {
             receivers.push((dispatch.index, RaceBranchReceiver::Output(rx)));
         }
 
+        // Issue #2007: a suspension here is a race, whatever its commands.
+        self.race_waiting
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let (winner_index, winner_raw) = RaceFirstFut { receivers }.await?;
         let winner_result = match winner_raw {
             Ok(value) => Ok(value),

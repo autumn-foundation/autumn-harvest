@@ -7,7 +7,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-autumn-harvest = { version = "0.7.0", path = "../../autumn-harvest", features = ["db"] }
+autumn-harvest = { version = "0.7.0", path = "../../autumn-harvest", features = ["db", "testing"] }
 autumn-harvest-agent = { version = "0.7.0", path = "../../autumn-harvest-agent" }
 deadpool = { workspace = true, features = ["rt_tokio_1"] }
 diesel-async = { workspace = true }

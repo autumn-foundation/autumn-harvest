@@ -9,7 +9,7 @@ worker counts each decision as `harvest.workflow.resident_hit` or as
 that counts both, runs the agent loop, and prints a table.
 
 The model is offline. It asks for one `lookup` tool call per turn, then
-answers. No API key and no network are needed.
+answers. The binary needs no API key and no network.
 
 ## Run
 
@@ -19,7 +19,7 @@ agent activities run.
 ```sh
 createdb agent_hit_rate
 DATABASE_URL=postgres://postgres:postgres@localhost:5432/agent_hit_rate \
-  RUNS=20 TURNS=4 cargo run -p agent-loop-hit-rate
+  RUNS=20 TURNS=4 cargo run -p agent-loop-hit-rate --release
 ```
 
 | Variable | Default | Meaning |
@@ -28,7 +28,7 @@ DATABASE_URL=postgres://postgres:postgres@localhost:5432/agent_hit_rate \
 | `RUNS` | 20 | The number of agent runs. |
 | `TURNS` | 4 | The tool turns of each run. |
 
-## Output
+## Example output
 
 ```text
 | Outcome | Decisions | Share |

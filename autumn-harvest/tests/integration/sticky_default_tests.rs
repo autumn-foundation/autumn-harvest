@@ -22,7 +22,8 @@
 //! 10. LRU eviction drops the resident workflow. The next decision is a miss
 //!     and replays cold.
 //! 11. A join or a race counts a resident miss with its reason. Each
-//!     decision records one resident sample (issue #2007).
+//!     decision records one resident sample, also when a local activity
+//!     re-drives it (issue #2007).
 //!
 //! A queue-level test also proves which rows the shutdown release touches.
 //! Each test uses its own queue and worker ids, so the tests can share one
@@ -352,6 +353,39 @@ fn join_workflow<'a>(
     })
 }
 
+const LOCAL_THEN_ACTIVITY_WORKFLOW: &str = "sticky_default_local_wf";
+const LOCAL_ECHO_ACTIVITY: &str = "sticky_default_local_echo";
+
+/// Runs a local activity, then an activity (issue #2007).
+///
+/// The local activity re-drives the first decision inside one task.
+fn local_then_activity_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let queue = input["queue"].as_str().ok_or("missing queue")?;
+        let local = ctx
+            .execute_local_activity_raw(LOCAL_ECHO_ACTIVITY, serde_json::json!("l"), None, Some(30))
+            .await
+            .map_err(|e| e.to_string())?;
+        let remote = ctx
+            .execute_activity_raw(ECHO_ACTIVITY, serde_json::json!("r"), queue)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!([local, remote]))
+    })
+}
+
+fn local_echo_activity_info() -> ActivityInfo {
+    ActivityInfo {
+        name: LOCAL_ECHO_ACTIVITY,
+        is_local: true,
+        handler: echo_activity,
+        ..slow_activity_info()
+    }
+}
+
 const RACE_WORKFLOW: &str = "sticky_default_race_wf";
 
 /// Races two activities with `ctx.race()` (issue #2007).
@@ -446,8 +480,13 @@ fn build_worker(
             info_for(EVICT_WORKFLOW, evict_workflow),
             info_for(JOIN_WORKFLOW, join_workflow),
             info_for(RACE_WORKFLOW, race_workflow),
+            info_for(LOCAL_THEN_ACTIVITY_WORKFLOW, local_then_activity_workflow),
         ])
-        .activities(vec![slow_activity_info(), echo_activity_info()])
+        .activities(vec![
+            slow_activity_info(),
+            echo_activity_info(),
+            local_echo_activity_info(),
+        ])
         .telemetry(TelemetryConfig {
             service_name: Arc::from("sticky_default_tests"),
             propagator: Arc::new(NoOpPropagator),
@@ -1378,6 +1417,47 @@ async fn a_join_or_a_race_counts_a_resident_miss_with_its_reason() {
     }
 
     assert_eq!(counts.resident_misses("cold"), 2, "each first decision");
+    assert_eq!(counts.resident_samples(), counts.decisions());
+
+    worker.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+}
+
+/// AC (issue #2007): a local activity re-drives the first decision inside
+/// one task. The task still records one resident sample.
+#[tokio::test]
+async fn a_local_activity_redrive_records_one_resident_sample() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let mut conn = connect(&url).await;
+    let queue = unique_id("local-q");
+
+    let counts = Arc::new(CacheCounts::default());
+    let worker = build_default_worker(&queue, &unique_id("local-a"), Arc::clone(&counts));
+    let handle = spawn(&worker, &pool);
+
+    let exec_id = ExecutionId::new();
+    let workflow_id = unique_id("local-wf");
+    let input = serde_json::json!({ "queue": queue });
+    start_or_load_workflow_execution(
+        &mut conn,
+        start_workflow(
+            LOCAL_THEN_ACTIVITY_WORKFLOW,
+            exec_id,
+            &workflow_id,
+            &queue,
+            input,
+        ),
+        None,
+    )
+    .await
+    .expect("start workflow");
+    wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", Duration::from_secs(30))
+        .await;
+
+    assert_eq!(counts.decisions(), 2, "the start and the activity result");
+    assert_eq!(counts.resident_misses("cold"), 1, "decision 1 is cold");
+    assert_eq!(counts.resident_hits(), 1, "decision 2 resumes warm");
     assert_eq!(counts.resident_samples(), counts.decisions());
 
     worker.shutdown();
