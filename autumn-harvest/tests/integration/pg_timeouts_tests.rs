@@ -3130,6 +3130,12 @@ async fn an_idle_connection_that_the_server_killed_is_replaced_at_checkout() {
 
 #[tokio::test]
 async fn a_recently_used_connection_is_handed_out_without_a_ping() {
+    #[derive(diesel::QueryableByName)]
+    struct LastQuery {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        query: String,
+    }
+
     let (url, _container) = setup_db().await;
     let pool = engine_pool(
         url.clone(),
@@ -3138,25 +3144,31 @@ async fn a_recently_used_connection_is_handed_out_without_a_ping() {
         &timeouts(5_000, SessionTimeouts::for_role(DbRole::Hot)),
     )
     .expect("engine pool builds");
-    let old_pid = {
+    // Connect the admin session first. The idle bound runs from the first
+    // checkout, and a new connection can take longer than the bound.
+    let mut admin = connect(&url).await;
+    let pid = {
         let mut conn = pool.get().await.expect("first connection");
         backend_pid(&mut conn).await
     };
-    let mut admin = connect(&url).await;
-    diesel::sql_query(format!("SELECT pg_terminate_backend({old_pid})"))
-        .execute(&mut admin)
-        .await
-        .expect("terminate the pooled backend");
     // The checkout follows within the idle bound, so the pool sends no ping.
-    // The dead connection comes back, and its first statement fails. This is
-    // the cost of skipping the ping, and the engine retries such a failure.
-    let mut conn = pool
+    // `pg_stat_activity` keeps the last statement of the backend. A ping
+    // would replace it with `SELECT 1`. This needs no killed backend, so the
+    // client cannot see a closed socket and swap the connection first.
+    let conn = pool
         .get()
         .await
-        .expect("the pool does not ping a hot connection");
-    let outcome = diesel::sql_query("SELECT 1").execute(&mut conn).await;
+        .expect("the pool hands out the hot connection");
+    let last = diesel::sql_query("SELECT query FROM pg_stat_activity WHERE pid = $1")
+        .bind::<diesel::sql_types::Integer, _>(pid)
+        .get_result::<LastQuery>(&mut admin)
+        .await
+        .expect("read the last statement of the pooled backend")
+        .query;
+    drop(conn);
     assert!(
-        outcome.is_err(),
-        "a hot checkout must hand out the connection without a ping"
+        last.contains("pg_backend_pid"),
+        "a hot checkout must hand out the connection without a ping, \
+         but the last statement was {last:?}"
     );
 }
