@@ -18,7 +18,8 @@ cannot change the outcome. The body's commands from the cancelling cycle
 never reach the worker, so an operation cannot start and leak in that cycle.
 A value or version gate that the body recorded in that cycle stays in the
 marker, so replay returns the same value. A replayed decision that differs
-from the captured one reports non-determinism. A withdrawn timer command restores the timer state.
+from the captured one, or comes in a different order, reports
+non-determinism. A withdrawn timer command restores the timer state.
 
 **Deferred cancel.**
 

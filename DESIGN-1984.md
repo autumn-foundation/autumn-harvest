@@ -98,7 +98,8 @@ its next poll:
 3. **Replay.** At the first poll the scope finds its marker ahead. Then it
    polls the body with the matcher cut at the horizon, and it holds the body's
    commands. A recording primitive that misses reads its value from the
-   marker. At the cancel it takes the marker and consumes the member events.
+   marker. It must ask for the values in the live order, or replay reports
+   drift. At the cancel it takes the marker and consumes the member events.
    It returns `Err(Cancelled)`.
 
 A `cancel()` after `run` completes does nothing. A `cancel()` before the

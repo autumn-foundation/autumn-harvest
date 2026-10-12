@@ -129,26 +129,62 @@ struct CancelMarker {
 pub(crate) enum CapturedRecord {
     /// A `RecordSideEffect`.
     SideEffect {
+        /// The push order in the cancelling cycle.
+        #[serde(default)]
+        order: u64,
         kind: SideEffectKind,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         value: Value,
     },
     /// A `RecordMarker`, such as a version gate.
-    Marker { name: String, details: Value },
+    Marker {
+        /// The push order in the cancelling cycle.
+        #[serde(default)]
+        order: u64,
+        name: String,
+        details: Value,
+    },
 }
 
-/// The recorded decisions among `cmds`, in order.
+impl CapturedRecord {
+    const fn order(&self) -> u64 {
+        match self {
+            Self::SideEffect { order, .. } | Self::Marker { order, .. } => *order,
+        }
+    }
+
+    /// Names the record for a non-determinism diagnostic.
+    fn label(&self) -> String {
+        match self {
+            Self::SideEffect { kind, name, .. } => side_effect_label(*kind, name.as_deref()),
+            Self::Marker { name, .. } => format!("MarkerRecorded({name})"),
+        }
+    }
+}
+
+/// Names a side effect for a non-determinism diagnostic.
+fn side_effect_label(kind: SideEffectKind, name: Option<&str>) -> String {
+    format!(
+        "SideEffectRecorded({})",
+        name.unwrap_or_else(|| kind.as_str())
+    )
+}
+
+/// The recorded decisions among `cmds`, in push order.
 ///
 /// A nested scope that cancelled in the same cycle withdrew its own records
-/// into its marker. That marker is withdrawn now, so its records move here,
-/// at its place.
-fn captured_records(cmds: &[WorkflowCommand]) -> Vec<CapturedRecord> {
+/// into its marker. That marker is withdrawn now, so its records move here.
+/// The push order puts them back among the other records, as the body made
+/// them.
+fn captured_records(cmds: &[(u64, WorkflowCommand)]) -> Vec<CapturedRecord> {
     let mut records = Vec::new();
-    for cmd in cmds {
+    for (order, cmd) in cmds {
+        let order = *order;
         match cmd {
             WorkflowCommand::RecordSideEffect { kind, name, value } => {
                 records.push(CapturedRecord::SideEffect {
+                    order,
                     kind: *kind,
                     name: name.clone(),
                     value: value.clone(),
@@ -163,6 +199,7 @@ fn captured_records(cmds: &[WorkflowCommand]) -> Vec<CapturedRecord> {
             }
             WorkflowCommand::RecordMarker { name, details } => {
                 records.push(CapturedRecord::Marker {
+                    order,
                     name: name.clone(),
                     details: details.clone(),
                 });
@@ -170,6 +207,7 @@ fn captured_records(cmds: &[WorkflowCommand]) -> Vec<CapturedRecord> {
             _ => {}
         }
     }
+    records.sort_by_key(CapturedRecord::order);
     records
 }
 
@@ -275,69 +313,86 @@ pub(crate) fn route_command(
     Some((cmd, tags))
 }
 
-/// Take the first captured record that `wanted` accepts, on replay.
+/// The result of a lookup for a captured decision (issue #1984).
+pub(crate) enum Captured {
+    /// No scope on the stack replays a cancel, so the primitive runs as usual.
+    NotReplaying,
+    /// The next captured decision, which the primitive returns.
+    Value(Value),
+    /// The replayed body asks for a decision out of order, or for one that
+    /// the live cycle did not make. The text names both sides.
+    Drift(String),
+}
+
+/// Take the next captured decision of the innermost replaying scope.
 ///
-/// The live cancel withdraws the body's recorded decisions and keeps them in
-/// its marker. The body asks for them in the same order on replay, so the
-/// first match is the right one. A record that no primitive asks for stays
-/// and does not block the others.
+/// Replay must ask for the decisions in the order that the live cycle made
+/// them, as a positional history match does. A record that does not match
+/// the next one, or a request with no record left, is drift.
 fn take_captured(
     stack: &[ScopeFrame],
+    asked: &str,
     wanted: impl Fn(&CapturedRecord) -> Option<Value>,
-) -> Option<Value> {
+) -> Captured {
     for frame in stack.iter().rev() {
         let ScopeFrame::Cancellable(shared) = frame else {
             break;
         };
         let mut inner = shared.lock();
-        if let Some(at) = inner
-            .records
-            .iter()
-            .position(|record| wanted(record).is_some())
-        {
-            return inner.records.remove(at).as_ref().and_then(&wanted);
+        if !inner.holding {
+            continue;
         }
+        let next = inner
+            .records
+            .front()
+            .map(|record| (wanted(record), record.label()));
+        let taken = match next {
+            Some((Some(value), _)) => {
+                inner.records.pop_front();
+                Captured::Value(value)
+            }
+            Some((None, expected)) => Captured::Drift(format!(
+                "the replayed body asked for {asked}, but the next recorded decision is {expected}"
+            )),
+            None => Captured::Drift(format!(
+                "the replayed body asked for {asked}, but no recorded decision is left"
+            )),
+        };
+        drop(inner);
+        return taken;
     }
-    None
+    Captured::NotReplaying
 }
 
-/// The name of a replayed marker that differs from its captured record.
+/// The drift of a replayed marker against the next captured record.
 ///
 /// A doomed scope re-derives a withdrawn marker on replay, such as a race or
 /// fan-out decision. Normal replay compares such a marker with history. Here
 /// the captured record takes the place of history, so a deploy that changes
-/// the decision reports drift instead of passing in silence.
+/// the decision reports drift instead of passing in silence. A version gate
+/// takes its record when it is served, so it is not checked here. A nested
+/// cancel marker gave its records to the outer one, so it is not checked.
 pub(crate) fn captured_marker_drift(stack: &[ScopeFrame], cmd: &WorkflowCommand) -> Option<String> {
     let WorkflowCommand::RecordMarker { name, details } = cmd else {
         return None;
     };
-    for frame in stack.iter().rev() {
-        let ScopeFrame::Cancellable(shared) = frame else {
-            break;
-        };
-        // A matched record counts as used, as a matched history event does.
-        let (holding, captured) = {
-            let mut inner = shared.lock();
-            let at = inner.records.iter().position(
-                |record| matches!(record, CapturedRecord::Marker { name: n, .. } if n == name),
-            );
-            let captured =
-                at.and_then(|at| inner.records.remove(at))
-                    .and_then(|record| match record {
-                        CapturedRecord::Marker { details, .. } => Some(details),
-                        CapturedRecord::SideEffect { .. } => None,
-                    });
-            (inner.holding, captured)
-        };
-        if !holding {
-            continue;
-        }
-        return match captured {
-            Some(captured) if &captured != details => Some(name.clone()),
-            _ => None,
-        };
+    if name.starts_with(CANCEL_MARKER_PREFIX) || name.starts_with("version:") {
+        return None;
     }
-    None
+    let asked = format!("MarkerRecorded({name})");
+    match take_captured(stack, &asked, |record| match record {
+        CapturedRecord::Marker {
+            name: n, details, ..
+        } if n == name => Some(details.clone()),
+        _ => None,
+    }) {
+        Captured::NotReplaying => None,
+        Captured::Value(captured) if &captured == details => None,
+        Captured::Value(_) => Some(format!(
+            "marker '{name}' differs from the one that a scope cancel recorded"
+        )),
+        Captured::Drift(drift) => Some(drift),
+    }
 }
 
 /// The side-effect value that a cancelled scope recorded here, on replay.
@@ -345,23 +400,34 @@ pub(crate) fn take_captured_side_effect(
     stack: &[ScopeFrame],
     kind: SideEffectKind,
     name: Option<&str>,
-) -> Option<Value> {
-    take_captured(stack, |record| match record {
-        CapturedRecord::SideEffect {
-            kind: k,
-            name: n,
-            value,
-        } if *k == kind && n.as_deref() == name => Some(value.clone()),
-        _ => None,
-    })
+) -> Captured {
+    take_captured(
+        stack,
+        &side_effect_label(kind, name),
+        |record| match record {
+            CapturedRecord::SideEffect {
+                kind: k,
+                name: n,
+                value,
+                ..
+            } if *k == kind && n.as_deref() == name => Some(value.clone()),
+            _ => None,
+        },
+    )
 }
 
 /// The marker details that a cancelled scope recorded here, on replay.
-pub(crate) fn take_captured_marker(stack: &[ScopeFrame], name: &str) -> Option<Value> {
-    take_captured(stack, |record| match record {
-        CapturedRecord::Marker { name: n, details } if n == name => Some(details.clone()),
-        _ => None,
-    })
+pub(crate) fn take_captured_marker(stack: &[ScopeFrame], name: &str) -> Captured {
+    take_captured(
+        stack,
+        &format!("MarkerRecorded({name})"),
+        |record| match record {
+            CapturedRecord::Marker {
+                name: n, details, ..
+            } if n == name => Some(details.clone()),
+            _ => None,
+        },
+    )
 }
 
 /// The cancellable scopes on `stack` up to the nearest shield, innermost last.
@@ -1705,6 +1771,73 @@ mod tests {
         assert!(
             matches!(result, Err(HarvestError::NonDeterministic { .. })),
             "{result:?}"
+        );
+    }
+
+    /// Records two named side effects, in the given order.
+    fn pick_both(ctx: &WorkflowContext, first: &str, second: &str) -> Value {
+        let picks = [first, second].map(|name| {
+            ctx.side_effect(name, || name.len())
+                .map_err(|e| matches!(e, HarvestError::NonDeterministic { .. }))
+        });
+        json!(picks.map(|pick| match pick {
+            Ok(_) => "ok",
+            Err(true) => "drift",
+            Err(false) => "error",
+        }))
+    }
+
+    /// Replay must ask for the captured decisions in the live order.
+    #[tokio::test]
+    async fn a_replay_that_reorders_captured_decisions_is_drift() {
+        let live = WorkflowContext::new_test();
+        let seen = std::sync::Mutex::new(None);
+        record_then_cancel(&live, &seen, |ctx| pick_both(ctx, "a", "bb")).await;
+        let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+        let same = replay_of(details.clone());
+        let replayed = std::sync::Mutex::new(None);
+        record_then_cancel(&same, &replayed, |ctx| pick_both(ctx, "a", "bb")).await;
+        assert_eq!(
+            replayed.lock().expect("replayed lock").take(),
+            Some(json!(["ok", "ok"]))
+        );
+
+        // The unused "bb" record also fails the cancel.
+        let swapped = replay_of(details);
+        let result = bounded(run_then_cancel(&swapped, async {
+            *replayed.lock().expect("replayed lock") = Some(pick_both(&swapped, "bb", "a"));
+            std::future::pending::<()>().await;
+        }))
+        .await;
+        assert_eq!(
+            replayed.lock().expect("replayed lock").take(),
+            Some(json!(["drift", "ok"]))
+        );
+        assert!(
+            matches!(result, Err(HarvestError::NonDeterministic { .. })),
+            "{result:?}"
+        );
+    }
+
+    /// A decision that the live cycle did not make is drift on replay.
+    #[tokio::test]
+    async fn a_replay_that_adds_a_decision_is_drift() {
+        let live = WorkflowContext::new_test();
+        let seen = std::sync::Mutex::new(None);
+        record_then_cancel(&live, &seen, |ctx| {
+            json!(ctx.side_effect("a", || 1).expect("side effect"))
+        })
+        .await;
+        let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+        let replay = replay_of(details);
+        let replayed = std::sync::Mutex::new(None);
+        record_then_cancel(&replay, &replayed, |ctx| pick_both(ctx, "a", "bb")).await;
+
+        assert_eq!(
+            replayed.lock().expect("replayed lock").take(),
+            Some(json!(["ok", "drift"]))
         );
     }
 

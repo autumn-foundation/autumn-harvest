@@ -2897,6 +2897,8 @@ pub(crate) struct SagaUnwindObservation {
 
 /// A buffered command and the cancellation scopes that issued it (issue #1984).
 struct BufferedCommand {
+    /// The push order. A scope cancel keeps it with each record it withdraws.
+    order: u64,
     cmd: WorkflowCommand,
     scopes: Vec<u32>,
 }
@@ -3127,6 +3129,8 @@ pub struct WorkflowContext {
     /// this cycle (issue #1984). A scope cancel restores the entries of the
     /// commands that it withdraws.
     timer_undo: Mutex<Vec<TimerUndo>>,
+    /// The next push order of a buffered command (issue #1984).
+    command_order: std::sync::atomic::AtomicU64,
     /// Per-run set of `timer_id`s used by the classic `ctx.timer`/`sleep_until`
     /// API this task (issue #768, Codex P2 round 16). Populated by
     /// [`Self::timer`]; consulted by [`Self::start_timer`] / [`Self::reset_timer`]
@@ -3768,6 +3772,7 @@ impl WorkflowContext {
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             timer_arm_epochs: Mutex::new(std::collections::HashMap::new()),
             timer_undo: Mutex::new(Vec::new()),
+            command_order: std::sync::atomic::AtomicU64::new(0),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
             held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
             suspending: std::sync::atomic::AtomicBool::new(false),
@@ -3952,6 +3957,7 @@ impl WorkflowContext {
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             timer_arm_epochs: Mutex::new(std::collections::HashMap::new()),
             timer_undo: Mutex::new(Vec::new()),
+            command_order: std::sync::atomic::AtomicU64::new(0),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
             held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
             suspending: std::sync::atomic::AtomicBool::new(false),
@@ -4034,6 +4040,7 @@ impl WorkflowContext {
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             timer_arm_epochs: Mutex::new(std::collections::HashMap::new()),
             timer_undo: Mutex::new(Vec::new()),
+            command_order: std::sync::atomic::AtomicU64::new(0),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
             held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
             suspending: std::sync::atomic::AtomicBool::new(false),
@@ -4994,10 +5001,10 @@ impl WorkflowContext {
                 // host-wall-clock contract is untouched (this internal probe is
                 // the only reader that consults the virtual clock).
                 let millis = self
-                    .captured_scope_record(
+                    .captured_or_drift(self.captured_scope_record(
                         crate::event::SideEffectKind::Now,
                         Some(crate::replay::DEADLINE_PROBE_SIDE_EFFECT_NAME),
-                    )
+                    ))
                     .and_then(|value| {
                         let millis = value.as_i64();
                         if millis.is_none() {
@@ -5430,13 +5437,22 @@ impl WorkflowContext {
             HistoryMatch::NoMatch => {
                 self.check_strict_replay_no_match(&format!("SideEffectRecorded({id})"))?;
 
-                // An invalid captured value fails as a recorded one does.
-                let result = self
+                // An invalid captured value fails as a recorded one does. Drift
+                // fails before `f` runs.
+                let result = match self
                     .captured_scope_record(crate::event::SideEffectKind::Custom, Some(id))
-                    .map(serde_json::from_value::<T>)
-                    .transpose()
-                    .map_err(HarvestError::Serialization)?
-                    .unwrap_or_else(f);
+                {
+                    crate::cancellation_scope::Captured::NotReplaying => f(),
+                    crate::cancellation_scope::Captured::Value(value) => {
+                        serde_json::from_value::<T>(value).map_err(HarvestError::Serialization)?
+                    }
+                    crate::cancellation_scope::Captured::Drift(drift) => {
+                        return Err(self.scope_nd_error(
+                            format!("non-deterministic replay: {drift}"),
+                            format!("SideEffectRecorded({id})"),
+                        ));
+                    }
+                };
                 let output = serde_json::to_value(&result)?;
 
                 // Enforce side-effect payload cap before recording.
@@ -5594,7 +5610,7 @@ impl WorkflowContext {
                 }
                 // An invalid captured value is drift, as a recorded one is.
                 let result = self
-                    .captured_scope_record(kind, None)
+                    .captured_or_drift(self.captured_scope_record(kind, None))
                     .and_then(|value| match serde_json::from_value::<T>(value) {
                         Ok(value) if is_valid(&value) => Some(value),
                         _ => {
@@ -5788,7 +5804,7 @@ impl WorkflowContext {
                 }
                 // An invalid captured value is drift, as a recorded one is.
                 let captured = self
-                    .captured_scope_record(SideEffectKind::Random, None)
+                    .captured_or_drift(self.captured_scope_record(SideEffectKind::Random, None))
                     .and_then(|value| match serde_json::from_value::<T>(value) {
                         Ok(value) if range.contains(&value) => Some(value),
                         _ => {
@@ -5872,7 +5888,9 @@ impl WorkflowContext {
         // the version that the live cycle chose, even after a deploy raises max.
         if self.at_history_frontier()
             && let Some(captured) = self
-                .captured_scope_marker(&crate::replay::version_marker_name(change_id))
+                .captured_or_drift(
+                    self.captured_scope_marker(&crate::replay::version_marker_name(change_id)),
+                )
                 .and_then(|details| {
                     let version = details
                         .as_u64()
@@ -7426,16 +7444,29 @@ impl WorkflowContext {
         &self,
         kind: crate::event::SideEffectKind,
         name: Option<&str>,
-    ) -> Option<Value> {
+    ) -> crate::cancellation_scope::Captured {
         let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
         crate::cancellation_scope::take_captured_side_effect(&stack, kind, name)
     }
 
     /// The marker details that a cancelled scope recorded here, on replay
     /// (issue #1984).
-    fn captured_scope_marker(&self, name: &str) -> Option<Value> {
+    fn captured_scope_marker(&self, name: &str) -> crate::cancellation_scope::Captured {
         let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
         crate::cancellation_scope::take_captured_marker(&stack, name)
+    }
+
+    /// The captured value, if any. Drift is deferred non-determinism, and the
+    /// primitive then runs as usual until the task fails.
+    fn captured_or_drift(&self, captured: crate::cancellation_scope::Captured) -> Option<Value> {
+        match captured {
+            crate::cancellation_scope::Captured::NotReplaying => None,
+            crate::cancellation_scope::Captured::Value(value) => Some(value),
+            crate::cancellation_scope::Captured::Drift(drift) => {
+                self.record_deferred_nd(format!("non-deterministic replay: {drift}"));
+                None
+            }
+        }
     }
 
     /// Record the state of `timer_id` before a scope body changes it.
@@ -14822,11 +14853,8 @@ impl WorkflowContext {
         let drift = crate::cancellation_scope::captured_marker_drift(&stack, &cmd);
         let routed = crate::cancellation_scope::route_command(&stack, cmd);
         drop(stack);
-        if let Some(name) = drift {
-            self.record_deferred_nd(format!(
-                "non-deterministic replay: marker '{name}' differs from the one that a \
-                 scope cancel recorded"
-            ));
+        if let Some(drift) = drift {
+            self.record_deferred_nd(format!("non-deterministic replay: {drift}"));
         }
         // The caller changes the timer state after this push.
         if let Some(timer_id) = timer_id
@@ -14838,7 +14866,13 @@ impl WorkflowContext {
             self.commands
                 .lock()
                 .expect("commands lock poisoned")
-                .push(BufferedCommand { cmd, scopes });
+                .push(BufferedCommand {
+                    order: self
+                        .command_order
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    cmd,
+                    scopes,
+                });
         }
     }
 
@@ -14954,7 +14988,7 @@ impl WorkflowContext {
     /// Remove the buffered commands that scope `seq` issued, and return them.
     ///
     /// `ReleaseMutex` stays, so a guard dropped in the body still releases.
-    pub(crate) fn withdraw_scope_commands(&self, seq: u32) -> Vec<WorkflowCommand> {
+    pub(crate) fn withdraw_scope_commands(&self, seq: u32) -> Vec<(u64, WorkflowCommand)> {
         let mut cmds = self.commands.lock().expect("commands lock poisoned");
         let (withdrawn, kept): (Vec<_>, Vec<_>) =
             std::mem::take(&mut *cmds)
@@ -14965,7 +14999,10 @@ impl WorkflowContext {
                 });
         *cmds = kept;
         drop(cmds);
-        withdrawn.into_iter().map(|buffered| buffered.cmd).collect()
+        withdrawn
+            .into_iter()
+            .map(|buffered| (buffered.order, buffered.cmd))
+            .collect()
     }
 
     /// Keep only the members that are still open in history.
