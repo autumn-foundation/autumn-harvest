@@ -365,7 +365,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "criterion 0.5.1",
- "croner 2.2.0",
+ "croner",
  "deadpool",
  "diesel",
  "diesel-async",
@@ -638,7 +638,7 @@ dependencies = [
  "bytes",
  "chrono",
  "chrono-tz",
- "croner 3.0.1",
+ "croner",
  "deadpool",
  "diesel",
  "diesel-async",
@@ -2066,15 +2066,6 @@ name = "critical-section"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
-
-[[package]]
-name = "croner"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c344b0690c1ad1c7176fe18eb173e0c927008fdaaa256e40dfd43ddd149c0843"
-dependencies = [
- "chrono",
-]
 
 [[package]]
 name = "croner"
@@ -7002,7 +6993,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.61.2",
@@ -7327,7 +7318,7 @@ checksum = "1f50e41f200fd8ed426489bd356910ede4f053e30cebfbd59ef0f856f0d7432a"
 dependencies = [
  "chrono",
  "chrono-tz",
- "croner 3.0.1",
+ "croner",
  "num-derive",
  "num-traits",
  "tokio",

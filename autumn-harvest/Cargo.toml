@@ -116,7 +116,7 @@ toml = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 lru = "0.18.2"
-croner = "2.2"
+croner = "3.0.1"
 seahash = "4.1"
 rand = { workspace = true }
 deadpool = { workspace = true, optional = true }

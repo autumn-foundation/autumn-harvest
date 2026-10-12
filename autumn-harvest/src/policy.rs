@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use croner::Cron;
+use croner::parser::{CronParser, Seconds};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -1578,9 +1578,10 @@ impl WorkflowSchedule {
 /// fractional second.
 pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
     match schedule {
-        Schedule::Cron(expr) => Cron::new(expr)
-            .with_seconds_optional()
-            .parse()
+        Schedule::Cron(expr) => CronParser::builder()
+            .seconds(Seconds::Optional)
+            .build()
+            .parse(expr)
             .map(|_| ())
             .map_err(|e| format!("invalid cron expression '{expr}': {e}")),
         Schedule::CronInTimezone { expr, tz } => {
@@ -1590,9 +1591,10 @@ pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
                     "unknown timezone '{tz}'; use an IANA timezone name (e.g. \"America/Los_Angeles\", \"UTC\")"
                 ));
             }
-            Cron::new(expr)
-                .with_seconds_optional()
-                .parse()
+            CronParser::builder()
+                .seconds(Seconds::Optional)
+                .build()
+                .parse(expr)
                 .map(|_| ())
                 .map_err(|e| format!("invalid cron expression '{expr}': {e}"))
         }

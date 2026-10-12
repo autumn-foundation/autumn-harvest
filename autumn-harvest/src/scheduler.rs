@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
-use croner::Cron;
+use croner::parser::{CronParser, Seconds};
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
@@ -5144,16 +5144,21 @@ fn rebase_logical_date(
 
 fn next_run_after(schedule: Option<&Schedule>, reference: DateTime<Utc>) -> Option<DateTime<Utc>> {
     match schedule {
-        Some(Schedule::Cron(expr)) => Cron::new(expr)
-            .with_seconds_optional()
-            .parse()
+        Some(Schedule::Cron(expr)) => CronParser::builder()
+            .seconds(Seconds::Optional)
+            .build()
+            .parse(expr)
             .ok()
             .and_then(|cron| cron.find_next_occurrence(&reference, false).ok()),
         Some(Schedule::CronInTimezone { expr, tz }) => {
             // Parse the IANA timezone; if it's invalid we return None so the
             // schedule simply doesn't fire (validation should have caught this).
             let tz: chrono_tz::Tz = tz.parse().ok()?;
-            let cron = Cron::new(expr).with_seconds_optional().parse().ok()?;
+            let cron = CronParser::builder()
+                .seconds(Seconds::Optional)
+                .build()
+                .parse(expr)
+                .ok()?;
             // Convert the reference instant into the schedule's local timezone.
             let local_ref = reference.with_timezone(&tz);
             // First pass: find the candidate next occurrence strictly after the
