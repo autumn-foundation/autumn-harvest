@@ -95,6 +95,10 @@ pub struct HeartbeatTask {
     /// untrusted data, and a note shows in every later run of the scope.
     #[serde(default)]
     pub allow_memory_writes: bool,
+    /// The tenant that scopes the response cache. See
+    /// [`AgentTask::tenant`](crate::AgentTask::tenant).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 fn default_prompt() -> String {
@@ -131,6 +135,7 @@ impl HeartbeatTask {
             max_output_tokens: None,
             approval_timeout_secs: DEFAULT_HEARTBEAT_APPROVAL_TIMEOUT_SECS,
             allow_memory_writes: false,
+            tenant: None,
         }
     }
 
@@ -214,6 +219,13 @@ impl HeartbeatTask {
         self
     }
 
+    /// Set the tenant that scopes the response cache.
+    #[must_use]
+    pub fn tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = Some(tenant.into());
+        self
+    }
+
     /// The agent task of one tick.
     fn agent_task(&self) -> AgentTask {
         let mut task = AgentTask::new(self.prompt.clone())
@@ -229,6 +241,7 @@ impl HeartbeatTask {
         task.read_only = !self.allow_actions;
         task.unattended = true;
         task.unattended_memory_writes = self.allow_memory_writes;
+        task.tenant.clone_from(&self.tenant);
         task
     }
 }
@@ -329,6 +342,13 @@ mod tests {
         assert!(!task.read_only);
         assert!(task.unattended);
         assert_eq!(task.memory_tool_scope(), None);
+    }
+
+    #[test]
+    fn a_tick_passes_its_tenant_to_the_run() {
+        assert_eq!(HeartbeatTask::new().agent_task().tenant, None);
+        let task = HeartbeatTask::new().tenant("acme").agent_task();
+        assert_eq!(task.tenant.as_deref(), Some("acme"));
     }
 
     #[test]
