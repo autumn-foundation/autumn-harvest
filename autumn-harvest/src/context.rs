@@ -5046,9 +5046,9 @@ impl WorkflowContext {
 
     // ── Cancellation ──────────────────────────────────────────────────
 
-    /// Returns `true` if a `WorkflowCancelled` event is present in the event
-    /// history backing this context, or if the backend passes a pending cancel
-    /// request (issue #2021).
+    /// Returns `true` if a `WorkflowCancelled` event is in the history.
+    /// It also returns `true` when the backend passes a pending cancel request
+    /// (issue #2021).
     ///
     /// Workflows performing long-running loops or multi-step orchestration
     /// should check this periodically and bail out with cleanup when it

@@ -5,8 +5,8 @@ Cancel is cooperative. Terminate seals the run at once.
 
 **No new `WorkflowEvent` variant.** Both paths record the core
 `WorkflowCancelled` event, as Postgres does. The SQLite schema gets one
-nullable column, `harvest_executions.cancel_reason`. The core gets one
-additive seam, `WorkflowExecuteSpanMeta::cancellation_reason`.
+nullable column, `harvest_executions.cancel_reason`. The core gets one new
+seam, `WorkflowExecuteSpanMeta::cancellation_reason`.
 
 ---
 
@@ -21,7 +21,7 @@ additive seam, `WorkflowExecuteSpanMeta::cancellation_reason`.
   `WorkflowCancelled` event in the history. No other input sets it.
 - The core `HistoryMatcher` does not skip `WorkflowCancelled`. A command
   after that event in history diverges. `docs/shipped-work.md` (issue #801,
-  round 3) records this limitation.
+  PR #973) records this limitation.
 - An experiment on the core `WorkflowReplayer` gave these results:
 
   | History | Body | Result |
@@ -56,6 +56,7 @@ additive seam, `WorkflowExecuteSpanMeta::cancellation_reason`.
 | E2 | When the body blocks on a signal or a timer and no activity is left to run. | **Adopted.** A parked await cannot observe the cancel (0.1). Without this rule a stuck run never ends. |
 | E3 | Wait while an activity task is still pending, for example a retry in backoff. | **Adopted.** That work can still resolve the await. The body then sees the cancel at its next check. |
 | E4 | Fire pending timers early to wake the body. | Rejected. A false `TimerFired` makes the history lie. |
+| E5 | When the cycle diverges or deadlocks. | **Adopted after review.** The body sees the request from the start of its replay. A check before recorded commands therefore diverges on every drive. The driver discards that cycle and ends the run. |
 
 ### 0.4 Reverse brainstorm — how can this change do harm?
 
@@ -66,9 +67,10 @@ additive seam, `WorkflowExecuteSpanMeta::cancellation_reason`.
 | R3 | A sealed run keeps a pending task, timer or signal row. | Both seals delete them in the seal transaction. Tests count the rows. |
 | R4 | A second `cancel` overwrites the first reason. | A repeat cancel keeps the first reason and appends nothing. A test pins it. |
 | R5 | The seam changes Postgres replay. | Postgres passes `None`. A recorded `WorkflowCancelled` still wins over the seam. A unit test pins both. |
-| R6 | A non-determinism or panic during cleanup seals the run. | Those errors keep their current non-terminal handling. Only a clean return or a block seals. |
+| R6 | A non-determinism or panic during cleanup seals the run. | A panic keeps its strike budget. Non-determinism and a deadlock end the run `CANCELLED` (rule E5), because a pending cancel must end the run. |
 | R7 | A body that ignores the cancel runs forever. | It seals as soon as it blocks (E2). `terminate` is the hard stop. |
 | R8 | `AllowDuplicateFailedOnly` cannot restart a cancelled run. | A `CANCELLED` prior is replaced like a `FAILED` one, as in the Postgres matrix. |
+| R9 | A check at the top of a loop replays as cancelled before recorded steps, so every drive diverges and the run never ends. | Rule E5 ends the run. A test cancels a loop body and a body that checks before a recorded timer. |
 
 ### 0.5 Six thinking hats
 
@@ -80,8 +82,9 @@ additive seam, `WorkflowExecuteSpanMeta::cancellation_reason`.
   cannot observe the cancel. Sections 0.3 and 0.4 cover each risk.
 - **Yellow (value).** The agent daemon and CLIs can stop a stuck run.
   Cleanup activities run. Both histories replay on the core replayer.
-- **Green (options).** Section 0.2. A later issue can wake a parked await
-  through the resident path (issue #1798).
+- **Green (options).** Section 0.2. Follow-ups: record the request position
+  in history, so a check sees the request only after that point. Wake a
+  parked await through the resident path (issue #1798).
 - **Blue (process).** Red tests first, then the core seam, then the SQLite
   paths, then docs. Comment hygiene and clippy gate the push.
 
@@ -103,7 +106,8 @@ pub enum RunState {
 ```
 
 - An unknown id returns `ExecutionNotFound`. A terminal run returns
-  `WorkflowNotRunning`.
+  `WorkflowNotRunning`. Postgres treats a repeat call on a terminal run as a
+  no-op, but the acceptance criteria ask for the error.
 - A blank reason becomes the Postgres default text.
 - `outcome()` reports `Terminated("CANCELLED")` or `Terminated("TERMINATED")`.
 
@@ -115,10 +119,17 @@ pub enum RunState {
    `WorkflowExecuteSpanMeta::cancellation_reason`. The body sees
    `cancellation_reason()` from the start of the replay.
 3. Cleanup commands persist and run as usual.
-4. The run seals per section 0.3. The seal appends pending terminal
-   bookkeeping, then `WorkflowCancelled { reason }`. It sets `CANCELLED`
-   with `error = reason` and deletes pending tasks, unfired timers and
-   staged signals. The drive returns `RunState::Cancelled(reason)`.
+4. The run ends per section 0.3. A body that returned keeps its terminal
+   bookkeeping. A diverged or deadlocked cycle is discarded. The seal then
+   appends `WorkflowCancelled { reason }`, sets `CANCELLED` with
+   `error = reason`, and deletes pending tasks, unfired timers and staged
+   signals. The drive returns `RunState::Cancelled(reason)`.
+
+Known limits:
+
+- A check before recorded commands ends the run without cleanup (E5).
+- A cleanup that waits on a timer or a signal ends the run at that wait (E2).
+- The output of a body that returns `Ok` after a request is not kept (E1).
 
 ## 3. Terminate
 
@@ -130,7 +141,8 @@ signals. The body does not run again. A later drive returns
 ## 4. Replay
 
 - A cancel history ends `..., cleanup events, WorkflowCancelled`. It replays
-  on `WorkflowReplayer` (0.1, row 1).
+  on `WorkflowReplayer` (0.1, row 1). A cancel that ends a parked body with
+  no check has the terminate limit below.
 - A terminate history ends `..., WorkflowCancelled`. It replays when the
   body checks `is_cancelled()` before it issues a new command. A body parked
   on a signal does not replay (0.1, row 3). The same limit applies to a

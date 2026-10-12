@@ -237,11 +237,11 @@ pub fn find_active_executions_by_key(
     Ok(out)
 }
 
-/// Transition an execution to a SEALED terminal state (issue #1068) — used by the
-/// reuse-policy "replace" cases (`AllowDuplicateFailedOnly` over a FAILED or `CANCELLED` prior;
-/// `TerminateIfRunning` over any prior) to move the superseded run out of the
-/// active set so the `(workflow_name, workflow_id)` slot is freed for the fresh
-/// run. `sealed_state` is `CONTINUED_AS_NEW` (mirroring core's `replace_execution`,
+/// Transition an execution to a SEALED terminal state (issue #1068). The
+/// reuse-policy "replace" cases use it: `AllowDuplicateFailedOnly` over a FAILED
+/// or `CANCELLED` prior, and `TerminateIfRunning` over any prior. The seal moves
+/// the superseded run out of the active set, so the fresh run gets the
+/// `(workflow_name, workflow_id)` slot. `sealed_state` is `CONTINUED_AS_NEW` (mirroring core's `replace_execution`,
 /// which seals to `CONTINUED_AS_NEW`).
 ///
 /// Sealing a *terminal* prior (e.g. a `COMPLETED` run replaced by
