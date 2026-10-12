@@ -143,11 +143,11 @@ pub enum ExecutionOutcome {
     Failed(String),
     /// A terminal state OTHER than a clean success/failure — inert and never
     /// resumable, but carrying no output (unlike [`Self::Completed`]) and no
-    /// failure error (unlike [`Self::Failed`]). The payload is the raw state
-    /// name: `CANCELLED` or `TERMINATED` after [`SqliteRuntime::cancel`] or
-    /// [`SqliteRuntime::terminate`] (issue #2021), or `CONTINUED_AS_NEW` for a prior
-    /// that a reuse-policy start replaced (issue #1068). A drive returns the cancel
-    /// or terminate reason in [`RunState`].
+    /// failure error (unlike [`Self::Failed`]). [`SqliteRuntime::cancel`] and
+    /// [`SqliteRuntime::terminate`] write `CANCELLED` and `TERMINATED` (issue
+    /// #2021). A reuse-policy start writes `CONTINUED_AS_NEW` for the prior it
+    /// replaced (issue #1068). A drive returns the cancel or terminate reason in
+    /// [`RunState`].
     /// The payload is the RAW stored state name (e.g. `"CONTINUED_AS_NEW"`) so a
     /// caller can distinguish which terminal it is. Reporting these terminally —
     /// rather than as [`Self::Running`] — keeps `outcome()` consistent with the
@@ -603,10 +603,10 @@ impl SqliteRuntime {
     /// - A prior in a SEALED state (`CONTINUED_AS_NEW`/`TERMINATED`) is invisible to
     ///   the reuse check — ALL policies (including `RejectDuplicate`) create fresh
     ///   over it, mirroring core's uniqueness-index-excludes-terminal nuance.
-    /// - "Replace" (`AllowDuplicateFailedOnly` over a FAILED or `CANCELLED` prior;
-    ///   `TerminateIfRunning` over any prior) SEALS the prior to `CONTINUED_AS_NEW`
-    ///   so it leaves the active set and the fresh run takes the key
-    ///   (mirroring core's `replace_execution`).
+    /// - "Replace" SEALS the prior to `CONTINUED_AS_NEW`, so it leaves the active
+    ///   set and the fresh run takes the key (mirroring core's
+    ///   `replace_execution`). `AllowDuplicateFailedOnly` replaces a FAILED or
+    ///   `CANCELLED` prior. `TerminateIfRunning` replaces any prior.
     /// - `TerminateIfRunning` over a still-`RUNNING` prior additionally appends a
     ///   `WorkflowCancelled` event to the prior's history (recording the forced
     ///   cancellation) and cleans up its PENDING task rows and unfired timers, then
@@ -1348,10 +1348,10 @@ impl SqliteRuntime {
         // `future_not_send`) — the drivers' closures satisfy it.
         failure_now: &(dyn Fn() -> i64 + Send + Sync),
     ) -> SqliteResult<RunState> {
-        // Already terminal? Return the stored outcome without re-running. This uses
-        // the core `erase::is_terminal_state` so it covers not only COMPLETED/FAILED
-        // but every SEALED / terminal state (issue #1068): a run replaced by the
-        // reuse-policy path is sealed `CONTINUED_AS_NEW`. `cancel` and `terminate`
+        // Already terminal? Return the stored outcome without re-running. The
+        // core `erase::is_terminal_state` covers COMPLETED/FAILED and every SEALED
+        // or terminal state (issue #1068). A run replaced by the reuse-policy path
+        // is sealed `CONTINUED_AS_NEW`. `cancel` and `terminate`
         // write `CANCELLED` and `TERMINATED` (issue #2021), and `TIMED_OUT` is
         // handled defensively. The fleet poll loop never reaches
         // these (`store::running_executions` filters to `state = 'RUNNING'`), but a
