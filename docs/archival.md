@@ -289,6 +289,9 @@ key of each dropped partition. Each backend call has the
   budget reports `truncated`, and the next pass goes on.
 - **Dry run.** With `dry_run` set, the retention runtime ignores the
   archiver. It uploads nothing and writes no marker.
+- **Isolation.** In a caller's transaction, an exporting sweep needs
+  `READ COMMITTED`. At a higher level, one snapshot could hide a rewrite,
+  such as an erasure, so the sweep returns an error and drops nothing.
 
 ### Keys
 

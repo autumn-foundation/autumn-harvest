@@ -1247,3 +1247,41 @@ async fn a_cancelled_sweep_in_a_caller_transaction_leaves_no_lock() {
     .expect("count advisory locks");
     assert_eq!(held.n, 0, "the rollback releases every export lock");
 }
+
+/// A caller transaction above READ COMMITTED keeps one snapshot. The export
+/// and the checksum under `SHARE` would both read it, and miss a rewrite
+/// that committed after it, such as an erasure. So an exporting sweep there
+/// refuses to run and drops nothing.
+#[tokio::test]
+async fn an_exporting_sweep_refuses_a_repeatable_read_caller_transaction() {
+    use diesel_async::{AnsiTransactionManager, TransactionManager};
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_partitioned(&mut conn).await;
+    let aged = seed_aged_partition(&mut conn, 2).await;
+
+    AnsiTransactionManager::begin_transaction(&mut conn)
+        .await
+        .expect("begin the caller transaction");
+    conn.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .expect("set the isolation level");
+    let refused = partition::sweep_exporting(
+        &mut conn,
+        Utc::now(),
+        &SweepOptions::default(),
+        None,
+        &export_to(Arc::new(TestArchiver::default())),
+    )
+    .await;
+    AnsiTransactionManager::commit_transaction(&mut conn)
+        .await
+        .expect("commit the caller transaction");
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("READ COMMITTED")),
+        "{refused:?}"
+    );
+    assert!(exists(&mut conn, &aged.name).await, "nothing is dropped");
+}

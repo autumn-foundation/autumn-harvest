@@ -1075,6 +1075,21 @@ impl<'a> ExportGate<'a> {
                 }
             };
         };
+        // A caller transaction above READ COMMITTED reads one snapshot. The
+        // export and the checksum under `SHARE` would both miss a rewrite that
+        // committed after it, such as an erasure. The sweep's own drop
+        // transaction takes its snapshot after the lock, so it needs no check.
+        if scoped
+            && !flag(
+                conn,
+                "SELECT current_setting('transaction_isolation') = 'read committed' AS v",
+            )
+            .await?
+        {
+            return Err(crate::error::HarvestError::Config(
+                "an exporting sweep in a transaction needs READ COMMITTED isolation".into(),
+            ));
+        }
         if !scoped
             && !flag(
                 conn,
