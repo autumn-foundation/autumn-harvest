@@ -199,7 +199,9 @@ separate steps, so a fire can use a stale snapshot.
 The workload is 3 workers, 3 client workflows and one schedule. A client
 workflow runs an activity, a timer, a signal wait and a second activity.
 Each step awaits one command, so each decision can stay resident. The
-schedule fires every 2 ticks, 3 times.
+schedule fires every 2 ticks, 3 times. Each scheduled run joins two
+activities, so a decision can resume the join with one result and park
+the other (issue #2008).
 
 Faults:
 
