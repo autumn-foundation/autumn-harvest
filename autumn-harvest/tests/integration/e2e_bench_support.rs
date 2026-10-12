@@ -255,6 +255,21 @@ pub const INFLIGHT_ENV_VAR: &str = "HARVEST_BENCH_INFLIGHT";
 /// Override the number of measured completions per shard.
 pub const WORKFLOWS_ENV_VAR: &str = "HARVEST_BENCH_WORKFLOWS";
 
+/// Override the claim loops of each worker (issue #2007).
+///
+/// Unset keeps the worker default. The resident hit-rate record compares one
+/// claim loop against the default with this knob.
+pub const CLAIM_LOOPS_ENV_VAR: &str = "HARVEST_BENCH_CLAIM_LOOPS";
+
+/// The claim loops that `raw` asks for, or `None` for the worker default.
+///
+/// A malformed or zero value means the default, as for [`positive_override`].
+#[must_use]
+pub fn claim_loops_override(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+}
+
 /// Read a positive-integer override from the environment, falling back to
 /// `default`.
 ///
@@ -1769,6 +1784,15 @@ mod tests {
         assert!(!commit_probe_enabled(Some("0")));
         assert!(commit_probe_enabled(Some("1")));
         assert!(commit_probe_enabled(Some(" 1 ")));
+    }
+
+    #[test]
+    fn a_claim_loop_override_is_positive_or_the_default() {
+        assert_eq!(claim_loops_override(Some("1")), Some(1));
+        assert_eq!(claim_loops_override(Some(" 3 ")), Some(3));
+        assert_eq!(claim_loops_override(Some("0")), None);
+        assert_eq!(claim_loops_override(Some("two")), None);
+        assert_eq!(claim_loops_override(None), None);
     }
 
     #[test]
@@ -3800,6 +3824,11 @@ pub mod db {
                 runtime.shutdown_timeout = std::time::Duration::from_secs(5);
                 runtime.max_concurrent_workflows = MAX_CONCURRENT_WORKFLOWS;
                 runtime.max_concurrent_activities = MAX_CONCURRENT_ACTIVITIES;
+                if let Some(loops) = super::claim_loops_override(
+                    std::env::var(super::CLAIM_LOOPS_ENV_VAR).ok().as_deref(),
+                ) {
+                    runtime.max_concurrent_claims = loops;
+                }
                 runtime.sharded_pool = Some(sharded.clone());
                 let worker = Arc::new(
                     Worker::new(runtime, Arc::clone(registry)).expect("bench worker should build"),

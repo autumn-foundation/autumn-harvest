@@ -42,6 +42,8 @@ HARVEST_BENCH_SCENARIOS=throughput HARVEST_BENCH_SHARDS=1 \
   cargo bench -p autumn-harvest --features db,testing --bench e2e_bench
 ```
 
+`HARVEST_BENCH_CLAIM_LOOPS=1` runs the one-claim-loop control.
+
 ### Run 2 — agent loop, `examples/agent-loop-hit-rate`
 
 The binary runs the real `autumn_harvest_agent::agent_loop` with an offline
@@ -77,8 +79,10 @@ DATABASE_URL=postgres://postgres:postgres@localhost:5432/agent_hit_rate \
 | 2 (default), repeat | 4,864 | 3,600 | 1,264 | 74.0% | 43.57 |
 | 1 | 4,800 | 3,600 | 1,200 | 75.0% | 33.88 |
 
-The one-loop row comes from a run before the snapshots settled. It counted
-exactly four decisions per run, so no boundary sample moved. Two earlier
+The one-loop row comes from a run before the snapshots settled and before
+`HARVEST_BENCH_CLAIM_LOOPS` existed: a local edit set
+`max_concurrent_claims = 1` in `start_fleet`, as that knob now does. It
+counted exactly four decisions per run, so no boundary sample moved. Two earlier
 two-loop runs without settled snapshots counted 4,873 and 4,861 decisions.
 
 ### Run 2 — `agent_loop`, 20 runs
