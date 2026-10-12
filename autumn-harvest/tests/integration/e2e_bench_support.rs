@@ -3581,6 +3581,25 @@ pub mod db {
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone()
         }
+
+        /// A copy of the counts once they stop changing.
+        ///
+        /// A closed loop returns when its runs are terminal. A decision
+        /// attempt can still be in flight, and it records its sample later.
+        /// The snapshot waits until two reads 250 ms apart agree, for at most
+        /// ten seconds. A phase boundary then falls between samples.
+        pub async fn settled_snapshot(&self) -> BTreeMap<String, u64> {
+            let mut last = self.snapshot();
+            for _ in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let now = self.snapshot();
+                if now == last {
+                    break;
+                }
+                last = now;
+            }
+            last
+        }
     }
 
     impl MetricsRecorder for ResidentCounts {
@@ -4350,8 +4369,8 @@ pub mod db {
             .map(|l| u64::try_from(l.completed).unwrap_or(0))
             .collect();
 
+        let resident_before = resident.settled_snapshot().await;
         reset_commit_probe();
-        let resident_before = resident.snapshot();
         let loops = run_closed_loop(
             &cluster,
             "meas",
@@ -4361,7 +4380,7 @@ pub mod db {
             &census,
         )
         .await;
-        let resident_note = resident_note(&resident_before, &resident.snapshot());
+        let resident_note = resident_note(&resident_before, &resident.settled_snapshot().await);
         let requested = per_shard_total * shards.len();
 
         // Completion instants come from the database clock (`completed_at`), so

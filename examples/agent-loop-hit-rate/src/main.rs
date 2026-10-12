@@ -111,6 +111,12 @@ impl Counts {
 }
 
 impl MetricsRecorder for Counts {
+    /// `false`, so the worker starts no metric sampler. A sampler would add
+    /// its own queries to the measured load.
+    fn is_enabled(&self) -> bool {
+        false
+    }
+
     fn record_workflow_cache_hit(&self, _workflow_name: &str, _queue: &str) {
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
     }
