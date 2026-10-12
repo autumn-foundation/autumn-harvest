@@ -18,7 +18,8 @@
 //!     coupled (no phantom rows surviving a rename or a decoupling),
 //!   * every inventory row carries an explicit (a)/(b)/(c) classification, so
 //!     a module cannot be listed and then left unjudged,
-//!   * the per-mechanism counts quoted in the report match live greps, and
+//!   * the ratios the prose states hold against live greps, and the report
+//!     quotes no live count that every feature PR would have to edit, and
 //!   * the evidence the report cites (the cross-backend replay test, the
 //!     `default-features = false` seam) actually exists.
 //!
@@ -625,61 +626,41 @@ fn every_inventoried_module_records_the_mechanisms_grep_finds() {
 }
 
 #[test]
-fn mechanism_counts_quoted_in_the_report_are_current() {
+fn every_mechanism_has_a_row_and_no_count() {
     let report = read_report();
-    let detected = detect_coupled_modules();
-
     let section = markdown_section(&report, "Coupling mechanisms")
         .unwrap_or_else(|| panic!("the report must contain a \"Coupling mechanisms\" section"));
-
-    // Per-mechanism module counts, recomputed live. The report publishes these
-    // as `| <mechanism> | <n> modules | ... |`; a stale number here is the
-    // classic way an audit rots without anyone noticing.
+    let rows: Vec<&str> = section
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('|'))
+        .collect();
     for (label, _) in MECHANISMS {
-        let count = detected.values().filter(|ms| ms.contains(label)).count();
-        // Only table rows: prose elsewhere in the section may legitimately
-        // mention a mechanism without publishing its count.
-        let row = section
-            .lines()
-            .map(str::trim)
-            .filter(|l| l.starts_with('|'))
-            .find(|l| l.contains(label))
-            .unwrap_or_else(|| {
-                panic!("no table row in \"Coupling mechanisms\" mentions {label:?}")
-            });
-        // Parse the reach cell as a *number*, not a substring: `contains("13
-        // modules")` is satisfied by "113 modules", so a count that grew past a
-        // decimal boundary would silently keep passing.
-        let reach = row.split('|').nth(2).unwrap_or_default().trim();
-        let published: usize = reach
-            .split_whitespace()
-            .next()
-            .and_then(|n| n.parse().ok())
-            .unwrap_or_else(|| {
-                panic!(
-                    "the reach cell for {label:?} must start with a module count; \
-                     found {reach:?} in row:\n  {row}"
-                )
-            });
-        assert_eq!(
-            published, count,
-            "the report says {published} for {label:?}:\n  {row}\nbut a live audit \
-             finds {count}."
-        );
-        // Singular/plural so the guard never forces ungrammatical prose ("1 modules").
-        let unit = if count == 1 { "module" } else { "modules" };
         assert!(
-            reach.contains(unit),
-            "the reach cell for {label:?} should read \"{count} {unit}\"; found {reach:?}"
+            rows.iter().any(|l| l.contains(label)),
+            "no table row in \"Coupling mechanisms\" mentions {label:?}"
         );
     }
-
-    let total = detected.len();
+    // A live count in a table cell is the line every feature PR edits. Two
+    // open PRs that each add a module then conflict on it.
+    let counted: Vec<&&str> = rows
+        .iter()
+        .filter(|row| row.split('|').map(str::trim).any(is_module_count))
+        .collect();
     assert!(
-        report.contains(&format!("**{total} of the")),
-        "the report should state the headline coupling figure as \"**{total} of the \
-         N core modules**\"; a live audit currently finds {total} coupled modules"
+        counted.is_empty(),
+        "the mechanism table must not quote live module counts. Each feature PR \
+         would edit the same cell, and open PRs would conflict on it. \
+         `live_figures_support_the_prose` prints the counts. Rows:\n{counted:#?}"
     );
+}
+
+/// True for a cell such as `68 modules` or `1 module`.
+fn is_module_count(cell: &str) -> bool {
+    let mut words = cell.split_whitespace();
+    let number = words.next().is_some_and(|w| w.parse::<usize>().is_ok());
+    let unit = matches!(words.next(), Some("module" | "modules"));
+    number && unit && words.next().is_none()
 }
 
 /// A module that hand-writes SQL cannot be "plain CRUD through Diesel".
@@ -725,123 +706,110 @@ fn raw_sql_modules_are_never_classified_trivially_traitable() {
     );
 }
 
-/// The report's derived totals must agree with its own table and with the tree.
-///
-/// The per-mechanism counts are guarded above, but the *derived* figures are
-/// the ones a reader actually quotes in a decision: "43 of 93 modules", the
-/// (a)/(b)/(c) split, "83 migrations". Each is arithmetic over something that
-/// changes without anyone re-reading this document.
-#[test]
-fn derived_totals_agree_with_the_table_and_the_tree() {
-    let report = read_report();
-    let rows = inventory_rows(&report);
+/// The live figures, as the guards count them.
+struct Figures {
+    core: usize,
+    coupled: usize,
+    class_a: usize,
+    class_c: usize,
+    raw_sql: usize,
+    migrations: usize,
+}
 
-    // (a)/(b)/(c) split, recomputed from the table the report itself publishes.
-    let mut by_class: BTreeMap<&str, usize> = BTreeMap::new();
-    for row in rows.values() {
-        *by_class.entry(row.class.as_str()).or_default() += 1;
-    }
-    let (a, b, c) = (
-        by_class.get("(a)").copied().unwrap_or_default(),
-        by_class.get("(b)").copied().unwrap_or_default(),
-        by_class.get("(c)").copied().unwrap_or_default(),
-    );
-    let totals = format!("**Totals: (a) {a} · (b) {b} · (c) {c}.**");
-    assert!(
-        report.contains(&totals),
-        "the classification totals must match the table. Expected the line:\n  \
-         {totals}\nRows counted: {by_class:?} across {} rows.",
-        rows.len()
-    );
-    assert_eq!(
-        a + b + c,
-        rows.len(),
-        "every inventory row must fall in exactly one class; {} rows but \
-         {a}+{b}+{c} classified",
-        rows.len()
-    );
-
-    // Denominator: total core modules, counted live from the *same* source of
-    // truth as the coupling detector, so the two can never disagree about scope
-    // and the documented test-only exclusions are applied consistently.
-    let total_modules = core_module_files().len();
-    let headline = format!("**{} of the {total_modules} core modules**", rows.len());
-    assert!(
-        report.contains(&headline),
-        "the headline coupling ratio must be current. Expected:\n  {headline}\n\
-         (a live count finds {} coupled of {total_modules} core modules)",
-        rows.len()
-    );
-
-    // The same figures again, as the *prose* quotes them.
-    //
-    // The table above is guarded, but a reader making a decision quotes the
-    // sentences, not the table — "19 of 43 coupled modules are portable only by
-    // dropping a capability" is the line that gets pasted into a design review.
-    // Those sentences drifted: they were a coherent snapshot of an earlier audit
-    // (43 coupled, 19 class (c), 26 raw-SQL) left behind by a table that had
-    // since grown, so the document contradicted itself in the one place it is
-    // most likely to be quoted from. Each figure below is pure arithmetic over
-    // the inventory rows, so it is derivable and therefore guardable; the
-    // estimates that are *not* derivable (`~13 modules` for the scanner rewrite)
-    // are deliberately left alone.
+fn live_figures() -> Figures {
+    let rows = inventory_rows(&read_report());
+    let count = |class: &str| rows.values().filter(|row| row.class == class).count();
     let raw_sql = detect_coupled_modules()
         .values()
         .filter(|ms| ms.contains("raw-sql"))
         .count();
-    for phrase in [
-        format!("{c} of {} coupled modules", rows.len()),
-        format!(
-            "That {raw_sql} of the {} coupled modules hand-write SQL",
-            rows.len()
-        ),
-        format!("~{} modules touched", rows.len()),
-        format!("**{c} modules are class (c)**"),
-        format!("against {a} that are trivially trait-able"),
-        format!("**{raw_sql} modules reach for raw SQL**"),
-    ] {
-        assert!(
-            report.contains(&phrase),
-            "the report's prose must quote the same figures as its own table; \
-             expected to find {phrase:?}. A live audit finds {} coupled modules, \
-             {a} class (a), {c} class (c), {raw_sql} reaching for raw SQL.",
-            rows.len()
-        );
-    }
-
-    // Migration count.
     let migrations = std::fs::read_dir(repo_root().join("autumn-harvest/migrations"))
         .expect("migrations dir readable")
         .filter_map(Result::ok)
         .filter(|e| e.path().is_dir())
         .count();
-    assert!(
-        report.contains(&format!("**{migrations} migrations**")),
-        "the report states {}; a live count finds {migrations} migration \
-         directories. Update the report to \"**{migrations} migrations**\"",
-        stated_migration_count(&report).map_or_else(
-            || "no \"**N migrations**\" figure".to_string(),
-            |stated| format!("\"**{stated} migrations**\"")
-        )
-    );
+    Figures {
+        // Counted from the same source as the coupling detector, so the two
+        // agree on scope and on the documented test-only exclusions.
+        core: core_module_files().len(),
+        coupled: rows.len(),
+        class_a: count("(a)"),
+        class_c: count("(c)"),
+        raw_sql,
+        migrations,
+    }
 }
 
-/// Return the migration count the report currently states, if a bold
-/// `**N migrations**` figure is present.
+/// The report's prose ratios must hold against the live tree.
 ///
-/// The panic message above quotes this alongside the live count. Without it,
-/// a failing assertion could only ever interpolate the live count on both
-/// sides of its sentence. A reader could not tell from the message alone
-/// what the report actually says versus what is live.
-fn stated_migration_count(report: &str) -> Option<usize> {
-    let digits_end = report.find(" migrations**")?;
-    let digits_start = report[..digits_end]
-        .rfind(|c: char| !c.is_ascii_digit())
-        .map_or(0, |i| i + 1);
-    if digits_start >= digits_end || !report[..digits_start].ends_with("**") {
-        return None;
+/// The report once quoted exact counts: "68 of the 137 core modules", the
+/// (a)/(b)/(c) totals, "132 migrations". Each count changed with almost every
+/// feature PR. So every open PR edited the same lines, and each merge
+/// conflicted the rest. The prose now states ratios, and this guard checks
+/// each ratio. A ratio changes only when the finding changes, and then the
+/// prose must change too.
+///
+/// Run with `--nocapture` to print the live counts.
+#[test]
+fn live_figures_support_the_prose() {
+    let report = read_report();
+    let f = live_figures();
+    eprintln!(
+        "core modules: {}\ncoupled modules: {}\nclass (a): {}\nclass (c): {}\n\
+         raw SQL: {}\nmigrations: {}",
+        f.core, f.coupled, f.class_a, f.class_c, f.raw_sql, f.migrations
+    );
+    let claims = [
+        (
+            "**About half of the core modules**",
+            f.coupled * 10 >= f.core * 4 && f.coupled * 10 <= f.core * 6,
+            "40% to 60% of core modules are coupled",
+        ),
+        (
+            "more than a quarter of the coupled modules are portable",
+            f.class_c * 4 > f.coupled,
+            "class (c) is over 25% of the coupled modules",
+        ),
+        (
+            "**Class (c) holds more than a quarter of the coupled modules**",
+            f.class_c * 4 > f.coupled,
+            "class (c) is over 25% of the coupled modules",
+        ),
+        (
+            "outnumbers\n  the trivially trait-able class (a) at least two to one",
+            f.class_c >= f.class_a * 2,
+            "class (c) is at least twice class (a)",
+        ),
+        (
+            "That most coupled modules hand-write SQL",
+            f.raw_sql * 2 > f.coupled,
+            "over half of the coupled modules use raw SQL",
+        ),
+        (
+            "**Most coupled modules reach for raw SQL**",
+            f.raw_sql * 2 > f.coupled,
+            "over half of the coupled modules use raw SQL",
+        ),
+        (
+            "**Every migration** — well over a hundred —",
+            f.migrations > 100,
+            "there are over 100 migrations",
+        ),
+    ];
+    for (phrase, holds, rule) in claims {
+        assert!(
+            report.contains(phrase),
+            "the report must state {phrase:?}. If the finding changed, change this \
+             guard with the prose"
+        );
+        assert!(
+            holds,
+            "the report states {phrase:?}, which requires that {rule}. A live audit \
+             finds {} core, {} coupled, (a) {}, (c) {}, raw SQL {}, {} migrations. \
+             Rewrite the prose and this claim to match the new finding",
+            f.core, f.coupled, f.class_a, f.class_c, f.raw_sql, f.migrations
+        );
     }
-    report[digits_start..digits_end].parse().ok()
 }
 
 #[test]
