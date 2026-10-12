@@ -146,6 +146,26 @@ fn next_timer_arm_seq(conn: &Connection) -> SqliteResult<i64> {
     Ok(max.map_or(0, |m| m + 1))
 }
 
+/// Reclaim the tasks of `exec_id` that a dropped drive left `RUNNING` (issue
+/// #2024).
+///
+/// The drain awaits an `#[activity]` body after its claim commits. A caller can
+/// drop the drive future during that await, for example with a timeout. The row
+/// then stays `RUNNING`, and no later drive in this process claims it. Drives
+/// are serialised by `&mut SqliteRuntime`, so a `RUNNING` row at the start of a
+/// drive has no live owner. The body re-runs, as after a crash. Returns the
+/// number of rows reclaimed.
+pub fn reclaim_running_for_execution(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> SqliteResult<usize> {
+    let n = conn.execute(
+        "UPDATE harvest_tasks SET state = 'PENDING' WHERE state = 'RUNNING' AND exec_id = ?1",
+        params![exec_id.to_string()],
+    )?;
+    Ok(n)
+}
+
 /// Reclaim tasks stranded `RUNNING` by a crash, flipping them back to `PENDING`.
 ///
 /// Safe because this backend is single-server: any `RUNNING` row observed at

@@ -99,7 +99,9 @@ async fn info_reports_the_dispatch_values() {
     let mut rt = SqliteRuntime::open(&path).unwrap();
     rt.register_workflow(&info_flow_info());
     rt.register_activity(&report_info_info());
-    let exec = rt.start_workflow_with_id("info_flow", "order-7", json!(1)).unwrap();
+    let exec = rt
+        .start_workflow_with_id("info_flow", "order-7", json!(1))
+        .unwrap();
 
     let before = Utc::now();
     let report = completed(&mut rt, exec).await;
@@ -129,6 +131,29 @@ async fn info_reports_the_dispatch_values() {
     assert_eq!(report["cancelled"], json!(false));
 
     // The deadline is the claim instant plus the one-hour budget.
+    let deadline: DateTime<Utc> = report["deadline"].as_str().unwrap().parse().unwrap();
+    let budget = chrono::Duration::hours(1);
+    assert!(deadline >= before + budget - chrono::Duration::seconds(1));
+    assert!(deadline <= after + budget);
+}
+
+/// Under a simulated clock, `deadline()` still uses the real clock, because
+/// `time_remaining()` compares it with `Utc::now()`.
+#[tokio::test]
+async fn the_deadline_is_on_the_real_clock_under_a_simulated_drive() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&info_flow_info());
+    rt.register_activity(&report_info_info());
+    let exec = rt.start_workflow("info_flow", json!(1)).unwrap();
+
+    let before = Utc::now();
+    let epoch = DateTime::from_timestamp(0, 0).unwrap();
+    let report = match rt.run_until_blocked_as_of(exec, epoch).await.unwrap() {
+        RunState::Completed(v) => v,
+        other => panic!("the run must complete, got {other:?}"),
+    };
+    let after = Utc::now();
+
     let deadline: DateTime<Utc> = report["deadline"].as_str().unwrap().parse().unwrap();
     let budget = chrono::Duration::hours(1);
     assert!(deadline >= before + budget - chrono::Duration::seconds(1));
@@ -297,6 +322,24 @@ async fn a_heartbeat_checkpoint_survives_a_crash() {
     );
 }
 
+/// A caller drops the drive while the body hangs. The next drive in the same
+/// process reclaims the task and re-runs the body.
+#[tokio::test]
+async fn a_dropped_drive_does_not_strand_the_task() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&crash_flow_info());
+    rt.register_activity(&hangs_after_checkpoint_info());
+    let exec = rt.start_workflow("crash_flow", json!(0)).unwrap();
+
+    let drive = tokio::time::timeout(Duration::from_millis(200), rt.run_until_blocked(exec));
+    assert!(drive.await.is_err(), "the hung body must block the drive");
+
+    assert_eq!(
+        completed(&mut rt, exec).await,
+        json!({ "resumed": { "done": 9 } })
+    );
+}
+
 // ── A panic is contained ──────────────────────────────────────────────────────
 
 #[activity]
@@ -307,7 +350,10 @@ async fn panics_after_await(_ctx: &ActivityContext, _n: i64) -> Result<i64, Stri
 
 #[workflow]
 async fn panic_flow(ctx: &WorkflowContext, n: i64) -> Result<String, String> {
-    match ctx.execute_activity::<_, i64>(&panics_after_await_info(), n).await {
+    match ctx
+        .execute_activity::<_, i64>(&panics_after_await_info(), n)
+        .await
+    {
         Ok(_) => Ok("completed".to_string()),
         Err(e) => Ok(format!("failed: {e}")),
     }

@@ -15,7 +15,17 @@ queue and the task row id. `deadline()` is the earlier of claim time plus
 `start_to_close` and the `schedule_to_close` deadline.
 `previous_failure()` is the previous attempt's error message.
 `idempotency_key()` derives from the activity id, as on Postgres. The
-cancellation token never fires on SQLite.
+cancellation token never fires on SQLite. `deadline()` is on the real clock,
+also under the `_as_of` drivers.
+
+**Known differences.** With no declared `retry`, SQLite runs one attempt and
+reports `max_attempts() == 1`. Postgres applies its engine default. A re-run
+after a crash keeps its `attempt` number. `state()`, `headers()` and
+`metrics()` are empty on SQLite.
+
+**Dropped drive.** A caller can drop the drive future while a body runs. The
+next drive of that run now reclaims the `RUNNING` task and re-runs the body,
+as after a crash.
 
 **Heartbeats.** `ctx.heartbeat(..)` stores the latest payload on the task row.
 A retry, or a reopen after a crash, reads it back with

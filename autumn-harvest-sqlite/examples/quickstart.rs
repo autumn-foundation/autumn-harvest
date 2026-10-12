@@ -60,7 +60,10 @@ async fn process_order(ctx: &WorkflowContext, order: Order) -> Result<String, St
 #[activity]
 async fn reserve_inventory(ctx: &ActivityContext, order: Order) -> Result<String, String> {
     let key = ctx.idempotency_key().map_err(|e| e.to_string())?;
-    Ok(format!("reserved {}x {} (key {key})", order.qty, order.item))
+    Ok(format!(
+        "reserved {}x {} (key {key})",
+        order.qty, order.item
+    ))
 }
 
 /// Charges the card. `ctx.info()` reports the attempt and the owning run.

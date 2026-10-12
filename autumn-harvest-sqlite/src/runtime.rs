@@ -13,9 +13,9 @@ use autumn_harvest::executor::{
     WorkflowExecuteSpanMeta, run_workflow_with_state_history_policy_and_caps,
 };
 use autumn_harvest::{
-    ActivityExecId, ActivityHandlerFn, ActivityInfo, ExecutionId, NoOpMetrics, TimerId, WorkflowCommand,
-    WorkflowEvent, WorkflowHandlerFn, WorkflowHistoryPolicy, WorkflowIdReusePolicy, WorkflowInfo,
-    WorkflowOutcome,
+    ActivityExecId, ActivityHandlerFn, ActivityInfo, ExecutionId, NoOpMetrics, TimerId,
+    WorkflowCommand, WorkflowEvent, WorkflowHandlerFn, WorkflowHistoryPolicy,
+    WorkflowIdReusePolicy, WorkflowInfo, WorkflowOutcome,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
@@ -400,9 +400,20 @@ impl SqliteRuntime {
     /// - The cancellation token never fires on this backend.
     ///
     /// A panic in the body becomes a retryable `HandlerPanic` failure, as on
-    /// Postgres. A body that never returns blocks the drive.
+    /// Postgres. A body that never returns blocks the drive. If the caller drops
+    /// the drive future, for example with a timeout, the next drive of that run
+    /// re-runs the body, as after a crash.
     ///
-        /// This is the **audited, `ActivityInfo`-driven** registration path — the
+    /// Some values differ from Postgres by design:
+    ///
+    /// - With no declared `retry`, this backend runs one attempt, so
+    ///   `max_attempts()` is `1`. Postgres applies its engine default.
+    /// - A re-run after a crash or a dropped drive keeps its `attempt` number.
+    ///   Postgres counts the lost attempt.
+    /// - `state()` is always `None`, `headers()` is empty, and `metrics()`
+    ///   records nothing.
+    ///
+    /// This is the **audited, `ActivityInfo`-driven** registration path — the
     /// analog of [`register_workflow`](Self::register_workflow) — and the one that
     /// closes the third author-declared-feature ingress surface (Codex #1069 P2,
     /// `runtime.rs:39`). Beyond the command layer ([`apply_schedule_activity`],
@@ -1331,6 +1342,9 @@ impl SqliteRuntime {
             };
         }
 
+        // A drive dropped mid-body leaves its task `RUNNING` (issue #2024).
+        // Nothing else owns it now, so hand it back to the claim.
+        queue::reclaim_running_for_execution(&self.conn, exec)?;
         let history = store::load_history(&self.conn, exec)?;
         let input = store::execution_input(&self.conn, exec)?;
         let workflow_name = store::workflow_name_of(&self.conn, exec)?;

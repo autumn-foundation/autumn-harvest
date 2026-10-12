@@ -64,6 +64,8 @@ two nullable columns on `harvest_tasks`. The core gains one hidden constructor.
 | R6 | The drive future stops being `Send`. | Everything held across the await is `Send`. Clippy `future_not_send` gates it. |
 | R7 | An old database lacks the new columns and every claim fails. | `schema::migrate` adds them, additive and idempotent. Test. |
 | R8 | The rename breaks downstream callers silently. | It is a compile error, not a behavior change. The changelog names the new method. |
+| R10 | A caller drops the drive future during a body, so the task stays `RUNNING` and the run is stuck. | Each drive first reclaims the run's `RUNNING` rows. Drives are serialised by `&mut self`, so such a row has no owner. Test. |
+| R11 | A simulated `_as_of` clock puts `deadline()` decades away from the real clock. | The deadline is the remaining span added to `Utc::now()`. Test. |
 | R9 | The same fn gives different `info()` on the two backends. | One shared fixture runs on both. A core test runs it on Postgres. A SQLite test runs it here. Both assert the same JSON. |
 
 ### 0.4 Six thinking hats
@@ -128,6 +130,10 @@ body runs inline, as before.
 | `task_id` | the task row's UUID | same |
 | `deadline()` | min(claim + `start_to_close`, `schedule_to_close_at`) | same rule |
 
+Known differences: with no declared `retry`, SQLite runs one attempt and
+`max_attempts` is `1`. A re-run after a crash keeps its `attempt`. `state()`,
+`headers()` and `metrics()` are empty.
+
 ### 1.5 Schema
 
 `harvest_tasks.heartbeat_details TEXT` and `harvest_tasks.last_error TEXT`.
@@ -144,5 +150,5 @@ Both are nullable and added by `schema::migrate`.
 - `tests/integration/portable_activity.rs` (SQLite) and
   `autumn-harvest/tests/integration/sqlite_portable_activity_tests.rs`
   (Postgres) run one shared fixture and assert the same report.
-- `examples/portable_activity.rs` shows the fn on SQLite.
+- `examples/quickstart.rs` runs two `#[activity]` bodies on SQLite.
 - Every existing raw-closure test passes unchanged.

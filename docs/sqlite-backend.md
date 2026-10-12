@@ -125,8 +125,18 @@ async fn reserve_inventory(ctx: &ActivityContext, order: Order) -> Result<String
 > and the task row id. `ctx.heartbeat(..)` stores the latest payload on the task
 > row, so a retry or a reopen resumes from it with `ctx.heartbeat_details()`.
 > `ctx.previous_failure()` is the previous attempt's error. The cancellation
-> token never fires here. `ctx.state::<T>()` is always `None`, because this
-> backend has no shared-state registry.
+> token never fires here.
+>
+> Some values differ from Postgres by design:
+>
+> - With no declared `retry`, this backend runs one attempt, so
+>   `max_attempts()` is `1`. Postgres applies its engine default.
+> - A re-run after a crash, or after a dropped drive, keeps its `attempt`
+>   number. Postgres counts the lost attempt.
+> - `ctx.state::<T>()` is always `None`, `ctx.headers()` is empty, and
+>   `ctx.metrics()` records nothing.
+> - `heartbeat_timeout` is rejected at registration. No scanner times out a
+>   silent attempt here.
 
 ---
 

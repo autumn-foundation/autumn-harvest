@@ -238,32 +238,30 @@ pub async fn drain_ready(
         let started = std::time::Instant::now();
         let result = match &spec.body {
             ActivityRunner::Closure(body) => {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    body(task.input.clone())
-                }))
-                .unwrap_or_else(|payload| {
-                    // Encode the caught panic as the TYPED `harvest_activity_failure_v1`
-                    // envelope carrying `error_type = "HandlerPanic"` (issue #782; Codex
-                    // #1069 P2, `worker.rs:119`) — NOT a plain string. This is the one
-                    // activity-failure path that would otherwise skip the typed-envelope
-                    // treatment the ordinary `Err(String)` path already gets, because the
-                    // finalize path derives BOTH the retry classification
-                    // (`parse_typed_payload` → `RetryPolicy::is_non_retryable`) AND the
-                    // terminal `ActivityFailed` metadata (`parse_error_payload_full`) from
-                    // this string. Emitting the typed HandlerPanic envelope makes a retry
-                    // policy that marks `HandlerPanic` non-retryable actually match (the
-                    // panicking task fails terminally after ONE attempt instead of being
-                    // retried to `max_attempts`), and records a terminal
-                    // `ActivityFailed { error_type: "HandlerPanic", .. }` byte-equivalent
-                    // to the Postgres worker's caught-panic path
-                    // (`handler_panic_activity_envelope`). Retryable like the core — a
-                    // caught panic follows the activity's retry policy exactly as
-                    // `Err(String)` does. The carried message is the raw panic message (no
-                    // synthetic prefix), matching the core envelope.
-                    Err(handler_panic_activity_envelope(
-                        autumn_harvest::error::panic_message(payload),
-                    ))
-                })
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(task.input.clone())))
+                    .unwrap_or_else(|payload| {
+                        // Encode the caught panic as the TYPED `harvest_activity_failure_v1`
+                        // envelope carrying `error_type = "HandlerPanic"` (issue #782; Codex
+                        // #1069 P2, `worker.rs:119`) — NOT a plain string. This is the one
+                        // activity-failure path that would otherwise skip the typed-envelope
+                        // treatment the ordinary `Err(String)` path already gets, because the
+                        // finalize path derives BOTH the retry classification
+                        // (`parse_typed_payload` → `RetryPolicy::is_non_retryable`) AND the
+                        // terminal `ActivityFailed` metadata (`parse_error_payload_full`) from
+                        // this string. Emitting the typed HandlerPanic envelope makes a retry
+                        // policy that marks `HandlerPanic` non-retryable actually match (the
+                        // panicking task fails terminally after ONE attempt instead of being
+                        // retried to `max_attempts`), and records a terminal
+                        // `ActivityFailed { error_type: "HandlerPanic", .. }` byte-equivalent
+                        // to the Postgres worker's caught-panic path
+                        // (`handler_panic_activity_envelope`). Retryable like the core — a
+                        // caught panic follows the activity's retry policy exactly as
+                        // `Err(String)` does. The carried message is the raw panic message (no
+                        // synthetic prefix), matching the core envelope.
+                        Err(handler_panic_activity_envelope(
+                            autumn_harvest::error::panic_message(payload),
+                        ))
+                    })
             }
             ActivityRunner::Handler(handler) => {
                 let ctx = activity_context(exec_id, owner, &task, claim_now, max_attempts);
@@ -405,6 +403,8 @@ fn activity_context(
         task.activity_id,
     );
     let attempt = task.attempt.saturating_add(1);
+    let task_id = task.task_id.parse().ok();
+    debug_assert!(task_id.is_some(), "a task row id is a UUID");
     let ctx = ActivityContext::new_embedded(
         empty_shared_state(),
         identity,
@@ -412,7 +412,7 @@ fn activity_context(
         task.heartbeat_details.clone(),
     )
     .with_queue_name(task.queue.clone())
-    .with_task_id(task.task_id.parse().ok())
+    .with_task_id(task_id)
     .with_deadline(attempt_deadline(
         claim_now,
         task.start_to_close_ms,
@@ -428,11 +428,13 @@ fn activity_context(
     (ctx, rx)
 }
 
-/// The attempt deadline in epoch milliseconds: the earlier of
-/// `claim_ms + start_to_close_ms` and `schedule_to_close_at` (issue #2024).
+/// The attempt deadline: the earlier of `claim_ms + start_to_close_ms` and
+/// `schedule_to_close_at` (issue #2024).
 ///
 /// It is the same rule as the Postgres worker. A non-positive budget is
-/// unbounded, as in [`start_to_close_exceeded`].
+/// unbounded, as in [`start_to_close_exceeded`]. `claim_ms` can be a simulated
+/// clock, but `ActivityContext::time_remaining` reads the real clock. So the
+/// result is the remaining span added to `Utc::now()`.
 fn attempt_deadline(
     claim_ms: i64,
     start_to_close_ms: Option<i64>,
@@ -445,8 +447,9 @@ fn attempt_deadline(
         (Some(a), Some(b)) => Some(a.min(b)),
         (Some(only), None) | (None, Some(only)) => Some(only),
         (None, None) => None,
-    };
-    at.and_then(DateTime::from_timestamp_millis)
+    }?;
+    let remaining = chrono::Duration::try_milliseconds(at.saturating_sub(claim_ms))?;
+    Utc::now().checked_add_signed(remaining)
 }
 
 /// Await one `#[activity]` handler with its context (issue #2024).
@@ -1954,9 +1957,17 @@ mod tests {
         // post-body finalize clock = 1500 (>= deadline → finalize recheck seals the
         // timeout).
         let failure_now = advancing_finalize_clock(0, 1_500);
-        let produced = drain_ready(&mut conn, exec, &TEST_OWNER, 0, &failure_now, &activities, false)
-            .await
-            .unwrap();
+        let produced = drain_ready(
+            &mut conn,
+            exec,
+            &TEST_OWNER,
+            0,
+            &failure_now,
+            &activities,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(produced, "a terminal timeout event was appended");
 
         let history = store::load_history(&conn, exec).unwrap();
@@ -2008,9 +2019,17 @@ mod tests {
 
         // finalize clock = 500 < deadline 1000 → normal completion.
         let failure_now = || 500_i64;
-        let produced = drain_ready(&mut conn, exec, &TEST_OWNER, 0, &failure_now, &activities, false)
-            .await
-            .unwrap();
+        let produced = drain_ready(
+            &mut conn,
+            exec,
+            &TEST_OWNER,
+            0,
+            &failure_now,
+            &activities,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(produced);
 
         let history = store::load_history(&conn, exec).unwrap();
@@ -2064,9 +2083,17 @@ mod tests {
         // post-body finalize clock = 1500 (>= deadline → generalized finalize recheck
         // seals the timeout even though the body returned Err).
         let failure_now = advancing_finalize_clock(0, 1_500);
-        let produced = drain_ready(&mut conn, exec, &TEST_OWNER, 0, &failure_now, &activities, false)
-            .await
-            .unwrap();
+        let produced = drain_ready(
+            &mut conn,
+            exec,
+            &TEST_OWNER,
+            0,
+            &failure_now,
+            &activities,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(produced, "a terminal timeout event was appended");
 
         let history = store::load_history(&conn, exec).unwrap();
@@ -2110,7 +2137,8 @@ mod tests {
     // RED pre-fix: the finalize-time recheck was `result.is_ok()`-only, so the Err body
     // requeued at the stale cycle `now` (0 < 1000) and re-ran a second attempt past the cap.
     #[tokio::test]
-    async fn drain_ready_seals_schedule_to_close_for_a_zero_delay_retry_finalized_past_the_deadline() {
+    async fn drain_ready_seals_schedule_to_close_for_a_zero_delay_retry_finalized_past_the_deadline()
+     {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2148,9 +2176,17 @@ mod tests {
         // post-body finalize clock = 1500 (>= deadline → the generalized finalize recheck
         // seals the timeout).
         let failure_now = advancing_finalize_clock(0, 1_500);
-        let produced = drain_ready(&mut conn, exec, &TEST_OWNER, 0, &failure_now, &activities, false)
-            .await
-            .unwrap();
+        let produced = drain_ready(
+            &mut conn,
+            exec,
+            &TEST_OWNER,
+            0,
+            &failure_now,
+            &activities,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(produced);
 
         let history = store::load_history(&conn, exec).unwrap();
