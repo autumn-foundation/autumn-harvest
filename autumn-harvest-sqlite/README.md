@@ -112,10 +112,13 @@ Out of scope for this backend (tracked as issue #1068 follow-ups):
 - Distributed / multi-writer workers; multi-server crash recovery.
 - `LISTEN`/`NOTIFY` push wake-ups.
 - Schedules, the management API, DAGs, worker sessions, retention, sharding.
-- Child workflows, external signals/cancels, local activities, updates,
-  search attributes, and `continue_as_new` — a workflow reaching one of these is
-  rejected **loudly, by name**, never silently dropped. The run then ends
-  `FAILED` with `error_type = "UnsupportedFeature"` (issue #1834).
+- Local activities, updates, search attributes, and `continue_as_new` — a
+  workflow reaching one of these is rejected **loudly, by name**, never
+  silently dropped. The run then ends `FAILED` with
+  `error_type = "UnsupportedFeature"` (issue #1834).
+
+Child workflows and signal, cancel and await between runs are supported since
+issue #2026. See the docs guide.
 
 ## Learn more
 

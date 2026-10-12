@@ -8,9 +8,8 @@
 //! `command_name` and fell through the generic catch-all).
 //!
 //! Only fire-once `ctx.timer(...)` durable timers are supported on this backend;
-//! the full set of unsupported primitives (child workflows, external
-//! signals/cancels, local activities, updates, search attributes, detached
-//! children, cancellable timers) is documented as a v0.1 non-goal in the crate
+//! the full set of unsupported primitives (local activities, updates, search
+//! attributes, cancellable timers) is documented as a v0.1 non-goal in the crate
 //! docs and is likewise rejected BY NAME via `command_name`'s exhaustive match.
 //!
 //! No Docker: `SQLite` is embedded (`rusqlite` `bundled`).

@@ -25,10 +25,11 @@ R&D decision record [`docs/rnd/sqlite-feasibility.md`](rnd/sqlite-feasibility.md
 6. [Starting a workflow](#6-starting-a-workflow)
 7. [The drive model](#7-the-drive-model)
 8. [Signals (pull-only)](#8-signals-pull-only)
-9. [Durability and crash recovery](#9-durability-and-crash-recovery)
-10. [The single-writer / single-server contract](#10-the-single-writer--single-server-contract)
-11. [v0.1 non-goals and follow-ups](#11-v01-non-goals-and-follow-ups)
-12. [Runnable examples](#12-runnable-examples)
+9. [Child workflows and commands between runs](#9-child-workflows-and-commands-between-runs)
+10. [Durability and crash recovery](#10-durability-and-crash-recovery)
+11. [The single-writer / single-server contract](#11-the-single-writer--single-server-contract)
+12. [v0.1 non-goals and follow-ups](#12-v01-non-goals-and-follow-ups)
+13. [Runnable examples](#13-runnable-examples)
 
 ---
 
@@ -138,9 +139,9 @@ let mut rt = SqliteRuntime::open_in_memory()?;
 
 - Use **`open(path)`** for anything that must survive a process restart. Opening
   applies the schema idempotently and reclaims any task stranded `RUNNING` by a
-  previous crash (see [§9](#9-durability-and-crash-recovery)). It first takes the
+  previous crash (see [§10](#10-durability-and-crash-recovery)). It first takes the
   single-writer lock, so a second open of a held file fails with
-  `SqliteError::DatabaseLocked` (see [§10](#10-the-single-writer--single-server-contract)).
+  `SqliteError::DatabaseLocked` (see [§11](#11-the-single-writer--single-server-contract)).
 - Use **`open_in_memory()`** for tests, demos, and throwaway runs. Each call is a
   brand-new database and is **not** reopen-safe — dropping the runtime discards
   all state.
@@ -255,6 +256,7 @@ match rt.run_until_blocked(exec).await? {
     RunState::Failed(err)       => println!("failed: {err}"),
     RunState::WaitingSignal(name) => println!("blocked on signal `{name}`"),
     RunState::WaitingTimer      => println!("blocked on a durable timer"),
+    RunState::WaitingWorkflow(other) => println!("blocked on run {other}"),
     RunState::InProgress        => {} // not returned by run_until_blocked
 }
 
@@ -279,7 +281,7 @@ match rt.outcome(exec)? {
   the cadence and inspect the `bool` progress flag yourself.
 
 `poll_once()`/`run_until_idle()` drive every execution in a pass even if an
-earlier one errors — see [§11](#11-v01-non-goals-and-follow-ups) for what
+earlier one errors — see [§12](#12-v01-non-goals-and-follow-ups) for what
 happens to a rejected execution. `run_until_blocked(exec)` is the one
 fail-fast driver, since it already targets a single execution.
 
@@ -331,7 +333,79 @@ rejected rather than silently lost.
 
 ---
 
-## 9. Durability and crash recovery
+## 9. Child workflows and commands between runs
+
+A workflow can start a child, await another run, and signal or cancel
+another run (issue #2026). Each command resolves in the caller's decision
+transaction. One file holds every run, so no outbox is needed.
+
+```rust
+// Inside a workflow: start a child and wait for its result.
+let receipt: serde_json::Value = ctx
+    .spawn_child_workflow_raw("charge_card", serde_json::json!({ "cents": 500 }))
+    .await
+    .map_err(|e| e.to_string())?;
+
+// Start a detached child. The parent does not wait for it.
+let audit = ctx
+    .spawn_child_workflow_detached_raw(
+        "audit",
+        serde_json::json!({}),
+        autumn_harvest::ParentClosePolicy::Abandon,
+    )
+    .map_err(|e| e.to_string())?;
+
+// Signal or await another run. `ctx.request_cancel_external_workflow(id)`
+// cancels one.
+ctx.signal_external_workflow(audit, "flush", ()).await.map_err(|e| e.to_string())?;
+let report = ctx.await_external_workflow_value(audit).await.map_err(|e| e.to_string())?;
+```
+
+| Command | What the target gets | What the caller sees |
+| --- | --- | --- |
+| Attached child | Its own run, with a parent link | The child's output, or its typed failure |
+| Detached child | Its own run, with a parent-close policy | The child's execution id at once |
+| Await | Nothing | The target's output, or its typed failure |
+| Signal | A staged signal | `Ok(())`, or `target_terminal` / `not_running` |
+| Cancel | `WorkflowCancelled`, then `CANCELLED` | `Ok(())`, also for a terminal target |
+
+Every caller gets `target_unknown` at once for a run that does not exist.
+Postgres waits a grace window first, because another shard can still create
+the run. One file has no other shard, so its answer is final.
+
+**Children.** A child is a full run. Its `workflow_id` is its execution id.
+`ctx.info().parent_execution_id` names its parent. A child failure reaches
+the parent as `HarvestError::WorkflowFailed`, with the child's `error_type`,
+`details` and `non_retryable`. A cancelled child fails the parent's wait with
+`child workflow cancelled: <reason>`. An unregistered child workflow returns
+`SqliteError::UnknownWorkflow` and leaves the parent `RUNNING`, so a fix in the
+same runtime can resume it.
+
+**Parent-close policy.** When a parent ends, each running detached child gets
+its policy. `request_cancel` cancels it with reason `parent closed`.
+`terminate` fails it with `ParentClosed`. `abandon` leaves it running. An
+attached child is left running, as on Postgres.
+
+**Cancel is a hard seal.** The target ends `CANCELLED` at once. Its pending
+tasks, timers and staged signals go. Its body does not run again, so
+`ctx.cancellation_reason()` stays unobserved. This matches the Postgres
+external cancel.
+
+**Driving.** A run that waits on a `RUNNING` child or await target returns
+`RunState::WaitingWorkflow(target)`. `run_until_blocked` drives that target in
+the same call. So a parent whose child needs no outside input completes in
+one call. When the target blocks, the parent returns `WaitingWorkflow` naming
+it. Drive the target, or send it the signal it waits for.
+`poll_once` and `run_until_idle` treat `WaitingWorkflow` as blocked.
+
+**Replay.** Every history replays on the core `WorkflowReplayer`. The one
+exception is shared with Postgres: a run cancelled while it waits ends in a
+`WorkflowCancelled` that its code never saw. Strict replay reports that run
+as still parked. Replay the events before the cancel in canary mode instead.
+
+---
+
+## 10. Durability and crash recovery
 
 All durable state lives in the database. Dropping a runtime and re-`open`-ing the
 **same file** is a faithful crash/restart:
@@ -356,7 +430,7 @@ from history in session 2) and the ship body ran exactly once (session 2 only).
 
 ---
 
-## 10. The single-writer / single-server contract
+## 11. The single-writer / single-server contract
 
 This backend assumes **one writer process** against **one** SQLite file:
 
@@ -366,7 +440,7 @@ This backend assumes **one writer process** against **one** SQLite file:
   exactly-once by construction — no two claimers race.
 - **Polling replaces `LISTEN`/`NOTIFY`** (see [§7](#7-the-drive-model)).
 - **Restart = drop the runtime + reopen the file** (see
-  [§9](#9-durability-and-crash-recovery)).
+  [§10](#10-durability-and-crash-recovery)).
 
 The runtime opens the database with `journal_mode = WAL`, `synchronous = FULL`
 (fsync on every commit — the crash tests depend on it), and a `busy_timeout` so
@@ -412,16 +486,13 @@ next `open`. A single-process design has no heartbeat-timeout reclaimer for a
 
 ---
 
-## 11. v0.1 non-goals and follow-ups
+## 12. v0.1 non-goals and follow-ups
 
 Out-of-subset workflow primitives are rejected **loudly, by name** — never
 silently dropped. A workflow reaching one of these surfaces
 `SqliteError::Unsupported` (or a setup-time panic at registration) naming the
 specific command/feature. The run then ends `FAILED` (see below):
 
-- **Child workflows** (`spawn_child_workflow`, `spawn_child_workflow_detached`).
-- **External signals / cancels** (`signal_external_workflow`,
-  `request_cancel_external_workflow`).
 - **Local activities** (`execute_local_activity`) and **external / task-token
   activities**.
 - **Updates**, **search attributes** (`upsert_search_attributes`), and
@@ -436,7 +507,7 @@ transaction, with a typed `WorkflowFailed` event:
 | Field | Value |
 |---|---|
 | `error_type` | `"UnsupportedFeature"` (`UNSUPPORTED_FEATURE_ERROR_TYPE`) |
-| `details` | `{"feature": "<stable token>", "message": "<full text>"}`. The token is a command or field name, such as `StartChildWorkflow` or `ScheduleActivity.session_id`. |
+| `details` | `{"feature": "<stable token>", "message": "<full text>"}`. The token is a command or field name, such as `RunLocalActivity` or `ScheduleActivity.session_id`. |
 | `non_retryable` | `true` |
 | `error` | The `SqliteError::Unsupported` message |
 
@@ -464,7 +535,9 @@ retention, worker sessions, sharding, and DAGs. Rejection is deliberate, so a
 partial, silently-wrong implementation never ships.
 
 The `WorkflowIdReusePolicy` matrix (see [§6](#6-starting-a-workflow)) shipped
-under issue #1068. It is no longer a non-goal.
+under issue #1068. It is no longer a non-goal. Child workflows and commands
+between runs (see [§9](#9-child-workflows-and-commands-between-runs)) shipped
+under issue #2026.
 
 Two benign bookkeeping commands are silently no-ops (they append no event and
 gate no control flow): `ctx.set_current_details(...)` and a re-park
@@ -472,7 +545,7 @@ gate no control flow): `ctx.set_current_details(...)` and a re-park
 
 ---
 
-## 12. Runnable examples
+## 13. Runnable examples
 
 - **[`examples/quickstart.rs`](../autumn-harvest-sqlite/examples/quickstart.rs)**
   — a complete order-processing workflow: open in-memory → register a workflow +
@@ -496,7 +569,7 @@ gate no control flow): `ctx.set_current_details(...)` and a re-park
   sessions as durable workflows. It shows the drive loop
   ([§7](#7-the-drive-model)), pull signals with a deadline
   ([§8](#8-signals-pull-only)), and crash recovery
-  ([§9](#9-durability-and-crash-recovery)) in one place, and it runs with no API
+  ([§10](#10-durability-and-crash-recovery)) in one place, and it runs with no API
   key against a scripted offline model.
 
   ```text

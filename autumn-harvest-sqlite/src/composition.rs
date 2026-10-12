@@ -1,8 +1,8 @@
 //! Child workflows and commands between runs (issue #2026).
 //!
 //! Every helper here runs inside the caller's transaction. One database
-//! holds every run, so a child start, a result delivery, a cancel or a signal
-//! commits together with the event that asked for it. No outbox is needed.
+//! holds every run. So a child start, a result, a cancel or a signal commits
+//! with the event that asked for it. No outbox is needed.
 //!
 //! Each event has the shape that the Postgres worker writes, so a history
 //! from this backend replays on the core `WorkflowReplayer`.

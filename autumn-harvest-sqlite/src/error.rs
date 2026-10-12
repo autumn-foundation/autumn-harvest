@@ -86,8 +86,8 @@ pub enum SqliteError {
     },
 
     /// A workflow emitted a [`WorkflowCommand`](autumn_harvest::WorkflowCommand)
-    /// outside the single-writer backend's supported subset (child workflows,
-    /// external signals/cancels, continue-as-new, local activities, …).
+    /// outside the single-writer backend's supported subset (continue-as-new,
+    /// local activities, updates, …).
     ///
     /// The run is terminal (issue #1834). The drive that returns this error
     /// first rolls back the cycle. It then seals the run `FAILED` with a typed

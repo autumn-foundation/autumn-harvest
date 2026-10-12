@@ -950,11 +950,16 @@ impl SqliteRuntime {
     /// its true arm instant, so a `timer(1s)` following a 2s activity waits ~1s
     /// from when it was armed instead of firing immediately (issue #1069 P2).
     ///
+    /// A run that waits on a `RUNNING` child or await target is driven
+    /// together with that target (issue #2026). When the target blocks, this
+    /// returns [`RunState::WaitingWorkflow`] naming it.
+    ///
     /// # Errors
     ///
     /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns
     /// [`SqliteError::Stuck`] if the run makes no progress and cannot be
-    /// classified. Returns [`SqliteError::Unsupported`] for an unsupported
+    /// classified. An error from a waited-on run also returns here, unless
+    /// that run is now terminal. Returns [`SqliteError::Unsupported`] for an unsupported
     /// command, after it seals the run `FAILED` (issue #1834). Returns
     /// [`SqliteError::UnknownWorkflow`] for an unregistered workflow.
     /// Returns [`SqliteError::UnregisteredActivity`] for an unregistered activity.
@@ -1276,7 +1281,7 @@ impl SqliteRuntime {
     ///
     /// The `WorkflowFailed` event carries [`UNSUPPORTED_FEATURE_ERROR_TYPE`]
     /// and `non_retryable = true`. A retry would meet the same feature again.
-    /// `details.feature` is a stable token, such as `StartChildWorkflow` or
+    /// `details.feature` is a stable token, such as `RunLocalActivity` or
     /// `ScheduleActivity.session_id`. `details.message` holds the full text.
     fn seal_unsupported(&mut self, exec: ExecutionId, unsupported: &str) -> SqliteResult<()> {
         let feature = unsupported
@@ -1759,10 +1764,10 @@ impl SqliteRuntime {
                 cmd @ (WorkflowCommand::ArmTimer { .. } | WorkflowCommand::CancelTimer { .. }) => {
                     return Err(cancellable_timer_unsupported(cmd));
                 }
-                // Every OTHER unsupported command (external activities, local
-                // activities, updates, search attributes) is rejected BY NAME via
-                // `command_name` — no opaque `"Unknown"` for any current variant
-                // (Codex #1069 P2, `runtime.rs:840`). Dropping `tx` here
+                // Every OTHER unsupported command is rejected BY NAME via
+                // `command_name`. Examples are external and local activities,
+                // updates and search attributes. No current variant is an opaque
+                // `"Unknown"` (Codex #1069 P2, `runtime.rs:840`). Dropping `tx` here
                 // (un-committed) rolls back the whole batch — an unsupported command
                 // after a supported one leaves NEITHER the supported command's event
                 // NOR its queue/timer row persisted.
