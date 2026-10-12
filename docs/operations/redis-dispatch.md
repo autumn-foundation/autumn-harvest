@@ -316,6 +316,9 @@ fails startup instead, in every mode.
   cache hint, never a correctness rule.
 - **No new event variant and no migration.** The channel adds nothing to
   `harvest_events` and nothing to the schema.
+- **One claim loop per channel.** The follower claim loops of
+  `max_concurrent_claims` claim only through Postgres, so they stay idle on a
+  shard with a channel. In degraded mode the leader drains Postgres alone.
 
 ## How to turn it off
 
