@@ -81,6 +81,11 @@ struct EffectLedger {
     /// state before it fails.
     #[serde(default)]
     failed_updates: Vec<String>,
+    /// Timers that a won race tore down, by id. The signature covers this
+    /// list, so the loader can use it as teardown evidence. A timer that
+    /// fired is not evidence of a teardown.
+    #[serde(default)]
+    torn_down_timers: Vec<String>,
 }
 
 /// Removes the open effect `id` and returns it.
@@ -182,7 +187,7 @@ impl EffectLedger {
         }
         for timer in torn_down_timers {
             if close(&mut open, &format!("timer:{timer}")).is_some() {
-                ledger.timers.push(timer.clone());
+                ledger.torn_down_timers.push(timer.clone());
             }
         }
         match open.into_iter().next() {
@@ -386,9 +391,9 @@ impl Snapshot {
             return Err(SnapshotError::UnknownVersion(snapshot.version));
         }
         if let Some(source) = source {
-            // The signed ledger lists each timer that the stamp closed,
-            // torn-down race timers included.
-            let expected = EffectLedger::from_history(source, &snapshot.ledger.timers)
+            // Only the signed teardown list closes a timer that history
+            // leaves open.
+            let expected = EffectLedger::from_history(source, &snapshot.ledger.torn_down_timers)
                 .map_err(SnapshotError::Open)?;
             if expected != snapshot.ledger {
                 return Err(SnapshotError::LedgerMismatch);
@@ -812,7 +817,8 @@ fn a_wait_won_by_its_signal_can_checkpoint() {
     let raw = Snapshot::stamp(&unstamped, &history, &view).expect("the view closes the timer");
     let (_, ledger) =
         Snapshot::load::<OrderV1>(&raw, Some(&history)).expect("the signed ledger closes it too");
-    assert_eq!(ledger.timers, [deadline]);
+    assert_eq!(ledger.torn_down_timers, [deadline]);
+    assert_eq!(ledger.timers, Vec::<String>::new());
 }
 
 #[test]
@@ -922,6 +928,31 @@ fn a_forged_snapshot_is_refused() {
     assert_eq!(
         Snapshot::load::<Order>(&forged_snapshot(), None),
         Err(SnapshotError::Forged)
+    );
+}
+
+#[test]
+fn a_fired_timer_is_not_teardown_evidence_for_another_history() {
+    // The snapshot's timer fired. A different history starts the same
+    // reserved id and leaves it open. The loader must not close it.
+    let deadline = "__signal_timeout:1:approve";
+    let started_timer = WorkflowEvent::TimerStarted {
+        timer_id: TimerId::new(deadline),
+        duration_secs: 60,
+    };
+    let fired = vec![
+        started(Value::Null),
+        started_timer.clone(),
+        WorkflowEvent::TimerFired {
+            timer_id: TimerId::new(deadline),
+        },
+    ];
+    let open = vec![started(Value::Null), started_timer];
+    let raw = Snapshot::save(&OrderV1 { charged: 0 }, &fired).expect("quiescent");
+    assert_eq!(
+        Snapshot::load::<OrderV1>(&raw, Some(&open)),
+        Err(SnapshotError::Open(OpenEffect::Timer(deadline.into()))),
+        "a fired timer must not close an open one in another history"
     );
 }
 
