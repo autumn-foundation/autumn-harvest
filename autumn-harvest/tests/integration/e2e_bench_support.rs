@@ -2675,7 +2675,6 @@ pub mod db {
 
     use chrono::{DateTime, Utc};
     use diesel::QueryableByName;
-    use diesel_async::pooled_connection::AsyncDieselConnectionManager;
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
     use testcontainers::ContainerAsync;
     use testcontainers::ImageExt;
@@ -3172,11 +3171,15 @@ pub mod db {
     }
 
     fn build_pool(url: &str) -> DbPool {
-        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
-        deadpool::managed::Pool::builder(manager)
-            .max_size(POOL_SIZE_PER_SHARD)
-            .build()
-            .expect("bench pool build failed")
+        let manager = autumn_harvest::pool::engine_manager(url);
+        autumn_harvest::pool::with_engine_timeouts(
+            deadpool::managed::Pool::builder(manager).max_size(POOL_SIZE_PER_SHARD),
+            autumn_harvest::pool::DbRole::Hot,
+            &autumn_harvest::pool::EngineDbTimeouts::default(),
+        )
+        .expect("bench pool timeouts are valid")
+        .build()
+        .expect("bench pool build failed")
     }
 
     impl ShardCluster {
