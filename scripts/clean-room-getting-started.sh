@@ -9,8 +9,9 @@
 #
 # Modes:
 #   (default)      Resolve `autumn-harvest*` from crates.io, as a newcomer does.
-#   --checkout     Patch `autumn-harvest*` to this checkout. Use it to test a
-#                  docs or API change before release.
+#   --checkout     Point `autumn-harvest*` at this checkout with path
+#                  dependencies, then check that Cargo resolved them from
+#                  disk. Use it to test a docs or API change before release.
 #
 # Not covered: the Postgres steps (`docker compose up`, `curl`). They need a
 # Docker daemon. `run-standalone-chapter.sh` covers that half for the
@@ -38,7 +39,10 @@ done
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 log="${log:-$work/steps.tsv}"
-printf 'step\texit\tseconds\tcommand\n' > "$log"
+if ! printf 'step\texit\tseconds\tcommand\n' > "$log"; then
+  echo "cannot create the log file: $log" >&2
+  exit 2
+fi
 steps=0
 failures=0
 
@@ -95,16 +99,33 @@ PY
 ex=$?
 
 if [ "$ex" = 0 ] && [ "$mode" = checkout ]; then
+  # A `[patch]` entry only adds a resolver candidate. Cargo still picks a newer
+  # crates.io release over the checkout, so rewrite the two direct dependencies
+  # to paths and patch the macro crate that the engine pulls in.
+  sed -i -E \
+    -e "s|^(autumn-harvest) = \"[^\"]*\"|\1 = { path = \"$repo/autumn-harvest\" }|" \
+    -e "s|^(autumn-harvest-plugin) = \"[^\"]*\"|\1 = { path = \"$repo/autumn-harvest-plugin\" }|" \
+    "$work/crate/Cargo.toml"
   {
     echo
     echo "[patch.crates-io]"
-    for c in autumn-harvest autumn-harvest-plugin autumn-harvest-macros; do
-      echo "$c = { path = \"$repo/$c\" }"
-    done
+    echo "autumn-harvest-macros = { path = \"$repo/autumn-harvest-macros\" }"
   } >> "$work/crate/Cargo.toml"
 fi
 
 [ "$ex" = 0 ] && run_step cargo-check cargo check --quiet --message-format=short
+
+# Fail if a checkout run compiled any published copy of this repo's crates.
+if [ "$ex" = 0 ] && [ "$mode" = checkout ]; then
+  run_step verify-sources python3 -I -c '
+import json, subprocess, sys
+meta = json.loads(subprocess.check_output(["cargo", "metadata", "--format-version=1"]))
+bad = [p["name"] for p in meta["packages"]
+       if p["name"].startswith("autumn-harvest") and p["source"] is not None]
+if bad:
+    sys.exit("resolved from a registry, not the checkout: " + ", ".join(bad))
+'
+fi
 
 total=$(awk -F'\t' 'NR>1 {s += $3} END {print s+0}' "$log")
 echo "clean-room mode=$mode steps=$steps failures=$failures seconds=$total log=$log"
