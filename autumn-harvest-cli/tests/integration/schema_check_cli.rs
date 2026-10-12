@@ -912,6 +912,8 @@ fn a_retargeted_acknowledgement_record_fails_the_escape_hatch_check() {
     // The base revision already carries a record for an earlier, unrelated break.
     let mut base_artifact = autumn_harvest::WorkflowSchemaContract::parse(BASELINE).unwrap();
     let stale = autumn_harvest::AcknowledgedBreakingChange {
+        subject: autumn_harvest::SchemaSubject::Workflow,
+        side_effect: None,
         workflow: "some_other_workflow".to_string(),
         role: Some(autumn_harvest::SchemaRole::Output),
         field_path: "/legacy".to_string(),
@@ -930,6 +932,8 @@ fn a_retargeted_acknowledgement_record_fails_the_escape_hatch_check() {
     head_artifact.acknowledged_breaking_changes = diff
         .breaking()
         .map(|d| autumn_harvest::AcknowledgedBreakingChange {
+            subject: autumn_harvest::SchemaSubject::Workflow,
+            side_effect: None,
             workflow: d.workflow.clone(),
             role: d.role,
             field_path: d.field_path.clone(),
@@ -976,6 +980,8 @@ fn appending_to_a_non_empty_acknowledgement_log_passes() {
     base_artifact
         .acknowledged_breaking_changes
         .push(autumn_harvest::AcknowledgedBreakingChange {
+            subject: autumn_harvest::SchemaSubject::Workflow,
+            side_effect: None,
             workflow: "some_other_workflow".to_string(),
             role: Some(autumn_harvest::SchemaRole::Output),
             field_path: "/legacy".to_string(),
@@ -1062,4 +1068,260 @@ fn the_real_binary_survives_a_one_mebibyte_main_thread_stack() {
             args.join(" ")
         );
     }
+}
+
+// ── Issue #1994: activity and side-effect schemas ───────────────────────────
+
+/// A baseline with one workflow, one activity and one side effect.
+const BASELINE_1994: &str = r#"{
+  "version": "0.0.0-test",
+  "contract_version": "2",
+  "workflows": [ { "name": "checkout", "input_schema": {"type": "object"} } ],
+  "activities": [
+    { "name": "charge",
+      "output_schema": {
+        "type": "object",
+        "properties": { "id": {"type": "string"}, "amount": {"type": "integer"} },
+        "required": ["id", "amount"] } }
+  ],
+  "side_effects": [
+    { "workflow": "checkout", "id": "pick",
+      "value_schema": {"type": "string", "enum": ["a", "b"]} }
+  ]
+}"#;
+
+/// `charge` drops the `amount` field from its output type.
+const CURRENT_1994_ACTIVITY_BREAK: &str = r#"{
+  "version": "0.0.0-test",
+  "contract_version": "2",
+  "workflows": [ { "name": "checkout", "input_schema": {"type": "object"} } ],
+  "activities": [
+    { "name": "charge",
+      "output_schema": {
+        "type": "object",
+        "properties": { "id": {"type": "string"} },
+        "required": ["id"] } }
+  ],
+  "side_effects": [
+    { "workflow": "checkout", "id": "pick",
+      "value_schema": {"type": "string", "enum": ["a", "b"]} }
+  ]
+}"#;
+
+/// `charge` gains an optional output field. Safe on replay.
+const CURRENT_1994_ACTIVITY_COMPATIBLE: &str = r#"{
+  "version": "0.0.0-test",
+  "contract_version": "2",
+  "workflows": [ { "name": "checkout", "input_schema": {"type": "object"} } ],
+  "activities": [
+    { "name": "charge",
+      "output_schema": {
+        "type": "object",
+        "properties": { "id": {"type": "string"}, "amount": {"type": "integer"},
+                        "note": {"type": ["string", "null"]} },
+        "required": ["id", "amount"] } }
+  ],
+  "side_effects": [
+    { "workflow": "checkout", "id": "pick",
+      "value_schema": {"type": "string", "enum": ["a", "b"]} }
+  ]
+}"#;
+
+/// AC 2 of issue #1994: an incompatible change to an activity output type
+/// fails `harvest schema check`.
+#[test]
+fn schema_check_flags_an_incompatible_activity_output_change() {
+    let (_d, b, c) = tree(BASELINE_1994, CURRENT_1994_ACTIVITY_BREAK);
+    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, false, None)
+        .expect_err("an activity output break must fail the gate");
+    assert_eq!(err.exit_code(), 1);
+    assert!(
+        matches!(
+            err,
+            autumn_harvest_cli::CliError::SchemaContractBreaking { breaking: 1 }
+        ),
+        "exactly the one activity break is reported: {err:?}"
+    );
+
+    let base = autumn_harvest::WorkflowSchemaContract::parse(BASELINE_1994).unwrap();
+    let cur = autumn_harvest::WorkflowSchemaContract::parse(CURRENT_1994_ACTIVITY_BREAK).unwrap();
+    let text = format_schema_diff_text(&autumn_harvest::diff_schema_contracts(&base, &cur));
+    assert!(
+        text.contains("activity:charge.output: /amount — breaking"),
+        "the text report names the activity, the role and the field: {text}"
+    );
+}
+
+#[test]
+fn schema_check_passes_a_compatible_activity_output_change() {
+    let (_d, b, c) = tree(BASELINE_1994, CURRENT_1994_ACTIVITY_COMPATIBLE);
+    let out = run_schema_check(&b, &c, SchemaCheckFormat::Text, false, None);
+    assert!(out.is_ok(), "an optional output field is safe: {out:?}");
+}
+
+#[test]
+fn schema_check_flags_an_incompatible_side_effect_value_change() {
+    let current = BASELINE_1994.replace(r#"["a", "b"]"#, r#"["a"]"#);
+    let (_d, b, c) = tree(BASELINE_1994, &current);
+    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, false, None)
+        .expect_err("a side-effect value break must fail the gate");
+    assert!(
+        matches!(
+            err,
+            autumn_harvest_cli::CliError::SchemaContractBreaking { breaking: 1 }
+        ),
+        "exactly the one side-effect break is reported: {err:?}"
+    );
+
+    let base = autumn_harvest::WorkflowSchemaContract::parse(BASELINE_1994).unwrap();
+    let cur = autumn_harvest::WorkflowSchemaContract::parse(&current).unwrap();
+    let text = format_schema_diff_text(&autumn_harvest::diff_schema_contracts(&base, &cur));
+    assert!(
+        text.contains("checkout/side_effect:pick.value: (root) — breaking"),
+        "the text report names the side effect and the verdict: {text}"
+    );
+
+    let json: serde_json::Value = serde_json::from_str(
+        &schema_diff_json(&autumn_harvest::diff_schema_contracts(&base, &cur)).unwrap(),
+    )
+    .unwrap();
+    let d = &json["deltas"][0];
+    assert_eq!(d["subject"], "side_effect", "{d}");
+    assert_eq!(d["workflow"], "checkout", "{d}");
+    assert_eq!(d["side_effect"], "pick", "{d}");
+    assert_eq!(d["role"], "value", "{d}");
+    assert_eq!(d["change"], "enum_value_removed", "{d}");
+    assert_eq!(d["verdict"], "breaking", "{d}");
+}
+
+/// A generated contract that drops the last side effect is not refused as a
+/// broken producer. The removal is a breaking delta, so `--acknowledge` can
+/// record it.
+#[test]
+fn removing_the_last_side_effect_can_be_acknowledged() {
+    let current = CURRENT_1994_ACTIVITY_COMPATIBLE.replace(
+        r#""side_effects": [
+    { "workflow": "checkout", "id": "pick",
+      "value_schema": {"type": "string", "enum": ["a", "b"]} }
+  ]"#,
+        r#""side_effects": []"#,
+    );
+    assert!(
+        !current.contains("pick"),
+        "the fixture drops the side effect"
+    );
+    let (_d, b, c) = tree(BASELINE_1994, &current);
+    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, false, None)
+        .expect_err("removing a side-effect declaration is breaking");
+    assert!(
+        matches!(
+            err,
+            autumn_harvest_cli::CliError::SchemaContractBreaking { breaking: 1 }
+        ),
+        "{err:?}"
+    );
+    run_schema_update(&b, &c, Some("call site removed; runs drained"), None)
+        .expect("the removal can be acknowledged");
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&b).unwrap()).unwrap();
+    let ack = &written["acknowledged_breaking_changes"][0];
+    assert_eq!(ack["change"], "side_effect_removed", "{ack}");
+    assert_eq!(ack["side_effect"], "pick", "{ack}");
+}
+
+/// A version 1 baseline upgrades to version 2 through `schema update`.
+#[test]
+fn schema_update_writes_contract_version_2_over_a_version_1_baseline() {
+    let (_d, b, c) = tree(BASELINE, CURRENT_COMPATIBLE);
+    run_schema_update(&b, &c, None, None).expect("a compatible update succeeds");
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&b).unwrap()).unwrap();
+    assert_eq!(written["contract_version"], "2");
+}
+
+/// A bare `GET /workflows/registered` array has no activity section. It must
+/// not read as "every activity removed", which is compatible.
+#[test]
+fn a_current_without_activities_cannot_drop_their_coverage() {
+    let bare = r#"[ { "name": "checkout", "input_schema": {"type": "object"} } ]"#;
+    let (_d, b, c) = tree(BASELINE_1994, bare);
+    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, false, None)
+        .expect_err("a current that drops every activity must be refused");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("activities") && msg.contains("side effects"),
+        "the refusal names both missing sections: {msg}"
+    );
+
+    let err = run_schema_update(&b, &c, Some("drained"), None)
+        .expect_err("update must refuse it too, or it disarms the gate");
+    assert!(format!("{err}").contains("activities"), "{err}");
+}
+
+#[test]
+fn schema_update_records_an_activity_break_with_its_subject() {
+    let (_d, b, c) = tree(BASELINE_1994, CURRENT_1994_ACTIVITY_BREAK);
+    run_schema_update(&b, &c, Some("in-flight runs drained"), Some("#1994"))
+        .expect("an acknowledged update succeeds");
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&b).unwrap()).unwrap();
+    assert_eq!(written["contract_version"], "2");
+    assert_eq!(written["activities"][0]["name"], "charge");
+    let ack = &written["acknowledged_breaking_changes"][0];
+    assert_eq!(ack["subject"], "activity", "{ack}");
+    assert_eq!(ack["field_path"], "/amount", "{ack}");
+
+    let out = run_schema_check(&b, &c, SchemaCheckFormat::Text, true, None);
+    assert!(out.is_ok(), "the regenerated baseline is current: {out:?}");
+}
+
+/// The escape hatch: an ack recorded for a workflow of the same name does not
+/// cover an activity break.
+#[test]
+fn the_escape_hatch_needs_an_ack_with_the_right_subject() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.json");
+    let generated = dir.path().join("generated.json");
+    let head = dir.path().join("head.json");
+    std::fs::write(&base, BASELINE_1994).unwrap();
+    std::fs::write(&generated, CURRENT_1994_ACTIVITY_BREAK).unwrap();
+
+    let base_c = autumn_harvest::WorkflowSchemaContract::parse(BASELINE_1994).unwrap();
+    let mut head_c =
+        autumn_harvest::WorkflowSchemaContract::parse(CURRENT_1994_ACTIVITY_BREAK).unwrap();
+    let diff = autumn_harvest::diff_schema_contracts(&base_c, &head_c);
+    head_c.acknowledged_breaking_changes = diff
+        .breaking()
+        .map(|d| autumn_harvest::AcknowledgedBreakingChange {
+            subject: autumn_harvest::SchemaSubject::Workflow,
+            workflow: d.workflow.clone(),
+            side_effect: None,
+            role: d.role,
+            field_path: d.field_path.clone(),
+            change: d.change,
+            reason: "wrong subject".to_string(),
+            recorded_in: None,
+        })
+        .collect();
+    std::fs::write(&head, head_c.to_json_pretty().unwrap()).unwrap();
+
+    let err = run_schema_check(
+        &base,
+        &generated,
+        SchemaCheckFormat::Text,
+        false,
+        Some(&head),
+    )
+    .expect_err("a workflow ack must not cover an activity break");
+    assert!(
+        matches!(
+            err,
+            autumn_harvest_cli::CliError::SchemaContractUnacknowledged { missing: 1, .. }
+        ),
+        "{err:?}"
+    );
+    assert!(
+        format!("{err}").contains("activity:charge"),
+        "the unrecorded break is named by its subject label: {err}"
+    );
 }

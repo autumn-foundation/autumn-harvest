@@ -452,6 +452,8 @@ jobs:
         run: cargo clippy -p standalone-runner --all-targets -- -D warnings
       - name: "Clippy standalone-quickstart example (issue #1614)"
         run: cargo clippy -p standalone-quickstart --all-targets -- -D warnings
+      - name: "Clippy agent-loop-hit-rate example (issue #2007)"
+        run: cargo clippy -p agent-loop-hit-rate --all-targets -- -D warnings
       # Same issue #962 rule as the verify and redis crates below: a new
       # workspace member gets NO clippy coverage without its own step here.
       # `--no-deps` scopes the deny to the example, because it depends on
@@ -650,6 +652,15 @@ jobs:
       # Quoted for the trailing-`::` YAML reason above.
       - name: Run docs/safety-report.md guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration safety_report_docs::"
+
+      # Issue #2014: the journaled host-call spike report lives under `docs/`,
+      # so a docs-only change skips the `test` matrix. These guards run here.
+      # They check that the report cites each prototype test and each bound.
+      #
+      # Guarded by `agent_code_journal_docs::guards_run_on_docs_only_changes`.
+      # Quoted for the trailing-`::` YAML reason above.
+      - name: Run the agent-code journal report guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration agent_code_journal_docs::"
 
       # Folio corpus harness: internal link check across all of docs/ (see
       # docs/audits/corpus-link-check.py). Same reasoning as the docs-only
@@ -1132,9 +1143,9 @@ jobs:
       - name: Run plugin doctests (issue #944 review)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test --doc -p autumn-harvest-plugin --features connectors
-      - name: Run plugin MCP tool tests (issue #597, DAG MCP tools issue #601 follow-up, MCP Tasks issue #2005)
+      - name: Run plugin MCP tool tests (issue #597, DAG MCP tools issue #601 follow-up, MCP Tasks issue #2005, remote tasks issue #2006)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
-        run: cargo test -p autumn-harvest-plugin --features mcp,unified-dag-execution --lib --test mcp_tools_http_tests --test mcp_tasks_http_tests
+        run: cargo test -p autumn-harvest-plugin --features mcp,unified-dag-execution --lib --test mcp_tools_http_tests --test mcp_tasks_http_tests --test remote_tasks_http_tests
       - name: Run plugin metrics scrape tests (issue #355)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest-plugin --features metrics --lib --test metrics_scrape_http_tests
@@ -1209,6 +1220,11 @@ jobs:
       - name: "Run standalone-quickstart example tests (issue #1614)"
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p standalone-quickstart
+      # Issue #2007. `--bins` runs the unit tests. The measurement itself
+      # needs Postgres and runs by hand (see the crate README).
+      - name: "Run agent-loop-hit-rate example tests (issue #2007)"
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo test -p agent-loop-hit-rate --bins
       - name: Run business_metrics example tests (issue #758)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics
@@ -1577,16 +1593,20 @@ jobs:
           if grep -q -- '--test connector_sqs_broker' <<<"$plan"; then
             images="$images softwaremill/elasticmq:1.5.2"
           fi
-          # Docker Hub rate-limits anonymous pulls. An official image (no
-          # slash in its name) comes from the ECR Public mirror of the
-          # Docker Official Images first. The tag then gives it the name that
-          # the suites request.
-          mirror="public.ecr.aws/docker/library"
+          # Docker Hub rate-limits anonymous pulls, and the ECR Public mirror
+          # has a data limit. An official image (no slash in its name) comes
+          # from the Google mirror first, then from ECR Public. The tag then
+          # gives it the name that the suites request.
+          mirrors="mirror.gcr.io/library public.ecr.aws/docker/library"
           for image in $images; do
             for attempt in 1 2 3 4 5; do
-              if [[ "$image" != */* ]] && docker pull "$mirror/$image"; then
-                docker tag "$mirror/$image" "$image"
-                continue 2
+              if [[ "$image" != */* ]]; then
+                for mirror in $mirrors; do
+                  if docker pull "$mirror/$image"; then
+                    docker tag "$mirror/$image" "$image"
+                    continue 3
+                  fi
+                done
               fi
               if docker pull "$image"; then
                 continue 2
@@ -1645,9 +1665,9 @@ jobs:
     # connects verbatim, same as `docker compose -f examples/quickstart/compose.yaml up -d`.
     services:
       postgres:
-        # The ECR Public mirror of the official image. Docker Hub rate-limits
-        # anonymous pulls.
-        image: public.ecr.aws/docker/library/postgres:16
+        # The Google mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls, and ECR Public has a data limit.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_USER: quickstart
           POSTGRES_PASSWORD: quickstart
@@ -1802,9 +1822,9 @@ jobs:
     # DATABASE_URL connects as written.
     services:
       postgres:
-        # The ECR Public mirror of the official image. Docker Hub rate-limits
-        # anonymous pulls.
-        image: public.ecr.aws/docker/library/postgres:16
+        # The Google mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls, and ECR Public has a data limit.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_USER: harvest
           POSTGRES_PASSWORD: harvest
@@ -1850,9 +1870,9 @@ jobs:
     timeout-minutes: 60
     services:
       postgres:
-        # The ECR Public mirror of the official image. Docker Hub rate-limits
-        # anonymous pulls.
-        image: public.ecr.aws/docker/library/postgres:16
+        # The Google mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls, and ECR Public has a data limit.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -1902,9 +1922,9 @@ jobs:
     # Matches examples/quickstart/autumn.toml, same as the `quickstart` job.
     services:
       postgres:
-        # The ECR Public mirror of the official image. Docker Hub rate-limits
-        # anonymous pulls.
-        image: public.ecr.aws/docker/library/postgres:16
+        # The Google mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls, and ECR Public has a data limit.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_USER: quickstart
           POSTGRES_PASSWORD: quickstart
@@ -2011,9 +2031,9 @@ jobs:
     # config connects verbatim — the truest AC-2/AC-3 test.
     services:
       postgres:
-        # The ECR Public mirror of the official image. Docker Hub rate-limits
-        # anonymous pulls.
-        image: public.ecr.aws/docker/library/postgres:16
+        # The Google mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls, and ECR Public has a data limit.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_USER: demo_app
           POSTGRES_PASSWORD: demo_app

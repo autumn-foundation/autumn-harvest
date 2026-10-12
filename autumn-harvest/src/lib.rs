@@ -211,6 +211,13 @@ pub mod analyzer;
 pub mod api_token;
 /// The database guard on append-only `harvest_events` (issue #1817).
 pub mod append_only;
+/// R&D spike: physical backout, saga or a hybrid per workflow (issue #2012).
+///
+/// The `atomicity-spike` feature turns it on. The module has no stability
+/// guarantee. See `docs/rnd/contention-adaptive-atomicity.md`.
+#[cfg(feature = "atomicity-spike")]
+#[doc(hidden)]
+pub mod atomicity;
 /// Audit trail for management API mutations (issue #158).
 #[cfg(feature = "db")]
 pub mod audit;
@@ -394,6 +401,8 @@ pub mod migrate;
 /// Durable mutual-exclusion locks for workflow code (`ctx.mutex`, issue #691).
 pub mod mutex;
 pub mod partition;
+/// Export of aged event partitions to object storage (issue #2009).
+pub mod partition_archive;
 pub mod payload_codec;
 pub mod payload_store;
 /// The connection transport a DSN's `sslmode` selects, with TLS through
@@ -427,6 +436,12 @@ pub mod quota_reconcile;
 /// Automatic resume of a shard rebalance stalled after its cutover (issue
 /// #1839).
 pub mod rebalance_resume;
+/// Durable outbound calls to a remote MCP or A2A task (issue #2006).
+pub mod remote_task;
+// The Postgres side of `remote_task`. A flat file keeps the core module tree
+// flat (`sqlite_feasibility_docs`).
+#[cfg(feature = "db")]
+mod remote_task_db;
 pub mod replay;
 /// Stratified in-flight history sampling for the replay-drift gate (issue #798).
 ///
@@ -569,6 +584,9 @@ pub mod store;
 pub mod timeout;
 #[cfg(feature = "wasm-activities")]
 pub mod wasm_activities;
+/// Journaled, capability-gated host calls for WASM activities (issue #2014).
+#[cfg(feature = "wasm-activities")]
+pub mod wasm_journal;
 /// Ed25519 publisher signatures for WASM modules (issue #1838).
 #[cfg(feature = "wasm-activities")]
 pub mod wasm_signing;
@@ -695,8 +713,8 @@ pub use history_export::{
 };
 pub use info::{
     ActivityHandlerFn, ActivityInfo, DagInfo, InterfaceHandlerRecord, QueryHandlerFn,
-    QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerFn, UpdateHandlerInfo, UpdateValidatorFn,
-    WorkflowHandlerFn, WorkflowInfo, WorkflowInterfaceRecord,
+    QueryHandlerInfo, SideEffectInfo, SignalHandlerInfo, UpdateHandlerFn, UpdateHandlerInfo,
+    UpdateValidatorFn, WorkflowHandlerFn, WorkflowInfo, WorkflowInterfaceRecord,
 };
 pub use interceptor::{
     ActivityInterceptor, ActivityInterceptorFuture, ActivityInterceptorNext, ActivityInvocation,
@@ -738,8 +756,8 @@ pub use retention::{
 };
 #[cfg(feature = "db")]
 pub use retention::{
-    RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult, release_legal_hold,
-    set_legal_hold,
+    RetentionHooks, RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult,
+    release_legal_hold, set_legal_hold,
 };
 pub use retry_budget::RetryBudgetConfig;
 pub use run_chain::{
@@ -754,10 +772,12 @@ pub use scheduler::{
     register_schedules, register_workflow_schedules, tick_once, trigger_unified_dag,
 };
 pub use schema_contract::{
-    AcknowledgedBreakingChange, ChangeKind, CompatibilityRules, DEFAULT_SCHEMA_CONTRACT_PATH,
-    MAX_DELTAS, SCHEMA_CONTRACT_VERSION, SchemaContractDiff, SchemaContractError, SchemaCoverage,
-    SchemaDelta, SchemaRole, Verdict, WorkflowSchemaContract, WorkflowSchemaEntry,
-    canonicalize_schema, diff_schema_contracts, dropped_acknowledgements, unacknowledged_breaking,
+    AcknowledgedBreakingChange, ActivitySchemaEntry, ChangeKind, CompatibilityRules,
+    DEFAULT_SCHEMA_CONTRACT_PATH, MAX_DELTAS, SCHEMA_CONTRACT_VERSION, SchemaContractDiff,
+    SchemaContractError, SchemaCoverage, SchemaDelta, SchemaRole, SchemaSubject,
+    SideEffectSchemaEntry, Verdict, WorkflowSchemaContract, WorkflowSchemaEntry,
+    canonicalize_schema, diff_schema_contracts, dropped_acknowledgements, subject_label,
+    unacknowledged_breaking,
 };
 #[cfg(feature = "db")]
 pub use shard::ShardedDbPool;
