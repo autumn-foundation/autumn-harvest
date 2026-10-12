@@ -25,6 +25,9 @@ use super::formal_models_coverage::formal_job_defect;
 const TRUST_ESCAPES: &[&str] = &[
     "assume",
     "admit",
+    // `axiom fn f() ensures false;` verifies, and so does every proof
+    // that calls it.
+    "axiom",
     "external_body",
     "external",
     "external_fn_specification",
@@ -353,6 +356,11 @@ fn the_trust_escape_check_lexes_the_source() {
         ("let s = \"//\"; assume(false);", "assume"),
         ("let s = \"/*\"; admit(); // */", "admit"),
         ("use vstd::prelude::assume as a;", "assume"),
+        ("pub axiom fn bogus()\n    ensures false;", "axiom"),
+        (
+            "pub broadcast axiom fn bogus()\n    ensures false;",
+            "axiom",
+        ),
         ("#[verifier :: external]\nfn f() {}", "external"),
         ("#[verifier(external_body)]\nfn f() {}", "external_body"),
         (
