@@ -60,7 +60,7 @@ pub enum SqliteError {
     /// reached a terminal state (`COMPLETED`/`FAILED`/…). Mirrors the Postgres
     /// engine's rejection of a signal to a terminal target
     /// ([`send_signal`](crate::SqliteRuntime::send_signal)): staging it would
-    /// silently drop the wakeup, since no live `wait_for_signal` will ever consume
+    /// silently drop the wakeup, since no drive will ever consume
     /// it. An unknown id is [`ExecutionNotFound`](Self::ExecutionNotFound); this
     /// variant is only for a *present but sealed* run.
     #[error(

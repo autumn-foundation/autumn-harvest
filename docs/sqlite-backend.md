@@ -24,7 +24,7 @@ R&D decision record [`docs/rnd/sqlite-feasibility.md`](rnd/sqlite-feasibility.md
 5. [Registering workflows and activities](#5-registering-workflows-and-activities)
 6. [Starting a workflow](#6-starting-a-workflow)
 7. [The drive model](#7-the-drive-model)
-8. [Signals (pull-only)](#8-signals-pull-only)
+8. [Signals](#8-signals)
 9. [Durability and crash recovery](#9-durability-and-crash-recovery)
 10. [The single-writer / single-server contract](#10-the-single-writer--single-server-contract)
 11. [v0.1 non-goals and follow-ups](#11-v01-non-goals-and-follow-ups)
@@ -297,10 +297,10 @@ after the deadline passes and it proceeds.
 
 ---
 
-## 8. Signals (pull-only)
+## 8. Signals
 
-Deliver a signal from outside with `send_signal`; consume it inside the workflow
-with a **pull** primitive.
+Deliver a signal from outside with `send_signal`. Read it inside the workflow
+with any signal API.
 
 ```rust
 // Inside the workflow — block until the signal arrives:
@@ -312,22 +312,30 @@ rt.send_signal(exec, "approve", serde_json::json!(true))?;
 rt.run_until_blocked(exec).await?;
 ```
 
-A staged signal is appended to history (as `SignalReceived`) **only when a
-workflow reaches a pull primitive that consumes it** — this backend is
-pull-only. The supported pull surface is the plain waits
-(`wait_for_signal` / `receive_signal`) and the signal-or-deadline waits
-(`wait_for_signal_timeout` / `receive_signal_timeout`, which race the signal
-against a durable deadline timer).
+Each drive appends every staged signal to history (as `SignalReceived`)
+before the workflow runs, in arrival order. Postgres does the same at task
+preparation. Thus every signal API works here:
+
+- the blocking waits `wait_for_signal` / `receive_signal`;
+- the non-blocking reads `drain_signals` / `try_receive_signal`;
+- push handlers (`register_signal_handler`), also with `await_condition`;
+- the signal-or-deadline waits `wait_for_signal_timeout` /
+  `receive_signal_timeout`. They race the signal against a durable deadline
+  timer, and arrival time decides the winner.
+
+A push handler runs at the next history call after it registers. Put a timer
+or an activity between the registration and a read of its state. A run parked
+on `await_condition` emits no command, so a drive before the signal returns
+`SqliteError::Stuck`. The run stays `RUNNING`. Drive it again after
+`send_signal`.
+
+A signal that the workflow never reads also reaches history. The strict core
+`WorkflowReplayer` reports it as unconsumed, as for a Postgres history.
 
 `send_signal` validates the target at the boundary: an unknown execution is
 `SqliteError::ExecutionNotFound` and a terminal one is
-`SqliteError::WorkflowNotRunning`, so a wakeup no live wait could ever consume is
+`SqliteError::WorkflowNotRunning`, so a wakeup no drive could ever consume is
 rejected rather than silently lost.
-
-> Push-based signal *handlers* (`register_signal_handler`) and the non-blocking
-> drain APIs (`drain_signals` / `try_receive_signal`) depend on the Postgres
-> task-preparation ingest and are **not** available here — restrict to the pull
-> primitives.
 
 ---
 
@@ -494,8 +502,8 @@ gate no control flow): `ctx.set_current_details(...)` and a re-park
 - **[`examples/claude-agent-daemon/`](../examples/claude-agent-daemon/)** — a
   whole application on this backend: a local daemon that runs Claude agent
   sessions as durable workflows. It shows the drive loop
-  ([§7](#7-the-drive-model)), pull signals with a deadline
-  ([§8](#8-signals-pull-only)), and crash recovery
+  ([§7](#7-the-drive-model)), signals with a deadline
+  ([§8](#8-signals)), and crash recovery
   ([§9](#9-durability-and-crash-recovery)) in one place, and it runs with no API
   key against a scripted offline model.
 

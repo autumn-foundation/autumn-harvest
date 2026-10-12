@@ -1079,7 +1079,7 @@ fn delivered_decision(conn: &Connection, exec_id: &str, signal: &str) -> Result<
 /// take up. `Some(false)` is a row that suppresses the wait and that no drive
 /// can consume.
 ///
-/// The row is read the way `peek_pending_signal` reads it, and then
+/// The row is read the way `pending_signals` reads it, and then
 /// deserialised into the type the workflow asks for. Nothing here restates
 /// what that type accepts, so nothing here can drift from it.
 ///
@@ -1098,9 +1098,9 @@ fn delivered_decision(conn: &Connection, exec_id: &str, signal: &str) -> Result<
 /// An UNKNOWN key is accepted, because the type accepts it. Measured:
 /// `{"approved":true,"extra":1}` deserialises.
 ///
-/// The row is chosen with the backend's OWN order. `peek_pending_signal`
-/// takes the earliest-arrived undelivered row, so a bare `LIMIT 1` could
-/// report on a row the engine never reads.
+/// The row is chosen with the backend's OWN order. `pending_signals` reads
+/// undelivered rows earliest-arrived first, so a bare `LIMIT 1` could report
+/// on a row the engine never reads first.
 fn staged_decision(conn: &Connection, exec_id: &str, signal: &str) -> Result<Option<bool>, String> {
     let mut statement = conn
         .prepare(

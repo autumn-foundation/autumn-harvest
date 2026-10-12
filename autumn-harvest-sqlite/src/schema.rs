@@ -196,7 +196,7 @@ CREATE TABLE IF NOT EXISTS harvest_signals (
     received_at  INTEGER NOT NULL DEFAULT 0   -- absolute epoch-millisecond the signal arrived
 );
 
--- Without this, every exec_id/delivered-scoped query here (peek_pending_signal,
+-- Without this, every exec_id/delivered-scoped query here (pending_signals,
 -- delete_undelivered_signals_for_execution) scans the whole table, unlike
 -- harvest_timers, whose (exec_id, timer_id) PRIMARY KEY already covers this.
 -- `CREATE INDEX IF NOT EXISTS` is idempotent and applied on every open
