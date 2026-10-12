@@ -429,6 +429,12 @@ pub mod quota_reconcile;
 /// Automatic resume of a shard rebalance stalled after its cutover (issue
 /// #1839).
 pub mod rebalance_resume;
+/// Durable outbound calls to a remote MCP or A2A task (issue #2006).
+pub mod remote_task;
+// The Postgres side of `remote_task`. A flat file keeps the core module tree
+// flat (`sqlite_feasibility_docs`).
+#[cfg(feature = "db")]
+mod remote_task_db;
 pub mod replay;
 /// Stratified in-flight history sampling for the replay-drift gate (issue #798).
 ///
