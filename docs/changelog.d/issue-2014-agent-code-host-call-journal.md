@@ -14,9 +14,10 @@ the journal.
 durable, synchronous journal store must land first. Not yet for WASM
 workflows: tier T2 stays a conditional go that waits for demonstrated demand.
 
-**Design.** With no grant, the import is not linked. A call to an ungranted
-name is denied in-band and journaled. A journaled run links no ambient
-`env::` import, so each nondeterministic value goes through the journal. A
+**Design.** With no grant and no prior journal, the import is not linked. A
+call to an ungranted name is denied in-band and journaled. A journaled run
+links no ambient `env::` import, so each nondeterministic value goes through
+the journal. A
 changed request on replay, or a journal left unconsumed, is a non-retryable
 `WasmJournalDivergence`. A transient handler failure is a retryable
 `HostCallFailed` and is not journaled. The host bounds requests, responses,

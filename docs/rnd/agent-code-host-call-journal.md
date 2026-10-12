@@ -63,8 +63,9 @@ never makes a second call to fetch a long response.
 `HostCallGrants` maps a capability name to a Rust handler. The default grant
 set is empty:
 
-- With no grant, the host does not link `harvest::host_call`. Instantiation
-  fails as a non-retryable `SandboxDenied`.
+- With no grant and no prior journal, the host does not link
+  `harvest::host_call`. Instantiation fails as a non-retryable
+  `SandboxDenied`.
 - A call to an ungranted name returns `HOST_CALL_DENIED`. The journal records
   a `Denied` entry, so an auditor sees each attempt.
 - A journaled run links no ambient `env::` import. A clock or a random source
@@ -110,8 +111,9 @@ A replay checks the grants again for each `ok` or `err` entry:
 - A revoked grant is a divergence. Recorded data never reaches a guest that
   lost the capability.
 - A recorded `denied` entry stays denied after a new grant.
-- With an empty grant set, the import is not linked. A run with a full
-  journal then fails as `SandboxDenied`.
+- A prior journal keeps the import linked, even with an empty grant set.
+  The checks above still run, so a revoked grant is a divergence and a
+  recorded `denied` entry replays.
 
 ### 2.5 Handler failures
 
@@ -169,6 +171,8 @@ The tests are unit tests in `src/wasm_journal.rs`. CI runs them in the
 | An ungranted name is denied in-band and journaled. | `an_ungranted_host_call_is_denied_in_band_and_journaled` |
 | A replayed denial stays denied after a new grant. | `a_replayed_denial_stays_denied_after_a_new_grant` |
 | With no grant, the import is not linked. | `no_grant_means_the_host_call_import_is_not_linked` |
+| Revoking every grant is a divergence on replay. | `revoking_every_grant_is_a_divergence_on_replay` |
+| A recorded denial replays with no grant. | `a_recorded_denial_replays_with_no_grant` |
 | A changed request on replay is a non-retryable divergence. | `a_divergent_request_on_replay_is_non_retryable` |
 | A changed name on replay is a non-retryable divergence. | `a_divergent_name_on_replay_is_non_retryable` |
 | A revoked grant is a divergence on replay. | `a_revoked_grant_is_a_divergence_on_replay` |
@@ -177,17 +181,20 @@ The tests are unit tests in `src/wasm_journal.rs`. CI runs them in the
 | A malformed journal is rejected before the guest runs. | `a_malformed_journal_is_rejected_before_the_guest_runs` |
 | A recorded outcome over its bound makes the journal malformed. | `an_oversized_recorded_outcome_is_a_malformed_journal` |
 | A journal over the call budget is malformed. A journal at the budget is not. | `a_journal_over_the_call_budget_is_malformed` |
+| An oversized entry fails before the journal total is counted. | `an_oversized_entry_fails_before_the_journal_total` |
 | A journaled run links no ambient import. | `a_journaled_run_links_no_ambient_import` |
 | A fatal handler error is journaled and replayed. | `a_fatal_handler_error_is_journaled_and_replayed` |
 | A transient handler error is retryable and not journaled. | `a_transient_handler_error_is_retryable_and_not_journaled` |
 | An oversized request never reaches the handler. A request at the bound does. | `an_oversized_request_is_rejected_before_the_handler` |
 | Each bad call is invalid, runs no handler and is not journaled. | `each_bad_call_is_invalid_and_not_journaled` |
 | An oversized response is journaled as an error. | `an_oversized_response_is_journaled_as_an_error` |
+| The encoder stops at the bound, so an oversized response is never held whole. | `an_oversized_response_stops_encoding_at_the_bound` |
 | A response at the bound is served. | `a_response_at_the_bound_is_served` |
 | An error message is bounded after JSON escaping. | `an_error_message_is_bounded_after_json_escaping` |
 | The call budget bounds the journal, also on replay. | `the_host_call_budget_bounds_the_journal` |
 | The byte budget bounds host memory and the persisted size. | `the_journal_byte_budget_bounds_host_memory` |
 | The byte count covers JSON escapes and framing. | `byte_size_bounds_the_serialized_journal` |
+| The escape count matches `serde_json` and allocates nothing. | `escaped_len_matches_serde_json` |
 | A handler panic becomes a `WasmTrap`. | `a_panicking_handler_is_contained_as_a_wasm_trap` |
 | The handler gets a stable `seq`, also on resume. | `the_handler_receives_the_journal_sequence_number` |
 | A cancelled run skips the handler. | `a_cancelled_run_skips_the_handler` |

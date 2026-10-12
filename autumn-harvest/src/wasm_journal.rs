@@ -20,10 +20,10 @@
 //!
 //! # Grants
 //!
-//! [`HostCallGrants`] maps a capability name to a host handler. With no grant,
-//! the import is not linked, so the guest fails at instantiation. A journaled
-//! run links no ambient `env::` import. A clock or a random source is a named
-//! grant, so the journal records it.
+//! [`HostCallGrants`] maps a capability name to a host handler. With no grant
+//! and no prior journal, the import is not linked, so the guest fails at
+//! instantiation. A journaled run links no ambient `env::` import. A clock or
+//! a random source is a named grant, so the journal records it.
 //!
 //! # Journal
 //!
@@ -280,8 +280,10 @@ pub fn invoke_journaled(
         entries: prior.entries,
         ..Session::default()
     }));
+    // A prior journal keeps the import, so the replay checks still run. A
+    // revoked grant is then a divergence, and a recorded denial replays.
     let link = |linker: &mut Linker<HostState>| -> Result<(), ActivityFailure> {
-        if grants.is_empty() {
+        if grants.is_empty() && prior_len == 0 {
             return Ok(());
         }
         let session = Arc::clone(&session);
@@ -1045,6 +1047,30 @@ mod tests {
         let out = run(&guest, &revoked, journal);
         assert_divergence(&out);
         assert_eq!(out.replayed, 0);
+    }
+
+    #[test]
+    fn revoking_every_grant_is_a_divergence_on_replay() {
+        let runs = Arc::new(AtomicU32::new(0));
+        let guest = Guest::new("text.upper", UPPER_REQ, 1);
+        let journal = run(&guest, &upper_grant(&runs), HostCallJournal::default()).journal;
+
+        let out = run(&guest, &HostCallGrants::new(), journal);
+        assert_divergence(&out);
+        assert_eq!(out.replayed, 0);
+    }
+
+    /// A recorded denial needs no grant, so it replays with none.
+    #[test]
+    fn a_recorded_denial_replays_with_no_grant() {
+        let guest = Guest::new("text.upper", UPPER_REQ, 1);
+        let other = HostCallGrants::new().grant("other", |_call| Ok(json!(null)));
+        let journal = run(&guest, &other, HostCallJournal::default()).journal;
+        assert_eq!(journal.entries[0].outcome, HostCallOutcome::Denied);
+
+        let out = run(&guest, &HostCallGrants::new(), journal);
+        assert_eq!(out.result.unwrap(), json!({ "code": HOST_CALL_DENIED }));
+        assert_eq!(out.replayed, 1);
     }
 
     #[test]
