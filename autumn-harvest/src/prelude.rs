@@ -37,7 +37,8 @@ pub use crate::handle_typed::{
     TypedSignalWithStartOptions, TypedStartOptions, TypedWorkflowHandle, TypedWorkflowResult,
 };
 pub use crate::info::{
-    ActivityInfo, DagInfo, QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerInfo, WorkflowInfo,
+    ActivityInfo, DagInfo, QueryHandlerInfo, SideEffectInfo, SignalHandlerInfo, UpdateHandlerInfo,
+    WorkflowInfo,
 };
 pub use crate::interceptor::{
     ActivityInterceptor, ActivityInterceptorFuture, ActivityInterceptorNext, ActivityInvocation,

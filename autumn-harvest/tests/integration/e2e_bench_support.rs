@@ -255,6 +255,21 @@ pub const INFLIGHT_ENV_VAR: &str = "HARVEST_BENCH_INFLIGHT";
 /// Override the number of measured completions per shard.
 pub const WORKFLOWS_ENV_VAR: &str = "HARVEST_BENCH_WORKFLOWS";
 
+/// Override the claim loops of each worker (issue #2007).
+///
+/// Unset keeps the worker default. The resident hit-rate record compares one
+/// claim loop against the default with this knob.
+pub const CLAIM_LOOPS_ENV_VAR: &str = "HARVEST_BENCH_CLAIM_LOOPS";
+
+/// The claim loops that `raw` asks for, or `None` for the worker default.
+///
+/// A malformed or zero value means the default, as for [`positive_override`].
+#[must_use]
+pub fn claim_loops_override(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+}
+
 /// Read a positive-integer override from the environment, falling back to
 /// `default`.
 ///
@@ -1772,6 +1787,15 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_loop_override_is_positive_or_the_default() {
+        assert_eq!(claim_loops_override(Some("1")), Some(1));
+        assert_eq!(claim_loops_override(Some(" 3 ")), Some(3));
+        assert_eq!(claim_loops_override(Some("0")), None);
+        assert_eq!(claim_loops_override(Some("two")), None);
+        assert_eq!(claim_loops_override(None), None);
+    }
+
+    #[test]
     fn commit_probe_notes_give_percentiles_and_commits_per_workflow() {
         let persist: Vec<f64> = (1..=100).map(|ms| f64::from(ms) / 1e3).collect();
         let claim = [0.002, 0.001, 0.003];
@@ -2662,7 +2686,9 @@ pub mod db {
 
     use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
     use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
-    use autumn_harvest::telemetry::{DbOp, MetricsRecorder, NoOpMetrics, TelemetryConfig};
+    use autumn_harvest::telemetry::{
+        DbOp, MetricsRecorder, NoOpMetrics, ResidentOutcome, TelemetryConfig,
+    };
     use autumn_harvest::types::{ExecutionId, ShardId};
     use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
     use autumn_harvest::{
@@ -3447,6 +3473,8 @@ pub mod db {
             circuit_breaker: None,
             requires: None,
             handler: bench_activity,
+            input_schema: None,
+            output_schema: None,
         }
     }
 
@@ -3559,17 +3587,139 @@ pub mod db {
         .collect()
     }
 
+    /// Counts each `outcome` of `harvest.workflow.resident` (issue #2007).
+    ///
+    /// The `throughput` scenario reports the counts in its notes. The
+    /// recorder forwards query durations to the commit probe when the probe
+    /// is on. Every other recorder method stays a no-op.
+    #[derive(Default)]
+    pub struct ResidentCounts {
+        /// Each `outcome` label value to its count.
+        counts: Mutex<BTreeMap<String, u64>>,
+    }
+
+    impl ResidentCounts {
+        /// A copy of the counts so far.
+        #[must_use]
+        pub fn snapshot(&self) -> BTreeMap<String, u64> {
+            self.counts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        /// A copy of the counts once they stop changing.
+        ///
+        /// A closed loop returns when its runs are terminal. A decision
+        /// attempt can still be in flight, and it records its sample later.
+        /// The snapshot waits until two reads 250 ms apart agree, for at most
+        /// ten seconds. A phase boundary then falls between samples.
+        pub async fn settled_snapshot(&self) -> BTreeMap<String, u64> {
+            let mut last = self.snapshot();
+            for _ in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let now = self.snapshot();
+                if now == last {
+                    break;
+                }
+                last = now;
+            }
+            last
+        }
+    }
+
+    impl MetricsRecorder for ResidentCounts {
+        /// `false`, as for [`CommitProbe`]. A metric sampler would add its
+        /// own queries to the measured load.
+        fn is_enabled(&self) -> bool {
+            false
+        }
+
+        fn record_db_query_duration(&self, op: DbOp, shard: u16, seconds: f64) {
+            if let Some(probe) = commit_probe() {
+                probe.record_db_query_duration(op, shard, seconds);
+            }
+        }
+
+        fn record_workflow_resident(
+            &self,
+            _workflow_name: &str,
+            _queue: &str,
+            outcome: ResidentOutcome,
+        ) {
+            *self
+                .counts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(outcome.as_str().to_owned())
+                .or_default() += 1;
+        }
+    }
+
+    /// Renders the resident outcomes that `after` adds to `before`.
+    #[must_use]
+    pub fn resident_note(before: &BTreeMap<String, u64>, after: &BTreeMap<String, u64>) -> String {
+        let delta: BTreeMap<&str, u64> = after
+            .iter()
+            .map(|(key, n)| (key.as_str(), n - before.get(key).copied().unwrap_or(0)))
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        let hits = delta.get("hit").copied().unwrap_or(0);
+        let total: u64 = delta.values().sum();
+        let replays = delta
+            .iter()
+            .filter(|(key, _)| **key != "hit")
+            .map(|(key, n)| format!("{key} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "decision counts here are far below 2^53"
+        )]
+        let rate = if total == 0 {
+            "n/a".to_owned()
+        } else {
+            format!("{:.1}%", hits as f64 * 100.0 / total as f64)
+        };
+        format!(
+            "resident decisions (issue #2007, measured loop): {hits} hits of {total}, \
+             hit rate {rate}; replays: {}",
+            if replays.is_empty() { "none" } else { &replays }
+        )
+    }
+
+    #[test]
+    fn the_resident_note_counts_only_the_measured_decisions() {
+        let counts = ResidentCounts::default();
+        counts.record_workflow_resident("wf", "q", ResidentOutcome::Cold);
+        let before = counts.snapshot();
+        counts.record_workflow_resident("wf", "q", ResidentOutcome::Cold);
+        for _ in 0..3 {
+            counts.record_workflow_resident("wf", "q", ResidentOutcome::Hit);
+        }
+        assert_eq!(
+            resident_note(&before, &counts.snapshot()),
+            "resident decisions (issue #2007, measured loop): 3 hits of 4, hit rate 75.0%; \
+             replays: cold 1"
+        );
+        assert!(resident_note(&before, &before).ends_with("hit rate n/a; replays: none"));
+    }
+
     /// Build the registry both bench workflows and all three activities share.
     #[must_use]
     pub fn build_registry() -> (Arc<HandlerRegistry>, Arc<BenchObservations>) {
-        let telemetry = Arc::new(
-            TelemetryConfig::builder()
-                .metrics(commit_probe().map_or_else(
-                    || Arc::new(NoOpMetrics) as Arc<dyn MetricsRecorder>,
-                    |probe| Arc::clone(probe) as Arc<dyn MetricsRecorder>,
-                ))
-                .build(),
-        );
+        build_registry_with_metrics(commit_probe().map_or_else(
+            || Arc::new(NoOpMetrics) as Arc<dyn MetricsRecorder>,
+            |probe| Arc::clone(probe) as Arc<dyn MetricsRecorder>,
+        ))
+    }
+
+    /// [`build_registry`] with `metrics` as the recorder.
+    #[must_use]
+    pub fn build_registry_with_metrics(
+        metrics: Arc<dyn MetricsRecorder>,
+    ) -> (Arc<HandlerRegistry>, Arc<BenchObservations>) {
+        let telemetry = Arc::new(TelemetryConfig::builder().metrics(metrics).build());
         let observations = Arc::new(BenchObservations::default());
         let mut state = std::collections::HashMap::new();
         state.insert(
@@ -3676,6 +3826,11 @@ pub mod db {
                 runtime.shutdown_timeout = std::time::Duration::from_secs(5);
                 runtime.max_concurrent_workflows = MAX_CONCURRENT_WORKFLOWS;
                 runtime.max_concurrent_activities = MAX_CONCURRENT_ACTIVITIES;
+                if let Some(loops) = super::claim_loops_override(
+                    std::env::var(super::CLAIM_LOOPS_ENV_VAR).ok().as_deref(),
+                ) {
+                    runtime.max_concurrent_claims = loops;
+                }
                 runtime.sharded_pool = Some(sharded.clone());
                 let worker = Arc::new(
                     Worker::new(runtime, Arc::clone(registry)).expect("bench worker should build"),
@@ -4218,7 +4373,9 @@ pub mod db {
         let scenario_started = Instant::now();
         let cluster = Box::pin(setup_shards(shard_count)).await?;
         let sharded = cluster.sharded_pool();
-        let (registry, _observations) = build_registry();
+        let resident = Arc::new(ResidentCounts::default());
+        let (registry, _observations) =
+            build_registry_with_metrics(Arc::clone(&resident) as Arc<dyn MetricsRecorder>);
         let fleet = start_fleet(&cluster, &sharded, &registry, &census);
         let deadline = scenario_deadline();
         let shards = cluster.shard_ids();
@@ -4243,6 +4400,7 @@ pub mod db {
             .map(|l| u64::try_from(l.completed).unwrap_or(0))
             .collect();
 
+        let resident_before = resident.settled_snapshot().await;
         reset_commit_probe();
         let loops = run_closed_loop(
             &cluster,
@@ -4319,6 +4477,9 @@ pub mod db {
         unsound.extend(per_shard_inflight_soundness(inflight, &per_shard_flight));
 
         let probe_notes = commit_probe_report(&cluster, "meas").await;
+        // The settling wait comes after the probe report, so the probe holds
+        // no idle polls from it.
+        let resident_note = resident_note(&resident_before, &resident.settled_snapshot().await);
         fleet.stop().await;
         let topology = cluster.topology;
         drop(sharded);
@@ -4346,6 +4507,7 @@ pub mod db {
                 vec![
                     shard_note(&per_shard),
                     format!("topology: {}", topology.as_str()),
+                    resident_note,
                     format!(
                         "closed loop: {inflight} workflows in flight per shard, {requested} \
                          measured completions, warmup population {}",

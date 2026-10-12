@@ -951,7 +951,7 @@ fn any_sink() -> bool {
 ///
 /// A broken transaction state counts as inside, so the caller takes the safe
 /// path.
-fn in_transaction(conn: &mut AsyncPgConnection) -> bool {
+pub(crate) fn in_transaction(conn: &mut AsyncPgConnection) -> bool {
     use diesel_async::TransactionManager as _;
     let status =
         <AsyncPgConnection as diesel_async::AsyncConnection>::TransactionManager::transaction_manager_status_mut(conn);

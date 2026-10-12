@@ -373,6 +373,8 @@ fn activity_info(name: &'static str) -> ActivityInfo {
         is_local: false,
         max_input_bytes: None,
         max_result_bytes: None,
+        input_schema: None,
+        output_schema: None,
         requires: None,
         handler: act_inert,
     }
