@@ -329,6 +329,37 @@ rejected rather than silently lost.
 > task-preparation ingest and are **not** available here — restrict to the pull
 > primitives.
 
+### Updates (issue #2025)
+
+An update is a request with a result. Register the handler in the workflow
+body, or register a declarative `#[update]` with `register_update`.
+
+```rust
+// Inside the workflow — register the handler before the first wait:
+ctx.register_update_handler(
+    "set_limit",
+    |input| if input.as_i64() > Some(0) { Ok(()) } else { Err("must be positive".into()) },
+    |input| async move { Ok(serde_json::json!({ "limit": input })) },
+);
+
+// From outside — run the update and get its result:
+let result = rt.update(exec, "set_limit", serde_json::json!(5)).await?;
+```
+
+`update` replays the run to rebuild its handlers. The arg schema and the
+validator run first. A rejection is `SqliteError::UpdateRejected` and writes no
+event. The handler then runs to completion. One transaction appends
+`UpdateAdmitted` and `UpdateCompleted`, or `UpdateFailed` for a handler error.
+These are the core update events, so the history replays on the core
+`WorkflowReplayer`.
+
+The update does not drive the run. Call `run_until_blocked` after it, as after
+`send_signal`. The handler runs once, at admission. Replay returns the recorded
+result and does not run the handler again.
+
+A handler cannot await a durable command, such as an activity or a timer. Such
+a handler returns `SqliteError::UpdateBlocked` and writes no event.
+
 ---
 
 ## 9. Durability and crash recovery
@@ -424,8 +455,7 @@ specific command/feature. The run then ends `FAILED` (see below):
   `request_cancel_external_workflow`).
 - **Local activities** (`execute_local_activity`) and **external / task-token
   activities**.
-- **Updates**, **search attributes** (`upsert_search_attributes`), and
-  **`continue_as_new`**.
+- **Search attributes** (`upsert_search_attributes`) and **`continue_as_new`**.
 - **Worker sessions** (`create_session`) and **cancellable durable timers**
   (`start_timer` / `TimerHandle::…` — use the fire-once `ctx.timer(...)`).
 

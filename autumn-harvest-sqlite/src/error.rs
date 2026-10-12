@@ -63,14 +63,71 @@ pub enum SqliteError {
     /// silently drop the wakeup, since no live `wait_for_signal` will ever consume
     /// it. An unknown id is [`ExecutionNotFound`](Self::ExecutionNotFound); this
     /// variant is only for a *present but sealed* run.
+    ///
+    /// An update to a terminal run also returns this variant (issue #2025).
     #[error(
-        "workflow execution {execution_id} is not running (state: {state}); cannot accept a signal"
+        "workflow execution {execution_id} is not running (state: {state}); \
+         cannot accept a signal or an update"
     )]
     WorkflowNotRunning {
-        /// The terminal execution the signal targeted.
+        /// The terminal execution the signal or update targeted.
         execution_id: ExecutionId,
         /// Its current (terminal) state — `COMPLETED`, `FAILED`, etc.
         state: String,
+    },
+
+    /// The workflow has no update handler with this name (issue #2025).
+    ///
+    /// No event is written.
+    #[error("execution {execution_id} has no update handler named {name:?}")]
+    UpdateHandlerNotFound {
+        /// The execution the update targeted.
+        execution_id: ExecutionId,
+        /// The update name.
+        name: String,
+    },
+
+    /// The update failed its arg schema or its validator (issue #2025).
+    ///
+    /// No event is written.
+    #[error("update {name:?} to execution {execution_id} was rejected: {reason}")]
+    UpdateRejected {
+        /// The execution the update targeted.
+        execution_id: ExecutionId,
+        /// The update name.
+        name: String,
+        /// Why the update was rejected.
+        reason: String,
+    },
+
+    /// The update handler returned an error or panicked (issue #2025).
+    ///
+    /// The update was admitted. History holds `UpdateAdmitted` and
+    /// `UpdateFailed` with this error.
+    #[error("update {name:?} to execution {execution_id} failed: {error}")]
+    UpdateFailed {
+        /// The execution the update targeted.
+        execution_id: ExecutionId,
+        /// The update name.
+        name: String,
+        /// The handler error.
+        error: String,
+    },
+
+    /// The update handler stopped before it returned (issue #2025).
+    ///
+    /// This backend runs a handler to completion in one call. A handler that
+    /// awaits a durable command, such as an activity or a timer, cannot
+    /// finish. No event is written.
+    #[error(
+        "update {name:?} to execution {execution_id} is blocked: \
+         an update handler cannot await a durable command on this backend"
+    )]
+    UpdateBlocked {
+        /// The execution the update targeted.
+        execution_id: ExecutionId,
+        /// The update name.
+        name: String,
     },
 
     /// A decision cycle failed the workflow **task**, not the run
