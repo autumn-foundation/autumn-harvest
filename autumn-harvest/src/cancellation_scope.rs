@@ -20,9 +20,12 @@ use crate::types::{ActivityExecId, ExecutionId, TimerId};
 /// The reason that a cancelled scope reports.
 const SCOPE_CANCEL_REASON: &str = "cancellation scope cancelled";
 
+/// The name prefix of a scope cancel marker.
+const CANCEL_MARKER_PREFIX: &str = "cancel_scope:";
+
 /// The marker that records the cancel decision of scope `seq`.
 fn cancel_marker_name(seq: u32) -> String {
-    format!("cancel_scope:{seq}")
+    format!("{CANCEL_MARKER_PREFIX}{seq}")
 }
 
 /// The marker that opens non-cancellable block `seq`.
@@ -120,27 +123,54 @@ struct CancelMarker {
     records: Vec<CapturedRecord>,
 }
 
-/// A `RecordSideEffect` that a scope cancel withdraws (issue #1984).
+/// A recorded decision that a scope cancel withdraws (issue #1984).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct CapturedRecord {
-    kind: SideEffectKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-    value: Value,
+#[serde(tag = "record", rename_all = "snake_case")]
+pub(crate) enum CapturedRecord {
+    /// A `RecordSideEffect`.
+    SideEffect {
+        kind: SideEffectKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        value: Value,
+    },
+    /// A `RecordMarker`, such as a version gate.
+    Marker { name: String, details: Value },
 }
 
-/// The record values among `cmds`, in order.
+/// The recorded decisions among `cmds`, in order.
+///
+/// A nested scope that cancelled in the same cycle withdrew its own records
+/// into its marker. That marker is withdrawn now, so its records move here,
+/// at its place.
 fn captured_records(cmds: &[WorkflowCommand]) -> Vec<CapturedRecord> {
-    cmds.iter()
-        .filter_map(|cmd| match cmd {
-            WorkflowCommand::RecordSideEffect { kind, name, value } => Some(CapturedRecord {
-                kind: *kind,
-                name: name.clone(),
-                value: value.clone(),
-            }),
-            _ => None,
-        })
-        .collect()
+    let mut records = Vec::new();
+    for cmd in cmds {
+        match cmd {
+            WorkflowCommand::RecordSideEffect { kind, name, value } => {
+                records.push(CapturedRecord::SideEffect {
+                    kind: *kind,
+                    name: name.clone(),
+                    value: value.clone(),
+                });
+            }
+            WorkflowCommand::RecordMarker { name, details }
+                if name.starts_with(CANCEL_MARKER_PREFIX) =>
+            {
+                if let Ok(inner) = serde_json::from_value::<CancelMarker>(details.clone()) {
+                    records.extend(inner.records);
+                }
+            }
+            WorkflowCommand::RecordMarker { name, details } => {
+                records.push(CapturedRecord::Marker {
+                    name: name.clone(),
+                    details: details.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+    records
 }
 
 /// One entry of the context's scope stack.
@@ -245,30 +275,54 @@ pub(crate) fn route_command(
     Some((cmd, tags))
 }
 
-/// The value that a cancelled scope recorded for this primitive, on replay.
+/// Take the first captured record that `wanted` accepts, on replay.
 ///
-/// The live cancel withdraws the body's `RecordSideEffect` commands and keeps
-/// their values in its marker. Replay serves them in the same order. A kind or
-/// name that does not match returns `None`, so the primitive runs as before.
-pub(crate) fn take_captured_record(
+/// The live cancel withdraws the body's recorded decisions and keeps them in
+/// its marker. The body asks for them in the same order on replay, so the
+/// first match is the right one. A record that no primitive asks for stays
+/// and does not block the others.
+fn take_captured(
     stack: &[ScopeFrame],
-    kind: SideEffectKind,
-    name: Option<&str>,
+    wanted: impl Fn(&CapturedRecord) -> Option<Value>,
 ) -> Option<Value> {
     for frame in stack.iter().rev() {
         let ScopeFrame::Cancellable(shared) = frame else {
             break;
         };
         let mut inner = shared.lock();
-        let Some(next) = inner.records.front() else {
-            continue;
-        };
-        if next.kind != kind || next.name.as_deref() != name {
-            return None;
+        if let Some(at) = inner
+            .records
+            .iter()
+            .position(|record| wanted(record).is_some())
+        {
+            return inner.records.remove(at).as_ref().and_then(&wanted);
         }
-        return inner.records.pop_front().map(|record| record.value);
     }
     None
+}
+
+/// The side-effect value that a cancelled scope recorded here, on replay.
+pub(crate) fn take_captured_side_effect(
+    stack: &[ScopeFrame],
+    kind: SideEffectKind,
+    name: Option<&str>,
+) -> Option<Value> {
+    take_captured(stack, |record| match record {
+        CapturedRecord::SideEffect {
+            kind: k,
+            name: n,
+            value,
+        } if *k == kind && n.as_deref() == name => Some(value.clone()),
+        _ => None,
+    })
+}
+
+/// The marker details that a cancelled scope recorded here, on replay.
+pub(crate) fn take_captured_marker(stack: &[ScopeFrame], name: &str) -> Option<Value> {
+    take_captured(stack, |record| match record {
+        CapturedRecord::Marker { name: n, details } if n == name => Some(details.clone()),
+        _ => None,
+    })
 }
 
 /// The cancellable scopes on `stack` up to the nearest shield, innermost last.
@@ -1431,6 +1485,90 @@ mod tests {
             *seen.lock().expect("seen lock")
         );
         assert!(replay.take_nd_details().is_none());
+    }
+
+    /// A version gate in the cancelling cycle keeps its live choice on
+    /// replay, even after a deploy raises the maximum.
+    #[tokio::test]
+    async fn replay_keeps_a_version_chosen_in_the_cancelling_cycle() {
+        let live = WorkflowContext::new_test();
+        let seen = std::sync::Mutex::new(None);
+        record_then_cancel(&live, &seen, |ctx| json!(ctx.version("gate", 1, 2))).await;
+        let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+        let replay = replay_of(details);
+        let replayed = std::sync::Mutex::new(None);
+        record_then_cancel(&replay, &replayed, |ctx| json!(ctx.version("gate", 1, 3))).await;
+
+        assert_eq!(*seen.lock().expect("seen lock"), Some(json!(2)));
+        assert_eq!(
+            *replayed.lock().expect("replayed lock"),
+            Some(json!(2)),
+            "the live choice wins over the new maximum"
+        );
+        assert!(replay.take_nd_details().is_none());
+    }
+
+    /// An inner scope cancels after its body records a value, and the outer
+    /// scope cancels in the same cycle. The outer marker keeps the value.
+    #[tokio::test]
+    async fn an_outer_cancel_keeps_the_records_of_a_nested_cancel() {
+        async fn run(
+            ctx: &WorkflowContext,
+            seen: &std::sync::Mutex<Option<Value>>,
+            pick: impl FnOnce() -> i32 + Send,
+        ) {
+            let outer = ctx.cancellation_scope();
+            let inner = ctx.cancellation_scope();
+            let body = async {
+                let nested = inner
+                    .run(async {
+                        let value = ctx.side_effect("pick", pick).expect("side effect");
+                        *seen.lock().expect("seen lock") = Some(json!(value));
+                        inner.cancel();
+                        std::future::pending::<()>().await;
+                    })
+                    .await;
+                assert!(matches!(nested, Err(HarvestError::Cancelled(_))));
+                std::future::pending::<()>().await;
+            };
+            let sibling = async {
+                tokio::task::yield_now().await;
+                outer.cancel();
+            };
+            let (result, ()) = bounded(async { tokio::join!(outer.run(body), sibling) }).await;
+            assert!(
+                matches!(result, Err(HarvestError::Cancelled(_))),
+                "{result:?}"
+            );
+        }
+
+        let live = WorkflowContext::new_test();
+        let seen = std::sync::Mutex::new(None);
+        run(&live, &seen, || 41).await;
+        let commands = live.drain_commands();
+        assert!(
+            marker(&commands, "cancel_scope:2").is_none(),
+            "the outer cancel withdraws the inner marker: {commands:?}"
+        );
+        let details = marker(&commands, "cancel_scope:1").expect("recorded");
+
+        let replay = replay_of(details);
+        let replayed = std::sync::Mutex::new(None);
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        run(&replay, &replayed, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            99
+        })
+        .await;
+
+        assert_eq!(
+            *replayed.lock().expect("replayed lock"),
+            *seen.lock().expect("seen lock")
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(replay.take_nd_details().is_none());
+        assert!(!replay.history_has_unconsumed_events());
     }
 
     #[tokio::test]

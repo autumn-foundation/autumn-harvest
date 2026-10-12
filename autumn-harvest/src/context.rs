@@ -5834,6 +5834,22 @@ impl WorkflowContext {
         );
         let version = self.match_history(|m| m.match_version(change_id, min, max));
 
+        // Issue #1984: a scope cancel withdrew the gate's marker. Replay keeps
+        // the version that the live cycle chose, even after a deploy raises max.
+        if self.at_history_frontier()
+            && let Some(captured) = self
+                .captured_scope_marker(&crate::replay::version_marker_name(change_id))
+                .and_then(|details| details.as_u64())
+                .and_then(|v| u32::try_from(v).ok())
+                .filter(|v| (min..=max).contains(v))
+        {
+            self.push_command(WorkflowCommand::RecordMarker {
+                name: crate::replay::version_marker_name(change_id),
+                details: Value::from(u64::from(captured)),
+            });
+            return captured;
+        }
+
         // During live execution (matcher returned max_version and is past
         // history), emit a marker so future replays see this version.
         //
@@ -7368,7 +7384,14 @@ impl WorkflowContext {
         name: Option<&str>,
     ) -> Option<Value> {
         let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
-        crate::cancellation_scope::take_captured_record(&stack, kind, name)
+        crate::cancellation_scope::take_captured_side_effect(&stack, kind, name)
+    }
+
+    /// The marker details that a cancelled scope recorded here, on replay
+    /// (issue #1984).
+    fn captured_scope_marker(&self, name: &str) -> Option<Value> {
+        let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
+        crate::cancellation_scope::take_captured_marker(&stack, name)
     }
 
     /// Record the state of `timer_id` before a scope body changes it.
