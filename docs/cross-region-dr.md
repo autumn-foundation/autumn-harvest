@@ -69,7 +69,7 @@ they read `pg_replication_slots`, which covers both.
 ### Logical replication does not replicate sequences
 
 **If you choose logical, this is the step that will bite you.** `harvest_events.id`,
-`harvest_workflow_logs.id`, and `harvest_mutex_waiters.id` are `BIGSERIAL`.
+`harvest_workflow_logs.id`, `harvest_stream_chunks.id`, and `harvest_mutex_waiters.id` are `BIGSERIAL`.
 Logical replication copies the *rows*, including those id values, but it does
 not advance the standby's sequences. A promoted logical standby therefore holds
 a full copy of `harvest_events` while `harvest_events_id_seq` still sits where

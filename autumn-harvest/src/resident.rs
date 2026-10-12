@@ -476,6 +476,7 @@ fn plan_suspension(commands: &[WorkflowCommand]) -> Result<SuspensionPlan, Resid
             WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. } => false,
             WorkflowCommand::AcquireMutex { .. } | WorkflowCommand::ReleaseMutex { .. } => {
                 return Err(ResidentOutcome::Mutex);
@@ -905,6 +906,9 @@ mod tests {
             }
             WorkflowCommand::PublishProgress { seq, chunk } => {
                 format!("PublishProgress({seq}, {chunk})")
+            }
+            WorkflowCommand::PublishDurableProgress { offset, chunk } => {
+                format!("PublishDurableProgress({offset}, {chunk})")
             }
             WorkflowCommand::RecordMarker { name, .. } => format!("RecordMarker({name})"),
             WorkflowCommand::RecordSideEffect { kind, name, .. } => {
