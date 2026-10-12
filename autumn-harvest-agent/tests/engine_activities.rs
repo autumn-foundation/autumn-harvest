@@ -16,7 +16,7 @@ use autumn_harvest_agent::{
     AgentHarness, ChatMessage, ChatRole, ModelTurn, ModelTurnRequest, Rule, StopReason, TokenUsage,
     ToolCall, ToolCallRequest, ToolDecision, ToolEffect, ToolOutcome, ToolRules,
 };
-use common::{Recorder, ScriptedModel, calls, recorded_tool};
+use common::{MemStore, Recorder, ScriptedModel, answer, calls, recorded_tool, response_cache};
 use serde_json::json;
 
 fn with_harness(harness: AgentHarness) -> ActivityContext {
@@ -37,6 +37,7 @@ fn turn_request() -> ModelTurnRequest {
         read_only: false,
         memory_scope: None,
         extra_tools: Vec::new(),
+        tenant: None,
     }
 }
 
@@ -75,6 +76,37 @@ async fn the_model_turn_handler_records_the_reply_and_each_decision() {
     assert_eq!(sent.temperature, Some(0.5));
     assert_eq!(sent.tools.len(), 2);
     assert_eq!(recorder.runs(), Vec::<serde_json::Value>::new());
+}
+
+/// The engine-path handler serves a repeat from the cache, per tenant
+/// (issue #1998). A test context has no run row, so the request tenant
+/// scopes the key.
+#[tokio::test]
+async fn the_model_turn_handler_serves_a_repeat_from_the_cache() {
+    let model = ScriptedModel::named("m-1", vec![answer("one", 3), answer("two", 3)]);
+    let store = Arc::new(MemStore::default());
+    let harness = AgentHarness::new(model.clone()).response_cache(response_cache(&store));
+    let ctx = with_harness(harness);
+    let info = agent_model_turn_info();
+    let turn = |tenant: &str| {
+        let request = ModelTurnRequest {
+            tenant: Some(tenant.to_owned()),
+            ..turn_request()
+        };
+        (info.handler)(&ctx, serde_json::to_value(request).unwrap())
+    };
+
+    let first: ModelTurn = serde_json::from_value(turn("a").await.unwrap()).unwrap();
+    let repeat: ModelTurn = serde_json::from_value(turn("a").await.unwrap()).unwrap();
+    let other: ModelTurn = serde_json::from_value(turn("b").await.unwrap()).unwrap();
+
+    assert!(!first.cache_hit);
+    assert!(repeat.cache_hit);
+    assert_eq!(repeat.content, first.content);
+    assert_eq!(repeat.usage, TokenUsage::default());
+    assert!(!other.cache_hit);
+    assert_eq!(other.text(), "two");
+    assert_eq!(model.calls(), 2);
 }
 
 #[tokio::test]

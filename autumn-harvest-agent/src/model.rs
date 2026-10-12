@@ -55,13 +55,19 @@ pub trait AgentModel: Send + Sync + std::fmt::Debug {
         request: &'a ChatRequest,
     ) -> BoxFuture<'a, Result<ChatResponse, AgentError>>;
 
-    /// The model id that the LLM ledger records (issue #1997).
+    /// The id of the model that answers, for example `acme-chat-2026-01`.
     ///
-    /// The default is `"unknown"`.
-    // An implementation can return a field, so the borrow stays.
-    #[allow(clippy::unnecessary_literal_bound)]
-    fn model_id(&self) -> &str {
-        "unknown"
+    /// The [`ResponseCache`](crate::ResponseCache) puts it in each key. A
+    /// model with no id is never cached. The default is `None`.
+    ///
+    /// The id must change whenever the answer can change for the same
+    /// request. Use a pinned model version, not an alias. Put each client
+    /// setting that [`ChatRequest`] does not hold, such as `top_p`, in the id.
+    ///
+    /// The LLM ledger records the id too (issue #1997). A model with no id
+    /// records `"unknown"`.
+    fn model_id(&self) -> Option<&str> {
+        None
     }
 
     /// The cost of one call, in millionths of a currency unit (issue #1997).

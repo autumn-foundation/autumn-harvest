@@ -18,9 +18,9 @@ tests for it, and `LlmBudgetExceeded::from_error` reads it. The quota metric
 register the workflow type on each worker that runs its LLM steps.
 
 The agent adapter checks and records on each model turn. `AgentModel` gets
-the provided methods `model_id` and `cost_micros`. `AgentTask` gets an
-optional `tenant`. A refused turn ends the run under the new stop
-`budget_exceeded`.
+the provided method `cost_micros`, and the ledger records `model_id`. A
+response cache hit records nothing. `AgentTask::tenant` keys the tenant
+budget. A refused turn ends the run under the new stop `budget_exceeded`.
 
 This ships the part of the cost ledger (issue #1996) that the budgets need.
 That part is the `harvest_llm_ledger` side table, the write, and the

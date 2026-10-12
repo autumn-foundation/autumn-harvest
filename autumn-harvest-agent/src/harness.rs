@@ -13,8 +13,9 @@ use crate::error::AgentError;
 use crate::heartbeat::{HeartbeatTask, Precheck};
 use crate::memory::{MEMORY_TOOL, MemoryScope, MemoryStore, MemoryTool, render_snapshot};
 use crate::message::{ContentPart, RunId, TokenUsage, ToolDefinition};
-use crate::model::{AgentModel, BoxFuture, ChatRequest};
+use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse};
 use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
+use crate::response_cache::{CacheKey, KeyTenant, ResponseCache};
 use crate::tool::{Tool, ToolContext, ToolEffect};
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
@@ -27,8 +28,9 @@ pub const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 8_000;
 
 /// The default time budget of one model call: 13 minutes.
 ///
-/// With [`DEFAULT_POLICY_TIMEOUT`], it stays below the 15-minute
-/// `start_to_close` of `agent_model_turn`. A slow call therefore ends as a
+/// With [`DEFAULT_POLICY_TIMEOUT`] and three [`DEFAULT_CACHE_TIMEOUT`]
+/// budgets, it stays below the 15-minute `start_to_close` of
+/// `agent_model_turn`. A slow call therefore ends as a
 /// retryable failure that the harness reports. It does not end as an engine
 /// timeout, which SQLite reports only after the body returns.
 pub const DEFAULT_MODEL_TIMEOUT: Duration = Duration::from_secs(13 * 60);
@@ -53,6 +55,12 @@ pub const DEFAULT_POLICY_TIMEOUT: Duration = Duration::from_secs(60);
 /// activities. SQLite cannot end a stalled call from outside.
 pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The default time budget of one response-cache call: 5 seconds.
+///
+/// One turn makes at most three cache calls: the tenant read, the lookup and
+/// the store. Each call has this budget. A cache call over it is a miss.
+pub const DEFAULT_CACHE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The bytes that the `ToolOutcome` JSON adds around its content.
 const OUTCOME_ENVELOPE_BYTES: u64 = 64;
 
@@ -75,9 +83,11 @@ pub struct AgentHarness {
     tool_timeout: Duration,
     policy_timeout: Duration,
     hook_timeout: Duration,
+    cache_timeout: Duration,
     memory: Option<Arc<dyn MemoryStore>>,
     delivery: Arc<dyn Delivery>,
     precheck: Option<Arc<dyn Precheck>>,
+    cache: Option<ResponseCache>,
 }
 
 impl AgentHarness {
@@ -95,9 +105,11 @@ impl AgentHarness {
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
             policy_timeout: DEFAULT_POLICY_TIMEOUT,
             hook_timeout: DEFAULT_HOOK_TIMEOUT,
+            cache_timeout: DEFAULT_CACHE_TIMEOUT,
             memory: None,
             delivery: Arc::new(LogDelivery),
             precheck: None,
+            cache: None,
         }
     }
 
@@ -201,10 +213,49 @@ impl AgentHarness {
         self
     }
 
+    /// Serve an identical model call from `cache`, across runs.
+    ///
+    /// The model must name itself through [`AgentModel::model_id`]. A model
+    /// with no id is never cached.
+    #[must_use]
+    pub fn response_cache(mut self, cache: ResponseCache) -> Self {
+        if self.client.model_id().is_none() {
+            tracing::warn!("the model has no model_id, so the response cache serves nothing");
+        }
+        self.cache = Some(cache);
+        self
+    }
+
+    /// Set the time budget of one response-cache call. One turn makes at
+    /// most three. Keep the sum of the model, policy and cache budgets below
+    /// the 15-minute `start_to_close` of `agent_model_turn`.
+    #[must_use]
+    pub const fn cache_timeout(mut self, timeout: Duration) -> Self {
+        self.cache_timeout = timeout;
+        self
+    }
+
+    /// Whether a turn can use the response cache: the harness has a cache,
+    /// and the model has an id.
+    pub(crate) fn cache_active(&self) -> bool {
+        self.cache.is_some() && self.client.model_id().is_some()
+    }
+
+    /// The time budget of one response-cache call, the tenant read included.
+    pub(crate) const fn cache_budget(&self) -> Duration {
+        self.cache_timeout
+    }
+
     /// Run one model call, then ask the policy about each tool call.
     ///
     /// The decisions are part of the result. Replay reads them back, so a
     /// policy that reads changing state cannot change a recorded run.
+    ///
+    /// With a response cache, `request.tenant` scopes the key. This method
+    /// does not read the verified tenant of the run. The `agent_model_turn`
+    /// activity does, so register [`activities`](crate::activities) on
+    /// Postgres. A hit skips the model call. The policy still decides each
+    /// tool call.
     ///
     /// # Errors
     ///
@@ -212,7 +263,8 @@ impl AgentHarness {
     /// retryable: a rate limit, a transport fault, a provider outage, or the
     /// time budget. Every other failure is not.
     pub async fn model_turn(&self, request: ModelTurnRequest) -> Result<ModelTurn, String> {
-        self.model_turn_with(request, |_content| {}).await
+        let tenant = CacheTenant::declared(request.tenant.as_deref());
+        self.model_turn_in(request, tenant, |_content| {}).await
     }
 
     /// One model turn between an LLM budget check and a ledger write (issue
@@ -222,9 +274,13 @@ impl AgentHarness {
     /// called. After a turn that returns, `record` writes its usage. A failed
     /// write logs a warning and keeps the turn, because a retry would pay for
     /// the call again. A call that fails or times out records nothing.
+    ///
+    /// A response cache hit calls no model and spends no tokens, so it
+    /// records nothing.
     pub(crate) async fn metered_turn<C, CF, R, RF>(
         &self,
         request: ModelTurnRequest,
+        tenant: CacheTenant,
         check: C,
         record: R,
     ) -> Result<ModelTurn, String>
@@ -235,7 +291,12 @@ impl AgentHarness {
         RF: std::future::Future<Output = Result<bool, String>>,
     {
         check().await?;
-        let (turn, latency) = self.timed_model_turn(request, |_content| {}).await?;
+        let (turn, latency) = self
+            .timed_model_turn(request, tenant, |_content| {})
+            .await?;
+        if turn.cache_hit {
+            return Ok(turn);
+        }
         if let Err(error) = record(self.ledger_usage(&turn.usage, latency)).await {
             tracing::warn!(error = %error, "could not record the LLM usage of a model turn");
         }
@@ -246,26 +307,42 @@ impl AgentHarness {
     /// the policy about each tool call.
     ///
     /// The evaluation harness uses `prepare` to set the recorded call ids
-    /// before the policy reads them.
+    /// before the policy reads them. It skips the response cache, because an
+    /// evaluation measures the live answer of the candidate.
     ///
     /// # Errors
     ///
     /// The errors of [`model_turn`](Self::model_turn).
+    #[cfg(feature = "eval")]
     pub(crate) async fn model_turn_with(
         &self,
         request: ModelTurnRequest,
-        prepare: impl FnOnce(&mut Vec<ContentPart>),
+        prepare: impl FnMut(&mut Vec<ContentPart>),
     ) -> Result<ModelTurn, String> {
-        self.timed_model_turn(request, prepare)
+        self.model_turn_in(request, CacheTenant::Skip, prepare)
+            .await
+    }
+
+    /// [`model_turn_with`](Self::model_turn_with), with the tenant that
+    /// scopes the response cache.
+    pub(crate) async fn model_turn_in(
+        &self,
+        request: ModelTurnRequest,
+        tenant: CacheTenant,
+        prepare: impl FnMut(&mut Vec<ContentPart>),
+    ) -> Result<ModelTurn, String> {
+        self.timed_model_turn(request, tenant, prepare)
             .await
             .map(|(turn, _)| turn)
     }
 
-    /// [`Self::model_turn_with`], with the time that the model call took.
+    /// [`model_turn_in`](Self::model_turn_in), with the time that the model
+    /// call took. A cache hit calls no model, so its time is zero.
     pub(crate) async fn timed_model_turn(
         &self,
         request: ModelTurnRequest,
-        prepare: impl FnOnce(&mut Vec<ContentPart>),
+        tenant: CacheTenant,
+        mut prepare: impl FnMut(&mut Vec<ContentPart>),
     ) -> Result<(ModelTurn, Duration), String> {
         let builtins = self.builtins(
             request.memory_scope.as_ref(),
@@ -278,56 +355,102 @@ impl AgentHarness {
             max_tokens: request.max_output_tokens,
             temperature: self.temperature,
         };
-        let started = std::time::Instant::now();
-        let response = match tokio::time::timeout(self.model_timeout, self.client.chat(&chat)).await
-        {
-            Ok(response) => response.map_err(|err| model_failure(&err))?,
-            Err(_) => {
-                return Err(ActivityFailure::retryable(
-                    "ModelTimeout",
-                    format!("the model did not answer within {:?}", self.model_timeout),
-                )
-                .into_error_payload());
+        let key = self.cache_key(&tenant, &chat);
+        let mut cached = match &key {
+            Some(key) => self.cache_lookup(key).await,
+            None => None,
+        };
+        // At most two passes. A hit whose turn is over the result cap is a
+        // miss, so the second pass asks the model. Both passes share one
+        // policy budget, so the turn stays inside `start_to_close`.
+        let mut policy_budget = self.policy_timeout;
+        let mut latency = Duration::ZERO;
+        loop {
+            let cache_hit = cached.is_some();
+            // A fresh answer waits for its decisions before it reaches the cache.
+            let mut fresh = None;
+            let response = if let Some(response) = cached.take() {
+                // No model call ran, so the turn spent no tokens.
+                ChatResponse {
+                    usage: TokenUsage::default(),
+                    ..response
+                }
+            } else {
+                let started = std::time::Instant::now();
+                let response = self.call_model(&chat).await?;
+                latency = started.elapsed();
+                fresh = key.as_ref().map(|key| (key, response.clone()));
+                response
+            };
+            let mut content = response.content;
+            prepare(&mut content);
+            let mut turn = ModelTurn {
+                content,
+                stop: response.stop_reason,
+                usage: response.usage,
+                decisions: Vec::new(),
+                cache_hit,
+            };
+            let info = RunInfo {
+                run_id: RunId::new(request.run_id.clone()),
+                session_id: request.session_id.clone(),
+                steps_used: request.steps_used,
+                max_steps: request.max_steps,
+                usage: request.usage.saturating_add(response.usage),
+            };
+            self.decide_calls(
+                &mut turn,
+                &info,
+                (request.read_only, &builtins),
+                &mut policy_budget,
+            )
+            .await;
+            // A turn over the result cap fails. The cache serves and keeps
+            // only a turn that fits, so no identical request fails from it.
+            let fits = self.fits_result_cap(&turn);
+            if cache_hit && !fits {
+                tracing::warn!("a cached answer does not fit the result cap; calling the model");
+                continue;
             }
-        };
-        let latency = started.elapsed();
-        let mut content = response.content;
-        prepare(&mut content);
-        let mut turn = ModelTurn {
-            content,
-            stop: response.stop_reason,
-            usage: response.usage,
-            decisions: Vec::new(),
-        };
-        let info = RunInfo {
-            run_id: RunId::new(request.run_id),
-            session_id: request.session_id,
-            steps_used: request.steps_used,
-            max_steps: request.max_steps,
-            usage: request.usage.saturating_add(response.usage),
-        };
-        // One deadline bounds the whole decision phase. A per-call budget
-        // would let many stalled calls add up past `start_to_close`.
-        let deadline = tokio::time::Instant::now() + self.policy_timeout;
-        let read_only: Arc<dyn ToolPolicy>;
-        let policy: &dyn ToolPolicy = if request.read_only {
+            if let Some((key, response)) = fresh
+                && fits
+            {
+                self.cache_store(key, &response).await;
+            }
+            return Ok((turn, latency));
+        }
+    }
+
+    /// Ask the policy about each tool call of `turn`, in order.
+    ///
+    /// One deadline bounds the whole decision phase. A per-call budget would
+    /// let many stalled calls add up past `start_to_close`. The phase spends
+    /// from `budget` and leaves the rest in it for a second pass. A stalled
+    /// policy denies the call. That fails closed, and the model reads why.
+    async fn decide_calls(
+        &self,
+        turn: &mut ModelTurn,
+        info: &RunInfo,
+        (read_only, builtins): (bool, &[Arc<dyn Tool>]),
+        budget: &mut Duration,
+    ) {
+        let started = tokio::time::Instant::now();
+        let deadline = started + *budget;
+        let read_only_policy: Arc<dyn ToolPolicy>;
+        let policy: &dyn ToolPolicy = if read_only {
             // The read-only rules go first. Their deny ends the decision, so
             // the app policy is not asked about a call that cannot run.
-            read_only = Arc::new(Strictest::new(vec![
+            read_only_policy = Arc::new(Strictest::new(vec![
                 Arc::new(ToolRules::read_only()),
                 Arc::clone(&self.policy),
             ]));
-            read_only.as_ref()
+            read_only_policy.as_ref()
         } else {
             self.policy.as_ref()
         };
         for call in turn.calls() {
-            let tool = self
-                .visible(&builtins)
-                .find(|tool| tool.name() == call.name);
-            let decide = policy.decide(&call, tool, &info);
-            // A stalled policy denies the call. That fails closed, and the
-            // model reads why.
+            let tool = self.visible(builtins).find(|tool| tool.name() == call.name);
+            let decide = policy.decide(&call, tool, info);
             let decision = tokio::time::timeout_at(deadline, decide)
                 .await
                 .unwrap_or_else(|_| ToolDecision::Deny {
@@ -335,7 +458,84 @@ impl AgentHarness {
                 });
             turn.decisions.push(decision);
         }
-        Ok((turn, latency))
+        *budget = budget.saturating_sub(started.elapsed());
+    }
+
+    /// Send `chat` to the model within the model time budget.
+    async fn call_model(&self, chat: &ChatRequest) -> Result<ChatResponse, String> {
+        tokio::time::timeout(self.model_timeout, self.client.chat(chat))
+            .await
+            .map_err(|_| {
+                ActivityFailure::retryable(
+                    "ModelTimeout",
+                    format!("the model did not answer within {:?}", self.model_timeout),
+                )
+                .into_error_payload()
+            })?
+            .map_err(|err| model_failure(&err))
+    }
+
+    /// The cache key of `chat`, or `None` when this turn skips the cache.
+    ///
+    /// The turn skips the cache when the harness has no cache, the model has
+    /// no id, or the tenant says to skip.
+    fn cache_key(&self, tenant: &CacheTenant, chat: &ChatRequest) -> Option<CacheKey> {
+        let cache = self.cache.as_ref()?;
+        let model_id = self.client.model_id()?;
+        let tenant = match tenant {
+            CacheTenant::None => KeyTenant::None,
+            CacheTenant::Verified(name) => KeyTenant::Verified(name),
+            CacheTenant::Declared(name) => KeyTenant::Declared(name),
+            CacheTenant::Skip => return None,
+        };
+        cache
+            .key(tenant, model_id, chat)
+            .inspect_err(|err| tracing::warn!(error = %err, "the response cache skips this turn"))
+            .ok()
+    }
+
+    /// The cached answer for `key`. A fault or a slow cache is a miss.
+    async fn cache_lookup(&self, key: &CacheKey) -> Option<ChatResponse> {
+        let cache = self.cache.as_ref()?;
+        match tokio::time::timeout(self.cache_timeout, cache.lookup(key)).await {
+            Ok(Ok(found)) => found,
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, "response cache read failed; calling the model");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(budget = ?self.cache_timeout, "response cache read timed out; calling the model");
+                None
+            }
+        }
+    }
+
+    /// Whether a later hit on the answer of `turn` fits the result cap.
+    ///
+    /// The check measures the turn as a hit records it: the same content
+    /// and decisions, no usage, and `cache_hit`. A zero cap is no cap, as on
+    /// a worker.
+    fn fits_result_cap(&self, turn: &ModelTurn) -> bool {
+        let hit = ModelTurn {
+            usage: TokenUsage::default(),
+            cache_hit: true,
+            ..turn.clone()
+        };
+        self.max_result_bytes == 0 || !crate::bounds::exceeds_bytes(&hit, self.max_result_bytes)
+    }
+
+    /// Store a fresh answer. A fault or a slow cache is only a warning.
+    async fn cache_store(&self, key: &CacheKey, response: &ChatResponse) {
+        let Some(cache) = &self.cache else {
+            return;
+        };
+        match tokio::time::timeout(self.cache_timeout, cache.store(key, response)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::warn!(error = %err, "response cache write failed"),
+            Err(_) => {
+                tracing::warn!(budget = ?self.cache_timeout, "response cache write timed out");
+            }
+        }
     }
 
     /// Run one tool call.
@@ -400,12 +600,12 @@ impl AgentHarness {
 
     /// The ledger usage of one model call (issue #1997).
     ///
-    /// The model id is the id that [`AgentModel::model_id`] configures. The
-    /// `input_tokens` count already holds the cached prompt tokens, so this
-    /// function does not add the cache counts again.
+    /// The model id is the id that [`AgentModel::model_id`] configures, or
+    /// `"unknown"`. The `input_tokens` count already holds the cached prompt
+    /// tokens, so this function does not add the cache counts again.
     pub(crate) fn ledger_usage(&self, usage: &TokenUsage, latency: Duration) -> LlmUsage {
         LlmUsage::new(
-            self.client.model_id(),
+            self.client.model_id().unwrap_or("unknown"),
             u64::from(usage.input_tokens),
             u64::from(usage.output_tokens),
         )
@@ -512,6 +712,27 @@ impl AgentHarness {
                 .map(AsRef::as_ref)
                 .filter(move |tool| !taken(tool.name())),
         )
+    }
+}
+
+/// The tenant that scopes the response cache for one turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CacheTenant {
+    /// The run has no tenant.
+    None,
+    /// The engine verified this tenant for the run.
+    Verified(String),
+    /// The task names this tenant.
+    Declared(String),
+    /// The turn skips the cache. For example, the activity cannot read the
+    /// verified tenant.
+    Skip,
+}
+
+impl CacheTenant {
+    /// The tenant that a task field names, if any.
+    pub(crate) fn declared(task: Option<&str>) -> Self {
+        task.map_or(Self::None, |name| Self::Declared(name.to_owned()))
     }
 }
 
@@ -623,9 +844,8 @@ mod tests {
             Box::pin(async { Err(AgentError::new(ErrorKind::Provider, "unused")) })
         }
 
-        #[allow(clippy::unnecessary_literal_bound)]
-        fn model_id(&self) -> &str {
-            "priced-1"
+        fn model_id(&self) -> Option<&str> {
+            Some("priced-1")
         }
 
         fn cost_micros(&self, usage: &TokenUsage) -> u64 {
@@ -653,8 +873,11 @@ mod tests {
     #[test]
     fn a_model_with_the_defaults_records_an_unknown_id_and_no_cost() {
         let model = PricedModelDefaults;
-        assert_eq!(model.model_id(), "unknown");
+        assert_eq!(model.model_id(), None);
         assert_eq!(model.cost_micros(&TokenUsage::new(5, 5)), 0);
+        let harness = AgentHarness::new(Arc::new(PricedModelDefaults));
+        let ledger = harness.ledger_usage(&TokenUsage::new(5, 5), Duration::ZERO);
+        assert_eq!(ledger.model, "unknown");
     }
 
     #[derive(Debug)]
@@ -690,9 +913,8 @@ mod tests {
             })
         }
 
-        #[allow(clippy::unnecessary_literal_bound)]
-        fn model_id(&self) -> &str {
-            "counted-1"
+        fn model_id(&self) -> Option<&str> {
+            Some("counted-1")
         }
 
         fn cost_micros(&self, usage: &TokenUsage) -> u64 {
@@ -715,6 +937,7 @@ mod tests {
             read_only: false,
             memory_scope: None,
             extra_tools: Vec::new(),
+            tenant: None,
         }
     }
 
@@ -726,6 +949,7 @@ mod tests {
         let outcome = harness
             .metered_turn(
                 turn_request(),
+                CacheTenant::None,
                 || async { Err("refused".to_owned()) },
                 |usage| {
                     recorded.lock().unwrap().push(usage);
@@ -746,6 +970,7 @@ mod tests {
         let turn = harness
             .metered_turn(
                 turn_request(),
+                CacheTenant::None,
                 || async {
                     // The check runs before the call.
                     assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -777,12 +1002,81 @@ mod tests {
         let turn = harness
             .metered_turn(
                 turn_request(),
+                CacheTenant::None,
                 || async { Ok(()) },
                 |_| async { Err("ledger down".to_owned()) },
             )
             .await;
         assert!(turn.is_ok(), "{turn:?}");
         assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A payload store in memory, for the response cache.
+    #[derive(Debug, Default)]
+    struct MemStore {
+        blobs: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    }
+
+    impl autumn_harvest::payload_store::PayloadStore for MemStore {
+        fn put(
+            &self,
+            bytes: &[u8],
+        ) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, String> {
+            let key = {
+                let mut blobs = self.blobs.lock().unwrap();
+                let key = format!("blob-{}", blobs.len());
+                blobs.insert(key.clone(), bytes.to_vec());
+                key
+            };
+            Box::pin(std::future::ready(Ok(key)))
+        }
+
+        fn get(&self, key: &str) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, Vec<u8>> {
+            let found = self.blobs.lock().unwrap().get(key).cloned();
+            Box::pin(std::future::ready(found.ok_or_else(|| {
+                autumn_harvest::payload_store::PayloadStoreError(format!("no blob {key}"))
+            })))
+        }
+
+        fn delete(&self, key: &str) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, ()> {
+            self.blobs.lock().unwrap().remove(key);
+            Box::pin(std::future::ready(Ok(())))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cache_hit_checks_the_budget_but_records_nothing() {
+        let model = Arc::new(CountingModel::default());
+        let cache = ResponseCache::new(
+            Arc::new(MemStore::default()),
+            Arc::new(crate::response_cache::InMemoryCacheIndex::default()),
+            autumn_harvest::payload_codec::PayloadCodecs::default(),
+        );
+        let harness = AgentHarness::new(model.clone()).response_cache(cache);
+        let tenant = || CacheTenant::Verified("acme".to_owned());
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let recorded = std::sync::Mutex::new(Vec::new());
+        for _ in 0..2 {
+            harness
+                .metered_turn(
+                    turn_request(),
+                    tenant(),
+                    || {
+                        checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        async { Ok(()) }
+                    },
+                    |usage| {
+                        recorded.lock().unwrap().push(usage);
+                        async { Ok(true) }
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        // The second turn is a hit. It calls no model and spends nothing.
+        assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(checks.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(recorded.into_inner().unwrap().len(), 1);
     }
 
     #[test]
@@ -818,6 +1112,12 @@ mod tests {
         }
         assert_eq!(fit_result("short".into(), cap), "short");
         assert!(fit_result("x".repeat(100), 300).ends_with(TRUNCATED));
+    }
+
+    #[test]
+    fn the_default_budgets_fit_the_model_turn_start_to_close() {
+        let turn = DEFAULT_MODEL_TIMEOUT + DEFAULT_POLICY_TIMEOUT + 3 * DEFAULT_CACHE_TIMEOUT;
+        assert!(turn < Duration::from_secs(15 * 60), "{turn:?}");
     }
 
     #[test]

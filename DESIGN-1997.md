@@ -124,10 +124,14 @@ register the workflow type passes the check and logs one warning.
 
 ### 1.4 The agent adapter
 
-- `AgentModel` gets two provided methods: `model_id` and `cost_micros`.
+- `AgentModel` gets the provided method `cost_micros`. The ledger reads
+  the model id from `model_id`, which the response cache (#1998) added. A
+  model with no id records `"unknown"`.
 - `agent_model_turn` checks the budget, calls the model, then records the
-  usage with the latency.
-- `AgentTask` gets an optional `tenant`, for `QuotaPolicy::new("tenant")`.
+  usage with the latency. A response cache hit calls no model, so it
+  records nothing.
+- `QuotaPolicy::new("tenant")` reads `AgentTask::tenant`, which the
+  response cache (#1998) added.
 - The loop ends under `AgentStop::BudgetExceeded` when a step is refused.
 
 ---
