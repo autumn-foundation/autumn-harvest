@@ -356,17 +356,18 @@ fn journal_defect(journal: &HostCallJournal) -> Option<String> {
             journal.entries.len()
         ));
     }
-    if journal.byte_size() > MAX_JOURNAL_BYTES {
-        return Some(format!(
-            "the journal holds {} bytes, over the {MAX_JOURNAL_BYTES}-byte budget",
-            journal.byte_size()
-        ));
-    }
-    journal
+    if let Some(defect) = journal
         .entries
         .iter()
         .enumerate()
         .find_map(|(index, entry)| entry_defect(index, entry))
+    {
+        return Some(defect);
+    }
+    let bytes = journal.byte_size();
+    (bytes > MAX_JOURNAL_BYTES).then(|| {
+        format!("the journal holds {bytes} bytes, over the {MAX_JOURNAL_BYTES}-byte budget")
+    })
 }
 
 /// A defect of one recorded entry at `index`, or `None`.
@@ -394,8 +395,19 @@ fn is_json(bytes: &[u8]) -> bool {
 }
 
 /// The length of `text` as a JSON string, quotes and escapes included.
+///
+/// It follows the escapes of `serde_json` and allocates nothing. A recorded
+/// string can be large, and an escaped copy can be six times larger.
 fn escaped_len(text: &str) -> usize {
-    serde_json::to_string(text).map_or(usize::MAX, |json| json.len())
+    let escapes: usize = text
+        .bytes()
+        .map(|byte| match byte {
+            b'"' | b'\\' | b'\x08' | b'\x0c' | b'\n' | b'\r' | b'\t' => 1,
+            0x00..=0x1f => 5,
+            _ => 0,
+        })
+        .sum();
+    text.len() + escapes + 2
 }
 
 /// The journal state of one run.
@@ -1098,6 +1110,43 @@ mod tests {
             entries: (0..=MAX_HOST_CALLS).map(entry).collect(),
         };
         assert!(journal_defect(&over).is_some());
+    }
+
+    /// The bound of each field holds before the journal total is counted.
+    #[test]
+    fn an_oversized_entry_fails_before_the_journal_total() {
+        let journal = HostCallJournal {
+            entries: vec![HostCallEntry {
+                seq: 0,
+                name: "text.upper".into(),
+                request: "{}".into(),
+                outcome: HostCallOutcome::Err {
+                    message: "\u{1}".repeat(MAX_JOURNAL_BYTES),
+                },
+            }],
+        };
+        let defect = journal_defect(&journal).expect("an oversized entry is a defect");
+        assert!(defect.starts_with("journal entry 0"), "{defect}");
+    }
+
+    #[test]
+    fn escaped_len_matches_serde_json() {
+        let mut samples: Vec<String> = (0u8..=0x7f).map(|b| char::from(b).to_string()).collect();
+        samples.extend(
+            [
+                "",
+                "plain",
+                "a\"b\\c",
+                "\u{7f}\u{80}é漢🦀",
+                "\u{0}\u{1f}\n\t\r\u{8}\u{c}",
+            ]
+            .map(String::from),
+        );
+        samples.push(samples.concat());
+        for text in &samples {
+            let expected = serde_json::to_string(text).unwrap().len();
+            assert_eq!(escaped_len(text), expected, "{text:?}");
+        }
     }
 
     #[test]
