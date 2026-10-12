@@ -540,7 +540,10 @@ async fn ui_lists_workflows_and_renders_detail_page() {
     assert!(list_html.contains("name=\"state\""));
     assert!(!list_html.contains("http://"));
     assert!(!list_html.contains("https://"));
-    assert!(!list_html.contains("<script"));
+    // Issue #1982: the list loads one same-origin script for live refresh.
+    // The page holds no inline `<script>` element.
+    assert_eq!(list_html.matches("<script").count(), 1, "{list_html}");
+    assert!(list_html.contains(r#"<script src="assets/live.js" defer></script>"#));
 
     let (status, filtered_html) = fetch_html(&ui_app, "/workflows?state=COMPLETED").await;
     assert_eq!(status, StatusCode::OK);
@@ -567,6 +570,7 @@ async fn ui_lists_workflows_and_renders_detail_page() {
     );
     // Input payload is pretty-printed and HTML-escaped
     assert!(detail_html.contains("&quot;hello&quot;"));
+    // Issue #1982: a run that ended loads no live script.
     assert!(!detail_html.contains("<script"));
 
     let (status, _body) = fetch_html(&ui_app, "/workflows/not-a-uuid").await;
