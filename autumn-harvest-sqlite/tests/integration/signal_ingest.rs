@@ -573,3 +573,52 @@ async fn an_unsupported_seal_records_the_signal_that_replay_saw() {
         "{history:?}"
     );
 }
+
+fn stored_bytes(history: &[WorkflowEvent]) -> u64 {
+    history
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap().len() as u64)
+        .sum()
+}
+
+/// The planned signals count toward the byte cap. A run that reads a large
+/// signal and completes in one decision still fails at the cap.
+#[tokio::test]
+async fn ingested_signal_bytes_count_toward_the_byte_cap() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&try_once_info());
+    let exec = rt.start_workflow("try_once", json!(0)).unwrap();
+    let start = stored_bytes(&rt.load_history(exec).unwrap());
+    rt.set_history_byte_hard_cap(Some(start + 100));
+    rt.send_signal_as_of(exec, "x", json!("y".repeat(500)), t0())
+        .unwrap();
+
+    let state = rt.run_until_blocked_as_of(exec, at(1)).await.unwrap();
+
+    assert!(
+        matches!(state, RunState::Failed(ref m) if m.contains("HistoryBytesCapExceeded")),
+        "{state:?}"
+    );
+}
+
+/// A signal flood stops at the event cap. The plan reads only the signals
+/// that fit, so the sealed history stays at the cap.
+#[tokio::test]
+async fn a_signal_flood_is_planned_only_up_to_the_event_cap() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&drain_loop_info());
+    rt.set_history_event_hard_cap(Some(5));
+    let exec = rt.start_workflow("drain_loop", json!(0)).unwrap();
+    for i in 0..20 {
+        rt.send_signal_as_of(exec, "x", json!(i), t0()).unwrap();
+    }
+
+    let state = rt.run_until_blocked_as_of(exec, at(1)).await.unwrap();
+
+    assert!(
+        matches!(state, RunState::Failed(ref m) if m.contains("HistoryCapExceeded")),
+        "{state:?}"
+    );
+    // The cap, plus the `WorkflowFailed` event.
+    assert_eq!(rt.load_history(exec).unwrap().len(), 6);
+}

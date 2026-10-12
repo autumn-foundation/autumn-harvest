@@ -19,6 +19,10 @@ Postgres task-preparation ingest.
 - Behaviour change: a signal that the workflow never reads now reaches
   history. The strict `WorkflowReplayer` then reports
   `NonDeterminismDetected(EarlyCompletion)`, as for a Postgres history.
+- The #2023 history caps bound the ingest. A plan reads staged signals one
+  at a time and stops once it fills the room that the caps leave. Its events
+  count toward the byte cap, as Postgres counts its ingested signals. A
+  signal flood thus fails the run at the cap and never loads past it.
 - Behaviour change for `continue_as_new` (#2023): the hand-off decision
   replays every staged signal, so each one stays with the old run, read or
   not, as on Postgres. Before, unread staged signals moved to the successor.

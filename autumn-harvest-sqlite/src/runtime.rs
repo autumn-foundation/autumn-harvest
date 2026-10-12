@@ -1332,6 +1332,20 @@ impl SqliteRuntime {
         Ok(RunState::Failed(error))
     }
 
+    /// Plan the staged signals of `exec` within the room the history caps
+    /// leave after `count` events and `bytes` stored bytes (issue #2020).
+    fn plan_ingest(
+        &self,
+        exec: ExecutionId,
+        now: i64,
+        count: usize,
+        bytes: u64,
+    ) -> SqliteResult<worker::SignalIngest> {
+        let count = u64::try_from(count).unwrap_or(u64::MAX);
+        let budget = worker::IngestBudget::remaining(self.history_policy, count, bytes);
+        worker::SignalIngest::plan(&self.conn, exec, now, budget)
+    }
+
     /// Append `event`, set `exec` `FAILED` with `error`, and remove its pending
     /// tasks, unfired timers and staged signals, in one transaction.
     fn seal_failed(
@@ -1345,7 +1359,13 @@ impl SqliteRuntime {
         // The failed cycle replayed the staged signals, and its transaction
         // rolled back. A new plan at the same `now` gives the same events, so
         // the terminal history holds the input that the cycle saw (#2020).
-        worker::SignalIngest::plan(&tx, exec, now)?.apply(&tx, exec)?;
+        let (history, history_bytes) = store::load_history_sized(&tx, exec)?;
+        let budget = worker::IngestBudget::remaining(
+            self.history_policy,
+            u64::try_from(history.len()).unwrap_or(u64::MAX),
+            history_bytes,
+        );
+        worker::SignalIngest::plan(&tx, exec, now, budget)?.apply(&tx, exec)?;
         store::append_event(&tx, exec, event)?;
         store::set_failed(&tx, exec, error)?;
         // The cycle's own cleanup, such as a race's loser cancellation, rolled
@@ -1469,8 +1489,9 @@ impl SqliteRuntime {
         // Plan every staged signal before replay (issue #2020). Replay reads
         // the planned events in memory. Each persisting transaction below
         // applies the plan first, so a discarded cycle consumes no signal.
-        let ingest = worker::SignalIngest::plan(&self.conn, exec, now)?;
+        // The plan stops at the room the history caps leave.
         let (mut history, history_bytes) = store::load_history_sized(&self.conn, exec)?;
+        let ingest = self.plan_ingest(exec, now, history.len(), history_bytes)?;
         history.extend(ingest.events().cloned());
         let input = store::execution_input(&self.conn, exec)?;
         let workflow_name = store::workflow_name_of(&self.conn, exec)?;
@@ -1567,7 +1588,7 @@ impl SqliteRuntime {
         // its transaction, before its terminal event.
         let caps = CapCheck {
             policy: self.history_policy,
-            start_bytes: history_bytes,
+            start_bytes: history_bytes.saturating_add(ingest.bytes()),
             workflow_type: &workflow_name,
         };
 

@@ -380,6 +380,10 @@ before the signal returns `SqliteError::Stuck`. `poll_once` and
 `run_until_idle` report it as a per-execution error and still drive the other
 runs. The run stays `RUNNING`. Drive it again after `send_signal`.
 
+The history caps bound this ingest. A drive reads staged signals only up to
+the room the caps leave. A signal flood thus fails the run at the cap, as on
+Postgres, and never loads past it into memory.
+
 A signal that the workflow never reads also reaches history. The strict core
 `WorkflowReplayer` then reports `NonDeterminismDetected(EarlyCompletion)`, as
 for a Postgres history. A signal that lost a deadline race is exempt. A file

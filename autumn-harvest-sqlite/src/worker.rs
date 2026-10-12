@@ -34,7 +34,9 @@
 use std::collections::HashMap;
 
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
-use autumn_harvest::{ExecutionId, TimeoutType, TimerId, WorkflowCommand, WorkflowEvent};
+use autumn_harvest::{
+    ExecutionId, TimeoutType, TimerId, WorkflowCommand, WorkflowEvent, WorkflowHistoryPolicy,
+};
 use rusqlite::Connection;
 
 use crate::error::SqliteResult;
@@ -591,6 +593,38 @@ enum IngestRow {
 #[must_use]
 pub struct SignalIngest {
     planned: Vec<(WorkflowEvent, IngestRow)>,
+    /// The stored JSON bytes of the planned events.
+    bytes: u64,
+}
+
+/// The room that the history caps leave for one plan (issue #2023).
+///
+/// `None` is unlimited. The plan stops once it fills the room. It then holds
+/// at most one signal past it, which makes the cap check fail the run. So a
+/// signal flood never loads past the caps into memory.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IngestBudget {
+    events: Option<u64>,
+    bytes: Option<u64>,
+}
+
+impl IngestBudget {
+    /// The room left under `policy` by a history of `count` events and
+    /// `bytes` stored bytes.
+    #[must_use]
+    pub fn remaining(policy: WorkflowHistoryPolicy, count: u64, bytes: u64) -> Self {
+        Self {
+            events: policy.event_hard_cap().map(|cap| cap.saturating_sub(count)),
+            bytes: policy.byte_hard_cap().map(|cap| cap.saturating_sub(bytes)),
+        }
+    }
+
+    /// True once `events` planned events and `bytes` planned bytes fill it.
+    fn is_full(self, events: usize, bytes: u64) -> bool {
+        let events = u64::try_from(events).unwrap_or(u64::MAX);
+        self.events.is_some_and(|room| events >= room)
+            || self.bytes.is_some_and(|room| bytes >= room)
+    }
 }
 
 impl SignalIngest {
@@ -603,7 +637,14 @@ impl SignalIngest {
     ///
     /// An unrelated due timer stays for [`drain_ready`]. A `TimerFired` ahead
     /// of a `SignalReceived` that it does not race wedges replay (issue #1071).
-    pub fn plan(conn: &Connection, exec_id: ExecutionId, now: i64) -> SqliteResult<Self> {
+    ///
+    /// The plan stops when it fills `budget`. Later signals stay staged.
+    pub fn plan(
+        conn: &Connection,
+        exec_id: ExecutionId,
+        now: i64,
+        budget: IngestBudget,
+    ) -> SqliteResult<Self> {
         // One read of the due deadlines, grouped by signal name in `fire_at`
         // order. Each name keeps a cursor, so the plan is O(signals + timers).
         let mut deadlines: HashMap<String, std::collections::VecDeque<(String, i64)>> =
@@ -616,8 +657,14 @@ impl SignalIngest {
                     .push_back((timer_id, fire_at));
             }
         }
-        let mut planned = Vec::new();
-        for signal in store::pending_signals(conn, exec_id)? {
+        let mut plan = Self {
+            planned: Vec::new(),
+            bytes: 0,
+        };
+        store::for_each_pending_signal(conn, exec_id, |signal| {
+            if budget.is_full(plan.planned.len(), plan.bytes) {
+                return Ok(false);
+            }
             if let Some(due) = deadlines.get_mut(&signal.name) {
                 while due
                     .front()
@@ -627,7 +674,7 @@ impl SignalIngest {
                         let event = WorkflowEvent::TimerFired {
                             timer_id: TimerId::new(timer_id.clone()),
                         };
-                        planned.push((event, IngestRow::Timer(timer_id)));
+                        plan.push(event, IngestRow::Timer(timer_id))?;
                     }
                 }
             }
@@ -635,9 +682,24 @@ impl SignalIngest {
                 signal_name: signal.name,
                 payload: signal.payload,
             };
-            planned.push((event, IngestRow::Signal(signal.seq)));
-        }
-        Ok(Self { planned })
+            plan.push(event, IngestRow::Signal(signal.seq))?;
+            Ok(true)
+        })?;
+        Ok(plan)
+    }
+
+    /// Add one event and count its stored bytes.
+    fn push(&mut self, event: WorkflowEvent, row: IngestRow) -> SqliteResult<()> {
+        let bytes = serde_json::to_string(&event)?.len() as u64;
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.planned.push((event, row));
+        Ok(())
+    }
+
+    /// The stored JSON bytes of the planned events. The byte cap counts them
+    /// as stored history, as Postgres does after its own ingest.
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
     }
 
     /// The planned events, in history order.
@@ -1040,10 +1102,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        SignalIngest, commands_open_activity_race, drain_ready, finalize_within_tx, fire_timer,
-        fire_timer_within_tx, handler_panic_activity_envelope, history_has_unsettled_activity_race,
-        payload_too_large_activity_envelope, schedule_to_close_exceeded, signal_timeout_name,
-        start_to_close_exceeded,
+        IngestBudget, SignalIngest, commands_open_activity_race, drain_ready, finalize_within_tx,
+        fire_timer, fire_timer_within_tx, handler_panic_activity_envelope,
+        history_has_unsettled_activity_race, payload_too_large_activity_envelope,
+        schedule_to_close_exceeded, signal_timeout_name, start_to_close_exceeded,
     };
     use crate::queue::{self, ClaimedTask};
     use crate::runtime::ActivitySpec;
@@ -1460,7 +1522,7 @@ mod tests {
         // Ingest inside a transaction (the real caller passes a `&tx`); commit so
         // the assertions read the persisted state.
         let tx = conn.unchecked_transaction().unwrap();
-        let produced = SignalIngest::plan(&tx, exec, 200)
+        let produced = SignalIngest::plan(&tx, exec, 200, IngestBudget::default())
             .unwrap()
             .apply(&tx, exec)
             .unwrap();
@@ -1535,7 +1597,7 @@ mod tests {
         store::stage_signal(&conn, exec, "go", &serde_json::json!("later"), 100).unwrap();
         queue::enqueue_timer(&conn, exec, "__signal_timeout:0:go", 60).unwrap();
 
-        let ingest = SignalIngest::plan(&conn, exec, 120).unwrap();
+        let ingest = SignalIngest::plan(&conn, exec, 120, IngestBudget::default()).unwrap();
         let order: Vec<String> = ingest
             .events()
             .map(|e| match e {
@@ -1547,6 +1609,30 @@ mod tests {
             })
             .collect();
         assert_eq!(order, ["on_time", "deadline", "late", "later"]);
+    }
+
+    // Issue #2020: a plan stops when it fills its budget. Later rows stay staged.
+    #[test]
+    fn a_plan_stops_at_its_budget() {
+        let conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
+        for i in 0..5 {
+            store::stage_signal(&conn, exec, "go", &serde_json::json!(i), i).unwrap();
+        }
+        let policy = autumn_harvest::WorkflowHistoryPolicy::default().with_event_hard_cap(3);
+
+        let ingest =
+            SignalIngest::plan(&conn, exec, 10, IngestBudget::remaining(policy, 1, 0)).unwrap();
+        assert_eq!(ingest.events().count(), 2, "the room under the cap");
+        assert!(ingest.bytes() > 0);
     }
 
     // Issue #2020: a plan writes nothing. A discarded cycle leaves every signal
@@ -1566,12 +1652,18 @@ mod tests {
         store::stage_signal(&conn, exec, "go", &serde_json::json!(1), 100).unwrap();
         queue::enqueue_timer(&conn, exec, "__signal_timeout:0:go", 60).unwrap();
 
-        let ingest = SignalIngest::plan(&conn, exec, 200).unwrap();
+        let ingest = SignalIngest::plan(&conn, exec, 200, IngestBudget::default()).unwrap();
         assert_eq!(ingest.events().count(), 2, "a deadline and a signal");
         drop(ingest);
 
         assert!(store::load_history(&conn, exec).unwrap().is_empty());
-        assert_eq!(store::pending_signals(&conn, exec).unwrap().len(), 1);
+        let mut staged = 0;
+        store::for_each_pending_signal(&conn, exec, |_| {
+            staged += 1;
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(staged, 1);
         assert!(queue::has_unfired_timer(&conn, exec).unwrap());
     }
 

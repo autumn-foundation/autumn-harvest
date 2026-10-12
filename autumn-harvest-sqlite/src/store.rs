@@ -487,7 +487,7 @@ pub struct PendingSignal {
     pub payload: Value,
 }
 
-/// Read every undelivered signal of `exec_id`, in arrival order.
+/// Read the undelivered signals of `exec_id` one at a time, in arrival order.
 ///
 /// The order is `received_at`, then `signal_seq` (issue #1069 P2). Insertion
 /// order can differ from arrival order, because `send_signal_as_of` can stage a
@@ -497,10 +497,14 @@ pub struct PendingSignal {
 /// Each payload is deserialized here. A corrupt row is an error before the
 /// caller writes anything, so the row stays staged. The error names the row,
 /// so an operator can find it.
-pub fn pending_signals(
+///
+/// `visit` returns `false` to stop. No row after the stop is read, so a large
+/// backlog is never loaded whole.
+pub fn for_each_pending_signal(
     conn: &Connection,
     exec_id: ExecutionId,
-) -> SqliteResult<Vec<PendingSignal>> {
+    mut visit: impl FnMut(PendingSignal) -> SqliteResult<bool>,
+) -> SqliteResult<()> {
     let mut stmt = conn.prepare_cached(
         "SELECT signal_seq, name, received_at, payload_json FROM harvest_signals \
          WHERE exec_id = ?1 AND delivered = 0 \
@@ -514,7 +518,6 @@ pub fn pending_signals(
             row.get::<_, String>(3)?,
         ))
     })?;
-    let mut out = Vec::new();
     for row in rows {
         let (seq, name, received_at, payload) = row?;
         let payload = serde_json::from_str(&payload).map_err(|e| {
@@ -522,14 +525,17 @@ pub fn pending_signals(
                 "harvest_signals row {seq} ('{name}') of execution {exec_id}: {e}"
             ))
         })?;
-        out.push(PendingSignal {
+        let signal = PendingSignal {
             seq,
             name,
             received_at,
             payload,
-        });
+        };
+        if !visit(signal)? {
+            break;
+        }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Mark a staged signal delivered (consumed). Call only after the matching

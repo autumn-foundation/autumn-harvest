@@ -70,6 +70,8 @@ Red tests in `tests/integration/signal_ingest.rs`, on trunk-dev `7a751d6`:
 | R12 | An unsupported-feature seal drops the signals that its replay saw. Codex found it. | The seal plans again at the same `now` and applies the plan before `WorkflowFailed`. `an_unsupported_seal_records_the_signal_that_replay_saw` pins it. |
 | R13 | The daemon restores a session that a corrupt row of another name blocks. Codex found it. | The restart checks every staged row as the backend reads it. `an_unreadable_staged_row_of_another_name_is_refused` pins it. |
 | R14 | `continue_as_new` (#2023) moves replayed signals to the successor, so a drained signal runs twice. | The hand-off transaction delivers the plan to the old run first, as on Postgres. The user chose this over a move. `a_drained_signal_is_not_delivered_again_after_the_hand_off` pins it. |
+| R15 | Planned signals miss the byte cap, so a run completes over it. Codex found it. | The cap counts the planned bytes as stored history. `ingested_signal_bytes_count_toward_the_byte_cap` pins it. |
+| R16 | A signal flood is read whole into memory before any cap check. Codex found it. | The plan reads rows one at a time and stops at the room the caps leave. `a_signal_flood_is_planned_only_up_to_the_event_cap` and `a_plan_stops_at_its_budget` pin it. |
 
 ### 0.5 Six thinking hats
 
