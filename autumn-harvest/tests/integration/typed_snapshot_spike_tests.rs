@@ -30,6 +30,7 @@ use std::fmt::Write as _;
 
 use autumn_harvest::WorkflowContext;
 use autumn_harvest::context::WorkflowCommand;
+use autumn_harvest::error::TimeoutType;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::executor::{WorkflowOutcome, run_workflow};
 use autumn_harvest::info::WorkflowHandlerFn;
@@ -63,16 +64,21 @@ enum OpenEffect {
 struct EffectLedger {
     /// The ledger schema that wrote this ledger. Schema 1 had no failure
     /// lists and no teardown list. Schemas 1 and 2 listed a cancelled timer
-    /// with the fired ones. An envelope with no schema field is schema 1.
+    /// with the fired ones. Schemas 2 and 3 listed a timed-out activity with
+    /// the failed ones. An envelope with no schema field is schema 1.
     #[serde(default = "schema_1")]
     schema: u32,
     /// Completed activities, by name, in order.
     activities: Vec<String>,
-    /// Activities that failed or timed out, by name, in order. Workflow
+    /// Activities that failed, by name, in order. Workflow
     /// code can catch a failure and change the state, so a cover rule must
     /// see it.
     #[serde(default)]
     failed_activities: Vec<String>,
+    /// Activities that timed out, by name and timeout, in order. Code can
+    /// branch on a timeout against a failure.
+    #[serde(default)]
+    timed_out_activities: Vec<TimedOutActivity>,
     /// Timers that fired, by id.
     timers: Vec<String>,
     /// Timers that workflow code cancelled, by id. Code can branch on fired
@@ -104,8 +110,15 @@ struct EffectLedger {
     torn_down_timers: Vec<String>,
 }
 
+/// An activity that timed out, and which timeout fired.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TimedOutActivity {
+    name: String,
+    timeout_type: TimeoutType,
+}
+
 /// The ledger schema that this code writes.
-const LEDGER_SCHEMA: u32 = 3;
+const LEDGER_SCHEMA: u32 = 4;
 
 /// The schema of an envelope with no schema field.
 const fn schema_1() -> u32 {
@@ -118,12 +131,31 @@ fn close(open: &mut Vec<(String, OpenEffect)>, id: &str) -> Option<OpenEffect> {
     Some(open.remove(at).1)
 }
 
+/// Removes the open activity `id` and returns its name.
+fn close_activity(
+    open: &mut Vec<(String, OpenEffect)>,
+    id: &impl std::fmt::Display,
+) -> Option<String> {
+    match close(open, &id.to_string())? {
+        OpenEffect::Activity(name) => Some(name),
+        _ => None,
+    }
+}
+
 impl EffectLedger {
     /// This ledger as an older `schema` would have written it. Schema 1
     /// tracked no failures and no teardowns.
     fn project(&self, schema: u32) -> Self {
         let mut old = self.clone();
         old.schema = schema;
+        if schema < 4 {
+            // Schemas 2 and 3 listed a timed-out activity with the failed
+            // ones. The order between the two kinds is lost, so compare them
+            // sorted.
+            old.failed_activities
+                .extend(old.timed_out_activities.drain(..).map(|t| t.name));
+            old.failed_activities.sort();
+        }
         if schema < 2 {
             old.failed_activities.clear();
             old.failed_updates.clear();
@@ -172,22 +204,26 @@ impl EffectLedger {
                     activity_id, name, ..
                 } => open.push((activity_id.to_string(), OpenEffect::Activity(name.clone()))),
                 WorkflowEvent::ActivityCompleted { activity_id, .. }
-                | WorkflowEvent::ActivityCompletedExternally { activity_id, .. } => {
-                    if let Some(OpenEffect::Activity(name)) =
-                        close(&mut open, &activity_id.to_string())
-                    {
-                        ledger.activities.push(name);
-                    }
+                | WorkflowEvent::ActivityCompletedExternally { activity_id, .. } => ledger
+                    .activities
+                    .extend(close_activity(&mut open, activity_id)),
+                WorkflowEvent::ActivityTimedOut {
+                    activity_id,
+                    timeout_type,
+                } => {
+                    ledger
+                        .timed_out_activities
+                        .extend(close_activity(&mut open, activity_id).map(|name| {
+                            TimedOutActivity {
+                                name,
+                                timeout_type: timeout_type.clone(),
+                            }
+                        }));
                 }
                 WorkflowEvent::ActivityFailed { activity_id, .. }
-                | WorkflowEvent::ActivityTimedOut { activity_id, .. }
-                | WorkflowEvent::ActivityFailedExternally { activity_id, .. } => {
-                    if let Some(OpenEffect::Activity(name)) =
-                        close(&mut open, &activity_id.to_string())
-                    {
-                        ledger.failed_activities.push(name);
-                    }
-                }
+                | WorkflowEvent::ActivityFailedExternally { activity_id, .. } => ledger
+                    .failed_activities
+                    .extend(close_activity(&mut open, activity_id)),
                 WorkflowEvent::TimerStarted { timer_id, .. } => open.push((
                     format!("timer:{}", timer_id.as_str()),
                     OpenEffect::Timer(timer_id.as_str().to_owned()),
@@ -466,6 +502,9 @@ impl Snapshot {
                 // Check the fields that the stored schema knew, then use
                 // the full ledger that the source gives.
                 let mut stored = snapshot.ledger.clone();
+                if stored.schema < 4 {
+                    stored.failed_activities.sort();
+                }
                 if stored.schema < 3 {
                     stored.timers.sort();
                 }
@@ -1032,6 +1071,72 @@ fn a_cancelled_timer_is_recorded_apart_from_a_fired_one() {
     assert_eq!(ledger.cancelled_timers, ["stopped"]);
 }
 
+/// A history with one activity that failed and one that timed out.
+fn failed_and_timed_out_activities() -> Vec<WorkflowEvent> {
+    let mut history = vec![started(Value::Null)];
+    let mut charge = activity_events("charge", false);
+    let WorkflowEvent::ActivityScheduled { activity_id, .. } = charge[0].clone() else {
+        unreachable!("activity_events starts with a schedule");
+    };
+    charge.push(WorkflowEvent::ActivityFailed {
+        activity_id,
+        error: "card declined".into(),
+        attempt: 1,
+        error_type: "Declined".into(),
+        non_retryable: true,
+        details: None,
+    });
+    history.extend(charge);
+    let mut ship = activity_events("ship", false);
+    let WorkflowEvent::ActivityScheduled { activity_id, .. } = ship[0].clone() else {
+        unreachable!("activity_events starts with a schedule");
+    };
+    ship.push(WorkflowEvent::ActivityTimedOut {
+        activity_id,
+        timeout_type: TimeoutType::StartToClose,
+    });
+    history.extend(ship);
+    history
+}
+
+#[test]
+fn an_activity_timeout_is_recorded_apart_from_a_failure() {
+    // Workflow code can branch on a timeout against a failure, so a cover
+    // rule must tell the two apart.
+    let ledger = EffectLedger::from_history(&failed_and_timed_out_activities(), &[])
+        .expect("no effect is open");
+    assert_eq!(ledger.failed_activities, ["charge"]);
+    assert_eq!(
+        ledger.timed_out_activities,
+        [TimedOutActivity {
+            name: "ship".into(),
+            timeout_type: TimeoutType::StartToClose,
+        }]
+    );
+}
+
+#[test]
+fn a_schema_3_ledger_does_not_read_a_timeout_as_a_failure() {
+    // Schema 3 listed a timed-out activity with the failed ones. With no
+    // source, nothing can split them, so the loader refuses.
+    let history = failed_and_timed_out_activities();
+    let mut raw = Snapshot::save(&Tally { bumps: 0 }, &history).expect("quiescent");
+    let ledger = raw["ledger"].as_object_mut().expect("a ledger object");
+    ledger.insert("schema".into(), Value::from(3));
+    ledger.remove("timed_out_activities");
+    ledger.insert("failed_activities".into(), json!(["charge", "ship"]));
+    let old_ledger = raw["ledger"].clone();
+    raw["mac"] = Value::String(sign(&raw["version"], &raw["state"], &old_ledger));
+    assert_eq!(
+        Snapshot::load::<Tally>(&raw, None),
+        Err(SnapshotError::LedgerTooOld(3))
+    );
+    // With the source, the loader matches the merged list and splits it.
+    let (_, ledger) = Snapshot::load::<Tally>(&raw, Some(&history)).expect("the source splits it");
+    assert_eq!(ledger.failed_activities, ["charge"]);
+    assert_eq!(ledger.timed_out_activities.len(), 1);
+}
+
 #[test]
 fn a_failed_update_is_recorded_in_the_ledger() {
     // A handler can change the state and then fail, so a cover rule must
@@ -1192,6 +1297,7 @@ fn schema_1_envelope(history: &[WorkflowEvent]) -> Value {
     for newer in [
         "schema",
         "failed_activities",
+        "timed_out_activities",
         "failed_updates",
         "failed_children",
         "torn_down_timers",

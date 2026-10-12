@@ -200,12 +200,14 @@ Each claim names its test in `typed_snapshot_spike_tests.rs`.
 | A wait won by its signal can checkpoint. The context view closes the torn-down timer. | `a_wait_won_by_its_signal_can_checkpoint` |
 | Only the signed teardown list closes an open timer. A timer that fired in another history does not. | `a_fired_timer_is_not_teardown_evidence_for_another_history` |
 | The ledger records a failed activity, so a cover rule can check a caught failure. | `a_failed_activity_is_recorded_in_the_ledger` |
+| The ledger records a timed-out activity and its timeout apart from a failed one. | `an_activity_timeout_is_recorded_apart_from_a_failure` |
 | The ledger records a failed update, so a cover rule can check its change. | `a_failed_update_is_recorded_in_the_ledger` |
 | The ledger records a failed child apart from a completed one. | `a_failed_child_is_recorded_apart_from_a_completed_one` |
 | The ledger records a cancelled timer apart from a fired one. | `a_cancelled_timer_is_recorded_apart_from_a_fired_one` |
 | A snapshot from an older ledger schema still verifies. The loader checks the envelope as written. | `a_snapshot_from_an_older_ledger_schema_still_verifies` |
 | An older ledger schema needs its source history. With the source, the loader rebuilds the ledger under the current schema. | `an_older_ledger_needs_its_source_history` |
 | An older ledger that lists a cancelled timer as fired needs its source history. The source splits the two kinds. | `a_schema_2_ledger_does_not_read_a_cancelled_timer_as_fired` |
+| An older ledger that lists a timed-out activity as failed needs its source history. The source splits the two kinds. | `a_schema_3_ledger_does_not_read_a_timeout_as_a_failure` |
 | The loader refuses a snapshot with a wrong engine signature. | `a_forged_snapshot_is_refused` |
 | A forged start input cannot skip the charges. | `a_forged_start_input_cannot_skip_the_charges` |
 | A v1 snapshot loads under v2 code through its upgrade step. | `a_v1_snapshot_loads_under_v2_code` |
