@@ -26,8 +26,7 @@ The report also finds a gap: continue-as-new carries the assigned build, so
 a pinned run needs a build re-resolve at the checkpoint.
 `tests/integration/typed_snapshot_docs.rs` guards the report.
 
-**Other.** The core crate takes `autumn-harvest-agent` as a path-only
-dev-dependency for the agent-loop measurement. `deny.toml` allows a
-path-only dependency, so `cargo deny` accepts it.
+**Other.** The core crate takes `autumn-harvest-agent` as a dev-dependency
+for the agent-loop measurement.
 
 No engine code. No migration. No new `WorkflowEvent` variant.
