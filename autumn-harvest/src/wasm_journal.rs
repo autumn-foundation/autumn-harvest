@@ -381,7 +381,11 @@ fn entry_defect(index: usize, entry: &HostCallEntry) -> Option<String> {
         HostCallOutcome::Ok { response } => {
             response.len() <= MAX_HOST_CALL_BYTES && is_json(response.as_bytes())
         }
-        HostCallOutcome::Err { message } => escaped_len(message) <= MAX_HOST_CALL_BYTES,
+        // Escapes only add bytes, so the raw length rejects a long message
+        // before any scan.
+        HostCallOutcome::Err { message } => {
+            message.len() <= MAX_HOST_CALL_BYTES && escaped_len(message) <= MAX_HOST_CALL_BYTES
+        }
         HostCallOutcome::Denied => true,
     };
     let fits = entry.name.len() <= MAX_HOST_CALL_NAME_BYTES
