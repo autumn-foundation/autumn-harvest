@@ -813,6 +813,18 @@ impl SqliteRuntime {
         // state read and the stage cannot race a concurrent transition: no other
         // writer exists to seal the execution between the check and the insert.
         let state = store::execution_state(&self.conn, exec)?;
+        // Issue #1985: a promise signal must carry a settlement, and a promise
+        // settles once. The Postgres path drops a second settlement through its
+        // idempotency key. This backend has no key, so it skips the stage. The
+        // check runs before the terminal check, so a retry after the run ends
+        // is a no-op here too, as on Postgres.
+        if name.starts_with(autumn_harvest::durable_promise::PROMISE_SIGNAL_PREFIX) {
+            autumn_harvest::durable_promise::settlement_idempotency_key(name, &payload, None)
+                .map_err(|e| SqliteError::InvalidSignal(e.to_string()))?;
+            if store::has_signal(&self.conn, exec, name)? {
+                return Ok(());
+            }
+        }
         if autumn_harvest::erase::is_terminal_state(&state) {
             return Err(SqliteError::WorkflowNotRunning {
                 execution_id: exec,
@@ -840,16 +852,6 @@ impl SqliteRuntime {
                     observed_bytes: observed,
                     cap_bytes: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
                 });
-            }
-        }
-        // Issue #1985: a promise signal must carry a settlement, and a promise
-        // settles once. The Postgres path drops a second settlement through its
-        // idempotency key. This backend has no key, so it skips the stage.
-        if name.starts_with(autumn_harvest::durable_promise::PROMISE_SIGNAL_PREFIX) {
-            autumn_harvest::durable_promise::settlement_idempotency_key(name, &payload, None)
-                .map_err(|e| SqliteError::InvalidSignal(e.to_string()))?;
-            if store::has_signal(&self.conn, exec, name)? {
-                return Ok(());
             }
         }
         // Millisecond precision (issue #1069 P2): `received_at` is compared against
@@ -3213,5 +3215,50 @@ mod feature_gate_tests {
         rt.send_signal(exec, "go", serde_json::json!(1)).unwrap();
         rt.send_signal(exec, "go", serde_json::json!(2)).unwrap();
         assert_eq!(staged(&rt, "go"), 2, "other signals stage every send");
+    }
+
+    // Issue #1985: a retried settlement after the run ends is a no-op, as on
+    // Postgres. A settlement the run never had still fails on a terminal run.
+    #[test]
+    fn a_retried_settlement_after_the_run_ends_is_a_no_op() {
+        let mut rt = super::SqliteRuntime::open_in_memory().unwrap();
+        rt.register_workflow(&base_wf_info());
+        let exec = rt.start_workflow("base_wf", serde_json::json!(0)).unwrap();
+
+        let name = "harvest.promise:approval";
+        let settlement =
+            autumn_harvest::durable_promise::PromiseSettlement::resolved(serde_json::json!(1))
+                .to_value();
+        rt.send_signal(exec, name, settlement.clone()).unwrap();
+        rt.conn
+            .execute(
+                "UPDATE harvest_signals SET delivered = 1 WHERE name = ?1",
+                [name],
+            )
+            .unwrap();
+        rt.conn
+            .execute(
+                "UPDATE harvest_executions SET state = 'COMPLETED' WHERE exec_id = ?1",
+                [exec.to_string()],
+            )
+            .unwrap();
+
+        rt.send_signal(exec, name, settlement.clone()).unwrap();
+        assert_eq!(staged(&rt, name), 1, "the retry stages no row");
+
+        let err = rt
+            .send_signal(exec, "harvest.promise:other", settlement)
+            .unwrap_err();
+        assert!(
+            matches!(err, super::SqliteError::WorkflowNotRunning { .. }),
+            "got {err:?}"
+        );
+        let err = rt
+            .send_signal(exec, "go", serde_json::json!(1))
+            .unwrap_err();
+        assert!(
+            matches!(err, super::SqliteError::WorkflowNotRunning { .. }),
+            "got {err:?}"
+        );
     }
 }
