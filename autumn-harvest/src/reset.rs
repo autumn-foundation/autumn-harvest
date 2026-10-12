@@ -1678,12 +1678,45 @@ async fn share_carried_refs(
         .clone()
         .map(|row| row.event_data.clone())
         .collect::<Vec<_>>();
-    // A row that this registry cannot decode still names its envelopes.
-    let decoded = carried
-        .filter_map(|row| codecs.decode_event(row.event_data.clone()).ok())
-        .collect::<Vec<_>>();
+    let decoded = decode_carried_checked(carried, codecs)?;
     crate::fork::share_payload_refs(conn, ids, &copied, Some(&source.input), &decoded, &[]).await?;
     Ok(())
+}
+
+/// Decode the carried rows for their stored-result keys.
+///
+/// Only an activity result can hold a fan-out stored result. Its key sits
+/// in a payload field, so a codec can hide it. A reset that cannot decode
+/// such a row would take no reference to the blob, and retention of the
+/// sealed source could collect it. So that row fails the reset. A codec
+/// that the node does not hold either fails the decode or leaves the
+/// envelope in place, so both fail it. The API passes no registry before
+/// start-up ends, so a retry after start-up succeeds. Any other row that
+/// cannot be decoded still names its envelopes, so it is skipped.
+fn decode_carried_checked<'a>(
+    rows: impl Iterator<Item = &'a HarvestEvent>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> Result<Vec<WorkflowEvent>, HarvestError> {
+    let mut decoded = Vec::new();
+    for row in rows {
+        let event = match codecs.decode_event(row.event_data.clone()) {
+            Ok(event) => event,
+            Err(error) if row.event_type == "ActivityCompleted" => return Err(error),
+            Err(_) => continue,
+        };
+        // A codec that this node does not hold leaves the envelope in place.
+        if let WorkflowEvent::ActivityCompleted { output, .. } = &event
+            && crate::payload_codec::is_codec_envelope(output)
+        {
+            return Err(HarvestError::Config(format!(
+                "event {} holds an activity result that this node cannot decode; \
+                 retry the reset on a node with the payload codecs",
+                row.event_id
+            )));
+        }
+        decoded.push(event);
+    }
+    Ok(decoded)
 }
 
 async fn copy_carried_events(
@@ -1944,6 +1977,41 @@ pub(crate) mod tests {
         ResetSignalReapplyPolicy, WorkflowResetError, validate_reset_point,
         validate_source_execution,
     };
+
+    /// A carried row with a keyed codec envelope that the codecs cannot open.
+    fn encoded_row(event_type: &str, field: &str) -> crate::models::HarvestEvent {
+        let envelope = serde_json::json!({
+            crate::payload_codec::CODEC_ENVELOPE_KEY: {
+                "codec_id": "aes",
+                "data": "AAAA",
+                crate::payload_codec::CODEC_ENVELOPE_KID_KEY: "k1",
+            },
+        });
+        assert!(crate::payload_codec::is_codec_envelope(&envelope));
+        crate::models::HarvestEvent {
+            id: 1,
+            workflow_exec_id: uuid::Uuid::new_v4(),
+            event_id: 1,
+            event_type: event_type.to_string(),
+            event_data: serde_json::json!({
+                "type": event_type,
+                "data": { "activity_id": uuid::Uuid::new_v4(), "signal_name": "go", field: envelope },
+            }),
+            timestamp: Utc::now(),
+        }
+    }
+
+    /// A stored result can hide in an encoded activity output. A reset that
+    /// cannot decode one would take no reference to its blob, so it fails.
+    /// Another row that this node cannot decode does not refuse the reset.
+    #[test]
+    fn a_reset_refuses_an_activity_result_it_cannot_decode() {
+        let codecs = &*crate::store::DEFAULT_PAYLOAD_CODECS;
+        let result = encoded_row("ActivityCompleted", "output");
+        assert!(super::decode_carried_checked([&result].into_iter(), codecs).is_err());
+        let signal = encoded_row("SignalReceived", "payload");
+        assert!(super::decode_carried_checked([&signal].into_iter(), codecs).is_ok());
+    }
 
     pub fn execution_in_state(state: &str) -> crate::models::WorkflowExecution {
         crate::models::WorkflowExecution {
