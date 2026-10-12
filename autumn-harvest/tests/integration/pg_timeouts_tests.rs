@@ -3082,3 +3082,79 @@ async fn task_state(conn: &mut AsyncPgConnection, task_id: Uuid) -> String {
         .expect("read state")
         .state
 }
+
+/// The backend pid of `conn`.
+async fn backend_pid(conn: &mut AsyncPgConnection) -> i32 {
+    #[derive(diesel::QueryableByName)]
+    struct Pid {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        pid: i32,
+    }
+    diesel::sql_query("SELECT pg_backend_pid() AS pid")
+        .get_result::<Pid>(conn)
+        .await
+        .expect("read pid")
+        .pid
+}
+
+#[tokio::test]
+async fn an_idle_connection_that_the_server_killed_is_replaced_at_checkout() {
+    let (url, _container) = setup_db().await;
+    let pool = engine_pool(
+        url.clone(),
+        1,
+        DbRole::Hot,
+        &timeouts(5_000, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("engine pool builds");
+    let old_pid = {
+        let mut conn = pool.get().await.expect("first connection");
+        backend_pid(&mut conn).await
+    };
+    let mut admin = connect(&url).await;
+    diesel::sql_query(format!("SELECT pg_terminate_backend({old_pid})"))
+        .execute(&mut admin)
+        .await
+        .expect("terminate the pooled backend");
+    tokio::time::sleep(autumn_harvest::pool::VERIFY_IDLE_AFTER + Duration::from_millis(200)).await;
+
+    let mut conn = pool.get().await.expect("replacement connection");
+    let new_pid = backend_pid(&mut conn).await;
+    assert_ne!(
+        new_pid, old_pid,
+        "the idle ping must drop the dead connection"
+    );
+}
+
+#[tokio::test]
+async fn a_recently_used_connection_is_handed_out_without_a_ping() {
+    let (url, _container) = setup_db().await;
+    let pool = engine_pool(
+        url.clone(),
+        1,
+        DbRole::Hot,
+        &timeouts(5_000, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("engine pool builds");
+    let old_pid = {
+        let mut conn = pool.get().await.expect("first connection");
+        backend_pid(&mut conn).await
+    };
+    let mut admin = connect(&url).await;
+    diesel::sql_query(format!("SELECT pg_terminate_backend({old_pid})"))
+        .execute(&mut admin)
+        .await
+        .expect("terminate the pooled backend");
+    // The checkout follows within the idle bound, so the pool sends no ping.
+    // The dead connection comes back, and its first statement fails. This is
+    // the cost of skipping the ping, and the engine retries such a failure.
+    let mut conn = pool
+        .get()
+        .await
+        .expect("the pool does not ping a hot connection");
+    let outcome = diesel::sql_query("SELECT 1").execute(&mut conn).await;
+    assert!(
+        outcome.is_err(),
+        "a hot checkout must hand out the connection without a ping"
+    );
+}
