@@ -305,6 +305,8 @@ pub fn activities() -> Vec<ActivityInfo> {
         max_result_bytes: None,
         requires: None,
         handler: start_handler,
+        input_schema: None,
+        output_schema: None,
     }]
 }
 
