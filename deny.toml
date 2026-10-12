@@ -140,6 +140,21 @@ ignore = [
     # proc-macro-error2 gains a maintained release.
     { id = "RUSTSEC-2026-0173", reason = "unmaintained, no safe upgrade exists; entirely inside autumn-web's `validator` dependency, not used directly here. Revisit: autumn-web drops/replaces validator, or proc-macro-error2 is revived." },
 
+    # RUSTSEC-2024-0449 — unsafe-libyaml 0.2.11 is unmaintained (no
+    # vulnerability). Its repository is archived, and the advisory says "no
+    # safe upgrade is available". It reaches the graph only through
+    # serde_yaml 0.9, from two users:
+    # - autumn-web 0.8.0, behind its `openapi` feature. Its one call is
+    #   `serde_yaml::to_string` in src/openapi.rs, which emits the spec that
+    #   autumn-web builds itself. It never parses YAML.
+    # - autumn-harvest's dev-dependency. Integration tests parse this
+    #   repository's own `.github` workflow files with it. It never ships.
+    # Replacing our dev-dependency alone would not clear the finding,
+    # because autumn-web keeps serde_yaml.
+    # Revisit: autumn-web drops serde_yaml, or a test parses YAML from
+    # outside this repository.
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained, no safe upgrade exists; reached via serde_yaml from autumn-web's openapi emitter (serialize only, its own spec) and autumn-harvest's dev-only tests that parse this repo's own CI YAML. Revisit: autumn-web drops serde_yaml, or a test parses YAML from outside this repo." },
+
     # RUSTSEC-2023-0071 — rsa 0.9.10 Marvin Attack (timing side-channel on
     # private-key ops). Pulled by jsonwebtoken -> autumn-web; whether this is
     # reachable depends on whether autumn-web ever performs RSA *signing*
