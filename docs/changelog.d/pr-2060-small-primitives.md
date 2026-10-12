@@ -37,6 +37,9 @@ once with `durable_promise::resolve` / `reject`, `ctx.resolve_promise` /
   `harvest.promise:` signal gets its name as its idempotency key, and a
   payload that is not a settlement is refused. No other signal can use a
   `harvest.promise:` key.
+- The `SQLite` backend applies the same payload rule in `send_signal`. A bad
+  payload returns the new `SqliteError::InvalidSignal`. A second settlement
+  for a run stages no row.
 - `harvest-verify` classifies the six new `WorkflowContext` methods.
 
 **`AllowAll` overlap.** `OverlapPolicy::AllowAll` (`allow_all`) starts a new

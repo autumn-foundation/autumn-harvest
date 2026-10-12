@@ -91,6 +91,9 @@ A rejection body is `{"outcome":"rejected","error":"budget exceeded"}`.
   the name and refuses a payload that is not a settlement. It also refuses a
   `harvest.promise:` key on any other signal. The database drops a second
   settlement.
+  The `SQLite` backend has no idempotency key. Its `send_signal` refuses a
+  payload that is not a settlement with `SqliteError::InvalidSignal`, and
+  stages no second settlement for a run.
 - **Settle early.** A settlement that arrives before the wait stays buffered.
 - **Replay.** The token is recorded in a `SideEffectRecorded` event, and the
   settlement in a `SignalReceived` event. Replay under a new execution id

@@ -842,6 +842,16 @@ impl SqliteRuntime {
                 });
             }
         }
+        // Issue #1985: a promise signal must carry a settlement, and a promise
+        // settles once. The Postgres path drops a second settlement through its
+        // idempotency key. This backend has no key, so it skips the stage.
+        if name.starts_with(autumn_harvest::durable_promise::PROMISE_SIGNAL_PREFIX) {
+            autumn_harvest::durable_promise::settlement_idempotency_key(name, &payload, None)
+                .map_err(|e| SqliteError::InvalidSignal(e.to_string()))?;
+            if store::has_signal(&self.conn, exec, name)? {
+                return Ok(());
+            }
+        }
         // Millisecond precision (issue #1069 P2): `received_at` is compared against
         // a deadline timer's `fire_at` (both epoch-MILLISECOND) by the wake-event
         // ingest, so a whole-second floor could flip an on-time signal past its
@@ -3150,5 +3160,58 @@ mod feature_gate_tests {
             .query_row("SELECT COUNT(*) FROM harvest_signals", [], |r| r.get(0))
             .unwrap();
         assert_eq!(signals, 0, "no signal row staged");
+    }
+
+    /// Counts the staged rows of signal `name`.
+    fn staged(rt: &super::SqliteRuntime, name: &str) -> i64 {
+        rt.conn
+            .query_row(
+                "SELECT COUNT(*) FROM harvest_signals WHERE name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    // Issue #1985: a promise signal must carry a settlement, as on Postgres.
+    #[test]
+    fn a_promise_signal_without_a_settlement_stages_no_row() {
+        let mut rt = super::SqliteRuntime::open_in_memory().unwrap();
+        rt.register_workflow(&base_wf_info());
+        let exec = rt.start_workflow("base_wf", serde_json::json!(0)).unwrap();
+
+        let name = "harvest.promise:approval";
+        let err = rt
+            .send_signal(exec, name, serde_json::json!("not a settlement"))
+            .unwrap_err();
+        assert!(
+            matches!(err, super::SqliteError::InvalidSignal(_)),
+            "got {err:?}"
+        );
+        assert_eq!(staged(&rt, name), 0, "no signal row staged");
+    }
+
+    // Issue #1985: a promise settles once. A second settlement stages no row,
+    // as the Postgres idempotency key drops it. Other signals still stage
+    // every send.
+    #[test]
+    fn a_second_promise_settlement_stages_no_row() {
+        let mut rt = super::SqliteRuntime::open_in_memory().unwrap();
+        rt.register_workflow(&base_wf_info());
+        let exec = rt.start_workflow("base_wf", serde_json::json!(0)).unwrap();
+
+        let name = "harvest.promise:approval";
+        let first =
+            autumn_harvest::durable_promise::PromiseSettlement::resolved(serde_json::json!(1))
+                .to_value();
+        let second =
+            autumn_harvest::durable_promise::PromiseSettlement::rejected("late").to_value();
+        rt.send_signal(exec, name, first).unwrap();
+        rt.send_signal(exec, name, second).unwrap();
+        assert_eq!(staged(&rt, name), 1, "only the first settlement stages");
+
+        rt.send_signal(exec, "go", serde_json::json!(1)).unwrap();
+        rt.send_signal(exec, "go", serde_json::json!(2)).unwrap();
+        assert_eq!(staged(&rt, "go"), 2, "other signals stage every send");
     }
 }

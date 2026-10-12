@@ -443,6 +443,19 @@ pub fn stage_signal(
     Ok(())
 }
 
+/// Whether `exec_id` has a staged signal named `name`, delivered or not.
+///
+/// # Errors
+///
+/// Returns a persistence error if the query fails.
+pub fn has_signal(conn: &Connection, exec_id: ExecutionId, name: &str) -> SqliteResult<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM harvest_signals WHERE exec_id = ?1 AND name = ?2)",
+        params![exec_id.to_string(), name],
+        |r| r.get(0),
+    )?)
+}
+
 /// A staged signal awaiting delivery: its row id, arrival time, and payload.
 pub struct PendingSignal {
     /// `harvest_signals.signal_seq` — pass to [`mark_signal_delivered`].
