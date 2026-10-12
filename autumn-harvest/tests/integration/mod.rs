@@ -388,6 +388,7 @@ mod upgrade_check_db_tests;
 #[cfg(feature = "testing")]
 mod upgrade_check_tests;
 mod usage_report_activity_lookback_tests;
+mod verus_proofs_coverage;
 #[cfg(feature = "wasm-activities")]
 mod wasm_activities_tests;
 mod webhook_trigger_tests;
