@@ -12,8 +12,9 @@ use autumn_harvest::payload_store::PayloadStore;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest_agent::workflow::agent_loop_info;
 use autumn_harvest_agent::{
-    AgentHarness, AgentStop, AgentTask, CacheIndex, CacheScope, InMemoryCacheIndex, ModelTurn,
-    ResponseCache, StopReason, TokenUsage, ToolDecision, ToolEffect, sqlite,
+    AgentHarness, AgentStop, AgentTask, BoxFuture, CacheIndex, CacheScope, InMemoryCacheIndex,
+    ModelTurn, ResponseCache, RunInfo, StopReason, TokenUsage, Tool, ToolCall, ToolDecision,
+    ToolEffect, ToolPolicy, sqlite,
 };
 use autumn_harvest_sqlite::{ExecutionId, SqliteRuntime};
 use common::{
@@ -236,6 +237,81 @@ async fn a_hit_over_a_lowered_cap_asks_the_model() {
     assert_eq!(text, "short");
     assert_eq!(model.calls(), 2, "the over-cap hit must ask the model");
     assert!(!turns(&narrow, exec)[0].cache_hit);
+}
+
+/// A policy that allows each call after `delay`.
+#[derive(Debug)]
+struct SlowPolicy {
+    delay: std::time::Duration,
+}
+
+impl ToolPolicy for SlowPolicy {
+    fn decide<'a>(
+        &'a self,
+        _call: &'a ToolCall,
+        _tool: Option<&'a dyn Tool>,
+        _info: &'a RunInfo,
+    ) -> BoxFuture<'a, ToolDecision> {
+        let delay = self.delay;
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            ToolDecision::Allow
+        })
+    }
+}
+
+/// Both passes of an over-cap hit share one policy budget. The hit pass
+/// spends most of it, so the fresh pass runs out and denies.
+#[tokio::test(flavor = "multi_thread")]
+async fn both_passes_share_one_policy_budget() {
+    let store = Arc::new(MemStore::default());
+    let index: Arc<dyn CacheIndex> = Arc::new(InMemoryCacheIndex::default());
+    let cache = || {
+        ResponseCache::new(
+            Arc::clone(&store) as Arc<dyn PayloadStore>,
+            Arc::clone(&index),
+            PayloadCodecs::default(),
+        )
+    };
+    let big = json!({"pad": "x".repeat(900)});
+    let model = ScriptedModel::named(
+        "m-1",
+        vec![
+            calls(&[("c1", "lookup", big)], 1),
+            answer("done", 1),
+            calls(&[("c1", "lookup", json!({}))], 1),
+            answer("done", 1),
+        ],
+    );
+    let harness = |cap| {
+        let harness = AgentHarness::new(model.clone())
+            .policy(Arc::new(SlowPolicy {
+                delay: std::time::Duration::from_millis(300),
+            }))
+            .policy_timeout(std::time::Duration::from_millis(400))
+            .response_cache(cache());
+        match cap {
+            Some(cap) => harness.max_result_bytes(cap),
+            None => harness,
+        }
+    };
+    let task = AgentTask::new("look it up");
+
+    let (_wide_dir, wide_db) = fresh_db();
+    let mut wide = runtime(&wide_db, harness(None));
+    run(&mut wide, &task).await;
+
+    let (_narrow_dir, narrow_db) = fresh_db();
+    let mut narrow = runtime(&narrow_db, harness(Some(512)));
+    let (exec, _) = run(&mut narrow, &task).await;
+    let first = &turns(&narrow, exec)[0];
+    assert!(!first.cache_hit, "the over-cap hit is a miss");
+    match &first.decisions[..] {
+        [ToolDecision::Deny { reason }] => {
+            assert!(reason.contains("did not decide"), "{reason}");
+        }
+        other => panic!("the fresh pass must run out of budget: {other:?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

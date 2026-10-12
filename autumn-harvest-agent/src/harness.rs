@@ -311,7 +311,9 @@ impl AgentHarness {
             None => None,
         };
         // At most two passes. A hit whose turn is over the result cap is a
-        // miss, so the second pass asks the model.
+        // miss, so the second pass asks the model. Both passes share one
+        // policy budget, so the turn stays inside `start_to_close`.
+        let mut policy_budget = self.policy_timeout;
         loop {
             let cache_hit = cached.is_some();
             // A fresh answer waits for its decisions before it reaches the cache.
@@ -343,8 +345,13 @@ impl AgentHarness {
                 max_steps: request.max_steps,
                 usage: request.usage.saturating_add(response.usage),
             };
-            self.decide_calls(&mut turn, &info, request.read_only, &builtins)
-                .await;
+            self.decide_calls(
+                &mut turn,
+                &info,
+                (request.read_only, &builtins),
+                &mut policy_budget,
+            )
+            .await;
             // A turn over the result cap fails. The cache serves and keeps
             // only a turn that fits, so no identical request fails from it.
             let fits = self.fits_result_cap(&turn);
@@ -364,16 +371,18 @@ impl AgentHarness {
     /// Ask the policy about each tool call of `turn`, in order.
     ///
     /// One deadline bounds the whole decision phase. A per-call budget would
-    /// let many stalled calls add up past `start_to_close`. A stalled policy
-    /// denies the call. That fails closed, and the model reads why.
+    /// let many stalled calls add up past `start_to_close`. The phase spends
+    /// from `budget` and leaves the rest in it for a second pass. A stalled
+    /// policy denies the call. That fails closed, and the model reads why.
     async fn decide_calls(
         &self,
         turn: &mut ModelTurn,
         info: &RunInfo,
-        read_only: bool,
-        builtins: &[Arc<dyn Tool>],
+        (read_only, builtins): (bool, &[Arc<dyn Tool>]),
+        budget: &mut Duration,
     ) {
-        let deadline = tokio::time::Instant::now() + self.policy_timeout;
+        let started = tokio::time::Instant::now();
+        let deadline = started + *budget;
         let read_only_policy: Arc<dyn ToolPolicy>;
         let policy: &dyn ToolPolicy = if read_only {
             // The read-only rules go first. Their deny ends the decision, so
@@ -396,6 +405,7 @@ impl AgentHarness {
                 });
             turn.decisions.push(decision);
         }
+        *budget = budget.saturating_sub(started.elapsed());
     }
 
     /// Send `chat` to the model within the model time budget.
