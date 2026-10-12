@@ -535,6 +535,44 @@ async fn a_panic_seal_records_the_signal_that_replay_saw() {
     );
 }
 
+/// The cap room holds only a prefix of the backlog. The panic seal writes that
+/// prefix and removes the rest, as every other terminal seal does.
+#[tokio::test]
+async fn a_panic_seal_past_the_cap_leaves_no_staged_signal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("harvest.sqlite3");
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&boom_on_signal_info());
+    rt.set_history_event_hard_cap(Some(3));
+    let exec = rt.start_workflow("boom_on_signal", json!(0)).unwrap();
+    for n in 0..5 {
+        rt.send_signal_as_of(exec, "boom", json!(n), t0()).unwrap();
+    }
+
+    let mut state = None;
+    for secs in 1..10 {
+        match rt.run_until_blocked_as_of(exec, at(secs)).await {
+            Err(SqliteError::WorkflowPanicked { .. }) => {}
+            other => {
+                state = Some(other.unwrap());
+                break;
+            }
+        }
+    }
+    assert!(matches!(state, Some(RunState::Failed(_))), "{state:?}");
+
+    let history = rt.load_history(exec).unwrap();
+    let received = history
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::SignalReceived { .. }))
+        .count();
+    assert!(
+        received < 5,
+        "the cap room holds only a prefix: {history:?}"
+    );
+    assert_eq!(undelivered(&path, exec), 0, "no row stays on a sealed run");
+}
+
 /// Spawns a child, which this backend does not support, when it reads `spawn`.
 #[workflow]
 async fn spawn_on_signal(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {

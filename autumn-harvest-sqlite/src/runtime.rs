@@ -2017,6 +2017,9 @@ impl SqliteRuntime {
             ingest.apply(&tx, exec)?;
             store::append_event(&tx, exec, &WorkflowEvent::workflow_failed_typed(&decoded))?;
             store::set_failed(&tx, exec, &decoded.message)?;
+            // The plan can stop at the cap room. No drive reads the rest, so
+            // remove it, as `seal_failed` does.
+            queue::delete_undelivered_signals_for_execution(&tx, exec)?;
             tx.commit()?;
             Ok(RunState::Failed(decoded.message))
         } else {
