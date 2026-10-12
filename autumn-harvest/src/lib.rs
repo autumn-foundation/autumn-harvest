@@ -211,6 +211,13 @@ pub mod analyzer;
 pub mod api_token;
 /// The database guard on append-only `harvest_events` (issue #1817).
 pub mod append_only;
+/// R&D spike: physical backout, saga or a hybrid per workflow (issue #2012).
+///
+/// The `atomicity-spike` feature turns it on. The module has no stability
+/// guarantee. See `docs/rnd/contention-adaptive-atomicity.md`.
+#[cfg(feature = "atomicity-spike")]
+#[doc(hidden)]
+pub mod atomicity;
 /// Audit trail for management API mutations (issue #158).
 #[cfg(feature = "db")]
 pub mod audit;
