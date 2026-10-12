@@ -284,6 +284,7 @@ fn build_worker_with(
                 notification_database_url: None,
                 max_concurrent_workflows: 2,
                 max_concurrent_activities: 2,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(50),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -471,6 +472,8 @@ async fn a_rate_limit_bucket_registers_after_a_startup_timeout() {
         circuit_breaker: None,
         requires: None,
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        input_schema: None,
+        output_schema: None,
     };
     let worker_id = format!("pg-timeouts-{}", Uuid::new_v4());
     let worker = build_worker_with(

@@ -849,6 +849,7 @@ The loop reports as scanner `rebalance_resume` in `scanner_liveness` and in
 | The parked workflow task row | ✅ | none |
 | Terminal task rows (activity history) | ❌ stays on the sealed source | none — the durable record is in `harvest_events` |
 | Workflow logs | ✅ | none — copied for a privacy reason as much as an operational one: they are free text, so a PII sink, and `erase.rs` scrubs them via the execution's own shard. Logs left behind would be out of reach of an erasure issued against the run. |
+| Durable stream chunks (`harvest_stream_chunks`, #1974) | ✅ in pages of 1,000 rows, and again at activation, so a chunk stored after verification is not lost | none — copied for the same reason as the logs: they are author output, and erasure must reach them |
 | Start idempotency keys | ❌ | none for an existing run: a keyed start still hashes to the same shard |
 | Debounce rows | ❌ | at most one extra debounced start per key immediately after the move |
 | Start-throttle tokens, rate-limit buckets | ❌ | already per-shard; unaffected for an existing run |
@@ -1235,6 +1236,17 @@ predicate text, so every shard derives the identical typed comparison and the
 merged result is deterministic. Numeric comparison matches only number-typed
 stored values; a value stored as a string on one shard is excluded uniformly on
 all shards, never a partial false match.
+
+### Filter expressions (`filter`, issue #1982)
+
+A `filter` expression compiles to one parenthesized fragment in the same
+per-shard `WHERE` clause. Its attribute leaves use the SQL in the table above.
+Every key and value is a bound parameter. The merge, the cursor and the
+partial-availability rules do not change.
+
+A filter with `OR` must find each row through an attribute predicate or
+`workflow_name` with `=` or `IN`. So each shard can use its indexes, for
+example with `BitmapOr`, and an `OR` never forces a full scan of a shard.
 
 ---
 

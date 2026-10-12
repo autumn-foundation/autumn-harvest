@@ -5745,6 +5745,18 @@ pub async fn annotate_workflow_execution(
                     .await
                     .map_err(database_error)?;
             }
+            // A triage update appends no event, but `owner` and `severity`
+            // are list filters (issue #1982). A zero-count wake on the
+            // events channel tells live list views to fetch again.
+            if !changed_fields.is_empty() {
+                crate::notify::notify_workflow_events_appended(
+                    conn,
+                    exec_id.as_uuid(),
+                    0,
+                    "WorkflowTriaged",
+                )
+                .await?;
+            }
 
             Ok(TriageOutcome {
                 execution_id: exec_id.to_string(),
@@ -8459,7 +8471,13 @@ pub async fn lookup_idempotent_signal_dedupe(
         .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
         .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
         .filter(harvest_signals::idempotency_key.eq(idempotency_key))
-        .order_by(harvest_signals::received_at.desc())
+        // A reset with the `Buffer` policy copies a keyed row onto the fork
+        // with the source `received_at` (issue #2004). The source row stays.
+        // On a tie, the newer execution is the live run.
+        .order_by((
+            harvest_signals::received_at.desc(),
+            harvest_workflow_executions::created_at.desc(),
+        ))
         .select(WorkflowExecution::as_select())
         .first(conn)
         .await

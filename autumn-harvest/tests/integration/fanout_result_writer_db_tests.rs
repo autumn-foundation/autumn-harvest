@@ -256,6 +256,8 @@ fn registry(store: Arc<MemStore>, threshold: u64) -> Arc<HandlerRegistry> {
         is_local: false,
         max_input_bytes: None,
         max_result_bytes: None,
+        input_schema: None,
+        output_schema: None,
         requires: None,
         handler,
     };

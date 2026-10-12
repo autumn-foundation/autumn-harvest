@@ -52,7 +52,8 @@ use crate::signal;
 use crate::store;
 use crate::telemetry::{
     ATTR_ACTIVITY_NAME, ATTR_ATTEMPT, ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID,
-    ATTR_WORKFLOW_ID, ActivityStatus, DbOp, SlotType, TraceContextCarrier, WorkflowStatus,
+    ATTR_WORKFLOW_ID, ActivityStatus, DbOp, ResidentOutcome, SlotType, TraceContextCarrier,
+    WorkflowStatus,
 };
 use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, IdempotencyKey, ParentClosePolicy, ShardId,
@@ -81,6 +82,8 @@ pub type DbPool = deadpool::managed::Pool<
 /// [`WorkerRuntimeConfig`] — whose conversion writes the write-once
 /// `GLOBAL_DEFAULT_WORKFLOW_QUEUE` and so must not run on a read-only path.
 pub const DEFAULT_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+pub use crate::builder::DEFAULT_MAX_CONCURRENT_CLAIMS;
 
 /// Ceiling for the overdue-schedule gauge's adaptive sampling interval (issue
 /// #696).
@@ -179,6 +182,10 @@ pub struct WorkerRuntimeConfig {
     pub max_concurrent_workflows: usize,
     /// Maximum concurrent activity task executions.
     pub max_concurrent_activities: usize,
+    /// The most claims this worker runs at once. `1` is one serial claim
+    /// loop. Must be at least 1. See
+    /// [`crate::builder::WorkerConfig::max_concurrent_claims`].
+    pub max_concurrent_claims: usize,
     /// Interval between queue poll attempts when idle.
     pub poll_interval: Duration,
     /// Maximum time to wait for in-flight tasks during shutdown.
@@ -333,14 +340,19 @@ impl WorkerRuntimeConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`HarvestError::Config`] if `queues` is empty, or if
-    /// `cancellation_grace_period` exceeds [`MAX_CANCELLATION_GRACE_PERIOD`].
-    /// With `fairness_keys` on, it also rejects a queue name that the weight
-    /// API does not accept.
+    /// Returns [`HarvestError::Config`] if `queues` is empty, if
+    /// `max_concurrent_claims` is 0, or if `cancellation_grace_period`
+    /// exceeds [`MAX_CANCELLATION_GRACE_PERIOD`]. With `fairness_keys` on, it
+    /// also rejects a queue name that the weight API does not accept.
     pub fn validate(&self) -> HarvestResult<()> {
         if self.queues.is_empty() {
             return Err(HarvestError::Config(
                 "worker must poll at least one queue".into(),
+            ));
+        }
+        if self.max_concurrent_claims == 0 {
+            return Err(HarvestError::Config(
+                "max_concurrent_claims is 0; a worker needs at least one claim loop".into(),
             ));
         }
         if self.cancellation_grace_period > MAX_CANCELLATION_GRACE_PERIOD {
@@ -481,6 +493,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             shard_notification_database_urls: cfg.shard_notification_database_urls,
             max_concurrent_workflows: cfg.max_concurrent_workflows,
             max_concurrent_activities: cfg.max_concurrent_activities,
+            max_concurrent_claims: cfg.max_concurrent_claims,
             poll_interval: DEFAULT_WORKER_POLL_INTERVAL,
             shutdown_timeout: cfg.shutdown_timeout,
             cancellation_grace_period: cfg.cancellation_grace_period,
@@ -577,6 +590,8 @@ fn session_internal_activity_info(name: &'static str) -> ActivityInfo {
         circuit_breaker: None,
         requires: None,
         handler: session_internal_stub_handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -1862,6 +1877,7 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::UpsertSearchAttributes { .. } => "UpsertSearchAttributes",
         WorkflowCommand::SetCurrentDetails { .. } => "SetCurrentDetails",
         WorkflowCommand::PublishProgress { .. } => "PublishProgress",
+        WorkflowCommand::PublishDurableProgress { .. } => "PublishDurableProgress",
         WorkflowCommand::RecordLog { .. } => "RecordLog",
         WorkflowCommand::SignalExternalWorkflow { .. } => "SignalExternalWorkflow",
         WorkflowCommand::RequestCancelExternalWorkflow { .. } => "RequestCancelExternalWorkflow",
@@ -1930,6 +1946,7 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::PublishProgress { .. }
+                | WorkflowCommand::PublishDurableProgress { .. }
                 | WorkflowCommand::RecordLog { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
@@ -1953,6 +1970,7 @@ fn only_bookkeeping_commands(commands: &[WorkflowCommand]) -> bool {
                     | WorkflowCommand::UpsertSearchAttributes { .. }
                     | WorkflowCommand::SetCurrentDetails { .. }
                     | WorkflowCommand::PublishProgress { .. }
+                    | WorkflowCommand::PublishDurableProgress { .. }
                     | WorkflowCommand::RecordLog { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                     | WorkflowCommand::CancelRaceLosers { .. }
@@ -1985,6 +2003,7 @@ fn should_handle_mutex_acquire(commands: &[WorkflowCommand]) -> bool {
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
@@ -2065,8 +2084,8 @@ struct PreparedWorkflowTask {
     cold_history_bytes: Option<u64>,
     /// The byte mark taken with a warm cache entry (issue #1804).
     cached_history_bytes: Option<crate::cache::HistoryBytesMark>,
-    /// The resident workflow of a warm hit, if any (issue #1798).
-    resident: Option<crate::resident::ResidentWorkflow>,
+    /// The resident state of a warm hit (issue #1798, issue #2007).
+    resident: crate::resident::Residency,
     /// Index in `history_events` of the first event after the cached
     /// snapshot. The resident workflow resumes with the events from here.
     delta_start: usize,
@@ -2366,13 +2385,14 @@ const fn workflow_command_variant_index(cmd: &WorkflowCommand) -> usize {
         WorkflowCommand::CancelTimer { .. } => 23,
         WorkflowCommand::AcquireMutex { .. } => 24,
         WorkflowCommand::ReleaseMutex { .. } => 25,
+        WorkflowCommand::PublishDurableProgress { .. } => 26,
     }
 }
 
 /// Number of `WorkflowCommand` variants, as indexed by
 /// [`workflow_command_variant_index`].
 #[cfg(test)]
-const WORKFLOW_COMMAND_VARIANTS: usize = 26;
+const WORKFLOW_COMMAND_VARIANTS: usize = 27;
 
 impl TerminalCommandPolicy {
     /// Discriminant label, so the AC4 audit table can state each variant's
@@ -2428,6 +2448,9 @@ pub(crate) const fn terminal_command_policy(cmd: &WorkflowCommand) -> TerminalCo
         }
         WorkflowCommand::PublishProgress { .. } => {
             TerminalCommandPolicy::SidePath("notify_progress_from_commands")
+        }
+        WorkflowCommand::PublishDurableProgress { .. } => {
+            TerminalCommandPolicy::SidePath("persist_durable_stream_from_commands")
         }
         WorkflowCommand::CancelRaceLosers { .. } => {
             TerminalCommandPolicy::SidePath("apply_race_loser_cancellations")
@@ -2866,6 +2889,7 @@ fn extract_single_command<T>(
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::PublishProgress { .. }
+                | WorkflowCommand::PublishDurableProgress { .. }
                 | WorkflowCommand::RecordLog { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
@@ -2899,6 +2923,7 @@ fn extract_all_scheduled_activities(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
@@ -2953,6 +2978,7 @@ fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<Activi
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
@@ -3013,6 +3039,7 @@ fn extract_started_timer_for_suspension(
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::PublishProgress { .. }
+                | WorkflowCommand::PublishDurableProgress { .. }
                 | WorkflowCommand::RecordLog { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
@@ -3043,6 +3070,7 @@ fn extract_all_started_child_workflows(
                     | WorkflowCommand::UpsertSearchAttributes { .. }
                     | WorkflowCommand::SetCurrentDetails { .. }
                     | WorkflowCommand::PublishProgress { .. }
+                    | WorkflowCommand::PublishDurableProgress { .. }
                     | WorkflowCommand::RecordLog { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                     | WorkflowCommand::CancelRaceLosers { .. }
@@ -3168,6 +3196,7 @@ fn extract_child_timeout_race(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
             | WorkflowCommand::ReleaseMutex { .. } => {}
@@ -3325,6 +3354,7 @@ fn extract_mixed_suspension_batch(commands: &[WorkflowCommand]) -> Option<MixedS
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
@@ -3718,6 +3748,7 @@ fn extract_run_local_activity(commands: Vec<WorkflowCommand>) -> LocalActivityCo
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::ReleaseMutex { .. } => {}
             // A resolved ctx.race() CAN co-batch CancelRaceLosers with a local
             // activity. The loser branches started on an earlier cycle, so no
@@ -4047,6 +4078,7 @@ fn split_mixed_signal_batch(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. } => {}
             other => remaining.push(other),
         }
@@ -8260,6 +8292,7 @@ fn first_persist_capability_miss(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SignalExternalWorkflow { .. }
             | WorkflowCommand::RequestCancelExternalWorkflow { .. }
@@ -10544,6 +10577,64 @@ async fn notify_progress_from_commands(
             "progress chunks exceeded per-cycle ceiling; excess dropped (best-effort)"
         );
     }
+}
+
+/// Collect this cycle's durable stream chunks, in emission order (issue #1974).
+///
+/// Pure. The offset is a `u64` call ordinal and the column is an `i64`. The
+/// cast clamps below [`store::DURABLE_STREAM_TRUNCATION_OFFSET`], so a real
+/// chunk can never take the marker slot.
+fn collect_durable_stream_chunks(commands: &[WorkflowCommand]) -> Vec<store::DurableStreamChunk> {
+    commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            WorkflowCommand::PublishDurableProgress { offset, chunk } => {
+                Some(store::DurableStreamChunk {
+                    offset: i64::try_from(*offset)
+                        .unwrap_or(i64::MAX)
+                        .min(store::DURABLE_STREAM_TRUNCATION_OFFSET - 1),
+                    chunk: chunk.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Store this cycle's durable stream chunks and wake their readers
+/// (issue #1974).
+///
+/// **Not best-effort.** The rows go into the persist transaction, and an
+/// error fails the cycle the same way as `persist_current_details_from_commands`.
+/// A committed cycle therefore holds all of its chunks, so a reader sees no
+/// gap. A cycle with no durable chunk runs no statement.
+///
+/// The wake is one note per cycle. The post-commit sender sends it after the
+/// write commits, so a full `NOTIFY` queue cannot fail the write (issue
+/// #1796). A reader treats the wake as a hint and reads the table.
+async fn persist_durable_stream_from_commands(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    commands: &[WorkflowCommand],
+) -> HarvestResult<()> {
+    let chunks = collect_durable_stream_chunks(commands);
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    // One transaction for the rows and the wake. The inline paths call this
+    // on a bare connection, and inside a persist transaction it is a
+    // savepoint.
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |c| {
+        store::append_stream_chunks(
+            c,
+            exec_id,
+            &chunks,
+            crate::context::DURABLE_STREAM_MAX_CHUNKS,
+        )
+        .await?;
+        crate::notify::notify_durable_stream(c, exec_id.as_uuid()).await
+    }))
+    .await
 }
 
 /// Per-decision-cycle ceiling on the number of `ctx.publish_progress` chunks the
@@ -16638,6 +16729,7 @@ fn is_worker_local_failure(error_type: &str) -> bool {
         crate::failure::ERROR_TYPE_WASM_TRAP,
         crate::failure::ERROR_TYPE_SANDBOX_DENIED,
         crate::failure::ERROR_TYPE_WASM_OUTPUT_TOO_LARGE,
+        crate::failure::ERROR_TYPE_WASM_JOURNAL_DIVERGENCE,
     ]
     .contains(&error_type)
     {
@@ -17003,6 +17095,7 @@ mod adaptive_limit_gate_tests {
             crate::failure::ERROR_TYPE_WASM_TRAP,
             crate::failure::ERROR_TYPE_SANDBOX_DENIED,
             crate::failure::ERROR_TYPE_WASM_OUTPUT_TOO_LARGE,
+            crate::failure::ERROR_TYPE_WASM_JOURNAL_DIVERGENCE,
         ] {
             assert_eq!(
                 limit_sample_outcome(
@@ -18629,6 +18722,10 @@ async fn process_activity_task(
                         .telemetry()
                         .metrics
                         .record_activity_concurrency_deferred(activity_name);
+                    // Wake an idle poll loop when the row is due again.
+                    registry
+                        .adaptive_limits()
+                        .wake_when_deferral_due(retry_after);
                 }
                 return Ok(());
             }
@@ -21094,6 +21191,19 @@ async fn handle_suspended_workflow(
         )
         .await;
     }
+    // Store durable stream chunks (issue #1974). An error fails the cycle.
+    if let Err(e) =
+        persist_durable_stream_from_commands(conn, context.persistence.exec_id, commands).await
+    {
+        return fail_execution_on_error(
+            conn,
+            context.persistence.task,
+            context.persistence.worker_id,
+            Err(e),
+            registry.payload_codecs(),
+        )
+        .await;
+    }
     // Persist durable workflow logs (issue #790) — best-effort, never fails
     // the cycle. No-op when the sink is disabled (the default).
     if let Some(policy) = registry.workflow_log_policy {
@@ -21811,13 +21921,36 @@ fn delta_is_contiguous(from_event_id: i32, delta: &store::EventHistory) -> bool 
         .is_ok_and(|span| span == delta.events.len())
 }
 
+/// The resident outcome of a warm hit before its first drive (issue #2007).
+///
+/// A parked workflow counts as a hit. A decline of its resume changes the
+/// outcome to [`ResidentOutcome::Declined`].
+const fn resident_outcome_before_drive(residency: &crate::resident::Residency) -> ResidentOutcome {
+    match residency {
+        crate::resident::Residency::Parked(_) => ResidentOutcome::Hit,
+        crate::resident::Residency::Missed(reason) => *reason,
+        crate::resident::Residency::Unknown => ResidentOutcome::Cold,
+    }
+}
+
+/// The resident state of a suspension that cannot stay resident (issue
+/// #2007). A hot-swap module wins over `reason`, because it binds around
+/// every drive.
+const fn final_miss(hot_swapped: bool, reason: ResidentOutcome) -> crate::resident::Residency {
+    crate::resident::Residency::Missed(if hot_swapped {
+        ResidentOutcome::HotSwap
+    } else {
+        reason
+    })
+}
+
 /// Puts a taken cache entry back, and drops any displaced entry outside the
 /// lock (issue #1798).
 async fn put_back_cache_entry(
     workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
     exec_uuid: uuid::Uuid,
     state: crate::cache::CachedWorkflowState,
-    resident: Option<crate::resident::ResidentWorkflow>,
+    resident: crate::resident::Residency,
     history_bytes: Option<crate::cache::HistoryBytesMark>,
 ) {
     let displaced = workflow_cache
@@ -21942,7 +22075,9 @@ async fn prepare_workflow_task_with_cache(
         // delta is not the plain run of events the snapshot expects.
         let contiguous = delta_is_contiguous(cached_state.next_event_id, &existing_delta)
             && delta_is_contiguous(existing_delta.next_event_id, &after_ingest);
-        resident = resident.filter(|_| contiguous);
+        if !contiguous && resident.is_parked() {
+            resident = crate::resident::Residency::Missed(ResidentOutcome::Declined);
+        }
 
         // Reconstruct full history: cached snapshot + any pre-existing delta +
         // ingested timer/signal events.
@@ -21995,7 +22130,7 @@ async fn prepare_workflow_task_with_cache(
             was_cache_hit: false,
             cold_history_bytes: Some(history_bytes),
             cached_history_bytes: None,
-            resident: None,
+            resident: crate::resident::Residency::Unknown,
             delta_start,
             resident_enabled,
         }))
@@ -24109,6 +24244,7 @@ async fn persist_terminal_outcome_commands(
     .await?;
     persist_search_attrs_from_commands(conn, persistence.exec_id, pending_cmds).await?;
     persist_current_details_from_commands(conn, persistence.exec_id, pending_cmds).await?;
+    persist_durable_stream_from_commands(conn, persistence.exec_id, pending_cmds).await?;
     // Persist durable workflow logs (issue #790) — best-effort, never fails the cycle.
     if let Some(policy) = registry.workflow_log_policy {
         persist_workflow_logs_from_commands(
@@ -25481,16 +25617,26 @@ async fn process_workflow_task(
     let decision_start_event_id = prepared.next_event_id;
     // Issue #1798: the resident workflow of a warm hit. The first iteration
     // tries to resume it. A decline replays cold, as on a miss.
-    let mut warm_resident = prepared.resident.take();
-    // The resident workflow of the final cycle, kept for the next decision.
-    let mut final_resident: Option<crate::resident::ResidentWorkflow> = None;
+    let warm_residency = std::mem::take(&mut prepared.resident);
+    // Issue #2007: the resident outcome of this decision. The worker
+    // records it once, after the first drive.
+    let mut resident_outcome = prepared.resident_enabled.then(|| {
+        if prepared.was_cache_hit {
+            resident_outcome_before_drive(&warm_residency)
+        } else {
+            ResidentOutcome::Cold
+        }
+    });
+    let mut warm_resident = warm_residency.into_workflow();
+    // The resident state of the final cycle, kept for the next decision.
+    let mut final_resident: crate::resident::Residency;
     // A module-hosted workflow binds its module around one drive only, so
     // it cannot stay resident.
     #[cfg(feature = "hot-code-swap")]
-    let can_stay_resident =
-        prepared.resident_enabled && !crate::hot_swap::is_module_hosted(workflow.handler);
+    let hot_swapped = crate::hot_swap::is_module_hosted(workflow.handler);
     #[cfg(not(feature = "hot-code-swap"))]
-    let can_stay_resident = prepared.resident_enabled;
+    let hot_swapped = false;
+    let can_stay_resident = prepared.resident_enabled && !hot_swapped;
 
     // Issue #678/#1034: external-op ids resolved INLINE during this decision
     // cycle. Set by the mixed-signal arm below (any suspension whose command
@@ -25626,11 +25772,14 @@ async fn process_workflow_task(
                     .await
                 {
                     Ok(drive) => return drive,
-                    Err(reason) => tracing::debug!(
-                        exec_id = %prepared.exec_id,
-                        ?reason,
-                        "resident workflow declined; replaying cold (issue #1798)"
-                    ),
+                    Err(reason) => {
+                        resident_outcome = Some(ResidentOutcome::Declined);
+                        tracing::debug!(
+                            exec_id = %prepared.exec_id,
+                            ?reason,
+                            "resident workflow declined; replaying cold (issue #1798)"
+                        );
+                    }
                 }
             }
             let ctx = crate::executor::build_task_context(
@@ -25698,6 +25847,14 @@ async fn process_workflow_task(
             router: resolved_router,
             resident: iter_resident,
         } = drive;
+        // Issue #2007: one sample per decision, after its first drive.
+        if let Some(outcome) = resident_outcome.take() {
+            telemetry.metrics.record_workflow_resident(
+                &prepared.execution.workflow_name,
+                &task.queue_name,
+                outcome,
+            );
+        }
 
         match run_outcome {
             WorkflowOutcome::Suspended { commands }
@@ -25756,6 +25913,8 @@ async fn process_workflow_task(
                 persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await?;
                 // Persist the current_details breadcrumb before inline execution (issue #473).
                 persist_current_details_from_commands(conn, prepared.exec_id, &commands).await?;
+                // Store durable stream chunks before inline execution (issue #1974).
+                persist_durable_stream_from_commands(conn, prepared.exec_id, &commands).await?;
                 // Persist durable workflow logs (issue #790) — best-effort, before inline run.
                 if let Some(policy) = registry.workflow_log_policy {
                     persist_workflow_logs_from_commands(
@@ -26109,6 +26268,7 @@ async fn process_workflow_task(
                             | WorkflowCommand::UpsertSearchAttributes { .. }
                             | WorkflowCommand::SetCurrentDetails { .. }
                             | WorkflowCommand::PublishProgress { .. }
+                            | WorkflowCommand::PublishDurableProgress { .. }
                             | WorkflowCommand::RecordLog { .. }
                             | WorkflowCommand::ReleaseMutex { .. }
                     )
@@ -26173,6 +26333,21 @@ async fn process_workflow_task(
                 }
                 if let Err(e) =
                     persist_current_details_from_commands(conn, prepared.exec_id, &commands).await
+                {
+                    return fail_workflow_execution_clearing_strikes(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(e),
+                        workflow_panic_strikes,
+                        prepared.exec_id.as_uuid(),
+                        registry.payload_codecs(),
+                    )
+                    .await;
+                }
+                // Store durable stream chunks (issue #1974). An error fails the cycle.
+                if let Err(e) =
+                    persist_durable_stream_from_commands(conn, prepared.exec_id, &commands).await
                 {
                     return fail_workflow_execution_clearing_strikes(
                         conn,
@@ -26356,6 +26531,8 @@ async fn process_workflow_task(
                     // Re-acquire a fresh execute_span so persist_workflow_outcome
                     // (via handle_suspended_workflow) gets a valid span reference.
                     let execute_span = tracing::Span::none();
+                    // Issue #2007: an external-op batch cannot stay resident.
+                    final_resident = final_miss(hot_swapped, ResidentOutcome::Unsupported);
                     break (
                         WorkflowOutcome::Suspended {
                             commands: reconstructed_commands,
@@ -26436,6 +26613,21 @@ async fn process_workflow_task(
                 }
                 if let Err(e) =
                     persist_current_details_from_commands(conn, prepared.exec_id, &commands).await
+                {
+                    return fail_workflow_execution_clearing_strikes(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(e),
+                        workflow_panic_strikes,
+                        prepared.exec_id.as_uuid(),
+                        registry.payload_codecs(),
+                    )
+                    .await;
+                }
+                // Store durable stream chunks (issue #1974). An error fails the cycle.
+                if let Err(e) =
+                    persist_durable_stream_from_commands(conn, prepared.exec_id, &commands).await
                 {
                     return fail_workflow_execution_clearing_strikes(
                         conn,
@@ -26548,6 +26740,8 @@ async fn process_workflow_task(
                 // (via handle_suspended_workflow) gets a valid span reference.
                 // The original span was dropped above.
                 let execute_span = tracing::Span::none();
+                // Issue #2007: an external-op batch cannot stay resident.
+                final_resident = final_miss(hot_swapped, ResidentOutcome::Unsupported);
                 break (
                     WorkflowOutcome::Suspended {
                         commands: remaining_commands_with_unresolved,
@@ -26558,7 +26752,11 @@ async fn process_workflow_task(
                 );
             }
             other => {
-                final_resident = iter_resident;
+                final_resident = if hot_swapped {
+                    final_miss(hot_swapped, ResidentOutcome::HotSwap)
+                } else {
+                    iter_resident
+                };
                 break (other, pending_cmds, execute_span, resolved_router);
             }
         }
@@ -27551,7 +27749,7 @@ async fn process_workflow_task(
                     events: std::mem::take(&mut history_events),
                     next_event_id,
                 },
-                final_resident.take(),
+                std::mem::take(&mut final_resident),
                 history_bytes,
             )
             .await;
@@ -27781,7 +27979,7 @@ async fn store_cache_entry(
     exec_uuid: uuid::Uuid,
     suspended: Option<bool>,
     state: crate::cache::CachedWorkflowState,
-    resident: Option<crate::resident::ResidentWorkflow>,
+    resident: crate::resident::Residency,
     // Issue #1804: the byte mark measured at the start of this decision.
     history_bytes: Option<crate::cache::HistoryBytesMark>,
 ) {
@@ -30446,7 +30644,7 @@ static POLLERS_BY_RECORDER: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<usize, RecorderPollers>>,
 > = std::sync::LazyLock::new(std::sync::Mutex::default);
 
-/// Counts one running poll loop and keeps `harvest.worker.pollers` current
+/// Counts one running claim loop and keeps `harvest.worker.pollers` current
 /// (issue #1815).
 ///
 /// The guard sets the gauge when its loop starts and again when the loop
@@ -31246,6 +31444,9 @@ pub struct Worker {
     /// Wakes a saturated poll loop when a task releases its permit (issue
     /// #1787). See [`CapacityPermit`].
     capacity_freed: Arc<tokio::sync::Notify>,
+    /// Wakes every idle wait when a task deferred at its adaptive limit is
+    /// due (issue #1836). Unlike `capacity_freed`, no gate holds it back.
+    deferral_due: Arc<tokio::sync::Notify>,
     /// Kinds the poll gate refused since the last claim of that kind (issue
     /// #1787). The slot tuner counts a claimed task's queue wait only when
     /// the gate held its kind back. Otherwise a NOTIFY delay reads as a
@@ -32757,6 +32958,55 @@ const fn dispatch_kind_admitted(
     }
 }
 
+/// Which claim loop runs a Postgres poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollRole {
+    /// The poll loop. It owns the listener, the timer and the capacity wake.
+    Leader,
+    /// A follower claim loop. See [`Worker::run_claim_followers`].
+    Follower,
+}
+
+/// Whether a follower claims on one target through Postgres.
+///
+/// The follower claims only where the leader polls Postgres. An unverified
+/// registration claims nothing (see [`may_claim_tasks`]). A per-shard
+/// channel, or a global channel the loop may use, takes the claims. This
+/// mirrors `run_poll_loop` and `run_poll_loop_multi`. A leader in degraded
+/// dispatch mode drains Postgres alone.
+const fn follower_polls_postgres(
+    registration_pending: bool,
+    per_shard_channel: bool,
+    usable_global_channel: bool,
+) -> bool {
+    may_claim_tasks(registration_pending) && !per_shard_channel && !usable_global_channel
+}
+
+/// Whether `claim_loops` in-flight claims can hold every connection of a
+/// pool of `max_size`.
+///
+/// A task, a heartbeat and a persist then wait behind the claims.
+const fn claim_loops_fill_pool(claim_loops: usize, max_size: usize) -> bool {
+    claim_loops >= max_size
+}
+
+/// One Postgres claim target of a follower claim loop.
+///
+/// See [`Worker::run_claim_followers`].
+struct ClaimTarget<'a> {
+    /// The shard that `pool` serves. `None` on a legacy single pool.
+    shard: Option<crate::types::ShardId>,
+    /// The pool the claim runs on.
+    pool: &'a DbPool,
+    /// Set while this shard's registration is not verified.
+    registration_pending: &'a AtomicBool,
+    /// The pool acquisition bound. See [`shard_acquire_bound`].
+    acquire_bound: Option<Duration>,
+    /// Whether the global dispatch channel may serve this target. Only the
+    /// single-pool loop allows it.
+    global_dispatch: bool,
+}
+
 /// What one Postgres poll may claim (issue #1787).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PollAdmission {
@@ -33198,6 +33448,7 @@ impl Worker {
         // The limit registry fires this wake when a limit slot frees (issue
         // #1836). That happens before the attempt writes its result.
         let capacity_freed = registry.adaptive_limits.slot_freed_notify();
+        let deferral_due = registry.adaptive_limits.deferral_due_notify();
 
         let workflow_parts =
             build_dispatch_semaphore(config.max_concurrent_workflows, config.slot_tuner.as_ref());
@@ -33224,6 +33475,7 @@ impl Worker {
             dispatch_reserved_workflow: Arc::new(AtomicUsize::new(0)),
             dispatch_reserved_activity: Arc::new(AtomicUsize::new(0)),
             capacity_freed,
+            deferral_due,
             gate_refused: Arc::new(GateRefused::default()),
             limit_refused: AtomicBool::new(false),
             monitoring_started: std::sync::atomic::AtomicBool::new(false),
@@ -33901,13 +34153,32 @@ impl Worker {
             .map(|(shard, _)| self.shard_dispatch.get(shard).cloned())
             .collect();
 
-        self.run_poll_loop_multi(
-            shard_targets.clone(),
-            shard_listeners,
-            &registration_pending_per_shard,
-            &shard_dispatch,
-        )
-        .await;
+        // The followers poll Postgres where the leader would (no global
+        // channel on this path).
+        let more_work = tokio::sync::Notify::new();
+        let acquire_bound = shard_acquire_bound(true, self.config.poll_interval);
+        let claim_targets: Vec<ClaimTarget<'_>> = shard_targets
+            .iter()
+            .zip(&registration_pending_per_shard)
+            .map(|((shard, shard_pool), pending)| ClaimTarget {
+                shard: Some(*shard),
+                pool: shard_pool,
+                registration_pending: pending,
+                acquire_bound,
+                global_dispatch: false,
+            })
+            .collect();
+        self.warn_if_claim_loops_fill_pools(&claim_targets);
+        tokio::join!(
+            self.run_poll_loop_multi(
+                shard_targets.clone(),
+                shard_listeners,
+                &registration_pending_per_shard,
+                &shard_dispatch,
+                &more_work,
+            ),
+            self.run_claim_followers(&claim_targets, &more_work),
+        );
 
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received (multi-shard)");
 
@@ -33951,12 +34222,16 @@ impl Worker {
     /// anywhere. When all shards are idle we `tokio::select!` across all
     /// per-shard listeners (falling back to a `poll_interval` sleep for shards
     /// without a listener) before the next full scan.
+    ///
+    /// A successful Postgres claim wakes one follower through `more_work`.
+    /// See [`Self::run_claim_followers`].
     async fn run_poll_loop_multi(
         &self,
         shard_targets: Vec<(crate::types::ShardId, DbPool)>,
         mut shard_listeners: Vec<Option<crate::notify::QueueListener>>,
         registration_pending_per_shard: &[Arc<AtomicBool>],
         shard_dispatch: &[Option<crate::dispatch::InstalledDispatch>],
+        more_work: &tokio::sync::Notify,
     ) {
         let _poller = self.poller_guard();
         let n = shard_targets.len();
@@ -34003,14 +34278,17 @@ impl Worker {
                     )
                     .await
                 } else {
-                    u32::from(
-                        self.poll_once(
+                    let claimed = self
+                        .poll_once(
                             &shard_targets[idx].1,
                             shard_acquire_bound(true, self.config.poll_interval),
                             Some(shard_targets[idx].0),
                         )
-                        .await,
-                    )
+                        .await;
+                    if claimed {
+                        more_work.notify_one();
+                    }
+                    u32::from(claimed)
                 };
                 if dispatched > 0 {
                     any_claimed = true;
@@ -34048,6 +34326,7 @@ impl Worker {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     () = self.capacity_freed.notified(), if capacity_bound => {}
+                    () = self.deferral_due.notified() => {}
                     () = tokio::time::sleep(poll_interval) => {}
                 }
             } else {
@@ -34080,6 +34359,9 @@ impl Worker {
             if capacity_bound
                 && futures::FutureExt::now_or_never(self.capacity_freed.notified()).is_some()
             {
+                break 'notify_wait;
+            }
+            if futures::FutureExt::now_or_never(self.deferral_due.notified()).is_some() {
                 break 'notify_wait;
             }
             let mut broken_idx: Option<usize> = None;
@@ -34390,7 +34672,7 @@ impl Worker {
         // coverage.
         let dispatch_allowed = self.dispatch_span_allowed();
 
-        self.run_poll_loop(
+        self.run_single_pool_claim_loops(
             pool,
             poll_shard,
             listener,
@@ -35380,6 +35662,7 @@ impl Worker {
                         // only a database with a DR marker (issue #1823).
                         // The fence is pinned before the heartbeat starts.
                         dr_fencing: crate::replication::FenceRegistry::is_enabled(),
+                        claim_loops: self.config.max_concurrent_claims,
                     },
                     payload: self.registry.payload_policy(),
                 }),
@@ -35785,6 +36068,7 @@ impl Worker {
             tokio::select! {
                 () = self.shutdown.cancelled() => {}
                 () = self.capacity_freed.notified(), if capacity_bound => {}
+                () = self.deferral_due.notified() => {}
                 () = tokio::time::sleep(wait) => {}
             }
         }
@@ -36142,6 +36426,7 @@ impl Worker {
         mut listener: Option<crate::notify::QueueListener>,
         registration_pending: &AtomicBool,
         dispatch_allowed: bool,
+        more_work: &tokio::sync::Notify,
     ) {
         let _poller = self.poller_guard();
         // Dispatch-channel state for this loop (issue #1312). All three are
@@ -36228,6 +36513,8 @@ impl Worker {
                 )
                 .await
             {
+                // More work may wait. Wake one follower claim loop.
+                more_work.notify_one();
                 // Per-shard dispatch counter (issue #961, AC5). Emitted on the
                 // single-shard path too, so `harvest.shard.dispatched` is a
                 // uniform series across deployment shapes whenever the worker
@@ -36282,6 +36569,7 @@ impl Worker {
             let capacity_bound = self.capacity_bound();
             tokio::select! {
                 () = self.capacity_freed.notified(), if capacity_bound => {}
+                () = self.deferral_due.notified() => {}
                 () = idle_wait => {}
             }
         }
@@ -37041,6 +37329,147 @@ impl Worker {
         exclusions
     }
 
+    /// Run the single-pool leader loop and its followers until shutdown.
+    async fn run_single_pool_claim_loops(
+        &self,
+        pool: &DbPool,
+        shard: Option<crate::types::ShardId>,
+        listener: Option<crate::notify::QueueListener>,
+        registration_pending: &AtomicBool,
+        dispatch_allowed: bool,
+    ) {
+        let more_work = tokio::sync::Notify::new();
+        let claim_targets = [ClaimTarget {
+            shard,
+            pool,
+            registration_pending,
+            acquire_bound: shard_acquire_bound(false, self.config.poll_interval),
+            global_dispatch: dispatch_allowed,
+        }];
+        self.warn_if_claim_loops_fill_pools(&claim_targets);
+        tokio::join!(
+            self.run_poll_loop(
+                pool,
+                shard,
+                listener,
+                registration_pending,
+                dispatch_allowed,
+                &more_work,
+            ),
+            self.run_claim_followers(&claim_targets, &more_work),
+        );
+    }
+
+    /// Warn when the claim loops alone can hold every connection of a claim
+    /// pool. See [`claim_loops_fill_pool`].
+    fn warn_if_claim_loops_fill_pools(&self, targets: &[ClaimTarget<'_>]) {
+        let claim_loops = self.config.max_concurrent_claims;
+        for target in targets {
+            let max_size = target.pool.status().max_size;
+            if claim_loops_fill_pool(claim_loops, max_size) {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    shard = ?target.shard,
+                    max_concurrent_claims = claim_loops,
+                    pool_max_size = max_size,
+                    "the claim loops can hold every pool connection; tasks, heartbeats and \
+                     persists then wait behind them. Use a larger pool or lower \
+                     max_concurrent_claims"
+                );
+            }
+        }
+    }
+
+    /// Run `max_concurrent_claims - 1` follower claim loops beside the leader.
+    ///
+    /// Assay #14 measured claim-loop occupancy at 0.94, which fits one claim
+    /// in flight. That loop capped throughput. A follower adds a claim in flight only while claims return
+    /// work. The leader alone still guarantees progress, so a follower needs
+    /// no timer and no listener. See `DESIGN-claim-concurrency.md`.
+    ///
+    /// The caller joins this future with the leader. The drain therefore
+    /// starts only after every claim loop returns.
+    async fn run_claim_followers(
+        &self,
+        targets: &[ClaimTarget<'_>],
+        more_work: &tokio::sync::Notify,
+    ) {
+        let followers = self.config.max_concurrent_claims.saturating_sub(1);
+        futures::future::join_all(
+            (0..followers).map(|_| self.run_claim_follower(targets, more_work)),
+        )
+        .await;
+    }
+
+    /// One follower claim loop.
+    ///
+    /// It waits for a wake from a successful claim. It then claims until a
+    /// claim returns nothing, and wakes one more follower after each success.
+    async fn run_claim_follower(
+        &self,
+        targets: &[ClaimTarget<'_>],
+        more_work: &tokio::sync::Notify,
+    ) {
+        let _poller = self.poller_guard();
+        let mut start = 0usize;
+        loop {
+            tokio::select! {
+                biased;
+                () = self.shutdown.cancelled() => return,
+                () = more_work.notified() => {}
+            }
+            while !self.shutdown.is_cancelled() && self.follower_claim(targets, &mut start).await {
+                more_work.notify_one();
+            }
+            // This run ended on an empty claim or on shutdown. A wake stored
+            // during the run would only cost one more empty claim. The next
+            // success wakes a follower again.
+            let _ = futures::FutureExt::now_or_never(more_work.notified());
+        }
+    }
+
+    /// One follower claim attempt over `targets`, from a rotating start.
+    ///
+    /// A follower claims only where the leader polls Postgres. It skips a
+    /// target with an unverified registration or with a dispatch channel.
+    /// Returns `true` when it claimed and dispatched one task.
+    async fn follower_claim(&self, targets: &[ClaimTarget<'_>], start: &mut usize) -> bool {
+        let n = targets.len();
+        for i in 0..n {
+            if self.shutdown.is_cancelled() {
+                return false;
+            }
+            let idx = (*start + i) % n;
+            let target = &targets[idx];
+            // Fully qualified: diesel's `RunQueryDsl::load` shadows it.
+            let pending = AtomicBool::load(target.registration_pending, Ordering::Relaxed);
+            let per_shard_channel = target
+                .shard
+                .is_some_and(|shard| self.shard_dispatch.contains_key(&shard));
+            // Read the global channel only where it may serve, as the leader does.
+            let global_channel = target.global_dispatch && self.global_dispatch_binding().is_some();
+            if !follower_polls_postgres(pending, per_shard_channel, global_channel) {
+                continue;
+            }
+            if self
+                .poll_once_as(
+                    PollRole::Follower,
+                    target.pool,
+                    target.acquire_bound,
+                    target.shard,
+                )
+                .await
+            {
+                if let Some(shard) = target.shard {
+                    self.record_shard_dispatched_many(shard, 1);
+                }
+                *start = (idx + 1) % n;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Execute a single poll iteration.
     ///
     /// Claims one task of a kind with a free permit and dispatches it. Returns
@@ -37053,12 +37482,28 @@ impl Worker {
     /// exhausted pool on one shard cannot park the loop and strand its peers.
     /// See `shard_acquire_bound`. A timeout increments
     /// `harvest.db.pool_acquire_timeout{site="claim"}`.
+    async fn poll_once(
+        &self,
+        pool: &DbPool,
+        acquire_bound: Option<Duration>,
+        shard: Option<crate::types::ShardId>,
+    ) -> bool {
+        self.poll_once_as(PollRole::Leader, pool, acquire_bound, shard)
+            .await
+    }
+
+    /// [`Self::poll_once`] for one claim loop `role`.
+    ///
+    /// Only the leader runs the throttle check after an empty claim. A
+    /// follower ends each run with an empty claim, so its check would repeat
+    /// the leader's and count each throttled key once more.
     // significant_drop_tightening: `permits` holds `OwnedSemaphorePermit`s
     // across the claim on purpose (issue #1787). An earlier drop would let a
     // slot tuner shrink take the permit of a row this poll then claims.
     #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
-    async fn poll_once(
+    async fn poll_once_as(
         &self,
+        role: PollRole,
         pool: &DbPool,
         acquire_bound: Option<Duration>,
         shard: Option<crate::types::ShardId>,
@@ -37179,7 +37624,9 @@ impl Worker {
             }
 
             // All queues tried — emit throttle metrics and report idle.
-            self.emit_throttle_metrics(&mut conn).await;
+            if role == PollRole::Leader {
+                self.emit_throttle_metrics(&mut conn).await;
+            }
             return false;
         }
 
@@ -37221,7 +37668,9 @@ impl Worker {
                 true
             }
             Ok(None) => {
-                self.emit_throttle_metrics(&mut conn).await;
+                if role == PollRole::Leader {
+                    self.emit_throttle_metrics(&mut conn).await;
+                }
                 false
             }
             Err(e) => {
@@ -38171,6 +38620,60 @@ impl Worker {
     /// Request graceful shutdown of this worker.
     pub fn shutdown(&self) {
         self.shutdown.cancel();
+    }
+
+    /// Run one poll-loop iteration and wait for the task it claims.
+    ///
+    /// This is a hook for the world simulation of issue #2002. It is not a
+    /// stable API. It runs the Postgres path of `run_poll_loop` once, for
+    /// the first assigned shard only. The simulator then runs one actor at a
+    /// time, so a seed fixes the order of every claim and every decision.
+    ///
+    /// Call [`Self::dst_register`] first. Never call this on a worker that
+    /// runs [`Self::run`]: a drain closes the same task tracker.
+    ///
+    /// Returns `true` when the poll claimed a task. Returns `false` with no
+    /// claim when the worker is not registered, has a slot tuner, or shuts
+    /// down.
+    #[doc(hidden)]
+    pub async fn dst_poll_once(&self, pool: &DbPool) -> bool {
+        let registered = std::sync::atomic::AtomicBool::load(
+            &self.monitoring_started,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        if !registered || self.config.slot_tuner.is_some() || self.shutdown.is_cancelled() {
+            return false;
+        }
+        let shard = match self.config.shard_assignments.as_slice() {
+            [shard, ..] => Some(*shard),
+            [] => None,
+        };
+        let claimed = self.poll_once(pool, None, shard).await;
+        // A closed tracker waits for every body that it holds. It then
+        // reopens, so the next poll can spawn again.
+        self.dispatched.tracker.close();
+        self.dispatched.tracker.wait().await;
+        self.dispatched.tracker.reopen();
+        claimed
+    }
+
+    /// Write this worker's liveness row, as `run` does at startup.
+    ///
+    /// This is a hook for the world simulation of issue #2002. It is not a
+    /// stable API. Returns `true` when the row is written.
+    ///
+    /// The simulation starts no monitoring task. A slot tuner needs those
+    /// tasks to withhold permits, so a worker with a tuner returns `false`.
+    #[doc(hidden)]
+    pub async fn dst_register(&self, pool: &DbPool) -> bool {
+        if self.config.slot_tuner.is_some() {
+            return false;
+        }
+        // No tuner means no permit to withhold, so dispatch may start.
+        self.monitoring_started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // `register_in_fleet` returns whether a retry is pending.
+        !self.register_in_fleet(pool, None).await
     }
 }
 
@@ -40905,6 +41408,7 @@ mod tests {
             shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 10,
             max_concurrent_activities: 20,
+            max_concurrent_claims: DEFAULT_MAX_CONCURRENT_CLAIMS,
             poll_interval: Duration::from_millis(100),
             shutdown_timeout: Duration::from_secs(5),
             cancellation_grace_period: Duration::from_secs(5),
@@ -41037,6 +41541,16 @@ mod tests {
         // a worker that can never dispatch a task must never look healthy.
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("max_slots is 0"));
+    }
+
+    #[test]
+    fn runtime_config_validate_rejects_zero_claim_loops() {
+        let mut cfg = default_runtime_config();
+        cfg.max_concurrent_claims = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("max_concurrent_claims is 0"));
+        cfg.max_concurrent_claims = 1;
+        assert!(cfg.validate().is_ok(), "one serial claim loop is valid");
     }
 
     #[test]
@@ -41800,6 +42314,7 @@ mod tests {
             shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 5,
             max_concurrent_activities: 15,
+            max_concurrent_claims: 3,
             shutdown_timeout: Duration::from_secs(60),
             workflow_cache_size: 500,
             resident_workflows: true,
@@ -41847,6 +42362,7 @@ mod tests {
         );
         assert_eq!(runtime_cfg.max_concurrent_workflows, 5);
         assert_eq!(runtime_cfg.max_concurrent_activities, 15);
+        assert_eq!(runtime_cfg.max_concurrent_claims, 3);
         assert_eq!(runtime_cfg.shutdown_timeout, Duration::from_secs(60));
         assert_eq!(runtime_cfg.poll_interval, Duration::from_millis(500));
         assert_eq!(
@@ -42190,6 +42706,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
 
         let registry = HandlerRegistry::new(vec![wf], vec![act]);
@@ -42296,6 +42814,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }
         }
         let global = crate::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
@@ -42390,6 +42910,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }
         }
 
@@ -42437,6 +42959,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }
         }
 
@@ -43421,6 +43945,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         }
     }
 
@@ -45793,6 +46319,8 @@ mod tests {
             circuit_breaker: None,
             requires: Some("gpu = true"),
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![act]));
         match Worker::new(default_runtime_config(), registry) {
@@ -45824,6 +46352,8 @@ mod tests {
             circuit_breaker: None,
             requires: Some("gpu = true"),
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
 
         let act2 = ActivityInfo {
@@ -45847,6 +46377,8 @@ mod tests {
             circuit_breaker: None,
             requires: Some("region in [us-east-1, us-west-2]"),
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
 
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![act1, act2]));
@@ -47817,6 +48349,34 @@ mod tests {
         );
     }
 
+    /// A follower polls Postgres only where the leader would.
+    #[test]
+    fn a_follower_polls_postgres_only_where_the_leader_does() {
+        // (registration pending, per-shard channel, usable global channel)
+        for (pending, per_shard, global, polls) in [
+            (false, false, false, true),
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, true, true, false),
+            (true, true, true, false),
+        ] {
+            assert_eq!(
+                follower_polls_postgres(pending, per_shard, global),
+                polls,
+                "pending={pending} per_shard={per_shard} global={global}"
+            );
+        }
+    }
+
+    #[test]
+    fn claim_loops_that_can_fill_the_pool_are_flagged() {
+        assert!(!claim_loops_fill_pool(2, 10));
+        assert!(!claim_loops_fill_pool(9, 10));
+        assert!(claim_loops_fill_pool(10, 10));
+        assert!(claim_loops_fill_pool(4, 2));
+    }
+
     #[test]
     fn an_unregistered_worker_may_not_claim_tasks() {
         // Issue #804, Codex round-54 P1. A worker whose atomic register+
@@ -47920,6 +48480,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }],
         )
     }
@@ -51644,6 +52206,14 @@ mod tests {
                 "side-path",
             ),
             (
+                "PublishDurableProgress",
+                WorkflowCommand::PublishDurableProgress {
+                    offset: 1,
+                    chunk: Value::Null,
+                },
+                "side-path",
+            ),
+            (
                 "CancelRaceLosers",
                 WorkflowCommand::CancelRaceLosers {
                     activities: Vec::new(),
@@ -51885,6 +52455,10 @@ mod tests {
             ("SetCurrentDetails", "persist_current_details_from_commands"),
             ("RecordLog", "persist_workflow_logs_from_commands"),
             ("PublishProgress", "notify_progress_from_commands"),
+            (
+                "PublishDurableProgress",
+                "persist_durable_stream_from_commands",
+            ),
             ("CancelRaceLosers", "apply_race_loser_cancellations"),
             ("ReleaseMutex", "mutex::sweep_terminal_holder_and_wake"),
         ];

@@ -12,6 +12,7 @@ pub mod verdict;
 use crate::entry::Entry;
 use crate::model::Model;
 use crate::resolve::Program;
+use crate::structure::{StructureBuilder, WorkflowStructure};
 use crate::verdict::WorkflowVerdict;
 
 use summary::Analyzer;
@@ -35,7 +36,38 @@ pub fn analyze_with_warnings(
     model: &Model,
     entries: &[Entry],
 ) -> (Vec<WorkflowVerdict>, Vec<String>) {
-    let mut out = Vec::with_capacity(entries.len());
+    let outcome = analyze_entries(program, model, entries, None);
+    (outcome.verdicts, outcome.warnings)
+}
+
+/// Everything one analysis run produces.
+#[derive(Debug, Clone, Default)]
+pub struct Analysis {
+    /// One verdict per entry, in entry order.
+    pub verdicts: Vec<WorkflowVerdict>,
+    pub warnings: Vec<String>,
+    /// One structure per entry, in entry order (issue #1995). Empty unless
+    /// the run asked for it.
+    pub structures: Vec<WorkflowStructure>,
+}
+
+/// [`analyze_with_warnings`], plus the call graph of each workflow.
+#[must_use]
+pub fn analyze_full(program: &Program, model: &Model, entries: &[Entry]) -> Analysis {
+    let mut builder = StructureBuilder::new(program);
+    analyze_entries(program, model, entries, Some(&mut builder))
+}
+
+fn analyze_entries(
+    program: &Program,
+    model: &Model,
+    entries: &[Entry],
+    mut builder: Option<&mut StructureBuilder<'_>>,
+) -> Analysis {
+    let mut out = Analysis {
+        verdicts: Vec::with_capacity(entries.len()),
+        ..Analysis::default()
+    };
     let mut warnings: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for entry in entries {
         let mut analyzer = Analyzer::new(program, model);
@@ -45,13 +77,32 @@ pub fn analyze_with_warnings(
         // the entry must be the body in this workflow's own crate.
         let body = program.body_id_in(&entry.crate_name, &entry.body);
         analyzer.analyze_body(&body, &crate::resolve::Substitution::new(), &args, &[]);
-        out.push(verdict::assemble(
+        let verdict = verdict::assemble(
             &entry.workflow,
             &entry.crate_name,
             std::mem::take(&mut analyzer.findings),
             std::mem::take(&mut analyzer.boundaries),
-        ));
+        );
+        if let Some(builder) = builder.as_deref_mut() {
+            let boundaries = structure_boundaries(&verdict.boundaries);
+            out.structures
+                .push(builder.build(entry, &body, &analyzer.recorder, boundaries));
+        }
+        out.verdicts.push(verdict);
         warnings.append(&mut analyzer.warnings);
     }
-    (out, warnings.into_iter().collect())
+    out.warnings = warnings.into_iter().collect();
+    out
+}
+
+/// Boundaries as the structure manifest lists them: `kind: detail`.
+#[must_use]
+pub fn structure_boundaries(boundaries: &[crate::verdict::Boundary]) -> Vec<String> {
+    let mut out: Vec<String> = boundaries
+        .iter()
+        .map(|b| format!("{}: {}", b.kind.name(), b.detail))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }

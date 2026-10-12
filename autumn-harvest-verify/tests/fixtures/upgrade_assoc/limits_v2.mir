@@ -1,0 +1,4 @@
+// WARNING: This output format is intended for human consumers only
+// and is subject to change without notice. Knock yourself out.
+// HINT: See also -Z dump-mir for MIR at specific points during compilation.
+const <impl at limits.rs:8:1: 8:28>::MAX: u64 = const 4_u64;

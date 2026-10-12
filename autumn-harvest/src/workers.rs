@@ -1466,6 +1466,9 @@ pub struct ExecutionPolicy {
     /// claim query and before each history persist. That check adds to the
     /// latency that the window records.
     pub dr_fencing: bool,
+    /// `max_concurrent_claims`. More claim loops fill the slots faster
+    /// under a backlog, so tasks run under more load.
+    pub claim_loops: usize,
 }
 
 impl Default for ExecutionPolicy {
@@ -1481,6 +1484,7 @@ impl Default for ExecutionPolicy {
             poison_pill_threshold: 3,
             cancellation_grace_period: std::time::Duration::from_secs(5),
             dr_fencing: false,
+            claim_loops: crate::builder::DEFAULT_MAX_CONCURRENT_CLAIMS,
         }
     }
 }
@@ -1499,6 +1503,7 @@ impl ExecutionPolicy {
             "poison_pill_threshold": self.poison_pill_threshold.max(0),
             "cancellation_grace_period": duration_key(self.cancellation_grace_period),
             "dr_fencing": self.dr_fencing,
+            "claim_loops": self.claim_loops,
         })
     }
 }
@@ -4324,6 +4329,10 @@ mod tests {
             },
             ExecutionPolicy {
                 dr_fencing: true,
+                ..base
+            },
+            ExecutionPolicy {
+                claim_loops: 1,
                 ..base
             },
         ];

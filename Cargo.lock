@@ -55,6 +55,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-loop-hit-rate"
+version = "0.7.0"
+dependencies = [
+ "autumn-harvest",
+ "autumn-harvest-agent",
+ "deadpool",
+ "diesel-async",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "ahash"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -360,6 +372,7 @@ dependencies = [
  "aes-gcm",
  "arbitrary",
  "async-trait",
+ "autumn-harvest-agent",
  "autumn-harvest-macros",
  "base64 0.22.1",
  "chrono",
@@ -419,10 +432,12 @@ dependencies = [
  "autumn-harvest",
  "autumn-harvest-sqlite",
  "chrono",
+ "flate2",
  "futures",
  "proptest",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -555,12 +570,16 @@ name = "autumn-harvest-verify"
 version = "0.7.0"
 dependencies = [
  "autumn-harvest",
+ "chrono",
  "clap",
+ "proc-macro2",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "syn 2.0.117",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio",
  "toml 1.1.3+spec-1.1.0",
 ]
 

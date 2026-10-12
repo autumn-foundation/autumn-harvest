@@ -166,7 +166,8 @@ For a support/on-call/status-dashboard principal that should **read but not
 mutate**, mount with `api_with_role_auth` instead of `api_with_auth` — a single
 call that adds a class-aware enforcement layer giving `403 Forbidden` on every
 mutating management route (and every mutating [MCP tool](./mcp-tools.md), when
-`mcp_tools()` is enabled) to any principal your middleware marks read-only,
+`mcp_tools()` is enabled, and the whole [MCP Tasks route](./mcp-tools.md#mcp-tasks-issue-2005)
+when `mcp_tasks()` is enabled) to any principal your middleware marks read-only,
 while leaving 100% of the read surface reachable. See **[the read-only operator
 role guide](./operator-role.md)** for the Session claim contract, the
 fail-closed guarantee, the MCP-tool coverage, and the `/ui` limitation.
@@ -983,6 +984,7 @@ It can use only the routes in `TENANT_SCOPED_ROUTES`:
 - `POST /workflows/{id}/signal/{name}`.
 - `GET` and `POST /workflows/{id}/query/{name}`, and `GET /workflows/{id}/queries`.
 - `POST /workflows/{id}/update/{name}` and `GET /workflows/{id}/update/{update_id}/result`.
+- `GET /workflows/{id}/stream/durable`, the durable progress stream (#1974).
 
 Public routes such as `/health` also answer. The token scope still applies,
 so a `read` tenant token cannot cancel.
@@ -1205,7 +1207,9 @@ Data-governance operations follow the same posture: **per-execution legal hold**
 admin-gated mutating routes, audited under `legal_hold.set` / `legal_hold.release`
 and `workflow.erase_payloads`. A legal hold exempts a single execution's history
 from the retention janitor and from PII erasure until released — see
-[`docs/archival.md`](archival.md) for the retention/erasure lifecycle.
+[`docs/archival.md`](archival.md) for the retention/erasure lifecycle. No reset
+forks an erased run. See
+[Workflow reset](workflow-reset.md#a-fork-never-uses-a-pii-erased-source).
 
 ### Tamper-evident audit rows (issue #1838)
 
@@ -1320,6 +1324,38 @@ with access to `harvest_events` can copy a ciphertext to another field, event
 or execution under the same key, and it decodes. Restrict write access to the
 Harvest database.
 
+### Agent response cache (issue #1998)
+
+The agent response cache is opt-in. It stores each answer in the embedder's
+`PayloadStore`, encoded by the `PayloadCodecs` that the embedder passes in.
+Pass a clone of the engine registry, so an active codec encrypts each entry.
+A registry with no active codec stores entries in clear. The entry holds the
+answer, its stop reason and its token usage. It holds no prompt. With an
+active codec, a read refuses an entry that is not a codec envelope.
+
+These cache fields stay in clear:
+
+- The cache key. It is an unkeyed SHA-256 hash of the request and the tenant.
+  A reader of the index can test a guessed prompt against a key. Set a secret
+  `ResponseCache::namespace` to stop that.
+- The blob key that the `PayloadStore` returns.
+
+The default scope is the tenant. On Postgres, the activity reads the verified
+tenant of the run (issue #1977). `AgentTask::tenant` cannot change it. A run
+with no verified tenant uses `AgentTask::tenant` as a declared tenant. Only a
+principal with no tenant binding can start such a run. A declared tenant
+never shares an entry with a verified tenant of the same name. A local
+activity cannot read the tenant, so it skips the cache.
+
+`CacheScope::Shared` lets every tenant read every entry. A hit records
+`cache_hit: true` in the run history. A tenant can therefore learn that
+another tenant sent the same request.
+
+Erasure (issue #495) does not reach the cache. Key rotation (issue #948) does
+not re-encrypt cache entries. `ResponseCache::max_age` limits what the cache
+serves, not what the store keeps. Give the cache its own store, with an
+expiry of at least `max_age`.
+
 ### Column coverage (issue #1979)
 
 Column encoding is off by default. Turn it on with
@@ -1383,6 +1419,7 @@ a `JSONB` column has no row here. Gaps marked #2043 are follow-up work.
 | `harvest_schedules.buffered_runs` | Clear | Fire times only. |
 | `harvest_schedules.retry_policy` | Clear | Engine configuration, not payload. |
 | `harvest_signals.payload` | Covered | The signal payload. Signal ingest decodes it before it records `SignalReceived`. |
+| `harvest_stream_chunks.chunk` | Clear | Durable output chunks (#1974). The stream route sends them as stored. PII erasure deletes them. Do not put secrets in a chunk. |
 | `harvest_dead_letters.input` | Covered | The failed task input. A completion-callback entry copies the clear webhook body, so it stays in clear. Follow-up #2043. |
 | `harvest_workers.queues` | Clear | Worker registration, not payload. |
 | `harvest_workers.shard_assignments` | Clear | Worker registration, not payload. |

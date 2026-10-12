@@ -163,6 +163,29 @@ pub const DEFAULT_CURRENT_DETAILS_CAP_BYTES: usize = 1024;
 /// [`publish_progress`]: WorkflowContext::publish_progress
 pub const PROGRESS_CHUNK_MAX_BYTES: usize = 7000;
 
+/// Per-execution cap on stored durable stream chunks (issue #1974).
+///
+/// The store drops chunks above the cap and stores one terminal marker. The
+/// context queues at most `cap + 1` commands in one cycle, so the store can
+/// see the overflow.
+pub const DURABLE_STREAM_MAX_CHUNKS: u32 = 10_000;
+
+/// Serialize a progress chunk and apply [`PROGRESS_CHUNK_MAX_BYTES`].
+///
+/// An oversize chunk becomes a truncation marker. The chunk slot stays, and
+/// the client sees that the content was cut (issues #791 and #1974).
+fn cap_progress_chunk(chunk: &impl serde::Serialize) -> HarvestResult<Value> {
+    let value = serde_json::to_value(chunk).map_err(HarvestError::Serialization)?;
+    let serialized_len = serde_json::to_vec(&value).map_or(usize::MAX, |v| v.len());
+    if serialized_len > PROGRESS_CHUNK_MAX_BYTES {
+        return Ok(serde_json::json!({
+            "_harvest_progress_truncated": true,
+            "bytes": serialized_len,
+        }));
+    }
+    Ok(value)
+}
+
 /// Bits reserved for the per-cycle local index in a progress `seq` (issue #791).
 ///
 /// A progress `seq` is `(epoch << PROGRESS_SEQ_LOCAL_BITS) | local_index`, where
@@ -712,6 +735,19 @@ pub enum WorkflowCommand {
         /// marker).
         chunk: Value,
     },
+    /// Store one durable output-stream chunk (issue #1974).
+    ///
+    /// Emitted by [`WorkflowContext::publish_durable_progress`] during live
+    /// execution only. Bookkeeping: no result channel, no suspension shape and
+    /// no `harvest_events` row. The worker writes it to
+    /// `harvest_stream_chunks` in the persist transaction.
+    PublishDurableProgress {
+        /// The 0-based call ordinal. A re-drive gets the same offset again,
+        /// so the store keeps the first copy.
+        offset: u64,
+        /// The chunk, already size-capped like a best-effort chunk.
+        chunk: Value,
+    },
     /// Persist one author-emitted log line to the durable per-execution log
     /// store (issue #790).
     ///
@@ -974,6 +1010,7 @@ impl WorkflowCommand {
             | Self::UpsertSearchAttributes { .. }
             | Self::SetCurrentDetails { .. }
             | Self::PublishProgress { .. }
+            | Self::PublishDurableProgress { .. }
             | Self::RecordLog { .. }
             | Self::SpawnDetachedChildWorkflow { .. }
             | Self::CancelRaceLosers { .. }
@@ -1089,6 +1126,11 @@ impl std::fmt::Debug for WorkflowCommand {
             Self::PublishProgress { seq, chunk } => f
                 .debug_struct("PublishProgress")
                 .field("seq", seq)
+                .field("chunk", chunk)
+                .finish(),
+            Self::PublishDurableProgress { offset, chunk } => f
+                .debug_struct("PublishDurableProgress")
+                .field("offset", offset)
                 .field("chunk", chunk)
                 .finish(),
             Self::RecordLog {
@@ -1815,6 +1857,25 @@ impl RaceBuilder<'_> {
             return Err(err);
         }
         self.ctx.race_impl(self.branches).await
+    }
+}
+
+/// Counts one `ctx.race()` call in flight while it lives (issue #2007).
+///
+/// The race future holds it across its awaits. Dropping the future, or the
+/// end of the race, drops it.
+struct OpenRace<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> OpenRace<'a> {
+    fn enter(count: &'a std::sync::atomic::AtomicUsize) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for OpenRace<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -2890,6 +2951,14 @@ pub struct WorkflowContext {
     /// stable, unique `race:{seq}` / `race_winner:{seq}` marker names across
     /// replays, mirroring `fan_out_seq`.
     race_seq: Mutex<u32>,
+    /// The number of `ctx.race()` calls in flight (issue #2007). A race
+    /// that suspends cannot stay resident.
+    open_races: std::sync::atomic::AtomicUsize,
+    /// Set while a resident cycle runs with re-parked siblings (issue #2008).
+    /// Such a cycle must not read the replay position.
+    speculative: std::sync::atomic::AtomicBool,
+    /// Set when a speculative cycle reads the replay position.
+    speculation_read_position: std::sync::atomic::AtomicBool,
     /// Monotonically increasing counter for naming worker-session identity
     /// markers (issue #606). Each `create_session()` call increments this once
     /// so each session has a stable, unique `session:{seq}` marker name across
@@ -2919,6 +2988,16 @@ pub struct WorkflowContext {
     /// epoch (in the high bits) is what carries monotonicity across cycles.
     /// Not part of replay state: `publish_progress` is a no-op during replay.
     progress_local_index: std::sync::atomic::AtomicU64,
+    /// 0-based call ordinal of `publish_durable_progress` (issue #1974).
+    ///
+    /// It is the chunk offset. Each call claims one value, also during replay.
+    /// A re-drive re-runs the body from the top, so a chunk gets the same
+    /// offset again. The epoch `seq` of `publish_progress` cannot do this.
+    /// See `log_call_ordinal` for the cases that move the epoch.
+    durable_progress_ordinal: std::sync::atomic::AtomicU64,
+    /// Count of `PublishDurableProgress` commands queued this cycle
+    /// (issue #1974). It bounds memory at `DURABLE_STREAM_MAX_CHUNKS + 1`.
+    durable_progress_queued: std::sync::atomic::AtomicU64,
     /// 0-based **call ordinal** for durable-log `seq` generation (issue #790):
     /// the count of `ctx.log_*` calls made so far by *this run of the workflow
     /// body*.
@@ -3377,6 +3456,10 @@ impl WorkflowContext {
     where
         F: FnOnce(&mut HistoryMatcher) -> R,
     {
+        // Every public history read and every command match passes here. In
+        // a speculative cycle each one counts as a position read (issue
+        // #2008).
+        self.note_position_read();
         let result = {
             let mut matcher = self.matcher.lock().expect("matcher lock poisoned");
             f(&mut matcher)
@@ -3596,9 +3679,14 @@ impl WorkflowContext {
             child_placement_seq: Mutex::new(0),
             shard_router: None,
             race_seq: Mutex::new(0),
+            open_races: std::sync::atomic::AtomicUsize::new(0),
+            speculative: std::sync::atomic::AtomicBool::new(false),
+            speculation_read_position: std::sync::atomic::AtomicBool::new(false),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_ordinal: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_queued: std::sync::atomic::AtomicU64::new(0),
             log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
             log_commands_queued: std::sync::atomic::AtomicU64::new(0),
             log_policy: None,
@@ -3769,9 +3857,14 @@ impl WorkflowContext {
             child_placement_seq: Mutex::new(0),
             shard_router: None,
             race_seq: Mutex::new(0),
+            open_races: std::sync::atomic::AtomicUsize::new(0),
+            speculative: std::sync::atomic::AtomicBool::new(false),
+            speculation_read_position: std::sync::atomic::AtomicBool::new(false),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_ordinal: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_queued: std::sync::atomic::AtomicU64::new(0),
             log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
             log_commands_queued: std::sync::atomic::AtomicU64::new(0),
             log_policy: None,
@@ -3840,9 +3933,14 @@ impl WorkflowContext {
             child_placement_seq: Mutex::new(0),
             shard_router: None,
             race_seq: Mutex::new(0),
+            open_races: std::sync::atomic::AtomicUsize::new(0),
+            speculative: std::sync::atomic::AtomicBool::new(false),
+            speculation_read_position: std::sync::atomic::AtomicBool::new(false),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_ordinal: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_queued: std::sync::atomic::AtomicU64::new(0),
             log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
             log_commands_queued: std::sync::atomic::AtomicU64::new(0),
             log_policy: None,
@@ -4610,6 +4708,7 @@ impl WorkflowContext {
     /// The current cursor position in the history events during replay.
     #[must_use]
     pub fn replay_position(&self) -> usize {
+        self.note_position_read();
         self.match_history(|m| m.position())
     }
 
@@ -4878,8 +4977,38 @@ impl WorkflowContext {
     /// ones that lock the matcher directly rather than calling
     /// [`Self::is_replaying`] — so the two spellings can never drift.
     pub(crate) fn replay_suppresses_side_effects(&self) -> bool {
+        // A speculative cycle may be dropped, so it fires no side effect.
+        if self.note_position_read() {
+            return true;
+        }
         let matcher = self.matcher.lock().expect("matcher lock poisoned");
         matcher.is_replaying() || matcher.has_terminal_failure_tail()
+    }
+
+    /// Replay gate of [`publish_durable_progress`](Self::publish_durable_progress)
+    /// (issue #1974).
+    ///
+    /// The raw cursor check of [`Self::replay_suppresses_side_effects`] counts
+    /// a signal or an update that waits at the cursor as history to replay.
+    /// Code before the matching `wait_for_signal` then looks replayed, also
+    /// on its first run, and its chunks are never stored. A best-effort side
+    /// effect can accept that loss. A durable chunk cannot.
+    ///
+    /// So this gate asks whether `prepare_match` would still report replay.
+    /// It skips the same signal and update events, but it only reads the
+    /// matcher. It moves no cursor and fills no stash. Thus later code sees
+    /// the same `ctx.is_replaying()` value with or without a durable call.
+    ///
+    /// A speculative resident cycle (issue #2008) can see another replay
+    /// position than a cold replay. The gate then counts as a position read
+    /// and stores nothing. The resume declines, and a cold replay stores the
+    /// chunk at the same offset.
+    pub(crate) fn durable_replay_suppresses(&self) -> bool {
+        if self.note_position_read() {
+            return true;
+        }
+        let matcher = self.matcher.lock().expect("matcher lock poisoned");
+        matcher.would_replay_after_prepare() || matcher.has_terminal_failure_tail()
     }
 
     /// Cursor-only "is there recorded history left to consume?" — the
@@ -4889,6 +5018,7 @@ impl WorkflowContext {
     /// Used only where the question really is "did the matcher run off the end
     /// of recorded history?", never as a replay-suppression guard.
     fn at_history_frontier(&self) -> bool {
+        self.note_position_read();
         !self
             .matcher
             .lock()
@@ -7267,10 +7397,11 @@ impl WorkflowContext {
 
     /// Returns why this context cannot stay resident, or `None` (issue #1798).
     ///
-    /// A resident workflow resumes its parked future with one new result. A
+    /// A resident workflow resumes its parked future with new results. A
     /// warm decision must then equal a cold replay. Each state below can make
     /// a cold replay read the new events in a way that a parked future cannot:
     ///
+    /// - An open `ctx.race()` settles by a winner marker and cancels losers.
     /// - A held park token resolves only by a replay match.
     /// - A push signal handler runs inside history matching.
     /// - A held mutex depends on the suspension flag of each cycle.
@@ -7278,22 +7409,35 @@ impl WorkflowContext {
     ///   test-clock context changes how replay reads events.
     /// - Unread history means that the cursor is not at the live frontier.
     ///
+    /// The result is the miss reason of the `harvest.workflow.resident`
+    /// counter (issue #2007).
+    ///
     /// # Panics
     ///
     /// Panics if an internal mutex is poisoned.
-    pub(crate) fn resident_blocker(&self) -> Option<&'static str> {
-        if self.parks.is_held() {
-            return Some("a park token is held");
+    pub(crate) fn resident_blocker(&self) -> Option<crate::telemetry::ResidentOutcome> {
+        use crate::telemetry::ResidentOutcome;
+        if self.has_open_race() {
+            return Some(ResidentOutcome::Race);
         }
-        if self.strict_replay || self.canary_mode {
-            return Some("strict or canary replay");
+        if !self
+            .held_mutex_keys
+            .lock()
+            .expect("held_mutex_keys lock poisoned")
+            .is_empty()
+        {
+            return Some(ResidentOutcome::Mutex);
+        }
+        if self.parks.is_held()
+            || self.strict_replay
+            || self.canary_mode
+            || self.cancellation_reason.is_some()
+        {
+            return Some(ResidentOutcome::Blocked);
         }
         #[cfg(any(test, feature = "testing"))]
         if self.timer_clock_elapsed_secs.is_some() {
-            return Some("the advancing test clock is on");
-        }
-        if self.cancellation_reason.is_some() {
-            return Some("the run is cancelled");
+            return Some(ResidentOutcome::Blocked);
         }
         if !self
             .signal_registry
@@ -7302,15 +7446,7 @@ impl WorkflowContext {
             .list_names()
             .is_empty()
         {
-            return Some("a push signal handler is registered");
-        }
-        if !self
-            .held_mutex_keys
-            .lock()
-            .expect("held_mutex_keys lock poisoned")
-            .is_empty()
-        {
-            return Some("a durable mutex is held");
+            return Some(ResidentOutcome::Blocked);
         }
         if self
             .nd_details
@@ -7323,7 +7459,7 @@ impl WorkflowContext {
                 .expect("deferred_nd_error lock poisoned")
                 .is_some()
         {
-            return Some("a non-determinism record is set");
+            return Some(ResidentOutcome::Blocked);
         }
         if self
             .matcher
@@ -7331,7 +7467,7 @@ impl WorkflowContext {
             .expect("matcher lock poisoned")
             .has_buffered_history()
         {
-            return Some("history is not fully read");
+            return Some(ResidentOutcome::Blocked);
         }
         None
     }
@@ -7349,20 +7485,62 @@ impl WorkflowContext {
     /// replay. The call ordinals and sequence counters keep their values. A
     /// replay from the top counts up to the same values.
     ///
+    /// Last, it queues `waits`: the commands that park unresolved activities
+    /// of a join again (issue #2008). A cold replay emits the same commands.
+    /// A cycle with waits is speculative until [`Self::end_speculation`].
+    ///
     /// # Panics
     ///
     /// Panics if the matcher mutex is poisoned.
     #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
-    pub(crate) fn begin_resident_cycle(&self, delta: &[WorkflowEvent]) {
+    pub(crate) fn begin_resident_cycle(
+        &self,
+        delta: &[WorkflowEvent],
+        waits: Vec<WorkflowCommand>,
+    ) {
         self.set_suspending(false);
         self.log_commands_queued
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.progress_local_index
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.durable_progress_queued
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         self.matcher
             .lock()
             .expect("matcher lock poisoned")
             .append_consumed(delta);
+        self.speculative
+            .store(!waits.is_empty(), std::sync::atomic::Ordering::SeqCst);
+        self.speculation_read_position
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        for wait in waits {
+            self.push_command(wait);
+        }
+    }
+
+    /// Records a read of the replay position in a speculative cycle.
+    ///
+    /// A warm cycle with re-parked siblings consumed the whole delta, but a
+    /// cold replay can stop its cursor at a sibling command (issue #2008).
+    /// So such a read can differ, and the resume must decline. Returns
+    /// whether the cycle is speculative.
+    fn note_position_read(&self) -> bool {
+        let speculative = self.speculative.load(std::sync::atomic::Ordering::SeqCst);
+        if speculative {
+            self.speculation_read_position
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        speculative
+    }
+
+    /// Ends a speculative cycle (issue #2008). Returns whether it read the
+    /// replay position.
+    #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
+    pub(crate) fn end_speculation(&self) -> bool {
+        self.speculative
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.speculation_read_position
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Whether a non-blocking signal claim probed `signal_name` with a scan
@@ -11802,6 +11980,11 @@ impl WorkflowContext {
 
     // ── Race / select (issue #600) ───────────────────────────────────────────
 
+    /// Whether a `ctx.race()` call is in flight (issue #2007).
+    pub(crate) fn has_open_race(&self) -> bool {
+        self.open_races.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
     /// Generate the next race sequence number for marker naming (mirrors
     /// `next_fan_out_seq`).
     fn next_race_seq(&self) -> u32 {
@@ -11824,6 +12007,7 @@ impl WorkflowContext {
 
     #[allow(clippy::too_many_lines)]
     async fn race_impl(&self, branches: Vec<RaceBranch>) -> HarvestResult<RaceWinner> {
+        let _open = OpenRace::enter(&self.open_races);
         self.check_cancellation()?;
 
         if branches.is_empty() {
@@ -12922,6 +13106,34 @@ impl WorkflowContext {
                 )
             }
         }
+    }
+
+    /// Call a task on a remote MCP or A2A server and wait for it to end
+    /// (issue #2006).
+    ///
+    /// The start activity records the remote task handle. An external
+    /// activity then journals the handle as a task token, and the workflow
+    /// suspends with no worker slot. A
+    /// [`RemoteTaskPoller`](crate::remote_task::RemoteTaskPoller) or a push
+    /// settles the token. Replay reads both steps from history.
+    ///
+    /// A tool result with `isError: true` returns `Ok` with
+    /// [`is_error`](crate::remote_task::RemoteTaskOutcome::is_error) set.
+    /// See `docs/remote-tasks.md`.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::ActivityFailed`] when the start fails, or when the
+    ///   remote server fails or cancels the task.
+    /// - [`HarvestError::Timeout`] when the task does not end within
+    ///   [`RemoteTaskCall::timeout`](crate::remote_task::RemoteTaskCall::timeout).
+    /// - [`HarvestError::NonDeterministic`] when history does not match.
+    /// - [`HarvestError::Serialization`] when a recorded value does not decode.
+    pub async fn call_remote_task(
+        &self,
+        call: &crate::remote_task::RemoteTaskCall,
+    ) -> HarvestResult<crate::remote_task::RemoteTaskOutcome> {
+        crate::remote_task::call(self, call).await
     }
 
     // ── Continue-as-new ───────────────────────────────────────────────
@@ -14109,24 +14321,67 @@ impl WorkflowContext {
             let matcher = self.matcher.lock().expect("matcher lock poisoned");
             matcher.event_count()
         };
-        // Serialize the caller's chunk (the only fallible step).
-        let mut value = serde_json::to_value(&chunk).map_err(HarvestError::Serialization)?;
-        // Cap the serialized size below the Postgres NOTIFY payload limit.
-        // Oversize chunks are REPLACED with a truncation marker (never silently
-        // dropped) so the ordered seq slot survives and the SSE client learns
-        // content was cut.
-        let serialized_len = serde_json::to_vec(&value).map_or(usize::MAX, |v| v.len());
-        if serialized_len > PROGRESS_CHUNK_MAX_BYTES {
-            value = serde_json::json!({
-                "_harvest_progress_truncated": true,
-                "bytes": serialized_len,
-            });
-        }
+        let value = cap_progress_chunk(&chunk)?;
         let local_index = self
             .progress_local_index
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let seq = encode_progress_seq(epoch, local_index);
         self.push_command(WorkflowCommand::PublishProgress { seq, chunk: value });
+        Ok(())
+    }
+
+    /// Publish a durable, resumable output chunk (issue #1974).
+    ///
+    /// This is the opt-in durable mode of [`publish_progress`](Self::publish_progress).
+    /// The worker stores the chunk in `harvest_stream_chunks` in the same
+    /// transaction as the decision cycle. A reader of
+    /// `GET /workflows/{id}/stream/durable` gets every stored chunk in order.
+    /// It can disconnect and resume after its last offset.
+    ///
+    /// - **Offset**: the 0-based ordinal of this call in the workflow body.
+    ///   The SSE `id:` carries it. A re-drive gives a chunk the same offset,
+    ///   and the store keeps the first copy.
+    /// - **Determinism**: the content can change between runs. The number and
+    ///   order of calls must be deterministic, as for any workflow code.
+    /// - **Replay-neutral**: during replay the call claims its offset and
+    ///   pushes no command. No event goes to `harvest_events`.
+    /// - **Bounded**: [`DURABLE_STREAM_MAX_CHUNKS`] chunks per execution, then
+    ///   one terminal marker. A chunk above [`PROGRESS_CHUNK_MAX_BYTES`]
+    ///   becomes a truncation marker, as in the best-effort mode.
+    /// - **Postgres only**: the SQLite runtime ignores the chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if `chunk` cannot be
+    /// serialized. On replay it returns `Ok(())` without touching `chunk`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher mutex is poisoned.
+    pub fn publish_durable_progress(&self, chunk: impl serde::Serialize) -> HarvestResult<()> {
+        // Claim the offset first, also on replay. Otherwise each later chunk
+        // moves down one offset and collides with a stored row.
+        let offset = self
+            .durable_progress_ordinal
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.durable_replay_suppresses() {
+            return Ok(());
+        }
+        // Bound the queue at cap + 1. The extra command lets the store see
+        // the overflow and write its marker. Check first, so a call over the
+        // bound does no serialization. Take the slot only after serialization
+        // succeeds, because a failed call queues nothing.
+        let queued = &self.durable_progress_queued;
+        if queued.load(std::sync::atomic::Ordering::Relaxed) > u64::from(DURABLE_STREAM_MAX_CHUNKS)
+        {
+            return Ok(());
+        }
+        let value = cap_progress_chunk(&chunk)?;
+        queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.push_command(WorkflowCommand::PublishDurableProgress {
+            offset,
+            chunk: value,
+        });
         Ok(())
     }
 
@@ -15793,6 +16048,59 @@ impl ActivityContext {
     #[must_use]
     pub fn state<T: Any + Send + Sync>(&self) -> Option<&T> {
         self.state.get(&TypeId::of::<T>())?.downcast_ref::<T>()
+    }
+
+    /// Read the verified tenant of the run that owns this activity (issue
+    /// #1998).
+    ///
+    /// The value comes from `harvest_workflow_executions.tenant` (issue #1977).
+    /// Each call runs one query. History does not record the value, so replay
+    /// never depends on it.
+    ///
+    /// Returns `Ok(None)` for a run with no tenant. It also returns `Ok(None)`
+    /// for a test context and for a build without the `db` feature.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::Config`] for a local activity. It has no pool, so it
+    ///   cannot read the row.
+    /// - A [`HarvestError`] when the pool or the read fails, or when the row is
+    ///   not on this shard, for example during a rebalance.
+    // Without `db` the body has no `.await`, so both no-await lints fire.
+    #[cfg_attr(
+        not(feature = "db"),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
+    pub async fn run_tenant(&self) -> HarvestResult<Option<String>> {
+        // A local activity runs inside a tenant run, so `None` would be false.
+        if self.is_local {
+            return Err(HarvestError::Config(
+                "a local activity cannot read the run tenant".to_owned(),
+            ));
+        }
+        #[cfg(feature = "db")]
+        if let Some(txn) = &self.transactional_state {
+            use crate::schema::harvest_workflow_executions::dsl::{
+                harvest_workflow_executions, tenant,
+            };
+            use diesel::{QueryDsl as _, prelude::OptionalExtension as _};
+            use diesel_async::RunQueryDsl as _;
+
+            let mut conn = crate::replication::fenced_checkout(&txn.pool).await?;
+            let found: Option<Option<String>> = harvest_workflow_executions
+                .find(txn.exec_id.as_uuid())
+                .select(tenant)
+                .first(&mut *conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            // A missing row is not "no tenant". The run can be on another
+            // shard, so the caller must not guess.
+            return found.ok_or_else(|| {
+                HarvestError::Database(format!("execution {} is not on this shard", txn.exec_id))
+            });
+        }
+        Ok(None)
     }
 
     /// Return the heartbeat payload durably persisted by the previous attempt.
@@ -25859,6 +26167,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         }
     }
 
@@ -26314,6 +26624,284 @@ mod tests {
         assert!(encode_progress_seq(5, 1) > encode_progress_seq(5, 0));
         // Deterministic on a crash-retry of the same cycle: same inputs → same seq.
         assert_eq!(encode_progress_seq(7, 3), encode_progress_seq(7, 3));
+    }
+
+    // ── Durable output streams (issue #1974) ──────────────────────────
+
+    /// Collect every `PublishDurableProgress` command as `(offset, chunk)`.
+    fn durable_chunks(cmds: &[WorkflowCommand]) -> Vec<(u64, Value)> {
+        cmds.iter()
+            .filter_map(|cmd| match cmd {
+                WorkflowCommand::PublishDurableProgress { offset, chunk } => {
+                    Some((*offset, chunk.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn durable_progress_offsets_start_at_zero_and_increase_by_one() {
+        let ctx = WorkflowContext::new_test();
+        ctx.publish_durable_progress(serde_json::json!("a"))
+            .expect("first");
+        ctx.publish_durable_progress(serde_json::json!("b"))
+            .expect("second");
+        let chunks = durable_chunks(&ctx.drain_commands());
+        assert_eq!(
+            chunks,
+            vec![(0, serde_json::json!("a")), (1, serde_json::json!("b"))]
+        );
+    }
+
+    #[test]
+    fn durable_progress_does_not_change_the_best_effort_command() {
+        let ctx = WorkflowContext::new_test();
+        ctx.publish_progress(serde_json::json!("x")).expect("live");
+        let cmds = ctx.drain_commands();
+        assert_eq!(durable_chunks(&cmds), Vec::new());
+        assert!(matches!(
+            cmds.as_slice(),
+            [WorkflowCommand::PublishProgress { .. }]
+        ));
+    }
+
+    #[test]
+    fn durable_progress_is_suppressed_during_replay_but_claims_an_offset() {
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let side_effect = WorkflowEvent::SideEffectRecorded {
+            kind: crate::event::SideEffectKind::Uuid,
+            name: None,
+            value: serde_json::json!("00000000-0000-7000-8000-000000000000"),
+        };
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started, side_effect]);
+        assert!(ctx.is_replaying(), "the side effect is not consumed yet");
+        ctx.publish_durable_progress(serde_json::json!("old"))
+            .expect("replay call");
+        let _ = ctx.new_uuid();
+        assert!(!ctx.is_replaying(), "the cycle is at the frontier");
+        ctx.publish_durable_progress(serde_json::json!("new"))
+            .expect("live call");
+        assert_eq!(
+            durable_chunks(&ctx.drain_commands()),
+            vec![(1, serde_json::json!("new"))],
+            "the replayed call pushes nothing but still claims offset 0"
+        );
+    }
+
+    #[test]
+    fn durable_progress_is_live_when_a_buffered_signal_waits_at_the_cursor() {
+        // Regression (issue #1974 review). A signal that arrives before the
+        // first cycle sits at the cursor. The raw cursor check then reports
+        // replay, and the chunks before `wait_for_signal` were never stored.
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let signal = WorkflowEvent::SignalReceived {
+            signal_name: "go".to_string(),
+            payload: serde_json::json!({}),
+        };
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started, signal]);
+        ctx.publish_durable_progress(serde_json::json!("first"))
+            .expect("publish");
+        assert_eq!(
+            durable_chunks(&ctx.drain_commands()),
+            vec![(0, serde_json::json!("first"))],
+            "a buffered signal is not replayed history, so the chunk is live"
+        );
+    }
+
+    #[test]
+    fn durable_progress_does_not_change_is_replaying() {
+        // Regression (issue #1974 review). The durable gate must only read
+        // the matcher. A gate that moves the cursor makes later code see
+        // `is_replaying() == false` early, so a guarded side effect runs twice.
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let signal = WorkflowEvent::SignalReceived {
+            signal_name: "go".to_string(),
+            payload: serde_json::json!({}),
+        };
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started, signal]);
+        let before = ctx.is_replaying();
+        ctx.publish_durable_progress(serde_json::json!("first"))
+            .expect("publish");
+        assert_eq!(
+            ctx.is_replaying(),
+            before,
+            "the durable call moved the cursor"
+        );
+        assert_eq!(
+            durable_chunks(&ctx.drain_commands()),
+            vec![(0, serde_json::json!("first"))],
+            "the chunk is still live"
+        );
+    }
+
+    #[test]
+    fn durable_progress_offset_is_stable_when_the_cycle_appends_an_event() {
+        // The ephemeral epoch seq fails this case. The same chunk gets a new
+        // value in cycle 2, so the store holds it twice.
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let cycle1 = WorkflowContext::for_replay(ExecutionId::new(), vec![started.clone()]);
+        cycle1
+            .publish_durable_progress(serde_json::json!("A"))
+            .expect("A");
+        let _ = cycle1.new_uuid();
+        cycle1
+            .publish_durable_progress(serde_json::json!("B"))
+            .expect("B");
+        let first = durable_chunks(&cycle1.drain_commands());
+        assert_eq!(first.len(), 2, "both chunks are live in cycle 1");
+
+        let side_effect = WorkflowEvent::SideEffectRecorded {
+            kind: crate::event::SideEffectKind::Uuid,
+            name: None,
+            value: serde_json::json!("00000000-0000-7000-8000-000000000000"),
+        };
+        let cycle2 = WorkflowContext::for_replay(ExecutionId::new(), vec![started, side_effect]);
+        cycle2
+            .publish_durable_progress(serde_json::json!("A"))
+            .expect("A");
+        let _ = cycle2.new_uuid();
+        cycle2
+            .publish_durable_progress(serde_json::json!("B"))
+            .expect("B");
+        let second = durable_chunks(&cycle2.drain_commands());
+        assert_eq!(second.len(), 1, "only B is live in cycle 2");
+        assert_eq!(second[0], first[1], "B keeps its offset across cycles");
+    }
+
+    #[test]
+    fn durable_progress_offset_is_stable_across_a_pause_resume() {
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let before = WorkflowContext::for_replay(ExecutionId::new(), vec![started.clone()]);
+        before
+            .publish_durable_progress(serde_json::json!("waiting"))
+            .expect("before");
+        let now = Utc::now();
+        let after = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started,
+                WorkflowEvent::WorkflowExecutionPaused {
+                    paused_at: now,
+                    reason: None,
+                    actor: "operator".to_string(),
+                },
+                WorkflowEvent::WorkflowExecutionResumed {
+                    resumed_at: now,
+                    actor: "operator".to_string(),
+                },
+            ],
+        );
+        after
+            .publish_durable_progress(serde_json::json!("waiting"))
+            .expect("after");
+        let before_chunks = durable_chunks(&before.drain_commands());
+        assert_eq!(before_chunks.len(), 1, "the chunk is live before the pause");
+        assert_eq!(
+            before_chunks,
+            durable_chunks(&after.drain_commands()),
+            "a pause and resume must not move the offset"
+        );
+    }
+
+    #[test]
+    fn durable_progress_offset_continues_across_a_resident_cycle() {
+        let ctx = WorkflowContext::new_test();
+        ctx.publish_durable_progress(serde_json::json!(0))
+            .expect("cycle 1");
+        let _ = ctx.drain_commands();
+        ctx.begin_resident_cycle(&[], Vec::new());
+        ctx.publish_durable_progress(serde_json::json!(1))
+            .expect("cycle 2");
+        assert_eq!(
+            durable_chunks(&ctx.drain_commands()),
+            vec![(1, serde_json::json!(1))],
+            "a resident cycle does not re-run the body, so the counter continues"
+        );
+        ctx.begin_resident_cycle(&[], Vec::new());
+        assert_eq!(
+            ctx.durable_progress_queued
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the queue bound is per cycle, so a resident cycle resets it"
+        );
+    }
+
+    #[test]
+    fn durable_progress_in_a_speculative_cycle_reads_the_position() {
+        let ctx = WorkflowContext::new_test();
+        let (result_tx, _result_rx) = tokio::sync::oneshot::channel();
+        ctx.begin_resident_cycle(
+            &[],
+            vec![WorkflowCommand::WaitForActivity {
+                activity_id: ActivityExecId::new(),
+                result_tx,
+            }],
+        );
+        let _ = ctx.drain_commands();
+        ctx.publish_durable_progress(serde_json::json!("chunk"))
+            .expect("publish");
+        assert!(
+            durable_chunks(&ctx.drain_commands()).is_empty(),
+            "a speculative cycle may be dropped, so it queues no chunk"
+        );
+        assert!(
+            ctx.end_speculation(),
+            "the gate reads the replay position, so the resume must decline"
+        );
+    }
+
+    #[test]
+    fn durable_progress_oversize_chunk_becomes_truncation_marker() {
+        let ctx = WorkflowContext::new_test();
+        let huge = "x".repeat(PROGRESS_CHUNK_MAX_BYTES + 1);
+        ctx.publish_durable_progress(Value::String(huge))
+            .expect("oversize publish succeeds");
+        let chunks = durable_chunks(&ctx.drain_commands());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].0, 0, "the marker keeps the offset");
+        assert_eq!(
+            chunks[0].1.get("_harvest_progress_truncated"),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn a_failed_serialization_does_not_use_a_queue_slot() {
+        // Regression (issue #1974 review). A failed call queues nothing, so it
+        // must not use a slot. Otherwise the overflow command is lost and the
+        // store never writes its marker.
+        let ctx = WorkflowContext::new_test();
+        let unserializable: std::collections::BTreeMap<(i32, i32), i32> =
+            std::iter::once(((1, 2), 3)).collect();
+        assert!(ctx.publish_durable_progress(unserializable).is_err());
+        let cap = u64::from(DURABLE_STREAM_MAX_CHUNKS);
+        for i in 0..=cap {
+            ctx.publish_durable_progress(i).expect("publish");
+        }
+        let queued = durable_chunks(&ctx.drain_commands()).len();
+        assert_eq!(
+            u64::try_from(queued).expect("fits"),
+            cap + 1,
+            "all cap + 1 good chunks are queued"
+        );
+    }
+
+    #[test]
+    fn durable_progress_queue_is_bounded_at_cap_plus_one() {
+        let ctx = WorkflowContext::new_test();
+        let cap = u64::from(DURABLE_STREAM_MAX_CHUNKS);
+        for i in 0..cap + 5 {
+            ctx.publish_durable_progress(i).expect("publish");
+        }
+        let chunks = durable_chunks(&ctx.drain_commands());
+        let queued = u64::try_from(chunks.len()).expect("fits");
+        assert_eq!(
+            queued,
+            cap + 1,
+            "one extra command lets the store detect overflow and write its marker"
+        );
+        assert_eq!(chunks.last().map(|c| c.0), Some(cap));
     }
 
     // ── Durable workflow logs (issue #790) ────────────────────────────
@@ -30499,6 +31087,25 @@ mod activity_info_tests {
         );
         assert!(local.is_local());
         assert!(local.info().is_local);
+    }
+
+    /// Issue #1998: a test context has no run, and a local activity cannot
+    /// read its run.
+    #[tokio::test]
+    async fn run_tenant_is_none_for_a_test_context_and_refused_for_a_local_one() {
+        assert_eq!(
+            ActivityContext::new_test().run_tenant().await.unwrap(),
+            None
+        );
+        let local = ActivityContext::new_local_activity(
+            crate::context::empty_shared_state(),
+            tokio_util::sync::CancellationToken::new(),
+            ActivityIdentity::for_test(),
+        );
+        assert!(matches!(
+            local.run_tenant().await,
+            Err(crate::error::HarvestError::Config(_))
+        ));
     }
 
     /// AC2: no `start_to_close` configured -> unbounded.

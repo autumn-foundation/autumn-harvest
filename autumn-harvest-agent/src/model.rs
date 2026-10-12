@@ -50,4 +50,16 @@ pub trait AgentModel: Send + Sync + std::fmt::Debug {
         &'a self,
         request: &'a ChatRequest,
     ) -> BoxFuture<'a, Result<ChatResponse, AgentError>>;
+
+    /// The id of the model that answers, for example `acme-chat-2026-01`.
+    ///
+    /// The [`ResponseCache`](crate::ResponseCache) puts it in each key. A
+    /// model with no id is never cached. The default is `None`.
+    ///
+    /// The id must change whenever the answer can change for the same
+    /// request. Use a pinned model version, not an alias. Put each client
+    /// setting that [`ChatRequest`] does not hold, such as `top_p`, in the id.
+    fn model_id(&self) -> Option<&str> {
+        None
+    }
 }

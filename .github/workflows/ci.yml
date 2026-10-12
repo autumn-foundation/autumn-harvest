@@ -430,6 +430,10 @@ jobs:
         run: cargo clippy -p autumn-harvest-agent --all-targets --no-deps -- -D warnings
       - name: Clippy autumn-harvest-agent (sqlite feature)
         run: cargo clippy -p autumn-harvest-agent --all-targets --features sqlite --no-deps -- -D warnings
+      - name: Clippy autumn-harvest-agent (eval feature, issue #2001)
+        run: cargo clippy -p autumn-harvest-agent --all-targets --features eval --no-deps -- -D warnings
+      - name: Clippy autumn-harvest-agent (sqlite and eval features, issue #2001)
+        run: cargo clippy -p autumn-harvest-agent --all-targets --features sqlite,eval --no-deps -- -D warnings
       - name: Check autumn-harvest-agent depends on no Autumn crate outside the engine
         run: ./scripts/check-agent-adapter-deps.sh
       # Same issue #962 rule as every other crate on this page: a workspace
@@ -448,6 +452,8 @@ jobs:
         run: cargo clippy -p standalone-runner --all-targets -- -D warnings
       - name: "Clippy standalone-quickstart example (issue #1614)"
         run: cargo clippy -p standalone-quickstart --all-targets -- -D warnings
+      - name: "Clippy agent-loop-hit-rate example (issue #2007)"
+        run: cargo clippy -p agent-loop-hit-rate --all-targets -- -D warnings
       # Same issue #962 rule as the verify and redis crates below: a new
       # workspace member gets NO clippy coverage without its own step here.
       # `--no-deps` scopes the deny to the example, because it depends on
@@ -514,6 +520,13 @@ jobs:
       # the same trailing-`::` YAML reason as above.
       - name: Run docs/rnd/sqlite-feasibility.md guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration sqlite_feasibility_docs::"
+
+      # Issue #2011: the speculation spike report states measured numbers and
+      # a verdict. A docs-only PR skips the `test` matrix, so its guards run
+      # here. `speculative_execution_docs::guards_run_on_docs_only_changes`
+      # checks that this step exists.
+      - name: Run docs/rnd/speculative-execution-spike.md guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration speculative_execution_docs::"
 
       # Issue #1816: the SLO burn-rate pack lives under `docs/`, so a PR
       # that edits only the pack skips the `test` matrix. These guards pin
@@ -629,6 +642,25 @@ jobs:
       # Quoted for the trailing-`::` YAML reason above.
       - name: Run standalone-activity decision guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration standalone_activity_docs::"
+
+      # Issue #2004: the safety report lives under `docs/`, so a docs-only
+      # change skips the `test` matrix. These guards run here, ungated. They
+      # check that each result has a real command. They check that the
+      # report states each known limit.
+      #
+      # Guarded by `safety_report_docs::guards_run_on_docs_only_changes`.
+      # Quoted for the trailing-`::` YAML reason above.
+      - name: Run docs/safety-report.md guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration safety_report_docs::"
+
+      # Issue #2014: the journaled host-call spike report lives under `docs/`,
+      # so a docs-only change skips the `test` matrix. These guards run here.
+      # They check that the report cites each prototype test and each bound.
+      #
+      # Guarded by `agent_code_journal_docs::guards_run_on_docs_only_changes`.
+      # Quoted for the trailing-`::` YAML reason above.
+      - name: Run the agent-code journal report guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration agent_code_journal_docs::"
 
       # Folio corpus harness: internal link check across all of docs/ (see
       # docs/audits/corpus-link-check.py). Same reasoning as the docs-only
@@ -1111,9 +1143,9 @@ jobs:
       - name: Run plugin doctests (issue #944 review)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test --doc -p autumn-harvest-plugin --features connectors
-      - name: Run plugin MCP tool tests (issue #597, DAG MCP tools issue #601 follow-up)
+      - name: Run plugin MCP tool tests (issue #597, DAG MCP tools issue #601 follow-up, MCP Tasks issue #2005, remote tasks issue #2006)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
-        run: cargo test -p autumn-harvest-plugin --features mcp,unified-dag-execution --lib --test mcp_tools_http_tests
+        run: cargo test -p autumn-harvest-plugin --features mcp,unified-dag-execution --lib --test mcp_tools_http_tests --test mcp_tasks_http_tests --test remote_tasks_http_tests
       - name: Run plugin metrics scrape tests (issue #355)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest-plugin --features metrics --lib --test metrics_scrape_http_tests
@@ -1142,10 +1174,11 @@ jobs:
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-sqlite
       # Issue #1973. Offline: a scripted model, no API key, no network. The
-      # crash test runs its own binary as a child process.
-      - name: Run autumn-harvest-agent tests (issue #1973)
+      # crash test runs its own binary as a child process. Issue #2001 adds
+      # the `eval` suite.
+      - name: Run autumn-harvest-agent tests (issues #1973, #2001)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
-        run: cargo test -p autumn-harvest-agent --features sqlite
+        run: cargo test -p autumn-harvest-agent --features sqlite,eval
       # The agent-daemon example's suite is offline: a scripted stub model, no
       # API key, and no network. Linux only, because the daemon's control
       # surface is a Unix domain socket.
@@ -1187,6 +1220,11 @@ jobs:
       - name: "Run standalone-quickstart example tests (issue #1614)"
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p standalone-quickstart
+      # Issue #2007. `--bins` runs the unit tests. The measurement itself
+      # needs Postgres and runs by hand (see the crate README).
+      - name: "Run agent-loop-hit-rate example tests (issue #2007)"
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo test -p agent-loop-hit-rate --bins
       - name: Run business_metrics example tests (issue #758)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics
@@ -1555,8 +1593,21 @@ jobs:
           if grep -q -- '--test connector_sqs_broker' <<<"$plan"; then
             images="$images softwaremill/elasticmq:1.5.2"
           fi
+          # Docker Hub rate-limits anonymous pulls, and the ECR Public mirror
+          # has a data limit. An official image (no slash in its name) comes
+          # from the Google mirror first, then from ECR Public. The tag then
+          # gives it the name that the suites request.
+          mirrors="mirror.gcr.io/library public.ecr.aws/docker/library"
           for image in $images; do
             for attempt in 1 2 3 4 5; do
+              if [[ "$image" != */* ]]; then
+                for mirror in $mirrors; do
+                  if docker pull "$mirror/$image"; then
+                    docker tag "$mirror/$image" "$image"
+                    continue 3
+                  fi
+                done
+              fi
               if docker pull "$image"; then
                 continue 2
               fi
@@ -1614,7 +1665,9 @@ jobs:
     # connects verbatim, same as `docker compose -f examples/quickstart/compose.yaml up -d`.
     services:
       postgres:
-        image: postgres:16
+        # The Google mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls, and ECR Public has a data limit.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_USER: quickstart
           POSTGRES_PASSWORD: quickstart
@@ -1769,7 +1822,9 @@ jobs:
     # DATABASE_URL connects as written.
     services:
       postgres:
-        image: postgres:16
+        # The Google mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls, and ECR Public has a data limit.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_USER: harvest
           POSTGRES_PASSWORD: harvest
@@ -1815,7 +1870,9 @@ jobs:
     timeout-minutes: 60
     services:
       postgres:
-        image: postgres:16
+        # The Google mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls, and ECR Public has a data limit.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -1865,7 +1922,9 @@ jobs:
     # Matches examples/quickstart/autumn.toml, same as the `quickstart` job.
     services:
       postgres:
-        image: postgres:16
+        # The Google mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls, and ECR Public has a data limit.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_USER: quickstart
           POSTGRES_PASSWORD: quickstart
@@ -1972,7 +2031,9 @@ jobs:
     # config connects verbatim — the truest AC-2/AC-3 test.
     services:
       postgres:
-        image: postgres:16
+        # The Google mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls, and ECR Public has a data limit.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_USER: demo_app
           POSTGRES_PASSWORD: demo_app
@@ -2144,7 +2205,8 @@ jobs:
 
   # TLA+ models of the core protocols (issue #1819). The runner checks each
   # row of formal/tla/models.txt. A `violation:` row is a counter-example, and
-  # it must fail on its named invariant. See docs/testing/formal-methods.md.
+  # it must fail on its named invariant. The job also checks the trace
+  # fixtures (issue #2003). See docs/testing/formal-methods.md.
   formal-models:
     name: TLA+ models
     needs: changes
@@ -2153,12 +2215,17 @@ jobs:
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
       needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # A full run takes about 40 seconds. The runner image has Java.
+    # The models take about 40 seconds and the trace fixtures about 10.
+    # The runner image has Java and Python.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Model-check every manifest row with TLC
         run: scripts/check-formal-models.sh
+      # Issue #2003: TLC must accept each clean fixture trace and reject
+      # each red one. The chaos traces are checked in chaos.yml.
+      - name: Check the trace fixtures against the TLA+ specs
+        run: scripts/check-formal-traces.sh formal/tla/trace/fixtures
 
   # Kani proofs of the pure kernels (issue #1819). The script fails when Kani
   # verifies fewer proofs than the source holds, or when a cover check fails.

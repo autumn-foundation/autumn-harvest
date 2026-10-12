@@ -1076,6 +1076,7 @@ pub(crate) fn runtime_config(
         notification_database_url: None,
         max_concurrent_workflows,
         max_concurrent_activities,
+        max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
         poll_interval: Duration::from_millis(25),
         shutdown_timeout: Duration::from_secs(1),
         cancellation_grace_period: Duration::from_secs(1),
@@ -2127,6 +2128,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -2366,6 +2368,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -2537,6 +2540,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -2680,6 +2684,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -2844,6 +2849,8 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             max_result_bytes: None,
             requires: None,
             handler: send_email_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ));
     let worker = Arc::new(
@@ -2857,6 +2864,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -3022,6 +3030,8 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             max_result_bytes: None,
             requires: None,
             handler: checkpointed_import_activity,
+            input_schema: None,
+            output_schema: None,
         }],
         heartbeat_resume_state(Arc::clone(&stats)),
     ));
@@ -3099,6 +3109,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -3150,6 +3161,8 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                     max_result_bytes: None,
                     requires: None,
                     handler: send_email_activity,
+                    input_schema: None,
+                    output_schema: None,
                 }],
             )),
         )
@@ -3366,6 +3379,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -3448,6 +3462,8 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     max_result_bytes: None,
                     requires: None,
                     handler: slow_activity,
+                    input_schema: None,
+                    output_schema: None,
                 }],
             )),
         )
@@ -3563,6 +3579,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -5112,6 +5129,8 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             max_result_bytes: None,
             requires: None,
             handler: stateful_activity,
+            input_schema: None,
+            output_schema: None,
         }])
         .state(String::from("haunted"))
         .worker(WorkerConfig::default())
@@ -5769,6 +5788,8 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             max_result_bytes: None,
             requires: None,
             handler: send_email_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ));
     let worker = build_runtime_worker("worker-e2e-early-signal", 1, 1, registry);
@@ -8104,6 +8125,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 notification_database_url: None,
                 max_concurrent_workflows: 4,
                 max_concurrent_activities: 4,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(100),
                 shutdown_timeout: Duration::from_secs(2),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -8338,6 +8360,7 @@ async fn workflow_schedule_pause_and_resume() {
                 notification_database_url: None,
                 max_concurrent_workflows: 4,
                 max_concurrent_activities: 4,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(100),
                 shutdown_timeout: Duration::from_secs(2),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -9327,6 +9350,8 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
             max_result_bytes: None,
             requires: None,
             handler: always_non_retryable_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ));
 
@@ -9496,6 +9521,8 @@ async fn circuit_breaker_short_circuits_after_tripping() {
             max_result_bytes: None,
             requires: None,
             handler: always_retryable_failure_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ));
 
@@ -9630,6 +9657,8 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
             max_result_bytes: None,
             requires: None,
             handler: always_legacy_string_failure_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ));
 
@@ -11433,6 +11462,8 @@ async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
             max_result_bytes: None,
             requires: None,
             handler: retry_context_activity,
+            input_schema: None,
+            output_schema: None,
         }],
         shared_state,
     ));
@@ -11716,6 +11747,8 @@ fn saga_activity_info(
         max_result_bytes: None,
         requires: None,
         handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -11969,6 +12002,8 @@ fn windowed_fanout_e2e_registry() -> Arc<HandlerRegistry> {
             max_result_bytes: None,
             requires: None,
             handler: slow_double_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ))
 }

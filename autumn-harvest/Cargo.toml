@@ -55,6 +55,11 @@ schema = ["dep:schemars"]
 # --workspace`, default features, never compiles wasmtime). See
 # docs/rnd/wasm-activities-spike.md.
 wasm-activities = ["dep:wasmtime", "dep:wat", "db", "dep:ed25519-dalek"]
+# Contention-adaptive atomicity R&D spike (issue #2012). Physical backout,
+# a saga or a hybrid per workflow, with a measurement harness. Off by
+# default. No production path calls it. It adds no dependency.
+# See docs/rnd/contention-adaptive-atomicity.md.
+atomicity-spike = ["db"]
 # Hot code swap for workflow definitions via runtime modules (issue #967).
 #
 # R&D spike. Hosts `#[workflow]` logic as a runtime-loaded WebAssembly module
@@ -187,6 +192,11 @@ required-features = ["db", "testing"]
 [[example]]
 name = "signal_with_start_webhook"
 required-features = ["db"]
+
+# Issue #1995: the upgrade-check command of a candidate build.
+[[example]]
+name = "upgrade_check"
+required-features = ["db", "testing"]
 
 [[example]]
 name = "update_with_start_cart"
@@ -325,6 +335,11 @@ serde_yaml = "0.9"
 [target.'cfg(not(loom))'.dev-dependencies]
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+
+# Runs the real `agent_loop` on a Postgres worker to measure the resident hit
+# rate (issue #2013). The loom and shuttle models never use it.
+[target.'cfg(not(any(loom, shuttle)))'.dev-dependencies]
+autumn-harvest-agent = { version = "0.7.0", path = "../autumn-harvest-agent" }
 
 # loom is only pulled in under `RUSTFLAGS="--cfg loom"`. It must live under a
 # `cfg(loom)` target dependency rather than `[dev-dependencies]` because the

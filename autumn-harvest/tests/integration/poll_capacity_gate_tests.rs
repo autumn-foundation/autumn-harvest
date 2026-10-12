@@ -208,6 +208,8 @@ fn activity_info(
         max_result_bytes: None,
         requires: None,
         handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -250,6 +252,7 @@ fn build_worker_polling(
                 notification_database_url: None,
                 max_concurrent_workflows: 8,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval,
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),

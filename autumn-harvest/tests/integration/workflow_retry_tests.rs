@@ -306,6 +306,7 @@ fn make_worker(
             shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 10,
             max_concurrent_activities: 20,
+            max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
             poll_interval: Duration::from_millis(50),
             shutdown_timeout: Duration::from_secs(2),
             cancellation_grace_period: Duration::from_secs(2),

@@ -324,6 +324,8 @@ fn activity_info(name: &'static str) -> ActivityInfo {
         max_result_bytes: None,
         requires: None,
         handler: act_inert,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -731,6 +733,7 @@ async fn start_one(
             start_source_ref: None,
             started_by: None,
             tenant: None,
+            fairness_key: None,
         },
         None,
     )

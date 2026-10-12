@@ -80,6 +80,7 @@ fn make_worker_with_redeliveries(registry: Arc<HandlerRegistry>, redeliveries: u
             notification_database_url: None,
             max_concurrent_workflows: 10,
             max_concurrent_activities: 20,
+            max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
             poll_interval: Duration::from_millis(50),
             shutdown_timeout: Duration::from_secs(2),
             cancellation_grace_period: Duration::from_secs(2),
@@ -319,6 +320,8 @@ fn local_activity_info(
         circuit_breaker: None,
         requires: None,
         handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -1230,7 +1233,6 @@ async fn workflow_reset_cascades_detached_children() {
             operator_id: "test-operator".to_string(),
             signal_reapply: autumn_harvest::ResetSignalReapplyPolicy::default(),
             allow_terminal_source: false,
-            refuse_erased_source: false,
         },
         None,
     )

@@ -141,9 +141,13 @@ A worker with a payload cap other than the default must say so. Set
   ends is denied, and the decision is recorded.
 - `hook_timeout(d)` — the time budget of one memory read, delivery or
   precheck. The default is 30 seconds.
+- `cache_timeout(d)` — the time budget of one response-cache call. The
+  default is 5 seconds.
 - `memory(store)` — the `MemoryStore` for runs with a memory scope.
 - `delivery(delivery)` — where reports go. The default is `LogDelivery`.
 - `precheck(precheck)` — the cheap check that can skip a heartbeat tick.
+- `response_cache(cache)` — serve an identical model call across runs.
+  Section 11 explains it.
 
 The names `memory` and `schedule_followup` belong to the built-in tools.
 When a built-in is active, it hides an app tool with the same name. With a
@@ -157,9 +161,10 @@ cannot fail the run.
 segment), `max_total_tokens` (per run), `max_output_tokens`,
 `approval_timeout` (default one hour, rounded up to whole seconds) and
 `max_request_bytes` (default: the engine default). Its content is `input`,
-`system`, `history` and `session`. Section 10 explains the always-on
-settings: `deliver`, `memory`, `followups`, `loop_guard`, `read_only`,
-`unattended` and `unattended_memory_writes`.
+`system`, `history` and `session`. `tenant` scopes the response cache.
+Section 10 explains the always-on settings: `deliver`, `memory`,
+`followups`, `loop_guard`, `read_only`, `unattended` and
+`unattended_memory_writes`.
 
 The loop drops a system message inside `history`. Only `system` reaches
 the model as the prompt.
@@ -264,7 +269,7 @@ strict replay compares each recorded input as it was written.
 - **A follow-up chain shares one workflow history.** Each segment adds to
   it. Keep `max_chain` low, or start a new run from the report.
 - **The session entity is separate.** It is a sibling issue. Per-step token
-  cost belongs to the agent cost ledger (#1970).
+  cost belongs to the agent cost ledger (#1996).
 
 ## 10. Always-on agents
 
@@ -438,7 +443,176 @@ The guard is not a cost control. A model that changes its arguments, or a
 tool whose result changes, does not trip it. Use `max_steps`,
 `max_total_tokens` and the chain cap for cost.
 
-## 11. The daemon example
+## 11. Response cache
+
+Replay reads an answer from the history of one run. A second run that sends
+the same request pays again. The response cache (issue #1998) serves that
+request from an earlier answer. It is off by default.
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+use autumn_harvest_agent::{AgentHarness, InMemoryCacheIndex, ResponseCache};
+
+// Add the codecs to the builder first. Clones share their keys.
+let codecs = builder.payload_codecs().clone();
+let cache = ResponseCache::new(store, Arc::new(InMemoryCacheIndex::default()), codecs)
+    .max_age(Duration::from_secs(24 * 3600));
+let harness = AgentHarness::new(model).response_cache(cache);
+```
+
+**The key.** The key is a SHA-256 hash of the model id, the output cap, the
+temperature, the tools, the messages, the tenant and its source, and the
+namespace.
+
+**The model id.** A model names itself through `AgentModel::model_id`. A
+model with no id is never cached. The crate ships no model with an id. The
+id must change whenever the answer can change for the same request. Use a
+pinned model version, not an alias such as `latest`. Put each client setting
+that `ChatRequest` does not hold, such as `top_p`, in the id.
+
+**The tenant.** The default scope is `CacheScope::Tenant`. Only runs of the
+same tenant share an entry. Runs with no tenant share only with each other.
+A declared tenant never shares an entry with a verified tenant of the same
+name.
+
+| Backend | Tenant of the key |
+|---------|-------------------|
+| Postgres, run with a verified tenant (#1977) | The verified tenant. `AgentTask::tenant` cannot change it. |
+| Postgres, run with no tenant | `AgentTask::tenant`, as a declared tenant |
+| Postgres, the tenant read fails | No key. The turn skips the cache. |
+| SQLite | `AgentTask::tenant`, as a declared tenant |
+
+`HeartbeatTask::tenant` sets the tenant of each tick. `CacheScope::Shared`
+lets every run share every entry. Use it only for prompts that hold no
+tenant data.
+
+**History.** A hit is the result of `agent_model_turn`. History records it
+like any other answer, with `cache_hit: true` and zero token usage. The
+policy still decides each tool call, and each tool still runs. Replay reads
+history and never reads the cache.
+
+**Tool idempotency.** A hit repeats the tool-call ids of the stored answer.
+Tools take the run id, the step and the call id as an idempotency key. With
+`RunIdSource::WorkflowId`, two runs can share a run id. On Postgres, such a
+turn skips the cache. On SQLite, start each run from `AgentTask::new`, which
+uses the execution id.
+
+**Storage.** The answer goes to your `PayloadStore`, inside a codec
+envelope. Pass a clone of the engine's `PayloadCodecs`, so an active codec
+encrypts each entry. A registry with no active codec stores entries in
+clear. The entry holds the answer and no prompt. Use a store for the cache
+alone, with an expiry of at least `max_age`. Do not put an expiry on the
+store that holds offloaded event payloads.
+
+**The index.** A `CacheIndex` maps each key to its blob. `InMemoryCacheIndex`
+keeps the map in process memory, with a capacity. It loses the map on a
+restart, and each worker has its own map. Implement `CacheIndex` to share
+one map between workers:
+
+- `get` returns the blob key of an entry, if any.
+- `put` stores a blob key, and returns each blob key that no entry holds
+  after the write. The cache deletes those blobs.
+- An index owns its blobs. Do not let a store share one blob between two
+  indexes.
+
+**Faults.** A cache fault, a slow cache or an entry that does not decode is a
+miss with a warning. An out-of-date entry is a quiet miss. The cache never
+fails a turn. Each cache call, the tenant read included, has the
+`cache_timeout` budget: 5 seconds by default. One turn makes at most three
+cache calls. A turn over `AgentHarness::max_result_bytes` fails, so the
+cache neither stores nor serves one. A hit over the cap is a miss, and the
+harness asks the model. A codec error is logged with fixed text,
+because a custom codec can quote the answer.
+
+**Limits.**
+
+- A hit repeats one sample. At a high temperature, a second run gets the
+  same answer.
+- `max_age` limits what the cache serves, not what the store keeps. Change
+  `namespace` to make every old entry a miss. The old blobs stay in the store
+  until the index drops them.
+- PII erasure (#495) does not reach the cache. Bound it with `max_age` and a
+  store expiry.
+- Key rotation (#948) does not re-encrypt entries. An entry under a retired
+  key is a miss. Its blob stays until a new answer replaces it or the store
+  expires it.
+- Two runs that miss at the same time both call the model.
+- A run that sets `tenant` records it in each model-turn input. An older
+  binary rebuilds that input without it, so set `tenant` only after the
+  whole fleet runs this release.
+
+## 12. Evaluate a candidate model or prompt
+
+`eval::evaluate` re-drives a recorded `agent_loop` run with a candidate model
+or prompt (issue #2001). It reports where the decisions of the two runs
+diverge. Turn on the `eval` feature.
+
+```rust,ignore
+use autumn_harvest_agent::eval::{Candidate, evaluate};
+
+// The source history, for example from SqliteRuntime::load_history.
+let history = rt.load_history(exec)?;
+let candidate = Candidate::new(AgentHarness::new(new_model).tools(tools))
+    .system_prompt("Answer in one sentence.");
+let evaluation = evaluate(&history, &candidate).await?;
+if let Some(turn) = evaluation.first_divergence {
+    println!("{:?}", evaluation.turns[turn]);
+}
+```
+
+The harness runs the real loop in the in-memory test engine. It writes
+nothing to a database. The source history is a borrowed slice, so it cannot
+change.
+
+| Activity | In an evaluation |
+|---|---|
+| `agent_model_turn` | The candidate model answers, then the candidate policy decides. These are the only live calls. The response cache is skipped, so every turn asks the candidate. |
+| `agent_tool_call` | The recorded outcome of the same call, or an error stub. No tool runs. |
+| `agent_memory_snapshot` | The recorded snapshot, or an empty one. |
+| `agent_deliver` | A stub. No report leaves the harness. |
+| Any other activity, such as `agent_precheck` | No mock. The candidate run fails. |
+
+A tool or snapshot activity that failed the source fails the candidate at the
+same activity.
+
+The policy runs live, so use a policy with no side effects. It sees the
+recorded run id and the aligned call ids. A retryable model failure retries
+under the retry policy of `agent_model_turn`, as on a worker. A turn over the
+harness result cap (`AgentHarness::max_result_bytes`) fails, as on a worker
+with no payload store.
+
+A recorded outcome answers a call with the same step, tool name and
+arguments. A candidate call that equals the recorded call at the same turn
+and position takes the recorded call id. Approval signal names hold the call
+id, so the recorded approvals stay valid. Any other call gets a new `eval_`
+id, so no recorded approval can release it. The harness sends again only an
+approval for a wait that the source opened, when it arrived before the
+deadline. An approval sent before its wait opened leaves no deadline timer,
+so the harness drops it, and the candidate times out at that wait.
+
+The report holds one `TurnDiff` per model turn. A turn diverges when the
+calls, the arguments, the policy decisions or the stop reason differ. Two
+final answers with the same stop reason and different text get `Reworded`.
+That is not a divergence. `end_diverged` compares how the two runs end, for
+example `Completed` and `TokensExhausted`. `diverged()` reads both.
+`stubbed_tool_calls` counts the calls with no recorded outcome.
+
+Each candidate turn is a live model call. `Candidate::max_turns` caps them.
+The default cap is the recorded turn count plus `DEFAULT_EXTRA_TURNS`. The
+report sets `turn_cap_reached` when the cap stops the candidate. Each engine
+cycle replays the history so far, so the time of an evaluation grows with the
+square of the run length.
+
+The harness refuses an erased source, a source that has not ended, a source
+that was cancelled or timed out, and a history that is not an agent run. A history with payload-store references or
+encrypted payloads needs decoding first. The model call blocks in place, so
+run the evaluation on a multi-thread Tokio runtime.
+
+The evaluation is an in-memory fork at the first event. The database fork of
+issue #2000 is a separate feature.
+
+## 13. The daemon example
 
 `examples/claude-agent-daemon` speaks the Anthropic Messages API and replays
 thinking blocks verbatim, which the provider-neutral `ChatMessage` cannot

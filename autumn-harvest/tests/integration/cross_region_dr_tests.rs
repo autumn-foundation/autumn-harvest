@@ -569,6 +569,64 @@ async fn a_fenced_worker_cannot_persist_events() {
     FenceRegistry::clear();
 }
 
+/// A stale worker after a fence stores no durable stream chunk (issue #1974).
+///
+/// The inline paths call `append_stream_chunks` on a bare connection. The
+/// fence must run in that transaction, or the demoted database diverges.
+#[tokio::test]
+async fn a_fenced_worker_cannot_store_durable_stream_chunks() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("stream");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .unwrap();
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, state, input, shard_id) \
+         VALUES ($1, 'wf', 'k1', 'RUNNING', '{}'::jsonb, 0)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    FenceRegistry::clear();
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    FenceRegistry::set_default_shard(ShardId::new(0))
+        .expect("no conflicting default shard in this test");
+    bump_generation(&mut conn, ShardId::new(0), "promote", "oncall")
+        .await
+        .unwrap();
+
+    let chunks = [autumn_harvest::store::DurableStreamChunk {
+        offset: 0,
+        chunk: serde_json::json!({"step": 1}),
+    }];
+    let err = autumn_harvest::store::append_stream_chunks(&mut conn, exec_id, &chunks, 10)
+        .await
+        .expect_err("a fenced worker must not store stream chunks");
+    assert!(
+        matches!(err, autumn_harvest::error::HarvestError::ShardFenced { .. }),
+        "expected ShardFenced, got {err:?}"
+    );
+
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let rows: Vec<Count> = diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_stream_chunks")
+        .load(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].n, 0, "a fenced append must store no chunk");
+    FenceRegistry::clear();
+}
+
 #[tokio::test]
 async fn a_fenced_worker_cannot_re_encrypt_history() {
     // The codec re-encryption sweep (issue #948) is sanctioned exception #3 to

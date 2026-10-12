@@ -930,6 +930,8 @@ fn e2e_registry() -> std::sync::Arc<autumn_harvest::worker::HandlerRegistry> {
         max_result_bytes: None,
         requires: None,
         handler: e2e_activity,
+        input_schema: None,
+        output_schema: None,
     };
     std::sync::Arc::new(
         autumn_harvest::worker::HandlerRegistry::with_state_and_telemetry(
@@ -958,6 +960,7 @@ fn e2e_worker(
                 notification_database_url: None,
                 max_concurrent_workflows: 2,
                 max_concurrent_activities: 2,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),

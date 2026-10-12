@@ -17,7 +17,9 @@ webhooks = ["autumn-harvest/db"]
 # MCP tool exposure for #[workflow(mcp)] workflows (issue #597). Enables
 # autumn-web's MCP layer so HarvestPlugin::mcp_tools() can project workflows
 # as start/status/signal/update/watch tools via AppBuilder::mount_mcp.
-mcp = ["autumn-web/mcp"]
+# `base64` decodes the `Mcp-Name` header sentinel on the MCP Tasks route
+# (issue #2005). It is already in the lockfile.
+mcp = ["autumn-web/mcp", "dep:base64"]
 # Built-in Prometheus scrape endpoint (issue #355). Registers Harvest's nine
 # ADR-0001 catalogue metrics as an autumn-web MetricsSource feeding the
 # app's shared /actuator/prometheus endpoint. No new dependency: rendering
