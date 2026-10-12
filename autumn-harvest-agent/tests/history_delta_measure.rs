@@ -90,6 +90,7 @@ fn agent_loop_history(filler: Filler) -> Vec<WorkflowEvent> {
             read_only: false,
             memory_scope: None,
             extra_tools: Vec::new(),
+            tenant: None,
         };
         let call = ToolCall {
             id: format!("call-{turn}"),
@@ -115,6 +116,7 @@ fn agent_loop_history(filler: Filler) -> Vec<WorkflowEvent> {
             stop: StopReason::ToolUse,
             usage: TokenUsage::default(),
             decisions: Vec::new(),
+            cache_hit: false,
         };
         events.push(WorkflowEvent::ActivityCompleted {
             activity_id: model_id,
