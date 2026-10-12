@@ -141,12 +141,51 @@ async fn grace(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
         .await
         .map_err(|e| e.to_string())?;
     if ctx.is_cancelled() {
-        ctx.timer("grace", 5).await.map_err(|e| e.to_string())?;
+        ctx.timer("grace", 3600).await.map_err(|e| e.to_string())?;
         ctx.execute_activity_raw("cleanup", json!(n), "default")
             .await
             .map_err(|e| e.to_string())?;
         return Ok(json!("cleaned"));
     }
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
+/// When cancelled, it runs `cleanup`, mints a UUID, and returns. The UUID is a
+/// side effect of the cycle that returns.
+#[workflow]
+async fn mints_on_cancel(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
+    ctx.execute_activity_raw("step", json!(n), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    if ctx.is_cancelled() {
+        ctx.execute_activity_raw("cleanup", json!(n), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(json!(ctx.new_uuid().to_string()));
+    }
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
+/// When cancelled, it waits on a future that never wakes, so the cycle
+/// deadlocks.
+#[workflow]
+async fn hangs_on_cancel(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
+    ctx.execute_activity_raw("step", json!(n), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    if ctx.is_cancelled() {
+        std::future::pending::<()>().await;
+    }
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
+/// When cancelled, the body panics.
+#[workflow]
+async fn panics_on_cancel(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
+    ctx.execute_activity_raw("step", json!(n), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    assert!(!ctx.is_cancelled(), "cleanup bug");
     ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
 }
 
@@ -180,6 +219,9 @@ fn register(rt: &mut SqliteRuntime, calls: &Arc<Calls>) {
     rt.register_workflow(&loops_info());
     rt.register_workflow(&checks_then_naps_info());
     rt.register_workflow(&grace_info());
+    rt.register_workflow(&mints_on_cancel_info());
+    rt.register_workflow(&hangs_on_cancel_info());
+    rt.register_workflow(&panics_on_cancel_info());
     let c = Arc::clone(calls);
     rt.register_activity_raw(
         "step",
@@ -441,6 +483,16 @@ async fn a_check_before_recorded_steps_still_ends_the_run() {
         "a check that replays before recorded steps must not wedge the run, got {state:?}"
     );
     assert_sealed_without_cleanup(&rt, &calls, exec, &prefix, "stop");
+    let report = replay(
+        rt.load_history(exec).unwrap(),
+        "loops",
+        loops_info().handler,
+    )
+    .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "the documented limit: this history does not replay:\n{report}"
+    );
 }
 
 #[tokio::test]
@@ -460,6 +512,125 @@ async fn a_check_before_a_recorded_timer_still_ends_the_run() {
     assert!(matches!(&state, Ok(RunState::Cancelled(reason)) if reason == "no nap"));
     assert_sealed_without_cleanup(&rt, &calls, exec, &prefix, "no nap");
     assert_eq!(leftover_rows(&path, exec), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn a_deadlock_under_a_cancel_request_ends_the_run() {
+    let (_dir, path) = temp_db();
+    let (mut rt, calls) = runtime(&path);
+    let exec = start_parked(&mut rt, "hangs_on_cancel").await;
+    let prefix = rt.load_history(exec).unwrap();
+
+    rt.cancel(exec, "stop").unwrap();
+    let state = rt.run_until_blocked(exec).await;
+
+    assert!(
+        matches!(&state, Ok(RunState::Cancelled(reason)) if reason == "stop"),
+        "a deadlocked cycle must not keep a cancelled run alive, got {state:?}"
+    );
+    assert_sealed_without_cleanup(&rt, &calls, exec, &prefix, "stop");
+    assert_eq!(leftover_rows(&path, exec), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn a_panic_under_a_cancel_request_keeps_the_panic_budget() {
+    let (_dir, path) = temp_db();
+    let (mut rt, _calls) = runtime(&path);
+    let exec = start_parked(&mut rt, "panics_on_cancel").await;
+    rt.cancel(exec, "stop").unwrap();
+
+    for strike in 1..3 {
+        let state = rt.run_until_blocked(exec).await;
+        assert!(
+            matches!(state, Err(SqliteError::WorkflowPanicked { .. })),
+            "strike {strike} stays non-terminal, got {state:?}"
+        );
+        assert!(matches!(
+            rt.outcome(exec).unwrap(),
+            ExecutionOutcome::Running
+        ));
+        assert_eq!(cancelled_events(&rt, exec), 0);
+    }
+
+    let state = rt.run_until_blocked(exec).await.unwrap();
+
+    assert!(
+        matches!(state, RunState::Failed(_)),
+        "the used-up budget ends the run FAILED, as without a cancel, got {state:?}"
+    );
+    assert_eq!(cancelled_events(&rt, exec), 0);
+}
+
+#[tokio::test]
+async fn a_side_effect_of_the_returning_cycle_persists_before_the_seal() {
+    let (_dir, path) = temp_db();
+    let (mut rt, calls) = runtime(&path);
+    let exec = start_parked(&mut rt, "mints_on_cancel").await;
+
+    rt.cancel(exec, "stop").unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+
+    assert!(matches!(&state, RunState::Cancelled(reason) if reason == "stop"));
+    assert_eq!(calls.cleanup.load(Ordering::SeqCst), 1);
+    let history = rt.load_history(exec).unwrap();
+    assert!(
+        matches!(
+            &history[history.len() - 2..],
+            [
+                WorkflowEvent::SideEffectRecorded { .. },
+                WorkflowEvent::WorkflowCancelled { .. }
+            ]
+        ),
+        "the side effect lands just before the seal event: {history:?}"
+    );
+    let report = replay(history, "mints_on_cancel", mints_on_cancel_info().handler).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn a_cancelled_run_is_not_driven_again() {
+    let (_dir, path) = temp_db();
+    let (mut rt, calls) = runtime(&path);
+    let exec = start_parked(&mut rt, "cleans_up").await;
+    rt.cancel(exec, "user stop").unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    let history = rt.load_history(exec).unwrap().len();
+
+    let state = rt.run_until_blocked(exec).await.unwrap();
+
+    assert!(matches!(&state, RunState::Cancelled(reason) if reason == "user stop"));
+    assert_eq!(calls.step.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.cleanup.load(Ordering::SeqCst), 1);
+    assert_eq!(rt.load_history(exec).unwrap().len(), history);
+}
+
+#[tokio::test]
+async fn a_reason_is_trimmed_as_on_postgres() {
+    let (_dir, path) = temp_db();
+    let (mut rt, _calls) = runtime(&path);
+    let cancelled = start_parked(&mut rt, "parks").await;
+    let terminated = start_parked(&mut rt, "parks").await;
+
+    rt.cancel(cancelled, "  stop  ").unwrap();
+    rt.terminate(terminated, " kill ").unwrap();
+
+    assert!(matches!(
+        rt.run_until_blocked(cancelled).await.unwrap(),
+        RunState::Cancelled(reason) if reason == "stop"
+    ));
+    assert!(matches!(
+        rt.run_until_blocked(terminated).await.unwrap(),
+        RunState::Terminated(reason) if reason == "kill"
+    ));
+    for (exec, reason) in [(cancelled, "stop"), (terminated, "kill")] {
+        assert!(matches!(
+            last_event(&rt, exec),
+            WorkflowEvent::WorkflowCancelled { reason: r } if r == reason
+        ));
+    }
 }
 
 #[tokio::test]
@@ -686,7 +857,10 @@ async fn a_terminal_target_returns_workflow_not_running() {
     ));
     let cancelled = start_parked(&mut rt, "parks").await;
     rt.cancel(cancelled, "c").unwrap();
-    rt.run_until_blocked(cancelled).await.unwrap();
+    assert!(matches!(
+        rt.run_until_blocked(cancelled).await.unwrap(),
+        RunState::Cancelled(_)
+    ));
     let terminated = start_parked(&mut rt, "parks").await;
     rt.terminate(terminated, "t").unwrap();
 
@@ -784,12 +958,7 @@ async fn a_terminated_history_replays_on_the_core_replayer() {
 async fn allow_duplicate_failed_only_replaces_a_cancelled_prior() {
     let (_dir, path) = temp_db();
     let (mut rt, _calls) = runtime(&path);
-    let prior = rt
-        .start_workflow_with_id("parks", "session-1", json!(1))
-        .unwrap();
-    rt.run_until_blocked(prior).await.unwrap();
-    rt.cancel(prior, "c").unwrap();
-    rt.run_until_blocked(prior).await.unwrap();
+    let prior = cancelled_prior(&mut rt, "session-1").await;
 
     let next = rt
         .start_workflow_with_reuse_policy(
@@ -805,6 +974,49 @@ async fn allow_duplicate_failed_only_replaces_a_cancelled_prior() {
         "a cancelled prior is replaced like a failed one"
     );
     assert_ne!(next.exec_id, prior);
+    assert!(
+        matches!(rt.outcome(prior).unwrap(), ExecutionOutcome::Terminated(s) if s == "CONTINUED_AS_NEW")
+    );
+    assert_eq!(cancelled_events(&rt, prior), 1, "the replace adds no event");
+}
+
+/// Starts `parks` under `workflow_id`, cancels it, and drives it to the end.
+async fn cancelled_prior(rt: &mut SqliteRuntime, workflow_id: &str) -> ExecutionId {
+    let prior = rt
+        .start_workflow_with_id("parks", workflow_id, json!(1))
+        .unwrap();
+    rt.run_until_blocked(prior).await.unwrap();
+    rt.cancel(prior, "c").unwrap();
+    assert!(matches!(
+        rt.run_until_blocked(prior).await.unwrap(),
+        RunState::Cancelled(_)
+    ));
+    prior
+}
+
+#[tokio::test]
+async fn the_other_policies_treat_a_cancelled_prior_as_terminal() {
+    let (_dir, path) = temp_db();
+    let (mut rt, _calls) = runtime(&path);
+    let prior = cancelled_prior(&mut rt, "session-3").await;
+    let start = |rt: &mut SqliteRuntime, policy| {
+        rt.start_workflow_with_reuse_policy("parks", "session-3", json!(2), policy)
+    };
+
+    let attached = start(&mut rt, WorkflowIdReusePolicy::AllowDuplicate).unwrap();
+    assert!(!attached.created);
+    assert_eq!(attached.exec_id, prior);
+
+    let refused = start(&mut rt, WorkflowIdReusePolicy::RejectDuplicate);
+    assert!(matches!(
+        &refused,
+        Err(SqliteError::AlreadyExists { existing_exec_id, existing_state })
+            if *existing_exec_id == prior && existing_state == "CANCELLED"
+    ));
+
+    let fresh = start(&mut rt, WorkflowIdReusePolicy::TerminateIfRunning).unwrap();
+    assert!(fresh.created);
+    assert_eq!(cancelled_events(&rt, prior), 1, "no second cancel event");
 }
 
 #[tokio::test]
@@ -826,4 +1038,5 @@ async fn a_terminated_prior_frees_its_reuse_key() {
         .unwrap();
 
     assert!(next.created);
+    assert_ne!(next.exec_id, prior);
 }

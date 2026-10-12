@@ -3567,6 +3567,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_advancing_clock_path_also_reads_the_span_meta_reason() {
+        let mut meta = span_meta("wf", "q");
+        meta.cancellation_reason = Some("stop".into());
+        let (outcome, _, _, _) = run_workflow_with_state_advancing_clock(
+            ExecutionId::new(),
+            started_only(),
+            reports_cancellation,
+            Value::Null,
+            empty_shared_state(),
+            Some(&meta),
+            std::sync::Arc::new(crate::telemetry::NoOpMetrics),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(outcome, WorkflowOutcome::Completed { ref output, .. } if *output == serde_json::json!("stop")),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_recorded_cancel_wins_over_the_span_meta_reason() {
         let mut history = started_only();
         history.push(WorkflowEvent::WorkflowCancelled {

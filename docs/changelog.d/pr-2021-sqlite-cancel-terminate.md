@@ -63,8 +63,11 @@ covers:
 - cleanup with the reason, and a reopen between request and end;
 - a body parked on a signal, on a timer, and behind a pending retry;
 - a check before recorded steps and before a recorded timer;
-- idempotence, blank reasons, an `Err` return and the fleet driver;
-- row cleanup, unknown and terminal targets, and the reuse matrix;
+- a deadlock and a panic under a pending request;
+- a side effect of the returning cycle, and a second drive of a cancelled run;
+- idempotence, blank and padded reasons, an `Err` return and the fleet driver;
+- row cleanup, unknown and terminal targets, and each reuse policy over a
+  cancelled prior;
 - replay of a cancel history, a terminate history and a parked cancel.
 
 Core unit tests pin the seam and the precedence of a recorded event. A schema

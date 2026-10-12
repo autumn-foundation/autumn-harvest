@@ -945,7 +945,6 @@ impl SqliteRuntime {
         persist_terminal_pending_commands(&tx, exec, pending)?;
         seal_with_cancel_event(&tx, exec, CANCELLED_STATE, reason)?;
         tx.commit()?;
-        self.workflow_panic_strikes.remove(&exec);
         Ok(RunState::Cancelled(reason.to_string()))
     }
 
