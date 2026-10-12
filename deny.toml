@@ -208,6 +208,29 @@ ignore = [
     # `Client::new`/`Client::from_conf` API, never a connector type
     # directly, so the swap is behavior-invisible to it. No new packages
     # added to Cargo.lock, only the legacy cluster removed.
+
+    # RUSTSEC-2024-0449 — unsafe-libyaml is unmaintained. Its repository was
+    # archived on 2024-03-25, and 0.2.11 is the last release. This is an
+    # `unmaintained` notice, not a vulnerability. The advisory reached the
+    # database on 2026-10-12 and turned every cargo-deny run red, on
+    # `trunk-dev` too.
+    #
+    # The only path is `serde_yaml` 0.9.34, itself deprecated. Two crates
+    # pull it in:
+    # - `autumn-web` 0.8.0 (external, a normal dependency). It is not ours
+    #   to change, so this entry stays until it moves off `serde_yaml`.
+    # - our own dev-dependency in autumn-harvest/Cargo.toml. Three test
+    #   guards (`slo_pack_docs`, `supply_chain_ci`, `formal_trace_coverage`)
+    #   parse checked-in YAML with it. Tests never ship, and they read only
+    #   files in this repository, so no untrusted input reaches the parser.
+    #
+    # Dropping our dev-dependency alone would not clear the advisory, since
+    # `autumn-web` keeps the crate in the graph. The advisory names
+    # `saphyr` / `serde-saphyr` and `noyalib` as safe replacements.
+    #
+    # Revisit: when `autumn-web` drops `serde_yaml`, move the three guards
+    # to a maintained parser and delete this entry.
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained, not a vulnerability: unsafe-libyaml arrives only through the deprecated serde_yaml, which autumn-web 0.8.0 (external) depends on; our own use is a dev-dependency that parses checked-in YAML in three test guards. Revisit: autumn-web drops serde_yaml." },
 ]
 
 # ---------------------------------------------------------------------------
