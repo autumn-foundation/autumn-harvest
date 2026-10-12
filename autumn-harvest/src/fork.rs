@@ -77,10 +77,8 @@ impl WorkflowForkRequest {
     fn normalized(mut self) -> Self {
         self.reason = non_empty_or(&self.reason, "workflow fork requested");
         self.operator_id = non_empty_or(&self.operator_id, "unknown");
-        self.workflow_id = self
-            .workflow_id
-            .map(|id| id.trim().to_string())
-            .filter(|id| !id.is_empty());
+        // An explicit empty id stays empty, so the fork refuses it.
+        self.workflow_id = self.workflow_id.map(|id| id.trim().to_string());
         self
     }
 }
@@ -503,6 +501,7 @@ async fn fork_workflow_id(
     source: &WorkflowExecution,
     request: &WorkflowForkRequest,
 ) -> Result<String, WorkflowForkError> {
+    check_workflow_id(request.workflow_id.as_deref())?;
     let workflow_id = request
         .workflow_id
         .clone()
@@ -1000,6 +999,19 @@ fn decode_rows(rows: &[HarvestEvent], codecs: &PayloadCodecs) -> HarvestResult<V
     rows.iter()
         .map(|row| codecs.decode_event(row.event_data.clone()))
         .collect()
+}
+
+/// Refuse an explicit empty workflow id.
+///
+/// The start and rerun routes refuse it too (issue #1353). The by-id routes
+/// cannot address an empty id. An omitted id still derives a new one.
+fn check_workflow_id(workflow_id: Option<&str>) -> Result<(), WorkflowForkError> {
+    if workflow_id.is_some_and(str::is_empty) {
+        return Err(WorkflowForkError::InvalidOverride {
+            message: "workflow_id must not be empty; omit it to derive one".to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Map a logical fork point that cannot resolve to a fork error.
@@ -2914,6 +2926,23 @@ mod tests {
             validate_fork(&source, 2, &twice),
             Err(WorkflowForkError::InvalidOverride { .. })
         ));
+    }
+
+    #[test]
+    fn an_explicit_empty_workflow_id_is_refused() {
+        for raw in ["", "  "] {
+            let request = WorkflowForkRequest {
+                workflow_id: Some(raw.to_string()),
+                ..WorkflowForkRequest::default()
+            }
+            .normalized();
+            assert!(matches!(
+                check_workflow_id(request.workflow_id.as_deref()),
+                Err(WorkflowForkError::InvalidOverride { .. })
+            ));
+        }
+        assert!(check_workflow_id(None).is_ok());
+        assert!(check_workflow_id(Some("orders-7")).is_ok());
     }
 
     #[test]

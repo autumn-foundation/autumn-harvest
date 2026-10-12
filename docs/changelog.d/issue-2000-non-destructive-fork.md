@@ -62,7 +62,9 @@ an erased run. Erasure does not reach a fork, which is a new root, so erase
 each fork on its own. A fork point at or after a terminal
 event, a carried `MutexGranted` and a continue-as-new history are refused.
 As for a rerun, a draining source shard and a business key held on any
-shard are refused. The erased-lineage walk locks each ancestor and fails
+shard are refused. An explicit empty or blank `workflow_id` is refused with
+`400`, as on the start and rerun routes (issue #1353). Omit the field to
+derive an id. The erased-lineage walk locks each ancestor and fails
 closed past 64 links. A lineage that reaches a deleted run fails closed
 too, because retention can delete an erased run. So does a lineage that
 reaches a migration seal: an erasure on the new shard leaves the seal as it

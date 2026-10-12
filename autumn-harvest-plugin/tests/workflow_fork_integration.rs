@@ -308,6 +308,13 @@ async fn fork_route_maps_refusals() {
     let (status, _) = post_fork(&app, &Uuid::new_v4().to_string(), json!({}), true).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
+    // An explicit empty id is refused, as on the start and rerun routes. It
+    // never falls back to a derived id in silence.
+    for id in ["", "   "] {
+        let (status, body) = post_fork(&app, &source, json!({ "workflow_id": id }), true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "id {id:?}, body: {body}");
+    }
+
     // A typo or a bad mode never falls back to the default silently.
     for body in [json!({ "effects": "LIVE" }), json!({ "effect": "live" })] {
         let (status, _) = post_fork(&app, &source, body, true).await;
