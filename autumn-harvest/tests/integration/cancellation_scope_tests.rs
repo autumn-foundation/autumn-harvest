@@ -361,6 +361,14 @@ async fn non_cancellable_block_completes_after_the_workflow_is_cancelled() {
         "RUNNING",
         "the run keeps running while the block is open"
     );
+    // A paused run claims no task, so the block could never close.
+    let paused =
+        autumn_harvest::pause_workflow_execution(&mut conn, exec_id, None, "oncall", &NoOpMetrics)
+            .await;
+    assert!(
+        matches!(paused, Err(HarvestError::Config(_))),
+        "a pending cancel rejects a pause: {paused:?}"
+    );
 
     CLEANUP_GATE.store(true, Ordering::SeqCst);
     let parent = wait_for_execution_state_with_timeout(

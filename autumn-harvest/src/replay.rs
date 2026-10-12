@@ -6577,10 +6577,12 @@ impl HistoryMatcher {
                 }
                 // Other writers append between the horizon and the marker: a
                 // completion, a late external result, a signal. The marker
-                // name is unique, so the scan steps over any event that is not
-                // a terminal lifecycle event. The cursor returns to the first
-                // stepped-over event, so nothing is lost.
-                event if !event.is_terminal_lifecycle() => {
+                // name is unique, so the scan steps over such an event. The
+                // cursor returns to the first stepped-over event, so nothing
+                // is lost. A command event stops the scan: the replayed body
+                // did not issue a command that the recorded run issued, and
+                // that is drift.
+                event if !event.is_terminal_lifecycle() && !Self::is_command_event(event) => {
                     first_interleaved_command.get_or_insert(scan_cursor);
                     scan_cursor += 1;
                 }

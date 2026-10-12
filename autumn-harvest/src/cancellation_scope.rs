@@ -315,12 +315,18 @@ pub(crate) fn captured_marker_drift(stack: &[ScopeFrame], cmd: &WorkflowCommand)
         let ScopeFrame::Cancellable(shared) = frame else {
             break;
         };
+        // A matched record counts as used, as a matched history event does.
         let (holding, captured) = {
-            let inner = shared.lock();
-            let captured = inner.records.iter().find_map(|record| match record {
-                CapturedRecord::Marker { name: n, details } if n == name => Some(details.clone()),
-                _ => None,
-            });
+            let mut inner = shared.lock();
+            let at = inner.records.iter().position(
+                |record| matches!(record, CapturedRecord::Marker { name: n, .. } if n == name),
+            );
+            let captured =
+                at.and_then(|at| inner.records.remove(at))
+                    .and_then(|record| match record {
+                        CapturedRecord::Marker { details, .. } => Some(details),
+                        CapturedRecord::SideEffect { .. } => None,
+                    });
             (inner.holding, captured)
         };
         if !holding {
@@ -545,13 +551,25 @@ impl<F: Future> ScopeRun<'_, F> {
         let name = cancel_marker_name(seq);
         let mut withdrawn = Vec::new();
         let result = if let Some((index, details)) = ctx.take_marker(&name) {
-            parse_cancel_marker(ctx, &name, details).map(|marker| {
+            parse_cancel_marker(ctx, &name, details).and_then(|marker| {
+                // Each captured decision stands in for a history event. One
+                // that the replayed body did not ask for is drift.
+                let unused = self.shared.lock().records.len();
+                if unused > 0 {
+                    return Err(ctx.scope_nd_error(
+                        format!(
+                            "cancellation scope {seq}: the replayed body skipped {unused} \
+                             recorded decision(s) of the cancelling cycle"
+                        ),
+                        name.clone(),
+                    ));
+                }
                 ctx.consume_scope_members(&marker.members, marker.horizon..index);
                 // The held commands are the commands that the live cycle withdrew.
                 ctx.undo_scope_timer_mutations(seq);
                 ctx.mark_scope_timers_cancelled(&marker.members.timers);
                 ctx.mark_scope_arms_cancelled(&self.armed_timers());
-                marker.reason
+                Ok(marker.reason)
             })
         } else if self.replay.is_some() || ctx.has_unconsumed_marker(&name) {
             Err(ctx.scope_nd_error(
@@ -1664,6 +1682,61 @@ mod tests {
         assert!(
             changed.take_nd_details().is_some(),
             "a changed decision is non-determinism"
+        );
+    }
+
+    /// A replayed body that no longer makes a captured decision is drift.
+    #[tokio::test]
+    async fn a_replay_that_skips_a_captured_decision_is_drift() {
+        let live = WorkflowContext::new_test();
+        let seen = std::sync::Mutex::new(None);
+        record_then_cancel(&live, &seen, |ctx| {
+            json!(ctx.side_effect("pick", || 41).expect("side effect"))
+        })
+        .await;
+        let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+        let replay = replay_of(details);
+        let result = bounded(run_then_cancel(&replay, async {
+            std::future::pending::<()>().await;
+        }))
+        .await;
+
+        assert!(
+            matches!(result, Err(HarvestError::NonDeterministic { .. })),
+            "{result:?}"
+        );
+    }
+
+    /// A member start that the replayed body no longer issues stops the
+    /// scan for the cancel marker, so the removed command is drift.
+    #[tokio::test]
+    async fn a_removed_member_start_is_drift_at_the_cancel() {
+        let a = ActivityExecId::new();
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started(),
+                scheduled(a, "charge"),
+                WorkflowEvent::MarkerRecorded {
+                    name: "cancel_scope:1".into(),
+                    details: json!({
+                        "reason": "cancellation scope cancelled",
+                        "horizon": 2,
+                        "activities": [a],
+                    }),
+                },
+            ],
+        );
+
+        let result = bounded(run_then_cancel(&ctx, async {
+            std::future::pending::<()>().await;
+        }))
+        .await;
+
+        assert!(
+            matches!(result, Err(HarvestError::NonDeterministic { .. })),
+            "{result:?}"
         );
     }
 

@@ -5203,6 +5203,23 @@ pub fn pause_timeout_exceeded(
     chrono::Duration::from_std(max).is_ok_and(|max| now - paused_at >= max)
 }
 
+/// Reject a pause while a deferred cancel is pending (issue #1984).
+///
+/// A paused run claims no task, so its open block cannot close. A pending
+/// cancel would then wait without end.
+fn reject_pause_with_pending_cancel(
+    exec_id: ExecutionId,
+    events: &[WorkflowEvent],
+) -> HarvestResult<()> {
+    if DeferredCancelState::of(events).requested.is_some() {
+        return Err(HarvestError::Config(format!(
+            "workflow execution {exec_id} has a pending cancel; it completes when its \
+             non-cancellable block closes, so the run cannot be paused"
+        )));
+    }
+    Ok(())
+}
+
 /// Pause a running workflow execution (issue #383).
 ///
 /// Pausing is a durable, **non-terminal** transition: it appends a
@@ -5280,8 +5297,10 @@ pub async fn pause_workflow_execution(
                 }
             }
 
-            // Undecoded: this reads `next_event_id` only (see the loader's docs).
+            // Undecoded: this reads `next_event_id` and the event types only
+            // (see the loader's docs).
             let history = store::load_history_undecoded(conn, exec_id).await?;
+            reject_pause_with_pending_cancel(exec_id, &history.events)?;
             store::append_events(
                 conn,
                 exec_id,

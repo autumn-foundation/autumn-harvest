@@ -28,7 +28,8 @@ from the captured one reports non-determinism. A withdrawn timer command restore
   holds when the block closes in an inline local-activity loop.
 - A cycle that would fail or continue as new is cancelled instead. A cycle
   that completes keeps its result.
-- A paused run is not deferred. A reset drops a copied request. The
+- A paused run is not deferred, and a run with a pending deferred cancel
+  cannot be paused. A reset drops a copied request. The
   same-shard parent-close cascade defers like the cross-shard path.
 - Scheduler `CancelOther` counts a deferred cancel as no freed slot.
 
