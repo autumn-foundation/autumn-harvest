@@ -319,7 +319,11 @@ impl AgentHarness {
             }
         } else {
             let response = self.call_model(&chat).await?;
-            if let Some(key) = &key {
+            // An answer over the result cap fails its turn. A cached copy
+            // would fail every later turn with the same request.
+            if let Some(key) = &key
+                && self.fits_result_cap(&response)
+            {
                 self.cache_store(key, &response).await;
             }
             response
@@ -419,6 +423,16 @@ impl AgentHarness {
                 None
             }
         }
+    }
+
+    /// Whether the content of `response` fits the result cap.
+    ///
+    /// The recorded turn adds the decisions to the content, so a miss here
+    /// means that the turn cannot fit either.
+    fn fits_result_cap(&self, response: &ChatResponse) -> bool {
+        serde_json::to_vec(&response.content).is_ok_and(|bytes| {
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= self.max_result_bytes
+        })
     }
 
     /// Store a fresh answer. A fault or a slow cache is only a warning.

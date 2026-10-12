@@ -44,8 +44,9 @@ fleet runs this release.
 
 **Tests.** `tests/response_cache.rs` serves a second SQLite run from the
 cache and checks the recorded turn. A strict replay of that history
-succeeds. Other tests prove five more rules. Tenants do not share an entry.
-A model with no id is not cached. A broken store falls back to the model.
+succeeds. Other tests prove six more rules. Tenants do not share an entry.
+A model with no id is not cached. An answer over the result cap is not
+cached. A broken store falls back to the model.
 The shared scope serves every tenant. A hit still asks the policy. Unit
 tests cover each key part, both scopes, the tenant source, the entry check,
 `max_age`, eviction, and `AeadCodec` encryption of the stored blob. They

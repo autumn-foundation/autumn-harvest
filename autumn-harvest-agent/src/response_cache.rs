@@ -420,19 +420,24 @@ impl ResponseCache {
     }
 
     /// The codec envelope of `entry`, as bytes.
+    ///
+    /// The errors use fixed text. A custom codec error can quote the answer
+    /// or key context, and the harness logs each error.
     fn encode(&self, entry: &Entry) -> Result<Vec<u8>, AgentError> {
         let value = serde_json::to_value(entry).map_err(|_| shape_error())?;
-        let encoded = self
-            .codecs
-            .encode_payload(&value)
-            .map_err(|err| AgentError::new(ErrorKind::Config, format!("cache encode: {err}")))?;
+        let encoded = self.codecs.encode_payload(&value).map_err(|_| {
+            AgentError::new(
+                ErrorKind::Config,
+                "the payload codec could not encode a response cache entry",
+            )
+        })?;
         serde_json::to_vec(&encoded).map_err(|_| shape_error())
     }
 
     /// The entry inside the codec envelope `bytes`.
     ///
-    /// The errors use fixed text. A serde error can quote the decoded
-    /// answer, and the harness logs each error.
+    /// The errors use fixed text. A serde error or a custom codec error can
+    /// quote the decoded answer, and the harness logs each error.
     fn decode(&self, bytes: &[u8]) -> Result<Entry, AgentError> {
         let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| shape_error())?;
         // With an active codec, a plain entry is not one this cache wrote.
@@ -447,10 +452,12 @@ impl ResponseCache {
                 "response cache entry is not a codec envelope",
             ));
         }
-        let decoded = self
-            .codecs
-            .decode_payload(&value)
-            .map_err(|err| AgentError::new(ErrorKind::Decode, format!("cache decode: {err}")))?;
+        let decoded = self.codecs.decode_payload(&value).map_err(|_| {
+            AgentError::new(
+                ErrorKind::Decode,
+                "the payload codec could not decode a response cache entry",
+            )
+        })?;
         serde_json::from_value(decoded).map_err(|_| shape_error())
     }
 

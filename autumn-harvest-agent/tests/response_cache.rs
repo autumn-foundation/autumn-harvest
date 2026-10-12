@@ -132,6 +132,32 @@ async fn tenants_do_not_share_an_entry_by_default() {
     assert_eq!(model.calls(), 3, "only the same tenant shares an entry");
 }
 
+/// An answer over the result cap fails its turn, so the cache must not keep
+/// it. A later run with the same request asks the model again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_over_the_result_cap_is_not_cached() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::named(
+        "m-1",
+        vec![answer(&"x".repeat(4096), 1), answer("short", 1)],
+    );
+    let store = Arc::new(MemStore::default());
+    let harness = AgentHarness::new(model.clone())
+        .max_result_bytes(1024)
+        .response_cache(response_cache(&store));
+    let mut rt = runtime(&db, harness);
+    let task = AgentTask::new("hi");
+
+    // The oversized turn may fail the run. Only the cache matters here.
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let _ = rt.run_until_blocked(exec).await;
+    assert_eq!(store.len(), 0, "the oversized answer must not be cached");
+
+    let (_, text) = run(&mut rt, &task).await;
+    assert_eq!(text, "short");
+    assert_eq!(model.calls(), 2, "the second run must ask the model");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_model_with_no_id_is_never_cached() {
     let (_dir, db) = fresh_db();
