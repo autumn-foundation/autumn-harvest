@@ -557,7 +557,8 @@ The guard suite fails in these cases:
 - A mirrored body differs from its engine source.
 - An engine source does not name the Verus file that proves it.
 - A Verus file uses `assume`, `admit`, `external_body` or another way to
-  skip a step.
+  skip a step. The guard lexes the file and bans each name as an
+  identifier, so a comment, a space or a `use` alias cannot hide it.
 - `formal/verus/src/lib.rs` does not declare a module, so Verus never
   checks it.
 - `ci.yml` does not run the script on every PR.

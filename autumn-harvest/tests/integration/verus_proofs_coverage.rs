@@ -17,17 +17,20 @@ use std::path::Path;
 use super::ci_run_coverage::{parse_workflow, repo_root};
 use super::formal_models_coverage::formal_job_defect;
 
-/// Verus constructs that let a proof skip a step. None may appear.
+/// Identifiers that let a proof skip a step. None may appear in code.
 ///
-/// The guard matches them after it drops all whitespace, so `assume (x)`
-/// and `verifier :: external` match too.
+/// The guard lexes each file, so comments and literals do not count. A
+/// space or a comment between two tokens cannot hide a name. The guard
+/// bans the name itself, so a `use` alias cannot hide it either.
 const TRUST_ESCAPES: &[&str] = &[
-    "assume(",
-    "admit(",
+    "assume",
+    "admit",
     "external_body",
+    "external",
+    "external_fn_specification",
+    "external_type_specification",
     "assume_specification",
-    "verifier::external",
-    "verifier::truncate",
+    "truncate",
 ];
 
 /// One `// mirror:` marker.
@@ -242,16 +245,94 @@ fn every_mirrored_source_names_its_verus_proof() {
     }
 }
 
-/// The first trust escape in `code`, if any. Comments do not count.
+/// The identifiers of `src` in order. Comments, nested block comments,
+/// and string, raw string and char literals hold no identifier.
+fn code_identifiers(src: &str) -> Vec<String> {
+    let c: Vec<char> = src.chars().collect();
+    let at = |i: usize| c.get(i).copied().unwrap_or('\0');
+    let is_ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let mut idents = Vec::new();
+    let mut i = 0;
+    while i < c.len() {
+        match (c[i], at(i + 1)) {
+            ('/', '/') => {
+                while i < c.len() && c[i] != '\n' {
+                    i += 1;
+                }
+            }
+            ('/', '*') => {
+                let mut depth = 0_usize;
+                while i < c.len() {
+                    match (c[i], at(i + 1)) {
+                        ('/', '*') => {
+                            depth += 1;
+                            i += 2;
+                        }
+                        ('*', '/') => {
+                            depth -= 1;
+                            i += 2;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            ('"', _) => {
+                i += 1;
+                while i < c.len() && c[i] != '"' {
+                    i += if c[i] == '\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            // A char literal. A lifetime has no closing quote, so it
+            // falls through and its name lexes as an identifier.
+            ('\'', '\\') => {
+                i += 2;
+                while i < c.len() && c[i] != '\'' {
+                    i += if c[i] == '\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            ('\'', _) if at(i + 2) == '\'' => i += 3,
+            (ch, _) if is_ident(ch) => {
+                let start = i;
+                while i < c.len() && is_ident(c[i]) {
+                    i += 1;
+                }
+                let word: String = c[start..i].iter().collect();
+                // A raw string: `r"..."`, `r#"..."#` or `br#"..."#`.
+                if (word == "r" || word == "br") && matches!(at(i), '"' | '#') {
+                    let mut hashes = 0;
+                    while at(i) == '#' {
+                        hashes += 1;
+                        i += 1;
+                    }
+                    if at(i) == '"' {
+                        i += 1;
+                        while i < c.len()
+                            && !(c[i] == '"' && (1..=hashes).all(|k| at(i + k) == '#'))
+                        {
+                            i += 1;
+                        }
+                        i += 1 + hashes;
+                        continue;
+                    }
+                }
+                idents.push(word);
+            }
+            _ => i += 1,
+        }
+    }
+    idents
+}
+
+/// The first trust escape in `code`, if any.
 fn trust_escape(code: &str) -> Option<&'static str> {
-    let compact: String = strip_comments(code)
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    TRUST_ESCAPES
+    code_identifiers(code)
         .iter()
-        .copied()
-        .find(|escape| compact.contains(escape))
+        .find_map(|word| TRUST_ESCAPES.iter().copied().find(|e| e == word))
 }
 
 #[test]
@@ -264,15 +345,35 @@ fn no_verus_proof_trusts_an_unproved_step() {
 }
 
 #[test]
-fn the_trust_escape_check_ignores_whitespace() {
-    assert_eq!(trust_escape("proof { assume (false); }"), Some("assume("));
-    assert_eq!(trust_escape("proof { admit\n(); }"), Some("admit("));
-    assert_eq!(
-        trust_escape("#[verifier :: external]\nfn f() {}"),
-        Some("verifier::external")
-    );
-    assert_eq!(trust_escape("// assume (false)\nfn f() {}"), None);
-    assert_eq!(trust_escape("proof { assert(x == x); }"), None);
+fn the_trust_escape_check_lexes_the_source() {
+    let hidden = [
+        ("proof { assume (false); }", "assume"),
+        ("proof { admit\n(); }", "admit"),
+        ("proof { assume/* hidden */(false); }", "assume"),
+        ("let s = \"//\"; assume(false);", "assume"),
+        ("let s = \"/*\"; admit(); // */", "admit"),
+        ("use vstd::prelude::assume as a;", "assume"),
+        ("#[verifier :: external]\nfn f() {}", "external"),
+        ("#[verifier(external_body)]\nfn f() {}", "external_body"),
+        (
+            "fn f<'a>(x: &'a u8) { let q = '\"'; assume(false); }",
+            "assume",
+        ),
+    ];
+    for (code, escape) in hidden {
+        assert_eq!(trust_escape(code), Some(escape), "{code}");
+    }
+    let clean = [
+        "// assume (false)\nfn f() {}",
+        "/* outer /* assume(x) */ admit() */ fn f() {}",
+        "let s = \"assume(false)\";",
+        "let s = r#\"admit() \" assume\"#;",
+        "let c = '\\''; let d = 'x';",
+        "proof { assert(x == x); }",
+    ];
+    for code in clean {
+        assert_eq!(trust_escape(code), None, "{code}");
+    }
 }
 
 #[test]
