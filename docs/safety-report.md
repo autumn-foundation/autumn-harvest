@@ -147,9 +147,8 @@ rejects the writes of the stale worker.
   external side effects of that holder.
 - The scanner lease is a load control, not a fence. If the lease query
   fails, scanners run without it.
-- The oracle harness drives store statements, not the `worker.rs` loop.
-  The world simulation runs the loop, but one step is one whole poll. See
-  [`simulation.md`](testing/simulation.md#limits).
+- The simulation has limits of its own. See
+  [Deterministic simulation](#deterministic-simulation) below.
 
 ## Fencing
 
@@ -202,10 +201,8 @@ The partition test fails with the fence off ([`chaos.md`](testing/chaos.md)).
 
 ### Known limits
 
-- No model covers shard-generation fencing or the rebalance cutover. See
-  [`formal-methods.md`](testing/formal-methods.md#not-modelled-yet).
-- Trace conformance checks chaos traces against `ActivityClaim` and
-  `WorkflowTaskClaim`. No check compares chaos traces with `CodecRotation`.
+- Some protocols have no model yet. See [Formal models](#formal-models)
+  below.
 - The models are bounded. `ActivityClaim` has 3 workers and 5 claims.
   `WorkflowTaskClaim` has 2 workers, 5 claims and 2 strikes.
 - The model `SelfRelease` uses a stronger guard than the code.
@@ -214,13 +211,8 @@ The partition test fails with the fence off ([`chaos.md`](testing/chaos.md)).
 - `fail_task`, `requeue_for_retry` and `defer_rate_limited_task` have no
   fence by design. The timeout sweeper acts only on the claim it scanned
   (#1809). The model `TimeoutFail` has no such check.
-- The oracle harness does not model the timeout sweeper, the `FAILED` state
-  or quarantine. The world simulation runs them, but the world workload
-  never fails an activity or quarantines a task.
-- A world crash falls between two steps, so no worker dies inside a task
-  body.
-- The scheduler draws actions from fixed weights. It does not use PCT
-  (probabilistic concurrency testing).
+- The simulation does not reach every state. See
+  [Deterministic simulation](#deterministic-simulation) below.
 - A 0.6 worker has no claim fence. A mixed 0.6 and 0.7 fleet must keep
   timeouts terminal until the upgrade ends
   ([ADR 0005](adr/0005-activity-timeout-retry-and-open-circuit.md)).
@@ -391,10 +383,43 @@ pins the fix.
   random choices of a history test, not the schedule.
 - The report covers four guarantees. It does not cover determinism, codec
   rotation or retention.
-- Each source page keeps its own limits. This report restates the ones that
-  touch the four guarantees:
-  [`formal-methods.md`](testing/formal-methods.md#not-modelled-yet) and
-  [`simulation.md`](testing/simulation.md#limits).
+
+Two source pages keep limits that touch the four guarantees. This report
+copies each list verbatim. A guard fails when a copy differs from its source.
+Do not edit a copy by hand. The guard prints the command that rewrites it.
+
+### Deterministic simulation
+
+From [`simulation.md`](testing/simulation.md#limits):
+
+<!-- mirror: testing/simulation.md#limits -->
+- The oracle harness drives the store statements, not the `worker.rs`
+  loop. The world simulation runs the loop, but one step is one whole
+  poll. A race between two statements of one cycle is out of its scope.
+- A world crash falls between two steps. An abandoned claim models a death
+  before the task body, but no worker dies inside a body. The chaos
+  `kill_at` points can close this gap.
+- The world workload never fails an activity, and its reclaimer never
+  quarantines. So it does not reach the quarantine or the `FAILED` state.
+- The scheduler draws actions from fixed weights. Unlike probabilistic
+  concurrency testing (PCT), it does not search for rare interleavings.
+- The oracle harness does not model the timeout sweeper, the `FAILED`
+  state or the poison-pill quarantine. Its reclaimer always requeues, so
+  many long runs reach strike counts that production would quarantine. The
+  world simulation runs the real sweeper and reclaimer, and abandoned
+  claims give them work.
+<!-- /mirror -->
+
+### Formal models
+
+From [`formal-methods.md`](testing/formal-methods.md#not-modelled-yet):
+
+<!-- mirror: testing/formal-methods.md#not-modelled-yet -->
+- **Model (d), shard-generation fencing and rebalance.** It needs its own
+  model of `replication::assert_fence` and the rebalance cutover.
+- **Trace conformance of `CodecRotation`.** Issue #2003 checks chaos traces
+  against `ActivityClaim` and `WorkflowTaskClaim` only.
+<!-- /mirror -->
 
 ## Related
 

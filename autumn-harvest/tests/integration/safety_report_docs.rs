@@ -64,64 +64,39 @@ const REQUIRED_LIMITS: &[(&str, &str)] = &[
     ("## Limits of this report", "#1818"),
 ];
 
-/// A page section that lists limits, and how the report restates each one.
+/// A page section that lists limits. The report mirrors its bullets verbatim.
 ///
-/// Each limit pairs a phrase from its source bullet with a phrase from the
-/// report. A source bullet that is added, removed or reworded fails the
-/// guard. So does a report that drops a restatement. Update the pairs here
-/// in the same change as the report.
+/// A hand-written restatement differs on each branch that writes one. When a
+/// source page changes on `trunk-dev`, every open branch then ports its own
+/// wording, and the ports conflict. A verbatim mirror is the same bytes on
+/// every branch, so the ports merge cleanly. Set `UPDATE_DOC_MIRRORS=1` and
+/// run these guards to rewrite each mirror from its source.
 struct LimitSource {
     page: &'static str,
     heading: &'static str,
     link: &'static str,
-    limits: &'static [(&'static str, &'static str)],
 }
 
 const LIMIT_SOURCES: &[LimitSource] = &[
     LimitSource {
-        page: "docs/testing/formal-methods.md",
-        heading: "## Not modelled yet",
-        link: "testing/formal-methods.md#not-modelled-yet",
-        limits: &[
-            (
-                "Model (d), shard-generation fencing and rebalance.",
-                "No model covers shard-generation fencing or the rebalance cutover.",
-            ),
-            (
-                "Trace conformance of `CodecRotation`.",
-                "No check compares chaos traces with `CodecRotation`.",
-            ),
-        ],
-    },
-    LimitSource {
         page: "docs/testing/simulation.md",
         heading: "## Limits",
         link: "testing/simulation.md#limits",
-        limits: &[
-            (
-                "drives the store statements, not the `worker.rs` loop.",
-                "The oracle harness drives store statements, not the `worker.rs` loop.",
-            ),
-            (
-                "A world crash falls between two steps.",
-                "A world crash falls between two steps, so no worker dies inside a task body.",
-            ),
-            (
-                "The world workload never fails an activity",
-                "the world workload never fails an activity or quarantines a task.",
-            ),
-            (
-                "draws actions from fixed weights.",
-                "The scheduler draws actions from fixed weights.",
-            ),
-            (
-                "does not model the timeout sweeper, the `FAILED` state or the poison-pill \
-                 quarantine.",
-                "does not model the timeout sweeper, the `FAILED` state or quarantine.",
-            ),
-        ],
+    },
+    LimitSource {
+        page: "docs/testing/formal-methods.md",
+        heading: "## Not modelled yet",
+        link: "testing/formal-methods.md#not-modelled-yet",
     },
 ];
+
+/// The line that opens the mirror of a source section.
+fn mirror_open(link: &str) -> String {
+    format!("<!-- mirror: {link} -->\n")
+}
+
+/// The line that closes a mirror.
+const MIRROR_CLOSE: &str = "<!-- /mirror -->";
 
 /// Pages that must link the report, so an evaluator can find it.
 const LINKED_FROM: &[&str] = &["README.md", "docs/comparison.md", "docs/testing/chaos.md"];
@@ -306,52 +281,124 @@ fn every_required_limit_is_stated() {
     }
 }
 
-/// The report cannot drop a limit that a source page records.
+/// The report copies each limit that a source page records, byte for byte.
 #[test]
-fn every_source_limit_is_restated() {
-    let report = flat(&read(REPORT));
+fn every_source_limit_is_mirrored() {
+    let mut report = read(REPORT);
+    let mut stale = Vec::new();
     for source in LIMIT_SOURCES {
-        let (page, heading) = (source.page, source.heading);
+        let expected = mirror_body(&read(source.page), source);
         assert!(
-            report.contains(source.link),
-            "{REPORT} must link the limits in `{page}` as `{}`",
+            expected.lines().any(|line| line.starts_with("- ")),
+            "`{}` in {} lists no limits as bullets",
+            source.heading,
+            source.page
+        );
+        assert!(
+            report.contains(&format!("]({})", source.link)),
+            "{REPORT} must link the limits in `{}` as `{}`",
+            source.page,
             source.link
         );
-        let text = read(page);
-        let body = section(&text, &format!("\n{heading}\n"), "\n## ")
-            .unwrap_or_else(|| panic!("{page} lacks `{heading}`"));
-        let bullets = body
-            .lines()
-            .filter(|line| {
-                ["- ", "* "]
-                    .iter()
-                    .any(|b| line.trim_start().starts_with(b))
-            })
-            .count();
-        assert_eq!(
-            bullets,
-            source.limits.len(),
-            "`{heading}` in {page} now lists {bullets} limits. Restate each new limit in \
-             {REPORT}, then add it to LIMIT_SOURCES"
-        );
-        let body = flat(body);
-        for (in_source, in_report) in source.limits {
-            assert!(
-                body.contains(in_source),
-                "`{heading}` in {page} no longer says `{in_source}`. Check that {REPORT} \
-                 still states the limit, then update LIMIT_SOURCES"
-            );
-            assert!(
-                report.contains(in_report),
-                "{REPORT} must restate the limit `{in_source}` from {page} as `{in_report}`"
-            );
+        let (from, to) = mirror_span(&report, source.link).unwrap_or_else(|| {
+            panic!(
+                "{REPORT} must mirror `{}` in {} between `{}` and `{MIRROR_CLOSE}`",
+                source.heading,
+                source.page,
+                mirror_open(source.link).trim_end()
+            )
+        });
+        if report[from..to] != expected {
+            stale.push(source.page);
+            report.replace_range(from..to, &expected);
         }
     }
+    if stale.is_empty() {
+        return;
+    }
+    if std::env::var_os("UPDATE_DOC_MIRRORS").is_some() {
+        let path = repo_root().join(REPORT);
+        std::fs::write(&path, report)
+            .unwrap_or_else(|err| panic!("cannot write {}: {err}", path.display()));
+        return;
+    }
+    panic!(
+        "{REPORT} no longer mirrors the limits in {stale:?}. Do not edit the mirror by \
+         hand. Rewrite it with:\n  UPDATE_DOC_MIRRORS=1 cargo test -p autumn-harvest \
+         --no-default-features --features testing {FILTER}every_source_limit_is_mirrored"
+    );
 }
 
-/// Squash text to one line, so a phrase can wrap.
-fn flat(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+/// The byte range of the mirror of `link` in the report, between its markers.
+fn mirror_span(report: &str, link: &str) -> Option<(usize, usize)> {
+    let open = mirror_open(link);
+    let from = report.find(&open)? + open.len();
+    let to = from + report[from..].find(MIRROR_CLOSE)?;
+    Some((from, to))
+}
+
+/// The bullet list of a source section, as the report must mirror it.
+///
+/// Only the list is copied, not the prose around it. A relative link is
+/// rewritten to resolve from `docs/`, where the report lives.
+fn mirror_body(page_text: &str, source: &LimitSource) -> String {
+    let body = section(page_text, &format!("\n{}\n", source.heading), "\n## ")
+        .unwrap_or_else(|| panic!("{} lacks `{}`", source.page, source.heading));
+    let page = source.page.strip_prefix("docs/").unwrap_or(source.page);
+    // A loose list puts a blank line between bullets. The list ends at the
+    // first line that is neither blank, a bullet nor indented.
+    let lines: Vec<&str> = body
+        .lines()
+        .skip_while(|line| !line.starts_with("- "))
+        .take_while(|line| line.is_empty() || line.starts_with("- ") || line.starts_with("  "))
+        .collect();
+    let used = lines
+        .iter()
+        .rposition(|line| !line.is_empty())
+        .map_or(0, |at| at + 1);
+    let mut out = String::new();
+    for line in &lines[..used] {
+        out.push_str(&rebase_links(line, page));
+        out.push('\n');
+    }
+    out
+}
+
+/// Rewrite each relative Markdown link in `line` to resolve from `docs/`.
+///
+/// `page` is the source page relative to `docs/`. A bare anchor points at the
+/// source page itself.
+fn rebase_links(line: &str, page: &str) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    while let Some(at) = rest.find("](") {
+        let (head, tail) = rest.split_at(at + 2);
+        out.push_str(head);
+        let end = tail.find(')').unwrap_or(tail.len());
+        let target = &tail[..end];
+        if target.contains("://") || target.starts_with('/') || target.starts_with("mailto:") {
+            out.push_str(target);
+        } else if target.starts_with('#') {
+            out.push_str(page);
+            out.push_str(target);
+        } else {
+            let mut parts: Vec<&str> = page.split('/').collect();
+            parts.pop();
+            for part in target.split('/') {
+                match part {
+                    ".." => {
+                        parts.pop();
+                    }
+                    "." => {}
+                    _ => parts.push(part),
+                }
+            }
+            out.push_str(&parts.join("/"));
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 #[test]
@@ -493,6 +540,30 @@ fn helpers_parse_their_inputs() {
         issue_refs("(#603) [x](https://github.com/o/r/issues/1817#top) [y](c.md#5-five)"),
         BTreeSet::from([603, 1817])
     );
+    assert_eq!(
+        rebase_links(
+            "See [a](#x), [b](chaos.md#y), [c](../adr/1.md) and [d](https://e.f/g).",
+            "testing/simulation.md"
+        ),
+        "See [a](testing/simulation.md#x), [b](testing/chaos.md#y), [c](adr/1.md) and \
+         [d](https://e.f/g)."
+    );
+    let source = LimitSource {
+        page: "docs/testing/p.md",
+        heading: "## Limits",
+        link: "testing/p.md#limits",
+    };
+    let page =
+        "# P\n\n## Limits\n\nIntro.\n\n- One [x](#y).\n  Two.\n- Three.\n\nOutro.\n\n## Next\n";
+    assert_eq!(
+        mirror_body(page, &source),
+        "- One [x](testing/p.md#y).\n  Two.\n- Three.\n"
+    );
+    let loose = "# P\n\n## Limits\n\n- One.\n\n- Two.\n  More.\n\nOutro.\n";
+    assert_eq!(mirror_body(loose, &source), "- One.\n\n- Two.\n  More.\n");
+    let report = "a\n<!-- mirror: testing/p.md#limits -->\n- old\n<!-- /mirror -->\nb\n";
+    let (from, to) = mirror_span(report, source.link).expect("the mirror has both markers");
+    assert_eq!(&report[from..to], "- old\n");
     let features = BTreeSet::from(["db".to_string()]);
     for (cfg, holds) in [
         ("feature = \"db\")]", true),
