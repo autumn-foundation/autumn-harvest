@@ -143,10 +143,10 @@ pub enum ExecutionOutcome {
     /// A terminal state OTHER than a clean success/failure — inert and never
     /// resumable, but carrying no output (unlike [`Self::Completed`]) and no
     /// failure error (unlike [`Self::Failed`]). The dominant case is a run
-    /// SEALED to `CONTINUED_AS_NEW`, either by `continue_as_new` (issue #2023)
-    /// or when a `TerminateIfRunning` /
-    /// `AllowDuplicateFailedOnly` reuse-policy decision superseded it with a newer
-    /// run (issue #1068); it also covers `CANCELLED` / `TIMED_OUT` / `TERMINATED`.
+    /// SEALED to `CONTINUED_AS_NEW`. A `continue_as_new` seals it so (issue
+    /// #2023). A `TerminateIfRunning` or `AllowDuplicateFailedOnly` replace
+    /// seals it so too (issue #1068). It also covers `CANCELLED`, `TIMED_OUT`
+    /// and `TERMINATED`.
     /// The payload is the RAW stored state name (e.g. `"CONTINUED_AS_NEW"`) so a
     /// caller can distinguish which terminal it is. Reporting these terminally —
     /// rather than as [`Self::Running`] — keeps `outcome()` consistent with the
