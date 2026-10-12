@@ -8,8 +8,9 @@ two big hash maps are `activities` and `closed_activities`, both keyed by
 `ActivityExecId`.
 
 ```sh
-cargo build --release --features testing --bench awaitables_profile
-valgrind --tool=callgrind --callgrind-out-file=cg.out target/release/deps/awaitables_profile-*
+BIN=$(cargo build --release --features testing --bench awaitables_profile \
+  --message-format=json | jq -r 'select(.target.name=="awaitables_profile") | .executable | select(. != null)')
+valgrind --tool=callgrind --callgrind-out-file=cg.out "$BIN"
 callgrind_annotate cg.out
 ```
 
@@ -67,6 +68,7 @@ change on a bare `Uuid` newtype.
 ## Reproduce
 
 ```sh
-cargo build --release --features testing --bench awaitables_profile
-valgrind --tool=callgrind --callgrind-out-file=cg.out target/release/deps/awaitables_profile-*
+BIN=$(cargo build --release --features testing --bench awaitables_profile \
+  --message-format=json | jq -r 'select(.target.name=="awaitables_profile") | .executable | select(. != null)')
+valgrind --tool=callgrind --callgrind-out-file=cg.out "$BIN"
 ```
