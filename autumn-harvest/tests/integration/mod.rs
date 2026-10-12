@@ -269,6 +269,8 @@ mod replay_verifier_tests;
 mod replayer_integration_tests;
 #[cfg(feature = "testing")]
 mod replayer_tests;
+#[cfg(feature = "db")]
+mod resident_outcome_tests;
 mod retention_overrides_tests;
 mod retention_reclaim_support;
 mod retention_summary_tests;
@@ -322,6 +324,7 @@ mod slot_tuner_tests;
 mod small_primitives_db_tests;
 #[cfg(feature = "testing")]
 mod small_primitives_tests;
+mod speculative_execution_docs;
 mod sqlite_feasibility_docs;
 mod standalone_activity_docs;
 #[cfg(feature = "db")]
