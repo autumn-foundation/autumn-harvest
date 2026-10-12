@@ -743,6 +743,11 @@ path = "history_has_unconsumed_events"
 receiver = "WorkflowContext"
 kind = "value"
 reason = "context.rs:3448 = `match_history(|m| m.has_non_lifecycle_unconsumed())`. Doc 3444-3447: it exists so `run_workflow_strict` can \"detect early-completion non-determinism\" — a cursor-relative predicate, false live and true on replay at the same program point."
+[[source]]
+path = "first_unconsumed_command_event"
+receiver = "WorkflowContext"
+kind = "value"
+reason = "context.rs: `matcher.first_unconsumed_command_event()`, the first recorded command event that the cycle did not consume (issue #1791). A cursor-relative read, like `history_has_unconsumed_events`: `None` live and `Some(..)` on a drifted replay at the same program point. Public for the SQLite query drift check (issue #2022)."
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SOURCES — kind = "order"
