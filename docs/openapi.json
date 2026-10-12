@@ -7682,6 +7682,20 @@
             "style": "form"
           },
           {
+            "description": "Filter expression with AND, OR and parentheses (issue #1982). AND binds tighter than OR. Fields: attrs.<key> (=, !=, >, >=, <, <=, IN, EXISTS), state, workflow_name, owner, severity (=, !=, IN), started_at (>, >=, <, <= with an RFC 3339 string). Values: a quoted string, a number, true or false. <> is the same as !=. A filter with OR must find each row through an index: each OR branch, or the whole filter, holds an attrs.* predicate or workflow_name with = or IN. The parameter is repeatable. Each value joins the query with AND. An empty value is ignored. Limits: 2048 bytes, 8 levels and 100 IN values for each value, and 32 predicates for the request. state = 'MIGRATED' gets 400; use state=MIGRATED. Errors return 400. Example: attrs.phase = 'blocked' OR (workflow_name = 'payment' AND attrs.amount > 10000).",
+            "explode": true,
+            "in": "query",
+            "name": "filter",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "style": "form"
+          },
+          {
             "description": "Maximum number of results to return (legacy; use page_size for paginated access).",
             "in": "query",
             "name": "limit",
@@ -9384,6 +9398,38 @@
         ],
         "x-harvest-read-only": true,
         "x-harvest-route-class": "read_only"
+      }
+    },
+    "/workflows/changes/stream": {
+      "get": {
+        "description": "Server-Sent Events signal for live list views (issue #1982). Listens to the harvest_events LISTEN/NOTIFY channel on each shard, the channel of the #324 stream. Sends event:changed with data {\"notifications\": n}, the count of notifications since the last frame, at most once each second. One notification can cover more than one event of a run. A frame names no execution and holds no payload. A client fetches the list again. Sends event:stream-error and closes when a shard listener closes, so the client connects again. The stream sends a :ping comment every 15 s by default. Admin-gated, the same as GET /executions/{exec_id}/events/stream. Each stream holds one dedicated LISTEN connection for each shard.",
+        "operationId": "get_workflows_changes_stream",
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "description": "Server-sent event frames. See the response description.",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Content-Type: text/event-stream. Frames: event:changed (data {\"notifications\": n}), or a final event:stream-error (data {\"error\": \"listener_closed\", \"retry\": true})."
+          },
+          "401": {
+            "description": "Unauthenticated request."
+          },
+          "503": {
+            "description": "SSE notification URL not configured, or a shard listener is not available."
+          }
+        },
+        "summary": "Server-Sent Events signal for live list views (issue #1982).",
+        "tags": [
+          "workflow"
+        ],
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only",
+        "x-harvest-stream": true
       }
     },
     "/workflows/count": {

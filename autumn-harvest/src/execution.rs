@@ -5726,6 +5726,18 @@ pub async fn annotate_workflow_execution(
                     .await
                     .map_err(database_error)?;
             }
+            // A triage update appends no event, but `owner` and `severity`
+            // are list filters (issue #1982). A zero-count wake on the
+            // events channel tells live list views to fetch again.
+            if !changed_fields.is_empty() {
+                crate::notify::notify_workflow_events_appended(
+                    conn,
+                    exec_id.as_uuid(),
+                    0,
+                    "WorkflowTriaged",
+                )
+                .await?;
+            }
 
             Ok(TriageOutcome {
                 execution_id: exec_id.to_string(),

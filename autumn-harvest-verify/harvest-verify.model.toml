@@ -84,10 +84,11 @@
 # model error, not a warning, because an unexplained rule is how a model rots.
 #
 # The version string is printed with every verdict ("no non-determinism found,
-# under model 2026.10.0, up to boundaries ..."), so a verdict can always be
-# traced to the rules that produced it. Bump the date component when rows change.
+# under model 2026.10.1, up to boundaries ..."), so a verdict can always be
+# traced to the rules that produced it. Bump the date component when rows change,
+# or when the analysis gives another structure manifest for the same MIR.
 
-version = "2026.10.0"
+version = "2026.10.1"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # AMBIENT TYPES — statics of these types are taint roots

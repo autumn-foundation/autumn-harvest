@@ -1,0 +1,244 @@
+//! The `async` block a closure returns (issue #2010).
+//!
+//! The analysis follows that block when a bodyless callee, such as
+//! `Saga::step`, polls it. These cases pin two sides of that rule. A clock
+//! read in a followed block is found. A case the analysis cannot follow in
+//! full stays `unknown`, and never becomes a false `proven-deterministic`.
+
+use std::path::{Path, PathBuf};
+
+use autumn_harvest_verify::analysis;
+use autumn_harvest_verify::entry;
+use autumn_harvest_verify::mir;
+use autumn_harvest_verify::model::Model;
+use autumn_harvest_verify::resolve::{Program, SourceRoots};
+use autumn_harvest_verify::verdict::{Verdict, WorkflowVerdict};
+
+fn fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("async_block_follow")
+}
+
+fn verdicts() -> Vec<WorkflowVerdict> {
+    verdicts_in(&fixture_dir())
+}
+
+fn verdicts_in(dir: &Path) -> Vec<WorkflowVerdict> {
+    let dir = dir.to_path_buf();
+    let path = dir.join("flow.mir");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let docs = vec![mir::parse("flow", "flow.mir", &text)];
+    let entries = entry::discover(&docs);
+    let program = Program::build(docs, &SourceRoots { roots: vec![dir] }).expect("build");
+    let model = Model::builtin().expect("the embedded model must parse");
+    analysis::analyze(&program, &model, &entries)
+}
+
+fn verdict<'a>(all: &'a [WorkflowVerdict], name: &str) -> &'a Verdict {
+    &all.iter()
+        .find(|v| v.workflow == name || v.workflow.ends_with(&format!("::{name}")))
+        .unwrap_or_else(|| panic!("no verdict for {name}"))
+        .verdict
+}
+
+#[test]
+fn a_clock_read_in_a_saga_step_block_is_found() {
+    let all = verdicts();
+    for name in [
+        "wf_saga_clock",
+        "wf_saga_async_fn",
+        "wf_step_named_future",
+        "wf_step_mut_ref_future",
+        "wf_step_async_closure",
+    ] {
+        assert!(
+            matches!(verdict(&all, name), Verdict::NondeterminismFound { .. }),
+            "{name}: {:?}",
+            verdict(&all, name)
+        );
+    }
+}
+
+#[test]
+fn a_case_the_analysis_cannot_follow_is_never_proven() {
+    let all = verdicts();
+    for name in [
+        "wf_external",
+        "wf_shared_span",
+        "wf_block_write",
+        "wf_step_write",
+        "wf_step_write_tuple",
+        "wf_step_write_struct",
+        "wf_step_write_cell",
+        "wf_step_write_arc",
+        "wf_step_named_write_future",
+        "wf_step_move_mut",
+        "wf_step_boxed_dyn",
+        "wf_step_wrapped_block",
+        "wf_step_external_future",
+        "wf_step_boxed_external",
+        "wf_step_async_closure",
+        "wf_step_identity_write",
+        "wf_step_moved_write",
+        "wf_step_named_shared_future",
+        "wf_step_named_shared_ctor",
+        "wf_step_write_newtype",
+        "wf_step_noext_module",
+        "wf_step_raw_ptr_write",
+        "wf_step_closure_capture",
+        "wf_step_ref_future",
+        "wf_step_dep_ref_future",
+        "wf_step_inner_block",
+        "wf_step_inner_async_closure",
+        "wf_step_unsafe_cell",
+        "wf_step_ref_ref_future",
+        "wf_step_generic_future",
+        "wf_step_dyn_writer",
+    ] {
+        assert!(
+            !matches!(verdict(&all, name), Verdict::ProvenDeterministic),
+            "{name} must not be proven: {:?}",
+            verdict(&all, name)
+        );
+    }
+}
+
+#[test]
+fn a_future_built_in_another_crate_is_not_an_unresolved_callback() {
+    let all = verdicts();
+    let Verdict::Unknown { boundaries } = verdict(&all, "wf_foreign_block") else {
+        panic!("the stub method is not in the model, so the verdict is unknown");
+    };
+    assert!(
+        boundaries
+            .iter()
+            .all(|b| b.kind.name() != "unresolved-callback"),
+        "{boundaries:?}"
+    );
+}
+
+#[test]
+fn a_future_of_an_untrusted_crate_is_a_boundary() {
+    // The fixture also has a local `ClockFuture`. Its `poll` must not stand
+    // in for the `poll` of `other_crate::ClockFuture`.
+    let all = verdicts();
+    let Verdict::Unknown { boundaries } = verdict(&all, "wf_step_external_future") else {
+        panic!(
+            "the dependency `poll` has no body here: {:?}",
+            verdict(&all, "wf_step_external_future")
+        );
+    };
+    assert!(
+        boundaries
+            .iter()
+            .any(|b| b.kind.name() == "external-crate-body"
+                && b.detail.contains("other_crate::ClockFuture")),
+        "{boundaries:?}"
+    );
+}
+
+#[test]
+fn an_erased_future_of_an_untrusted_crate_is_a_boundary() {
+    // `Box::pin(other_crate::ClockFuture)` coerces to `dyn Future`. The
+    // untrusted constant is a boundary at `Box::pin`. The erased `poll` is
+    // a boundary of its own, so the case holds if either one goes.
+    let all = verdicts();
+    let Verdict::Unknown { boundaries } = verdict(&all, "wf_step_boxed_external") else {
+        panic!(
+            "the erased `poll` has no body here: {:?}",
+            verdict(&all, "wf_step_boxed_external")
+        );
+    };
+    assert!(
+        boundaries
+            .iter()
+            .any(|b| b.detail.contains("other_crate::ClockFuture")),
+        "{boundaries:?}"
+    );
+    assert!(
+        boundaries
+            .iter()
+            .any(|b| b.kind.name() == "dyn-dispatch" && b.detail.contains("dyn Future")),
+        "{boundaries:?}"
+    );
+}
+
+#[test]
+fn a_dependency_named_like_a_local_module_is_still_a_boundary() {
+    // MIR prints `helpers::ClockFuture` for the dependency, and the crate
+    // has a `helpers` module. The module name alone is no evidence.
+    // A local `ClockFuture` exists too. Its `poll` must not stand in.
+    let all = verdicts_in(&fixture_dir().with_file_name("async_block_collide"));
+    let Verdict::Unknown { boundaries } = verdict(&all, "wf_colliding_crate") else {
+        panic!("{:?}", verdict(&all, "wf_colliding_crate"));
+    };
+    assert!(
+        boundaries
+            .iter()
+            .any(|b| b.kind.name() == "external-crate-body"
+                && b.detail == "<helpers::ClockFuture as std::future::Future>::poll"),
+        "{boundaries:?}"
+    );
+}
+
+#[test]
+fn a_first_party_future_with_no_poll_body_is_a_boundary() {
+    // A partial MIR input can lack the `poll` of a local future. The source
+    // shows that `ClockFuture` implements `Future`, so its `poll` exists.
+    let dir = fixture_dir();
+    let text = std::fs::read_to_string(dir.join("flow.mir")).expect("read");
+    let start = text
+        .find("fn <impl at flow.rs:237:1: 237:28>::poll(")
+        .expect("the ClockFuture poll body");
+    let end = start + text[start..].find("\n}\n").expect("its end") + 3;
+    let cut = format!("{}{}", &text[..start], &text[end..]);
+    let docs = vec![mir::parse("flow", "flow.mir", &cut)];
+    let entries = entry::discover(&docs);
+    let program = Program::build(docs, &SourceRoots { roots: vec![dir] }).expect("build");
+    let model = Model::builtin().expect("the embedded model must parse");
+    let all = analysis::analyze(&program, &model, &entries);
+    let Verdict::Unknown { boundaries } = verdict(&all, "wf_step_named_future") else {
+        panic!("{:?}", verdict(&all, "wf_step_named_future"));
+    };
+    assert!(
+        boundaries
+            .iter()
+            .any(|b| b.kind.name() == "missing-body" && b.detail.contains("ClockFuture")),
+        "{boundaries:?}"
+    );
+}
+
+#[test]
+fn a_wrapper_in_a_nested_module_file_is_indexed() {
+    // MIR names no span in `state/shared.rs`. The source index follows
+    // `mod state;` and `pub mod shared;` to read the fields of `Shared`.
+    let all = verdicts_in(&fixture_dir().with_file_name("async_block_modfile"));
+    assert!(
+        !matches!(
+            verdict(&all, "wf_step_write_modfile"),
+            Verdict::ProvenDeterministic
+        ),
+        "{:?}",
+        verdict(&all, "wf_step_write_modfile")
+    );
+}
+
+#[test]
+fn a_shared_reference_future_of_an_untrusted_crate_is_a_boundary() {
+    // The `&` impl of `other_crate::RefTick` has no body here. The boundary
+    // must name it, not only the generic `Saga::step` it passes through.
+    let all = verdicts();
+    let Verdict::Unknown { boundaries } = verdict(&all, "wf_step_dep_ref_future") else {
+        panic!("{:?}", verdict(&all, "wf_step_dep_ref_future"));
+    };
+    assert!(
+        boundaries
+            .iter()
+            .any(|b| b.kind.name() == "external-crate-body"
+                && b.detail.contains("RefTick as std::future::Future>::poll")),
+        "{boundaries:?}"
+    );
+}

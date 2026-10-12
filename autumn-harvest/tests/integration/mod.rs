@@ -273,6 +273,8 @@ mod replay_verifier_tests;
 mod replayer_integration_tests;
 #[cfg(feature = "testing")]
 mod replayer_tests;
+#[cfg(feature = "db")]
+mod resident_outcome_tests;
 mod retention_overrides_tests;
 mod retention_reclaim_support;
 mod retention_summary_tests;
@@ -322,6 +324,7 @@ mod signal_with_start_tests;
 mod sla_breach_tests;
 mod slo_pack_docs;
 mod slot_tuner_tests;
+mod speculative_execution_docs;
 mod sqlite_feasibility_docs;
 mod standalone_activity_docs;
 #[cfg(feature = "db")]

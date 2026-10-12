@@ -1233,6 +1233,17 @@ merged result is deterministic. Numeric comparison matches only number-typed
 stored values; a value stored as a string on one shard is excluded uniformly on
 all shards, never a partial false match.
 
+### Filter expressions (`filter`, issue #1982)
+
+A `filter` expression compiles to one parenthesized fragment in the same
+per-shard `WHERE` clause. Its attribute leaves use the SQL in the table above.
+Every key and value is a bound parameter. The merge, the cursor and the
+partial-availability rules do not change.
+
+A filter with `OR` must find each row through an attribute predicate or
+`workflow_name` with `=` or `IN`. So each shard can use its indexes, for
+example with `BitmapOr`, and an `OR` never forces a full scan of a shard.
+
 ---
 
 ## Adding a Shard — Operational Runbook (issue #522)

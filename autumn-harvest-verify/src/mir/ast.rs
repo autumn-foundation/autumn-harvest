@@ -152,6 +152,9 @@ pub enum Terminator {
     SwitchInt {
         operand: Operand,
         targets: Vec<String>,
+        /// The case value of each target, in order, such as `0` or
+        /// `otherwise` (issue #2010). Empty when MIR printed no value.
+        values: Vec<String>,
     },
     Goto {
         target: String,
