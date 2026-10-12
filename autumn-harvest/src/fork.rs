@@ -861,7 +861,7 @@ struct StoredHistory {
 /// stored rows with `pg_column_size`, the measure of the worker and of the
 /// quota. So it is exact for compression, offloaded fields and row overhead.
 /// A refusal rolls the whole fork back.
-async fn check_stored_history(
+pub(crate) async fn check_stored_history(
     conn: &mut AsyncPgConnection,
     registry: Option<&HandlerRegistry>,
     workflow_name: &str,

@@ -1853,6 +1853,40 @@ async fn the_history_cap_uses_the_stored_measure() {
         .expect("one byte under the cap is admitted");
 }
 
+/// A reset of a fork adds markers and copies its overrides again. A reset
+/// history that reaches a worker cap is refused before commit. The source fork
+/// is then not sealed for a run that could never start.
+#[tokio::test]
+async fn a_reset_of_a_fork_that_reaches_a_history_cap_is_refused() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("reset-cap");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let capped = HandlerRegistry::new(
+        vec![fork_pay_wf_info()],
+        activities![fork_charge, fork_receipt],
+    )
+    .with_history_policy(autumn_harvest::WorkflowHistoryPolicy::default().with_event_hard_cap(2));
+
+    let result = reset_workflow_execution(&mut conn, forked, reset_request(), Some(&capped)).await;
+    assert!(
+        matches!(
+            result,
+            Err(WorkflowResetError::HistoryCapReached {
+                measure: "events",
+                ..
+            })
+        ),
+        "a reset that reaches the cap is refused: {result:?}"
+    );
+    assert_eq!(
+        snapshot(&url, forked).await.0.state,
+        "RUNNING",
+        "the refused reset leaves the fork running"
+    );
+}
+
 /// A fork whose history reaches a worker history cap could never run. Its
 /// first workflow task would dead-letter it. So the fork is refused, and no
 /// row is written.

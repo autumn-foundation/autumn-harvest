@@ -426,6 +426,18 @@ pub enum WorkflowResetError {
         exec_id: ExecutionId,
         reason: String,
     },
+    /// A reset of a fork (issue #2000) would store a history at or past a
+    /// worker history cap. The new run could not run one workflow task, so
+    /// the reset is refused and the source is not sealed.
+    #[error("the reset would store {observed} history {measure}, which reaches the cap of {cap}")]
+    HistoryCapReached {
+        /// The capped measure: `events` or `bytes`.
+        measure: &'static str,
+        /// The prospective value of the measure.
+        observed: u64,
+        /// The cap.
+        cap: u64,
+    },
     /// An underlying storage or database error occurred during the reset operation.
     #[error(transparent)]
     Harvest(#[from] HarvestError),
@@ -895,6 +907,10 @@ pub async fn reset_workflow_execution(
                 &override_rows,
             )
             .await?;
+            if fork_mode.is_some() {
+                reject_capped_fork_reset(conn, registry, &source.workflow_name, new_exec_id)
+                    .await?;
+            }
 
             let source_tasks_cancelled = queue::cancel_open_tasks_for_execution(
                 conn,
@@ -1094,6 +1110,34 @@ pub fn batch_skip_reason(error: &WorkflowResetError) -> ResetSkipReason {
         other => ResetSkipReason::InfrastructureError {
             message: format!("reset failed: {other}"),
         },
+    }
+}
+
+/// Refuse a reset of a fork whose stored history reaches a worker cap.
+///
+/// The reset copies the overrides of the fork again, after its own markers.
+/// So the new history can reach a cap that the fork stayed under. The check
+/// runs before commit, so a refusal rolls back the seal of the source.
+async fn reject_capped_fork_reset(
+    conn: &mut AsyncPgConnection,
+    registry: Option<&HandlerRegistry>,
+    workflow_name: &str,
+    new_exec_id: ExecutionId,
+) -> Result<(), WorkflowResetError> {
+    match crate::fork::check_stored_history(conn, registry, workflow_name, new_exec_id, None).await
+    {
+        Ok(()) => Ok(()),
+        Err(crate::fork::WorkflowForkError::HistoryCapReached {
+            measure,
+            observed,
+            cap,
+        }) => Err(WorkflowResetError::HistoryCapReached {
+            measure,
+            observed,
+            cap,
+        }),
+        Err(crate::fork::WorkflowForkError::Harvest(error)) => Err(error.into()),
+        Err(other) => Err(HarvestError::Database(other.to_string()).into()),
     }
 }
 

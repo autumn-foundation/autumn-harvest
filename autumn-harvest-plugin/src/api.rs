@@ -25668,6 +25668,14 @@ fn reset_error_response(error: WorkflowResetError) -> axum::response::Response {
             }),
         )
             .into_response(),
+        // A reset of a fork that could never run one task (issue #2000).
+        WorkflowResetError::HistoryCapReached { .. } => (
+            axum::http::StatusCode::CONFLICT,
+            Json(ResetErrorResponse {
+                message: format!("{error}; reset at an earlier point"),
+            }),
+        )
+            .into_response(),
         // A reset of a fork walks its lineage as a fork does (issue #2000).
         WorkflowResetError::ForkLineage { exec_id, reason } => (
             axum::http::StatusCode::CONFLICT,

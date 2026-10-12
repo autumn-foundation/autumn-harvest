@@ -130,7 +130,10 @@ the node is refused with `404`, as a rerun is.
 
 **Reset of a fork.** A reset of a fork walks its lineage as a fork does. A
 reset preview and a batch reset preview run the same walk, so they predict
-the refusal. An
+the refusal. A reset of a fork copies its overrides again, so its history is
+checked against the worker history caps before commit. One that reaches a
+cap is refused with `WorkflowResetError::HistoryCapReached` (`409`), and the
+fork stays running. An
 erased ancestor refuses it with `ErasedSource`. A missing or sealed
 ancestor, or a lineage past 64 links, refuses it with the new
 `WorkflowResetError::ForkLineage` (`409`).
