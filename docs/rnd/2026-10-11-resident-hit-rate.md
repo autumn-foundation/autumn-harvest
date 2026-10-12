@@ -32,7 +32,9 @@ recorder counts each `outcome`. Each decision records one sample.
 The canonical workflow runs three activities in sequence. Each run makes
 four decisions: the start and one per activity result. The bench prints the
 outcomes of its measured loop in its notes. Its recorder returns `false`
-from `is_enabled`, so the worker starts no metric sampler.
+from `is_enabled`, so the worker starts no metric sampler. The bench takes
+each snapshot of the counts after they stop changing, so a decision attempt
+in flight at a phase boundary falls on one side of it.
 
 ```sh
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
@@ -45,8 +47,9 @@ HARVEST_BENCH_SCENARIOS=throughput HARVEST_BENCH_SHARDS=1 \
 The binary runs the real `autumn_harvest_agent::agent_loop` with an offline
 model. The model asks for one tool call per turn, then answers. A run with
 `TURNS` tool turns makes `2 × TURNS + 2` decisions. The binary sets the step
-cap of each run to `TURNS`. It fails if the decision total differs from
-`RUNS × (2 × TURNS + 2)`.
+cap of each run to `TURNS`. It fails if the runs make fewer than
+`RUNS × (2 × TURNS + 2)` decisions, and it reports any decisions above that.
+Its recorder also returns `false` from `is_enabled`.
 
 ```sh
 DATABASE_URL=postgres://postgres:postgres@localhost:5432/agent_hit_rate \
@@ -70,32 +73,38 @@ DATABASE_URL=postgres://postgres:postgres@localhost:5432/agent_hit_rate \
 
 | Claim loops | Decisions | `hit` | `cold` | Hit rate | Workflows/s |
 |---|---:|---:|---:|---:|---:|
-| 2 (default) | 4,873 | 3,600 | 1,273 | 73.9% | 47.91 |
-| 2 (default), repeat | 4,861 | 3,600 | 1,261 | 74.1% | 41.37 |
+| 2 (default) | 4,864 | 3,600 | 1,264 | 74.0% | 43.41 |
+| 2 (default), repeat | 4,864 | 3,600 | 1,264 | 74.0% | 43.57 |
 | 1 | 4,800 | 3,600 | 1,200 | 75.0% | 33.88 |
+
+The one-loop row comes from a run before the snapshots settled. It counted
+exactly four decisions per run, so no boundary sample moved. Two earlier
+two-loop runs without settled snapshots counted 4,873 and 4,861 decisions.
 
 ### Run 2 — `agent_loop`, 20 runs
 
-| Tool turns | Decisions | `hit` | `cold` | Hit rate |
-|---|---:|---:|---:|---:|
-| 4 | 200 | 180 | 20 | 90.0% |
-| 12 | 520 | 500 | 20 | 96.2% |
+| Tool turns | Runs of 20 | Decisions | `hit` | `cold` | Hit rate |
+|---|---:|---:|---:|---:|---:|
+| 4 | 5 | 200 | 180 | 20 | 90.0% |
+| 4 | 1 | 201 | 180 | 21 | 89.6% |
+| 12 | 1 | 520 | 500 | 20 | 96.2% |
 
-The 4-turn run gave the same counts in four repeats. No outcome other than
-`hit` and `cold` occurred in any run.
+No outcome other than `hit` and `cold` occurred in any run.
 
 ## Reading
 
 - **Each run resumes warm after its first decision.** Every run had one
-  `cold` first decision and a `hit` for each later decision. For a run with
-  `n` decisions on one worker, the hit rate is `(n − 1) / n`.
+  `cold` first decision and a `hit` for each later decision that it needs.
+  For a run with `n` such decisions on one worker, the hit rate is
+  `(n − 1) / n`. The only other decisions are the extra ones below.
 - **The resident path already covers these shapes.** A sequential workflow
   and the sequential agent loop await one command per cycle.
-- **The second claim loop adds cold decisions under load.** With two claim
-  loops, the bench made 61 to 73 decisions more than four per run, and each
+- **The second claim loop adds cold decisions.** With two claim loops, the
+  bench made 64 decisions more than four per run, in both runs, and each
   extra decision was `cold`. With one claim loop, it made exactly four per
   run. The hits do not change, so the extra decisions are replays on top of
-  the warm path. The agent loop shows no extra decisions at its lower rate.
+  the warm path. At its lower rate, the agent loop made one extra `cold`
+  decision in one of six runs.
 - **For these shapes, a wider resident path wins nothing.** Typed-state
   snapshots can reach a decision after a restart or an eviction. A run's
   first decision has no state to restore. The extra decisions under two
@@ -111,8 +120,7 @@ The 4-turn run gave the same counts in four repeats. No outcome other than
 - These runs do not show why a second claim loop adds decisions. One
   explanation fits: a second workflow task for a run is claimed while the
   first decision holds the cache entry. The runs do not test it.
-- An earlier 4-turn run counted 21 cache misses, one more than its runs.
-  Its outcome table was not kept. The four later runs matched exactly.
+- The agent loop ran each 12-turn configuration once.
 
 ## Next step
 

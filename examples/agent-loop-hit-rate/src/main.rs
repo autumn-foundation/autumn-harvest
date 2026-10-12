@@ -268,11 +268,19 @@ async fn main() -> Result<(), BoxError> {
     }
     let decisions: u64 = resident.values().sum();
     let expected = expected_decisions(runs, turns);
-    if decisions != expected {
+    // Fewer decisions mean that a run ended before its last tool turn. More
+    // decisions are extra workflow tasks, which the table reports.
+    if decisions < expected {
         return Err(format!(
             "{decisions} decisions, expected {expected}: a run ended before its last tool turn"
         )
         .into());
+    }
+    if decisions > expected {
+        println!(
+            "\n{} decisions more than the {expected} that the runs need.",
+            decisions - expected
+        );
     }
     Ok(())
 }
