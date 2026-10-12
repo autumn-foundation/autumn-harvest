@@ -510,11 +510,12 @@ impl VersionedState for Order {
         }
     }
 
-    /// Each completed charge is in `charged`. The phase moves on after two.
+    /// Each completed charge is in `charged`. The phase is exactly
+    /// `charge` below two charges and exactly `ship` from two on.
     fn covers(&self, ledger: &EffectLedger) -> bool {
         let charges = ledger.activities.iter().filter(|a| *a == "charge").count();
-        usize::try_from(self.charged).is_ok_and(|c| c == charges)
-            && (self.charged >= 2) == (self.phase == "ship")
+        let phase = if self.charged >= 2 { "ship" } else { "charge" };
+        usize::try_from(self.charged).is_ok_and(|c| c == charges) && self.phase == phase
     }
 }
 
@@ -709,6 +710,22 @@ impl VersionedState for Tally {
         let bumps = ledger.updates.iter().filter(|u| *u == "bump").count();
         usize::try_from(self.bumps).is_ok_and(|b| b == bumps)
     }
+}
+
+#[test]
+fn a_state_in_an_unknown_phase_is_refused() {
+    // No charge has run, but the phase claims the order is done. The
+    // workflow would skip its charge loop.
+    let history = vec![started(Value::Null)];
+    let bad = Order {
+        charged: 0,
+        phase: "done".into(),
+    };
+    let raw = Snapshot::save(&bad, &history).expect("quiescent");
+    assert_eq!(
+        Snapshot::load::<Order>(&raw, Some(&history)),
+        Err(SnapshotError::NotCovered)
+    );
 }
 
 #[test]
