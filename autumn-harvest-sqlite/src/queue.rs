@@ -689,7 +689,7 @@ mod tests {
     use crate::schema;
 
     // harvest_signals has no index beyond signal_seq, so this exec-scoped delete
-    // would be a full table SCAN without idx_harvest_signals_exec_delivered.
+    // would be a full table SCAN without idx_harvest_signals_exec_arrival.
     #[test]
     fn signal_cleanup_delete_uses_an_index_not_a_full_scan() {
         let conn = open();
@@ -704,13 +704,38 @@ mod tests {
             )
             .unwrap();
         assert!(
-            plan.contains("USING INDEX idx_harvest_signals_exec_delivered"),
+            plan.contains("USING INDEX idx_harvest_signals_exec_arrival"),
             "expected an index search, got plan: {plan}"
         );
         assert!(
             !plan.contains("SCAN"),
             "expected no full-table scan, got plan: {plan}"
         );
+    }
+
+    // Issue #2020: the bounded signal read must stream rows in arrival order.
+    // A temporary sort would first load every staged row, payload and all.
+    #[test]
+    fn the_pending_signal_read_uses_an_index_for_its_order() {
+        let conn = open();
+        let exec = ExecutionId::new();
+        let mut stmt = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                crate::store::PENDING_SIGNALS_SQL
+            ))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(params![exec.to_string()], |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let plan = plan.join(" | ");
+        assert!(
+            plan.contains("USING INDEX"),
+            "expected an index search: {plan}"
+        );
+        assert!(!plan.contains("TEMP B-TREE"), "expected no sort: {plan}");
     }
 
     fn open() -> Connection {

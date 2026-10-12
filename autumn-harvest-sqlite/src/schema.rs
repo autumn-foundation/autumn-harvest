@@ -196,13 +196,16 @@ CREATE TABLE IF NOT EXISTS harvest_signals (
     received_at  INTEGER NOT NULL DEFAULT 0   -- absolute epoch-millisecond the signal arrived
 );
 
--- Without this, every exec_id/delivered-scoped query here (pending_signals,
+-- Without this, every exec_id/delivered-scoped query here (the signal read,
 -- delete_undelivered_signals_for_execution) scans the whole table, unlike
 -- harvest_timers, whose (exec_id, timer_id) PRIMARY KEY already covers this.
--- `CREATE INDEX IF NOT EXISTS` is idempotent and applied on every open
--- (including a pre-existing file), needing no separate migration.
-CREATE INDEX IF NOT EXISTS idx_harvest_signals_exec_delivered
-    ON harvest_signals (exec_id, delivered);
+-- The trailing columns serve the arrival order of the signal read (issue
+-- #2020). Without them, the read sorts the whole backlog before its first row.
+-- It replaces the (exec_id, delivered) index of earlier files. Both statements
+-- are idempotent and run on every open, so no separate migration is needed.
+CREATE INDEX IF NOT EXISTS idx_harvest_signals_exec_arrival
+    ON harvest_signals (exec_id, delivered, received_at, signal_seq);
+DROP INDEX IF EXISTS idx_harvest_signals_exec_delivered;
 
 CREATE TABLE IF NOT EXISTS harvest_activity_attempts (
     attempt_seq INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -487,6 +487,12 @@ pub struct PendingSignal {
     pub payload: Value,
 }
 
+/// The arrival-ordered read of [`for_each_pending_signal`]. An index serves the
+/// order, so the first row needs no sort of the whole backlog (issue #2020).
+pub const PENDING_SIGNALS_SQL: &str = "SELECT signal_seq, name, received_at, payload_json \
+     FROM harvest_signals WHERE exec_id = ?1 AND delivered = 0 \
+     ORDER BY received_at, signal_seq";
+
 /// Read the undelivered signals of `exec_id` one at a time, in arrival order.
 ///
 /// The order is `received_at`, then `signal_seq` (issue #1069 P2). Insertion
@@ -505,11 +511,7 @@ pub fn for_each_pending_signal(
     exec_id: ExecutionId,
     mut visit: impl FnMut(PendingSignal) -> SqliteResult<bool>,
 ) -> SqliteResult<()> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT signal_seq, name, received_at, payload_json FROM harvest_signals \
-         WHERE exec_id = ?1 AND delivered = 0 \
-         ORDER BY received_at, signal_seq",
-    )?;
+    let mut stmt = conn.prepare_cached(PENDING_SIGNALS_SQL)?;
     let rows = stmt.query_map(params![exec_id.to_string()], |row| {
         Ok((
             row.get::<_, i64>(0)?,
