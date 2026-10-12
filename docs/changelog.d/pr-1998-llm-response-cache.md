@@ -50,3 +50,12 @@ tests cover each key part, both scopes, the tenant source, the entry check,
 `max_age`, eviction, and `AeadCodec` encryption of the stored blob. They
 also cover the tenant rules of the activity. On Postgres,
 `an_activity_reads_the_verified_tenant` proves `run_tenant`.
+
+**Also fixed: a deferred task wakes the poll loop when due (issue #1836).**
+Two claim loops (PR #2106) can claim past an adaptive limit at once. The
+dispatch gate then defers the extra row by about one baseline latency.
+Nothing woke an idle poll loop when that row became due, so the loop slept a
+full poll interval. `a_freed_slot_wakes_the_poll_loop` failed on that stall.
+A persisted adaptive-limit deferral now fires a wake when its row is due.
+Every idle wait listens for it, with no capacity gate.
+`a_deferral_wakes_the_worker_when_due` covers the timing.
