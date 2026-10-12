@@ -60,6 +60,11 @@ enum OpenEffect {
 struct EffectLedger {
     /// Completed activities, by name, in order.
     activities: Vec<String>,
+    /// Activities that failed or timed out, by name, in order. Workflow
+    /// code can catch a failure and change the state, so a cover rule must
+    /// see it.
+    #[serde(default)]
+    failed_activities: Vec<String>,
     /// Timers that fired or were cancelled, by id.
     timers: Vec<String>,
     /// Children that ended, by id.
@@ -85,8 +90,16 @@ impl EffectLedger {
     ///
     /// # Errors
     ///
+    /// `torn_down_timers` names the timers that a won race removed. That
+    /// teardown writes no event, so history alone leaves them open.
+    ///
+    /// # Errors
+    ///
     /// Returns the first effect that is still open at the end of `history`.
-    fn from_history(history: &[WorkflowEvent]) -> Result<Self, OpenEffect> {
+    fn from_history(
+        history: &[WorkflowEvent],
+        torn_down_timers: &[String],
+    ) -> Result<Self, OpenEffect> {
         let mut ledger = Self::default();
         // Each open effect, by its id, in the order it opened.
         let mut open: Vec<(String, OpenEffect)> = Vec::new();
@@ -113,7 +126,11 @@ impl EffectLedger {
                 WorkflowEvent::ActivityFailed { activity_id, .. }
                 | WorkflowEvent::ActivityTimedOut { activity_id, .. }
                 | WorkflowEvent::ActivityFailedExternally { activity_id, .. } => {
-                    close(&mut open, &activity_id.to_string());
+                    if let Some(OpenEffect::Activity(name)) =
+                        close(&mut open, &activity_id.to_string())
+                    {
+                        ledger.failed_activities.push(name);
+                    }
                 }
                 WorkflowEvent::TimerStarted { timer_id, .. } => open.push((
                     format!("timer:{}", timer_id.as_str()),
@@ -154,6 +171,11 @@ impl EffectLedger {
                 WorkflowEvent::SideEffectRecorded { .. } => ledger.side_effects += 1,
                 WorkflowEvent::SignalReceived { .. } => ledger.signals += 1,
                 _ => {}
+            }
+        }
+        for timer in torn_down_timers {
+            if close(&mut open, &format!("timer:{timer}")).is_some() {
+                ledger.timers.push(timer.clone());
             }
         }
         match open.into_iter().next() {
@@ -204,6 +226,17 @@ enum SnapshotError {
     Decode(String),
 }
 
+/// What the worker knows about a checkpoint that history cannot show.
+///
+/// The worker reads both lists from the replay matcher and the context.
+#[derive(Debug, Clone, Default)]
+struct ContextView {
+    /// Signals in history that the body has not taken yet.
+    unread_signals: Vec<String>,
+    /// Timers that a won race tore down. The teardown writes no event.
+    torn_down_timers: Vec<String>,
+}
+
 /// The key that signs each stamped snapshot. A worker would use a key that
 /// callers cannot read, such as a codec key.
 const ENGINE_KEY: &[u8] = b"issue-2013-spike-engine-key";
@@ -246,10 +279,9 @@ impl Snapshot {
 
     /// Stamps the ledger of `history` on an unstamped snapshot.
     ///
-    /// The engine side calls this when it persists the checkpoint.
-    /// `unread_signals` names the signals in history that the body has not
-    /// taken. The worker reads them from the replay matcher. History alone
-    /// cannot show them.
+    /// The engine side calls this when it persists the checkpoint. `view`
+    /// gives what history alone cannot show: unread signals and torn-down
+    /// race timers.
     ///
     /// # Errors
     ///
@@ -258,12 +290,13 @@ impl Snapshot {
     fn stamp(
         unstamped: &Value,
         history: &[WorkflowEvent],
-        unread_signals: &[String],
+        view: &ContextView,
     ) -> Result<Value, SnapshotError> {
-        if let Some(name) = unread_signals.first() {
+        if let Some(name) = view.unread_signals.first() {
             return Err(SnapshotError::Open(OpenEffect::Signal(name.clone())));
         }
-        let ledger = EffectLedger::from_history(history).map_err(SnapshotError::Open)?;
+        let ledger = EffectLedger::from_history(history, &view.torn_down_timers)
+            .map_err(SnapshotError::Open)?;
         let version = unstamped
             .get("version")
             .and_then(Value::as_u64)
@@ -299,7 +332,7 @@ impl Snapshot {
         state: &S,
         history: &[WorkflowEvent],
     ) -> Result<Value, SnapshotError> {
-        Self::stamp(&Self::unstamped(state), history, &[])
+        Self::stamp(&Self::unstamped(state), history, &ContextView::default())
     }
 
     /// Loads a snapshot under this code.
@@ -329,7 +362,10 @@ impl Snapshot {
             return Err(SnapshotError::UnknownVersion(snapshot.version));
         }
         if let Some(source) = source {
-            let expected = EffectLedger::from_history(source).map_err(SnapshotError::Open)?;
+            // The signed ledger lists each timer that the stamp closed,
+            // torn-down race timers included.
+            let expected = EffectLedger::from_history(source, &snapshot.ledger.timers)
+                .map_err(SnapshotError::Open)?;
             if expected != snapshot.ledger {
                 return Err(SnapshotError::LedgerMismatch);
             }
@@ -548,7 +584,7 @@ fn a_quiescent_history_gives_a_ledger_of_its_completed_effects() {
     history.extend(activity_events("charge", true));
     history.extend(update_events("bump"));
 
-    let ledger = EffectLedger::from_history(&history).expect("no effect is open");
+    let ledger = EffectLedger::from_history(&history, &[]).expect("no effect is open");
     assert_eq!(ledger.activities, ["charge", "charge"]);
     assert_eq!(ledger.timers, ["pause"]);
     assert_eq!(ledger.signals, 1);
@@ -663,7 +699,7 @@ fn a_checkpoint_with_an_open_effect_is_refused() {
         let mut history = vec![started(Value::Null)];
         history.extend(events);
         assert_eq!(
-            EffectLedger::from_history(&history),
+            EffectLedger::from_history(&history, &[]),
             Err(expected.clone()),
             "{name}: an open effect must refuse the ledger"
         );
@@ -688,9 +724,71 @@ fn a_checkpoint_with_an_unread_signal_is_refused() {
     ];
     let unstamped = Snapshot::unstamped(&OrderV1 { charged: 0 });
     assert_eq!(
-        Snapshot::stamp(&unstamped, &history, &["cancel".to_owned()]),
+        Snapshot::stamp(
+            &unstamped,
+            &history,
+            &ContextView {
+                unread_signals: vec!["cancel".to_owned()],
+                ..ContextView::default()
+            }
+        ),
         Err(SnapshotError::Open(OpenEffect::Signal("cancel".into())))
     );
+}
+
+#[test]
+fn a_failed_activity_is_recorded_in_the_ledger() {
+    // A workflow can catch the failure and change its state, so a cover rule
+    // must see it.
+    let mut history = vec![started(Value::Null)];
+    let mut charge = activity_events("charge", false);
+    let WorkflowEvent::ActivityScheduled { activity_id, .. } = charge[0].clone() else {
+        unreachable!("activity_events starts with a schedule");
+    };
+    charge.push(WorkflowEvent::ActivityFailed {
+        activity_id,
+        error: "card declined".into(),
+        attempt: 1,
+        error_type: "Declined".into(),
+        non_retryable: true,
+        details: None,
+    });
+    history.extend(charge);
+    let ledger = EffectLedger::from_history(&history, &[]).expect("no effect is open");
+    assert_eq!(ledger.activities, Vec::<String>::new());
+    assert_eq!(ledger.failed_activities, ["charge"]);
+}
+
+#[test]
+fn a_wait_won_by_its_signal_can_checkpoint() {
+    // The signal wins, so the context tears the deadline timer down. That
+    // teardown writes no event. Only the context view shows it.
+    let deadline = "__signal_timeout:1:approve";
+    let history = vec![
+        started(Value::Null),
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new(deadline),
+            duration_secs: 60,
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "approve".into(),
+            payload: Value::Null,
+        },
+    ];
+    let unstamped = Snapshot::unstamped(&OrderV1 { charged: 0 });
+    assert_eq!(
+        Snapshot::stamp(&unstamped, &history, &ContextView::default()),
+        Err(SnapshotError::Open(OpenEffect::Timer(deadline.into()))),
+        "history alone sees an open timer"
+    );
+    let view = ContextView {
+        torn_down_timers: vec![deadline.to_owned()],
+        ..ContextView::default()
+    };
+    let raw = Snapshot::stamp(&unstamped, &history, &view).expect("the view closes the timer");
+    let (_, ledger) =
+        Snapshot::load::<OrderV1>(&raw, Some(&history)).expect("the signed ledger closes it too");
+    assert_eq!(ledger.timers, [deadline]);
 }
 
 // ── Claim 2: versioned save and load ─────────────────────────────────────────
@@ -816,7 +914,8 @@ async fn changed_code_before_the_checkpoint_resumes_from_the_snapshot() {
     else {
         panic!("v1 must checkpoint: {v1_end:?}");
     };
-    let raw = Snapshot::stamp(&unstamped, &v1_history, &[]).expect("the checkpoint is quiescent");
+    let raw = Snapshot::stamp(&unstamped, &v1_history, &ContextView::default())
+        .expect("the checkpoint is quiescent");
 
     // A full replay of the v1 history under v2 code diverges at the audit.
     let replayed = run_workflow(

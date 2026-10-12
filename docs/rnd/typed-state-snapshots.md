@@ -149,8 +149,10 @@ The cost is high:
    continue-as-new provenance, such as `continued_from_exec_id`.
 4. The stamp refuses an open effect. It also refuses a signal in history
    that the body has not taken. Continue-as-new moves only signals that the
-   run did not ingest, so it would drop that signal. The worker reads this
-   from the replay matcher, because history alone cannot show it.
+   run did not ingest, so it would drop that signal. A won race tears down
+   its losing timer without an event, so the stamp also takes the list of
+   torn-down timers. The worker reads both lists from the replay matcher
+   and the context, because history alone cannot show them.
 5. The successor loads the state. It first checks the signature. An older
    version then passes through the `upgrade` step of the state type. The
    loader refuses a newer version. It then asks the state type whether the
@@ -187,6 +189,8 @@ Each claim names its test in `typed_snapshot_spike_tests.rs`.
 | A quiescent history gives a ledger of its completed effects. | `a_quiescent_history_gives_a_ledger_of_its_completed_effects` |
 | The stamp refuses an open activity, external activity, timer, child or update. | `a_checkpoint_with_an_open_effect_is_refused` |
 | The stamp refuses a signal that the body has not taken. | `a_checkpoint_with_an_unread_signal_is_refused` |
+| A wait won by its signal can checkpoint. The context view closes the torn-down timer. | `a_wait_won_by_its_signal_can_checkpoint` |
+| The ledger records a failed activity, so a cover rule can check a caught failure. | `a_failed_activity_is_recorded_in_the_ledger` |
 | The loader refuses a snapshot with a wrong engine signature. | `a_forged_snapshot_is_refused` |
 | A forged start input cannot skip the charges. | `a_forged_start_input_cannot_skip_the_charges` |
 | A v1 snapshot loads under v2 code through its upgrade step. | `a_v1_snapshot_loads_under_v2_code` |
