@@ -40,11 +40,23 @@ async fn four_steps_then_continue(ctx: &WorkflowContext, phase: i64) -> Result<i
     Ok(phase)
 }
 
+/// Runs four steps, then completes.
+#[workflow]
+async fn four_steps_then_complete(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    for _ in 0..4 {
+        ctx.execute_activity_raw("step", json!(null), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(4)
+}
+
 /// A step result of about 500 bytes, so the byte cap is reached fast.
 fn runtime() -> SqliteRuntime {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&endless_loop_info());
     rt.register_workflow(&four_steps_then_continue_info());
+    rt.register_workflow(&four_steps_then_complete_info());
     rt.register_activity_raw(
         "step",
         ActivitySpec::new(1, |_: Value| Ok(json!("x".repeat(500)))),
@@ -60,21 +72,16 @@ fn failure_reason(state: &RunState) -> HistoryCapReason {
     }
 }
 
-/// The last event is a typed `WorkflowFailed` that carries `reason`.
+/// The last event is the `WorkflowFailed` the Postgres worker writes.
 fn assert_failed_event(rt: &SqliteRuntime, exec: ExecutionId, reason: &HistoryCapReason) {
-    match rt.load_history(exec).unwrap().last() {
-        Some(WorkflowEvent::WorkflowFailed {
-            error,
-            error_type,
-            non_retryable,
-            ..
-        }) => {
-            assert_eq!(error, &reason.to_string());
-            assert_eq!(error_type.as_deref(), Some(reason.type_tag()));
-            assert_eq!(*non_retryable, Some(true));
-        }
-        other => panic!("expected a typed WorkflowFailed, got {other:?}"),
-    }
+    let history = rt.load_history(exec).unwrap();
+    let stored = serde_json::to_string(history.last().unwrap()).unwrap();
+    let postgres =
+        serde_json::to_string(&WorkflowEvent::workflow_failed(reason.to_string())).unwrap();
+    assert_eq!(
+        stored, postgres,
+        "the event must match the Postgres cap failure byte for byte"
+    );
     assert!(
         matches!(rt.outcome(exec).unwrap(), ExecutionOutcome::Failed(ref e) if e == &reason.to_string())
     );
@@ -112,7 +119,7 @@ async fn a_run_past_the_event_cap_fails_with_history_cap_exceeded() {
             workflow_type,
         } => {
             assert_eq!(*cap, 10);
-            assert!(*count >= 10, "count {count} must reach the cap");
+            assert_eq!(*count, 10, "the decision that adds event 10 breaches");
             assert_eq!(workflow_type, "endless_loop");
         }
         other @ HistoryCapReason::HistoryBytesCapExceeded { .. } => {
@@ -120,8 +127,13 @@ async fn a_run_past_the_event_cap_fails_with_history_cap_exceeded() {
         }
     }
     assert_failed_event(&rt, exec, &reason);
-    // The breaching decision rolled back, so the history stops near the cap.
-    assert!(rt.load_history(exec).unwrap().len() <= 11);
+    // The breaching `ActivityScheduled` rolled back: 9 events, then the failure.
+    let history = rt.load_history(exec).unwrap();
+    assert_eq!(history.len(), 10);
+    assert!(matches!(
+        history[8],
+        WorkflowEvent::ActivityCompleted { .. }
+    ));
     // A later drive returns the stored failure and runs nothing.
     let again = rt.run_until_blocked(exec).await.unwrap();
     assert_eq!(failure_reason(&again), reason);
@@ -171,6 +183,83 @@ async fn a_continuing_run_is_exempt_from_the_cap() {
     assert!(
         matches!(done, RunState::Completed(ref v) if v == &json!(1)),
         "{done:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_continuing_run_is_exempt_from_the_byte_cap() {
+    // Measure the bytes stored when the hand-off decision starts.
+    let mut probe = runtime();
+    let first = probe
+        .start_workflow("four_steps_then_continue", json!(0))
+        .unwrap();
+    probe.run_until_blocked(first).await.unwrap();
+    let history = probe.load_history(first).unwrap();
+    let before_hand_off: usize = history[..history.len() - 1]
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap().len())
+        .sum();
+    // One step stores about 600 bytes, so only the hand-off decision is at the
+    // cap. The slack absorbs a timestamp of another length.
+    let cap = u64::try_from(before_hand_off).unwrap() - 50;
+
+    let mut rt = runtime();
+    rt.set_history_byte_hard_cap(Some(cap));
+    let first = rt
+        .start_workflow("four_steps_then_continue", json!(0))
+        .unwrap();
+    let state = rt.run_until_blocked(first).await.unwrap();
+
+    assert!(matches!(state, RunState::ContinuedAsNew(_)), "{state:?}");
+}
+
+#[tokio::test]
+async fn a_completing_run_at_the_cap_fails_and_its_rows_go() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("caps.db");
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&four_steps_then_complete_info());
+    rt.register_activity_raw("step", ActivitySpec::new(1, |_: Value| Ok(json!(null))));
+    // The completing decision holds 9 events before its terminal event.
+    rt.set_history_event_hard_cap(Some(9));
+    let exec = rt
+        .start_workflow("four_steps_then_complete", json!(0))
+        .unwrap();
+    rt.send_signal(exec, "never_awaited", json!(null)).unwrap();
+
+    let state = rt.run_until_blocked(exec).await.unwrap();
+
+    let reason = failure_reason(&state);
+    assert_eq!(
+        reason,
+        HistoryCapReason::HistoryCapExceeded {
+            count: 9,
+            cap: 9,
+            workflow_type: "four_steps_then_complete".into(),
+        }
+    );
+    assert_failed_event(&rt, exec, &reason);
+    assert_eq!(rt.load_history(exec).unwrap().len(), 10);
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    let staged: i64 = raw
+        .query_row(
+            "SELECT COUNT(*) FROM harvest_signals WHERE exec_id = ?1",
+            rusqlite::params![exec.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(staged, 0, "the cap seal removes staged signals");
+
+    // One more event of room lets the same run complete.
+    let mut rt = runtime();
+    rt.set_history_event_hard_cap(Some(10));
+    let exec = rt
+        .start_workflow("four_steps_then_complete", json!(0))
+        .unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!(4)),
+        "{state:?}"
     );
 }
 

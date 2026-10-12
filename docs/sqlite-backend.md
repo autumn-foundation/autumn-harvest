@@ -279,6 +279,24 @@ match rt.outcome(exec)? {
 - **`poll_once()`** for a custom loop — e.g. a background tick where you decide
   the cadence and inspect the `bool` progress flag yourself.
 
+
+`poll_once()`/`run_until_idle()` drive every execution in a pass even if an
+earlier one errors — see [§11](#11-v01-non-goals-and-follow-ups) for what
+happens to a rejected execution. `run_until_blocked(exec)` is the one
+fail-fast driver, since it already targets a single execution.
+
+`outcome(exec)`, `load_history(exec)`, and `activity_attempts(exec, name)` are
+**pure reads** — they never advance a run.
+
+Every call that takes an `exec` id returns `SqliteError::ExecutionNotFound(exec)`
+when no execution has that id. This includes `run_until_blocked` and the list
+reads. A typo or a stale id gives this one typed error. It never gives an empty
+list or a generic `SQLite` error.
+
+Timers use the real wall clock (read once per decision cycle), so a run blocked
+on a `ctx.timer(...)` that is not yet due returns `WaitingTimer`; drive it again
+after the deadline passes and it proceeds.
+
 ### Long-lived runs: `continue_as_new` and the history caps (issue #2023)
 
 Each decision reloads and replays the whole history. A loop workflow, such as
@@ -298,8 +316,14 @@ drive of the old run returns the same successor and starts no other run.
 `start_workflow_with_id` with the same id attaches to the newest run. Send
 later signals to the successor, because the old run is terminal.
 
+`continue_as_new` bounds the replay cost of a run, not the database size. This
+backend has no retention, so each sealed run keeps its history in the file.
+
 `outcome()` of the old run is `ExecutionOutcome::Terminated("CONTINUED_AS_NEW")`.
-`ctx.should_continue_as_new()` uses the default threshold of 10,000 events.
+`successor(old)` returns the successor id without a drive.
+`ctx.should_continue_as_new()` uses the default threshold of 10,000 events. An
+event cap at or below it logs a warning, because the cap then fails the run
+before the advice turns true.
 
 The #1804 hard caps apply, with the Postgres defaults:
 
@@ -310,31 +334,15 @@ The #1804 hard caps apply, with the Postgres defaults:
 
 `None` removes a cap. A decision that reaches a cap rolls back. The run then
 fails, and the drive returns `RunState::Failed` with the reason JSON. The
-`WorkflowFailed` event holds the same JSON in `error`, the reason tag in
-`error_type`, and `non_retryable = true`. Parse the JSON as
-`HistoryCapReason`. The JSON is byte-identical to the Postgres DLQ reason.
+`WorkflowFailed` event holds the same JSON in `error`. The event is
+byte-identical to the one the Postgres worker writes. Parse the JSON as
+`HistoryCapReason`. The seal removes the run's pending tasks, unfired timers
+and staged signals.
 
 A continuing run is exempt, because its successor starts a new history. The
 event count includes the decision's own appends. The byte count is the stored
 event JSON length when the decision starts. Postgres measures
 `pg_column_size` instead, so the two byte counts can differ.
-
-`poll_once()`/`run_until_idle()` drive every execution in a pass even if an
-earlier one errors — see [§11](#11-v01-non-goals-and-follow-ups) for what
-happens to a rejected execution. `run_until_blocked(exec)` is the one
-fail-fast driver, since it already targets a single execution.
-
-`outcome(exec)`, `load_history(exec)`, and `activity_attempts(exec, name)` are
-**pure reads** — they never advance a run.
-
-Every call that takes an `exec` id returns `SqliteError::ExecutionNotFound(exec)`
-when no execution has that id. This includes `run_until_blocked` and the list
-reads. A typo or a stale id gives this one typed error. It never gives an empty
-list or a generic `SQLite` error.
-
-Timers use the real wall clock (read once per decision cycle), so a run blocked
-on a `ctx.timer(...)` that is not yet due returns `WaitingTimer`; drive it again
-after the deadline passes and it proceeds.
 
 ---
 
@@ -490,7 +498,8 @@ That drive still returns `SqliteError::Unsupported`, so the caller sees the
 reason. A later drive returns `RunState::Failed` and does not run the handler
 again. `outcome()` returns `ExecutionOutcome::Failed`.
 
-Only an unsupported feature seals a run. Other errors leave the run `RUNNING`:
+Only an unsupported feature or a history cap seals a run. Other errors leave
+the run `RUNNING`:
 an unregistered workflow or activity, a replay divergence, a contained panic
 under its budget, or a failed task. A fix in the same runtime can then resume
 the run.

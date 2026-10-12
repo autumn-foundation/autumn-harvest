@@ -143,10 +143,10 @@ pub enum ExecutionOutcome {
     /// A terminal state OTHER than a clean success/failure — inert and never
     /// resumable, but carrying no output (unlike [`Self::Completed`]) and no
     /// failure error (unlike [`Self::Failed`]). The dominant case is a run
-    /// SEALED to `CONTINUED_AS_NEW`. A `continue_as_new` seals it so (issue
-    /// #2023). A `TerminateIfRunning` or `AllowDuplicateFailedOnly` replace
-    /// seals it so too (issue #1068). It also covers `CANCELLED`, `TIMED_OUT`
-    /// and `TERMINATED`.
+    /// sealed `CONTINUED_AS_NEW`. A `continue_as_new` (issue #2023) or a
+    /// `TerminateIfRunning` / `AllowDuplicateFailedOnly` replace (issue #1068)
+    /// writes that state. [`SqliteRuntime::successor`] tells the two apart. It
+    /// also covers `CANCELLED`, `TIMED_OUT` and `TERMINATED`.
     /// The payload is the RAW stored state name (e.g. `"CONTINUED_AS_NEW"`) so a
     /// caller can distinguish which terminal it is. Reporting these terminally —
     /// rather than as [`Self::Running`] — keeps `outcome()` consistent with the
@@ -354,12 +354,28 @@ impl SqliteRuntime {
     /// The default is
     /// [`DEFAULT_HISTORY_EVENT_HARD_CAP`](autumn_harvest::DEFAULT_HISTORY_EVENT_HARD_CAP).
     /// A run that reaches the cap fails with
-    /// [`HistoryCapReason::HistoryCapExceeded`](crate::HistoryCapReason).
-    pub const fn set_history_event_hard_cap(&mut self, cap: Option<u64>) {
+    /// [`HistoryCapReason::HistoryCapExceeded`](crate::HistoryCapReason::HistoryCapExceeded).
+    /// The Postgres builder spells this `history_event_hard_cap(n)` and
+    /// `history_event_hard_cap_unlimited()`.
+    ///
+    /// A cap at or below the soft threshold of `should_continue_as_new` logs a
+    /// warning. A run that waits for that advice then fails before it gets it.
+    pub fn set_history_event_hard_cap(&mut self, cap: Option<u64>) {
         self.history_policy = match cap {
             Some(cap) => self.history_policy.with_event_hard_cap(cap),
             None => self.history_policy.without_event_hard_cap(),
         };
+        let threshold = self.history_policy.continue_as_new_threshold();
+        if let Some(cap) = cap
+            && cap <= threshold
+        {
+            tracing::warn!(
+                cap,
+                threshold,
+                "the history event cap is at or below the continue-as-new threshold; \
+                 should_continue_as_new() fires only after the cap fails the run"
+            );
+        }
     }
 
     /// The stored-history byte cap per run (issue #2023). `None` is unlimited.
@@ -374,7 +390,9 @@ impl SqliteRuntime {
     /// The default is
     /// [`DEFAULT_HISTORY_BYTE_HARD_CAP`](autumn_harvest::DEFAULT_HISTORY_BYTE_HARD_CAP).
     /// A run that reaches the cap fails with
-    /// [`HistoryCapReason::HistoryBytesCapExceeded`](crate::HistoryCapReason).
+    /// [`HistoryCapReason::HistoryBytesCapExceeded`](crate::HistoryCapReason::HistoryBytesCapExceeded).
+    /// The Postgres builder spells this `history_byte_hard_cap(n)` and
+    /// `history_byte_hard_cap_unlimited()`.
     pub const fn set_history_byte_hard_cap(&mut self, cap: Option<u64>) {
         self.history_policy = match cap {
             Some(cap) => self.history_policy.with_byte_hard_cap(cap),
@@ -903,6 +921,23 @@ impl SqliteRuntime {
         )
     }
 
+    /// The run that `exec` continued as, if any (issue #2023).
+    ///
+    /// `Some` only for a run that `continue_as_new` sealed. A reuse-policy seal
+    /// shares the `CONTINUED_AS_NEW` state but has no successor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns a
+    /// persistence error if the history cannot be read.
+    pub fn successor(&self, exec: ExecutionId) -> SqliteResult<Option<ExecutionId>> {
+        let state = store::execution_state(&self.conn, exec)?;
+        if state != SEALED_STATE {
+            return Ok(None);
+        }
+        store::successor_of(&self.conn, exec)
+    }
+
     /// The full ordered event history — the canonical, replayable log.
     ///
     /// # Errors
@@ -1277,8 +1312,8 @@ impl SqliteRuntime {
     /// Fail `exec` at a history cap (issue #2023).
     ///
     /// The breaching decision has already rolled back. The `WorkflowFailed`
-    /// event carries the reason JSON as `error`, the reason tag as
-    /// `error_type`, and `non_retryable = true`.
+    /// event holds the reason JSON as `error` and nothing else. The Postgres
+    /// worker writes the same event, so the stored bytes match.
     fn fail_for_history_cap(
         &mut self,
         exec: ExecutionId,
@@ -1286,12 +1321,7 @@ impl SqliteRuntime {
     ) -> SqliteResult<RunState> {
         let error = reason.to_string();
         tracing::warn!(%exec, %error, "workflow history reached a hard cap; failing the run");
-        let event = WorkflowEvent::WorkflowFailed {
-            error: error.clone(),
-            error_type: Some(reason.type_tag().to_string()),
-            details: None,
-            non_retryable: Some(true),
-        };
+        let event = WorkflowEvent::workflow_failed(error.clone());
         self.seal_failed(exec, &event, &error)?;
         Ok(RunState::Failed(error))
     }
@@ -1337,6 +1367,15 @@ impl SqliteRuntime {
         pending: &[WorkflowCommand],
         input: Value,
     ) -> SqliteResult<RunState> {
+        let dropped = pending.iter().filter(|cmd| is_dispatch(cmd)).count();
+        if dropped > 0 {
+            // Postgres logs the same drop (issue #952). A drop is never silent.
+            tracing::warn!(
+                %exec,
+                dropped_dispatches = dropped,
+                "continue-as-new dropped dispatched work; the old run never resumes"
+            );
+        }
         let successor = ExecutionId::new();
         let tx = self.conn.transaction()?;
         persist_terminal_pending_commands(
@@ -1404,9 +1443,8 @@ impl SqliteRuntime {
                     || RunState::Failed(format!("execution is terminal ({state}); not resumable")),
                     RunState::ContinuedAsNew,
                 )),
-                // A sealed / superseded run (`CONTINUED_AS_NEW`) or any other terminal
-                // state is inert and not resumable — surface a terminal `Failed`
-                // naming the state rather than re-driving.
+                // Any other terminal state (`CANCELLED`, `TIMED_OUT`, `TERMINATED`)
+                // is inert. Surface a terminal `Failed` that names it.
                 other => Ok(RunState::Failed(format!(
                     "execution is terminal ({other}); not resumable"
                 ))),

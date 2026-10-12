@@ -59,6 +59,8 @@ replays the whole history, so a loop workflow gets slower without limit.
 | R7 | The cap fails a run whose cycle is a replay divergence. | The divergence, panic and failed-task gates return first, as on Postgres. |
 | R8 | A test needs 50,000 events. | `set_history_event_hard_cap` lowers the cap. |
 | R9 | `claude-agent-daemon` matches `RunState` exhaustively. | Add the arm: retire the old run, keep the successor live. |
+| R10 | A typed cap event breaks byte identity with Postgres. | Write the same `workflow_failed(reason)` event. `HistoryCapReason` parses its `error`. |
+| R11 | A dropped dispatch is silent. | Log one warning per hand-off, as Postgres does (issue #952). |
 
 ### 0.4 Six thinking hats
 
@@ -98,17 +100,18 @@ continuation seals `FAILED` with feature `ContinueAsNew.new_workflow_type`.
 
 ### 1.2 History caps
 
-`run_workflow_*` gets the configured caps. After the handler, and only for
-a `Completed`, an author `Failed` or a `Suspended` outcome:
+`run_workflow_*` gets the policy for its soft threshold only. `CapCheck`
+checks the caps after the handler, and only for a `Completed`, an author
+`Failed` or a `Suspended` outcome:
 
 - Event cap: the durable count after this decision's appends, before its
   terminal event, reaches the cap.
 - Byte cap: the stored JSON bytes at decision start reach the cap.
 
 A breach rolls the decision back. A new transaction appends
-`WorkflowFailed` with `error` = the reason JSON, `error_type` = the reason
-tag and `non_retryable = true`. It sets the run `FAILED` and removes its
-pending tasks, unfired timers and staged signals.
+`WorkflowFailed { error: <reason JSON> }`, the same event as Postgres. It
+sets the run `FAILED` and removes its pending tasks, unfired timers and
+staged signals.
 
 ## 2. Test plan (red first)
 

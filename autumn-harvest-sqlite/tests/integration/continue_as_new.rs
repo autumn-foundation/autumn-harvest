@@ -7,9 +7,9 @@
 // The `#[workflow]` macro references its input param through expansion.
 #![allow(clippy::used_underscore_binding)]
 
-use autumn_harvest::WorkflowIdReusePolicy;
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
+use autumn_harvest::{WorkflowIdReusePolicy, WorkflowInfo};
 use autumn_harvest_sqlite::{
     ActivitySpec, ExecutionOutcome, RunState, SqliteError, SqliteRuntime,
     UNSUPPORTED_FEATURE_ERROR_TYPE,
@@ -76,17 +76,65 @@ async fn dispatch_in_hand_off(ctx: &WorkflowContext, phase: i64) -> Result<i64, 
     Ok(phase)
 }
 
-fn runtime() -> SqliteRuntime {
-    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+/// Arms a one-hour timer and runs one step, then continues. The timer is
+/// still unfired at the hand-off.
+#[workflow]
+async fn timer_at_hand_off(ctx: &WorkflowContext, phase: i64) -> Result<i64, String> {
+    if phase == 0 {
+        let mut deadline = std::pin::pin!(ctx.timer("deadline", 3600));
+        let mut step = std::pin::pin!(ctx.execute_activity_raw("add_one", json!(0), "default"));
+        std::future::poll_fn(|cx| {
+            let _ = deadline.as_mut().poll(cx);
+            step.as_mut().poll(cx)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        ctx.continue_as_new(json!(1))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(phase)
+}
+
+fn register(rt: &mut SqliteRuntime) {
     rt.register_workflow(&counting_loop_info());
     rt.register_workflow(&signal_hand_off_info());
     rt.register_workflow(&cross_type_info());
     rt.register_workflow(&dispatch_in_hand_off_info());
+    rt.register_workflow(&timer_at_hand_off_info());
     rt.register_activity_raw(
         "add_one",
         ActivitySpec::new(1, |v: Value| Ok(json!(v.as_i64().unwrap_or_default() + 1))),
     );
+}
+
+fn runtime() -> SqliteRuntime {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    register(&mut rt);
     rt
+}
+
+/// Replays `history` of `exec` on the core replayer and asserts success.
+async fn assert_replays(exec: ExecutionId, history: Vec<WorkflowEvent>, info: &WorkflowInfo) {
+    let report = WorkflowReplayer::new()
+        .register_fn(info.name, info.handler)
+        .replay_from_events(history)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the history of {exec} must replay:\n{report}"
+    );
+}
+
+/// Counts rows of `table` for `exec` on a raw connection to the file.
+fn row_count(path: &std::path::Path, table: &str, filter: &str, exec: ExecutionId) -> i64 {
+    let raw = rusqlite::Connection::open(path).unwrap();
+    raw.query_row(
+        &format!("SELECT COUNT(*) FROM {table} WHERE exec_id = ?1 AND {filter}"),
+        rusqlite::params![exec.to_string()],
+        |row| row.get(0),
+    )
+    .unwrap()
 }
 
 fn successor_of(state: &RunState) -> ExecutionId {
@@ -174,6 +222,12 @@ async fn a_redrive_of_a_continued_run_names_the_same_successor() {
     let again = successor_of(&rt.run_until_blocked(first).await.unwrap());
 
     assert_eq!(again, second, "a re-drive starts no second successor");
+    assert_eq!(rt.successor(first).unwrap(), Some(second));
+    assert_eq!(
+        rt.successor(second).unwrap(),
+        None,
+        "a running run has none"
+    );
     let started = rt.load_history(first).unwrap();
     assert_eq!(
         started
@@ -204,6 +258,7 @@ async fn a_reuse_policy_seal_names_no_successor() {
         matches!(state, RunState::Failed(ref m) if m.contains("not resumable")),
         "{state:?}"
     );
+    assert_eq!(rt.successor(prior).unwrap(), None);
 }
 
 // ── AC2: signals staged before the hand-off reach the successor ───────────
@@ -224,6 +279,10 @@ async fn signals_staged_before_the_hand_off_reach_the_successor() {
         matches!(done, RunState::Completed(ref v) if v == &json!({"for": "run 2"})),
         "{done:?}"
     );
+    // The successor consumed the moved signal.
+    assert!(rt.load_history(second).unwrap().iter().any(
+        |e| matches!(e, WorkflowEvent::SignalReceived { signal_name, .. } if signal_name == "second")
+    ));
     // The consumed signal stays on the old run. Only the staged one moved.
     let old = rt.load_history(first).unwrap();
     assert!(old.iter().any(
@@ -250,16 +309,83 @@ async fn both_histories_replay_on_the_core_replayer() {
     assert!(matches!(done, RunState::Completed(_)), "{done:?}");
 
     for exec in [first, second] {
-        let history = rt.load_history(exec).unwrap();
-        let report = WorkflowReplayer::new()
-            .register_fn("counting_loop", counting_loop_info().handler)
-            .replay_from_events(history)
-            .await;
-        assert!(
-            matches!(report.status, ReplayStatus::ReplaySucceeded),
-            "the history of {exec} must replay:\n{report}"
-        );
+        assert_replays(exec, rt.load_history(exec).unwrap(), &counting_loop_info()).await;
     }
+}
+
+#[tokio::test]
+async fn every_hand_off_shape_replays_on_the_core_replayer() {
+    let mut rt = runtime();
+    let signal = rt.start_workflow("signal_hand_off", json!(0)).unwrap();
+    rt.send_signal(signal, "first", json!(1)).unwrap();
+    rt.send_signal(signal, "second", json!(2)).unwrap();
+    let dispatch = rt.start_workflow("dispatch_in_hand_off", json!(0)).unwrap();
+    let timer = rt.start_workflow("timer_at_hand_off", json!(0)).unwrap();
+
+    for (first, info) in [
+        (signal, signal_hand_off_info()),
+        (dispatch, dispatch_in_hand_off_info()),
+        (timer, timer_at_hand_off_info()),
+    ] {
+        let second = successor_of(&rt.run_until_blocked(first).await.unwrap());
+        let done = rt.run_until_blocked(second).await.unwrap();
+        assert!(matches!(done, RunState::Completed(_)), "{done:?}");
+        assert_replays(first, rt.load_history(first).unwrap(), &info).await;
+        assert_replays(second, rt.load_history(second).unwrap(), &info).await;
+    }
+}
+
+// ── Durability ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_chain_resumes_after_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("chain.db");
+    let (first, second) = {
+        let mut rt = SqliteRuntime::open(&path).unwrap();
+        register(&mut rt);
+        let first = rt
+            .start_workflow_with_id("counting_loop", "k", json!(0))
+            .unwrap();
+        let second = successor_of(&rt.run_until_blocked(first).await.unwrap());
+        (first, second)
+    };
+
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    register(&mut rt);
+    while rt.poll_once().await.unwrap() {}
+
+    assert_eq!(rt.successor(first).unwrap(), Some(second));
+    let last = rt
+        .start_workflow_with_id("counting_loop", "k", json!(0))
+        .unwrap();
+    assert!(
+        matches!(rt.outcome(last).unwrap(), ExecutionOutcome::Completed(ref v) if v == &json!(3))
+    );
+    let again = successor_of(&rt.run_until_blocked(first).await.unwrap());
+    assert_eq!(again, second, "a reopen starts no second successor");
+}
+
+#[tokio::test]
+async fn the_hand_off_deletes_the_old_runs_unfired_timer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("timer.db");
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    register(&mut rt);
+    let first = rt.start_workflow("timer_at_hand_off", json!(0)).unwrap();
+
+    let second = successor_of(&rt.run_until_blocked(first).await.unwrap());
+
+    assert!(
+        rt.load_history(first)
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerStarted { .. })),
+        "the timer was armed before the hand-off"
+    );
+    assert_eq!(row_count(&path, "harvest_timers", "fired = 0", first), 0);
+    let done = rt.run_until_blocked(second).await.unwrap();
+    assert!(matches!(done, RunState::Completed(ref v) if v == &json!(1)));
 }
 
 // ── Edges ─────────────────────────────────────────────────────────────────

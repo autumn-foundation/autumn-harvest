@@ -1817,9 +1817,7 @@ async fn drive_one(
         // Issue #2023: the old run is sealed. Drive the successor instead.
         Ok(RunState::ContinuedAsNew(successor)) => {
             retire(blocked, live, exec);
-            if !live.contains(&successor) {
-                live.push(successor);
-            }
+            enlist(live, successor);
             tracing::info!(%exec, %successor, "session continued as new");
         }
         // A drive failure carries the activity's own message, which holds

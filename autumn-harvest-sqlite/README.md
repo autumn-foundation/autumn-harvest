@@ -109,7 +109,7 @@ A complete, runnable version is in
   one transaction. Undelivered signals move to the successor.
   `run_until_blocked` returns `RunState::ContinuedAsNew(successor)`. The #1804
   history caps apply with the Postgres defaults: 50,000 events and 50 MiB per
-  run. A run that reaches a cap fails with a typed `HistoryCapReason`. Change
+  run. A run that reaches a cap fails. Its error is `HistoryCapReason` JSON. Change
   the caps with `set_history_event_hard_cap` and `set_history_byte_hard_cap`.
 
 ## v0.1 non-goals

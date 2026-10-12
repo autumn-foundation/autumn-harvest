@@ -41,7 +41,7 @@ pub enum HistoryCapReason {
 }
 
 impl HistoryCapReason {
-    /// The serde `type` tag. The `WorkflowFailed` event uses it as `error_type`.
+    /// The serde `type` tag, such as `HistoryCapExceeded`.
     #[must_use]
     pub const fn type_tag(&self) -> &'static str {
         match self {
