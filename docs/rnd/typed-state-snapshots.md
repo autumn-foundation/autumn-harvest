@@ -193,6 +193,7 @@ Each claim names its test in `typed_snapshot_spike_tests.rs`.
 | The loader refuses a snapshot from newer code. | `a_snapshot_from_newer_code_is_refused` |
 | The loader refuses a ledger that differs from its source history. | `a_ledger_that_differs_from_its_source_history_is_refused` |
 | The loader refuses a state that does not cover its ledger. | `a_state_that_does_not_cover_its_ledger_is_refused` |
+| The ledger records each completed update, so a cover rule can check an update's change. | `a_state_that_misses_a_completed_update_is_refused` |
 | Changed code before the checkpoint fails a full replay as non-deterministic. The same code resumes from the snapshot and runs no completed charge again. | `changed_code_before_the_checkpoint_resumes_from_the_snapshot` |
 | A new context restarts reserved names. An in-place resume must restore the counters. | `reserved_names_restart_in_each_new_context` |
 

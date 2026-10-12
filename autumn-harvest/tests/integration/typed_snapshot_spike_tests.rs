@@ -68,6 +68,10 @@ struct EffectLedger {
     side_effects: u64,
     /// Signals that the run received.
     signals: u64,
+    /// Updates that completed, by name, in order. An update handler can
+    /// change the state, so a cover rule must see each one.
+    #[serde(default)]
+    updates: Vec<String>,
 }
 
 /// Removes the open effect `id` and returns it.
@@ -133,14 +137,18 @@ impl EffectLedger {
                         ledger.children.push(child_id.to_string());
                     }
                 }
-                WorkflowEvent::UpdateAdmitted { update_id, .. } => {
-                    open.push((
-                        update_id.to_string(),
-                        OpenEffect::Update(update_id.to_string()),
-                    ));
+                WorkflowEvent::UpdateAdmitted {
+                    update_id, name, ..
+                } => {
+                    open.push((update_id.to_string(), OpenEffect::Update(name.clone())));
                 }
-                WorkflowEvent::UpdateCompleted { update_id, .. }
-                | WorkflowEvent::UpdateFailed { update_id, .. } => {
+                WorkflowEvent::UpdateCompleted { update_id, .. } => {
+                    if let Some(OpenEffect::Update(name)) = close(&mut open, &update_id.to_string())
+                    {
+                        ledger.updates.push(name);
+                    }
+                }
+                WorkflowEvent::UpdateFailed { update_id, .. } => {
                     close(&mut open, &update_id.to_string());
                 }
                 WorkflowEvent::SideEffectRecorded { .. } => ledger.side_effects += 1,
@@ -538,11 +546,65 @@ fn a_quiescent_history_gives_a_ledger_of_its_completed_effects() {
         payload: Value::Null,
     });
     history.extend(activity_events("charge", true));
+    history.extend(update_events("bump"));
 
     let ledger = EffectLedger::from_history(&history).expect("no effect is open");
     assert_eq!(ledger.activities, ["charge", "charge"]);
     assert_eq!(ledger.timers, ["pause"]);
     assert_eq!(ledger.signals, 1);
+    assert_eq!(ledger.updates, ["bump"]);
+}
+
+/// An admitted update named `name` and its completion.
+fn update_events(name: &str) -> [WorkflowEvent; 2] {
+    let update_id = autumn_harvest::types::UpdateId::new();
+    [
+        WorkflowEvent::UpdateAdmitted {
+            update_id,
+            name: name.into(),
+            input: Value::Null,
+            timestamp: chrono::DateTime::from_timestamp(1_791_676_800, 0).expect("valid timestamp"),
+        },
+        WorkflowEvent::UpdateCompleted {
+            update_id,
+            output: Value::Null,
+        },
+    ]
+}
+
+/// A state that an update handler changes: each `bump` adds one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Tally {
+    bumps: u32,
+}
+
+impl VersionedState for Tally {
+    const VERSION: u32 = 1;
+
+    fn upgrade(version: u32, _raw: Value) -> Result<Value, String> {
+        Err(format!("no upgrade from version {version}"))
+    }
+
+    /// Each completed `bump` update is in `bumps`.
+    fn covers(&self, ledger: &EffectLedger) -> bool {
+        let bumps = ledger.updates.iter().filter(|u| *u == "bump").count();
+        usize::try_from(self.bumps).is_ok_and(|b| b == bumps)
+    }
+}
+
+#[test]
+fn a_state_that_misses_a_completed_update_is_refused() {
+    let mut history = vec![started(Value::Null)];
+    history.extend(update_events("bump"));
+    history.extend(update_events("bump"));
+    let stale = Snapshot::save(&Tally { bumps: 1 }, &history).expect("quiescent");
+    assert_eq!(
+        Snapshot::load::<Tally>(&stale, Some(&history)),
+        Err(SnapshotError::NotCovered),
+        "a state that dropped one update must not load"
+    );
+    let fresh = Snapshot::save(&Tally { bumps: 2 }, &history).expect("quiescent");
+    assert!(Snapshot::load::<Tally>(&fresh, Some(&history)).is_ok());
 }
 
 #[test]
@@ -594,7 +656,7 @@ fn a_checkpoint_with_an_open_effect_is_refused() {
                 timestamp: chrono::DateTime::from_timestamp(1_791_676_800, 0)
                     .expect("valid timestamp"),
             }],
-            OpenEffect::Update(update.to_string()),
+            OpenEffect::Update("bump".into()),
         ),
     ];
     for (name, events, expected) in cases {
