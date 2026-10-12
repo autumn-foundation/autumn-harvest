@@ -299,7 +299,7 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_workflow_cache_miss", &["workflow", "queue"]),
     (
         "harvest_workflow_resident",
-        &["workflow", "queue", "outcome", "reason"],
+        &["workflow", "queue", "outcome"],
     ),
     (
         "harvest_workflow_external_signal_sent",

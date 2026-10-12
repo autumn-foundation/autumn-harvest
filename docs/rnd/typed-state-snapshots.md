@@ -29,18 +29,21 @@ loses or repeats no completed side effect.
 ## 2. The gate: resident hit rate
 
 The issue gates the spike on the resident-state hit rate of issue #2007.
-That data did not exist, so this change builds it first.
 
-**The counter.** `harvest.workflow.resident` counts one outcome for each
-decision. `outcome=hit` means the decision resumed a resident workflow and
-replayed nothing. `outcome=miss` means it replayed. A miss names its
-`reason` from a closed set. `docs/telemetry.md` lists every reason.
+**The counter.** #2114 added `harvest.workflow.resident`, with the labels
+`workflow`, `queue` and `outcome`. It counts one outcome for each decision. `outcome="hit"` means
+that the decision resumed a resident workflow and replayed nothing. Each
+other value names why the decision replayed, such as `cold`,
+`multi_await`, `race` or `unsupported`. `docs/telemetry.md` lists each
+value.
 
 **Measurement 1: e2e bench.** The `throughput` and `signal_roundtrip`
 scenarios of `benches/e2e_bench.rs` ran at 1 shard. The setup was a local
 PostgreSQL 16 server, a shared-server topology, a debug build and 4 vCPUs.
 One worker served the shard, and the cache evicted nothing. In that setup
-the hit rate depends on the workflow shape, not on speed.
+the hit rate depends on the workflow shape, not on speed. A recorder that
+tallies `harvest.workflow.resident` replaced the bench's no-op recorder for
+this run. The tally counts the warmup cohort too.
 
 | Scenario | Workflow shape | Decisions | Hits | Hit rate | Misses |
 |---|---|--:|--:|--:|---|
@@ -56,17 +59,22 @@ tool calls, then a gated call, then answers.
 
 | Decision | What it ran | Outcome |
 |--:|---|---|
-| 1 | Start, first model turn | `miss/cold` |
-| 2–6 | Model turns and allowed tool calls | `hit/resumed` × 5 |
-| 7 | After the approval signal | `miss/race` |
-| 8–9 | Gated tool call, last model turn | `miss/race_teardown` × 2 |
+| 1 | Start, first model turn | `cold` |
+| 2–6 | Model turns and allowed tool calls | `hit` × 5 |
+| 7 | After the approval signal | `multi_await` |
+| 8–9 | Gated tool call, last model turn | `unsupported` × 2 |
 
 The agent loop resumed 5 of 9 decisions, or 5 of 6 before the gate.
 
-**A finding for #2008.** A won signal-with-deadline race pushes
+The approval wait is a timer and a signal at once. It does not run inside
+`ctx.race()`, so the counter names it `multi_await`, not `race`.
+
+**A finding beyond #2008.** #2114 keeps joins of parallel activities
+resident. A won signal-with-deadline wait pushes
 `CancelRaceLosers` on each cold replay. That command writes no event. A
-suspension with that command cannot stay resident. So after one approval
-gate, every later decision of the run replays. The test pins this behavior.
+suspension with that command cannot stay resident, so the counter names it
+`unsupported`. So after one approval gate, every later decision of the run
+replays. The test pins this behavior.
 
 A fix can let the resident path keep such a suspension. That is a
 hypothesis, not a proven change. A cold replay re-issues the teardown today.
@@ -240,8 +248,8 @@ rest.
 
 **Follow-up work, in order:**
 
-1. #2008: let the resident path keep a suspension with the teardown of a
-   finished race, with the proof in section 2.
+1. A follow-up to #2008: let the resident path keep a suspension with the
+   teardown of a finished race, with the proof in section 2.
 2. Re-resolve the build at a checkpoint, as an opt-in. Without it, the
    versioning gain does not reach a pinned run.
 3. A versioned state, an upgrade step and a cover rule for the keyed entity
@@ -254,10 +262,10 @@ rest.
 
 **What would change the verdict:**
 
-- `harvest.workflow.resident{reason="cold"}` is more than 20% of decisions
+- `harvest.workflow.resident{outcome="cold"}` is more than 20% of decisions
   on a production fleet for a week.
 - The p99 replay time of a cold decision is above 50 ms.
-- Agent runs keep replaying after a gate, because the #2008 fix does not
+- Agent runs keep replaying after a gate, because the teardown fix does not
   land.
 - Child workflows need checkpoints, or a stable execution id across
   checkpoints becomes a hard requirement.

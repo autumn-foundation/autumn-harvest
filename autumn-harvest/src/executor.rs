@@ -2275,15 +2275,11 @@ pub(crate) struct DriveResult {
     pub(crate) span: tracing::Span,
     /// The explicit context-local router, if any. See [`run_workflow_with_state`].
     pub(crate) router: Option<crate::shard::ShardRouter>,
-    /// The suspended workflow, kept for the next decision (issue #1798).
+    /// The suspended workflow kept for the next decision, or why it was
+    /// not kept (issue #1798, issue #2007).
     #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))]
     // Resident paths need the worker or the test harness.
-    pub(crate) resident: Option<crate::resident::ResidentWorkflow>,
-    /// Why a suspension that the caller asked to keep did not stay resident
-    /// (issue #2007). `None` when it stayed, or when the caller did not ask.
-    #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))]
-    // Resident paths need the worker or the test harness.
-    pub(crate) not_kept: Option<crate::resident::NotKept>,
+    pub(crate) resident: crate::resident::Residency,
 }
 
 impl DriveResult {
@@ -2414,14 +2410,14 @@ async fn drive_cycle(
     let keep = keep.filter(|_| matches!(cycle_result, HandlerCycleResult::Suspended));
     let future = keep.is_some().then_some(future);
     let (mut outcome, pending) = span_handle.in_scope(|| classify_cycle(&ctx, cycle_result));
-    let (resident, not_kept) = match (future, keep) {
+    let resident = match (future, keep) {
         (Some(future), Some(key)) => {
             match crate::resident::ResidentWorkflow::capture(&ctx, future, &mut outcome, key) {
-                Ok(resident) => (Some(resident), None),
-                Err(reason) => (None, Some(reason)),
+                Ok(workflow) => crate::resident::Residency::Parked(workflow),
+                Err(miss) => crate::resident::Residency::Missed(miss),
             }
         }
-        _ => (None, None),
+        _ => crate::resident::Residency::Unknown,
     };
 
     // Issue #1263 items 11/15/17: carry the EXPLICIT context-local router
@@ -2439,7 +2435,6 @@ async fn drive_cycle(
         span: span_handle,
         router,
         resident,
-        not_kept,
     }
 }
 

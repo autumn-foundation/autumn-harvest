@@ -629,56 +629,13 @@ pub const METRIC_WORKFLOW_CACHE_HIT: &str = "harvest.workflow.cache_hit";
 /// the existing cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_CACHE_MISS: &str = "harvest.workflow.cache_miss";
 
-/// Counter: one per workflow decision that runs the workflow body (issue
-/// #2007).
+/// Counter: one per workflow decision attempt on a worker with resident
+/// state on (issue #2007).
 ///
-/// `outcome` is [`RESIDENT_OUTCOME_HIT`] when the decision resumed a
-/// resident workflow, and [`RESIDENT_OUTCOME_MISS`] when it replayed history.
-/// `reason` is [`RESIDENT_HIT_REASON`] on a hit and one of
-/// [`RESIDENT_MISS_REASONS`] on a miss. Also labeled by `workflow` and
-/// `queue`. The hit rate is `hit / (hit + miss)`.
+/// Labels: `workflow`, `queue` and `outcome`. The [`ResidentOutcome`] enum
+/// bounds `outcome`. `hit` means that the decision resumed a resident
+/// workflow. Each other value names why it replayed.
 pub const METRIC_WORKFLOW_RESIDENT: &str = "harvest.workflow.resident";
-
-/// The `outcome` label of a resident hit (issue #2007).
-pub const RESIDENT_OUTCOME_HIT: &str = "hit";
-
-/// The `outcome` label of a resident miss (issue #2007).
-pub const RESIDENT_OUTCOME_MISS: &str = "miss";
-
-/// The `reason` label of a resident hit (issue #2007).
-pub const RESIDENT_HIT_REASON: &str = "resumed";
-
-/// Every `reason` label of a resident miss (issue #2007).
-///
-/// The set is closed, so the counter has a bounded number of series.
-pub const RESIDENT_MISS_REASONS: &[&str] = &[
-    "cold",
-    "disabled",
-    "hot_swap",
-    "gap",
-    "multi_await",
-    "race",
-    "race_teardown",
-    "mutex",
-    "command",
-    "no_await",
-    "park_token",
-    "strict_replay",
-    "test_clock",
-    "cancelled",
-    "signal_handler",
-    "nondeterminism",
-    "unread_history",
-    "signal_probe",
-    "key_changed",
-    "own_events_mismatch",
-    "no_resolution",
-    "extra_events",
-    "inexact_resolution",
-    "unexpected_event",
-    "receiver_dropped",
-    "unrecorded",
-];
 
 /// Counter: incremented once per `signal_external_workflow` call after the
 /// terminal outcome is recorded in `harvest_events`.
@@ -1904,6 +1861,76 @@ impl WebhookOutcome {
 }
 
 impl std::fmt::Display for WebhookOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The result of one workflow decision for the resident path (issue #2007).
+///
+/// It is the `outcome` label of [`METRIC_WORKFLOW_RESIDENT`]. The set is
+/// closed, so the label cardinality is bounded (ADR-0001 §7). Each value
+/// other than [`Self::Hit`] names why the decision replayed history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ResidentOutcome {
+    /// The decision resumed the resident workflow.
+    Hit,
+    /// The worker held no resident state for the run, for example after a
+    /// cache miss or on the first decision.
+    Cold,
+    /// The resident workflow did not resume. The delta, the context inputs
+    /// or the warm cycle failed a check. See `resident::ResumeDeclined`.
+    Declined,
+    /// The last suspension awaited more than one command, in a shape that
+    /// the resident path does not cover.
+    MultiAwait,
+    /// The last suspension was inside `ctx.race()`.
+    Race,
+    /// The last suspension held or acquired a durable mutex.
+    Mutex,
+    /// The workflow runs in a hot-swap module, which binds around one drive.
+    HotSwap,
+    /// Another context state blocked the capture, such as a park token, a
+    /// push signal handler or unread history.
+    Blocked,
+    /// The last suspension had a command that the resident path does not
+    /// cover, such as a child workflow or a local activity.
+    Unsupported,
+}
+
+impl ResidentOutcome {
+    /// Every value, in label order.
+    pub const ALL: [Self; 9] = [
+        Self::Hit,
+        Self::Cold,
+        Self::Declined,
+        Self::MultiAwait,
+        Self::Race,
+        Self::Mutex,
+        Self::HotSwap,
+        Self::Blocked,
+        Self::Unsupported,
+    ];
+
+    /// The stable `outcome` label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Cold => "cold",
+            Self::Declined => "declined",
+            Self::MultiAwait => "multi_await",
+            Self::Race => "race",
+            Self::Mutex => "mutex",
+            Self::HotSwap => "hot_swap",
+            Self::Blocked => "blocked",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+impl std::fmt::Display for ResidentOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
@@ -3897,23 +3924,18 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow_name, queue);
     }
 
-    /// A workflow decision resumed a resident workflow, or replayed (issue
+    /// A workflow decision ran on a worker with resident state on (issue
     /// #2007).
     ///
-    /// `outcome` is [`RESIDENT_OUTCOME_HIT`] or [`RESIDENT_OUTCOME_MISS`].
-    /// `reason` is [`RESIDENT_HIT_REASON`] or one of
-    /// [`RESIDENT_MISS_REASONS`]. See [`METRIC_WORKFLOW_RESIDENT`].
+    /// The worker calls this once per decision attempt, after its first
+    /// drive. A decision that does not commit runs again and records again.
+    /// `outcome` is [`ResidentOutcome::Hit`] when the decision resumed a
+    /// resident workflow, or the reason why it replayed history.
     ///
-    /// Maps to the counter
-    /// `harvest.workflow.resident{workflow, queue, outcome, reason}`.
-    fn record_workflow_resident(
-        &self,
-        workflow_name: &str,
-        queue: &str,
-        outcome: &str,
-        reason: &str,
-    ) {
-        let _ = (workflow_name, queue, outcome, reason);
+    /// Maps to the counter [`METRIC_WORKFLOW_RESIDENT`] with labels
+    /// `workflow`, `queue` and `outcome`.
+    fn record_workflow_resident(&self, workflow_name: &str, queue: &str, outcome: ResidentOutcome) {
+        let _ = (workflow_name, queue, outcome);
     }
 
     /// A workflow execution was terminated because its `deadline_at` elapsed.
@@ -5028,6 +5050,42 @@ mod tests {
         assert_eq!(METRIC_LABEL_ACTIVITY, "activity");
         assert_eq!(METRIC_LABEL_QUEUE, "queue");
         assert_eq!(METRIC_LABEL_BUILD_ID, "build_id");
+    }
+
+    #[test]
+    fn resident_outcome_labels_are_stable_and_distinct() {
+        // Dashboards and alerts key on these strings (issue #2007).
+        let labels: Vec<&str> = ResidentOutcome::ALL.iter().map(|o| o.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "hit",
+                "cold",
+                "declined",
+                "multi_await",
+                "race",
+                "mutex",
+                "hot_swap",
+                "blocked",
+                "unsupported",
+            ]
+        );
+        assert_eq!(METRIC_WORKFLOW_RESIDENT, "harvest.workflow.resident");
+        assert_eq!(ResidentOutcome::MultiAwait.to_string(), "multi_await");
+        // An exhaustive match: a new variant must join `ALL`.
+        for outcome in ResidentOutcome::ALL {
+            match outcome {
+                ResidentOutcome::Hit
+                | ResidentOutcome::Cold
+                | ResidentOutcome::Declined
+                | ResidentOutcome::MultiAwait
+                | ResidentOutcome::Race
+                | ResidentOutcome::Mutex
+                | ResidentOutcome::HotSwap
+                | ResidentOutcome::Blocked
+                | ResidentOutcome::Unsupported => {}
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

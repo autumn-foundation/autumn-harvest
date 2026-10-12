@@ -17,6 +17,12 @@ The issue gates the spike on the resident-state hit-rate data of issue
 adds one counter and one `MetricsRecorder` method with a no-op default. The
 spike adds no engine code.
 
+> **Superseded in part.** #2114 landed the #2007 counter on `trunk-dev`
+> first, as `harvest.workflow.resident{workflow, queue, outcome}` with a
+> `ResidentOutcome` enum. This branch dropped its own counter for that one.
+> Sections 1 and 2 below record the original plan. The measurements and the
+> spike use the `trunk-dev` counter.
+
 ---
 
 ## 0. Planning record

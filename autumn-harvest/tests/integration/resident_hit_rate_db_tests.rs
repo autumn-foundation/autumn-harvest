@@ -8,7 +8,9 @@
 //!
 //! Each model turn and each allowed tool call awaits one activity, so those
 //! decisions resume. A gated call waits for its approval signal with a
-//! deadline. That wait is a race, so the decision after it replays.
+//! deadline: a timer and a signal at once. The decision after it replays.
+//! Each later decision replays too, because a cold replay re-issues the
+//! event-less `CancelRaceLosers` of the won wait.
 //!
 //! `docs/rnd/typed-state-snapshots.md` records the rate. Print it with
 //! `-- --nocapture`.
@@ -18,7 +20,9 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use autumn_harvest::telemetry::{MetricsRecorder, NoOpPropagator, TelemetryConfig};
+use autumn_harvest::telemetry::{
+    MetricsRecorder, NoOpPropagator, ResidentOutcome, TelemetryConfig,
+};
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
@@ -36,7 +40,7 @@ use crate::integration_e2e::{
     build_test_pool, setup_test_database_url_or_env, wait_for_execution_state_with_timeout,
 };
 
-/// Each resident outcome of one worker, as `outcome/reason`, in order.
+/// Each resident outcome of one worker, in order.
 #[derive(Debug, Default)]
 struct ResidentLog(Mutex<Vec<String>>);
 
@@ -51,13 +55,12 @@ impl MetricsRecorder for ResidentLog {
         &self,
         _workflow_name: &str,
         _queue: &str,
-        outcome: &str,
-        reason: &str,
+        outcome: ResidentOutcome,
     ) {
         self.0
             .lock()
             .expect("log lock")
-            .push(format!("{outcome}/{reason}"));
+            .push(outcome.as_str().to_owned());
     }
 }
 
@@ -303,7 +306,7 @@ async fn agent_loop_resumes_every_sequential_turn_and_replays_after_a_gate() {
         .await;
 
     let outcomes = log.outcomes();
-    let hits = outcomes.iter().filter(|o| o.starts_with("hit/")).count();
+    let hits = outcomes.iter().filter(|o| *o == "hit").count();
     println!(
         "agent loop resident outcomes: {outcomes:?}; hit rate {hits}/{}",
         outcomes.len()
@@ -311,15 +314,15 @@ async fn agent_loop_resumes_every_sequential_turn_and_replays_after_a_gate() {
     assert_eq!(
         outcomes,
         [
-            "miss/cold",
-            "hit/resumed",
-            "hit/resumed",
-            "hit/resumed",
-            "hit/resumed",
-            "hit/resumed",
-            "miss/race",
-            "miss/race_teardown",
-            "miss/race_teardown",
+            "cold",
+            "hit",
+            "hit",
+            "hit",
+            "hit",
+            "hit",
+            "multi_await",
+            "unsupported",
+            "unsupported",
         ],
         "each single-await turn resumes until the gate; after it, each replay re-issues the teardown"
     );
