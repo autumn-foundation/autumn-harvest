@@ -4409,7 +4409,6 @@ pub mod db {
             &census,
         )
         .await;
-        let resident_note = resident_note(&resident_before, &resident.settled_snapshot().await);
         let requested = per_shard_total * shards.len();
 
         // Completion instants come from the database clock (`completed_at`), so
@@ -4476,6 +4475,9 @@ pub mod db {
         unsound.extend(per_shard_inflight_soundness(inflight, &per_shard_flight));
 
         let probe_notes = commit_probe_report(&cluster, "meas").await;
+        // The settling wait comes after the probe report, so the probe holds
+        // no idle polls from it.
+        let resident_note = resident_note(&resident_before, &resident.settled_snapshot().await);
         fleet.stop().await;
         let topology = cluster.topology;
         drop(sharded);

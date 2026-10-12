@@ -107,6 +107,10 @@ No outcome other than `hit` and `cold` occurred in any run.
   run. The hits do not change, so the extra decisions are replays on top of
   the warm path. At its lower rate, the agent loop made one extra `cold`
   decision in one of six runs.
+- **Each extra decision persists.** A two-loop run with
+  `HARVEST_BENCH_COMMIT_PROBE=1` counted 4,856 decisions and 4,856
+  workflow-task persists. So the extra decisions are whole decisions, not
+  claim attempts that lost and wrote nothing.
 - **For these shapes, a wider resident path wins nothing.** Typed-state
   snapshots can reach a decision after a restart or an eviction. A run's
   first decision has no state to restore. The extra decisions under two
