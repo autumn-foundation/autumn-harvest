@@ -1705,6 +1705,45 @@ async fn rerun_writes_audit_row() {
     assert_eq!(rows[0].actor, TEST_ACTOR);
 }
 
+/// Issue #1979: a re-run whose stored input cannot be decoded is rejected and
+/// audited like every other rejection.
+#[tokio::test]
+async fn rerun_of_an_undecodable_input_writes_a_failed_audit_row() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_undecodable_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    // An envelope for a codec this node does not have.
+    let wf_id = unique("rr-undecodable");
+    let source = seed_execution(
+        &mut conn,
+        wf,
+        &wf_id,
+        "FAILED",
+        Seed {
+            input: Some(json!({
+                "_harvest_codec_envelope": 1,
+                "codec_id": "missing-codec",
+                "data": "AAAA",
+            })),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
+    assert_ne!(status, StatusCode::CREATED, "{body}");
+
+    let rows = audit_rows(&mut conn, "workflow.rerun", &source).await;
+    assert_eq!(rows.len(), 1, "the rejection is audited: {rows:?}");
+    assert_eq!(rows[0].status, "failed");
+    assert_eq!(
+        rows[0].error_summary.as_deref(),
+        Some("stored input could not be decoded")
+    );
+}
+
 /// R-16: an explicit `input` override replaces the clone and never mutates the
 /// source row's own input.
 #[tokio::test]

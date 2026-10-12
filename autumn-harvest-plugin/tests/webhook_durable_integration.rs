@@ -1,31 +1,55 @@
+//! Durable outbound webhook delivery through a Harvest workflow.
+//!
+//! Requires Docker. CI runs this suite from a `linux` manifest row (issue #1959).
+
 #![cfg(feature = "webhooks")]
 
 use autumn_harvest::prelude::WorkerConfig;
 use autumn_harvest_plugin::HarvestPlugin;
-use autumn_web::test::{TestApp, TestDb};
+use autumn_web::test::TestApp;
 use autumn_web::webhook_outbound::{
     InMemoryOutboundWebhookHandler, OutboundWebhookPlugin, WebhookOutboundManager,
     WebhookSubscription, WebhookSubscriptionStatus,
 };
+use diesel_async::AsyncPgConnection;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use diesel_async::pooled_connection::deadpool::Pool;
 use std::sync::Arc;
 use std::time::Duration;
+use testcontainers::ImageExt;
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
-#[tokio::test]
-#[ignore = "requires Docker (testcontainers)"]
+// Multi-thread runtime: `TestApp::plugin` blocks on plugin startup, and that
+// deadlocks a current-thread runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_durable_signed_webhook_via_harvest_workflow() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    // 1. Initialize TestDb and run pending migrations
-    let db = TestDb::shared().await;
-    autumn_web::migrate::run_pending(db.url(), autumn_web::migrate::FRAMEWORK_MIGRATIONS)
+    // 1. Start Postgres 16 and run the migrations. `TestDb` starts Postgres 11.
+    // There, the worker claim query fails on `MATERIALIZED`, so no task runs.
+    // `test_init_sql()` loads the Harvest schema. A second `run_pending` call
+    // skips six Harvest migrations that share a framework migration version.
+    let container = Postgres::default()
+        .with_init_sql(autumn_harvest::test_init_sql().into_bytes())
+        .with_tag("16")
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+    let host = container.get_host().await.expect("container host");
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("container port");
+    let db_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    autumn_web::migrate::run_pending(&db_url, autumn_web::migrate::FRAMEWORK_MIGRATIONS)
         .expect("failed to run framework migrations");
-    autumn_web::migrate::run_pending(db.url(), autumn_harvest::MIGRATIONS)
-        .expect("failed to run Harvest migrations");
-
-    // Clean tables before test run
-    db.execute_sql("TRUNCATE TABLE autumn_jobs CASCADE").await;
-    db.execute_sql("TRUNCATE TABLE harvest_workflow_executions CASCADE")
-        .await;
+    let pool = Pool::builder(AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+        &db_url,
+    ))
+    .max_size(5)
+    .build()
+    .expect("failed to build pool");
 
     // 2. Setup the Webhook Outbound Plugin with a process-local InMemory handler
     let handler = Arc::new(InMemoryOutboundWebhookHandler::new());
@@ -54,7 +78,7 @@ async fn test_durable_signed_webhook_via_harvest_workflow() {
             ..Default::default()
         },
         database: autumn_web::config::DatabaseConfig {
-            url: Some(db.url().to_owned()),
+            url: Some(db_url.clone()),
             ..Default::default()
         },
         ..Default::default()
@@ -68,7 +92,7 @@ async fn test_durable_signed_webhook_via_harvest_workflow() {
                 .worker(WorkerConfig::default().with_queues(["webhooks"]))
                 .api("/api/harvest"),
         )
-        .with_db(db.pool());
+        .with_db(pool);
 
     // Register HTTP mock for the outbound signed webhook target
     let mock = app_builder
@@ -94,9 +118,9 @@ async fn test_durable_signed_webhook_via_harvest_workflow() {
         .await
         .unwrap();
 
-    // 5. Wait for the Harvest workflow and activity to execute in the background
+    // 5. Wait up to 30 s for the Harvest workflow and activity to run.
     let mut logs = Vec::new();
-    for _ in 0..50 {
+    for _ in 0..300 {
         logs = handler.get_delivery_logs().await.unwrap();
         if let Some(log) = logs.first() {
             // Wait until response status is logged (indicating HTTP request completed)

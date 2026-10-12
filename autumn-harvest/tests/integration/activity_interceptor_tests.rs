@@ -490,6 +490,7 @@ fn build_worker(worker_id: &str, queue: &str, registry: Arc<HandlerRegistry>) ->
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -582,6 +583,7 @@ async fn seed_workflow_with_headers(
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -759,6 +761,8 @@ fn act_info_with_breaker(
         max_result_bytes: None,
         requires: None,
         handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 

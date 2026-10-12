@@ -164,3 +164,51 @@ Those columns stay directly queryable by design — indexing and search
 attribute matching read them straight via SQL — and a codec envelope
 would break that, so encoding them is a separate, larger design decision
 out of scope for this fix.
+
+## Addendum (issue #1979): the codec covers columns outside the event log
+
+**Decision.** The codec now also encodes the codec columns:
+`harvest_workflow_executions.input`, `.output` and `.memo`,
+`harvest_signals.payload`, `harvest_dead_letters.input`, and the workflow
+task's `harvest_task_queue.input` and `.output`. This supersedes the "third
+residual" above, which kept these columns out of scope.
+
+**Opt-in, readers first.** Column encoding is off by default. This release
+always decodes the codec columns at every engine read. An older release reads
+an envelope as literal data. So an operator upgrades every process first, then
+turns the switch on with `HarvestBuilder::encode_payload_columns()`. The switch
+lives on `PayloadCodecs` behind a shared cell, like the active key, so every
+clone sees it at once.
+
+**One rule per copy.** A value that enters a start, a handler, a signal event
+or a webhook is decoded first. The write that follows encodes it once. A
+row-to-row copy keeps the stored bytes. So no value nests one envelope inside
+another.
+
+**Search attributes stay in clear.** Visibility queries filter on them. Error
+text keeps its issue #1920 decision. Every other `JSONB` column has a row in
+the coverage table in `docs/security-posture.md`, with a reason when it stays
+clear. A unit test parses `schema.rs`, so a new `JSONB` column cannot skip the
+table.
+
+**Rotation.** `codec_rotation::CODEC_COLUMNS` lists the swept columns, with
+`harvest_execution_summaries.result`, which copies the output verbatim. The
+census counts each envelope cell. The retirement gate therefore stays closed
+while any column still holds the key. The sweep converts columns with a
+compare-and-swap on the old value, so it loses to an erasure. The column pass
+runs only when the event pass reaches its end, so a converged shard scans
+nothing extra between revalidations. A column pass keeps to the batch
+budget and resumes from an in-process cursor, so it never rescans a drained
+column within a pass. These tables are not append-only, so the
+column pass is not a sanctioned exception. Only the ciphertext changes. The
+replay-fidelity test now also proves the columns decode byte-identical after a
+sweep.
+
+**Escape guard.** A new write escapes a value shaped like an envelope, with
+the switch on or off, as the event codec does (issue #1253). Without it, a
+caller could store an envelope-shaped value that an engine read unwraps.
+
+**Residual.** A row written before this release had no escape. If it holds
+an envelope-shaped value, an engine read now decodes it. This is the issue
+#1253 residual, now on the engine path. The remaining short-lived copies are
+follow-up work in issue #2043.

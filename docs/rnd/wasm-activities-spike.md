@@ -335,6 +335,11 @@ worker with a trusted publisher key runs a module only if a trusted key signed
 its activity name and hash. See `crate::wasm_signing` and
 [ADR 0004](../adr/0004-security-extras.md).
 
+**Update (issue #2014).** A prototype adds one host import,
+`harvest::host_call`, with named capability grants. The host journals each
+call, and a retry replays the journal. See
+[agent-code-host-call-journal.md](agent-code-host-call-journal.md).
+
 ---
 
 ## 7. Storage & distribution — Postgres content-hash table

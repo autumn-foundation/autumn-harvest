@@ -131,6 +131,7 @@ fn make_worker(_db_url: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 notification_database_url: None,
                 max_concurrent_workflows: 4,
                 max_concurrent_activities: 4,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(2),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -323,6 +324,7 @@ async fn transactional_activity_happy_path_atomic_commit() {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                tenant: None,
             },
             None,
         )
@@ -420,6 +422,7 @@ async fn transactional_activity_err_rolls_back_user_writes() {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                tenant: None,
             },
             None,
         )

@@ -102,6 +102,7 @@ async fn insert(conn: &mut AsyncPgConnection, spec: InsertSpec<'_>) -> Execution
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     diesel::insert_into(t::table)
         .values(&row)

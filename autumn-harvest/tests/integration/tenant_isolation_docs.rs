@@ -1,8 +1,11 @@
-//! Guards for the issue #1837 tenant-isolation decision.
+//! Guards for the issue #1837 tenant-isolation decision and its issue #1977
+//! amendment.
 //!
 //! ADR 0004 records whether Harvest supports multi-tenant deployment. The
-//! security posture page states the same answer to operators. These guards
-//! check that both pages exist, agree, and cite APIs and tests that are real.
+//! amendment records that hostile multi-tenancy is in scope at the
+//! management API. The security posture page states the same answer to
+//! operators. These guards check that both pages exist, agree, and cite APIs
+//! and tests that are real.
 //!
 //! The guards do not freeze the ADR prose. They check facts only: the status,
 //! the decision line, the cited API names and the cited test names.
@@ -13,6 +16,8 @@ const ADR: &str = "docs/adr/0004-tenant-isolation-cells.md";
 const POSTURE: &str = "docs/security-posture.md";
 const SHARDING: &str = "docs/sharding.md";
 const FLOOD_TEST: &str = "autumn-harvest/tests/integration/tenant_cell_isolation_tests.rs";
+const BINDING_TEST: &str = "autumn-harvest-plugin/tests/tenant_binding_integration.rs";
+const RETENTION_TEST: &str = "autumn-harvest/tests/integration/retention_overrides_tests.rs";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -46,8 +51,9 @@ fn adr_records_an_accepted_decision() {
     }
     for answer in [
         "Harvest supports cooperative multi-tenant deployment",
-        "Harvest does not support hostile multi-tenancy",
         "Harvest adds no first-class namespaces",
+        "## Amendment: tenant binding (issue #1977)",
+        "Hostile multi-tenancy is in scope at the management",
     ] {
         assert!(adr.contains(answer), "{ADR} must state: {answer}");
     }
@@ -93,6 +99,50 @@ fn adr_cites_the_flood_test_that_proves_the_bound() {
     }
 }
 
+/// The issue #1977 amendment names the APIs and the tests that prove it.
+#[test]
+fn adr_amendment_cites_real_apis_and_tests() {
+    let adr = read(ADR);
+    let retention = read("autumn-harvest/src/retention.rs");
+    let tenant = read("autumn-harvest-plugin/src/tenant.rs");
+    for (api, source, sig) in [
+        (
+            "with_tenant_override",
+            &retention,
+            "pub fn with_tenant_override(",
+        ),
+        ("VerifiedTenant", &tenant, "pub struct VerifiedTenant("),
+        (
+            "TENANT_SCOPED_ROUTES",
+            &tenant,
+            "pub const TENANT_SCOPED_ROUTES:",
+        ),
+    ] {
+        assert!(adr.contains(api), "{ADR} must cite `{api}`");
+        assert!(
+            source.contains(sig),
+            "{ADR} cites `{api}`, which is not real"
+        );
+    }
+    let suite = read(BINDING_TEST);
+    for test in [
+        "tenant_a_credential_cannot_reach_tenant_b_by_setting_the_header",
+        "tenant_token_reaches_only_its_own_runs_without_an_authorizer",
+        "tenant_token_is_refused_off_the_tenant_scoped_routes",
+    ] {
+        assert!(adr.contains(test), "{ADR} must cite `{test}`");
+        assert!(
+            suite.contains(&format!("async fn {test}(")),
+            "{BINDING_TEST} lacks `{test}`"
+        );
+    }
+    assert!(adr.contains("retention_overrides_tests.rs"));
+    assert!(
+        read(RETENTION_TEST).contains("async fn tenant_override_deletes_only_that_tenants_runs("),
+        "{RETENTION_TEST} lacks the per-tenant override test"
+    );
+}
+
 #[test]
 fn security_posture_states_the_tenancy_model() {
     let posture = read(POSTURE);
@@ -105,6 +155,10 @@ fn security_posture_states_the_tenancy_model() {
     assert!(
         posture.contains("not a security boundary between tenants"),
         "{POSTURE} must say that cells do not isolate a hostile tenant"
+    );
+    assert!(
+        posture.contains("## Tenant binding (issue #1977)"),
+        "{POSTURE} must document tenant binding"
     );
 }
 

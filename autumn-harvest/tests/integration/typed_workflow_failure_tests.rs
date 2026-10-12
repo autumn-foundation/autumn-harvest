@@ -296,6 +296,7 @@ mod db_handle_surface {
                 start_source: None,
                 start_source_ref: None,
                 started_by: None,
+                tenant: None,
             })
             .execute(conn)
             .await

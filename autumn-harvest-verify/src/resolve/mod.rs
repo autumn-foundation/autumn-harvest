@@ -302,6 +302,34 @@ impl Program {
         matches!(root, "std" | "core" | "alloc") || self.trusted_crates.contains(root)
     }
 
+    /// A trusted crate, or a primitive type, as the first segment of a path.
+    ///
+    /// A `const` such as `u64::MAX` comes from `core`, whatever the path
+    /// prints.
+    #[must_use]
+    pub fn is_trusted_root(&self, root: &str) -> bool {
+        self.is_trusted_crate(root)
+            || matches!(
+                root,
+                "u8" | "u16"
+                    | "u32"
+                    | "u64"
+                    | "u128"
+                    | "usize"
+                    | "i8"
+                    | "i16"
+                    | "i32"
+                    | "i64"
+                    | "i128"
+                    | "isize"
+                    | "f32"
+                    | "f64"
+                    | "bool"
+                    | "char"
+                    | "str"
+            )
+    }
+
     // ── indexing ────────────────────────────────────────────────────────────
 
     fn index_bodies(&mut self) {
@@ -748,6 +776,28 @@ impl Program {
         self.closures.get(span).map_or(&[], Vec::as_slice)
     }
 
+    /// The coroutine bodies nested under `owner` for the `async` block
+    /// `span` (issue #2010).
+    ///
+    /// A closure that builds an `async` block owns its coroutine body, as
+    /// `owner::{closure#N}`. The lookup never leaves `owner`. So a macro span
+    /// that two blocks share, or a block another function returns, cannot
+    /// resolve here to the wrong body.
+    #[must_use]
+    pub fn nested_coroutines(&self, owner: &str, span: &str) -> Vec<String> {
+        let prefix = format!("{owner}::");
+        self.order
+            .iter()
+            .filter(|path| path.starts_with(&prefix))
+            .filter(|path| {
+                self.body(path)
+                    .and_then(coroutine_param_span)
+                    .is_some_and(|found| found == span)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// [`Self::closure_bodies`], narrowed to the ones a call site inside
     /// `caller_body` can mean.
     ///
@@ -811,26 +861,54 @@ impl Program {
 
     /// Generic parameter names in scope inside `body`, in declaration order when known.
     #[must_use]
+    ///
+    /// A closure or coroutine sees the generics of each function around it,
+    /// as `make_step::{closure#0}` sees `StepFuture` of `make_step`.
     pub fn generic_params(&self, body_path: &str) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
-        if let Some(header) = self.impl_headers.get(body_path) {
-            names.extend(header.generics.iter().cloned());
-        }
-        let name = split_last(body_path).map_or(body_path, |(_, last)| last);
-        if let Some(extra) = self.sources.fn_generics.get(name) {
-            for param in extra {
-                if !names.contains(param) {
-                    names.push(param.clone());
-                }
+        let mut path = body_path;
+        loop {
+            if let Some(header) = self.impl_headers.get(path) {
+                names.extend(header.generics.iter().cloned());
             }
+            let (parent, name) = split_last(path).unwrap_or(("", path));
+            if let Some(extra) = self.sources.fn_generics.get(name) {
+                names.extend(extra.iter().cloned());
+            }
+            // Only a `{closure#0}` or `{coroutine#0}` segment has a parent
+            // whose generics are in scope.
+            if parent.is_empty() || !name.starts_with('{') {
+                break;
+            }
+            path = parent;
         }
+        let mut seen = BTreeSet::new();
+        names.retain(|n| seen.insert(n.clone()));
         names
     }
 
     /// True when `name`, used as a type inside `body_path`, is a type parameter.
     #[must_use]
+    ///
+    /// The source index keys generics by bare function name. So a name that
+    /// any function of that name declares counts, in this body and in each
+    /// function around it.
     pub fn is_generic_param(&self, body_path: &str, name: &str) -> bool {
-        self.generic_params(body_path).iter().any(|p| p == name) || looks_like_type_param(name)
+        if self.generic_params(body_path).iter().any(|p| p == name) || looks_like_type_param(name) {
+            return true;
+        }
+        let mut path = body_path;
+        loop {
+            let (parent, last) = split_last(path).unwrap_or(("", path));
+            let declared = self.sources.fn_generic_names.get(last);
+            if declared.is_some_and(|names| names.contains(name)) {
+                return true;
+            }
+            if parent.is_empty() || !last.starts_with('{') {
+                return false;
+            }
+            path = parent;
+        }
     }
 
     /// Resolve a printed callee path as seen from `caller_body`.
@@ -1311,6 +1389,63 @@ impl Program {
             .unwrap_or_else(|| path.to_string())
     }
 
+    /// The local types whose fields can write to state another clone sees.
+    ///
+    /// A field qualifies when it holds `&mut`, takes a lifetime argument, or
+    /// names a type of `interior` or another such local type. An opaque
+    /// type, made by a macro with no body here, qualifies too. So
+    /// `struct Shared(Arc<Mutex<u64>>)` qualifies, and so does a type that
+    /// holds a `Shared`.
+    #[must_use]
+    pub fn writable_types(&self, interior: &[&str]) -> BTreeSet<String> {
+        let mut writable: BTreeSet<String> = BTreeSet::new();
+        loop {
+            let found: Vec<&String> = self
+                .sources
+                .type_fields
+                .iter()
+                .filter(|(name, _)| !writable.contains(*name))
+                .filter(|(_, facts)| {
+                    facts.mut_ref
+                        || facts.opaque
+                        || facts.lifetime
+                        || facts
+                            .names
+                            .iter()
+                            .any(|n| interior.contains(&n.as_str()) || writable.contains(n))
+                })
+                .map(|(name, _)| name)
+                .collect();
+            if found.is_empty() {
+                return writable;
+            }
+            writable.extend(found.into_iter().cloned());
+        }
+    }
+
+    /// Do the sources implement `Future` for the type `path` names?
+    #[must_use]
+    pub fn sources_impl_future(&self, path: &str) -> bool {
+        let bare = strip_generics_everywhere(path);
+        self.sources.future_impls.contains(last_segment(&bare))
+    }
+
+    /// Is the rooted type path `path` first-party?
+    ///
+    /// MIR prints a local type without its crate name, as `models::Order`. It
+    /// prints a dependency type the same way, as `helpers::Clock`. A local
+    /// type prints by its bare name or its full path, never by a part. So the
+    /// sources must declare exactly that path. An analyzed crate name is
+    /// proof alone.
+    #[must_use]
+    pub fn is_first_party_type(&self, path: &str) -> bool {
+        let bare = strip_generics_everywhere(path);
+        let Some(root) = crate_root(&bare) else {
+            return false;
+        };
+        self.crates.contains(root) || self.sources.type_paths.contains(bare.trim())
+    }
+
     /// `crate::path` for a body id — the spelling every report uses.
     #[must_use]
     pub fn qualified_name(&self, id: &str) -> String {
@@ -1479,6 +1614,27 @@ fn closure_param_span(body: &Body) -> Option<String> {
     let ty = peel_refs(ty).trim();
     let ty = ty.trim_start_matches("mut ").trim();
     (ty.starts_with('{') && ty.contains('@') && ty.ends_with('}')).then(|| ty.to_string())
+}
+
+/// The `{async block@..}` or `{async closure body@..}` span of a coroutine
+/// body, which takes `Pin<&mut ..>` of it as its first parameter (issue
+/// #2010).
+fn coroutine_param_span(body: &Body) -> Option<String> {
+    let (_, ty) = body.params.first()?;
+    let inner = ty
+        .trim()
+        .strip_prefix("Pin<")
+        .or_else(|| ty.trim().strip_prefix("std::pin::Pin<"))?
+        .strip_suffix('>')?;
+    let inner = peel_refs(inner).trim().trim_start_matches("mut ").trim();
+    (is_coroutine_span(inner) && inner.ends_with('}')).then(|| inner.to_string())
+}
+
+/// The span of a coroutine that a closure can return: an `async` block, or
+/// the body of an `async` closure.
+#[must_use]
+pub fn is_coroutine_span(span: &str) -> bool {
+    span.starts_with("{async block@") || span.starts_with("{async closure body@")
 }
 
 /// `Box<dyn Jitter>` / `&dyn Jitter + Send` → `Jitter`.

@@ -713,6 +713,7 @@ async fn start_workflow(
             start_source: StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -870,6 +871,8 @@ fn activity_info(
         max_result_bytes: None,
         requires: None,
         handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 

@@ -566,6 +566,7 @@ mod tests {
             req.extensions_mut().insert(TokenPrincipal {
                 id: uuid::Uuid::nil(),
                 scope: crate::api_token::TokenScope::Mutate,
+                tenant: None,
             });
             next.run(req).await
         }

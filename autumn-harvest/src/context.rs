@@ -163,6 +163,29 @@ pub const DEFAULT_CURRENT_DETAILS_CAP_BYTES: usize = 1024;
 /// [`publish_progress`]: WorkflowContext::publish_progress
 pub const PROGRESS_CHUNK_MAX_BYTES: usize = 7000;
 
+/// Per-execution cap on stored durable stream chunks (issue #1974).
+///
+/// The store drops chunks above the cap and stores one terminal marker. The
+/// context queues at most `cap + 1` commands in one cycle, so the store can
+/// see the overflow.
+pub const DURABLE_STREAM_MAX_CHUNKS: u32 = 10_000;
+
+/// Serialize a progress chunk and apply [`PROGRESS_CHUNK_MAX_BYTES`].
+///
+/// An oversize chunk becomes a truncation marker. The chunk slot stays, and
+/// the client sees that the content was cut (issues #791 and #1974).
+fn cap_progress_chunk(chunk: &impl serde::Serialize) -> HarvestResult<Value> {
+    let value = serde_json::to_value(chunk).map_err(HarvestError::Serialization)?;
+    let serialized_len = serde_json::to_vec(&value).map_or(usize::MAX, |v| v.len());
+    if serialized_len > PROGRESS_CHUNK_MAX_BYTES {
+        return Ok(serde_json::json!({
+            "_harvest_progress_truncated": true,
+            "bytes": serialized_len,
+        }));
+    }
+    Ok(value)
+}
+
 /// Bits reserved for the per-cycle local index in a progress `seq` (issue #791).
 ///
 /// A progress `seq` is `(epoch << PROGRESS_SEQ_LOCAL_BITS) | local_index`, where
@@ -419,6 +442,10 @@ pub struct TransactionalState {
     /// inside the transaction so an oversized result is caught before
     /// `ActivityCompleted` is committed.
     pub(crate) max_result_bytes: u64,
+    /// The task row asks for the fan-out result writer (issue #1986).
+    pub(crate) result_writer: bool,
+    /// The worker's offloader, whose store the result writer uses.
+    pub(crate) offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
 }
 const LOCAL_ACTIVITY_HEARTBEAT_REASON: &str =
     "local activities do not support heartbeats; use a regular activity";
@@ -516,6 +543,11 @@ pub enum WorkflowCommand {
         /// dispatch, which continues to use the activity's registered
         /// `default_schedule_to_start`.
         schedule_to_start_override: Option<std::time::Duration>,
+        /// Write the result through the `PayloadStore` (issue #1986).
+        ///
+        /// When `true`, the worker records a `StoredResult` reference, not
+        /// the value. Only a fan-out with `write_results` sets it.
+        result_writer: bool,
         /// The worker sends the result back through this channel.
         result_tx: oneshot::Sender<Result<Value, String>>,
     },
@@ -723,6 +755,19 @@ pub enum WorkflowCommand {
         /// The chunk payload (already serialized to JSON and size-capped; an
         /// oversize chunk is a `{"_harvest_progress_truncated": true, ..}`
         /// marker).
+        chunk: Value,
+    },
+    /// Store one durable output-stream chunk (issue #1974).
+    ///
+    /// Emitted by [`WorkflowContext::publish_durable_progress`] during live
+    /// execution only. Bookkeeping: no result channel, no suspension shape and
+    /// no `harvest_events` row. The worker writes it to
+    /// `harvest_stream_chunks` in the persist transaction.
+    PublishDurableProgress {
+        /// The 0-based call ordinal. A re-drive gets the same offset again,
+        /// so the store keeps the first copy.
+        offset: u64,
+        /// The chunk, already size-capped like a best-effort chunk.
         chunk: Value,
     },
     /// Persist one author-emitted log line to the durable per-execution log
@@ -992,6 +1037,7 @@ impl WorkflowCommand {
             | Self::UpsertSearchAttributes { .. }
             | Self::SetCurrentDetails { .. }
             | Self::PublishProgress { .. }
+            | Self::PublishDurableProgress { .. }
             | Self::RecordLog { .. }
             | Self::SpawnDetachedChildWorkflow { .. }
             | Self::CancelRaceLosers { .. }
@@ -1107,6 +1153,11 @@ impl std::fmt::Debug for WorkflowCommand {
             Self::PublishProgress { seq, chunk } => f
                 .debug_struct("PublishProgress")
                 .field("seq", seq)
+                .field("chunk", chunk)
+                .finish(),
+            Self::PublishDurableProgress { offset, chunk } => f
+                .debug_struct("PublishDurableProgress")
+                .field("offset", offset)
                 .field("chunk", chunk)
                 .finish(),
             Self::RecordLog {
@@ -1845,6 +1896,25 @@ impl RaceBuilder<'_> {
     }
 }
 
+/// Counts one `ctx.race()` call in flight while it lives (issue #2007).
+///
+/// The race future holds it across its awaits. Dropping the future, or the
+/// end of the race, drops it.
+struct OpenRace<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> OpenRace<'a> {
+    fn enter(count: &'a std::sync::atomic::AtomicUsize) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for OpenRace<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// The live-mode receiving end of one race branch (issue #950).
 ///
 /// The four branch kinds park on channels of three different payload types
@@ -1949,6 +2019,19 @@ const RESERVED_SEARCH_ATTR_KEYS: &[&str] = &[
 ];
 
 const RESERVED_SEARCH_ATTR_PREFIX: &str = "_harvest";
+
+/// Copy the test harness clock for an update handler context (issue #1991).
+///
+/// The handler gets its own counter, so a timer in the handler cannot move
+/// the clock of the workflow body.
+#[cfg(any(test, feature = "testing"))]
+fn snapshot_timer_clock(
+    elapsed: &Arc<std::sync::atomic::AtomicU64>,
+) -> Arc<std::sync::atomic::AtomicU64> {
+    Arc::new(std::sync::atomic::AtomicU64::new(
+        elapsed.load(std::sync::atomic::Ordering::Relaxed),
+    ))
+}
 
 fn validate_search_attr_key(key: &str) -> HarvestResult<()> {
     if key.is_empty() {
@@ -2675,6 +2758,7 @@ impl Session<'_> {
                 Some(self.id),
                 Some(self.host_worker_id.clone()),
                 None,
+                false,
             )
             .await
             .map_err(|err| self.broken_session_error(err))?;
@@ -2705,6 +2789,7 @@ impl Session<'_> {
                 Some(self.id),
                 Some(self.host_worker_id.clone()),
                 None,
+                false,
             )
             .await
             .map_err(|err| self.broken_session_error(err))
@@ -2765,6 +2850,7 @@ impl Session<'_> {
                 Some(self.id),
                 Some(self.host_worker_id.clone()),
                 None,
+                false,
             )
             .await
             .map_err(|err| self.broken_session_error(err))?;
@@ -2917,6 +3003,14 @@ pub struct WorkflowContext {
     /// Every scope of this run, so a resident cycle can drop the members
     /// that resolved (issue #1984).
     live_scopes: Mutex<Vec<std::sync::Weak<crate::cancellation_scope::ScopeShared>>>,
+    /// The number of `ctx.race()` calls in flight (issue #2007). A race
+    /// that suspends cannot stay resident.
+    open_races: std::sync::atomic::AtomicUsize,
+    /// Set while a resident cycle runs with re-parked siblings (issue #2008).
+    /// Such a cycle must not read the replay position.
+    speculative: std::sync::atomic::AtomicBool,
+    /// Set when a speculative cycle reads the replay position.
+    speculation_read_position: std::sync::atomic::AtomicBool,
     /// Monotonically increasing counter for naming worker-session identity
     /// markers (issue #606). Each `create_session()` call increments this once
     /// so each session has a stable, unique `session:{seq}` marker name across
@@ -2946,6 +3040,16 @@ pub struct WorkflowContext {
     /// epoch (in the high bits) is what carries monotonicity across cycles.
     /// Not part of replay state: `publish_progress` is a no-op during replay.
     progress_local_index: std::sync::atomic::AtomicU64,
+    /// 0-based call ordinal of `publish_durable_progress` (issue #1974).
+    ///
+    /// It is the chunk offset. Each call claims one value, also during replay.
+    /// A re-drive re-runs the body from the top, so a chunk gets the same
+    /// offset again. The epoch `seq` of `publish_progress` cannot do this.
+    /// See `log_call_ordinal` for the cases that move the epoch.
+    durable_progress_ordinal: std::sync::atomic::AtomicU64,
+    /// Count of `PublishDurableProgress` commands queued this cycle
+    /// (issue #1974). It bounds memory at `DURABLE_STREAM_MAX_CHUNKS + 1`.
+    durable_progress_queued: std::sync::atomic::AtomicU64,
     /// 0-based **call ordinal** for durable-log `seq` generation (issue #790):
     /// the count of `ctx.log_*` calls made so far by *this run of the workflow
     /// body*.
@@ -3156,8 +3260,11 @@ pub struct WorkflowContext {
     /// `None` = production behavior (`ctx.now()` always returns `start_time`).
     /// `Some` = test harness advancing-clock mode; incremented each time a
     /// durable timer resolves from history so `ctx.now()` reflects virtual elapsed time.
+    ///
+    /// Shared through an `Arc`, so a declarative update handler can read the
+    /// clock when it runs (issue #1991).
     #[cfg(any(test, feature = "testing"))]
-    timer_clock_elapsed_secs: Option<std::sync::atomic::AtomicU64>,
+    timer_clock_elapsed_secs: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// Metrics recorder for user-emitted custom business metrics (issue #532).
     /// Defaults to [`NoOpMetrics`](crate::telemetry::NoOpMetrics) when the
     /// worker has no telemetry configured.  Workflow metrics are replay-safe:
@@ -3404,6 +3511,10 @@ impl WorkflowContext {
     where
         F: FnOnce(&mut HistoryMatcher) -> R,
     {
+        // Every public history read and every command match passes here. In
+        // a speculative cycle each one counts as a position read (issue
+        // #2008).
+        self.note_position_read();
         let result = {
             let mut matcher = self.matcher.lock().expect("matcher lock poisoned");
             f(&mut matcher)
@@ -3627,9 +3738,14 @@ impl WorkflowContext {
             shield_seq: Mutex::new(0),
             scope_stack: Mutex::new(Vec::new()),
             live_scopes: Mutex::new(Vec::new()),
+            open_races: std::sync::atomic::AtomicUsize::new(0),
+            speculative: std::sync::atomic::AtomicBool::new(false),
+            speculation_read_position: std::sync::atomic::AtomicBool::new(false),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_ordinal: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_queued: std::sync::atomic::AtomicU64::new(0),
             log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
             log_commands_queued: std::sync::atomic::AtomicU64::new(0),
             log_policy: None,
@@ -3805,9 +3921,14 @@ impl WorkflowContext {
             shield_seq: Mutex::new(0),
             scope_stack: Mutex::new(Vec::new()),
             live_scopes: Mutex::new(Vec::new()),
+            open_races: std::sync::atomic::AtomicUsize::new(0),
+            speculative: std::sync::atomic::AtomicBool::new(false),
+            speculation_read_position: std::sync::atomic::AtomicBool::new(false),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_ordinal: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_queued: std::sync::atomic::AtomicU64::new(0),
             log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
             log_commands_queued: std::sync::atomic::AtomicU64::new(0),
             log_policy: None,
@@ -3881,9 +4002,14 @@ impl WorkflowContext {
             shield_seq: Mutex::new(0),
             scope_stack: Mutex::new(Vec::new()),
             live_scopes: Mutex::new(Vec::new()),
+            open_races: std::sync::atomic::AtomicUsize::new(0),
+            speculative: std::sync::atomic::AtomicBool::new(false),
+            speculation_read_position: std::sync::atomic::AtomicBool::new(false),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_ordinal: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_queued: std::sync::atomic::AtomicU64::new(0),
             log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
             log_commands_queued: std::sync::atomic::AtomicU64::new(0),
             log_policy: None,
@@ -3939,7 +4065,7 @@ impl WorkflowContext {
     #[must_use]
     #[allow(clippy::missing_const_for_fn)]
     pub fn with_advancing_timer_clock(mut self) -> Self {
-        self.timer_clock_elapsed_secs = Some(std::sync::atomic::AtomicU64::new(0));
+        self.timer_clock_elapsed_secs = Some(Arc::new(std::sync::atomic::AtomicU64::new(0)));
         self
     }
 
@@ -4048,6 +4174,37 @@ impl WorkflowContext {
     /// inline, and therefore must NOT be rejected by the #252 size cap.
     const fn offload_will_apply(&self, observed: u64) -> bool {
         matches!(self.payload_offload_threshold, Some(t) if observed > t)
+    }
+
+    /// The history policy this run runs under.
+    pub(crate) const fn history_policy(&self) -> WorkflowHistoryPolicy {
+        self.history_policy
+    }
+
+    /// Serialized bytes of the history loaded for this task.
+    ///
+    /// It reads only the loaded events, so the result is the same on each
+    /// call within one task (issue #1975).
+    pub(crate) fn loaded_history_bytes(&self) -> u64 {
+        self.match_history(|matcher| matcher.loaded_bytes())
+    }
+
+    /// The largest same-type continue-as-new input this run can write.
+    ///
+    /// Returns `None` when every size is accepted. That is true when the cap
+    /// is `0`. It is also true when the offload threshold is at or below the
+    /// cap, because each input above the cap is then offloaded. A higher
+    /// threshold leaves a size band that is rejected, so the cap applies.
+    /// The entity loop uses it to size a checkpoint (issue #1975).
+    pub(crate) const fn continue_as_new_input_budget(&self) -> Option<u64> {
+        let cap = self.payload_max_workflow_input;
+        if cap == 0 {
+            return None;
+        }
+        match self.payload_offload_threshold {
+            Some(threshold) if threshold <= cap => None,
+            _ => Some(cap),
+        }
     }
 
     /// Add or replace a per-activity input cap override.
@@ -4621,6 +4778,7 @@ impl WorkflowContext {
     /// The current cursor position in the history events during replay.
     #[must_use]
     pub fn replay_position(&self) -> usize {
+        self.note_position_read();
         self.match_history(|m| m.position())
     }
 
@@ -4889,8 +5047,38 @@ impl WorkflowContext {
     /// ones that lock the matcher directly rather than calling
     /// [`Self::is_replaying`] — so the two spellings can never drift.
     pub(crate) fn replay_suppresses_side_effects(&self) -> bool {
+        // A speculative cycle may be dropped, so it fires no side effect.
+        if self.note_position_read() {
+            return true;
+        }
         let matcher = self.matcher.lock().expect("matcher lock poisoned");
         matcher.is_replaying() || matcher.has_terminal_failure_tail()
+    }
+
+    /// Replay gate of [`publish_durable_progress`](Self::publish_durable_progress)
+    /// (issue #1974).
+    ///
+    /// The raw cursor check of [`Self::replay_suppresses_side_effects`] counts
+    /// a signal or an update that waits at the cursor as history to replay.
+    /// Code before the matching `wait_for_signal` then looks replayed, also
+    /// on its first run, and its chunks are never stored. A best-effort side
+    /// effect can accept that loss. A durable chunk cannot.
+    ///
+    /// So this gate asks whether `prepare_match` would still report replay.
+    /// It skips the same signal and update events, but it only reads the
+    /// matcher. It moves no cursor and fills no stash. Thus later code sees
+    /// the same `ctx.is_replaying()` value with or without a durable call.
+    ///
+    /// A speculative resident cycle (issue #2008) can see another replay
+    /// position than a cold replay. The gate then counts as a position read
+    /// and stores nothing. The resume declines, and a cold replay stores the
+    /// chunk at the same offset.
+    pub(crate) fn durable_replay_suppresses(&self) -> bool {
+        if self.note_position_read() {
+            return true;
+        }
+        let matcher = self.matcher.lock().expect("matcher lock poisoned");
+        matcher.would_replay_after_prepare() || matcher.has_terminal_failure_tail()
     }
 
     /// Cursor-only "is there recorded history left to consume?" — the
@@ -4900,6 +5088,7 @@ impl WorkflowContext {
     /// Used only where the question really is "did the matcher run off the end
     /// of recorded history?", never as a replay-suppression guard.
     fn at_history_frontier(&self) -> bool {
+        self.note_position_read();
         !self
             .matcher
             .lock()
@@ -6000,7 +6189,7 @@ impl WorkflowContext {
         input: Value,
         queue: &str,
     ) -> HarvestResult<Value> {
-        self.execute_activity_raw_full(name, input, queue, None, None, None, None, None)
+        self.execute_activity_raw_full(name, input, queue, None, None, None, None, None, false)
             .await
     }
 
@@ -6026,6 +6215,7 @@ impl WorkflowContext {
             None,
             None,
             None,
+            false,
         )
         .await
     }
@@ -6050,6 +6240,7 @@ impl WorkflowContext {
         session_id: Option<SessionId>,
         session_worker_id: Option<String>,
         schedule_to_start_override: Option<std::time::Duration>,
+        result_writer: bool,
     ) -> HarvestResult<Value> {
         let history_match = if self.strict_replay {
             self.match_history(|m| m.match_activity_strict(name, &input))
@@ -6154,6 +6345,7 @@ impl WorkflowContext {
                     session_id,
                     session_worker_id,
                     schedule_to_start_override,
+                    result_writer,
                     result_tx: tx,
                 });
                 match rx.await {
@@ -7324,10 +7516,11 @@ impl WorkflowContext {
 
     /// Returns why this context cannot stay resident, or `None` (issue #1798).
     ///
-    /// A resident workflow resumes its parked future with one new result. A
+    /// A resident workflow resumes its parked future with new results. A
     /// warm decision must then equal a cold replay. Each state below can make
     /// a cold replay read the new events in a way that a parked future cannot:
     ///
+    /// - An open `ctx.race()` settles by a winner marker and cancels losers.
     /// - A held park token resolves only by a replay match.
     /// - A push signal handler runs inside history matching.
     /// - A held mutex depends on the suspension flag of each cycle.
@@ -7335,22 +7528,35 @@ impl WorkflowContext {
     ///   test-clock context changes how replay reads events.
     /// - Unread history means that the cursor is not at the live frontier.
     ///
+    /// The result is the miss reason of the `harvest.workflow.resident`
+    /// counter (issue #2007).
+    ///
     /// # Panics
     ///
     /// Panics if an internal mutex is poisoned.
-    pub(crate) fn resident_blocker(&self) -> Option<&'static str> {
-        if self.parks.is_held() {
-            return Some("a park token is held");
+    pub(crate) fn resident_blocker(&self) -> Option<crate::telemetry::ResidentOutcome> {
+        use crate::telemetry::ResidentOutcome;
+        if self.has_open_race() {
+            return Some(ResidentOutcome::Race);
         }
-        if self.strict_replay || self.canary_mode {
-            return Some("strict or canary replay");
+        if !self
+            .held_mutex_keys
+            .lock()
+            .expect("held_mutex_keys lock poisoned")
+            .is_empty()
+        {
+            return Some(ResidentOutcome::Mutex);
+        }
+        if self.parks.is_held()
+            || self.strict_replay
+            || self.canary_mode
+            || self.cancellation_reason.is_some()
+        {
+            return Some(ResidentOutcome::Blocked);
         }
         #[cfg(any(test, feature = "testing"))]
         if self.timer_clock_elapsed_secs.is_some() {
-            return Some("the advancing test clock is on");
-        }
-        if self.cancellation_reason.is_some() {
-            return Some("the run is cancelled");
+            return Some(ResidentOutcome::Blocked);
         }
         if !self
             .signal_registry
@@ -7359,15 +7565,7 @@ impl WorkflowContext {
             .list_names()
             .is_empty()
         {
-            return Some("a push signal handler is registered");
-        }
-        if !self
-            .held_mutex_keys
-            .lock()
-            .expect("held_mutex_keys lock poisoned")
-            .is_empty()
-        {
-            return Some("a durable mutex is held");
+            return Some(ResidentOutcome::Blocked);
         }
         if self
             .nd_details
@@ -7380,7 +7578,7 @@ impl WorkflowContext {
                 .expect("deferred_nd_error lock poisoned")
                 .is_some()
         {
-            return Some("a non-determinism record is set");
+            return Some(ResidentOutcome::Blocked);
         }
         if self
             .matcher
@@ -7388,7 +7586,7 @@ impl WorkflowContext {
             .expect("matcher lock poisoned")
             .has_buffered_history()
         {
-            return Some("history is not fully read");
+            return Some(ResidentOutcome::Blocked);
         }
         None
     }
@@ -7406,15 +7604,25 @@ impl WorkflowContext {
     /// replay. The call ordinals and sequence counters keep their values. A
     /// replay from the top counts up to the same values.
     ///
+    /// Last, it queues `waits`: the commands that park unresolved activities
+    /// of a join again (issue #2008). A cold replay emits the same commands.
+    /// A cycle with waits is speculative until [`Self::end_speculation`].
+    ///
     /// # Panics
     ///
     /// Panics if the matcher mutex is poisoned.
     #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
-    pub(crate) fn begin_resident_cycle(&self, delta: &[WorkflowEvent]) {
+    pub(crate) fn begin_resident_cycle(
+        &self,
+        delta: &[WorkflowEvent],
+        waits: Vec<WorkflowCommand>,
+    ) {
         self.set_suspending(false);
         self.log_commands_queued
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.progress_local_index
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.durable_progress_queued
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.matcher
             .lock()
@@ -7424,6 +7632,38 @@ impl WorkflowContext {
             &mut self.live_scopes.lock().expect("live scopes lock poisoned"),
             delta,
         );
+        self.speculative
+            .store(!waits.is_empty(), std::sync::atomic::Ordering::SeqCst);
+        self.speculation_read_position
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        for wait in waits {
+            self.push_command(wait);
+        }
+    }
+
+    /// Records a read of the replay position in a speculative cycle.
+    ///
+    /// A warm cycle with re-parked siblings consumed the whole delta, but a
+    /// cold replay can stop its cursor at a sibling command (issue #2008).
+    /// So such a read can differ, and the resume must decline. Returns
+    /// whether the cycle is speculative.
+    fn note_position_read(&self) -> bool {
+        let speculative = self.speculative.load(std::sync::atomic::Ordering::SeqCst);
+        if speculative {
+            self.speculation_read_position
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        speculative
+    }
+
+    /// Ends a speculative cycle (issue #2008). Returns whether it read the
+    /// replay position.
+    #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
+    pub(crate) fn end_speculation(&self) -> bool {
+        self.speculative
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.speculation_read_position
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Whether a non-blocking signal claim probed `signal_name` with a scan
@@ -10355,10 +10595,10 @@ impl WorkflowContext {
     /// recorded count with the current count, returning `Ok(false)` on a
     /// match. Returns a [`HarvestError::NonDeterministic`] when they differ.
     ///
-    /// Used as-is by the activity fan-out methods, which have no pre-dispatch
-    /// validation step to sequence around the marker. Child fan-out instead
-    /// uses [`peek_fan_out_count`](Self::peek_fan_out_count) +
-    /// [`record_fan_out_marker`](Self::record_fan_out_marker) so the marker
+    /// The activity fan-out methods use it as-is, except `fan_out_with_impl`.
+    /// That method checks the store between the peek and the marker. Child
+    /// fan-out also uses [`peek_fan_out_count`](Self::peek_fan_out_count) +
+    /// [`record_fan_out_marker`](Self::record_fan_out_marker), so the marker
     /// is recorded only *after* payload validation succeeds — see those
     /// methods' docs for why.
     fn check_fan_out_count(&self, seq: u32, count: usize) -> HarvestResult<bool> {
@@ -10414,6 +10654,62 @@ impl WorkflowContext {
             name: format!("fan_out:{seq}"),
             details: Value::from(count as u64),
         });
+    }
+
+    /// The writer mode of a fan-out, as history records it (issue #1986).
+    ///
+    /// A fresh dispatch with the writer records `fan_out_writer:{seq}` right
+    /// after the `fan_out:{seq}` marker. Replay reads the mode from history,
+    /// not from the current options. A deploy can change the option for an
+    /// in-flight run. Replay then still reads each recorded item as recorded.
+    fn fan_out_writer_mode(&self, seq: u32, fresh: bool, wanted: bool) -> bool {
+        let name = format!("fan_out_writer:{seq}");
+        if fresh {
+            if wanted {
+                self.push_command(WorkflowCommand::RecordMarker {
+                    name,
+                    details: Value::from(1u64),
+                });
+            }
+            return wanted;
+        }
+        matches!(
+            self.match_history(|m| m.match_u64_marker(&name, 1)),
+            HistoryMatch::Matched { .. }
+        )
+    }
+
+    /// Record or verify the stop marker of a fan-out (issue #1986).
+    ///
+    /// A fan-out that stops on its failure tolerance records how many slots
+    /// it dispatched. Replay reads the count ahead of the slots, through
+    /// `peek_u64_marker_ahead`, so the recorded prefix never takes an
+    /// activity that the workflow scheduled after the stop.
+    fn record_fan_out_stop(&self, name: &str, dispatched: usize) -> HarvestResult<()> {
+        let dispatched = dispatched as u64;
+        match self.match_history(|m| m.match_u64_marker(name, dispatched)) {
+            HistoryMatch::NoMatch => {
+                self.push_command(WorkflowCommand::RecordMarker {
+                    name: name.to_string(),
+                    details: Value::from(dispatched),
+                });
+                Ok(())
+            }
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
+                format!(
+                    "{name}: the fan-out stopped with {expected} but history has {actual}; \
+                     use ctx.version() to guard a tolerance change for in-flight runs"
+                ),
+                event_index,
+                Some(expected),
+                Some(actual),
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// Record or verify a condition-skip decision for a DAG node in event history.
@@ -10609,17 +10905,10 @@ impl WorkflowContext {
             .map(|(name, input, queue)| {
                 let retry = retry.clone();
                 async move {
-                    match self
-                        .execute_activity_raw_with_opts(&name, input, &queue, retry, timeout)
-                        .await
-                    {
-                        Ok(v) => Ok(Ok(v)),
-                        Err(
-                            e
-                            @ (HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. }),
-                        ) => Ok(Err(e.to_string())),
-                        Err(e) => Err(e),
-                    }
+                    classify_fan_out_slot(
+                        self.execute_activity_raw_with_opts(&name, input, &queue, retry, timeout)
+                            .await,
+                    )
                 }
             })
             .collect();
@@ -10959,13 +11248,7 @@ impl WorkflowContext {
         // Per-slot classification shared by both phases: engine errors abort the
         // fan-out (`Err`); an activity failure/timeout is captured in the slot
         // (`Ok(Err(..))`) so `try_join_all` never short-circuits.
-        let classify = |slot: HarvestResult<Value>| match slot {
-            Ok(v) => Ok(Ok(v)),
-            Err(e @ (HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. })) => {
-                Ok(Err(e.to_string()))
-            }
-            Err(e) => Err(e),
-        };
+        let classify = classify_fan_out_slot;
 
         let mut activities = activities;
         let mut results = Vec::with_capacity(count);
@@ -11127,6 +11410,269 @@ impl WorkflowContext {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(typed)
+    }
+
+    // ── Fan-out with options (issue #1986) ───────────────────────────────
+
+    /// Execute N activities in parallel with [`FanOutOptions`].
+    ///
+    /// [`FanOutOptions`]: crate::fan_out::FanOutOptions
+    ///
+    /// The options add three things to the collect-all fan-out:
+    ///
+    /// - **Window.** `max_in_flight` limits the items in flight, as
+    ///   [`execute_activity_fan_out_collect_raw_windowed`](Self::execute_activity_fan_out_collect_raw_windowed)
+    ///   does. A value of 0 counts as 1.
+    /// - **Failure tolerance.** The fan-out completes when at most N items
+    ///   fail. It fails with
+    ///   [`HarvestError::FanOutFailureThresholdExceeded`] when more fail. A
+    ///   windowed fan-out then dispatches no further wave. The stop cancels
+    ///   the activities still in flight, as `ctx.race()` cancels its losers.
+    /// - **Result writer.** The worker writes each result through the
+    ///   `PayloadStore`. History records a small
+    ///   [`StoredResult`](crate::fan_out::StoredResult) for the item, not the
+    ///   value. Its size does not depend on the result. An activity worker
+    ///   without a store records the value inline.
+    ///
+    /// The returned [`FanOutResults`](crate::fan_out::FanOutResults) is the
+    /// manifest. It holds one item per input, in input order.
+    ///
+    /// # Replay safety
+    ///
+    /// The fan-out records the same `fan_out:{n}` marker as the other
+    /// helpers. History records neither the window nor the tolerance.
+    ///
+    /// Each wave polls every slot before it counts the failures. So the
+    /// fan-out consumes every recorded slot of the wave, and a workflow can
+    /// catch the threshold error and go on (issue #1791). Failures only
+    /// accumulate, so a replay that sees more results makes the same decision.
+    ///
+    /// A fan-out that stops records a `fan_out_stop:{n}` marker with the
+    /// number of slots it dispatched. Replay reads it ahead, so the fan-out
+    /// never takes an activity that the workflow scheduled after the stop. The
+    /// stop also consumes the start events of its slots that still run, and
+    /// removes their waits. Change a tolerance for in-flight runs behind
+    /// `ctx.version()`. History records the writer mode, so a change to it
+    /// needs no guard.
+    ///
+    /// Do not run a windowed fan-out in a `join!` with other activity
+    /// dispatch. On resume, it treats the recorded schedules after it as its
+    /// own. The `_windowed` helpers have the same limit (issue #750).
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::FanOutFailureThresholdExceeded`] when more items
+    ///   fail than the tolerance allows. Only `ActivityFailed` and `Timeout`
+    ///   count as item failures.
+    /// - [`HarvestError::Config`] on a fresh dispatch with the result writer
+    ///   and no `PayloadStore`. The check does not run on replay.
+    /// - [`HarvestError::NonDeterministic`] if `activities.len()` differs
+    ///   from the recorded count.
+    /// - [`HarvestError::Cancelled`] if the workflow was cancelled.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn execute_activity_fan_out_raw_with(
+        &self,
+        activities: Vec<(String, Value, String)>,
+        options: &crate::fan_out::FanOutOptions,
+    ) -> HarvestResult<crate::fan_out::FanOutResults<Value>> {
+        let (slots, tolerated, writer) = self
+            .fan_out_with_impl(activities, options, None, None)
+            .await?;
+        let items = slots
+            .into_iter()
+            .map(|slot| fan_out_item(slot, writer, Ok))
+            .collect::<HarvestResult<Vec<_>>>()?;
+        Ok(crate::fan_out::FanOutResults::new(items, tolerated))
+    }
+
+    /// Typed sibling of
+    /// [`execute_activity_fan_out_raw_with`](Self::execute_activity_fan_out_raw_with).
+    ///
+    /// All slots share the same `ActivityInfo`. An inline value decodes to
+    /// `O`. A stored result stays a reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Config`] for a local activity, and
+    /// [`HarvestError::Serialization`] if an input does not serialize or an
+    /// inline value does not decode. Propagates the errors of
+    /// [`execute_activity_fan_out_raw_with`](Self::execute_activity_fan_out_raw_with).
+    pub async fn execute_activity_fan_out_with<I, O>(
+        &self,
+        info: &crate::info::ActivityInfo,
+        inputs: Vec<I>,
+        options: &crate::fan_out::FanOutOptions,
+    ) -> HarvestResult<crate::fan_out::FanOutResults<O>>
+    where
+        I: serde::Serialize,
+        O: serde::de::DeserializeOwned,
+    {
+        if info.is_local {
+            return Err(HarvestError::Config(format!(
+                "activity '{}' is marked local = true; fan-out requires remote activities",
+                info.name
+            )));
+        }
+        let queue = info.default_queue.unwrap_or("default").to_string();
+        let activities = inputs
+            .into_iter()
+            .map(|i| {
+                let json_input = serde_json::to_value(i)?;
+                Ok((info.name.to_string(), json_input, queue.clone()))
+            })
+            .collect::<Result<Vec<_>, serde_json::Error>>()?;
+
+        let (slots, tolerated, writer) = self
+            .fan_out_with_impl(
+                activities,
+                options,
+                info.default_retry_policy.clone(),
+                info.default_start_to_close,
+            )
+            .await?;
+        let items = slots
+            .into_iter()
+            .map(|slot| {
+                fan_out_item(slot, writer, |v| {
+                    serde_json::from_value(v).map_err(HarvestError::Serialization)
+                })
+            })
+            .collect::<HarvestResult<Vec<_>>>()?;
+        Ok(crate::fan_out::FanOutResults::new(items, tolerated))
+    }
+
+    /// Shared body of the fan-out helpers that take options.
+    ///
+    /// Returns the classified slots in input order, the tolerated count and
+    /// the writer mode that history records.
+    /// The structure is the windowed fan-out's: resume the recorded prefix,
+    /// then dispatch the rest in waves. No window means one wave.
+    async fn fan_out_with_impl(
+        &self,
+        activities: Vec<(String, Value, String)>,
+        options: &crate::fan_out::FanOutOptions,
+        retry: Option<crate::policy::RetryPolicy>,
+        timeout: Option<std::time::Duration>,
+    ) -> HarvestResult<(Vec<Result<Value, String>>, usize, bool)> {
+        self.check_cancellation()?;
+
+        let seq = self.next_fan_out_seq();
+        let count = activities.len();
+        // Check the store before the marker, so a failed check records
+        // nothing. Replay does not check again: the store can change.
+        let fresh = self.peek_fan_out_count(seq, count)?;
+        if fresh {
+            if options.result_writer() && self.payload_offload_threshold.is_none() {
+                return Err(HarvestError::Config(
+                    "a fan-out with a result writer needs a PayloadStore; \
+                     register one with HarvestBuilder::payload_store"
+                        .into(),
+                ));
+            }
+            self.record_fan_out_marker(seq, count);
+        }
+        let writer = self.fan_out_writer_mode(seq, fresh, options.result_writer());
+
+        let tolerated = options.tolerance().max_failures(count);
+        if activities.is_empty() {
+            return Ok((Vec::new(), tolerated, writer));
+        }
+        let window = options.max_in_flight().map_or(count, |w| w.max(1));
+
+        // The recorded prefix holds only this fan-out's slots. A fan-out that
+        // stopped recorded how many slots it dispatched. The prefix stops
+        // there, so it never takes an activity that the workflow scheduled
+        // after a caught threshold error.
+        let stop_marker = format!("fan_out_stop:{seq}");
+        let dispatched_before_stop = self
+            .match_history(|m| m.peek_u64_marker_ahead(&stop_marker))
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(count)
+            .min(count);
+        let prefix_ids =
+            self.match_history(|m| m.pending_scheduled_activity_ids(dispatched_before_stop));
+
+        let dispatch = |(name, input, queue): (String, Value, String)| {
+            let retry = retry.clone();
+            async move {
+                classify_fan_out_slot(
+                    self.execute_activity_raw_full(
+                        &name, input, &queue, retry, timeout, None, None, None, writer,
+                    )
+                    .await,
+                )
+            }
+        };
+
+        let mut activities = activities;
+        let mut results = Vec::with_capacity(count);
+        let mut failures = 0;
+        let limit = FailureLimit {
+            tolerated,
+            total: count,
+        };
+        // Phase 1 resumes the recorded prefix as one batch. Phase 2 sends the
+        // rest in waves. See `fan_out_raw_windowed_impl` for why.
+        let joined = async {
+            if !prefix_ids.is_empty() {
+                self.check_cancellation()?;
+                let wave = activities
+                    .drain(..prefix_ids.len())
+                    .map(&dispatch)
+                    .collect();
+                join_fan_out_wave(wave, &mut failures, limit, &mut results).await?;
+            }
+            while !activities.is_empty() {
+                self.check_cancellation()?;
+                let take = window.min(activities.len());
+                let wave = activities.drain(..take).map(&dispatch).collect();
+                join_fan_out_wave(wave, &mut failures, limit, &mut results).await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(HarvestError::FanOutFailureThresholdExceeded { .. }) = &joined {
+            // A slot still in flight leaves its start and heartbeat events in
+            // front of the cursor. Consume them, so the step after a caught
+            // error does not diverge on them (as `ctx.race()` does, issue
+            // #1126). Only a recorded slot can be in flight at a stop.
+            self.match_history(|m| m.consume_race_loser_frontier(&prefix_ids, &[]));
+            // Nothing waits on an abandoned slot. Its `WaitForActivity` would
+            // read as a new command to strict replay, so remove it, as
+            // `AwaitConditionTimeoutFut` removes a stale `StartTimer`.
+            let candidates: std::collections::HashSet<_> = prefix_ids.iter().collect();
+            let mut in_flight = Vec::new();
+            self.commands
+                .lock()
+                .expect("commands lock poisoned")
+                .retain(|buffered| match &buffered.cmd {
+                    WorkflowCommand::WaitForActivity { activity_id, .. }
+                        if candidates.contains(activity_id) =>
+                    {
+                        in_flight.push(*activity_id);
+                        false
+                    }
+                    _ => true,
+                });
+            // Cancel the slots still in flight, as `ctx.race()` cancels its
+            // losers. The worker cancels each open task row and records a
+            // terminal for it. So no result can arrive after the workflow
+            // ends, where replay would not consume it.
+            if !in_flight.is_empty() {
+                self.push_command(WorkflowCommand::CancelRaceLosers {
+                    reason: LoserCancelReason::RaceLoser,
+                    activities: in_flight,
+                    children: Vec::new(),
+                    timers: Vec::new(),
+                });
+            }
+            self.record_fan_out_stop(&stop_marker, count - activities.len())?;
+        }
+        joined?;
+        Ok((results, tolerated, writer))
     }
 
     // ── Fan-out / parallel child workflows (issue #601) ──────────────────
@@ -11565,6 +12111,11 @@ impl WorkflowContext {
 
     // ── Race / select (issue #600) ───────────────────────────────────────────
 
+    /// Whether a `ctx.race()` call is in flight (issue #2007).
+    pub(crate) fn has_open_race(&self) -> bool {
+        self.open_races.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
     /// Generate the next race sequence number for marker naming (mirrors
     /// `next_fan_out_seq`).
     fn next_race_seq(&self) -> u32 {
@@ -11587,6 +12138,7 @@ impl WorkflowContext {
 
     #[allow(clippy::too_many_lines)]
     async fn race_impl(&self, branches: Vec<RaceBranch>) -> HarvestResult<RaceWinner> {
+        let _open = OpenRace::enter(&self.open_races);
         self.check_cancellation()?;
 
         if branches.is_empty() {
@@ -12132,6 +12684,7 @@ impl WorkflowContext {
                             session_id: None,
                             session_worker_id: None,
                             schedule_to_start_override: None,
+                            result_writer: false,
                             result_tx: tx,
                         });
                     } else {
@@ -12539,6 +13092,7 @@ impl WorkflowContext {
                 None,
                 None,
                 Some(options.acquisition_timeout),
+                false,
             )
             .await?;
         raw.as_str().map(str::to_string).ok_or_else(|| {
@@ -13272,6 +13826,10 @@ impl WorkflowContext {
         // `new_for_handler` inits it to `None`; without this the update-handler
         // path (unlike the workflow body) would never see the parent.
         let parent_execution_id = self.parent_execution_id;
+        // Issue #1991: the test harness clock. The handler reads it when it
+        // runs, so its `ctx.now()` matches the workflow body.
+        #[cfg(any(test, feature = "testing"))]
+        let timer_clock = self.timer_clock_elapsed_secs.clone();
 
         let boxed_handler: crate::update::BoxUpdateHandler = std::sync::Arc::new(move |input| {
             let mut ctx = Self::new_for_handler(
@@ -13299,6 +13857,10 @@ impl WorkflowContext {
                 inner.current_shard_id = current_shard_id;
                 // Issue #698: inherit the spawning parent's execution id.
                 inner.parent_execution_id = parent_execution_id;
+                #[cfg(any(test, feature = "testing"))]
+                {
+                    inner.timer_clock_elapsed_secs = timer_clock.as_ref().map(snapshot_timer_clock);
+                }
             }
             handler_fn(ctx, input)
         });
@@ -13377,6 +13939,13 @@ impl WorkflowContext {
                 // Issue #698: inherit the spawning parent's execution id so
                 // `ctx.info().parent_execution_id` is visible inside the handler.
                 inner.parent_execution_id = self.parent_execution_id;
+                #[cfg(any(test, feature = "testing"))]
+                {
+                    inner.timer_clock_elapsed_secs = self
+                        .timer_clock_elapsed_secs
+                        .as_ref()
+                        .map(snapshot_timer_clock);
+                }
             }
             h(ctx, input)
         })
@@ -13861,24 +14430,67 @@ impl WorkflowContext {
             let matcher = self.matcher.lock().expect("matcher lock poisoned");
             matcher.event_count()
         };
-        // Serialize the caller's chunk (the only fallible step).
-        let mut value = serde_json::to_value(&chunk).map_err(HarvestError::Serialization)?;
-        // Cap the serialized size below the Postgres NOTIFY payload limit.
-        // Oversize chunks are REPLACED with a truncation marker (never silently
-        // dropped) so the ordered seq slot survives and the SSE client learns
-        // content was cut.
-        let serialized_len = serde_json::to_vec(&value).map_or(usize::MAX, |v| v.len());
-        if serialized_len > PROGRESS_CHUNK_MAX_BYTES {
-            value = serde_json::json!({
-                "_harvest_progress_truncated": true,
-                "bytes": serialized_len,
-            });
-        }
+        let value = cap_progress_chunk(&chunk)?;
         let local_index = self
             .progress_local_index
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let seq = encode_progress_seq(epoch, local_index);
         self.push_command(WorkflowCommand::PublishProgress { seq, chunk: value });
+        Ok(())
+    }
+
+    /// Publish a durable, resumable output chunk (issue #1974).
+    ///
+    /// This is the opt-in durable mode of [`publish_progress`](Self::publish_progress).
+    /// The worker stores the chunk in `harvest_stream_chunks` in the same
+    /// transaction as the decision cycle. A reader of
+    /// `GET /workflows/{id}/stream/durable` gets every stored chunk in order.
+    /// It can disconnect and resume after its last offset.
+    ///
+    /// - **Offset**: the 0-based ordinal of this call in the workflow body.
+    ///   The SSE `id:` carries it. A re-drive gives a chunk the same offset,
+    ///   and the store keeps the first copy.
+    /// - **Determinism**: the content can change between runs. The number and
+    ///   order of calls must be deterministic, as for any workflow code.
+    /// - **Replay-neutral**: during replay the call claims its offset and
+    ///   pushes no command. No event goes to `harvest_events`.
+    /// - **Bounded**: [`DURABLE_STREAM_MAX_CHUNKS`] chunks per execution, then
+    ///   one terminal marker. A chunk above [`PROGRESS_CHUNK_MAX_BYTES`]
+    ///   becomes a truncation marker, as in the best-effort mode.
+    /// - **Postgres only**: the SQLite runtime ignores the chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if `chunk` cannot be
+    /// serialized. On replay it returns `Ok(())` without touching `chunk`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher mutex is poisoned.
+    pub fn publish_durable_progress(&self, chunk: impl serde::Serialize) -> HarvestResult<()> {
+        // Claim the offset first, also on replay. Otherwise each later chunk
+        // moves down one offset and collides with a stored row.
+        let offset = self
+            .durable_progress_ordinal
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.durable_replay_suppresses() {
+            return Ok(());
+        }
+        // Bound the queue at cap + 1. The extra command lets the store see
+        // the overflow and write its marker. Check first, so a call over the
+        // bound does no serialization. Take the slot only after serialization
+        // succeeds, because a failed call queues nothing.
+        let queued = &self.durable_progress_queued;
+        if queued.load(std::sync::atomic::Ordering::Relaxed) > u64::from(DURABLE_STREAM_MAX_CHUNKS)
+        {
+            return Ok(());
+        }
+        let value = cap_progress_chunk(&chunk)?;
+        queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.push_command(WorkflowCommand::PublishDurableProgress {
+            offset,
+            chunk: value,
+        });
         Ok(())
     }
 
@@ -14656,6 +15268,110 @@ impl From<crate::heartbeat::HeartbeatSlot> for HeartbeatSink {
     fn from(slot: crate::heartbeat::HeartbeatSlot) -> Self {
         Self::Stamped(slot)
     }
+}
+
+/// The failure limit of one fan-out (issue #1986).
+#[derive(Clone, Copy)]
+struct FailureLimit {
+    tolerated: usize,
+    total: usize,
+}
+
+/// Split a fan-out slot outcome into an item failure or an engine error.
+///
+/// `ActivityFailed` and `Timeout` are item failures. Every other error
+/// aborts the fan-out, as in the collect-all helpers.
+fn classify_fan_out_slot(slot: HarvestResult<Value>) -> HarvestResult<Result<Value, String>> {
+    match slot {
+        Ok(v) => Ok(Ok(v)),
+        Err(e @ (HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. })) => {
+            Ok(Err(e.to_string()))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Map one classified slot to a manifest item.
+///
+/// With the result writer, a recorded `StoredResult` becomes `Stored`. Any
+/// other value goes through `decode`.
+fn fan_out_item<T>(
+    slot: Result<Value, String>,
+    writer: bool,
+    decode: impl FnOnce(Value) -> HarvestResult<T>,
+) -> HarvestResult<crate::fan_out::FanOutItem<T>> {
+    use crate::fan_out::{FanOutItem, StoredResult};
+    match slot {
+        Err(error) => Ok(FanOutItem::Failed(error)),
+        Ok(value) => StoredResult::from_recorded_value(&value)
+            .filter(|_| writer)
+            .map_or_else(
+                || decode(value).map(FanOutItem::Value),
+                |stored| Ok(FanOutItem::Stored(stored)),
+            ),
+    }
+}
+
+/// Join one fan-out wave and apply the failure limit (issue #1986).
+///
+/// Every wake polls every slot before it decides. `try_join_all` stops at
+/// the first error and leaves later slots unpolled. Their recorded events
+/// are then unconsumed, and a workflow that catches the error drifts (issue
+/// #1791). An engine error still aborts at once, as in the collect-all
+/// helpers.
+async fn join_fan_out_wave<F>(
+    wave: Vec<F>,
+    failures: &mut usize,
+    limit: FailureLimit,
+    results: &mut Vec<Result<Value, String>>,
+) -> HarvestResult<()>
+where
+    F: std::future::Future<Output = HarvestResult<Result<Value, String>>>,
+{
+    use std::task::Poll;
+
+    let mut slots: Vec<_> = wave
+        .into_iter()
+        .map(|f| Box::pin(futures::future::maybe_done(f)))
+        .collect();
+    let prior = *failures;
+    let wave_failures = std::future::poll_fn(|cx| {
+        let mut pending = false;
+        let mut wave_failures = 0;
+        for slot in &mut slots {
+            if slot.as_mut().poll(cx).is_pending() {
+                pending = true;
+                continue;
+            }
+            match slot.as_mut().output_mut() {
+                Some(Ok(Err(_))) => wave_failures += 1,
+                Some(Err(_)) => {
+                    if let Some(Err(error)) = slot.as_mut().take_output() {
+                        return Poll::Ready(Err(error));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if prior + wave_failures > limit.tolerated {
+            Poll::Ready(Err(HarvestError::FanOutFailureThresholdExceeded {
+                tolerated: limit.tolerated,
+                total: limit.total,
+            }))
+        } else if pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(wave_failures))
+        }
+    })
+    .await?;
+    *failures = prior + wave_failures;
+    for slot in &mut slots {
+        if let Some(outcome) = slot.as_mut().take_output() {
+            results.push(outcome?);
+        }
+    }
+    Ok(())
 }
 
 /// Context passed to every activity function.
@@ -16178,6 +16894,12 @@ impl ActivityContext {
         // observes a `set_active_key` that lands mid-activity.
         let codecs = self.payload_codecs.clone();
         let max_result_bytes = txn.max_result_bytes;
+        let result_writer = txn.result_writer;
+        let writer_store = txn
+            .offloader
+            .as_ref()
+            .filter(|_| result_writer)
+            .map(|offloader| Arc::clone(offloader.store()));
 
         let mut conn = crate::replication::fenced_checkout(&txn.pool)
             .await
@@ -16196,15 +16918,50 @@ impl ActivityContext {
                 let user_result = f(conn).await.map_err(TxError::User)?;
 
                 // Serialize the result for the event log.
-                let output =
+                let mut output =
                     serde_json::to_value(&user_result).map_err(HarvestError::Serialization)?;
+
+                // Issue #1986: a fan-out row with the result writer records a
+                // reference. The upload runs before the execution row lock.
+                // Its reference row commits with the event, so retention can
+                // delete the blob. A rollback leaves one blob without a row,
+                // as a rolled-back offload does.
+                let stored = match &writer_store {
+                    Some(store) => Some(
+                        crate::fan_out::StoredResult::write(
+                            store.as_ref(),
+                            &codecs,
+                            activity_id,
+                            &output,
+                        )
+                        .await?,
+                    ),
+                    None => None,
+                };
+                if result_writer
+                    && stored.is_none()
+                    && output.get(crate::fan_out::STORED_RESULT_KEY).is_some()
+                {
+                    use crate::failure::IntoActivityErrorString as _;
+                    return Err(TxError::Payload(
+                        crate::failure::ActivityFailure::non_retryable(
+                            "ReservedResultKey",
+                            format!(
+                                "transactional activity result carries the reserved key \
+                                 '{}' and this worker has no PayloadStore to write it",
+                                crate::fan_out::STORED_RESULT_KEY
+                            ),
+                        )
+                        .into_error_payload(),
+                    ));
+                }
 
                 // Enforce the result-size cap before committing.  The worker's
                 // post-handler cap check runs after the handler returns, which
                 // is too late for transactional activities — the event would
                 // already be committed.  Rolling back here ensures an oversized
                 // result never lands in harvest_events.
-                if max_result_bytes > 0 {
+                if max_result_bytes > 0 && stored.is_none() {
                     let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
                     if observed > max_result_bytes {
                         use crate::failure::IntoActivityErrorString as _;
@@ -16257,6 +17014,20 @@ impl ActivityContext {
                          rolling back user writes"
                         ))));
                     }
+                }
+
+                if let Some(stored) = &stored {
+                    crate::store::insert_payload_refs(
+                        conn,
+                        exec_id,
+                        &[crate::payload_store::OffloadedRef {
+                            blob_key: stored.key.clone(),
+                            store_id: stored.store_id.clone(),
+                            byte_len: stored.len,
+                        }],
+                    )
+                    .await?;
+                    output = stored.to_recorded_value();
                 }
 
                 // Append ActivityCompleted within the same transaction.
@@ -16447,6 +17218,30 @@ impl ActivityContext {
             identity,
         )
         .with_idempotency_key(key)
+        .with_attempt(1)
+        .with_max_attempts(1)
+    }
+
+    /// Like [`new_test`](Self::new_test) but with registered state, so a test
+    /// can run an activity that reads [`state`](Self::state) (issue #1973).
+    ///
+    /// Build `state` the way `HarvestBuilder::state` does: one boxed value per
+    /// type, keyed by its `TypeId`.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn new_test_with_state(state: SharedState) -> Self {
+        let id = ActivityExecId::new();
+        let identity = ActivityIdentity {
+            activity_id: id,
+            ..ActivityIdentity::for_test()
+        };
+        Self::new(
+            state,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            identity,
+        )
+        .with_idempotency_key(IdempotencyKey::from_activity_exec_id(id))
         .with_attempt(1)
         .with_max_attempts(1)
     }
@@ -25623,6 +26418,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         }
     }
 
@@ -26078,6 +26875,284 @@ mod tests {
         assert!(encode_progress_seq(5, 1) > encode_progress_seq(5, 0));
         // Deterministic on a crash-retry of the same cycle: same inputs → same seq.
         assert_eq!(encode_progress_seq(7, 3), encode_progress_seq(7, 3));
+    }
+
+    // ── Durable output streams (issue #1974) ──────────────────────────
+
+    /// Collect every `PublishDurableProgress` command as `(offset, chunk)`.
+    fn durable_chunks(cmds: &[WorkflowCommand]) -> Vec<(u64, Value)> {
+        cmds.iter()
+            .filter_map(|cmd| match cmd {
+                WorkflowCommand::PublishDurableProgress { offset, chunk } => {
+                    Some((*offset, chunk.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn durable_progress_offsets_start_at_zero_and_increase_by_one() {
+        let ctx = WorkflowContext::new_test();
+        ctx.publish_durable_progress(serde_json::json!("a"))
+            .expect("first");
+        ctx.publish_durable_progress(serde_json::json!("b"))
+            .expect("second");
+        let chunks = durable_chunks(&ctx.drain_commands());
+        assert_eq!(
+            chunks,
+            vec![(0, serde_json::json!("a")), (1, serde_json::json!("b"))]
+        );
+    }
+
+    #[test]
+    fn durable_progress_does_not_change_the_best_effort_command() {
+        let ctx = WorkflowContext::new_test();
+        ctx.publish_progress(serde_json::json!("x")).expect("live");
+        let cmds = ctx.drain_commands();
+        assert_eq!(durable_chunks(&cmds), Vec::new());
+        assert!(matches!(
+            cmds.as_slice(),
+            [WorkflowCommand::PublishProgress { .. }]
+        ));
+    }
+
+    #[test]
+    fn durable_progress_is_suppressed_during_replay_but_claims_an_offset() {
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let side_effect = WorkflowEvent::SideEffectRecorded {
+            kind: crate::event::SideEffectKind::Uuid,
+            name: None,
+            value: serde_json::json!("00000000-0000-7000-8000-000000000000"),
+        };
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started, side_effect]);
+        assert!(ctx.is_replaying(), "the side effect is not consumed yet");
+        ctx.publish_durable_progress(serde_json::json!("old"))
+            .expect("replay call");
+        let _ = ctx.new_uuid();
+        assert!(!ctx.is_replaying(), "the cycle is at the frontier");
+        ctx.publish_durable_progress(serde_json::json!("new"))
+            .expect("live call");
+        assert_eq!(
+            durable_chunks(&ctx.drain_commands()),
+            vec![(1, serde_json::json!("new"))],
+            "the replayed call pushes nothing but still claims offset 0"
+        );
+    }
+
+    #[test]
+    fn durable_progress_is_live_when_a_buffered_signal_waits_at_the_cursor() {
+        // Regression (issue #1974 review). A signal that arrives before the
+        // first cycle sits at the cursor. The raw cursor check then reports
+        // replay, and the chunks before `wait_for_signal` were never stored.
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let signal = WorkflowEvent::SignalReceived {
+            signal_name: "go".to_string(),
+            payload: serde_json::json!({}),
+        };
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started, signal]);
+        ctx.publish_durable_progress(serde_json::json!("first"))
+            .expect("publish");
+        assert_eq!(
+            durable_chunks(&ctx.drain_commands()),
+            vec![(0, serde_json::json!("first"))],
+            "a buffered signal is not replayed history, so the chunk is live"
+        );
+    }
+
+    #[test]
+    fn durable_progress_does_not_change_is_replaying() {
+        // Regression (issue #1974 review). The durable gate must only read
+        // the matcher. A gate that moves the cursor makes later code see
+        // `is_replaying() == false` early, so a guarded side effect runs twice.
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let signal = WorkflowEvent::SignalReceived {
+            signal_name: "go".to_string(),
+            payload: serde_json::json!({}),
+        };
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started, signal]);
+        let before = ctx.is_replaying();
+        ctx.publish_durable_progress(serde_json::json!("first"))
+            .expect("publish");
+        assert_eq!(
+            ctx.is_replaying(),
+            before,
+            "the durable call moved the cursor"
+        );
+        assert_eq!(
+            durable_chunks(&ctx.drain_commands()),
+            vec![(0, serde_json::json!("first"))],
+            "the chunk is still live"
+        );
+    }
+
+    #[test]
+    fn durable_progress_offset_is_stable_when_the_cycle_appends_an_event() {
+        // The ephemeral epoch seq fails this case. The same chunk gets a new
+        // value in cycle 2, so the store holds it twice.
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let cycle1 = WorkflowContext::for_replay(ExecutionId::new(), vec![started.clone()]);
+        cycle1
+            .publish_durable_progress(serde_json::json!("A"))
+            .expect("A");
+        let _ = cycle1.new_uuid();
+        cycle1
+            .publish_durable_progress(serde_json::json!("B"))
+            .expect("B");
+        let first = durable_chunks(&cycle1.drain_commands());
+        assert_eq!(first.len(), 2, "both chunks are live in cycle 1");
+
+        let side_effect = WorkflowEvent::SideEffectRecorded {
+            kind: crate::event::SideEffectKind::Uuid,
+            name: None,
+            value: serde_json::json!("00000000-0000-7000-8000-000000000000"),
+        };
+        let cycle2 = WorkflowContext::for_replay(ExecutionId::new(), vec![started, side_effect]);
+        cycle2
+            .publish_durable_progress(serde_json::json!("A"))
+            .expect("A");
+        let _ = cycle2.new_uuid();
+        cycle2
+            .publish_durable_progress(serde_json::json!("B"))
+            .expect("B");
+        let second = durable_chunks(&cycle2.drain_commands());
+        assert_eq!(second.len(), 1, "only B is live in cycle 2");
+        assert_eq!(second[0], first[1], "B keeps its offset across cycles");
+    }
+
+    #[test]
+    fn durable_progress_offset_is_stable_across_a_pause_resume() {
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let before = WorkflowContext::for_replay(ExecutionId::new(), vec![started.clone()]);
+        before
+            .publish_durable_progress(serde_json::json!("waiting"))
+            .expect("before");
+        let now = Utc::now();
+        let after = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started,
+                WorkflowEvent::WorkflowExecutionPaused {
+                    paused_at: now,
+                    reason: None,
+                    actor: "operator".to_string(),
+                },
+                WorkflowEvent::WorkflowExecutionResumed {
+                    resumed_at: now,
+                    actor: "operator".to_string(),
+                },
+            ],
+        );
+        after
+            .publish_durable_progress(serde_json::json!("waiting"))
+            .expect("after");
+        let before_chunks = durable_chunks(&before.drain_commands());
+        assert_eq!(before_chunks.len(), 1, "the chunk is live before the pause");
+        assert_eq!(
+            before_chunks,
+            durable_chunks(&after.drain_commands()),
+            "a pause and resume must not move the offset"
+        );
+    }
+
+    #[test]
+    fn durable_progress_offset_continues_across_a_resident_cycle() {
+        let ctx = WorkflowContext::new_test();
+        ctx.publish_durable_progress(serde_json::json!(0))
+            .expect("cycle 1");
+        let _ = ctx.drain_commands();
+        ctx.begin_resident_cycle(&[], Vec::new());
+        ctx.publish_durable_progress(serde_json::json!(1))
+            .expect("cycle 2");
+        assert_eq!(
+            durable_chunks(&ctx.drain_commands()),
+            vec![(1, serde_json::json!(1))],
+            "a resident cycle does not re-run the body, so the counter continues"
+        );
+        ctx.begin_resident_cycle(&[], Vec::new());
+        assert_eq!(
+            ctx.durable_progress_queued
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the queue bound is per cycle, so a resident cycle resets it"
+        );
+    }
+
+    #[test]
+    fn durable_progress_in_a_speculative_cycle_reads_the_position() {
+        let ctx = WorkflowContext::new_test();
+        let (result_tx, _result_rx) = tokio::sync::oneshot::channel();
+        ctx.begin_resident_cycle(
+            &[],
+            vec![WorkflowCommand::WaitForActivity {
+                activity_id: ActivityExecId::new(),
+                result_tx,
+            }],
+        );
+        let _ = ctx.drain_commands();
+        ctx.publish_durable_progress(serde_json::json!("chunk"))
+            .expect("publish");
+        assert!(
+            durable_chunks(&ctx.drain_commands()).is_empty(),
+            "a speculative cycle may be dropped, so it queues no chunk"
+        );
+        assert!(
+            ctx.end_speculation(),
+            "the gate reads the replay position, so the resume must decline"
+        );
+    }
+
+    #[test]
+    fn durable_progress_oversize_chunk_becomes_truncation_marker() {
+        let ctx = WorkflowContext::new_test();
+        let huge = "x".repeat(PROGRESS_CHUNK_MAX_BYTES + 1);
+        ctx.publish_durable_progress(Value::String(huge))
+            .expect("oversize publish succeeds");
+        let chunks = durable_chunks(&ctx.drain_commands());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].0, 0, "the marker keeps the offset");
+        assert_eq!(
+            chunks[0].1.get("_harvest_progress_truncated"),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn a_failed_serialization_does_not_use_a_queue_slot() {
+        // Regression (issue #1974 review). A failed call queues nothing, so it
+        // must not use a slot. Otherwise the overflow command is lost and the
+        // store never writes its marker.
+        let ctx = WorkflowContext::new_test();
+        let unserializable: std::collections::BTreeMap<(i32, i32), i32> =
+            std::iter::once(((1, 2), 3)).collect();
+        assert!(ctx.publish_durable_progress(unserializable).is_err());
+        let cap = u64::from(DURABLE_STREAM_MAX_CHUNKS);
+        for i in 0..=cap {
+            ctx.publish_durable_progress(i).expect("publish");
+        }
+        let queued = durable_chunks(&ctx.drain_commands()).len();
+        assert_eq!(
+            u64::try_from(queued).expect("fits"),
+            cap + 1,
+            "all cap + 1 good chunks are queued"
+        );
+    }
+
+    #[test]
+    fn durable_progress_queue_is_bounded_at_cap_plus_one() {
+        let ctx = WorkflowContext::new_test();
+        let cap = u64::from(DURABLE_STREAM_MAX_CHUNKS);
+        for i in 0..cap + 5 {
+            ctx.publish_durable_progress(i).expect("publish");
+        }
+        let chunks = durable_chunks(&ctx.drain_commands());
+        let queued = u64::try_from(chunks.len()).expect("fits");
+        assert_eq!(
+            queued,
+            cap + 1,
+            "one extra command lets the store detect overflow and write its marker"
+        );
+        assert_eq!(chunks.last().map(|c| c.0), Some(cap));
     }
 
     // ── Durable workflow logs (issue #790) ────────────────────────────
@@ -30314,6 +31389,17 @@ mod activity_info_tests {
         assert_eq!(info.attempt, 1);
         assert_eq!(info.max_attempts, 1);
         assert_eq!(info.task_id, None);
+    }
+
+    /// `new_test_with_state()` exposes the state it was given, and nothing else.
+    #[test]
+    fn new_test_with_state_exposes_its_state() {
+        let mut map: crate::context::SharedStateMap = std::collections::HashMap::new();
+        map.insert(std::any::TypeId::of::<u32>(), Box::new(7_u32));
+        let ctx = ActivityContext::new_test_with_state(std::sync::Arc::new(map));
+        assert_eq!(ctx.state::<u32>(), Some(&7));
+        assert_eq!(ctx.state::<String>(), None);
+        assert_eq!(ctx.info().attempt, 1);
     }
 
     #[test]

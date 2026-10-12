@@ -709,6 +709,7 @@ async fn fleet_gate_leaves_zero_uncounted_admissions() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -942,6 +943,7 @@ async fn seed_target_prior(conn: &mut AsyncPgConnection, workflow_id: &str, stat
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )

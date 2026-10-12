@@ -817,7 +817,7 @@ mod scanner {
         // Issue #1243: forwarded to the owning-workflow failure write.
         codecs: &crate::payload_codec::PayloadCodecs,
     ) -> HarvestResult<QuarantineOutcome> {
-        use crate::dlq::{DeadLetterReason, NewDeadLetterEntry, dead_letter};
+        use crate::dlq::{DeadLetterReason, NewDeadLetterEntry, dead_letter_with_codecs};
         use crate::schema::harvest_task_queue::dsl;
 
         let reason = DeadLetterReason::PoisonPill {
@@ -944,7 +944,7 @@ mod scanner {
                         return Ok((false, None, Vec::new(), Vec::new(), Vec::new()));
                     }
 
-                    dead_letter(conn, &entry).await?;
+                    dead_letter_with_codecs(conn, &entry, codecs).await?;
 
                     diesel::update(dsl::harvest_task_queue.find(task_id))
                         .set((

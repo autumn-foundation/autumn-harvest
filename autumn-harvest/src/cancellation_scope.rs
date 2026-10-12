@@ -1785,9 +1785,12 @@ mod tests {
         assert!(parked.is_err(), "the body parks on its timer");
         assert_eq!(scope.shared.lock().members.timers, vec![TimerId::new("t")]);
 
-        ctx.begin_resident_cycle(&[WorkflowEvent::TimerFired {
-            timer_id: TimerId::new("t"),
-        }]);
+        ctx.begin_resident_cycle(
+            &[WorkflowEvent::TimerFired {
+                timer_id: TimerId::new("t"),
+            }],
+            Vec::new(),
+        );
 
         assert!(scope.shared.lock().members.is_empty());
     }

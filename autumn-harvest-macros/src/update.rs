@@ -328,6 +328,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 max_workflow_attempts_ceiling: client.max_workflow_attempts(),
                 // Typed stubs already reject debounced workflows up front.
                 reject_fresh_if_debounced: false,
+                tenant: opts.tenant.as_deref(),
             };
             let _ = client;
             ::autumn_harvest::update_with_start_workflow_execution(conn, params).await

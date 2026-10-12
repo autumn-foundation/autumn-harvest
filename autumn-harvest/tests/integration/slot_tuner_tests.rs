@@ -160,6 +160,8 @@ fn build_registry(telemetry: Arc<TelemetryConfig>) -> Arc<HandlerRegistry> {
             max_result_bytes: None,
             requires: None,
             handler: slow_activity,
+            input_schema: None,
+            output_schema: None,
         }],
         autumn_harvest::context::empty_shared_state(),
         telemetry,
@@ -179,6 +181,7 @@ fn runtime_config(worker_id: &str, slot_tuner: Option<SlotTunerConfig>) -> Worke
         // the initial target and drives the permit-wait signal above the
         // default 50ms grow threshold.
         max_concurrent_activities: 4,
+        max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
         poll_interval: Duration::from_millis(50),
         shutdown_timeout: Duration::from_secs(5),
         cancellation_grace_period: Duration::from_secs(1),
@@ -256,6 +259,7 @@ async fn start_workflow(database_url: &str, workflow_id: &str) -> ExecutionId {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )

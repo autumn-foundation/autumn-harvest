@@ -152,6 +152,7 @@ async fn seed_execution(conn: &mut AsyncPgConnection, workflow_id: &str) -> Exec
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )

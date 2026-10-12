@@ -1,0 +1,6 @@
+{"spec":"WorkflowTaskClaim","case":"a crash orphan is reclaimed with a strike, then re-claimed and closed","checks":{"fixed":"accept"}}
+{"op":"init","state":"PENDING","worker":null,"attempt":0,"strikes":0,"terminal":0,"actor":null}
+{"op":"write","state":"RUNNING","worker":"w1","attempt":1,"strikes":0,"terminal":0,"actor":null}
+{"op":"write","state":"PENDING","worker":null,"attempt":1,"strikes":1,"terminal":0,"actor":null}
+{"op":"write","state":"RUNNING","worker":"w2","attempt":2,"strikes":1,"terminal":0,"actor":null}
+{"op":"write","state":"COMPLETED","worker":"w2","attempt":2,"strikes":1,"terminal":1,"actor":{"worker":"w2","attempt":2}}

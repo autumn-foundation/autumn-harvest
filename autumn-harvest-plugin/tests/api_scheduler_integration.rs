@@ -383,6 +383,8 @@ fn recording_activity_info(name: &'static str) -> ActivityInfo {
         circuit_breaker: None,
         requires: None,
         handler: record_activity,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -408,6 +410,8 @@ fn blocking_activity_info(name: &'static str, start_to_close: Duration) -> Activ
         circuit_breaker: None,
         requires: None,
         handler: wait_on_barrier_activity,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -496,6 +500,7 @@ async fn insert_workflow_on_url(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -593,6 +598,7 @@ async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> Exec
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -773,6 +779,7 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
             start_source: None,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         })
         .execute(&mut conn)
         .await
@@ -1118,6 +1125,7 @@ async fn seed_scheduled_activity_task_from_url(
             start_source: None,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         })
         .execute(&mut conn)
         .await
@@ -3543,6 +3551,11 @@ async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
         diesel::update(harvest_task_queue::table.find(task_id))
             .set((
                 harvest_task_queue::state.eq("RUNNING"),
+                harvest_task_queue::worker_id.eq(Some("race-worker")),
+                harvest_task_queue::attempt.eq(1),
+                // One attempt keeps the terminal timeout, which appends an
+                // event, as the path under test.
+                harvest_task_queue::max_attempts.eq(1),
                 harvest_task_queue::started_at
                     .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(60))),
                 harvest_task_queue::start_to_close.eq(Some(chrono::Duration::seconds(1))),
@@ -3599,7 +3612,8 @@ async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
     )
     .await
     .expect("failed to append competing completion event");
-    autumn_harvest::queue::complete_task(&mut lock_conn, task_id, json!({ "completed": true }))
+    let claim = autumn_harvest::queue::TaskClaim::new(task_id, "race-worker", 1);
+    autumn_harvest::queue::complete_task(&mut lock_conn, &claim, json!({ "completed": true }))
         .await
         .expect("failed to complete competing activity task");
     lock_conn
@@ -6026,6 +6040,8 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             circuit_breaker: None,
             requires: None,
             handler: record_activity,
+            input_schema: None,
+            output_schema: None,
         }],
         Arc::new(state),
     ));
@@ -8172,6 +8188,7 @@ async fn insert_running_execution_for(database_url: &str, wf_name: &str) {
             start_source: None,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         })
         .execute(&mut conn)
         .await

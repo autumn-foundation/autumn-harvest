@@ -11,6 +11,9 @@ by default and **never** part of `default`. This is *not* production/runtime
 chaos (that is issue #796); the harness exists purely to reproduce and guard the
 engine's internal race classes.
 
+The [safety report](../safety-report.md) collects the results of this harness
+by guarantee, with a command for each result (issue #2004).
+
 ```toml
 # autumn-harvest/Cargo.toml
 [features]
@@ -413,6 +416,21 @@ not starts or schedule fires.
 The checker self-tests feed it forged violations: two creators, a read of
 two runs, a real-time inversion, a lost fire, a replaced run, and a crashed
 fire that takes effect after its bound.
+
+## TLA+ trace checks (issue #2003)
+
+`chaos.yml` sets `HARVEST_TLA_TRACE_DIR`. Each chaos case then records the
+history of every task row. After the suite, TLC checks each history against
+`ActivityClaim` or `WorkflowTaskClaim`. A trace that no behavior of the spec
+matches fails the job.
+
+- `chaos_tests::trace_red` injects the #1789 and #1806 stale writes. TLC must
+  reject their traces.
+- `chaos_tests::trace_activity` runs activities on a real worker, so the
+  `ActivityClaim` check has engine traces without Docker.
+
+[`formal-methods.md`](formal-methods.md#check-engine-traces-against-the-models)
+describes the recorder, the trace format and the checks.
 
 ## Out of scope
 

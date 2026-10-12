@@ -15,6 +15,9 @@
 //! `N` independent Postgres databases. Operators sizing a multi-shard
 //! deployment should account for that multiplication when setting Postgres
 //! `max_connections` on each shard host and the process-wide ceiling.
+//!
+//! Size `worker_pool_size` for the worker slots plus `max_concurrent_claims`.
+//! Each in-flight claim holds one connection.
 
 use crate::error::{HarvestError, HarvestResult};
 

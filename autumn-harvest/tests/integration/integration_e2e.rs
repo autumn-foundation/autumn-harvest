@@ -18,7 +18,7 @@ use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::{
     HarvestTimer, NewWorkflowExecution, TaskQueueItem, WorkflowExecution,
 };
-use autumn_harvest::queue::{EnqueueParams, StickyHint, TaskType};
+use autumn_harvest::queue::{EnqueueParams, StickyHint, TaskClaim, TaskType};
 use autumn_harvest::schema::{harvest_task_queue, harvest_timers, harvest_workflow_executions};
 use autumn_harvest::store;
 use autumn_harvest::types::{ActivityExecId, ExecutionId, Priority};
@@ -191,7 +191,9 @@ const LEGACY_INIT_SQL: &str = concat!(
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_state TEXT NULL;\n",
     // issue #1596 review: WorkflowExecution::as_select() also references
     // this column, for the same reason as the column above.
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_by UUID NULL;\n"
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_by UUID NULL;\n",
+    // Issue #1977: the diesel insert and `as_select()` name this column too.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS tenant TEXT NULL;\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -679,6 +681,7 @@ pub(crate) async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> E
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -739,6 +742,7 @@ pub(crate) async fn insert_workflow_execution_on_shard(
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -797,6 +801,7 @@ pub(crate) async fn insert_workflow_execution_with_id(
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -871,6 +876,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -1066,6 +1072,7 @@ pub(crate) fn runtime_config(
         notification_database_url: None,
         max_concurrent_workflows,
         max_concurrent_activities,
+        max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
         poll_interval: Duration::from_millis(25),
         shutdown_timeout: Duration::from_secs(1),
         cancellation_grace_period: Duration::from_secs(1),
@@ -1930,7 +1937,8 @@ async fn full_workflow_lifecycle() {
     assert_eq!(claimed.state, "RUNNING");
 
     // 5. Complete the task
-    queue::complete_task(&mut conn, task_id, serde_json::json!({"sent": true}))
+    let claim = TaskClaim::of(&claimed).expect("a claimed task");
+    queue::complete_task(&mut conn, &claim, serde_json::json!({"sent": true}))
         .await
         .expect("complete_task failed");
 
@@ -2066,6 +2074,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     let started = start_or_load_workflow_execution(&mut conn, request, None)
         .await
@@ -2113,6 +2122,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -2280,6 +2290,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     let started = start_or_load_workflow_execution(&mut conn, request, None)
         .await
@@ -2349,6 +2360,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -2519,6 +2531,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -2661,6 +2674,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -2824,6 +2838,8 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             max_result_bytes: None,
             requires: None,
             handler: send_email_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ));
     let worker = Arc::new(
@@ -2837,6 +2853,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -3001,6 +3018,8 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             max_result_bytes: None,
             requires: None,
             handler: checkpointed_import_activity,
+            input_schema: None,
+            output_schema: None,
         }],
         heartbeat_resume_state(Arc::clone(&stats)),
     ));
@@ -3078,6 +3097,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -3128,6 +3148,8 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                     max_result_bytes: None,
                     requires: None,
                     handler: send_email_activity,
+                    input_schema: None,
+                    output_schema: None,
                 }],
             )),
         )
@@ -3344,6 +3366,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -3425,6 +3448,8 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     max_result_bytes: None,
                     requires: None,
                     handler: slow_activity,
+                    input_schema: None,
+                    output_schema: None,
                 }],
             )),
         )
@@ -3540,6 +3565,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -5088,6 +5114,8 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             max_result_bytes: None,
             requires: None,
             handler: stateful_activity,
+            input_schema: None,
+            output_schema: None,
         }])
         .state(String::from("haunted"))
         .worker(WorkerConfig::default())
@@ -5745,6 +5773,8 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             max_result_bytes: None,
             requires: None,
             handler: send_email_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ));
     let worker = build_runtime_worker("worker-e2e-early-signal", 1, 1, registry);
@@ -5876,6 +5906,7 @@ async fn insert_named_workflow_execution(
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -6689,6 +6720,7 @@ mod reuse_policy_helpers {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         }
     }
 
@@ -7758,7 +7790,8 @@ async fn concurrency_cap_limits_concurrent_claims_cluster_wide() {
     );
 
     // Complete one in-flight task to free a slot.
-    queue::complete_task(&mut conn, t1.unwrap().id, serde_json::json!(null))
+    let claim = TaskClaim::of(&t1.unwrap()).expect("a claimed task");
+    queue::complete_task(&mut conn, &claim, serde_json::json!(null))
         .await
         .expect("complete_task failed");
 
@@ -8076,6 +8109,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 notification_database_url: None,
                 max_concurrent_workflows: 4,
                 max_concurrent_activities: 4,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(100),
                 shutdown_timeout: Duration::from_secs(2),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -8309,6 +8343,7 @@ async fn workflow_schedule_pause_and_resume() {
                 notification_database_url: None,
                 max_concurrent_workflows: 4,
                 max_concurrent_activities: 4,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(100),
                 shutdown_timeout: Duration::from_secs(2),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -8561,6 +8596,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -8745,6 +8781,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -9293,6 +9330,8 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
             max_result_bytes: None,
             requires: None,
             handler: always_non_retryable_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ));
 
@@ -9462,6 +9501,8 @@ async fn circuit_breaker_short_circuits_after_tripping() {
             max_result_bytes: None,
             requires: None,
             handler: always_retryable_failure_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ));
 
@@ -9596,6 +9637,8 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
             max_result_bytes: None,
             requires: None,
             handler: always_legacy_string_failure_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ));
 
@@ -10190,6 +10233,7 @@ async fn insert_cross_type_scheduled_execution(
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -10247,6 +10291,7 @@ async fn insert_manual_trigger_execution(
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -10900,6 +10945,7 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -11059,7 +11105,7 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
     // Repeatedly claim a task, assert the in-flight count respects the cap,
     // then immediately complete one held task to free a slot.  Repeat until all
     // TOTAL tasks have been claimed and completed.
-    let mut held: Vec<Uuid> = Vec::new();
+    let mut held: Vec<TaskClaim> = Vec::new();
 
     loop {
         // Try to claim one more task.
@@ -11076,7 +11122,7 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
         .expect("claim query failed");
 
         if let Some(task) = claimed {
-            held.push(task.id);
+            held.push(TaskClaim::of(&task).expect("a claimed task"));
             let in_flight = u32::try_from(held.len()).unwrap();
             assert!(
                 in_flight <= LIMIT,
@@ -11087,8 +11133,8 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
             }
         } else if !held.is_empty() {
             // Cap is saturated; complete the oldest held task to free a slot.
-            let id = held.remove(0);
-            queue::complete_task(&mut conn, id, serde_json::json!(null))
+            let claim = held.remove(0);
+            queue::complete_task(&mut conn, &claim, serde_json::json!(null))
                 .await
                 .expect("complete_task failed");
             completed_count += 1;
@@ -11111,7 +11157,7 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
             .await
             .expect("claim query failed")
             .is_some_and(|t| {
-                held.push(t.id);
+                held.push(TaskClaim::of(&t).expect("a claimed task"));
                 true
             })
         {
@@ -11124,8 +11170,8 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
     }
 
     // Complete any remaining held tasks.
-    for id in held {
-        queue::complete_task(&mut conn, id, serde_json::json!(null))
+    for claim in held {
+        queue::complete_task(&mut conn, &claim, serde_json::json!(null))
             .await
             .expect("final complete_task failed");
         completed_count += 1;
@@ -11212,7 +11258,8 @@ async fn per_key_concurrency_does_not_block_other_keys() {
             );
             quiet_claimed += 1;
             // Immediately complete quiet tasks so they don't hold state.
-            queue::complete_task(&mut conn, task.id, serde_json::json!(null))
+            let claim = TaskClaim::of(&task).expect("a claimed task");
+            queue::complete_task(&mut conn, &claim, serde_json::json!(null))
                 .await
                 .expect("complete quiet task failed");
         } else {
@@ -11229,7 +11276,8 @@ async fn per_key_concurrency_does_not_block_other_keys() {
     );
 
     // Complete the held loud task; verify the next loud task is now claimable.
-    queue::complete_task(&mut conn, loud_task.id, serde_json::json!(null))
+    let claim = TaskClaim::of(&loud_task).expect("a claimed task");
+    queue::complete_task(&mut conn, &claim, serde_json::json!(null))
         .await
         .expect("complete loud task failed");
 
@@ -11394,6 +11442,8 @@ async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
             max_result_bytes: None,
             requires: None,
             handler: retry_context_activity,
+            input_schema: None,
+            output_schema: None,
         }],
         shared_state,
     ));
@@ -11677,6 +11727,8 @@ fn saga_activity_info(
         max_result_bytes: None,
         requires: None,
         handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -11930,12 +11982,14 @@ fn windowed_fanout_e2e_registry() -> Arc<HandlerRegistry> {
             max_result_bytes: None,
             requires: None,
             handler: slow_double_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ))
 }
 
 /// Insert a RUNNING execution row for `(workflow_name, workflow_id)`.
-async fn insert_named_execution(
+pub(crate) async fn insert_named_execution(
     conn: &mut AsyncPgConnection,
     workflow_name: &'static str,
     workflow_id: &'static str,
@@ -11978,6 +12032,7 @@ async fn insert_named_execution(
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)

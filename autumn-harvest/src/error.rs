@@ -330,6 +330,18 @@ pub enum HarvestError {
         compensation_errors: Vec<String>,
     },
 
+    /// More fan-out items failed than the tolerance allows (issue #1986).
+    ///
+    /// The error carries no failure count. A replay that sees more results
+    /// gives a higher count, and a workflow that branches on it drifts.
+    #[error("fan-out failed: more than {tolerated} of {total} items failed")]
+    FanOutFailureThresholdExceeded {
+        /// The largest number of failures the fan-out tolerates.
+        tolerated: usize,
+        /// The number of items in the fan-out.
+        total: usize,
+    },
+
     /// The workflow's published input schema (issue #373) rejected
     /// `start_input` on a **genuine fresh start** initiated through
     /// [`crate::execution::signal_with_start_workflow_execution`].
@@ -534,6 +546,20 @@ pub enum HarvestError {
         existing_exec_id: ExecutionId,
         /// The state of the conflicting prior run (e.g. `"RUNNING"`, `"COMPLETED"`).
         existing_state: String,
+    },
+
+    /// A start with a tenant met a prior run of another tenant (issue #1977).
+    ///
+    /// The start changes nothing: it does not attach to, cancel, replace or
+    /// seal the prior run. A run with no tenant counts as another tenant. The
+    /// error names no execution, so a caller learns only that the id is in
+    /// use.
+    #[error("workflow id {workflow_name}/{workflow_id} is in use by a run of another tenant")]
+    TenantConflict {
+        /// The workflow type of the start.
+        workflow_name: String,
+        /// The business key of the start.
+        workflow_id: String,
     },
 
     /// An update request was rejected by the handler's validator before being

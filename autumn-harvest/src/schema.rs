@@ -211,6 +211,13 @@ diesel::table! {
         /// row's marker with a direct match on the vacating migration's own
         /// execution id, with no cross-database write and no retry race.
         staging_vacated_by -> Nullable<Uuid>,
+        /// Verified tenant of the run (issue #1977). A start by a tenant-bound
+        /// caller sets it. Children, retries, continue-as-new, reset and re-run
+        /// copy it from the source run. NULL means the run has no tenant.
+        ///
+        /// The 65th column. The workspace enables diesel's
+        /// `128-column-tables` feature for it.
+        tenant -> Nullable<Text>,
     }
 }
 
@@ -698,6 +705,9 @@ diesel::table! {
         last_used_at -> Nullable<Timestamptz>,
         revoked_at -> Nullable<Timestamptz>,
         created_by -> Text,
+        /// Tenant claim of the token (issue #1977). NULL means not
+        /// tenant-bound.
+        tenant -> Nullable<Text>,
     }
 }
 
@@ -840,6 +850,8 @@ diesel::table! {
         /// #1227, Finding 4). The claim query can then exclude the row until
         /// its backoff elapses, instead of leaving it to dominate every batch.
         next_attempt_at -> Nullable<Timestamptz>,
+        /// Tenant of the source run (issue #1977). The target run gets it.
+        tenant -> Nullable<Text>,
     }
 }
 
@@ -1196,6 +1208,23 @@ diesel::table! {
 diesel::table! {
     use diesel::sql_types::*;
 
+    /// Durable workflow output-stream chunks (issue #1974).
+    ///
+    /// Written in the worker persist transaction by
+    /// `ctx.publish_durable_progress`. Not part of `harvest_events` and never
+    /// replayed. `stream_offset` is the call ordinal and the resume cursor.
+    harvest_stream_chunks (id) {
+        id               -> Int8,
+        workflow_exec_id -> Uuid,
+        stream_offset    -> Int8,
+        chunk            -> Jsonb,
+        created_at       -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
     /// Durable resume cursor for the lazy payload-codec re-encryption sweep
     /// (issue #948).
     ///
@@ -1282,6 +1311,7 @@ diesel::table! {
     }
 }
 
+diesel::joinable!(harvest_stream_chunks -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_workflow_logs -> harvest_workflow_executions (workflow_exec_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
@@ -1322,6 +1352,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_wasm_modules,
     harvest_mutex_locks,
     harvest_mutex_waiters,
+    harvest_stream_chunks,
     harvest_workflow_logs,
     harvest_codec_rotation_cursor,
     harvest_codec_key_state,

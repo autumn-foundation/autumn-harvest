@@ -21,7 +21,10 @@ the same shape with one fewer service to operate.
 
 Weighing harvest against Temporal, DBOS, Inngest, Hatchet, or Restate? See the
 honest, evidence-linked [comparison page](docs/comparison.md) — it names
-harvest's own gaps, not just its strengths.
+harvest's own gaps, not just its strengths. The
+[safety report](docs/safety-report.md) states what the engine guarantees for
+leases, fencing, exactly-once completion and signal ordering. It gives the tests,
+the results, a command for each result and the known limits.
 
 Moving an existing Temporal deployment? See the
 [Temporal migration guide](docs/migrating-from-temporal.md) — a concept
@@ -271,8 +274,11 @@ guardrails against a runaway loop:
 A run that reaches a cap fails unless it calls `continue_as_new`. The worker
 moves it to the DLQ with the typed reason. The guardrail adds no workflow
 event variant. The byte measure is `pg_column_size(event_data)`, the
-same measure as the tenant `max_history_bytes` quota. The Postgres worker
-enforces both caps. The SQLite backend does not.
+same measure as the tenant `max_history_bytes` quota. The SQLite backend
+enforces both caps too, with the same defaults (issue #2023). It has no DLQ, so
+the `WorkflowFailed` event carries the reason. Its byte cap measures the
+stored event JSON length, not `pg_column_size`. Set its caps with `set_history_event_hard_cap` and
+`set_history_byte_hard_cap`.
 
 `harvest.workflow.history_bloat` fires once per run at 20.48% of the event
 cap, so at `10_240` events by default. The worker also logs a warning. Set
@@ -339,6 +345,7 @@ for a compile-checked polling loop that works with and without the `db` feature.
 | [`autumn-harvest-cli`](autumn-harvest-cli/) | `harvest` CLI: thin operator client for the management API |
 | [`autumn-harvest-redis`](autumn-harvest-redis/) | Optional Redis Streams dispatch channel — carries references to claimable rows; Postgres stays the source of truth |
 | [`autumn-harvest-sqlite`](autumn-harvest-sqlite/) | Optional SQLite storage backend for single-process and embedded deployments |
+| [`autumn-harvest-agent`](autumn-harvest-agent/) | Optional durable agent loop: model and tool calls as activities, approvals as durable waits ([guide](docs/agent-adapter.md)) |
 
 Use `autumn-harvest-plugin` if you're building an Autumn app. For a non-web
 context — a worker or CLI process with no HTTP surface at all — use the bare
@@ -416,7 +423,7 @@ this section documents.
 
 Match each route's own declared content type instead: `harvest events
 tail` sends `Accept: text/event-stream`, and so must any direct client
-of the `.../events/stream` or `.../stream` routes. `GET /admin/metrics`
+of the `.../events/stream`, `.../stream` or `.../stream/durable` routes. `GET /admin/metrics`
 and `GET /admin/queues/scaling?format=prometheus` return Prometheus
 plain text; do not send `Accept: application/json` to either.
 
@@ -1489,4 +1496,8 @@ With no `telemetry(...)` call (the default), all `info_span!` sites compile to b
 
 ## License
 
-Dual-licensed under MIT or Apache 2.0 at your option.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Each published crate ships both license files.
+
+To contribute, read [`CONTRIBUTING.md`](CONTRIBUTING.md).
+To report a vulnerability, follow [`SECURITY.md`](SECURITY.md).

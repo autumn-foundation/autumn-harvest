@@ -1955,6 +1955,44 @@ impl HistoryMatcher {
         }
     }
 
+    /// Whether [`Self::prepare_match`] would report replay, without moving
+    /// the cursor or filling a stash (issue #1974).
+    ///
+    /// It skips the same events as `prepare_match`: consumed events, and the
+    /// signal, external and update events that `drain_early_signals` takes.
+    /// A caller that only asks "is this call live?" uses it, so the answer
+    /// cannot change what later code sees from [`Self::is_replaying`].
+    #[must_use]
+    pub(crate) fn would_replay_after_prepare(&self) -> bool {
+        self.events
+            .iter()
+            .enumerate()
+            .skip(self.cursor)
+            .any(|(index, event)| {
+                !self.is_consumed(index)
+                    && !Self::is_transparent_external_event(event)
+                    && !Self::is_update_event(event)
+            })
+    }
+
+    /// The events that `drain_early_signals` moves to a stash: signals and
+    /// the external signal, cancel and await events.
+    const fn is_transparent_external_event(event: &WorkflowEvent) -> bool {
+        matches!(
+            event,
+            WorkflowEvent::SignalReceived { .. }
+                | WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. }
+        )
+    }
+
     /// Advances the cursor past already-consumed events, drains any signals
     /// (and update/external-signal/external-cancel events) sitting at the
     /// current cursor into their pending stashes, and resolves any external
@@ -2014,6 +2052,18 @@ impl HistoryMatcher {
     #[must_use]
     pub fn event_count(&self) -> u64 {
         u64::try_from(self.events.len()).unwrap_or(u64::MAX)
+    }
+
+    /// Serialized JSON bytes of the events loaded into this matcher.
+    ///
+    /// It estimates the stored history size. The store can encode or offload
+    /// a payload, so the stored size can differ (issue #1975).
+    #[must_use]
+    pub(crate) fn loaded_bytes(&self) -> u64 {
+        self.events
+            .iter()
+            .map(|event| serde_json::to_vec(event).map_or(0, |json| json.len() as u64))
+            .sum()
     }
 
     /// Returns `true` if there are unconsumed events that are not terminal
@@ -2266,6 +2316,47 @@ impl HistoryMatcher {
         n
     }
 
+    /// The ids of the unconsumed `ActivityScheduled` events at or after the
+    /// cursor, at most `cap` of them (issue #1986).
+    ///
+    /// Read-only. Like
+    /// [`count_pending_scheduled_activities`](Self::count_pending_scheduled_activities),
+    /// but it returns the ids, so a fan-out that stops can consume the start
+    /// events of its slots that still run.
+    #[must_use]
+    pub(crate) fn pending_scheduled_activity_ids(&self, cap: usize) -> Vec<ActivityExecId> {
+        let mut ids = Vec::new();
+        let mut cursor = self.cursor;
+        while cursor < self.events.len() && ids.len() < cap {
+            if !self.is_consumed(cursor)
+                && let WorkflowEvent::ActivityScheduled { activity_id, .. } = &self.events[cursor]
+            {
+                ids.push(*activity_id);
+            }
+            cursor += 1;
+        }
+        ids
+    }
+
+    /// The `u64` value of the first unconsumed marker named `name` at or
+    /// after the cursor (issue #1986).
+    ///
+    /// Read-only. A fan-out that stopped on its tolerance records a stop
+    /// marker. The marker comes after the slots in history, but replay must
+    /// know the slot count before it reaches the marker.
+    #[must_use]
+    pub(crate) fn peek_u64_marker_ahead(&self, name: &str) -> Option<u64> {
+        (self.cursor..self.events.len())
+            .filter(|&i| !self.is_consumed(i))
+            .find_map(|i| match &self.events[i] {
+                WorkflowEvent::MarkerRecorded {
+                    name: recorded,
+                    details,
+                } if recorded == name => details.as_u64(),
+                _ => None,
+            })
+    }
+
     /// Total number of events in history.
     #[must_use]
     pub const fn len(&self) -> usize {
@@ -2316,16 +2407,7 @@ impl HistoryMatcher {
                 // by their own primitives regardless of where they fall in
                 // history relative to ActivityScheduled / TimerStarted events
                 // (mixed batches).
-                WorkflowEvent::SignalReceived { .. }
-                | WorkflowEvent::ExternalSignalRequested { .. }
-                | WorkflowEvent::ExternalSignalDelivered { .. }
-                | WorkflowEvent::ExternalSignalFailed { .. }
-                | WorkflowEvent::ExternalCancelRequested { .. }
-                | WorkflowEvent::ExternalCancelDelivered { .. }
-                | WorkflowEvent::ExternalCancelFailed { .. }
-                | WorkflowEvent::ExternalAwaitRequested { .. }
-                | WorkflowEvent::ExternalAwaitResolved { .. }
-                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                ev if Self::is_transparent_external_event(ev) => {
                     self.stash_transparent_external_event(self.cursor);
                     self.cursor += 1;
                     self.advance_to_next_unconsumed_event();
