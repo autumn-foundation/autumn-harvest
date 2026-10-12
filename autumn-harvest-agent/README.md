@@ -13,7 +13,8 @@ but it does not depend on that crate. On the engine:
 - A call that the policy gates waits on a durable signal with a deadline.
 
 It also has the always-on primitives: heartbeats, follow-ups on a durable
-timer, delivery, a frozen memory snapshot, and a loop guard.
+timer, delivery, a frozen memory snapshot, and a loop guard. An opt-in
+response cache serves an identical model call across runs, per tenant.
 
 A crash costs at most the one step that was in flight. The crate depends on
 the core engine only. It has no Autumn plugin and no `autumn-web` dependency.

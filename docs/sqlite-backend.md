@@ -24,8 +24,7 @@ R&D decision record [`docs/rnd/sqlite-feasibility.md`](rnd/sqlite-feasibility.md
 5. [Registering workflows and activities](#5-registering-workflows-and-activities)
 6. [Starting a workflow](#6-starting-a-workflow)
 7. [The drive model](#7-the-drive-model)
-8. [Signals (pull-only)](#8-signals-pull-only), and
-   [updates](#updates-issue-2025)
+8. [Signals](#8-signals), and [updates](#updates-issue-2025)
 9. [Durability and crash recovery](#9-durability-and-crash-recovery)
 10. [The single-writer / single-server contract](#10-the-single-writer--single-server-contract)
 11. [v0.1 non-goals and follow-ups](#11-v01-non-goals-and-follow-ups)
@@ -256,6 +255,7 @@ match rt.run_until_blocked(exec).await? {
     RunState::Failed(err)       => println!("failed: {err}"),
     RunState::WaitingSignal(name) => println!("blocked on signal `{name}`"),
     RunState::WaitingTimer      => println!("blocked on a durable timer"),
+    RunState::ContinuedAsNew(next) => println!("continued as new; drive {next}"),
     RunState::InProgress        => {} // not returned by run_until_blocked
 }
 
@@ -279,6 +279,7 @@ match rt.outcome(exec)? {
 - **`poll_once()`** for a custom loop — e.g. a background tick where you decide
   the cadence and inspect the `bool` progress flag yourself.
 
+
 `poll_once()`/`run_until_idle()` drive every execution in a pass even if an
 earlier one errors — see [§11](#11-v01-non-goals-and-follow-ups) for what
 happens to a rejected execution. `run_until_blocked(exec)` is the one
@@ -296,12 +297,61 @@ Timers use the real wall clock (read once per decision cycle), so a run blocked
 on a `ctx.timer(...)` that is not yet due returns `WaitingTimer`; drive it again
 after the deadline passes and it proceeds.
 
+### Long-lived runs: `continue_as_new` and the history caps (issue #2023)
+
+Each decision reloads and replays the whole history. A loop workflow, such as
+an agent session or a poller, must therefore bound its history. Call
+`ctx.continue_as_new(input)`. One transaction then does all of this:
+
+- It appends `WorkflowContinuedAsNew` and seals the run `CONTINUED_AS_NEW`.
+- It starts a successor with the same `workflow_name` and `workflow_id`. The
+  successor's `WorkflowStarted` carries `input`.
+- It appends the staged signals that the hand-off decision replayed to the
+  old run (issue #2020). Such a signal stays with the old run, read or not,
+  as on Postgres. A backlog past the room the history caps leave was not
+  replayed. It moves to the successor, so each signal arrives exactly once.
+- It deletes the old run's pending tasks and unfired timers.
+
+`run_until_blocked` returns `RunState::ContinuedAsNew(successor)`. A later
+drive of the old run returns the same successor and starts no other run.
+`run_until_idle` and `poll_once` drive the successor like any other run.
+`start_workflow_with_id` with the same id attaches to the newest run. Send
+later signals to the successor, because the old run is terminal.
+
+`continue_as_new` bounds the replay cost of a run, not the database size. This
+backend has no retention, so each sealed run keeps its history in the file.
+
+`outcome()` of the old run is `ExecutionOutcome::Terminated("CONTINUED_AS_NEW")`.
+`successor(old)` returns the successor id without a drive.
+`ctx.should_continue_as_new()` uses the default threshold of 10,000 events. An
+event cap at or below it logs a warning, because the cap then fails the run
+before the advice turns true.
+
+The #1804 hard caps apply, with the Postgres defaults:
+
+| Cap | Default | Setter | Reason |
+| --- | --- | --- | --- |
+| Events per run | `50_000` | `set_history_event_hard_cap(Some(n))` | `HistoryCapExceeded { count, cap, workflow_type }` |
+| Stored bytes per run | 50 MiB | `set_history_byte_hard_cap(Some(n))` | `HistoryBytesCapExceeded { bytes, cap, workflow_type }` |
+
+`None` removes a cap. A decision that reaches a cap rolls back. The run then
+fails, and the drive returns `RunState::Failed` with the reason JSON. The
+`WorkflowFailed` event holds the same JSON in `error`. The event is
+byte-identical to the one the Postgres worker writes. Parse the JSON as
+`HistoryCapReason`. The seal removes the run's pending tasks, unfired timers
+and staged signals.
+
+A continuing run is exempt, because its successor starts a new history. The
+event count includes the decision's own appends. The byte count is the stored
+event JSON length when the decision starts. Postgres measures
+`pg_column_size` instead, so the two byte counts can differ.
+
 ---
 
-## 8. Signals (pull-only)
+## 8. Signals
 
-Deliver a signal from outside with `send_signal`; consume it inside the workflow
-with a **pull** primitive.
+Deliver a signal from outside with `send_signal`. Read it inside the workflow
+with any signal API.
 
 ```rust
 // Inside the workflow — block until the signal arrives:
@@ -313,22 +363,38 @@ rt.send_signal(exec, "approve", serde_json::json!(true))?;
 rt.run_until_blocked(exec).await?;
 ```
 
-A staged signal is appended to history (as `SignalReceived`) **only when a
-workflow reaches a pull primitive that consumes it** — this backend is
-pull-only. The supported pull surface is the plain waits
-(`wait_for_signal` / `receive_signal`) and the signal-or-deadline waits
-(`wait_for_signal_timeout` / `receive_signal_timeout`, which race the signal
-against a durable deadline timer).
+Each drive appends every staged signal to history (as `SignalReceived`)
+before the workflow runs, in arrival order. Postgres does the same at task
+preparation. So every signal API works here:
+
+- the blocking waits `wait_for_signal` / `receive_signal`;
+- the non-blocking reads `drain_signals` / `try_receive_signal`;
+- push handlers (`register_signal_handler`), also with `await_condition`;
+- the signal-or-deadline waits `wait_for_signal_timeout` /
+  `receive_signal_timeout`. They race the signal against a durable deadline
+  timer, and arrival time decides the winner.
+
+A push handler runs at the next durable call (a timer, an activity or a signal
+read) after it registers. Put such a call between the registration and a read
+of its state. A run parked on `await_condition` emits no command, so a drive
+before the signal returns `SqliteError::Stuck`. `poll_once` and
+`run_until_idle` report it as a per-execution error and still drive the other
+runs. The run stays `RUNNING`. Drive it again after `send_signal`.
+
+The history caps bound this ingest. A drive reads staged signals only up to
+the room the caps leave. A signal flood thus fails the run at the cap, as on
+Postgres, and never loads past it into memory.
+
+A signal that the workflow never reads also reaches history. The strict core
+`WorkflowReplayer` then reports `NonDeterminismDetected(EarlyCompletion)`, as
+for a Postgres history. A signal that lost a deadline race is exempt. A file
+from an earlier release can hold signals staged for a name that the run never
+awaited. The first drive after the upgrade appends them to history.
 
 `send_signal` validates the target at the boundary: an unknown execution is
 `SqliteError::ExecutionNotFound` and a terminal one is
-`SqliteError::WorkflowNotRunning`, so a wakeup no live wait could ever consume is
+`SqliteError::WorkflowNotRunning`, so a wakeup no drive could ever consume is
 rejected rather than silently lost.
-
-> Push-based signal *handlers* (`register_signal_handler`) and the non-blocking
-> drain APIs (`drain_signals` / `try_receive_signal`) depend on the Postgres
-> task-preparation ingest and are **not** available here — restrict to the pull
-> primitives.
 
 ### Updates (issue #2025)
 
@@ -467,7 +533,10 @@ specific command/feature. The run then ends `FAILED` (see below):
   `request_cancel_external_workflow`).
 - **Local activities** (`execute_local_activity`) and **external / task-token
   activities**.
-- **Search attributes** (`upsert_search_attributes`) and **`continue_as_new`**.
+- **Search attributes** (`upsert_search_attributes`) and a **continue-as-new
+  to a different type** (`continue_as_new_as_type`). The token is
+  `ContinueAsNew.new_workflow_type`. A same-type `continue_as_new` is
+  supported (see [§7](#7-the-drive-model)).
 - **Worker sessions** (`create_session`) and **cancellable durable timers**
   (`start_timer` / `TimerHandle::…` — use the fire-once `ctx.timer(...)`).
 
@@ -489,7 +558,8 @@ That drive still returns `SqliteError::Unsupported`, so the caller sees the
 reason. A later drive returns `RunState::Failed` and does not run the handler
 again. `outcome()` returns `ExecutionOutcome::Failed`.
 
-Only an unsupported feature seals a run. Other errors leave the run `RUNNING`:
+Only an unsupported feature or a history cap seals a run. Other errors leave
+the run `RUNNING`:
 an unregistered workflow or activity, a replay divergence, a contained panic
 under its budget, or a failed task. A fix in the same runtime can then resume
 the run.
@@ -536,8 +606,8 @@ gate no control flow): `ctx.set_current_details(...)` and a re-park
 - **[`examples/claude-agent-daemon/`](../examples/claude-agent-daemon/)** — a
   whole application on this backend: a local daemon that runs Claude agent
   sessions as durable workflows. It shows the drive loop
-  ([§7](#7-the-drive-model)), pull signals with a deadline
-  ([§8](#8-signals-pull-only)), and crash recovery
+  ([§7](#7-the-drive-model)), signals with a deadline
+  ([§8](#8-signals)), and crash recovery
   ([§9](#9-durability-and-crash-recovery)) in one place, and it runs with no API
   key against a scripted offline model.
 

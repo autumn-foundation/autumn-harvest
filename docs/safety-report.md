@@ -348,7 +348,7 @@ their order. Signals that share one time have no defined order on either run.
   stays on the old run.
 - No TLA+ model, simulator or history check covers signals. No
   infrastructure-fault test sends a signal.
-- The SQLite backend has its own signal limits, for example #2020 and #2028.
+- The SQLite backend has its own signal limits, for example #2028.
 
 ## Bugs these tests found
 

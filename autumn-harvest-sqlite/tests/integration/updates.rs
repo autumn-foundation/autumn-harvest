@@ -201,12 +201,13 @@ async fn body_update_err_then_wait_wf(ctx: &WorkflowContext, _n: i64) -> Result<
     Ok(json!({ "failed": failed, "go": go }))
 }
 
-/// Registers `set_limit`, waits for `go`, then panics.
+/// Registers `set_limit`, waits on a 60 second timer, then panics. The
+/// fired timer is in history, so every replay past it panics.
 #[workflow]
-async fn panic_after_go_wf(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+async fn panic_after_timer_wf(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
     ctx.register_update_handler_no_validator("set_limit", |input: Value| async move { Ok(input) });
-    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
-    panic!("panic after go");
+    ctx.timer("t", 60).await.map_err(|e| e.to_string())?;
+    panic!("panic after the timer");
 }
 
 /// A runtime with `limit_wf` started and blocked on `go`.
@@ -577,16 +578,28 @@ async fn update_to_terminal_run_is_rejected() {
 #[tokio::test]
 async fn rebuild_panic_is_contained() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&panic_after_go_wf_info());
-    let exec = rt.start_workflow("panic_after_go_wf", json!(0)).unwrap();
-    rt.run_until_blocked(exec).await.unwrap();
-    rt.send_signal(exec, "go", json!(1)).unwrap();
-    let drive = rt.run_until_blocked(exec).await.unwrap_err();
+    rt.register_workflow(&panic_after_timer_wf_info());
+    let exec = rt.start_workflow("panic_after_timer_wf", json!(0)).unwrap();
+    let t0 = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    rt.run_until_blocked_as_of(exec, t0).await.unwrap();
+    let drive = rt
+        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(61))
+        .await
+        .unwrap_err();
     assert!(
         matches!(drive, SqliteError::WorkflowPanicked { .. }),
         "{drive:?}"
     );
-    let before = rt.load_history(exec).unwrap().len();
+    let history = rt.load_history(exec).unwrap();
+    assert!(
+        history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        "the panic point must be in stored history:\n{history:?}"
+    );
+    let before = history.len();
 
     let err = rt.update(exec, "set_limit", json!(1)).await.unwrap_err();
     assert!(

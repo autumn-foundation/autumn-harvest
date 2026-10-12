@@ -46,14 +46,18 @@
 # per-suite `cargo test` runs CI executes. One suite per line. Read by
 # two PRs each appending a line both land with no textual conflict; a
 # union-merge duplicate/reorder is caught (never a conflict) by
+allos        autumn-harvest         integration                      -                          agent_code_journal_docs
 allos        autumn-harvest         integration                      -                          assay_rerun_docs
 allos        autumn-harvest         integration                      -                          benchmarks_docs
+allos        autumn-harvest         integration                      -                          contention_adaptive_atomicity_docs
 allos        autumn-harvest         integration                      -                          hot_code_swap_docs
 allos        autumn-harvest         integration                      -                          lock_order_docs
 allos        autumn-harvest         integration                      -                          otel_semconv_docs
 allos        autumn-harvest         integration                      -                          partitioned_events_docs
 allos        autumn-harvest         integration                      -                          standalone_activity_docs
 allos        autumn-harvest         integration                      -                          tenant_isolation_docs
+allos        autumn-harvest         integration                      -                          typed_snapshot_docs
+allos        autumn-harvest         integration                      -                          typed_snapshot_spike_tests
 allos        autumn-harvest         integration                      fuzzing                    replay_fuzz_seeds
 allos        autumn-harvest         integration                      testing                    -
 allos        autumn-harvest         integration                      testing,debugger           debugger_tests
@@ -126,6 +130,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          drain_release_tests
 linux        autumn-harvest         integration                      -                          dst_differential_tests
 linux        autumn-harvest         integration                      -                          dst_world_tests
+linux        autumn-harvest         integration                      -                          durable_stream_tests
 linux        autumn-harvest         integration                      -                          entity_tests
 linux        autumn-harvest         integration                      -                          event_batch_tests
 linux        autumn-harvest         integration                      -                          event_partitioning_tests
@@ -149,6 +154,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          notify_post_commit_tests
 linux        autumn-harvest         integration                      -                          panic_containment_tests
 linux        autumn-harvest         integration                      -                          parent_close_cascade_unfinished_handlers_perf
+linux        autumn-harvest         integration                      -                          partition_archive_tests
 linux        autumn-harvest         integration                      -                          pause_tests
 linux        autumn-harvest         integration                      -                          payload_offload_db_tests
 linux        autumn-harvest         integration                      -                          pg_timeouts_tests
@@ -168,6 +174,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          rate_limit_bucket_gc_tests
 linux        autumn-harvest         integration                      -                          rate_limit_key
 linux        autumn-harvest         integration                      -                          redrive_tests
+linux        autumn-harvest         integration                      -                          resident_hit_rate_db_tests
 linux        autumn-harvest         integration                      -                          resident_outcome_tests
 linux        autumn-harvest         integration                      -                          retention_overrides_tests
 linux        autumn-harvest         integration                      -                          retention_summary_tests
@@ -226,6 +233,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          workflow_reachability_samples_tests
 linux        autumn-harvest         integration                      -                          workflow_retry_tests
 linux        autumn-harvest         integration                      -                          workflow_task_timeout_tests
+linux        autumn-harvest         integration                      atomicity-spike            atomicity_spike_tests
 linux        autumn-harvest         integration                      hot-code-swap,testing      hot_code_swap_tests
 linux        autumn-harvest         integration                      testing                    backup_verify_refs_batch_perf
 linux        autumn-harvest         integration                      testing                    backup_verify_retention_batch_perf
@@ -240,6 +248,7 @@ linux        autumn-harvest         integration                      testing    
 linux        autumn-harvest         integration                      testing                    decision_boundary_db_tests
 linux        autumn-harvest         integration                      testing                    dispatch_tests
 linux        autumn-harvest         integration                      testing                    nd_block
+linux        autumn-harvest         integration                      testing                    remote_task_db_tests
 linux        autumn-harvest         integration                      testing                    replay_canary_tests
 linux        autumn-harvest         integration                      testing                    replayer_integration_tests
 linux        autumn-harvest         integration                      testing                    scheduled_time_tests
@@ -301,6 +310,7 @@ linux        autumn-harvest-plugin  queue_pause_integration          -          
 linux        autumn-harvest-plugin  quota_admin_integration          -                          -
 linux        autumn-harvest-plugin  rate_limit_key_admin_integration  -                          -
 linux        autumn-harvest-plugin  read_path_decode_integration     -                          -
+linux        autumn-harvest-plugin  remote_tasks_integration         mcp,unified-dag-execution  -
 linux        autumn-harvest-plugin  replay_canary_integration        -                          -
 linux        autumn-harvest-plugin  replay_diagnosis_integration     -                          -
 linux        autumn-harvest-plugin  replay_sample_export_integration  -                          -

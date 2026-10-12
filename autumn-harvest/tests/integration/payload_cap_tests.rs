@@ -42,6 +42,8 @@ fn fake_activity_info(name: &'static str) -> ActivityInfo {
         circuit_breaker: None,
         requires: None,
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -325,6 +327,8 @@ fn activity_info_has_max_input_and_result_bytes_fields() {
         circuit_breaker: None,
         requires: None,
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        input_schema: None,
+        output_schema: None,
     };
     assert_eq!(info.max_input_bytes, Some(4 * 1024 * 1024));
     assert_eq!(info.max_result_bytes, Some(8 * 1024 * 1024));

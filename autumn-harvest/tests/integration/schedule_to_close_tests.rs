@@ -599,6 +599,8 @@ fn activity_info_schedule_to_close_duration_roundtrip() {
         circuit_breaker: None,
         requires: None,
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        input_schema: None,
+        output_schema: None,
     };
 
     assert_eq!(

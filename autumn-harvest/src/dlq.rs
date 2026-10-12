@@ -979,6 +979,22 @@ pub async fn replay_dead_letter_at(
 /// *scanned*; narrow with the SQL-expressible filters (queue/activity/workflow/
 /// time window/`min_attempts`) on large DLQs.
 ///
+/// Clone-class note: the six-filter chain (`activity_name` through
+/// `failed_before`) below repeats verbatim in [`query_dead_letters_for_bulk`].
+/// Apply any change to one of those filters to both functions.
+///
+/// Two instances only, co-changed together each time (issue #613 added
+/// `queue_name`/`min_attempts` to both in the same commit).
+///
+/// `api.rs`'s `apply_api_bulk_filters` applies the same predicate set over a
+/// richer type. jscpd does not pair it with either copy here. It is not a
+/// third textual instance, so the merge-evidence bar (rule of three, or a
+/// missed-fix) is not met yet.
+///
+/// PR #824 attempted this exact extraction. It was closed unmerged with no
+/// technical objection on record (stale, not rejected). Re-run jscpd before
+/// retrying it, so a new third instance or missed-fix is not missed.
+///
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`] on query failure.
@@ -1036,6 +1052,11 @@ pub async fn count_bulk_filter_matches(
 
 /// Query dead-letter rows matching `filter`, ordered oldest-first, up to
 /// `filter.effective_limit()` rows.
+///
+/// Clone-class note: the six-filter chain below repeats verbatim in
+/// [`count_bulk_filter_matches`]. Apply any change to one of those filters
+/// to both functions. Two instances only, so the merge-evidence bar is not
+/// met yet. See the note on `count_bulk_filter_matches`.
 async fn query_dead_letters_for_bulk(
     conn: &mut AsyncPgConnection,
     filter: &BulkDlqFilter,
@@ -2698,6 +2719,31 @@ mod tests {
         assert_eq!(back, reason);
         assert_eq!(dlq_reason(&json), "history_bytes_cap_exceeded");
         assert_eq!(error_class(&json), "HistoryBytesCapExceeded");
+    }
+
+    #[test]
+    fn history_cap_reasons_keep_the_bytes_the_sqlite_backend_mirrors() {
+        // Issue #2023: `autumn_harvest_sqlite::HistoryCapReason` writes these
+        // exact bytes. Its own test pins the same literals.
+        let events = DeadLetterReason::HistoryCapExceeded {
+            count: 12_001,
+            cap: 12_000,
+            workflow_type: "billing_poll".into(),
+        };
+        let bytes = DeadLetterReason::HistoryBytesCapExceeded {
+            bytes: 52_428_801,
+            cap: 52_428_800,
+            workflow_type: "billing_poll".into(),
+        };
+
+        assert_eq!(
+            events.to_string(),
+            r#"{"type":"HistoryCapExceeded","count":12001,"cap":12000,"workflow_type":"billing_poll"}"#
+        );
+        assert_eq!(
+            bytes.to_string(),
+            r#"{"type":"HistoryBytesCapExceeded","bytes":52428801,"cap":52428800,"workflow_type":"billing_poll"}"#
+        );
     }
 
     #[test]
