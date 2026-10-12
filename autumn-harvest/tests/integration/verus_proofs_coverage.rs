@@ -248,13 +248,14 @@ fn every_mirrored_source_names_its_verus_proof() {
     }
 }
 
-/// The identifiers of `src` in order. Comments, nested block comments,
-/// and string, raw string and char literals hold no identifier.
-fn code_identifiers(src: &str) -> Vec<String> {
+/// The tokens of `src` in order. A token is an identifier or one
+/// punctuation char. Comments, nested block comments and whitespace yield
+/// none. A string, raw string or char literal yields the token `<lit>`.
+fn code_tokens(src: &str) -> Vec<String> {
     let c: Vec<char> = src.chars().collect();
     let at = |i: usize| c.get(i).copied().unwrap_or('\0');
     let is_ident = |ch: char| ch.is_alphanumeric() || ch == '_';
-    let mut idents = Vec::new();
+    let mut tokens = Vec::new();
     let mut i = 0;
     while i < c.len() {
         match (c[i], at(i + 1)) {
@@ -288,6 +289,7 @@ fn code_identifiers(src: &str) -> Vec<String> {
                     i += if c[i] == '\\' { 2 } else { 1 };
                 }
                 i += 1;
+                tokens.push(LITERAL.to_owned());
             }
             // A char literal. A lifetime has no closing quote, so it
             // falls through and its name lexes as an identifier.
@@ -297,8 +299,12 @@ fn code_identifiers(src: &str) -> Vec<String> {
                     i += if c[i] == '\\' { 2 } else { 1 };
                 }
                 i += 1;
+                tokens.push(LITERAL.to_owned());
             }
-            ('\'', _) if at(i + 2) == '\'' => i += 3,
+            ('\'', _) if at(i + 2) == '\'' => {
+                i += 3;
+                tokens.push(LITERAL.to_owned());
+            }
             (ch, _) if is_ident(ch) => {
                 let start = i;
                 while i < c.len() && is_ident(c[i]) {
@@ -320,22 +326,61 @@ fn code_identifiers(src: &str) -> Vec<String> {
                             i += 1;
                         }
                         i += 1 + hashes;
+                        tokens.push(LITERAL.to_owned());
                         continue;
                     }
                 }
-                idents.push(word);
+                tokens.push(word);
             }
-            _ => i += 1,
+            (ch, _) => {
+                if !ch.is_whitespace() {
+                    tokens.push(ch.to_string());
+                }
+                i += 1;
+            }
         }
     }
-    idents
+    tokens
 }
+
+/// The token that [`code_tokens`] yields for a literal.
+const LITERAL: &str = "<lit>";
 
 /// The first trust escape in `code`, if any.
 fn trust_escape(code: &str) -> Option<&'static str> {
-    code_identifiers(code)
+    code_tokens(code)
         .iter()
         .find_map(|word| TRUST_ESCAPES.iter().copied().find(|e| e == word))
+}
+
+/// The modules that a crate root declares, in order.
+///
+/// The root may hold only `mod <name>;` and `pub mod <name>;` items, and
+/// comments. Any other token is an error. An attribute such as
+/// `#[cfg(any())]` or `#[path = "..."]` could hide a module from Verus, so
+/// none may appear.
+fn root_modules(src: &str) -> Result<Vec<String>, String> {
+    let tokens = code_tokens(src);
+    let mut modules = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let start = if tokens[i] == "pub" { i + 1 } else { i };
+        match tokens.get(start..start + 3) {
+            Some([kw, name, semi])
+                if kw == "mod"
+                    && semi == ";"
+                    && name.chars().all(|ch| ch.is_alphanumeric() || ch == '_') =>
+            {
+                modules.push(name.clone());
+                i = start + 3;
+            }
+            _ => {
+                let rest: Vec<&str> = tokens[i..].iter().take(8).map(String::as_str).collect();
+                return Err(format!("unexpected `{}`", rest.join(" ")));
+            }
+        }
+    }
+    Ok(modules)
 }
 
 #[test]
@@ -386,7 +431,9 @@ fn the_trust_escape_check_lexes_the_source() {
 
 #[test]
 fn every_verus_module_is_in_the_crate_root() {
-    let root = read("formal/verus/src/lib.rs");
+    let root = root_modules(&read("formal/verus/src/lib.rs")).unwrap_or_else(|e| {
+        panic!("formal/verus/src/lib.rs may hold only `mod <name>;` items: {e}")
+    });
     for file in verus_files() {
         let stem = Path::new(&file)
             .file_stem()
@@ -394,7 +441,7 @@ fn every_verus_module_is_in_the_crate_root() {
             .unwrap_or_default();
         if stem != "lib" {
             assert!(
-                root.contains(&format!("mod {stem};")),
+                root.iter().any(|m| m == stem),
                 "formal/verus/src/lib.rs must declare `mod {stem};`, or Verus never checks {file}"
             );
         }
@@ -438,5 +485,20 @@ fn formal_methods_doc_names_every_verus_file_and_mirror() {
             "docs/testing/formal-methods.md does not name `{}`",
             m.source_fn
         );
+    }
+}
+
+#[test]
+fn the_crate_root_check_counts_only_active_modules() {
+    let ok = |src: &str| root_modules(src).expect(src);
+    assert_eq!(ok("mod a;\npub mod b;"), ["a", "b"]);
+    assert_eq!(ok("mod a;\n// mod b;\n/* mod c; */"), ["a"]);
+    for bad in [
+        "#[cfg(any())] mod a;",
+        "#[path = \"other.rs\"] mod a;",
+        "mod a { }",
+        "fn f() {}",
+    ] {
+        assert!(root_modules(bad).is_err(), "{bad}");
     }
 }
