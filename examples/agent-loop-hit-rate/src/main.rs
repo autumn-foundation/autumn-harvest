@@ -222,7 +222,11 @@ async fn main() -> Result<(), BoxError> {
         tokio::spawn(async move { worker.run(&pool).await })
     };
 
-    let task = serde_json::to_value(AgentTask::new("Look up each value, then answer."))?;
+    // The default step cap is 8. Each tool turn is one step, so a larger
+    // `TURNS` needs a larger cap.
+    let mut task = AgentTask::new("Look up each value, then answer.");
+    task.max_steps = u32::try_from(turns)?;
+    let task = serde_json::to_value(task)?;
     let mut started = Vec::with_capacity(runs);
     for run in 0..runs {
         let exec_id = ExecutionId::new();
@@ -238,24 +242,7 @@ async fn main() -> Result<(), BoxError> {
         started.push(exec_id);
     }
 
-    let deadline = Instant::now() + RUN_TIMEOUT;
-    let mut failed = 0_usize;
-    for exec_id in started {
-        loop {
-            let execution = autumn_harvest::execution::load_execution(&mut conn, exec_id).await?;
-            match execution.state.as_str() {
-                "COMPLETED" => break,
-                "FAILED" | "CANCELLED" | "TERMINATED" | "TIMED_OUT" => {
-                    failed += 1;
-                    break;
-                }
-                _ if Instant::now() > deadline => {
-                    return Err(format!("run {exec_id} did not end in {RUN_TIMEOUT:?}").into());
-                }
-                _ => tokio::time::sleep(Duration::from_millis(50)).await,
-            }
-        }
-    }
+    let failed = wait_for_runs(&mut conn, started).await?;
     worker.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
 
@@ -273,12 +260,59 @@ async fn main() -> Result<(), BoxError> {
     if failed > 0 {
         return Err(format!("{failed} runs did not complete").into());
     }
+    let decisions: u64 = resident.values().sum();
+    let expected = expected_decisions(runs, turns);
+    if decisions != expected {
+        return Err(format!(
+            "{decisions} decisions, expected {expected}: a run ended before its last tool turn"
+        )
+        .into());
+    }
     Ok(())
+}
+
+/// Waits until each run ends. Returns the number of runs that did not
+/// complete.
+async fn wait_for_runs(
+    conn: &mut AsyncPgConnection,
+    started: Vec<ExecutionId>,
+) -> Result<usize, BoxError> {
+    let deadline = Instant::now() + RUN_TIMEOUT;
+    let mut failed = 0_usize;
+    for exec_id in started {
+        loop {
+            let execution = autumn_harvest::execution::load_execution(conn, exec_id).await?;
+            match execution.state.as_str() {
+                "COMPLETED" => break,
+                "FAILED" | "CANCELLED" | "TERMINATED" | "TIMED_OUT" => {
+                    failed += 1;
+                    break;
+                }
+                _ if Instant::now() > deadline => {
+                    return Err(format!("run {exec_id} did not end in {RUN_TIMEOUT:?}").into());
+                }
+                _ => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    }
+    Ok(failed)
+}
+
+/// The decisions of `runs` runs with `turns` tool turns each. A run makes
+/// one start decision, one per model turn and one per tool result.
+fn expected_decisions(runs: usize, turns: usize) -> u64 {
+    u64::try_from(runs * (2 * turns + 2)).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_makes_two_decisions_per_tool_turn_and_two_more() {
+        assert_eq!(expected_decisions(20, 4), 200);
+        assert_eq!(expected_decisions(20, 12), 520);
+    }
     use autumn_harvest_agent::{ChatMessage, ChatRole};
 
     fn request(results: usize) -> ChatRequest {

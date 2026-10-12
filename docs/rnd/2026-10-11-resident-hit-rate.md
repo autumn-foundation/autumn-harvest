@@ -1,35 +1,38 @@
 # Resident-state hit rate — first measurements (issue #2007)
 
-> **Status:** measurement record. No code change follows from it here. It
-> answers the question of issue #2007 for two workloads: how often does a
-> warm decision resume the parked workflow (#1798)?
+> **Status:** measurement record. It answers the question of issue #2007
+> for two workloads: how often does a warm decision resume the parked
+> workflow (#1798)? It also records one finding: the second claim loop of
+> #2106 adds cold decisions under load.
 
 ## Question
 
-Resident workflow state skips replay only for a narrow set of suspensions.
-Two bets of epic #1970 depend on how often real workflows hit that path:
+Resident workflow state skips replay only for some suspensions. Two bets
+of epic #1970 depend on how often real workflows take that path:
 
-- **Generalize the resident path.** This helps when many misses come from
-  joins, races, mutexes or other narrow-path limits.
-- **Typed-state snapshots.** This helps when many misses are `cold`: no
+- **Generalize the resident path.** This helps when many replays come from
+  joins, races, mutexes or other shapes that the path does not cover.
+- **Typed-state snapshots.** This helps when many replays are `cold`: no
   resident state on the worker, as on a first decision, a restart or an
   eviction.
 
-The counters `harvest.workflow.resident_hit` and
-`harvest.workflow.resident_miss{reason}` answer it. See
-[Resident hit rate](../telemetry.md#resident-hit-rate-issue-2007).
+The counter `harvest.workflow.resident{workflow, queue, outcome}` (#2114)
+answers it. `outcome` is `hit`, or the reason why the decision replayed
+history. See the `harvest.workflow.resident` row in
+[`docs/telemetry.md`](../telemetry.md).
 
 ## Method
 
-Both runs use one worker with the defaults: sticky routing on, resident
-workflows on, a cache of 1,000 entries. A recorder counts the two counters.
-Each decision records one sample.
+Each run uses one worker with the defaults: sticky routing on, resident
+workflows on, a cache of 1,000 entries and two claim loops (#2106). A
+recorder counts each `outcome`. Each decision records one sample.
 
 ### Run 1 — e2e bench, `throughput` scenario
 
 The canonical workflow runs three activities in sequence. Each run makes
 four decisions: the start and one per activity result. The bench prints the
-counts of the measured loop in its notes.
+outcomes of its measured loop in its notes. Its recorder returns `false`
+from `is_enabled`, so the worker starts no metric sampler.
 
 ```sh
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
@@ -41,7 +44,9 @@ HARVEST_BENCH_SCENARIOS=throughput HARVEST_BENCH_SHARDS=1 \
 
 The binary runs the real `autumn_harvest_agent::agent_loop` with an offline
 model. The model asks for one tool call per turn, then answers. A run with
-`TURNS` tool turns makes `2 × TURNS + 2` decisions.
+`TURNS` tool turns makes `2 × TURNS + 2` decisions. The binary sets the step
+cap of each run to `TURNS`. It fails if the decision total differs from
+`RUNS × (2 × TURNS + 2)`.
 
 ```sh
 DATABASE_URL=postgres://postgres:postgres@localhost:5432/agent_hit_rate \
@@ -52,8 +57,8 @@ DATABASE_URL=postgres://postgres:postgres@localhost:5432/agent_hit_rate \
 
 | | |
 |:--|:--|
-| Date | 2026-10-11 |
-| Commit | `bac2d66` (PR #2109) |
+| Date | 2026-10-12 |
+| Base | `trunk-dev` at `abdd301`, with #2106 and #2114 |
 | CPUs | 4 logical, cloud container |
 | Postgres | 16.15, local, one server |
 | Bench profile | `bench` (release) |
@@ -61,50 +66,55 @@ DATABASE_URL=postgres://postgres:postgres@localhost:5432/agent_hit_rate \
 
 ## Results
 
-### Run 1 — e2e bench `throughput`, 1 shard
+### Run 1 — e2e bench `throughput`, 1 shard, 1,200 measured runs
 
-1,200 measured completions at 31.72 workflows/s.
+| Claim loops | Decisions | `hit` | `cold` | Hit rate | Workflows/s |
+|---|---:|---:|---:|---:|---:|
+| 2 (default) | 4,873 | 3,600 | 1,273 | 73.9% | 47.91 |
+| 2 (default), repeat | 4,861 | 3,600 | 1,261 | 74.1% | 41.37 |
+| 1 | 4,800 | 3,600 | 1,200 | 75.0% | 33.88 |
 
-| Outcome | Decisions | Share |
-|---|---:|---:|
-| resident hit | 3,600 | 75.0% |
-| miss: `cold` | 1,200 | 25.0% |
-| **total** | 4,800 | |
+### Run 2 — `agent_loop`, 20 runs
 
-### Run 2 — `agent_loop`
-
-| Runs × tool turns | Decisions | Resident hits | Miss: `cold` | Hit rate |
+| Tool turns | Decisions | `hit` | `cold` | Hit rate |
 |---|---:|---:|---:|---:|
-| 20 × 4 | 200 | 180 | 20 | 90.0% |
-| 20 × 12 | 360 | 340 | 20 | 94.4% |
+| 4 | 200 | 180 | 20 | 90.0% |
+| 12 | 520 | 500 | 20 | 96.2% |
 
-No other miss reason occurred in either run.
+The 4-turn run gave the same counts in four repeats. No outcome other than
+`hit` and `cold` occurred in any run.
 
 ## Reading
 
-- **Every decision after the first resumed warm.** Each run had exactly one
-  miss, its first decision, and that miss was `cold`. For a run with `n`
-  decisions on one worker, the hit rate is `(n − 1) / n`.
-- **The narrow path already covers these shapes.** A sequential workflow and
-  the sequential agent loop await one command per cycle. The issue predicted
-  this for agents, and the data confirms it.
-- **For these shapes, the remaining misses are all `cold`.** A wider
-  resident path would win nothing here. Typed-state snapshots could reach
-  the first decision after a restart or an eviction. A run's very first
-  decision has no earlier state to restore.
+- **Each run resumes warm after its first decision.** Every run had one
+  `cold` first decision and a `hit` for each later decision. For a run with
+  `n` decisions on one worker, the hit rate is `(n − 1) / n`.
+- **The resident path already covers these shapes.** A sequential workflow
+  and the sequential agent loop await one command per cycle.
+- **The second claim loop adds cold decisions under load.** With two claim
+  loops, the bench made 61 to 73 decisions more than four per run, and each
+  extra decision was `cold`. With one claim loop, it made exactly four per
+  run. The hits do not change, so the extra decisions are replays on top of
+  the warm path. The agent loop shows no extra decisions at its lower rate.
+- **For these shapes, a wider resident path wins nothing.** Typed-state
+  snapshots can reach a decision after a restart or an eviction. A run's
+  first decision has no state to restore. The extra decisions under two
+  claim loops need their cause found first.
 
 ## Limits
 
 - One worker and no eviction. A fleet with failover, rolling deploys or a
-  small cache adds `cold` misses that these runs do not show.
+  small cache adds `cold` replays that these runs do not show.
 - No joins, races, approvals, conditions or push signal handlers. The agent
-  run used no approval policy. An approval with a deadline is a race, so it
-  would add `race` misses. The production mix of these shapes needs a
-  measurement on real traffic. The counters now make that possible.
+  run used no approval policy. An approval with a deadline is a race.
 - The two workloads are synthetic. Each activity returns at once.
+- These runs do not show why a second claim loop adds decisions. One
+  explanation fits: a second workflow task for a run is claimed while the
+  first decision holds the cache entry. The runs do not test it.
+- An earlier 4-turn run counted 21 cache misses, one more than its runs.
+  Its outcome table was not kept. The four later runs matched exactly.
 
 ## Next step
 
-Read the counters on a real fleet before you choose between the two bets.
-The [dashboard panels](../dashboards/starter-pack-v0.1.0.json) "Resident hit
-ratio" and "Resident misses by reason" show both views.
+- Find the cause of the extra cold decisions under two claim loops (#2106).
+- Read the counter on a real fleet before choosing between the two bets.

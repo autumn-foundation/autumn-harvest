@@ -41,7 +41,8 @@ DATABASE_URL=postgres://postgres:postgres@localhost:5432/agent_hit_rate \
 
 A run with `TURNS` tool turns makes `2 × TURNS + 2` decisions: the start,
 one per model turn and one per tool call. The first decision of each run is
-always `cold`.
+always `cold`. The binary sets the step cap of each run to `TURNS`, and it
+fails if the decision total differs from `RUNS × (2 × TURNS + 2)`.
 
 Recorded results are in
 [`docs/rnd/2026-10-11-resident-hit-rate.md`](../../docs/rnd/2026-10-11-resident-hit-rate.md).
