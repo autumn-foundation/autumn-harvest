@@ -17,7 +17,10 @@ script pins the Verus release `0.2026.10.12.4bfc2b4` by SHA-256 and checks
 Each proof checks a copy of an engine function. The no-DB guard suite
 `verus_proofs_coverage.rs` fails when a copy drifts from its source, when
 a proof uses `assume` or `external_body`, or when CI stops running the
-script.
+script. It also fails when a contract changes. The stored list
+`formal/verus/contracts.txt` holds each proof's `requires` and `ensures`
+clauses and each `spec fn`, so a weaker property is a visible change to a
+second, generated file. Rewrite the list with `UPDATE_VERUS_CONTRACTS=1`.
 
 **Defect found by Verus (issue #1832).** `dlq::redrive_spread_offset`
 computed `(slot * mix64(seed)) >> 64` in `u128`. For a window over about

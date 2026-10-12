@@ -572,8 +572,18 @@ The guard suite fails in these cases:
   `#[verifier::...]` attribute can trust a step, and a `#[cfg(...)]` can
   delete a proof, so a new attribute must be allowed in the guard on
   purpose.
+- A Verus contract differs from its line in `formal/verus/contracts.txt`.
+  The list holds the signature and the `requires`, `ensures` and
+  `decreases` clauses of each function, and the whole of each `spec fn`.
+  A weaker `ensures` clause still verifies, so this guard makes it a
+  visible change to a second, generated file. A deleted lemma fails the
+  same way. Do not edit the list by hand. Rewrite it with
+  `UPDATE_VERUS_CONTRACTS=1 cargo test -p autumn-harvest --test integration verus_proofs_coverage::every_verus_contract_matches_the_stored_list`.
 - `formal/verus/src/lib.rs` does not declare a module, so Verus never
   checks it.
+- A Verus file sits below `formal/verus/src`, or a proof file loads
+  another file with `mod <name>;` or `include!`. No guard would read that
+  file.
 - `ci.yml` does not run the script on every PR.
 - This page does not name a Verus file or a mirrored function.
 
