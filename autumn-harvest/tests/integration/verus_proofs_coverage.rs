@@ -332,7 +332,10 @@ const CONTRACTS_HEADER: &str = "\
 /// of tokens.
 ///
 /// An item ends at a `;` or at the `}` of its body, outside parentheses
-/// and brackets. A `spec fn` keeps its body. Any other item drops its body.
+/// and brackets. A `spec fn` keeps its body. Any other `fn` drops its body.
+/// An `impl`, `trait` or `mod` item gives one line for its header, one for
+/// each item inside it, and one for its `}`. Any other item keeps its body,
+/// because a `struct` or `enum` body gives a contract its meaning.
 fn contracts(src: &str) -> Vec<String> {
     let tokens = code_tokens(src);
     let Some(at) = tokens
@@ -343,12 +346,18 @@ fn contracts(src: &str) -> Vec<String> {
     };
     let close = matching_brace(&tokens, at + 2);
     let mut out = Vec::new();
-    let mut i = at + 3;
-    while i < close {
+    item_contracts(&tokens, at + 3, close, &mut out);
+    out
+}
+
+/// Pushes the contract of each item in `tokens[from..to]` to `out`.
+fn item_contracts(tokens: &[String], from: usize, to: usize, out: &mut Vec<String>) {
+    let mut i = from;
+    while i < to {
         let start = i;
         let mut depth = 0_i32;
         let mut body = None;
-        while i < close {
+        while i < to {
             let t = tokens[i].as_str();
             i += 1;
             match t {
@@ -357,21 +366,32 @@ fn contracts(src: &str) -> Vec<String> {
                 ";" if depth == 0 => break,
                 "{" if depth == 0 => {
                     body = Some(i - 1);
-                    i = matching_brace(&tokens, i - 1) + 1;
+                    i = matching_brace(tokens, i - 1) + 1;
                     break;
                 }
                 _ => {}
             }
         }
         let item = &tokens[start..i];
-        let spec = item.iter().take_while(|t| *t != "fn").any(|t| t == "spec");
-        let kept = match body {
-            Some(b) if !spec => &tokens[start..b],
-            _ => item,
+        let Some(b) = body else {
+            out.push(render(item));
+            continue;
         };
-        out.push(render(kept));
+        let head = &tokens[start..b];
+        if head.iter().any(|t| t == "fn") {
+            let spec = head.iter().take_while(|t| *t != "fn").any(|t| t == "spec");
+            out.push(render(if spec { item } else { head }));
+        } else if head
+            .iter()
+            .any(|t| matches!(t.as_str(), "impl" | "trait" | "mod"))
+        {
+            out.push(render(&tokens[start..=b]));
+            item_contracts(tokens, b + 1, i - 1, out);
+            out.push("}".to_string());
+        } else {
+            out.push(render(item));
+        }
     }
-    out
 }
 
 /// Joins tokens into one line of code-like text.
@@ -489,6 +509,36 @@ fn contracts_keep_clauses_and_spec_bodies_only() {
     assert_ne!(contracts(src), contracts(&weaker));
     let body_only = src.replace("    x\n}", "    x + 0\n}");
     assert_eq!(contracts(src), contracts(&body_only));
+}
+
+#[test]
+fn contracts_read_the_items_inside_a_container() {
+    let src = "verus! {\n\
+        struct P { x: u8 }\n\
+        impl P {\n    proof fn lemma(self)\n        ensures self.x < 9,\n    {\n    }\n}\n\
+        mod m {\n    trait T {\n        spec fn f(&self) -> int;\n    }\n}\n\
+        }\n";
+    assert_eq!(
+        contracts(src),
+        [
+            "struct P { x: u8 }",
+            "impl P {",
+            "proof fn lemma(self) ensures self.x < 9,",
+            "}",
+            "mod m {",
+            "trait T {",
+            "spec fn f(& self) -> int;",
+            "}",
+            "}",
+        ]
+    );
+    let weaker = src.replace("self.x < 9", "self.x < 99");
+    assert_ne!(contracts(src), contracts(&weaker));
+    let deleted = src.replace(
+        "proof fn lemma(self)\n        ensures self.x < 9,\n    {\n    }\n",
+        "",
+    );
+    assert_ne!(contracts(src), contracts(&deleted));
 }
 
 #[test]
