@@ -2,8 +2,10 @@
 
 **What changed.** `pool::engine_manager(dsn)` builds the connection manager
 with `RecyclingMethod::Fast`. `pool::with_engine_timeouts` adds a
-`pre_recycle` hook that pings a connection only when it has been idle for
-`pool::VERIFY_IDLE_AFTER` (1 second) or longer. A failed ping drops the
+`pre_recycle` hook that pings a connection only when its last checkout is
+`pool::VERIFY_IDLE_AFTER` (1 second) or longer ago. The ping runs under the
+`recycle` timeout. deadpool stamps the time at checkout, so a connection that
+a caller held for a second is pinged too. A failed ping drops the
 connection, and the pool takes the next one. `engine_pool`, the sharded pool
 and the e2e bench build their pools this way.
 
