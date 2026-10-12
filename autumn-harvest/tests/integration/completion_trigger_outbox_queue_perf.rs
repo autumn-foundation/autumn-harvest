@@ -163,6 +163,7 @@ fn build_outbox_rows(n: usize, distinct_names: &[String]) -> Vec<NewCompletionTr
             concurrency_limit: None,
             priority: json!("Normal"),
             max_workflow_input_bytes: 1_048_576,
+            tenant: None,
         })
         .collect()
 }
@@ -496,6 +497,7 @@ async fn outbox_scan_resolves_the_same_queue_with_or_without_batching() {
             concurrency_limit: None,
             priority: json!("Normal"),
             max_workflow_input_bytes: 1_048_576,
+            tenant: None,
         },
         NewCompletionTriggerOutboxDb {
             source_exec_id: Uuid::new_v4(),
@@ -509,6 +511,7 @@ async fn outbox_scan_resolves_the_same_queue_with_or_without_batching() {
             concurrency_limit: None,
             priority: json!("Normal"),
             max_workflow_input_bytes: 1_048_576,
+            tenant: None,
         },
     ];
     diesel::insert_into(harvest_completion_trigger_outbox::table)

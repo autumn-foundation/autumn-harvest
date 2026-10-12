@@ -2599,11 +2599,11 @@ fn classify_force_fail_target(
 ///   [`enforce_activity_timeout`] and the worker's `finalize_activity_*`
 ///   paths use, so a concurrent late worker result serializes with this call
 ///   rather than racing it).
-/// - **Late results are ignored**: after this commits, a late `Ok` hits
-///   `complete_task`'s `state = 'RUNNING'` filter (no-op error), a late
-///   retryable `Err` hits `requeue_for_retry`'s `state = 'RUNNING'` filter
-///   (cannot resurrect the FAILED row), and a late non-retryable `Err` no-ops
-///   in `finalize_activity_failure`'s terminal-history/row-state guards.
+/// - **Late results are ignored.** After this commits, the row is `FAILED`
+///   and the activity is not pending. A late `Ok` writes nothing, because its
+///   claim is lost (issue #1789). A late retryable `Err` cannot requeue the
+///   `FAILED` row. A late non-retryable `Err` no-ops in the terminal-history
+///   and row-state guards of `finalize_activity_failure`.
 /// - **Idempotent**: re-issuing the call on an already-forced task returns
 ///   `Ok` with `already_forced: true` and performs zero writes — including
 ///   after the owning run has since sealed (the woken workflow consuming the
@@ -4070,6 +4070,8 @@ struct SignalDeliveryRequest<'a> {
     /// Whether the cross-shard resolution saw a **live** run on the shard this
     /// attempt is running against — see [`DeliveryRoute::CrossShard`].
     expected_live: bool,
+    /// The registry that encodes the stored payload (issue #1979).
+    codecs: &'a crate::payload_codec::PayloadCodecs,
 }
 
 async fn attempt_signal_delivery(
@@ -4084,15 +4086,17 @@ async fn attempt_signal_delivery(
         payload,
         idempotency_key,
         expected_live,
+        codecs,
     } = request;
     match target {
         ExternalTarget::ExecutionId(target_id) => {
-            match crate::signal::send_signal_idempotent(
+            match crate::signal::send_signal_idempotent_with_codecs(
                 conn,
                 *target_id,
                 signal_name,
                 payload,
                 idempotency_key,
+                codecs,
             )
             .await
             {
@@ -4115,13 +4119,14 @@ async fn attempt_signal_delivery(
         ExternalTarget::WorkflowId {
             workflow_name,
             workflow_id,
-        } => match crate::signal::resolve_and_signal_by_workflow_id(
+        } => match crate::signal::resolve_and_signal_by_workflow_id_with_codecs(
             conn,
             workflow_name,
             workflow_id,
             signal_name,
             payload,
             idempotency_key,
+            codecs,
         )
         .await
         {
@@ -4390,6 +4395,7 @@ pub async fn enforce_external_signals_outbox(
                                 payload: payload.clone(),
                                 idempotency_key: idempotency_key.as_deref(),
                                 expected_live,
+                                codecs: &codecs,
                             },
                             not_found_terminal,
                         )
@@ -4459,6 +4465,7 @@ pub async fn enforce_external_signals_outbox(
                                 payload: payload.clone(),
                                 idempotency_key: idempotency_key.as_deref(),
                                 expected_live,
+                                codecs: &codecs,
                             },
                             not_found_terminal,
                         )
@@ -5605,7 +5612,7 @@ pub async fn enforce_external_awaits_outbox(
                 // the row pending so the sweep continues and retries next
                 // tick (issue #757 review, P2-b).
                 let read_result = if same_pool {
-                    match crate::execution::read_external_await_outcome(conn, target).await {
+                    match crate::execution::read_external_await_outcome_with_codecs(conn, target, &codecs).await {
                         Ok(r) => r,
                         Err(HarvestError::Database(e)) => {
                             tracing::error!(error = %e, "await outbox sweep: db error reading target; leaving pending");
@@ -5649,7 +5656,7 @@ pub async fn enforce_external_awaits_outbox(
                             return Ok(Some((false, Some(row.id))));
                         }
                     };
-                    match crate::execution::read_external_await_outcome(&mut target_conn, target)
+                    match crate::execution::read_external_await_outcome_with_codecs(&mut target_conn, target, &codecs)
                         .await
                     {
                         Ok(r) => r,

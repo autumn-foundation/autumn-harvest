@@ -17,7 +17,9 @@ webhooks = ["autumn-harvest/db"]
 # MCP tool exposure for #[workflow(mcp)] workflows (issue #597). Enables
 # autumn-web's MCP layer so HarvestPlugin::mcp_tools() can project workflows
 # as start/status/signal/update/watch tools via AppBuilder::mount_mcp.
-mcp = ["autumn-web/mcp"]
+# `base64` decodes the `Mcp-Name` header sentinel on the MCP Tasks route
+# (issue #2005). It is already in the lockfile.
+mcp = ["autumn-web/mcp", "dep:base64"]
 # Built-in Prometheus scrape endpoint (issue #355). Registers Harvest's nine
 # ADR-0001 catalogue metrics as an autumn-web MetricsSource feeding the
 # app's shared /actuator/prometheus endpoint. No new dependency: rendering
@@ -49,6 +51,11 @@ aws-kms = ["dep:aws-sdk-kms", "dep:async-trait"]
 object-store = ["dep:sha2"]
 s3 = ["object-store", "dep:aws-sdk-s3"]
 gcs = ["object-store"]
+# HashiCorp Vault Transit binding for the same codec (issue #1981).
+# `autumn_harvest_plugin::vault_transit::VaultTransit` implements `KmsDecrypt`
+# over the Vault HTTP API. It uses the `reqwest` client that this crate already
+# has. `base64` is already in the lockfile, so the feature adds no new crate.
+vault-transit = ["dep:async-trait", "dep:base64"]
 # Zero-setup local dev runtime (issue #525) — the `harvest-dev` binary.
 #
 # Off by default and never in a release build. It provisions an **ephemeral**
@@ -79,6 +86,10 @@ dev-runtime-managed = ["dev-runtime", "dep:postgresql_archive"]
 # carries references to claimable `harvest_task_queue` rows; Postgres stays
 # the source of truth. See `docs/operations/redis-dispatch.md`.
 redis = ["dep:autumn-harvest-redis"]
+# OIDC login for Vantage and the management API (issue #1978). It turns on
+# the autumn-web OIDC client, which does PKCE, `state`, `nonce` and the JWKS
+# check. It adds no crate that is not already in the lockfile. See ADR 0006.
+oidc = ["autumn-web/oauth2"]
 
 
 [dependencies]
@@ -169,6 +180,9 @@ aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio",
 # S3 client for the `s3` feature. Same feature choice as `aws-sdk-sqs`, for the
 # same reason.
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"], optional = true }
+# Base64 for the Vault Transit wire format (`vault-transit` feature). It is
+# already in the lockfile through the core crate.
+base64 = { version = "0.22", optional = true }
 
 [[bin]]
 # Zero-setup local dev runtime (issue #525). `cargo dev` is the workspace alias
@@ -194,6 +208,16 @@ tracing-subscriber = "0.3"
 # Issue #798: the export -> bundle -> drift-gate end-to-end test writes a real
 # bundle directory and feeds it to `WorkflowReplayer::replay_bundle`.
 tempfile = "3"
+# Issue #1978: property tests for the custom-role decision.
+proptest = { workspace = true }
+# Issue #1978: the OIDC round-trip test signs ID tokens for a local mock
+# identity provider. All three crates are already in the lockfile.
+jsonwebtoken = { version = "11.1", default-features = false, features = ["rust_crypto"] }
+ed25519-dalek = "2.2"
+# The KMS binding tests also use `base64` for the fake wire formats (issue
+# #1981).
+base64 = "0.22"
+sha2 = "0.11"
 
 # Deterministic (non-criterion) instruction/allocation-count profiling
 # harness for `dag_graph::build_run_graph` -- the pure projection behind

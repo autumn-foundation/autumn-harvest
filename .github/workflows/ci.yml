@@ -136,6 +136,11 @@ jobs:
         # the `quickstart`/build-only CI jobs run `cargo build`, which can't
         # itself be ambiguous. See scripts/check-default-run.sh.
         run: ./scripts/check-default-run.sh
+      - name: Check license and policy files (issue #1990)
+        # The root must hold the license and policy files. Each publishable
+        # crate must ship both license texts. Cargo does not copy a root file
+        # into a crate. See scripts/check-license-files.sh.
+        run: ./scripts/check-license-files.sh
       - name: Check cargo-dev root caveat is documented
         # Guards a real, reproduced-live defect: `cargo dev` is the flagship
         # "no database, no Docker, nothing to configure" front door
@@ -403,6 +408,14 @@ jobs:
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features object-store -- -D warnings
       - name: Clippy autumn-harvest-plugin (s3 and gcs features, issue #1983)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features s3,gcs -- -D warnings
+      - name: Clippy autumn-harvest-plugin (vault-transit feature, issue #1981)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features vault-transit -- -D warnings
+      # Issue #1978: the OIDC login module is `cfg`d out of the default build.
+      - name: Clippy autumn-harvest-plugin (oidc feature, issue #1978)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features oidc -- -D warnings
+      # The OIDC gate on the MCP tool routes compiles only with both features.
+      - name: Clippy autumn-harvest-plugin (oidc and mcp features, issue #1978)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features oidc,mcp,unified-dag-execution -- -D warnings
       # Issue #1312: the runtime wiring for the Redis dispatch channel is
       # `cfg`d out of the default build, so only this step compiles it.
       - name: Clippy autumn-harvest-plugin (redis feature)
@@ -417,6 +430,18 @@ jobs:
         run: cargo clippy -p autumn-harvest-cli --all-targets -- -D warnings
       - name: Clippy autumn-harvest-sqlite
         run: cargo clippy -p autumn-harvest-sqlite --all-targets -- -D warnings
+      # Issue #1973. `--no-deps`: the core crate without `db` has dead-code
+      # warnings of its own, which the core's own clippy step owns.
+      - name: Clippy autumn-harvest-agent (issue #1973)
+        run: cargo clippy -p autumn-harvest-agent --all-targets --no-deps -- -D warnings
+      - name: Clippy autumn-harvest-agent (sqlite feature)
+        run: cargo clippy -p autumn-harvest-agent --all-targets --features sqlite --no-deps -- -D warnings
+      - name: Clippy autumn-harvest-agent (eval feature, issue #2001)
+        run: cargo clippy -p autumn-harvest-agent --all-targets --features eval --no-deps -- -D warnings
+      - name: Clippy autumn-harvest-agent (sqlite and eval features, issue #2001)
+        run: cargo clippy -p autumn-harvest-agent --all-targets --features sqlite,eval --no-deps -- -D warnings
+      - name: Check autumn-harvest-agent depends on no Autumn crate outside the engine
+        run: ./scripts/check-agent-adapter-deps.sh
       # Same issue #962 rule as every other crate on this page: a workspace
       # member gets NO clippy coverage without its own step, and these three
       # standalone example crates (each its own `examples/*/Cargo.toml`
@@ -499,6 +524,13 @@ jobs:
       # the same trailing-`::` YAML reason as above.
       - name: Run docs/rnd/sqlite-feasibility.md guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration sqlite_feasibility_docs::"
+
+      # Issue #2011: the speculation spike report states measured numbers and
+      # a verdict. A docs-only PR skips the `test` matrix, so its guards run
+      # here. `speculative_execution_docs::guards_run_on_docs_only_changes`
+      # checks that this step exists.
+      - name: Run docs/rnd/speculative-execution-spike.md guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration speculative_execution_docs::"
 
       # Issue #1816: the SLO burn-rate pack lives under `docs/`, so a PR
       # that edits only the pack skips the `test` matrix. These guards pin
@@ -586,6 +618,14 @@ jobs:
       - name: Run audit-export opt-in-cost guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration audit_export_docs::"
 
+      # Issue #1993: the replay positioning page lives under `docs/`, so a
+      # docs-only change skips the `test` matrix. These guards run here,
+      # ungated. `replay_positioning_docs::guards_run_on_docs_only_changes`
+      # fails if this step leaves `lint` or gains an `if:`. Quoted for the
+      # trailing-`::` YAML reason above.
+      - name: Run docs/why-deterministic-replay.md guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration replay_positioning_docs::"
+
       # Issue #1810: online-migration lock safety. A migration after the
       # cutoff must have a non-zero `lock_timeout` in force when it locks a
       # hot table. It must build or drop a hot-table index with CONCURRENTLY.
@@ -597,6 +637,34 @@ jobs:
       # See docs/upgrading/online-migrations.md.
       - name: "Online-migration lock-safety lint (issue #1810)"
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration migration_lock_safety::"
+
+      # Issue #1987: the standalone-activity decision lives under `docs/`.
+      # A PR that edits only the perf page, the ADR or the capture skips the
+      # `test` matrix, so these guards run here.
+      #
+      # Guarded by `standalone_activity_docs::guards_run_on_docs_only_changes`.
+      # Quoted for the trailing-`::` YAML reason above.
+      - name: Run standalone-activity decision guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration standalone_activity_docs::"
+
+      # Issue #2004: the safety report lives under `docs/`, so a docs-only
+      # change skips the `test` matrix. These guards run here, ungated. They
+      # check that each result has a real command. They check that the
+      # report states each known limit.
+      #
+      # Guarded by `safety_report_docs::guards_run_on_docs_only_changes`.
+      # Quoted for the trailing-`::` YAML reason above.
+      - name: Run docs/safety-report.md guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration safety_report_docs::"
+
+      # Issue #2014: the journaled host-call spike report lives under `docs/`,
+      # so a docs-only change skips the `test` matrix. These guards run here.
+      # They check that the report cites each prototype test and each bound.
+      #
+      # Guarded by `agent_code_journal_docs::guards_run_on_docs_only_changes`.
+      # Quoted for the trailing-`::` YAML reason above.
+      - name: Run the agent-code journal report guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration agent_code_journal_docs::"
 
       # Folio corpus harness: internal link check across all of docs/ (see
       # docs/audits/corpus-link-check.py). Same reasoning as the docs-only
@@ -743,6 +811,25 @@ jobs:
         run: |
           python3 docs/audits/action-sha-pin.py --self-test
           python3 docs/audits/action-sha-pin.py
+
+      # Issue #1989. Lint the worker chart, then check the image contract.
+      # The audit renders the chart with `helm template`. The pinned version
+      # and its checksum stop a new Helm release from failing the lint job.
+      - name: Worker chart and image contract (docs/audits/worker-image-contract.py)
+        env:
+          HELM_VERSION: "3.21.0"
+          HELM_SHA256: "0093eb572e3d2380f094df162ddb525e219249de88957afe24cfbb19632acd36"
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/helm.tar.gz" \
+            "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  ${RUNNER_TEMP}/helm.tar.gz" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/helm-bin"
+          tar -xzf "${RUNNER_TEMP}/helm.tar.gz" -C "${RUNNER_TEMP}/helm-bin" --strip-components=1 linux-amd64/helm
+          export PATH="${RUNNER_TEMP}/helm-bin:${PATH}"
+          helm lint --strict charts/autumn-harvest-worker -f charts/autumn-harvest-worker/ci/lint-values.yaml
+          python3 docs/audits/worker-image-contract.py --self-test
+          python3 docs/audits/worker-image-contract.py
 
       # Issue #1828. The rolling-deploy contract page and the
       # `mixed-version-smoke` job must both exist and name each other.
@@ -1048,15 +1135,26 @@ jobs:
       - name: Run plugin lib tests (s3 and gcs features, issue #1983)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest-plugin --features s3,gcs --lib object_store
+      # Issue #1981. The Vault Transit binding runs the same KMS conformance
+      # suite as AWS, against a local fake Vault server.
+      - name: Run plugin lib tests (vault-transit feature, issue #1981)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        run: cargo test -p autumn-harvest-plugin --features vault-transit --lib vault_transit
+      # Issue #1978. The OIDC unit tests and the `api_with_oidc` builder test
+      # compile only with the feature. The MCP tool gate test also needs
+      # `mcp`. The round-trip suite runs from the manifest (`oidc_login`).
+      - name: Run plugin lib tests (oidc and mcp features, issue #1978)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo test -p autumn-harvest-plugin --features oidc,mcp,unified-dag-execution --lib oidc
       # No CI step ran the plugin's doctests, so a broken `///` example landed
       # silently (issue #944 review found exactly that). These are compile-only
       # (`no_run`), so they cost seconds and need no database.
       - name: Run plugin doctests (issue #944 review)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test --doc -p autumn-harvest-plugin --features connectors
-      - name: Run plugin MCP tool tests (issue #597, DAG MCP tools issue #601 follow-up)
+      - name: Run plugin MCP tool tests (issue #597, DAG MCP tools issue #601 follow-up, MCP Tasks issue #2005)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
-        run: cargo test -p autumn-harvest-plugin --features mcp,unified-dag-execution --lib --test mcp_tools_http_tests
+        run: cargo test -p autumn-harvest-plugin --features mcp,unified-dag-execution --lib --test mcp_tools_http_tests --test mcp_tasks_http_tests
       - name: Run plugin metrics scrape tests (issue #355)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest-plugin --features metrics --lib --test metrics_scrape_http_tests
@@ -1084,6 +1182,12 @@ jobs:
       - name: Run autumn-harvest-sqlite tests (issue #1068)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-sqlite
+      # Issue #1973. Offline: a scripted model, no API key, no network. The
+      # crash test runs its own binary as a child process. Issue #2001 adds
+      # the `eval` suite.
+      - name: Run autumn-harvest-agent tests (issues #1973, #2001)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        run: cargo test -p autumn-harvest-agent --features sqlite,eval
       # The agent-daemon example's suite is offline: a scripted stub model, no
       # API key, and no network. Linux only, because the daemon's control
       # surface is a Unix domain socket.
@@ -1165,6 +1269,9 @@ jobs:
       - name: Run entity_phase_transition example tests (issue #803)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest --no-default-features --features testing --example entity_phase_transition
+      - name: Run agent_session_entity example tests (issue #1975)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        run: cargo test -p autumn-harvest --no-default-features --features testing --example agent_session_entity
       - name: Run mutex_ledger example tests (issue #691)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --no-default-features --features testing --example mutex_ledger
@@ -1499,8 +1606,21 @@ jobs:
           if grep -q -- '--test object_store_gcs_emulator' <<<"$plan"; then
             images="$images fsouza/fake-gcs-server:1.56.1"
           fi
+          # Docker Hub rate-limits anonymous pulls, and the ECR Public mirror
+          # has a data limit. An official image (no slash in its name) comes
+          # from the Google mirror first, then from ECR Public. The tag then
+          # gives it the name that the suites request.
+          mirrors="mirror.gcr.io/library public.ecr.aws/docker/library"
           for image in $images; do
             for attempt in 1 2 3 4 5; do
+              if [[ "$image" != */* ]]; then
+                for mirror in $mirrors; do
+                  if docker pull "$mirror/$image"; then
+                    docker tag "$mirror/$image" "$image"
+                    continue 3
+                  fi
+                done
+              fi
               if docker pull "$image"; then
                 continue 2
               fi
@@ -1558,7 +1678,9 @@ jobs:
     # connects verbatim, same as `docker compose -f examples/quickstart/compose.yaml up -d`.
     services:
       postgres:
-        image: postgres:16
+        # The Google mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls, and ECR Public has a data limit.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_USER: quickstart
           POSTGRES_PASSWORD: quickstart
@@ -1713,7 +1835,9 @@ jobs:
     # DATABASE_URL connects as written.
     services:
       postgres:
-        image: postgres:16
+        # The Google mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls, and ECR Public has a data limit.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_USER: harvest
           POSTGRES_PASSWORD: harvest
@@ -1759,7 +1883,9 @@ jobs:
     timeout-minutes: 60
     services:
       postgres:
-        image: postgres:16
+        # The Google mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls, and ECR Public has a data limit.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -1809,7 +1935,9 @@ jobs:
     # Matches examples/quickstart/autumn.toml, same as the `quickstart` job.
     services:
       postgres:
-        image: postgres:16
+        # The Google mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls, and ECR Public has a data limit.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_USER: quickstart
           POSTGRES_PASSWORD: quickstart
@@ -1916,7 +2044,9 @@ jobs:
     # config connects verbatim — the truest AC-2/AC-3 test.
     services:
       postgres:
-        image: postgres:16
+        # The Google mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls, and ECR Public has a data limit.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_USER: demo_app
           POSTGRES_PASSWORD: demo_app
@@ -2092,7 +2222,8 @@ jobs:
 
   # TLA+ models of the core protocols (issue #1819). The runner checks each
   # row of formal/tla/models.txt. A `violation:` row is a counter-example, and
-  # it must fail on its named invariant. See docs/testing/formal-methods.md.
+  # it must fail on its named invariant. The job also checks the trace
+  # fixtures (issue #2003). See docs/testing/formal-methods.md.
   formal-models:
     name: TLA+ models
     needs: changes
@@ -2101,12 +2232,17 @@ jobs:
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
       needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # A full run takes about 40 seconds. The runner image has Java.
+    # The models take about 40 seconds and the trace fixtures about 10.
+    # The runner image has Java and Python.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Model-check every manifest row with TLC
         run: scripts/check-formal-models.sh
+      # Issue #2003: TLC must accept each clean fixture trace and reject
+      # each red one. The chaos traces are checked in chaos.yml.
+      - name: Check the trace fixtures against the TLA+ specs
+        run: scripts/check-formal-traces.sh formal/tla/trace/fixtures
 
   # Kani proofs of the pure kernels (issue #1819). The script fails when Kani
   # verifies fewer proofs than the source holds, or when a cover check fails.

@@ -760,6 +760,7 @@ async fn no_debounce_policy_uses_normal_start_path() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )

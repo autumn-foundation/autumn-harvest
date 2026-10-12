@@ -210,6 +210,10 @@ there is no interleaving where a tombstoned run is forked. A retry refused at th
 second check reports the same `409`, so you never need to care which one caught
 it.
 
+The second check is not specific to DAG retry. Every fork path runs it, batch
+reset included (issue #1999). See
+[Workflow reset](../workflow-reset.md#a-fork-never-uses-a-pii-erased-source).
+
 ### An offloaded payload with no store configured is refused
 
 Signal 2 reads a payload field, so the endpoint inflates offloaded payloads

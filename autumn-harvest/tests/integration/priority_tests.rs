@@ -266,6 +266,7 @@ fn start_workflow_params_has_priority_field() {
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
 
     assert_eq!(params.priority, Priority::High);
@@ -320,6 +321,7 @@ fn start_workflow_params_default_priority_is_normal() {
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
 
     assert_eq!(params.priority, Priority::Normal);

@@ -41,3 +41,6 @@ formal/tla/states/
 # (docs/audits/tracked-artifacts.py).
 *.orig
 *.rej
+
+# An interrupted Ledger capture can leave its stage (issue #1956).
+docs/perf-artifacts/**/.staging-*/

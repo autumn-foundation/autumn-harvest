@@ -97,7 +97,7 @@ use autumn_harvest::queue::{self, ConcurrencyKeyStats};
 use autumn_harvest::reset::{
     BatchResetItem, BatchResetOutcome, ResetInvalidPoint, ResetPoint, ResetResult,
     ResetSignalReapplyPolicy, ResetSkipReason, WorkflowResetError, WorkflowResetRequest,
-    preview_workflow_reset, reset_workflow_execution, resolve_batch_reset_one,
+    batch_skip_reason, preview_workflow_reset, reset_workflow_execution, resolve_batch_reset_one,
 };
 use autumn_harvest::retention::{RetentionConfig, RetentionMonitor, RetentionStatus};
 use autumn_harvest::scheduler::{
@@ -1282,7 +1282,11 @@ impl HarvestApiState {
             WorkflowHandleClient::new(pool.sharded_pool().clone(), runtime.router().clone(), urls)
                 // Issue #684: wire the engine recorder so the in-process typed-update
                 // path emits harvest.update.admitted.
-                .with_metrics(runtime.registry.telemetry().metrics.clone()),
+                .with_metrics(runtime.registry.telemetry().metrics.clone())
+                // Issue #1979: the route decodes the output itself, through the
+                // gated read-path decoder (issue #608).
+                .with_codecs(self.payload_codecs())
+                .with_stored_result_output(),
         )
     }
 
@@ -1978,6 +1982,16 @@ pub(crate) struct SignalQuery {
     idempotency_key: Option<String>,
 }
 
+impl SignalQuery {
+    /// A query that carries `key`, for the MCP Tasks route (issue #2005).
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub(crate) fn with_key(key: impl Into<String>) -> Self {
+        Self {
+            idempotency_key: Some(key.into()),
+        }
+    }
+}
+
 /// Response for the standalone signal route.
 ///
 /// `signal_delivered` is `true` when a signal row was freshly queued and
@@ -2042,7 +2056,7 @@ struct ReplayDeadLetterResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct CancelWorkflowResponse {
+pub(crate) struct CancelWorkflowResponse {
     ok: bool,
     execution_id: String,
     state: String,
@@ -2755,8 +2769,18 @@ impl DagTriggerRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct CancelWorkflowRequest {
+pub(crate) struct CancelWorkflowRequest {
     reason: Option<String>,
+}
+
+impl CancelWorkflowRequest {
+    /// A cancel request with `reason`, for the MCP Tasks route (issue #2005).
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub(crate) fn with_reason(reason: impl Into<String>) -> Self {
+        Self {
+            reason: Some(reason.into()),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3249,6 +3273,9 @@ pub(crate) struct WorkflowFilters {
     /// Combined with `AND` against each other and against the legacy
     /// `search_attrs` containment predicates above.
     pub(crate) search_attr_predicates: Vec<SearchAttrPredicate>,
+    /// Parsed `filter` expressions (issue #1982). Each one joins the query
+    /// with `AND`.
+    pub(crate) filter: Vec<crate::visibility_query::Expr>,
     pub(crate) started_after: Option<chrono::DateTime<chrono::Utc>>,
     pub(crate) started_before: Option<chrono::DateTime<chrono::Utc>>,
     /// Prefix match on the execution UUID cast to text (e.g. "abc123").
@@ -3971,6 +3998,11 @@ struct CreateTokenRequest {
     /// Optional expiry; an expired token is rejected 401 on the next request.
     #[serde(default)]
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Optional tenant claim (issue #1977). A tenant-bound token reaches only
+    /// the runs of its tenant, through the tenant-scoped routes. It must be 1
+    /// to 128 bytes of visible ASCII, with no spaces.
+    #[serde(default)]
+    tenant: Option<String>,
 }
 
 fn default_token_scope() -> String {
@@ -3998,6 +4030,15 @@ async fn create_token_handler(
         )
             .into_response();
     };
+    if let Some(tenant) = body.tenant.as_deref()
+        && let Err(e) = autumn_harvest::tenant::validate_tenant(tenant)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("invalid tenant: {e}") })),
+        )
+            .into_response();
+    }
 
     let pool = match api_state.storage_pool() {
         Ok(p) => p,
@@ -4008,8 +4049,15 @@ async fn create_token_handler(
         Err(e) => return e.into_response(),
     };
 
-    match crate::api_token::create_token(&mut conn, &body.name, scope, body.expires_at, &actor)
-        .await
+    match crate::api_token::create_token(
+        &mut conn,
+        &body.name,
+        scope,
+        body.expires_at,
+        &actor,
+        body.tenant.as_deref(),
+    )
+    .await
     {
         Ok(mint) => {
             let id_str = mint.view.id.to_string();
@@ -4898,6 +4946,12 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
         // inherits the general management API auth middleware (api_with_auth)
         // like the other non-admin `/workflows/{id}/…` read routes.
         .route("/workflows/{id}/stream", get(stream_workflow_progress))
+        // Durable, resumable output stream (issue #1974). Same auth posture
+        // as `/stream`: not admin-gated.
+        .route(
+            "/workflows/{id}/stream/durable",
+            get(stream_workflow_progress_durable),
+        )
         .route("/workflows/{workflow_name}/start", post(start_workflow))
         .route(
             "/workflows/{workflow_name}/signal-with-start",
@@ -5359,6 +5413,11 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             "/executions/{exec_id}/events/stream",
             get(stream_execution_events).route_layer(require_admin.clone()),
         )
+        // Live list signal (issue #1982). Admin-gated, the same as #324.
+        .route(
+            "/workflows/changes/stream",
+            get(stream_workflow_changes).route_layer(require_admin.clone()),
+        )
         // Build routing management (issue #362): expose build policies,
         // compatibility declarations, and cross-shard reachability.
         // Mutating routes are admin-gated; the read route is open to any
@@ -5474,11 +5533,15 @@ pub struct StandaloneAdminAuth {
     deployment_profile: Option<String>,
     admin_auth_session_key: Option<String>,
     rate_limit: Option<crate::api_rate_limit::ApiRateLimit>,
+    roles: Option<crate::roles::HarvestRoles>,
+    #[cfg(feature = "oidc")]
+    oidc: Option<crate::oidc::OidcLogin>,
 }
 
 impl StandaloneAdminAuth {
-    /// A mount that declares nothing. [`Self::mount`] then returns the router
-    /// unchanged, which is the pre-issue-#1608 standalone posture.
+    /// A mount that declares nothing. [`Self::mount`] then adds only the tenant
+    /// binding layer (issue #1977). It passes every request with no verified
+    /// tenant unchanged, which is the pre-issue-#1608 standalone posture.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -5530,6 +5593,36 @@ impl StandaloneAdminAuth {
         rate_limit: crate::api_rate_limit::ApiRateLimit,
     ) -> Self {
         self.rate_limit = Some(rate_limit);
+        self
+    }
+
+    /// Install the custom-role layer (issue #1978).
+    ///
+    /// Each request needs a role that allows its route. Roles come from a
+    /// [`crate::roles::RoleGrant`] extension or the session key
+    /// [`crate::roles::SESSION_ROLES_KEY`]. A verified token skips the check.
+    /// See [`crate::roles`].
+    #[must_use]
+    pub fn with_roles(mut self, roles: crate::roles::HarvestRoles) -> Self {
+        self.roles = Some(roles);
+        self
+    }
+
+    /// Install OIDC login and its session boundary (issue #1978).
+    ///
+    /// This also installs the role layer with the roles of `login`, and
+    /// declares the auth boundary. The roles of `login` replace any set by
+    /// [`Self::with_roles`]. It turns off [`Self::with_read_only_role`]. The login routes sit outside the boundary.
+    /// The host must apply an autumn-web session layer outside the mounted
+    /// router. See [`crate::oidc`].
+    #[cfg(feature = "oidc")]
+    #[must_use]
+    pub fn with_oidc(mut self, login: crate::oidc::OidcLogin) -> Self {
+        self.admin_auth_boundary = true;
+        // The read-only role reads host session keys. The login replaces that
+        // host auth, so the custom roles decide alone.
+        self.read_only_role = false;
+        self.oidc = Some(login);
         self
     }
 
@@ -5594,8 +5687,9 @@ impl StandaloneAdminAuth {
     /// is how [`HarvestPlugin`] composes it.
     ///
     /// When an embedder auth boundary is declared, apply it outside. The
-    /// request order is then: embedder auth -> token layer -> read-only-role
-    /// layer -> authorizer -> per-route `require_admin` -> handler. Without
+    /// request order is then as follows. Embedder auth, the token layer, the
+    /// rate limiter, tenant binding, the read-only-role layer, the
+    /// authorizer, per-route `require_admin`, the handler. Without
     /// that declaration, enabling API tokens additionally installs a
     /// fail-closed token requirement on every non-public route.
     ///
@@ -5610,6 +5704,14 @@ impl StandaloneAdminAuth {
         if let Some(session_key) = &self.admin_auth_session_key {
             api_state.set_admin_auth_session_key(session_key.clone());
         }
+        #[cfg(feature = "oidc")]
+        let roles = self
+            .oidc
+            .as_ref()
+            .map(|login| login.roles().clone())
+            .or_else(|| self.roles.clone());
+        #[cfg(not(feature = "oidc"))]
+        let roles = self.roles.clone();
         let router = apply_admin_auth_layers(
             router,
             api_state,
@@ -5618,8 +5720,13 @@ impl StandaloneAdminAuth {
                 read_only_role: self.read_only_role,
                 authorizer: self.authorizer.clone(),
                 rate_limit: self.rate_limit.clone(),
+                roles,
             },
         );
+        #[cfg(feature = "oidc")]
+        if let Some(login) = &self.oidc {
+            return crate::oidc::apply_oidc(router, login, self.api_tokens);
+        }
         if self.api_tokens && !self.admin_auth_boundary {
             router.layer(middleware::from_fn(
                 crate::api_token::require_token_for_non_public,
@@ -5640,6 +5747,8 @@ pub(crate) struct AdminAuthLayers {
     pub authorizer: Option<crate::authz::SharedAuthorizer>,
     /// The per-client rate limiter (issue #1827).
     pub rate_limit: Option<crate::api_rate_limit::ApiRateLimit>,
+    /// The custom-role layer (issue #1978).
+    pub roles: Option<crate::roles::HarvestRoles>,
 }
 
 /// Wrap a composed Harvest router in the admin-auth layer stack.
@@ -5665,13 +5774,27 @@ pub(crate) struct AdminAuthLayers {
 /// layer. It runs after both built-in gates, so it can only deny. It sees the
 /// `TokenPrincipal` the token layer sets.
 ///
+/// Issue #1978: the custom-role layer sits INSIDE the read-only-class layer
+/// and OUTSIDE the authorizer. A verified token skips it. An allowed request
+/// carries a `RolePrincipal`, which the admin gate and the #1802 gate admit.
+/// The authorizer can then only narrow what a role allows.
+///
 /// Issue #1827: the rate-limit layer sits directly INSIDE the token layer. It
 /// keys a bucket on the verified `TokenPrincipal`, so an unverified bearer
-/// cannot open a new bucket. It runs before the read-only and authorizer
-/// layers, so a refused request reaches no handler.
+/// cannot open a new bucket. It runs before the tenant binding, read-only and
+/// authorizer layers, so a refused request reaches no handler.
 ///
-/// No layer is installed unless asked for, so a deployment that declares none
-/// does an identical amount of work as before.
+/// Issue #1977: the tenant binding layer sits directly INSIDE the rate-limit
+/// layer. Its refusals do a lookup and an audit write, so the limiter bounds
+/// them. It is always installed. A request with no verified tenant passes it
+/// unchanged.
+///
+/// With tokens on, a pre-auth layer of the same limiter sits OUTSIDE the token
+/// layer. It charges each claimed token to its address before the lookup. A
+/// flood of made-up tokens thus gets `429` and never reaches the pool. The
+/// inner layer refunds that charge when the token verifies.
+///
+/// No other layer is installed unless asked for.
 pub(crate) fn apply_admin_auth_layers(
     router: Router<()>,
     api_state: &HarvestApiState,
@@ -5684,15 +5807,28 @@ pub(crate) fn apply_admin_auth_layers(
             crate::authz::enforce_authorizer,
         ));
     }
+    if let Some(roles) = &layers.roles {
+        router = router.layer(middleware::from_fn_with_state(
+            (api_state.clone(), roles.clone()),
+            crate::roles::enforce_custom_roles,
+        ));
+    }
     if layers.read_only_role {
         router = router.layer(middleware::from_fn(enforce_read_only_class));
     }
-    if let Some(rate_limit) = &layers.rate_limit {
+    // Issue #1977: always installed. A request with no verified tenant passes
+    // it unchanged, so a deployment with no tenants sees no change.
+    router = router.layer(middleware::from_fn_with_state(
+        api_state.clone(),
+        crate::tenant::enforce_tenant_binding,
+    ));
+    let limiter = layers
+        .rate_limit
+        .clone()
+        .map(crate::api_rate_limit::ApiRateLimiter::new);
+    if let Some(limiter) = &limiter {
         router = router.layer(middleware::from_fn_with_state(
-            (
-                api_state.clone(),
-                crate::api_rate_limit::ApiRateLimiter::new(rate_limit.clone()),
-            ),
+            (api_state.clone(), limiter.clone()),
             crate::api_rate_limit::enforce_api_rate_limit,
         ));
     }
@@ -5701,6 +5837,12 @@ pub(crate) fn apply_admin_auth_layers(
             api_state.clone(),
             crate::api_token::enforce_token_scope,
         ));
+        if let Some(limiter) = limiter {
+            router = router.layer(middleware::from_fn_with_state(
+                (api_state.clone(), limiter),
+                crate::api_rate_limit::enforce_pre_auth_rate_limit,
+            ));
+        }
     }
     router
 }
@@ -5724,6 +5866,14 @@ pub(crate) async fn require_harvest_admin(
     if request
         .extensions()
         .get::<crate::api_token::TokenPrincipal>()
+        .is_some()
+    {
+        return next.run(request).await;
+    }
+    // Issue #1978: the role layer already allowed this route for this caller.
+    if request
+        .extensions()
+        .get::<crate::roles::RolePrincipal>()
         .is_some()
     {
         return next.run(request).await;
@@ -5782,10 +5932,15 @@ async fn admit_mutation(
     request: axum::extract::Request,
     next: Next,
 ) -> axum::response::Response {
+    // Issue #1978: a role principal counts as a credential, as a token does.
     let has_token = request
         .extensions()
         .get::<crate::api_token::TokenPrincipal>()
-        .is_some();
+        .is_some()
+        || request
+            .extensions()
+            .get::<crate::roles::RolePrincipal>()
+            .is_some();
     let session = request.extensions().get::<Session>().cloned();
     if !mutation_admitted(api_state, has_token, session).await {
         return AutumnError::unauthorized_msg("authentication required").into_response();
@@ -5920,6 +6075,11 @@ pub(crate) async fn has_harvest_admin_access(
     api_state: &HarvestApiState,
     session: Option<Session>,
 ) -> bool {
+    // Issue #1978: under the role layer, only an `admin`-scope role passes.
+    // A declared boundary must not widen a narrower role.
+    if let Some(admin) = crate::roles::role_admin_access() {
+        return admin;
+    }
     if api_state.admin_auth_boundary() {
         return true;
     }
@@ -6442,6 +6602,13 @@ pub(crate) const fn decode_gate(flag: bool, is_admin: bool) -> bool {
     flag && is_admin
 }
 
+/// The error a route returns when a stored codec column does not decode
+/// (issue #1979). It never carries the codec's own error text, which is
+/// embedder-controlled.
+fn undecodable_stored_payload() -> HarvestError {
+    HarvestError::Config("a stored payload could not be decoded".to_string())
+}
+
 /// Resolve the codec registry for read-path decoding, or `None` when this
 /// request must see today's bytes (issue #608).
 ///
@@ -6756,12 +6923,12 @@ pub(crate) fn decode_workflow_execution_fields(
     execution: &mut WorkflowExecution,
     codecs: &PayloadCodecs,
 ) -> LossyDecodeOutcome {
-    let mut outcome = codecs.decode_value_lossy(&mut execution.input);
+    let mut outcome = codecs.decode_column_lossy(&mut execution.input);
     if let Some(output) = execution.output.as_mut() {
-        outcome = outcome.merged(codecs.decode_value_lossy(output));
+        outcome = outcome.merged(codecs.decode_column_lossy(output));
     }
     if let Some(memo) = execution.memo.as_mut() {
-        outcome = outcome.merged(codecs.decode_value_lossy(memo));
+        outcome = outcome.merged(codecs.decode_column_lossy(memo));
     }
     if let Some(search_attrs) = execution.search_attrs.as_mut() {
         outcome = outcome.merged(codecs.decode_value_lossy(search_attrs));
@@ -6810,6 +6977,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         // Ephemeral workflow progress SSE stream (issue #791). Read-only,
         // text/event-stream; NOT admin-gated (AC5). See docs/api-contract.json.
         ("GET", "/workflows/{id}/stream"),
+        // Durable output stream (issue #1974): text/event-stream, NOT admin-gated.
+        ("GET", "/workflows/{id}/stream/durable"),
         ("POST", "/workflows/{workflow_name}/start"),
         ("POST", "/workflows/{workflow_name}/signal-with-start"),
         ("POST", "/workflows/{workflow_name}/update-with-start"),
@@ -7012,6 +7181,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/audit"),
         // ── SSE execution event stream (issue #324) ───────────────────────────
         ("GET", "/executions/{exec_id}/events/stream"),
+        // ── live list signal (issue #1982) ────────────────────────────────────
+        ("GET", "/workflows/changes/stream"),
         // ── build routing management (issue #362) ─────────────────────────────
         ("GET", "/admin/build-routing"),
         ("POST", "/admin/build-routing/policies"),
@@ -7517,7 +7688,7 @@ pub const fn management_api_request_fields()
         (
             "POST",
             "/admin/tokens",
-            Some(&["name", "scope", "expires_at"]),
+            Some(&["name", "scope", "expires_at", "tenant"]),
         ),
         ("DELETE", "/admin/tokens/{id}", Some(&[])),
         (
@@ -7739,6 +7910,8 @@ pub const fn management_api_response_fields()
         // no JSON body. Frames: `event: progress` (data = the chunk JSON, `id:` =
         // monotonic seq), a terminal `event: end`, or `event: error`.
         ("GET", "/workflows/{id}/stream", None),
+        // Durable output stream (issue #1974): text/event-stream, free-form.
+        ("GET", "/workflows/{id}/stream/durable", None),
         (
             "POST",
             "/workflows/{workflow_name}/start",
@@ -7868,6 +8041,7 @@ pub const fn management_api_response_fields()
                 "summary_scrubbed",
                 "signals_scrubbed",
                 "logs_deleted",
+                "stream_chunks_deleted",
                 "completion_deliveries_scrubbed",
                 "dead_letters_scrubbed",
                 "children",
@@ -8920,6 +9094,7 @@ pub const fn management_api_response_fields()
         ("GET", "/admin/audit", None), // Vec<AuditRecord> (external model)
         // ── SSE execution event stream (issue #324) ───────────────────────────
         ("GET", "/executions/{exec_id}/events/stream", None), // text/event-stream
+        ("GET", "/workflows/changes/stream", None),           // text/event-stream
         // ── build routing (issue #362) ────────────────────────────────────────
         (
             "GET",
@@ -9036,6 +9211,7 @@ pub const fn management_api_response_fields()
                 "last_used_at",
                 "revoked_at",
                 "secret",
+                "tenant",
             ]),
         ),
         ("DELETE", "/admin/tokens/{id}", Some(&["revoked"])),
@@ -10775,6 +10951,30 @@ pub(crate) fn parse_workflow_filters(
                 let predicate = parse_search_attr_filter(value)?;
                 filters.search_attr_predicates.push(predicate);
             }
+            "filter" => {
+                // An empty value is absent, the same as `state=` or `owner=`.
+                if value.trim().is_empty() {
+                    continue;
+                }
+                // The index rule reads all values together, after the loop.
+                let expr = crate::visibility_query::parse_unanchored(value).map_err(|message| {
+                    AutumnError::bad_request_msg(format!("invalid filter: {message}"))
+                })?;
+                // The predicate limit applies to the request, not to each value.
+                let total = filters
+                    .filter
+                    .iter()
+                    .chain(std::iter::once(&expr))
+                    .map(crate::visibility_query::predicate_count)
+                    .sum::<usize>();
+                if total > crate::visibility_query::MAX_PREDICATES {
+                    return Err(AutumnError::bad_request_msg(format!(
+                        "invalid filter: the filter values hold more than {} predicates",
+                        crate::visibility_query::MAX_PREDICATES
+                    )));
+                }
+                filters.filter.push(expr);
+            }
             "failure_cause" => {
                 let trimmed = value.trim();
                 if !trimmed.is_empty() {
@@ -10905,6 +11105,9 @@ pub(crate) fn parse_workflow_filters(
             }
         }
     }
+
+    crate::visibility_query::check_anchor(&filters.filter)
+        .map_err(|message| AutumnError::bad_request_msg(format!("invalid filter: {message}")))?;
 
     // `page_size` takes precedence over `limit` whenever it is present, so the
     // documented "page_size overrides limit" contract holds independent of the
@@ -12021,7 +12224,7 @@ async fn respond_with_workflow_result(
     if let Some(codecs) = decoder {
         let mut outcome = LossyDecodeOutcome::default();
         if let Some(output) = result.output.as_mut() {
-            outcome = outcome.merged(codecs.decode_value_lossy(output));
+            outcome = outcome.merged(codecs.decode_column_lossy(output));
         }
         if let Some(error) = result.error.as_mut() {
             outcome = outcome.merged(decode_error_field(codecs, error));
@@ -13799,7 +14002,11 @@ pub(crate) async fn build_awaitables_report(
             {
                 ctx.register_declarative_update_handler(h);
             }
-            let input = std::mem::take(&mut execution.input);
+            // The replayed handler gets the plaintext input (issue #1979).
+            let input = api_state
+                .payload_codecs()
+                .decode_column(&std::mem::take(&mut execution.input))
+                .map_err(|_| map_error(undecodable_stored_payload()))?;
             let outcome =
                 drive_query_replay_async(&ctx, workflow.handler, input, api_state.query_timeout())
                     .await;
@@ -16138,7 +16345,7 @@ async fn get_workflow_stack(
                     decode_outcome = decode_outcome.merged(codecs.decode_value_lossy(checkpoint));
                 }
                 let mut input = t.input;
-                decode_outcome = decode_outcome.merged(codecs.decode_value_lossy(&mut input));
+                decode_outcome = decode_outcome.merged(codecs.decode_column_lossy(&mut input));
                 Some(input)
             } else {
                 None
@@ -16796,6 +17003,9 @@ async fn probe_committed_start_replay(
     // only when the *retry* carried an explicit placement, so an unpinned keyed
     // replay keeps its pre-#697 response shape byte-for-byte.
     report_shard: Option<i32>,
+    // The verified tenant of the caller (issue #1977). A claim on a run of
+    // another tenant is a miss, so the engine refuses the start.
+    tenant: Option<&str>,
 ) -> Option<axum::response::Response> {
     use axum::response::IntoResponse as _;
     let pool = api_state.storage_pool().ok()?;
@@ -16826,16 +17036,20 @@ async fn probe_committed_start_replay(
     // `Some` claim implies the row existed at lookup time. Re-read its identity
     // for the no-op response; if it vanished or the read errors, return `None`
     // so the caller re-reserves / reclaims as needed.
-    let (dup_workflow_id, dup_state) = harvest_workflow_executions::table
+    let (dup_workflow_id, dup_state, dup_tenant) = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::id.eq(claim_exec_id.as_uuid()))
         .select((
             harvest_workflow_executions::workflow_id,
             harvest_workflow_executions::state,
+            harvest_workflow_executions::tenant,
         ))
-        .first::<(String, String)>(&mut probe_conn)
+        .first::<(String, String, Option<String>)>(&mut probe_conn)
         .await
         .optional()
         .ok()??;
+    if tenant.is_some() && dup_tenant.as_deref() != tenant {
+        return None;
+    }
     // Best-effort dedup audit (intentional asymmetry with the fresh-start arm's
     // 503-on-audit-failure): the original start was already audited when it
     // created the run, so a failed audit here is a no-op read and never fails
@@ -17094,6 +17308,7 @@ async fn handle_malformed_start_body(
     workflow_name: &str,
     headers: &axum::http::HeaderMap,
     rejection: JsonRejection,
+    tenant: Option<&str>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
     let header_key = match extract_start_idempotency_header_key(headers) {
@@ -17147,6 +17362,7 @@ async fn handle_malformed_start_body(
         route,
         // The body did not parse, so no placement can be read from it.
         None,
+        tenant,
     )
     .await
     {
@@ -17160,10 +17376,15 @@ pub(crate) async fn start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(workflow_name): Path<String>,
     maybe_session: Option<Extension<Session>>,
+    verified_tenant: Option<Extension<crate::tenant::VerifiedTenant>>,
     headers: axum::http::HeaderMap,
     body: Result<Json<StartWorkflowRequest>, JsonRejection>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
+
+    // The tenant binding layer sets this for a tenant-bound caller (issue
+    // #1977). The new run is stamped with it. The body cannot set a tenant.
+    let tenant: Option<&str> = verified_tenant.as_ref().map(|Extension(t)| t.as_str());
 
     // issue #808 (Codex P2): take the body as a `Result` so a malformed JSON
     // body no longer short-circuits with axum's `400`/`422` before the handler
@@ -17174,8 +17395,14 @@ pub(crate) async fn start_workflow(
     let request = match body {
         Ok(Json(req)) => req,
         Err(rejection) => {
-            return handle_malformed_start_body(&api_state, &workflow_name, &headers, rejection)
-                .await;
+            return handle_malformed_start_body(
+                &api_state,
+                &workflow_name,
+                &headers,
+                rejection,
+                tenant,
+            )
+            .await;
         }
     };
 
@@ -17605,6 +17832,7 @@ pub(crate) async fn start_workflow(
             request_id.as_deref(),
             route,
             pinned_shard_id,
+            tenant,
         )
         .await
     {
@@ -17875,6 +18103,18 @@ pub(crate) async fn start_workflow(
     // a `200` no-op before this check, so a workflow that gained a throttle/
     // debounce/batch policy after an original keyed start still returns the
     // existing execution rather than a `400` on retry.
+    // Issue #1977: a deferred start creates its run later, through a path
+    // that carries no tenant. Refuse it for a tenant-bound caller rather
+    // than start a run the caller then cannot reach.
+    if tenant.is_some() && (throttle_applies || is_debounced_start || has_batch_policy) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "a tenant-bound start cannot be throttled, debounced or batched"
+            })),
+        )
+            .into_response();
+    }
     if idempotency_key.is_some() && (throttle_applies || is_debounced_start || has_batch_policy) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
@@ -19489,6 +19729,7 @@ pub(crate) async fn start_workflow(
                 completion_callbacks,
                 start_source: effective_start_source,
                 start_source_ref: effective_start_source_ref.as_deref(),
+                tenant,
                 ..StartWorkflowParams::new(
                     &workflow_name,
                     &workflow_id,
@@ -19715,6 +19956,7 @@ pub(crate) async fn start_workflow(
         completion_callbacks,
         start_source: effective_start_source,
         start_source_ref: effective_start_source_ref.as_deref(),
+        tenant,
         ..StartWorkflowParams::new(&workflow_name, &workflow_id, exec_id, input, &queue_name)
     };
     let metrics_ref: Option<&(dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync)> =
@@ -21452,11 +21694,6 @@ async fn batch_reset_workflows(
                         operator_id: request.operator_id.clone(),
                         signal_reapply: request.signal_reapply,
                         allow_terminal_source: true,
-                        // Left `false` deliberately: this is the batch-reset
-                        // endpoint, not the issue #780 DAG retry, and refusing
-                        // an erased source here would be an unrelated behavior
-                        // change to an already-shipped surface.
-                        refuse_erased_source: false,
                     };
                     match reset_workflow_execution(
                         conn,
@@ -21478,15 +21715,15 @@ async fn batch_reset_workflows(
                             });
                             reset_count += 1;
                         }
+                        // The fork refuses an erased source under its row lock
+                        // (issue #1999). `batch_skip_reason` keeps that skip typed.
                         Err(reset_err) => {
                             items.push(BatchResetItem {
                                 exec_id: exec_id_str,
                                 outcome: BatchResetOutcome::Skipped,
                                 resolved_event_id: Some(resolved_event_id),
                                 new_exec_id: None,
-                                skip_reason: Some(ResetSkipReason::InfrastructureError {
-                                    message: format!("reset failed: {reset_err}"),
-                                }),
+                                skip_reason: Some(batch_skip_reason(&reset_err)),
                             });
                             skipped_count += 1;
                         }
@@ -22157,6 +22394,7 @@ pub(crate) async fn signal_with_start_workflow(
             workflow_info: runtime.registry.workflows.get(&workflow_name),
             start_source_override: request.start_source_override,
             start_source_ref_override: request.start_source_ref_override.clone(),
+            tenant: None,
         },
         Some(runtime.registry.telemetry().metrics.as_ref()),
         // issue #618 (PR #1014): gate a FRESH create AUTHORITATIVELY under the
@@ -22984,6 +23222,7 @@ async fn update_with_start_workflow(
         workflow_retry_policy: uws_workflow_retry_policy,
         max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
         reject_fresh_if_debounced,
+        tenant: None,
     };
 
     // A committed-replay hit short-circuits the authoritative in-lock call and
@@ -23281,7 +23520,7 @@ async fn update_with_start_workflow(
     }
 }
 
-async fn cancel_workflow(
+pub(crate) async fn cancel_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
@@ -23803,9 +24042,23 @@ async fn rerun_workflow(
             .into_response();
     }
 
-    let effective_input = input_override
-        .clone()
-        .unwrap_or_else(|| source.input.clone());
+    // The start path encodes the input itself, so it gets the plaintext
+    // (issue #1979).
+    let effective_input = if let Some(input) = input_override.clone() {
+        input
+    } else if let Ok(input) = api_state.payload_codecs().decode_column(&source.input) {
+        input
+    } else {
+        // A rejected re-run is audited like every other rejection.
+        audit_rerun_failure_on(
+            &mut conn,
+            &audit_ctx,
+            Some(&exec_id_str),
+            "stored input could not be decoded",
+        )
+        .await;
+        return map_error(undecodable_stored_payload()).into_response();
+    };
 
     // Deferred-start policies are incompatible with a re-run: they admit the
     // start without creating an execution, so there is no execution_id to
@@ -25384,18 +25637,14 @@ fn reset_error_response(error: WorkflowResetError) -> axum::response::Response {
             }),
         )
             .into_response(),
-        // Same `409` and the same operator instruction as the DAG-retry
-        // pre-flight guard, so a caller cannot tell whether the erasure was
-        // already committed or landed in the race window — only that the
-        // source is unusable and a fresh run is the answer.
+        // Every fork refuses an erased source (issue #1999). DAG retry maps
+        // this case to its own message in `dag_retry_reset_error_response`.
         WorkflowResetError::ErasedSource { exec_id } => (
             axum::http::StatusCode::CONFLICT,
             Json(ResetErrorResponse {
                 message: format!(
-                    "workflow execution {exec_id} had its payloads erased (issue #495), so its \
-                     carried-over node outputs are tombstones and whether it already compensated \
-                     cannot be determined; retrying would resume on unreadable state — start a \
-                     fresh DAG run instead"
+                    "workflow execution {exec_id} had its payloads erased (issue #495); a fork \
+                     would resume on tombstones, so start a fresh run instead"
                 ),
             }),
         )
@@ -25535,8 +25784,26 @@ fn dag_retry_invalid_point_response(invalid: &ResetInvalidPoint) -> axum::respon
 /// contract: the invalid-boundary case is a `409` (not the `400` the standalone
 /// reset uses), everything else mirrors the standalone reset mapping.
 fn dag_retry_reset_error_response(error: WorkflowResetError) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
     match error {
         WorkflowResetError::InvalidPoint(invalid) => dag_retry_invalid_point_response(&invalid),
+        // Same `409` and the same operator instruction as the DAG-retry
+        // pre-flight guard. A caller cannot tell whether the erasure committed
+        // before the pre-flight check or in the race window. It only learns
+        // that the source is unusable and that a fresh run is the answer.
+        WorkflowResetError::ErasedSource { exec_id } => (
+            axum::http::StatusCode::CONFLICT,
+            Json(ResetErrorResponse {
+                message: format!(
+                    "workflow execution {exec_id} had its payloads erased (issue #495), so its \
+                     carried-over node outputs are tombstones and whether it already compensated \
+                     cannot be determined; retrying would resume on unreadable state — start a \
+                     fresh DAG run instead"
+                ),
+            }),
+        )
+            .into_response(),
         other => reset_error_response(other),
     }
 }
@@ -25867,6 +26134,12 @@ pub(crate) async fn retry_dag_run_inner(
 
     // Compose the reset request: the reason carries the DAG-retry annotation so
     // the audit trail (#158) and the WorkflowResetFork event read cleanly.
+    //
+    // The pre-flight erasure guard above ran on an unlocked read. The
+    // connection was then dropped for blob inflation, so `erase-payloads` can
+    // commit before this transaction opens. The fork rechecks erasure under its
+    // own row lock (issue #1999). So the fork never acts on an issue #780
+    // guard decision whose evidence an erasure destroyed.
     let augmented_reason = format!(
         "{} | dag_retry: nodes=[{}]",
         reason.trim(),
@@ -25879,13 +26152,6 @@ pub(crate) async fn retry_dag_run_inner(
         operator_id: operator_id.trim().to_string(),
         signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::default(),
         allow_terminal_source: true,
-        // Recheck erasure under the fork's own row lock. The pre-flight guard
-        // above ran on an unlocked read, and the connection was dropped for blob
-        // inflation before this transaction opens — so `erase-payloads` can
-        // commit in that window. Without this, the fork would carry tombstoned
-        // outputs and the issue #780 compensated-run guard would have been
-        // decided on evidence that no longer exists.
-        refuse_erased_source: true,
     };
 
     // Dry-run: validate the boundary and return the plan without writing.
@@ -26223,13 +26489,14 @@ pub(crate) async fn signal_workflow(
             Ok(b) => b,
             Err(e) => return map_error(e).into_response(),
         };
-        signal::send_signal_from_resolved(
+        signal::send_signal_from_resolved_with_codecs(
             bound.as_mut(),
             exec_id,
             target,
             &signal_name,
             payload,
             idempotency_key.as_deref(),
+            &api_state.payload_codecs(),
         )
         .await
     };
@@ -26438,13 +26705,13 @@ async fn hydrate_ctx_for_query(
     // resolve via pre-sent oneshot channels so the entire history replays
     // synchronously; this is read-only and appends no events / performs no
     // writes (issue #612 AC4).
-    let outcome = drive_query_replay_async(
-        &ctx,
-        workflow.handler,
-        execution.input.clone(),
-        api_state.query_timeout(),
-    )
-    .await;
+    // The replayed handler gets the plaintext input (issue #1979).
+    let input = api_state
+        .payload_codecs()
+        .decode_column(&execution.input)
+        .map_err(|_| map_error(undecodable_stored_payload()))?;
+    let outcome =
+        drive_query_replay_async(&ctx, workflow.handler, input, api_state.query_timeout()).await;
 
     if terminal {
         // Drift guard (Codex P2, PR #986 follow-up): if the driven handler
@@ -32537,7 +32804,7 @@ async fn list_dead_letters(
         // only; one audit row per request that touched ≥1 envelope.
         let mut outcome = LossyDecodeOutcome::default();
         for dl in &mut dead_letters {
-            outcome = outcome.merged(codecs.decode_value_lossy(&mut dl.input));
+            outcome = outcome.merged(codecs.decode_column_lossy(&mut dl.input));
             outcome = outcome.merged(decode_error_field(codecs, &mut dl.error));
         }
         // No live connection here: the per-shard DLQ loads are scoped inside
@@ -41655,13 +41922,15 @@ fn apply_min_history_events_filter(
     )
 }
 
-/// Apply the legacy `search_attr` containment predicates and the typed
-/// `search_attr_filter` comparison/set predicates (issue #506) to a boxed
-/// `harvest_workflow_executions` query.
+/// Apply the legacy `search_attr` containment predicates, the typed
+/// `search_attr_filter` comparison/set predicates (issue #506) and the
+/// `filter` expressions (issue #1982) to a boxed
+/// `harvest_workflow_executions` query. `visibility_query::SqlFilter` holds
+/// the SQL for all three.
 ///
-/// Shared by `load_workflows` and `load_stalled_workflows` so both list code
-/// paths filter identically — without this the `no_progress_minutes` (stalled)
-/// path silently ignored every search-attribute filter (issue #506 review).
+/// All three list loaders share this helper, so each list path filters the
+/// same way. Before issue #506, the `no_progress_minutes` (stalled) path
+/// ignored every search-attribute filter.
 ///
 /// Every fragment stays on an index path: `@>` (containment) and `?` (key
 /// existence) both hit the existing `idx_harvest_we_search` GIN index;
@@ -41674,70 +41943,22 @@ fn apply_search_attr_filters<'a>(
     mut query: harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg>,
     legacy: &[Value],
     predicates: &[SearchAttrPredicate],
+    exprs: &[crate::visibility_query::Expr],
 ) -> harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg> {
-    use diesel::dsl::sql;
-    use diesel::sql_types::{Array, Bool, Jsonb, Text};
+    use crate::visibility_query::SqlFilter;
 
     // Legacy `search_attr=key:value` exact-match containment. Repeated keys
     // narrow the result set (AND).
     for predicate in legacy {
-        query = query.filter(
-            sql::<Bool>("harvest_workflow_executions.search_attrs @> ")
-                .bind::<Jsonb, _>(predicate.clone()),
-        );
+        query = query.filter(SqlFilter::contains(predicate.clone()));
     }
     for predicate in predicates {
-        query = match predicate {
-            SearchAttrPredicate::Eq { key, value } => {
-                let object = serde_json::json!({ key.clone(): value.clone() });
-                query.filter(
-                    sql::<Bool>("harvest_workflow_executions.search_attrs @> ")
-                        .bind::<Jsonb, _>(object),
-                )
-            }
-            SearchAttrPredicate::Ne { key, value } => {
-                let object = serde_json::json!({ key.clone(): value.clone() });
-                query.filter(
-                    sql::<Bool>("(harvest_workflow_executions.search_attrs ? ")
-                        .bind::<Text, _>(key.clone())
-                        .sql(" AND NOT (harvest_workflow_executions.search_attrs @> ")
-                        .bind::<Jsonb, _>(object)
-                        .sql("))"),
-                )
-            }
-            SearchAttrPredicate::Cmp { key, op, value } => {
-                let head = sql::<Bool>("(harvest_workflow_executions.search_attrs ? ")
-                    .bind::<Text, _>(key.clone())
-                    .sql(" AND jsonb_typeof(harvest_workflow_executions.search_attrs -> ")
-                    .bind::<Text, _>(key.clone())
-                    .sql(") = 'number' AND (harvest_workflow_executions.search_attrs ->> ")
-                    .bind::<Text, _>(key.clone());
-                // Fold the operator (from the fixed `CmpOp` enum) into a single
-                // static literal per branch so the fragment never chains two
-                // raw-SQL pieces back to back. The threshold is bound as text and
-                // cast `::numeric` so the comparison is exact even past 2^53.
-                let body = match op {
-                    CmpOp::Gt => head.sql(")::numeric > "),
-                    CmpOp::Gte => head.sql(")::numeric >= "),
-                    CmpOp::Lt => head.sql(")::numeric < "),
-                    CmpOp::Lte => head.sql(")::numeric <= "),
-                };
-                query.filter(body.bind::<Text, _>(value.clone()).sql("::numeric)"))
-            }
-            SearchAttrPredicate::In { key, values } => query.filter(
-                sql::<Bool>("(harvest_workflow_executions.search_attrs ? ")
-                    .bind::<Text, _>(key.clone())
-                    .sql(" AND harvest_workflow_executions.search_attrs -> ")
-                    .bind::<Text, _>(key.clone())
-                    .sql(" = ANY(")
-                    .bind::<Array<Jsonb>, _>(values.clone())
-                    .sql("))"),
-            ),
-            SearchAttrPredicate::Exists { key } => query.filter(
-                sql::<Bool>("harvest_workflow_executions.search_attrs ? ")
-                    .bind::<Text, _>(key.clone()),
-            ),
-        };
+        query = query.filter(SqlFilter::from_attr(predicate));
+    }
+    // The `filter` grammar (issue #1982). Its attribute leaves compile to the
+    // same SQL as the predicates above.
+    for expr in exprs {
+        query = query.filter(SqlFilter::from_expr(expr));
     }
     query
 }
@@ -41762,29 +41983,104 @@ fn exclude_canary_from_list(workflow_name: Option<&str>) -> bool {
 /// LIKE wildcard ambiguity) and works inside the stalled loader's
 /// correlated-subquery context. The prefix is always a *bound* `Text` param,
 /// never interpolated.
+///
+/// A `filter` expression that names a canary workflow with `=` or `IN` also
+/// opts back in (issue #1982). Only the canary names that it names pass.
 fn apply_canary_list_exclusion<'a>(
     query: harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg>,
-    workflow_name: Option<&str>,
+    filters: &WorkflowFilters,
 ) -> harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg> {
     use diesel::dsl::sql;
-    use diesel::sql_types::{Bool, Text};
+    use diesel::sql_types::{Array, Bool, Text};
 
-    if exclude_canary_from_list(workflow_name) {
-        query.filter(
-            sql::<Bool>("NOT starts_with(harvest_workflow_executions.workflow_name, ")
-                .bind::<Text, _>(autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX)
-                .sql(")"),
-        )
+    if !exclude_canary_from_list(filters.workflow_name.as_deref()) {
+        return query;
+    }
+    let named: Vec<String> = filters
+        .filter
+        .iter()
+        .flat_map(crate::visibility_query::workflow_names)
+        .filter(|name| autumn_harvest::canary::is_canary_workflow(name))
+        .collect();
+    let excluded = sql::<Bool>("(NOT starts_with(harvest_workflow_executions.workflow_name, ")
+        .bind::<Text, _>(autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX);
+    if named.is_empty() {
+        query.filter(excluded.sql("))"))
     } else {
-        query
+        query.filter(
+            excluded
+                .sql(") OR harvest_workflow_executions.workflow_name = ANY(")
+                .bind::<Array<Text>, _>(named)
+                .sql("))"),
+        )
     }
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn load_workflows(
     conn: &mut AsyncPgConnection,
     filters: &WorkflowFilters,
 ) -> HarvestResult<Vec<WorkflowExecution>> {
+    workflow_list_query(filters)
+        .select(WorkflowExecution::as_select())
+        .load(conn)
+        .await
+        .map_err(database_error)
+}
+
+/// Runs `EXPLAIN` on the default `GET /workflows` query for `raw_query`
+/// (issue #1982). Returns one line of the plan for each row.
+///
+/// A test hook. It parses the query string the same way as the route, and it
+/// explains the same SQL that `load_workflows` runs.
+///
+/// # Errors
+///
+/// Returns a message when the query string is not valid, or when the
+/// database rejects the statement.
+#[doc(hidden)]
+pub async fn explain_workflow_list(
+    conn: &mut AsyncPgConnection,
+    raw_query: &str,
+) -> Result<Vec<String>, String> {
+    let pairs =
+        crate::strict_query::decode_or_autumn_error(Some(raw_query)).map_err(|e| e.to_string())?;
+    let filters = parse_workflow_filters(&pairs).map_err(|e| e.to_string())?;
+    let query = workflow_list_query(&filters).select(WorkflowExecution::as_select());
+    Explain(query)
+        .load::<String>(conn)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// `EXPLAIN` in front of a query.
+struct Explain<Q>(Q);
+
+impl<Q: diesel::query_builder::QueryFragment<diesel::pg::Pg>>
+    diesel::query_builder::QueryFragment<diesel::pg::Pg> for Explain<Q>
+{
+    fn walk_ast<'b>(
+        &'b self,
+        mut out: diesel::query_builder::AstPass<'_, 'b, diesel::pg::Pg>,
+    ) -> diesel::QueryResult<()> {
+        out.push_sql("EXPLAIN ");
+        self.0.walk_ast(out.reborrow())
+    }
+}
+
+impl<Q> diesel::query_builder::QueryId for Explain<Q> {
+    type QueryId = ();
+    const HAS_STATIC_QUERY_ID: bool = false;
+}
+
+impl<Q> diesel::query_builder::Query for Explain<Q> {
+    type SqlType = diesel::sql_types::Text;
+}
+
+/// Builds the default `GET /workflows` query, with no `SELECT` list.
+#[allow(clippy::too_many_lines)]
+fn workflow_list_query(
+    filters: &WorkflowFilters,
+) -> harvest_workflow_executions::BoxedQuery<'static, diesel::pg::Pg> {
     use diesel::dsl::sql;
     use diesel::sql_types::{Bool, Jsonb, Text, Timestamptz, Uuid as SqlUuid};
 
@@ -41873,7 +42169,7 @@ pub(crate) async fn load_workflows(
     }
     // Issue #796 (AC8): hide synthetic liveness canary runs from the default
     // list unless the caller explicitly filters to a canary workflow name.
-    query = apply_canary_list_exclusion(query, filters.workflow_name.as_deref());
+    query = apply_canary_list_exclusion(query, filters);
     if let Some(after) = filters.started_after {
         query = query.filter(harvest_workflow_executions::started_at.ge(after));
     }
@@ -41900,6 +42196,7 @@ pub(crate) async fn load_workflows(
         query,
         &filters.search_attrs,
         &filters.search_attr_predicates,
+        &filters.filter,
     );
     if let Some(cause) = &filters.failure_cause {
         let predicate = serde_json::json!({ "failure_cause": cause });
@@ -41949,12 +42246,7 @@ pub(crate) async fn load_workflows(
     // `apply_min_history_events_filter`) rather than an unbounded
     // `COUNT(*)`. No schema migration is required — it reads from the
     // existing `harvest_events` table via the existing composite index.
-    query = apply_min_history_events_filter(query, filters.min_history_events);
-    query
-        .select(WorkflowExecution::as_select())
-        .load(conn)
-        .await
-        .map_err(database_error)
+    apply_min_history_events_filter(query, filters.min_history_events)
 }
 
 // ── Issue #756: partial-availability for cross-shard fan-out reads ───────────
@@ -42318,7 +42610,7 @@ pub(crate) async fn load_stalled_workflows(
     // Without this, a canary stuck RUNNING (e.g. when the timeout scanner is
     // itself wedged — a failure the canary exists to detect) would surface in
     // `GET /workflows?no_progress_minutes=N`, the same endpoint AC8 excludes.
-    query = apply_canary_list_exclusion(query, filters.workflow_name.as_deref());
+    query = apply_canary_list_exclusion(query, filters);
     if let Some(owner) = &filters.owner {
         query = query.filter(harvest_workflow_executions::owner.eq(owner.as_str()));
     }
@@ -42392,6 +42684,7 @@ pub(crate) async fn load_stalled_workflows(
         query,
         &filters.search_attrs,
         &filters.search_attr_predicates,
+        &filters.filter,
     );
 
     if !filters.include_sleeping {
@@ -42709,7 +43002,7 @@ pub(crate) async fn load_history_bloat_workflows(
     }
     // Issue #796 (AC8): hide synthetic liveness canary runs unless the caller
     // explicitly filters to a canary workflow name.
-    query = apply_canary_list_exclusion(query, filters.workflow_name.as_deref());
+    query = apply_canary_list_exclusion(query, filters);
     if let Some(owner) = &filters.owner {
         query = query.filter(harvest_workflow_executions::owner.eq(owner.as_str()));
     }
@@ -42720,6 +43013,7 @@ pub(crate) async fn load_history_bloat_workflows(
         query,
         &filters.search_attrs,
         &filters.search_attr_predicates,
+        &filters.filter,
     );
     // PR #1139 review: mirror `load_workflows`'s `failure_cause` handling --
     // omitting it here silently broadened the result to unrelated bloated
@@ -45142,6 +45436,168 @@ async fn stream_execution_events(
         .into_response()
 }
 
+/// The longest wait for the `LISTEN` connection of one shard.
+const WORKFLOW_CHANGES_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The shortest gap between two `changed` frames on the change stream.
+const WORKFLOW_CHANGES_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The shared state of the shard listeners of one change stream.
+#[derive(Default)]
+struct WorkflowChangeSignal {
+    notify: tokio::sync::Notify,
+    count: std::sync::atomic::AtomicU64,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+/// Stops each listener task when the stream ends.
+struct AbortOnDrop(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+/// Opens one `LISTEN` connection for each shard, all at the same time.
+///
+/// Each connect has a 5 s limit, so one silent shard cannot hold the request.
+/// Returns the first shard that failed.
+async fn connect_change_listeners(
+    urls: &BTreeMap<ShardId, String>,
+) -> Result<Vec<autumn_harvest::notify::WorkflowEventListener>, i32> {
+    use autumn_harvest::notify::WorkflowEventListener;
+
+    let connects = urls.iter().map(|(shard, url)| async move {
+        let connect = WorkflowEventListener::connect(url);
+        match tokio::time::timeout(WORKFLOW_CHANGES_CONNECT_TIMEOUT, connect).await {
+            Ok(Ok(listener)) => Ok(listener),
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    shard = shard.as_i32(),
+                    error = %e,
+                    "workflow change stream: shard listener failed"
+                );
+                Err(shard.as_i32())
+            }
+            Err(_) => {
+                tracing::warn!(
+                    shard = shard.as_i32(),
+                    "workflow change stream: shard listener timed out"
+                );
+                Err(shard.as_i32())
+            }
+        }
+    });
+    futures::future::try_join_all(connects).await
+}
+
+/// `GET /workflows/changes/stream` (issue #1982): a live signal for list views.
+///
+/// The stream listens to `harvest_events` on each shard. That is the channel
+/// of the #324 stream. It sends `event: changed` with the count of
+/// notifications since the last frame, at most once each second. A frame
+/// holds no run id and no payload. A client fetches the list again.
+///
+/// The route is admin-gated, the same as #324. Each stream holds one `LISTEN`
+/// connection for each shard. When a listener closes, the stream sends
+/// `event: stream-error` and ends, so the client connects again.
+async fn stream_workflow_changes(
+    Extension(api_state): Extension<HarvestApiState>,
+    session: Option<axum::extract::Extension<Session>>,
+) -> axum::response::Response {
+    use autumn_harvest::notify::WorkflowEventWaitOutcome;
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::SinkExt as _;
+    use std::sync::atomic::Ordering;
+
+    if !has_harvest_admin_access(&api_state, session.map(|s| s.0)).await {
+        return AutumnError::unauthorized_msg("authentication required").into_response();
+    }
+    let Ok(urls) = api_state.workflow_result_notification_database_urls() else {
+        return AutumnError::service_unavailable_msg(
+            "SSE notification URL is not configured".to_string(),
+        )
+        .into_response();
+    };
+
+    // The listeners start before the response, so the stream gets each later
+    // change. The client fetches the page once on connect, which covers the
+    // time before.
+    let Ok(listeners) = connect_change_listeners(&urls).await else {
+        return AutumnError::service_unavailable_msg(
+            "a shard notification listener is not available".to_string(),
+        )
+        .into_response();
+    };
+
+    let signal = std::sync::Arc::new(WorkflowChangeSignal::default());
+    let tasks = listeners
+        .into_iter()
+        .map(|mut listener| {
+            let signal = signal.clone();
+            tokio::spawn(async move {
+                loop {
+                    let outcome = listener.wait_for_notification().await;
+                    if matches!(outcome, Ok(WorkflowEventWaitOutcome::ChannelClosed)) {
+                        signal.closed.store(true, Ordering::Release);
+                        signal.notify.notify_one();
+                        return;
+                    }
+                    // A payload that does not parse is still a change.
+                    signal.count.fetch_add(1, Ordering::Relaxed);
+                    signal.notify.notify_one();
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let keepalive = api_state.sse_keepalive_interval();
+    let (mut tx, rx) =
+        futures::channel::mpsc::channel::<Result<Event, std::convert::Infallible>>(4);
+    tokio::spawn(async move {
+        let _listeners = AbortOnDrop(tasks);
+        loop {
+            // `Notify` keeps one permit, so changes during the gap below
+            // join into the next frame.
+            tokio::select! {
+                () = signal.notify.notified() => {}
+                () = tokio::time::sleep(keepalive) => {
+                    if tx.is_closed() {
+                        return;
+                    }
+                    continue;
+                }
+            }
+            if std::sync::atomic::AtomicBool::load(&signal.closed, Ordering::Acquire) {
+                let frame = Event::default()
+                    .event("stream-error")
+                    .data(r#"{"error":"listener_closed","retry":true}"#);
+                let _ = tx.send(Ok(frame)).await;
+                return;
+            }
+            let count = signal.count.swap(0, Ordering::Relaxed);
+            // A late permit from a change that the last frame counted.
+            if count == 0 {
+                continue;
+            }
+            let frame = Event::default()
+                .event("changed")
+                .data(serde_json::json!({ "notifications": count }).to_string());
+            if tx.send(Ok(frame)).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(WORKFLOW_CHANGES_MIN_GAP).await;
+        }
+    });
+
+    Sse::new(rx)
+        .keep_alive(KeepAlive::new().interval(keepalive).text("ping"))
+        .into_response()
+}
+
 /// Terminal-close poll cadence / keepalive ceiling for the workflow progress SSE
 /// stream (issue #791). Bounds how long after a workflow reaches a terminal
 /// state the final `event: end` frame is emitted (there is no terminal *chunk*,
@@ -45491,6 +45947,345 @@ async fn stream_workflow_progress(
         .into_response()
 }
 
+/// Rows that one table read of the durable stream returns (issue #1974).
+///
+/// The producer reads the next page only when the send buffer has room. One
+/// stream therefore holds at most this page and the buffer in memory.
+const DURABLE_STREAM_PAGE: i64 = 256;
+
+/// Longest wait for a client to take one durable stream frame (issue #1974).
+///
+/// A client that reads nothing for this long loses its stream. Nothing is
+/// lost: the client resumes with `Last-Event-ID`. Without this bound, a
+/// stalled client holds its producer task and connections forever.
+const DURABLE_STREAM_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Sender half of an SSE frame channel.
+type SseSender =
+    futures::channel::mpsc::Sender<Result<axum::response::sse::Event, std::convert::Infallible>>;
+
+/// Query of `GET /workflows/{id}/stream/durable` (issue #1974).
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct DurableStreamQuery {
+    /// Exclusive resume offset. It wins over the `Last-Event-ID` header.
+    #[serde(default)]
+    after: Option<u64>,
+}
+
+/// Resolve the resume cursor of a durable stream (issue #1974).
+///
+/// `?after=` wins over `Last-Event-ID`, which a browser `EventSource` sends
+/// on reconnect. `None` reads from the first chunk. An offset above
+/// `i64::MAX` clamps to it, so the reader gets nothing more.
+fn durable_stream_cursor(
+    after: Option<u64>,
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<i64>, AutumnError> {
+    let raw = match (after, headers.get("last-event-id")) {
+        (Some(after), _) => Some(after),
+        (None, None) => None,
+        (None, Some(value)) => Some(
+            value
+                .to_str()
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .ok_or_else(|| {
+                    AutumnError::bad_request_msg(
+                        "Last-Event-ID must be a non-negative integer offset",
+                    )
+                })?,
+        ),
+    };
+    Ok(raw.map(|offset| i64::try_from(offset).unwrap_or(i64::MAX)))
+}
+
+/// Send one frame, and wait at most [`DURABLE_STREAM_SEND_TIMEOUT`].
+///
+/// Returns `false` when the client is gone or too slow. The caller then ends
+/// the stream.
+async fn send_durable_frame(tx: &mut SseSender, event: axum::response::sse::Event) -> bool {
+    use futures::SinkExt as _;
+    matches!(
+        tokio::time::timeout(DURABLE_STREAM_SEND_TIMEOUT, tx.send(Ok(event))).await,
+        Ok(Ok(()))
+    )
+}
+
+/// Result of one drain of the durable stream table.
+enum DurableDrain {
+    /// Every stored chunk above the cursor went to the client.
+    Done,
+    /// A read failed for a transient reason. The next tick retries.
+    Incomplete,
+    /// The client disconnected or stopped reading.
+    ClientGone,
+    /// The run left the request's shard fence (issue #1803).
+    LeftFence,
+}
+
+/// Send every stored chunk above `cursor`, in pages, and move the cursor.
+///
+/// The send waits while the client is slow. Nothing is dropped, because the
+/// next page comes from the table. No pooled connection is held during a
+/// send.
+async fn drain_durable_stream(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+    cursor: &mut Option<i64>,
+    tx: &mut SseSender,
+) -> DurableDrain {
+    loop {
+        let rows = match stream_conn_for_execution(api_state, exec_id).await {
+            FencedCheckout::Ready(mut conn) => match autumn_harvest::store::load_stream_chunks(
+                &mut conn,
+                exec_id,
+                *cursor,
+                DURABLE_STREAM_PAGE,
+            )
+            .await
+            {
+                Ok(rows) => rows,
+                Err(_) => return DurableDrain::Incomplete,
+            },
+            FencedCheckout::Retry => return DurableDrain::Incomplete,
+            FencedCheckout::LeftFence => return DurableDrain::LeftFence,
+        };
+        let full = i64::try_from(rows.len()).unwrap_or(i64::MAX) >= DURABLE_STREAM_PAGE;
+        for row in rows {
+            let event = axum::response::sse::Event::default()
+                .id(row.stream_offset.to_string())
+                .event("progress")
+                .data(row.chunk.to_string());
+            if !send_durable_frame(tx, event).await {
+                return DurableDrain::ClientGone;
+            }
+            *cursor = Some(row.stream_offset);
+        }
+        if !full {
+            return DurableDrain::Done;
+        }
+    }
+}
+
+/// Send the terminal `event: end` frame of a durable stream.
+async fn send_durable_end(tx: &mut SseSender, reason: &str) {
+    let data = serde_json::json!({ "reason": reason }).to_string();
+    let _ = send_durable_frame(
+        tx,
+        axum::response::sse::Event::default()
+            .event("end")
+            .data(data),
+    )
+    .await;
+}
+
+/// What the durable producer knows about the run when it starts.
+enum DurableStart {
+    /// The run was terminal at connect. No listener is needed.
+    Terminal(String),
+    /// The run is live. The listener opened before the first read.
+    Live {
+        listener: autumn_harvest::notify::DurableStreamListener,
+        shard: ShardId,
+    },
+}
+
+/// Producer task of a durable stream (issue #1974).
+///
+/// A terminal run needs no listener: its chunks are all committed. The
+/// producer drains them and ends. A live run drains on each wake and each
+/// keepalive tick. After a tick sees a terminal state, one more drain reads
+/// the chunks of the terminal cycle, which commit with that state.
+async fn durable_stream_producer(
+    api_state: HarvestApiState,
+    exec_id: ExecutionId,
+    mut cursor: Option<i64>,
+    start: DurableStart,
+    keepalive: std::time::Duration,
+    mut tx: SseSender,
+) {
+    use autumn_harvest::notify::{DurableStreamListener, DurableStreamWait};
+
+    let (mut listener, mut listener_shard, mut end_reason) = match start {
+        DurableStart::Terminal(reason) => {
+            // Retry a transient read failure once per keepalive.
+            loop {
+                match drain_durable_stream(&api_state, exec_id, &mut cursor, &mut tx).await {
+                    DurableDrain::Done => {
+                        send_durable_end(&mut tx, &reason).await;
+                        return;
+                    }
+                    DurableDrain::Incomplete => tokio::time::sleep(keepalive).await,
+                    DurableDrain::ClientGone => return,
+                    DurableDrain::LeftFence => {
+                        let _ = send_durable_frame(&mut tx, shard_fence_error_event()).await;
+                        return;
+                    }
+                }
+                if tx.is_closed() {
+                    return;
+                }
+            }
+        }
+        DurableStart::Live { listener, shard } => (listener, shard, None::<String>),
+    };
+
+    loop {
+        match drain_durable_stream(&api_state, exec_id, &mut cursor, &mut tx).await {
+            DurableDrain::Done => {
+                if let Some(reason) = end_reason.take() {
+                    send_durable_end(&mut tx, &reason).await;
+                    return;
+                }
+            }
+            DurableDrain::Incomplete => {}
+            DurableDrain::ClientGone => return,
+            DurableDrain::LeftFence => {
+                let _ = send_durable_frame(&mut tx, shard_fence_error_event()).await;
+                return;
+            }
+        }
+
+        // Rebind the listener after a shard move, as `/stream` does.
+        match stream_live_shard(&api_state, exec_id).await {
+            FencedCheckout::Ready(current) if current != listener_shard => {
+                if let Ok(url) = api_state.sse_notification_url(current)
+                    && let Ok(l) = DurableStreamListener::connect(&url, exec_id.as_uuid()).await
+                {
+                    listener = l;
+                    listener_shard = current;
+                }
+            }
+            FencedCheckout::LeftFence => {
+                let _ = send_durable_frame(&mut tx, shard_fence_error_event()).await;
+                return;
+            }
+            FencedCheckout::Ready(_) | FencedCheckout::Retry => {}
+        }
+
+        match listener.wait_timeout(keepalive).await {
+            DurableStreamWait::Woken => {}
+            DurableStreamWait::TimedOut => {
+                if tx.is_closed() {
+                    return;
+                }
+                // The tick also reads the table, so a lost wake only delays
+                // a chunk by one keepalive.
+                match progress_stream_end_reason(&api_state, exec_id).await {
+                    ProgressPoll::End(reason) => end_reason = Some(reason),
+                    ProgressPoll::Wait => {}
+                    ProgressPoll::LeftFence => {
+                        let _ = send_durable_frame(&mut tx, shard_fence_error_event()).await;
+                        return;
+                    }
+                }
+            }
+            DurableStreamWait::ChannelClosed => {
+                let data = serde_json::json!({ "error": "listen_connection_closed" }).to_string();
+                let _ = send_durable_frame(
+                    &mut tx,
+                    axum::response::sse::Event::default()
+                        .event("error")
+                        .data(data),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+}
+
+/// `GET /workflows/{id}/stream/durable`
+///
+/// Durable, resumable output stream (issue #1974). It streams the chunks that
+/// [`WorkflowContext::publish_durable_progress`](autumn_harvest::context::WorkflowContext::publish_durable_progress)
+/// stored in `harvest_stream_chunks`, in offset order.
+///
+/// - **Resume**: `?after=<offset>` or `Last-Event-ID` sets an exclusive
+///   cursor. The query parameter wins. With neither, the stream starts at the
+///   first chunk.
+/// - **No gap, no duplicate**: for a live run, `LISTEN` opens before the
+///   first read. Each wake and each keepalive tick reads the rows above the
+///   cursor.
+/// - **No drop**: the producer waits for a slow client and loses nothing. A
+///   client that reads nothing for 60 s loses the stream and resumes.
+/// - **End**: a run that is terminal at connect streams its stored chunks,
+///   then `event: end`, with no `LISTEN`. A live run sends `event: end` after
+///   the drain that follows its terminal state.
+///
+/// The frames are the `/stream` frames, and the SSE `id:` is the offset.
+/// Auth and the 400 and 404 responses are the same as for `/stream`. The 503
+/// for a missing or unreachable LISTEN database applies to a live run only.
+/// A live stream holds one `LISTEN` connection. A pooled connection is held
+/// for one page read only.
+async fn stream_workflow_progress_durable(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(exec_id_raw): Path<String>,
+    Query(query): Query<DurableStreamQuery>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use autumn_harvest::notify::DurableStreamListener;
+    use axum::response::sse::{Event, KeepAlive, Sse};
+
+    let exec_id = match parse_execution_id(&exec_id_raw) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    let cursor = match durable_stream_cursor(query.after, &headers) {
+        Ok(cursor) => cursor,
+        Err(e) => return e.into_response(),
+    };
+    let state = {
+        let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+        match load_execution(&mut conn, exec_id).await {
+            Ok(execution) => execution.state,
+            Err(e) => return map_error(e).into_response(),
+        }
+    };
+    // A terminal run reads stored rows only, so it needs no LISTEN URL. A
+    // deployment without live streaming can still read finished runs.
+    let start = if is_terminal_state(&state) {
+        DurableStart::Terminal(state.to_lowercase().replace('_', "-"))
+    } else {
+        let Some(shard) = resolve_shard_best_effort(&api_state, exec_id).await else {
+            return AutumnError::service_unavailable_msg(
+                "progress streaming is not configured (no LISTEN/NOTIFY database URL)",
+            )
+            .into_response();
+        };
+        let Ok(notification_url) = api_state.sse_notification_url(shard) else {
+            return AutumnError::service_unavailable_msg(
+                "progress streaming is not configured (no LISTEN/NOTIFY database URL)",
+            )
+            .into_response();
+        };
+        // LISTEN before the first read, so no commit falls between the two.
+        match DurableStreamListener::connect(&notification_url, exec_id.as_uuid()).await {
+            Ok(listener) => DurableStart::Live { listener, shard },
+            Err(e) => return map_error(e).into_response(),
+        }
+    };
+
+    let keepalive = api_state
+        .sse_keepalive_interval()
+        .min(PROGRESS_STREAM_KEEPALIVE);
+    let (tx, rx) = futures::channel::mpsc::channel::<Result<Event, std::convert::Infallible>>(
+        PROGRESS_STREAM_CHANNEL_CAPACITY,
+    );
+    let fence = ::autumn_harvest::shard_fence::current();
+    tokio::spawn(::autumn_harvest::shard_fence::scoped(
+        fence,
+        durable_stream_producer(api_state.clone(), exec_id, cursor, start, keepalive, tx),
+    ));
+
+    Sse::new(rx)
+        .keep_alive(KeepAlive::new().interval(keepalive).text("ping"))
+        .into_response()
+}
+
 /// Shared flat JSON body for a `HarvestError::QuotaExceeded` 429 response
 /// (issue #946, AC4) -- the single source of truth for the wire shape used
 /// by every bespoke route arm (`start_workflow`, `signal_with_start_workflow`,
@@ -45586,6 +46381,9 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
         } => AutumnError::bad_request_msg(format!(
             "workflow execution already exists: {existing_exec_id} (state: {existing_state})"
         )),
+        // Issue #1977: the message names the key the caller sent, never a run.
+        e @ HarvestError::TenantConflict { .. } => AutumnError::bad_request_msg(e.to_string())
+            .with_status(axum::http::StatusCode::CONFLICT),
         // Safety-net fallback for a per-tenant resource quota rejection
         // (issue #946) reached from a route that has no bespoke structured
         // 429 arm of its own (every request-time `map_error` call site not
@@ -50943,6 +51741,47 @@ mod reserved_idempotency_key_tests {
 #[cfg(test)]
 mod tests {
 
+    // ── issue #1974: durable stream resume cursor ──────────────────────────
+
+    fn last_event_id(value: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "last-event-id",
+            axum::http::HeaderValue::from_str(value).expect("header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn durable_stream_cursor_reads_the_query_then_the_header() {
+        let none = axum::http::HeaderMap::new();
+        assert_eq!(durable_stream_cursor(None, &none).ok(), Some(None));
+        assert_eq!(
+            durable_stream_cursor(None, &last_event_id(" 41 ")).ok(),
+            Some(Some(41))
+        );
+        assert_eq!(
+            durable_stream_cursor(Some(7), &last_event_id("41")).ok(),
+            Some(Some(7)),
+            "the query parameter wins over the header"
+        );
+        assert_eq!(
+            durable_stream_cursor(Some(u64::MAX), &none).ok(),
+            Some(Some(i64::MAX)),
+            "an offset above i64::MAX clamps, so the reader gets nothing more"
+        );
+    }
+
+    #[test]
+    fn durable_stream_cursor_rejects_a_malformed_header() {
+        for bad in ["abc", "-1", "1.5", ""] {
+            assert!(
+                durable_stream_cursor(None, &last_event_id(bad)).is_err(),
+                "{bad:?} must be a 400"
+            );
+        }
+    }
+
     // ── issue #1814: one ramp id per keyed build-routing fan-out ────────────
 
     const PAYLOAD: &[Option<&str>] = &[Some("canary-v2"), Some("25")];
@@ -52153,6 +52992,47 @@ mod tests {
                 "human_message must be non-empty for {variant:?}"
             );
         }
+    }
+
+    /// Read the `message` of a reset error response.
+    async fn reset_error_message(response: axum::response::Response) -> (StatusCode, String) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body must be readable");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
+        (
+            status,
+            body["message"].as_str().unwrap_or_default().to_string(),
+        )
+    }
+
+    /// Every fork refuses an erased source (issue #1999). The shared reset
+    /// `409` names no DAG. DAG retry keeps its own advice for the race window.
+    #[tokio::test]
+    async fn erased_source_409_is_generic_for_reset_and_specific_for_dag_retry() {
+        use autumn_harvest::reset::WorkflowResetError;
+        use autumn_harvest::types::{ExecutionId, ShardId};
+
+        let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+
+        let (status, message) =
+            reset_error_message(reset_error_response(WorkflowResetError::ErasedSource {
+                exec_id,
+            }))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(message.contains("erased"), "message: {message}");
+        assert!(message.contains("fresh run"), "message: {message}");
+        assert!(!message.contains("DAG"), "message: {message}");
+
+        let (status, message) = reset_error_message(dag_retry_reset_error_response(
+            WorkflowResetError::ErasedSource { exec_id },
+        ))
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(message.contains("erased"), "message: {message}");
+        assert!(message.contains("fresh DAG run"), "message: {message}");
     }
 
     /// The bulk DLQ `min_attempts` guard (issue #613): `>= 1` is accepted, but
@@ -54027,6 +54907,7 @@ mod tests {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                tenant: None,
             },
             None,
             None,
@@ -54116,6 +54997,7 @@ mod tests {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                tenant: None,
             },
             None,
             None,
@@ -54243,6 +55125,7 @@ mod tests {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                tenant: None,
             },
             None,
             None,
@@ -54376,6 +55259,7 @@ mod tests {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                tenant: None,
             },
             None,
             None,
@@ -58195,6 +59079,7 @@ mod tests {
             migrated_run_terminal_state: None,
             staging_vacated_state: None,
             staging_vacated_by: None,
+            tenant: None,
         }
     }
 
@@ -60227,6 +61112,7 @@ mod mutation_gate_tests {
                 .insert(crate::api_token::TokenPrincipal {
                     id: uuid::Uuid::nil(),
                     scope: crate::api_token::TokenScope::Mutate,
+                    tenant: None,
                 });
         }
         harvest_api_router(api_state)

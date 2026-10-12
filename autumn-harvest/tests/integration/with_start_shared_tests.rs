@@ -104,6 +104,7 @@ fn sws(id: &str, policy: WorkflowIdReusePolicy) -> SignalWithStartParams<'_> {
         workflow_info: None,
         start_source_override: None,
         start_source_ref_override: None,
+        tenant: None,
     }
 }
 
@@ -139,6 +140,7 @@ fn uws(id: &str, policy: WorkflowIdReusePolicy) -> UpdateWithStartParams<'_> {
         workflow_retry_policy: None,
         max_workflow_attempts_ceiling: None,
         reject_fresh_if_debounced: false,
+        tenant: None,
     }
 }
 

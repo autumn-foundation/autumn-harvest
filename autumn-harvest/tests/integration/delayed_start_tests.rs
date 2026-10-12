@@ -178,6 +178,7 @@ async fn test_delayed_start_validation() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -241,6 +242,7 @@ async fn test_delayed_start_validation() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -284,6 +286,7 @@ async fn test_delayed_start_no_premature_dispatch() {
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(50),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -372,6 +375,7 @@ async fn test_delayed_start_no_premature_dispatch() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -466,6 +470,7 @@ async fn test_delayed_start_cancel_before_firing() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -567,6 +572,7 @@ async fn test_delayed_start_workflow_started_event_timestamp() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -636,6 +642,7 @@ async fn test_immediate_start_skew_tolerance() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )

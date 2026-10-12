@@ -938,6 +938,8 @@ fn activity_info() -> ActivityInfo {
         max_result_bytes: None,
         requires: None,
         handler: failing_activity,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -1022,6 +1024,7 @@ fn start_params<'a>(
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     }
 }
 
@@ -1162,6 +1165,23 @@ async fn a_direct_scanner_pass_labels_its_assigned_shards() {
     );
 }
 
+/// Each claim loop counts once, so the steady pollers count is the claim cap.
+fn assert_every_claim_loop_polls(metrics: &Recording, queue: &str) {
+    let most_pollers = metrics
+        .samples()
+        .into_iter()
+        .filter_map(|s| match s {
+            Sample::Pollers { queue: q, pollers } if q == queue => Some(pollers),
+            _ => None,
+        })
+        .max();
+    assert_eq!(
+        most_pollers,
+        u64::try_from(autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS).ok(),
+        "every claim loop counts as a poller"
+    );
+}
+
 /// A running worker emits the pool, wait, query, poller and outlier metrics,
 /// and its heartbeat publishes a task-stats row that counts the failed
 /// activity attempts.
@@ -1240,10 +1260,6 @@ async fn running_worker_emits_saturation_metrics_and_publishes_task_stats() {
         Sample::Query(DbOp::Claim.as_str()),
         Sample::Query(DbOp::Persist.as_str()),
         Sample::Query(DbOp::Heartbeat.as_str()),
-        Sample::Pollers {
-            queue: queue.clone(),
-            pollers: 1,
-        },
         Sample::Outlier {
             dimension: OutlierDimension::FailureRatio,
             flagged: false,
@@ -1255,6 +1271,7 @@ async fn running_worker_emits_saturation_metrics_and_publishes_task_stats() {
     ] {
         assert!(metrics.has(&wanted), "missing {wanted:?}");
     }
+    assert_every_claim_loop_polls(&metrics, &queue);
     // A single-pool worker tags every wait with its own pool. The
     // process-global sharded pool does not change the label.
     assert!(
@@ -1538,12 +1555,18 @@ async fn a_terminal_failure_write_records_a_persist_sample() {
 const HANGING_WORKFLOW: &str = "saturation_hanging_wf";
 const HANGING_ACTIVITY: &str = "saturation_hanging_activity";
 
+/// Hang until the worker cancels the attempt. A fixed sleep races the
+/// timeout scanner. If the sleep ends first, the attempt succeeds. The bound
+/// only stops a broken scanner from hanging the test.
 fn hangs<'a>(
-    _ctx: &'a ActivityContext,
+    ctx: &'a ActivityContext,
     _input: serde_json::Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !ctx.is_cancelled() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         Ok(serde_json::json!({}))
     })
 }
@@ -1583,7 +1606,11 @@ async fn a_scanner_enforced_activity_timeout_counts_as_a_failure() {
             name: HANGING_ACTIVITY,
             handler: hangs,
             default_retry_policy: Some(RetryPolicy::fixed(1, Duration::from_millis(10))),
-            default_start_to_close: Some(Duration::from_millis(300)),
+            // The deadline counts from the claim, not from the handler start.
+            // A timeout before the handler starts is not a failure, by design
+            // (issue #1785). The lag from claim to handler start can pass
+            // 500ms on a loaded runner, so the deadline leaves a wide margin.
+            default_start_to_close: Some(Duration::from_secs(3)),
             ..activity_info()
         }])
         .worker(WorkerConfig::default().with_queues([queue.as_str()]))

@@ -1,7 +1,7 @@
 # ADR 0004: Tenant isolation with cells
 
 ## Status
-Accepted
+Accepted. Amended by issue #1977 (tenant binding).
 
 Date: 2026-10-06. Records the decision for issue #1837.
 
@@ -80,10 +80,15 @@ a **cell**: one reserved shard plus the worker pool assigned to it.
 - Tenants without a cell share the unreserved shards. Key-based quotas,
   throttles and concurrency caps still apply there.
 
-Harvest does not support hostile multi-tenancy. A cell bounds the load one
-tenant puts on another. It is not a security boundary. The caller declares the
-`x-harvest-tenant` header. Harvest does not bind it to stored executions.
-Use the authorizer hook (#1803) to confine a caller to its tenant.
+Harvest did not support hostile multi-tenancy. A cell bounds the load one
+tenant puts on another. It is not a security boundary. The caller declared
+the `x-harvest-tenant` header, and Harvest did not bind it to stored
+executions. The authorizer hook (#1803) was the way to confine a caller to
+its tenant.
+
+**Superseded in part.** The amendment at the end of this ADR (#1977) puts
+hostile multi-tenancy in scope at the management API. A cell still bounds
+load, not access.
 
 Harvest adds no first-class namespaces. Revisit this decision if a
 deployment needs per-tenant authorization inside one shard, or more tenants
@@ -138,3 +143,85 @@ backlog of 60 tasks.
 Router tests in `sharding_unit.rs` prove that unpinned placement never
 picks a reserved shard. They also prove that a reservation moves only the
 keys that hashed to the reserved shard.
+
+## Amendment: tenant binding (issue #1977)
+
+Date: 2026-10-08. Records the decision for issue #1977.
+
+### Context
+
+The decision above left access to the authorizer hook. The hook read the
+tenant from `x-harvest-tenant`, which the caller declares. A caller with a
+credential for tenant A could set the header to B. A hook that trusted the
+header then let it read and cancel B's runs. Retention also had no
+per-tenant age.
+
+### Options considered
+
+1. **Keep the header and document the risk.** Rejected. Every embedder must
+   then find the defect and work around it.
+2. **Bind the tenant to the credential, and leave all access to the hook.**
+   Rejected alone. The hook cannot tell which tenant owns a run on a shared
+   shard, because Harvest stores no owner.
+3. **Namespaces with row filters on every route.** Rejected again. See
+   "First-class namespaces" in the first list of options.
+4. **Bind the tenant to the credential, stamp it on each run, and give a
+   bound caller a fixed route allowlist.** Chosen.
+
+### Decision
+
+Hostile multi-tenancy is in scope at the management API. It is out of
+scope inside the engine.
+
+- A Harvest token can carry a tenant (`harvest_api_tokens.tenant`). The
+  embedder's auth layer can attach `VerifiedTenant`. Either makes the caller
+  tenant-bound.
+- For a bound caller, the verified tenant replaces the header. A header that
+  names another tenant gets `403`. The hook sees the verified tenant, with
+  `tenant_verified = true`.
+- A bound caller reaches only `TENANT_SCOPED_ROUTES`: start, and the by-id
+  routes that a tenant client needs. Every other route gets `403`. Harvest
+  does not filter list routes, so a bound caller cannot use them.
+- A start by a bound caller stamps `harvest_workflow_executions.tenant`. Each
+  run derived from it copies the tenant. A by-id request for a run of
+  another tenant gets `404`.
+- A start with a tenant never attaches to, cancels, replaces or seals a run
+  of another tenant. The engine refuses it with
+  `HarvestError::TenantConflict`, under the row lock. The API answers `409`
+  and names no run.
+- `RetentionConfig::with_tenant_override` keeps the runs of one tenant for
+  its own age. It wins over the per-type override (#737).
+- Workflow code stays trusted. It can still signal, cancel or pin into any
+  run or cell.
+
+### Consequences
+
+- A bound caller must keep the execution ids it gets from start. It cannot
+  list its runs.
+- Workflow ids and idempotency keys stay shared across tenants. A collision
+  tells a tenant that an id is in use, but cannot change the other run.
+  Prefix workflow ids with the tenant.
+- Deferred starts (throttle, debounce, batch), signal-with-start,
+  update-with-start and the MCP tools cannot carry the tenant through the API.
+  A bound caller cannot use them.
+- `harvest_workflow_executions` now has 65 columns. The workspace enables
+  diesel's `128-column-tables` feature, which makes a cold diesel build
+  slower.
+- A deployment with no bound callers sees no change.
+
+### Proof
+
+`autumn-harvest-plugin/tests/tenant_binding_integration.rs`:
+
+- `tenant_a_credential_cannot_reach_tenant_b_by_setting_the_header` is the
+  red test. Before the fix, a tenant-A token read a tenant-B run with `200`.
+- `tenant_token_reaches_only_its_own_runs_without_an_authorizer` and
+  `tenant_token_is_refused_off_the_tenant_scoped_routes` prove the
+  allowlist and the row check.
+- `tenant_start_cannot_terminate_or_replace_another_tenants_run` and
+  `tenant_start_conflict_leaks_no_execution` prove the start guard. Before
+  the guard, `terminate_existing` from tenant A got `201` and cancelled
+  tenant B's run.
+
+`autumn-harvest/tests/integration/retention_overrides_tests.rs` proves the
+per-tenant override and its precedence.

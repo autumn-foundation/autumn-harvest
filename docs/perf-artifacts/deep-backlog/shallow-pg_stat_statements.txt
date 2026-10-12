@@ -1,0 +1,22 @@
+-- pg_stat_statements over the workload, this database only, top 25 by buffers --
+| % buffers | calls | buffers | buffers/call | rows | total ms | temp blks written | statement |
+|--:|--:|--:|--:|--:|--:|--:|--|
+| 86.3 | 21 | 17647 | 840.3 | 20 | 389.7 | 0 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_queues AS MATERIALIZED ( SELECT …` |
+| 3.6 | 20 | 728 | 36.4 | 0 | 0.7 | 0 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8 AND worker_id = $2 …` |
+| 2.8 | 15 | 574 | 38.3 | 0 | 0.5 | 0 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8 AND worker_id = $2 …` |
+| 2.2 | 11 | 452 | 41.1 | 11 | 3.9 | 0 | `INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", "max_attempts", "sch…` |
+| 1.8 | 9 | 378 | 42.0 | 9 | 3.0 | 0 | `INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", "max_attempts", "sch…` |
+| 1.7 | 20 | 351 | 17.6 | 20 | 7.4 | 0 | `UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "completed_at" = $5 WHERE (("harvest_task_queue"."id" = $6)…` |
+| 0.8 | 5 | 155 | 31.0 | 0 | 0.2 | 0 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8 AND worker_id = $2 …` |
+| 0.5 | 20 | 93 | 4.7 | 20 | 5.6 | 0 | `DELETE FROM harvest_task_queue WHERE id = $1 AND state = $2` |
+| 0.4 | 20 | 80 | 4.0 | 20 | 0.4 | 0 | `SELECT $2 FROM ONLY "public"."harvest_workflow_executions" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x` |
+| 0.0 | 21 | 0 | 0.0 | 0 | 0.1 | 0 | `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED` |
+| 0.0 | 21 | 0 | 0.0 | 0 | 0.0 | 0 | `COMMIT` |
+| 0.0 | 3 | 0 | 0.0 | 3 | 0.0 | 0 | `SELECT current_setting($1)::bigint AS n` |
+| 0.0 | 20 | 0 | 0.0 | 20 | 0.2 | 0 | `SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)` |
+| 0.0 | 20 | 0 | 0.0 | 20 | 0.1 | 0 | `SELECT pg_try_advisory_xact_lock_shared($1, $2) AS acquired` |
+| 0.0 | 20 | 0 | 0.0 | 20 | 0.1 | 0 | `SELECT txid_current_if_assigned()` |
+| 0.0 | 5 | 0 | 0.0 | 0 | 0.0 | 0 | `SET CLIENT_ENCODING TO 'UTF8'` |
+| 0.0 | 5 | 0 | 0.0 | 0 | 0.9 | 0 | `SET TIME ZONE 'UTC'` |
+
+17 statements, 20458 shared buffers in all.

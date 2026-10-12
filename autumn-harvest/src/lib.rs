@@ -302,7 +302,8 @@ pub mod diagnostic;
 /// Task dispatch channel seam (issue #1312): Postgres stays the source of
 /// truth, a [`dispatch::TaskDispatch`] carries task references.
 pub mod dispatch;
-/// Deterministic simulation of the activity claim protocol (issue #1830).
+/// Deterministic simulation of the activity claim protocol (issue #1830),
+/// and of the real worker loop (issue #2002).
 pub mod dst;
 /// Effective runtime-configuration introspection (issue #695).
 ///
@@ -313,6 +314,8 @@ pub mod dst;
 /// tunable is a compile error until it is surfaced.
 pub mod effective_config;
 pub mod eligibility;
+/// Keyed entity: serialized handlers over durable state for each key (issue #1975).
+pub mod entity;
 /// Targeted PII erasure for completed workflow executions (issue #495).
 ///
 /// Provides [`erase::erase_workflow_payloads`] (DB-gated) plus the pure
@@ -334,6 +337,7 @@ pub mod external_target_location;
 #[cfg(feature = "db")]
 pub mod external_task;
 pub mod failure;
+pub mod fan_out;
 /// Replay fuzz harness (issue #1835). Not a stable API.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
@@ -390,6 +394,8 @@ pub mod migrate;
 /// Durable mutual-exclusion locks for workflow code (`ctx.mutex`, issue #691).
 pub mod mutex;
 pub mod partition;
+/// Export of aged event partitions to object storage (issue #2009).
+pub mod partition_archive;
 pub mod payload_codec;
 pub mod payload_store;
 /// The connection transport a DSN's `sslmode` selects, with TLS through
@@ -491,6 +497,8 @@ pub mod stall_diagnosis;
 pub mod start_idempotency;
 /// OpenTelemetry integration: trace-context propagation and metrics.
 pub mod telemetry;
+/// Tenant keys: validation shared by tokens, starts and retention (issue #1977).
+pub mod tenant;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_generator;
 /// Replay test harness for verifying workflow determinism pre-deploy.
@@ -509,6 +517,9 @@ pub mod timeline;
 pub mod trace_export;
 pub mod types;
 pub mod update;
+/// Pre-deploy upgrade verdict for each in-flight run (issue #1995).
+#[cfg(any(test, feature = "testing"))]
+pub mod upgrade_check;
 /// Read-only per-tenant/per-workflow usage aggregation (issue #596).
 ///
 /// Pure wire-format types compile without the `db` feature;
@@ -560,6 +571,9 @@ pub mod store;
 pub mod timeout;
 #[cfg(feature = "wasm-activities")]
 pub mod wasm_activities;
+/// Journaled, capability-gated host calls for WASM activities (issue #2014).
+#[cfg(feature = "wasm-activities")]
+pub mod wasm_journal;
 /// Ed25519 publisher signatures for WASM modules (issue #1838).
 #[cfg(feature = "wasm-activities")]
 pub mod wasm_signing;
@@ -686,8 +700,8 @@ pub use history_export::{
 };
 pub use info::{
     ActivityHandlerFn, ActivityInfo, DagInfo, InterfaceHandlerRecord, QueryHandlerFn,
-    QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerFn, UpdateHandlerInfo, UpdateValidatorFn,
-    WorkflowHandlerFn, WorkflowInfo, WorkflowInterfaceRecord,
+    QueryHandlerInfo, SideEffectInfo, SignalHandlerInfo, UpdateHandlerFn, UpdateHandlerInfo,
+    UpdateValidatorFn, WorkflowHandlerFn, WorkflowInfo, WorkflowInterfaceRecord,
 };
 pub use interceptor::{
     ActivityInterceptor, ActivityInterceptorFuture, ActivityInterceptorNext, ActivityInvocation,
@@ -721,7 +735,7 @@ pub use replay::{
 pub use reset::{
     BatchResetItem, BatchResetOutcome, ResetInvalidPoint, ResetPlan, ResetPoint, ResetResult,
     ResetSignalReapplyPolicy, ResetSkipReason, ResetUnresolvedSideEffect, WorkflowResetError,
-    WorkflowResetRequest, preview_workflow_reset, reset_workflow_execution,
+    WorkflowResetRequest, batch_skip_reason, preview_workflow_reset, reset_workflow_execution,
     resolve_batch_reset_one, resolve_reset_point, validate_reset_point,
 };
 pub use retention::{
@@ -730,8 +744,8 @@ pub use retention::{
 };
 #[cfg(feature = "db")]
 pub use retention::{
-    RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult, release_legal_hold,
-    set_legal_hold,
+    RetentionHooks, RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult,
+    release_legal_hold, set_legal_hold,
 };
 pub use retry_budget::RetryBudgetConfig;
 pub use run_chain::{
@@ -746,10 +760,12 @@ pub use scheduler::{
     register_schedules, register_workflow_schedules, tick_once, trigger_unified_dag,
 };
 pub use schema_contract::{
-    AcknowledgedBreakingChange, ChangeKind, CompatibilityRules, DEFAULT_SCHEMA_CONTRACT_PATH,
-    MAX_DELTAS, SCHEMA_CONTRACT_VERSION, SchemaContractDiff, SchemaContractError, SchemaCoverage,
-    SchemaDelta, SchemaRole, Verdict, WorkflowSchemaContract, WorkflowSchemaEntry,
-    canonicalize_schema, diff_schema_contracts, dropped_acknowledgements, unacknowledged_breaking,
+    AcknowledgedBreakingChange, ActivitySchemaEntry, ChangeKind, CompatibilityRules,
+    DEFAULT_SCHEMA_CONTRACT_PATH, MAX_DELTAS, SCHEMA_CONTRACT_VERSION, SchemaContractDiff,
+    SchemaContractError, SchemaCoverage, SchemaDelta, SchemaRole, SchemaSubject,
+    SideEffectSchemaEntry, Verdict, WorkflowSchemaContract, WorkflowSchemaEntry,
+    canonicalize_schema, diff_schema_contracts, dropped_acknowledgements, subject_label,
+    unacknowledged_breaking,
 };
 #[cfg(feature = "db")]
 pub use shard::ShardedDbPool;
@@ -767,10 +783,10 @@ pub use stall_diagnosis::{
 #[cfg(feature = "db")]
 pub use store::AwaitMode;
 pub use telemetry::{
-    ActivityStatus, MetricsRecorder, NoOpMetrics, NoOpPropagator, SCANNER_SHARD_LABEL_NONE,
-    TelemetryConfig, TelemetryConfigBuilder, TraceContextCarrier, TraceContextPropagator,
-    USER_METRIC_PREFIX, UserMetricError, UserMetrics, WebhookOutcome, WorkflowStatus,
-    validate_user_metric,
+    ActivityStatus, MetricsRecorder, NoOpMetrics, NoOpPropagator, ResidentOutcome,
+    SCANNER_SHARD_LABEL_NONE, TelemetryConfig, TelemetryConfigBuilder, TraceContextCarrier,
+    TraceContextPropagator, USER_METRIC_PREFIX, UserMetricError, UserMetrics, WebhookOutcome,
+    WorkflowStatus, validate_user_metric,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use test_generator::TestHarnessGenerator;
@@ -778,7 +794,7 @@ pub use test_generator::TestHarnessGenerator;
 pub use testing::{
     BatchReplayReport, CiReport, FailOnMode, FixtureResult, FixtureStatus, HarnessErrorKind,
     ReplayBlocked, ReplayDrift, ReplayDriftReport, ReplayVerifier, ReportFormat, TestRunOutcome,
-    WorkflowTestEnv,
+    TestRunStatus, WorkflowTestEnv, WorkflowTestRun,
 };
 #[cfg(all(feature = "db", any(test, feature = "testing")))]
 pub use testing::{

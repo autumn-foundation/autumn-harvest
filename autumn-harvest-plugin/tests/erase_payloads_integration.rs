@@ -107,6 +107,7 @@ fn build_worker(registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 shard_notification_database_urls: Vec::new(),
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -215,6 +216,7 @@ async fn seed_execution_with_pii(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )

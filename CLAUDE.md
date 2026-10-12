@@ -141,6 +141,10 @@ mutation of the **task queue** row, not of the event log. The `#2` / `#3`
 numbering above is kept because the issues and their PRs use it, but there are
 two `event_data` writers, not three.
 
+The rotation sweep also rewrites `codec_rotation::CODEC_COLUMNS` (issue
+#1979). Those tables are not append-only, so that pass is not an exception.
+`the_column_sweep_loses_to_an_erasure` proves that it loses to an erasure.
+
 If you add another exception, it belongs in this list, with its own scope
 guarantee and its own proof.
 
@@ -192,3 +196,20 @@ have homes:
   record. Two guard suites read it as data, so treat it as load-bearing.
 - [`docs/changelog.d/README.md`](docs/changelog.d/README.md) — where a feature
   PR's changelog entry goes (a fragment file, never the shared phase list).
+
+### Keep docs guards from becoming conflict magnets
+
+A docs guard that makes every feature PR edit the same lines makes open PRs
+conflict with each other. Two shapes caused this, and both are now banned:
+
+- **A live count in prose.** "68 of the 137 core modules" or "132 migrations"
+  changes with almost every PR. State a ratio or a bound, and guard that the
+  ratio holds. `sqlite_feasibility_docs` shows the pattern.
+- **A hand-written copy of another page.** When the source page changes on
+  `trunk-dev`, every open branch ports its own wording, and the ports
+  conflict. Mirror the source verbatim and regenerate the mirror with a
+  command. Identical ports merge cleanly. `safety_report_docs` shows the
+  pattern: run its guards with `UPDATE_DOC_MIRRORS=1`.
+
+When a docs guard goes red on `trunk-dev`, fix it once in a small dedicated
+PR. Do not port a hand-written fix into each feature branch.

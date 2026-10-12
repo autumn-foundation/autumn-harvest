@@ -66,6 +66,8 @@
 mod claim_bench_support;
 #[path = "../tests/integration/e2e_bench_support.rs"]
 mod e2e_bench_support;
+#[path = "../tests/integration/pg_stats_snapshot.rs"]
+mod pg_stats_snapshot;
 
 use e2e_bench_support::{
     BenchScenario, CELL_HARD_TIMEOUT_SECS, CENSUS_CLEAR_TIMEOUT_SECS, CHECK_ENV_VAR, CellOutcome,

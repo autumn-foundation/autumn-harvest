@@ -241,6 +241,9 @@ pub struct TypedStartOptions {
     pub sla: Option<Duration>,
     /// Optional batch policy for this start request. Overrides `WorkflowInfo::batch`.
     pub batch: Option<crate::event_batch::BatchPolicy>,
+    /// Verified tenant of a fresh run (issue #1977). Set it only from a
+    /// verified source. See [`crate::StartWorkflowParams::tenant`].
+    pub tenant: Option<String>,
 }
 
 /// Optional configurations when invoking an update and starting a workflow atomically.
@@ -273,6 +276,9 @@ pub struct TypedUpdateWithStartOptions {
     /// Soft SLA duration: emits `harvest.workflow.sla_breached` once when the run exceeds this
     /// without terminating it. Overrides `WorkflowInfo::sla`; clamped to `execution_timeout`.
     pub sla: Option<std::time::Duration>,
+    /// Verified tenant of a fresh run (issue #1977). Set it only from a
+    /// verified source. See [`crate::StartWorkflowParams::tenant`].
+    pub tenant: Option<String>,
 }
 
 /// Optional configurations when signaling and starting a workflow atomically.
@@ -303,4 +309,7 @@ pub struct TypedSignalWithStartOptions {
     /// Soft SLA duration: emits `harvest.workflow.sla_breached` once when the run exceeds this
     /// without terminating it. Overrides `WorkflowInfo::sla`; clamped to `execution_timeout`.
     pub sla: Option<Duration>,
+    /// Verified tenant of a fresh run (issue #1977). Set it only from a
+    /// verified source. See [`crate::StartWorkflowParams::tenant`].
+    pub tenant: Option<String>,
 }

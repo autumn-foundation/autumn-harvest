@@ -353,6 +353,8 @@ fn act_info(name: &'static str, handler: autumn_harvest::info::ActivityHandlerFn
         max_result_bytes: None,
         requires: None,
         handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -412,6 +414,7 @@ fn build_worker_polling(
                 notification_database_url: None,
                 max_concurrent_workflows: 8,
                 max_concurrent_activities: 32,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval,
                 shutdown_timeout: Duration::from_secs(5),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -485,6 +488,7 @@ async fn seed_workflow(conn: &mut AsyncPgConnection, queue: &str, activity: &str
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)

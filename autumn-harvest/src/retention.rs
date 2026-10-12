@@ -383,6 +383,16 @@ pub struct RetentionConfig {
     /// type is never deleted. Uses [`BTreeMap`] for deterministic ordering and
     /// serialization. Issue #737.
     pub overrides: BTreeMap<String, u64>,
+    /// Per-tenant retention overrides keyed by tenant, each a max-age in
+    /// seconds (issue #1977).
+    ///
+    /// The janitor matches the key against `harvest_workflow_executions.tenant`.
+    /// Precedence is strict: a tenant override wins over a type override,
+    /// which wins over the global `max_age_secs`. A run with no tenant, or a
+    /// tenant with no override, falls back to the type and global ages. A
+    /// legal hold still exempts a run.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tenant_overrides: BTreeMap<String, u64>,
     /// How often the background retention job wakes up to scan for expired data.
     pub tick_interval_secs: u64,
     /// The maximum number of records to process in a single transaction/batch.
@@ -549,6 +559,7 @@ impl Default for RetentionConfig {
         Self {
             max_age_secs: None,
             overrides: BTreeMap::new(),
+            tenant_overrides: BTreeMap::new(),
             tick_interval_secs: DEFAULT_TICK_INTERVAL.as_secs(),
             batch_size: DEFAULT_BATCH_SIZE,
             dry_run: false,
@@ -598,6 +609,32 @@ impl RetentionConfig {
     ) -> Self {
         for (name, max_age) in iter {
             self.overrides.insert(name.into(), max_age.as_secs());
+        }
+        self
+    }
+
+    /// Register a per-tenant retention override (issue #1977).
+    ///
+    /// Every run whose stored tenant is `tenant` is kept for `max_age`. That
+    /// age wins over a type override and over the global `max_age`.
+    /// [`Self::validate`] applies the same bounds as a type override, and
+    /// checks the key with [`crate::tenant::validate_tenant`].
+    #[must_use]
+    pub fn with_tenant_override(mut self, tenant: impl Into<String>, max_age: Duration) -> Self {
+        self.tenant_overrides
+            .insert(tenant.into(), max_age.as_secs());
+        self
+    }
+
+    /// Register many per-tenant retention overrides (issue #1977).
+    #[must_use]
+    pub fn with_tenant_overrides<S: Into<String>>(
+        mut self,
+        iter: impl IntoIterator<Item = (S, Duration)>,
+    ) -> Self {
+        for (tenant, max_age) in iter {
+            self.tenant_overrides
+                .insert(tenant.into(), max_age.as_secs());
         }
         self
     }
@@ -801,6 +838,24 @@ impl RetentionConfig {
             .or_else(|| self.max_age())
     }
 
+    /// Resolves the effective history max-age for one run (issue #1977).
+    ///
+    /// The order is: the override for `tenant`, then the override for
+    /// `workflow_name`, then the global `max_age`. Returns `None` when none of
+    /// them is set. The run is then never deleted.
+    #[must_use]
+    pub fn effective_max_age_for(
+        &self,
+        workflow_name: &str,
+        tenant: Option<&str>,
+    ) -> Option<Duration> {
+        tenant
+            .and_then(|t| self.tenant_overrides.get(t))
+            .copied()
+            .map(Duration::from_secs)
+            .or_else(|| self.effective_max_age(workflow_name))
+    }
+
     /// The smallest effective retention age across the global `max_age` and all
     /// per-type overrides (issue #737).
     ///
@@ -811,18 +866,24 @@ impl RetentionConfig {
     /// then applies the exact per-type age to each candidate in Rust.
     ///
     /// Returns `None` iff the global `max_age` is unset *and* there are no
-    /// overrides.
+    /// type or tenant overrides.
     #[must_use]
     pub fn loosest_cutoff_age(&self) -> Option<Duration> {
         self.max_age()
             .into_iter()
             .chain(self.overrides.values().copied().map(Duration::from_secs))
+            .chain(
+                self.tenant_overrides
+                    .values()
+                    .copied()
+                    .map(Duration::from_secs),
+            )
             .min()
     }
 
-    /// Returns `true` if workflow-history retention should run this tick, i.e.
-    /// either the global `max_age` or at least one per-type override is set
-    /// (issue #737).
+    /// Returns `true` if workflow-history retention should run this tick.
+    /// That is so when the global `max_age`, a per-type override (issue #737)
+    /// or a per-tenant override (issue #1977) is set.
     #[must_use]
     pub fn history_retention_active(&self) -> bool {
         self.loosest_cutoff_age().is_some()
@@ -832,6 +893,13 @@ impl RetentionConfig {
     #[must_use]
     pub const fn workflow_overrides(&self) -> &BTreeMap<String, u64> {
         &self.overrides
+    }
+
+    /// Read access to the per-tenant retention overrides, in seconds (issue
+    /// #1977).
+    #[must_use]
+    pub const fn tenant_overrides(&self) -> &BTreeMap<String, u64> {
+        &self.tenant_overrides
     }
 
     /// Translates the raw numeric tick value into a standard [`Duration`] for the scheduler loop.
@@ -877,6 +945,21 @@ impl RetentionConfig {
             if !(MIN_MAX_AGE..=MAX_MAX_AGE).contains(&age) {
                 return Err(format!(
                     "retention override for '{name}' must be between {}s and {}s",
+                    MIN_MAX_AGE.as_secs(),
+                    MAX_MAX_AGE.as_secs()
+                ));
+            }
+        }
+        // A tenant override has the type-override bounds (issue #1977). Its
+        // key must be a valid tenant key, or no run can ever match it.
+        for (tenant, secs) in &self.tenant_overrides {
+            if let Err(e) = crate::tenant::validate_tenant(tenant) {
+                return Err(format!("retention tenant override {tenant:?}: {e}"));
+            }
+            let age = Duration::from_secs(*secs);
+            if !(MIN_MAX_AGE..=MAX_MAX_AGE).contains(&age) {
+                return Err(format!(
+                    "retention override for tenant {tenant:?} must be between {}s and {}s",
                     MIN_MAX_AGE.as_secs(),
                     MAX_MAX_AGE.as_secs()
                 ));
@@ -945,11 +1028,13 @@ impl RetentionConfig {
     ///
     /// Per-workflow-type overrides count as enabling workflow-history retention
     /// even when the global `max_age` is unset (issue #737), so an
-    /// overrides-only configuration still spawns the janitor.
+    /// overrides-only configuration still spawns the janitor. Per-tenant
+    /// overrides count the same way (issue #1977).
     #[must_use]
     pub fn enabled(&self) -> bool {
         self.max_age_secs.is_some()
             || !self.overrides.is_empty()
+            || !self.tenant_overrides.is_empty()
             || self.audit_retention_days > 0
             || self.schedule_decision_retention_days > 0
             // A bounded summary policy spawns the janitor so its GC pass runs
@@ -1519,6 +1604,7 @@ async fn run_partition_maintenance_pass(
     owner: crate::scanner_health::ScannerOwner,
     shutdown: &CancellationToken,
     tick_fenced: bool,
+    partition_archiver: Option<&Arc<dyn crate::partition_archive::PartitionArchiver>>,
 ) {
     if !config.partitions.enabled {
         return;
@@ -1644,13 +1730,27 @@ async fn run_partition_maintenance_pass(
             // Issue #1823: the connection predates the pass, so it joins it.
             // A lost guard then ends its backend.
             let _member = crate::replication::join_fenced_pass(pool, &mut conn).await;
-            crate::partition::maintain_with_progress(
+            // Issue #2009: with an archiver, each drop waits for a checked
+            // export. The shard ID goes into each key. A dry run drops
+            // nothing, so it takes no archiver. An exporting pass would
+            // write the marker, and the marker outlives the dry run.
+            let export = partition_archiver
+                .filter(|_| !config.dry_run)
+                .map(|archiver| {
+                    crate::partition_archive::PartitionExport::new(
+                        Arc::clone(archiver),
+                        shard.as_i32(),
+                    )
+                    .with_io_timeout(config.archival_timeout())
+                });
+            crate::partition::maintain_exporting(
                 &mut conn,
                 now,
                 config.partitions.lookahead_cohorts,
                 &sweep_opts,
                 cursor.resume_after,
                 cursor.catch_up_target,
+                export.as_ref(),
                 &mut tick_partition,
             )
             .await
@@ -1744,6 +1844,64 @@ pub struct RetentionRuntime {
     monitor: RetentionMonitor,
 }
 
+/// The optional hooks a [`RetentionRuntime`] calls.
+///
+/// Start from [`RetentionHooks::default`] and add hooks with the `with_*`
+/// calls. The struct is `non_exhaustive`, so a new hook is not a breaking
+/// change.
+#[cfg(feature = "db")]
+#[derive(Clone, Default)]
+#[non_exhaustive]
+pub struct RetentionHooks {
+    /// Gets each run's history before retention deletes the run.
+    pub archiver: Option<Arc<dyn HistoryArchiver>>,
+    /// Inflates offloaded payloads for the archive, and collects their blobs.
+    pub offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
+    /// Gets each aged event partition before the sweep drops it (issue #2009).
+    pub partition_archiver: Option<Arc<dyn crate::partition_archive::PartitionArchiver>>,
+}
+
+#[cfg(feature = "db")]
+impl RetentionHooks {
+    /// Set the history archiver.
+    #[must_use]
+    pub fn with_archiver(mut self, archiver: Option<Arc<dyn HistoryArchiver>>) -> Self {
+        self.archiver = archiver;
+        self
+    }
+
+    /// Set the payload offloader.
+    #[must_use]
+    pub fn with_offloader(
+        mut self,
+        offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
+    ) -> Self {
+        self.offloader = offloader;
+        self
+    }
+
+    /// Set the partition archiver (issue #2009).
+    #[must_use]
+    pub fn with_partition_archiver(
+        mut self,
+        archiver: Option<Arc<dyn crate::partition_archive::PartitionArchiver>>,
+    ) -> Self {
+        self.partition_archiver = archiver;
+        self
+    }
+}
+
+#[cfg(feature = "db")]
+impl std::fmt::Debug for RetentionHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetentionHooks")
+            .field("archiver", &self.archiver.is_some())
+            .field("offloader", &self.offloader.is_some())
+            .field("partition_archiver", &self.partition_archiver.is_some())
+            .finish()
+    }
+}
+
 #[cfg(feature = "db")]
 impl RetentionRuntime {
     /// Returns `None` when nothing in `config` is enabled.
@@ -1755,7 +1913,6 @@ impl RetentionRuntime {
     /// phase is gated on `loosest_cutoff_age()` and is simply skipped. The
     /// terminal-task janitor (issue #1811) also spawns the runtime on its own.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
     pub fn spawn(
         pools: ShardedDbPool,
         config: RetentionConfig,
@@ -1763,6 +1920,50 @@ impl RetentionRuntime {
         archiver: Option<Arc<dyn HistoryArchiver>>,
         offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
     ) -> Option<Self> {
+        Self::spawn_inner(
+            pools,
+            config,
+            metrics,
+            RetentionHooks::default()
+                .with_archiver(archiver)
+                .with_offloader(offloader),
+        )
+    }
+
+    /// The same as [`Self::spawn`], with every hook in one struct.
+    ///
+    /// Use it to set a partition archiver (issue #2009).
+    #[must_use]
+    pub fn spawn_with_hooks(
+        pools: ShardedDbPool,
+        config: RetentionConfig,
+        metrics: Arc<dyn MetricsRecorder>,
+        hooks: RetentionHooks,
+    ) -> Option<Self> {
+        Self::spawn_inner(pools, config, metrics, hooks)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn spawn_inner(
+        pools: ShardedDbPool,
+        config: RetentionConfig,
+        metrics: Arc<dyn MetricsRecorder>,
+        hooks: RetentionHooks,
+    ) -> Option<Self> {
+        let RetentionHooks {
+            archiver,
+            offloader,
+            partition_archiver,
+        } = hooks;
+        // Issue #2009: an export turns the straggler delete off, because no
+        // export holds the rows it removes. `try_build` refuses the pair, but
+        // a direct caller can still set both.
+        if partition_archiver.is_some() && config.partitions.straggler_grace_secs.is_some() {
+            tracing::warn!(
+                "partitions.straggler_grace_secs has no effect with a partition archiver; \
+                 the sweep skips straggler deletes while it exports"
+            );
+        }
         if !config.enabled() {
             return None;
         }
@@ -1858,6 +2059,7 @@ impl RetentionRuntime {
                 owner,
                 &shutdown_task,
                 false,
+                partition_archiver.as_ref(),
             )
             .await;
             if shutdown_task.is_cancelled() {
@@ -2034,6 +2236,7 @@ impl RetentionRuntime {
                         owner,
                         &shutdown_task,
                         true,
+                        partition_archiver.as_ref(),
                     )
                     .await;
 
@@ -2354,6 +2557,9 @@ struct CandidateExecution {
     /// in no `WorkflowEvent` and the archive is its last surviving copy.
     #[diesel(sql_type = Text)]
     queue_name: String,
+    /// Stored tenant (issue #1977). It selects a per-tenant retention override.
+    #[diesel(sql_type = Nullable<Text>)]
+    tenant: Option<String>,
 }
 
 #[cfg(feature = "db")]
@@ -2588,6 +2794,16 @@ async fn run_shard_tick(
             override_cuts.push(now - delta);
         }
     }
+    // Per-tenant cutoffs (issue #1977), built the same way. The SQL tries the
+    // tenant arm before the type arm, so a tenant override wins.
+    let mut tenant_cut_names: Vec<String> = Vec::new();
+    let mut tenant_cuts: Vec<DateTime<Utc>> = Vec::new();
+    for (tenant, secs) in config.tenant_overrides() {
+        if let Ok(delta) = chrono::Duration::from_std(Duration::from_secs(*secs)) {
+            tenant_cut_names.push(tenant.clone());
+            tenant_cuts.push(now - delta);
+        }
+    }
     // The global fallback cutoff for un-overridden types. `None` means "no global
     // age" (or an unrepresentable one — same fail-safe): the SQL uses an
     // `'-infinity'` literal so those types are never selected.
@@ -2653,6 +2869,8 @@ async fn run_shard_tick(
         let lease_id_inner = lease_id.clone();
         let names_inner = override_cut_names.clone();
         let cuts_inner = override_cuts.clone();
+        let tenant_names_inner = tenant_cut_names.clone();
+        let tenant_cuts_inner = tenant_cuts.clone();
         let candidates = Box::pin(
             conn.transaction::<Vec<CandidateExecution>, HarvestError, _>(async |conn| {
                 // The claim asserts the fence in its own transaction (issue
@@ -2675,7 +2893,8 @@ async fn run_shard_tick(
                 let sql = candidate_scan_sql(global_fallback.is_some());
                 // Bind order maps to $1..$N regardless of textual position. The
                 // override arrays ($1/$2) are always bound; $3 is the global
-                // fallback only in the global-age variant.
+                // fallback only in the global-age variant. The tenant arrays
+                // are always bound last (issue #1977).
                 let query = diesel::sql_query(sql)
                     .bind::<Array<Text>, _>(names_inner)
                     .bind::<Array<Timestamptz>, _>(cuts_inner);
@@ -2685,6 +2904,8 @@ async fn run_shard_tick(
                         .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
                         .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
                         .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
+                        .bind::<Array<Text>, _>(tenant_names_inner)
+                        .bind::<Array<Timestamptz>, _>(tenant_cuts_inner)
                         .load::<CandidateExecution>(conn)
                         .await
                 } else {
@@ -2692,6 +2913,8 @@ async fn run_shard_tick(
                         .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
                         .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
                         .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
+                        .bind::<Array<Text>, _>(tenant_names_inner)
+                        .bind::<Array<Timestamptz>, _>(tenant_cuts_inner)
                         .load::<CandidateExecution>(conn)
                         .await
                 }
@@ -2784,7 +3007,10 @@ async fn run_shard_tick(
             // row is ever selected. They are kept as cheap defense-in-depth. The
             // `should_skip_candidate` chain-link check below still needs the
             // RESOLVED per-type cutoff, which is derived here.
-            let Some(age) = config.effective_max_age(&candidate.workflow_name) else {
+            // Issue #1977: a tenant override wins over the type override.
+            let Some(age) =
+                config.effective_max_age_for(&candidate.workflow_name, candidate.tenant.as_deref())
+            else {
                 // Neither an override nor a global max-age applies to this
                 // type: never delete it. Routine skip.
                 routine_skip_candidate(
@@ -3218,13 +3444,19 @@ enum CandidateDeleteOutcome {
 const RETENTION_CANDIDATE_STATES: &[&str] = crate::erase::TERMINAL_STATES_WITHOUT_MIGRATED;
 
 /// Candidate-scan template when a global age fallback is bound as `$3`.
+///
+/// The tenant override arrays are bound last, as `$7` and `$8` (issue #1977).
+/// The tenant arm comes first in the `COALESCE`, so a tenant override wins.
 #[cfg(feature = "db")]
-const CANDIDATE_SCAN_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name
+const CANDIDATE_SCAN_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name, tenant
                  FROM harvest_workflow_executions
                  WHERE state IN ({states})
                    AND completed_at IS NOT NULL
                    AND (sticky_worker_id IS NULL OR sticky_worker_id NOT LIKE 'retention-lease-%')
                    AND completed_at < COALESCE(
+                       (SELECT tv.cut
+                          FROM unnest($7::text[], $8::timestamptz[]) AS tv(nm, cut)
+                         WHERE tv.nm = harvest_workflow_executions.tenant),
                        (SELECT ov.cut
                           FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
                          WHERE ov.nm = harvest_workflow_executions.workflow_name),
@@ -3239,13 +3471,18 @@ const CANDIDATE_SCAN_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflo
                  FOR UPDATE SKIP LOCKED";
 
 /// Candidate-scan template when no global age is set; the fallback is `-infinity`.
+///
+/// The tenant override arrays are bound last, as `$6` and `$7` (issue #1977).
 #[cfg(feature = "db")]
-const CANDIDATE_SCAN_NO_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name
+const CANDIDATE_SCAN_NO_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name, tenant
                  FROM harvest_workflow_executions
                  WHERE state IN ({states})
                    AND completed_at IS NOT NULL
                    AND (sticky_worker_id IS NULL OR sticky_worker_id NOT LIKE 'retention-lease-%')
                    AND completed_at < COALESCE(
+                       (SELECT tv.cut
+                          FROM unnest($6::text[], $7::timestamptz[]) AS tv(nm, cut)
+                         WHERE tv.nm = harvest_workflow_executions.tenant),
                        (SELECT ov.cut
                           FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
                          WHERE ov.nm = harvest_workflow_executions.workflow_name),
@@ -4786,6 +5023,105 @@ mod tests {
         );
     }
 
+    // --- Issue #1977: per-tenant history retention overrides ---
+
+    #[test]
+    fn tenant_override_wins_over_type_and_global() {
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("slow_wf", Duration::from_secs(7200))
+            .with_tenant_override("acme", Duration::from_secs(600));
+        assert_eq!(
+            config.effective_max_age_for("slow_wf", Some("acme")),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(
+            config.effective_max_age_for("other_wf", Some("acme")),
+            Some(Duration::from_secs(600))
+        );
+        // Another tenant, or no tenant, falls back to the type, then the global.
+        assert_eq!(
+            config.effective_max_age_for("slow_wf", Some("globex")),
+            Some(Duration::from_secs(7200))
+        );
+        assert_eq!(
+            config.effective_max_age_for("other_wf", None),
+            Some(Duration::from_secs(3600))
+        );
+        // The type-only resolver is unchanged.
+        assert_eq!(
+            config.effective_max_age("slow_wf"),
+            Some(Duration::from_secs(7200))
+        );
+    }
+
+    #[test]
+    fn tenant_override_alone_enables_history_retention() {
+        let config =
+            RetentionConfig::default().with_tenant_override("acme", Duration::from_secs(900));
+        assert!(config.enabled());
+        assert!(config.history_retention_active());
+        assert_eq!(config.loosest_cutoff_age(), Some(Duration::from_secs(900)));
+        assert_eq!(config.effective_max_age_for("wf", None), None);
+        assert_eq!(config.effective_max_age_for("wf", Some("globex")), None);
+        assert_eq!(
+            config.tenant_overrides().get("acme").copied(),
+            Some(900),
+            "the override is stored in seconds"
+        );
+    }
+
+    #[test]
+    fn loosest_cutoff_age_counts_tenant_overrides() {
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("wf", Duration::from_secs(1800))
+            .with_tenant_overrides([("acme", Duration::from_secs(120))]);
+        assert_eq!(config.loosest_cutoff_age(), Some(Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn validate_rejects_bad_tenant_overrides() {
+        let base = RetentionConfig::with_max_age(Duration::from_secs(3600));
+        assert!(
+            base.clone()
+                .with_tenant_override("acme", Duration::from_secs(0))
+                .validate()
+                .is_err(),
+            "below MIN_MAX_AGE"
+        );
+        assert!(
+            base.clone()
+                .with_tenant_override("acme", MAX_MAX_AGE + Duration::from_secs(1))
+                .validate()
+                .is_err(),
+            "above MAX_MAX_AGE"
+        );
+        assert!(
+            base.clone()
+                .with_tenant_override("", Duration::from_secs(60))
+                .validate()
+                .is_err(),
+            "an empty tenant key"
+        );
+        assert!(
+            base.clone()
+                .with_tenant_override("t".repeat(129), Duration::from_secs(60))
+                .validate()
+                .is_err(),
+            "a tenant key longer than 128 bytes"
+        );
+        assert!(
+            base.clone()
+                .with_tenant_override("t".repeat(128), MIN_MAX_AGE)
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            base.with_tenant_override("acme", MAX_MAX_AGE)
+                .validate()
+                .is_ok()
+        );
+    }
+
     // --- Issue #737: per-workflow-type history retention overrides ---
 
     #[test]
@@ -5368,6 +5704,7 @@ mod tests {
             deadline_at: None,
             parent_id: None,
             queue_name: "default".to_string(),
+            tenant: None,
         };
         let candidate_skip = CandidateExecution {
             id: uuid::Uuid::new_v4(),
@@ -5382,6 +5719,7 @@ mod tests {
             deadline_at: None,
             parent_id: None,
             queue_name: "default".to_string(),
+            tenant: None,
         };
 
         // When evaluating outcome next_cursor logic, if the first candidate completes,

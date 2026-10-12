@@ -314,6 +314,7 @@ async fn insert_workflow_on_url(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -539,7 +540,10 @@ async fn ui_lists_workflows_and_renders_detail_page() {
     assert!(list_html.contains("name=\"state\""));
     assert!(!list_html.contains("http://"));
     assert!(!list_html.contains("https://"));
-    assert!(!list_html.contains("<script"));
+    // Issue #1982: the list loads one same-origin script for live refresh.
+    // The page holds no inline `<script>` element.
+    assert_eq!(list_html.matches("<script").count(), 1, "{list_html}");
+    assert!(list_html.contains(r#"<script src="assets/live.js" defer></script>"#));
 
     let (status, filtered_html) = fetch_html(&ui_app, "/workflows?state=COMPLETED").await;
     assert_eq!(status, StatusCode::OK);
@@ -566,6 +570,7 @@ async fn ui_lists_workflows_and_renders_detail_page() {
     );
     // Input payload is pretty-printed and HTML-escaped
     assert!(detail_html.contains("&quot;hello&quot;"));
+    // Issue #1982: a run that ended loads no live script.
     assert!(!detail_html.contains("<script"));
 
     let (status, _body) = fetch_html(&ui_app, "/workflows/not-a-uuid").await;
@@ -4709,6 +4714,7 @@ async fn insert_child_workflow_on_url(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -6364,6 +6370,7 @@ async fn workflow_detail_ui_renders_decoded_input() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -6446,6 +6453,14 @@ async fn workflow_detail_ui_renders_decoded_input() {
         .expect("seed pending signal");
     }
 
+    // The engine may wrap the input in a column envelope (issue #1979).
+    let stored_before: Value = autumn_harvest::schema::harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(autumn_harvest::schema::harvest_workflow_executions::input)
+        .first(&mut conn)
+        .await
+        .expect("load stored input before the render");
+
     let app = build_decode_enabled_api_with_ui_app(&database_url);
 
     let (status, html) = fetch_html(&app, &format!("/ui/workflows/{exec_id}")).await;
@@ -6493,7 +6508,11 @@ async fn workflow_detail_ui_renders_decoded_input() {
         .await
         .expect("load stored input");
     assert_eq!(
-        stored_input, input_envelope,
+        stored_input, stored_before,
+        "the decoded render must not write the stored input back"
+    );
+    assert!(
+        !stored_input.to_string().contains("pii-detail-input"),
         "stored input must remain ciphertext after the decoded render"
     );
 }
@@ -6556,6 +6575,7 @@ async fn rejected_signal_render_attributes_decode_audit_to_the_post_route() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -6646,6 +6666,7 @@ async fn workflow_detail_ui_writes_no_audit_row_when_only_hidden_fields_carry_en
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )
@@ -6943,6 +6964,7 @@ async fn dag957_seed_run(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         },
         None,
     )

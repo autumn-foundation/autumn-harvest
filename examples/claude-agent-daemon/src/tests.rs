@@ -18,10 +18,11 @@ use crate::guard;
 use crate::inspect;
 use crate::protocol::{self, Request, Response};
 use crate::session::{
-    self, ApprovalDecision, SIGNAL_TOOL_APPROVAL, SessionReport, SessionTask, ToolCall,
-    ToolOutcome, ToolRequest, TurnReply, TurnRequest, WORKFLOW_NAME,
+    self, ApprovalDecision, SessionReport, SessionTask, ToolCall, ToolOutcome, ToolRequest,
+    TurnReply, TurnRequest, WORKFLOW_NAME,
 };
 use crate::tools;
+use autumn_harvest_agent::approval::SIGNAL_TOOL_APPROVAL;
 
 /// The resolved workspace identity a session records.
 fn workspace_id(workspace: &Path) -> String {
@@ -358,6 +359,37 @@ async fn a_denied_call_is_reported_to_the_model_and_the_session_continues() {
         report.answer.contains("NOT recorded"),
         "a denied write must be reported as such: {}",
         report.answer
+    );
+}
+
+/// The approval wait comes from the agent adapter (issue #1973). A payload
+/// that is not an `ApprovalDecision` still fails the session, as before, and
+/// never releases the write.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreadable_decision_fails_the_session_and_never_writes() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+    std::fs::write(workspace.join("README.md"), "hello").expect("the fixture is written");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut rt = runtime(&dir.path().join("agentd.db"), &workspace, &calls);
+    let exec = rt
+        .start_workflow(WORKFLOW_NAME, task(&workspace))
+        .expect("the session starts");
+    let signal = drive_to_approval(&mut rt, exec).await;
+
+    rt.send_signal(exec, &signal, json!({"verdict": "approve"}))
+        .expect("the signal is recorded");
+    let state = rt.run_until_blocked(exec).await.expect("the run finishes");
+
+    assert!(
+        matches!(state, RunState::Failed(ref e) if e.contains("not readable")),
+        "expected a failed session, got {state:?}"
+    );
+    assert!(
+        !workspace.join("agent-notes.md").exists(),
+        "an unreadable decision must not release the write"
     );
 }
 
