@@ -127,8 +127,13 @@ pub enum RunState {
     WaitingTimer,
     /// Blocked awaiting another run that is not terminal (issue #2026).
     ///
-    /// The id names an awaited child or an `await_external_workflow` target.
-    /// Drive that run, or send it the input it waits for.
+    /// The id names the run this run waits on directly: an awaited child or an
+    /// `await_external_workflow` target. That run can wait on another run in
+    /// turn. Call `run_until_blocked` on it to find the run that needs input.
+    ///
+    /// This state wins over the other waits, because the runtime can drive
+    /// that run itself. The run can also wait on a timer, such as a child
+    /// deadline. Drive it again after the deadline.
     WaitingWorkflow(ExecutionId),
 }
 
@@ -143,10 +148,11 @@ pub enum ExecutionOutcome {
     Failed(String),
     /// A terminal state OTHER than a clean success/failure — inert and never
     /// resumable, but carrying no output (unlike [`Self::Completed`]) and no
-    /// failure error (unlike [`Self::Failed`]). The dominant case is a prior run
-    /// SEALED to `CONTINUED_AS_NEW` when a `TerminateIfRunning` /
-    /// `AllowDuplicateFailedOnly` reuse-policy decision superseded it with a newer
-    /// run (issue #1068); it also covers `CANCELLED` / `TIMED_OUT` / `TERMINATED`.
+    /// failure error (unlike [`Self::Failed`]). One common case is a run that
+    /// another run cancelled (`CANCELLED`, issue #2026). Another is a prior run
+    /// SEALED to `CONTINUED_AS_NEW`. A `TerminateIfRunning` or
+    /// `AllowDuplicateFailedOnly` start superseded it (issue #1068). It also
+    /// covers `TIMED_OUT` and `TERMINATED`.
     /// The payload is the RAW stored state name (e.g. `"CONTINUED_AS_NEW"`) so a
     /// caller can distinguish which terminal it is. Reporting these terminally —
     /// rather than as [`Self::Running`] — keeps `outcome()` consistent with the
@@ -219,6 +225,10 @@ pub struct SqliteRuntime {
     /// The single-writer lock (issue #1834). It is released when the runtime
     /// drops.
     writer_lock: Option<WriterLock>,
+    /// The waited-on runs that one `run_until_blocked` call found blocked
+    /// (issue #2026). The call clears it at its start and end. Any progress
+    /// also clears it, because progress can unblock a run.
+    drive_blocked: HashSet<ExecutionId>,
 }
 
 impl Drop for SqliteRuntime {
@@ -323,6 +333,7 @@ impl SqliteRuntime {
             workflow_panic_strikes: HashMap::new(),
             now_fn: std::sync::Arc::new(Utc::now),
             writer_lock,
+            drive_blocked: HashSet::new(),
         })
     }
 
@@ -587,9 +598,8 @@ impl SqliteRuntime {
     /// return a [`StartOutcome`] reporting the resolved execution and whether a
     /// fresh run was created.
     ///
-    /// The single-writer PLAIN-start matrix, restricted to the states this backend
-    /// can hold (none / `RUNNING` / `COMPLETED` / `FAILED`; a replaced prior is
-    /// SEALED to `CONTINUED_AS_NEW`):
+    /// The single-writer PLAIN-start matrix covers the states this backend can
+    /// hold. A replaced prior is SEALED to `CONTINUED_AS_NEW`:
     ///
     /// | Prior state | `AllowDuplicate` | `RejectDuplicate` | `AllowDuplicateFailedOnly` | `TerminateIfRunning` |
     /// |-------------|------------------|-------------------|----------------------------|----------------------|
@@ -597,6 +607,9 @@ impl SqliteRuntime {
     /// | RUNNING     | existing         | `AlreadyExists`   | existing                   | cancel + fresh       |
     /// | COMPLETED   | existing         | `AlreadyExists`   | existing                   | fresh (no cancel)    |
     /// | FAILED      | existing         | `AlreadyExists`   | **fresh (replace)**        | fresh (no cancel)    |
+    /// | CANCELLED   | existing         | `AlreadyExists`   | **fresh (replace)**        | fresh (no cancel)    |
+    ///
+    /// A run ends `CANCELLED` when another run cancels it (issue #2026).
     ///
     /// - A prior in a SEALED state (`CONTINUED_AS_NEW`/`TERMINATED`) is invisible to
     ///   the reuse check — ALL policies (including `RejectDuplicate`) create fresh
@@ -712,12 +725,13 @@ impl SqliteRuntime {
                         });
                     }
 
-                    // Replace a FAILED prior; otherwise return the existing run.
+                    // Replace a FAILED or CANCELLED prior, as core does. Otherwise
+                    // return the existing run. A run ends CANCELLED since issue #2026.
                     (
                         WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
                         Some((prior_exec, prior_state)),
                     ) => {
-                        if prior_state == "FAILED" {
+                        if matches!(prior_state.as_str(), "FAILED" | "CANCELLED") {
                             cancel_and_seal_prior(&tx, prior_exec, &prior_state)?;
                             insert_fresh_execution(&tx, workflow_name, Some(id), input)?
                         } else {
@@ -911,6 +925,20 @@ impl SqliteRuntime {
         Ok(rows)
     }
 
+    /// The parent of `exec`, or `None` for a top-level run (issue #2026). A pure
+    /// read. It matches `ctx.info().parent_execution_id` inside the run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id, or a
+    /// persistence error.
+    pub fn parent_execution(&self, exec: ExecutionId) -> SqliteResult<Option<ExecutionId>> {
+        if !store::execution_exists(&self.conn, exec)? {
+            return Err(SqliteError::ExecutionNotFound(exec));
+        }
+        Ok(store::parent_link(&self.conn, exec)?.map(|(parent, _)| parent))
+    }
+
     /// The stored, non-driving outcome of `exec` (a pure read; does not advance
     /// the workflow).
     ///
@@ -950,16 +978,17 @@ impl SqliteRuntime {
     /// its true arm instant, so a `timer(1s)` following a 2s activity waits ~1s
     /// from when it was armed instead of firing immediately (issue #1069 P2).
     ///
-    /// A run that waits on a `RUNNING` child or await target is driven
-    /// together with that target (issue #2026). When the target blocks, this
-    /// returns [`RunState::WaitingWorkflow`] naming it.
+    /// This call also drives each `RUNNING` child or await target that the run
+    /// waits on (issue #2026). When every such target blocks, this returns
+    /// [`RunState::WaitingWorkflow`] naming one of them.
     ///
     /// # Errors
     ///
     /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns
     /// [`SqliteError::Stuck`] if the run makes no progress and cannot be
     /// classified. An error from a waited-on run also returns here, unless
-    /// that run is now terminal. Returns [`SqliteError::Unsupported`] for an unsupported
+    /// that run is now terminal. Such an error can name another run, or no
+    /// run, so it does not always concern `exec`. Returns [`SqliteError::Unsupported`] for an unsupported
     /// command, after it seals the run `FAILED` (issue #1834). Returns
     /// [`SqliteError::UnknownWorkflow`] for an unregistered workflow.
     /// Returns [`SqliteError::UnregisteredActivity`] for an unregistered activity.
@@ -1035,10 +1064,15 @@ impl SqliteRuntime {
     /// input, so it goes on a stack and is driven next. When it ends, its
     /// waiter is driven again and sees the result.
     ///
-    /// When a run on the stack blocks, the root returns
-    /// `WaitingWorkflow` naming the run it waits on directly. A run that is
-    /// already on the stack is never pushed again, so two runs that wait on
-    /// each other block instead of spinning.
+    /// A waited-on run that blocks is marked and popped. Its waiter is driven
+    /// again and picks another unmarked run, so a sibling that needs no input
+    /// still runs. A waiter whose every waited-on run is blocked is blocked
+    /// too. Progress clears the marks, because it can unblock a run. A run on
+    /// the stack is never pushed again, so a mutual wait blocks instead of
+    /// spinning.
+    ///
+    /// Each run gets its own budget of [`MAX_ITERATIONS`] cycles. A run that
+    /// spends it returns [`SqliteError::Stuck`] naming that run.
     ///
     /// An error from the root returns at once. An error from a waited-on run
     /// returns too, unless that run is now terminal. A sealed run is terminal,
@@ -1049,34 +1083,53 @@ impl SqliteRuntime {
         cycle_now: &(dyn Fn() -> i64 + Send + Sync),
         failure_now: &(dyn Fn() -> i64 + Send + Sync),
     ) -> SqliteResult<RunState> {
+        self.drive_blocked.clear();
+        let result = self.drive_stack(root, cycle_now, failure_now).await;
+        self.drive_blocked.clear();
+        result
+    }
+
+    /// The loop of [`drive_until_blocked`](Self::drive_until_blocked).
+    async fn drive_stack(
+        &mut self,
+        root: ExecutionId,
+        cycle_now: &(dyn Fn() -> i64 + Send + Sync),
+        failure_now: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> SqliteResult<RunState> {
         let mut stack = vec![root];
-        for _ in 0..MAX_ITERATIONS {
-            let Some(&exec) = stack.last() else {
-                break;
-            };
-            let result = self.drive_one_cycle(exec, cycle_now(), failure_now).await;
-            if exec == root {
-                match result? {
-                    RunState::WaitingWorkflow(target) if !stack.contains(&target) => {
-                        stack.push(target);
-                    }
-                    RunState::InProgress => {}
-                    terminal_or_blocked => return Ok(terminal_or_blocked),
-                }
-                continue;
+        let mut cycles: HashMap<ExecutionId, usize> = HashMap::new();
+        while let Some(&exec) = stack.last() {
+            let spent = cycles.entry(exec).or_insert(0);
+            *spent += 1;
+            if *spent > MAX_ITERATIONS {
+                return Err(SqliteError::Stuck(exec));
             }
+            let is_root = stack.len() == 1;
+            let result = self.drive_one_cycle(exec, cycle_now(), failure_now).await;
             match result {
-                Ok(RunState::InProgress) => {}
-                Ok(RunState::WaitingWorkflow(target)) if !stack.contains(&target) => {
+                Ok(RunState::InProgress) => self.drive_blocked.clear(),
+                Ok(RunState::WaitingWorkflow(target))
+                    if !stack.contains(&target) && !self.drive_blocked.contains(&target) =>
+                {
                     stack.push(target);
                 }
-                Ok(RunState::Completed(_) | RunState::Failed(_)) => {
+                Ok(state @ (RunState::Completed(_) | RunState::Failed(_))) => {
+                    if is_root {
+                        return Ok(state);
+                    }
+                    stack.pop();
+                    self.drive_blocked.clear();
+                }
+                Ok(blocked) => {
+                    if is_root {
+                        return Ok(blocked);
+                    }
+                    self.drive_blocked.insert(exec);
                     stack.pop();
                 }
-                Ok(_) => return Ok(RunState::WaitingWorkflow(stack[1])),
                 Err(err) => {
                     let state = store::execution_state(&self.conn, exec)?;
-                    if !autumn_harvest::erase::is_terminal_state(&state) {
+                    if is_root || !autumn_harvest::erase::is_terminal_state(&state) {
                         return Err(err);
                     }
                     tracing::warn!(
@@ -1085,6 +1138,7 @@ impl SqliteRuntime {
                         "a waited-on run ended with an error; its waiter records the failure"
                     );
                     stack.pop();
+                    self.drive_blocked.clear();
                 }
             }
         }
@@ -1099,7 +1153,8 @@ impl SqliteRuntime {
     /// still drives every other execution.
     ///
     /// [`run_until_blocked`](Self::run_until_blocked) targets ONE execution
-    /// the caller already knows, so it stays fail-fast on error. This call
+    /// the caller already knows, plus each run it waits on, so it stays
+    /// fail-fast on error. This call
     /// drives many UNRELATED executions, so one failure must not silently
     /// starve the rest.
     ///
@@ -1267,7 +1322,7 @@ impl SqliteRuntime {
     ) -> SqliteResult<RunState> {
         let result = self.drive_one_cycle_inner(exec, now, failure_now).await;
         if let Err(SqliteError::Unsupported(message)) = &result
-            && let Err(seal_error) = self.seal_unsupported(exec, message)
+            && let Err(seal_error) = self.seal_unsupported(exec, message, now)
         {
             // Keep the reason the caller needs. The run stays `RUNNING`, so
             // the next drive meets the feature again and retries the seal.
@@ -1283,7 +1338,12 @@ impl SqliteRuntime {
     /// and `non_retryable = true`. A retry would meet the same feature again.
     /// `details.feature` is a stable token, such as `RunLocalActivity` or
     /// `ScheduleActivity.session_id`. `details.message` holds the full text.
-    fn seal_unsupported(&mut self, exec: ExecutionId, unsupported: &str) -> SqliteResult<()> {
+    fn seal_unsupported(
+        &mut self,
+        exec: ExecutionId,
+        unsupported: &str,
+        now: i64,
+    ) -> SqliteResult<()> {
         let feature = unsupported
             .split(" — ")
             .next()
@@ -1304,7 +1364,7 @@ impl SqliteRuntime {
         // the work no one can use any more, as the `TerminateIfRunning` seal does.
         composition::release_open_work(&tx, exec)?;
         // A parent that awaits this run gets the typed failure (issue #2026).
-        composition::close_execution(&tx, exec, &event)?;
+        composition::close_execution(&tx, exec, &event, now)?;
         tx.commit()?;
         self.workflow_panic_strikes.remove(&exec);
         Ok(())
@@ -1443,7 +1503,7 @@ impl SqliteRuntime {
             ..
         } = &outcome
         {
-            return self.contain_workflow_panic(exec, error);
+            return self.contain_workflow_panic(exec, error, now);
         }
         self.workflow_panic_strikes.remove(&exec);
 
@@ -1460,13 +1520,14 @@ impl SqliteRuntime {
                     &history,
                     &pending,
                     TerminalCycle::Completing,
+                    now,
                 )?;
                 let terminal = WorkflowEvent::WorkflowCompleted {
                     output: output.clone(),
                 };
                 store::append_event(&tx, exec, &terminal)?;
                 store::set_completed(&tx, exec, &output)?;
-                composition::close_execution(&tx, exec, &terminal)?;
+                composition::close_execution(&tx, exec, &terminal, now)?;
                 tx.commit()?;
                 Ok(RunState::Completed(output))
             }
@@ -1520,11 +1581,12 @@ impl SqliteRuntime {
                     &history,
                     &pending,
                     TerminalCycle::Failing,
+                    now,
                 )?;
                 let terminal = WorkflowEvent::workflow_failed_typed(&decoded);
                 store::append_event(&tx, exec, &terminal)?;
                 store::set_failed(&tx, exec, &decoded.message)?;
-                composition::close_execution(&tx, exec, &terminal)?;
+                composition::close_execution(&tx, exec, &terminal, now)?;
                 tx.commit()?;
                 Ok(RunState::Failed(decoded.message))
             }
@@ -1560,6 +1622,11 @@ impl SqliteRuntime {
         failure_now: &(dyn Fn() -> i64 + Send + Sync),
     ) -> SqliteResult<RunState> {
         let applied = self.apply_commands(exec, history, commands, now)?;
+        // The batch sealed this run (issue #2026). Run none of its work. The
+        // next cycle reports the terminal state.
+        if store::execution_state(&self.conn, exec)? != "RUNNING" {
+            return Ok(RunState::InProgress);
+        }
         let settle_after_first_terminal = worker::activity_race_in_flight(history, commands);
         let drained = worker::drain_ready(
             &mut self.conn,
@@ -1740,7 +1807,7 @@ impl SqliteRuntime {
                     children,
                     timers,
                 } => {
-                    if apply_cancel_race_losers(&tx, exec, activities, children, timers)? {
+                    if apply_cancel_race_losers(&tx, exec, activities, children, timers, now)? {
                         produced = true;
                     }
                 }
@@ -1754,6 +1821,11 @@ impl SqliteRuntime {
                     if composition::apply_command(&tx, &self.workflows, exec, history, cmd, now)? {
                         produced = true;
                     }
+                    // A cancel can reach this run through a parent-close cascade.
+                    // A sealed run applies no more of its batch.
+                    if store::execution_state(&tx, exec)? != "RUNNING" {
+                        break;
+                    }
                 }
                 // Cancellable durable timers (issue #768) — a v0.1 non-goal.
                 // Reject LOUDLY and by NAME with an actionable message pointing at
@@ -1764,9 +1836,9 @@ impl SqliteRuntime {
                 cmd @ (WorkflowCommand::ArmTimer { .. } | WorkflowCommand::CancelTimer { .. }) => {
                     return Err(cancellable_timer_unsupported(cmd));
                 }
-                // Every OTHER unsupported command is rejected BY NAME via
-                // `command_name`. Examples are external and local activities,
-                // updates and search attributes. No current variant is an opaque
+                // `command_name` rejects every OTHER unsupported command BY NAME.
+                // Examples are external and local activities, updates and search
+                // attributes. No current variant is an opaque
                 // `"Unknown"` (Codex #1069 P2, `runtime.rs:840`). Dropping `tx` here
                 // (un-committed) rolls back the whole batch — an unsupported command
                 // after a supported one leaves NEITHER the supported command's event
@@ -1780,8 +1852,9 @@ impl SqliteRuntime {
 
     /// Classify why a no-progress cycle is blocked.
     ///
-    /// A no-progress `Suspended` cycle is a legitimate *wait* for one of two
-    /// reasons: an undelivered signal, or a not-yet-due durable timer. Each is
+    /// A no-progress `Suspended` cycle is a legitimate *wait* for one of three
+    /// reasons. They are a `RUNNING` child or await target (issue #2026), an
+    /// undelivered signal, and a not-yet-due durable timer. Each is
     /// checked against ground truth: a `WaitForSignal` command names the awaited
     /// signal, and an armed-but-unfired row in `harvest_timers` proves a pending
     /// timer (`drain_ready` already fired every *due* timer this cycle, so any
@@ -1797,8 +1870,15 @@ impl SqliteRuntime {
     ) -> SqliteResult<RunState> {
         // A wait on another run comes first: the driver can drive that run
         // itself (issue #2026). The other waits need input from outside.
-        if let Some(target) = composition::awaited_running_run(&self.conn, commands)? {
-            return Ok(RunState::WaitingWorkflow(target));
+        // The driver marks a run it found blocked. Prefer a run not yet marked,
+        // so each waited-on run gets driven.
+        let running = composition::awaited_running_runs(&self.conn, commands)?;
+        if let Some(target) = running
+            .iter()
+            .find(|run| !self.drive_blocked.contains(run))
+            .or_else(|| running.first())
+        {
+            return Ok(RunState::WaitingWorkflow(*target));
         }
         for cmd in commands {
             if let WorkflowCommand::WaitForSignal { signal_name, .. } = cmd {
@@ -1835,7 +1915,12 @@ impl SqliteRuntime {
     ///   fix/roll back the build and re-drive the unchanged history.
     /// - **At/over budget**: clear the strike and seal a CLEAN terminal
     ///   `WorkflowFailed` carrying the typed `HandlerPanic` error.
-    fn contain_workflow_panic(&mut self, exec: ExecutionId, error: &str) -> SqliteResult<RunState> {
+    fn contain_workflow_panic(
+        &mut self,
+        exec: ExecutionId,
+        error: &str,
+        now: i64,
+    ) -> SqliteResult<RunState> {
         let strikes = {
             let count = self.workflow_panic_strikes.entry(exec).or_insert(0);
             *count = count.saturating_add(1);
@@ -1857,7 +1942,7 @@ impl SqliteRuntime {
             let terminal = WorkflowEvent::workflow_failed_typed(&decoded);
             store::append_event(&tx, exec, &terminal)?;
             store::set_failed(&tx, exec, &decoded.message)?;
-            composition::close_execution(&tx, exec, &terminal)?;
+            composition::close_execution(&tx, exec, &terminal, now)?;
             tx.commit()?;
             Ok(RunState::Failed(decoded.message))
         } else {
@@ -2115,7 +2200,7 @@ fn cancel_and_seal_prior(
     // A RUNNING prior closes here, so settle its parent and its detached
     // children (issue #2026). A terminal prior settled them when it ended.
     if let Some(event) = &cancelled {
-        composition::close_execution(conn, prior_exec, event)?;
+        composition::close_execution(conn, prior_exec, event, Utc::now().timestamp_millis())?;
     }
     Ok(())
 }
@@ -2243,6 +2328,7 @@ fn persist_terminal_pending_commands(
     history: &[WorkflowEvent],
     pending: &[WorkflowCommand],
     cycle: TerminalCycle,
+    now: i64,
 ) -> SqliteResult<()> {
     for cmd in pending {
         match cmd {
@@ -2321,7 +2407,7 @@ fn persist_terminal_pending_commands(
                 children,
                 timers,
             } => {
-                apply_cancel_race_losers(conn, exec, activities, children, timers)?;
+                apply_cancel_race_losers(conn, exec, activities, children, timers, now)?;
             }
             // Benign bookkeeping — appends no event, gates no control flow.
             // `PublishProgress` (issue #791) is an ephemeral Postgres-only
@@ -2386,13 +2472,15 @@ fn apply_cancel_race_losers(
     activities: &[ActivityExecId],
     children: &[ExecutionId],
     timers: &[TimerId],
+    now: i64,
 ) -> SqliteResult<bool> {
     let mut changed = false;
-    // A losing child is cancelled, as on Postgres (issue #2026). Its close then
-    // writes the untyped `ChildWorkflowFailed` to this parent.
+    // Cancel a losing child, as Postgres does (issue #2026). Its close then
+    // writes the untyped `ChildWorkflowFailed` to this parent. A loser that
+    // never started has no row, and Postgres skips it too.
     for child in children {
-        if store::execution_state(conn, *child)? == "RUNNING" {
-            composition::cancel_execution(conn, *child, composition::RACE_LOSER_REASON)?;
+        if composition::state_of(conn, *child)?.as_deref() == Some("RUNNING") {
+            composition::cancel_execution(conn, *child, composition::RACE_LOSER_REASON, now)?;
             changed = true;
         }
     }
@@ -2767,7 +2855,29 @@ mod tests {
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(schema::SCHEMA).unwrap();
+        schema::migrate(&conn).unwrap();
         conn
+    }
+
+    // Issue #2026: a race can name a losing child it never started. That child
+    // has no row. The teardown skips it, as Postgres does, and changes nothing.
+    #[test]
+    fn a_race_loser_child_with_no_row_is_skipped() {
+        let conn = open();
+        let parent = ExecutionId::new();
+        store::insert_execution(
+            &conn,
+            parent,
+            "wf",
+            &parent.to_string(),
+            &serde_json::json!(0),
+        )
+        .unwrap();
+        let changed =
+            super::apply_cancel_race_losers(&conn, parent, &[], &[ExecutionId::new()], &[], 0)
+                .unwrap();
+        assert!(!changed);
+        assert!(store::load_history(&conn, parent).unwrap().is_empty());
     }
 
     // ── unsupported_activity_feature audit (Codex #1069 P2, runtime.rs:39) ────────

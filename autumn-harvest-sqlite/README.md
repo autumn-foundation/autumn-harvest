@@ -117,8 +117,9 @@ Out of scope for this backend (tracked as issue #1068 follow-ups):
   silently dropped. The run then ends `FAILED` with
   `error_type = "UnsupportedFeature"` (issue #1834).
 
-Child workflows and signal, cancel and await between runs are supported since
-issue #2026. See the docs guide.
+Since issue #2026, the backend supports child workflows and signal, cancel and
+await between runs. See
+[§9 of the docs guide](../docs/sqlite-backend.md#9-child-workflows-and-commands-between-runs).
 
 ## Learn more
 

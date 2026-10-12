@@ -59,7 +59,8 @@ CREATE TABLE IF NOT EXISTS harvest_executions (
                                            -- distinct per run (mirrors the Postgres worker,
                                            -- which injects StartWorkflowParams.workflow_id).
     input_json    TEXT NOT NULL,
-    state         TEXT NOT NULL,          -- RUNNING | COMPLETED | FAILED | CANCELLED
+    state         TEXT NOT NULL,          -- RUNNING | COMPLETED | FAILED | CANCELLED |
+                                          -- CONTINUED_AS_NEW (the reuse-policy seal)
     output_json   TEXT,
     error         TEXT,
     parent_exec_id      TEXT,             -- the parent run of a child (issue #2026)

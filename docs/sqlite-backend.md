@@ -244,7 +244,7 @@ blocked on external input. All three drivers are `async`.
 | Driver | Scope | Stops when | Returns |
 | --- | --- | --- | --- |
 | `poll_once().await` | Every running execution, **one cycle each** | after a single pass | `bool` — did anything make progress? |
-| `run_until_blocked(exec).await` | **One** execution | that run is terminal or blocked | `RunState` |
+| `run_until_blocked(exec).await` | **One** execution, plus each run it waits on | that run is terminal or blocked | `RunState` |
 | `run_until_idle().await` | **Every** execution, repeatedly | the whole fleet quiesces | `()` |
 
 ```rust
@@ -283,7 +283,9 @@ match rt.outcome(exec)? {
 `poll_once()`/`run_until_idle()` drive every execution in a pass even if an
 earlier one errors — see [§12](#12-v01-non-goals-and-follow-ups) for what
 happens to a rejected execution. `run_until_blocked(exec)` is the one
-fail-fast driver, since it already targets a single execution.
+fail-fast driver, since it targets one execution. It also drives each run that
+`exec` waits on, so an error from that run can return too (see
+[§9](#9-child-workflows-and-commands-between-runs)).
 
 `outcome(exec)`, `load_history(exec)`, and `activity_attempts(exec, name)` are
 **pure reads** — they never advance a run.
@@ -336,8 +338,9 @@ rejected rather than silently lost.
 ## 9. Child workflows and commands between runs
 
 A workflow can start a child, await another run, and signal or cancel
-another run (issue #2026). Each command resolves in the caller's decision
-transaction. One file holds every run, so no outbox is needed.
+another run (issue #2026). Each command takes effect in the caller's decision
+transaction. An await of a running target stays open, and each later cycle
+checks it again. One file holds every run, so the backend needs no outbox.
 
 ```rust
 // Inside a workflow: start a child and wait for its result.
@@ -369,7 +372,8 @@ let report = ctx.await_external_workflow_value(audit).await.map_err(|e| e.to_str
 | Signal | A staged signal | `Ok(())`, or `target_terminal` / `not_running` |
 | Cancel | `WorkflowCancelled`, then `CANCELLED` | `Ok(())`, also for a terminal target |
 
-Every caller gets `target_unknown` at once for a run that does not exist.
+Signal, cancel and await get `target_unknown` at once for a run that does not
+exist.
 Postgres waits a grace window first, because another shard can still create
 the run. One file has no other shard, so its answer is final.
 
@@ -377,31 +381,51 @@ the run. One file has no other shard, so its answer is final.
 `ctx.info().parent_execution_id` names its parent. A child failure reaches
 the parent as `HarvestError::WorkflowFailed`, with the child's `error_type`,
 `details` and `non_retryable`. A cancelled child fails the parent's wait with
-`child workflow cancelled: <reason>`. An unregistered child workflow returns
-`SqliteError::UnknownWorkflow` and leaves the parent `RUNNING`, so a fix in the
-same runtime can resume it.
+`child workflow cancelled: <reason>`. Under `spawn_child_workflow_timeout`, a
+deadline that is due fires before a late child's result, so the deadline wins,
+as on Postgres. A drive that starts an unregistered child workflow returns
+`SqliteError::UnknownWorkflow`. The cycle rolls back, and the parent stays
+`RUNNING`, so a fix in the same runtime can resume it.
+`rt.parent_execution(child)` reads a child's parent.
 
 **Parent-close policy.** When a parent ends, each running detached child gets
 its policy. `request_cancel` cancels it with reason `parent closed`.
-`terminate` fails it with `ParentClosed`. `abandon` leaves it running. An
-attached child is left running, as on Postgres.
+`terminate` fails it with `ParentClosed`. `abandon` leaves it running. The
+cascade reaches every level of a chain of detached children. An attached child
+is left running, as on Postgres.
 
-**Cancel is a hard seal.** The target ends `CANCELLED` at once. Its pending
-tasks, timers and staged signals go. Its body does not run again, so
-`ctx.cancellation_reason()` stays unobserved. This matches the Postgres
-external cancel.
+**Cancel is a hard seal.** The target ends `CANCELLED` at once. The backend
+deletes its pending tasks, unfired timers and unkeyed staged signals. A keyed
+signal row stays, so a duplicate send still dedups. The target's body does not
+run again, so `ctx.cancellation_reason()` stays unobserved. This matches the
+Postgres external cancel. A run that its own cancel seals, through a
+parent-close cascade, applies no more of its batch. A drive of a cancelled run
+returns `RunState::Failed` naming the state, and `outcome()` returns
+`Terminated("CANCELLED")`. `AllowDuplicateFailedOnly` replaces a cancelled run,
+as core does.
 
 **Driving.** A run that waits on a `RUNNING` child or await target returns
-`RunState::WaitingWorkflow(target)`. `run_until_blocked` drives that target in
-the same call. So a parent whose child needs no outside input completes in
-one call. When the target blocks, the parent returns `WaitingWorkflow` naming
-it. Drive the target, or send it the signal it waits for.
-`poll_once` and `run_until_idle` treat `WaitingWorkflow` as blocked.
+`RunState::WaitingWorkflow(target)`. `run_until_blocked` drives each such
+target in the same call. So a parent whose children need no outside input
+completes in one call. When every target blocks, the parent returns
+`WaitingWorkflow` naming the run it waits on directly. That run can wait on
+another run in turn, so call `run_until_blocked` on it to find the run that
+needs input. The parent can also wait on a timer, such as a child deadline,
+so drive it again after the deadline. `poll_once` and `run_until_idle` treat
+`WaitingWorkflow` as blocked. Each run gets its own cycle budget in one call.
+An error from a waited-on run returns from the call, unless that run is now
+terminal. Such an error does not always name `exec`.
 
-**Replay.** Every history replays on the core `WorkflowReplayer`. The one
-exception is shared with Postgres: a run cancelled while it waits ends in a
+**Replay.** Every history replays on the core `WorkflowReplayer`. This change
+also fixes a core replay gap: an await whose result lands after a sibling's
+child or activity events now resolves on replay, on both backends. Postgres
+has the same single exception: a run cancelled while it waits ends in a
 `WorkflowCancelled` that its code never saw. Strict replay reports that run
 as still parked. Replay the events before the cancel in canary mode instead.
+
+**Event order.** This backend writes a batch in command order. Postgres
+writes the external signal, cancel and await events of a mixed batch first.
+Each event is the same, and replay accepts both orders.
 
 ---
 
@@ -515,10 +539,12 @@ The seal also removes the run's pending tasks, unfired timers and staged
 signals. The cycle's own cleanup rolled back, and nothing can use them now.
 
 That drive still returns `SqliteError::Unsupported`, so the caller sees the
-reason. A later drive returns `RunState::Failed` and does not run the handler
+reason. When the sealed run is a child or await target, the waiter's drive does
+not return the error. The waiter records the typed failure instead. A later drive returns `RunState::Failed` and does not run the handler
 again. `outcome()` returns `ExecutionOutcome::Failed`.
 
-Only an unsupported feature seals a run. Other errors leave the run `RUNNING`:
+Among drive errors, only an unsupported feature seals a run. Other errors
+leave the run `RUNNING`:
 an unregistered workflow or activity, a replay divergence, a contained panic
 under its budget, or a failed task. A fix in the same runtime can then resume
 the run.

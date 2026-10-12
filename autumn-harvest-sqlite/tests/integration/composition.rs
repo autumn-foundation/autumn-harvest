@@ -8,7 +8,12 @@
 // Some fixtures return at once and hold no `.await`.
 #![allow(clippy::unused_async)]
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+
 use autumn_harvest::ParentClosePolicy;
+use autumn_harvest::WorkflowIdReusePolicy;
+use autumn_harvest::failure::ERROR_TYPE_HANDLER_PANIC;
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::{WorkflowHandlerFn, WorkflowInfo};
@@ -88,12 +93,179 @@ async fn parent_reports_child_failure(
 
 #[workflow]
 async fn waits_for_go(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    // A recorded side effect gives a replay of a cancelled run a command to check.
+    let _ticket = ctx.new_uuid();
     ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
 }
 
 #[workflow]
 async fn waits_on_timer(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
     ctx.timer("nap", 3600).await.map_err(|e| e.to_string())
+}
+
+/// Spawns a detached copy of itself under `request_cancel` until `depth` is 0,
+/// then waits for a signal. Each link waits for `go` after its spawn.
+#[workflow]
+async fn detached_chain(ctx: &WorkflowContext, depth: i64) -> Result<Value, String> {
+    if depth > 0 {
+        ctx.spawn_child_workflow_detached_raw(
+            "detached_chain",
+            json!(depth - 1),
+            ParentClosePolicy::RequestCancel,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
+/// Awaits `target` and runs a child in one `join!`, the await first.
+#[workflow]
+async fn joins_await_then_child(
+    ctx: &WorkflowContext,
+    target: ExecutionId,
+) -> Result<Value, String> {
+    let (awaited, child) = tokio::join!(
+        ctx.await_external_workflow_value(target),
+        ctx.spawn_child_workflow_raw("child_work", json!(2)),
+    );
+    Ok(json!({
+        "awaited": awaited.map_err(|e| e.to_string())?,
+        "child": child.map_err(|e| e.to_string())?["doubled"],
+    }))
+}
+
+/// The same `join!` with the child first.
+#[workflow]
+async fn joins_child_then_await(
+    ctx: &WorkflowContext,
+    target: ExecutionId,
+) -> Result<Value, String> {
+    let (child, awaited) = tokio::join!(
+        ctx.spawn_child_workflow_raw("child_work", json!(2)),
+        ctx.await_external_workflow_value(target),
+    );
+    Ok(json!({
+        "awaited": awaited.map_err(|e| e.to_string())?,
+        "child": child.map_err(|e| e.to_string())?["doubled"],
+    }))
+}
+
+/// Fails with the child's failure, without catching it.
+#[workflow]
+async fn parent_propagates(ctx: &WorkflowContext, child: String) -> Result<Value, String> {
+    ctx.spawn_child_workflow_raw(&child, json!(0))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[workflow]
+async fn child_panics(_ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    panic!("kaboom")
+}
+
+/// A chain of attached children. The leaf waits for `go`.
+#[workflow]
+async fn attached_chain(ctx: &WorkflowContext, depth: i64) -> Result<Value, String> {
+    if depth == 0 {
+        return ctx.wait_for_signal("go").await.map_err(|e| e.to_string());
+    }
+    ctx.spawn_child_workflow_raw("attached_chain", json!(depth - 1))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Awaits `target` while a child signals it. Neither needs outside input.
+#[workflow]
+async fn joins_await_and_signaller(
+    ctx: &WorkflowContext,
+    target: ExecutionId,
+) -> Result<Value, String> {
+    let (awaited, sent) = tokio::join!(
+        ctx.await_external_workflow_value(target),
+        ctx.spawn_child_workflow_raw("signal_reports", json!(target)),
+    );
+    Ok(json!({
+        "awaited": awaited.map_err(|e| e.to_string())?,
+        "sent": sent.map_err(|e| e.to_string())?,
+    }))
+}
+
+/// Spawns a detached watchdog that cancels this parent, then waits.
+#[workflow]
+async fn parent_with_watchdog(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let me = ctx.info().execution_id;
+    ctx.spawn_child_workflow_detached_raw("watchdog", json!(me), ParentClosePolicy::RequestCancel)
+        .map_err(|e| e.to_string())?;
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
+/// Cancels its own parent and runs an activity in the same batch. The
+/// cascade seals this run, so the activity must never run.
+#[workflow]
+async fn watchdog(ctx: &WorkflowContext, parent: ExecutionId) -> Result<(), String> {
+    let (cancel, effect) = tokio::join!(
+        ctx.request_cancel_external_workflow(parent),
+        ctx.execute_activity_raw("watchdog_effect", json!(1), "default"),
+    );
+    cancel.map_err(|e| e.to_string())?;
+    effect.map(drop).map_err(|e| e.to_string())
+}
+
+/// Spawns a detached `request_cancel` waiter, then fails in the same cycle.
+#[workflow]
+async fn spawns_detached_then_fails(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
+    ctx.spawn_child_workflow_detached_raw(
+        "waits_for_go",
+        json!(0),
+        ParentClosePolicy::RequestCancel,
+    )
+    .map_err(|e| e.to_string())?;
+    Err("parent gave up".to_string())
+}
+
+/// Sends the same keyed signal by workflow id.
+#[workflow]
+async fn keyed_signal_by_id(ctx: &WorkflowContext, key: Value) -> Result<String, String> {
+    let name = key["name"].as_str().unwrap_or_default().to_string();
+    let id = key["id"].as_str().unwrap_or_default().to_string();
+    let idem = key["key"].as_str().unwrap_or_default().to_string();
+    ctx.signal_external_workflow_by_id_with_idempotency(&name, &id, "go", json!("keyed"), idem)
+        .await
+        .map(|()| "delivered".to_string())
+        .map_err(|e| e.to_string())
+}
+
+/// Sends one keyed signal to `target`.
+#[workflow]
+async fn keyed_signal(ctx: &WorkflowContext, args: Value) -> Result<String, String> {
+    let target: ExecutionId =
+        serde_json::from_value(args["target"].clone()).map_err(|e| e.to_string())?;
+    let idem = args["key"].as_str().unwrap_or_default().to_string();
+    match ctx
+        .signal_external_workflow_with_idempotency(target, "other", json!(1), idem)
+        .await
+    {
+        Ok(()) => Ok("delivered".to_string()),
+        Err(HarvestError::ExternalSignalFailed { reason_code, .. }) => Ok(reason_code),
+        Err(other) => Err(other.to_string()),
+    }
+}
+
+/// Runs a child under a one-second deadline. The child runs `slow`.
+#[workflow]
+async fn parent_child_timeout_slow(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let out = ctx
+        .spawn_child_workflow_timeout("slow_child", json!(0), std::time::Duration::from_secs(1))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(json!({ "child": out }))
+}
+
+#[workflow]
+async fn slow_child(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    ctx.execute_activity_raw("slow", json!(0), "default")
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[workflow]
@@ -298,6 +470,20 @@ fn fixtures() -> Vec<WorkflowInfo> {
         parent_reports_child_failure_info(),
         waits_for_go_info(),
         waits_on_timer_info(),
+        detached_chain_info(),
+        joins_await_then_child_info(),
+        joins_child_then_await_info(),
+        parent_propagates_info(),
+        child_panics_info(),
+        attached_chain_info(),
+        joins_await_and_signaller_info(),
+        parent_with_watchdog_info(),
+        watchdog_info(),
+        spawns_detached_then_fails_info(),
+        keyed_signal_by_id_info(),
+        keyed_signal_info(),
+        parent_child_timeout_slow_info(),
+        slow_child_info(),
         parent_of_waiter_info(),
         parent_reports_waiter_info(),
         parent_detached_awaits_info(),
@@ -324,7 +510,8 @@ fn handler_of(name: &str) -> WorkflowHandlerFn {
         .map_or_else(|| panic!("no fixture named {name}"), |info| info.handler)
 }
 
-/// Replay the stored history of `exec` on the core replayer.
+/// Replay the stored history of `exec` on the core replayer, with the run's
+/// execution id, workflow id and parent id.
 ///
 /// A cancel is a hard seal. It ends a parked run, and the run's code never
 /// sees the `WorkflowCancelled` event. Strict core replay verifies a
@@ -337,32 +524,49 @@ fn assert_replays<'a>(
     exec: ExecutionId,
     workflow: &'a str,
 ) -> impl std::future::Future<Output = ()> + 'a {
-    // Read the history now. The future then holds no runtime borrow.
+    // Read the run now. The future then holds no runtime borrow.
     let history = rt.load_history(exec).unwrap();
-    async move { replay_history(history, exec, workflow).await }
+    let parent = rt.parent_execution(exec).unwrap();
+    async move { replay_history(history, exec, parent, workflow).await }
 }
 
-async fn replay_history(history: Vec<WorkflowEvent>, exec: ExecutionId, workflow: &str) {
+async fn replay_history(
+    history: Vec<WorkflowEvent>,
+    exec: ExecutionId,
+    parent: Option<ExecutionId>,
+    workflow: &str,
+) {
     let replayer = WorkflowReplayer::new().register_fn(workflow, handler_of(workflow));
-    let report = match history.split_last() {
-        Some((WorkflowEvent::WorkflowCancelled { .. }, written)) => {
-            let snapshot = serde_json::from_value(json!({
-                "workflow_name": workflow,
-                "execution_id": exec,
-                "events": written,
-            }))
-            .unwrap();
-            replayer.replay_canary_snapshot(snapshot).await
-        }
-        _ => replayer.replay_from_events(history.clone()).await,
+    // Post-terminal bookkeeping, such as a cascade record, can follow the cancel.
+    let cancel_at = history
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::WorkflowCancelled { .. }));
+    let events = cancel_at.map_or(&history[..], |at| &history[..at]);
+    // Every run in these tests uses its execution id as its workflow id.
+    let snapshot = serde_json::from_value(json!({
+        "workflow_name": workflow,
+        "execution_id": exec,
+        "events": events,
+        "parent_execution_id": parent,
+        "workflow_id": exec.to_string(),
+    }))
+    .unwrap();
+    let report = if cancel_at.is_some() {
+        replayer.replay_canary_snapshot(snapshot).await
+    } else {
+        replayer.replay_from_snapshot(snapshot).await
     };
-    let ok = match &report.status {
-        ReplayStatus::ReplaySucceeded => true,
-        // A failed run replays to the same failure.
-        ReplayStatus::WorkflowFailed { .. } => history
-            .iter()
-            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
-        ReplayStatus::NonDeterminismDetected { .. } => false,
+    let recorded_failure = history.iter().rev().find_map(|e| match e {
+        WorkflowEvent::WorkflowFailed { error, .. } => Some(error.clone()),
+        _ => None,
+    });
+    let ok = match (&report.status, &recorded_failure) {
+        (ReplayStatus::ReplaySucceeded, _) => true,
+        // A failed run must replay to the same failure.
+        (ReplayStatus::WorkflowFailed { error, .. }, Some(recorded)) => {
+            &autumn_harvest::failure::decode_workflow_failure(error).message == recorded
+        }
+        _ => false,
     };
     assert!(
         ok,
@@ -1104,4 +1308,451 @@ async fn a_cancelled_timer_wait_replays() {
         ExecutionOutcome::Terminated(ref s) if s == "CANCELLED"
     ));
     assert_replays(&rt, target, "waits_on_timer").await;
+}
+
+/// Closing the root cascades down a chain of detached children. The cascade
+/// uses a worklist, so each level is cancelled and records its own cascade.
+#[tokio::test]
+async fn a_cascade_reaches_every_level_of_a_detached_chain() {
+    let (_dir, path) = temp_db();
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    register_all(&mut rt);
+    let root = rt.start_workflow("detached_chain", json!(3)).unwrap();
+    rt.run_until_idle().await.unwrap();
+
+    let mut chain = vec![root];
+    while let Some(next) = children_of(&rt, *chain.last().unwrap()).first().copied() {
+        chain.push(next);
+    }
+    assert_eq!(chain.len(), 4, "the root and three detached levels");
+
+    rt.send_signal(root, "go", json!("done")).unwrap();
+    rt.run_until_idle().await.unwrap();
+    assert_eq!(completed(&rt, root), json!("done"));
+    for (level, run) in chain.iter().enumerate().skip(1) {
+        assert!(
+            matches!(rt.outcome(*run).unwrap(), ExecutionOutcome::Terminated(ref s) if s == "CANCELLED"),
+            "level {level} must be cancelled"
+        );
+        assert_no_open_rows(&path, *run);
+    }
+    for (level, run) in chain.iter().enumerate().take(3) {
+        let cascades = rt
+            .load_history(*run)
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::ChildWorkflowCascadeApplied { .. }))
+            .count();
+        assert_eq!(cascades, 1, "level {level} records one cascade");
+    }
+    for run in &chain {
+        assert_replays(&rt, *run, "detached_chain").await;
+    }
+}
+
+/// A `join!` of an await and a child completes in either order, and replays.
+#[tokio::test]
+async fn a_join_of_an_await_and_a_child_completes() {
+    for workflow in ["joins_await_then_child", "joins_child_then_await"] {
+        let mut rt = runtime();
+        let target = rt.start_workflow("waits_for_go", json!(0)).unwrap();
+        rt.run_until_blocked(target).await.unwrap();
+        let parent = rt.start_workflow(workflow, json!(target)).unwrap();
+        let state = rt.run_until_blocked(parent).await;
+        let state = state
+            .unwrap_or_else(|e| panic!("{workflow}: {e}\n{:#?}", rt.load_history(parent).unwrap()));
+        assert!(
+            matches!(state, RunState::WaitingWorkflow(id) if id == target),
+            "{workflow}: {state:?}"
+        );
+
+        rt.send_signal(target, "go", json!("ready")).unwrap();
+        let state = rt.run_until_blocked(parent).await;
+        let state = state
+            .unwrap_or_else(|e| panic!("{workflow}: {e}\n{:#?}", rt.load_history(parent).unwrap()));
+        assert!(
+            matches!(state, RunState::Completed(ref v) if v == &json!({ "awaited": "ready", "child": 4 })),
+            "{workflow}: {state:?}\n{:#?}",
+            rt.load_history(parent).unwrap()
+        );
+        assert_replays(&rt, parent, workflow).await;
+    }
+}
+
+// ── Review follow-ups ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn an_uncaught_child_failure_fails_the_parent() {
+    let mut rt = runtime();
+    let parent = rt
+        .start_workflow("parent_propagates", json!("child_typed_failure"))
+        .unwrap();
+    let state = rt.run_until_blocked(parent).await.unwrap();
+    assert!(
+        matches!(state, RunState::Failed(ref m) if m.contains("card declined")),
+        "{state:?}"
+    );
+    assert_replays(&rt, parent, "parent_propagates").await;
+}
+
+#[tokio::test]
+async fn a_typed_child_failure_keeps_non_retryable() {
+    let mut rt = runtime();
+    let parent = rt
+        .start_workflow("parent_reports_child_failure", json!("child_typed_failure"))
+        .unwrap();
+    rt.run_until_blocked(parent).await.unwrap();
+    assert_eq!(completed(&rt, parent)["non_retryable"], json!(false));
+}
+
+/// A panicking child keeps the drive's error until its budget runs out. Then
+/// it is sealed, and the parent records the typed panic.
+#[tokio::test]
+async fn a_panicking_child_fails_its_parent_after_the_budget() {
+    let mut rt = runtime();
+    let parent = rt
+        .start_workflow("parent_reports_child_failure", json!("child_panics"))
+        .unwrap();
+    let mut panics = 0;
+    let state = loop {
+        match rt.run_until_blocked(parent).await {
+            Err(SqliteError::WorkflowPanicked { .. }) => panics += 1,
+            other => break other.unwrap(),
+        }
+        assert!(panics < 5, "the panic budget must seal the child");
+    };
+    assert_eq!(panics, 2, "two strikes stay resumable");
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    assert_eq!(
+        completed(&rt, parent)["error_type"],
+        json!(ERROR_TYPE_HANDLER_PANIC)
+    );
+    assert_replays(&rt, parent, "parent_reports_child_failure").await;
+}
+
+/// The root names the run it waits on directly, not the leaf that needs input.
+#[tokio::test]
+async fn a_three_level_chain_names_the_direct_child_and_completes() {
+    let mut rt = runtime();
+    let root = rt.start_workflow("attached_chain", json!(2)).unwrap();
+    let state = rt.run_until_blocked(root).await.unwrap();
+    let middle = children_of(&rt, root)[0];
+    let leaf = children_of(&rt, middle)[0];
+    assert!(
+        matches!(state, RunState::WaitingWorkflow(id) if id == middle),
+        "{state:?}"
+    );
+    assert!(!rt.poll_once().await.unwrap(), "every run is blocked");
+
+    rt.send_signal(leaf, "go", json!("deep")).unwrap();
+    let state = rt.run_until_blocked(root).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!("deep")),
+        "{state:?}"
+    );
+    for run in [root, middle, leaf] {
+        assert_replays(&rt, run, "attached_chain").await;
+    }
+}
+
+/// A blocked waited-on run does not starve a sibling that needs no input.
+#[tokio::test]
+async fn a_blocked_target_does_not_starve_a_sibling_child() {
+    let mut rt = runtime();
+    let target = rt.start_workflow("waits_for_go", json!(0)).unwrap();
+    let parent = rt
+        .start_workflow("joins_await_and_signaller", json!(target))
+        .unwrap();
+    let state = rt.run_until_blocked(parent).await.unwrap();
+    assert!(
+        matches!(
+            state,
+            RunState::Completed(ref v)
+                if v == &json!({ "awaited": { "from": "signaller" }, "sent": "delivered" })
+        ),
+        "one drive must finish the parent: {state:?}"
+    );
+    assert_replays(&rt, parent, "joins_await_and_signaller").await;
+    assert_replays(&rt, target, "waits_for_go").await;
+}
+
+static WATCHDOG_EFFECTS: AtomicUsize = AtomicUsize::new(0);
+
+/// A run that the cascade of its own cancel seals applies no more of its batch.
+#[tokio::test]
+async fn a_run_sealed_by_its_own_cancel_runs_no_more_work() {
+    let (_dir, path) = temp_db();
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    register_all(&mut rt);
+    rt.register_activity_raw(
+        "watchdog_effect",
+        ActivitySpec::new(1, |v: Value| {
+            WATCHDOG_EFFECTS.fetch_add(1, Ordering::SeqCst);
+            Ok(v)
+        }),
+    );
+    let parent = rt.start_workflow("parent_with_watchdog", json!(0)).unwrap();
+    rt.run_until_idle().await.unwrap();
+
+    let dog = children_of(&rt, parent)[0];
+    for run in [parent, dog] {
+        assert!(matches!(
+            rt.outcome(run).unwrap(),
+            ExecutionOutcome::Terminated(ref s) if s == "CANCELLED"
+        ));
+        assert_no_open_rows(&path, run);
+    }
+    assert_eq!(
+        WATCHDOG_EFFECTS.load(Ordering::SeqCst),
+        0,
+        "the body must never run"
+    );
+    let kinds: Vec<&str> = rt
+        .load_history(dog)
+        .unwrap()
+        .iter()
+        .map(WorkflowEvent::type_name)
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "WorkflowStarted",
+            "ExternalCancelRequested",
+            "ExternalCancelDelivered",
+            "WorkflowCancelled"
+        ]
+    );
+    assert_replays(&rt, dog, "watchdog").await;
+}
+
+#[tokio::test]
+async fn a_detached_spawn_in_a_failing_cycle_is_cascaded() {
+    let (_dir, path) = temp_db();
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    register_all(&mut rt);
+    let parent = rt
+        .start_workflow("spawns_detached_then_fails", json!(0))
+        .unwrap();
+    let state = rt.run_until_blocked(parent).await.unwrap();
+    assert!(
+        matches!(state, RunState::Failed(ref m) if m == "parent gave up"),
+        "{state:?}"
+    );
+    let child = children_of(&rt, parent)[0];
+    assert!(matches!(
+        rt.outcome(child).unwrap(),
+        ExecutionOutcome::Terminated(ref s) if s == "CANCELLED"
+    ));
+    assert_no_open_rows(&path, child);
+    let kinds: Vec<&str> = rt
+        .load_history(parent)
+        .unwrap()
+        .iter()
+        .map(WorkflowEvent::type_name)
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "WorkflowStarted",
+            "ChildWorkflowSpawnedDetached",
+            "WorkflowFailed",
+            "ChildWorkflowCascadeApplied"
+        ]
+    );
+    assert_replays(&rt, parent, "spawns_detached_then_fails").await;
+}
+
+/// `TerminateIfRunning` supersedes a running child. The parent sees a cancel.
+#[tokio::test]
+async fn a_reuse_seal_of_a_running_child_fails_its_parent() {
+    let mut rt = runtime();
+    let parent = rt
+        .start_workflow("parent_reports_waiter", json!(0))
+        .unwrap();
+    rt.run_until_blocked(parent).await.unwrap();
+    let child = children_of(&rt, parent)[0];
+    rt.start_workflow_with_reuse_policy(
+        "waits_for_go",
+        &child.to_string(),
+        json!(0),
+        WorkflowIdReusePolicy::TerminateIfRunning,
+    )
+    .unwrap();
+    rt.run_until_blocked(parent).await.unwrap();
+    assert_eq!(
+        completed(&rt, parent),
+        json!("child workflow cancelled: superseded by a TerminateIfRunning start (#1068)")
+    );
+    assert_replays(&rt, parent, "parent_reports_waiter").await;
+}
+
+/// An await reports a run that a reuse seal superseded by its last terminal.
+#[tokio::test]
+async fn an_await_of_a_superseded_target_reports_its_last_terminal() {
+    let mut rt = runtime();
+    // A completed run that a restart later sealed still resolves the await.
+    let done = rt
+        .start_workflow_with_id("child_typed_failure", "sealed-1", json!(0))
+        .unwrap();
+    rt.run_until_blocked(done).await.unwrap();
+    let running = rt
+        .start_workflow_with_id("waits_for_go", "sealed-2", json!(0))
+        .unwrap();
+    rt.run_until_blocked(running).await.unwrap();
+    for (name, id) in [
+        ("child_typed_failure", "sealed-1"),
+        ("waits_for_go", "sealed-2"),
+    ] {
+        rt.start_workflow_with_reuse_policy(
+            name,
+            id,
+            json!(0),
+            WorkflowIdReusePolicy::TerminateIfRunning,
+        )
+        .unwrap();
+    }
+    let on_failed = rt.start_workflow("await_reports", json!(done)).unwrap();
+    let on_running = rt.start_workflow("await_reports", json!(running)).unwrap();
+    rt.run_until_blocked(on_failed).await.unwrap();
+    rt.run_until_blocked(on_running).await.unwrap();
+
+    assert_eq!(
+        completed(&rt, on_failed)["error_type"],
+        json!("PaymentDeclined")
+    );
+    let out = completed(&rt, on_running);
+    assert_eq!(out["error_type"], json!("target_cancelled"));
+    assert_eq!(
+        out["failed"],
+        json!("superseded by a TerminateIfRunning start (#1068)")
+    );
+}
+
+/// `AllowDuplicateFailedOnly` replaces a cancelled run, as core does.
+#[tokio::test]
+async fn failed_only_reuse_replaces_a_cancelled_run() {
+    let mut rt = runtime();
+    let first = rt
+        .start_workflow_with_id("waits_for_go", "reuse-1", json!(0))
+        .unwrap();
+    let canceller = rt.start_workflow("cancel_reports", json!(first)).unwrap();
+    rt.run_until_idle().await.unwrap();
+    assert_eq!(completed(&rt, canceller), json!("delivered"));
+
+    let outcome = rt
+        .start_workflow_with_reuse_policy(
+            "waits_for_go",
+            "reuse-1",
+            json!(0),
+            WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
+        )
+        .unwrap();
+    assert!(outcome.created, "a cancelled prior is replaced");
+    assert_ne!(outcome.exec_id, first);
+}
+
+/// A keyed signal row outlives a cancel of its target, so a duplicate send
+/// still dedups, as on Postgres.
+#[tokio::test]
+async fn a_signal_key_survives_a_cancel_of_its_target() {
+    let mut rt = runtime();
+    let target = rt.start_workflow("waits_for_go", json!(0)).unwrap();
+    rt.run_until_blocked(target).await.unwrap();
+    let args = json!({ "target": target, "key": "k" });
+    let first = rt.start_workflow("keyed_signal", args.clone()).unwrap();
+    rt.run_until_blocked(first).await.unwrap();
+    let canceller = rt.start_workflow("cancel_reports", json!(target)).unwrap();
+    rt.run_until_blocked(canceller).await.unwrap();
+
+    let again = rt.start_workflow("keyed_signal", args).unwrap();
+    rt.run_until_blocked(again).await.unwrap();
+    assert_eq!(completed(&rt, first), json!("delivered"));
+    assert_eq!(
+        completed(&rt, again),
+        json!("delivered"),
+        "a duplicate key dedups"
+    );
+
+    let unkeyed = rt
+        .start_workflow("keyed_signal", json!({ "target": target, "key": "" }))
+        .unwrap();
+    rt.run_until_blocked(unkeyed).await.unwrap();
+    assert_eq!(
+        completed(&rt, unkeyed),
+        json!("target_terminal"),
+        "an empty key is no key"
+    );
+}
+
+/// A by-id key dedups across every run of that key.
+#[tokio::test]
+async fn a_by_id_signal_key_dedups_across_runs() {
+    let mut rt = runtime();
+    let first = rt
+        .start_workflow_with_id("waits_for_go", "chain-1", json!(0))
+        .unwrap();
+    let key = json!({ "name": "waits_for_go", "id": "chain-1", "key": "k2" });
+    let sender = rt
+        .start_workflow("keyed_signal_by_id", key.clone())
+        .unwrap();
+    rt.run_until_idle().await.unwrap();
+    assert_eq!(completed(&rt, sender), json!("delivered"));
+    assert_eq!(completed(&rt, first), json!("keyed"));
+
+    let second = rt
+        .start_workflow_with_reuse_policy(
+            "waits_for_go",
+            "chain-1",
+            json!(0),
+            WorkflowIdReusePolicy::TerminateIfRunning,
+        )
+        .unwrap()
+        .exec_id;
+    let again = rt.start_workflow("keyed_signal_by_id", key).unwrap();
+    rt.run_until_idle().await.unwrap();
+    assert_eq!(completed(&rt, again), json!("delivered"));
+    let state = rt.run_until_blocked(second).await.unwrap();
+    assert!(
+        matches!(state, RunState::WaitingSignal(ref s) if s == "go"),
+        "the new run gets no duplicate: {state:?}"
+    );
+}
+
+/// A child that ends after its parent's deadline loses to the deadline, as
+/// on Postgres (issue #779).
+#[tokio::test]
+async fn a_late_child_loses_to_a_due_deadline() {
+    let mut rt = runtime();
+    let clock = Arc::new(AtomicI64::new(1_767_225_600_000));
+    let read = Arc::clone(&clock);
+    rt.set_clock(move || {
+        chrono::DateTime::from_timestamp_millis(read.load(Ordering::SeqCst)).unwrap()
+    });
+    let bump = Arc::clone(&clock);
+    rt.register_activity_raw(
+        "slow",
+        ActivitySpec::new(1, move |_| {
+            bump.fetch_add(5_000, Ordering::SeqCst);
+            Ok(json!("slow-done"))
+        }),
+    );
+    let parent = rt
+        .start_workflow("parent_child_timeout_slow", json!(0))
+        .unwrap();
+    let state = rt.run_until_blocked(parent).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!({ "child": null })),
+        "the deadline wins: {state:?}"
+    );
+    let history = rt.load_history(parent).unwrap();
+    let fired = history
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::TimerFired { .. }))
+        .expect("the deadline fired");
+    let child_done = history
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::ChildWorkflowCompleted { .. }))
+        .expect("the child result is still recorded");
+    assert!(fired < child_done, "{history:#?}");
+    assert_replays(&rt, parent, "parent_child_timeout_slow").await;
 }

@@ -194,8 +194,8 @@
 //! # Child workflows and commands between runs (issue #2026)
 //!
 //! A workflow can start a child, await another run, and signal or cancel
-//! another run. Each command resolves in the caller's cycle transaction. One
-//! database holds every run, so no outbox is needed.
+//! another run. Each command takes effect in the caller's decision
+//! transaction. One database holds every run, so the backend needs no outbox.
 //!
 //! - **Attached child** — `ctx.spawn_child_workflow(...)`. The parent records
 //!   `ChildWorkflowStarted`. The child gets its own row, with a parent link.
@@ -203,22 +203,27 @@
 //!   `ChildWorkflowCompleted` or `ChildWorkflowFailed` to the parent in the
 //!   same transaction. A typed failure keeps `error_type`, `details` and
 //!   `non_retryable`. A cancelled child fails the parent's await with
-//!   `child workflow cancelled: <reason>`.
+//!   `child workflow cancelled: <reason>`. A parent child-timeout deadline
+//!   that is due fires first, so a late child loses to it, as on Postgres.
 //! - **Detached child** — `ctx.spawn_child_workflow_detached(...)`. The parent
 //!   records `ChildWorkflowSpawnedDetached` and does not wait. When the parent
 //!   closes, `request_cancel` cancels a running child (reason `parent closed`),
 //!   `terminate` fails it (`ParentClosed`), and `abandon` leaves it. The parent
-//!   records `ChildWorkflowCascadeApplied` for each child it cascades to.
+//!   records `ChildWorkflowCascadeApplied` for each child it cascades to. The
+//!   cascade reaches every level of a chain of detached children.
 //! - **Await** — `ctx.await_external_workflow(...)` reads another run's result.
 //!   A running target leaves the await open. Each later cycle checks it again.
-//! - **Signal** — `ctx.signal_external_workflow(...)`, also by business key.
+//! - **Signal** — `ctx.signal_external_workflow(...)`, also by workflow id.
 //!   A running target gets a staged signal. A terminal target fails the call
-//!   with `target_terminal`, or `not_running` by key. An idempotency key
-//!   already staged on the target reports delivered and stages nothing.
-//! - **Cancel** — `ctx.request_cancel_external_workflow(...)`, also by key. A
-//!   running target ends `CANCELLED` with reason `cancelled by external
+//!   with `target_terminal`, or `not_running` by workflow id. An idempotency
+//!   key that the target already holds reports delivered and stages nothing.
+//!   By workflow id, the key dedups across every run of that id. A keyed row
+//!   stays when its run closes, so the dedup outlives a cancel.
+//! - **Cancel** — `ctx.request_cancel_external_workflow(...)`, also by workflow
+//!   id. A running target ends `CANCELLED` with reason `cancelled by external
 //!   request`. Its body does not run again. A terminal target is a no-op
-//!   success.
+//!   success. A run that its own cancel seals, through a cascade, applies no
+//!   more of its batch.
 //!
 //! An unknown target fails at once with `target_unknown`. Postgres waits a
 //! grace window first, because another shard can still create the run. One
@@ -226,13 +231,16 @@
 //!
 //! A run that waits on a `RUNNING` child or await target parks as
 //! [`RunState::WaitingWorkflow`]. [`SqliteRuntime::run_until_blocked`] then
-//! drives that run in the same call. When the waited-on run blocks, the
-//! waiter returns `WaitingWorkflow` naming it. The fleet drivers treat it as
-//! blocked. An unregistered child workflow returns
-//! [`SqliteError::UnknownWorkflow`] and leaves the parent `RUNNING`.
+//! drives each such run in the same call. When all of them block, the waiter
+//! returns `WaitingWorkflow` naming the run it waits on directly. The fleet
+//! drivers treat it as blocked. A drive that starts an unregistered child
+//! workflow returns [`SqliteError::UnknownWorkflow`]. The cycle rolls back,
+//! and the parent stays `RUNNING`.
 //!
-//! A child is a full run. `ctx.info().parent_execution_id` names its parent,
-//! and [`SqliteRuntime::outcome`] reads its result.
+//! A child is a full run. `ctx.info().parent_execution_id` names its parent.
+//! [`SqliteRuntime::parent_execution`] reads the same link, and
+//! [`SqliteRuntime::outcome`] reads the child's result. A drive of a run that
+//! another run cancelled returns [`RunState::Failed`] naming the state.
 //!
 //! # Non-goals (see issue #1068 follow-ups)
 //!
@@ -266,20 +274,18 @@
 //!
 //! ### State-model restriction vs. the Postgres core
 //!
-//! This backend's execution state model is a strict subset of the core's: an
-//! active run is only ever `RUNNING` (there is no `PAUSED`), and the only terminal
-//! states it writes are `COMPLETED`, `FAILED`, and the `CONTINUED_AS_NEW` SEAL used
-//! by the reuse "replace" cases (it never writes a distinct `TIMED_OUT`, an active
-//! `CANCELLED`, or a distinct `TERMINATED`). So the reuse matrix is realized over
-//! `{none, RUNNING, COMPLETED, FAILED}` priors only:
+//! This backend's execution state model is a strict subset of the core's. An
+//! active run is only ever `RUNNING` (there is no `PAUSED`). The terminal states
+//! it writes are `COMPLETED`, `FAILED`, `CANCELLED` (issue #2026) and the
+//! `CONTINUED_AS_NEW` seal of the reuse "replace" cases. It never writes
+//! `TIMED_OUT` or `TERMINATED`. So the reuse matrix is realized over
+//! `{none, RUNNING, COMPLETED, FAILED, CANCELLED}` priors only:
 //!
 //! - `AllowDuplicate` — attach to / return any non-sealed prior; else fresh.
 //! - `RejectDuplicate` — [`SqliteError::AlreadyExists`] for any non-sealed prior;
 //!   else fresh (a SEALED-only prior is invisible, so it creates fresh).
-//! - `AllowDuplicateFailedOnly` — replace (seal + fresh) a FAILED prior; return a
-//!   RUNNING/COMPLETED prior unchanged; else fresh. (Core also replaces a
-//!   `CANCELLED` prior, but this backend has no active `CANCELLED` state, so FAILED
-//!   is the only replace case.)
+//! - `AllowDuplicateFailedOnly` — replace (seal + fresh) a FAILED or CANCELLED
+//!   prior, as core does; return a RUNNING/COMPLETED prior unchanged; else fresh.
 //! - `TerminateIfRunning` — cancel (record `WorkflowCancelled` + clean up the
 //!   prior's PENDING tasks and unfired timers) then seal a RUNNING prior; seal an
 //!   already-terminal prior without a cancellation event; then start fresh. The

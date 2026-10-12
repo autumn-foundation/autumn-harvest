@@ -654,12 +654,17 @@ pub fn delete_unfired_timers_for_execution(
 /// never be delivered, because the prior is never driven again. This backend has
 /// no retention/GC pass to reclaim it otherwise. Returns the number of rows deleted.
 /// Delivered rows are left untouched (inert audit history).
+///
+/// A row with an idempotency key stays (issue #2026). It is the dedup record of
+/// an external signal, so a duplicate send to the sealed run still reports
+/// delivered, as on Postgres. No pull primitive consumes it again.
 pub fn delete_undelivered_signals_for_execution(
     conn: &Connection,
     exec_id: ExecutionId,
 ) -> SqliteResult<usize> {
     Ok(conn.execute(
-        "DELETE FROM harvest_signals WHERE exec_id = ?1 AND delivered = 0",
+        "DELETE FROM harvest_signals \
+         WHERE exec_id = ?1 AND delivered = 0 AND idempotency_key IS NULL",
         params![exec_id.to_string()],
     )?)
 }

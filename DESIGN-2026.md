@@ -6,9 +6,9 @@ change, each of these commands sealed the caller `FAILED` as an unsupported
 feature.
 
 **One additive schema step. No new `WorkflowEvent` variant. One new
-`RunState` variant, `WaitingWorkflow`.** Every event this change writes
-already exists in the core. Each event has the shape that the Postgres worker
-writes.
+`RunState` variant, `WaitingWorkflow`. One core replay fix.** Every event this
+change writes already exists in the core. Each event has the shape that the
+Postgres worker writes.
 
 ---
 
@@ -47,7 +47,7 @@ writes.
 |---|------|---------|
 | B1 | A child is an execution row plus a parent link. Start it in the parent's cycle transaction. | **Adopted.** The issue proposes it, and it matches Postgres. |
 | B2 | Write the child's result into the parent's history in the child's terminal transaction. | **Adopted.** The parent then sees the result on its next cycle. No outbox is needed. |
-| B3 | Poll the child's state from the parent on each cycle instead. | Rejected for children. It writes the result at a later point than Postgres. It is used for await, where Postgres also polls. |
+| B3 | Poll the child's state from the parent on each cycle instead. | Rejected for children. It writes the result at a later point than Postgres. Await uses it, because Postgres also polls. |
 | B4 | Let `run_until_blocked(parent)` drive a running child or await target in the same call. | **Adopted.** A child is local work, not an external input. The simple case then completes in one call. |
 | B5 | Return the child's own block reason from `run_until_blocked(parent)`. | Rejected. A caller would send a signal to the wrong run. A new `WaitingWorkflow(exec)` state names the run to look at. |
 | B6 | Resolve an external target in the caller's transaction. | **Adopted.** One database holds every run, so the answer is final at once. |
@@ -66,7 +66,7 @@ writes.
 | R4 | A cancel leaves task, timer or signal rows behind. | The cancel removes them, as the unsupported seal does. A test counts the rows. |
 | R5 | Two runs await each other, and the driver spins. | The driver keeps a stack and refuses a run that is already on it. It returns `WaitingWorkflow`. |
 | R6 | A history does not replay on Postgres. | Each test replays every history on the core `WorkflowReplayer`. |
-| R7 | An old database file lacks the new columns. | The additive `migrate` step adds them. A test opens an old-shape file. |
+| R7 | An old database file lacks the new columns. | The additive `migrate` step adds them. A unit test migrates an old-shape schema twice. |
 | R8 | A child error hides behind the parent's drive. | A sealed child is terminal, and the parent records its typed failure. Any other child error returns from the drive. |
 | R9 | A new `RunState` variant breaks an exhaustive match. | The crate is pre-1.0. The changelog names the variant. The in-tree daemon match is updated. |
 
@@ -121,7 +121,7 @@ the same, with the policy on the row. An unregistered child workflow returns
 | Command | Target state | Caller events |
 |---|---|---|
 | Signal | `RUNNING` | `ExternalSignalRequested`, `ExternalSignalDelivered` |
-| Signal | terminal | `ExternalSignalFailed` `target_terminal`, or `not_running` by id |
+| Signal | terminal | `ExternalSignalFailed` `target_terminal`, or `not_running` for a target named by workflow id |
 | Signal | unknown | `ExternalSignalFailed` `target_unknown` |
 | Cancel | `RUNNING` | `ExternalCancelRequested`, `ExternalCancelDelivered` |
 | Cancel | terminal | `ExternalCancelDelivered` |
@@ -130,11 +130,16 @@ the same, with the policy on the row. An unregistered child workflow returns
 | Await | terminal | `ExternalAwaitResolved` or `ExternalAwaitFailed` |
 | Await | unknown | `ExternalAwaitFailed` `target_unknown` |
 
+Every row records the `*Requested` event first. A cancel records its outcome
+before it cancels, because the cancel can seal the caller through a cascade.
+
 ### 1.5 Drive
 
 A parked run that waits on a running child or await target returns
 `WaitingWorkflow(target)`. `run_until_blocked` then drives the target in the
-same call. The fleet drivers treat `WaitingWorkflow` as blocked.
+same call. A target that blocks is marked, and the waiter picks the next
+unmarked target. Progress clears the marks. Each run gets its own cycle
+budget. The fleet drivers treat `WaitingWorkflow` as blocked.
 
 ### 1.6 Terminal cycle
 
@@ -142,3 +147,37 @@ A failing cycle that drops a fresh `StartChildWorkflow` records the abandoned
 pair, as Postgres does (issue #952). A detached spawn in a terminal cycle
 starts its child before the terminal event. External commands in a terminal
 cycle write nothing, as on Postgres.
+
+## 2. Review round
+
+Four review agents read the change: correctness, Postgres parity, tests and
+docs. Codex also reviewed the PR. The round fixed these defects:
+
+| Finding | Fix |
+|---|---|
+| A deep chain of detached children recursed without a bound. | `close_execution` uses a worklist. |
+| A run that its own cancel sealed kept applying its batch. | The batch stops at the seal, and the drain does not run. |
+| `run_until_blocked` drove only the first waited-on run. | The driver marks blocked targets and tries the next one. |
+| One cycle budget covered the whole driven stack. | Each run gets its own budget. |
+| `AllowDuplicateFailedOnly` kept a `CANCELLED` prior. | It replaces a `CANCELLED` prior, as core does. |
+| A seal deleted keyed signal rows, so dedup failed later. | Keyed rows stay as dedup records. |
+| A race loser that never started had no row and failed the cycle. | The teardown skips it, as Postgres does. |
+| A due child deadline fired after a late child's result. | The deadline fires first, as `materialize_due_child_timeout_deadlines` does. |
+| A superseded await target reported `target_terminated`. | It reports `target_cancelled`, as Postgres does. |
+| `join!(await_external_workflow, spawn_child_workflow)` parked permanently. | Core fix: the look-ahead also resolves stashed await terminals. |
+
+The last row is a core bug, so it also affects Postgres. The matcher
+stashed an `ExternalAwaitRequested` at the cursor. Its terminal landed past
+a sibling's child events, and nothing attached it to the stash entry.
+`scan_ahead_for_external_signal_terminals` already did this for signals and
+cancels. It now does it for awaits too.
+
+Two items stay as documented limits:
+
+- A run cancelled while it waits does not pass strict core replay. Postgres
+  has the same result, and `completed_and_cancelled_tails_are_not_terminal_failure_tails`
+  pins it on purpose. The tests replay the events before the cancel in
+  canary mode.
+- This backend writes a mixed batch in command order. Postgres writes the
+  external events first. Replay accepts both orders.
+

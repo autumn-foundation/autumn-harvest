@@ -2,17 +2,20 @@
 //!
 //! Every helper here runs inside the caller's transaction. One database
 //! holds every run. So a child start, a result, a cancel or a signal commits
-//! with the event that asked for it. No outbox is needed.
+//! with the event that asked for it. The backend needs no outbox.
 //!
 //! Each event has the shape that the Postgres worker writes, so a history
 //! from this backend replays on the core `WorkflowReplayer`.
 //!
-//! Two rules differ from Postgres, because one file is authoritative:
+//! One rule differs from Postgres, because one file is authoritative. An
+//! unknown target fails at once with `target_unknown`. Postgres waits a grace
+//! window first, because another shard can still create the run.
 //!
-//! - An unknown target fails at once with `target_unknown`. Postgres waits a
-//!   grace window first, because another shard can still be creating the run.
-//! - A child result never reaches a parent that is no longer `RUNNING`. The
-//!   parent can never consume it.
+//! Two smaller differences change no event. A child result reaches only a
+//! `RUNNING` parent, because a closed parent can never consume it. And this
+//! backend writes a batch in command order. Postgres writes the external
+//! signal, cancel and await events of a mixed batch first. Replay accepts
+//! both orders, because it drains external events wherever they sit.
 
 use std::collections::HashMap;
 
@@ -24,7 +27,7 @@ use chrono::Utc;
 use serde_json::Value;
 
 use crate::error::{SqliteError, SqliteResult};
-use crate::{queue, store};
+use crate::{queue, store, worker};
 use rusqlite::Connection;
 
 /// The cancel reason of an external cancel. It matches Postgres.
@@ -38,6 +41,10 @@ const PARENT_CLOSED_REASON: &str = "parent closed";
 
 /// The failure text of a `terminate` parent-close cascade.
 const PARENT_CLOSED_TERMINATE: &str = "ParentClosed";
+
+/// The id prefix of a `spawn_child_workflow_timeout` deadline timer. It
+/// mirrors the core `CHILD_TIMEOUT_TIMER_PREFIX`, which is not public.
+const CHILD_TIMEOUT_TIMER_PREFIX: &str = "__child_timeout:";
 
 /// Apply one composition command of a suspending cycle (issue #2026).
 ///
@@ -114,7 +121,15 @@ pub fn apply_command(
             target,
             already_requested,
             ..
-        } => cancel_external(conn, exec, history, *cancel_id, target, *already_requested),
+        } => cancel_external(
+            conn,
+            exec,
+            history,
+            *cancel_id,
+            target,
+            *already_requested,
+            now,
+        ),
         WorkflowCommand::AwaitExternalWorkflow {
             await_id,
             target,
@@ -191,7 +206,7 @@ pub fn start_child(
 ///
 /// The parent gets `ChildWorkflowStarted` and then `ChildWorkflowFailed` with
 /// the core's abandoned-dispatch reason. No child row is made, so the child
-/// never runs. A child that already started is skipped.
+/// never runs. The call skips a child that already started.
 pub fn record_abandoned_child(
     conn: &Connection,
     parent: ExecutionId,
@@ -239,52 +254,80 @@ fn child_recorded(history: &[WorkflowEvent], child_id: ExecutionId) -> bool {
 
 /// Settle what a closed run owes other runs.
 ///
-/// Call it in the transaction that closes `exec`, after `terminal` is
-/// appended and the row state is set. It does two things:
+/// Call it in the transaction that closes `exec`, after the caller appends
+/// `terminal` and sets the row state. It does two things:
 ///
 /// 1. An awaited child writes its result to its `RUNNING` parent.
 /// 2. Each `RUNNING` detached child gets its parent-close policy. The parent
 ///    then records `ChildWorkflowCascadeApplied` for that child.
 ///
 /// Every terminal path calls it. A path that skips it leaves a parent parked
-/// for ever, or a detached child running after its parent closed.
+/// permanently, or a detached child running after its parent closed.
 pub fn close_execution(
     conn: &Connection,
     exec: ExecutionId,
     terminal: &WorkflowEvent,
+    now: i64,
 ) -> SqliteResult<()> {
-    if let Some((parent, None)) = store::parent_link(conn, exec)?
-        && store::execution_state(conn, parent)? == "RUNNING"
-    {
-        let state = store::execution_state(conn, exec)?;
-        if let Some(event) = child_result_event(exec, terminal, &state) {
-            store::append_event(conn, parent, &event)?;
+    // A worklist, not recursion: a deep chain of detached children must not
+    // overflow the stack. Each entry is a run that just closed.
+    let mut closed = vec![(exec, terminal.clone())];
+    while let Some((exec, terminal)) = closed.pop() {
+        notify_parent(conn, exec, &terminal, now)?;
+        for (child, policy) in store::running_detached_children(conn, exec)? {
+            let policy: ParentClosePolicy = policy
+                .parse()
+                .map_err(|_| SqliteError::corrupt("parent_close_policy"))?;
+            let (action, child_terminal) = match policy {
+                ParentClosePolicy::Abandon => continue,
+                ParentClosePolicy::RequestCancel => (
+                    "request_cancel",
+                    seal_cancelled(conn, child, PARENT_CLOSED_REASON)?,
+                ),
+                ParentClosePolicy::Terminate => (
+                    "terminate",
+                    seal_failed(conn, child, PARENT_CLOSED_TERMINATE)?,
+                ),
+            };
+            store::append_event(
+                conn,
+                exec,
+                &WorkflowEvent::ChildWorkflowCascadeApplied {
+                    child_id: child,
+                    policy,
+                    action: action.to_string(),
+                },
+            )?;
+            closed.push((child, child_terminal));
         }
     }
-    for (child, policy) in store::running_detached_children(conn, exec)? {
-        let policy: ParentClosePolicy = policy
-            .parse()
-            .map_err(|_| SqliteError::corrupt("parent_close_policy"))?;
-        let action = match policy {
-            ParentClosePolicy::Abandon => continue,
-            ParentClosePolicy::RequestCancel => {
-                cancel_execution(conn, child, PARENT_CLOSED_REASON)?;
-                "request_cancel"
-            }
-            ParentClosePolicy::Terminate => {
-                fail_execution(conn, child, PARENT_CLOSED_TERMINATE)?;
-                "terminate"
-            }
-        };
-        store::append_event(
-            conn,
-            exec,
-            &WorkflowEvent::ChildWorkflowCascadeApplied {
-                child_id: child,
-                policy,
-                action: action.to_string(),
-            },
-        )?;
+    Ok(())
+}
+
+/// Write the result of an awaited child to its `RUNNING` parent.
+///
+/// A child-timeout deadline of the parent that is due at `now` fires first,
+/// as the Postgres `materialize_due_child_timeout_deadlines` does (issue
+/// #779). The deadline then wins over a child that finished too late.
+fn notify_parent(
+    conn: &Connection,
+    exec: ExecutionId,
+    terminal: &WorkflowEvent,
+    now: i64,
+) -> SqliteResult<()> {
+    let Some((parent, None)) = store::parent_link(conn, exec)? else {
+        return Ok(());
+    };
+    if store::execution_state(conn, parent)? != "RUNNING" {
+        return Ok(());
+    }
+    for timer_id in queue::due_timers(conn, parent, now)? {
+        if timer_id.starts_with(CHILD_TIMEOUT_TIMER_PREFIX) {
+            worker::fire_timer_within_tx(conn, parent, &timer_id)?;
+        }
+    }
+    if let Some(event) = child_result_event(exec, terminal) {
+        store::append_event(conn, parent, &event)?;
     }
     Ok(())
 }
@@ -293,11 +336,7 @@ pub fn close_execution(
 ///
 /// A completion maps to `ChildWorkflowCompleted`. A failure keeps its typed
 /// fields. A cancel becomes an untyped `ChildWorkflowFailed`, as on Postgres.
-fn child_result_event(
-    child_id: ExecutionId,
-    terminal: &WorkflowEvent,
-    state: &str,
-) -> Option<WorkflowEvent> {
+fn child_result_event(child_id: ExecutionId, terminal: &WorkflowEvent) -> Option<WorkflowEvent> {
     match terminal {
         WorkflowEvent::WorkflowCompleted { output } => {
             Some(WorkflowEvent::ChildWorkflowCompleted {
@@ -317,21 +356,14 @@ fn child_result_event(
             details: details.clone(),
             non_retryable: *non_retryable,
         }),
-        WorkflowEvent::WorkflowCancelled { reason } => {
-            // A reuse-policy seal ends the run by force, as a terminate does.
-            let verb = if state == "CANCELLED" {
-                "cancelled"
-            } else {
-                "terminated"
-            };
-            Some(WorkflowEvent::ChildWorkflowFailed {
-                child_id,
-                error: format!("child workflow {verb}: {reason}"),
-                error_type: None,
-                details: None,
-                non_retryable: None,
-            })
-        }
+        // A reuse-policy seal also cancels, as the Postgres pre-check path does.
+        WorkflowEvent::WorkflowCancelled { reason } => Some(WorkflowEvent::ChildWorkflowFailed {
+            child_id,
+            error: format!("child workflow cancelled: {reason}"),
+            error_type: None,
+            details: None,
+            non_retryable: None,
+        }),
         _ => None,
     }
 }
@@ -341,18 +373,35 @@ fn child_result_event(
 /// The run gets `WorkflowCancelled { reason }` and ends `CANCELLED`. Its open
 /// rows go, and [`close_execution`] settles its parent and children. This is a
 /// hard seal: the run's body does not run again.
-pub fn cancel_execution(conn: &Connection, exec: ExecutionId, reason: &str) -> SqliteResult<()> {
+pub fn cancel_execution(
+    conn: &Connection,
+    exec: ExecutionId,
+    reason: &str,
+    now: i64,
+) -> SqliteResult<()> {
+    let event = seal_cancelled(conn, exec, reason)?;
+    close_execution(conn, exec, &event, now)
+}
+
+/// Seal a `RUNNING` run `CANCELLED`, and return its terminal event. The caller
+/// then closes the run.
+fn seal_cancelled(
+    conn: &Connection,
+    exec: ExecutionId,
+    reason: &str,
+) -> SqliteResult<WorkflowEvent> {
     let event = WorkflowEvent::WorkflowCancelled {
         reason: reason.to_string(),
     };
     store::append_event(conn, exec, &event)?;
     store::set_cancelled(conn, exec, reason)?;
     release_open_work(conn, exec)?;
-    close_execution(conn, exec, &event)
+    Ok(event)
 }
 
-/// Fail a `RUNNING` run with an untyped error, for a `terminate` cascade.
-fn fail_execution(conn: &Connection, exec: ExecutionId, error: &str) -> SqliteResult<()> {
+/// Seal a `RUNNING` run `FAILED` with an untyped error, for a `terminate`
+/// cascade. Return its terminal event. The caller then closes the run.
+fn seal_failed(conn: &Connection, exec: ExecutionId, error: &str) -> SqliteResult<WorkflowEvent> {
     let event = WorkflowEvent::WorkflowFailed {
         error: error.to_string(),
         error_type: None,
@@ -362,7 +411,7 @@ fn fail_execution(conn: &Connection, exec: ExecutionId, error: &str) -> SqliteRe
     store::append_event(conn, exec, &event)?;
     store::set_failed(conn, exec, error)?;
     release_open_work(conn, exec)?;
-    close_execution(conn, exec, &event)
+    Ok(event)
 }
 
 /// Remove the pending tasks, unfired timers and staged signals of a run that
@@ -389,7 +438,7 @@ fn resolve_target(
 }
 
 /// The state of `exec`, or `None` if it has no row.
-fn state_of(conn: &Connection, exec: ExecutionId) -> SqliteResult<Option<String>> {
+pub fn state_of(conn: &Connection, exec: ExecutionId) -> SqliteResult<Option<String>> {
     match store::execution_state(conn, exec) {
         Ok(state) => Ok(Some(state)),
         Err(SqliteError::ExecutionNotFound(_)) => Ok(None),
@@ -500,7 +549,7 @@ fn signal_failure(
 /// Resolve a `RequestCancelExternalWorkflow` command in the caller's
 /// transaction.
 ///
-/// A `RUNNING` target is cancelled with [`EXTERNAL_CANCEL_REASON`]. A terminal
+/// It cancels a `RUNNING` target with [`EXTERNAL_CANCEL_REASON`]. A terminal
 /// target is a no-op success. An unknown target fails with `target_unknown`.
 ///
 /// Returns `true` when it appended an event.
@@ -511,6 +560,7 @@ fn cancel_external(
     cancel_id: ExternalCancelId,
     target: &ExternalTarget,
     already_requested: bool,
+    now: i64,
 ) -> SqliteResult<bool> {
     if history.iter().any(|e| {
         matches!(e,
@@ -529,19 +579,24 @@ fn cancel_external(
             },
         )?;
     }
-    let outcome = match resolve_target(conn, target)? {
-        None => WorkflowEvent::ExternalCancelFailed {
+    let Some((id, state)) = resolve_target(conn, target)? else {
+        let failed = WorkflowEvent::ExternalCancelFailed {
             cancel_id,
             reason_code: "target_unknown".to_string(),
-        },
-        Some((id, state)) => {
-            if state == "RUNNING" {
-                cancel_execution(conn, id, EXTERNAL_CANCEL_REASON)?;
-            }
-            WorkflowEvent::ExternalCancelDelivered { cancel_id }
-        }
+        };
+        store::append_event(conn, caller, &failed)?;
+        return Ok(true);
     };
-    store::append_event(conn, caller, &outcome)?;
+    // Record the outcome first. The cancel can seal the caller too, through a
+    // parent-close cascade, and a sealed run gets no more events.
+    store::append_event(
+        conn,
+        caller,
+        &WorkflowEvent::ExternalCancelDelivered { cancel_id },
+    )?;
+    if state == "RUNNING" {
+        cancel_execution(conn, id, EXTERNAL_CANCEL_REASON, now)?;
+    }
     Ok(true)
 }
 
@@ -679,8 +734,10 @@ fn sealed_target(
             output: output.clone(),
         },
         Some(WorkflowEvent::WorkflowFailed { .. }) => failed_target(conn, await_id, target)?,
+        // Postgres reports a replaced run by its last terminal event, so a
+        // cancelled one is `target_cancelled`.
         Some(WorkflowEvent::WorkflowCancelled { reason }) => {
-            await_failed(await_id, "target_terminated", Some(reason.clone()))
+            await_failed(await_id, "target_cancelled", Some(reason.clone()))
         }
         _ => await_failed(
             await_id,
@@ -708,23 +765,24 @@ fn await_failed(
     }
 }
 
-/// The run a parked `commands` batch waits on, if that run is `RUNNING`.
+/// The `RUNNING` runs that a parked `commands` batch waits on, in command order.
 ///
-/// It is an awaited child or an await target. The driver can drive that run
-/// itself, so this check comes before the signal and timer checks.
-pub fn awaited_running_run(
+/// Each is an awaited child or an await target. The driver can drive these
+/// runs itself, so this check comes before the signal and timer checks.
+pub fn awaited_running_runs(
     conn: &Connection,
     commands: &[WorkflowCommand],
-) -> SqliteResult<Option<ExecutionId>> {
+) -> SqliteResult<Vec<ExecutionId>> {
+    let mut running = Vec::new();
     for cmd in commands {
         let id = match cmd {
             WorkflowCommand::StartChildWorkflow { child_id, .. } => *child_id,
             WorkflowCommand::AwaitExternalWorkflow { target, .. } => *target,
             _ => continue,
         };
-        if state_of(conn, id)?.as_deref() == Some("RUNNING") {
-            return Ok(Some(id));
+        if !running.contains(&id) && state_of(conn, id)?.as_deref() == Some("RUNNING") {
+            running.push(id);
         }
     }
-    Ok(None)
+    Ok(running)
 }
