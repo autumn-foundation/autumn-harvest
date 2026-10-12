@@ -14,9 +14,13 @@ its result. Before this change, a `RecordUpdateResult` command sealed the run
   without a result.
 - A `RecordUpdateResult` from the workflow body records the same events, on
   the suspend path and before a terminal event, as on Postgres.
+- The history caps (#2023) count the two update events. An update that
+  would reach a cap writes no update event, and the run fails at the cap, as
+  a drive fails it.
 - New errors: `UpdateHandlerNotFound`, `UpdateInputInvalid`,
-  `UpdateRejected`, `UpdateFailed` and `UpdateTimedOut`. `SqliteError` gains
-  five variants, so an exhaustive `match` on it needs new arms.
+  `UpdateRejected`, `UpdateFailed`, `UpdateTimedOut` and
+  `UpdateHistoryCapReached`. `SqliteError` gains six variants, so an
+  exhaustive `match` on it needs new arms.
 - A handler can await any future within a 5 second limit. A handler that
   awaits a durable command times out and writes no event.
 - The handler runs on a separate replay, so state that it writes does not

@@ -429,6 +429,10 @@ replays on the core `WorkflowReplayer`.
 The update does not drive the run. Call `run_until_blocked` after it, as after
 `send_signal`.
 
+The history caps count the two update events. An update that would reach a
+cap writes no update event. The run then fails at the cap, as a drive fails
+it, and the call returns `SqliteError::UpdateHistoryCapReached`.
+
 The handler runs once, on a separate replay of the run. **State that the
 handler writes does not reach the workflow body.** Use an update to compute a
 result from the workflow state, not to change that state. Replay returns the

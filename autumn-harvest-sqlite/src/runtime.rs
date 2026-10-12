@@ -998,6 +998,9 @@ impl SqliteRuntime {
     ///   history.
     /// - [`SqliteError::UpdateTimedOut`] if the handler does not finish in
     ///   time, for example because it awaits a durable command.
+    /// - [`SqliteError::UpdateHistoryCapReached`] if the two update events
+    ///   would reach a history cap. The run then fails at the cap, as a drive
+    ///   fails it.
     /// - [`SqliteError::UpdateFailed`] if the handler returns an error or
     ///   panics. History records `WorkflowEvent::UpdateFailed`.
     /// - A persistence error if the history cannot be read or written.
@@ -1036,7 +1039,8 @@ impl SqliteRuntime {
             });
         }
 
-        let (ctx, run_input) = self.update_context(exec, &workflow_name, &declarative)?;
+        let (ctx, run_input, history_bytes) =
+            self.update_context(exec, &workflow_name, &declarative)?;
         settle_update_context(exec, &ctx, handler, run_input).await?;
         // A validator is user code. Contain its panic, as the handler poll does.
         let validated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1074,15 +1078,38 @@ impl SqliteRuntime {
             });
         };
 
+        let now = (self.now_fn)();
         let admitted = WorkflowEvent::UpdateAdmitted {
             update_id,
             name: name.to_string(),
             input,
-            timestamp: (self.now_fn)(),
+            timestamp: now,
+        };
+        let outcome = update::result_event(update_id, &result);
+        // The caps bound history whether or not a drive follows (issue #2023).
+        // The check counts both new events, as the drive counts a decision.
+        let added = [&admitted, &outcome]
+            .iter()
+            .map(|e| serde_json::to_string(e).map(|json| json.len() as u64))
+            .sum::<Result<u64, _>>()?;
+        let caps = CapCheck {
+            policy: self.history_policy,
+            start_bytes: history_bytes.saturating_add(added),
+            workflow_type: &workflow_name,
         };
         let tx = self.conn.transaction()?;
         store::append_event(&tx, exec, &admitted)?;
-        store::append_event(&tx, exec, &update::result_event(update_id, &result))?;
+        store::append_event(&tx, exec, &outcome)?;
+        if let Some(reason) = caps.reached(&tx, exec)? {
+            // Roll the update back, then fail the run as a drive does.
+            drop(tx);
+            self.fail_for_history_cap(exec, &reason, now.timestamp_millis())?;
+            return Err(SqliteError::UpdateHistoryCapReached {
+                execution_id: exec,
+                name: name.to_string(),
+                reason,
+            });
+        }
         tx.commit()?;
 
         result.map_err(|error| SqliteError::UpdateFailed {
@@ -1101,7 +1128,7 @@ impl SqliteRuntime {
     }
 
     /// A replay context for `exec`, with the declarative update handlers of
-    /// its workflow, and the run input.
+    /// its workflow, the run input and the stored history bytes.
     ///
     /// It reads but does not drive. [`settle_update_context`] replays the
     /// body so it registers its own handlers.
@@ -1110,8 +1137,8 @@ impl SqliteRuntime {
         exec: ExecutionId,
         workflow_name: &str,
         declarative: &[UpdateHandlerInfo],
-    ) -> SqliteResult<(WorkflowContext, Value)> {
-        let history = store::load_history(&self.conn, exec)?;
+    ) -> SqliteResult<(WorkflowContext, Value, u64)> {
+        let (history, history_bytes) = store::load_history_sized(&self.conn, exec)?;
         let input = store::execution_input(&self.conn, exec)?;
         let workflow_id = store::workflow_id_of(&self.conn, exec)?;
         // The same policy as the drive, so `should_continue_as_new` replays the
@@ -1127,7 +1154,7 @@ impl SqliteRuntime {
         for info in declarative {
             ctx.register_declarative_update_handler(info);
         }
-        Ok((ctx, input))
+        Ok((ctx, input, history_bytes))
     }
 
     /// The run that `exec` continued as, if any (issue #2023).

@@ -62,6 +62,7 @@ core `UpdateAdmitted`, `UpdateCompleted` and `UpdateFailed` events.
 | R8 | A workflow panic during the state rebuild takes down the caller. | The core replay driver contains it. The call returns `WorkflowPanicked`. |
 | R9 | A body-driven `RecordUpdateResult` still seals the run. | Tests cover the suspend path and the terminal path. |
 | R13 | A body that mints a new update id on each cycle makes the drive spin. | A recorded result is not progress, so each drive appends one result, as on Postgres. |
+| R14 | Updates on a run that no one drives grow history past the caps (#2023). | The update transaction checks the caps with its two events. At a cap it rolls back and fails the run, as a drive does. |
 
 ### 0.4 Six thinking hats
 
@@ -129,8 +130,8 @@ the update replay both register them.
   returns `UpdateTimedOut` after 5 seconds. No event is written.
 - A workflow body that wakes itself forever makes the rebuild run for 5
   seconds, then return `TaskFailed`. A drive of that run fails too.
-- Update input and output have no size cap, as on the in-process Postgres
-  path.
+- Update input and output have no size cap of their own, as on the
+  in-process Postgres path. The history caps still bound them.
 
 ---
 

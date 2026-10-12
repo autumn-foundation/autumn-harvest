@@ -1072,3 +1072,75 @@ async fn record_update_result_does_not_spin_the_drive() {
     );
     assert_eq!(update_events(&rt.load_history(exec).unwrap()).len(), 1);
 }
+
+// ─────────────────────────────── history caps ────────────────────────────────
+
+/// An update that would reach the event cap writes no update event. The run
+/// fails at the cap, as a drive fails it (issue #2023).
+#[tokio::test]
+async fn update_at_the_event_cap_fails_the_run() {
+    let (mut rt, exec) = blocked_limit_run().await;
+    let len = u64::try_from(rt.load_history(exec).unwrap().len()).unwrap();
+    // Room for one more event, not for the two that an update writes.
+    rt.set_history_event_hard_cap(Some(len + 2));
+
+    let err = rt.update(exec, "set_limit", json!(5)).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SqliteError::UpdateHistoryCapReached { ref reason, .. }
+                if reason.type_tag() == "HistoryCapExceeded"
+        ),
+        "{err:?}"
+    );
+    let history = rt.load_history(exec).unwrap();
+    assert!(update_events(&history).is_empty(), "{history:?}");
+    assert!(
+        matches!(history.last(), Some(WorkflowEvent::WorkflowFailed { error, .. }) if error.contains("HistoryCapExceeded")),
+        "{history:?}"
+    );
+    assert!(matches!(
+        rt.outcome(exec).unwrap(),
+        ExecutionOutcome::Failed(_)
+    ));
+}
+
+/// An update whose events would reach the byte cap fails the run the same way.
+#[tokio::test]
+async fn update_at_the_byte_cap_fails_the_run() {
+    let (mut rt, exec) = blocked_limit_run().await;
+    rt.set_history_byte_hard_cap(Some(64 * 1024));
+
+    let big = json!("x".repeat(64 * 1024));
+    let err = rt.update(exec, "later", big).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SqliteError::UpdateHistoryCapReached { ref reason, .. }
+                if reason.type_tag() == "HistoryBytesCapExceeded"
+        ),
+        "{err:?}"
+    );
+    assert!(update_events(&rt.load_history(exec).unwrap()).is_empty());
+    assert!(matches!(
+        rt.outcome(exec).unwrap(),
+        ExecutionOutcome::Failed(_)
+    ));
+}
+
+/// An update below the caps is unchanged.
+#[tokio::test]
+async fn update_below_the_caps_succeeds() {
+    let (mut rt, exec) = blocked_limit_run().await;
+    let len = u64::try_from(rt.load_history(exec).unwrap().len()).unwrap();
+    rt.set_history_event_hard_cap(Some(len + 3));
+
+    assert_eq!(
+        rt.update(exec, "set_limit", json!(5)).await.unwrap(),
+        json!({ "limit": 5 })
+    );
+    assert!(matches!(
+        rt.outcome(exec).unwrap(),
+        ExecutionOutcome::Running
+    ));
+}

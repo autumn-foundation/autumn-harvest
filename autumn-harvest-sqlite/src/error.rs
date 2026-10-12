@@ -133,6 +133,21 @@ pub enum SqliteError {
         error: String,
     },
 
+    /// The update would reach a history cap, so the run fails at the cap
+    /// (issues #2025 and #2023).
+    ///
+    /// The call writes no update event. It seals the run `FAILED` with the
+    /// cap reason, as a drive that reaches the cap does.
+    #[error("update {name:?} to execution {execution_id} reached a history cap: {reason}")]
+    UpdateHistoryCapReached {
+        /// The execution the update targeted. It is now `FAILED`.
+        execution_id: ExecutionId,
+        /// The update name.
+        name: String,
+        /// The cap that the update would reach.
+        reason: crate::HistoryCapReason,
+    },
+
     /// The update handler did not finish within its time limit (issue #2025).
     ///
     /// The limit is 5 seconds. A handler that awaits a durable command, such
