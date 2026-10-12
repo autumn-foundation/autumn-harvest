@@ -4998,7 +4998,15 @@ impl WorkflowContext {
     /// It skips the same signal and update events, but it only reads the
     /// matcher. It moves no cursor and fills no stash. Thus later code sees
     /// the same `ctx.is_replaying()` value with or without a durable call.
+    ///
+    /// A speculative resident cycle (issue #2008) can see another replay
+    /// position than a cold replay. The gate then counts as a position read
+    /// and stores nothing. The resume declines, and a cold replay stores the
+    /// chunk at the same offset.
     pub(crate) fn durable_replay_suppresses(&self) -> bool {
+        if self.note_position_read() {
+            return true;
+        }
         let matcher = self.matcher.lock().expect("matcher lock poisoned");
         matcher.would_replay_after_prepare() || matcher.has_terminal_failure_tail()
     }
@@ -26733,6 +26741,30 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "the queue bound is per cycle, so a resident cycle resets it"
+        );
+    }
+
+    #[test]
+    fn durable_progress_in_a_speculative_cycle_reads_the_position() {
+        let ctx = WorkflowContext::new_test();
+        let (result_tx, _result_rx) = tokio::sync::oneshot::channel();
+        ctx.begin_resident_cycle(
+            &[],
+            vec![WorkflowCommand::WaitForActivity {
+                activity_id: ActivityExecId::new(),
+                result_tx,
+            }],
+        );
+        let _ = ctx.drain_commands();
+        ctx.publish_durable_progress(serde_json::json!("chunk"))
+            .expect("publish");
+        assert!(
+            durable_chunks(&ctx.drain_commands()).is_empty(),
+            "a speculative cycle may be dropped, so it queues no chunk"
+        );
+        assert!(
+            ctx.end_speculation(),
+            "the gate reads the replay position, so the resume must decline"
         );
     }
 
