@@ -11074,7 +11074,7 @@
                     "description": "Reason for the fork, recorded in the marker and the audit log."
                   },
                   "workflow_id": {
-                    "description": "Business key of the fork. Omitted = <source workflow_id>-fork-<uuid>. The source key is refused with 400. A key that another run holds returns 409; a run holds its key unless it continued as new or was terminated."
+                    "description": "Business key of the fork. Omitted = <source workflow_id>-fork-<uuid>. The source key, and an explicit empty or blank id, are refused with 400. A key that another run holds returns 409; a run holds its key unless it continued as new or was terminated."
                   }
                 },
                 "type": "object"
@@ -11116,6 +11116,9 @@
           },
           "413": {
             "description": "The quota key that the fork input resolves exceeds its byte cap (issue #946)."
+          },
+          "422": {
+            "description": "effects=live and a completion callback target that the fork inherits from its source is no longer admissible under the live SSRF policy (as for a rerun, issue #605). Body: {error: \"completion callback target rejected\", url, rejection}, where `rejection` is a machine-readable SsrfRejection object. A recorded fork sends no callback, so it is never refused for this. Nothing is created."
           },
           "429": {
             "description": "The fork would exceed the tenant quota of its workflow type (issue #946), or load shedding refuses new starts on its queue (issue #1794). A fork counts as an active run of its quota key."
