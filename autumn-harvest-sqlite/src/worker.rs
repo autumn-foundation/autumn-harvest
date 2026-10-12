@@ -596,29 +596,22 @@ pub struct SignalIngest {
 impl SignalIngest {
     /// Plan every undelivered signal of `exec_id`, in arrival order.
     ///
-    /// The first signal of each name can resolve an open signal-or-deadline
-    /// race (issue #476). Before it, the plan fires each due deadline timer
-    /// of that name whose `fire_at` is at or before the signal arrival. Thus a
-    /// late signal cannot win the race.
+    /// Before each signal, the plan fires each due deadline timer of that
+    /// signal name whose `fire_at` is at or before the signal arrival (issue
+    /// #476). So a late signal cannot win a signal-or-deadline race, also when
+    /// several races share the name. Each deadline fires at most once.
     ///
-    /// Two kinds of timer stay for [`drain_ready`]:
-    ///
-    /// - An unrelated due timer. A `TimerFired` before a `SignalReceived` it
-    ///   does not race wedges replay (issue #1071).
-    /// - A deadline after the first signal of its name. That signal already
-    ///   resolved the race, so the fire is a stray event. Strict replay then
-    ///   reports an early completion.
+    /// An unrelated due timer stays for [`drain_ready`]. A `TimerFired` ahead
+    /// of a `SignalReceived` that it does not race wedges replay (issue #1071).
     pub fn plan(conn: &Connection, exec_id: ExecutionId, now: i64) -> SqliteResult<Self> {
         let mut planned = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut fired = std::collections::HashSet::new();
         for signal in store::pending_signals(conn, exec_id)? {
-            let due = if seen.insert(signal.name.clone()) {
-                queue::due_timers_before_signal(conn, exec_id, now, signal.received_at)?
-            } else {
-                Vec::new()
-            };
-            for timer_id in due {
-                if is_signal_timeout_deadline_timer(&timer_id, &signal.name) {
+            for timer_id in queue::due_timers_before_signal(conn, exec_id, now, signal.received_at)?
+            {
+                if is_signal_timeout_deadline_timer(&timer_id, &signal.name)
+                    && fired.insert(timer_id.clone())
+                {
                     let event = WorkflowEvent::TimerFired {
                         timer_id: TimerId::new(timer_id.clone()),
                     };
@@ -1428,7 +1421,7 @@ mod tests {
         ));
     }
 
-    // FIX 1 (Codex #1069 P2, runtime.rs:699): the signal ingest reorders ONLY
+    // FIX 1 (issue #1069 P2): the signal ingest reorders ONLY
     // the raced `__signal_timeout:{seq}:{name}` deadline timer ahead of the signal.
     // An UNRELATED due timer (e.g. a `join!`ed `ctx.timer("t", 5)`) is deliberately
     // LEFT UNFIRED here — firing a `TimerFired(t)` before `SignalReceived(go)` would
@@ -1521,10 +1514,10 @@ mod tests {
         );
     }
 
-    // Issue #2020: the first signal of a name resolves its race. A deadline
-    // after it stays for `drain_ready`, so no stray `TimerFired` reaches history.
+    // Issue #2020: a deadline goes ahead of the first signal that arrives after
+    // it, and fires only once. Signals before it stay ahead of it.
     #[test]
-    fn ingest_fires_a_deadline_only_ahead_of_the_first_signal_of_its_name() {
+    fn ingest_fires_each_deadline_once_in_arrival_order() {
         let conn = open();
         let exec = ExecutionId::new();
         store::insert_execution(
@@ -1537,17 +1530,21 @@ mod tests {
         .unwrap();
         store::stage_signal(&conn, exec, "go", &serde_json::json!("on_time"), 10).unwrap();
         store::stage_signal(&conn, exec, "go", &serde_json::json!("late"), 90).unwrap();
+        store::stage_signal(&conn, exec, "go", &serde_json::json!("later"), 100).unwrap();
         queue::enqueue_timer(&conn, exec, "__signal_timeout:0:go", 60).unwrap();
 
         let ingest = SignalIngest::plan(&conn, exec, 120).unwrap();
-        let events: Vec<_> = ingest.events().cloned().collect();
-        assert_eq!(events.len(), 2, "two signals and no timer:\n{events:?}");
-        assert!(
-            events
-                .iter()
-                .all(|e| matches!(e, autumn_harvest::WorkflowEvent::SignalReceived { .. })),
-            "{events:?}"
-        );
+        let order: Vec<String> = ingest
+            .events()
+            .map(|e| match e {
+                autumn_harvest::WorkflowEvent::SignalReceived { payload, .. } => {
+                    payload.as_str().unwrap_or_default().to_string()
+                }
+                autumn_harvest::WorkflowEvent::TimerFired { .. } => "deadline".to_string(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(order, ["on_time", "deadline", "late", "later"]);
     }
 
     // Issue #2020: a plan writes nothing. A discarded cycle leaves every signal

@@ -397,7 +397,9 @@
 //!
 //! **Signals.** Each decision cycle appends every staged signal to history
 //! (as `SignalReceived`) before replay, in arrival order (issue #2020). This
-//! mirrors the Postgres task-preparation ingest. Thus every signal API works:
+//! mirrors the Postgres task-preparation ingest, but an unrelated due timer
+//! fires after the signals of the cycle (issue #1071). So every signal API
+//! works:
 //! - the plain waits `ctx.wait_for_signal` / `ctx.receive_signal`;
 //! - the non-blocking reads `ctx.drain_signals` / `ctx.try_receive_signal`
 //!   (#775);
@@ -407,16 +409,20 @@
 //!   `ctx.receive_signal_timeout` (issue #476).
 //!
 //! The ingest is planned before replay. The transaction that persists the
-//! cycle outcome writes it first. A discarded cycle (non-determinism, a
-//! contained panic) thus consumes no signal.
+//! cycle outcome writes it first. So a discarded cycle (non-determinism, a
+//! contained panic under its budget) consumes no signal. A panic seal writes
+//! the signals that its replay saw.
 //!
 //! A signal that the workflow never reads also reaches history. The strict
-//! core `WorkflowReplayer` reports it as unconsumed, as for a Postgres history.
+//! core `WorkflowReplayer` then reports `NonDeterminismDetected(EarlyCompletion)`,
+//! as for a Postgres history. A signal that lost a deadline race is exempt.
 //!
-//! A push handler runs at the next history call after it registers. Put a
-//! timer or an activity between the registration and a read of its state. A
-//! run parked on `ctx.await_condition` emits no command. A drive before the
-//! signal arrives thus returns [`SqliteError::Stuck`]. The run stays
+//! A push handler runs at the next durable call (a timer, an activity or a
+//! signal read) after it registers. Put such a call between the registration
+//! and a read of its state. A run parked on `ctx.await_condition` emits no
+//! command. So a drive before the signal arrives returns
+//! [`SqliteError::Stuck`]. `poll_once` and `run_until_idle` report it as a
+//! per-execution error and still drive the other runs. The run stays
 //! `RUNNING`, and the next drive after `send_signal` resumes it.
 //!
 //! A signal-or-deadline wait races the signal against a durable deadline
@@ -427,8 +433,9 @@
 //!   insertion order (`signal_seq`). An on-time signal staged after a late one
 //!   still wins.
 //! - Before the first staged signal of a name, the ingest compares its
-//!   `received_at` with the `fire_at` of the race deadline of that name. This
-//!   mirrors the Postgres `merge_wake_events`.
+//!   `received_at` with the `fire_at` of the race deadline of that name. It
+//!   uses the tie rule of the Postgres `merge_wake_events`: a tie goes to the
+//!   timer.
 //! - A deadline at or before the signal arrival records its `TimerFired` first.
 //!   The timeout wins, and the late signal stays in history for a later wait.
 //! - An on-time signal wins, also when the drive comes after the deadline.
@@ -439,7 +446,7 @@
 //! When the **signal** wins, the core emits a `CancelRaceLosers` bookkeeping
 //! command to delete the losing deadline timer. This backend deletes the
 //! `harvest_timers` row in the same cycle transaction, for a suspending batch
-//! and for the terminal drain. Thus the run completes cleanly and leaves no
+//! and for the terminal drain. So the run completes cleanly and leaves no
 //! orphaned timer.
 //!
 //! **Known limitation — a plain `wait_for_signal(name)` composed with a

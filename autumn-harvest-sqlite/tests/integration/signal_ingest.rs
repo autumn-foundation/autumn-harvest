@@ -8,13 +8,14 @@
 // used underscore binding.
 #![allow(clippy::used_underscore_binding)]
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::WorkflowHandlerFn;
 use autumn_harvest::prelude::*;
-use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
-use autumn_harvest_sqlite::{RunState, SqliteError, SqliteRuntime};
+use autumn_harvest::testing::{NonDeterminismKind, ReplayStatus, WorkflowReplayer};
+use autumn_harvest_sqlite::{ActivitySpec, RunState, SqliteError, SqliteRuntime};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
@@ -234,6 +235,40 @@ async fn an_on_time_signal_wins_when_a_late_one_is_also_staged() {
     assert_replays("short_gate", short_gate_info().handler, history).await;
 }
 
+/// Two races on one signal name, with different deadlines.
+#[workflow]
+async fn twin_gates(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let (a, b) = tokio::join!(
+        ctx.wait_for_signal_timeout("go", Duration::from_secs(60)),
+        ctx.wait_for_signal_timeout("go", Duration::from_secs(120)),
+    );
+    let a = a.map_err(|e| e.to_string())?;
+    let b = b.map_err(|e| e.to_string())?;
+    Ok(json!({ "a": a, "b": b }))
+}
+
+/// Each staged signal is checked against every due deadline of its name. A
+/// signal after the second deadline cannot win the second race (issue #476).
+#[tokio::test]
+async fn a_late_signal_loses_the_second_of_two_same_name_races() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&twin_gates_info());
+    let exec = rt.start_workflow("twin_gates", json!(0)).unwrap();
+
+    let state = rt.run_until_blocked_as_of(exec, t0()).await.unwrap();
+    assert!(matches!(state, RunState::WaitingSignal(_)), "{state:?}");
+    rt.send_signal_as_of(exec, "go", json!("on_time"), at(30))
+        .unwrap();
+    rt.send_signal_as_of(exec, "go", json!("late"), at(150))
+        .unwrap();
+
+    let state = rt.run_until_blocked_as_of(exec, at(200)).await.unwrap();
+    assert_eq!(completed(&state), json!({ "a": "on_time", "b": null }));
+
+    let history = rt.load_history(exec).unwrap();
+    assert_replays("twin_gates", twin_gates_info().handler, history).await;
+}
+
 #[tokio::test]
 async fn a_late_signal_loses_to_the_deadline_under_eager_ingest() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
@@ -276,4 +311,223 @@ async fn a_parked_condition_resumes_on_the_drive_after_the_signal() {
 
     let history = rt.load_history(exec).unwrap();
     assert_replays("handler_gate", handler_gate_info().handler, history).await;
+}
+
+/// `1` arms a durable timer. `2` schedules an activity in its place, which
+/// diverges from the phase-1 history. Only one test reads it.
+static DRIFT_PHASE: AtomicU32 = AtomicU32::new(1);
+
+#[workflow]
+async fn drifty_drain(ctx: &WorkflowContext, _n: i64) -> Result<usize, String> {
+    if DRIFT_PHASE.load(Ordering::SeqCst) == 1 {
+        ctx.timer("t", 3600).await.map_err(|e| e.to_string())?;
+    } else {
+        ctx.execute_activity_raw("work", json!(1), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(ctx.drain_signals_raw("x").map_err(|e| e.to_string())?.len())
+}
+
+/// A non-deterministic cycle is discarded, so it consumes no signal.
+#[tokio::test]
+async fn a_non_deterministic_cycle_consumes_no_signal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("harvest.sqlite3");
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&drifty_drain_info());
+    rt.register_activity_raw("work", ActivitySpec::new(1, Ok));
+
+    DRIFT_PHASE.store(1, Ordering::SeqCst);
+    let exec = rt.start_workflow("drifty_drain", json!(0)).unwrap();
+    let state = rt.run_until_blocked_as_of(exec, t0()).await.unwrap();
+    assert!(matches!(state, RunState::WaitingTimer), "{state:?}");
+    let before = rt.load_history(exec).unwrap();
+    rt.send_signal_as_of(exec, "x", json!(1), t0()).unwrap();
+
+    DRIFT_PHASE.store(2, Ordering::SeqCst);
+    let err = rt.run_until_blocked_as_of(exec, at(1)).await.unwrap_err();
+    assert!(matches!(err, SqliteError::NonDeterministic { .. }), "{err}");
+    assert_eq!(rt.load_history(exec).unwrap().len(), before.len());
+    assert_eq!(undelivered(&path, exec), 1, "the signal stays staged");
+
+    // The fixed build ingests the signal on its next drive.
+    DRIFT_PHASE.store(1, Ordering::SeqCst);
+    let state = rt.run_until_blocked_as_of(exec, at(2)).await.unwrap();
+    assert!(matches!(state, RunState::WaitingTimer), "{state:?}");
+    assert_eq!(undelivered(&path, exec), 0);
+}
+
+/// A fleet pass reports a parked run as `Stuck` and still drives the others.
+#[tokio::test]
+async fn a_fleet_pass_still_drives_other_runs_past_a_parked_condition() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&handler_gate_info());
+    rt.register_workflow(&try_once_info());
+    let parked = rt.start_workflow("handler_gate", json!(0)).unwrap();
+    let state = rt.run_until_blocked_as_of(parked, t0()).await.unwrap();
+    assert!(matches!(state, RunState::WaitingTimer), "{state:?}");
+
+    let other = rt.start_workflow("try_once", json!(0)).unwrap();
+    rt.send_signal_as_of(other, "x", json!("hi"), t0()).unwrap();
+
+    // The first pass fires the parked run's timer. The second finds it parked.
+    assert!(
+        rt.poll_once_as_of(at(2)).await.unwrap(),
+        "the first pass progresses"
+    );
+    let err = rt.poll_once_as_of(at(3)).await.unwrap_err();
+    assert!(matches!(err, SqliteError::Stuck(e) if e == parked), "{err}");
+    let state = rt.run_until_blocked_as_of(other, at(2)).await.unwrap();
+    assert_eq!(completed(&state), json!("hi"));
+}
+
+/// A corrupt staged row fails the drive. It changes no history and stays
+/// staged.
+#[tokio::test]
+async fn a_corrupt_staged_row_fails_the_drive_and_stays_staged() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("harvest.sqlite3");
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&try_once_info());
+    let exec = rt.start_workflow("try_once", json!(0)).unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT INTO harvest_signals (exec_id, name, payload_json, delivered, received_at) \
+             VALUES (?1, 'junk', 'not json', 0, 0)",
+            [exec.to_string()],
+        )
+        .unwrap();
+
+    let err = rt.run_until_blocked_as_of(exec, at(1)).await.unwrap_err();
+    assert!(matches!(err, SqliteError::Json(_)), "{err}");
+    assert_eq!(rt.load_history(exec).unwrap().len(), 1, "only the start");
+    assert_eq!(undelivered(&path, exec), 1);
+}
+
+/// An unread signal reaches history. Strict replay reports it, as for a
+/// Postgres history.
+#[tokio::test]
+async fn an_unread_signal_fails_strict_replay() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&try_once_info());
+    let exec = rt.start_workflow("try_once", json!(0)).unwrap();
+    rt.send_signal_as_of(exec, "x", json!("read"), t0())
+        .unwrap();
+    rt.send_signal_as_of(exec, "y", json!("unread"), t0())
+        .unwrap();
+
+    let state = rt.run_until_blocked_as_of(exec, at(1)).await.unwrap();
+    assert_eq!(completed(&state), json!("read"));
+
+    let report = WorkflowReplayer::new()
+        .register_fn("try_once", try_once_info().handler)
+        .replay_from_events(rt.load_history(exec).unwrap())
+        .await;
+    assert!(
+        matches!(
+            report.status,
+            ReplayStatus::NonDeterminismDetected {
+                kind: NonDeterminismKind::EarlyCompletion,
+                ..
+            }
+        ),
+        "{report}"
+    );
+}
+
+/// Each pass runs an activity, drains two names, then sleeps.
+#[workflow]
+async fn activity_drains(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let (mut x, mut y) = (0, 0);
+    for i in 0..2 {
+        ctx.execute_activity_raw("work", json!(i), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        x += ctx.drain_signals_raw("x").map_err(|e| e.to_string())?.len();
+        y += ctx.drain_signals_raw("y").map_err(|e| e.to_string())?.len();
+        ctx.timer("tick", 1).await.map_err(|e| e.to_string())?;
+    }
+    Ok(json!([x, y]))
+}
+
+#[tokio::test]
+async fn drains_interleave_with_activities() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&activity_drains_info());
+    rt.register_activity_raw("work", ActivitySpec::new(1, Ok));
+    let exec = rt.start_workflow("activity_drains", json!(0)).unwrap();
+
+    let state = rt.run_until_blocked_as_of(exec, t0()).await.unwrap();
+    assert!(matches!(state, RunState::WaitingTimer), "{state:?}");
+    rt.send_signal_as_of(exec, "x", json!(1), t0()).unwrap();
+    rt.send_signal_as_of(exec, "y", json!(2), t0()).unwrap();
+    rt.send_signal_as_of(exec, "x", json!(3), t0()).unwrap();
+
+    let mut state = state;
+    for secs in 2..10 {
+        state = rt.run_until_blocked_as_of(exec, at(secs)).await.unwrap();
+        if matches!(state, RunState::Completed(_)) {
+            break;
+        }
+    }
+    assert_eq!(completed(&state), json!([2, 1]));
+    let history = rt.load_history(exec).unwrap();
+    assert_replays("activity_drains", activity_drains_info().handler, history).await;
+}
+
+/// Panics when it reads a `boom` signal.
+#[allow(clippy::unused_async)]
+#[workflow]
+async fn boom_on_signal(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    let booms = ctx.drain_signals_raw("boom").map_err(|e| e.to_string())?;
+    assert!(booms.is_empty(), "boom signal");
+    Ok(0)
+}
+
+fn undelivered(path: &std::path::Path, exec: ExecutionId) -> i64 {
+    let raw = rusqlite::Connection::open(path).unwrap();
+    raw.query_row(
+        "SELECT COUNT(*) FROM harvest_signals WHERE exec_id = ?1 AND delivered = 0",
+        [exec.to_string()],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// A discarded panic strike leaves the signal staged. The terminal seal writes
+/// the signal that replay saw, ahead of `WorkflowFailed`.
+#[tokio::test]
+async fn a_panic_seal_records_the_signal_that_replay_saw() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("harvest.sqlite3");
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&boom_on_signal_info());
+    let exec = rt.start_workflow("boom_on_signal", json!(0)).unwrap();
+    rt.send_signal_as_of(exec, "boom", json!(1), t0()).unwrap();
+
+    let mut state = None;
+    for secs in 1..10 {
+        match rt.run_until_blocked_as_of(exec, at(secs)).await {
+            Err(SqliteError::WorkflowPanicked { .. }) => {
+                assert_eq!(undelivered(&path, exec), 1, "a discarded strike");
+                assert_eq!(rt.load_history(exec).unwrap().len(), 1, "only the start");
+            }
+            other => {
+                state = Some(other.unwrap());
+                break;
+            }
+        }
+    }
+    assert!(matches!(state, Some(RunState::Failed(_))), "{state:?}");
+    assert_eq!(undelivered(&path, exec), 0, "the seal consumes the signal");
+
+    let history = rt.load_history(exec).unwrap();
+    let n = history.len();
+    assert!(
+        matches!(history[n - 2], WorkflowEvent::SignalReceived { .. })
+            && matches!(history[n - 1], WorkflowEvent::WorkflowFailed { .. }),
+        "{history:?}"
+    );
 }

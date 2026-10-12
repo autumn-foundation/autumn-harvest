@@ -7,16 +7,17 @@ Postgres task-preparation ingest.
 
 - `worker::SignalIngest` plans the events before replay. The transaction that
   persists the cycle outcome writes them first. A discarded cycle
-  (non-determinism, a contained panic) consumes no signal.
-- The #476 rule stays. Before the first staged signal of a name, a due race
-  deadline of that name fires first, so a late signal cannot win. An unrelated
-  due timer never goes ahead of a signal (#1071).
+  (non-determinism, a contained panic under its budget) consumes no signal. A
+  panic seal writes the signals that its replay saw.
+- The #476 rule stays. Before the first staged signal of a name, the ingest
+  fires each race deadline of that name that falls at or before the signal
+  arrival. So a late signal cannot win. An unrelated due timer never goes
+  ahead of a signal (#1071).
 - `ingest_awaited_signal` and `store::peek_pending_signal` are removed.
   `store::pending_signals` reads every staged signal of a run.
 - Behaviour change: a signal that the workflow never reads now reaches
   history. The strict `WorkflowReplayer` reports it as unconsumed, as for a
   Postgres history.
-- `docs/sqlite-backend.md` §8 drops "pull-only".
 
 No migration. No new `WorkflowEvent` variant. No public API change.
 

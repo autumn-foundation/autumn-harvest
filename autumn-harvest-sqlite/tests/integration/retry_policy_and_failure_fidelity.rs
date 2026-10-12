@@ -652,7 +652,7 @@ async fn approval_gate(ctx: &WorkflowContext, _n: i64) -> Result<String, String>
     ))
 }
 
-// RED pre-fix (`store.rs:327`): the signal read ordered by `signal_seq`.
+// RED before issue #1069 P2: the signal read ordered by `signal_seq`.
 // The LATE signal (staged first, lowest seq) was consumed first. Its late
 // `received_at` let the deadline timer fire first. The race resolved to
 // `auto_rejected`, and the on-time signal stayed queued. With

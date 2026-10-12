@@ -314,7 +314,7 @@ rt.run_until_blocked(exec).await?;
 
 Each drive appends every staged signal to history (as `SignalReceived`)
 before the workflow runs, in arrival order. Postgres does the same at task
-preparation. Thus every signal API works here:
+preparation. So every signal API works here:
 
 - the blocking waits `wait_for_signal` / `receive_signal`;
 - the non-blocking reads `drain_signals` / `try_receive_signal`;
@@ -323,14 +323,16 @@ preparation. Thus every signal API works here:
   `receive_signal_timeout`. They race the signal against a durable deadline
   timer, and arrival time decides the winner.
 
-A push handler runs at the next history call after it registers. Put a timer
-or an activity between the registration and a read of its state. A run parked
-on `await_condition` emits no command, so a drive before the signal returns
-`SqliteError::Stuck`. The run stays `RUNNING`. Drive it again after
-`send_signal`.
+A push handler runs at the next durable call (a timer, an activity or a signal
+read) after it registers. Put such a call between the registration and a read
+of its state. A run parked on `await_condition` emits no command, so a drive
+before the signal returns `SqliteError::Stuck`. `poll_once` and
+`run_until_idle` report it as a per-execution error and still drive the other
+runs. The run stays `RUNNING`. Drive it again after `send_signal`.
 
 A signal that the workflow never reads also reaches history. The strict core
-`WorkflowReplayer` reports it as unconsumed, as for a Postgres history.
+`WorkflowReplayer` then reports `NonDeterminismDetected(EarlyCompletion)`, as
+for a Postgres history. A signal that lost a deadline race is exempt.
 
 `send_signal` validates the target at the boundary: an unknown execution is
 `SqliteError::ExecutionNotFound` and a terminal one is

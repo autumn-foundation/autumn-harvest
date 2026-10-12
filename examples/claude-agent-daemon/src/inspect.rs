@@ -1098,9 +1098,9 @@ fn delivered_decision(conn: &Connection, exec_id: &str, signal: &str) -> Result<
 /// An UNKNOWN key is accepted, because the type accepts it. Measured:
 /// `{"approved":true,"extra":1}` deserialises.
 ///
-/// The row is chosen with the backend's OWN order. `pending_signals` reads
-/// undelivered rows earliest-arrived first, so a bare `LIMIT 1` could report
-/// on a row the engine never reads first.
+/// The row is chosen with the backend's OWN order. The wait takes the
+/// earliest-arrived row of its name, so a bare `LIMIT 1` could report on a
+/// later row.
 fn staged_decision(conn: &Connection, exec_id: &str, signal: &str) -> Result<Option<bool>, String> {
     let mut statement = conn
         .prepare(
