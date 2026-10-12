@@ -440,13 +440,13 @@ impl ResponseCache {
     /// quote the decoded answer, and the harness logs each error.
     fn decode(&self, bytes: &[u8]) -> Result<Entry, AgentError> {
         let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| shape_error())?;
-        // With an active codec, a plain entry is not one this cache wrote.
-        if self
+        // With an encoding codec, a plain entry is not one this cache wrote.
+        // The active key wins. Without keys, the default codec encodes.
+        let encoding = self
             .codecs
             .active_codec_id()
-            .is_some_and(|id| id != "identity")
-            && !is_codec_envelope(&value)
-        {
+            .unwrap_or_else(|| self.codecs.default_codec_id());
+        if encoding != "identity" && !is_codec_envelope(&value) {
             return Err(AgentError::new(
                 ErrorKind::Decode,
                 "response cache entry is not a codec envelope",
@@ -840,6 +840,22 @@ mod tests {
             .register_with(&codecs)
             .unwrap();
         codecs.set_active_key("k1").unwrap();
+        let sealed = ResponseCache::new(Arc::clone(&store) as _, index, codecs);
+        assert!(sealed.lookup(&key).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_default_codec_refuses_a_plain_entry() {
+        let store = Arc::new(MemStore::default());
+        let index: Arc<dyn CacheIndex> = Arc::new(InMemoryCacheIndex::default());
+        let plain = cache_over(&store, Arc::clone(&index));
+        let key = plain.key(KeyTenant::None, "m", &request("hi")).unwrap();
+        plain.store(&key, &response("planted")).await.unwrap();
+
+        let mut codecs = PayloadCodecs::default();
+        codecs.set_default(Arc::new(
+            AeadCodec::new("k1", &DataKey::generate()).unwrap(),
+        ));
         let sealed = ResponseCache::new(Arc::clone(&store) as _, index, codecs);
         assert!(sealed.lookup(&key).await.is_err());
     }
