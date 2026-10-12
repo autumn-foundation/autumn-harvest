@@ -450,6 +450,7 @@ kani_proofs` beside the code that it proves.
 | `retry_delay_never_exceeds_max_interval` | `policy.rs` | `compute_retry_delay` does not panic. |
 | `seeded_action_respects_caps_and_never_holds` | `chaos.rs` | A seeded plan picks only an allowed action, and never `Hold`, for every stream. |
 | `execution_id_round_trips_every_encodable_shard` | `types.rs` | An id built for an encodable shard decodes to that shard, for every UUID. The other 14 bytes stay. |
+| `supersede_count_sheds_exactly_down_to_the_cap` | `concurrency.rs` | The shed count is the least that meets the limit, up to `usize::MAX`. |
 | `supersede_plan_sheds_only_candidates_and_meets_the_limit` | `concurrency.rs` | A latest-wins plan sheds at most the candidates and the scan limit. A full shed meets the limit. |
 | `apply_action_stays_in_band_and_reports_the_move` | `slot_tuner.rs` | A tuner step lands in the band, even a degenerate band, and its decision names the real move. |
 | `initial_target_lands_in_the_band` | `slot_tuner.rs` | The initial target is in the band, and a target in the band keeps its value. |
@@ -486,8 +487,9 @@ A proof is only as wide as its inputs. These limits are deliberate:
   `splitmix64` bijection in 5 minutes. The chaos proof holds for every
   stream instead, so it holds for any mixer. Verus proves the bijection.
 - **The supersede proof found an overflow.** `supersede_count` added 1 to
-  any `usize`, and `supersede_plan` added two counts. Both now saturate.
-  The proof covers every `usize`.
+  any `usize`, and `supersede_plan` added two counts. `supersede_count`
+  now subtracts `cap - 1` from the count, so it never adds 1.
+  `supersede_plan` saturates its sum. The proof covers every `usize`.
 - **The entity proof checks a table, not `ilog10`.** A harness that called
   `ilog10` and `pow` did not finish in 10 minutes. A table of the powers
   of 10 finishes in about 6 seconds.

@@ -25,13 +25,16 @@ computed `(slot * mix64(seed)) >> 64` in `u128`. For a window over about
 release build wrapped the jitter. The callers cap the window at one hour,
 so no production path reached it. The kernel now splits `slot` at bit 64.
 
-**Kani.** Six new proofs, for 11 in total:
+**Kani.** Seven new proofs, for 12 in total:
 `execution_id_round_trips_every_encodable_shard`,
+`supersede_count_sheds_exactly_down_to_the_cap`,
 `supersede_plan_sheds_only_candidates_and_meets_the_limit`,
 `apply_action_stays_in_band_and_reports_the_move`,
 `initial_target_lands_in_the_band`, `slot_occupancy_partitions_the_target`,
 and `counter_growth_is_one_byte_at_a_power_of_ten`. The supersede proof found an
-unchecked `+` in `supersede_count` and `supersede_plan`. Both now saturate.
+unchecked `+` in `supersede_count` and `supersede_plan`.
+`supersede_count` now subtracts `cap - 1` instead, and `supersede_plan`
+saturates its sum.
 
 **Shuttle.** `adaptive_limit_wakes_the_poll_loop` drives the real
 `AdaptiveLimitRegistry` (issue #1836) under the random and PCT schedulers.

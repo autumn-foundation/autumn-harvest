@@ -135,7 +135,9 @@ impl ConcurrencyPolicy {
 ///
 /// `existing_others` counts the non-terminal runs for the key **excluding** the
 /// run being admitted. The admitted run itself always survives (latest-wins), so
-/// the shed count is `(existing_others + 1).saturating_sub(max(limit, 1))`.
+/// the shed count is `existing_others.saturating_sub(max(limit, 1) - 1)`.
+/// That is `(existing_others + 1) - cap` without the `+ 1`, so it cannot
+/// overflow at `usize::MAX`.
 ///
 /// A `limit` of `0` is clamped to `1`: a literal zero would demand cancelling
 /// every run *including the one we just admitted*, which is never the intent.
@@ -144,7 +146,7 @@ pub const fn supersede_count(existing_others: usize, limit: u32) -> usize {
     let effective = if limit == 0 { 1 } else { limit };
     // `as usize` is lossless on every supported target (>= 32-bit pointers).
     let cap = effective as usize;
-    existing_others.saturating_add(1).saturating_sub(cap)
+    existing_others.saturating_sub(cap - 1)
 }
 
 /// Shed decision for one latest-wins supersede pass (issue #811, Codex round 2).
@@ -976,6 +978,24 @@ async fn supersede_inner(
 mod kani_proofs {
     use super::*;
 
+    /// The shed count is the least that leaves at most `cap` runs, the
+    /// admitted run included. It holds at `usize::MAX`, where adding the
+    /// admitted run to the count would overflow.
+    #[kani::proof]
+    fn supersede_count_sheds_exactly_down_to_the_cap() {
+        let existing_others: usize = kani::any();
+        let limit: u32 = kani::any();
+        let shed = supersede_count(existing_others, limit);
+        let cap = usize::try_from(limit.max(1)).unwrap_or(usize::MAX);
+        assert!(shed <= existing_others);
+        let surviving_others = existing_others - shed;
+        assert!(surviving_others < cap);
+        if shed > 0 {
+            assert_eq!(surviving_others, cap - 1);
+        }
+        kani::cover!(existing_others == usize::MAX && shed == usize::MAX);
+    }
+
     /// A plan never sheds more than the candidates or the scan limit. A
     /// limit of 0 acts as 1. When the plan sheds its full target, the key
     /// ends at or under its limit, the admitted run included.
@@ -1237,6 +1257,12 @@ mod tests {
     #[test]
     fn supersede_count_saturates_on_absurd_limit() {
         assert_eq!(supersede_count(3, u32::MAX), 0);
+    }
+
+    #[test]
+    fn supersede_count_keeps_only_the_admitted_run_at_usize_max() {
+        assert_eq!(supersede_count(usize::MAX, 1), usize::MAX);
+        assert_eq!(supersede_count(usize::MAX, 2), usize::MAX - 1);
     }
 
     #[test]
