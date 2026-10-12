@@ -8132,15 +8132,24 @@ const TERMINAL_TASK_CURSOR: &str = "AND (t.completed_at, t.id) > ($3, $4) ";
 ///   takes its entry, so the row goes 7 days after the cutoff. The grace is
 ///   at most [`crate::worker::MAX_CANCELLATION_GRACE_PERIOD`], so a live
 ///   owner always takes its entry first.
+/// - **Fork hold.** A race loser that a recorded fork holds stays while its
+///   execution is live (issue #2000). The race finds the hold mark when its
+///   winner fires. A timer winner can fire after the window.
 #[must_use]
 fn terminal_task_predicates() -> String {
     let terminal = crate::erase::sql_literal_list(TERMINAL_TASK_STATES);
     let execution_terminal = crate::erase::sql_literal_list(crate::erase::TERMINAL_STATES);
+    let hold = crate::erase::sql_literal_list(&[crate::fork::FORK_HOLD_ERROR]);
     format!(
         "t.state IN ({terminal}) \
          AND t.completed_at < $1 \
          AND (COALESCE(cardinality(t.timed_out_claims), 0) = 0 \
               OR t.completed_at < $1 - INTERVAL '7 days') \
+         AND (t.error IS DISTINCT FROM {hold} OR NOT EXISTS ( \
+             SELECT 1 FROM harvest_workflow_executions e \
+              WHERE e.id = t.workflow_exec_id \
+                AND e.state NOT IN ({execution_terminal}) \
+         )) \
          AND (t.task_type = 'activity' OR ( \
              NOT EXISTS ( \
                  SELECT 1 FROM harvest_workflow_executions e \
@@ -11877,6 +11886,16 @@ mod tests {
             assert!(!sql.contains(live), "{live} must not appear: {sql}");
         }
         assert!(sql.contains("t.completed_at < $1"));
+    }
+
+    #[test]
+    fn terminal_task_predicates_keep_a_live_fork_hold() {
+        let sql = terminal_task_predicates();
+        let hold = format!(
+            "t.error IS DISTINCT FROM '{}'",
+            crate::fork::FORK_HOLD_ERROR
+        );
+        assert!(sql.contains(&hold), "{sql}");
     }
 
     #[test]
