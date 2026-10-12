@@ -2080,6 +2080,53 @@ async fn the_llm_ledger_moves_with_the_run() {
     );
 }
 
+/// Issue #1997: activation copies a ledger of several pages, each row once.
+///
+/// The ledger has no row cap. Activation reads it in pages of 1,000 rows, so
+/// 2,500 rows take three pages. The target must hold every row, and the run
+/// spend must match the source.
+#[tokio::test]
+async fn a_ledger_of_several_pages_moves_whole() {
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "entity-ledger-pages").await;
+    {
+        let mut source = shards.source().await;
+        diesel::sql_query(
+            "INSERT INTO harvest_llm_ledger \
+                 (execution_id, workflow_name, quota_key, activity_name, activity_id, attempt, \
+                  model, input_tokens, output_tokens, cost_micros, latency_ms, recorded_at) \
+             SELECT $1, 'entity_flow', 'acme', 'llm_step', gen_random_uuid(), 1, \
+                    'm-1', 3, 1, 10, 5, NOW() \
+             FROM generate_series(1, 2500)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut source)
+        .await
+        .expect("seed 2,500 ledger rows");
+    }
+
+    migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate");
+
+    let mut target = shards.target().await;
+    assert_eq!(
+        count(
+            &mut target,
+            "SELECT count(*)::BIGINT AS value FROM harvest_llm_ledger WHERE execution_id = $1",
+            exec_id
+        )
+        .await,
+        2_500,
+        "every page must arrive, and no row twice"
+    );
+    let spend = autumn_harvest::llm_budget::load_llm_spend(&mut target, exec_id, 3_600, true)
+        .await
+        .expect("read the spend on the target");
+    assert_eq!(spend.run_tokens, 10_000);
+    assert_eq!(spend.run_cost_micros, 25_000);
+}
+
 /// Issue #1997: the tenant spend of a moving run counts on at least one shard
 /// in every phase, and each row keeps its own key.
 ///
