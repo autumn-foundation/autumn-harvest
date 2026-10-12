@@ -495,3 +495,55 @@ async fn the_hand_off_keeps_side_effects_and_drops_dispatches() {
         "{done:?}"
     );
 }
+
+/// Drains `x`, then continues while it found any. Returns the total.
+#[workflow]
+async fn drain_until_empty(ctx: &WorkflowContext, seen: i64) -> Result<Value, String> {
+    let more = ctx.drain_signals_raw("x").map_err(|e| e.to_string())?.len();
+    if more == 0 {
+        return Ok(json!(seen));
+    }
+    let total = seen + i64::try_from(more).unwrap_or(i64::MAX);
+    ctx.continue_as_new(json!(total))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(json!(total))
+}
+
+/// A backlog past the history caps reaches the successors in arrival order.
+/// Each run replays only the signals that fit. The rest move on at the
+/// hand-off, so each signal arrives exactly once (issue #2020).
+#[tokio::test]
+async fn a_backlog_past_the_caps_moves_on_at_the_hand_off_exactly_once() {
+    let mut rt = runtime();
+    rt.register_workflow(&drain_until_empty_info());
+    rt.set_history_event_hard_cap(Some(4));
+    let mut exec = rt.start_workflow("drain_until_empty", json!(0)).unwrap();
+    for i in 0..10 {
+        rt.send_signal(exec, "x", json!(i)).unwrap();
+    }
+
+    let mut payloads = Vec::new();
+    let done = loop {
+        let state = rt.run_until_blocked(exec).await.unwrap();
+        payloads.extend(
+            rt.load_history(exec)
+                .unwrap()
+                .into_iter()
+                .filter_map(|e| match e {
+                    WorkflowEvent::SignalReceived { payload, .. } => Some(payload),
+                    _ => None,
+                }),
+        );
+        match state {
+            RunState::ContinuedAsNew(next) => exec = next,
+            other => break other,
+        }
+    };
+
+    assert!(
+        matches!(done, RunState::Completed(ref v) if v == &json!(10)),
+        "{done:?}"
+    );
+    assert_eq!(payloads, (0..10).map(|i| json!(i)).collect::<Vec<_>>());
+}

@@ -1385,8 +1385,9 @@ impl SqliteRuntime {
     /// The successor has the same `workflow_name` and `workflow_id`. Its
     /// `WorkflowStarted` carries `input`. The signals that this cycle replayed
     /// are delivered to `exec` first (issue #2020), as on Postgres. The run
-    /// could have read them, so a move would deliver them twice. Any row still
-    /// undelivered after that moves to the successor.
+    /// could have read them, so a move would deliver them twice. A row past
+    /// the room the caps leave was not replayed, so it moves to the successor.
+    /// Each signal thus arrives exactly once.
     ///
     /// The drain keeps its bookkeeping events, such as a side effect. It drops
     /// a dispatch, as the Postgres worker does: the old run never resumes, so

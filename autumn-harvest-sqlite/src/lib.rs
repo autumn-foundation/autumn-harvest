@@ -307,8 +307,10 @@
 //! ## Long-lived runs (issue #2023)
 //!
 //! `ctx.continue_as_new(input)` seals the run `CONTINUED_AS_NEW` and starts a
-//! successor with the same `workflow_id`, in one transaction. Staged signals
-//! stay with the old run, as on Postgres (issue #2020). The drive returns
+//! successor with the same `workflow_id`, in one transaction. The staged
+//! signals that the hand-off decision replayed stay with the old run, as on
+//! Postgres (issue #2020). A backlog past the history caps moves to the
+//! successor. The drive returns
 //! [`RunState::ContinuedAsNew`] with the successor id.
 //!
 //! The #1804 history caps apply, with the Postgres defaults: 50,000 events and

@@ -306,9 +306,10 @@ an agent session or a poller, must therefore bound its history. Call
 - It appends `WorkflowContinuedAsNew` and seals the run `CONTINUED_AS_NEW`.
 - It starts a successor with the same `workflow_name` and `workflow_id`. The
   successor's `WorkflowStarted` carries `input`.
-- It appends every staged signal to the old run, because the hand-off
-  decision replayed them (issue #2020). A signal stays with the old run, read
-  or not, as on Postgres.
+- It appends the staged signals that the hand-off decision replayed to the
+  old run (issue #2020). Such a signal stays with the old run, read or not,
+  as on Postgres. A backlog past the room the history caps leave was not
+  replayed. It moves to the successor, so each signal arrives exactly once.
 - It deletes the old run's pending tasks and unfired timers.
 
 `run_until_blocked` returns `RunState::ContinuedAsNew(successor)`. A later

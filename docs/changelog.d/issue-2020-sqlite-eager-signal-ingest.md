@@ -27,7 +27,8 @@ Postgres task-preparation ingest.
   replays every staged signal, so each one stays with the old run, read or
   not, as on Postgres. Before, unread staged signals moved to the successor.
   Send a signal meant for the successor after the hand-off. A move could
-  deliver a drained signal twice.
+  deliver a drained signal twice. A backlog past the history caps was not
+  replayed, so it moves to the successor, and each signal arrives once.
 - Upgrade note: a file from an earlier release can hold signals staged for a
   name that the run never awaited. The first drive after the upgrade appends
   them to history.
