@@ -61,8 +61,9 @@ pub struct PollReport {
     pub settled: usize,
     /// Remote reads and settles that failed. Their tokens stay pending.
     pub errors: usize,
-    /// Due reads not sent, because their server timed out earlier in this
-    /// poll. Their tokens stay pending, with no backoff.
+    /// Due reads not sent, because a read of their server failed with a
+    /// retryable error earlier in this poll. Their tokens stay pending, with
+    /// no backoff.
     pub skipped: usize,
 }
 
@@ -536,15 +537,16 @@ impl RemoteTaskPoller {
             polled: due.len(),
             ..PollReport::default()
         };
-        // A server whose read timed out gets no more reads in this poll. A
-        // hanging server then costs one wave of reads, not one per task, and
-        // the next page comes sooner.
-        let timed_out: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
-        let timed_out = &timed_out;
+        // A server whose read failed with a retryable error (a timeout, a
+        // lost connection, 429 or 5xx) gets no more reads in this poll. A
+        // hanging or busy server then costs one wave of reads, not one per
+        // task, and the next page comes sooner.
+        let failing: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+        let failing = &failing;
         let mut reads = futures::stream::iter(interleave_by_server(due))
             .map(|pending| async move {
                 let server = &pending.handle.server;
-                if timed_out
+                if failing
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .contains(server)
@@ -555,12 +557,14 @@ impl RemoteTaskPoller {
                     tokio::time::timeout(self.get_timeout, self.transport.get(&pending.handle))
                         .await
                         .unwrap_or_else(|_| {
-                            timed_out
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .insert(server.clone());
                             Err(RemoteTaskError::retryable("the remote read timed out"))
                         });
+                if read.as_ref().is_err_and(|e| e.retryable) {
+                    failing
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(server.clone());
+                }
                 (pending, Some(read))
             })
             .buffer_unordered(self.concurrency);

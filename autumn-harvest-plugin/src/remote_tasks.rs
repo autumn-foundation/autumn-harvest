@@ -409,6 +409,15 @@ fn is_event_stream(content_type: &str) -> bool {
         .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
+/// `true` when `envelope` names request `id`, or is an error with no id.
+/// The full JSON-RPC rule is [`belongs_to`].
+fn carries_id(envelope: &Value, id: u64) -> bool {
+    match envelope.get("id") {
+        None | Some(Value::Null) => envelope.get("error").is_some(),
+        Some(other) => other.as_u64() == Some(id),
+    }
+}
+
 /// An event-stream reader that keeps its state across chunks. It reads
 /// each byte once and returns the JSON-RPC response with the request id.
 ///
@@ -477,9 +486,12 @@ impl SseReader {
         if line.is_empty() {
             let data = std::mem::take(&mut self.data);
             let data = data.strip_suffix('\n')?;
+            // An event with the request id ends the read, valid or not.
+            // `rpc` then checks it with `belongs_to`, so a bad envelope is a
+            // protocol error now, not a read timeout later.
             return serde_json::from_str::<Value>(data)
                 .ok()
-                .filter(|message| belongs_to(message, self.id));
+                .filter(|message| carries_id(message, self.id));
         }
         if line.starts_with(':') {
             return None;
@@ -664,6 +676,14 @@ mod tests {
             reader.push(&bytes[bytes.len() - 1..]),
             Some(json!({"jsonrpc": "2.0", "id": 8, "result": {}}))
         );
+    }
+
+    #[test]
+    fn an_invalid_event_with_the_request_id_ends_the_read() {
+        // No `jsonrpc` member: `rpc` refuses it, but the read stops here.
+        let body = "data: {\"id\":3,\"result\":{}}\n\n";
+        assert_eq!(sse_response(body, 3), Some(json!({"id": 3, "result": {}})));
+        assert_eq!(sse_response(body, 4), None);
     }
 
     #[test]

@@ -110,6 +110,8 @@ struct FakeServer {
     release: tokio::sync::Notify,
     /// Every read hangs, as on a server that never answers.
     hang: std::sync::atomic::AtomicBool,
+    /// Every read fails at once with a retryable error, as on a busy server.
+    busy: std::sync::atomic::AtomicBool,
     /// The number of reads started.
     gets: std::sync::atomic::AtomicUsize,
 }
@@ -181,6 +183,9 @@ impl RemoteTaskTransport for FakeTransport {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.0.hang.load(std::sync::atomic::Ordering::SeqCst) {
                 std::future::pending::<()>().await;
+            }
+            if self.0.busy.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(RemoteTaskError::retryable("HTTP 503"));
             }
             let held = self.0.held.lock().expect("held").clone();
             if held.as_deref() == Some(handle.task_id.as_str()) {
@@ -836,6 +841,28 @@ async fn a_hanging_server_costs_one_wave_per_poll() {
         1,
         "one timeout stops the reads of that server"
     );
+    assert_eq!((report.errors, report.skipped), (1, 2));
+    p.stop().await;
+}
+
+/// A retryable read error, such as a transport timeout or HTTP 503, also
+/// stops the reads of that server for the rest of the poll.
+#[tokio::test]
+async fn a_busy_server_costs_one_read_per_poll() {
+    let db = setup().await;
+    let url = &db.url;
+    let server = Arc::new(FakeServer::default());
+    let p = Process::start(url, "remote-task-busy", &server);
+    for id in ["report-18", "report-19", "report-20"] {
+        let exec_id = start_run(url, id, json!({})).await;
+        wait_for_token(url, exec_id).await;
+    }
+    server.busy.store(true, std::sync::atomic::Ordering::SeqCst);
+    let poller = RemoteTaskPoller::new(&RemoteTasks::new(FakeTransport(Arc::clone(&server))))
+        .with_concurrency(1);
+
+    let report = poller.poll_once(&p.pool).await.expect("poll");
+    assert_eq!(server.gets.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!((report.errors, report.skipped), (1, 2));
     p.stop().await;
 }

@@ -516,6 +516,40 @@ async fn an_open_event_stream_returns_before_a_partial_character() {
     );
 }
 
+/// An invalid response with the request id on an open stream is a protocol
+/// error at once, not a read timeout.
+#[tokio::test]
+async fn an_invalid_response_on_an_open_stream_fails_at_once() {
+    use autumn_web::reexports::axum::body::Body;
+    let (url, _) = serve(Arc::new(|body| {
+        let event = format!(
+            "data: {}\n\n",
+            json!({"jsonrpc": "1.0", "id": body["id"], "result": {"resultType": "task", "taskId": "t-v"}})
+        );
+        let stream = futures::stream::iter([Ok::<_, std::io::Error>(event.into_bytes())])
+            .chain(futures::stream::pending());
+        Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(stream))
+            .expect("response")
+    }))
+    .await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client");
+    let client = HttpRemoteTasks::with_client(client).server("reports", RemoteServer::mcp(&url));
+
+    let began = std::time::Instant::now();
+    let err = client
+        .start(&request(RemoteProtocol::Mcp, "export"), "k")
+        .await
+        .expect_err("invalid");
+    assert!(!err.retryable, "{}", err.message);
+    assert!(began.elapsed() < Duration::from_secs(4), "{}", err.message);
+}
+
 /// A JSON response for another request id is a protocol error.
 #[tokio::test]
 async fn a_response_with_another_id_is_refused() {
