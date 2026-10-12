@@ -452,6 +452,8 @@ jobs:
         run: cargo clippy -p standalone-runner --all-targets -- -D warnings
       - name: "Clippy standalone-quickstart example (issue #1614)"
         run: cargo clippy -p standalone-quickstart --all-targets -- -D warnings
+      - name: "Clippy agent-loop-hit-rate example (issue #2007)"
+        run: cargo clippy -p agent-loop-hit-rate --all-targets -- -D warnings
       # Same issue #962 rule as the verify and redis crates below: a new
       # workspace member gets NO clippy coverage without its own step here.
       # `--no-deps` scopes the deny to the example, because it depends on
@@ -1141,9 +1143,9 @@ jobs:
       - name: Run plugin doctests (issue #944 review)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test --doc -p autumn-harvest-plugin --features connectors
-      - name: Run plugin MCP tool tests (issue #597, DAG MCP tools issue #601 follow-up, MCP Tasks issue #2005)
+      - name: Run plugin MCP tool tests (issue #597, DAG MCP tools issue #601 follow-up, MCP Tasks issue #2005, remote tasks issue #2006)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
-        run: cargo test -p autumn-harvest-plugin --features mcp,unified-dag-execution --lib --test mcp_tools_http_tests --test mcp_tasks_http_tests
+        run: cargo test -p autumn-harvest-plugin --features mcp,unified-dag-execution --lib --test mcp_tools_http_tests --test mcp_tasks_http_tests --test remote_tasks_http_tests
       - name: Run plugin metrics scrape tests (issue #355)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest-plugin --features metrics --lib --test metrics_scrape_http_tests
@@ -1218,6 +1220,11 @@ jobs:
       - name: "Run standalone-quickstart example tests (issue #1614)"
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p standalone-quickstart
+      # Issue #2007. `--bins` runs the unit tests. The measurement itself
+      # needs Postgres and runs by hand (see the crate README).
+      - name: "Run agent-loop-hit-rate example tests (issue #2007)"
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo test -p agent-loop-hit-rate --bins
       - name: Run business_metrics example tests (issue #758)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics

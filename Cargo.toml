@@ -13,6 +13,7 @@ members = [
     "autumn-harvest-verify/corpus/boundary",
     "autumn-harvest-verify/corpus/helpers",
     "autumn-harvest-verify/corpus/helpers-deep",
+    "examples/agent-loop-hit-rate",
     "examples/billing-autumn-web",
     "examples/claude-agent-daemon",
     "examples/quickstart",

@@ -211,6 +211,13 @@ pub mod analyzer;
 pub mod api_token;
 /// The database guard on append-only `harvest_events` (issue #1817).
 pub mod append_only;
+/// R&D spike: physical backout, saga or a hybrid per workflow (issue #2012).
+///
+/// The `atomicity-spike` feature turns it on. The module has no stability
+/// guarantee. See `docs/rnd/contention-adaptive-atomicity.md`.
+#[cfg(feature = "atomicity-spike")]
+#[doc(hidden)]
+pub mod atomicity;
 /// Audit trail for management API mutations (issue #158).
 #[cfg(feature = "db")]
 pub mod audit;
@@ -431,6 +438,12 @@ pub mod quota_reconcile;
 /// Automatic resume of a shard rebalance stalled after its cutover (issue
 /// #1839).
 pub mod rebalance_resume;
+/// Durable outbound calls to a remote MCP or A2A task (issue #2006).
+pub mod remote_task;
+// The Postgres side of `remote_task`. A flat file keeps the core module tree
+// flat (`sqlite_feasibility_docs`).
+#[cfg(feature = "db")]
+mod remote_task_db;
 pub mod replay;
 /// Stratified in-flight history sampling for the replay-drift gate (issue #798).
 ///
