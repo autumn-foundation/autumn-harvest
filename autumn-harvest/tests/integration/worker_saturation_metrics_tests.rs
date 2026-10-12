@@ -1163,6 +1163,23 @@ async fn a_direct_scanner_pass_labels_its_assigned_shards() {
     );
 }
 
+/// Each claim loop counts once, so the steady pollers count is the claim cap.
+fn assert_every_claim_loop_polls(metrics: &Recording, queue: &str) {
+    let most_pollers = metrics
+        .samples()
+        .into_iter()
+        .filter_map(|s| match s {
+            Sample::Pollers { queue: q, pollers } if q == queue => Some(pollers),
+            _ => None,
+        })
+        .max();
+    assert_eq!(
+        most_pollers,
+        u64::try_from(autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS).ok(),
+        "every claim loop counts as a poller"
+    );
+}
+
 /// A running worker emits the pool, wait, query, poller and outlier metrics,
 /// and its heartbeat publishes a task-stats row that counts the failed
 /// activity attempts.
@@ -1241,10 +1258,6 @@ async fn running_worker_emits_saturation_metrics_and_publishes_task_stats() {
         Sample::Query(DbOp::Claim.as_str()),
         Sample::Query(DbOp::Persist.as_str()),
         Sample::Query(DbOp::Heartbeat.as_str()),
-        Sample::Pollers {
-            queue: queue.clone(),
-            pollers: 1,
-        },
         Sample::Outlier {
             dimension: OutlierDimension::FailureRatio,
             flagged: false,
@@ -1256,6 +1269,7 @@ async fn running_worker_emits_saturation_metrics_and_publishes_task_stats() {
     ] {
         assert!(metrics.has(&wanted), "missing {wanted:?}");
     }
+    assert_every_claim_loop_polls(&metrics, &queue);
     // A single-pool worker tags every wait with its own pool. The
     // process-global sharded pool does not change the label.
     assert!(
