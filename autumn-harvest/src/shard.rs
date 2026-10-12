@@ -1896,9 +1896,7 @@ impl ShardedDbPool {
                 });
             pool_group.insert(shard, u32::try_from(group).unwrap_or(u32::MAX));
 
-            let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
-                diesel_async::AsyncPgConnection,
-            >::new(dsn);
+            let manager = crate::pool::engine_manager(dsn);
             // Operator tooling, so the `Maintenance` session timeouts apply
             // (issue #1788).
             let pool = crate::pool::with_engine_timeouts(
