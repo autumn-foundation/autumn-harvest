@@ -80,7 +80,7 @@ use autumn_harvest::executor::{
 };
 use autumn_harvest::external_task;
 use autumn_harvest::fork::{
-    WorkflowForkError, WorkflowForkRequest, fork_workflow_execution_audited,
+    ForkEffects, WorkflowForkError, WorkflowForkRequest, fork_workflow_execution_audited,
 };
 use autumn_harvest::history_export::{
     DEFAULT_HISTORY_EXPORT_MAX_BYTES, HistoryExportDocument, HistoryExportError,
@@ -25548,6 +25548,12 @@ async fn fork_workflow(
         Ok(conn) => conn,
         Err(e) => return e.into_response(),
     };
+    if request.effects == ForkEffects::Live
+        && let Some(response) =
+            reject_inadmissible_fork_callbacks(&api_state, &mut conn, &context, exec_id).await
+    {
+        return response;
+    }
     // The fork commits on the source shard, with its success audit row in
     // the same transaction. A fork leaves its source as it was, so a retry
     // makes another fork. So a failed audit insert must roll the fork back,
@@ -25569,6 +25575,80 @@ async fn fork_workflow(
             fork_error_response(error)
         }
     }
+}
+
+/// Refuse a live fork whose inherited callback targets fail the SSRF policy.
+///
+/// A live fork sends the completion callbacks of its source. The terminal
+/// path checks each target against the current policy and skips a rejected
+/// one in silence. So the route checks the targets first and refuses the fork
+/// with `422`, as a rerun does. The targets are fixed at start, so the check
+/// before the fork transaction sees the targets that the fork copies.
+///
+/// Returns the refusal response, or `None` when the fork can go on.
+async fn reject_inadmissible_fork_callbacks(
+    api_state: &HarvestApiState,
+    conn: &mut AsyncPgConnection,
+    context: &(String, String, Option<String>),
+    exec_id: ExecutionId,
+) -> Option<axum::response::Response> {
+    use axum::response::IntoResponse as _;
+
+    let exec_id_str = exec_id.to_string();
+    // A missing source is left to the fork, which refuses it with `404`.
+    let stored: Option<Option<Value>> = match harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(harvest_workflow_executions::completion_callbacks)
+        .first(conn)
+        .await
+        .optional()
+    {
+        Ok(stored) => stored,
+        Err(e) => {
+            let error = autumn_harvest::error::database_error(e);
+            let failure = error.to_string();
+            let _ = audit_fork(conn, context, &exec_id_str, Some(&failure)).await;
+            return Some(map_error(error).into_response());
+        }
+    };
+    // A source with no callback targets has nothing to check.
+    let raw = stored.flatten()?;
+    let targets: Vec<autumn_harvest::completion_callback::CallbackTarget> =
+        match serde_json::from_value(raw) {
+            Ok(targets) => targets,
+            Err(e) => {
+                let failure = "malformed stored completion_callbacks";
+                let _ = audit_fork(conn, context, &exec_id_str, Some(failure)).await;
+                return Some(
+                    AutumnError::bad_request_msg(format!(
+                        "source execution {exec_id} has an unparseable stored \
+                     completion_callbacks value ({e}); a live fork cannot send them"
+                    ))
+                    .into_response(),
+                );
+            }
+        };
+    let policy = api_state.completion_callback_ssrf_policy();
+    for target in &targets {
+        if let Err(rejection) =
+            autumn_harvest::completion_callback::validate_target_url(&target.url, &policy)
+        {
+            let failure = "completion callback target no longer admissible";
+            let _ = audit_fork(conn, context, &exec_id_str, Some(failure)).await;
+            return Some(
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "error": "completion callback target rejected",
+                        "url": target.url,
+                        "rejection": rejection,
+                    })),
+                )
+                    .into_response(),
+            );
+        }
+    }
+    None
 }
 
 /// Write one `workflow.fork` audit row on the default shard.

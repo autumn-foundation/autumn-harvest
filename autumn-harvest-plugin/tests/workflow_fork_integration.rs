@@ -328,6 +328,41 @@ async fn fork_route_maps_refusals() {
     );
 }
 
+/// A live fork sends the completion callbacks of its source, so it checks
+/// them against the current SSRF policy, as a rerun does. A target that the
+/// policy no longer admits refuses the fork with `422`. A recorded fork sends
+/// no callback, so it is not refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_fork_refuses_a_callback_target_the_policy_rejects() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    // The default SSRF policy has an empty allowlist, so it rejects any URL.
+    let app = build_app(&pool, true);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+    let source = seed_completed(&mut conn).await;
+    let stale = vec![autumn_harvest::completion_callback::CallbackTarget::new(
+        "https://stale-receiver.example.com/hook",
+        autumn_harvest::completion_callback::EventFilter::AnyTerminal,
+    )];
+    diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
+        .set(harvest_workflow_executions::completion_callbacks.eq(Some(json!(stale))))
+        .execute(&mut conn)
+        .await
+        .expect("set the callback targets");
+    let source = source.to_string();
+
+    let (status, body) = post_fork(&app, &source, json!({ "effects": "live" }), true).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+    assert_eq!(body["error"], json!("completion callback target rejected"));
+    assert_eq!(
+        body["url"].as_str(),
+        Some("https://stale-receiver.example.com/hook")
+    );
+
+    let (status, body) = post_fork(&app, &source, json!({}), true).await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+}
+
 /// Create and migrate two shard databases next to the database at `url`.
 async fn two_shard_urls(url: &str) -> (String, String) {
     use diesel_async::SimpleAsyncConnection as _;

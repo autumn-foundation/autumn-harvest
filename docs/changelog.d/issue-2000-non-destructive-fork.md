@@ -31,6 +31,10 @@ is never written, so a run in any state can be forked, `COMPLETED` and
 - The fork sends no completion callback and fires no completion trigger.
   Its marker gates them, so the fork row keeps the callback targets of its
   source. A later live fork of this fork then sends them.
+- A live fork checks the callback targets of its source against the current
+  SSRF policy, as a rerun does. A target that the policy no longer admits
+  refuses the fork with `422`, so a live fork never drops a callback in
+  silence.
 - A reset of a fork keeps `start_source = fork` and appends a marker with the
   mode of that fork, so it keeps that mode. It copies the overrides of that
   fork after the new marker. A fork of a fork uses its own, last, marker.

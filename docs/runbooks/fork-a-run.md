@@ -44,6 +44,11 @@ The route is admin-only. Each call creates a new execution.
 A recorded fork cannot charge a card again under a new identity. Use
 `"effects": "live"` only when you want real effects.
 
+A live fork sends the completion callbacks of its source. The route checks
+each target against the current SSRF policy first. A target that the policy
+no longer admits refuses the fork with `422`. Use a recorded fork, or allow
+the host again.
+
 A recorded fork reads its source while it runs. Retention does not wait for
 it. If retention deletes the source first, each later activity has no record
 and fails closed with `ForkEffectUnavailable`. Fork a run well inside its

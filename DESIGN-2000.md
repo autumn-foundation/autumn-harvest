@@ -182,6 +182,8 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | A reset preview does not predict a lineage refusal. | Both previews run the same lineage walk. |
 | The terminal-task janitor deletes a held race loser while its run is live, so the race finds no hold. | Keep a row with the hold mark while its execution is not terminal. |
 | A reset copies envelopes in its carried prefix but takes no reference. Retention of the sealed source can then collect the blob. | Every reset takes its own reference to each blob that its prefix and kept input name. |
+| A live fork copies callback targets that the current SSRF policy rejects. The terminal path then skips them in silence. | The route checks the inherited targets first and refuses the live fork with `422`, as a rerun does. |
+| Durable streams add `PublishDurableProgress`. The recorded-fork command match has no catch-all. | A chunk goes to the stream of the fork itself, so recorded mode allows it. |
 | A reset of a fork skips the lineage check. | The reset walks the fork lineage under its lock. An erased ancestor is `ErasedSource`; a gap, a seal or a deep lineage is `ForkLineage` (`409`). |
 | The `LiveFork` lineage walk scans every execution for each rebalance candidate. | A partial index on `start_source_ref WHERE start_source = 'fork'` serves the seed, and the step joins on the primary key. |
 | A fork of an old run is pinned to a retired source build. | A fork at point 0 resolves its build like a fresh start. A carried prefix keeps the source build; the runbook gives the compatibility remedy. |
