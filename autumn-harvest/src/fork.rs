@@ -165,6 +165,17 @@ pub enum WorkflowForkError {
         /// What is wrong.
         message: String,
     },
+    /// A row in the fork lineage is marked as a fork, but its source
+    /// reference is missing or is not a UUID. Its erasure cannot be ruled
+    /// out, so the walk fails closed.
+    #[error(
+        "the fork lineage of workflow execution {exec_id} has a malformed source reference, \
+         so its erasure cannot be ruled out"
+    )]
+    LineageMalformed {
+        /// The fork row whose reference is malformed.
+        exec_id: ExecutionId,
+    },
     /// The workflow type of the source is not registered on this node. A
     /// fork of it would fail on every worker, so it is refused, as a rerun
     /// is.
@@ -702,12 +713,15 @@ pub(crate) async fn erased_fork_ancestor(
     source: &WorkflowExecution,
 ) -> Result<Option<ExecutionId>, WorkflowForkError> {
     let mut current = (is_fork(source), source.start_source_ref.clone());
+    let mut child = ExecutionId::from_uuid(source.id);
     for _ in 0..MAX_FORK_LINEAGE {
-        let (true, Some(parent)) = current else {
+        let (true, reference) = current else {
             return Ok(None);
         };
-        let Ok(parent) = parent.parse::<Uuid>() else {
-            return Ok(None);
+        // A fork always names its source by id. A missing or malformed
+        // reference cannot prove the lineage clean, so the walk fails closed.
+        let Some(parent) = reference.and_then(|parent| parent.parse::<Uuid>().ok()) else {
+            return Err(WorkflowForkError::LineageMalformed { exec_id: child });
         };
         let row: Option<(Value, Option<String>, Option<String>, String)> =
             harvest_workflow_executions::table
@@ -737,6 +751,7 @@ pub(crate) async fn erased_fork_ancestor(
         if crate::erase::execution_input_is_erased(&input) {
             return Ok(Some(ExecutionId::from_uuid(parent)));
         }
+        child = ExecutionId::from_uuid(parent);
         current = (
             start_source.as_deref() == Some(StartSource::Fork.as_str()),
             start_source_ref,

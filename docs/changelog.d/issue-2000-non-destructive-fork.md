@@ -121,6 +121,10 @@ table, build the index `CONCURRENTLY` first, as the migration header shows.
 A failed audit insert rolls the fork back, so a retry after a `503` cannot
 make a second fork.
 
+**Malformed lineage.** A row in the lineage that is marked as a fork, but
+has a missing or non-UUID source reference, fails the walk closed with
+`LineageMalformed` (`409`).
+
 **Unregistered type.** A source whose workflow type is not registered on
 the node is refused with `404`, as a rerun is.
 

@@ -25606,6 +25606,7 @@ fn fork_error_response(error: WorkflowForkError) -> axum::response::Response {
         | WorkflowForkError::WorkflowIdInUse { .. }
         | WorkflowForkError::LineageTooDeep { .. }
         | WorkflowForkError::LineageGap { .. }
+        | WorkflowForkError::LineageMalformed { .. }
         | WorkflowForkError::HistoryCapReached { .. }
         | WorkflowForkError::ShardRefused { .. } => axum::http::StatusCode::CONFLICT,
     };

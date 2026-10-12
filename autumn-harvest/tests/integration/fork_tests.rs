@@ -629,6 +629,34 @@ fn reset_request() -> WorkflowResetRequest {
     }
 }
 
+/// A row marked as a fork whose source reference is missing or not a UUID
+/// cannot prove its lineage clean. A fork of it fails closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_fork_reference_is_refused() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("malformed");
+    let mut conn = connect(&url).await;
+    for reference in [Some("not-a-uuid"), None] {
+        let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+        diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
+            .set((
+                harvest_workflow_executions::start_source.eq(Some("fork")),
+                harvest_workflow_executions::start_source_ref.eq(reference),
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("mark the row as a fork");
+        let error =
+            fork_workflow_execution(&mut conn, source, request(ForkEffects::Recorded), None)
+                .await
+                .expect_err("a malformed lineage fails closed");
+        assert!(
+            matches!(error, WorkflowForkError::LineageMalformed { exec_id } if exec_id == source),
+            "{reference:?}: unexpected error: {error}"
+        );
+    }
+}
+
 /// A fork lineage deeper than the scan bound is refused. The walk cannot
 /// prove that no erased run lies above it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

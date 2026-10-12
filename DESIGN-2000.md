@@ -177,6 +177,7 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | A stored result that the record serves later loses its blob reference. | Share the source reference when the outcome is appended. |
 | A failed audit insert after the commit reports `503` for a fork that exists, and a retry makes another fork. | Insert the success audit row in the fork transaction. |
 | A fork of an unregistered workflow type fails on every worker. | Refuse it with `404`, as a rerun does. |
+| A fork row with a missing or malformed source reference reads as a clean lineage. | Fail the walk closed with `LineageMalformed`. |
 | A reset preview does not predict a lineage refusal. | Both previews run the same lineage walk. |
 | A reset of a fork skips the lineage check. | The reset walks the fork lineage under its lock. An erased ancestor is `ErasedSource`; a gap, a seal or a deep lineage is `ForkLineage` (`409`). |
 | The `LiveFork` lineage walk scans every execution for each rebalance candidate. | A partial index on `start_source_ref WHERE start_source = 'fork'` serves the seed, and the step joins on the primary key. |
