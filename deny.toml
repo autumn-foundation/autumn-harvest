@@ -161,6 +161,19 @@ ignore = [
     # its parking_lot 0.11 dependency, or instant gains a maintained fork.
     { id = "RUSTSEC-2024-0384", reason = "unmaintained, no safe upgrade exists; reached only through dev-runtime-managed (local `cargo dev` tooling), off by default and never shipped. Revisit: postgresql_archive moves off parking_lot 0.11, or instant is forked/revived." },
 
+    # RUSTSEC-2024-0449 — `unsafe-libyaml` 0.2.11 is unmaintained (no
+    # vulnerability, "no safe upgrade available"). Upstream archived it in
+    # 2024-03, and RustSec published the advisory later. It is reached only
+    # through `serde_yaml` 0.9. Two paths, and neither parses untrusted input:
+    # autumn-harvest lists `serde_yaml` under `[dev-dependencies]` only, and
+    # its integration tests read this repo's own checked-in CI YAML.
+    # autumn-web's `openapi` feature only serializes its own spec to
+    # `openapi.yaml` (`serde_yaml::to_string` in src/openapi.rs). It never
+    # parses with it. Revisit: autumn-web moves off `serde_yaml`, or a test
+    # starts to parse YAML from outside this repo. Then move the tests to a
+    # safe parser such as `serde-saphyr`.
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained, no safe upgrade exists; reached through serde_yaml as a dev-dependency (tests parse this repo's own CI YAML) and autumn-web's openapi emitter (serialize only). No untrusted input is parsed. Revisit: autumn-web drops serde_yaml, or a test parses YAML from outside the repo." },
+
     # RUSTSEC-2026-0098 / -0099 / -0104 (rustls-webpki 0.101.7) and the
     # h2@0.3.27 half of RUSTSEC-2026-0258 — FIXED, not deferred. All four
     # traced to the same root cause, previously mis-scoped in this file as
