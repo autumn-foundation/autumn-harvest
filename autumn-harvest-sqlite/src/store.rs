@@ -417,12 +417,12 @@ pub fn load_attempts(
 /// Stage an inbound signal, recording the absolute epoch-millisecond it arrived
 /// (`received_at`).
 ///
-/// `received_at` is compared against a `wait_for_signal_timeout` deadline timer's
-/// `fire_at` by the cycle-start ingest ([`crate::worker::SignalIngest`]),
-/// so it must be on the **same clock** as the deadline: the public
-/// [`send_signal`](crate::SqliteRuntime::send_signal) uses the wall clock (as the
-/// wall-clock drivers do), and the `*_as_of` seam injects a test epoch (as the
-/// `*_as_of` drivers do). Mirrors the Postgres engine's `harvest_signals.received_at`.
+/// The cycle-start ingest ([`crate::worker::SignalIngest`]) compares
+/// `received_at` with the `fire_at` of a `wait_for_signal_timeout` deadline.
+/// Thus both must use the **same clock**. The public
+/// [`send_signal`](crate::SqliteRuntime::send_signal) uses the wall clock, as
+/// the wall-clock drivers do. The `*_as_of` seam injects a test epoch, as the
+/// `*_as_of` drivers do. Mirrors the Postgres `harvest_signals.received_at`.
 pub fn stage_signal(
     conn: &Connection,
     exec_id: ExecutionId,

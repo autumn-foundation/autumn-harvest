@@ -463,13 +463,12 @@
 //! the late-signal-vs-deadline tests) — do not also add a plain `wait_for_signal`
 //! on the same name in the same race.
 //!
-//! Signal ingress is validated at the boundary:
-//! [`SqliteRuntime::send_signal`](crate::SqliteRuntime::send_signal) rejects a signal
-//! aimed at an unknown execution ([`SqliteError::ExecutionNotFound`]) or a terminal
-//! one ([`SqliteError::WorkflowNotRunning`]) instead of staging a row no drive
-//! could ever consume — mirroring the Postgres engine's rejection of a
-//! signal to an unknown/terminal target. A `RUNNING` execution stages the
-//! signal, and the next drive consumes it.
+//! [`SqliteRuntime::send_signal`](crate::SqliteRuntime::send_signal) validates
+//! the target at the boundary. An unknown execution is
+//! [`SqliteError::ExecutionNotFound`]. A terminal one is
+//! [`SqliteError::WorkflowNotRunning`]. No drive could consume a row staged for
+//! either, so the call rejects it, as the Postgres engine does. A `RUNNING`
+//! execution stages the signal, and the next drive consumes it.
 //!
 //! There is deliberately **no import/seed-a-foreign-history API**. The
 //! cross-backend guarantee (a history written here replays on the core engine) is

@@ -802,9 +802,9 @@ impl SqliteRuntime {
         received_at: DateTime<Utc>,
     ) -> SqliteResult<()> {
         // Validate the target BEFORE staging (Codex #1069 P2). `harvest_signals`
-        // has no FK/state check, so an unconditional stage returns `Ok(())` for a
-        // typoed id or a sealed run and silently loses the wakeup — no drive
-        // will ever consume it. Mirror the Postgres `send_signal`
+        // has no FK or state check. An unconditional stage returns `Ok(())` for
+        // a typoed id or a sealed run. No drive will ever consume that row, so
+        // the wakeup is silently lost. Mirror the Postgres `send_signal`
         // rejections. `store::execution_state` returns `ExecutionNotFound` for an
         // unknown id. A terminal execution is `WorkflowNotRunning`. A RUNNING
         // (non-terminal) execution stages as before.
@@ -820,9 +820,9 @@ impl SqliteRuntime {
             });
         }
         // Enforce the signal-payload cap at INGRESS (issue #252, Codex #1069
-        // `runtime.rs:346`), before staging the `harvest_signals` row — otherwise
-        // the next drive records an oversized `SignalReceived` event,
-        // bloating history and accepting a payload the Postgres path rejects at its
+        // `runtime.rs:346`), before the `harvest_signals` row is staged.
+        // Otherwise the next drive records an oversized `SignalReceived` event.
+        // That bloats history and accepts a payload that Postgres rejects at its
         // boundary. Checked AFTER the not-found / terminal rejections above: the
         // target's existence/state is a precondition for accepting ANY signal, so a
         // typoed or sealed target reports that (the more actionable error) rather

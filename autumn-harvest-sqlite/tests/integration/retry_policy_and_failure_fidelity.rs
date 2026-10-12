@@ -652,11 +652,11 @@ async fn approval_gate(ctx: &WorkflowContext, _n: i64) -> Result<String, String>
     ))
 }
 
-// RED pre-fix (`store.rs:327`): the signal read ordered by `signal_seq`, so
-// the LATE signal (staged first, lowest seq) was consumed; its late `received_at`
-// let the deadline timer fire first → the race resolved to `auto_rejected` while
-// the on-time signal stayed queued. With `ORDER BY received_at, signal_seq` the
-// on-time signal (earliest arrival) is consumed and wins.
+// RED pre-fix (`store.rs:327`): the signal read ordered by `signal_seq`.
+// The LATE signal (staged first, lowest seq) was consumed first. Its late
+// `received_at` let the deadline timer fire first. The race resolved to
+// `auto_rejected`, and the on-time signal stayed queued. With
+// `ORDER BY received_at, signal_seq` the on-time signal is consumed and wins.
 #[tokio::test]
 async fn pending_signals_are_consumed_in_arrival_order_not_insertion_order() {
     let (_dir, path) = temp_db();
@@ -688,13 +688,13 @@ async fn pending_signals_are_consumed_in_arrival_order_not_insertion_order() {
     )
     .unwrap();
 
-    // Drive AFTER both arrivals but BEFORE the 1h deadline (t0 + 20s). Arrival-order
-    // consumption (`store::pending_signals` orders by `received_at`, unfiltered by
-    // `now`) picks the on-time signal (received_at = 10 < deadline 3600), so the
-    // signal WINS the race cleanly — the deadline timer is not yet due, so there is
-    // no stray later `TimerFired` to reason about. With the pre-fix `signal_seq`
-    // ordering the LATE signal (received_at 3700 > deadline) would be consumed and
-    // the deadline timer would fire first → `auto_rejected`.
+    // Drive AFTER both arrivals but BEFORE the 1h deadline (t0 + 20s).
+    // `store::pending_signals` orders by `received_at` and ignores `now`. Thus
+    // the on-time signal (received_at = 10 < deadline 3600) comes first and
+    // WINS the race cleanly. The deadline timer is not yet due, so no stray
+    // `TimerFired` appears. With the pre-fix `signal_seq` order, the LATE
+    // signal (received_at 3700 > deadline) came first. The deadline timer then
+    // fired first, and the result was `auto_rejected`.
     let done = rt
         .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(20))
         .await
