@@ -161,6 +161,22 @@ ignore = [
     # its parking_lot 0.11 dependency, or instant gains a maintained fork.
     { id = "RUSTSEC-2024-0384", reason = "unmaintained, no safe upgrade exists; reached only through dev-runtime-managed (local `cargo dev` tooling), off by default and never shipped. Revisit: postgresql_archive moves off parking_lot 0.11, or instant is forked/revived." },
 
+    # RUSTSEC-2024-0449 — `unsafe-libyaml` 0.2.11 is unmaintained (no
+    # vulnerability, "no safe upgrade available"; the repository is archived).
+    # Pulled only by `serde_yaml` 0.9, along two paths, and neither parses
+    # untrusted YAML:
+    # - autumn-harvest's dev-dependency. The CI guards in
+    #   autumn-harvest/tests/integration (ci_run_coverage, supply_chain_ci and
+    #   others) parse this repository's own `.github/workflows/*.yml`. Never
+    #   shipped.
+    # - autumn-web's `openapi` feature, enabled through `mcp`
+    #   (autumn-harvest-plugin's `mcp` feature turns it on). Its one call,
+    #   `openapi::write_openapi_spec_to_dist`, runs `serde_yaml::to_string` to
+    #   EMIT a spec the application builds itself. It parses nothing.
+    # Revisit: anything starts parsing YAML from outside the repository, or
+    # serde_yaml / autumn-web move to a maintained YAML crate.
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained, no safe upgrade exists; serde_yaml is a dev-dependency that parses this repo's own CI YAML, and autumn-web's openapi feature only emits YAML for a spec the app builds. No untrusted YAML is parsed. Revisit: any untrusted YAML input, or a move off serde_yaml." },
+
     # RUSTSEC-2026-0098 / -0099 / -0104 (rustls-webpki 0.101.7) and the
     # h2@0.3.27 half of RUSTSEC-2026-0258 — FIXED, not deferred. All four
     # traced to the same root cause, previously mis-scoped in this file as
