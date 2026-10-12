@@ -4193,6 +4193,18 @@ impl WorkflowContext {
         self
     }
 
+    /// Set a cancel request that the history does not hold yet (issue #2021).
+    ///
+    /// A `WorkflowCancelled` event in the history wins, so this call cannot
+    /// replace a recorded reason. `None` changes nothing.
+    #[must_use]
+    pub(crate) fn with_pending_cancellation(mut self, reason: Option<String>) -> Self {
+        if self.cancellation_reason.is_none() {
+            self.cancellation_reason = reason;
+        }
+        self
+    }
+
     /// Set the shard the parent row lives on right now (issue #1405).
     ///
     /// Threaded by the executor from the loaded execution row's `shard_id`

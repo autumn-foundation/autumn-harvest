@@ -266,6 +266,43 @@ pub fn seal_execution(
     Ok(())
 }
 
+/// Store a cooperative cancel request on a `RUNNING` row (issue #2021).
+///
+/// The first request wins. A repeat call changes nothing. Returns `true` when
+/// this call stored the reason.
+pub fn request_cancel(conn: &Connection, exec_id: ExecutionId, reason: &str) -> SqliteResult<bool> {
+    let changed = conn.execute(
+        "UPDATE harvest_executions SET cancel_reason = ?2 \
+         WHERE exec_id = ?1 AND state = 'RUNNING' AND cancel_reason IS NULL",
+        params![exec_id.to_string(), reason],
+    )?;
+    Ok(changed > 0)
+}
+
+/// The pending cooperative cancel request of `exec_id`, if any (issue #2021).
+pub fn cancel_reason(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Option<String>> {
+    Ok(conn.query_row(
+        "SELECT cancel_reason FROM harvest_executions WHERE exec_id = ?1",
+        params![exec_id.to_string()],
+        |row| row.get(0),
+    )?)
+}
+
+/// Seal `exec_id` in a terminal `state` with `reason` as its error (issue
+/// #2021). The cancel and terminate paths use it.
+pub fn set_sealed_with_reason(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    state: &str,
+    reason: &str,
+) -> SqliteResult<()> {
+    conn.execute(
+        "UPDATE harvest_executions SET state = ?2, error = ?3 WHERE exec_id = ?1",
+        params![exec_id.to_string(), state, reason],
+    )?;
+    Ok(())
+}
+
 pub fn set_completed(conn: &Connection, exec_id: ExecutionId, output: &Value) -> SqliteResult<()> {
     conn.execute(
         "UPDATE harvest_executions SET state = 'COMPLETED', output_json = ?2 WHERE exec_id = ?1",

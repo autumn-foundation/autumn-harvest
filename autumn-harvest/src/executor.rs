@@ -413,6 +413,13 @@ pub struct WorkflowExecuteSpanMeta {
     /// execution row's `parent_id` column so a child workflow can identify its
     /// spawner via `ctx.info()` / `ctx.parent_execution_id()`.
     pub parent_execution_id: Option<ExecutionId>,
+    /// A cancel request that is not yet in the history (issue #2021).
+    ///
+    /// The SQLite backend stores a cooperative cancel outside the event log.
+    /// It appends `WorkflowCancelled` only when it seals the run. This field
+    /// lets the body read the request through `ctx.cancellation_reason()`.
+    /// A recorded `WorkflowCancelled` event wins. Postgres passes `None`.
+    pub cancellation_reason: Option<String>,
 }
 
 /// Classification of a bounded, read-only query-replay drive (issue #612).
@@ -1969,6 +1976,8 @@ pub(crate) fn advancing_clock_context(
     // pause/resume/redrive-shifted `deadline_at`) so `ctx.deadline()` matches
     // the timeout scanner rather than a stale start+timeout recompute.
     .with_deadline(span_meta.and_then(|m| m.deadline_at))
+    // Issue #2021: a cancel request the history does not hold yet.
+    .with_pending_cancellation(span_meta.and_then(|m| m.cancellation_reason.clone()))
     // Issue #1405: thread the row's current shard. A `ParentShard` child
     // then places on where this run actually lives, not the origin bits
     // `exec_id` encodes. Lets a WorkflowTestEnv run exercise a rebalanced
@@ -2176,6 +2185,8 @@ pub(crate) fn build_task_context(
     // Issue #698: thread the spawning parent's execution id so a child workflow
     // can read it via `ctx.info()` / `ctx.parent_execution_id()`.
     .with_parent_execution_id(span_meta.and_then(|m| m.parent_execution_id))
+    // Issue #2021: a cancel request the history does not hold yet.
+    .with_pending_cancellation(span_meta.and_then(|m| m.cancellation_reason.clone()))
     .with_payload_caps(
         max_activity_input_bytes,
         0,
@@ -3492,7 +3503,78 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_execution_id: None,
+            cancellation_reason: None,
         }
+    }
+
+    // ── Cancellation seam (issue #2021) ───────────────────────────────────
+
+    /// Returns the reason `ctx.cancellation_reason()` reports.
+    fn reports_cancellation<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move { Ok(serde_json::json!(ctx.cancellation_reason())) })
+    }
+
+    async fn reported_cancellation(
+        history: Vec<WorkflowEvent>,
+        seam: Option<&str>,
+        meta: bool,
+    ) -> Value {
+        let mut span_meta = span_meta("wf", "q");
+        span_meta.cancellation_reason = seam.map(str::to_owned);
+        let (outcome, _, _, _) = run_workflow_with_state_and_history_policy(
+            ExecutionId::new(),
+            history,
+            reports_cancellation,
+            Value::Null,
+            empty_shared_state(),
+            WorkflowHistoryPolicy::default(),
+            meta.then_some(&span_meta),
+            &[],
+            &[],
+            std::sync::Arc::new(crate::telemetry::NoOpMetrics),
+        )
+        .await;
+        match outcome {
+            WorkflowOutcome::Completed { output, .. } => output,
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    fn started_only() -> Vec<WorkflowEvent> {
+        started_then_late_signal()[..1].to_vec()
+    }
+
+    #[tokio::test]
+    async fn the_span_meta_reason_reaches_the_context() {
+        let reason = reported_cancellation(started_only(), Some("stop"), true).await;
+        assert_eq!(reason, serde_json::json!("stop"));
+    }
+
+    #[tokio::test]
+    async fn no_span_meta_reason_keeps_the_context_uncancelled() {
+        assert_eq!(
+            reported_cancellation(started_only(), None, true).await,
+            Value::Null
+        );
+        assert_eq!(
+            reported_cancellation(started_only(), None, false).await,
+            Value::Null
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recorded_cancel_wins_over_the_span_meta_reason() {
+        let mut history = started_only();
+        history.push(WorkflowEvent::WorkflowCancelled {
+            reason: "recorded".into(),
+        });
+        let reason = reported_cancellation(history.clone(), Some("seam"), true).await;
+        assert_eq!(reason, serde_json::json!("recorded"));
+        let reason = reported_cancellation(history, None, true).await;
+        assert_eq!(reason, serde_json::json!("recorded"));
     }
 
     fn started_then_late_signal() -> Vec<WorkflowEvent> {

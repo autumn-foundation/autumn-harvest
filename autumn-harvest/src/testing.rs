@@ -6506,6 +6506,8 @@ impl WorkflowTestEnv {
             // Issue #698: thread the configured parent so `ctx.info()` /
             // `ctx.parent_execution_id()` report it inside the test run.
             parent_execution_id: self.parent_execution_id,
+            // `with_cancellation` records the cancel as an event.
+            cancellation_reason: None,
         })
     }
 

@@ -9,6 +9,7 @@
 mod activity_info_features;
 mod activity_start_to_close;
 mod atomicity;
+mod cancel_terminate;
 mod cancellable_timer_unsupported;
 mod cross_backend;
 mod docs_start_contract;
