@@ -463,7 +463,8 @@ pub struct PendingSignal {
 /// the real arrival times. `signal_seq` breaks ties, as on Postgres.
 ///
 /// Each payload is deserialized here. A corrupt row is an error before the
-/// caller writes anything, so the row stays staged.
+/// caller writes anything, so the row stays staged. The error names the row,
+/// so an operator can find it.
 pub fn pending_signals(
     conn: &Connection,
     exec_id: ExecutionId,
@@ -484,11 +485,16 @@ pub fn pending_signals(
     let mut out = Vec::new();
     for row in rows {
         let (seq, name, received_at, payload) = row?;
+        let payload = serde_json::from_str(&payload).map_err(|e| {
+            SqliteError::Corrupt(format!(
+                "harvest_signals row {seq} ('{name}') of execution {exec_id}: {e}"
+            ))
+        })?;
         out.push(PendingSignal {
             seq,
             name,
             received_at,
-            payload: serde_json::from_str(&payload)?,
+            payload,
         });
     }
     Ok(out)

@@ -28,14 +28,14 @@
 //!   core `HistoryMatcher::match_timer` scans for its own `TimerFired` but STOPS at
 //!   an unconsumed sibling `TimerFired`, so a reversed fire order would wedge replay
 //!   (issue #1069 P2).
-//! - `harvest_signals` — staged inbound signals awaiting a matching
-//!   `wait_for_signal`. Each row records the absolute epoch-millisecond the signal
-//!   arrived (`received_at`, issue #1069 P2 — millisecond precision so an on-time
-//!   signal cannot lose a deadline race near a second boundary), which the
-//!   wake-event ingest interleaves against a deadline timer's `fire_at` so a
-//!   signal delivered *after* an expired `wait_for_signal_timeout` deadline cannot
-//!   retroactively win the race (issue #476; mirrors the Postgres `merge_wake_events`
-//!   `received_at` vs `fires_at` ordering).
+//! - `harvest_signals` — staged inbound signals. The next drive appends each one
+//!   to history (issue #2020). Each row records the epoch-millisecond the signal
+//!   arrived (`received_at`, issue #1069 P2). Millisecond precision keeps an
+//!   on-time signal from losing a deadline race near a second boundary. The
+//!   ingest compares `received_at` with the `fire_at` of a deadline timer. So a
+//!   signal delivered after an expired `wait_for_signal_timeout` deadline cannot
+//!   win the race (issue #476). This mirrors the Postgres `merge_wake_events`
+//!   order of `received_at` and `fires_at`.
 //! - `harvest_activity_attempts` — a per-attempt audit log. **Retryable** activity
 //!   failures live here, not in `harvest_events`, mirroring the Postgres engine's
 //!   `requeue_for_retry` (which stores the attempt error on the task-queue row,

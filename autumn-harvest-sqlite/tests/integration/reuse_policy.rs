@@ -511,9 +511,9 @@ async fn terminate_if_running_orphans_an_undelivered_signal_across_repeated_cycl
     );
 }
 
-// A signal staged while the prior is RUNNING can outlive it. This happens even
-// when the prior reaches COMPLETED on its own: the workflow completes without
-// ever awaiting that signal name. That prior is sealed via the same
+// A signal staged while the prior is RUNNING can outlive it. Before issue #2020
+// this happened even when the prior reached COMPLETED on its own, if the
+// workflow never awaited that signal name. Old files still hold such rows. That prior is sealed via the same
 // "already-terminal" path, which skips the cancellation branch. So the signal
 // cleanup must not live inside that branch.
 #[tokio::test]
@@ -532,7 +532,7 @@ async fn terminate_if_running_orphans_an_undelivered_signal_on_an_already_comple
         "prior has one staged, undelivered signal"
     );
 
-    // ...then let it run to completion WITHOUT ever consuming that signal.
+    // ...then let it run to completion. The workflow never awaits that name.
     let state = rt.run_until_blocked(prior).await.unwrap();
     assert!(
         matches!(state, RunState::Completed(_)),
@@ -851,7 +851,7 @@ async fn allow_duplicate_failed_only_orphans_an_undelivered_signal_on_the_replac
         "prior has one staged, undelivered signal"
     );
 
-    // ...then let it run to FAILED on its own, without ever consuming that signal.
+    // ...then let it run to FAILED on its own. The workflow never awaits that name.
     let _ = rt.run_until_blocked(prior).await;
     assert_eq!(raw_state(&path, prior), "FAILED");
     // The failing cycle ingests the signal (issue #2020). A file from an

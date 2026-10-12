@@ -401,7 +401,10 @@ async fn a_corrupt_staged_row_fails_the_drive_and_stays_staged() {
         .unwrap();
 
     let err = rt.run_until_blocked_as_of(exec, at(1)).await.unwrap_err();
-    assert!(matches!(err, SqliteError::Json(_)), "{err}");
+    assert!(
+        matches!(err, SqliteError::Corrupt(ref m) if m.contains("'junk'")),
+        "the error names the row: {err}"
+    );
     assert_eq!(rt.load_history(exec).unwrap().len(), 1, "only the start");
     assert_eq!(undelivered(&path, exec), 1);
 }

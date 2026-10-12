@@ -60,12 +60,13 @@ Red tests in `tests/integration/signal_ingest.rs`, on trunk-dev `7a751d6`:
 | R2 | Ingest order follows insertion, not arrival. | The planner sorts by `received_at`, then `signal_seq`. `other_names_are_ingested_in_arrival_order` pins it. |
 | R3 | Replay sees one history and storage holds another. | One list feeds both. The cycle appends it first, in list order. |
 | R4 | A discarded cycle consumes signals. | Only the persisting transactions apply the ingest. The signals stay staged for the next drive. |
-| R5 | A deadline fires after a signal that already won its race. The stray `TimerFired` fails strict replay. | The planner checks deadlines only before the first signal of each name. `ingest_fires_a_deadline_only_ahead_of_the_first_signal_of_its_name` pins it. |
+| R5 | A late signal wins the second of two races on one name. Review found it in a first-signal-only rule. | The planner checks deadlines before every signal and fires each one once. `a_late_signal_loses_the_second_of_two_same_name_races` and `ingest_fires_each_deadline_once_in_arrival_order` pin it. |
 | R6 | A history fails the core replayer. | Every new test that writes history replays on `WorkflowReplayer`. |
 | R7 | Ingest makes no progress visible, so the loop stops early. | A non-empty ingest counts as progress. |
 | R8 | An unread signal now reaches history, and strict replay reports `EarlyCompletion`. | Same as Postgres. The race tests drain later signals. The changelog names the behaviour change. |
 | R9 | A terminal run on an old file still holds an undelivered row. | The `reuse_policy` tests seed that legacy row. |
 | R10 | A panic seal drops the signals that its replay saw. Codex found it. | The seal applies the plan before `WorkflowFailed`. `a_panic_seal_records_the_signal_that_replay_saw` pins it. |
+| R11 | A corrupt row of any name blocks the run with an unclear error. | The `SqliteError::Corrupt` message names the row. `a_corrupt_staged_row_fails_the_drive_and_stays_staged` pins it. |
 
 ### 0.5 Six thinking hats
 
@@ -86,9 +87,9 @@ Red tests in `tests/integration/signal_ingest.rs`, on trunk-dev `7a751d6`:
 
 1. `store::pending_signals` reads every undelivered signal of a run, in
    arrival order.
-2. `worker::SignalIngest::plan` builds the events. Before the first signal of
-   each name, it adds each race deadline of that name that falls at or before
-   the signal arrival. Then it adds the signal.
+2. `worker::SignalIngest::plan` builds the events. Before each signal, it adds
+   each race deadline of that name that falls at or before the signal arrival.
+   Each deadline fires once. Then it adds the signal.
 3. `drive_one_cycle_inner` adds the planned events to the replay history.
 4. The completed, failed, suspended and panic-seal transactions apply the
    plan first.

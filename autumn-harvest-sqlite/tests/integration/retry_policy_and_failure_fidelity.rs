@@ -655,8 +655,9 @@ async fn approval_gate(ctx: &WorkflowContext, _n: i64) -> Result<String, String>
 // RED before issue #1069 P2: the signal read ordered by `signal_seq`.
 // The LATE signal (staged first, lowest seq) was consumed first. Its late
 // `received_at` let the deadline timer fire first. The race resolved to
-// `auto_rejected`, and the on-time signal stayed queued. With
-// `ORDER BY received_at, signal_seq` the on-time signal is consumed and wins.
+// `auto_rejected`, and the on-time signal stayed queued. Under the cycle-start
+// ingest (issue #2020), that order bug gives `approved:late`. With
+// `ORDER BY received_at, signal_seq` the on-time signal comes first and wins.
 #[tokio::test]
 async fn pending_signals_are_consumed_in_arrival_order_not_insertion_order() {
     let (_dir, path) = temp_db();
@@ -694,7 +695,9 @@ async fn pending_signals_are_consumed_in_arrival_order_not_insertion_order() {
     // WINS the race cleanly. The deadline timer is not yet due, so no stray
     // `TimerFired` appears. With the pre-fix `signal_seq` order, the LATE
     // signal (received_at 3700 > deadline) came first. The deadline timer then
-    // fired first, and the result was `auto_rejected`.
+    // fired first, and the result was `auto_rejected`. The late signal is
+    // ingested too, although its `received_at` is after `now`. The ingest
+    // ignores `now`, as the old wait path did.
     let done = rt
         .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(20))
         .await

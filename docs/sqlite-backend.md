@@ -332,7 +332,9 @@ runs. The run stays `RUNNING`. Drive it again after `send_signal`.
 
 A signal that the workflow never reads also reaches history. The strict core
 `WorkflowReplayer` then reports `NonDeterminismDetected(EarlyCompletion)`, as
-for a Postgres history. A signal that lost a deadline race is exempt.
+for a Postgres history. A signal that lost a deadline race is exempt. A file
+from an earlier release can hold signals staged for a name that the run never
+awaited. The first drive after the upgrade appends them to history.
 
 `send_signal` validates the target at the boundary: an unknown execution is
 `SqliteError::ExecutionNotFound` and a terminal one is

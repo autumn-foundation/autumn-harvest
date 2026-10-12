@@ -415,7 +415,9 @@
 //!
 //! A signal that the workflow never reads also reaches history. The strict
 //! core `WorkflowReplayer` then reports `NonDeterminismDetected(EarlyCompletion)`,
-//! as for a Postgres history. A signal that lost a deadline race is exempt.
+//! as for a Postgres history. A signal that lost a deadline race is exempt. A
+//! file from an earlier release can hold signals staged for a name that the
+//! run never awaited. The first drive after the upgrade appends them.
 //!
 //! A push handler runs at the next durable call (a timer, an activity or a
 //! signal read) after it registers. Put such a call between the registration
@@ -432,10 +434,10 @@
 //! - The ingest reads staged signals in arrival order (`received_at`), not
 //!   insertion order (`signal_seq`). An on-time signal staged after a late one
 //!   still wins.
-//! - Before the first staged signal of a name, the ingest compares its
-//!   `received_at` with the `fire_at` of the race deadline of that name. It
-//!   uses the tie rule of the Postgres `merge_wake_events`: a tie goes to the
-//!   timer.
+//! - Before each staged signal, the ingest compares its `received_at` with
+//!   the `fire_at` of each race deadline of that name. It uses the tie rule of
+//!   the Postgres `merge_wake_events`: a tie goes to the timer. Each deadline
+//!   fires at most once.
 //! - A deadline at or before the signal arrival records its `TimerFired` first.
 //!   The timeout wins, and the late signal stays in history for a later wait.
 //! - An on-time signal wins, also when the drive comes after the deadline.

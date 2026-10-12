@@ -1002,7 +1002,7 @@ fn signal_of(timer_id: &str) -> Option<String> {
 ///
 /// TWO tables answer that, and one of them alone is not enough. A decision is
 /// STAGED in `harvest_signals` when it is sent, and the event is appended
-/// later, when the workflow takes it up. A daemon that stopped between the
+/// later, on the next drive. A daemon that stopped between the
 /// two holds a decision that will win on the next drive.
 ///
 /// Reading the event alone would restore the wait over such a decision, and a
@@ -1079,7 +1079,7 @@ fn delivered_decision(conn: &Connection, exec_id: &str, signal: &str) -> Result<
 /// take up. `Some(false)` is a row that suppresses the wait and that no drive
 /// can consume.
 ///
-/// The row is read the way `pending_signals` reads it, and then
+/// The row is read as a `String`, as the backend reads it, and then
 /// deserialised into the type the workflow asks for. Nothing here restates
 /// what that type accepts, so nothing here can drift from it.
 ///
