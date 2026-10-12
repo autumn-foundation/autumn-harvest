@@ -880,6 +880,15 @@ pub async fn reset_workflow_execution(
             .await?;
             let fork = insert_fork_execution(conn, &source, new_exec_id).await?;
             copy_carried_events(conn, new_exec_id, &rows, reset_event_id).await?;
+            share_carried_refs(
+                conn,
+                (exec_id, new_exec_id),
+                &rows,
+                &source,
+                reset_event_id,
+                registry,
+            )
+            .await?;
             // A reset of a fork keeps the effects mode of that fork (issue
             // #2000). The carried prefix can hold an ancestor marker with
             // another mode, so the reset appends its own last marker.
@@ -1641,6 +1650,40 @@ struct NewHarvestEventOwned {
     event_id: i32,
     event_type: String,
     event_data: Value,
+}
+
+/// Give the reset its own reference to each blob that its copied history names.
+///
+/// The prefix rows and the kept input are copied byte for byte, envelopes
+/// included. The reset seals its source, and retention of that source drops
+/// its references. Without its own reference, the blob goes with them (issue
+/// #2000). A codec can hide a stored result in a payload field, so the keys
+/// also come from the decoded prefix.
+async fn share_carried_refs(
+    conn: &mut AsyncPgConnection,
+    ids: (ExecutionId, ExecutionId),
+    source_rows: &[HarvestEvent],
+    source: &WorkflowExecution,
+    reset_to_event_id: i64,
+    registry: Option<&HandlerRegistry>,
+) -> Result<(), WorkflowResetError> {
+    let codecs: &crate::payload_codec::PayloadCodecs = registry.map_or(
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+        HandlerRegistry::payload_codecs,
+    );
+    let carried = source_rows
+        .iter()
+        .filter(|row| i64::from(row.event_id) <= reset_to_event_id);
+    let copied = carried
+        .clone()
+        .map(|row| row.event_data.clone())
+        .collect::<Vec<_>>();
+    // A row that this registry cannot decode still names its envelopes.
+    let decoded = carried
+        .filter_map(|row| codecs.decode_event(row.event_data.clone()).ok())
+        .collect::<Vec<_>>();
+    crate::fork::share_payload_refs(conn, ids, &copied, Some(&source.input), &decoded, &[]).await?;
+    Ok(())
 }
 
 async fn copy_carried_events(

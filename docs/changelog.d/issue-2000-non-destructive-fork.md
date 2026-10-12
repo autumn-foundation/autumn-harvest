@@ -138,6 +138,16 @@ erased ancestor refuses it with `ErasedSource`. A missing or sealed
 ancestor, or a lineage past 64 links, refuses it with the new
 `WorkflowResetError::ForkLineage` (`409`).
 
+**Reset payload references.** A reset copies its carried prefix byte for
+byte, offload envelopes included. Every reset now takes its own reference
+to each blob that the prefix and the kept input name. Before this, the
+retention of a sealed reset source could collect a blob that the reset
+history still named. This applies to a reset of any run, not only a fork.
+
+**Held race losers.** The terminal-task janitor keeps a race loser that a
+recorded fork holds while its run is live. The race finds the hold when
+its winner fires, even after the retention window.
+
 **Rolling deploy.** A worker that predates this change cannot decode the new
 events. Fork a run only after every worker runs this version.
 

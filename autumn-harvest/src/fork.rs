@@ -599,7 +599,7 @@ async fn check_shards(
 /// alive after retention deletes the source. Only the rows that the fork
 /// stores count, so a replaced input releases its blob. The blobs of a new
 /// input, `input_refs`, are recorded in the same insert.
-async fn share_payload_refs(
+pub(crate) async fn share_payload_refs(
     conn: &mut AsyncPgConnection,
     (source_id, new_exec_id): (ExecutionId, ExecutionId),
     copied: &[Value],

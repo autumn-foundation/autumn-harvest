@@ -988,6 +988,72 @@ async fn a_reset_of_a_fork_references_its_offloaded_overrides() {
     );
 }
 
+/// A reset copies its carried prefix byte for byte, envelopes included. It
+/// takes its own reference to each blob that the prefix names. A reset seals
+/// its source, so retention of that source cannot then collect the blob.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reset_references_the_blobs_of_its_carried_prefix() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("reset-prefix");
+    let mut conn = connect(&url).await;
+    let offloader = Arc::new(autumn_harvest::payload_store::PayloadOffloader::new(
+        Arc::new(MemStore::default()),
+        64,
+        Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+    ));
+    let carryover = json!({ "previous": "X".repeat(512) });
+    let source = seed_run_with(
+        &mut conn,
+        &queue,
+        &json!({ "n": 1 }),
+        Some(carryover),
+        Some(&offloader),
+    )
+    .await;
+    let blob_keys = |refs: Vec<autumn_harvest::payload_store::OffloadedRef>| {
+        refs.into_iter().map(|r| r.blob_key).collect::<Vec<_>>()
+    };
+    let source_keys = blob_keys(
+        store::load_payload_refs(&mut conn, source)
+            .await
+            .expect("refs"),
+    );
+    assert_eq!(source_keys.len(), 1, "the carryover is offloaded");
+    let offloading = Arc::new(
+        HandlerRegistry::new(
+            vec![fork_pay_wf_info()],
+            activities![fork_charge, fork_receipt],
+        )
+        .with_payload_offloader(Some(offloader)),
+    );
+    let forked = fork_workflow_execution(
+        &mut conn,
+        source,
+        request(ForkEffects::Live),
+        Some(&offloading),
+    )
+    .await
+    .expect("fork")
+    .new_exec_id;
+
+    // A plain run and a fork each carry the started event with its envelope.
+    for exec_id in [source, forked] {
+        let reset =
+            reset_workflow_execution(&mut conn, exec_id, reset_request(), Some(&offloading))
+                .await
+                .expect("reset");
+        let reset_keys = blob_keys(
+            store::load_payload_refs(&mut conn, reset.new_exec_id)
+                .await
+                .expect("refs"),
+        );
+        assert_eq!(
+            reset_keys, source_keys,
+            "the reset of {exec_id} keeps the blob"
+        );
+    }
+}
+
 /// An input override keeps an offloaded carryover as an envelope. The fork
 /// references its blob, so retention of the source cannot collect it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
