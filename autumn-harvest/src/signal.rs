@@ -719,11 +719,26 @@ pub async fn resolve_and_signal_by_workflow_id_with_codecs(
         return Ok(ByIdSignalOutcome::NoRunFound);
     };
 
+    // Issue #1985: apply the promise settlement rules before the dedupe
+    // probe. A refusal ends as a refused insert below would.
+    let idempotency_key = match crate::durable_promise::settlement_idempotency_key(
+        signal_name,
+        &payload,
+        idempotency_key,
+    ) {
+        Ok(key) => key,
+        Err(HarvestError::Config(_)) => return Ok(ByIdSignalOutcome::NotRunning),
+        Err(e) => return Err(e),
+    };
+    // A promise belongs to one run, so its key dedupes per execution only,
+    // at the insert (issue #1985).
+    let promise_signal = signal_name.starts_with(crate::durable_promise::PROMISE_SIGNAL_PREFIX);
+
     // Cross-execution dedup: a keyed request already delivered to ANY
     // execution in this (workflow_name, workflow_id) chain — including a
     // predecessor sealed by a continue-as-new that raced ahead of this
     // retry — is reported as already-delivered without a fresh insert.
-    if let Some(key) = idempotency_key.filter(|k| !k.is_empty())
+    if let Some(key) = idempotency_key.filter(|k| !k.is_empty() && !promise_signal)
         && crate::execution::lookup_idempotent_signal_dedupe(conn, workflow_name, workflow_id, key)
             .await?
             .is_some()

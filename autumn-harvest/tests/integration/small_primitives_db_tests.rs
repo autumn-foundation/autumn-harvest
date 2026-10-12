@@ -987,3 +987,75 @@ async fn signal_with_start_settles_a_named_promise_in_a_new_run() {
         "the new run's promise must get its own settlement"
     );
 }
+
+/// A signal by workflow id dedupes across runs. A promise belongs to one
+/// run, so a settlement that an earlier run already holds must still reach
+/// the current run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn by_id_signal_settles_a_named_promise_in_a_new_run() {
+    use autumn_harvest::durable_promise::PromiseSettlement;
+    use autumn_harvest::execution::signal_with_start_workflow_execution;
+    use autumn_harvest::signal::{ByIdSignalOutcome, resolve_and_signal_by_workflow_id};
+
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let name = "harvest.promise:approval";
+    let settlement = PromiseSettlement::resolved(json!(1)).to_value();
+
+    let first = signal_with_start_workflow_execution(
+        &mut conn,
+        sws_params("by-id-run", name, settlement.clone(), None),
+    )
+    .await
+    .expect("first run");
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'COMPLETED', completed_at = now() \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(first.exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("finish the first run");
+    let second = signal_with_start_workflow_execution(
+        &mut conn,
+        sws_params("by-id-run", "kick", Value::Null, None),
+    )
+    .await
+    .expect("second run");
+    assert_ne!(second.exec_id, first.exec_id, "a new run starts");
+
+    let outcome = resolve_and_signal_by_workflow_id(
+        &mut conn,
+        "promise_wf",
+        "by-id-run",
+        name,
+        settlement,
+        Some(name),
+    )
+    .await
+    .expect("signal by id");
+    assert!(
+        matches!(outcome, ByIdSignalOutcome::Delivered),
+        "{outcome:?}"
+    );
+
+    let rows = diesel::sql_query(
+        "SELECT count(*) AS n FROM harvest_signals \
+         WHERE workflow_exec_id = $1 AND signal_name = $2",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(second.exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(name)
+    .get_result::<Count>(&mut conn)
+    .await
+    .expect("count settlements");
+    assert_eq!(
+        rows.n, 1,
+        "the current run's promise must get its own settlement"
+    );
+}
