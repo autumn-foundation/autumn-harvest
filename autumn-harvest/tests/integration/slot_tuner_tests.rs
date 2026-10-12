@@ -209,12 +209,18 @@ fn runtime_config(worker_id: &str, slot_tuner: Option<SlotTunerConfig>) -> Worke
 }
 
 async fn start_workflow(database_url: &str, workflow_id: &str) -> ExecutionId {
-    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     let mut conn = AsyncPgConnection::establish(database_url)
         .await
         .expect("connect");
+    start_workflow_on(&mut conn, workflow_id).await
+}
+
+/// Start one workflow on an open connection. A burst reuses one connection,
+/// so a slow runner does not pay a connection setup for each start.
+async fn start_workflow_on(conn: &mut AsyncPgConnection, workflow_id: &str) -> ExecutionId {
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     start_or_load_workflow_execution(
-        &mut conn,
+        conn,
         StartWorkflowParams {
             workflow_name: "slot_tuner_slow_workflow",
             workflow_id,
@@ -325,32 +331,43 @@ async fn tuner_grows_under_load_and_drains_cleanly() {
 
     // Enqueue a burst of workflows, each with one 400ms activity, well beyond
     // the initial 4-slot activity capacity, to sustain permit-wait pressure.
+    // One connection serves every start, so the burst arrives as a backlog.
+    let mut conn = AsyncPgConnection::establish(&db_url)
+        .await
+        .expect("connect");
     let mut exec_ids = Vec::new();
     for i in 0..24 {
-        exec_ids.push(start_workflow(&db_url, &format!("slot-tuner-grow-{i}")).await);
+        exec_ids.push(start_workflow_on(&mut conn, &format!("slot-tuner-grow-{i}")).await);
     }
 
     // Poll the recorded activity slot_target samples until we observe growth
-    // above the initial target of 4, or time out.
-    let grew = tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            let max_seen = recording
-                .activity_targets
-                .lock()
-                .unwrap()
-                .iter()
-                .copied()
-                .max()
-                .unwrap_or(0);
-            if max_seen > 4 {
-                return max_seen;
+    // above the initial target of 4, or time out. Until then, keep the load
+    // sustained. On a busy runner the first burst can drain before the
+    // permit wait reaches the grow threshold, so the tuner never sees it.
+    let max_activity_target = || {
+        recording
+            .activity_targets
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut next_batch = tokio::time::Instant::now() + Duration::from_millis(250);
+    while max_activity_target() <= 4 && tokio::time::Instant::now() < deadline {
+        if tokio::time::Instant::now() >= next_batch && exec_ids.len() < 96 {
+            for _ in 0..4 {
+                let id = format!("slot-tuner-grow-{}", exec_ids.len());
+                exec_ids.push(start_workflow_on(&mut conn, &id).await);
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            next_batch += Duration::from_millis(250);
         }
-    })
-    .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert!(
-        grew.is_ok(),
+        max_activity_target() > 4,
         "expected the tuner to grow the activity slot target above 4 under sustained load"
     );
 
