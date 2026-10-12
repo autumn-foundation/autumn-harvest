@@ -936,6 +936,29 @@ impl SqliteRuntime {
         }
     }
 
+    /// Run the query `name` on `exec` with `args` (issue #2022).
+    ///
+    /// Red-phase stub.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`SqliteError::Unsupported`].
+    pub fn query(
+        &self,
+        exec: ExecutionId,
+        name: &str,
+        args: Value,
+    ) -> impl std::future::Future<Output = SqliteResult<Value>> + Send + 'static {
+        let _ = (exec, args);
+        let name = name.to_string();
+        async move { Err(SqliteError::Unsupported(name)) }
+    }
+
+    /// Red-phase stub.
+    pub const fn set_query_timeout(&mut self, timeout: std::time::Duration) {
+        let _ = timeout;
+    }
+
     // ── Drivers ──────────────────────────────────────────────────────────────
 
     /// Drive `exec` to a terminal state or an external-input block, using the

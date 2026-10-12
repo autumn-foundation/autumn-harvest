@@ -197,6 +197,72 @@ pub enum SqliteError {
         details: String,
     },
 
+    /// The run has no query handler with this name (issue #2022).
+    ///
+    /// The replay registered every query the workflow reached before its
+    /// frontier. A query registered past the frontier is not yet known.
+    #[error("execution {execution_id} has no query handler named {name:?}")]
+    QueryNotFound {
+        /// The queried execution.
+        execution_id: ExecutionId,
+        /// The query name.
+        name: String,
+    },
+
+    /// The query handler returned an `Err` (issue #2022).
+    #[error("query {name:?} on execution {execution_id} failed: {details}")]
+    QueryFailed {
+        /// The queried execution.
+        execution_id: ExecutionId,
+        /// The query name.
+        name: String,
+        /// The handler's error.
+        details: String,
+    },
+
+    /// The query handler or the replayed workflow handler panicked
+    /// (issue #2022). The panic does not reach the caller. The run does not
+    /// change.
+    #[error("query {name:?} on execution {execution_id} panicked: {details}")]
+    QueryPanicked {
+        /// The queried execution.
+        execution_id: ExecutionId,
+        /// The query name.
+        name: String,
+        /// The panic message.
+        details: String,
+    },
+
+    /// The query replay did not stop before the query timeout (issue #2022).
+    ///
+    /// The usual cause is a workflow that spins on a non-Harvest future. Set
+    /// the timeout with
+    /// [`set_query_timeout`](crate::SqliteRuntime::set_query_timeout).
+    #[error("query {name:?} on execution {execution_id} timed out after {timeout_ms} ms")]
+    QueryTimedOut {
+        /// The queried execution.
+        execution_id: ExecutionId,
+        /// The query name.
+        name: String,
+        /// The timeout that elapsed.
+        timeout_ms: u64,
+    },
+
+    /// A terminal run cannot replay to its recorded end (issue #2022).
+    ///
+    /// The workflow code changed since the run executed, so the rebuilt
+    /// state does not match the history. The query serves no answer rather
+    /// than a wrong one.
+    #[error("query {name:?} on terminal execution {execution_id} is unavailable: {details}")]
+    QueryUnavailable {
+        /// The queried execution.
+        execution_id: ExecutionId,
+        /// The query name.
+        name: String,
+        /// Why the replay cannot serve.
+        details: String,
+    },
+
     /// A driven execution made no durable progress and could not be classified
     /// as waiting on a timer or a signal — surfaced honestly instead of looping.
     /// The most common cause is a task stranded `RUNNING` by a crash that the

@@ -31,3 +31,4 @@ mod subsecond_timer;
 mod unknown_execution_id;
 mod unsupported_terminal;
 mod workflow_info_features;
+mod workflow_queries;
