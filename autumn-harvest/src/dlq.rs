@@ -979,6 +979,22 @@ pub async fn replay_dead_letter_at(
 /// *scanned*; narrow with the SQL-expressible filters (queue/activity/workflow/
 /// time window/`min_attempts`) on large DLQs.
 ///
+/// Clone-class note: the six-filter chain (`activity_name` through
+/// `failed_before`) below repeats verbatim in [`query_dead_letters_for_bulk`].
+/// Apply any change to one of those filters to both functions.
+///
+/// Two instances only, co-changed together each time (issue #613 added
+/// `queue_name`/`min_attempts` to both in the same commit).
+///
+/// `api.rs`'s `apply_api_bulk_filters` applies the same predicate set over a
+/// richer type. jscpd does not pair it with either copy here. It is not a
+/// third textual instance, so the merge-evidence bar (rule of three, or a
+/// missed-fix) is not met yet.
+///
+/// PR #824 attempted this exact extraction. It was closed unmerged with no
+/// technical objection on record (stale, not rejected). Re-run jscpd before
+/// retrying it, so a new third instance or missed-fix is not missed.
+///
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`] on query failure.
@@ -1036,6 +1052,11 @@ pub async fn count_bulk_filter_matches(
 
 /// Query dead-letter rows matching `filter`, ordered oldest-first, up to
 /// `filter.effective_limit()` rows.
+///
+/// Clone-class note: the six-filter chain below repeats verbatim in
+/// [`count_bulk_filter_matches`]. Apply any change to one of those filters
+/// to both functions. Two instances only, so the merge-evidence bar is not
+/// met yet. See the note on `count_bulk_filter_matches`.
 async fn query_dead_letters_for_bulk(
     conn: &mut AsyncPgConnection,
     filter: &BulkDlqFilter,
