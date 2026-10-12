@@ -1066,6 +1066,8 @@ impl SqliteRuntime {
     /// - [`SqliteError::QueryTimedOut`]: the replay passes the query timeout.
     /// - [`SqliteError::QueryUnavailable`]: a terminal run cannot give a
     ///   stable answer.
+    /// - [`SqliteError::NonDeterministic`]: the workflow code changed, so the
+    ///   replay of a running run diverges. A drive returns the same error.
     /// - A persistence error: a row cannot be read.
     pub fn query(
         &self,

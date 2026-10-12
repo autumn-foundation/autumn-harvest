@@ -3795,7 +3795,15 @@ impl WorkflowContext {
     /// The read locks the matcher directly, so it runs no signal-handler
     /// pump. A pump here could dispatch a signal handler after the cycle
     /// ends. The read does not move the cursor.
-    pub(crate) fn first_unconsumed_command_event(&self) -> Option<(usize, String)> {
+    ///
+    /// The `SQLite` query replay uses it to refuse a drifted running run
+    /// (issue #2022), as the drive does.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher mutex is poisoned.
+    #[must_use]
+    pub fn first_unconsumed_command_event(&self) -> Option<(usize, String)> {
         self.matcher
             .lock()
             .expect("matcher lock poisoned")

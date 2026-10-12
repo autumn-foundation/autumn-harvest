@@ -8,7 +8,10 @@ nothing could call them. `SqliteRuntime::query(exec, name, args)` now does.
 - `query` reads the history, input and workflow ids of the run. It replays
   them with the core `drive_query_replay_async`, then calls the handler.
 - A running run answers with the state at its frontier, as the in-process
-  Postgres query does.
+  Postgres query does. If the workflow code changed, the replay diverges and
+  the query returns `NonDeterministic`, as a drive does. It does not serve
+  the state that the new code rebuilds. `WorkflowContext`'s
+  `first_unconsumed_command_event` is now public for this check.
 - A terminal run answers with the state at its recorded end. The core
   `classify_terminal_query` decides, as on the Postgres HTTP path (issue
   #612).

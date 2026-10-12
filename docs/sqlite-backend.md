@@ -419,6 +419,7 @@ The future resolves to one of these errors:
 | `QueryFailed` | The handler returned `Err`. |
 | `QueryPanicked` | The handler panicked, or the workflow panicked during the replay of a running run. |
 | `QueryTimedOut` | The replay passed the query timeout. The default is 5 s. Set it with `set_query_timeout`. The timeout holds only while the replay yields. |
+| `NonDeterministic` | The workflow code changed, so the replay of a running run diverges. A drive returns the same error. |
 | `QueryUnavailable` | A terminal run cannot give a stable answer. The workflow code changed, the replay panicked, or a seal for an unsupported feature or a history cap left side effects unrecorded. |
 | Other variants | A row cannot be read. |
 

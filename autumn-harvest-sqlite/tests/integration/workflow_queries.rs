@@ -151,6 +151,23 @@ async fn mints_until_capped(ctx: &WorkflowContext, _n: i64) -> Result<(), String
     }
 }
 
+/// Like `staged`, with a renamed activity. It models a code change.
+#[workflow]
+async fn renamed_activity(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    ctx.register_query("stage", || json!("renamed"));
+    ctx.execute_activity_raw("other", json!(1), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
+/// Like `staged`, with the activity removed. It models a code change.
+#[workflow]
+async fn skipped_activity(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    ctx.register_query("stage", || json!("skipped"));
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn temp_db() -> (tempfile::TempDir, PathBuf) {
@@ -697,6 +714,43 @@ async fn unrecorded_side_effect_on_a_capped_run_is_query_unavailable() {
             SqliteError::QueryUnavailable { execution_id, ref details, .. }
                 if execution_id == exec && details.contains("side-effect")
         ),
+        "got {err:?}"
+    );
+}
+
+/// Reopens a parked `staged` run under new code with the old name.
+async fn drifted_running_query(new_code: WorkflowInfo) -> (ExecutionId, SqliteError) {
+    let (_dir, path) = temp_db();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let exec = {
+        let mut rt = open_staged(&path, &calls);
+        parked_run(&mut rt).await
+    };
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&WorkflowInfo {
+        name: "staged",
+        ..new_code
+    });
+    let err = rt.query(exec, "stage", Value::Null).await.unwrap_err();
+    (exec, err)
+}
+
+/// A drive of drifted code returns `NonDeterministic`. A query on the same
+/// running run must not serve the state that the new code rebuilds.
+#[tokio::test]
+async fn drifted_running_run_is_non_deterministic() {
+    let (exec, err) = drifted_running_query(renamed_activity_info()).await;
+    assert!(
+        matches!(err, SqliteError::NonDeterministic { execution_id, .. } if execution_id == exec),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn running_run_that_skips_a_recorded_command_is_non_deterministic() {
+    let (exec, err) = drifted_running_query(skipped_activity_info()).await;
+    assert!(
+        matches!(err, SqliteError::NonDeterministic { execution_id, .. } if execution_id == exec),
         "got {err:?}"
     );
 }

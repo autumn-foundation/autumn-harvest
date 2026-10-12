@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use autumn_harvest::context::{WorkflowContext, empty_shared_state};
+use autumn_harvest::error::NonDeterministicDetails;
 use autumn_harvest::executor::{
     QueryReplayOutcome, TerminalQueryDecision, classify_terminal_query, drive_query_replay_async,
     history_reached_terminal_seal,
@@ -97,7 +98,7 @@ impl QueryReplay {
         let refusal = if self.terminal {
             terminal_refusal(&ctx, outcome, sealed)
         } else {
-            running_refusal(outcome)
+            running_refusal(&ctx, outcome)
         };
         if let Some(refusal) = refusal {
             return Err(refusal.into_error(exec, name, timeout));
@@ -120,6 +121,7 @@ enum Refusal {
     TimedOut,
     Panicked,
     Unavailable(&'static str),
+    Diverged(String),
 }
 
 impl Refusal {
@@ -140,18 +142,51 @@ impl Refusal {
                 name,
                 details: details.to_string(),
             },
+            Self::Diverged(details) => SqliteError::NonDeterministic {
+                execution_id,
+                details,
+            },
         }
     }
 }
 
 /// A running run serves the state at its frontier. This matches the
 /// in-process Postgres query.
-const fn running_refusal(outcome: QueryReplayOutcome) -> Option<Refusal> {
+///
+/// A drive of drifted code returns `NonDeterministic` and keeps the history.
+/// A query on the same run returns the same error. It does not serve the
+/// state that the new code rebuilds.
+fn running_refusal(ctx: &WorkflowContext, outcome: QueryReplayOutcome) -> Option<Refusal> {
     match outcome {
         QueryReplayOutcome::TimedOut => Some(Refusal::TimedOut),
         QueryReplayOutcome::Panicked => Some(Refusal::Panicked),
-        QueryReplayOutcome::ReachedTerminal | QueryReplayOutcome::Suspended => None,
+        QueryReplayOutcome::ReachedTerminal | QueryReplayOutcome::Suspended => {
+            if let Some(nd) = ctx.take_nd_details() {
+                return Some(Refusal::Diverged(divergence(&nd)));
+            }
+            // The worker runs the same check at each suspension (issue
+            // #1791). It counts command events only, so a pending signal or
+            // result is not drift.
+            ctx.first_unconsumed_command_event()
+                .map(|(index, recorded)| {
+                    Refusal::Diverged(format!(
+                        "the query replay skipped the recorded {recorded} at event {index}"
+                    ))
+                })
+        }
     }
+}
+
+/// Describe a divergence that the replay recorded.
+fn divergence(nd: &NonDeterministicDetails) -> String {
+    let at = nd
+        .event_index
+        .map_or_else(|| "an unknown event".to_string(), |i| format!("event {i}"));
+    format!(
+        "the query replay diverged from the recorded history at {at}: expected {}, got {}",
+        nd.expected.as_deref().unwrap_or("?"),
+        nd.actual.as_deref().unwrap_or("?"),
+    )
 }
 
 /// A terminal run serves the state at its recorded end. The core classifier
@@ -172,6 +207,9 @@ fn terminal_refusal(
             QueryReplayOutcome::Panicked => REPLAY_PANIC,
             _ => "the replay diverged from the recorded history",
         })),
+        TerminalQueryDecision::Serve if ctx.take_nd_details().is_some() => Some(
+            Refusal::Unavailable("the replay diverged from the recorded history"),
+        ),
         TerminalQueryDecision::Serve => {
             let minted = ctx.drain_commands().iter().any(|c| {
                 matches!(

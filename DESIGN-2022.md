@@ -58,6 +58,7 @@ nothing can call them. This change adds `SqliteRuntime::query`.
 | R11 | A seal for an unsupported feature or a history cap (issue #2023) rolls back its last cycle, side effects included. A replay mints new values, so each query answers differently. | A terminal replay that emits `RecordSideEffect` or `RecordMarker` is `QueryUnavailable`. A test covers it. |
 | R12 | A query fires a due timer. | The query never reads the timer queue. A test sets the clock past the deadline and compares the tables. |
 | R13 | Code past the last recorded event, a `side_effect` closure included, runs in each query. | Postgres does the same. The docs state it. A core replay-only mode is a follow-up. |
+| R14 | A running run with changed code serves the state the new code rebuilds. A drive returns `NonDeterministic` instead. | The query checks the recorded divergence and the first unconsumed command event, as the worker does (issue #1791). It returns `NonDeterministic`. Two tests cover a renamed and a skipped activity. |
 
 ### 0.4 Six thinking hats
 
@@ -68,7 +69,7 @@ nothing can call them. This change adds `SqliteRuntime::query`.
 - **Black (risks).** Five new error variants grow the enum. The returned
   future is a point-in-time read: it reads the rows at call time. The core
   does not catch an imperative handler panic, so this backend must. Review
-  found R11 and R13 after the first green phase.
+  found R11, R13 and R14 after the first green phase.
 - **Yellow (benefits).** Shared driver and classifier give parity with
   Postgres by construction. One process needs no routing to a worker.
 - **Green (alternatives).** A sync API on `drive_query_replay`. It
@@ -126,5 +127,6 @@ is polled.
 | An unrecorded side effect on a sealed run is `QueryUnavailable`. | R11 |
 | An unrecorded side effect on a history-capped run is `QueryUnavailable`. | R11 |
 | A continued-as-new run serves a stable answer. | R11 |
+| A running run with changed code is `NonDeterministic`. | R14 |
 | `ctx.info()` gives the stored workflow id and type. | — |
 | The future is `Send + 'static`. | R9 |
