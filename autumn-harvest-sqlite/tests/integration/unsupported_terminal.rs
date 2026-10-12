@@ -26,23 +26,25 @@ use autumn_harvest_sqlite::{
 };
 use serde_json::json;
 
-/// Counts runs of `spawns_child_counted` only. Other tests run in parallel in
-/// this binary, so they use `spawns_child` and never touch this counter.
+/// Counts runs of `runs_local_counted` only. Other tests run in parallel in
+/// this binary, so they use `runs_local` and never touch this counter.
 static COUNTED_RUNS: AtomicU32 = AtomicU32::new(0);
 
+/// A local activity is still outside the subset. Child workflows are
+/// supported since issue #2026, so they no longer serve as the example.
 #[workflow]
-async fn spawns_child_counted(ctx: &WorkflowContext, _n: i64) -> Result<serde_json::Value, String> {
+async fn runs_local_counted(ctx: &WorkflowContext, _n: i64) -> Result<serde_json::Value, String> {
     COUNTED_RUNS.fetch_add(1, Ordering::SeqCst);
-    ctx.spawn_child_workflow_raw("child", json!({}))
+    ctx.execute_local_activity_raw("local", json!({}), None, None)
         .await
         .map_err(|e| e.to_string())
 }
 
 #[workflow]
-async fn spawns_child(ctx: &WorkflowContext, _n: i64) -> Result<serde_json::Value, String> {
+async fn runs_local(ctx: &WorkflowContext, _n: i64) -> Result<serde_json::Value, String> {
     // A side effect in the same cycle. The rejected cycle must not keep it.
     let _id = ctx.new_uuid();
-    ctx.spawn_child_workflow_raw("child", json!({}))
+    ctx.execute_local_activity_raw("local", json!({}), None, None)
         .await
         .map_err(|e| e.to_string())
 }
@@ -119,17 +121,17 @@ fn assert_sealed_unsupported(rt: &SqliteRuntime, exec: ExecutionId, feature: &st
 }
 
 #[tokio::test]
-async fn a_child_workflow_ends_failed_with_a_typed_reason() {
+async fn a_local_activity_ends_failed_with_a_typed_reason() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&spawns_child_info());
-    let exec = rt.start_workflow("spawns_child", json!(0)).unwrap();
+    rt.register_workflow(&runs_local_info());
+    let exec = rt.start_workflow("runs_local", json!(0)).unwrap();
 
     let err = rt.run_until_blocked(exec).await.unwrap_err();
     assert!(
-        matches!(err, SqliteError::Unsupported(ref c) if c == "StartChildWorkflow"),
+        matches!(err, SqliteError::Unsupported(ref c) if c == "RunLocalActivity"),
         "the sealing drive still reports the reason: {err}"
     );
-    assert_sealed_unsupported(&rt, exec, "StartChildWorkflow");
+    assert_sealed_unsupported(&rt, exec, "RunLocalActivity");
 
     // The rejected cycle rolled back as a whole: no side effect survives.
     let history = rt.load_history(exec).unwrap();
@@ -140,14 +142,14 @@ async fn a_child_workflow_ends_failed_with_a_typed_reason() {
 #[tokio::test]
 async fn a_sealed_execution_is_not_driven_again() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&spawns_child_counted_info());
-    let exec = rt.start_workflow("spawns_child_counted", json!(0)).unwrap();
+    rt.register_workflow(&runs_local_counted_info());
+    let exec = rt.start_workflow("runs_local_counted", json!(0)).unwrap();
     let _ = rt.run_until_blocked(exec).await.unwrap_err();
     let runs = COUNTED_RUNS.load(Ordering::SeqCst);
 
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(
-        matches!(state, RunState::Failed(ref m) if m.contains("StartChildWorkflow")),
+        matches!(state, RunState::Failed(ref m) if m.contains("RunLocalActivity")),
         "a later drive reports the terminal state: {state:?}"
     );
     assert_eq!(
@@ -202,14 +204,14 @@ async fn an_unsupported_command_in_the_terminal_cycle_ends_failed() {
 #[tokio::test]
 async fn the_fleet_stops_reporting_a_sealed_execution() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&spawns_child_info());
+    rt.register_workflow(&runs_local_info());
     rt.register_workflow(&healthy_info());
-    let broken = rt.start_workflow("spawns_child", json!(0)).unwrap();
+    let broken = rt.start_workflow("runs_local", json!(0)).unwrap();
     let ok = rt.start_workflow("healthy", json!(4)).unwrap();
 
     let err = rt.poll_once().await.unwrap_err();
     assert!(matches!(err, SqliteError::Unsupported(_)), "{err}");
-    assert_sealed_unsupported(&rt, broken, "StartChildWorkflow");
+    assert_sealed_unsupported(&rt, broken, "RunLocalActivity");
     assert!(matches!(
         rt.outcome(ok).unwrap(),
         ExecutionOutcome::Completed(ref v) if v.as_i64() == Some(8)
@@ -226,14 +228,14 @@ async fn the_sealed_state_survives_a_reopen() {
     let path = dir.path().join("harvest.sqlite3");
     let exec = {
         let mut rt = SqliteRuntime::open(&path).unwrap();
-        rt.register_workflow(&spawns_child_info());
-        let exec = rt.start_workflow("spawns_child", json!(0)).unwrap();
+        rt.register_workflow(&runs_local_info());
+        let exec = rt.start_workflow("runs_local", json!(0)).unwrap();
         let _ = rt.run_until_blocked(exec).await.unwrap_err();
         exec
     };
 
     let rt = SqliteRuntime::open(&path).unwrap();
-    assert_sealed_unsupported(&rt, exec, "StartChildWorkflow");
+    assert_sealed_unsupported(&rt, exec, "RunLocalActivity");
 }
 
 /// Only an unsupported feature seals. A missing registration is fixable in
@@ -262,17 +264,17 @@ async fn an_unregistered_activity_does_not_seal_the_run() {
 }
 
 /// Races a quick activity against a long timer. The activity wins, and the
-/// same cycle meets an unsupported child. The cycle's loser cancellation rolls
-/// back with it, so only the seal can remove the timer row.
+/// same cycle meets an unsupported local activity. The cycle's loser
+/// cancellation rolls back with it, so only the seal can remove the timer row.
 #[workflow]
-async fn races_then_spawns_child(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
+async fn races_then_runs_local(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
     ctx.race()
         .activity_raw("quick", json!(1), "default")
         .timer(std::time::Duration::from_secs(3600))
         .run()
         .await
         .map_err(|e| e.to_string())?;
-    ctx.spawn_child_workflow_raw("child", json!({}))
+    ctx.execute_local_activity_raw("local", json!({}), None, None)
         .await
         .map(drop)
         .map_err(|e| e.to_string())
@@ -286,15 +288,15 @@ async fn sealing_removes_the_runs_outstanding_rows() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("harvest.sqlite3");
     let mut rt = SqliteRuntime::open(&path).unwrap();
-    rt.register_workflow(&races_then_spawns_child_info());
+    rt.register_workflow(&races_then_runs_local_info());
     rt.register_activity_raw("quick", ActivitySpec::new(1, Ok));
     let exec = rt
-        .start_workflow("races_then_spawns_child", json!(0))
+        .start_workflow("races_then_runs_local", json!(0))
         .unwrap();
 
     let err = rt.run_until_blocked(exec).await.unwrap_err();
     assert!(matches!(err, SqliteError::Unsupported(_)), "{err}");
-    assert_sealed_unsupported(&rt, exec, "StartChildWorkflow");
+    assert_sealed_unsupported(&rt, exec, "RunLocalActivity");
 
     let inspector = rusqlite::Connection::open(&path).unwrap();
     let count = |sql: &str| -> i64 {

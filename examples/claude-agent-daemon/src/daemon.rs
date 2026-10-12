@@ -1799,6 +1799,10 @@ async fn drive_one(
                 None,
             );
         }
+        // A session spawns no child, but the match must stay exhaustive.
+        Ok(RunState::WaitingWorkflow(other)) => {
+            note(blocked, exec, format!("waiting for run {other}"), None);
+        }
         Ok(RunState::Completed(output)) => {
             retire(blocked, live, exec);
             // The output holds the model's own answer, and this log reaches a

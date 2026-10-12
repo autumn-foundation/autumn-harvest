@@ -125,6 +125,11 @@ pub enum RunState {
     WaitingSignal(String),
     /// Blocked awaiting a durable timer that has not yet fired.
     WaitingTimer,
+    /// Blocked awaiting another run that is not terminal (issue #2026).
+    ///
+    /// The id names an awaited child or an `await_external_workflow` target.
+    /// Drive that run, or send it the input it waits for.
+    WaitingWorkflow(ExecutionId),
 }
 
 /// The stored, non-driving outcome of an execution — a pure read accessor.
