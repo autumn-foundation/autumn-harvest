@@ -559,6 +559,8 @@ The guard suite fails in these cases:
 - A Verus file uses `assume`, `admit`, `axiom`, `external_body` or another
   way to skip a step. The guard lexes the file and bans each name as an
   identifier, so a comment, a space or a `use` alias cannot hide it.
+  `cfg`, `cfg_attr` and `macro_rules` count too, because each can delete a
+  proof before Verus sees it.
 - `formal/verus/src/lib.rs` does not declare a module, so Verus never
   checks it.
 - `ci.yml` does not run the script on every PR.

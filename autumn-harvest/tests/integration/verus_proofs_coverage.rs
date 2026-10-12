@@ -34,6 +34,11 @@ const TRUST_ESCAPES: &[&str] = &[
     "external_type_specification",
     "assume_specification",
     "truncate",
+    // Conditional compilation and a local macro can delete a proof before
+    // Verus sees it, while the module still counts as declared.
+    "cfg",
+    "cfg_attr",
+    "macro_rules",
 ];
 
 /// One `// mirror:` marker.
@@ -46,50 +51,41 @@ struct Mirror {
     /// The function name in the engine file.
     source_fn: String,
     /// The normalized body of the Verus copy.
-    verus_body: String,
+    verus_body: Vec<String>,
 }
 
-/// Removes `//` comments. No mirrored body holds `//` inside a string.
-fn strip_comments(text: &str) -> String {
-    text.lines()
-        .map(|l| l.split("//").next().unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// The index just past the brace that closes the one at `open`.
-fn matching_brace(text: &str, open: usize) -> usize {
+/// The index of the `}` that closes the `{` at `open`.
+fn matching_brace(tokens: &[String], open: usize) -> usize {
     let mut depth = 0_usize;
-    for (i, c) in text[open..].char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
+    for (i, t) in tokens.iter().enumerate().skip(open) {
+        match t.as_str() {
+            "{" => depth += 1,
+            "}" => {
                 depth -= 1;
                 if depth == 0 {
-                    return open + i + 1;
+                    return i;
                 }
             }
             _ => {}
         }
     }
-    panic!("unbalanced braces after byte {open}");
+    panic!("unbalanced braces after token {open}");
 }
 
-/// The body of the first `fn <name>(` in `text`, with its braces.
+/// The body tokens of the first `fn <name>(` in `tokens`, with its braces.
 ///
 /// The body opens at the first `{` outside parentheses. A Verus `ensures`
 /// clause can hold a block, but only inside parentheses.
-fn fn_body(text: &str, name: &str) -> Option<String> {
-    let start = text.find(&format!("fn {name}("))?;
+fn fn_body(tokens: &[String], name: &str) -> Option<Vec<String>> {
+    let start = tokens
+        .windows(3)
+        .position(|w| w[0] == "fn" && w[1] == name && w[2] == "(")?;
     let mut parens = 0_i32;
-    for (i, c) in text[start..].char_indices() {
-        match c {
-            '(' => parens += 1,
-            ')' => parens -= 1,
-            '{' if parens == 0 => {
-                let open = start + i;
-                return Some(text[open..matching_brace(text, open)].to_string());
-            }
+    for (i, t) in tokens.iter().enumerate().skip(start) {
+        match t.as_str() {
+            "(" => parens += 1,
+            ")" => parens -= 1,
+            "{" if parens == 0 => return Some(tokens[i..=matching_brace(tokens, i)].to_vec()),
             _ => {}
         }
     }
@@ -97,40 +93,17 @@ fn fn_body(text: &str, name: &str) -> Option<String> {
 }
 
 /// Drops each `proof { ... }` block. Ghost code has no runtime effect.
-fn strip_proof_blocks(body: &str) -> String {
-    let mut out = body.to_string();
-    while let Some(at) = find_proof_block(&out) {
-        let open = at + out[at..].find('{').expect("a proof block has a brace");
-        let end = matching_brace(&out, open);
-        out.replace_range(at..end, "");
+fn strip_proof_blocks(mut body: Vec<String>) -> Vec<String> {
+    while let Some(at) = body.windows(2).position(|w| w[0] == "proof" && w[1] == "{") {
+        let end = matching_brace(&body, at + 1);
+        body.drain(at..=end);
     }
-    out
+    body
 }
 
-/// The byte index of the next `proof {` keyword in `text`.
-fn find_proof_block(text: &str) -> Option<usize> {
-    let mut from = 0;
-    while let Some(i) = text[from..].find("proof") {
-        let at = from + i;
-        let before_ok = text[..at]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
-        let after = text[at + "proof".len()..].trim_start();
-        if before_ok && after.starts_with('{') {
-            return Some(at);
-        }
-        from = at + 1;
-    }
-    None
-}
-
-/// A body with comments, ghost blocks and whitespace removed.
-fn normalize(body: &str) -> String {
-    strip_proof_blocks(&strip_comments(body))
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect()
+/// The tokens of a body, without comments, ghost blocks or whitespace.
+fn normalize(body: &[String]) -> Vec<String> {
+    strip_proof_blocks(body.to_vec())
 }
 
 fn read(rel: &str) -> String {
@@ -163,12 +136,13 @@ fn mirrors() -> Vec<Mirror> {
             let fields: Vec<&str> = line["// mirror: ".len()..].split_whitespace().collect();
             assert_eq!(fields.len(), 2, "{verus_file}: bad marker `{line}`");
             let after = &rest[at + line.len()..];
-            let copy = after
-                .find("fn ")
-                .map(|i| &after[i + 3..])
-                .and_then(|s| s.split('(').next())
+            let tokens = code_tokens(after);
+            let copy = tokens
+                .iter()
+                .position(|t| t == "fn")
+                .and_then(|i| tokens.get(i + 1))
                 .unwrap_or_else(|| panic!("{verus_file}: `{line}` precedes no fn"));
-            let body = fn_body(after, copy.trim())
+            let body = fn_body(&tokens, copy)
                 .unwrap_or_else(|| panic!("{verus_file}: no body for `{copy}`"));
             out.push(Mirror {
                 verus_file: verus_file.clone(),
@@ -182,25 +156,43 @@ fn mirrors() -> Vec<Mirror> {
     out
 }
 
+/// The normalized body of `fn f` in `src`.
+fn norm(src: &str) -> Vec<String> {
+    normalize(&fn_body(&code_tokens(src), "f").expect(src))
+}
+
 #[test]
 fn normalize_drops_comments_ghost_blocks_and_whitespace() {
-    let a = "{\n    let x = 1; // one\n    proof { lemma(x); }\n    x + 1\n}";
-    let b = "{ let x = 1;\n x + 1 }";
-    assert_eq!(normalize(a), normalize(b));
-    assert_ne!(normalize("{ x + 1 }"), normalize("{ x + 2 }"));
+    let a = "fn f() {\n    let x = 1; // one\n    proof { lemma(x); }\n    x + 1\n}";
+    let b = "fn f() { let x = 1;\n /* two */ x + 1 }";
+    assert_eq!(norm(a), norm(b));
+    assert_ne!(norm("fn f() { x + 1 }"), norm("fn f() { x + 2 }"));
     // A name that only starts with `proof` is code, not a ghost block.
-    assert_eq!(normalize("{ proofs { 1 } }"), "{proofs{1}}");
+    assert_eq!(norm("fn f() { proofs { 1 } }").concat(), "{proofs{1}}");
+    // A literal keeps its text, and a `//` inside it starts no comment.
+    assert_ne!(
+        norm("fn f() { let s = \"//\"; good() }"),
+        norm("fn f() { let s = \"//\"; bad() }")
+    );
+    assert_ne!(norm("fn f() { \"a\" }"), norm("fn f() { \"b\" }"));
+    // A brace inside a literal or a comment does not end the body.
+    assert_eq!(
+        norm("fn f() { let s = \"}\"; /* } */ g() }").concat(),
+        "{lets=\"}\";g()}"
+    );
 }
 
 #[test]
 fn fn_body_skips_blocks_inside_an_ensures_clause() {
+    let body = |src: &str, name: &str| fn_body(&code_tokens(src), name).map(|b| b.concat());
     let text = "fn f(x: u8) -> (r: u8)\n    ensures ({ let y = x; r == y }),\n{\n    x\n}\n";
-    assert_eq!(fn_body(text, "f").as_deref(), Some("{\n    x\n}"));
+    assert_eq!(body(text, "f").as_deref(), Some("{x}"));
     assert_eq!(
-        fn_body("const fn g() -> u8 { 1 }", "g").as_deref(),
-        Some("{ 1 }")
+        body("const fn g() -> u8 { 1 }", "g").as_deref(),
+        Some("{1}")
     );
-    assert_eq!(fn_body("fn g() {}", "h"), None);
+    assert_eq!(body("fn g() {}", "h"), None);
+    assert_eq!(body("// fn h() { 1 }\nfn g() {}", "h"), None);
 }
 
 #[test]
@@ -216,7 +208,7 @@ fn verus_crate_holds_mirrors() {
 fn every_verus_mirror_matches_its_engine_source() {
     for m in mirrors() {
         let source = read(&m.source_file);
-        let body = fn_body(&source, &m.source_fn).unwrap_or_else(|| {
+        let body = fn_body(&code_tokens(&source), &m.source_fn).unwrap_or_else(|| {
             panic!(
                 "{}: `{}` mirrors `fn {}`, which is gone",
                 m.verus_file, m.source_file, m.source_fn
@@ -248,9 +240,9 @@ fn every_mirrored_source_names_its_verus_proof() {
     }
 }
 
-/// The tokens of `src` in order. A token is an identifier or one
-/// punctuation char. Comments, nested block comments and whitespace yield
-/// none. A string, raw string or char literal yields the token `<lit>`.
+/// The tokens of `src` in order. A token is an identifier, one punctuation
+/// char, or a whole string, raw string or char literal with its quotes.
+/// Comments, nested block comments and whitespace yield none.
 fn code_tokens(src: &str) -> Vec<String> {
     let c: Vec<char> = src.chars().collect();
     let at = |i: usize| c.get(i).copied().unwrap_or('\0');
@@ -258,6 +250,7 @@ fn code_tokens(src: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut i = 0;
     while i < c.len() {
+        let from = i;
         match (c[i], at(i + 1)) {
             ('/', '/') => {
                 while i < c.len() && c[i] != '\n' {
@@ -289,7 +282,7 @@ fn code_tokens(src: &str) -> Vec<String> {
                     i += if c[i] == '\\' { 2 } else { 1 };
                 }
                 i += 1;
-                tokens.push(LITERAL.to_owned());
+                tokens.push(c[from..i.min(c.len())].iter().collect());
             }
             // A char literal. A lifetime has no closing quote, so it
             // falls through and its name lexes as an identifier.
@@ -299,11 +292,11 @@ fn code_tokens(src: &str) -> Vec<String> {
                     i += if c[i] == '\\' { 2 } else { 1 };
                 }
                 i += 1;
-                tokens.push(LITERAL.to_owned());
+                tokens.push(c[from..i.min(c.len())].iter().collect());
             }
             ('\'', _) if at(i + 2) == '\'' => {
                 i += 3;
-                tokens.push(LITERAL.to_owned());
+                tokens.push(c[from..i.min(c.len())].iter().collect());
             }
             (ch, _) if is_ident(ch) => {
                 let start = i;
@@ -326,7 +319,7 @@ fn code_tokens(src: &str) -> Vec<String> {
                             i += 1;
                         }
                         i += 1 + hashes;
-                        tokens.push(LITERAL.to_owned());
+                        tokens.push(c[from..i.min(c.len())].iter().collect());
                         continue;
                     }
                 }
@@ -342,9 +335,6 @@ fn code_tokens(src: &str) -> Vec<String> {
     }
     tokens
 }
-
-/// The token that [`code_tokens`] yields for a literal.
-const LITERAL: &str = "<lit>";
 
 /// The first trust escape in `code`, if any.
 fn trust_escape(code: &str) -> Option<&'static str> {
