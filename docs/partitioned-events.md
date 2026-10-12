@@ -211,6 +211,16 @@ the sweeper find a cohort whose rows are all orphaned and drop it. A failed
 archive leaves the execution in place — and therefore leaves its partition in
 place too.
 
+### Export before the drop (issue #2009)
+
+The partition export is a separate trait, `PartitionArchiver`, not the
+`HistoryArchiver` above. With one set, the sweep exports a droppable
+partition, reads it back, and checks it. The drop then computes a row
+checksum under its `SHARE` lock. It drops only when the checksum matches the
+export. A failure keeps the partition and goes into `blocked`. After the
+first export, a sweep with no archiver on that shard drops nothing. See
+[Partition export](archival.md#partition-export-issue-2009).
+
 ---
 
 ## What it costs
@@ -565,6 +575,22 @@ The sweeper reports every cohort it considered and left alone, with the reason:
   or a competing maintenance pass is holding the partition, or the
   authoritative re-check taken under `SHARE` found an owner that appeared after
   the gate ran. Expected under load, and self-correcting.
+- `export failed: ...` — a `PartitionArchiver` is set and the upload or the
+  read-back failed (issue #2009). Only the retention runtime exports, so
+  this reason shows in `GET /admin/retention`, not in
+  `harvest partition status`. Check the backend. The next tick tries again.
+- `changed since export` — a row changed between the export and the drop
+  (issue #2009). The sweep exports the partition again.
+- `export check exceeded its budget` — the row checksum under `SHARE` ran
+  past `exact_scan_timeout` (issue #2009). Raise the timeout or narrow the
+  cohort width.
+- `export required, but no archiver is set` — this shard exported before,
+  and this sweep has no archiver (issue #2009). `harvest partition maintain`
+  reports it on such a shard. Nothing drops until a process with the
+  archiver sweeps, or until you delete the row in `harvest_partition_export`.
+- `another process holds the export lock of this shard` — an exporter holds
+  the lock exclusive, or a sweep with no archiver holds it shared (issue
+  #2009). Expected with more than one runner. The next pass tries again.
 - `unbounded upper bound` — a partition with no upper bound, which this engine
   never creates. It means something else attached one by hand; it can never be
   swept.

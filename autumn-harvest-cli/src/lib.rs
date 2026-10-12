@@ -391,6 +391,10 @@ pub enum PartitionCommand {
     /// sweeps droppable cohorts. The retention janitor does exactly this every
     /// tick; this exists for incident response and for a deployment that runs
     /// with history retention disabled (where no janitor is running to do it).
+    ///
+    /// This command never exports a partition. On a shard whose engine exports
+    /// aged partitions (issue #2009), it drops nothing and reports
+    /// `export required, but no archiver is set`.
     Maintain {
         /// A shard database DSN. Repeat once per shard.
         #[arg(long = "shard", value_name = "DSN", required = true)]
