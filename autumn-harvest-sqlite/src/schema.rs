@@ -59,9 +59,12 @@ CREATE TABLE IF NOT EXISTS harvest_executions (
                                            -- distinct per run (mirrors the Postgres worker,
                                            -- which injects StartWorkflowParams.workflow_id).
     input_json    TEXT NOT NULL,
-    state         TEXT NOT NULL,          -- RUNNING | COMPLETED | FAILED
+    state         TEXT NOT NULL,          -- RUNNING | COMPLETED | FAILED | CANCELLED
     output_json   TEXT,
-    error         TEXT
+    error         TEXT,
+    parent_exec_id      TEXT,             -- the parent run of a child (issue #2026)
+    parent_close_policy TEXT              -- NULL for an awaited child; the policy of a
+                                          -- detached child
 );
 
 -- Non-unique lookup index for the (workflow_name, workflow_id) reuse-policy probe
@@ -193,7 +196,8 @@ CREATE TABLE IF NOT EXISTS harvest_signals (
     name         TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     delivered    INTEGER NOT NULL DEFAULT 0,
-    received_at  INTEGER NOT NULL DEFAULT 0   -- absolute epoch-millisecond the signal arrived
+    received_at  INTEGER NOT NULL DEFAULT 0,  -- absolute epoch-millisecond the signal arrived
+    idempotency_key TEXT                      -- dedup key of an external signal (issue #2026)
 );
 
 -- Without this, every exec_id/delivered-scoped query here (peek_pending_signal,
@@ -234,6 +238,10 @@ use crate::error::SqliteResult;
 /// data.
 ///
 /// Current migrations:
+/// - **issue #2026** — `harvest_executions.parent_exec_id` and
+///   `parent_close_policy` link a child to its parent. `harvest_signals.idempotency_key`
+///   holds the dedup key of an external signal. All are nullable. Their indexes
+///   are built here, after the columns exist.
 /// - **issue #1068** — `harvest_tasks.schedule_to_close_at` (the frozen absolute
 ///   total-deadline column) and `harvest_tasks.defaults_frozen` (the
 ///   resolved-defaults flag). Both are nullable/defaulted, so a pre-#1068 row is
@@ -257,6 +265,33 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
         "harvest_tasks",
         "defaults_frozen",
         "ALTER TABLE harvest_tasks ADD COLUMN defaults_frozen INTEGER NOT NULL DEFAULT 0",
+    )?;
+    // issue #2026: the parent link and the external signal dedup key.
+    add_column_if_absent(
+        conn,
+        "harvest_executions",
+        "parent_exec_id",
+        "ALTER TABLE harvest_executions ADD COLUMN parent_exec_id TEXT",
+    )?;
+    add_column_if_absent(
+        conn,
+        "harvest_executions",
+        "parent_close_policy",
+        "ALTER TABLE harvest_executions ADD COLUMN parent_close_policy TEXT",
+    )?;
+    add_column_if_absent(
+        conn,
+        "harvest_signals",
+        "idempotency_key",
+        "ALTER TABLE harvest_signals ADD COLUMN idempotency_key TEXT",
+    )?;
+    // An index on a new column must follow its `ADD COLUMN`. In `SCHEMA` it
+    // would fail on an old file, which still lacks the column.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_harvest_executions_parent \
+             ON harvest_executions (parent_exec_id);\n\
+         CREATE INDEX IF NOT EXISTS idx_harvest_signals_idem \
+             ON harvest_signals (exec_id, idempotency_key);",
     )?;
     Ok(())
 }
@@ -343,6 +378,8 @@ mod tests {
         assert!(!column_exists(&conn, "harvest_tasks", "schedule_to_close_at").unwrap());
         assert!(!column_exists(&conn, "harvest_tasks", "defaults_frozen").unwrap());
 
+        // An open applies `SCHEMA` first. It keeps the old `harvest_tasks`.
+        conn.execute_batch(SCHEMA).unwrap();
         migrate(&conn).unwrap();
 
         assert!(column_exists(&conn, "harvest_tasks", "schedule_to_close_at").unwrap());
@@ -362,5 +399,50 @@ mod tests {
             frozen, 0,
             "a migrated row is treated as defaults-not-yet-frozen"
         );
+    }
+
+    // The pre-#2026 `harvest_executions` and `harvest_signals` shapes.
+    const OLD_COMPOSITION_DDL: &str = "\
+        CREATE TABLE harvest_executions (\
+            exec_id TEXT PRIMARY KEY, workflow_name TEXT NOT NULL, \
+            workflow_id TEXT NOT NULL DEFAULT '', input_json TEXT NOT NULL, \
+            state TEXT NOT NULL, output_json TEXT, error TEXT);\
+        CREATE TABLE harvest_signals (\
+            signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, exec_id TEXT NOT NULL, \
+            name TEXT NOT NULL, payload_json TEXT NOT NULL, \
+            delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0);\
+        INSERT INTO harvest_executions (exec_id, workflow_name, input_json, state) \
+            VALUES ('e1', 'wf', '{}', 'RUNNING');";
+
+    // Issue #2026: an old file gains the parent link and the signal key. Its
+    // rows survive, and a pre-#2026 run reads as top-level.
+    #[test]
+    fn migrate_adds_composition_columns_to_an_old_file() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(OLD_COMPOSITION_DDL).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        assert!(!column_exists(&conn, "harvest_executions", "parent_exec_id").unwrap());
+
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        for (table, column) in [
+            ("harvest_executions", "parent_exec_id"),
+            ("harvest_executions", "parent_close_policy"),
+            ("harvest_signals", "idempotency_key"),
+        ] {
+            assert!(
+                column_exists(&conn, table, column).unwrap(),
+                "{table}.{column}"
+            );
+        }
+        let parent: Option<String> = conn
+            .query_row(
+                "SELECT parent_exec_id FROM harvest_executions WHERE exec_id = 'e1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent, None);
     }
 }

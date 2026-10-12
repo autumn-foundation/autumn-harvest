@@ -23,7 +23,7 @@ use serde_json::Value;
 
 use crate::error::{SqliteError, SqliteResult};
 use crate::lock::WriterLock;
-use crate::{lock, queue, schema, store, worker};
+use crate::{composition, lock, queue, schema, store, worker};
 
 /// The activity body a workflow's `execute_activity_raw(name, ...)` resolves to.
 ///
@@ -977,14 +977,10 @@ impl SqliteRuntime {
         // it does not borrow `self` across the `&mut self` cycle call).
         let now_fn = self.now_fn.clone();
         let failure_now = move || now_fn().timestamp_millis();
-        for _ in 0..MAX_ITERATIONS {
-            let now = (self.now_fn)().timestamp_millis();
-            match self.drive_one_cycle(exec, now, &failure_now).await? {
-                RunState::InProgress => {}
-                terminal_or_blocked => return Ok(terminal_or_blocked),
-            }
-        }
-        Err(SqliteError::Stuck(exec))
+        let now_fn = self.now_fn.clone();
+        let cycle_now = move || now_fn().timestamp_millis();
+        self.drive_until_blocked(exec, &cycle_now, &failure_now)
+            .await
     }
 
     /// Like [`run_until_blocked`](Self::run_until_blocked) but with an injected
@@ -1022,13 +1018,72 @@ impl SqliteRuntime {
         // so a policy retry's backoff anchor is byte-identical to a wall-clock cycle
         // with an instant body — deterministic, sleep-free (Codex #1069 P2).
         let failure_now = move || now;
+        self.drive_until_blocked(exec, &failure_now, &failure_now)
+            .await
+    }
+
+    /// Drive `root` until it is terminal or blocked, and drive in the same call
+    /// each run it waits on (issue #2026).
+    ///
+    /// A cycle that parks on a `RUNNING` child or await target returns
+    /// [`RunState::WaitingWorkflow`]. That run is local work, not an external
+    /// input, so it goes on a stack and is driven next. When it ends, its
+    /// waiter is driven again and sees the result.
+    ///
+    /// When a run on the stack blocks, the root returns
+    /// `WaitingWorkflow` naming the run it waits on directly. A run that is
+    /// already on the stack is never pushed again, so two runs that wait on
+    /// each other block instead of spinning.
+    ///
+    /// An error from the root returns at once. An error from a waited-on run
+    /// returns too, unless that run is now terminal. A sealed run is terminal,
+    /// and its waiter records the typed failure, so the drive goes on.
+    async fn drive_until_blocked(
+        &mut self,
+        root: ExecutionId,
+        cycle_now: &(dyn Fn() -> i64 + Send + Sync),
+        failure_now: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> SqliteResult<RunState> {
+        let mut stack = vec![root];
         for _ in 0..MAX_ITERATIONS {
-            match self.drive_one_cycle(exec, now, &failure_now).await? {
-                RunState::InProgress => {}
-                terminal_or_blocked => return Ok(terminal_or_blocked),
+            let Some(&exec) = stack.last() else {
+                break;
+            };
+            let result = self.drive_one_cycle(exec, cycle_now(), failure_now).await;
+            if exec == root {
+                match result? {
+                    RunState::WaitingWorkflow(target) if !stack.contains(&target) => {
+                        stack.push(target);
+                    }
+                    RunState::InProgress => {}
+                    terminal_or_blocked => return Ok(terminal_or_blocked),
+                }
+                continue;
+            }
+            match result {
+                Ok(RunState::InProgress) => {}
+                Ok(RunState::WaitingWorkflow(target)) if !stack.contains(&target) => {
+                    stack.push(target);
+                }
+                Ok(RunState::Completed(_) | RunState::Failed(_)) => {
+                    stack.pop();
+                }
+                Ok(_) => return Ok(RunState::WaitingWorkflow(stack[1])),
+                Err(err) => {
+                    let state = store::execution_state(&self.conn, exec)?;
+                    if !autumn_harvest::erase::is_terminal_state(&state) {
+                        return Err(err);
+                    }
+                    tracing::warn!(
+                        execution_id = %exec,
+                        error = %err,
+                        "a waited-on run ended with an error; its waiter records the failure"
+                    );
+                    stack.pop();
+                }
             }
         }
-        Err(SqliteError::Stuck(exec))
+        Err(SqliteError::Stuck(root))
     }
 
     /// Drive every non-terminal execution one cycle, using the real wall clock
@@ -1099,7 +1154,11 @@ impl SqliteRuntime {
             }
             let now = (self.now_fn)().timestamp_millis();
             match self.drive_one_cycle(exec, now, &failure_now).await {
-                Ok(RunState::WaitingSignal(_) | RunState::WaitingTimer) => {}
+                Ok(
+                    RunState::WaitingSignal(_)
+                    | RunState::WaitingTimer
+                    | RunState::WaitingWorkflow(_),
+                ) => {}
                 Ok(_) => progress = true,
                 Err(err) => {
                     skip.insert(exec);
@@ -1129,7 +1188,11 @@ impl SqliteRuntime {
         let mut first_error = None;
         for exec in store::running_executions(&self.conn)? {
             match self.drive_one_cycle(exec, now, &failure_now).await {
-                Ok(RunState::WaitingSignal(_) | RunState::WaitingTimer) => {}
+                Ok(
+                    RunState::WaitingSignal(_)
+                    | RunState::WaitingTimer
+                    | RunState::WaitingWorkflow(_),
+                ) => {}
                 Ok(_) => progress = true,
                 Err(err) => record_fleet_error(exec, err, &mut first_error),
             }
@@ -1234,9 +1297,9 @@ impl SqliteRuntime {
         // The cycle's own cleanup, such as a race's loser cancellation, rolled
         // back with the cycle. This backend has no retention pass, so remove
         // the work no one can use any more, as the `TerminateIfRunning` seal does.
-        queue::delete_pending_tasks_for_execution(&tx, exec)?;
-        queue::delete_unfired_timers_for_execution(&tx, exec)?;
-        queue::delete_undelivered_signals_for_execution(&tx, exec)?;
+        composition::release_open_work(&tx, exec)?;
+        // A parent that awaits this run gets the typed failure (issue #2026).
+        composition::close_execution(&tx, exec, &event)?;
         tx.commit()?;
         self.workflow_panic_strikes.remove(&exec);
         Ok(())
@@ -1320,7 +1383,8 @@ impl SqliteRuntime {
         // dedicated parameter on this entry point — the core reads it ONLY from
         // `span_meta.workflow_id`, so build a minimal meta carrying it (see
         // [`drive_span_meta`]).
-        let span_meta = drive_span_meta(&workflow_name, &workflow_id);
+        let parent = store::parent_link(&self.conn, exec)?.map(|(parent, _)| parent);
+        let span_meta = drive_span_meta(&workflow_name, &workflow_id, parent);
         let (outcome, pending, _span, _resolved_router) =
             run_workflow_with_state_history_policy_and_caps(
                 exec,
@@ -1384,15 +1448,20 @@ impl SqliteRuntime {
                 // Persist terminal-cycle bookkeeping (issue #1068) BEFORE the
                 // terminal event, in command order, inside the SAME transaction —
                 // mirroring the Postgres `persist_terminal_outcome_commands`.
-                persist_terminal_pending_commands(&tx, exec, &pending)?;
-                store::append_event(
+                persist_terminal_pending_commands(
                     &tx,
+                    &self.workflows,
                     exec,
-                    &WorkflowEvent::WorkflowCompleted {
-                        output: output.clone(),
-                    },
+                    &history,
+                    &pending,
+                    TerminalCycle::Completing,
                 )?;
+                let terminal = WorkflowEvent::WorkflowCompleted {
+                    output: output.clone(),
+                };
+                store::append_event(&tx, exec, &terminal)?;
                 store::set_completed(&tx, exec, &output)?;
+                composition::close_execution(&tx, exec, &terminal)?;
                 tx.commit()?;
                 Ok(RunState::Completed(output))
             }
@@ -1439,9 +1508,18 @@ impl SqliteRuntime {
                 // fields `None`, so its stored form is unchanged.
                 let decoded = autumn_harvest::failure::decode_workflow_failure(&error);
                 let tx = self.conn.transaction()?;
-                persist_terminal_pending_commands(&tx, exec, &pending)?;
-                store::append_event(&tx, exec, &WorkflowEvent::workflow_failed_typed(&decoded))?;
+                persist_terminal_pending_commands(
+                    &tx,
+                    &self.workflows,
+                    exec,
+                    &history,
+                    &pending,
+                    TerminalCycle::Failing,
+                )?;
+                let terminal = WorkflowEvent::workflow_failed_typed(&decoded);
+                store::append_event(&tx, exec, &terminal)?;
                 store::set_failed(&tx, exec, &decoded.message)?;
+                composition::close_execution(&tx, exec, &terminal)?;
                 tx.commit()?;
                 Ok(RunState::Failed(decoded.message))
             }
@@ -1661,6 +1739,17 @@ impl SqliteRuntime {
                         produced = true;
                     }
                 }
+                // Composition (issue #2026). The `composition` module resolves
+                // each of these in this cycle transaction.
+                cmd @ (WorkflowCommand::StartChildWorkflow { .. }
+                | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
+                | WorkflowCommand::SignalExternalWorkflow { .. }
+                | WorkflowCommand::RequestCancelExternalWorkflow { .. }
+                | WorkflowCommand::AwaitExternalWorkflow { .. }) => {
+                    if composition::apply_command(&tx, &self.workflows, exec, history, cmd, now)? {
+                        produced = true;
+                    }
+                }
                 // Cancellable durable timers (issue #768) — a v0.1 non-goal.
                 // Reject LOUDLY and by NAME with an actionable message pointing at
                 // the supported fire-once `ctx.timer(...)`, rather than letting them
@@ -1670,9 +1759,8 @@ impl SqliteRuntime {
                 cmd @ (WorkflowCommand::ArmTimer { .. } | WorkflowCommand::CancelTimer { .. }) => {
                     return Err(cancellable_timer_unsupported(cmd));
                 }
-                // Every OTHER unsupported command (child workflows, external
-                // activities/signals/cancels, local activities, updates, search
-                // attributes, detached children) is rejected BY NAME via
+                // Every OTHER unsupported command (external activities, local
+                // activities, updates, search attributes) is rejected BY NAME via
                 // `command_name` — no opaque `"Unknown"` for any current variant
                 // (Codex #1069 P2, `runtime.rs:840`). Dropping `tx` here
                 // (un-committed) rolls back the whole batch — an unsupported command
@@ -1702,6 +1790,11 @@ impl SqliteRuntime {
         exec: ExecutionId,
         commands: &[WorkflowCommand],
     ) -> SqliteResult<RunState> {
+        // A wait on another run comes first: the driver can drive that run
+        // itself (issue #2026). The other waits need input from outside.
+        if let Some(target) = composition::awaited_running_run(&self.conn, commands)? {
+            return Ok(RunState::WaitingWorkflow(target));
+        }
         for cmd in commands {
             if let WorkflowCommand::WaitForSignal { signal_name, .. } = cmd {
                 return Ok(RunState::WaitingSignal(signal_name.clone()));
@@ -1756,8 +1849,10 @@ impl SqliteRuntime {
             self.workflow_panic_strikes.remove(&exec);
             let decoded = autumn_harvest::failure::decode_workflow_failure(error);
             let tx = self.conn.transaction()?;
-            store::append_event(&tx, exec, &WorkflowEvent::workflow_failed_typed(&decoded))?;
+            let terminal = WorkflowEvent::workflow_failed_typed(&decoded);
+            store::append_event(&tx, exec, &terminal)?;
             store::set_failed(&tx, exec, &decoded.message)?;
+            composition::close_execution(&tx, exec, &terminal)?;
             tx.commit()?;
             Ok(RunState::Failed(decoded.message))
         } else {
@@ -2000,14 +2095,11 @@ fn cancel_and_seal_prior(
     prior_exec: ExecutionId,
     prior_state: &str,
 ) -> SqliteResult<()> {
-    if prior_state == "RUNNING" {
-        store::append_event(
-            conn,
-            prior_exec,
-            &WorkflowEvent::WorkflowCancelled {
-                reason: "superseded by a TerminateIfRunning start (#1068)".to_string(),
-            },
-        )?;
+    let cancelled = (prior_state == "RUNNING").then(|| WorkflowEvent::WorkflowCancelled {
+        reason: "superseded by a TerminateIfRunning start (#1068)".to_string(),
+    });
+    if let Some(event) = &cancelled {
+        store::append_event(conn, prior_exec, event)?;
         queue::delete_pending_tasks_for_execution(conn, prior_exec)?;
         queue::delete_unfired_timers_for_execution(conn, prior_exec)?;
     }
@@ -2015,6 +2107,11 @@ fn cancel_and_seal_prior(
     // a prior that reached COMPLETED/FAILED on its own, not only a cancelled one.
     queue::delete_undelivered_signals_for_execution(conn, prior_exec)?;
     store::seal_execution(conn, prior_exec, SEALED_STATE)?;
+    // A RUNNING prior closes here, so settle its parent and its detached
+    // children (issue #2026). A terminal prior settled them when it ended.
+    if let Some(event) = &cancelled {
+        composition::close_execution(conn, prior_exec, event)?;
+    }
     Ok(())
 }
 
@@ -2108,6 +2205,15 @@ pub fn persist_started_timer(
     Ok(())
 }
 
+/// How a terminal cycle ends. Only a failing cycle records an abandoned child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalCycle {
+    /// The workflow returned `Ok`.
+    Completing,
+    /// The workflow returned `Err`.
+    Failing,
+}
+
 /// Persist a terminal cycle's drained bookkeeping commands (issue #1068).
 ///
 /// A `RecordSideEffect`/`RecordMarker` emitted in the SAME decision cycle a
@@ -2127,11 +2233,55 @@ pub fn persist_started_timer(
 /// far this cycle. It is never silently dropped.
 fn persist_terminal_pending_commands(
     conn: &Connection,
+    workflows: &HashMap<String, WorkflowHandlerFn>,
     exec: ExecutionId,
+    history: &[WorkflowEvent],
     pending: &[WorkflowCommand],
+    cycle: TerminalCycle,
 ) -> SqliteResult<()> {
     for cmd in pending {
         match cmd {
+            // A detached spawn in the terminal cycle starts its child before the
+            // parent's terminal event, as on Postgres (issue #2026). The close
+            // then applies the child's parent-close policy.
+            WorkflowCommand::SpawnDetachedChildWorkflow {
+                child_id,
+                workflow_name,
+                input,
+                parent_close_policy,
+            } => {
+                composition::start_child(
+                    conn,
+                    workflows,
+                    exec,
+                    history,
+                    *child_id,
+                    workflow_name,
+                    input,
+                    Some(*parent_close_policy),
+                )?;
+            }
+            // A failing cycle that dropped a fresh child dispatch records it as
+            // abandoned (issue #952). A completing cycle, or a re-park of a
+            // started child, records nothing.
+            WorkflowCommand::StartChildWorkflow {
+                child_id,
+                workflow_name,
+                input,
+                ..
+            } => {
+                if cycle == TerminalCycle::Failing {
+                    composition::record_abandoned_child(
+                        conn,
+                        exec,
+                        history,
+                        *child_id,
+                        workflow_name,
+                        input,
+                    )?;
+                }
+            }
+
             WorkflowCommand::RecordMarker { name, details } => {
                 store::append_event(
                     conn,
@@ -2171,7 +2321,12 @@ fn persist_terminal_pending_commands(
             // Benign bookkeeping — appends no event, gates no control flow.
             // `PublishProgress` (issue #791) is an ephemeral Postgres-only
             // LISTEN/NOTIFY side channel — a benign NO-OP on this backend.
-            WorkflowCommand::WaitForActivity { .. }
+            // The cycle never ran an outbound signal, cancel or await, so it
+            // records none of them (issue #2026). Postgres does the same.
+            WorkflowCommand::SignalExternalWorkflow { .. }
+            | WorkflowCommand::RequestCancelExternalWorkflow { .. }
+            | WorkflowCommand::AwaitExternalWorkflow { .. }
+            | WorkflowCommand::WaitForActivity { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
             // Durable workflow logs (issue #790) — Postgres-only sink; a benign
@@ -2217,11 +2372,9 @@ fn persist_terminal_pending_commands(
 ///   future replay resolves that branch to a terminal instead of looping on
 ///   `ActivityInProgress`. An activity that genuinely completed first is `DONE`,
 ///   is left untouched, and keeps its real `ActivityCompleted`.
-/// - `children`: child-workflow races are OUT of the single-writer subset
-///   (`StartChildWorkflow` is [`SqliteError::Unsupported`]), so a child race can
-///   never have been dispatched on this backend and `children` is always empty. A
-///   non-empty `children` is rejected LOUDLY rather than silently dropping a loser
-///   the core would have cancelled.
+/// - `children`: cancel each still-`RUNNING` losing child (issue #2026). The
+///   child ends `CANCELLED`, and this parent records `ChildWorkflowFailed` with
+///   the text `child workflow cancelled: lost race to a sibling branch`.
 fn apply_cancel_race_losers(
     conn: &Connection,
     exec: ExecutionId,
@@ -2229,13 +2382,15 @@ fn apply_cancel_race_losers(
     children: &[ExecutionId],
     timers: &[TimerId],
 ) -> SqliteResult<bool> {
-    if !children.is_empty() {
-        return Err(SqliteError::Unsupported(
-            "CancelRaceLosers.children — child-workflow races are outside the sqlite subset"
-                .to_string(),
-        ));
-    }
     let mut changed = false;
+    // A losing child is cancelled, as on Postgres (issue #2026). Its close then
+    // writes the untyped `ChildWorkflowFailed` to this parent.
+    for child in children {
+        if store::execution_state(conn, *child)? == "RUNNING" {
+            composition::cancel_execution(conn, *child, composition::RACE_LOSER_REASON)?;
+            changed = true;
+        }
+    }
     for timer_id in timers {
         if queue::delete_pending_timer(conn, exec, &timer_id.to_string())? {
             changed = true;
@@ -2291,15 +2446,18 @@ pub fn duration_to_millis_saturating(d: std::time::Duration) -> i64 {
 /// `StartWorkflowParams.workflow_id` — a silent divergence on a documented core
 /// surface.
 ///
-/// Every field OTHER than `workflow_id`/`workflow_name` is set to the exact value
-/// the prior `None` produced (`queue ""`, build/timeout/deadline/parent `None`,
-/// `is_replay = false`), so the ONLY behavioral change is a non-empty
-/// `ctx.info().workflow_id`. `parent_execution_id` stays `None` because this
-/// backend rejects child-workflow commands as Unsupported (see [`command_name`]),
-/// so every `SQLite` run is top-level by design and `ctx.info().parent_execution_id`
-/// is correctly always `None`. The recorded span fields are inert here (no `OTel`
-/// worker/subscriber on this backend).
-fn drive_span_meta(workflow_name: &str, workflow_id: &str) -> WorkflowExecuteSpanMeta {
+/// Every other field is set to the exact value the prior `None` produced
+/// (`queue ""`, build/timeout/deadline `None`, `is_replay = false`).
+///
+/// `parent_execution_id` is the stored parent link of a child (issue #2026).
+/// It is `None` for a top-level run. The Postgres worker sets the same value,
+/// so `ctx.info().parent_execution_id` agrees on both backends. The recorded
+/// span fields are inert here (no `OTel` worker/subscriber on this backend).
+fn drive_span_meta(
+    workflow_name: &str,
+    workflow_id: &str,
+    parent_execution_id: Option<ExecutionId>,
+) -> WorkflowExecuteSpanMeta {
     WorkflowExecuteSpanMeta {
         workflow_name: workflow_name.to_string(),
         workflow_id: workflow_id.to_string(),
@@ -2310,7 +2468,7 @@ fn drive_span_meta(workflow_name: &str, workflow_id: &str) -> WorkflowExecuteSpa
         build_id: None,
         execution_timeout: None,
         deadline_at: None,
-        parent_execution_id: None,
+        parent_execution_id,
     }
 }
 

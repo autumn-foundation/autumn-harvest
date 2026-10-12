@@ -1,0 +1,730 @@
+//! Child workflows and commands between runs (issue #2026).
+//!
+//! Every helper here runs inside the caller's transaction. One database
+//! holds every run, so a child start, a result delivery, a cancel or a signal
+//! commits together with the event that asked for it. No outbox is needed.
+//!
+//! Each event has the shape that the Postgres worker writes, so a history
+//! from this backend replays on the core `WorkflowReplayer`.
+//!
+//! Two rules differ from Postgres, because one file is authoritative:
+//!
+//! - An unknown target fails at once with `target_unknown`. Postgres waits a
+//!   grace window first, because another shard can still be creating the run.
+//! - A child result never reaches a parent that is no longer `RUNNING`. The
+//!   parent can never consume it.
+
+use std::collections::HashMap;
+
+use autumn_harvest::types::{
+    ExternalAwaitId, ExternalCancelId, ExternalSignalId, ExternalTarget, ParentClosePolicy,
+};
+use autumn_harvest::{ExecutionId, WorkflowCommand, WorkflowEvent, WorkflowHandlerFn};
+use chrono::Utc;
+use serde_json::Value;
+
+use crate::error::{SqliteError, SqliteResult};
+use crate::{queue, store};
+use rusqlite::Connection;
+
+/// The cancel reason of an external cancel. It matches Postgres.
+pub const EXTERNAL_CANCEL_REASON: &str = "cancelled by external request";
+
+/// The cancel reason of a child that lost a race. It matches Postgres.
+pub const RACE_LOSER_REASON: &str = "lost race to a sibling branch";
+
+/// The cancel reason of a `request_cancel` parent-close cascade.
+const PARENT_CLOSED_REASON: &str = "parent closed";
+
+/// The failure text of a `terminate` parent-close cascade.
+const PARENT_CLOSED_TERMINATE: &str = "ParentClosed";
+
+/// Apply one composition command of a suspending cycle (issue #2026).
+///
+/// The command is one of `StartChildWorkflow`, `SpawnDetachedChildWorkflow`,
+/// `SignalExternalWorkflow`, `RequestCancelExternalWorkflow` or
+/// `AwaitExternalWorkflow`. Any other command writes nothing.
+///
+/// Returns `true` when the command changed durable state.
+///
+/// # Errors
+///
+/// Returns [`SqliteError::UnknownWorkflow`] for a child with no handler, or a
+/// persistence error. The caller then drops its transaction.
+pub fn apply_command(
+    conn: &Connection,
+    workflows: &HashMap<String, WorkflowHandlerFn>,
+    exec: ExecutionId,
+    history: &[WorkflowEvent],
+    cmd: &WorkflowCommand,
+    now: i64,
+) -> SqliteResult<bool> {
+    match cmd {
+        WorkflowCommand::StartChildWorkflow {
+            child_id,
+            workflow_name,
+            input,
+            ..
+        } => start_child(
+            conn,
+            workflows,
+            exec,
+            history,
+            *child_id,
+            workflow_name,
+            input,
+            None,
+        ),
+        WorkflowCommand::SpawnDetachedChildWorkflow {
+            child_id,
+            workflow_name,
+            input,
+            parent_close_policy,
+        } => start_child(
+            conn,
+            workflows,
+            exec,
+            history,
+            *child_id,
+            workflow_name,
+            input,
+            Some(*parent_close_policy),
+        ),
+        WorkflowCommand::SignalExternalWorkflow {
+            signal_id,
+            target,
+            signal_name,
+            payload,
+            already_requested,
+            idempotency_key,
+            ..
+        } => {
+            let request = SignalRequest {
+                signal_id: *signal_id,
+                target,
+                signal_name,
+                payload,
+                idempotency_key: idempotency_key.as_deref(),
+                already_requested: *already_requested,
+            };
+            signal_external(conn, exec, history, &request, now)
+        }
+        WorkflowCommand::RequestCancelExternalWorkflow {
+            cancel_id,
+            target,
+            already_requested,
+            ..
+        } => cancel_external(conn, exec, history, *cancel_id, target, *already_requested),
+        WorkflowCommand::AwaitExternalWorkflow {
+            await_id,
+            target,
+            already_requested,
+            ..
+        } => await_external(conn, exec, history, *await_id, *target, *already_requested),
+        _ => Ok(false),
+    }
+}
+
+/// Start a child run inside the parent's cycle transaction.
+///
+/// `policy` is `None` for an awaited child and `Some` for a detached child.
+/// The parent records `ChildWorkflowStarted` or `ChildWorkflowSpawnedDetached`.
+/// The child gets its row and its `WorkflowStarted` event.
+///
+/// A re-drive of an in-progress child re-emits its command with the recorded
+/// id. That id is in `history` or has a row, so the call writes nothing.
+///
+/// Returns `true` when it started a child.
+///
+/// # Errors
+///
+/// Returns [`SqliteError::UnknownWorkflow`] when no handler has the name. The
+/// caller drops its transaction, so the parent stays `RUNNING` and unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn start_child(
+    conn: &Connection,
+    workflows: &HashMap<String, WorkflowHandlerFn>,
+    parent: ExecutionId,
+    history: &[WorkflowEvent],
+    child_id: ExecutionId,
+    workflow_name: &str,
+    input: &Value,
+    policy: Option<ParentClosePolicy>,
+) -> SqliteResult<bool> {
+    if child_recorded(history, child_id) || store::execution_exists(conn, child_id)? {
+        return Ok(false);
+    }
+    if !workflows.contains_key(workflow_name) {
+        return Err(SqliteError::UnknownWorkflow(workflow_name.to_string()));
+    }
+    let parent_event = policy.map_or_else(
+        || WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: workflow_name.to_string(),
+            input: input.clone(),
+        },
+        |parent_close_policy| WorkflowEvent::ChildWorkflowSpawnedDetached {
+            child_id,
+            workflow_name: workflow_name.to_string(),
+            input: input.clone(),
+            parent_close_policy,
+        },
+    );
+    store::append_event(conn, parent, &parent_event)?;
+    store::insert_child_execution(
+        conn,
+        child_id,
+        workflow_name,
+        input,
+        parent,
+        policy.map(ParentClosePolicy::as_str),
+    )?;
+    store::append_event(
+        conn,
+        child_id,
+        &WorkflowEvent::workflow_started(input.clone(), Utc::now()),
+    )?;
+    Ok(true)
+}
+
+/// Record a child dispatch that a failing cycle dropped (issue #952).
+///
+/// The parent gets `ChildWorkflowStarted` and then `ChildWorkflowFailed` with
+/// the core's abandoned-dispatch reason. No child row is made, so the child
+/// never runs. A child that already started is skipped.
+pub fn record_abandoned_child(
+    conn: &Connection,
+    parent: ExecutionId,
+    history: &[WorkflowEvent],
+    child_id: ExecutionId,
+    workflow_name: &str,
+    input: &Value,
+) -> SqliteResult<()> {
+    if child_recorded(history, child_id) || store::execution_exists(conn, child_id)? {
+        return Ok(());
+    }
+    store::append_event(
+        conn,
+        parent,
+        &WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: workflow_name.to_string(),
+            input: input.clone(),
+        },
+    )?;
+    store::append_event(
+        conn,
+        parent,
+        &WorkflowEvent::ChildWorkflowFailed {
+            child_id,
+            error: autumn_harvest::event::ABANDONED_DISPATCH_REASON.to_string(),
+            error_type: None,
+            details: None,
+            non_retryable: Some(true),
+        },
+    )
+}
+
+/// True if `history` already records a start of `child_id`.
+fn child_recorded(history: &[WorkflowEvent], child_id: ExecutionId) -> bool {
+    history.iter().any(|e| {
+        matches!(
+            e,
+            WorkflowEvent::ChildWorkflowStarted { child_id: id, .. }
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { child_id: id, .. }
+                if *id == child_id
+        )
+    })
+}
+
+/// Settle what a closed run owes other runs.
+///
+/// Call it in the transaction that closes `exec`, after `terminal` is
+/// appended and the row state is set. It does two things:
+///
+/// 1. An awaited child writes its result to its `RUNNING` parent.
+/// 2. Each `RUNNING` detached child gets its parent-close policy. The parent
+///    then records `ChildWorkflowCascadeApplied` for that child.
+///
+/// Every terminal path calls it. A path that skips it leaves a parent parked
+/// for ever, or a detached child running after its parent closed.
+pub fn close_execution(
+    conn: &Connection,
+    exec: ExecutionId,
+    terminal: &WorkflowEvent,
+) -> SqliteResult<()> {
+    if let Some((parent, None)) = store::parent_link(conn, exec)?
+        && store::execution_state(conn, parent)? == "RUNNING"
+    {
+        let state = store::execution_state(conn, exec)?;
+        if let Some(event) = child_result_event(exec, terminal, &state) {
+            store::append_event(conn, parent, &event)?;
+        }
+    }
+    for (child, policy) in store::running_detached_children(conn, exec)? {
+        let policy: ParentClosePolicy = policy
+            .parse()
+            .map_err(|_| SqliteError::corrupt("parent_close_policy"))?;
+        let action = match policy {
+            ParentClosePolicy::Abandon => continue,
+            ParentClosePolicy::RequestCancel => {
+                cancel_execution(conn, child, PARENT_CLOSED_REASON)?;
+                "request_cancel"
+            }
+            ParentClosePolicy::Terminate => {
+                fail_execution(conn, child, PARENT_CLOSED_TERMINATE)?;
+                "terminate"
+            }
+        };
+        store::append_event(
+            conn,
+            exec,
+            &WorkflowEvent::ChildWorkflowCascadeApplied {
+                child_id: child,
+                policy,
+                action: action.to_string(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// The event an awaited child's terminal writes to its parent.
+///
+/// A completion maps to `ChildWorkflowCompleted`. A failure keeps its typed
+/// fields. A cancel becomes an untyped `ChildWorkflowFailed`, as on Postgres.
+fn child_result_event(
+    child_id: ExecutionId,
+    terminal: &WorkflowEvent,
+    state: &str,
+) -> Option<WorkflowEvent> {
+    match terminal {
+        WorkflowEvent::WorkflowCompleted { output } => {
+            Some(WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: output.clone(),
+            })
+        }
+        WorkflowEvent::WorkflowFailed {
+            error,
+            error_type,
+            details,
+            non_retryable,
+        } => Some(WorkflowEvent::ChildWorkflowFailed {
+            child_id,
+            error: error.clone(),
+            error_type: error_type.clone(),
+            details: details.clone(),
+            non_retryable: *non_retryable,
+        }),
+        WorkflowEvent::WorkflowCancelled { reason } => {
+            // A reuse-policy seal ends the run by force, as a terminate does.
+            let verb = if state == "CANCELLED" {
+                "cancelled"
+            } else {
+                "terminated"
+            };
+            Some(WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: format!("child workflow {verb}: {reason}"),
+                error_type: None,
+                details: None,
+                non_retryable: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Cancel a `RUNNING` run, as the Postgres `cancel_workflow_execution` does.
+///
+/// The run gets `WorkflowCancelled { reason }` and ends `CANCELLED`. Its open
+/// rows go, and [`close_execution`] settles its parent and children. This is a
+/// hard seal: the run's body does not run again.
+pub fn cancel_execution(conn: &Connection, exec: ExecutionId, reason: &str) -> SqliteResult<()> {
+    let event = WorkflowEvent::WorkflowCancelled {
+        reason: reason.to_string(),
+    };
+    store::append_event(conn, exec, &event)?;
+    store::set_cancelled(conn, exec, reason)?;
+    release_open_work(conn, exec)?;
+    close_execution(conn, exec, &event)
+}
+
+/// Fail a `RUNNING` run with an untyped error, for a `terminate` cascade.
+fn fail_execution(conn: &Connection, exec: ExecutionId, error: &str) -> SqliteResult<()> {
+    let event = WorkflowEvent::WorkflowFailed {
+        error: error.to_string(),
+        error_type: None,
+        details: None,
+        non_retryable: None,
+    };
+    store::append_event(conn, exec, &event)?;
+    store::set_failed(conn, exec, error)?;
+    release_open_work(conn, exec)?;
+    close_execution(conn, exec, &event)
+}
+
+/// Remove the pending tasks, unfired timers and staged signals of a run that
+/// will never be driven again. This backend has no retention pass.
+pub fn release_open_work(conn: &Connection, exec: ExecutionId) -> SqliteResult<()> {
+    queue::delete_pending_tasks_for_execution(conn, exec)?;
+    queue::delete_unfired_timers_for_execution(conn, exec)?;
+    queue::delete_undelivered_signals_for_execution(conn, exec)?;
+    Ok(())
+}
+
+/// The id and state of the run `target` names, or `None` if no run matches.
+fn resolve_target(
+    conn: &Connection,
+    target: &ExternalTarget,
+) -> SqliteResult<Option<(ExecutionId, String)>> {
+    match target {
+        ExternalTarget::ExecutionId(id) => state_of(conn, *id).map(|s| s.map(|s| (*id, s))),
+        ExternalTarget::WorkflowId {
+            workflow_name,
+            workflow_id,
+        } => store::resolve_workflow_id(conn, workflow_name, workflow_id),
+    }
+}
+
+/// The state of `exec`, or `None` if it has no row.
+fn state_of(conn: &Connection, exec: ExecutionId) -> SqliteResult<Option<String>> {
+    match store::execution_state(conn, exec) {
+        Ok(state) => Ok(Some(state)),
+        Err(SqliteError::ExecutionNotFound(_)) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// One external signal request, as the core command carries it.
+struct SignalRequest<'a> {
+    /// The correlation id of the request.
+    signal_id: ExternalSignalId,
+    /// The run to signal.
+    target: &'a ExternalTarget,
+    /// The signal name.
+    signal_name: &'a str,
+    /// The signal payload.
+    payload: &'a Value,
+    /// The dedup key, if any.
+    idempotency_key: Option<&'a str>,
+    /// `true` when history already holds the `ExternalSignalRequested`.
+    already_requested: bool,
+}
+
+/// Resolve a `SignalExternalWorkflow` command in the caller's transaction.
+///
+/// The caller records `ExternalSignalRequested` and then the outcome. A
+/// `RUNNING` target gets a staged signal that arrived at `now`. A key that the
+/// target already holds is a duplicate and reports delivered, as on Postgres.
+///
+/// Returns `true` when it appended an event.
+fn signal_external(
+    conn: &Connection,
+    caller: ExecutionId,
+    history: &[WorkflowEvent],
+    request: &SignalRequest<'_>,
+    now: i64,
+) -> SqliteResult<bool> {
+    let signal_id = request.signal_id;
+    if history.iter().any(|e| {
+        matches!(e,
+            WorkflowEvent::ExternalSignalDelivered { signal_id: id }
+            | WorkflowEvent::ExternalSignalFailed { signal_id: id, .. } if *id == signal_id)
+    }) {
+        return Ok(false);
+    }
+    if !request.already_requested {
+        store::append_event(
+            conn,
+            caller,
+            &WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target: request.target.clone(),
+                signal_name: request.signal_name.to_string(),
+                payload: request.payload.clone(),
+                idempotency_key: request.idempotency_key.map(str::to_string),
+            },
+        )?;
+    }
+    // Postgres treats an empty key as no key.
+    let key = request.idempotency_key.filter(|k| !k.is_empty());
+    let outcome = signal_failure(conn, request, key, now)?.map_or(
+        WorkflowEvent::ExternalSignalDelivered { signal_id },
+        |reason_code| WorkflowEvent::ExternalSignalFailed {
+            signal_id,
+            reason_code: reason_code.to_string(),
+        },
+    );
+    store::append_event(conn, caller, &outcome)?;
+    Ok(true)
+}
+
+/// Deliver the signal, or return the reason code of the failure.
+fn signal_failure(
+    conn: &Connection,
+    request: &SignalRequest<'_>,
+    key: Option<&str>,
+    now: i64,
+) -> SqliteResult<Option<&'static str>> {
+    if let (
+        Some(key),
+        ExternalTarget::WorkflowId {
+            workflow_name,
+            workflow_id,
+        },
+    ) = (key, request.target)
+        && store::business_key_signal_seen(conn, workflow_name, workflow_id, key)?
+    {
+        return Ok(None);
+    }
+    let Some((target, state)) = resolve_target(conn, request.target)? else {
+        return Ok(Some("target_unknown"));
+    };
+    if let Some(key) = key
+        && store::signal_key_seen(conn, target, key)?
+    {
+        return Ok(None);
+    }
+    if state != "RUNNING" {
+        return Ok(Some(match request.target {
+            ExternalTarget::ExecutionId(_) => "target_terminal",
+            ExternalTarget::WorkflowId { .. } => "not_running",
+        }));
+    }
+    store::stage_keyed_signal(conn, target, request.signal_name, request.payload, now, key)?;
+    Ok(None)
+}
+
+/// Resolve a `RequestCancelExternalWorkflow` command in the caller's
+/// transaction.
+///
+/// A `RUNNING` target is cancelled with [`EXTERNAL_CANCEL_REASON`]. A terminal
+/// target is a no-op success. An unknown target fails with `target_unknown`.
+///
+/// Returns `true` when it appended an event.
+fn cancel_external(
+    conn: &Connection,
+    caller: ExecutionId,
+    history: &[WorkflowEvent],
+    cancel_id: ExternalCancelId,
+    target: &ExternalTarget,
+    already_requested: bool,
+) -> SqliteResult<bool> {
+    if history.iter().any(|e| {
+        matches!(e,
+            WorkflowEvent::ExternalCancelDelivered { cancel_id: id }
+            | WorkflowEvent::ExternalCancelFailed { cancel_id: id, .. } if *id == cancel_id)
+    }) {
+        return Ok(false);
+    }
+    if !already_requested {
+        store::append_event(
+            conn,
+            caller,
+            &WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: target.clone(),
+            },
+        )?;
+    }
+    let outcome = match resolve_target(conn, target)? {
+        None => WorkflowEvent::ExternalCancelFailed {
+            cancel_id,
+            reason_code: "target_unknown".to_string(),
+        },
+        Some((id, state)) => {
+            if state == "RUNNING" {
+                cancel_execution(conn, id, EXTERNAL_CANCEL_REASON)?;
+            }
+            WorkflowEvent::ExternalCancelDelivered { cancel_id }
+        }
+    };
+    store::append_event(conn, caller, &outcome)?;
+    Ok(true)
+}
+
+/// Resolve an `AwaitExternalWorkflow` command in the caller's transaction.
+///
+/// The caller records `ExternalAwaitRequested` once. A terminal target then
+/// resolves the await at once. A `RUNNING` target leaves it open, and each
+/// later cycle checks the target again, as the Postgres outbox does.
+///
+/// Returns `true` when it appended an event.
+fn await_external(
+    conn: &Connection,
+    caller: ExecutionId,
+    history: &[WorkflowEvent],
+    await_id: ExternalAwaitId,
+    target: ExecutionId,
+    already_requested: bool,
+) -> SqliteResult<bool> {
+    if history.iter().any(|e| {
+        matches!(e,
+            WorkflowEvent::ExternalAwaitResolved { await_id: id, .. }
+            | WorkflowEvent::ExternalAwaitFailed { await_id: id, .. } if *id == await_id)
+    }) {
+        return Ok(false);
+    }
+    if !already_requested {
+        store::append_event(
+            conn,
+            caller,
+            &WorkflowEvent::ExternalAwaitRequested { await_id, target },
+        )?;
+    }
+    let outcome = await_outcome(conn, await_id, target)?;
+    if let Some(event) = &outcome {
+        store::append_event(conn, caller, event)?;
+    }
+    Ok(!already_requested || outcome.is_some())
+}
+
+/// The terminal event of an await, or `None` while the target runs.
+///
+/// The mapping follows the Postgres `read_external_await_outcome`.
+fn await_outcome(
+    conn: &Connection,
+    await_id: ExternalAwaitId,
+    target: ExecutionId,
+) -> SqliteResult<Option<WorkflowEvent>> {
+    let Some(state) = state_of(conn, target)? else {
+        return Ok(Some(await_failed(await_id, "target_unknown", None)));
+    };
+    let event = match state.as_str() {
+        "RUNNING" => return Ok(None),
+        "COMPLETED" => WorkflowEvent::ExternalAwaitResolved {
+            await_id,
+            output: store::execution_output(conn, target)?.unwrap_or(Value::Null),
+        },
+        "FAILED" => failed_target(conn, await_id, target)?,
+        "CANCELLED" => await_failed(
+            await_id,
+            "target_cancelled",
+            store::execution_error(conn, target)?,
+        ),
+        "TIMED_OUT" => await_failed(
+            await_id,
+            "target_timed_out",
+            store::execution_error(conn, target)?,
+        ),
+        // A reuse-policy seal (`CONTINUED_AS_NEW`) records no successor here.
+        // Report the run's own last terminal event instead.
+        _ => sealed_target(conn, await_id, target)?,
+    };
+    Ok(Some(event))
+}
+
+/// `ExternalAwaitFailed` for a target that ended `FAILED`, with the typed
+/// fields of its last `WorkflowFailed` event.
+fn failed_target(
+    conn: &Connection,
+    await_id: ExternalAwaitId,
+    target: ExecutionId,
+) -> SqliteResult<WorkflowEvent> {
+    let history = store::load_history(conn, target)?;
+    let last_failure = history.iter().rev().find_map(|e| match e {
+        WorkflowEvent::WorkflowFailed {
+            error,
+            error_type,
+            details,
+            non_retryable,
+        } => Some((
+            error.clone(),
+            error_type.clone(),
+            details.clone(),
+            *non_retryable,
+        )),
+        _ => None,
+    });
+    Ok(match last_failure {
+        Some((message, error_type, details, non_retryable)) => WorkflowEvent::ExternalAwaitFailed {
+            await_id,
+            reason_code: "target_failed".to_string(),
+            message: Some(message),
+            error_type,
+            details,
+            non_retryable,
+        },
+        None => WorkflowEvent::ExternalAwaitFailed {
+            await_id,
+            reason_code: "target_failed".to_string(),
+            message: store::execution_error(conn, target)?,
+            error_type: None,
+            details: None,
+            non_retryable: None,
+        },
+    })
+}
+
+/// The await outcome of a sealed target, read from its last terminal event.
+fn sealed_target(
+    conn: &Connection,
+    await_id: ExternalAwaitId,
+    target: ExecutionId,
+) -> SqliteResult<WorkflowEvent> {
+    let history = store::load_history(conn, target)?;
+    let terminal = history.iter().rev().find(|e| {
+        matches!(
+            e,
+            WorkflowEvent::WorkflowCompleted { .. }
+                | WorkflowEvent::WorkflowFailed { .. }
+                | WorkflowEvent::WorkflowCancelled { .. }
+        )
+    });
+    Ok(match terminal {
+        Some(WorkflowEvent::WorkflowCompleted { output }) => WorkflowEvent::ExternalAwaitResolved {
+            await_id,
+            output: output.clone(),
+        },
+        Some(WorkflowEvent::WorkflowFailed { .. }) => failed_target(conn, await_id, target)?,
+        Some(WorkflowEvent::WorkflowCancelled { reason }) => {
+            await_failed(await_id, "target_terminated", Some(reason.clone()))
+        }
+        _ => await_failed(
+            await_id,
+            "target_terminated",
+            store::execution_error(conn, target)?,
+        ),
+    })
+}
+
+/// An untyped `ExternalAwaitFailed`. A known terminal state also names itself
+/// in `error_type`, as on Postgres. `target_unknown` carries no fields.
+fn await_failed(
+    await_id: ExternalAwaitId,
+    reason_code: &str,
+    message: Option<String>,
+) -> WorkflowEvent {
+    let error_type = (reason_code != "target_unknown").then(|| reason_code.to_string());
+    WorkflowEvent::ExternalAwaitFailed {
+        await_id,
+        reason_code: reason_code.to_string(),
+        message,
+        error_type,
+        details: None,
+        non_retryable: None,
+    }
+}
+
+/// The run a parked `commands` batch waits on, if that run is `RUNNING`.
+///
+/// It is an awaited child or an await target. The driver can drive that run
+/// itself, so this check comes before the signal and timer checks.
+pub fn awaited_running_run(
+    conn: &Connection,
+    commands: &[WorkflowCommand],
+) -> SqliteResult<Option<ExecutionId>> {
+    for cmd in commands {
+        let id = match cmd {
+            WorkflowCommand::StartChildWorkflow { child_id, .. } => *child_id,
+            WorkflowCommand::AwaitExternalWorkflow { target, .. } => *target,
+            _ => continue,
+        };
+        if state_of(conn, id)?.as_deref() == Some("RUNNING") {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}

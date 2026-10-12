@@ -535,6 +535,7 @@
 //! deterministic primitive is **never** silently dropped, and a history written
 //! here always replays byte-identically on the core `WorkflowReplayer`.
 
+mod composition;
 mod error;
 mod lock;
 mod queue;

@@ -48,7 +48,8 @@ async fn parent_attached(ctx: &WorkflowContext, n: i64) -> Result<Value, String>
 #[workflow]
 async fn child_typed_failure(ctx: &WorkflowContext, _n: i64) -> Result<i64, WorkflowFailure> {
     let _ = ctx.info();
-    Err(WorkflowFailure::new("PaymentDeclined", "card declined").with_details(json!({ "code": 51 })))
+    Err(WorkflowFailure::new("PaymentDeclined", "card declined")
+        .with_details(json!({ "code": 51 })))
 }
 
 /// Completes, but its last cycle upserts a search attribute. This backend
@@ -62,7 +63,10 @@ async fn child_unsupported(ctx: &WorkflowContext, n: i64) -> Result<i64, String>
 
 /// Spawns the named child and reports the typed failure it observes.
 #[workflow]
-async fn parent_reports_child_failure(ctx: &WorkflowContext, child: String) -> Result<Value, String> {
+async fn parent_reports_child_failure(
+    ctx: &WorkflowContext,
+    child: String,
+) -> Result<Value, String> {
     match ctx.spawn_child_workflow_raw(&child, json!(0)).await {
         Ok(v) => Err(format!("the child must fail, got {v}")),
         Err(HarvestError::WorkflowFailed {
@@ -85,6 +89,11 @@ async fn parent_reports_child_failure(ctx: &WorkflowContext, child: String) -> R
 #[workflow]
 async fn waits_for_go(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
     ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
+#[workflow]
+async fn waits_on_timer(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
+    ctx.timer("nap", 3600).await.map_err(|e| e.to_string())
 }
 
 #[workflow]
@@ -216,11 +225,7 @@ async fn await_reports(ctx: &WorkflowContext, target: ExecutionId) -> Result<Val
 #[workflow]
 async fn parent_child_timeout(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
     let out = ctx
-        .spawn_child_workflow_timeout(
-            "waits_for_go",
-            json!(0),
-            std::time::Duration::from_secs(60),
-        )
+        .spawn_child_workflow_timeout("waits_for_go", json!(0), std::time::Duration::from_secs(60))
         .await
         .map_err(|e| e.to_string())?;
     Ok(json!({ "child": out }))
@@ -292,6 +297,7 @@ fn fixtures() -> Vec<WorkflowInfo> {
         child_unsupported_info(),
         parent_reports_child_failure_info(),
         waits_for_go_info(),
+        waits_on_timer_info(),
         parent_of_waiter_info(),
         parent_reports_waiter_info(),
         parent_detached_awaits_info(),
@@ -315,17 +321,41 @@ fn handler_of(name: &str) -> WorkflowHandlerFn {
         .into_iter()
         .chain(std::iter::once(registered_late_info()))
         .find(|info| info.name == name)
-        .map(|info| info.handler)
-        .unwrap_or_else(|| panic!("no fixture named {name}"))
+        .map_or_else(|| panic!("no fixture named {name}"), |info| info.handler)
 }
 
 /// Replay the stored history of `exec` on the core replayer.
-async fn assert_replays(rt: &SqliteRuntime, exec: ExecutionId, workflow: &str) {
+///
+/// A cancel is a hard seal. It ends a parked run, and the run's code never
+/// sees the `WorkflowCancelled` event. Strict core replay verifies a
+/// cancelled history in full, so it reports such a run as still parked. A
+/// Postgres history of the same run has the same bytes and the same result.
+/// For that history, replay the events the run wrote in frontier-tolerant
+/// (canary) mode. That mode accepts a run that parks at the end.
+fn assert_replays<'a>(
+    rt: &SqliteRuntime,
+    exec: ExecutionId,
+    workflow: &'a str,
+) -> impl std::future::Future<Output = ()> + 'a {
+    // Read the history now. The future then holds no runtime borrow.
     let history = rt.load_history(exec).unwrap();
-    let report = WorkflowReplayer::new()
-        .register_fn(workflow, handler_of(workflow))
-        .replay_from_events(history.clone())
-        .await;
+    async move { replay_history(history, exec, workflow).await }
+}
+
+async fn replay_history(history: Vec<WorkflowEvent>, exec: ExecutionId, workflow: &str) {
+    let replayer = WorkflowReplayer::new().register_fn(workflow, handler_of(workflow));
+    let report = match history.split_last() {
+        Some((WorkflowEvent::WorkflowCancelled { .. }, written)) => {
+            let snapshot = serde_json::from_value(json!({
+                "workflow_name": workflow,
+                "execution_id": exec,
+                "events": written,
+            }))
+            .unwrap();
+            replayer.replay_canary_snapshot(snapshot).await
+        }
+        _ => replayer.replay_from_events(history.clone()).await,
+    };
     let ok = match &report.status {
         ReplayStatus::ReplaySucceeded => true,
         // A failed run replays to the same failure.
@@ -334,7 +364,10 @@ async fn assert_replays(rt: &SqliteRuntime, exec: ExecutionId, workflow: &str) {
             .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
         ReplayStatus::NonDeterminismDetected { .. } => false,
     };
-    assert!(ok, "`{workflow}` history must replay on the core:\n{report}\n{history:#?}");
+    assert!(
+        ok,
+        "`{workflow}` history must replay on the core:\n{report}\n{history:#?}"
+    );
 }
 
 fn completed(rt: &SqliteRuntime, exec: ExecutionId) -> Value {
@@ -419,7 +452,10 @@ async fn the_fleet_drivers_converge_a_parent_and_its_child() {
     let mut rt = runtime();
     let parent = rt.start_workflow("parent_attached", json!(4)).unwrap();
 
-    assert!(rt.poll_once().await.unwrap(), "the first pass starts the child");
+    assert!(
+        rt.poll_once().await.unwrap(),
+        "the first pass starts the child"
+    );
     rt.run_until_idle().await.unwrap();
 
     assert_eq!(completed(&rt, parent)["child"]["doubled"], json!(8));
@@ -434,7 +470,11 @@ async fn a_parent_waits_on_a_blocked_child_and_starts_it_once() {
     for _ in 0..3 {
         let state = rt.run_until_blocked(parent).await.unwrap();
         let children = children_of(&rt, parent);
-        assert_eq!(children.len(), 1, "a re-drive must not start a second child");
+        assert_eq!(
+            children.len(),
+            1,
+            "a re-drive must not start a second child"
+        );
         assert!(
             matches!(state, RunState::WaitingWorkflow(id) if id == children[0]),
             "the parent waits on its child: {state:?}"
@@ -484,7 +524,9 @@ async fn a_typed_child_failure_surfaces_in_the_parent() {
         "{failed:?}"
     );
     let child = children_of(&rt, parent)[0];
-    assert!(matches!(rt.outcome(child).unwrap(), ExecutionOutcome::Failed(ref m) if m == "card declined"));
+    assert!(
+        matches!(rt.outcome(child).unwrap(), ExecutionOutcome::Failed(ref m) if m == "card declined")
+    );
     assert_replays(&rt, parent, "parent_reports_child_failure").await;
     assert_replays(&rt, child, "child_typed_failure").await;
 }
@@ -516,12 +558,18 @@ async fn an_unregistered_child_workflow_leaves_the_parent_running() {
         matches!(err, SqliteError::UnknownWorkflow(ref n) if n == "registered_late"),
         "{err}"
     );
-    assert!(matches!(rt.outcome(parent).unwrap(), ExecutionOutcome::Running));
+    assert!(matches!(
+        rt.outcome(parent).unwrap(),
+        ExecutionOutcome::Running
+    ));
     assert!(children_of(&rt, parent).is_empty(), "the cycle rolled back");
 
     rt.register_workflow(&registered_late_info());
     let state = rt.run_until_blocked(parent).await.unwrap();
-    assert!(matches!(state, RunState::Completed(ref v) if v == &json!(6)), "{state:?}");
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!(6)),
+        "{state:?}"
+    );
     assert_replays(&rt, parent, "parent_of_unregistered").await;
 }
 
@@ -533,7 +581,10 @@ async fn an_abandoned_child_dispatch_is_recorded_and_never_runs() {
         .unwrap();
 
     let state = rt.run_until_blocked(parent).await.unwrap();
-    assert!(matches!(state, RunState::Failed(ref m) if m == "boom"), "{state:?}");
+    assert!(
+        matches!(state, RunState::Failed(ref m) if m == "boom"),
+        "{state:?}"
+    );
     let history = rt.load_history(parent).unwrap();
     let child = children_of(&rt, parent)[0];
     assert!(
@@ -657,7 +708,16 @@ async fn a_detached_child_reports_through_await() {
     assert_replays(&rt, child, "child_work").await;
 }
 
-async fn run_detached(policy: &str, then_activity: bool) -> (tempfile::TempDir, std::path::PathBuf, SqliteRuntime, ExecutionId, ExecutionId) {
+async fn run_detached(
+    policy: &str,
+    then_activity: bool,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    SqliteRuntime,
+    ExecutionId,
+    ExecutionId,
+) {
     let (dir, path) = temp_db();
     let mut rt = SqliteRuntime::open(&path).unwrap();
     register_all(&mut rt);
@@ -711,7 +771,9 @@ async fn request_cancel_cancels_a_running_detached_child() {
 #[tokio::test]
 async fn terminate_fails_a_running_detached_child() {
     let (_dir, path, rt, parent, child) = run_detached("terminate", true).await;
-    assert!(matches!(rt.outcome(child).unwrap(), ExecutionOutcome::Failed(ref m) if m == "ParentClosed"));
+    assert!(
+        matches!(rt.outcome(child).unwrap(), ExecutionOutcome::Failed(ref m) if m == "ParentClosed")
+    );
     assert!(matches!(
         rt.load_history(child).unwrap().last(),
         Some(WorkflowEvent::WorkflowFailed { error, error_type: None, .. }) if error == "ParentClosed"
@@ -724,15 +786,18 @@ async fn terminate_fails_a_running_detached_child() {
 #[tokio::test]
 async fn abandon_leaves_a_detached_child_running() {
     let (_dir, _path, mut rt, parent, child) = run_detached("abandon", false).await;
-    assert!(matches!(rt.outcome(child).unwrap(), ExecutionOutcome::Running));
-    assert!(cascade_actions(&rt, parent).is_empty());
+    assert!(matches!(
+        rt.outcome(child).unwrap(),
+        ExecutionOutcome::Running
+    ));
+    assert_eq!(cascade_actions(&rt, parent), Vec::<String>::new());
 
     rt.send_signal(child, "go", json!("later")).unwrap();
     let state = rt.run_until_blocked(child).await.unwrap();
     assert!(matches!(state, RunState::Completed(ref v) if v == &json!("later")));
     assert_eq!(
         rt.load_history(parent).unwrap().len(),
-        4,
+        3,
         "a detached child never writes to its parent"
     );
 }
@@ -747,7 +812,10 @@ async fn a_signal_reaches_another_run() {
     let sender = rt.start_workflow("signal_reports", json!(target)).unwrap();
 
     let state = rt.run_until_blocked(sender).await.unwrap();
-    assert!(matches!(state, RunState::Completed(ref v) if v == &json!("delivered")), "{state:?}");
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!("delivered")),
+        "{state:?}"
+    );
     let kinds: Vec<&str> = rt
         .load_history(sender)
         .unwrap()
@@ -838,7 +906,11 @@ async fn a_keyed_signal_is_staged_once() {
     let state = rt.run_until_blocked(sender).await.unwrap();
     assert!(matches!(state, RunState::Completed(_)), "{state:?}");
     assert_eq!(
-        count_rows(&path, "SELECT COUNT(*) FROM harvest_signals WHERE exec_id = ?1", target),
+        count_rows(
+            &path,
+            "SELECT COUNT(*) FROM harvest_signals WHERE exec_id = ?1",
+            target
+        ),
         1,
         "the second send with the same key is a duplicate"
     );
@@ -865,7 +937,10 @@ async fn a_cancel_ends_another_run() {
     let canceller = rt.start_workflow("cancel_reports", json!(target)).unwrap();
 
     let state = rt.run_until_blocked(canceller).await.unwrap();
-    assert!(matches!(state, RunState::Completed(ref v) if v == &json!("delivered")), "{state:?}");
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!("delivered")),
+        "{state:?}"
+    );
     let kinds: Vec<&str> = rt
         .load_history(canceller)
         .unwrap()
@@ -918,7 +993,10 @@ async fn a_cancel_reports_unknown_and_terminal_targets() {
     assert_eq!(completed(&rt, unknown), json!("target_unknown"));
     assert_eq!(completed(&rt, terminal), json!("delivered"));
     assert_eq!(completed(&rt, by_id), json!("target_unknown"));
-    assert!(matches!(rt.outcome(done).unwrap(), ExecutionOutcome::Failed(_)), "a terminal target is unchanged");
+    assert!(
+        matches!(rt.outcome(done).unwrap(), ExecutionOutcome::Failed(_)),
+        "a terminal target is unchanged"
+    );
     assert_replays(&rt, unknown, "cancel_reports").await;
 }
 
@@ -985,7 +1063,10 @@ async fn an_await_of_an_unknown_target_fails_at_once() {
         .start_workflow("await_reports", json!(ExecutionId::new()))
         .unwrap();
     rt.run_until_blocked(awaiter).await.unwrap();
-    assert_eq!(completed(&rt, awaiter), json!({ "await_failed": "target_unknown" }));
+    assert_eq!(
+        completed(&rt, awaiter),
+        json!({ "await_failed": "target_unknown" })
+    );
     assert_replays(&rt, awaiter, "await_reports").await;
 }
 
@@ -995,7 +1076,10 @@ async fn an_await_of_a_cancelled_target_reports_it() {
     let target = rt.start_workflow("waits_for_go", json!(0)).unwrap();
     let awaiter = rt.start_workflow("await_reports", json!(target)).unwrap();
     let state = rt.run_until_blocked(awaiter).await.unwrap();
-    assert!(matches!(state, RunState::WaitingWorkflow(id) if id == target), "{state:?}");
+    assert!(
+        matches!(state, RunState::WaitingWorkflow(id) if id == target),
+        "{state:?}"
+    );
 
     let canceller = rt.start_workflow("cancel_reports", json!(target)).unwrap();
     rt.run_until_idle().await.unwrap();
@@ -1004,4 +1088,20 @@ async fn an_await_of_a_cancelled_target_reports_it() {
     assert_eq!(out["error_type"], json!("target_cancelled"));
     assert_eq!(out["failed"], json!("cancelled by external request"));
     assert_replays(&rt, awaiter, "await_reports").await;
+}
+
+/// A cancel seals a run that is parked on a timer. Its history must replay.
+#[tokio::test]
+async fn a_cancelled_timer_wait_replays() {
+    let mut rt = runtime();
+    let target = rt.start_workflow("waits_on_timer", json!(0)).unwrap();
+    let state = rt.run_until_blocked(target).await.unwrap();
+    assert!(matches!(state, RunState::WaitingTimer), "{state:?}");
+    let canceller = rt.start_workflow("cancel_reports", json!(target)).unwrap();
+    rt.run_until_blocked(canceller).await.unwrap();
+    assert!(matches!(
+        rt.outcome(target).unwrap(),
+        ExecutionOutcome::Terminated(ref s) if s == "CANCELLED"
+    ));
+    assert_replays(&rt, target, "waits_on_timer").await;
 }

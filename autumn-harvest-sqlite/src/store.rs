@@ -53,6 +53,106 @@ pub fn insert_execution(
     Ok(())
 }
 
+/// Insert a child run with its parent link (issue #2026).
+///
+/// `parent_close_policy` is `None` for an awaited child. A detached child
+/// stores its policy, as the Postgres `parent_close_policy` column does.
+pub fn insert_child_execution(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    workflow_name: &str,
+    input: &Value,
+    parent: ExecutionId,
+    parent_close_policy: Option<&str>,
+) -> SqliteResult<()> {
+    // A child's business id is its own execution id, as on Postgres.
+    conn.execute(
+        "INSERT INTO harvest_executions \
+         (exec_id, workflow_name, workflow_id, input_json, state, parent_exec_id, parent_close_policy) \
+         VALUES (?1, ?2, ?1, ?3, 'RUNNING', ?4, ?5)",
+        params![
+            exec_id.to_string(),
+            workflow_name,
+            serde_json::to_string(input)?,
+            parent.to_string(),
+            parent_close_policy
+        ],
+    )?;
+    Ok(())
+}
+
+/// The parent of `exec_id` and the stored close policy, if `exec_id` is a child.
+pub fn parent_link(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> SqliteResult<Option<(ExecutionId, Option<String>)>> {
+    let row: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT parent_exec_id, parent_close_policy FROM harvest_executions WHERE exec_id = ?1",
+            params![exec_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match row {
+        Some((Some(parent), policy)) => {
+            let parent = parent
+                .parse()
+                .map_err(|_| SqliteError::corrupt("parent_exec_id"))?;
+            Ok(Some((parent, policy)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The `RUNNING` detached children of `parent` with their close policies.
+pub fn running_detached_children(
+    conn: &Connection,
+    parent: ExecutionId,
+) -> SqliteResult<Vec<(ExecutionId, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT exec_id, parent_close_policy FROM harvest_executions \
+         WHERE parent_exec_id = ?1 AND parent_close_policy IS NOT NULL AND state = 'RUNNING' \
+         ORDER BY rowid",
+    )?;
+    let rows = stmt.query_map(params![parent.to_string()], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        let (exec, policy) = r?;
+        let exec = exec.parse().map_err(|_| SqliteError::corrupt("exec_id"))?;
+        out.push((exec, policy));
+    }
+    Ok(out)
+}
+
+/// The run a `(workflow_name, workflow_id)` target resolves to (issue #2026).
+///
+/// Prefer the newest `RUNNING` run. Else take the newest run of any state.
+/// This matches the Postgres `resolve_execution_id_by_workflow_id`.
+pub fn resolve_workflow_id(
+    conn: &Connection,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> SqliteResult<Option<(ExecutionId, String)>> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT exec_id, state FROM harvest_executions \
+             WHERE workflow_name = ?1 AND workflow_id = ?2 \
+             ORDER BY (state = 'RUNNING') DESC, rowid DESC LIMIT 1",
+            params![workflow_name, workflow_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match row {
+        Some((exec, state)) => {
+            let exec = exec.parse().map_err(|_| SqliteError::corrupt("exec_id"))?;
+            Ok(Some((exec, state)))
+        }
+        None => Ok(None),
+    }
+}
+
 pub fn execution_exists(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<bool> {
     let found: Option<i64> = conn
         .query_row(
@@ -274,6 +374,16 @@ pub fn set_completed(conn: &Connection, exec_id: ExecutionId, output: &Value) ->
     Ok(())
 }
 
+/// Move a run to `CANCELLED` and store the reason in `error` (issue #2026).
+pub fn set_cancelled(conn: &Connection, exec_id: ExecutionId, reason: &str) -> SqliteResult<()> {
+    conn.execute(
+        "UPDATE harvest_executions SET state = 'CANCELLED', output_json = NULL, error = ?2 \
+         WHERE exec_id = ?1",
+        params![exec_id.to_string(), reason],
+    )?;
+    Ok(())
+}
+
 pub fn set_failed(conn: &Connection, exec_id: ExecutionId, error: &str) -> SqliteResult<()> {
     conn.execute(
         "UPDATE harvest_executions SET state = 'FAILED', error = ?2 WHERE exec_id = ?1",
@@ -430,17 +540,66 @@ pub fn stage_signal(
     payload: &Value,
     received_at: i64,
 ) -> SqliteResult<()> {
+    stage_keyed_signal(conn, exec_id, name, payload, received_at, None)
+}
+
+/// Like [`stage_signal`], with the dedup key of an external signal (issue #2026).
+pub fn stage_keyed_signal(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    name: &str,
+    payload: &Value,
+    received_at: i64,
+    idempotency_key: Option<&str>,
+) -> SqliteResult<()> {
     conn.execute(
-        "INSERT INTO harvest_signals (exec_id, name, payload_json, delivered, received_at) \
-         VALUES (?1, ?2, ?3, 0, ?4)",
+        "INSERT INTO harvest_signals \
+         (exec_id, name, payload_json, delivered, received_at, idempotency_key) \
+         VALUES (?1, ?2, ?3, 0, ?4, ?5)",
         params![
             exec_id.to_string(),
             name,
             serde_json::to_string(payload)?,
-            received_at
+            received_at,
+            idempotency_key
         ],
     )?;
     Ok(())
+}
+
+/// True if `exec_id` already holds a signal row with `idempotency_key`.
+pub fn signal_key_seen(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    idempotency_key: &str,
+) -> SqliteResult<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM harvest_signals WHERE exec_id = ?1 AND idempotency_key = ?2 LIMIT 1",
+            params![exec_id.to_string(), idempotency_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
+/// True if any run of `(workflow_name, workflow_id)` holds a signal row with
+/// `idempotency_key`. This is the chain-wide dedup of a by-id signal.
+pub fn business_key_signal_seen(
+    conn: &Connection,
+    workflow_name: &str,
+    workflow_id: &str,
+    idempotency_key: &str,
+) -> SqliteResult<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM harvest_signals s JOIN harvest_executions e ON s.exec_id = e.exec_id \
+             WHERE e.workflow_name = ?1 AND e.workflow_id = ?2 AND s.idempotency_key = ?3 LIMIT 1",
+            params![workflow_name, workflow_id, idempotency_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
 }
 
 /// A staged signal awaiting delivery: its row id, arrival time, and payload.
