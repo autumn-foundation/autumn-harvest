@@ -12,9 +12,10 @@ nothing could call them. `SqliteRuntime::query(exec, name, args)` now does.
 - A terminal run answers with the state at its recorded end. The core
   `classify_terminal_query` decides, as on the Postgres HTTP path (issue
   #612).
-- A run sealed by an unsupported feature rolled back its last cycle. If the
-  replay then mints a side-effect value that the history does not record,
-  the query returns `QueryUnavailable`. A changing answer is worse than none.
+- A seal for an unsupported feature or a history cap rolls back the last
+  cycle. If the replay then mints a side-effect value that the history does
+  not record, the query returns `QueryUnavailable`. A changing answer is
+  worse than none.
 - The call reads the rows at once. The returned future is `Send + 'static`
   and borrows nothing from the runtime.
 - New typed errors: `QueryNotFound`, `QueryFailed`, `QueryPanicked`,

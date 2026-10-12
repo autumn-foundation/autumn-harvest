@@ -37,6 +37,7 @@ pub struct QueryReplay {
     workflow_name: String,
     workflow_id: String,
     terminal: bool,
+    history_policy: WorkflowHistoryPolicy,
 }
 
 impl QueryReplay {
@@ -50,6 +51,7 @@ impl QueryReplay {
     pub fn load(
         conn: &Connection,
         workflows: &HashMap<String, WorkflowHandlerFn>,
+        history_policy: WorkflowHistoryPolicy,
         exec: ExecutionId,
     ) -> SqliteResult<Self> {
         // The state read goes first. It is the read that rejects an unknown id.
@@ -66,6 +68,7 @@ impl QueryReplay {
             workflow_id: store::workflow_id_of(conn, exec)?,
             workflow_name,
             terminal: autumn_harvest::erase::is_terminal_state(&state),
+            history_policy,
         })
     }
 
@@ -79,13 +82,13 @@ impl QueryReplay {
     pub async fn run(self, name: String, args: Value, timeout: Duration) -> SqliteResult<Value> {
         let exec = self.exec;
         let sealed = self.terminal && history_reached_terminal_seal(&self.history);
-        // The drive builds its context with the same name and id, so a
-        // handler that reads `ctx.info()` replays the same path.
+        // The drive builds its context with the same name, id and history
+        // policy, so a handler that reads them replays the same path.
         let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
             exec,
             self.history,
             empty_shared_state(),
-            WorkflowHistoryPolicy::default(),
+            self.history_policy,
         )
         .with_workflow_name(self.workflow_name)
         .with_workflow_id(self.workflow_id);
@@ -154,8 +157,8 @@ const fn running_refusal(outcome: QueryReplayOutcome) -> Option<Refusal> {
 /// A terminal run serves the state at its recorded end. The core classifier
 /// decides, as on the Postgres HTTP path (issue #612).
 ///
-/// One more check is specific to this backend. A run sealed by an
-/// unsupported feature rolls back its last cycle, side effects included.
+/// One more check is specific to this backend. A seal for an unsupported
+/// feature or a history cap rolls back the last cycle, side effects included.
 /// The replay then mints new side-effect values past the recorded end. Each
 /// query would see different values, so the query refuses.
 fn terminal_refusal(

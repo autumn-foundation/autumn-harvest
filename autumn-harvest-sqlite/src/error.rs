@@ -260,9 +260,9 @@ pub enum SqliteError {
     /// - The workflow code changed, so the replay diverges from the history.
     /// - The workflow panics during the replay. The panic recurs on every
     ///   retry, as on the Postgres HTTP path.
-    /// - The run was sealed by an unsupported feature. Its last cycle rolled
-    ///   back, so the replay mints side-effect values that the history does
-    ///   not record.
+    /// - A seal for an unsupported feature or a history cap rolled back the
+    ///   last cycle. The replay then mints side-effect values that the
+    ///   history does not record.
     #[error("query {name:?} on terminal execution {execution_id} is unavailable: {details}")]
     QueryUnavailable {
         /// The queried execution.

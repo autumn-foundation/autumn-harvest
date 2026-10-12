@@ -124,6 +124,33 @@ async fn spawns_child_after_uuid(ctx: &WorkflowContext, _n: i64) -> Result<Value
         .map_err(|e| e.to_string())
 }
 
+/// Mints a value, then continues as new once. The seal records the value.
+#[workflow]
+async fn mints_then_continues(ctx: &WorkflowContext, phase: i64) -> Result<Value, String> {
+    let id = ctx.new_uuid().to_string();
+    ctx.register_query("stage", move || json!(id));
+    if phase == 0 {
+        ctx.continue_as_new(json!(1))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
+/// Mints a value before each step, until a history cap seals the run.
+#[workflow]
+async fn mints_until_capped(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
+    let last = Arc::new(Mutex::new(Value::Null));
+    let read = Arc::clone(&last);
+    ctx.register_query("stage", move || read.lock().unwrap().clone());
+    loop {
+        set(&last, json!(ctx.new_uuid().to_string()));
+        ctx.execute_activity_raw("step", json!(null), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn temp_db() -> (tempfile::TempDir, PathBuf) {
@@ -624,6 +651,51 @@ async fn workflow_panic_on_a_terminal_run_is_query_unavailable() {
             err,
             SqliteError::QueryUnavailable { execution_id, ref details, .. }
                 if execution_id == exec && details.contains("panicked")
+        ),
+        "got {err:?}"
+    );
+}
+
+/// The continue-as-new seal records the side effects of its last cycle
+/// (issue #2023). A query then serves a stable answer.
+#[tokio::test]
+async fn continued_as_new_run_serves_a_stable_answer() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&mints_then_continues_info());
+    let exec = rt.start_workflow("mints_then_continues", json!(0)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::ContinuedAsNew(_)),
+        "got {state:?}"
+    );
+
+    let first = rt.query(exec, "stage", Value::Null).await.unwrap();
+    let second = rt.query(exec, "stage", Value::Null).await.unwrap();
+    assert!(first.is_string(), "got {first:?}");
+    assert_eq!(
+        first, second,
+        "a recorded side effect replays the same value"
+    );
+}
+
+/// A history-cap seal rolls back its last cycle, as an unsupported feature
+/// does (issue #2023). The replay then mints an unrecorded value.
+#[tokio::test]
+async fn unrecorded_side_effect_on_a_capped_run_is_query_unavailable() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&mints_until_capped_info());
+    rt.register_activity_raw("step", ActivitySpec::new(1, |_| Ok(Value::Null)));
+    rt.set_history_event_hard_cap(Some(6));
+    let exec = rt.start_workflow("mints_until_capped", json!(0)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Failed(_)), "got {state:?}");
+
+    let err = rt.query(exec, "stage", Value::Null).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SqliteError::QueryUnavailable { execution_id, ref details, .. }
+                if execution_id == exec && details.contains("side-effect")
         ),
         "got {err:?}"
     );

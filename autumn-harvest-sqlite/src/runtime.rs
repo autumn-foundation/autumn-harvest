@@ -22,6 +22,7 @@ use rusqlite::Connection;
 use serde_json::Value;
 
 use crate::error::{SqliteError, SqliteResult};
+use crate::history_cap::{CapCheck, HistoryCapReason};
 use crate::lock::WriterLock;
 use crate::query::{DEFAULT_QUERY_TIMEOUT, QueryReplay};
 use crate::{lock, queue, schema, store, worker};
@@ -126,6 +127,9 @@ pub enum RunState {
     WaitingSignal(String),
     /// Blocked awaiting a durable timer that has not yet fired.
     WaitingTimer,
+    /// The run continued as new (issue #2023). It is sealed
+    /// `CONTINUED_AS_NEW`. Drive the successor with this id.
+    ContinuedAsNew(ExecutionId),
 }
 
 /// The stored, non-driving outcome of an execution — a pure read accessor.
@@ -139,10 +143,11 @@ pub enum ExecutionOutcome {
     Failed(String),
     /// A terminal state OTHER than a clean success/failure — inert and never
     /// resumable, but carrying no output (unlike [`Self::Completed`]) and no
-    /// failure error (unlike [`Self::Failed`]). The dominant case is a prior run
-    /// SEALED to `CONTINUED_AS_NEW` when a `TerminateIfRunning` /
-    /// `AllowDuplicateFailedOnly` reuse-policy decision superseded it with a newer
-    /// run (issue #1068); it also covers `CANCELLED` / `TIMED_OUT` / `TERMINATED`.
+    /// failure error (unlike [`Self::Failed`]). The dominant case is a run
+    /// sealed `CONTINUED_AS_NEW`. A `continue_as_new` (issue #2023) or a
+    /// `TerminateIfRunning` / `AllowDuplicateFailedOnly` replace (issue #1068)
+    /// writes that state. [`SqliteRuntime::successor`] tells the two apart. It
+    /// also covers `CANCELLED`, `TIMED_OUT` and `TERMINATED`.
     /// The payload is the RAW stored state name (e.g. `"CONTINUED_AS_NEW"`) so a
     /// caller can distinguish which terminal it is. Reporting these terminally —
     /// rather than as [`Self::Running`] — keeps `outcome()` consistent with the
@@ -215,6 +220,9 @@ pub struct SqliteRuntime {
     /// The single-writer lock (issue #1834). It is released when the runtime
     /// drops.
     writer_lock: Option<WriterLock>,
+    /// The history caps and the soft continue-as-new threshold (issue #2023).
+    /// The defaults match the Postgres worker.
+    history_policy: WorkflowHistoryPolicy,
     /// The time limit of one query replay (issue #2022).
     query_timeout: std::time::Duration,
 }
@@ -321,6 +329,7 @@ impl SqliteRuntime {
             workflow_panic_strikes: HashMap::new(),
             now_fn: std::sync::Arc::new(Utc::now),
             writer_lock,
+            history_policy: WorkflowHistoryPolicy::default(),
             query_timeout: DEFAULT_QUERY_TIMEOUT,
         })
     }
@@ -336,6 +345,63 @@ impl SqliteRuntime {
     #[doc(hidden)]
     pub fn set_clock(&mut self, now_fn: impl Fn() -> DateTime<Utc> + Send + Sync + 'static) {
         self.now_fn = std::sync::Arc::new(now_fn);
+    }
+
+    /// The event cap per run (issue #2023). `None` is unlimited.
+    #[must_use]
+    pub const fn history_event_hard_cap(&self) -> Option<u64> {
+        self.history_policy.event_hard_cap()
+    }
+
+    /// Set the event cap per run (issue #2023). `None` removes the cap.
+    ///
+    /// The default is
+    /// [`DEFAULT_HISTORY_EVENT_HARD_CAP`](autumn_harvest::DEFAULT_HISTORY_EVENT_HARD_CAP).
+    /// A run that reaches the cap fails with
+    /// [`HistoryCapReason::HistoryCapExceeded`](crate::HistoryCapReason::HistoryCapExceeded).
+    /// The Postgres builder spells this `history_event_hard_cap(n)` and
+    /// `history_event_hard_cap_unlimited()`.
+    ///
+    /// A cap at or below the soft threshold of `should_continue_as_new` logs a
+    /// warning. A run that waits for that advice then fails before it gets it.
+    pub fn set_history_event_hard_cap(&mut self, cap: Option<u64>) {
+        self.history_policy = match cap {
+            Some(cap) => self.history_policy.with_event_hard_cap(cap),
+            None => self.history_policy.without_event_hard_cap(),
+        };
+        let threshold = self.history_policy.continue_as_new_threshold();
+        if let Some(cap) = cap
+            && cap <= threshold
+        {
+            tracing::warn!(
+                cap,
+                threshold,
+                "the history event cap is at or below the continue-as-new threshold; \
+                 should_continue_as_new() fires only after the cap fails the run"
+            );
+        }
+    }
+
+    /// The stored-history byte cap per run (issue #2023). `None` is unlimited.
+    #[must_use]
+    pub const fn history_byte_hard_cap(&self) -> Option<u64> {
+        self.history_policy.byte_hard_cap()
+    }
+
+    /// Set the stored-history byte cap per run (issue #2023). `None` removes
+    /// the cap.
+    ///
+    /// The default is
+    /// [`DEFAULT_HISTORY_BYTE_HARD_CAP`](autumn_harvest::DEFAULT_HISTORY_BYTE_HARD_CAP).
+    /// A run that reaches the cap fails with
+    /// [`HistoryCapReason::HistoryBytesCapExceeded`](crate::HistoryCapReason::HistoryBytesCapExceeded).
+    /// The Postgres builder spells this `history_byte_hard_cap(n)` and
+    /// `history_byte_hard_cap_unlimited()`.
+    pub const fn set_history_byte_hard_cap(&mut self, cap: Option<u64>) {
+        self.history_policy = match cap {
+            Some(cap) => self.history_policy.with_byte_hard_cap(cap),
+            None => self.history_policy.without_byte_hard_cap(),
+        };
     }
 
     /// Register a workflow handler (by name) from its macro-generated
@@ -859,6 +925,23 @@ impl SqliteRuntime {
         )
     }
 
+    /// The run that `exec` continued as, if any (issue #2023).
+    ///
+    /// `Some` only for a run that `continue_as_new` sealed. A reuse-policy seal
+    /// shares the `CONTINUED_AS_NEW` state but has no successor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns a
+    /// persistence error if the history cannot be read.
+    pub fn successor(&self, exec: ExecutionId) -> SqliteResult<Option<ExecutionId>> {
+        let state = store::execution_state(&self.conn, exec)?;
+        if state != SEALED_STATE {
+            return Ok(None);
+        }
+        store::successor_of(&self.conn, exec)
+    }
+
     /// The full ordered event history — the canonical, replayable log.
     ///
     /// # Errors
@@ -990,7 +1073,7 @@ impl SqliteRuntime {
         name: &str,
         args: Value,
     ) -> impl std::future::Future<Output = SqliteResult<Value>> + Send + 'static {
-        let loaded = QueryReplay::load(&self.conn, &self.workflows, exec);
+        let loaded = QueryReplay::load(&self.conn, &self.workflows, self.history_policy, exec);
         let name = name.to_string();
         let timeout = self.query_timeout;
         async move { loaded?.run(name, args, timeout).await }
@@ -1292,9 +1375,37 @@ impl SqliteRuntime {
             details: Some(serde_json::json!({ "feature": feature, "message": unsupported })),
             non_retryable: Some(true),
         };
+        self.seal_failed(exec, &event, &message)
+    }
+
+    /// Fail `exec` at a history cap (issue #2023).
+    ///
+    /// The breaching decision has already rolled back. The `WorkflowFailed`
+    /// event holds the reason JSON as `error` and nothing else. The Postgres
+    /// worker writes the same event, so the stored bytes match.
+    fn fail_for_history_cap(
+        &mut self,
+        exec: ExecutionId,
+        reason: &HistoryCapReason,
+    ) -> SqliteResult<RunState> {
+        let error = reason.to_string();
+        tracing::warn!(%exec, %error, "workflow history reached a hard cap; failing the run");
+        let event = WorkflowEvent::workflow_failed(error.clone());
+        self.seal_failed(exec, &event, &error)?;
+        Ok(RunState::Failed(error))
+    }
+
+    /// Append `event`, set `exec` `FAILED` with `error`, and remove its pending
+    /// tasks, unfired timers and staged signals, in one transaction.
+    fn seal_failed(
+        &mut self,
+        exec: ExecutionId,
+        event: &WorkflowEvent,
+        error: &str,
+    ) -> SqliteResult<()> {
         let tx = self.conn.transaction()?;
-        store::append_event(&tx, exec, &event)?;
-        store::set_failed(&tx, exec, &message)?;
+        store::append_event(&tx, exec, event)?;
+        store::set_failed(&tx, exec, error)?;
         // The cycle's own cleanup, such as a race's loser cancellation, rolled
         // back with the cycle. This backend has no retention pass, so remove
         // the work no one can use any more, as the `TerminateIfRunning` seal does.
@@ -1304,6 +1415,59 @@ impl SqliteRuntime {
         tx.commit()?;
         self.workflow_panic_strikes.remove(&exec);
         Ok(())
+    }
+
+    /// Seal `exec` `CONTINUED_AS_NEW` and start its successor, in one
+    /// transaction (issue #2023).
+    ///
+    /// The successor has the same `workflow_name` and `workflow_id`. Its
+    /// `WorkflowStarted` carries `input`. Undelivered signals move to it.
+    /// Delivered signals stay with `exec`, as on Postgres.
+    ///
+    /// The drain keeps its bookkeeping events, such as a side effect. It drops
+    /// a dispatch, as the Postgres worker does: the old run never resumes, so
+    /// no one can await the result. Pending tasks and unfired timers of `exec`
+    /// are deleted for the same reason.
+    fn continue_as_new(
+        &mut self,
+        exec: ExecutionId,
+        workflow_name: &str,
+        workflow_id: &str,
+        pending: &[WorkflowCommand],
+        input: Value,
+    ) -> SqliteResult<RunState> {
+        let dropped = pending.iter().filter(|cmd| is_dispatch(cmd)).count();
+        if dropped > 0 {
+            // Postgres logs the same drop (issue #952). A drop is never silent.
+            tracing::warn!(
+                %exec,
+                dropped_dispatches = dropped,
+                "continue-as-new dropped dispatched work; the old run never resumes"
+            );
+        }
+        let successor = ExecutionId::new();
+        let tx = self.conn.transaction()?;
+        persist_terminal_pending_commands(
+            &tx,
+            exec,
+            pending.iter().filter(|cmd| !is_dispatch(cmd)),
+        )?;
+        store::append_event(
+            &tx,
+            exec,
+            &WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id: successor,
+                input: input.clone(),
+                new_workflow_type: None,
+            },
+        )?;
+        queue::delete_pending_tasks_for_execution(&tx, exec)?;
+        queue::delete_unfired_timers_for_execution(&tx, exec)?;
+        store::seal_execution(&tx, exec, SEALED_STATE)?;
+        insert_run(&tx, successor, workflow_name, workflow_id, input)?;
+        queue::move_undelivered_signals(&tx, exec, successor)?;
+        tx.commit()?;
+        Ok(RunState::ContinuedAsNew(successor))
     }
 
     /// Run exactly one decision cycle at logical time `now` (epoch milliseconds):
@@ -1342,16 +1506,21 @@ impl SqliteRuntime {
                 "FAILED" => Ok(RunState::Failed(
                     store::execution_error(&self.conn, exec)?.unwrap_or_default(),
                 )),
-                // A sealed / superseded run (`CONTINUED_AS_NEW`) or any other terminal
-                // state is inert and not resumable — surface a terminal `Failed`
-                // naming the state rather than re-driving.
+                // A continued run names its successor again (issue #2023). It
+                // starts no second successor.
+                SEALED_STATE => Ok(store::successor_of(&self.conn, exec)?.map_or_else(
+                    || RunState::Failed(format!("execution is terminal ({state}); not resumable")),
+                    RunState::ContinuedAsNew,
+                )),
+                // Any other terminal state (`CANCELLED`, `TIMED_OUT`, `TERMINATED`)
+                // is inert. Surface a terminal `Failed` that names it.
                 other => Ok(RunState::Failed(format!(
                     "execution is terminal ({other}); not resumable"
                 ))),
             };
         }
 
-        let history = store::load_history(&self.conn, exec)?;
+        let (history, history_bytes) = store::load_history_sized(&self.conn, exec)?;
         let input = store::execution_input(&self.conn, exec)?;
         let workflow_name = store::workflow_name_of(&self.conn, exec)?;
         // Re-read the persisted business `workflow_id` on EVERY cycle (issue #698,
@@ -1392,7 +1561,8 @@ impl SqliteRuntime {
                 handler,
                 input,
                 empty_shared_state(),
-                WorkflowHistoryPolicy::default(),
+                // Issue #2023: the soft threshold for `should_continue_as_new`.
+                self.history_policy,
                 Some(&span_meta), // FIX: the sole seam carrying business workflow_id → ctx.info()
                 &[],              // declarative query handlers (none on this backend)
                 &[],              // declarative update handlers (none on this backend)
@@ -1442,6 +1612,14 @@ impl SqliteRuntime {
         }
         self.workflow_panic_strikes.remove(&exec);
 
+        // Issue #2023: the #1804 caps. Each arm that writes checks them inside
+        // its transaction, before its terminal event.
+        let caps = CapCheck {
+            policy: self.history_policy,
+            start_bytes: history_bytes,
+            workflow_type: &workflow_name,
+        };
+
         match outcome {
             WorkflowOutcome::Completed { output, .. } => {
                 let tx = self.conn.transaction()?;
@@ -1449,6 +1627,10 @@ impl SqliteRuntime {
                 // terminal event, in command order, inside the SAME transaction —
                 // mirroring the Postgres `persist_terminal_outcome_commands`.
                 persist_terminal_pending_commands(&tx, exec, &pending)?;
+                if let Some(reason) = caps.reached(&tx, exec)? {
+                    drop(tx);
+                    return self.fail_for_history_cap(exec, &reason);
+                }
                 store::append_event(
                     &tx,
                     exec,
@@ -1504,14 +1686,31 @@ impl SqliteRuntime {
                 let decoded = autumn_harvest::failure::decode_workflow_failure(&error);
                 let tx = self.conn.transaction()?;
                 persist_terminal_pending_commands(&tx, exec, &pending)?;
+                if let Some(reason) = caps.reached(&tx, exec)? {
+                    drop(tx);
+                    return self.fail_for_history_cap(exec, &reason);
+                }
                 store::append_event(&tx, exec, &WorkflowEvent::workflow_failed_typed(&decoded))?;
                 store::set_failed(&tx, exec, &decoded.message)?;
                 tx.commit()?;
                 Ok(RunState::Failed(decoded.message))
             }
-            WorkflowOutcome::ContinuedAsNew { .. } => {
-                Err(SqliteError::Unsupported("ContinueAsNew".to_string()))
-            }
+            // Issue #2023. A continuing run is exempt from the caps: its
+            // successor starts a new history.
+            WorkflowOutcome::ContinuedAsNew {
+                input,
+                new_workflow_type: None,
+            } => self.continue_as_new(exec, &workflow_name, &workflow_id, &pending, input),
+            // A cross-type successor needs its own type's defaults. This backend
+            // does not resolve them, so it rejects the command by name.
+            WorkflowOutcome::ContinuedAsNew {
+                new_workflow_type: Some(_),
+                ..
+            } => Err(SqliteError::Unsupported(
+                "ContinueAsNew.new_workflow_type — continuing as a different workflow type \
+                 is outside the sqlite subset; use continue_as_new to keep the same type"
+                    .to_string(),
+            )),
             // Issue #1797: discard a deadlocked cycle, as for non-determinism
             // above. The error stops the decision loop, so it cannot spin.
             WorkflowOutcome::TaskFailed { error } => Err(SqliteError::TaskFailed {
@@ -1519,7 +1718,7 @@ impl SqliteRuntime {
                 details: error,
             }),
             WorkflowOutcome::Suspended { commands } => {
-                self.drive_suspension(exec, &history, &commands, now, failure_now)
+                self.drive_suspension(exec, &history, &commands, &caps, now, failure_now)
             }
         }
     }
@@ -1537,10 +1736,14 @@ impl SqliteRuntime {
         exec: ExecutionId,
         history: &[WorkflowEvent],
         commands: &[WorkflowCommand],
+        caps: &CapCheck<'_>,
         now: i64,
         failure_now: &(dyn Fn() -> i64 + Send + Sync),
     ) -> SqliteResult<RunState> {
-        let applied = self.apply_commands(exec, history, commands, now)?;
+        let applied = match self.apply_commands(exec, history, commands, caps, now)? {
+            Applied::Committed { produced } => produced,
+            Applied::CapReached(reason) => return self.fail_for_history_cap(exec, &reason),
+        };
         let settle_after_first_terminal = worker::activity_race_in_flight(history, commands);
         let drained = worker::drain_ready(
             &mut self.conn,
@@ -1572,13 +1775,17 @@ impl SqliteRuntime {
     /// (event + row commit together, or — if any command in the batch is
     /// unsupported and returns `Err`, dropping the uncommitted transaction —
     /// neither does).
+    ///
+    /// The cap check (issue #2023) runs after the appends and before the
+    /// commit. A breach drops the transaction, so the decision rolls back.
     fn apply_commands(
         &mut self,
         exec: ExecutionId,
         history: &[WorkflowEvent],
         commands: &[WorkflowCommand],
+        caps: &CapCheck<'_>,
         now: i64,
-    ) -> SqliteResult<bool> {
+    ) -> SqliteResult<Applied> {
         let tx = self.conn.transaction()?;
         let mut produced = false;
         // Timer ids armed within THIS batch, so a (pathological) duplicate
@@ -1669,6 +1876,10 @@ impl SqliteRuntime {
                 WorkflowCommand::WaitForActivity { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::PublishProgress { .. }
+                // Durable streams (issue #1974) need the Postgres-only
+                // `harvest_stream_chunks` table. A benign NO-OP here, as for
+                // `PublishProgress`.
+                | WorkflowCommand::PublishDurableProgress { .. }
                 // `RecordLog` (issue #790) is the OPT-IN durable per-execution
                 // log sink, backed by a Postgres-only `harvest_workflow_logs`
                 // table this backend does not have. A benign NO-OP here: the
@@ -1745,8 +1956,11 @@ impl SqliteRuntime {
                 other => return Err(SqliteError::Unsupported(command_name(other).to_string())),
             }
         }
+        if let Some(reason) = caps.reached(&tx, exec)? {
+            return Ok(Applied::CapReached(reason));
+        }
         tx.commit()?;
-        Ok(produced)
+        Ok(Applied::Committed { produced })
     }
 
     /// Classify why a no-progress cycle is blocked.
@@ -2097,16 +2311,47 @@ fn insert_fresh_execution(
 ) -> SqliteResult<StartOutcome> {
     let exec = ExecutionId::new();
     let workflow_id = business_id.map_or_else(|| exec.to_string(), str::to_string);
-    store::insert_execution(conn, exec, workflow_name, &workflow_id, &input)?;
-    store::append_event(
-        conn,
-        exec,
-        &WorkflowEvent::workflow_started(input, Utc::now()),
-    )?;
+    insert_run(conn, exec, workflow_name, &workflow_id, input)?;
     Ok(StartOutcome {
         exec_id: exec,
         created: true,
     })
+}
+
+/// Insert a `RUNNING` row for `exec` and its `WorkflowStarted` event. A
+/// start and a continue-as-new successor share it.
+fn insert_run(
+    conn: &Connection,
+    exec: ExecutionId,
+    workflow_name: &str,
+    workflow_id: &str,
+    input: Value,
+) -> SqliteResult<()> {
+    store::insert_execution(conn, exec, workflow_name, workflow_id, &input)?;
+    store::append_event(
+        conn,
+        exec,
+        &WorkflowEvent::workflow_started(input, Utc::now()),
+    )
+}
+
+/// The result of [`SqliteRuntime::apply_commands`].
+enum Applied {
+    /// The batch committed. `produced` is `true` when a durable row changed.
+    Committed { produced: bool },
+    /// The batch reached a history cap and rolled back (issue #2023).
+    CapReached(HistoryCapReason),
+}
+
+/// A command that dispatches work or waits for it. A continue-as-new drain
+/// drops it (issue #2023).
+const fn is_dispatch(cmd: &WorkflowCommand) -> bool {
+    matches!(
+        cmd,
+        WorkflowCommand::ScheduleActivity { .. }
+            | WorkflowCommand::StartTimer { .. }
+            | WorkflowCommand::WaitForSignal { .. }
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2189,10 +2434,10 @@ pub fn persist_started_timer(
 /// rejected LOUDLY with [`SqliteError::Unsupported`] — the `?` drops the caller's
 /// uncommitted terminal transaction, rolling back every side effect persisted so
 /// far this cycle. It is never silently dropped.
-fn persist_terminal_pending_commands(
+fn persist_terminal_pending_commands<'c>(
     conn: &Connection,
     exec: ExecutionId,
-    pending: &[WorkflowCommand],
+    pending: impl IntoIterator<Item = &'c WorkflowCommand>,
 ) -> SqliteResult<()> {
     for cmd in pending {
         match cmd {
@@ -2238,6 +2483,8 @@ fn persist_terminal_pending_commands(
             WorkflowCommand::WaitForActivity { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            // Durable streams (issue #1974): Postgres-only, a NO-OP here.
+            | WorkflowCommand::PublishDurableProgress { .. }
             // Durable workflow logs (issue #790) — Postgres-only sink; a benign
             // NO-OP here for the same reason as `PublishProgress`.
             | WorkflowCommand::RecordLog { .. } => {}
@@ -2413,6 +2660,7 @@ const fn command_name(cmd: &WorkflowCommand) -> &'static str {
         WorkflowCommand::UpsertSearchAttributes { .. } => "UpsertSearchAttributes",
         WorkflowCommand::SetCurrentDetails { .. } => "SetCurrentDetails",
         WorkflowCommand::PublishProgress { .. } => "PublishProgress",
+        WorkflowCommand::PublishDurableProgress { .. } => "PublishDurableProgress",
         WorkflowCommand::RecordLog { .. } => "RecordLog",
         WorkflowCommand::CancelRaceLosers { .. } => "CancelRaceLosers",
         WorkflowCommand::ArmTimer { .. } => "ArmTimer",

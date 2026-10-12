@@ -55,7 +55,7 @@ nothing can call them. This change adds `SqliteRuntime::query`.
 | R8 | A caller cannot tell an unknown name from an unknown run. | Two typed variants. A test checks both. |
 | R9 | The future cannot go to `tokio::spawn`. | A compile-time test checks `Send + 'static`. |
 | R10 | Drift on a terminal run serves a wrong answer. | `classify_terminal_query` maps it to `QueryUnavailable`. `drifted_terminal_run_is_query_unavailable` covers it. |
-| R11 | An unsupported-feature seal rolls back its last cycle, side effects included. A replay mints new values, so each query answers differently. | A terminal replay that emits `RecordSideEffect` or `RecordMarker` is `QueryUnavailable`. A test covers it. |
+| R11 | A seal for an unsupported feature or a history cap (issue #2023) rolls back its last cycle, side effects included. A replay mints new values, so each query answers differently. | A terminal replay that emits `RecordSideEffect` or `RecordMarker` is `QueryUnavailable`. A test covers it. |
 | R12 | A query fires a due timer. | The query never reads the timer queue. A test sets the clock past the deadline and compares the tables. |
 | R13 | Code past the last recorded event, a `side_effect` closure included, runs in each query. | Postgres does the same. The docs state it. A core replay-only mode is a follow-up. |
 
@@ -124,5 +124,7 @@ is polled.
 | A spinning replay is `QueryTimedOut` within the configured limit. | R7 |
 | Drift on a terminal run is `QueryUnavailable`. | R10 |
 | An unrecorded side effect on a sealed run is `QueryUnavailable`. | R11 |
+| An unrecorded side effect on a history-capped run is `QueryUnavailable`. | R11 |
+| A continued-as-new run serves a stable answer. | R11 |
 | `ctx.info()` gives the stored workflow id and type. | — |
 | The future is `Send + 'static`. | R9 |
