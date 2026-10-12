@@ -866,3 +866,34 @@ async fn a_busy_server_costs_one_read_per_poll() {
     assert_eq!((report.errors, report.skipped), (1, 2));
     p.stop().await;
 }
+
+/// A cancel ends `run` while a read hangs. It does not wait for the read
+/// timeout.
+#[tokio::test]
+async fn cancel_ends_a_poll_that_waits_on_a_hanging_server() {
+    let db = setup().await;
+    let url = &db.url;
+    let server = Arc::new(FakeServer::default());
+    let p = Process::start(url, "remote-task-cancel", &server);
+    let exec_id = start_run(url, "report-21", json!({})).await;
+    wait_for_token(url, exec_id).await;
+    server.hang.store(true, std::sync::atomic::Ordering::SeqCst);
+    let poller = RemoteTaskPoller::new(&RemoteTasks::new(FakeTransport(Arc::clone(&server))));
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    let stop = async {
+        while server.gets.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        cancel.cancel();
+    };
+    let (ended, ()) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(5), poller.run(&p.pool, cancel.clone())),
+        stop
+    );
+    assert!(
+        ended.is_ok(),
+        "run must end soon after the cancel, not after 30 s"
+    );
+    p.stop().await;
+}

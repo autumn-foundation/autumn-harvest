@@ -508,6 +508,18 @@ impl RemoteTaskPoller {
     /// Returns an error when the page query fails. A failed settle of one
     /// token is logged and counted in [`PollReport::errors`].
     pub async fn poll_once(&self, pool: &DbPool) -> HarvestResult<PollReport> {
+        self.poll_until(pool, &tokio_util::sync::CancellationToken::new())
+            .await
+    }
+
+    /// [`Self::poll_once`] that stops early when `cancel` fires. It stops
+    /// between reads: the remote reads in flight are dropped, but a settle
+    /// that has begun always ends, so no transaction is cut off.
+    async fn poll_until(
+        &self,
+        pool: &DbPool,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> HarvestResult<PollReport> {
         let page = {
             let mut conn = pool
                 .get()
@@ -570,7 +582,15 @@ impl RemoteTaskPoller {
             .buffer_unordered(self.concurrency);
         // Settle each ended task when its read lands. A slow read must not
         // keep a result back until the token deadline passes.
-        while let Some((pending, read)) = reads.next().await {
+        loop {
+            let next = tokio::select! {
+                biased;
+                () = cancel.cancelled() => break,
+                next = reads.next() => next,
+            };
+            let Some((pending, read)) = next else {
+                break;
+            };
             let Some(read) = read else {
                 report.skipped += 1;
                 continue;
@@ -692,10 +712,11 @@ impl RemoteTaskPoller {
     }
 
     /// Poll until `cancel` fires. The poller logs a failed poll, and the
-    /// next poll runs after the interval.
+    /// next poll runs after the interval. A cancel also ends the poll in
+    /// flight, between two reads.
     pub async fn run(&self, pool: &DbPool, cancel: tokio_util::sync::CancellationToken) {
         while !cancel.is_cancelled() {
-            match self.poll_once(pool).await {
+            match self.poll_until(pool, &cancel).await {
                 Ok(report) if report.settled > 0 => {
                     tracing::debug!(
                         polled = report.polled,
