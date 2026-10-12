@@ -69,8 +69,12 @@
 //! unaffected. Local activities and the SQLite backend do not use it.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+// Shuttle models drive the registry (issue #1800). See
+// `docs/testing/shuttle.md`.
+use crate::shuttle_sync::{AtomicUsize, Mutex, MutexGuard, Notify};
 use std::time::Duration;
 
 use crate::policy::AdaptiveLimitPolicy;
@@ -461,7 +465,7 @@ pub struct AdaptiveLimitRegistry {
     saturated_count: AtomicUsize,
     /// Wakes the worker's idle wait when a type leaves its cap. The worker
     /// uses it as its capacity wake.
-    slot_freed: Arc<tokio::sync::Notify>,
+    slot_freed: Arc<Notify>,
     metrics: Option<Arc<dyn MetricsRecorder>>,
 }
 
@@ -486,7 +490,7 @@ impl AdaptiveLimitRegistry {
             config,
             limiters: Mutex::new(HashMap::new()),
             saturated_count: AtomicUsize::new(0),
-            slot_freed: Arc::new(tokio::sync::Notify::new()),
+            slot_freed: Arc::new(Notify::new()),
             metrics: None,
         }
     }
@@ -552,10 +556,9 @@ impl AdaptiveLimitRegistry {
     }
 
     /// The wake that fires when an activity type leaves its cap. The worker
-    /// shares it as its capacity wake.
-    #[cfg(feature = "db")]
+    /// shares it as its capacity wake. The Shuttle models wait on it.
     #[must_use]
-    pub(crate) fn slot_freed_notify(&self) -> Arc<tokio::sync::Notify> {
+    pub fn slot_freed_notify(&self) -> Arc<Notify> {
         Arc::clone(&self.slot_freed)
     }
 

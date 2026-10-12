@@ -49,6 +49,9 @@ pub enum JitterPolicy {
     Decorrelated,
 }
 
+/// The `SplitMix64` finalizer.
+///
+/// It is a bijection on `u64`. `formal/verus/src/mixers.rs` proves it.
 const fn mix64(mut x: u64) -> u64 {
     x ^= x >> 30;
     x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -57,6 +60,10 @@ const fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+/// A value in `[lo, hi]` that `seed` selects.
+///
+/// `formal/verus/src/jitter.rs` proves the range for every input, with the
+/// real mixer.
 const fn uniform_inclusive(seed: u64, lo: u64, hi: u64) -> u64 {
     let range = hi.wrapping_sub(lo).wrapping_add(1);
     let offset = if range == 0 {

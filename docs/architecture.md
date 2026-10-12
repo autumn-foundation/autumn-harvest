@@ -1928,13 +1928,14 @@ randomized- and model-checking-based testing layers, and CI run coverage:
 * [`docs/testing/loom.md`](testing/loom.md) — permutation-testing
   concurrent Rust with [Loom](https://github.com/tokio-rs/loom).
 * [`docs/testing/shuttle.md`](testing/shuttle.md) — async model checking
-  with [Shuttle](https://github.com/awslabs/shuttle) for `slot_tuner.rs` and
-  `heartbeat.rs` (issue #1800).
+  with [Shuttle](https://github.com/awslabs/shuttle) for `slot_tuner.rs`,
+  `heartbeat.rs` and `adaptive_limit.rs` (issue #1800).
 * [`docs/testing/concurrency-model-checking.md`](testing/concurrency-model-checking.md)
   — the evaluation of loom / Shuttle / Turmoil behind the adoptions above.
 * [`docs/testing/formal-methods.md`](testing/formal-methods.md) — TLA+
-  models of the core protocols and Kani proofs of the pure kernels
-  (issue #1819).
+  models of the core protocols, Kani proofs of the pure kernels
+  (issue #1819), and Verus proofs of the integer kernels in
+  `formal/verus/`.
 * [`docs/testing/simulation.md`](testing/simulation.md) — seeded,
   deterministic simulation of the activity claim protocol, with a Postgres
   differential test (issue #1830). The world simulation runs the real

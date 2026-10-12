@@ -2,8 +2,9 @@
 
 [Shuttle](https://github.com/awslabs/shuttle) tests concurrent Rust under a
 controlled scheduler. Unlike loom, it models async tasks and tokio-style
-primitives. This repo uses it for two modules that loom cannot reach:
-`slot_tuner.rs` (tokio `Semaphore`) and `heartbeat.rs` (tokio `mpsc`).
+primitives. This repo uses it for three modules that loom cannot reach:
+`slot_tuner.rs` (tokio `Semaphore`), `heartbeat.rs` (tokio `mpsc`) and
+`adaptive_limit.rs` (tokio `Notify`).
 
 See [`concurrency-model-checking.md`](concurrency-model-checking.md) for the
 tool evaluation, and [`loom.md`](loom.md) for the loom models.
@@ -49,9 +50,14 @@ same names resolve to `shuttle-tokio` and `shuttle-tokio-util`:
 | `sleep` | `tokio::time` | `shuttle_tokio::time` |
 | `select!` | `tokio` | `shuttle_tokio` |
 | `CancellationToken` | `tokio_util::sync` | `shuttle_tokio_util::sync` |
+| `Notify` | `tokio::sync` | `shuttle_tokio::sync` |
+| `Mutex`, `MutexGuard` | `std::sync` | `shuttle::sync` |
+| `AtomicUsize` | `std::sync::atomic` | `shuttle::sync::atomic` |
 
-Only `slot_tuner.rs` and `heartbeat.rs` import from the shim. A normal build
-is unchanged. The Shuttle crates are `[target.'cfg(shuttle)'.dependencies]`,
+Only `slot_tuner.rs`, `heartbeat.rs` and `adaptive_limit.rs` import from the
+shim. A normal build is unchanged. The std `Mutex` and `AtomicUsize` go
+through the shim too. Shuttle can then switch tasks at each lock and at each
+atomic access of the adaptive limit registry. The Shuttle crates are `[target.'cfg(shuttle)'.dependencies]`,
 so a normal build does not fetch or compile them. They are target
 dependencies, not dev-dependencies, because the shim names them from the
 library sources.
@@ -81,6 +87,17 @@ Each model is one function. Two `#[test]`s run it: one with
 3. **`heartbeat_lease_lost_stops_the_flusher_*`.** The sink reports a lost
    lease (issue #1789) on the first flush. The model checks that the flusher
    cancels the activity token and flushes nothing more.
+4. **`adaptive_limit_wakes_the_poll_loop_*`.** One poll loop starts three
+   attempts of each of two activity types (issue #1836). The cap of each type
+   moves between 1 and 2, because some attempts report an overload. Other
+   attempts drop their permit. When every remaining type is at its cap, the
+   loop waits on `slot_freed_notify`, as the worker's idle wait does. The
+   worker's wait also has a poll timer, but the model has none. A lost wake
+   therefore blocks the loop, and Shuttle reports a deadlock. The model
+   checks:
+   - no type runs more than 2 attempts at once;
+   - every attempt starts, so no wake is lost;
+   - at the end, no type holds a slot, and the saturated count is 0.
 
 ## Defects found
 

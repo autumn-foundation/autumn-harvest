@@ -8,6 +8,8 @@
 //!   permits.
 //! * [`run_heartbeat_flusher`] drains a real `mpsc` channel while an activity
 //!   sends heartbeats.
+//! * [`AdaptiveLimitRegistry`] admits attempts while other attempts finish
+//!   and move the cap. Its slot-freed wake is a real `Notify`.
 //!
 //! Under `cfg(shuttle)`, `crate::shuttle_sync` swaps the tokio types for the
 //! `shuttle-tokio` types. Each model runs under the random scheduler and under
@@ -32,7 +34,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use autumn_harvest::adaptive_limit::{
+    Acquire, AdaptiveLimitConfig, AdaptiveLimitRegistry, SampleOutcome,
+};
 use autumn_harvest::heartbeat::{FlushOutcome, FlusherExit, HeartbeatSink, run_heartbeat_flusher};
+use autumn_harvest::policy::AdaptiveLimitPolicy;
 use autumn_harvest::slot_tuner::TunedSlotRuntime;
 use serde_json::{Value, json};
 use shuttle::future::{block_on, yield_now};
@@ -319,4 +325,100 @@ fn heartbeat_lease_lost_stops_the_flusher_random() {
 #[test]
 fn heartbeat_lease_lost_stops_the_flusher_pct() {
     shuttle::check_pct(heartbeat_lease_lost_model, PCT_ITERATIONS, PCT_DEPTH);
+}
+
+// ---------------------------------------------------------------------------
+// adaptive_limit
+// ---------------------------------------------------------------------------
+
+/// The activity types of the adaptive limit model.
+const LIMITED_TYPES: [&str; 2] = ["charge_card", "send_email"];
+/// Attempts of each type that the poll loop must start.
+const ATTEMPTS_PER_TYPE: usize = 3;
+/// The cap moves between 1 and this value.
+const LIMIT_MAX: u32 = 2;
+
+/// One poll loop starts three attempts of each of two types (issue #1836).
+///
+/// The cap of each type moves between 1 and 2. Attempts finish in parallel.
+/// Some report an overload, which can cut the cap. Some drop the permit.
+/// When every remaining type is at its cap, the loop waits on the
+/// slot-freed wake. The worker's real wait also has a poll timer. The
+/// model has none, so a lost wake leaves the loop blocked, and Shuttle
+/// reports a deadlock.
+///
+/// The model checks three properties:
+///
+/// 1. No type runs more attempts than `LIMIT_MAX` at once.
+/// 2. Every attempt starts. The slot-freed wake loses no free slot.
+/// 3. At the end, no type holds a slot or counts as saturated.
+fn adaptive_limit_model() {
+    block_on(async {
+        let policy = AdaptiveLimitPolicy::new(1, LIMIT_MAX);
+        let registry = Arc::new(AdaptiveLimitRegistry::new(
+            AdaptiveLimitConfig::disabled().with_default(Some(policy)),
+        ));
+        let wake = registry.slot_freed_notify();
+        let running: Arc<[AtomicUsize; 2]> = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let mut remaining = [ATTEMPTS_PER_TYPE; 2];
+        let mut attempts = Vec::new();
+
+        while remaining.iter().any(|&n| n > 0) {
+            let mut started = false;
+            for (kind, name) in LIMITED_TYPES.iter().enumerate() {
+                if remaining[kind] == 0 {
+                    continue;
+                }
+                let permit = match registry.try_acquire(name) {
+                    Acquire::Acquired(permit) => permit,
+                    Acquire::Limited { .. } => continue,
+                    other => panic!("{name} must have a limit, got {other:?}"),
+                };
+                remaining[kind] -= 1;
+                started = true;
+                let seq = remaining[kind];
+                let running = Arc::clone(&running);
+                attempts.push(shuttle_tokio::spawn(async move {
+                    let now = running[kind].fetch_add(1, Ordering::SeqCst) + 1;
+                    assert!(
+                        now <= LIMIT_MAX as usize,
+                        "{now} attempts of one type run at once"
+                    );
+                    yield_now().await;
+                    running[kind].fetch_sub(1, Ordering::SeqCst);
+                    match seq % 3 {
+                        0 => permit.complete(Duration::from_millis(5), SampleOutcome::Overloaded),
+                        1 => permit.complete(Duration::from_millis(5), SampleOutcome::Answered),
+                        _ => drop(permit),
+                    }
+                }));
+            }
+            if !started {
+                wake.notified().await;
+            }
+        }
+
+        for attempt in attempts {
+            attempt.await.expect("an attempt panicked");
+        }
+        for name in LIMITED_TYPES {
+            let snapshot = registry.snapshot(name).expect("the type has state");
+            assert_eq!(snapshot.in_flight, 0, "{name} still holds a slot");
+        }
+        assert!(
+            !registry.any_saturated(),
+            "the saturated count must return to 0"
+        );
+        assert!(registry.saturated().is_empty());
+    });
+}
+
+#[test]
+fn adaptive_limit_wakes_the_poll_loop_random() {
+    shuttle::check_random(adaptive_limit_model, RANDOM_ITERATIONS);
+}
+
+#[test]
+fn adaptive_limit_wakes_the_poll_loop_pct() {
+    shuttle::check_pct(adaptive_limit_model, PCT_ITERATIONS, PCT_DEPTH);
 }

@@ -144,7 +144,7 @@ pub const fn supersede_count(existing_others: usize, limit: u32) -> usize {
     let effective = if limit == 0 { 1 } else { limit };
     // `as usize` is lossless on every supported target (>= 32-bit pointers).
     let cap = effective as usize;
-    (existing_others + 1).saturating_sub(cap)
+    existing_others.saturating_add(1).saturating_sub(cap)
 }
 
 /// Shed decision for one latest-wins supersede pass (issue #811, Codex round 2).
@@ -172,7 +172,7 @@ pub const fn supersede_count(existing_others: usize, limit: u32) -> usize {
 #[must_use]
 pub const fn supersede_plan(candidates: usize, protected: usize, limit: u32) -> SupersedePlan {
     let target = {
-        let raw = supersede_count(candidates + protected, limit);
+        let raw = supersede_count(candidates.saturating_add(protected), limit);
         if raw > SUPERSEDE_SCAN_LIMIT {
             SUPERSEDE_SCAN_LIMIT
         } else {
@@ -967,6 +967,46 @@ async fn supersede_inner(
     }
 
     Ok(outcome)
+}
+
+/// Kani proofs of the latest-wins shed plan (issue #811).
+///
+/// The `kani` CI job runs them. See `docs/testing/formal-methods.md`.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// A plan never sheds more than the candidates or the scan limit. A
+    /// limit of 0 acts as 1. When the plan sheds its full target, the key
+    /// ends at or under its limit, the admitted run included.
+    #[kani::proof]
+    fn supersede_plan_sheds_only_candidates_and_meets_the_limit() {
+        let candidates: usize = kani::any();
+        let protected: usize = kani::any();
+        let limit: u32 = kani::any();
+        let plan = supersede_plan(candidates, protected, limit);
+        assert!(plan.shed <= plan.target);
+        assert!(plan.target <= SUPERSEDE_SCAN_LIMIT);
+        assert!(plan.shed <= candidates);
+        if limit == 0 {
+            assert_eq!(plan, supersede_plan(candidates, protected, 1));
+        }
+        let population = candidates
+            .checked_add(protected)
+            .and_then(|n| n.checked_add(1));
+        if let Some(population) = population
+            && plan.shed == plan.target
+            && plan.target < SUPERSEDE_SCAN_LIMIT
+        {
+            let cap = usize::try_from(limit.max(1)).unwrap_or(usize::MAX);
+            assert!(population - plan.shed <= cap);
+        }
+        if plan.shed < plan.target {
+            assert_eq!(plan.shed, candidates);
+        }
+        kani::cover!(plan.shed < plan.target);
+        kani::cover!(plan.shed > 0 && plan.shed == plan.target);
+    }
 }
 
 #[cfg(test)]
