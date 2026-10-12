@@ -1589,7 +1589,6 @@ async fn reset_rejected_while_holder_holds_mutex() {
             operator_id: "op".into(),
             signal_reapply: ResetSignalReapplyPolicy::default(),
             allow_terminal_source: false,
-            refuse_erased_source: false,
         },
     )
     .await;
@@ -1642,7 +1641,6 @@ async fn reset_after_release_succeeds() {
                 operator_id: "op".into(),
                 signal_reapply: ResetSignalReapplyPolicy::default(),
                 allow_terminal_source: false,
-                refuse_erased_source: false,
             },
         )
         .await;
@@ -1664,7 +1662,6 @@ async fn reset_after_release_succeeds() {
             operator_id: "op".into(),
             signal_reapply: ResetSignalReapplyPolicy::default(),
             allow_terminal_source: false,
-            refuse_erased_source: false,
         },
         None,
     )

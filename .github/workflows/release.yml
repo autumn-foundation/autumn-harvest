@@ -398,7 +398,9 @@ jobs:
       contents: read
     services:
       postgres:
-        image: postgres:16
+        # The ECR Public mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls.
+        image: public.ecr.aws/docker/library/postgres:16
         env:
           POSTGRES_USER: harvest
           POSTGRES_PASSWORD: harvest

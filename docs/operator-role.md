@@ -86,6 +86,9 @@ if caller.is_support_engineer() {
   stay reachable). The gate applies to both the tool's own HTTP path and the
   `/mcp` JSON-RPC `tools/call` envelope (autumn-web re-dispatches the envelope
   through the same route). See *MCP tool routes* below.
+- **Receives `403 Forbidden` on the MCP Tasks route** — when
+  [`mcp_tasks()`](./mcp-tools.md#mcp-tasks-issue-2005) is enabled. Every
+  JSON-RPC method on that route counts as a mutation, `tasks/get` included.
 
 The `403` is distinct from the anonymous `401` the admin gate returns, so an
 authenticated-but-insufficient read-only principal is distinguishable from an

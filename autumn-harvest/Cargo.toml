@@ -188,6 +188,11 @@ required-features = ["db", "testing"]
 name = "signal_with_start_webhook"
 required-features = ["db"]
 
+# Issue #1995: the upgrade-check command of a candidate build.
+[[example]]
+name = "upgrade_check"
+required-features = ["db", "testing"]
+
 [[example]]
 name = "update_with_start_cart"
 required-features = ["db"]

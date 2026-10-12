@@ -163,6 +163,7 @@ fn worker_config(worker_id: &str, local_cap: Duration) -> WorkerRuntimeConfig {
         notification_database_url: None,
         max_concurrent_workflows: 2,
         max_concurrent_activities: 2,
+        max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
         poll_interval: Duration::from_millis(25),
         shutdown_timeout: Duration::from_secs(1),
         cancellation_grace_period: Duration::from_secs(1),

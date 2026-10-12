@@ -144,6 +144,28 @@ CapMissRelease(c) ==
     /\ inflight' = inflight \ {c}
     /\ UNCHANGED <<run, events, claims>>
 
+\* release_unstarted_claim (issue #1813): a draining worker gives back a
+\* claim that never started. Its fence is claim_held, with no strikes term.
+\* The release came after #1806, so its guard checks attempt in every config.
+\* It subtracts 1 from attempt and keeps crash_strikes. The trace check of
+\* issue #2003 found the gap: a chaos trace of #1813 matched no action.
+\* The action drops the claim from inflight. That is an assumption: no
+\* handler ran, so the claim writes nothing more. A later claim can reuse
+\* (worker_id, attempt, crash_strikes), so a stale write after the release
+\* would break OwnerWritesByCurrentClaim. The drain calls the release only
+\* for a dispatch that never started.
+UnstartedRelease(c) ==
+    /\ c \in inflight
+    /\ IF /\ row.state = "RUNNING"
+          /\ row.worker = c.w
+          /\ row.attempt = c.a
+       THEN /\ Wrote(c)
+            /\ row' = [row EXCEPT !.state = "PENDING", !.worker = NoWorker,
+                                  !.seq = 0, !.attempt = @ - 1]
+       ELSE UNCHANGED <<row, writes>>
+    /\ inflight' = inflight \ {c}
+    /\ UNCHANGED <<run, events, claims>>
+
 \* The terminal persist: lock the run, check the guard, append the terminal
 \* event and close the run and the task in one transaction.
 PersistTerminal(c) ==
@@ -164,6 +186,7 @@ Next ==
     \/ \E c \in inflight :
         \/ SuspendRelease(c)
         \/ CapMissRelease(c)
+        \/ UnstartedRelease(c)
         \/ PersistTerminal(c)
 
 Spec == Init /\ [][Next]_vars

@@ -21,7 +21,10 @@ the same shape with one fewer service to operate.
 
 Weighing harvest against Temporal, DBOS, Inngest, Hatchet, or Restate? See the
 honest, evidence-linked [comparison page](docs/comparison.md) — it names
-harvest's own gaps, not just its strengths.
+harvest's own gaps, not just its strengths. The
+[safety report](docs/safety-report.md) states what the engine guarantees for
+leases, fencing, exactly-once completion and signal ordering. It gives the tests,
+the results, a command for each result and the known limits.
 
 Moving an existing Temporal deployment? See the
 [Temporal migration guide](docs/migrating-from-temporal.md) — a concept

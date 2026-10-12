@@ -662,3 +662,40 @@ async fn finished_run_rejects_signal_and_update_but_serves_query() {
         Ok(json!({ "approve": "a", "confirm": "c" }))
     );
 }
+
+// ───────────────────────────── iteration cap ─────────────────────────────────
+
+/// Runs `count` activities, one at a time. Each activity costs one cycle.
+fn sequential_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    count: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        for _ in 0..count.as_u64().unwrap_or(0) {
+            ctx.execute_activity_raw("step", json!(null), "default")
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(json!("done"))
+    })
+}
+
+#[tokio::test]
+async fn the_iteration_cap_is_configurable() {
+    let env = || WorkflowTestEnv::new().mock_activity("step", |_| Ok(json!(null)));
+
+    let capped = env()
+        .with_max_iterations(3)
+        .run(sequential_workflow, json!(10))
+        .await;
+    let error = capped
+        .result
+        .expect_err("three cycles cannot run ten activities");
+    assert!(error.contains("exceeded 3 iterations"), "{error}");
+
+    let raised = env()
+        .with_max_iterations(1_500)
+        .run(sequential_workflow, json!(1_200))
+        .await;
+    assert_eq!(raised.result, Ok(json!("done")));
+}

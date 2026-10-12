@@ -97,7 +97,7 @@ use autumn_harvest::queue::{self, ConcurrencyKeyStats};
 use autumn_harvest::reset::{
     BatchResetItem, BatchResetOutcome, ResetInvalidPoint, ResetPoint, ResetResult,
     ResetSignalReapplyPolicy, ResetSkipReason, WorkflowResetError, WorkflowResetRequest,
-    preview_workflow_reset, reset_workflow_execution, resolve_batch_reset_one,
+    batch_skip_reason, preview_workflow_reset, reset_workflow_execution, resolve_batch_reset_one,
 };
 use autumn_harvest::retention::{RetentionConfig, RetentionMonitor, RetentionStatus};
 use autumn_harvest::scheduler::{
@@ -1958,6 +1958,16 @@ pub(crate) struct SignalQuery {
     idempotency_key: Option<String>,
 }
 
+impl SignalQuery {
+    /// A query that carries `key`, for the MCP Tasks route (issue #2005).
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub(crate) fn with_key(key: impl Into<String>) -> Self {
+        Self {
+            idempotency_key: Some(key.into()),
+        }
+    }
+}
+
 /// Response for the standalone signal route.
 ///
 /// `signal_delivered` is `true` when a signal row was freshly queued and
@@ -2022,7 +2032,7 @@ struct ReplayDeadLetterResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct CancelWorkflowResponse {
+pub(crate) struct CancelWorkflowResponse {
     ok: bool,
     execution_id: String,
     state: String,
@@ -2735,8 +2745,18 @@ impl DagTriggerRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct CancelWorkflowRequest {
+pub(crate) struct CancelWorkflowRequest {
     reason: Option<String>,
+}
+
+impl CancelWorkflowRequest {
+    /// A cancel request with `reason`, for the MCP Tasks route (issue #2005).
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub(crate) fn with_reason(reason: impl Into<String>) -> Self {
+        Self {
+            reason: Some(reason.into()),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3229,6 +3249,9 @@ pub(crate) struct WorkflowFilters {
     /// Combined with `AND` against each other and against the legacy
     /// `search_attrs` containment predicates above.
     pub(crate) search_attr_predicates: Vec<SearchAttrPredicate>,
+    /// Parsed `filter` expressions (issue #1982). Each one joins the query
+    /// with `AND`.
+    pub(crate) filter: Vec<crate::visibility_query::Expr>,
     pub(crate) started_after: Option<chrono::DateTime<chrono::Utc>>,
     pub(crate) started_before: Option<chrono::DateTime<chrono::Utc>>,
     /// Prefix match on the execution UUID cast to text (e.g. "abc123").
@@ -5354,6 +5377,11 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             "/executions/{exec_id}/events/stream",
             get(stream_execution_events).route_layer(require_admin.clone()),
         )
+        // Live list signal (issue #1982). Admin-gated, the same as #324.
+        .route(
+            "/workflows/changes/stream",
+            get(stream_workflow_changes).route_layer(require_admin.clone()),
+        )
         // Build routing management (issue #362): expose build policies,
         // compatibility declarations, and cross-shard reachability.
         // Mutating routes are admin-gated; the read route is open to any
@@ -7114,6 +7142,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/audit"),
         // ── SSE execution event stream (issue #324) ───────────────────────────
         ("GET", "/executions/{exec_id}/events/stream"),
+        // ── live list signal (issue #1982) ────────────────────────────────────
+        ("GET", "/workflows/changes/stream"),
         // ── build routing management (issue #362) ─────────────────────────────
         ("GET", "/admin/build-routing"),
         ("POST", "/admin/build-routing/policies"),
@@ -9021,6 +9051,7 @@ pub const fn management_api_response_fields()
         ("GET", "/admin/audit", None), // Vec<AuditRecord> (external model)
         // ── SSE execution event stream (issue #324) ───────────────────────────
         ("GET", "/executions/{exec_id}/events/stream", None), // text/event-stream
+        ("GET", "/workflows/changes/stream", None),           // text/event-stream
         // ── build routing (issue #362) ────────────────────────────────────────
         (
             "GET",
@@ -10877,6 +10908,30 @@ pub(crate) fn parse_workflow_filters(
                 let predicate = parse_search_attr_filter(value)?;
                 filters.search_attr_predicates.push(predicate);
             }
+            "filter" => {
+                // An empty value is absent, the same as `state=` or `owner=`.
+                if value.trim().is_empty() {
+                    continue;
+                }
+                // The index rule reads all values together, after the loop.
+                let expr = crate::visibility_query::parse_unanchored(value).map_err(|message| {
+                    AutumnError::bad_request_msg(format!("invalid filter: {message}"))
+                })?;
+                // The predicate limit applies to the request, not to each value.
+                let total = filters
+                    .filter
+                    .iter()
+                    .chain(std::iter::once(&expr))
+                    .map(crate::visibility_query::predicate_count)
+                    .sum::<usize>();
+                if total > crate::visibility_query::MAX_PREDICATES {
+                    return Err(AutumnError::bad_request_msg(format!(
+                        "invalid filter: the filter values hold more than {} predicates",
+                        crate::visibility_query::MAX_PREDICATES
+                    )));
+                }
+                filters.filter.push(expr);
+            }
             "failure_cause" => {
                 let trimmed = value.trim();
                 if !trimmed.is_empty() {
@@ -11007,6 +11062,9 @@ pub(crate) fn parse_workflow_filters(
             }
         }
     }
+
+    crate::visibility_query::check_anchor(&filters.filter)
+        .map_err(|message| AutumnError::bad_request_msg(format!("invalid filter: {message}")))?;
 
     // `page_size` takes precedence over `limit` whenever it is present, so the
     // documented "page_size overrides limit" contract holds independent of the
@@ -21497,11 +21555,6 @@ async fn batch_reset_workflows(
                         operator_id: request.operator_id.clone(),
                         signal_reapply: request.signal_reapply,
                         allow_terminal_source: true,
-                        // Left `false` deliberately: this is the batch-reset
-                        // endpoint, not the issue #780 DAG retry, and refusing
-                        // an erased source here would be an unrelated behavior
-                        // change to an already-shipped surface.
-                        refuse_erased_source: false,
                     };
                     match reset_workflow_execution(
                         conn,
@@ -21523,15 +21576,15 @@ async fn batch_reset_workflows(
                             });
                             reset_count += 1;
                         }
+                        // The fork refuses an erased source under its row lock
+                        // (issue #1999). `batch_skip_reason` keeps that skip typed.
                         Err(reset_err) => {
                             items.push(BatchResetItem {
                                 exec_id: exec_id_str,
                                 outcome: BatchResetOutcome::Skipped,
                                 resolved_event_id: Some(resolved_event_id),
                                 new_exec_id: None,
-                                skip_reason: Some(ResetSkipReason::InfrastructureError {
-                                    message: format!("reset failed: {reset_err}"),
-                                }),
+                                skip_reason: Some(batch_skip_reason(&reset_err)),
                             });
                             skipped_count += 1;
                         }
@@ -23328,7 +23381,7 @@ async fn update_with_start_workflow(
     }
 }
 
-async fn cancel_workflow(
+pub(crate) async fn cancel_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
@@ -25445,18 +25498,14 @@ fn reset_error_response(error: WorkflowResetError) -> axum::response::Response {
             }),
         )
             .into_response(),
-        // Same `409` and the same operator instruction as the DAG-retry
-        // pre-flight guard, so a caller cannot tell whether the erasure was
-        // already committed or landed in the race window — only that the
-        // source is unusable and a fresh run is the answer.
+        // Every fork refuses an erased source (issue #1999). DAG retry maps
+        // this case to its own message in `dag_retry_reset_error_response`.
         WorkflowResetError::ErasedSource { exec_id } => (
             axum::http::StatusCode::CONFLICT,
             Json(ResetErrorResponse {
                 message: format!(
-                    "workflow execution {exec_id} had its payloads erased (issue #495), so its \
-                     carried-over node outputs are tombstones and whether it already compensated \
-                     cannot be determined; retrying would resume on unreadable state — start a \
-                     fresh DAG run instead"
+                    "workflow execution {exec_id} had its payloads erased (issue #495); a fork \
+                     would resume on tombstones, so start a fresh run instead"
                 ),
             }),
         )
@@ -25596,8 +25645,26 @@ fn dag_retry_invalid_point_response(invalid: &ResetInvalidPoint) -> axum::respon
 /// contract: the invalid-boundary case is a `409` (not the `400` the standalone
 /// reset uses), everything else mirrors the standalone reset mapping.
 fn dag_retry_reset_error_response(error: WorkflowResetError) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
     match error {
         WorkflowResetError::InvalidPoint(invalid) => dag_retry_invalid_point_response(&invalid),
+        // Same `409` and the same operator instruction as the DAG-retry
+        // pre-flight guard. A caller cannot tell whether the erasure committed
+        // before the pre-flight check or in the race window. It only learns
+        // that the source is unusable and that a fresh run is the answer.
+        WorkflowResetError::ErasedSource { exec_id } => (
+            axum::http::StatusCode::CONFLICT,
+            Json(ResetErrorResponse {
+                message: format!(
+                    "workflow execution {exec_id} had its payloads erased (issue #495), so its \
+                     carried-over node outputs are tombstones and whether it already compensated \
+                     cannot be determined; retrying would resume on unreadable state — start a \
+                     fresh DAG run instead"
+                ),
+            }),
+        )
+            .into_response(),
         other => reset_error_response(other),
     }
 }
@@ -25928,6 +25995,12 @@ pub(crate) async fn retry_dag_run_inner(
 
     // Compose the reset request: the reason carries the DAG-retry annotation so
     // the audit trail (#158) and the WorkflowResetFork event read cleanly.
+    //
+    // The pre-flight erasure guard above ran on an unlocked read. The
+    // connection was then dropped for blob inflation, so `erase-payloads` can
+    // commit before this transaction opens. The fork rechecks erasure under its
+    // own row lock (issue #1999). So the fork never acts on an issue #780
+    // guard decision whose evidence an erasure destroyed.
     let augmented_reason = format!(
         "{} | dag_retry: nodes=[{}]",
         reason.trim(),
@@ -25940,13 +26013,6 @@ pub(crate) async fn retry_dag_run_inner(
         operator_id: operator_id.trim().to_string(),
         signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::default(),
         allow_terminal_source: true,
-        // Recheck erasure under the fork's own row lock. The pre-flight guard
-        // above ran on an unlocked read, and the connection was dropped for blob
-        // inflation before this transaction opens — so `erase-payloads` can
-        // commit in that window. Without this, the fork would carry tombstoned
-        // outputs and the issue #780 compensated-run guard would have been
-        // decided on evidence that no longer exists.
-        refuse_erased_source: true,
     };
 
     // Dry-run: validate the boundary and return the plan without writing.
@@ -41717,13 +41783,15 @@ fn apply_min_history_events_filter(
     )
 }
 
-/// Apply the legacy `search_attr` containment predicates and the typed
-/// `search_attr_filter` comparison/set predicates (issue #506) to a boxed
-/// `harvest_workflow_executions` query.
+/// Apply the legacy `search_attr` containment predicates, the typed
+/// `search_attr_filter` comparison/set predicates (issue #506) and the
+/// `filter` expressions (issue #1982) to a boxed
+/// `harvest_workflow_executions` query. `visibility_query::SqlFilter` holds
+/// the SQL for all three.
 ///
-/// Shared by `load_workflows` and `load_stalled_workflows` so both list code
-/// paths filter identically — without this the `no_progress_minutes` (stalled)
-/// path silently ignored every search-attribute filter (issue #506 review).
+/// All three list loaders share this helper, so each list path filters the
+/// same way. Before issue #506, the `no_progress_minutes` (stalled) path
+/// ignored every search-attribute filter.
 ///
 /// Every fragment stays on an index path: `@>` (containment) and `?` (key
 /// existence) both hit the existing `idx_harvest_we_search` GIN index;
@@ -41736,70 +41804,22 @@ fn apply_search_attr_filters<'a>(
     mut query: harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg>,
     legacy: &[Value],
     predicates: &[SearchAttrPredicate],
+    exprs: &[crate::visibility_query::Expr],
 ) -> harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg> {
-    use diesel::dsl::sql;
-    use diesel::sql_types::{Array, Bool, Jsonb, Text};
+    use crate::visibility_query::SqlFilter;
 
     // Legacy `search_attr=key:value` exact-match containment. Repeated keys
     // narrow the result set (AND).
     for predicate in legacy {
-        query = query.filter(
-            sql::<Bool>("harvest_workflow_executions.search_attrs @> ")
-                .bind::<Jsonb, _>(predicate.clone()),
-        );
+        query = query.filter(SqlFilter::contains(predicate.clone()));
     }
     for predicate in predicates {
-        query = match predicate {
-            SearchAttrPredicate::Eq { key, value } => {
-                let object = serde_json::json!({ key.clone(): value.clone() });
-                query.filter(
-                    sql::<Bool>("harvest_workflow_executions.search_attrs @> ")
-                        .bind::<Jsonb, _>(object),
-                )
-            }
-            SearchAttrPredicate::Ne { key, value } => {
-                let object = serde_json::json!({ key.clone(): value.clone() });
-                query.filter(
-                    sql::<Bool>("(harvest_workflow_executions.search_attrs ? ")
-                        .bind::<Text, _>(key.clone())
-                        .sql(" AND NOT (harvest_workflow_executions.search_attrs @> ")
-                        .bind::<Jsonb, _>(object)
-                        .sql("))"),
-                )
-            }
-            SearchAttrPredicate::Cmp { key, op, value } => {
-                let head = sql::<Bool>("(harvest_workflow_executions.search_attrs ? ")
-                    .bind::<Text, _>(key.clone())
-                    .sql(" AND jsonb_typeof(harvest_workflow_executions.search_attrs -> ")
-                    .bind::<Text, _>(key.clone())
-                    .sql(") = 'number' AND (harvest_workflow_executions.search_attrs ->> ")
-                    .bind::<Text, _>(key.clone());
-                // Fold the operator (from the fixed `CmpOp` enum) into a single
-                // static literal per branch so the fragment never chains two
-                // raw-SQL pieces back to back. The threshold is bound as text and
-                // cast `::numeric` so the comparison is exact even past 2^53.
-                let body = match op {
-                    CmpOp::Gt => head.sql(")::numeric > "),
-                    CmpOp::Gte => head.sql(")::numeric >= "),
-                    CmpOp::Lt => head.sql(")::numeric < "),
-                    CmpOp::Lte => head.sql(")::numeric <= "),
-                };
-                query.filter(body.bind::<Text, _>(value.clone()).sql("::numeric)"))
-            }
-            SearchAttrPredicate::In { key, values } => query.filter(
-                sql::<Bool>("(harvest_workflow_executions.search_attrs ? ")
-                    .bind::<Text, _>(key.clone())
-                    .sql(" AND harvest_workflow_executions.search_attrs -> ")
-                    .bind::<Text, _>(key.clone())
-                    .sql(" = ANY(")
-                    .bind::<Array<Jsonb>, _>(values.clone())
-                    .sql("))"),
-            ),
-            SearchAttrPredicate::Exists { key } => query.filter(
-                sql::<Bool>("harvest_workflow_executions.search_attrs ? ")
-                    .bind::<Text, _>(key.clone()),
-            ),
-        };
+        query = query.filter(SqlFilter::from_attr(predicate));
+    }
+    // The `filter` grammar (issue #1982). Its attribute leaves compile to the
+    // same SQL as the predicates above.
+    for expr in exprs {
+        query = query.filter(SqlFilter::from_expr(expr));
     }
     query
 }
@@ -41824,29 +41844,104 @@ fn exclude_canary_from_list(workflow_name: Option<&str>) -> bool {
 /// LIKE wildcard ambiguity) and works inside the stalled loader's
 /// correlated-subquery context. The prefix is always a *bound* `Text` param,
 /// never interpolated.
+///
+/// A `filter` expression that names a canary workflow with `=` or `IN` also
+/// opts back in (issue #1982). Only the canary names that it names pass.
 fn apply_canary_list_exclusion<'a>(
     query: harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg>,
-    workflow_name: Option<&str>,
+    filters: &WorkflowFilters,
 ) -> harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg> {
     use diesel::dsl::sql;
-    use diesel::sql_types::{Bool, Text};
+    use diesel::sql_types::{Array, Bool, Text};
 
-    if exclude_canary_from_list(workflow_name) {
-        query.filter(
-            sql::<Bool>("NOT starts_with(harvest_workflow_executions.workflow_name, ")
-                .bind::<Text, _>(autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX)
-                .sql(")"),
-        )
+    if !exclude_canary_from_list(filters.workflow_name.as_deref()) {
+        return query;
+    }
+    let named: Vec<String> = filters
+        .filter
+        .iter()
+        .flat_map(crate::visibility_query::workflow_names)
+        .filter(|name| autumn_harvest::canary::is_canary_workflow(name))
+        .collect();
+    let excluded = sql::<Bool>("(NOT starts_with(harvest_workflow_executions.workflow_name, ")
+        .bind::<Text, _>(autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX);
+    if named.is_empty() {
+        query.filter(excluded.sql("))"))
     } else {
-        query
+        query.filter(
+            excluded
+                .sql(") OR harvest_workflow_executions.workflow_name = ANY(")
+                .bind::<Array<Text>, _>(named)
+                .sql("))"),
+        )
     }
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn load_workflows(
     conn: &mut AsyncPgConnection,
     filters: &WorkflowFilters,
 ) -> HarvestResult<Vec<WorkflowExecution>> {
+    workflow_list_query(filters)
+        .select(WorkflowExecution::as_select())
+        .load(conn)
+        .await
+        .map_err(database_error)
+}
+
+/// Runs `EXPLAIN` on the default `GET /workflows` query for `raw_query`
+/// (issue #1982). Returns one line of the plan for each row.
+///
+/// A test hook. It parses the query string the same way as the route, and it
+/// explains the same SQL that `load_workflows` runs.
+///
+/// # Errors
+///
+/// Returns a message when the query string is not valid, or when the
+/// database rejects the statement.
+#[doc(hidden)]
+pub async fn explain_workflow_list(
+    conn: &mut AsyncPgConnection,
+    raw_query: &str,
+) -> Result<Vec<String>, String> {
+    let pairs =
+        crate::strict_query::decode_or_autumn_error(Some(raw_query)).map_err(|e| e.to_string())?;
+    let filters = parse_workflow_filters(&pairs).map_err(|e| e.to_string())?;
+    let query = workflow_list_query(&filters).select(WorkflowExecution::as_select());
+    Explain(query)
+        .load::<String>(conn)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// `EXPLAIN` in front of a query.
+struct Explain<Q>(Q);
+
+impl<Q: diesel::query_builder::QueryFragment<diesel::pg::Pg>>
+    diesel::query_builder::QueryFragment<diesel::pg::Pg> for Explain<Q>
+{
+    fn walk_ast<'b>(
+        &'b self,
+        mut out: diesel::query_builder::AstPass<'_, 'b, diesel::pg::Pg>,
+    ) -> diesel::QueryResult<()> {
+        out.push_sql("EXPLAIN ");
+        self.0.walk_ast(out.reborrow())
+    }
+}
+
+impl<Q> diesel::query_builder::QueryId for Explain<Q> {
+    type QueryId = ();
+    const HAS_STATIC_QUERY_ID: bool = false;
+}
+
+impl<Q> diesel::query_builder::Query for Explain<Q> {
+    type SqlType = diesel::sql_types::Text;
+}
+
+/// Builds the default `GET /workflows` query, with no `SELECT` list.
+#[allow(clippy::too_many_lines)]
+fn workflow_list_query(
+    filters: &WorkflowFilters,
+) -> harvest_workflow_executions::BoxedQuery<'static, diesel::pg::Pg> {
     use diesel::dsl::sql;
     use diesel::sql_types::{Bool, Jsonb, Text, Timestamptz, Uuid as SqlUuid};
 
@@ -41935,7 +42030,7 @@ pub(crate) async fn load_workflows(
     }
     // Issue #796 (AC8): hide synthetic liveness canary runs from the default
     // list unless the caller explicitly filters to a canary workflow name.
-    query = apply_canary_list_exclusion(query, filters.workflow_name.as_deref());
+    query = apply_canary_list_exclusion(query, filters);
     if let Some(after) = filters.started_after {
         query = query.filter(harvest_workflow_executions::started_at.ge(after));
     }
@@ -41962,6 +42057,7 @@ pub(crate) async fn load_workflows(
         query,
         &filters.search_attrs,
         &filters.search_attr_predicates,
+        &filters.filter,
     );
     if let Some(cause) = &filters.failure_cause {
         let predicate = serde_json::json!({ "failure_cause": cause });
@@ -42011,12 +42107,7 @@ pub(crate) async fn load_workflows(
     // `apply_min_history_events_filter`) rather than an unbounded
     // `COUNT(*)`. No schema migration is required — it reads from the
     // existing `harvest_events` table via the existing composite index.
-    query = apply_min_history_events_filter(query, filters.min_history_events);
-    query
-        .select(WorkflowExecution::as_select())
-        .load(conn)
-        .await
-        .map_err(database_error)
+    apply_min_history_events_filter(query, filters.min_history_events)
 }
 
 // ── Issue #756: partial-availability for cross-shard fan-out reads ───────────
@@ -42380,7 +42471,7 @@ pub(crate) async fn load_stalled_workflows(
     // Without this, a canary stuck RUNNING (e.g. when the timeout scanner is
     // itself wedged — a failure the canary exists to detect) would surface in
     // `GET /workflows?no_progress_minutes=N`, the same endpoint AC8 excludes.
-    query = apply_canary_list_exclusion(query, filters.workflow_name.as_deref());
+    query = apply_canary_list_exclusion(query, filters);
     if let Some(owner) = &filters.owner {
         query = query.filter(harvest_workflow_executions::owner.eq(owner.as_str()));
     }
@@ -42454,6 +42545,7 @@ pub(crate) async fn load_stalled_workflows(
         query,
         &filters.search_attrs,
         &filters.search_attr_predicates,
+        &filters.filter,
     );
 
     if !filters.include_sleeping {
@@ -42771,7 +42863,7 @@ pub(crate) async fn load_history_bloat_workflows(
     }
     // Issue #796 (AC8): hide synthetic liveness canary runs unless the caller
     // explicitly filters to a canary workflow name.
-    query = apply_canary_list_exclusion(query, filters.workflow_name.as_deref());
+    query = apply_canary_list_exclusion(query, filters);
     if let Some(owner) = &filters.owner {
         query = query.filter(harvest_workflow_executions::owner.eq(owner.as_str()));
     }
@@ -42782,6 +42874,7 @@ pub(crate) async fn load_history_bloat_workflows(
         query,
         &filters.search_attrs,
         &filters.search_attr_predicates,
+        &filters.filter,
     );
     // PR #1139 review: mirror `load_workflows`'s `failure_cause` handling --
     // omitting it here silently broadened the result to unrelated bloated
@@ -45201,6 +45294,168 @@ async fn stream_execution_events(
     // comments every keepalive_interval so proxies don't idle the connection.
     Sse::new(rx)
         .keep_alive(KeepAlive::new().interval(keepalive_interval).text("ping"))
+        .into_response()
+}
+
+/// The longest wait for the `LISTEN` connection of one shard.
+const WORKFLOW_CHANGES_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The shortest gap between two `changed` frames on the change stream.
+const WORKFLOW_CHANGES_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The shared state of the shard listeners of one change stream.
+#[derive(Default)]
+struct WorkflowChangeSignal {
+    notify: tokio::sync::Notify,
+    count: std::sync::atomic::AtomicU64,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+/// Stops each listener task when the stream ends.
+struct AbortOnDrop(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+/// Opens one `LISTEN` connection for each shard, all at the same time.
+///
+/// Each connect has a 5 s limit, so one silent shard cannot hold the request.
+/// Returns the first shard that failed.
+async fn connect_change_listeners(
+    urls: &BTreeMap<ShardId, String>,
+) -> Result<Vec<autumn_harvest::notify::WorkflowEventListener>, i32> {
+    use autumn_harvest::notify::WorkflowEventListener;
+
+    let connects = urls.iter().map(|(shard, url)| async move {
+        let connect = WorkflowEventListener::connect(url);
+        match tokio::time::timeout(WORKFLOW_CHANGES_CONNECT_TIMEOUT, connect).await {
+            Ok(Ok(listener)) => Ok(listener),
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    shard = shard.as_i32(),
+                    error = %e,
+                    "workflow change stream: shard listener failed"
+                );
+                Err(shard.as_i32())
+            }
+            Err(_) => {
+                tracing::warn!(
+                    shard = shard.as_i32(),
+                    "workflow change stream: shard listener timed out"
+                );
+                Err(shard.as_i32())
+            }
+        }
+    });
+    futures::future::try_join_all(connects).await
+}
+
+/// `GET /workflows/changes/stream` (issue #1982): a live signal for list views.
+///
+/// The stream listens to `harvest_events` on each shard. That is the channel
+/// of the #324 stream. It sends `event: changed` with the count of
+/// notifications since the last frame, at most once each second. A frame
+/// holds no run id and no payload. A client fetches the list again.
+///
+/// The route is admin-gated, the same as #324. Each stream holds one `LISTEN`
+/// connection for each shard. When a listener closes, the stream sends
+/// `event: stream-error` and ends, so the client connects again.
+async fn stream_workflow_changes(
+    Extension(api_state): Extension<HarvestApiState>,
+    session: Option<axum::extract::Extension<Session>>,
+) -> axum::response::Response {
+    use autumn_harvest::notify::WorkflowEventWaitOutcome;
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::SinkExt as _;
+    use std::sync::atomic::Ordering;
+
+    if !has_harvest_admin_access(&api_state, session.map(|s| s.0)).await {
+        return AutumnError::unauthorized_msg("authentication required").into_response();
+    }
+    let Ok(urls) = api_state.workflow_result_notification_database_urls() else {
+        return AutumnError::service_unavailable_msg(
+            "SSE notification URL is not configured".to_string(),
+        )
+        .into_response();
+    };
+
+    // The listeners start before the response, so the stream gets each later
+    // change. The client fetches the page once on connect, which covers the
+    // time before.
+    let Ok(listeners) = connect_change_listeners(&urls).await else {
+        return AutumnError::service_unavailable_msg(
+            "a shard notification listener is not available".to_string(),
+        )
+        .into_response();
+    };
+
+    let signal = std::sync::Arc::new(WorkflowChangeSignal::default());
+    let tasks = listeners
+        .into_iter()
+        .map(|mut listener| {
+            let signal = signal.clone();
+            tokio::spawn(async move {
+                loop {
+                    let outcome = listener.wait_for_notification().await;
+                    if matches!(outcome, Ok(WorkflowEventWaitOutcome::ChannelClosed)) {
+                        signal.closed.store(true, Ordering::Release);
+                        signal.notify.notify_one();
+                        return;
+                    }
+                    // A payload that does not parse is still a change.
+                    signal.count.fetch_add(1, Ordering::Relaxed);
+                    signal.notify.notify_one();
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let keepalive = api_state.sse_keepalive_interval();
+    let (mut tx, rx) =
+        futures::channel::mpsc::channel::<Result<Event, std::convert::Infallible>>(4);
+    tokio::spawn(async move {
+        let _listeners = AbortOnDrop(tasks);
+        loop {
+            // `Notify` keeps one permit, so changes during the gap below
+            // join into the next frame.
+            tokio::select! {
+                () = signal.notify.notified() => {}
+                () = tokio::time::sleep(keepalive) => {
+                    if tx.is_closed() {
+                        return;
+                    }
+                    continue;
+                }
+            }
+            if std::sync::atomic::AtomicBool::load(&signal.closed, Ordering::Acquire) {
+                let frame = Event::default()
+                    .event("stream-error")
+                    .data(r#"{"error":"listener_closed","retry":true}"#);
+                let _ = tx.send(Ok(frame)).await;
+                return;
+            }
+            let count = signal.count.swap(0, Ordering::Relaxed);
+            // A late permit from a change that the last frame counted.
+            if count == 0 {
+                continue;
+            }
+            let frame = Event::default()
+                .event("changed")
+                .data(serde_json::json!({ "notifications": count }).to_string());
+            if tx.send(Ok(frame)).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(WORKFLOW_CHANGES_MIN_GAP).await;
+        }
+    });
+
+    Sse::new(rx)
+        .keep_alive(KeepAlive::new().interval(keepalive).text("ping"))
         .into_response()
 }
 
@@ -52218,6 +52473,47 @@ mod tests {
                 "human_message must be non-empty for {variant:?}"
             );
         }
+    }
+
+    /// Read the `message` of a reset error response.
+    async fn reset_error_message(response: axum::response::Response) -> (StatusCode, String) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body must be readable");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
+        (
+            status,
+            body["message"].as_str().unwrap_or_default().to_string(),
+        )
+    }
+
+    /// Every fork refuses an erased source (issue #1999). The shared reset
+    /// `409` names no DAG. DAG retry keeps its own advice for the race window.
+    #[tokio::test]
+    async fn erased_source_409_is_generic_for_reset_and_specific_for_dag_retry() {
+        use autumn_harvest::reset::WorkflowResetError;
+        use autumn_harvest::types::{ExecutionId, ShardId};
+
+        let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+
+        let (status, message) =
+            reset_error_message(reset_error_response(WorkflowResetError::ErasedSource {
+                exec_id,
+            }))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(message.contains("erased"), "message: {message}");
+        assert!(message.contains("fresh run"), "message: {message}");
+        assert!(!message.contains("DAG"), "message: {message}");
+
+        let (status, message) = reset_error_message(dag_retry_reset_error_response(
+            WorkflowResetError::ErasedSource { exec_id },
+        ))
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(message.contains("erased"), "message: {message}");
+        assert!(message.contains("fresh DAG run"), "message: {message}");
     }
 
     /// The bulk DLQ `min_attempts` guard (issue #613): `>= 1` is accepted, but
