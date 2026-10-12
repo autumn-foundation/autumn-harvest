@@ -161,6 +161,23 @@ ignore = [
     # its parking_lot 0.11 dependency, or instant gains a maintained fork.
     { id = "RUSTSEC-2024-0384", reason = "unmaintained, no safe upgrade exists; reached only through dev-runtime-managed (local `cargo dev` tooling), off by default and never shipped. Revisit: postgresql_archive moves off parking_lot 0.11, or instant is forked/revived." },
 
+    # RUSTSEC-2024-0449 — unsafe-libyaml 0.2.11 is unmaintained (not a
+    # vulnerability). Its repository is archived, and the advisory says no
+    # safe upgrade is available. serde_yaml 0.9.34+deprecated pulls it in
+    # by two paths:
+    # - autumn-web 0.8.0, a crates.io dependency, through its `openapi`
+    #   feature. Its one call is `serde_yaml::to_string` in
+    #   `openapi::write_openapi_spec_to_dist`, which emits our own spec and
+    #   parses no input.
+    # - autumn-harvest's dev-dependencies. Only guard tests use it, and they
+    #   parse checked-in CI workflow files. No release build contains it.
+    # Dropping our dev-dependency alone would not clear the advisory, because
+    # autumn-web still pulls the crate.
+    # Revisit: autumn-web drops or replaces serde_yaml. Then move the guard
+    # tests to a maintained parser, such as serde-saphyr, and delete this
+    # entry.
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained, no safe upgrade exists; autumn-web's openapi feature only emits YAML through serde_yaml::to_string, and our own use is test-only parsing of checked-in workflow files. Revisit: autumn-web drops serde_yaml, then move the guard tests to a maintained YAML parser." },
+
     # RUSTSEC-2026-0098 / -0099 / -0104 (rustls-webpki 0.101.7) and the
     # h2@0.3.27 half of RUSTSEC-2026-0258 — FIXED, not deferred. All four
     # traced to the same root cause, previously mis-scoped in this file as
@@ -208,19 +225,6 @@ ignore = [
     # `Client::new`/`Client::from_conf` API, never a connector type
     # directly, so the swap is behavior-invisible to it. No new packages
     # added to Cargo.lock, only the legacy cluster removed.
-
-    # RUSTSEC-2024-0449 — unsafe-libyaml is unmaintained (archived
-    # 2024-03-25, last release 0.2.11). "No safe upgrade is available."
-    # It reaches the graph only through `serde_yaml` 0.9, which is itself
-    # deprecated. Two users, neither on a production input:
-    # - `autumn-harvest` [dev-dependencies]: guard tests parse this repo's
-    #   own `.github/workflows/*.yml` and docs YAML. Dev-only, never ships.
-    # - `autumn-web` 0.8.0 (external), behind its `openapi` feature: one
-    #   call, `serde_yaml::to_string` in `src/openapi.rs`, which serializes
-    #   its own OpenAPI spec. It parses no YAML at all.
-    # Revisit: move the guard tests to `serde-saphyr` or `noyalib`, or
-    # autumn-web drops `serde_yaml`. Either removes the crate from the lockfile.
-    { id = "RUSTSEC-2024-0449", reason = "unmaintained, no safe upgrade. Only via serde_yaml 0.9: dev-only guard tests parse this repo's own YAML, and autumn-web 0.8.0 only serializes its own OpenAPI spec. No untrusted YAML is parsed. Revisit: guard tests move to serde-saphyr/noyalib, or autumn-web drops serde_yaml." },
 ]
 
 # ---------------------------------------------------------------------------

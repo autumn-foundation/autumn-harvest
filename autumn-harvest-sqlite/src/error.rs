@@ -59,9 +59,9 @@ pub enum SqliteError {
     /// A signal was sent to an execution that is not accepting signals — it has
     /// reached a terminal state (`COMPLETED`/`FAILED`/…). Mirrors the Postgres
     /// engine's rejection of a signal to a terminal target
-    /// ([`send_signal`](crate::SqliteRuntime::send_signal)): staging it would
-    /// silently drop the wakeup, since no live `wait_for_signal` will ever consume
-    /// it. An unknown id is [`ExecutionNotFound`](Self::ExecutionNotFound); this
+    /// ([`send_signal`](crate::SqliteRuntime::send_signal)). No drive ever
+    /// consumes a row staged for a sealed run, so the wakeup would be lost
+    /// silently. An unknown id is [`ExecutionNotFound`](Self::ExecutionNotFound); this
     /// variant is only for a *present but sealed* run.
     #[error(
         "workflow execution {execution_id} is not running (state: {state}); cannot accept a signal"

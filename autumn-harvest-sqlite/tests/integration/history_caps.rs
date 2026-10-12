@@ -220,8 +220,9 @@ async fn a_completing_run_at_the_cap_fails_and_its_rows_go() {
     let mut rt = SqliteRuntime::open(&path).unwrap();
     rt.register_workflow(&four_steps_then_complete_info());
     rt.register_activity_raw("step", ActivitySpec::new(1, |_: Value| Ok(json!(null))));
-    // The completing decision holds 9 events before its terminal event.
-    rt.set_history_event_hard_cap(Some(9));
+    // The completing decision holds 10 events before its terminal event. One
+    // of them is the staged signal, which the first decision appends (#2020).
+    rt.set_history_event_hard_cap(Some(10));
     let exec = rt
         .start_workflow("four_steps_then_complete", json!(0))
         .unwrap();
@@ -233,24 +234,27 @@ async fn a_completing_run_at_the_cap_fails_and_its_rows_go() {
     assert_eq!(
         reason,
         HistoryCapReason::HistoryCapExceeded {
-            count: 9,
-            cap: 9,
+            count: 10,
+            cap: 10,
             workflow_type: "four_steps_then_complete".into(),
         }
     );
     assert_failed_event(&rt, exec, &reason);
-    assert_eq!(rt.load_history(exec).unwrap().len(), 10);
+    assert_eq!(rt.load_history(exec).unwrap().len(), 11);
     let raw = rusqlite::Connection::open(&path).unwrap();
     let staged: i64 = raw
         .query_row(
-            "SELECT COUNT(*) FROM harvest_signals WHERE exec_id = ?1",
+            "SELECT COUNT(*) FROM harvest_signals WHERE exec_id = ?1 AND delivered = 0",
             rusqlite::params![exec.to_string()],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(staged, 0, "the cap seal removes staged signals");
+    assert_eq!(
+        staged, 0,
+        "the signal is in history, and no row stays staged"
+    );
 
-    // One more event of room lets the same run complete.
+    // Without the signal, the same cap leaves room for the run to complete.
     let mut rt = runtime();
     rt.set_history_event_hard_cap(Some(10));
     let exec = rt
