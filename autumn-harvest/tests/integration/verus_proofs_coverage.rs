@@ -112,18 +112,13 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// The `.rs` files under `formal/verus/src`, relative to the repo root.
+/// The `.rs` files at any depth under `formal/verus/src`, relative to the
+/// repo root.
+///
+/// The walk is recursive because `mod m;` also resolves to `m/mod.rs`. A
+/// nested file then fails the crate root check, so no file escapes a guard.
 fn verus_files() -> Vec<String> {
-    let dir = repo_root().join("formal/verus/src");
-    let mut files: Vec<String> = std::fs::read_dir(&dir)
-        .expect("read formal/verus/src")
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "rs"))
-        .filter_map(|p| Some(format!("formal/verus/src/{}", p.file_name()?.to_str()?)))
-        .collect();
-    files.sort();
-    files
+    rs_files_under("formal/verus/src")
 }
 
 /// Every mirror marker in the Verus sources.
@@ -228,10 +223,15 @@ fn every_verus_mirror_matches_its_engine_source() {
 }
 
 /// The `.rs` files under `autumn-harvest/src`, relative to the repo root.
-/// Each path joins its parts with `/` on every OS, as a mirror marker does.
 fn engine_files() -> Vec<String> {
+    rs_files_under("autumn-harvest/src")
+}
+
+/// The `.rs` files at any depth under `dir`, relative to the repo root.
+/// Each path joins its parts with `/` on every OS, as a mirror marker does.
+fn rs_files_under(dir: &str) -> Vec<String> {
     fn walk(dir: &Path, out: &mut Vec<String>) {
-        for entry in std::fs::read_dir(dir).expect("read engine dir").flatten() {
+        for entry in std::fs::read_dir(dir).expect("read source dir").flatten() {
             let path = entry.path();
             if path.is_dir() {
                 walk(&path, out);
@@ -246,7 +246,7 @@ fn engine_files() -> Vec<String> {
         }
     }
     let mut out = Vec::new();
-    walk(&repo_root().join("autumn-harvest/src"), &mut out);
+    walk(&repo_root().join(dir), &mut out);
     out.sort();
     out
 }
@@ -476,6 +476,19 @@ fn proof_file_shape(src: &str) -> Result<(), String> {
             tokens[close + 1]
         ));
     }
+    // `mod m;` and `include!` pull in another file. No guard reads that
+    // file, so it could hold an unproved step.
+    for (j, t) in tokens.iter().enumerate() {
+        if t == "mod" && tokens.get(j + 2).is_some_and(|n| n == ";") {
+            return Err(format!(
+                "`mod {};` loads a file that no guard reads",
+                tokens[j + 1]
+            ));
+        }
+        if t.starts_with("include") && tokens.get(j + 1).is_some_and(|n| n == "!") {
+            return Err(format!("`{t}!` loads a file that no guard reads"));
+        }
+    }
     Ok(())
 }
 
@@ -594,6 +607,9 @@ fn the_proof_file_shape_check_finds_code_outside_the_block() {
         "verus! { }\nverus! { }",
         "fn f() {}",
         "use a::b",
+        "use vstd::prelude::*;\nverus! {\nmod hidden;\n}",
+        "verus! {\npub mod hidden ;\n}",
+        "verus! {\ninclude!(\"hidden.rs\");\n}",
     ] {
         assert!(proof_file_shape(bad).is_err(), "{bad}");
     }
@@ -605,6 +621,11 @@ fn every_verus_module_is_in_the_crate_root() {
         panic!("formal/verus/src/lib.rs may hold only `mod <name>;` items: {e}")
     });
     for file in verus_files() {
+        let rel = file.strip_prefix("formal/verus/src/").unwrap_or(&file);
+        assert!(
+            !rel.contains('/'),
+            "{file} is nested: keep every Verus file directly in formal/verus/src, where the guards expect it"
+        );
         let stem = Path::new(&file)
             .file_stem()
             .and_then(|s| s.to_str())
