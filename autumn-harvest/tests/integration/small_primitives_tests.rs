@@ -533,3 +533,50 @@ async fn durable_promise_refuses_a_second_handle_for_a_replayed_key() {
     );
     assert_succeeded(&report);
 }
+
+/// Sends a `harvest.promise:` signal whose payload is not a settlement, by
+/// workflow id and by execution id.
+fn invalid_promise_signal_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+    Box::pin(async move {
+        let by_id = ctx
+            .signal_external_workflow_by_id("other", "other-1", "harvest.promise:k", json!("bad"))
+            .await;
+        let by_exec = ctx
+            .signal_external_workflow(ExecutionId::new(), "harvest.promise:k", json!("bad"))
+            .await;
+        let reserved = ctx
+            .signal_external_workflow_with_idempotency(
+                ExecutionId::new(),
+                "order",
+                json!(1),
+                Some("harvest.promise:k".to_string()),
+            )
+            .await;
+        Ok(json!([
+            by_id.map_err(|e| e.to_string()).err(),
+            by_exec.map_err(|e| e.to_string()).err(),
+            reserved.map_err(|e| e.to_string()).err(),
+        ]))
+    })
+}
+
+/// A broken promise signal is the sender's bug. The context refuses it
+/// before it records a request, so the outbox never reports it as a target
+/// state such as `not_running`.
+#[tokio::test]
+async fn an_invalid_promise_signal_is_refused_at_the_sender() {
+    let outcome = WorkflowTestEnv::new()
+        .run(invalid_promise_signal_workflow, Value::Null)
+        .await;
+    let errors = outcome.result.clone().expect("the workflow completes");
+    let errors = errors.as_array().expect("an array");
+    assert_eq!(errors.len(), 3);
+    for error in errors {
+        let message = error.as_str().unwrap_or_default();
+        assert!(
+            message.contains("invalid configuration"),
+            "each send must be refused as a configuration error: {errors:?}"
+        );
+    }
+    assert_succeeded(&outcome.replay_check(invalid_promise_signal_workflow).await);
+}

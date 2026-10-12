@@ -10230,6 +10230,15 @@ impl WorkflowContext {
                     "ExternalSignalRequested(target={target}, signal={signal_name})"
                 ))?;
                 let payload_json = serde_json::to_value(&payload)?;
+                // Issue #1985: a broken promise signal is the sender's bug.
+                // Refuse it here, before a request is recorded. The outbox
+                // would otherwise report it as a target state, such as
+                // `not_running`.
+                crate::durable_promise::settlement_idempotency_key(
+                    signal_name,
+                    &payload_json,
+                    idempotency_key.as_deref(),
+                )?;
                 let observed = serde_json::to_string(&payload_json).map_or(0, |s| s.len() as u64);
                 if self.payload_max_signal > 0 && observed > self.payload_max_signal {
                     return Err(HarvestError::PayloadTooLarge {
