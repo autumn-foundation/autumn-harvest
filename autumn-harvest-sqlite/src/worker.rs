@@ -599,9 +599,10 @@ pub struct SignalIngest {
 
 /// The room that the history caps leave for one plan (issue #2023).
 ///
-/// `None` is unlimited. The plan stops once it fills the room. It then holds
-/// at most one signal past it, which makes the cap check fail the run. So a
-/// signal flood never loads past the caps into memory.
+/// `None` is unlimited. The plan checks the room before each event and stops
+/// once the room is full. It then holds at most one event past the room,
+/// which makes the cap check fail the run. So a signal flood never loads past
+/// the caps into memory.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IngestBudget {
     events: Option<u64>,
@@ -662,14 +663,16 @@ impl SignalIngest {
             bytes: 0,
         };
         store::for_each_pending_signal(conn, exec_id, |signal| {
-            if budget.is_full(plan.planned.len(), plan.bytes) {
-                return Ok(false);
-            }
+            // The budget holds per event. A deadline fired without its signal
+            // is still in order, because it came due before the signal arrived.
             if let Some(due) = deadlines.get_mut(&signal.name) {
                 while due
                     .front()
                     .is_some_and(|(_, fire_at)| *fire_at <= signal.received_at)
                 {
+                    if budget.is_full(plan.planned.len(), plan.bytes) {
+                        return Ok(false);
+                    }
                     if let Some((timer_id, _)) = due.pop_front() {
                         let event = WorkflowEvent::TimerFired {
                             timer_id: TimerId::new(timer_id.clone()),
@@ -677,6 +680,9 @@ impl SignalIngest {
                         plan.push(event, IngestRow::Timer(timer_id))?;
                     }
                 }
+            }
+            if budget.is_full(plan.planned.len(), plan.bytes) {
+                return Ok(false);
             }
             let event = WorkflowEvent::SignalReceived {
                 signal_name: signal.name,
@@ -1633,6 +1639,31 @@ mod tests {
             SignalIngest::plan(&conn, exec, 10, IngestBudget::remaining(policy, 1, 0)).unwrap();
         assert_eq!(ingest.events().count(), 2, "the room under the cap");
         assert!(ingest.bytes() > 0);
+    }
+
+    // Issue #2020: the budget holds per event, also inside one signal's group
+    // of due deadlines.
+    #[test]
+    fn a_plan_checks_its_budget_before_each_deadline_event() {
+        let conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
+        for seq in 0..3 {
+            queue::enqueue_timer(&conn, exec, &format!("__signal_timeout:{seq}:go"), 10).unwrap();
+        }
+        store::stage_signal(&conn, exec, "go", &serde_json::json!(1), 50).unwrap();
+        let policy = autumn_harvest::WorkflowHistoryPolicy::default().with_event_hard_cap(3);
+
+        let ingest =
+            SignalIngest::plan(&conn, exec, 100, IngestBudget::remaining(policy, 1, 0)).unwrap();
+        assert_eq!(ingest.events().count(), 2, "the room under the cap");
     }
 
     // Issue #2020: a plan writes nothing. A discarded cycle leaves every signal

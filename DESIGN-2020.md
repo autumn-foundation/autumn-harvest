@@ -73,6 +73,7 @@ Red tests in `tests/integration/signal_ingest.rs`, on trunk-dev `7a751d6`:
 | R15 | Planned signals miss the byte cap, so a run completes over it. Codex found it. | The cap counts the planned bytes as stored history. `ingested_signal_bytes_count_toward_the_byte_cap` pins it. |
 | R16 | A signal flood is read whole into memory before any cap check. Codex found it. | The plan reads rows one at a time and stops at the room the caps leave. `a_signal_flood_is_planned_only_up_to_the_event_cap` and `a_plan_stops_at_its_budget` pin it. |
 | R17 | A backlog past the caps meets a `continue_as_new`. The old run replays only a prefix. Codex found it. | The prefix stays with the old run, and the rest moves to the successor, so each signal arrives once. `a_backlog_past_the_caps_moves_on_at_the_hand_off_exactly_once` pins it. |
+| R18 | One signal's group of due deadlines overshoots the budget. Codex found it. | The plan checks the room before each event. `a_plan_checks_its_budget_before_each_deadline_event` pins it. |
 
 ### 0.5 Six thinking hats
 
