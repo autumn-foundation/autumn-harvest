@@ -11503,18 +11503,27 @@ fn an_unreadable_staged_row_of_another_name_is_refused() {
         rusqlite::params![armed, r#"{"approved":true}"#],
     )
     .expect("the decision is staged");
-    conn.execute(
-        "INSERT INTO harvest_signals (exec_id, name, payload_json) VALUES ('e', 'noise', '{not json')",
-        [],
-    )
-    .expect("the unreadable row is staged");
+    // A payload that is not JSON, and an arrival time that is not an integer.
+    for (label, payload, received_at) in [
+        ("text that is not JSON", "{not json", "0"),
+        ("an arrival time that is text", "{}", "'soon'"),
+    ] {
+        let sql = format!(
+            "INSERT INTO harvest_signals (exec_id, name, payload_json, received_at) \
+             VALUES ('e', 'noise', ?1, {received_at})"
+        );
+        conn.execute(&sql, [payload])
+            .expect("the unreadable row is staged");
 
-    let refused = inspect::outstanding_signal(&conn, "e", 1_000)
-        .expect_err("an unreadable row of any name must refuse the restart");
-    assert!(
-        refused.contains("noise") && refused.contains("every drive fails"),
-        "the refusal must name the row and say why: {refused}"
-    );
+        let refused = inspect::outstanding_signal(&conn, "e", 1_000)
+            .expect_err("an unreadable row of any name must refuse the restart");
+        assert!(
+            refused.contains("noise") && refused.contains("every drive fails"),
+            "[{label}] the refusal must name the row and say why: {refused}"
+        );
+        conn.execute("DELETE FROM harvest_signals WHERE name = 'noise'", [])
+            .expect("the row is removed");
+    }
 }
 
 #[test]

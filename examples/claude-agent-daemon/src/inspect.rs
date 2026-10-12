@@ -1000,13 +1000,14 @@ pub fn outstanding_signal(
 
 /// The name of the first staged row that the backend cannot read, if any.
 ///
-/// The backend reads `payload_json` as a `String` and parses it as JSON, for
-/// every undelivered row of the run. A non-text class or text that is not JSON
-/// fails that read.
+/// The backend reads `received_at` as an `i64`, and `payload_json` as a
+/// `String` that it parses as JSON, for every undelivered row of the run.
+/// `SQLite` typing is dynamic, so a column can hold another class. Any such
+/// row fails that read.
 fn unreadable_staged_signal(conn: &Connection, exec_id: &str) -> Result<Option<String>, String> {
     let mut statement = conn
         .prepare(
-            "SELECT name, payload_json FROM harvest_signals \
+            "SELECT name, payload_json, received_at FROM harvest_signals \
              WHERE exec_id = ?1 AND delivered = 0 \
              ORDER BY received_at, signal_seq",
         )
@@ -1021,9 +1022,10 @@ fn unreadable_staged_signal(conn: &Connection, exec_id: &str) -> Result<Option<S
         let name: String = row
             .get(0)
             .map_err(|e| format!("cannot read a staged signal name: {e}"))?;
-        let readable = row
-            .get::<_, String>(1)
-            .is_ok_and(|payload| serde_json::from_str::<serde_json::Value>(&payload).is_ok());
+        let readable = row.get::<_, i64>(2).is_ok()
+            && row
+                .get::<_, String>(1)
+                .is_ok_and(|payload| serde_json::from_str::<serde_json::Value>(&payload).is_ok());
         if !readable {
             return Ok(Some(name));
         }
