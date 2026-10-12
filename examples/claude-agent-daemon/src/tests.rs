@@ -88,8 +88,8 @@ fn counting_model(
 fn runtime(db: &Path, workspace: &Path, calls: &Arc<AtomicUsize>) -> SqliteRuntime {
     let mut rt = SqliteRuntime::open(db).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity(&session::claude_turn_info(), counting_model(calls.clone()));
-    rt.register_activity(
+    rt.register_activity_with_body(&session::claude_turn_info(), counting_model(calls.clone()));
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.to_path_buf()),
     );
@@ -261,8 +261,8 @@ async fn a_transcript_too_large_to_send_ends_the_session() {
 
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity(&session::claude_turn_info(), model);
-    rt.register_activity(
+    rt.register_activity_with_body(&session::claude_turn_info(), model);
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
     );
@@ -896,7 +896,7 @@ async fn a_truncated_turn_never_reports_a_clean_finish() {
     // `max_tokens` stop reason the API reports for a truncated turn.
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity(&session::claude_turn_info(), |_input| {
+    rt.register_activity_with_body(&session::claude_turn_info(), |_input| {
         serde_json::to_value(TurnReply {
             content: json!([{ "type": "text", "text": "half an ans" }]),
             stop_reason: "max_tokens".to_string(),
@@ -905,7 +905,7 @@ async fn a_truncated_turn_never_reports_a_clean_finish() {
         })
         .map_err(|e| format!("bad reply: {e}"))
     });
-    rt.register_activity(
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
     );
@@ -1987,7 +1987,7 @@ async fn the_full_view_shows_a_write_that_the_status_trims() {
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
     let written = payload.clone();
-    rt.register_activity(&session::claude_turn_info(), move |_input| {
+    rt.register_activity_with_body(&session::claude_turn_info(), move |_input| {
         let input = json!({ "path": "notes.md", "content": written });
         serde_json::to_value(TurnReply {
             content: json!([
@@ -2003,7 +2003,7 @@ async fn the_full_view_shows_a_write_that_the_status_trims() {
         })
         .map_err(|e| format!("bad reply: {e}"))
     });
-    rt.register_activity(
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
     );
@@ -2188,8 +2188,8 @@ async fn a_session_refuses_to_continue_on_another_model() {
 
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity(&session::claude_turn_info(), claude::activity_body(model));
-    rt.register_activity(
+    rt.register_activity_with_body(&session::claude_turn_info(), claude::activity_body(model));
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
     );
@@ -7283,7 +7283,7 @@ async fn a_tool_call_under_an_unknown_stop_reason_is_not_run() {
     // still not what the stop reason asked for, so it must not run.
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity(&session::claude_turn_info(), |_input| {
+    rt.register_activity_with_body(&session::claude_turn_info(), |_input| {
         serde_json::to_value(TurnReply {
             content: json!([]),
             stop_reason: "pause_turn".to_string(),
@@ -7296,7 +7296,7 @@ async fn a_tool_call_under_an_unknown_stop_reason_is_not_run() {
         })
         .map_err(|e| format!("bad reply: {e}"))
     });
-    rt.register_activity(
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
     );
@@ -11818,8 +11818,8 @@ async fn one_turn_runs_no_more_calls_than_a_turn_may_run() {
 
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity(&session::claude_turn_info(), model);
-    rt.register_activity(
+    rt.register_activity_with_body(&session::claude_turn_info(), model);
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
     );
@@ -12051,8 +12051,8 @@ async fn a_batch_of_exactly_the_bound_is_answered() {
 
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity(&session::claude_turn_info(), model);
-    rt.register_activity(
+    rt.register_activity_with_body(&session::claude_turn_info(), model);
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
     );

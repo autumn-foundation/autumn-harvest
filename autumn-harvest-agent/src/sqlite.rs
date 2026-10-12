@@ -30,22 +30,22 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     rt.register_workflow(&agent_loop_info());
     rt.register_workflow(&agent_heartbeat_info());
     let h = Arc::clone(&harness);
-    rt.register_activity(&agent_model_turn_info(), move |input| {
+    rt.register_activity_with_body(&agent_model_turn_info(), move |input| {
         call(input, |request| h.model_turn(request))
     });
     let h = Arc::clone(&harness);
-    rt.register_activity(&agent_tool_call_info(), move |input| {
+    rt.register_activity_with_body(&agent_tool_call_info(), move |input| {
         call(input, |request| h.tool_call(request))
     });
     let h = Arc::clone(&harness);
-    rt.register_activity(&agent_memory_snapshot_info(), move |input| {
+    rt.register_activity_with_body(&agent_memory_snapshot_info(), move |input| {
         call(input, |scope| h.memory_snapshot(scope))
     });
     let h = Arc::clone(&harness);
-    rt.register_activity(&agent_deliver_info(), move |input| {
+    rt.register_activity_with_body(&agent_deliver_info(), move |input| {
         call(input, |report| h.deliver(report))
     });
-    rt.register_activity(&agent_precheck_info(), move |input| {
+    rt.register_activity_with_body(&agent_precheck_info(), move |input| {
         call(input, |task| harness.precheck_tick(task))
     });
 }

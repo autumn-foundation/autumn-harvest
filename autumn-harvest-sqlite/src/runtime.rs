@@ -13,7 +13,7 @@ use autumn_harvest::executor::{
     WorkflowExecuteSpanMeta, run_workflow_with_state_history_policy_and_caps,
 };
 use autumn_harvest::{
-    ActivityExecId, ActivityInfo, ExecutionId, NoOpMetrics, TimerId, WorkflowCommand,
+    ActivityExecId, ActivityHandlerFn, ActivityInfo, ExecutionId, NoOpMetrics, TimerId, WorkflowCommand,
     WorkflowEvent, WorkflowHandlerFn, WorkflowHistoryPolicy, WorkflowIdReusePolicy, WorkflowInfo,
     WorkflowOutcome,
 };
@@ -25,12 +25,24 @@ use crate::error::{SqliteError, SqliteResult};
 use crate::lock::WriterLock;
 use crate::{lock, queue, schema, store, worker};
 
-/// The activity body a workflow's `execute_activity_raw(name, ...)` resolves to.
+/// A synchronous activity body, keyed by name.
 ///
-/// Synchronous and keyed by name. The valuable, reused part of the engine is the
-/// workflow orchestration + deterministic replay; activity execution is a simple
-/// registered closure (no `ActivityContext`, no I/O framework).
+/// [`ActivitySpec::new`] and
+/// [`register_activity_with_body`](SqliteRuntime::register_activity_with_body)
+/// take one. It gets no `ActivityContext`. The default
+/// [`register_activity`](SqliteRuntime::register_activity) runs the
+/// `#[activity]` body instead (issue #2024).
 pub type ActivityBody = Box<dyn Fn(Value) -> Result<Value, String> + Send + Sync>;
+
+/// What runs for one registered activity (issue #2024).
+// Crate-internal like the `ActivitySpec` fields that hold it.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) enum ActivityRunner {
+    /// A synchronous closure. It runs inline and gets no `ActivityContext`.
+    Closure(ActivityBody),
+    /// The `#[activity]` handler. The drain awaits it with an `ActivityContext`.
+    Handler(ActivityHandlerFn),
+}
 
 /// A registered activity: its body plus the declared-default metadata this
 /// backend honors at dispatch/finalize.
@@ -39,7 +51,7 @@ pub struct ActivitySpec {
     // (read by the worker). `pub` would leak them onto the public type, so
     // `pub(crate)` is deliberate and NOT redundant despite the private module.
     #[allow(clippy::redundant_pub_crate)]
-    pub(crate) body: ActivityBody,
+    pub(crate) body: ActivityRunner,
     #[allow(clippy::redundant_pub_crate)]
     pub(crate) max_attempts: u32,
     /// The activity's declared total (cross-retry) deadline
@@ -103,7 +115,7 @@ impl ActivitySpec {
         body: impl Fn(Value) -> Result<Value, String> + Send + Sync + 'static,
     ) -> Self {
         Self {
-            body: Box::new(body),
+            body: ActivityRunner::Closure(Box::new(body)),
             max_attempts: max_attempts.max(1),
             schedule_to_close: None,
             default_retry_policy: None,
@@ -369,10 +381,28 @@ impl SqliteRuntime {
         self.workflows.insert(info.name.to_string(), info.handler);
     }
 
-    /// Register an activity from its macro-generated [`ActivityInfo`] plus its
-    /// (synchronous) body.
+    /// Register an activity from its macro-generated [`ActivityInfo`]. The
+    /// `#[activity]` body itself runs (issue #2024).
     ///
-    /// This is the **audited, `ActivityInfo`-driven** registration path — the
+    /// The drain awaits `info.handler` on the caller's async runtime, with a real
+    /// [`ActivityContext`](autumn_harvest::ActivityContext). So one `#[activity]`
+    /// fn runs unchanged on this backend and on Postgres:
+    ///
+    /// - `info()` reports the same dispatch values as the Postgres worker. They
+    ///   are the run, the activity, the 1-based attempt, the frozen attempt cap,
+    ///   the task queue and the task row id.
+    /// - `deadline()` is the earlier of claim time plus `start_to_close` and the
+    ///   `schedule_to_close` deadline.
+    /// - `heartbeat(..)` persists the latest payload on the task row. The next
+    ///   attempt, also after a crash and reopen, reads it with
+    ///   `heartbeat_details()`.
+    /// - `previous_failure()` is the previous attempt's error message.
+    /// - The cancellation token never fires on this backend.
+    ///
+    /// A panic in the body becomes a retryable `HandlerPanic` failure, as on
+    /// Postgres. A body that never returns blocks the drive.
+    ///
+        /// This is the **audited, `ActivityInfo`-driven** registration path — the
     /// analog of [`register_workflow`](Self::register_workflow) — and the one that
     /// closes the third author-declared-feature ingress surface (Codex #1069 P2,
     /// `runtime.rs:39`). Beyond the command layer ([`apply_schedule_activity`],
@@ -403,10 +433,7 @@ impl SqliteRuntime {
     ///   `max_concurrent`, `requires`, `is_local`, and a raised
     ///   `max_input_bytes` / `max_result_bytes`.
     /// - **ACCEPTED, inert**: `name` (registration key), `module` (diagnostics),
-    ///   and a lone `concurrency_key` (groups a cap that is not set). The core
-    ///   async `ActivityInfo::handler` is intentionally NOT used — this backend
-    ///   runs a caller-supplied SYNCHRONOUS body (no `ActivityContext`, no I/O
-    ///   framework), matching the crate's activity model.
+    ///   and a lone `concurrency_key` (groups a cap that is not set).
     ///
     /// # Panics
     ///
@@ -416,11 +443,33 @@ impl SqliteRuntime {
     /// and diverge from the declared `#[activity(...)]` contract. Use
     /// [`register_activity_raw`](Self::register_activity_raw) for a hand-made body
     /// that carries no declared defaults.
-    pub fn register_activity(
+    pub fn register_activity(&mut self, info: &ActivityInfo) {
+        self.register_audited_activity(info, ActivityRunner::Handler(info.handler));
+    }
+
+    /// Register an activity from its [`ActivityInfo`], but run a synchronous
+    /// `body` in place of the `#[activity]` body.
+    ///
+    /// The audit and the declared defaults are the same as for
+    /// [`register_activity`](Self::register_activity). The closure gets no
+    /// `ActivityContext`. Use it to stub an activity in a test. Before issue
+    /// #2024 this was the only form, under the name `register_activity`.
+    ///
+    /// # Panics
+    ///
+    /// Panics on the same unsupported features as
+    /// [`register_activity`](Self::register_activity).
+    pub fn register_activity_with_body(
         &mut self,
         info: &ActivityInfo,
         body: impl Fn(Value) -> Result<Value, String> + Send + Sync + 'static,
     ) {
+        self.register_audited_activity(info, ActivityRunner::Closure(Box::new(body)));
+    }
+
+    /// Audit `info` and register `body` under its name with its declared
+    /// defaults.
+    fn register_audited_activity(&mut self, info: &ActivityInfo, body: ActivityRunner) {
         if let Some((feature, hint)) = unsupported_activity_feature(info) {
             panic!(
                 "autumn-harvest-sqlite (v0.1): activity `{}` declares the unsupported \
@@ -446,7 +495,7 @@ impl SqliteRuntime {
         self.activities.insert(
             info.name.to_string(),
             ActivitySpec {
-                body: Box::new(body),
+                body,
                 max_attempts,
                 schedule_to_close: info.default_schedule_to_close,
                 // Store the WHOLE policy (backoff + `non_retryable_errors`), not just
@@ -1450,7 +1499,12 @@ impl SqliteRuntime {
                 details: error,
             }),
             WorkflowOutcome::Suspended { commands } => {
-                self.drive_suspension(exec, &history, &commands, now, failure_now)
+                let owner = worker::RunOwner {
+                    workflow_id: &workflow_id,
+                    workflow_type: &workflow_name,
+                };
+                self.drive_suspension(exec, &owner, &history, &commands, now, failure_now)
+                    .await
             }
         }
     }
@@ -1463,9 +1517,10 @@ impl SqliteRuntime {
     /// branch to terminal so the workflow re-settles and cancels the losers before
     /// they run. Fan-out and ordinary activities never trip the gate, so the drain
     /// is the byte-for-byte prior drain-ALL behavior.
-    fn drive_suspension(
+    async fn drive_suspension(
         &mut self,
         exec: ExecutionId,
+        owner: &worker::RunOwner<'_>,
         history: &[WorkflowEvent],
         commands: &[WorkflowCommand],
         now: i64,
@@ -1476,11 +1531,13 @@ impl SqliteRuntime {
         let drained = worker::drain_ready(
             &mut self.conn,
             exec,
+            owner,
             now,
             failure_now,
             &self.activities,
             settle_after_first_terminal,
-        )?;
+        )
+        .await?;
         if applied || drained {
             Ok(RunState::InProgress)
         } else {
@@ -2490,15 +2547,17 @@ const fn unsupported_workflow_feature(info: &WorkflowInfo) -> Option<(&'static s
 ///   and a claim-time registry fallback on the RAW path, `runtime.rs:331`),
 ///   `default_start_to_close` (via the command on the TYPED path and the same
 ///   claim-time fallback on the RAW path), `default_queue` (recorded).
-/// - **REJECTED** (reported here) — a dispatch-admission / cross-worker semantic
-///   this single-writer backend has no analog for, or a cap raiser that would
-///   otherwise silently apply the STRICTER global cap:
-///   `default_heartbeat_timeout` (no heartbeating in the inline drain),
-///   `default_schedule_to_start` (no queue-wait scanner), `circuit_breaker`
-///   (#369), `rate_limit_*` (#332), `max_concurrent` (#247), `requires`
-///   (capability routing), `is_local` (local-activity `RunLocalActivity` dispatch
-///   is a command-layer non-goal), and a raised `max_input_bytes` /
-///   `max_result_bytes` (#252).
+/// - **REJECTED** (reported here): each is a dispatch-admission or cross-worker
+///   semantic with no single-writer analog, or a cap raiser. A cap raiser would
+///   otherwise silently apply the STRICTER global cap.
+///   - `default_heartbeat_timeout`: heartbeats are stored, but no scanner times
+///     out a silent attempt.
+///   - `default_schedule_to_start`: no queue-wait scanner.
+///   - `circuit_breaker` (#369), `rate_limit_*` (#332), `max_concurrent` (#247).
+///   - `requires`: capability routing.
+///   - `is_local`: local-activity `RunLocalActivity` dispatch is a command-layer
+///     non-goal.
+///   - A raised `max_input_bytes` / `max_result_bytes` (#252).
 /// - **ACCEPTED, inert**: `name`, `module`, and a lone `concurrency_key` (groups a
 ///   cap that is not set).
 ///
@@ -2524,8 +2583,8 @@ const fn unsupported_activity_feature(info: &ActivityInfo) -> Option<(&'static s
     if info.default_heartbeat_timeout.is_some() {
         return Some((
             "heartbeat_timeout",
-            "Activity bodies run synchronously inline (no ActivityContext, no \
-             heartbeating), so a heartbeat-timeout could never be observed. Use \
+            "ctx.heartbeat(..) stores a checkpoint, but no scanner here times out \
+             a silent attempt, so a heartbeat-timeout could never be observed. Use \
              start_to_close (honored) for a per-attempt bound, or schedule_to_close \
              (honored) for a total cross-retry deadline.",
         ));

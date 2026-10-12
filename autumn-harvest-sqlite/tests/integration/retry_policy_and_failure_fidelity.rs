@@ -516,7 +516,7 @@ async fn raw_path_falls_back_to_registered_default_retry_policy_backoff() {
     rt.register_workflow(&raw_backoff_wf_info());
     // INFO-based registration: the spec must carry the FULL `default_retry_policy`, so a
     // raw (no-override) dispatch can fall back to it at claim time.
-    rt.register_activity(&raw_backoff_act_info(), move |input: serde_json::Value| {
+    rt.register_activity_with_body(&raw_backoff_act_info(), move |input: serde_json::Value| {
         // Fail attempt 1, succeed attempt 2 (like `flaky_wf`).
         if body_calls.fetch_add(1, Ordering::SeqCst) == 0 {
             Err("transient".to_string())
@@ -604,7 +604,7 @@ async fn raw_path_honors_registered_policy_non_retryable_errors() {
 
     rt.register_workflow(&raw_nonret_wf_info());
     // INFO-based registration carries the full policy (incl. `non_retryable_errors`).
-    rt.register_activity(&raw_nonret_act_info(), move |_input: serde_json::Value| {
+    rt.register_activity_with_body(&raw_nonret_act_info(), move |_input: serde_json::Value| {
         body_calls.fetch_add(1, Ordering::SeqCst);
         Err("fatal".to_string())
     });

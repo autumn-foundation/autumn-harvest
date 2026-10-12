@@ -11,15 +11,15 @@
 //! cargo run -p autumn-harvest-sqlite --example quickstart
 //! ```
 //!
-//! It mirrors the call sequence in the crate-level docs: open → register the
-//! workflow and its activity bodies → start → drive to quiescence with
-//! `run_until_idle` → read the terminal outcome.
+//! It mirrors the call sequence in the crate-level docs. Open, register the
+//! workflow and its activities, and start. Then drive to quiescence with
+//! `run_until_idle` and read the terminal outcome.
+//!
+//! The `#[activity]` fns are ordinary async bodies with an `ActivityContext`
+//! (issue #2024). The same fns run unchanged on the Postgres backend.
 
-// The `#[activity]` macro expands the await-free placeholder bodies (this backend
-// runs the registered closures, not the async fn bodies) into code that consumes
-// the `_`-prefixed params — both are proc-macro artifacts of the placeholder
-// pattern, not the hand-written example logic, so they are allowed file-wide.
-#![allow(clippy::unused_async, clippy::used_underscore_binding)]
+// `#[activity]` needs an `async fn`, also for a body with no `.await`.
+#![allow(clippy::unused_async)]
 
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{ExecutionOutcome, SqliteError, SqliteRuntime};
@@ -55,18 +55,25 @@ async fn process_order(ctx: &WorkflowContext, order: Order) -> Result<String, St
     ))
 }
 
-// The `#[activity]` async fn supplies the macro-generated `*_info()` companion
-// (its name + any declared `#[activity(...)]` defaults). This backend runs a
-// caller-supplied SYNCHRONOUS body registered against that info — the async body
-// below is only a placeholder for the shared `ActivityInfo`.
+/// Reserves stock for the order. The idempotency key is stable across retries,
+/// so a real inventory service can deduplicate on it.
 #[activity]
-async fn reserve_inventory(_ctx: &ActivityContext, _order: Order) -> Result<String, String> {
-    Ok(String::new())
+async fn reserve_inventory(ctx: &ActivityContext, order: Order) -> Result<String, String> {
+    let key = ctx.idempotency_key().map_err(|e| e.to_string())?;
+    Ok(format!("reserved {}x {} (key {key})", order.qty, order.item))
 }
 
+/// Charges the card. `ctx.info()` reports the attempt and the owning run.
 #[activity]
-async fn charge_payment(_ctx: &ActivityContext, _order: Order) -> Result<String, String> {
-    Ok(String::new())
+async fn charge_payment(ctx: &ActivityContext, order: Order) -> Result<String, String> {
+    let info = ctx.info();
+    Ok(format!(
+        "charged {}.{:02} USD for {} (attempt {})",
+        order.amount_cents / 100,
+        order.amount_cents % 100,
+        info.workflow_id,
+        info.attempt
+    ))
 }
 
 #[tokio::main]
@@ -75,25 +82,10 @@ async fn main() -> Result<(), SqliteError> {
     // `SqliteRuntime::open("orders.db")` for a durable, restart-safe file.
     let mut rt = SqliteRuntime::open_in_memory()?;
 
-    // Register the workflow handler and each activity's synchronous body.
+    // Register the workflow and its activities. The `#[activity]` bodies run.
     rt.register_workflow(&process_order_info());
-
-    rt.register_activity(&reserve_inventory_info(), |input| {
-        let order: Order = serde_json::from_value(input).map_err(|e| e.to_string())?;
-        Ok(serde_json::json!(format!(
-            "reserved {}x {}",
-            order.qty, order.item
-        )))
-    });
-
-    rt.register_activity(&charge_payment_info(), |input| {
-        let order: Order = serde_json::from_value(input).map_err(|e| e.to_string())?;
-        Ok(serde_json::json!(format!(
-            "charged {}.{:02} USD",
-            order.amount_cents / 100,
-            order.amount_cents % 100
-        )))
-    });
+    rt.register_activity(&reserve_inventory_info());
+    rt.register_activity(&charge_payment_info());
 
     // Start a run. `start_workflow` returns the ExecutionId immediately; nothing
     // has executed yet.

@@ -143,7 +143,7 @@ CREATE TABLE IF NOT EXISTS harvest_tasks (
                                            -- budget measured from when the activity was first
                                            -- scheduled, so a wait for late registration does not
                                            -- extend it.
-    defaults_frozen INTEGER NOT NULL DEFAULT 0  -- Whether the four resolved-default scalars
+    defaults_frozen INTEGER NOT NULL DEFAULT 0, -- Whether the four resolved-default scalars
                                            -- (`retry_policy_json`, `max_attempts`,
                                            -- `start_to_close_ms`, `schedule_to_close_at`) have
                                            -- been RESOLVED onto this row (issue #1068). 0 = not
@@ -158,6 +158,12 @@ CREATE TABLE IF NOT EXISTS harvest_tasks (
                                            -- scalars are frozen. `DEFAULT 0` so a row created by
                                            -- the additive migration (pre-#1068) is treated as
                                            -- unresolved and gets frozen on its next claim.
+    heartbeat_details TEXT,                -- The latest heartbeat payload as JSON (issue
+                                           -- #2024). NULL = no heartbeat yet. A retry or a
+                                           -- reopen reads it back as the checkpoint.
+    last_error TEXT                        -- The previous attempt's error message (issue
+                                           -- #2024). `ActivityContext::previous_failure`
+                                           -- reads it. NULL on the first attempt.
 );
 
 -- Non-unique index on `harvest_tasks(seq)` so `MAX(seq)` (the next-`seq` allocation
@@ -234,6 +240,8 @@ use crate::error::SqliteResult;
 /// data.
 ///
 /// Current migrations:
+/// - **issue #2024** — `harvest_tasks.heartbeat_details` and
+///   `harvest_tasks.last_error`. Both are nullable, so an old row is valid.
 /// - **issue #1068** — `harvest_tasks.schedule_to_close_at` (the frozen absolute
 ///   total-deadline column) and `harvest_tasks.defaults_frozen` (the
 ///   resolved-defaults flag). Both are nullable/defaulted, so a pre-#1068 row is
@@ -257,6 +265,19 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
         "harvest_tasks",
         "defaults_frozen",
         "ALTER TABLE harvest_tasks ADD COLUMN defaults_frozen INTEGER NOT NULL DEFAULT 0",
+    )?;
+    // issue #2024: the heartbeat checkpoint and the previous attempt's error.
+    add_column_if_absent(
+        conn,
+        "harvest_tasks",
+        "heartbeat_details",
+        "ALTER TABLE harvest_tasks ADD COLUMN heartbeat_details TEXT",
+    )?;
+    add_column_if_absent(
+        conn,
+        "harvest_tasks",
+        "last_error",
+        "ALTER TABLE harvest_tasks ADD COLUMN last_error TEXT",
     )?;
     Ok(())
 }
@@ -362,5 +383,37 @@ mod tests {
             frozen, 0,
             "a migrated row is treated as defaults-not-yet-frozen"
         );
+    }
+
+    // Issue #2024: an old table gains the checkpoint and error columns. Both
+    // read NULL on an existing row.
+    #[test]
+    fn migrate_adds_the_heartbeat_and_error_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(OLD_HARVEST_TASKS_DDL).unwrap();
+        conn.execute(
+            "INSERT INTO harvest_tasks \
+             (task_id, exec_id, activity_id, name, input_json, queue, state, attempt, \
+              run_at, seq, max_attempts, retry_policy_json, start_to_close_ms, scheduled_at) \
+             VALUES ('t1', 'e1', 'a1', 'act', '{}', 'default', 'PENDING', 0, 0, 0, NULL, NULL, NULL, 0)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        let (details, error): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT heartbeat_details, last_error FROM harvest_tasks WHERE task_id = 't1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((details, error), (None, None));
+        let fresh = Connection::open_in_memory().unwrap();
+        fresh.execute_batch(SCHEMA).unwrap();
+        assert!(column_exists(&fresh, "harvest_tasks", "heartbeat_details").unwrap());
+        assert!(column_exists(&fresh, "harvest_tasks", "last_error").unwrap());
     }
 }

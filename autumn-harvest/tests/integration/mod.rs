@@ -322,6 +322,7 @@ mod slo_pack_docs;
 mod slot_tuner_tests;
 mod speculative_execution_docs;
 mod sqlite_feasibility_docs;
+mod sqlite_portable_activity_tests;
 mod standalone_activity_docs;
 #[cfg(feature = "db")]
 mod standalone_activity_overhead_perf;

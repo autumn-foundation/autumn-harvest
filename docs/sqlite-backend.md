@@ -110,17 +110,23 @@ async fn process_order(ctx: &WorkflowContext, order: Order) -> Result<String, St
 }
 
 #[activity]
-async fn reserve_inventory(_ctx: &ActivityContext, _order: Order) -> Result<String, String> {
-    Ok(String::new())
+async fn reserve_inventory(ctx: &ActivityContext, order: Order) -> Result<String, String> {
+    // Stable across retries and re-runs: safe to send to a downstream API.
+    let key = ctx.idempotency_key().map_err(|e| e.to_string())?;
+    Ok(format!("reserved {}x {} ({key})", order.qty, order.item))
 }
 ```
 
-> **Important — activity bodies are separate.** On this backend an activity runs
-> a caller-supplied **synchronous** body registered against the activity's
-> `ActivityInfo`. The `#[activity]` async fn only supplies the macro-generated
-> `*_info()` companion (the name plus any declared `#[activity(...)]` defaults);
-> the closure you register in step 5 is what actually executes. There is no
-> `ActivityContext` I/O framework here — you write plain `Fn(Value) -> Result<Value, String>`.
+> **The `#[activity]` body runs (issue #2024).** `register_activity(&info)` runs
+> the async body itself, on the drive's async runtime, with a real
+> `ActivityContext`. The same fn runs unchanged on this backend and on Postgres.
+> `ctx.info()` reports the same values as the Postgres worker for one process:
+> the run, the activity, the 1-based `attempt`, `max_attempts`, the task queue
+> and the task row id. `ctx.heartbeat(..)` stores the latest payload on the task
+> row, so a retry or a reopen resumes from it with `ctx.heartbeat_details()`.
+> `ctx.previous_failure()` is the previous attempt's error. The cancellation
+> token never fires here. `ctx.state::<T>()` is always `None`, because this
+> backend has no shared-state registry.
 
 ---
 
@@ -157,11 +163,7 @@ Registrations live in process memory, not the database, so **every runtime
 
 ```rust
 rt.register_workflow(&process_order_info());
-
-rt.register_activity(&reserve_inventory_info(), |input| {
-    let order: Order = serde_json::from_value(input).map_err(|e| e.to_string())?;
-    Ok(serde_json::json!(format!("reserved {}x {}", order.qty, order.item)))
-});
+rt.register_activity(&reserve_inventory_info());
 ```
 
 - **`register_workflow(&WorkflowInfo)`** retains only the workflow's `name` +
@@ -170,13 +172,26 @@ rt.register_activity(&reserve_inventory_info(), |input| {
   (`execution_timeout`, a workflow-level `retry_policy`, `concurrency`,
   `debounce`, `batch`, `throttle`, a raised `max_input_bytes`), registration
   **panics at setup time** naming the feature — never a silently-dropped setting.
-- **`register_activity(&ActivityInfo, body)`** is the audited path: it honors the
+- **`register_activity(&ActivityInfo)`** is the default. It runs the
+  `#[activity]` body with an `ActivityContext`. It honors the
   declared `#[activity(...)]` defaults it can (`schedule_to_close`, the full
   `retry` policy — `max_attempts` + backoff + non-retryable classification —
   `start_to_close`, `queue`) and **panics** for one it cannot
   (`heartbeat_timeout`, `schedule_to_start`, `circuit_breaker`, `rate_limit_*`,
   `max_concurrent`, `is_local`, …). This keeps a declared setting from taking
   silently-wrong effect.
+- **`register_activity_with_body(&ActivityInfo, body)`** runs the same audit,
+  but runs a synchronous `Fn(Value) -> Result<Value, String>` closure in place of
+  the `#[activity]` body. The closure gets no `ActivityContext`. Use it to stub an
+  activity in a test, or to capture process state that the context cannot carry:
+
+```rust
+rt.register_activity_with_body(&reserve_inventory_info(), |input| {
+    let order: Order = serde_json::from_value(input).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!(format!("stub: {}", order.id)))
+});
+```
+
 - **`register_activity_raw(name, ActivitySpec::new(max_attempts, body))`** is the
   escape hatch — a hand-made body that carries no `ActivityInfo` and runs no
   audit. Use it when you don't have (or don't want) the macro companion:
@@ -346,7 +361,9 @@ All durable state lives in the database. Dropping a runtime and re-`open`-ing th
 
 This makes activity execution **at-least-once**: a crash *after a body runs but
 before its result commits* re-runs that body on resume. **Write activity bodies
-to be idempotent.**
+to be idempotent.** `ctx.idempotency_key()` is stable across these re-runs. A
+body that checkpoints with `ctx.heartbeat(..)` resumes from the last stored
+payload through `ctx.heartbeat_details()`.
 
 The [`examples/durability.rs`](../autumn-harvest-sqlite/examples/durability.rs)
 example proves resume-vs-restart with side-effect counters: it runs a workflow to

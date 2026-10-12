@@ -15241,6 +15241,46 @@ impl ActivityContext {
         }
     }
 
+    /// Build a context for an embedded backend, such as `autumn-harvest-sqlite`
+    /// (issue #2024).
+    ///
+    /// The backend drains `heartbeat_tx` and persists each payload.
+    /// `heartbeat_details` is the checkpoint of the previous attempt. The
+    /// idempotency key derives from `identity.activity_id`, as in the
+    /// Postgres worker. The cancellation token never fires.
+    ///
+    /// Not for activity authors. A test builds a context with
+    /// [`new_test`](Self::new_test) instead.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new_embedded(
+        state: SharedState,
+        identity: ActivityIdentity,
+        heartbeat_tx: tokio::sync::mpsc::Sender<serde_json::Value>,
+        heartbeat_details: Option<serde_json::Value>,
+    ) -> Self {
+        let key = IdempotencyKey::from_activity_exec_id(identity.activity_id);
+        Self::new(
+            state,
+            Some(heartbeat_tx.into()),
+            tokio_util::sync::CancellationToken::new(),
+            identity,
+        )
+        .seed_heartbeat_details(heartbeat_details)
+        .with_idempotency_key(key)
+    }
+
+    /// Seed the checkpoint of the previous attempt and the auto-heartbeat
+    /// re-send cell (issues #151, #682).
+    fn seed_heartbeat_details(mut self, details: Option<serde_json::Value>) -> Self {
+        self.heartbeat_details.clone_from(&details);
+        *self
+            .last_heartbeat_payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = details;
+        self
+    }
+
     /// Attach a trace context carrier captured from the task payload so the
     /// activity handler can stitch downstream calls into the same trace.
     #[must_use]
@@ -16739,13 +16779,8 @@ impl ActivityContext {
     /// including [`heartbeat_details`](Self::heartbeat_details).
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
-    pub fn with_heartbeat_details(mut self, details: Option<serde_json::Value>) -> Self {
-        self.heartbeat_details.clone_from(&details);
-        *self
-            .last_heartbeat_payload
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = details;
-        self
+    pub fn with_heartbeat_details(self, details: Option<serde_json::Value>) -> Self {
+        self.seed_heartbeat_details(details)
     }
 
     /// Like [`new_test`](Self::new_test) but with a caller-supplied identity, so
@@ -16816,6 +16851,52 @@ mod tests {
     use crate::types::{ActivityExecId, ShardId};
     use chrono::Utc;
     use std::time::Duration;
+
+    // ── Embedded-backend context (issue #2024) ──────────────────────────────
+
+    #[tokio::test]
+    async fn an_embedded_context_heartbeats_and_resumes() {
+        let identity = ActivityIdentity::for_test();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let ctx = ActivityContext::new_embedded(
+            empty_shared_state(),
+            identity.clone(),
+            tx,
+            Some(serde_json::json!({"done": 2})),
+        );
+
+        let resumed: Option<Value> = ctx.heartbeat_details().unwrap();
+        assert_eq!(resumed, Some(serde_json::json!({"done": 2})));
+        ctx.heartbeat(serde_json::json!({"done": 3})).await.unwrap();
+        assert_eq!(rx.recv().await, Some(serde_json::json!({"done": 3})));
+        assert_eq!(
+            ctx.idempotency_key().unwrap(),
+            &IdempotencyKey::from_activity_exec_id(identity.activity_id)
+        );
+        assert_eq!(ctx.identity(), identity);
+        assert!(!ctx.is_local());
+        assert!(!ctx.is_cancelled());
+        ctx.check_cancellation().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_embedded_context_reports_a_closed_sink_as_cancelled() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let ctx = ActivityContext::new_embedded(
+            empty_shared_state(),
+            ActivityIdentity::for_test(),
+            tx,
+            None,
+        );
+
+        let resumed: Option<Value> = ctx.heartbeat_details().unwrap();
+        assert_eq!(resumed, None);
+        assert!(matches!(
+            ctx.heartbeat(1).await,
+            Err(HarvestError::ActivityCancelled(_))
+        ));
+    }
 
     // ── Signal handlers (issue #546) ────────────────────────────────────────
 

@@ -231,8 +231,8 @@ pub async fn serve(options: Options) -> Result<(), String> {
     // off another daemon's file in every slower case.
     lock.still_names(&options.db)?;
     runtime.register_workflow(&session::agent_session_info());
-    runtime.register_activity(&session::claude_turn_info(), claude::activity_body(model));
-    runtime.register_activity(
+    runtime.register_activity_with_body(&session::claude_turn_info(), claude::activity_body(model));
+    runtime.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(options.workspace.clone()),
     );
