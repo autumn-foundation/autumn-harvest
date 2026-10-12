@@ -87,16 +87,18 @@ Each model is one function. Two `#[test]`s run it: one with
 3. **`heartbeat_lease_lost_stops_the_flusher_*`.** The sink reports a lost
    lease (issue #1789) on the first flush. The model checks that the flusher
    cancels the activity token and flushes nothing more.
-4. **`adaptive_limit_wakes_the_poll_loop_*`.** One poll loop starts three
-   attempts of each of two activity types (issue #1836). The cap of each type
-   moves between 1 and 2, because some attempts report an overload. Other
-   attempts drop their permit. When every remaining type is at its cap, the
-   loop waits on `slot_freed_notify`, as the worker's idle wait does. The
-   worker's wait also has a poll timer, but the model has none. A lost wake
-   therefore blocks the loop, and Shuttle reports a deadlock. The model
-   checks:
+4. **`adaptive_limit_wakes_the_poll_loop_*`.** One poll loop starts 14
+   attempts of each of two activity types (issue #1836). A fixed schedule
+   of outcomes moves the cap of each type: overloads cut it from 2 to 1,
+   and a window of answers raises it back to 2. Other attempts drop their
+   permit. When every remaining type is at its cap, the loop waits on
+   `slot_freed_notify`, as the worker's idle wait does. The worker's wait
+   also has a poll timer, but the model has none. A lost wake therefore
+   blocks the loop, and Shuttle reports a deadlock. A metrics recorder logs
+   every cap the registry publishes. The model checks:
    - no type runs more than 2 attempts at once;
    - every attempt starts, so no wake is lost;
+   - the cap of each type falls to 1 and returns to 2;
    - at the end, no type holds a slot, and the saturated count is 0.
 
 ## Defects found

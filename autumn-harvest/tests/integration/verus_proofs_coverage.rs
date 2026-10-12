@@ -18,6 +18,9 @@ use super::ci_run_coverage::{parse_workflow, repo_root};
 use super::formal_models_coverage::formal_job_defect;
 
 /// Verus constructs that let a proof skip a step. None may appear.
+///
+/// The guard matches them after it drops all whitespace, so `assume (x)`
+/// and `verifier :: external` match too.
 const TRUST_ESCAPES: &[&str] = &[
     "assume(",
     "admit(",
@@ -239,17 +242,37 @@ fn every_mirrored_source_names_its_verus_proof() {
     }
 }
 
+/// The first trust escape in `code`, if any. Comments do not count.
+fn trust_escape(code: &str) -> Option<&'static str> {
+    let compact: String = strip_comments(code)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    TRUST_ESCAPES
+        .iter()
+        .copied()
+        .find(|escape| compact.contains(escape))
+}
+
 #[test]
 fn no_verus_proof_trusts_an_unproved_step() {
     for file in verus_files() {
-        let code = strip_comments(&read(&file));
-        for escape in TRUST_ESCAPES {
-            assert!(
-                !code.contains(escape),
-                "{file} uses `{escape}`, so a proof can skip a step"
-            );
+        if let Some(escape) = trust_escape(&read(&file)) {
+            panic!("{file} uses `{escape}`, so a proof can skip a step");
         }
     }
+}
+
+#[test]
+fn the_trust_escape_check_ignores_whitespace() {
+    assert_eq!(trust_escape("proof { assume (false); }"), Some("assume("));
+    assert_eq!(trust_escape("proof { admit\n(); }"), Some("admit("));
+    assert_eq!(
+        trust_escape("#[verifier :: external]\nfn f() {}"),
+        Some("verifier::external")
+    );
+    assert_eq!(trust_escape("// assume (false)\nfn f() {}"), None);
+    assert_eq!(trust_escape("proof { assert(x == x); }"), None);
 }
 
 #[test]

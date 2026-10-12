@@ -37,7 +37,8 @@ unchecked `+` in `supersede_count` and `supersede_plan`. Both now saturate.
 `AdaptiveLimitRegistry` (issue #1836) under the random and PCT schedulers.
 The registry's `Mutex`, `AtomicUsize` and `Notify` now go through the
 `shuttle_sync` shim. `slot_freed_notify` is public, so the model can wait
-on it. The model has no poll timer, so a lost slot-freed wake deadlocks.
+on it. Overloads cut each cap from 2 to 1, and answers raise it back. The
+model has no poll timer, so a lost slot-freed wake deadlocks.
 
 No migration, no new `WorkflowEvent` variant, no change to
 `harvest_events`.
