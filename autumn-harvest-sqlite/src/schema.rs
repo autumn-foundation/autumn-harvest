@@ -64,9 +64,9 @@ CREATE TABLE IF NOT EXISTS harvest_executions (
     output_json   TEXT,
     error         TEXT,
     cancel_reason TEXT                     -- a cooperative cancel request (issue #2021).
-                                           -- NULL when no cancel is pending. The drive
-                                           -- passes it to the body, and the seal writes
-                                           -- `WorkflowCancelled`.
+                                           -- NULL until `cancel` stores a request. The
+                                           -- drive reads it only while the run is
+                                           -- RUNNING. A terminal run keeps the value.
 );
 
 -- Non-unique lookup index for the (workflow_name, workflow_id) reuse-policy probe

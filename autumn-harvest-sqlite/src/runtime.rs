@@ -125,9 +125,10 @@ pub enum RunState {
     WaitingSignal(String),
     /// Blocked awaiting a durable timer that has not yet fired.
     WaitingTimer,
-    /// The run ended `CANCELLED` with this reason (issue #2021).
+    /// The run ended `CANCELLED` (issue #2021). The payload is the reason.
     Cancelled(String),
-    /// The run ended `TERMINATED` with this reason (issue #2021).
+    /// The run ended `TERMINATED` (issue #2021). The payload is the reason, not
+    /// the state name that [`ExecutionOutcome::Terminated`] carries.
     Terminated(String),
 }
 
@@ -142,10 +143,11 @@ pub enum ExecutionOutcome {
     Failed(String),
     /// A terminal state OTHER than a clean success/failure — inert and never
     /// resumable, but carrying no output (unlike [`Self::Completed`]) and no
-    /// failure error (unlike [`Self::Failed`]). The dominant case is a prior run
-    /// SEALED to `CONTINUED_AS_NEW` when a `TerminateIfRunning` /
-    /// `AllowDuplicateFailedOnly` reuse-policy decision superseded it with a newer
-    /// run (issue #1068); it also covers `CANCELLED` / `TIMED_OUT` / `TERMINATED`.
+    /// failure error (unlike [`Self::Failed`]). The payload is the raw state
+    /// name: `CANCELLED` or `TERMINATED` after [`SqliteRuntime::cancel`] or
+    /// [`SqliteRuntime::terminate`] (issue #2021), or `CONTINUED_AS_NEW` for a prior
+    /// that a reuse-policy start replaced (issue #1068). A drive returns the cancel
+    /// or terminate reason in [`RunState`].
     /// The payload is the RAW stored state name (e.g. `"CONTINUED_AS_NEW"`) so a
     /// caller can distinguish which terminal it is. Reporting these terminally —
     /// rather than as [`Self::Running`] — keeps `outcome()` consistent with the
@@ -586,9 +588,9 @@ impl SqliteRuntime {
     /// return a [`StartOutcome`] reporting the resolved execution and whether a
     /// fresh run was created.
     ///
-    /// The single-writer PLAIN-start matrix, restricted to the states this backend
-    /// can hold (none / `RUNNING` / `COMPLETED` / `FAILED` / `CANCELLED`; a replaced
-    /// prior is SEALED to `CONTINUED_AS_NEW`):
+    /// The single-writer PLAIN-start matrix covers the states this backend can
+    /// hold: none, `RUNNING`, `COMPLETED`, `FAILED` and `CANCELLED`. A replaced
+    /// prior is SEALED to `CONTINUED_AS_NEW`.
     ///
     /// | Prior state | `AllowDuplicate` | `RejectDuplicate` | `AllowDuplicateFailedOnly` | `TerminateIfRunning` |
     /// |-------------|------------------|-------------------|----------------------------|----------------------|
@@ -601,7 +603,7 @@ impl SqliteRuntime {
     /// - A prior in a SEALED state (`CONTINUED_AS_NEW`/`TERMINATED`) is invisible to
     ///   the reuse check — ALL policies (including `RejectDuplicate`) create fresh
     ///   over it, mirroring core's uniqueness-index-excludes-terminal nuance.
-    /// - "Replace" (`AllowDuplicateFailedOnly` over a FAILED prior;
+    /// - "Replace" (`AllowDuplicateFailedOnly` over a FAILED or `CANCELLED` prior;
     ///   `TerminateIfRunning` over any prior) SEALS the prior to `CONTINUED_AS_NEW`
     ///   so it leaves the active set and the fresh run takes the key
     ///   (mirroring core's `replace_execution`).
@@ -712,12 +714,12 @@ impl SqliteRuntime {
                         });
                     }
 
-                    // Replace a FAILED prior; otherwise return the existing run.
+                    // Replace a FAILED or CANCELLED prior, as on Postgres.
+                    // Otherwise return the existing run.
                     (
                         WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
                         Some((prior_exec, prior_state)),
                     ) => {
-                        // A cancelled prior is replaced too, as on Postgres.
                         if prior_state == "FAILED" || prior_state == CANCELLED_STATE {
                             cancel_and_seal_prior(&tx, prior_exec, &prior_state)?;
                             insert_fresh_execution(&tx, workflow_name, Some(id), input)?
@@ -862,12 +864,17 @@ impl SqliteRuntime {
     /// the body can run cleanup activities. A blank `reason` becomes
     /// `"workflow cancellation requested"`, as on Postgres.
     ///
-    /// The run seals `CANCELLED` when the body returns `Ok` or `Err`. It also
-    /// seals when the body blocks on a signal or a timer with no activity task
-    /// left to run. A parked await cannot see the request. The
-    /// seal appends `WorkflowCancelled` as the last event and removes pending
-    /// tasks, unfired timers and staged signals. The drive that seals the run
-    /// returns [`RunState::Cancelled`].
+    /// The run ends `CANCELLED` when one of these occurs:
+    ///
+    /// - The body returns `Ok` or `Err`. The output of an `Ok` is not kept.
+    /// - The body blocks on a signal or a timer with no activity task left to
+    ///   run. A parked await cannot see the request.
+    /// - The cycle diverges or deadlocks. The body sees the request from the
+    ///   start of its replay, so a check before recorded commands diverges.
+    ///
+    /// The run then gets `WorkflowCancelled` as its last event, and its pending
+    /// tasks, unfired timers and staged signals are deleted. The drive that ends
+    /// the run returns [`RunState::Cancelled`].
     ///
     /// A repeat call on a run with a pending request keeps the first reason.
     /// Use [`terminate`](Self::terminate) to stop a run at once.
@@ -875,28 +882,29 @@ impl SqliteRuntime {
     /// # Errors
     ///
     /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id and
-    /// [`SqliteError::WorkflowNotRunning`] for a terminal execution. Returns a
-    /// persistence error if the request cannot be written.
+    /// [`SqliteError::WorkflowNotRunning`] for a terminal execution. Postgres
+    /// treats a cancel of a `CANCELLED` run as a no-op, but this backend refuses
+    /// it. Returns a persistence error if the request cannot be written.
     pub fn cancel(&mut self, exec: ExecutionId, reason: &str) -> SqliteResult<()> {
         self.refuse_unless_running(exec)?;
         let reason = reason_or(reason, DEFAULT_CANCEL_REASON);
-        store::request_cancel(&self.conn, exec, &reason)?;
-        Ok(())
+        store::request_cancel(&self.conn, exec, &reason)
     }
 
     /// Terminate `exec` at once (issue #2021).
     ///
-    /// One transaction appends `WorkflowCancelled { reason }`, seals the run
-    /// `TERMINATED`, and removes its pending tasks, unfired timers and staged
-    /// signals. The body does not run again, and a pending cancel request is
-    /// dropped. A later drive returns [`RunState::Terminated`]. A blank
+    /// One transaction appends `WorkflowCancelled { reason }`, ends the run
+    /// `TERMINATED`, and deletes its pending tasks, unfired timers and staged
+    /// signals. The body does not run again, and `terminate` drops a pending
+    /// cancel request. A later drive returns [`RunState::Terminated`]. A blank
     /// `reason` becomes `"workflow termination requested"`, as on Postgres.
     ///
     /// # Errors
     ///
     /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id and
-    /// [`SqliteError::WorkflowNotRunning`] for a terminal execution. Returns a
-    /// persistence error if the seal cannot be written.
+    /// [`SqliteError::WorkflowNotRunning`] for a terminal execution. Postgres
+    /// treats a terminate of a terminal run as a no-op, but this backend refuses
+    /// it. Returns a persistence error if the seal cannot be written.
     pub fn terminate(&mut self, exec: ExecutionId, reason: &str) -> SqliteResult<()> {
         self.refuse_unless_running(exec)?;
         let reason = reason_or(reason, DEFAULT_TERMINATE_REASON);
@@ -922,7 +930,7 @@ impl SqliteRuntime {
         Ok(())
     }
 
-    /// Seal a cancel-requested `exec` `CANCELLED` (issue #2021).
+    /// End a cancel-requested `exec` `CANCELLED` (issue #2021).
     ///
     /// `pending` holds the bookkeeping commands of a cycle that returned. They
     /// persist before the terminal `WorkflowCancelled` event, as on the
@@ -1343,8 +1351,9 @@ impl SqliteRuntime {
         // Already terminal? Return the stored outcome without re-running. This uses
         // the core `erase::is_terminal_state` so it covers not only COMPLETED/FAILED
         // but every SEALED / terminal state (issue #1068): a run replaced by the
-        // reuse-policy path is sealed `CONTINUED_AS_NEW`, and `CANCELLED`/`TIMED_OUT`/
-        // `TERMINATED` are defensively handled too. The fleet poll loop never reaches
+        // reuse-policy path is sealed `CONTINUED_AS_NEW`. `cancel` and `terminate`
+        // write `CANCELLED` and `TERMINATED` (issue #2021), and `TIMED_OUT` is
+        // handled defensively. The fleet poll loop never reaches
         // these (`store::running_executions` filters to `state = 'RUNNING'`), but a
         // DIRECT `run_until_blocked(sealed_exec)` must short-circuit rather than
         // re-drive a superseded run's handler.
@@ -1408,8 +1417,7 @@ impl SqliteRuntime {
         // dedicated parameter on this entry point — the core reads it ONLY from
         // `span_meta.workflow_id`, so build a minimal meta carrying it (see
         // [`drive_span_meta`]).
-        let mut span_meta = drive_span_meta(&workflow_name, &workflow_id);
-        span_meta.cancellation_reason.clone_from(&cancel_reason);
+        let span_meta = drive_span_meta(&workflow_name, &workflow_id, cancel_reason.clone());
         let (outcome, pending, _span, _resolved_router) =
             run_workflow_with_state_history_policy_and_caps(
                 exec,
@@ -1467,20 +1475,26 @@ impl SqliteRuntime {
         }
         self.workflow_panic_strikes.remove(&exec);
 
-        // Issue #2021: a body that returns after a cancel request seals the run
-        // `CANCELLED`, whether it returned `Ok` or `Err`. Non-determinism and
-        // a deadlock keep their non-terminal handling below.
-        if let Some(reason) = &cancel_reason
-            && matches!(
-                outcome,
+        // Issue #2021: a pending cancel request ends the run here.
+        // - A body that returns `Ok` or `Err` has done its cleanup. Its
+        //   bookkeeping commands persist before the terminal event.
+        // - The body sees the request from the start of its replay. A check
+        //   before recorded commands therefore diverges, and a deadlock never
+        //   resolves. The driver discards that cycle and ends the run, so a
+        //   cancel always ends the run.
+        // - `ContinueAsNew` keeps its unsupported handling below.
+        if let Some(reason) = &cancel_reason {
+            match &outcome {
                 WorkflowOutcome::Completed { .. }
-                    | WorkflowOutcome::Failed {
-                        non_deterministic_details: None,
-                        ..
-                    }
-            )
-        {
-            return self.seal_cancelled(exec, reason, &pending);
+                | WorkflowOutcome::Failed {
+                    non_deterministic_details: None,
+                    ..
+                } => return self.seal_cancelled(exec, reason, &pending),
+                WorkflowOutcome::Failed { .. } | WorkflowOutcome::TaskFailed { .. } => {
+                    return self.seal_cancelled(exec, reason, &[]);
+                }
+                WorkflowOutcome::ContinuedAsNew { .. } | WorkflowOutcome::Suspended { .. } => {}
+            }
         }
 
         match outcome {
@@ -2102,7 +2116,7 @@ const SEALED_STATE: &str = "CONTINUED_AS_NEW";
 /// If the prior is still `RUNNING`, append a `WorkflowCancelled` event recording the
 /// forced cancellation and clean up its PENDING task rows and unfired timers (so
 /// no orphan can be claimed / fire against a run that is never driven again). An
-/// already-terminal prior (`COMPLETED`/`FAILED`) is sealed WITHOUT a cancellation
+/// already-terminal prior (`COMPLETED`, `FAILED` or `CANCELLED`) is sealed WITHOUT a cancellation
 /// event and has no PENDING tasks or unfired timers left to clean up. Every prior
 /// being sealed — RUNNING or already-terminal — also has its undelivered staged
 /// signals deleted. A signal can be staged while the prior is RUNNING. It can then
@@ -2176,7 +2190,7 @@ fn seal_with_cancel_event(
             reason: reason.to_string(),
         },
     )?;
-    store::set_sealed_with_reason(conn, exec, state, reason)?;
+    store::set_terminal_with_reason(conn, exec, state, reason)?;
     delete_open_rows(conn, exec)
 }
 
@@ -2466,12 +2480,17 @@ pub fn duration_to_millis_saturating(d: std::time::Duration) -> i64 {
 /// Every field OTHER than `workflow_id`/`workflow_name` is set to the exact value
 /// the prior `None` produced (`queue ""`, build/timeout/deadline/parent `None`,
 /// `is_replay = false`), so the ONLY behavioral change is a non-empty
-/// `ctx.info().workflow_id`. `parent_execution_id` stays `None` because this
+/// `ctx.info().workflow_id`. Issue #2021 adds `cancel_reason`, a pending cancel
+/// request that `ctx.cancellation_reason()` reports. `parent_execution_id` stays `None` because this
 /// backend rejects child-workflow commands as Unsupported (see [`command_name`]),
 /// so every `SQLite` run is top-level by design and `ctx.info().parent_execution_id`
 /// is correctly always `None`. The recorded span fields are inert here (no `OTel`
 /// worker/subscriber on this backend).
-fn drive_span_meta(workflow_name: &str, workflow_id: &str) -> WorkflowExecuteSpanMeta {
+fn drive_span_meta(
+    workflow_name: &str,
+    workflow_id: &str,
+    cancel_reason: Option<String>,
+) -> WorkflowExecuteSpanMeta {
     WorkflowExecuteSpanMeta {
         workflow_name: workflow_name.to_string(),
         workflow_id: workflow_id.to_string(),
@@ -2483,7 +2502,7 @@ fn drive_span_meta(workflow_name: &str, workflow_id: &str) -> WorkflowExecuteSpa
         execution_timeout: None,
         deadline_at: None,
         parent_execution_id: None,
-        cancellation_reason: None,
+        cancellation_reason: cancel_reason,
     }
 }
 

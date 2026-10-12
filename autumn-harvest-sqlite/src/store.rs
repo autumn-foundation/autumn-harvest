@@ -166,8 +166,8 @@ pub fn running_executions(conn: &Connection) -> SqliteResult<Vec<ExecutionId>> {
 ///   legacy duplicate survives (Codex #1080 P2). It does NOT use this
 ///   newest-only accessor.
 /// - **`AllowDuplicateFailedOnly`** deliberately does not disturb a running run, so
-///   a legacy RUNNING duplicate persists under it — consistent with its "replace a
-///   FAILED run" contract (it only seals a FAILED prior).
+///   a legacy RUNNING duplicate persists under it. That fits its "replace a
+///   FAILED or `CANCELLED` run" contract.
 /// - **`AllowDuplicate` / `RejectDuplicate`** never replace, so any legacy
 ///   duplicates simply persist (they attach to / reject against the newest active
 ///   row this returns).
@@ -238,7 +238,7 @@ pub fn find_active_executions_by_key(
 }
 
 /// Transition an execution to a SEALED terminal state (issue #1068) — used by the
-/// reuse-policy "replace" cases (`AllowDuplicateFailedOnly` over a FAILED prior;
+/// reuse-policy "replace" cases (`AllowDuplicateFailedOnly` over a FAILED or `CANCELLED` prior;
 /// `TerminateIfRunning` over any prior) to move the superseded run out of the
 /// active set so the `(workflow_name, workflow_id)` slot is freed for the fresh
 /// run. `sealed_state` is `CONTINUED_AS_NEW` (mirroring core's `replace_execution`,
@@ -268,18 +268,18 @@ pub fn seal_execution(
 
 /// Store a cooperative cancel request on a `RUNNING` row (issue #2021).
 ///
-/// The first request wins. A repeat call changes nothing. Returns `true` when
-/// this call stored the reason.
-pub fn request_cancel(conn: &Connection, exec_id: ExecutionId, reason: &str) -> SqliteResult<bool> {
-    let changed = conn.execute(
+/// The first request wins. A repeat call changes nothing.
+pub fn request_cancel(conn: &Connection, exec_id: ExecutionId, reason: &str) -> SqliteResult<()> {
+    conn.execute(
         "UPDATE harvest_executions SET cancel_reason = ?2 \
          WHERE exec_id = ?1 AND state = 'RUNNING' AND cancel_reason IS NULL",
         params![exec_id.to_string(), reason],
     )?;
-    Ok(changed > 0)
+    Ok(())
 }
 
-/// The pending cooperative cancel request of `exec_id`, if any (issue #2021).
+/// The stored cooperative cancel request of `exec_id`, if any (issue #2021).
+/// It is pending only while the row is `RUNNING`.
 pub fn cancel_reason(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Option<String>> {
     Ok(conn.query_row(
         "SELECT cancel_reason FROM harvest_executions WHERE exec_id = ?1",
@@ -288,9 +288,9 @@ pub fn cancel_reason(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Op
     )?)
 }
 
-/// Seal `exec_id` in a terminal `state` with `reason` as its error (issue
+/// Put `exec_id` in a terminal `state` with `reason` as its error (issue
 /// #2021). The cancel and terminate paths use it.
-pub fn set_sealed_with_reason(
+pub fn set_terminal_with_reason(
     conn: &Connection,
     exec_id: ExecutionId,
     state: &str,

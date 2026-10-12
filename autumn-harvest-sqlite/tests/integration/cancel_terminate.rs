@@ -2,11 +2,14 @@
 //!
 //! `cancel` is cooperative. The body sees `cancellation_reason()` on the next
 //! drive and can run cleanup activities. `terminate` seals the run at once.
-//! Both paths record the core `WorkflowCancelled` event, so each history
-//! replays on the core `WorkflowReplayer`.
+//! Both paths record the core `WorkflowCancelled` event as the last event.
+//! A history replays on the core `WorkflowReplayer` when the body checks for
+//! the cancel before its next new command.
 
 // The `#[workflow]` macro reads its input through an underscore binding.
 #![allow(clippy::used_underscore_binding)]
+// The `#[activity]` fixture only supplies `flaky_step_info()`. Its body never runs.
+#![allow(clippy::unused_async)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -98,6 +101,55 @@ async fn retries(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
     ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
 }
 
+/// Checks for a cancel at the top of each loop turn, before recorded steps.
+#[workflow]
+async fn loops(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    for i in 0..2 {
+        if ctx.is_cancelled() {
+            ctx.execute_activity_raw("cleanup", json!(i), "default")
+                .await
+                .map_err(|e| e.to_string())?;
+            return Ok(json!("cleaned"));
+        }
+        ctx.execute_activity_raw("step", json!(i), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
+/// Runs `step`, checks for a cancel, then sleeps on a one-hour timer.
+#[workflow]
+async fn checks_then_naps(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
+    ctx.execute_activity_raw("step", json!(n), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    if ctx.is_cancelled() {
+        ctx.execute_activity_raw("cleanup", json!(n), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(json!("cleaned"));
+    }
+    ctx.timer("nap", 3600).await.map_err(|e| e.to_string())?;
+    Ok(json!("woke"))
+}
+
+/// Runs `step`. When cancelled, it waits on a grace timer before cleanup.
+#[workflow]
+async fn grace(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
+    ctx.execute_activity_raw("step", json!(n), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    if ctx.is_cancelled() {
+        ctx.timer("grace", 5).await.map_err(|e| e.to_string())?;
+        ctx.execute_activity_raw("cleanup", json!(n), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(json!("cleaned"));
+    }
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
 /// Counts the calls of each activity and records the cleanup input.
 #[derive(Default)]
 struct Calls {
@@ -125,6 +177,9 @@ fn register(rt: &mut SqliteRuntime, calls: &Arc<Calls>) {
     rt.register_workflow(&bails_info());
     rt.register_workflow(&naps_info());
     rt.register_workflow(&retries_info());
+    rt.register_workflow(&loops_info());
+    rt.register_workflow(&checks_then_naps_info());
+    rt.register_workflow(&grace_info());
     let c = Arc::clone(calls);
     rt.register_activity_raw(
         "step",
@@ -190,14 +245,13 @@ fn cancelled_events(rt: &SqliteRuntime, exec: ExecutionId) -> usize {
 }
 
 async fn replay(
-    rt: &SqliteRuntime,
-    exec: ExecutionId,
+    history: Vec<WorkflowEvent>,
     name: &str,
     handler: autumn_harvest::WorkflowHandlerFn,
 ) -> autumn_harvest::testing::ReplayReport {
     WorkflowReplayer::new()
         .register_fn(name, handler)
-        .replay_from_events(rt.load_history(exec).unwrap())
+        .replay_from_events(history)
         .await
 }
 
@@ -346,6 +400,101 @@ async fn cancel_waits_for_a_pending_activity_retry() {
         "the retry runs, then the body sees the cancel, got {state:?}"
     );
     assert_eq!(calls.flaky.load(Ordering::SeqCst), 2);
+}
+
+/// Asserts that `exec` ended `CANCELLED` with `reason`, that no cleanup ran,
+/// and that the history is the old prefix plus one `WorkflowCancelled`.
+fn assert_sealed_without_cleanup(
+    rt: &SqliteRuntime,
+    calls: &Calls,
+    exec: ExecutionId,
+    prefix: &[WorkflowEvent],
+    reason: &str,
+) {
+    assert_eq!(calls.cleanup.load(Ordering::SeqCst), 0, "no cleanup ran");
+    let history = rt.load_history(exec).unwrap();
+    assert_eq!(
+        history.len(),
+        prefix.len() + 1,
+        "only the seal event is new"
+    );
+    assert!(
+        matches!(history.last(), Some(WorkflowEvent::WorkflowCancelled { reason: r }) if r == reason)
+    );
+    assert!(
+        matches!(rt.outcome(exec).unwrap(), ExecutionOutcome::Terminated(s) if s == "CANCELLED")
+    );
+}
+
+#[tokio::test]
+async fn a_check_before_recorded_steps_still_ends_the_run() {
+    let (_dir, path) = temp_db();
+    let (mut rt, calls) = runtime(&path);
+    let exec = start_parked(&mut rt, "loops").await;
+    let prefix = rt.load_history(exec).unwrap();
+
+    rt.cancel(exec, "stop").unwrap();
+    let state = rt.run_until_blocked(exec).await;
+
+    assert!(
+        matches!(&state, Ok(RunState::Cancelled(reason)) if reason == "stop"),
+        "a check that replays before recorded steps must not wedge the run, got {state:?}"
+    );
+    assert_sealed_without_cleanup(&rt, &calls, exec, &prefix, "stop");
+}
+
+#[tokio::test]
+async fn a_check_before_a_recorded_timer_still_ends_the_run() {
+    let (_dir, path) = temp_db();
+    let (mut rt, calls) = runtime(&path);
+    let exec = rt.start_workflow("checks_then_naps", json!(3)).unwrap();
+    assert!(matches!(
+        rt.run_until_blocked(exec).await.unwrap(),
+        RunState::WaitingTimer
+    ));
+    let prefix = rt.load_history(exec).unwrap();
+
+    rt.cancel(exec, "no nap").unwrap();
+    let state = rt.run_until_blocked(exec).await;
+
+    assert!(matches!(&state, Ok(RunState::Cancelled(reason)) if reason == "no nap"));
+    assert_sealed_without_cleanup(&rt, &calls, exec, &prefix, "no nap");
+    assert_eq!(leftover_rows(&path, exec), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn a_cleanup_that_waits_on_a_timer_is_cut_short() {
+    let (_dir, path) = temp_db();
+    let (mut rt, calls) = runtime(&path);
+    let exec = start_parked(&mut rt, "grace").await;
+
+    rt.cancel(exec, "stop").unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+
+    assert!(matches!(&state, RunState::Cancelled(reason) if reason == "stop"));
+    assert_eq!(
+        calls.cleanup.load(Ordering::SeqCst),
+        0,
+        "the documented limit: a cleanup wait on a timer seals the run"
+    );
+    assert_eq!(leftover_rows(&path, exec), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn a_body_that_completes_after_a_cancel_request_seals_cancelled() {
+    let (_dir, path) = temp_db();
+    let (mut rt, _calls) = runtime(&path);
+    let exec = start_parked(&mut rt, "parks").await;
+
+    rt.cancel(exec, "stop").unwrap();
+    rt.send_signal(exec, "go", json!({ "answer": 42 })).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+
+    assert!(
+        matches!(&state, RunState::Cancelled(reason) if reason == "stop"),
+        "the request wins over a late completion, got {state:?}"
+    );
+    assert_eq!(cancelled_events(&rt, exec), 1);
 }
 
 #[tokio::test]
@@ -575,11 +724,37 @@ async fn a_cancelled_history_replays_on_the_core_replayer() {
     rt.cancel(exec, "user stop").unwrap();
     rt.run_until_blocked(exec).await.unwrap();
 
-    let report = replay(&rt, exec, "cleans_up", cleans_up_info().handler).await;
+    let report = replay(
+        rt.load_history(exec).unwrap(),
+        "cleans_up",
+        cleans_up_info().handler,
+    )
+    .await;
 
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "the cancel history must replay with its cleanup:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn a_cancel_sealed_while_parked_does_not_replay() {
+    let (_dir, path) = temp_db();
+    let (mut rt, _calls) = runtime(&path);
+    let exec = start_parked(&mut rt, "parks").await;
+    rt.cancel(exec, "stuck").unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+
+    let report = replay(
+        rt.load_history(exec).unwrap(),
+        "parks",
+        parks_info().handler,
+    )
+    .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "the documented limit: a body parked without a check does not replay, as on Postgres:\n{report}"
     );
 }
 
@@ -590,7 +765,12 @@ async fn a_terminated_history_replays_on_the_core_replayer() {
     let exec = start_parked(&mut rt, "stops").await;
     rt.terminate(exec, "kill").unwrap();
 
-    let report = replay(&rt, exec, "stops", stops_info().handler).await;
+    let report = replay(
+        rt.load_history(exec).unwrap(),
+        "stops",
+        stops_info().handler,
+    )
+    .await;
 
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),

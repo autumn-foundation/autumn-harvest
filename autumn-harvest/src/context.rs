@@ -3068,7 +3068,8 @@ pub struct WorkflowContext {
     /// `return Err(..)` paths cannot leak one.
     signal_pump_hold: std::sync::atomic::AtomicUsize,
     /// Cancellation reason captured from a `WorkflowCancelled` event in history,
-    /// if any. When set, `is_cancelled()` returns true and `check_cancellation()`
+    /// or a pending request from `WorkflowExecuteSpanMeta::cancellation_reason`
+    /// (issue #2021). A recorded event wins. When set, `is_cancelled()` returns true and `check_cancellation()`
     /// yields [`HarvestError::Cancelled`]. Cooperative: the workflow function is
     /// expected to consult these at strategic points to run cleanup logic.
     cancellation_reason: Option<String>,
@@ -5046,7 +5047,8 @@ impl WorkflowContext {
     // ── Cancellation ──────────────────────────────────────────────────
 
     /// Returns `true` if a `WorkflowCancelled` event is present in the event
-    /// history backing this context.
+    /// history backing this context, or if the backend passes a pending cancel
+    /// request (issue #2021).
     ///
     /// Workflows performing long-running loops or multi-step orchestration
     /// should check this periodically and bail out with cleanup when it
@@ -5096,8 +5098,8 @@ impl WorkflowContext {
     ///
     /// # Errors
     ///
-    /// Returns [`HarvestError::Cancelled`] if a `WorkflowCancelled` event is
-    /// present in the event history.
+    /// Returns [`HarvestError::Cancelled`] when
+    /// [`is_cancelled`](Self::is_cancelled) is true.
     pub fn check_cancellation(&self) -> HarvestResult<()> {
         if let Some(reason) = self.cancellation_reason.as_deref() {
             return Err(HarvestError::Cancelled(reason.to_string()));

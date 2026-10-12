@@ -378,7 +378,8 @@ fn encode_workflow_panic(message: String) -> String {
         .into_workflow_error_payload()
 }
 
-/// Caller-supplied metadata recorded onto the `harvest.workflow.execute` span.
+/// Caller-supplied metadata for the `harvest.workflow.execute` span, and context
+/// inputs the executor threads into [`WorkflowContext`].
 pub struct WorkflowExecuteSpanMeta {
     /// Logical workflow name (recorded as `harvest.workflow.id`).
     pub workflow_name: String,
@@ -418,7 +419,7 @@ pub struct WorkflowExecuteSpanMeta {
     /// The SQLite backend stores a cooperative cancel outside the event log.
     /// It appends `WorkflowCancelled` only when it seals the run. This field
     /// lets the body read the request through `ctx.cancellation_reason()`.
-    /// A recorded `WorkflowCancelled` event wins. Postgres passes `None`.
+    /// A recorded `WorkflowCancelled` event wins. Every other caller passes `None`.
     pub cancellation_reason: Option<String>,
 }
 

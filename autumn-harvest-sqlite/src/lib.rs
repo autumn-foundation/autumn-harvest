@@ -223,12 +223,13 @@
 //!
 //! ### State-model restriction vs. the Postgres core
 //!
-//! This backend's execution state model is a strict subset of the core's: an
-//! active run is only ever `RUNNING` (there is no `PAUSED`), and the only terminal
-//! states it writes are `COMPLETED`, `FAILED`, and the `CONTINUED_AS_NEW` SEAL used
-//! by the reuse "replace" cases (it never writes a distinct `TIMED_OUT`, an active
-//! `CANCELLED`, or a distinct `TERMINATED`). So the reuse matrix is realized over
-//! `{none, RUNNING, COMPLETED, FAILED}` priors only:
+//! This backend's execution state model is a strict subset of the core's. An
+//! active run is only ever `RUNNING` (there is no `PAUSED`). The terminal states
+//! it writes are `COMPLETED`, `FAILED`, `CANCELLED` and `TERMINATED` (issue
+//! #2021), plus the `CONTINUED_AS_NEW` SEAL of the reuse "replace" cases. It never
+//! writes `TIMED_OUT`. The reuse lookup skips `TERMINATED` and `CONTINUED_AS_NEW`,
+//! so the reuse matrix is realized over
+//! `{none, RUNNING, COMPLETED, FAILED, CANCELLED}` priors only:
 //!
 //! - `AllowDuplicate` — attach to / return any non-sealed prior; else fresh.
 //! - `RejectDuplicate` — [`SqliteError::AlreadyExists`] for any non-sealed prior;
@@ -250,14 +251,16 @@
 //!
 //! [`SqliteRuntime::cancel`] is cooperative. It stores the request, and the next
 //! drive replays the body with `ctx.cancellation_reason()` set. The body can run
-//! cleanup activities. The run seals `CANCELLED` when the body returns, or when it
-//! blocks with no activity task left. [`SqliteRuntime::terminate`] seals the run
-//! `TERMINATED` at once, and the body does not run again.
+//! cleanup activities. The run ends `CANCELLED` when the body returns, when it
+//! blocks with no activity task left, or when the cycle diverges or deadlocks.
+//! [`SqliteRuntime::terminate`] ends the run `TERMINATED` at once, and the body
+//! does not run again.
 //!
-//! Both seals append the core `WorkflowCancelled` event as the last event, as
-//! Postgres does. A cleanup that ran before it therefore replays on the core
-//! `WorkflowReplayer`. Both seals delete pending tasks, unfired timers and staged
-//! signals. The drives report [`RunState::Cancelled`] and [`RunState::Terminated`].
+//! Both paths append the core `WorkflowCancelled` event as the last event, as
+//! Postgres does. Cleanup events come before it. The history replays on the
+//! core `WorkflowReplayer` when the body checks the request before its next new
+//! command. Both paths delete pending tasks, unfired timers and staged signals.
+//! The drives report [`RunState::Cancelled`] and [`RunState::Terminated`].
 //!
 //! ## Unsupported workflow primitives — rejected LOUDLY, by name
 //!

@@ -104,12 +104,12 @@ A complete, runnable version is in
   starting a second one. The new call's input is discarded. Use
   `start_workflow_with_reuse_policy` for the full `WorkflowIdReusePolicy`
   matrix — reject, replace-if-failed, or terminate-and-restart.
-
 - **Cancel and terminate (issue #2021).** `cancel(exec, reason)` is
-  cooperative: the next drive replays the body with
-  `ctx.cancellation_reason()` set, so it can run cleanup activities, and the
-  run ends `CANCELLED`. `terminate(exec, reason)` ends the run `TERMINATED` at
-  once. Both record the core `WorkflowCancelled` event, as Postgres does.
+  cooperative. The next drive replays the body with
+  `ctx.cancellation_reason()` set, so the body can run cleanup activities. The
+  run then ends `CANCELLED`. `terminate(exec, reason)` ends the run
+  `TERMINATED` at once. Both record the core `WorkflowCancelled` event, as
+  Postgres does.
 
 ## v0.1 non-goals
 
