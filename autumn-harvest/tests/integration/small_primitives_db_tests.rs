@@ -1061,3 +1061,36 @@ async fn by_id_signal_settles_a_named_promise_in_a_new_run() {
         "the current run's promise must get its own settlement"
     );
 }
+
+/// A promise settlement skips the cross-run dedupe. A retry against the same
+/// run must still be a no-op, even after the signal payload cap drops below
+/// the payload size.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signal_with_start_retry_of_a_settlement_is_a_no_op_under_a_new_cap() {
+    use autumn_harvest::durable_promise::PromiseSettlement;
+    use autumn_harvest::execution::signal_with_start_workflow_execution;
+
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let name = "harvest.promise:approval";
+    let settlement = PromiseSettlement::resolved(json!({ "note": "approved" })).to_value();
+
+    let first = signal_with_start_workflow_execution(
+        &mut conn,
+        sws_params("sws-cap", name, settlement.clone(), None),
+    )
+    .await
+    .expect("first settlement");
+    assert!(first.signal_delivered, "the first settlement lands");
+
+    let mut retry = sws_params("sws-cap", name, settlement, None);
+    retry.max_signal_payload_bytes = 1;
+    let second = signal_with_start_workflow_execution(&mut conn, retry)
+        .await
+        .expect("the retry is a no-op, not a cap error");
+    assert_eq!(
+        second.exec_id, first.exec_id,
+        "the retry attaches to the run"
+    );
+    assert!(!second.signal_delivered, "the retry stages nothing");
+}

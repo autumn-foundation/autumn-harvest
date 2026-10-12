@@ -7516,6 +7516,27 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
             )
             .await?;
 
+            // Issue #1985: a promise skips the cross-run dedupe above. A retry
+            // against the same run must still dedupe before the payload cap,
+            // so a tightened cap cannot turn a settled retry into an error.
+            if promise_signal
+                && !started.created
+                && let Some(key) = signal_key.as_deref()
+                && crate::signal::signal_idempotency_key_exists(conn, started.exec_id, key).await?
+            {
+                return Ok((
+                    SignalWithStartOutcome {
+                        exec_id: started.exec_id,
+                        workflow_name: started.workflow_name,
+                        workflow_id: started.workflow_id,
+                        state: started.state,
+                        started_fresh: false,
+                        signal_delivered: false,
+                    },
+                    effects,
+                ));
+            }
+
             // Check signal payload cap here — after start/attach/AlreadyExists
             // resolution — so RejectDuplicate conflicts surface as 409 AlreadyExists
             // rather than 413 PayloadTooLarge when the payload happens to be oversized.
