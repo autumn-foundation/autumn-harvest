@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::context::{LoserCancelReason, WorkflowCommand, WorkflowContext};
 use crate::error::{HarvestError, HarvestResult};
-use crate::event::WorkflowEvent;
+use crate::event::{SideEffectKind, WorkflowEvent};
 use crate::types::{ActivityExecId, ExecutionId, TimerId};
 
 /// The reason that a cancelled scope reports.
@@ -114,6 +114,33 @@ struct CancelMarker {
     horizon: usize,
     #[serde(flatten)]
     members: ScopeMembers,
+    /// The values that the body recorded in the cancelling cycle, in order.
+    /// The cancel withdraws their commands, so replay reads them from here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    records: Vec<CapturedRecord>,
+}
+
+/// A `RecordSideEffect` that a scope cancel withdraws (issue #1984).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct CapturedRecord {
+    kind: SideEffectKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    value: Value,
+}
+
+/// The record values among `cmds`, in order.
+fn captured_records(cmds: &[WorkflowCommand]) -> Vec<CapturedRecord> {
+    cmds.iter()
+        .filter_map(|cmd| match cmd {
+            WorkflowCommand::RecordSideEffect { kind, name, value } => Some(CapturedRecord {
+                kind: *kind,
+                name: name.clone(),
+                value: value.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// One entry of the context's scope stack.
@@ -152,6 +179,8 @@ struct ScopeInner {
     holding: bool,
     held: Vec<WorkflowCommand>,
     members: ScopeMembers,
+    /// On replay of a cancelled scope, the values that the body recorded.
+    records: std::collections::VecDeque<CapturedRecord>,
     /// The handle timer arms that the body makes, matched or live, by epoch.
     /// A replay that matches an arm pushes no command, so `members` can miss it.
     armed_timers: Vec<(TimerId, u64)>,
@@ -214,6 +243,46 @@ pub(crate) fn route_command(
         tags.push(shared.seq);
     }
     Some((cmd, tags))
+}
+
+/// The value that a cancelled scope recorded for this primitive, on replay.
+///
+/// The live cancel withdraws the body's `RecordSideEffect` commands and keeps
+/// their values in its marker. Replay serves them in the same order. A kind or
+/// name that does not match returns `None`, so the primitive runs as before.
+pub(crate) fn take_captured_record(
+    stack: &[ScopeFrame],
+    kind: SideEffectKind,
+    name: Option<&str>,
+) -> Option<Value> {
+    for frame in stack.iter().rev() {
+        let ScopeFrame::Cancellable(shared) = frame else {
+            break;
+        };
+        let mut inner = shared.lock();
+        let Some(next) = inner.records.front() else {
+            continue;
+        };
+        if next.kind != kind || next.name.as_deref() != name {
+            return None;
+        }
+        return inner.records.pop_front().map(|record| record.value);
+    }
+    None
+}
+
+/// The cancellable scopes on `stack` up to the nearest shield, innermost last.
+pub(crate) fn cancellable_seqs(stack: &[ScopeFrame]) -> Vec<u32> {
+    let mut seqs: Vec<u32> = stack
+        .iter()
+        .rev()
+        .map_while(|frame| match frame {
+            ScopeFrame::Cancellable(shared) => Some(shared.seq),
+            ScopeFrame::Shield => None,
+        })
+        .collect();
+    seqs.reverse();
+    seqs
 }
 
 /// Record that the body makes arm `epoch` of the handle timer `timer_id`.
@@ -288,6 +357,7 @@ impl<'a> CancellationScope<'a> {
                     held: Vec::new(),
                     members: ScopeMembers::default(),
                     armed_timers: Vec::new(),
+                    records: std::collections::VecDeque::new(),
                 }),
             }),
         };
@@ -371,7 +441,11 @@ impl<F: Future> ScopeRun<'_, F> {
         let name = cancel_marker_name(self.shared.seq);
         if let Some(details) = self.ctx.peek_marker_details(&name) {
             let marker = parse_cancel_marker(self.ctx, &name, details)?;
-            self.shared.lock().holding = true;
+            {
+                let mut inner = self.shared.lock();
+                inner.holding = true;
+                inner.records = marker.records.iter().cloned().collect();
+            }
             self.replay = Some(marker);
         }
         Ok(())
@@ -386,9 +460,9 @@ impl<F: Future> ScopeRun<'_, F> {
         let result = if let Some((index, details)) = ctx.take_marker(&name) {
             parse_cancel_marker(ctx, &name, details).map(|marker| {
                 ctx.consume_scope_members(&marker.members, marker.horizon..index);
-                ctx.mark_scope_timers_cancelled(&marker.members.timers);
                 // The held commands are the commands that the live cycle withdrew.
-                ctx.mark_scope_timers_cancelled(&armed_timer_ids(&self.shared.lock().held));
+                ctx.undo_scope_timer_mutations(seq);
+                ctx.mark_scope_timers_cancelled(&marker.members.timers);
                 ctx.mark_scope_arms_cancelled(&self.armed_timers());
                 marker.reason
             })
@@ -408,13 +482,14 @@ impl<F: Future> ScopeRun<'_, F> {
                 reason: SCOPE_CANCEL_REASON.to_string(),
                 horizon: ctx.history_len(),
                 members,
+                records: captured_records(&withdrawn),
             };
             ctx.push_command(WorkflowCommand::RecordMarker {
                 name,
                 details: serde_json::to_value(&marker).unwrap_or(Value::Null),
             });
+            ctx.undo_scope_timer_mutations(seq);
             ctx.mark_scope_timers_cancelled(&marker.members.timers);
-            ctx.mark_scope_timers_cancelled(&armed_timer_ids(&withdrawn));
             ctx.mark_scope_arms_cancelled(&self.armed_timers());
             if !marker.members.is_empty() {
                 ctx.push_command(WorkflowCommand::CancelRaceLosers {
@@ -448,16 +523,6 @@ impl<F: Future> ScopeRun<'_, F> {
         };
         drop(held);
     }
-}
-
-/// The timer ids that `cmds` arm. A withdrawn arm never reaches the worker.
-fn armed_timer_ids(cmds: &[WorkflowCommand]) -> Vec<TimerId> {
-    cmds.iter()
-        .filter_map(|cmd| match cmd {
-            WorkflowCommand::ArmTimer { timer_id, .. } => Some(timer_id.clone()),
-            _ => None,
-        })
-        .collect()
 }
 
 fn parse_cancel_marker(
@@ -979,6 +1044,93 @@ mod tests {
         );
     }
 
+    /// Arms `deadline` outside a scope, then runs `mutate` in a scope that
+    /// is cancelled in the same cycle. Returns the commands and the marker.
+    async fn mutate_then_cancel(
+        ctx: &WorkflowContext,
+        mutate: impl FnOnce(&WorkflowContext),
+    ) -> Vec<WorkflowCommand> {
+        let _outer = ctx.start_timer("deadline", 60);
+        let result = bounded(run_then_cancel(ctx, async {
+            mutate(ctx);
+            std::future::pending::<()>().await;
+        }))
+        .await;
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+        ctx.drain_commands()
+    }
+
+    fn armed_deadline_history() -> Vec<WorkflowEvent> {
+        vec![
+            started(),
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("deadline"),
+                duration_secs: 60,
+            },
+        ]
+    }
+
+    /// The scope withdraws a `cancel_timer` of a timer armed outside it, so
+    /// the timer stays armed, live and on replay.
+    #[tokio::test]
+    async fn a_withdrawn_cancel_timer_leaves_the_timer_armed() {
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), armed_deadline_history());
+
+        let commands = mutate_then_cancel(&ctx, |ctx| {
+            ctx.cancel_timer("deadline").expect("cancel_timer");
+        })
+        .await;
+
+        assert_eq!(
+            count(&commands, |c| matches!(
+                c,
+                WorkflowCommand::CancelTimer { .. }
+            )),
+            0,
+            "the cancel is withdrawn: {commands:?}"
+        );
+        let _again = ctx.start_timer("deadline", 60);
+        let rearms = ctx.drain_commands();
+        assert_eq!(arms(&rearms), 0, "the timer is still armed: {rearms:?}");
+
+        let details = marker(&commands, "cancel_scope:1").expect("the cancel is recorded");
+        let mut history = armed_deadline_history();
+        history.push(WorkflowEvent::MarkerRecorded {
+            name: "cancel_scope:1".into(),
+            details,
+        });
+        let replay = WorkflowContext::for_replay(ExecutionId::new(), history);
+        let replayed = mutate_then_cancel(&replay, |ctx| {
+            ctx.cancel_timer("deadline").expect("cancel_timer");
+        })
+        .await;
+        assert!(replayed.is_empty(), "{replayed:?}");
+        let _again = replay.start_timer("deadline", 60);
+        assert_eq!(arms(&replay.drain_commands()), 0);
+        assert!(replay.take_nd_details().is_none());
+        assert!(!replay.history_has_unconsumed_events());
+    }
+
+    /// The scope withdraws a `reset_timer` of a timer armed outside it, so
+    /// the original arm stays armed.
+    #[tokio::test]
+    async fn a_withdrawn_reset_timer_keeps_the_original_arm() {
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), armed_deadline_history());
+
+        let commands = mutate_then_cancel(&ctx, |ctx| {
+            ctx.reset_timer("deadline", 30).expect("reset_timer");
+        })
+        .await;
+
+        assert_eq!(arms(&commands), 0, "the re-arm is withdrawn: {commands:?}");
+        let _again = ctx.start_timer("deadline", 60);
+        let rearms = ctx.drain_commands();
+        assert_eq!(arms(&rearms), 0, "the original arm stays: {rearms:?}");
+    }
+
     #[tokio::test]
     async fn scope_cancel_cancels_an_in_flight_child_workflow() {
         let child = ExecutionId::new();
@@ -1180,6 +1332,105 @@ mod tests {
         );
         assert!(ctx.take_nd_details().is_none());
         assert!(!ctx.history_has_unconsumed_events());
+    }
+
+    /// Records a value in a scope that is cancelled in the same cycle. The
+    /// body leaks the value to `seen`, as a borrowed variable would.
+    async fn record_then_cancel(
+        ctx: &WorkflowContext,
+        seen: &std::sync::Mutex<Option<Value>>,
+        record: impl FnOnce(&WorkflowContext) -> Value + Send,
+    ) {
+        let result = bounded(run_then_cancel(ctx, async {
+            *seen.lock().expect("seen lock") = Some(record(ctx));
+            std::future::pending::<()>().await;
+        }))
+        .await;
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+    }
+
+    fn replay_of(details: Value) -> WorkflowContext {
+        WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started(),
+                WorkflowEvent::MarkerRecorded {
+                    name: "cancel_scope:1".into(),
+                    details,
+                },
+            ],
+        )
+    }
+
+    /// A cancel withdraws the body's `side_effect` record, so the marker
+    /// keeps the value. Replay reads it and does not run the closure again.
+    #[tokio::test]
+    async fn replay_serves_a_side_effect_recorded_in_the_cancelling_cycle() {
+        let live = WorkflowContext::new_test();
+        let seen = std::sync::Mutex::new(None);
+        record_then_cancel(&live, &seen, |ctx| {
+            json!(ctx.side_effect("pick", || 41).expect("side effect"))
+        })
+        .await;
+        let commands = live.drain_commands();
+        assert_eq!(
+            count(&commands, |c| matches!(
+                c,
+                WorkflowCommand::RecordSideEffect { .. }
+            )),
+            0,
+            "the record is withdrawn: {commands:?}"
+        );
+        let details = marker(&commands, "cancel_scope:1").expect("recorded");
+        assert_eq!(details["records"][0]["value"], json!(41), "{details}");
+
+        let replay = replay_of(details);
+        let replayed = std::sync::Mutex::new(None);
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        record_then_cancel(&replay, &replayed, |ctx| {
+            json!(
+                ctx.side_effect("pick", || {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    99
+                })
+                .expect("side effect")
+            )
+        })
+        .await;
+
+        assert_eq!(
+            *replayed.lock().expect("replayed lock"),
+            *seen.lock().expect("seen lock")
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the closure must not run again"
+        );
+        assert!(replay.take_nd_details().is_none());
+        assert!(!replay.history_has_unconsumed_events());
+    }
+
+    /// A built-in primitive gets the same treatment.
+    #[tokio::test]
+    async fn replay_serves_a_uuid_recorded_in_the_cancelling_cycle() {
+        let live = WorkflowContext::new_test();
+        let seen = std::sync::Mutex::new(None);
+        record_then_cancel(&live, &seen, |ctx| json!(ctx.new_uuid().to_string())).await;
+        let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+        let replay = replay_of(details);
+        let replayed = std::sync::Mutex::new(None);
+        record_then_cancel(&replay, &replayed, |ctx| json!(ctx.new_uuid().to_string())).await;
+
+        assert_eq!(
+            *replayed.lock().expect("replayed lock"),
+            *seen.lock().expect("seen lock")
+        );
+        assert!(replay.take_nd_details().is_none());
     }
 
     #[tokio::test]

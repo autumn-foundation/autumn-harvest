@@ -88,13 +88,16 @@ its next poll:
 1. It polls the body once more. If the body completes, `run` returns `Ok`.
 2. **Live.** It removes the commands its body issued in this cycle
    (`ReleaseMutex` stays). It records the marker `cancel_scope:{seq}` with the
-   reason, the horizon and the member ids. It pushes
+   reason, the horizon, the member ids and the values of the withdrawn
+   `RecordSideEffect` commands. A withdrawn timer command restores the timer
+   state that it changed. It pushes
    `CancelRaceLosers { reason: ScopeCancelled, .. }` for the open members.
    It returns
    `Err(Cancelled)` and drops the body.
 3. **Replay.** At the first poll the scope finds its marker ahead. Then it
    polls the body with the matcher cut at the horizon, and it holds the body's
-   commands. At the cancel it takes the marker and consumes the member events.
+   commands. A recording primitive that misses reads its value from the
+   marker. At the cancel it takes the marker and consumes the member events.
    It returns `Err(Cancelled)`.
 
 A `cancel()` after `run` completes does nothing. A `cancel()` before the

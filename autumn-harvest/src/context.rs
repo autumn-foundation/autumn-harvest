@@ -1345,6 +1345,17 @@ pub enum TimerOutcome {
 /// does **not** override the recorded fire-vs-cancel race: `await_timer_fire`
 /// always consults recorded history first (`match_timer_or_cancel`) and only
 /// falls back to this state when history holds no resolving event yet.
+/// The handle timer state before a timer command that a scope body pushes
+/// (issue #1984).
+#[derive(Debug)]
+struct TimerUndo {
+    /// The cancellable scopes around the push, innermost last.
+    scopes: Vec<u32>,
+    timer_id: String,
+    state: Option<TimerLogicalState>,
+    epoch: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimerLogicalState {
     /// The timer is armed (or has been re-armed by `reset`) and awaiting a fire.
@@ -3112,6 +3123,10 @@ pub struct WorkflowContext {
     /// The arm count of each handle timer id (issue #1984). A scope cancel uses
     /// it to cancel only the arm that its body made.
     timer_arm_epochs: Mutex<std::collections::HashMap<String, u64>>,
+    /// The timer state before each timer command that a scope body pushes
+    /// this cycle (issue #1984). A scope cancel restores the entries of the
+    /// commands that it withdraws.
+    timer_undo: Mutex<Vec<TimerUndo>>,
     /// Per-run set of `timer_id`s used by the classic `ctx.timer`/`sleep_until`
     /// API this task (issue #768, Codex P2 round 16). Populated by
     /// [`Self::timer`]; consulted by [`Self::start_timer`] / [`Self::reset_timer`]
@@ -3752,6 +3767,7 @@ impl WorkflowContext {
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             timer_arm_epochs: Mutex::new(std::collections::HashMap::new()),
+            timer_undo: Mutex::new(Vec::new()),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
             held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
             suspending: std::sync::atomic::AtomicBool::new(false),
@@ -3935,6 +3951,7 @@ impl WorkflowContext {
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             timer_arm_epochs: Mutex::new(std::collections::HashMap::new()),
+            timer_undo: Mutex::new(Vec::new()),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
             held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
             suspending: std::sync::atomic::AtomicBool::new(false),
@@ -4016,6 +4033,7 @@ impl WorkflowContext {
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             timer_arm_epochs: Mutex::new(std::collections::HashMap::new()),
+            timer_undo: Mutex::new(Vec::new()),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
             held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
             suspending: std::sync::atomic::AtomicBool::new(false),
@@ -4975,7 +4993,13 @@ impl WorkflowContext {
                 // `Utc::now()` exactly as before — `system_now`'s #384
                 // host-wall-clock contract is untouched (this internal probe is
                 // the only reader that consults the virtual clock).
-                let millis = self.deadline_frontier_now_millis();
+                let millis = self
+                    .captured_scope_record(
+                        crate::event::SideEffectKind::Now,
+                        Some(crate::replay::DEADLINE_PROBE_SIDE_EFFECT_NAME),
+                    )
+                    .and_then(|value| value.as_i64())
+                    .unwrap_or_else(|| self.deadline_frontier_now_millis());
                 // Record the fresh clock read like `system_now` does at its
                 // `NoMatch` (frontier) branch — append the value + push the
                 // `RecordSideEffect` bookkeeping command — but under the reserved
@@ -5396,7 +5420,10 @@ impl WorkflowContext {
             HistoryMatch::NoMatch => {
                 self.check_strict_replay_no_match(&format!("SideEffectRecorded({id})"))?;
 
-                let result = f();
+                let result = self
+                    .captured_scope_record(crate::event::SideEffectKind::Custom, Some(id))
+                    .and_then(|value| serde_json::from_value::<T>(value).ok())
+                    .unwrap_or_else(f);
                 let output = serde_json::to_value(&result)?;
 
                 // Enforce side-effect payload cap before recording.
@@ -5552,7 +5579,10 @@ impl WorkflowContext {
                         kind.as_str()
                     ));
                 }
-                let result = f();
+                let result = self
+                    .captured_scope_record(kind, None)
+                    .and_then(|value| serde_json::from_value::<T>(value).ok())
+                    .unwrap_or_else(f);
                 // Built-in values (timestamps, UUIDs, u64/f64) always serialise.
                 let value = serde_json::to_value(&result)
                     .expect("built-in side-effect value must serialise");
@@ -5732,7 +5762,12 @@ impl WorkflowContext {
                             .to_string(),
                     );
                 }
-                let result = rand::Rng::gen_range(&mut rand::thread_rng(), range);
+                let captured = self
+                    .captured_scope_record(SideEffectKind::Random, None)
+                    .and_then(|value| serde_json::from_value::<T>(value).ok())
+                    .filter(|value| range.contains(value));
+                let result = captured
+                    .unwrap_or_else(|| rand::Rng::gen_range(&mut rand::thread_rng(), range));
                 let value = serde_json::to_value(&result)
                     .expect("built-in side-effect value must serialise");
                 self.push_command(WorkflowCommand::RecordSideEffect {
@@ -7326,6 +7361,78 @@ impl WorkflowContext {
             .remove(timer_id);
     }
 
+    /// The value that a cancelled scope recorded here, on replay (issue #1984).
+    fn captured_scope_record(
+        &self,
+        kind: crate::event::SideEffectKind,
+        name: Option<&str>,
+    ) -> Option<Value> {
+        let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
+        crate::cancellation_scope::take_captured_record(&stack, kind, name)
+    }
+
+    /// Record the state of `timer_id` before a scope body changes it.
+    fn journal_timer_undo(&self, scopes: Vec<u32>, timer_id: String) {
+        let state = self
+            .cancellable_timer_state
+            .lock()
+            .expect("cancellable_timer_state lock poisoned")
+            .get(&timer_id)
+            .copied();
+        let epoch = self
+            .timer_arm_epochs
+            .lock()
+            .expect("timer_arm_epochs lock poisoned")
+            .get(&timer_id)
+            .copied();
+        self.timer_undo
+            .lock()
+            .expect("timer_undo lock poisoned")
+            .push(TimerUndo {
+                scopes,
+                timer_id,
+                state,
+                epoch,
+            });
+    }
+
+    /// Restore the timer state that the withdrawn commands of scope `seq`
+    /// changed (issue #1984).
+    ///
+    /// A withdrawn `CancelTimer` or arm never reaches the worker, so its
+    /// durable row is unchanged. Replay holds the same commands, so it
+    /// restores the same entries. The newest entry is restored first.
+    pub(crate) fn undo_scope_timer_mutations(&self, seq: u32) {
+        let undone: Vec<TimerUndo> = {
+            let mut journal = self.timer_undo.lock().expect("timer_undo lock poisoned");
+            let (undone, kept) = std::mem::take(&mut *journal)
+                .into_iter()
+                .partition(|entry| entry.scopes.contains(&seq));
+            *journal = kept;
+            undone
+        };
+        for entry in undone.into_iter().rev() {
+            {
+                let mut states = self
+                    .cancellable_timer_state
+                    .lock()
+                    .expect("cancellable_timer_state lock poisoned");
+                match entry.state {
+                    Some(state) => states.insert(entry.timer_id.clone(), state),
+                    None => states.remove(&entry.timer_id),
+                };
+            }
+            let mut epochs = self
+                .timer_arm_epochs
+                .lock()
+                .expect("timer_arm_epochs lock poisoned");
+            match entry.epoch {
+                Some(epoch) => epochs.insert(entry.timer_id, epoch),
+                None => epochs.remove(&entry.timer_id),
+            };
+        }
+    }
+
     /// Mark each armed cancellable timer in `timer_ids` as cancelled (issue #1984).
     ///
     /// A scope cancel deletes the durable rows of its member timers. A later
@@ -7632,6 +7739,11 @@ impl WorkflowContext {
             &mut self.live_scopes.lock().expect("live scopes lock poisoned"),
             delta,
         );
+        // The last cycle persisted its commands, so no undo entry applies now.
+        self.timer_undo
+            .lock()
+            .expect("timer_undo lock poisoned")
+            .clear();
         self.speculative
             .store(!waits.is_empty(), std::sync::atomic::Ordering::SeqCst);
         self.speculation_read_position
@@ -14629,10 +14741,25 @@ impl WorkflowContext {
     /// The scopes on the scope stack see the command first (issue #1984). A
     /// scope that holds commands keeps it, and the worker never gets it.
     pub(crate) fn push_command(&self, cmd: WorkflowCommand) {
-        let routed = {
-            let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
-            crate::cancellation_scope::route_command(&stack, cmd)
+        let timer_id = match &cmd {
+            WorkflowCommand::CancelTimer { timer_id }
+            | WorkflowCommand::ArmTimer {
+                timer_id,
+                for_await: false,
+                ..
+            } => Some(timer_id.as_str().to_string()),
+            _ => None,
         };
+        let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
+        let scopes = crate::cancellation_scope::cancellable_seqs(&stack);
+        let routed = crate::cancellation_scope::route_command(&stack, cmd);
+        drop(stack);
+        // The caller changes the timer state after this push.
+        if let Some(timer_id) = timer_id
+            && !scopes.is_empty()
+        {
+            self.journal_timer_undo(scopes, timer_id);
+        }
         if let Some((cmd, scopes)) = routed {
             self.commands
                 .lock()
