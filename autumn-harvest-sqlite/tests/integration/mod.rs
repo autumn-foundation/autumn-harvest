@@ -27,6 +27,7 @@ mod reuse_policy;
 mod review_fixes;
 mod review_fixes_48d54b2;
 mod runtime_robustness;
+mod signal_ingest;
 mod signal_timeout;
 mod single_writer_lock;
 mod subsecond_timer;
