@@ -140,6 +140,13 @@ ignore = [
     # proc-macro-error2 gains a maintained release.
     { id = "RUSTSEC-2026-0173", reason = "unmaintained, no safe upgrade exists; entirely inside autumn-web's `validator` dependency, not used directly here. Revisit: autumn-web drops/replaces validator, or proc-macro-error2 is revived." },
 
+    # RUSTSEC-2024-0449 — unsafe-libyaml 0.2.11 is unmaintained. It is not a
+    # vulnerability, and no safe upgrade exists. serde_yaml 0.9 pulls it in.
+    # autumn-web uses serde_yaml to read its config. The core crate uses it
+    # only in dev-dependencies, to parse YAML in docs guards.
+    # Revisit: autumn-web moves off serde_yaml. Then move the docs guards too.
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained, no safe upgrade exists; reached through serde_yaml 0.9 in autumn-web (config) and in core dev-dependencies (docs guards). Revisit: autumn-web moves off serde_yaml." },
+
     # RUSTSEC-2023-0071 — rsa 0.9.10 Marvin Attack (timing side-channel on
     # private-key ops). Pulled by jsonwebtoken -> autumn-web; whether this is
     # reachable depends on whether autumn-web ever performs RSA *signing*
