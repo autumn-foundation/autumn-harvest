@@ -104,6 +104,13 @@ A complete, runnable version is in
   starting a second one. The new call's input is discarded. Use
   `start_workflow_with_reuse_policy` for the full `WorkflowIdReusePolicy`
   matrix — reject, replace-if-failed, or terminate-and-restart.
+- **Long-lived runs (issue #2023).** `ctx.continue_as_new(input)` seals the
+  run `CONTINUED_AS_NEW` and starts a successor with the same `workflow_id`, in
+  one transaction. Undelivered signals move to the successor.
+  `run_until_blocked` returns `RunState::ContinuedAsNew(successor)`. The #1804
+  history caps apply with the Postgres defaults: 50,000 events and 50 MiB per
+  run. A run that reaches a cap fails with a typed `HistoryCapReason`. Change
+  the caps with `set_history_event_hard_cap` and `set_history_byte_hard_cap`.
 
 ## v0.1 non-goals
 
@@ -113,7 +120,8 @@ Out of scope for this backend (tracked as issue #1068 follow-ups):
 - `LISTEN`/`NOTIFY` push wake-ups.
 - Schedules, the management API, DAGs, worker sessions, retention, sharding.
 - Child workflows, external signals/cancels, local activities, updates,
-  search attributes, and `continue_as_new` — a workflow reaching one of these is
+  search attributes, and a continue-as-new to a different workflow type
+  (`continue_as_new_as_type`) — a workflow reaching one of these is
   rejected **loudly, by name**, never silently dropped. The run then ends
   `FAILED` with `error_type = "UnsupportedFeature"` (issue #1834).
 

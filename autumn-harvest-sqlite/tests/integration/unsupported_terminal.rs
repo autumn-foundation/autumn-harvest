@@ -47,9 +47,11 @@ async fn spawns_child(ctx: &WorkflowContext, _n: i64) -> Result<serde_json::Valu
         .map_err(|e| e.to_string())
 }
 
+/// A same-type `continue_as_new` works since issue #2023. A cross-type one
+/// is still outside the subset.
 #[workflow]
-async fn continues_as_new(ctx: &WorkflowContext, n: i64) -> Result<(), String> {
-    ctx.continue_as_new(json!(n + 1))
+async fn continues_as_another_type(ctx: &WorkflowContext, n: i64) -> Result<(), String> {
+    ctx.continue_as_new_as_type("healthy", json!(n + 1))
         .await
         .map_err(|e| e.to_string())
 }
@@ -158,14 +160,17 @@ async fn a_sealed_execution_is_not_driven_again() {
 }
 
 #[tokio::test]
-async fn continue_as_new_ends_failed_with_a_typed_reason() {
+async fn a_cross_type_continue_as_new_ends_failed_with_a_typed_reason() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&continues_as_new_info());
-    let exec = rt.start_workflow("continues_as_new", json!(0)).unwrap();
+    rt.register_workflow(&continues_as_another_type_info());
+    rt.register_workflow(&healthy_info());
+    let exec = rt
+        .start_workflow("continues_as_another_type", json!(0))
+        .unwrap();
 
     let err = rt.run_until_blocked(exec).await.unwrap_err();
     assert!(matches!(err, SqliteError::Unsupported(_)), "{err}");
-    assert_sealed_unsupported(&rt, exec, "ContinueAsNew");
+    assert_sealed_unsupported(&rt, exec, "ContinueAsNew.new_workflow_type");
 }
 
 #[tokio::test]

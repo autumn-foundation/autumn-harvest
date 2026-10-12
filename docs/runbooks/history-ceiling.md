@@ -24,6 +24,11 @@ A `max_workflow_history_events` value above the worker event cap never fires
 for a run that the worker still decides. Raise the worker cap too, or use the
 scanner ceiling only below it.
 
+The SQLite backend enforces the two hard caps with the same defaults (issue
+#2023). It has no DLQ, so the run fails with the reason in its
+`WorkflowFailed` event. Set its caps with
+`SqliteRuntime::set_history_event_hard_cap` and `set_history_byte_hard_cap`.
+
 ---
 
 ## Finding oversized in-flight workflows

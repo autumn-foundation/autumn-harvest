@@ -1,0 +1,314 @@
+//! Issue #2023: `continue_as_new` on the `SQLite` backend.
+//!
+//! The drive seals the run `CONTINUED_AS_NEW` and starts a successor with the
+//! same `workflow_id` in one transaction. Undelivered signals move to the
+//! successor. Both histories replay on the core `WorkflowReplayer`.
+
+// The `#[workflow]` macro references its input param through expansion.
+#![allow(clippy::used_underscore_binding)]
+
+use autumn_harvest::WorkflowIdReusePolicy;
+use autumn_harvest::prelude::*;
+use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
+use autumn_harvest_sqlite::{
+    ActivitySpec, ExecutionOutcome, RunState, SqliteError, SqliteRuntime,
+    UNSUPPORTED_FEATURE_ERROR_TYPE,
+};
+use serde_json::{Value, json};
+
+/// Counts to 3. Each run adds one, then continues as new until it reaches 3.
+#[workflow]
+async fn counting_loop(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    let next = ctx
+        .execute_activity_raw("add_one", json!(n), "default")
+        .await
+        .map_err(|e| e.to_string())?
+        .as_i64()
+        .ok_or("add_one returned a non-integer")?;
+    if next < 3 {
+        ctx.continue_as_new(json!(next))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(next)
+}
+
+/// Phase 0 consumes `first`, then continues. Phase 1 waits for `second`.
+#[workflow]
+async fn signal_hand_off(ctx: &WorkflowContext, phase: i64) -> Result<Value, String> {
+    if phase == 0 {
+        ctx.wait_for_signal("first")
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.continue_as_new(json!(1))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    ctx.wait_for_signal("second")
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Continues as a different type. This backend rejects that by name.
+#[workflow]
+async fn cross_type(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
+    ctx.continue_as_new_as_type("counting_loop", json!(0))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Records a side effect and dispatches an activity in the hand-off cycle.
+#[workflow]
+async fn dispatch_in_hand_off(ctx: &WorkflowContext, phase: i64) -> Result<i64, String> {
+    if phase == 0 {
+        let _id = ctx.new_uuid();
+        // Poll the activity once, so its dispatch rides in the hand-off drain.
+        let mut activity =
+            std::pin::pin!(ctx.execute_activity_raw("add_one", json!(phase), "default"));
+        let mut hand_off = std::pin::pin!(ctx.continue_as_new(json!(1)));
+        std::future::poll_fn(|cx| {
+            let _ = activity.as_mut().poll(cx);
+            hand_off.as_mut().poll(cx)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(phase)
+}
+
+fn runtime() -> SqliteRuntime {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&counting_loop_info());
+    rt.register_workflow(&signal_hand_off_info());
+    rt.register_workflow(&cross_type_info());
+    rt.register_workflow(&dispatch_in_hand_off_info());
+    rt.register_activity_raw(
+        "add_one",
+        ActivitySpec::new(1, |v: Value| Ok(json!(v.as_i64().unwrap_or_default() + 1))),
+    );
+    rt
+}
+
+fn successor_of(state: &RunState) -> ExecutionId {
+    match state {
+        RunState::ContinuedAsNew(successor) => *successor,
+        other => panic!("expected ContinuedAsNew, got {other:?}"),
+    }
+}
+
+// ── AC1: a loop workflow continues as new and finishes in a successor ─────
+
+#[tokio::test]
+async fn a_loop_workflow_continues_as_new_and_finishes_in_a_successor() {
+    let mut rt = runtime();
+    let first = rt
+        .start_workflow_with_id("counting_loop", "loop-1", json!(0))
+        .unwrap();
+
+    let second = successor_of(&rt.run_until_blocked(first).await.unwrap());
+    let third = successor_of(&rt.run_until_blocked(second).await.unwrap());
+    let done = rt.run_until_blocked(third).await.unwrap();
+    assert!(
+        matches!(done, RunState::Completed(ref v) if v == &json!(3)),
+        "{done:?}"
+    );
+
+    for sealed in [first, second] {
+        assert!(
+            matches!(rt.outcome(sealed).unwrap(), ExecutionOutcome::Terminated(ref s) if s == "CONTINUED_AS_NEW"),
+            "a continued run is sealed CONTINUED_AS_NEW"
+        );
+    }
+
+    // The old run ends with the hand-off. The successor starts with its input.
+    let old = rt.load_history(first).unwrap();
+    assert!(
+        matches!(
+            old.last(),
+            Some(WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, input, new_workflow_type: None })
+                if *new_exec_id == second && input == &json!(1)
+        ),
+        "{old:?}"
+    );
+    let new = rt.load_history(second).unwrap();
+    assert!(
+        matches!(new.first(), Some(WorkflowEvent::WorkflowStarted { input, .. }) if input == &json!(1)),
+        "{new:?}"
+    );
+
+    // Same `workflow_id`: a start with the business id attaches to the last run.
+    let attached = rt
+        .start_workflow_with_reuse_policy(
+            "counting_loop",
+            "loop-1",
+            json!(0),
+            WorkflowIdReusePolicy::AllowDuplicate,
+        )
+        .unwrap();
+    assert_eq!(attached.exec_id, third);
+    assert!(!attached.created);
+}
+
+#[tokio::test]
+async fn the_fleet_driver_follows_the_chain_to_completion() {
+    let mut rt = runtime();
+    rt.start_workflow_with_id("counting_loop", "loop-2", json!(0))
+        .unwrap();
+
+    rt.run_until_idle().await.unwrap();
+
+    let last = rt
+        .start_workflow_with_id("counting_loop", "loop-2", json!(0))
+        .unwrap();
+    assert!(
+        matches!(rt.outcome(last).unwrap(), ExecutionOutcome::Completed(ref v) if v == &json!(3))
+    );
+}
+
+#[tokio::test]
+async fn a_redrive_of_a_continued_run_names_the_same_successor() {
+    let mut rt = runtime();
+    let first = rt.start_workflow("counting_loop", json!(0)).unwrap();
+    let second = successor_of(&rt.run_until_blocked(first).await.unwrap());
+
+    let again = successor_of(&rt.run_until_blocked(first).await.unwrap());
+
+    assert_eq!(again, second, "a re-drive starts no second successor");
+    let started = rt.load_history(first).unwrap();
+    assert_eq!(
+        started
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::WorkflowContinuedAsNew { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_reuse_policy_seal_names_no_successor() {
+    let mut rt = runtime();
+    let prior = rt
+        .start_workflow_with_id("signal_hand_off", "key", json!(1))
+        .unwrap();
+    rt.start_workflow_with_reuse_policy(
+        "signal_hand_off",
+        "key",
+        json!(1),
+        WorkflowIdReusePolicy::TerminateIfRunning,
+    )
+    .unwrap();
+
+    let state = rt.run_until_blocked(prior).await.unwrap();
+
+    assert!(
+        matches!(state, RunState::Failed(ref m) if m.contains("not resumable")),
+        "{state:?}"
+    );
+}
+
+// ── AC2: signals staged before the hand-off reach the successor ───────────
+
+#[tokio::test]
+async fn signals_staged_before_the_hand_off_reach_the_successor() {
+    let mut rt = runtime();
+    let first = rt.start_workflow("signal_hand_off", json!(0)).unwrap();
+    rt.send_signal(first, "first", json!("consumed by run 1"))
+        .unwrap();
+    rt.send_signal(first, "second", json!({"for": "run 2"}))
+        .unwrap();
+
+    let second = successor_of(&rt.run_until_blocked(first).await.unwrap());
+    let done = rt.run_until_blocked(second).await.unwrap();
+
+    assert!(
+        matches!(done, RunState::Completed(ref v) if v == &json!({"for": "run 2"})),
+        "{done:?}"
+    );
+    // The consumed signal stays on the old run. Only the staged one moved.
+    let old = rt.load_history(first).unwrap();
+    assert!(old.iter().any(
+        |e| matches!(e, WorkflowEvent::SignalReceived { signal_name, .. } if signal_name == "first")
+    ));
+    assert!(!old.iter().any(
+        |e| matches!(e, WorkflowEvent::SignalReceived { signal_name, .. } if signal_name == "second")
+    ));
+    // The old run is terminal, so a late signal to it is refused.
+    assert!(matches!(
+        rt.send_signal(first, "second", json!(null)),
+        Err(SqliteError::WorkflowNotRunning { .. })
+    ));
+}
+
+// ── AC4: both histories replay on the core `WorkflowReplayer` ─────────────
+
+#[tokio::test]
+async fn both_histories_replay_on_the_core_replayer() {
+    let mut rt = runtime();
+    let first = rt.start_workflow("counting_loop", json!(1)).unwrap();
+    let second = successor_of(&rt.run_until_blocked(first).await.unwrap());
+    let done = rt.run_until_blocked(second).await.unwrap();
+    assert!(matches!(done, RunState::Completed(_)), "{done:?}");
+
+    for exec in [first, second] {
+        let history = rt.load_history(exec).unwrap();
+        let report = WorkflowReplayer::new()
+            .register_fn("counting_loop", counting_loop_info().handler)
+            .replay_from_events(history)
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "the history of {exec} must replay:\n{report}"
+        );
+    }
+}
+
+// ── Edges ─────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_cross_type_continuation_fails_by_name() {
+    let mut rt = runtime();
+    let exec = rt.start_workflow("cross_type", json!(0)).unwrap();
+
+    let err = rt.run_until_blocked(exec).await.unwrap_err();
+
+    assert!(matches!(err, SqliteError::Unsupported(_)), "{err}");
+    match rt.load_history(exec).unwrap().last() {
+        Some(WorkflowEvent::WorkflowFailed {
+            error_type,
+            details,
+            ..
+        }) => {
+            assert_eq!(error_type.as_deref(), Some(UNSUPPORTED_FEATURE_ERROR_TYPE));
+            assert_eq!(
+                details.as_ref().and_then(|d| d.get("feature")),
+                Some(&json!("ContinueAsNew.new_workflow_type"))
+            );
+        }
+        other => panic!("expected a typed WorkflowFailed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_hand_off_keeps_side_effects_and_drops_dispatches() {
+    let mut rt = runtime();
+    let first = rt.start_workflow("dispatch_in_hand_off", json!(0)).unwrap();
+
+    let second = successor_of(&rt.run_until_blocked(first).await.unwrap());
+
+    let old = rt.load_history(first).unwrap();
+    assert!(
+        old.iter()
+            .any(|e| matches!(e, WorkflowEvent::SideEffectRecorded { .. })),
+        "the side effect of the hand-off cycle is kept: {old:?}"
+    );
+    assert!(
+        !old.iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityScheduled { .. })),
+        "the dispatch of the hand-off cycle is dropped: {old:?}"
+    );
+    let done = rt.run_until_blocked(second).await.unwrap();
+    assert!(
+        matches!(done, RunState::Completed(ref v) if v == &json!(1)),
+        "{done:?}"
+    );
+}

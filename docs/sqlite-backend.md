@@ -255,6 +255,7 @@ match rt.run_until_blocked(exec).await? {
     RunState::Failed(err)       => println!("failed: {err}"),
     RunState::WaitingSignal(name) => println!("blocked on signal `{name}`"),
     RunState::WaitingTimer      => println!("blocked on a durable timer"),
+    RunState::ContinuedAsNew(next) => println!("continued as new; drive {next}"),
     RunState::InProgress        => {} // not returned by run_until_blocked
 }
 
@@ -277,6 +278,46 @@ match rt.outcome(exec)? {
   pending work now" call. Follow it with `outcome(exec)` for a pure read.
 - **`poll_once()`** for a custom loop — e.g. a background tick where you decide
   the cadence and inspect the `bool` progress flag yourself.
+
+### Long-lived runs: `continue_as_new` and the history caps (issue #2023)
+
+Each decision reloads and replays the whole history. A loop workflow, such as
+an agent session or a poller, must therefore bound its history. Call
+`ctx.continue_as_new(input)`. One transaction then does all of this:
+
+- It appends `WorkflowContinuedAsNew` and seals the run `CONTINUED_AS_NEW`.
+- It starts a successor with the same `workflow_name` and `workflow_id`. The
+  successor's `WorkflowStarted` carries `input`.
+- It moves every undelivered signal to the successor. A consumed signal
+  stays with the old run.
+- It deletes the old run's pending tasks and unfired timers.
+
+`run_until_blocked` returns `RunState::ContinuedAsNew(successor)`. A later
+drive of the old run returns the same successor and starts no other run.
+`run_until_idle` and `poll_once` drive the successor like any other run.
+`start_workflow_with_id` with the same id attaches to the newest run. Send
+later signals to the successor, because the old run is terminal.
+
+`outcome()` of the old run is `ExecutionOutcome::Terminated("CONTINUED_AS_NEW")`.
+`ctx.should_continue_as_new()` uses the default threshold of 10,000 events.
+
+The #1804 hard caps apply, with the Postgres defaults:
+
+| Cap | Default | Setter | Reason |
+| --- | --- | --- | --- |
+| Events per run | `50_000` | `set_history_event_hard_cap(Some(n))` | `HistoryCapExceeded { count, cap, workflow_type }` |
+| Stored bytes per run | 50 MiB | `set_history_byte_hard_cap(Some(n))` | `HistoryBytesCapExceeded { bytes, cap, workflow_type }` |
+
+`None` removes a cap. A decision that reaches a cap rolls back. The run then
+fails, and the drive returns `RunState::Failed` with the reason JSON. The
+`WorkflowFailed` event holds the same JSON in `error`, the reason tag in
+`error_type`, and `non_retryable = true`. Parse the JSON as
+`HistoryCapReason`. The JSON is byte-identical to the Postgres DLQ reason.
+
+A continuing run is exempt, because its successor starts a new history. The
+event count includes the decision's own appends. The byte count is the stored
+event JSON length when the decision starts. Postgres measures
+`pg_column_size` instead, so the two byte counts can differ.
 
 `poll_once()`/`run_until_idle()` drive every execution in a pass even if an
 earlier one errors — see [§11](#11-v01-non-goals-and-follow-ups) for what
@@ -424,8 +465,10 @@ specific command/feature. The run then ends `FAILED` (see below):
   `request_cancel_external_workflow`).
 - **Local activities** (`execute_local_activity`) and **external / task-token
   activities**.
-- **Updates**, **search attributes** (`upsert_search_attributes`), and
-  **`continue_as_new`**.
+- **Updates**, **search attributes** (`upsert_search_attributes`), and a
+  **continue-as-new to a different type** (`continue_as_new_as_type`). The
+  token is `ContinueAsNew.new_workflow_type`. A same-type `continue_as_new` is
+  supported (see [§7](#7-the-drive-model)).
 - **Worker sessions** (`create_session`) and **cancellable durable timers**
   (`start_timer` / `TimerHandle::…` — use the fire-once `ctx.timer(...)`).
 

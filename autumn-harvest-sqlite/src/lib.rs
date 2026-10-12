@@ -272,7 +272,9 @@
 //! - **Updates** — admitted-update results (`RecordUpdateResult`).
 //! - **Search attributes** — `ctx.upsert_search_attributes(...)`
 //!   (`UpsertSearchAttributes`).
-//! - **`continue_as_new`** (`ContinueAsNew`, surfaced from the terminal path).
+//! - **A cross-type continue-as-new** — `ctx.continue_as_new_as_type(...)`
+//!   (`ContinueAsNew.new_workflow_type`). A same-type `continue_as_new` is
+//!   supported (issue #2023, see below).
 //! - **Worker sessions** — `ctx.create_session(...)` (issue #606; a session dispatch
 //!   carries the `session_id` / `schedule_to_start_override` `ScheduleActivity`
 //!   fields this single-writer backend cannot honor).
@@ -282,6 +284,19 @@
 //!   were previously the opaque `Unsupported("Unknown")` (absent from the
 //!   command-name table); they are now named with a message pointing at the
 //!   supported alternative (Codex #1069 P2, `runtime.rs:840`).
+//!
+//! ## Long-lived runs (issue #2023)
+//!
+//! `ctx.continue_as_new(input)` seals the run `CONTINUED_AS_NEW` and starts a
+//! successor with the same `workflow_id`, in one transaction. Undelivered
+//! signals move to the successor. The drive returns
+//! [`RunState::ContinuedAsNew`] with the successor id.
+//!
+//! The #1804 history caps apply, with the Postgres defaults: 50,000 events and
+//! 50 MiB of stored event JSON per run. A run that reaches a cap fails with a
+//! [`HistoryCapReason`]. A continuing run is exempt. See
+//! [`SqliteRuntime::set_history_event_hard_cap`] and
+//! [`SqliteRuntime::set_history_byte_hard_cap`].
 //!
 //! The command-name table (`runtime.rs`) is EXHAUSTIVE — a future core
 //! `WorkflowCommand` variant is a compile error in this backend, forcing an
@@ -536,6 +551,7 @@
 //! here always replays byte-identically on the core `WorkflowReplayer`.
 
 mod error;
+mod history_cap;
 mod lock;
 mod queue;
 mod runtime;
@@ -546,6 +562,7 @@ mod worker;
 pub use autumn_harvest::{ExecutionId, WorkflowEvent};
 
 pub use crate::error::{SqliteError, SqliteResult};
+pub use crate::history_cap::HistoryCapReason;
 pub use crate::runtime::{
     ActivityBody, ActivitySpec, ExecutionOutcome, RunState, SqliteRuntime, StartOutcome,
     UNSUPPORTED_FEATURE_ERROR_TYPE,
