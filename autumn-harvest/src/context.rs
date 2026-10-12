@@ -9401,7 +9401,15 @@ impl WorkflowContext {
                 fresh.key()
             )));
         }
-        self.record_promise(|| fresh)
+        let promise = self.record_promise(|| fresh)?;
+        // A reset fork replays the source run's token. Its key can differ from
+        // `key` when the key names the run. Register the recorded key too, so
+        // a second handle for it is refused in the fork as in the source run.
+        self.promise_keys
+            .lock()
+            .expect("promise key set poisoned")
+            .insert(promise.id().key().to_owned());
+        Ok(promise)
     }
 
     /// A durable promise with a new `UUIDv7` key.

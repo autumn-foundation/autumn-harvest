@@ -494,3 +494,42 @@ async fn durable_promise_token_replays_under_a_new_execution_id() {
         .await;
     assert_succeeded(&report);
 }
+
+/// Keys a promise on this run's id, then asks for a second handle with the
+/// key on the first handle. The workflow fails unless the context refuses it
+/// as a second handle.
+fn duplicate_run_keyed_handle_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+    Box::pin(async move {
+        let first = ctx
+            .promise(ctx.execution_id().to_string())
+            .map_err(|e| e.to_string())?;
+        let key = first.id().key().to_owned();
+        match ctx.promise(key) {
+            Err(e) if e.to_string().contains("already has a handle") => Ok(json!("refused")),
+            Err(e) => Err(format!("refused for another reason: {e}")),
+            Ok(_) => Err("second handle made".to_string()),
+        }
+    })
+}
+
+/// A reset fork replays the first token with the source run's key. The fork
+/// must still refuse a second handle for that key, as the source run did.
+#[tokio::test]
+async fn durable_promise_refuses_a_second_handle_for_a_replayed_key() {
+    let source = ExecutionId::new();
+    let recorded = PromiseId::new(source, source.to_string()).expect("valid key");
+    let events = vec![
+        started(),
+        promise_recorded(&recorded),
+        completed(json!("refused")),
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("duplicate_run_keyed", duplicate_run_keyed_handle_workflow)
+        .replay_from_events(events)
+        .await;
+    assert_ne!(
+        report.execution_id, source,
+        "the replay runs under a new id"
+    );
+    assert_succeeded(&report);
+}
