@@ -1,4 +1,4 @@
-# 🏛️ Keystone [deferred]: raise the documented Postgres floor (trigger: 2026-11-12 PG14 end of life, or a first feature that needs PG 13+ SQL)
+# 🏛️ Keystone [deferred]: raise the documented Postgres floor (trigger: 2026-11-12 PG14 end of life, or a first feature outside the partitioned layout that needs SQL newer than 12)
 
 **Status:** deferral record. No RFC, no code change, no architecture review needed.
 **Date:** 2026-10-12. **Scope:** `README.md` Requirements, `docs/partitioned-events.md`, `.github/workflows/ci.yml`.
