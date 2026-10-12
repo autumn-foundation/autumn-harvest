@@ -151,8 +151,11 @@ The cost is high:
    that the body has not taken. Continue-as-new moves only signals that the
    run did not ingest, so it would drop that signal. A won race tears down
    its losing timer without an event, so the stamp also takes the list of
-   torn-down timers. The worker reads both lists from the replay matcher
-   and the context, because history alone cannot show them.
+   torn-down timers. A decision can issue a command next to its
+   continue-as-new, such as a join that polls an activity. That command
+   has no event, so the stamp also refuses a pending command. The worker
+   reads these lists from the replay matcher and the context, because
+   history alone cannot show them.
 5. The successor loads the state. It first checks the signature. An older
    version then passes through the `upgrade` step of the state type. The
    loader refuses a newer version. It then asks the state type whether the
@@ -189,6 +192,7 @@ Each claim names its test in `typed_snapshot_spike_tests.rs`.
 | A quiescent history gives a ledger of its completed effects. | `a_quiescent_history_gives_a_ledger_of_its_completed_effects` |
 | The stamp refuses an open activity, external activity, timer, child or update. | `a_checkpoint_with_an_open_effect_is_refused` |
 | The stamp refuses a signal that the body has not taken. | `a_checkpoint_with_an_unread_signal_is_refused` |
+| The stamp refuses a command that the checkpoint decision issued. | `a_checkpoint_with_a_command_in_the_same_decision_is_refused` |
 | A wait won by its signal can checkpoint. The context view closes the torn-down timer. | `a_wait_won_by_its_signal_can_checkpoint` |
 | Only the signed teardown list closes an open timer. A timer that fired in another history does not. | `a_fired_timer_is_not_teardown_evidence_for_another_history` |
 | The ledger records a failed activity, so a cover rule can check a caught failure. | `a_failed_activity_is_recorded_in_the_ledger` |
@@ -268,9 +272,10 @@ rest.
    versioning gain does not reach a pinned run.
 3. A versioned state, an upgrade step and a cover rule for the keyed entity
    checkpoint. Its state type gets a schema through #1994.
-4. The quiescence and unread-signal check at the continue-as-new persist
-   step. The worker stamps and signs the ledger into the successor input.
-   The loader checks the signature and the continue-as-new provenance.
+4. The quiescence, unread-signal and pending-command check at the
+   continue-as-new persist step. The worker stamps and signs the ledger
+   into the successor input. The loader checks the signature and the
+   continue-as-new provenance.
 5. The upgrade verdict (#1995) already decodes stored payloads against the
    candidate schemas. Add the upgrade step and the cover rule to that check.
 

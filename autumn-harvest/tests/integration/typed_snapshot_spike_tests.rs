@@ -51,6 +51,8 @@ enum OpenEffect {
     Update(String),
     /// A signal in history that the body has not taken yet.
     Signal(String),
+    /// A command that the checkpoint decision issued. It has no event yet.
+    Command(String),
 }
 
 /// The effects that completed in a history prefix, by kind and key.
@@ -295,11 +297,14 @@ enum SnapshotError {
 
 /// What the worker knows about a checkpoint that history cannot show.
 ///
-/// The worker reads both lists from the replay matcher and the context.
+/// The worker reads these lists from the replay matcher and the context.
 #[derive(Debug, Clone, Default)]
 struct ContextView {
     /// Signals in history that the body has not taken yet.
     unread_signals: Vec<String>,
+    /// Commands that the checkpoint decision issued next to its
+    /// continue-as-new. The executor drops them, so none reaches history.
+    pending_commands: Vec<String>,
     /// Timers that a won race tore down. The teardown writes no event.
     torn_down_timers: Vec<String>,
 }
@@ -377,6 +382,9 @@ impl Snapshot {
     ) -> Result<Value, SnapshotError> {
         if let Some(name) = view.unread_signals.first() {
             return Err(SnapshotError::Open(OpenEffect::Signal(name.clone())));
+        }
+        if let Some(name) = view.pending_commands.first() {
+            return Err(SnapshotError::Open(OpenEffect::Command(name.clone())));
         }
         let ledger = EffectLedger::from_history(history, &view.torn_down_timers)
             .map_err(SnapshotError::Open)?;
@@ -851,6 +859,26 @@ fn a_checkpoint_with_an_unread_signal_is_refused() {
             }
         ),
         Err(SnapshotError::Open(OpenEffect::Signal("cancel".into())))
+    );
+}
+
+#[test]
+fn a_checkpoint_with_a_command_in_the_same_decision_is_refused() {
+    // A join can poll an activity in the decision that continues as new.
+    // The dispatch is a pending command, not an event, so history alone
+    // shows nothing open. Continue-as-new would drop the dispatch.
+    let history = vec![started(Value::Null)];
+    let unstamped = Snapshot::unstamped(&OrderV1 { charged: 0 });
+    assert_eq!(
+        Snapshot::stamp(
+            &unstamped,
+            &history,
+            &ContextView {
+                pending_commands: vec!["charge".to_owned()],
+                ..ContextView::default()
+            }
+        ),
+        Err(SnapshotError::Open(OpenEffect::Command("charge".into())))
     );
 }
 
