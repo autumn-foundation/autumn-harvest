@@ -261,6 +261,7 @@ struct Harness {
     /// A second workflow type with the same policy.
     other: &'static str,
     metrics: Arc<RejectedMetrics>,
+    registry: Arc<HandlerRegistry>,
     worker: Arc<autumn_harvest::worker::Worker>,
     handle: Option<tokio::task::JoinHandle<()>>,
     _container: Option<testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>>,
@@ -286,13 +287,14 @@ impl Harness {
             autumn_harvest::context::empty_shared_state(),
             telemetry,
         ));
-        let worker = build_runtime_worker(&format!("w-{name}"), 4, 4, registry);
+        let worker = build_runtime_worker(&format!("w-{name}"), 4, 4, Arc::clone(&registry));
         let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
         Self {
             url,
             name,
             other,
             metrics,
+            registry,
             worker,
             handle: Some(handle),
             _container: container,
@@ -342,10 +344,30 @@ impl Harness {
     }
 
     async fn stop(mut self) {
+        self.pause().await;
+    }
+
+    /// Stop the worker and wait for it. No step runs until [`Self::resume`].
+    async fn pause(&mut self) {
         self.worker.shutdown();
         if let Some(handle) = self.handle.take() {
             handle.await.expect("worker join");
         }
+    }
+
+    /// Start a new worker on the same registry after [`Self::pause`].
+    fn resume(&mut self) {
+        let worker = build_runtime_worker(
+            &format!("w-{}", self.name),
+            4,
+            4,
+            Arc::clone(&self.registry),
+        );
+        self.handle = Some(spawn_test_worker(
+            Arc::clone(&worker),
+            build_test_pool(&self.url),
+        ));
+        self.worker = worker;
     }
 }
 
@@ -634,7 +656,7 @@ async fn a_reset_fork_counts_toward_the_tenant_budget() {
 
     let _serial = TEST_SERIAL.lock().await;
     let policy = QuotaPolicy::new("tenant").with_max_tenant_llm_tokens(250);
-    let harness = Harness::new("llm_reset_fork", Some(policy)).await;
+    let mut harness = Harness::new("llm_reset_fork", Some(policy)).await;
     let mut conn = connect(&harness.url).await;
     let source = start_or_load_workflow_execution(
         &mut conn,
@@ -657,6 +679,10 @@ async fn a_reset_fork_counts_toward_the_tenant_budget() {
     //
     // The reset runs as an API-only process would: with no workflow metadata
     // in the process. The fork must still keep the key of its source.
+    //
+    // The worker reads the same global metadata. Pause it, so that no step
+    // of the fork runs while the metadata is gone.
+    harness.pause().await;
     let metadata = autumn_harvest::completion_trigger::GLOBAL_WORKFLOW_METADATA
         .write()
         .expect("metadata lock")
@@ -678,6 +704,7 @@ async fn a_reset_fork_counts_toward_the_tenant_budget() {
     *autumn_harvest::completion_trigger::GLOBAL_WORKFLOW_METADATA
         .write()
         .expect("metadata lock") = metadata;
+    harness.resume();
     let fork = fork.expect("reset").new_exec_id;
     let output = harness.output(fork).await;
     assert_eq!(output["ran"], 0, "{output}");
