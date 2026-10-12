@@ -520,8 +520,9 @@ one map between workers:
 miss with a warning. An out-of-date entry is a quiet miss. The cache never
 fails a turn. Each cache call, the tenant read included, has the
 `cache_timeout` budget: 5 seconds by default. One turn makes at most three
-cache calls. The cache does not store an answer whose turn is over
-`AgentHarness::max_result_bytes`, because that turn fails. A codec error is logged with fixed text,
+cache calls. A turn over `AgentHarness::max_result_bytes` fails, so the
+cache neither stores nor serves one. A hit over the cap is a miss, and the
+harness asks the model. A codec error is logged with fixed text,
 because a custom codec can quote the answer.
 
 **Limits.**

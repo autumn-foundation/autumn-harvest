@@ -280,7 +280,7 @@ impl AgentHarness {
     pub(crate) async fn model_turn_with(
         &self,
         request: ModelTurnRequest,
-        prepare: impl FnOnce(&mut Vec<ContentPart>),
+        prepare: impl FnMut(&mut Vec<ContentPart>),
     ) -> Result<ModelTurn, String> {
         self.model_turn_in(request, CacheTenant::Skip, prepare)
             .await
@@ -292,7 +292,7 @@ impl AgentHarness {
         &self,
         request: ModelTurnRequest,
         tenant: CacheTenant,
-        prepare: impl FnOnce(&mut Vec<ContentPart>),
+        mut prepare: impl FnMut(&mut Vec<ContentPart>),
     ) -> Result<ModelTurn, String> {
         let builtins = self.builtins(
             request.memory_scope.as_ref(),
@@ -306,62 +306,89 @@ impl AgentHarness {
             temperature: self.temperature,
         };
         let key = self.cache_key(&tenant, &chat);
-        let cached = match &key {
+        let mut cached = match &key {
             Some(key) => self.cache_lookup(key).await,
             None => None,
         };
-        let cache_hit = cached.is_some();
-        // A fresh answer waits for its decisions before it reaches the cache.
-        let mut fresh = None;
-        let response = if let Some(response) = cached {
-            // No model call ran, so the turn spent no tokens.
-            ChatResponse {
-                usage: TokenUsage::default(),
-                ..response
+        // At most two passes. A hit whose turn is over the result cap is a
+        // miss, so the second pass asks the model.
+        loop {
+            let cache_hit = cached.is_some();
+            // A fresh answer waits for its decisions before it reaches the cache.
+            let mut fresh = None;
+            let response = if let Some(response) = cached.take() {
+                // No model call ran, so the turn spent no tokens.
+                ChatResponse {
+                    usage: TokenUsage::default(),
+                    ..response
+                }
+            } else {
+                let response = self.call_model(&chat).await?;
+                fresh = key.as_ref().map(|key| (key, response.clone()));
+                response
+            };
+            let mut content = response.content;
+            prepare(&mut content);
+            let mut turn = ModelTurn {
+                content,
+                stop: response.stop_reason,
+                usage: response.usage,
+                decisions: Vec::new(),
+                cache_hit,
+            };
+            let info = RunInfo {
+                run_id: RunId::new(request.run_id.clone()),
+                session_id: request.session_id.clone(),
+                steps_used: request.steps_used,
+                max_steps: request.max_steps,
+                usage: request.usage.saturating_add(response.usage),
+            };
+            self.decide_calls(&mut turn, &info, request.read_only, &builtins)
+                .await;
+            // A turn over the result cap fails. The cache serves and keeps
+            // only a turn that fits, so no identical request fails from it.
+            let fits = self.fits_result_cap(&turn);
+            if cache_hit && !fits {
+                tracing::warn!("a cached answer does not fit the result cap; calling the model");
+                continue;
             }
-        } else {
-            let response = self.call_model(&chat).await?;
-            fresh = key.map(|key| (key, response.clone()));
-            response
-        };
-        let mut content = response.content;
-        prepare(&mut content);
-        let mut turn = ModelTurn {
-            content,
-            stop: response.stop_reason,
-            usage: response.usage,
-            decisions: Vec::new(),
-            cache_hit,
-        };
-        let info = RunInfo {
-            run_id: RunId::new(request.run_id),
-            session_id: request.session_id,
-            steps_used: request.steps_used,
-            max_steps: request.max_steps,
-            usage: request.usage.saturating_add(response.usage),
-        };
-        // One deadline bounds the whole decision phase. A per-call budget
-        // would let many stalled calls add up past `start_to_close`.
+            if let Some((key, response)) = fresh
+                && fits
+            {
+                self.cache_store(key, &response).await;
+            }
+            return Ok(turn);
+        }
+    }
+
+    /// Ask the policy about each tool call of `turn`, in order.
+    ///
+    /// One deadline bounds the whole decision phase. A per-call budget would
+    /// let many stalled calls add up past `start_to_close`. A stalled policy
+    /// denies the call. That fails closed, and the model reads why.
+    async fn decide_calls(
+        &self,
+        turn: &mut ModelTurn,
+        info: &RunInfo,
+        read_only: bool,
+        builtins: &[Arc<dyn Tool>],
+    ) {
         let deadline = tokio::time::Instant::now() + self.policy_timeout;
-        let read_only: Arc<dyn ToolPolicy>;
-        let policy: &dyn ToolPolicy = if request.read_only {
+        let read_only_policy: Arc<dyn ToolPolicy>;
+        let policy: &dyn ToolPolicy = if read_only {
             // The read-only rules go first. Their deny ends the decision, so
             // the app policy is not asked about a call that cannot run.
-            read_only = Arc::new(Strictest::new(vec![
+            read_only_policy = Arc::new(Strictest::new(vec![
                 Arc::new(ToolRules::read_only()),
                 Arc::clone(&self.policy),
             ]));
-            read_only.as_ref()
+            read_only_policy.as_ref()
         } else {
             self.policy.as_ref()
         };
         for call in turn.calls() {
-            let tool = self
-                .visible(&builtins)
-                .find(|tool| tool.name() == call.name);
-            let decide = policy.decide(&call, tool, &info);
-            // A stalled policy denies the call. That fails closed, and the
-            // model reads why.
+            let tool = self.visible(builtins).find(|tool| tool.name() == call.name);
+            let decide = policy.decide(&call, tool, info);
             let decision = tokio::time::timeout_at(deadline, decide)
                 .await
                 .unwrap_or_else(|_| ToolDecision::Deny {
@@ -369,14 +396,6 @@ impl AgentHarness {
                 });
             turn.decisions.push(decision);
         }
-        // A turn over the result cap fails. A cached copy would fail every
-        // later turn with the same request, so only a turn that fits is kept.
-        if let Some((key, response)) = fresh
-            && self.fits_result_cap(&turn)
-        {
-            self.cache_store(&key, &response).await;
-        }
-        Ok(turn)
     }
 
     /// Send `chat` to the model within the model time budget.

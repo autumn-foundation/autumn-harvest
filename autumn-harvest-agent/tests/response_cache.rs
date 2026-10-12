@@ -7,11 +7,13 @@ mod common;
 use std::sync::Arc;
 
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::payload_codec::PayloadCodecs;
+use autumn_harvest::payload_store::PayloadStore;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest_agent::workflow::agent_loop_info;
 use autumn_harvest_agent::{
-    AgentHarness, AgentStop, AgentTask, CacheScope, ModelTurn, StopReason, TokenUsage,
-    ToolDecision, ToolEffect, sqlite,
+    AgentHarness, AgentStop, AgentTask, CacheIndex, CacheScope, InMemoryCacheIndex, ModelTurn,
+    ResponseCache, StopReason, TokenUsage, ToolDecision, ToolEffect, sqlite,
 };
 use autumn_harvest_sqlite::{ExecutionId, SqliteRuntime};
 use common::{
@@ -197,6 +199,43 @@ async fn a_turn_over_the_cap_with_its_decisions_is_not_cached() {
         !turns(&rt, second)[0].cache_hit,
         "the oversized tool-call turn must not be served from the cache"
     );
+}
+
+/// A hit whose turn no longer fits the result cap is a miss. The cap fell
+/// after the entry was stored, so the run asks the model again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hit_over_a_lowered_cap_asks_the_model() {
+    let store = Arc::new(MemStore::default());
+    let index: Arc<dyn CacheIndex> = Arc::new(InMemoryCacheIndex::default());
+    let cache = || {
+        ResponseCache::new(
+            Arc::clone(&store) as Arc<dyn PayloadStore>,
+            Arc::clone(&index),
+            PayloadCodecs::default(),
+        )
+    };
+    let model = ScriptedModel::named("m-1", vec![answer(&"x".repeat(990), 1), answer("short", 1)]);
+    let task = AgentTask::new("hi");
+
+    let (_wide_dir, wide_db) = fresh_db();
+    let mut wide = runtime(
+        &wide_db,
+        AgentHarness::new(model.clone()).response_cache(cache()),
+    );
+    run(&mut wide, &task).await;
+    assert_eq!(store.len(), 1, "the answer fits the default cap");
+
+    let (_narrow_dir, narrow_db) = fresh_db();
+    let mut narrow = runtime(
+        &narrow_db,
+        AgentHarness::new(model.clone())
+            .max_result_bytes(512)
+            .response_cache(cache()),
+    );
+    let (exec, text) = run(&mut narrow, &task).await;
+    assert_eq!(text, "short");
+    assert_eq!(model.calls(), 2, "the over-cap hit must ask the model");
+    assert!(!turns(&narrow, exec)[0].cache_hit);
 }
 
 #[tokio::test(flavor = "multi_thread")]
