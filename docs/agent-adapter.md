@@ -130,8 +130,8 @@ A worker with a payload cap other than the default must say so. Set
 - `max_result_bytes(bytes)` — the activity-result cap of the workers. A
   larger tool result is cut to fit it. The default is the engine default.
 - `model_timeout(d)` — the time budget of one model call. The default is
-  13 minutes. With the policy budget, it stays below the 15-minute
-  `start_to_close`. A call over it is a
+  13 minutes. With the policy, cache and ledger budgets, it stays below the
+  15-minute `start_to_close`. A call over it is a
   retryable failure.
 - `tool_timeout(d)` — the time budget of one tool call. The default is
   9 minutes, below the 10-minute `start_to_close`. A call over it is an
@@ -143,6 +143,10 @@ A worker with a payload cap other than the default must say so. Set
   precheck. The default is 30 seconds.
 - `cache_timeout(d)` — the time budget of one response-cache call. The
   default is 5 seconds.
+- `ledger_timeout(d)` — the time budget of one LLM budget check or ledger
+  write (issue #1997). The default is 10 seconds. A check over it is a
+  retryable failure, before the model call. A write over it logs a warning
+  and keeps the turn.
 - `memory(store)` — the `MemoryStore` for runs with a memory scope.
 - `delivery(delivery)` — where reports go. The default is `LogDelivery`.
 - `precheck(precheck)` — the cheap check that can skip a heartbeat tick.

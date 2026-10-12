@@ -28,9 +28,9 @@ pub const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 8_000;
 
 /// The default time budget of one model call: 13 minutes.
 ///
-/// With [`DEFAULT_POLICY_TIMEOUT`] and three [`DEFAULT_CACHE_TIMEOUT`]
-/// budgets, it stays below the 15-minute `start_to_close` of
-/// `agent_model_turn`. A slow call therefore ends as a
+/// With [`DEFAULT_POLICY_TIMEOUT`], three [`DEFAULT_CACHE_TIMEOUT`] budgets
+/// and two [`DEFAULT_LEDGER_TIMEOUT`] budgets, it stays below the 15-minute
+/// `start_to_close` of `agent_model_turn`. A slow call therefore ends as a
 /// retryable failure that the harness reports. It does not end as an engine
 /// timeout, which SQLite reports only after the body returns.
 pub const DEFAULT_MODEL_TIMEOUT: Duration = Duration::from_secs(13 * 60);
@@ -61,6 +61,15 @@ pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 /// the store. Each call has this budget. A cache call over it is a miss.
 pub const DEFAULT_CACHE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The default time budget of one LLM budget check or ledger write: 10
+/// seconds (issue #1997).
+///
+/// One turn makes one check before the model call and one write after it.
+/// Without a budget, a slow pool or a slow spend read could end the activity
+/// after the model answers. The retry would then pay for the call again,
+/// and the first call would stay unrecorded.
+pub const DEFAULT_LEDGER_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The bytes that the `ToolOutcome` JSON adds around its content.
 const OUTCOME_ENVELOPE_BYTES: u64 = 64;
 
@@ -84,6 +93,7 @@ pub struct AgentHarness {
     policy_timeout: Duration,
     hook_timeout: Duration,
     cache_timeout: Duration,
+    ledger_timeout: Duration,
     memory: Option<Arc<dyn MemoryStore>>,
     delivery: Arc<dyn Delivery>,
     precheck: Option<Arc<dyn Precheck>>,
@@ -106,6 +116,7 @@ impl AgentHarness {
             policy_timeout: DEFAULT_POLICY_TIMEOUT,
             hook_timeout: DEFAULT_HOOK_TIMEOUT,
             cache_timeout: DEFAULT_CACHE_TIMEOUT,
+            ledger_timeout: DEFAULT_LEDGER_TIMEOUT,
             memory: None,
             delivery: Arc::new(LogDelivery),
             precheck: None,
@@ -227,11 +238,21 @@ impl AgentHarness {
     }
 
     /// Set the time budget of one response-cache call. One turn makes at
-    /// most three. Keep the sum of the model, policy and cache budgets below
-    /// the 15-minute `start_to_close` of `agent_model_turn`.
+    /// most three. Keep the sum of the model, policy, cache and ledger
+    /// budgets below the 15-minute `start_to_close` of `agent_model_turn`.
     #[must_use]
     pub const fn cache_timeout(mut self, timeout: Duration) -> Self {
         self.cache_timeout = timeout;
+        self
+    }
+
+    /// Set the time budget of one LLM budget check or ledger write (issue
+    /// #1997). One turn makes one of each. Keep the sum of the model,
+    /// policy, cache and ledger budgets below the 15-minute `start_to_close`
+    /// of `agent_model_turn`.
+    #[must_use]
+    pub const fn ledger_timeout(mut self, timeout: Duration) -> Self {
+        self.ledger_timeout = timeout;
         self
     }
 
@@ -275,6 +296,10 @@ impl AgentHarness {
     /// write logs a warning and keeps the turn, because a retry would pay for
     /// the call again. A call that fails or times out records nothing.
     ///
+    /// Each of `check` and `record` has the ledger time budget. A check over
+    /// it fails the attempt as retryable, before the model call. A write over
+    /// it logs a warning and keeps the turn.
+    ///
     /// A response cache hit calls no model and spends no tokens, so it
     /// records nothing.
     pub(crate) async fn metered_turn<C, CF, R, RF>(
@@ -290,15 +315,30 @@ impl AgentHarness {
         R: FnOnce(LlmUsage) -> RF,
         RF: std::future::Future<Output = Result<bool, String>>,
     {
-        check().await?;
+        let budget = self.ledger_timeout;
+        let Ok(checked) = tokio::time::timeout(budget, check()).await else {
+            let reason = format!("the read took longer than {budget:?}");
+            return Err(autumn_harvest::llm_budget::check_failed(&reason).into_error_payload());
+        };
+        checked?;
         let (turn, latency) = self
             .timed_model_turn(request, tenant, |_content| {})
             .await?;
         if turn.cache_hit {
             return Ok(turn);
         }
-        if let Err(error) = record(self.ledger_usage(&turn.usage, latency)).await {
-            tracing::warn!(error = %error, "could not record the LLM usage of a model turn");
+        let written = tokio::time::timeout(budget, record(self.ledger_usage(&turn.usage, latency)));
+        match written.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "could not record the LLM usage of a model turn");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    budget = ?budget,
+                    "the LLM ledger write of a model turn took longer than its budget"
+                );
+            }
         }
         Ok(turn)
     }
@@ -1011,6 +1051,43 @@ mod tests {
         assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn a_stalled_check_fails_retryable_before_the_model_call() {
+        let model = Arc::new(CountingModel::default());
+        let harness = AgentHarness::new(model.clone()).ledger_timeout(Duration::from_millis(20));
+        let outcome = harness
+            .metered_turn(
+                turn_request(),
+                CacheTenant::None,
+                std::future::pending::<Result<(), String>>,
+                |_| async { Ok(true) },
+            )
+            .await;
+        let failure = autumn_harvest::failure::parse_typed_payload(&outcome.unwrap_err()).unwrap();
+        assert_eq!(
+            failure.error_type,
+            autumn_harvest::llm_budget::ERROR_TYPE_LLM_BUDGET_CHECK_FAILED
+        );
+        assert!(!failure.non_retryable);
+        assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_ledger_write_keeps_the_paid_turn() {
+        let model = Arc::new(CountingModel::default());
+        let harness = AgentHarness::new(model.clone()).ledger_timeout(Duration::from_millis(20));
+        let turn = harness
+            .metered_turn(
+                turn_request(),
+                CacheTenant::None,
+                || async { Ok(()) },
+                |_| std::future::pending::<Result<bool, String>>(),
+            )
+            .await;
+        assert_eq!(turn.unwrap().usage, TokenUsage::new(7, 3));
+        assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     /// A payload store in memory, for the response cache.
     #[derive(Debug, Default)]
     struct MemStore {
@@ -1116,7 +1193,10 @@ mod tests {
 
     #[test]
     fn the_default_budgets_fit_the_model_turn_start_to_close() {
-        let turn = DEFAULT_MODEL_TIMEOUT + DEFAULT_POLICY_TIMEOUT + 3 * DEFAULT_CACHE_TIMEOUT;
+        let turn = DEFAULT_MODEL_TIMEOUT
+            + DEFAULT_POLICY_TIMEOUT
+            + 3 * DEFAULT_CACHE_TIMEOUT
+            + 2 * DEFAULT_LEDGER_TIMEOUT;
         assert!(turn < Duration::from_secs(15 * 60), "{turn:?}");
     }
 

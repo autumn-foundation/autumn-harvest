@@ -19,8 +19,9 @@ register the workflow type on each worker that runs its LLM steps.
 
 The agent adapter checks and records on each model turn. `AgentModel` gets
 the provided method `cost_micros`, and the ledger records `model_id`. A
-response cache hit records nothing. `AgentTask::tenant` keys the tenant
-budget. A refused turn ends the run under the new stop `budget_exceeded`.
+response cache hit records nothing. The check and the write each have a
+10-second budget, `AgentHarness::ledger_timeout`, so the model turn stays
+inside its `start_to_close`. `AgentTask::tenant` keys the tenant budget. A refused turn ends the run under the new stop `budget_exceeded`.
 
 This ships the part of the cost ledger (issue #1996) that the budgets need.
 That part is the `harvest_llm_ledger` side table, the write, and the
