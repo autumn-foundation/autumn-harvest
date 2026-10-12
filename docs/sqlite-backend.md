@@ -120,9 +120,9 @@ async fn reserve_inventory(ctx: &ActivityContext, order: Order) -> Result<String
 > **The `#[activity]` body runs (issue #2024).** `register_activity(&info)` runs
 > the async body itself, on the drive's async runtime, with a real
 > `ActivityContext`. The same fn runs unchanged on this backend and on Postgres.
-> `ctx.info()` reports the same values as the Postgres worker for one process:
-> the run, the activity, the 1-based `attempt`, `max_attempts`, the task queue
-> and the task row id. `ctx.heartbeat(..)` stores the latest payload on the task
+> `ctx.info()` reports the same values as the Postgres worker for one process.
+> They are the run, the activity, the 1-based `attempt`, `max_attempts`, the
+> task queue and the task row id. `ctx.heartbeat(..)` stores the latest payload on the task
 > row, so a retry or a reopen resumes from it with `ctx.heartbeat_details()`.
 > `ctx.previous_failure()` is the previous attempt's error. The cancellation
 > token never fires here.

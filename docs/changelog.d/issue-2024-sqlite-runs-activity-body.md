@@ -40,9 +40,9 @@ embedded backend. It is not for activity authors.
 file. No Postgres migration. No new `WorkflowEvent` variant.
 
 **Tests.** `autumn-harvest-sqlite/tests/integration/activity_context.rs`
-covers the body, `info()`, retries, heartbeats across a retry and a crash,
-and panic containment. `portable_fixture.rs` holds one `#[activity]` fn.
+covers the body, `info()`, retries, heartbeats across a retry and a crash, and
+panic containment. `portable_fixture.rs` holds one `#[activity]` fn.
 `portable_activity.rs` runs it on SQLite, and the core suite
 `sqlite_portable_activity_tests` runs it on Postgres. Both assert the same
-report. Every raw-closure test passes unchanged. Design record:
-`DESIGN-2024.md`.
+report. Every raw-closure test passes. The two-argument tests changed only the
+method name. Design record: `DESIGN-2024.md`.

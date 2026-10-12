@@ -74,9 +74,9 @@ if let RunState::WaitingSignal(signal) = rt.run_until_blocked(exec).await? {
 let state = rt.run_until_blocked(exec).await?;
 ```
 
-The SQLite backend runs a synchronous activity body. `sqlite::register`
-runs each async body with `block_in_place`, so use a multi-thread Tokio
-runtime.
+The SQLite backend has no shared-state registry, so `sqlite::register`
+captures the harness in synchronous closures. Each closure runs its async
+body with `block_in_place`, so use a multi-thread Tokio runtime.
 
 ## 3. Run it on Postgres
 

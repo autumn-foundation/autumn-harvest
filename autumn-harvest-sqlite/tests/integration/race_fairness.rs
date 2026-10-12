@@ -32,8 +32,8 @@
 // The `#[workflow]`/`#[activity]` macros reference their input params, so a
 // deliberately-unused param reads as a "used underscore binding" through expansion.
 #![allow(clippy::used_underscore_binding)]
-// The `#[activity]` fixture bodies are trivial and await-free — the crate runs a
-// registered `ActivitySpec`, not the macro body.
+// The `#[activity]` fixture bodies are trivial and await-free. These tests
+// register closures in their place.
 #![allow(clippy::unused_async)]
 
 use std::sync::Arc;

@@ -10,6 +10,8 @@
 // `#[activity]` needs an `async fn`, also for a body with no `.await`.
 #![allow(clippy::unused_async)]
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use autumn_harvest::failure::ERROR_TYPE_HANDLER_PANIC;
@@ -17,6 +19,7 @@ use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use tokio::sync::Notify;
 
 /// Runs `exec` to a terminal state and returns its output.
 async fn completed(rt: &mut SqliteRuntime, exec: ExecutionId) -> Value {
@@ -273,9 +276,18 @@ async fn a_heartbeat_burst_neither_blocks_nor_loses_the_last_payload() {
     assert_eq!(out, json!({ "resumed": { "done": 499 } }));
 }
 
-/// Attempt 1 checkpoints and then hangs. Attempt 2 returns the checkpoint.
+/// One `Notify` per test run, keyed by the activity input. Tests run in
+/// parallel, so a single shared signal would mix them up.
+fn checkpointed(key: i64) -> Arc<Notify> {
+    static SIGNALS: OnceLock<Mutex<HashMap<i64, Arc<Notify>>>> = OnceLock::new();
+    let signals = SIGNALS.get_or_init(Mutex::default);
+    Arc::clone(signals.lock().unwrap().entry(key).or_default())
+}
+
+/// Attempt 1 checkpoints, signals, and then hangs. Attempt 2 returns the
+/// checkpoint.
 #[activity]
-async fn hangs_after_checkpoint(ctx: &ActivityContext, _n: i64) -> Result<Value, String> {
+async fn hangs_after_checkpoint(ctx: &ActivityContext, key: i64) -> Result<Value, String> {
     if let Some(resumed) = ctx
         .heartbeat_details::<Value>()
         .map_err(|e| e.to_string())?
@@ -285,8 +297,27 @@ async fn hangs_after_checkpoint(ctx: &ActivityContext, _n: i64) -> Result<Value,
     ctx.heartbeat(json!({"done": 9}))
         .await
         .map_err(|e| e.to_string())?;
+    // The drain persists a heartbeat in the poll that sent it. So the row
+    // holds the checkpoint before this poll returns `Pending`.
+    checkpointed(key).notify_one();
     std::future::pending::<()>().await;
     unreachable!("a pending future never resolves")
+}
+
+/// Drives `exec` until its body signals the checkpoint, then drops the drive.
+async fn drop_drive_after_checkpoint(rt: &mut SqliteRuntime, exec: ExecutionId, key: i64) {
+    let signal = checkpointed(key);
+    tokio::select! {
+        state = rt.run_until_blocked(exec) => panic!("the hung body must block the drive: {state:?}"),
+        () = signal.notified() => {}
+    }
+}
+
+/// Like [`completed`], but fails instead of hanging.
+async fn completed_within(rt: &mut SqliteRuntime, exec: ExecutionId) -> Value {
+    tokio::time::timeout(Duration::from_secs(30), completed(rt, exec))
+        .await
+        .expect("the re-run must complete")
 }
 
 #[workflow]
@@ -305,10 +336,9 @@ async fn a_heartbeat_checkpoint_survives_a_crash() {
         let mut rt = SqliteRuntime::open(&path).unwrap();
         rt.register_workflow(&crash_flow_info());
         rt.register_activity(&hangs_after_checkpoint_info());
-        let exec = rt.start_workflow("crash_flow", json!(0)).unwrap();
-        // The body hangs, so the drive never returns. Dropping it is the crash.
-        let drive = tokio::time::timeout(Duration::from_millis(200), rt.run_until_blocked(exec));
-        assert!(drive.await.is_err(), "the hung body must block the drive");
+        let exec = rt.start_workflow("crash_flow", json!(1)).unwrap();
+        // Dropping the drive and then the runtime is the crash.
+        drop_drive_after_checkpoint(&mut rt, exec, 1).await;
         exec
     };
 
@@ -317,7 +347,7 @@ async fn a_heartbeat_checkpoint_survives_a_crash() {
     rt.register_activity(&hangs_after_checkpoint_info());
 
     assert_eq!(
-        completed(&mut rt, exec).await,
+        completed_within(&mut rt, exec).await,
         json!({ "resumed": { "done": 9 } })
     );
 }
@@ -329,14 +359,80 @@ async fn a_dropped_drive_does_not_strand_the_task() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&crash_flow_info());
     rt.register_activity(&hangs_after_checkpoint_info());
-    let exec = rt.start_workflow("crash_flow", json!(0)).unwrap();
+    let exec = rt.start_workflow("crash_flow", json!(2)).unwrap();
 
-    let drive = tokio::time::timeout(Duration::from_millis(200), rt.run_until_blocked(exec));
-    assert!(drive.await.is_err(), "the hung body must block the drive");
+    drop_drive_after_checkpoint(&mut rt, exec, 2).await;
+
+    assert_eq!(
+        completed_within(&mut rt, exec).await,
+        json!({ "resumed": { "done": 9 } })
+    );
+}
+
+// ── A typed failure stores its message ────────────────────────────────────────
+
+/// Attempt 1 checkpoints and panics. Attempt 2 reports what it inherited.
+#[activity(retry = RetryPolicy::fixed(2, Duration::ZERO))]
+async fn panics_then_reports(ctx: &ActivityContext, _n: i64) -> Result<Value, String> {
+    if ctx.attempt() == 1 {
+        ctx.heartbeat(json!({"done": 5}))
+            .await
+            .map_err(|e| e.to_string())?;
+        panic!("kaboom");
+    }
+    let resumed: Option<Value> = ctx.heartbeat_details().map_err(|e| e.to_string())?;
+    Ok(json!({
+        "previous_failure": ctx.previous_failure(),
+        "resumed": resumed,
+    }))
+}
+
+#[workflow]
+async fn typed_failure_flow(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
+    ctx.execute_activity(&panics_then_reports_info(), n)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The panic travels as a typed `HandlerPanic` envelope. The retry sees only
+/// its message, as on Postgres, and keeps the checkpoint.
+#[tokio::test]
+async fn a_typed_failure_reaches_the_retry_as_its_message() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&typed_failure_flow_info());
+    rt.register_activity(&panics_then_reports_info());
+    let exec = rt.start_workflow("typed_failure_flow", json!(0)).unwrap();
 
     assert_eq!(
         completed(&mut rt, exec).await,
-        json!({ "resumed": { "done": 9 } })
+        json!({ "previous_failure": "kaboom", "resumed": { "done": 5 } })
+    );
+}
+
+// ── Late registration ─────────────────────────────────────────────────────────
+
+/// The activity registers after the run schedules it. The claim then freezes
+/// the declared retry cap, and the context reports it.
+#[tokio::test]
+async fn a_late_registered_handler_reports_the_frozen_cap() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&flaky_flow_info());
+    let exec = rt.start_workflow("flaky_flow", json!(0)).unwrap();
+    assert!(
+        rt.run_until_blocked(exec).await.is_err(),
+        "an unregistered activity must fail the drive loudly"
+    );
+
+    rt.register_activity(&flaky_info());
+
+    assert_eq!(
+        completed(&mut rt, exec).await,
+        json!({
+            "attempt": 3,
+            "max_attempts": 3,
+            "previous_failure": "boom 2",
+            "is_last_attempt": true,
+        })
     );
 }
 

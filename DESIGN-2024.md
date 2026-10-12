@@ -151,4 +151,4 @@ Both are nullable and added by `schema::migrate`.
   `autumn-harvest/tests/integration/sqlite_portable_activity_tests.rs`
   (Postgres) run one shared fixture and assert the same report.
 - `examples/quickstart.rs` runs two `#[activity]` bodies on SQLite.
-- Every existing raw-closure test passes unchanged.
+- Every existing raw-closure test passes. Two-argument callers change only the method name.

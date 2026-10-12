@@ -1177,7 +1177,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        commands_open_activity_race, drain_ready, finalize_within_tx, fire_timer,
+        attempt_deadline, commands_open_activity_race, drain_ready, finalize_within_tx, fire_timer,
         fire_timer_within_tx, handler_panic_activity_envelope, history_has_unsettled_activity_race,
         ingest_awaited_signal, is_signal_timeout_deadline_timer,
         payload_too_large_activity_envelope, schedule_to_close_exceeded, start_to_close_exceeded,
@@ -1525,6 +1525,26 @@ mod tests {
     // comparison is `>=` (reached OR passed), mirroring the Postgres
     // `schedule_to_close_deadline_exceeded` contract used at BOTH the pre-run check
     // (cycle `now`) and the retry check (next attempt's `run_at`).
+    // Issue #2024: the deadline is the earlier clock, a non-positive budget is
+    // unbounded, and the span is anchored on the real clock.
+    #[test]
+    fn attempt_deadline_takes_the_earlier_clock_on_the_real_clock() {
+        // The deadline lies `want` seconds after the real clock, give or take
+        // the time the test itself takes.
+        let near = |at: Option<chrono::DateTime<chrono::Utc>>, want: i64| {
+            let secs = (at.expect("a bounded attempt") - chrono::Utc::now()).num_seconds();
+            assert!((want - 2..=want).contains(&secs), "{secs}s, want {want}s");
+        };
+        // A simulated claim at epoch 0 still gives a deadline about 60s away.
+        near(attempt_deadline(0, Some(60_000), None), 60);
+        near(attempt_deadline(0, Some(60_000), Some(30_000)), 30);
+        near(attempt_deadline(0, Some(60_000), Some(90_000)), 60);
+        near(attempt_deadline(0, None, Some(90_000)), 90);
+        assert_eq!(attempt_deadline(0, Some(0), None), None);
+        assert_eq!(attempt_deadline(0, Some(-5), None), None);
+        assert_eq!(attempt_deadline(0, None, None), None);
+    }
+
     #[test]
     fn schedule_to_close_exceeded_truth_table() {
         // No total deadline → never exceeded (prior behavior for every activity

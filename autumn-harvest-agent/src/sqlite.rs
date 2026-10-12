@@ -1,7 +1,8 @@
 //! The agent loop on the embedded SQLite backend.
 //!
-//! This backend runs a synchronous activity body with no `ActivityContext`.
-//! [`register`] therefore wraps each harness method in a closure. The closure
+//! The harness lives in process state, and `ctx.state::<T>()` is always `None`
+//! on this backend. [`register`] therefore wraps each harness method in a
+//! closure for `register_activity_with_body`. The closure
 //! runs the async body with `block_in_place` on the current Tokio runtime, so
 //! drive the runtime from a multi-thread Tokio runtime.
 
