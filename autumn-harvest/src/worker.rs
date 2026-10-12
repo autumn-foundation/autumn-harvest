@@ -557,6 +557,8 @@ fn session_internal_activity_info(name: &'static str) -> ActivityInfo {
         circuit_breaker: None,
         requires: None,
         handler: session_internal_stub_handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -16685,6 +16687,7 @@ fn is_worker_local_failure(error_type: &str) -> bool {
         crate::failure::ERROR_TYPE_WASM_TRAP,
         crate::failure::ERROR_TYPE_SANDBOX_DENIED,
         crate::failure::ERROR_TYPE_WASM_OUTPUT_TOO_LARGE,
+        crate::failure::ERROR_TYPE_WASM_JOURNAL_DIVERGENCE,
     ]
     .contains(&error_type)
     {
@@ -17050,6 +17053,7 @@ mod adaptive_limit_gate_tests {
             crate::failure::ERROR_TYPE_WASM_TRAP,
             crate::failure::ERROR_TYPE_SANDBOX_DENIED,
             crate::failure::ERROR_TYPE_WASM_OUTPUT_TOO_LARGE,
+            crate::failure::ERROR_TYPE_WASM_JOURNAL_DIVERGENCE,
         ] {
             assert_eq!(
                 limit_sample_outcome(
@@ -18676,6 +18680,10 @@ async fn process_activity_task(
                         .telemetry()
                         .metrics
                         .record_activity_concurrency_deferred(activity_name);
+                    // Wake an idle poll loop when the row is due again.
+                    registry
+                        .adaptive_limits()
+                        .wake_when_deferral_due(retry_after);
                 }
                 return Ok(());
             }
@@ -31400,6 +31408,9 @@ pub struct Worker {
     /// Wakes a saturated poll loop when a task releases its permit (issue
     /// #1787). See [`CapacityPermit`].
     capacity_freed: Arc<tokio::sync::Notify>,
+    /// Wakes every idle wait when a task deferred at its adaptive limit is
+    /// due (issue #1836). Unlike `capacity_freed`, no gate holds it back.
+    deferral_due: Arc<tokio::sync::Notify>,
     /// Kinds the poll gate refused since the last claim of that kind (issue
     /// #1787). The slot tuner counts a claimed task's queue wait only when
     /// the gate held its kind back. Otherwise a NOTIFY delay reads as a
@@ -33401,6 +33412,7 @@ impl Worker {
         // The limit registry fires this wake when a limit slot frees (issue
         // #1836). That happens before the attempt writes its result.
         let capacity_freed = registry.adaptive_limits.slot_freed_notify();
+        let deferral_due = registry.adaptive_limits.deferral_due_notify();
 
         let workflow_parts =
             build_dispatch_semaphore(config.max_concurrent_workflows, config.slot_tuner.as_ref());
@@ -33427,6 +33439,7 @@ impl Worker {
             dispatch_reserved_workflow: Arc::new(AtomicUsize::new(0)),
             dispatch_reserved_activity: Arc::new(AtomicUsize::new(0)),
             capacity_freed,
+            deferral_due,
             gate_refused: Arc::new(GateRefused::default()),
             limit_refused: AtomicBool::new(false),
             monitoring_started: std::sync::atomic::AtomicBool::new(false),
@@ -34277,6 +34290,7 @@ impl Worker {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     () = self.capacity_freed.notified(), if capacity_bound => {}
+                    () = self.deferral_due.notified() => {}
                     () = tokio::time::sleep(poll_interval) => {}
                 }
             } else {
@@ -34309,6 +34323,9 @@ impl Worker {
             if capacity_bound
                 && futures::FutureExt::now_or_never(self.capacity_freed.notified()).is_some()
             {
+                break 'notify_wait;
+            }
+            if futures::FutureExt::now_or_never(self.deferral_due.notified()).is_some() {
                 break 'notify_wait;
             }
             let mut broken_idx: Option<usize> = None;
@@ -36014,6 +36031,7 @@ impl Worker {
             tokio::select! {
                 () = self.shutdown.cancelled() => {}
                 () = self.capacity_freed.notified(), if capacity_bound => {}
+                () = self.deferral_due.notified() => {}
                 () = tokio::time::sleep(wait) => {}
             }
         }
@@ -36513,6 +36531,7 @@ impl Worker {
             let capacity_bound = self.capacity_bound();
             tokio::select! {
                 () = self.capacity_freed.notified(), if capacity_bound => {}
+                () = self.deferral_due.notified() => {}
                 () = idle_wait => {}
             }
         }
@@ -42621,6 +42640,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
 
         let registry = HandlerRegistry::new(vec![wf], vec![act]);
@@ -42727,6 +42748,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }
         }
         let global = crate::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
@@ -42821,6 +42844,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }
         }
 
@@ -42868,6 +42893,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }
         }
 
@@ -43852,6 +43879,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         }
     }
 
@@ -46224,6 +46253,8 @@ mod tests {
             circuit_breaker: None,
             requires: Some("gpu = true"),
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![act]));
         match Worker::new(default_runtime_config(), registry) {
@@ -46255,6 +46286,8 @@ mod tests {
             circuit_breaker: None,
             requires: Some("gpu = true"),
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
 
         let act2 = ActivityInfo {
@@ -46278,6 +46311,8 @@ mod tests {
             circuit_breaker: None,
             requires: Some("region in [us-east-1, us-west-2]"),
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
 
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![act1, act2]));
@@ -48379,6 +48414,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }],
         )
     }

@@ -362,11 +362,44 @@ pub type DbPoolBuilder = deadpool::managed::PoolBuilder<
     diesel_async::pooled_connection::AsyncDieselConnectionManager<diesel_async::AsyncPgConnection>,
 >;
 
+/// Time since the last checkout after which a pooled connection is verified.
+///
+/// A connection checked out more recently than this skips the `SELECT 1` ping
+/// that `RecyclingMethod::Verified` sends on every checkout. A busy worker
+/// checks out each connection many times per second, so almost every checkout
+/// skips it. A connection that sat idle still gets the ping. That is the case
+/// where a firewall, a failover or a restart has killed it.
+///
+/// deadpool stamps the time at checkout, not at return. A connection that a
+/// caller held for this long is therefore pinged too. That errs toward the
+/// ping, so it costs one round trip and never skips a needed check.
+pub const VERIFY_IDLE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The connection manager for an engine pool.
+///
+/// It recycles with `RecyclingMethod::Fast`: the pool still rejects a
+/// connection that holds an open transaction, but it sends no ping. Pair it
+/// with [`with_engine_timeouts`], which verifies the connections that were
+/// idle for [`VERIFY_IDLE_AFTER`].
+#[cfg(feature = "db")]
+#[must_use]
+pub fn engine_manager(
+    dsn: impl Into<String>,
+) -> diesel_async::pooled_connection::AsyncDieselConnectionManager<diesel_async::AsyncPgConnection>
+{
+    let mut config = diesel_async::pooled_connection::ManagerConfig::default();
+    config.recycling_method = diesel_async::pooled_connection::RecyclingMethod::Fast;
+    diesel_async::pooled_connection::AsyncDieselConnectionManager::new_with_config(dsn, config)
+}
+
 /// Add the engine timeouts for `role` to `builder`.
 ///
 /// Sets the deadpool timeouts and the Tokio runtime that they need. Adds a
 /// `post_create` hook that runs [`SessionTimeouts::setup_sql`] once on each new
-/// connection.
+/// connection. Adds a `pre_recycle` hook that pings a connection whose last
+/// checkout is [`VERIFY_IDLE_AFTER`] or longer ago. A failed or slow ping drops
+/// the connection, and the pool takes the next one. The `recycle` timeout
+/// bounds the ping, because deadpool runs the hook outside that timeout.
 ///
 /// # Errors
 ///
@@ -379,11 +412,34 @@ pub fn with_engine_timeouts(
     timeouts: &EngineDbTimeouts,
 ) -> HarvestResult<DbPoolBuilder> {
     timeouts.validate()?;
+    let ping_bound = timeouts.pool.recycle;
     let builder = builder
         .runtime(deadpool::Runtime::Tokio1)
         .wait_timeout(Some(timeouts.pool.wait))
         .create_timeout(Some(timeouts.pool.create))
-        .recycle_timeout(Some(timeouts.pool.recycle));
+        .recycle_timeout(Some(timeouts.pool.recycle))
+        .pre_recycle(deadpool::managed::Hook::async_fn(
+            move |conn: &mut diesel_async::AsyncPgConnection,
+                  metrics: &deadpool::managed::Metrics| {
+                let idle = metrics.last_used() >= VERIFY_IDLE_AFTER;
+                Box::pin(async move {
+                    if !idle {
+                        return Ok(());
+                    }
+                    let ping =
+                        diesel_async::RunQueryDsl::execute(diesel::sql_query("SELECT 1"), conn);
+                    match tokio::time::timeout(ping_bound, ping).await {
+                        Ok(Ok(_)) => Ok(()),
+                        Ok(Err(e)) => Err(deadpool::managed::HookError::Message(
+                            format!("idle connection failed its ping: {e}").into(),
+                        )),
+                        Err(_) => Err(deadpool::managed::HookError::message(
+                            "idle connection did not answer its ping in time",
+                        )),
+                    }
+                })
+            },
+        ));
     let sql = timeouts.session(role).setup_sql();
     if sql.is_empty() {
         return Ok(builder);
@@ -418,9 +474,7 @@ pub fn engine_pool(
     role: DbRole,
     timeouts: &EngineDbTimeouts,
 ) -> HarvestResult<crate::worker::DbPool> {
-    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
-        diesel_async::AsyncPgConnection,
-    >::new(dsn);
+    let manager = engine_manager(dsn);
     with_engine_timeouts(
         deadpool::managed::Pool::builder(manager).max_size(max_size.max(1)),
         role,

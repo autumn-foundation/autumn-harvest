@@ -107,6 +107,8 @@ pub struct HarvestBuilder {
     telemetry: Option<TelemetryConfig>,
     retention: RetentionConfig,
     history_archiver: Option<Arc<dyn crate::retention::HistoryArchiver>>,
+    /// Gets each aged event partition before the sweep drops it (issue #2009).
+    partition_archiver: Option<Arc<dyn crate::partition_archive::PartitionArchiver>>,
     /// Ordered activity execution interceptor chain (issue #680). Index 0 is the
     /// OUTERMOST wrapper; the activity handler is innermost. Empty (default) =
     /// no interceptors.
@@ -221,6 +223,7 @@ impl Default for HarvestBuilder {
             telemetry: None,
             retention: crate::retention::RetentionConfig::default(),
             history_archiver: None,
+            partition_archiver: None,
             activity_interceptors: Vec::new(),
             payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             payload_store: None,
@@ -379,6 +382,8 @@ pub struct BuiltHarvest {
     telemetry: Arc<TelemetryConfig>,
     retention: RetentionConfig,
     history_archiver: Option<Arc<dyn crate::retention::HistoryArchiver>>,
+    /// Gets each aged event partition before the sweep drops it (issue #2009).
+    partition_archiver: Option<Arc<dyn crate::partition_archive::PartitionArchiver>>,
     /// Ordered activity execution interceptor chain (issue #680). Index 0 = outermost.
     activity_interceptors: Vec<Arc<dyn crate::interceptor::ActivityInterceptor>>,
     payload_codecs: PayloadCodecs,
@@ -1290,6 +1295,14 @@ impl BuiltHarvest {
         self.history_archiver.as_ref()
     }
 
+    /// Get the registered partition archiver (issue #2009).
+    #[must_use]
+    pub fn partition_archiver(
+        &self,
+    ) -> Option<&Arc<dyn crate::partition_archive::PartitionArchiver>> {
+        self.partition_archiver.as_ref()
+    }
+
     /// Resolved builder-wide completion-callback configuration (issue #605).
     #[must_use]
     pub const fn completion_callback_config(
@@ -1978,6 +1991,22 @@ impl HarvestBuilder {
     #[must_use]
     pub fn history_archiver(mut self, archiver: impl crate::retention::HistoryArchiver) -> Self {
         self.history_archiver = Some(Arc::new(archiver));
+        self
+    }
+
+    /// Register a partition archiver (issue #2009).
+    ///
+    /// The retention sweep then exports each aged `harvest_events` partition,
+    /// reads it back, and checks it before the drop. It applies only on a
+    /// partitioned shard. `try_build` refuses it together with
+    /// `straggler_grace_secs`, because a straggler delete removes rows that
+    /// no export holds.
+    #[must_use]
+    pub fn partition_archiver(
+        mut self,
+        archiver: impl crate::partition_archive::PartitionArchiver,
+    ) -> Self {
+        self.partition_archiver = Some(Arc::new(archiver));
         self
     }
 
@@ -2711,6 +2740,17 @@ impl HarvestBuilder {
         self.retention
             .validate()
             .map_err(HarvestBuilderError::InvalidRetention)?;
+        // Issue #2009: a straggler delete removes orphan rows that no export
+        // holds, so the pair would lose history with an archiver set.
+        if self.partition_archiver.is_some()
+            && self.retention.partitions.straggler_grace_secs.is_some()
+        {
+            return Err(HarvestBuilderError::InvalidRetention(
+                "partitions.straggler_grace_secs cannot be set with a partition archiver: \
+                 a straggler delete removes rows that no export holds"
+                    .to_string(),
+            ));
+        }
         validate_retention_overrides(
             &self.retention,
             &self.workflows,
@@ -2851,6 +2891,7 @@ impl HarvestBuilder {
             telemetry: telemetry_arc,
             retention: self.retention,
             history_archiver: self.history_archiver,
+            partition_archiver: self.partition_archiver,
             activity_interceptors: self.activity_interceptors,
             payload_codecs: self.payload_codecs.clone(),
             payload_offloader,
@@ -5155,6 +5196,57 @@ mod tests {
     use crate::info::{DagInfo, WorkflowInfo};
     use crate::policy::Schedule;
 
+    /// A no-op partition archiver for the build checks (issue #2009).
+    struct NullPartitionArchiver;
+
+    impl crate::partition_archive::PartitionArchiver for NullPartitionArchiver {
+        fn put<'a>(
+            &'a self,
+            _key: &'a str,
+            _bytes: Vec<u8>,
+        ) -> crate::partition_archive::ArchiveIo<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn get<'a>(
+            &'a self,
+            _key: &'a str,
+        ) -> crate::partition_archive::ArchiveIo<'a, Option<Vec<u8>>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    /// A straggler delete removes orphan rows that no export holds, so the
+    /// build refuses both together (issue #2009).
+    #[test]
+    fn a_partition_archiver_with_straggler_deletes_fails_the_build() {
+        let mut retention = RetentionConfig::with_max_age(std::time::Duration::from_secs(3600));
+        retention.partitions.straggler_grace_secs = Some(3600);
+        let Err(err) = HarvestBuilder::new()
+            .retention(retention.clone())
+            .partition_archiver(NullPartitionArchiver)
+            .try_build()
+        else {
+            panic!("the build must refuse the pair");
+        };
+        assert!(
+            matches!(&err, HarvestBuilderError::InvalidRetention(m) if m.contains("straggler_grace_secs")),
+            "{err:?}"
+        );
+
+        let built = HarvestBuilder::new()
+            .retention(retention)
+            .try_build()
+            .expect("straggler deletes alone still build");
+        assert!(built.partition_archiver().is_none());
+
+        let built = HarvestBuilder::new()
+            .partition_archiver(NullPartitionArchiver)
+            .try_build()
+            .expect("an archiver alone builds");
+        assert!(built.partition_archiver().is_some());
+    }
+
     /// A duplicate shard would fan the per-shard control loops out twice
     /// against one database, and would collapse those two instances onto a
     /// single `(scanner, shard)` tick series so a healthy duplicate masks its
@@ -6223,6 +6315,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }])
             .state(String::from("haunted"))
             .build();
@@ -6435,6 +6529,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         }
     }
 
@@ -6460,6 +6556,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         }
     }
 
@@ -7410,6 +7508,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }])
             .try_build();
         assert!(result.is_ok());
@@ -7708,6 +7808,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         let act2 = ActivityInfo {
             name: "act2",
@@ -7730,6 +7832,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
 
         let result = HarvestBuilder::new()
@@ -7767,6 +7871,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
 
         let result = HarvestBuilder::new().activities(vec![act]).try_build();
@@ -7806,6 +7912,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         let result = HarvestBuilder::new().activities(vec![act]).try_build();
         assert!(
@@ -7852,6 +7960,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         let result = HarvestBuilder::new().activities(vec![act]).try_build();
         assert!(
@@ -7894,6 +8004,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         assert!(
             HarvestBuilder::new()
@@ -7934,6 +8046,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         let result = HarvestBuilder::new().activities(vec![act]).try_build();
         assert!(
@@ -7982,6 +8096,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         }
     }
 

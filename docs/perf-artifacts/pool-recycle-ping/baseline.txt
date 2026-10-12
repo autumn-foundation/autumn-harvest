@@ -1,0 +1,33 @@
+== label: baseline
+ claimed_activities | total_calls | ping_calls | pings_per_activity | ping_pct_of_calls | total_blocks | temp_blks_written | wal_bytes 
+--------------------+-------------+------------+--------------------+-------------------+--------------+-------------------+-----------
+                720 |       71290 |       6769 |              9.401 |              9.50 |       575917 |                 0 |  13002954
+(1 row)
+
+== top 10 by calls
+ calls | blks  |                                                query                                                 
+-------+-------+------------------------------------------------------------------------------------------------------
+  6769 |     0 | SELECT $1
+  4994 |     0 | COMMIT
+  3600 |     0 | SELECT txid_current() AS txid, current_database()::text AS database, pg_postmaster_start_time() AS s
+  3600 | 10800 | SELECT $2 FROM ONLY "public"."harvest_workflow_executions" x WHERE "id" OPERATOR(pg_catalog.=) $1 FO
+  3297 |     0 | BEGIN
+  2640 | 57793 | INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1
+  2572 |     0 | SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notificati
+  2149 |   331 | SELECT to_regclass($1) IS NOT NULL AS present
+  1923 | 12894 | SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "har
+  1898 |     0 | SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)
+(10 rows)
+
+== EXPLAIN of the ping statement
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Result  (cost=0.00..0.01 rows=1 width=4) (actual time=0.001..0.001 rows=1 loops=1)
+   Output: 1
+ Query Identifier: 6865378226349601843
+ Planning:
+   Buffers: shared hit=3
+ Planning Time: 0.064 ms
+ Execution Time: 0.035 ms
+(7 rows)
+
