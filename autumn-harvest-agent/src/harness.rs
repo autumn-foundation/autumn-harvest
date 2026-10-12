@@ -12,7 +12,7 @@ use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::error::AgentError;
 use crate::heartbeat::{HeartbeatTask, Precheck};
 use crate::memory::{MEMORY_TOOL, MemoryScope, MemoryStore, MemoryTool, render_snapshot};
-use crate::message::{RunId, TokenUsage, ToolDefinition};
+use crate::message::{ContentPart, RunId, TokenUsage, ToolDefinition};
 use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse};
 use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
 use crate::response_cache::{CacheKey, KeyTenant, ResponseCache};
@@ -155,6 +155,12 @@ impl AgentHarness {
         self
     }
 
+    /// The activity-result cap of the workers, in bytes.
+    #[cfg(feature = "eval")]
+    pub(crate) const fn result_cap(&self) -> u64 {
+        self.max_result_bytes
+    }
+
     /// Set the time budget of one model call.
     #[must_use]
     pub const fn model_timeout(mut self, timeout: Duration) -> Self {
@@ -257,15 +263,36 @@ impl AgentHarness {
     /// time budget. Every other failure is not.
     pub async fn model_turn(&self, request: ModelTurnRequest) -> Result<ModelTurn, String> {
         let tenant = CacheTenant::declared(request.tenant.as_deref());
-        self.model_turn_in(request, tenant).await
+        self.model_turn_in(request, tenant, |_content| {}).await
     }
 
-    /// [`model_turn`](Self::model_turn), with the tenant that scopes the
-    /// response cache.
+    /// Run one model call, let `prepare` edit the model content, then ask
+    /// the policy about each tool call.
+    ///
+    /// The evaluation harness uses `prepare` to set the recorded call ids
+    /// before the policy reads them. It skips the response cache, because an
+    /// evaluation measures the live answer of the candidate.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`model_turn`](Self::model_turn).
+    #[cfg(feature = "eval")]
+    pub(crate) async fn model_turn_with(
+        &self,
+        request: ModelTurnRequest,
+        prepare: impl FnOnce(&mut Vec<ContentPart>),
+    ) -> Result<ModelTurn, String> {
+        self.model_turn_in(request, CacheTenant::Skip, prepare)
+            .await
+    }
+
+    /// [`model_turn_with`](Self::model_turn_with), with the tenant that
+    /// scopes the response cache.
     pub(crate) async fn model_turn_in(
         &self,
         request: ModelTurnRequest,
         tenant: CacheTenant,
+        prepare: impl FnOnce(&mut Vec<ContentPart>),
     ) -> Result<ModelTurn, String> {
         let builtins = self.builtins(
             request.memory_scope.as_ref(),
@@ -297,8 +324,10 @@ impl AgentHarness {
             }
             response
         };
+        let mut content = response.content;
+        prepare(&mut content);
         let mut turn = ModelTurn {
-            content: response.content,
+            content,
             stop: response.stop_reason,
             usage: response.usage,
             decisions: Vec::new(),

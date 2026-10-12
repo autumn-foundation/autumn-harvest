@@ -52,6 +52,34 @@ pub fn first_divergence(a: &[String], b: &[String]) -> Option<usize> {
         .or_else(|| (a.len() != b.len()).then(|| a.len().min(b.len())))
 }
 
+/// The [`Nondeterminism`] of two runs of `seed`, or `None` when they match.
+///
+/// `a` and `b` are the traces. `equal` tells whether the whole reports are
+/// equal. `note` names what differs when only the reports differ.
+pub(super) fn diverged(
+    seed: u64,
+    a: &[String],
+    b: &[String],
+    equal: bool,
+    note: &str,
+) -> Option<Nondeterminism> {
+    if let Some(line) = first_divergence(a, b) {
+        let at = |trace: &[String]| trace.get(line).cloned().unwrap_or_default();
+        return Some(Nondeterminism {
+            seed,
+            line,
+            first: at(a),
+            second: at(b),
+        });
+    }
+    (!equal).then(|| Nondeterminism {
+        seed,
+        line: a.len(),
+        first: note.to_string(),
+        second: String::new(),
+    })
+}
+
 /// Run `config` twice and compare the traces and the operation logs.
 ///
 /// # Errors
@@ -74,24 +102,15 @@ pub fn run_twice_with(
 ) -> Result<SimReport, Nondeterminism> {
     let first = runner(config);
     let second = runner(config);
-    if let Some(line) = first_divergence(&first.trace, &second.trace) {
-        let at = |trace: &[String]| trace.get(line).cloned().unwrap_or_default();
-        return Err(Nondeterminism {
-            seed: config.seed,
-            line,
-            first: at(&first.trace),
-            second: at(&second.trace),
-        });
-    }
-    if first != second {
-        return Err(Nondeterminism {
-            seed: config.seed,
-            line: first.trace.len(),
-            first: "equal trace, different operation log or stats".to_string(),
-            second: String::new(),
-        });
-    }
-    Ok(first)
+    let note = "equal trace, different operation log or stats";
+    diverged(
+        config.seed,
+        &first.trace,
+        &second.trace,
+        first == second,
+        note,
+    )
+    .map_or(Ok(first), Err)
 }
 
 /// The seeds of a sweep.

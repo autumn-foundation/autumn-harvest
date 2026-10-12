@@ -89,6 +89,8 @@ pub mod usage;
 pub mod vault_transit;
 pub mod version_gate_retirement;
 pub mod version_usage;
+/// The `filter` grammar of `GET /workflows` (issue #1982).
+mod visibility_query;
 pub mod workflow_count;
 pub mod workflow_reachability;
 
@@ -101,6 +103,10 @@ pub mod webhook_receiver;
 
 #[cfg(feature = "mcp")]
 pub mod mcp_tools;
+
+/// MCP Tasks for `#[workflow(mcp)]` workflows (issue #2005).
+#[cfg(feature = "mcp")]
+pub mod mcp_tasks;
 
 /// OpenAPI 3.1 document for the management API (issue #694).
 ///

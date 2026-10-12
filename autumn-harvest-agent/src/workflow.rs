@@ -580,7 +580,7 @@ pub async fn agent_model_turn(
 ) -> Result<ModelTurn, String> {
     let harness = harness(ctx)?;
     let tenant = cache_tenant(ctx, harness, &request).await;
-    harness.model_turn_in(request, tenant).await
+    harness.model_turn_in(request, tenant, |_content| {}).await
 }
 
 /// The tenant that scopes the response cache for one turn (issue #1998).

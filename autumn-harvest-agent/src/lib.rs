@@ -10,8 +10,11 @@
 //! [`ToolPolicy`], [`Approval`] and the message types. It also has the
 //! always-on primitives: [`heartbeat`], [`followup`], [`delivery`],
 //! [`memory`] and [`loop_guard`]. [`ResponseCache`] serves an identical
-//! model call across runs. The crate depends on the core
-//! engine only, with no default features. It has no Autumn plugin dependency.
+//! model call across runs. The `eval` feature adds the `eval` module.
+//! That module re-drives a recorded run with a candidate model or prompt.
+//!
+//! The crate depends on the core engine only, with no default features. It
+//! has no Autumn plugin dependency.
 //! An app implements [`AgentModel`] for its provider, or bridges a framework
 //! it already uses.
 //!
@@ -60,6 +63,8 @@ pub mod approval;
 pub mod bounds;
 pub mod delivery;
 pub mod error;
+#[cfg(feature = "eval")]
+pub mod eval;
 pub mod followup;
 pub mod harness;
 pub mod heartbeat;

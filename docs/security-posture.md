@@ -166,7 +166,8 @@ For a support/on-call/status-dashboard principal that should **read but not
 mutate**, mount with `api_with_role_auth` instead of `api_with_auth` — a single
 call that adds a class-aware enforcement layer giving `403 Forbidden` on every
 mutating management route (and every mutating [MCP tool](./mcp-tools.md), when
-`mcp_tools()` is enabled) to any principal your middleware marks read-only,
+`mcp_tools()` is enabled, and the whole [MCP Tasks route](./mcp-tools.md#mcp-tasks-issue-2005)
+when `mcp_tasks()` is enabled) to any principal your middleware marks read-only,
 while leaving 100% of the read surface reachable. See **[the read-only operator
 role guide](./operator-role.md)** for the Session claim contract, the
 fail-closed guarantee, the MCP-tool coverage, and the `/ui` limitation.
@@ -1202,7 +1203,9 @@ Data-governance operations follow the same posture: **per-execution legal hold**
 admin-gated mutating routes, audited under `legal_hold.set` / `legal_hold.release`
 and `workflow.erase_payloads`. A legal hold exempts a single execution's history
 from the retention janitor and from PII erasure until released — see
-[`docs/archival.md`](archival.md) for the retention/erasure lifecycle.
+[`docs/archival.md`](archival.md) for the retention/erasure lifecycle. No reset
+forks an erased run. See
+[Workflow reset](workflow-reset.md#a-fork-never-uses-a-pii-erased-source).
 
 ### Tamper-evident audit rows (issue #1838)
 

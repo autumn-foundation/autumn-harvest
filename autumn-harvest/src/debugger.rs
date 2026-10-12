@@ -1666,11 +1666,12 @@ impl ReplayDebugger {
             self.declarative_queries.iter().collect();
         let updates: Vec<&crate::info::UpdateHandlerInfo> =
             self.declarative_updates.iter().collect();
-        crate::executor::register_declarative_handlers(
-            &ctx,
+        let ctx = crate::executor::register_declarative_handlers(
+            ctx,
             crate::executor::ReplayDeclarativeHandlers {
                 queries: &queries,
                 updates: &updates,
+                router: None,
             },
         );
 

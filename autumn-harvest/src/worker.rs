@@ -52,7 +52,8 @@ use crate::signal;
 use crate::store;
 use crate::telemetry::{
     ATTR_ACTIVITY_NAME, ATTR_ATTEMPT, ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID,
-    ATTR_WORKFLOW_ID, ActivityStatus, DbOp, SlotType, TraceContextCarrier, WorkflowStatus,
+    ATTR_WORKFLOW_ID, ActivityStatus, DbOp, ResidentOutcome, SlotType, TraceContextCarrier,
+    WorkflowStatus,
 };
 use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, IdempotencyKey, ParentClosePolicy, ShardId,
@@ -81,6 +82,8 @@ pub type DbPool = deadpool::managed::Pool<
 /// [`WorkerRuntimeConfig`] — whose conversion writes the write-once
 /// `GLOBAL_DEFAULT_WORKFLOW_QUEUE` and so must not run on a read-only path.
 pub const DEFAULT_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+pub use crate::builder::DEFAULT_MAX_CONCURRENT_CLAIMS;
 
 /// Ceiling for the overdue-schedule gauge's adaptive sampling interval (issue
 /// #696).
@@ -176,6 +179,10 @@ pub struct WorkerRuntimeConfig {
     pub max_concurrent_workflows: usize,
     /// Maximum concurrent activity task executions.
     pub max_concurrent_activities: usize,
+    /// The most claims this worker runs at once. `1` is one serial claim
+    /// loop. Must be at least 1. See
+    /// [`crate::builder::WorkerConfig::max_concurrent_claims`].
+    pub max_concurrent_claims: usize,
     /// Interval between queue poll attempts when idle.
     pub poll_interval: Duration,
     /// Maximum time to wait for in-flight tasks during shutdown.
@@ -330,12 +337,18 @@ impl WorkerRuntimeConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`HarvestError::Config`] if `queues` is empty, or if
-    /// `cancellation_grace_period` exceeds [`MAX_CANCELLATION_GRACE_PERIOD`].
+    /// Returns [`HarvestError::Config`] if `queues` is empty, if
+    /// `max_concurrent_claims` is 0, or if `cancellation_grace_period`
+    /// exceeds [`MAX_CANCELLATION_GRACE_PERIOD`].
     pub fn validate(&self) -> HarvestResult<()> {
         if self.queues.is_empty() {
             return Err(HarvestError::Config(
                 "worker must poll at least one queue".into(),
+            ));
+        }
+        if self.max_concurrent_claims == 0 {
+            return Err(HarvestError::Config(
+                "max_concurrent_claims is 0; a worker needs at least one claim loop".into(),
             ));
         }
         if self.cancellation_grace_period > MAX_CANCELLATION_GRACE_PERIOD {
@@ -447,6 +460,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             shard_notification_database_urls: cfg.shard_notification_database_urls,
             max_concurrent_workflows: cfg.max_concurrent_workflows,
             max_concurrent_activities: cfg.max_concurrent_activities,
+            max_concurrent_claims: cfg.max_concurrent_claims,
             poll_interval: DEFAULT_WORKER_POLL_INTERVAL,
             shutdown_timeout: cfg.shutdown_timeout,
             cancellation_grace_period: cfg.cancellation_grace_period,
@@ -1985,6 +1999,10 @@ struct ScheduledActivityCommand {
     /// internal session-acquire dispatch. `None` for every ordinary
     /// activity.
     schedule_to_start_override: Option<std::time::Duration>,
+    /// Write the result through the `PayloadStore` (issue #1986).
+    ///
+    /// `build_activity_enqueue_plan` adds `RESULT_WRITER_HEADER` to the row.
+    result_writer: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2027,8 +2045,8 @@ struct PreparedWorkflowTask {
     cold_history_bytes: Option<u64>,
     /// The byte mark taken with a warm cache entry (issue #1804).
     cached_history_bytes: Option<crate::cache::HistoryBytesMark>,
-    /// The resident workflow of a warm hit, if any (issue #1798).
-    resident: Option<crate::resident::ResidentWorkflow>,
+    /// The resident state of a warm hit (issue #1798, issue #2007).
+    resident: crate::resident::Residency,
     /// Index in `history_events` of the first event after the cached
     /// snapshot. The resident workflow resumes with the events from here.
     delta_start: usize,
@@ -2874,6 +2892,7 @@ fn extract_all_scheduled_activities(
                 session_id,
                 session_worker_id,
                 schedule_to_start_override,
+                result_writer,
                 ..
             } => {
                 scheduled.push(ScheduledActivityCommand {
@@ -2886,6 +2905,7 @@ fn extract_all_scheduled_activities(
                     session_id: *session_id,
                     session_worker_id: session_worker_id.clone(),
                     schedule_to_start_override: *schedule_to_start_override,
+                    result_writer: *result_writer,
                 });
             }
             _ => return None,
@@ -3236,6 +3256,7 @@ fn extract_mixed_suspension_batch(commands: &[WorkflowCommand]) -> Option<MixedS
                 session_id,
                 session_worker_id,
                 schedule_to_start_override,
+                result_writer,
                 ..
             } => batch.scheduled_activities.push(ScheduledActivityCommand {
                 activity_id: *activity_id,
@@ -3247,6 +3268,7 @@ fn extract_mixed_suspension_batch(commands: &[WorkflowCommand]) -> Option<MixedS
                 session_id: *session_id,
                 session_worker_id: session_worker_id.clone(),
                 schedule_to_start_override: *schedule_to_start_override,
+                result_writer: *result_writer,
             }),
             WorkflowCommand::WaitForActivity { activity_id, .. } => {
                 batch.activity_waits.push(*activity_id);
@@ -11051,6 +11073,80 @@ struct ActivityEnqueuePlan {
     dynamic_rate_buckets: Vec<(String, f64, f64)>,
 }
 
+/// The context headers for one activity row (issue #1986).
+///
+/// Only the engine sets `RESULT_WRITER_HEADER`. A caller can set any
+/// execution header, so this function removes an inherited copy of the
+/// reserved header. A row with the result writer gets the header. The header
+/// rides in the row's existing `context_headers` column, so it needs no
+/// migration.
+fn activity_row_context_headers(
+    context_headers: Option<&serde_json::Value>,
+    result_writer: bool,
+) -> Option<serde_json::Value> {
+    let key = crate::fan_out::RESULT_WRITER_HEADER;
+    let inherited = context_headers.and_then(serde_json::Value::as_object);
+    if !result_writer && !inherited.is_some_and(|headers| headers.contains_key(key)) {
+        return context_headers.cloned();
+    }
+    let mut headers = inherited.cloned().unwrap_or_default();
+    headers.remove(key);
+    if result_writer {
+        headers.insert(key.to_string(), serde_json::Value::from("1"));
+    }
+    Some(serde_json::Value::Object(headers))
+}
+
+#[cfg(test)]
+mod result_writer_header_tests {
+    use super::activity_row_context_headers;
+    use crate::fan_out::RESULT_WRITER_HEADER;
+    use serde_json::json;
+
+    #[test]
+    fn a_plain_row_keeps_the_execution_headers() {
+        let headers = json!({ "tenant": "a" });
+        assert_eq!(
+            activity_row_context_headers(Some(&headers), false),
+            Some(headers)
+        );
+        assert_eq!(activity_row_context_headers(None, false), None);
+    }
+
+    #[test]
+    fn a_writer_row_adds_the_header() {
+        let headers = json!({ "tenant": "a" });
+        assert_eq!(
+            activity_row_context_headers(Some(&headers), true),
+            Some(json!({ "tenant": "a", RESULT_WRITER_HEADER: "1" }))
+        );
+        assert_eq!(
+            activity_row_context_headers(None, true),
+            Some(json!({ RESULT_WRITER_HEADER: "1" }))
+        );
+    }
+
+    /// A caller can set execution headers. A plain row never inherits the
+    /// reserved header, so a caller cannot turn on the writer.
+    #[test]
+    fn a_plain_row_drops_a_caller_supplied_writer_header() {
+        let headers = json!({ "tenant": "a", RESULT_WRITER_HEADER: "1" });
+        assert_eq!(
+            activity_row_context_headers(Some(&headers), false),
+            Some(json!({ "tenant": "a" }))
+        );
+    }
+}
+
+/// Whether the task row asks the worker to write the result (issue #1986).
+fn task_writes_result(task: &TaskQueueItem) -> bool {
+    task.context_headers
+        .as_ref()
+        .and_then(|headers| headers.get(crate::fan_out::RESULT_WRITER_HEADER))
+        .and_then(serde_json::Value::as_str)
+        == Some("1")
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn build_activity_enqueue_plan(
     registry: &HandlerRegistry,
@@ -11337,7 +11433,8 @@ fn build_activity_enqueue_plan(
             { ATTR_QUEUE } = %queue_name,
         )
         .in_scope(|| registry.telemetry().capture_trace_context());
-        params.context_headers = context_headers.cloned();
+        params.context_headers =
+            activity_row_context_headers(context_headers, scheduled.result_writer);
         enqueued.push(params);
     }
 
@@ -14533,9 +14630,18 @@ pub async fn finalize_activity_completion(
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
-    finalize_activity_completion_write(conn, task, exec_id, activity_id, output, offloader, codecs)
-        .await
-        .map(|_| ())
+    finalize_activity_completion_write(
+        conn,
+        task,
+        exec_id,
+        activity_id,
+        output,
+        offloader,
+        codecs,
+        None,
+    )
+    .await
+    .map(|_| ())
 }
 
 /// [`finalize_activity_completion`], and whether the completion applied
@@ -14543,6 +14649,11 @@ pub async fn finalize_activity_completion(
 ///
 /// It returns [`queue::ClaimWrite::LeaseLost`] when this attempt no longer
 /// owns the outcome: the claim is lost, or the activity is no longer pending.
+///
+/// `stored` is the result writer's reference (issue #1986). When it is set,
+/// history records it in place of `output`, and the transaction adds its
+/// `harvest_payload_refs` row.
+#[allow(clippy::too_many_arguments)]
 async fn finalize_activity_completion_write(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -14551,18 +14662,15 @@ async fn finalize_activity_completion_write(
     output: serde_json::Value,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
     codecs: &crate::payload_codec::PayloadCodecs,
+    stored: Option<&crate::fan_out::StoredResult>,
 ) -> HarvestResult<queue::ClaimWrite> {
     let Some(activity_name) = task.activity_name.as_deref() else {
         return Ok(queue::ClaimWrite::LeaseLost);
     };
-    let completion_event = WorkflowEvent::ActivityCompleted {
-        activity_id,
-        output: output.clone(),
-    };
 
     let result = Box::pin(
         conn.transaction::<queue::ClaimWrite, HarvestError, _>(async |conn| {
-            let output = output.clone();
+            let mut output = output.clone();
             let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
             if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
                 return Ok(queue::ClaimWrite::LeaseLost);
@@ -14573,6 +14681,28 @@ async fn finalize_activity_completion_write(
                 log_lease_lost(task, "activity completion");
                 return Ok(queue::ClaimWrite::LeaseLost);
             }
+            // The blob is already in the store (issue #1986). Its reference
+            // row commits with the event, so retention can delete the blob.
+            if let Some(stored) = stored {
+                store::insert_payload_refs(
+                    conn,
+                    exec_id,
+                    &[crate::payload_store::OffloadedRef {
+                        blob_key: stored.key.clone(),
+                        store_id: stored.store_id.clone(),
+                        byte_len: stored.len,
+                    }],
+                )
+                .await?;
+                output = stored.to_recorded_value();
+            }
+            let completion_event = WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: output.clone(),
+            };
+            // A stored reference is already out of line. Ordinary offload
+            // would upload it again under a low threshold.
+            let offloader = offloader.filter(|_| stored.is_none());
             store::append_events_offloaded_with_codecs(
                 conn,
                 exec_id,
@@ -15909,13 +16039,37 @@ async fn handle_activity_result(
     // Issue #1243: configured codecs, so this write encodes under the
     // same registry replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // Issue #1986: the result writer's reference, written before the call.
+    stored: Option<&crate::fan_out::StoredResult>,
 ) -> HarvestResult<queue::ClaimWrite> {
     match activity_result {
+        // Issue #1986: a writer row that this worker cannot write records the
+        // value inline. A value that carries the reserved key would then read
+        // as a reference, so it fails instead (compare issue #1758).
+        Ok(output)
+            if stored.is_none()
+                && task_writes_result(task)
+                && output.get(crate::fan_out::STORED_RESULT_KEY).is_some() =>
+        {
+            use crate::failure::IntoActivityErrorString as _;
+            let error = crate::failure::ActivityFailure::non_retryable(
+                "ReservedResultKey",
+                format!(
+                    "activity '{activity_name_for_cap}' result carries the reserved key \
+                     '{}' and this worker has no PayloadStore to write it",
+                    crate::fan_out::STORED_RESULT_KEY
+                ),
+            )
+            .into_error_payload();
+            finalize_activity_failure_write(conn, task, exec_id, activity_id, &error, codecs).await
+        }
         Ok(output) => {
             let observed_bytes = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
             // Issue #524: an over-threshold result will be offloaded into a tiny
             // reference envelope, so it does not trip the #252 result cap.
-            let offload_applies = offloader.is_some_and(|o| observed_bytes > o.threshold());
+            // Issue #1986: a stored result is already out of line.
+            let offload_applies =
+                stored.is_some() || offloader.is_some_and(|o| observed_bytes > o.threshold());
             if max_result_bytes > 0 && observed_bytes > max_result_bytes && !offload_applies {
                 use crate::failure::IntoActivityErrorString as _;
                 let error = crate::failure::ActivityFailure::non_retryable(
@@ -15944,6 +16098,7 @@ async fn handle_activity_result(
                 output,
                 offloader,
                 codecs,
+                stored,
             )
             .await
         }
@@ -16067,6 +16222,7 @@ pub async fn write_activity_result_for_task(
         &crate::telemetry::NoOpMetrics,
         crate::builder::DEFAULT_RETRY_AFTER_CEILING,
         codecs,
+        None,
     )
     .await
 }
@@ -17782,9 +17938,18 @@ async fn handle_session_acquire(
         crate::telemetry::SessionAcquisitionOutcome::Acquired,
     );
     let output = serde_json::json!(actual_host);
-    finalize_activity_completion_write(&mut conn, task, exec_id, activity_id, output, None, codecs)
-        .await
-        .map(Some)
+    finalize_activity_completion_write(
+        &mut conn,
+        task,
+        exec_id,
+        activity_id,
+        output,
+        None,
+        codecs,
+        None,
+    )
+    .await
+    .map(Some)
 }
 
 /// Handle the internal session-release activity (issue #606), dispatched by
@@ -17843,9 +18008,18 @@ async fn handle_session_release(
     crate::sessions::release_session_slot(session_slots_in_use, session_id);
 
     let output = serde_json::Value::Null;
-    finalize_activity_completion_write(&mut conn, task, exec_id, activity_id, output, None, codecs)
-        .await
-        .map(Some)
+    finalize_activity_completion_write(
+        &mut conn,
+        task,
+        exec_id,
+        activity_id,
+        output,
+        None,
+        codecs,
+        None,
+    )
+    .await
+    .map(Some)
 }
 
 /// Settle the local slot of a session acquire that failed on a transient
@@ -18847,6 +19021,8 @@ async fn process_activity_task(
             activity_id,
             claim: activity_claim.clone(),
             max_result_bytes: effective_result_cap,
+            result_writer: task_writes_result(task),
+            offloader: registry.payload_offloader_arc(),
         });
 
     let telemetry = registry.telemetry().clone();
@@ -19170,9 +19346,10 @@ async fn process_activity_task(
     let activity_result = match activity_result {
         Ok(output) if effective_result_cap > 0 => {
             let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
+            // Issue #1986: the result writer moves every result to the store.
             let offload_applies = registry
                 .payload_offloader()
-                .is_some_and(|o| observed > o.threshold());
+                .is_some_and(|o| observed > o.threshold() || task_writes_result(task));
             if observed > effective_result_cap && !offload_applies {
                 use crate::failure::IntoActivityErrorString as _;
                 let error = crate::failure::ActivityFailure::non_retryable(
@@ -19764,6 +19941,22 @@ async fn write_activity_result(
         .map(crate::payload_store::PayloadOffloader::counting_uploads);
     let offloader = counted.as_ref().map(|(offloader, _)| offloader);
     let uploaded = || counted.as_ref().is_some_and(|(_, uploads)| uploads.any());
+    // Issue #1986: write the result once, before any lock is taken. Each try
+    // then records the same reference and uploads nothing, so the repeats stay
+    // safe. A lost claim leaves one blob without a reference row, as a
+    // rolled-back offload does.
+    let stored = match (activity_result, registry.payload_offloader()) {
+        (Ok(output), Some(offloader)) if task_writes_result(task) => Some(
+            crate::fan_out::StoredResult::write(
+                offloader.store().as_ref(),
+                registry.payload_codecs(),
+                activity_id,
+                output,
+            )
+            .await?,
+        ),
+        _ => None,
+    };
     let mut attempt = 1;
     loop {
         let outcome = handle_activity_result(
@@ -19780,6 +19973,7 @@ async fn write_activity_result(
             registry.telemetry().metrics.as_ref(),
             registry.retry_after_ceiling,
             registry.payload_codecs(),
+            stored.as_ref(),
         )
         .await;
         match outcome {
@@ -21543,13 +21737,36 @@ fn delta_is_contiguous(from_event_id: i32, delta: &store::EventHistory) -> bool 
         .is_ok_and(|span| span == delta.events.len())
 }
 
+/// The resident outcome of a warm hit before its first drive (issue #2007).
+///
+/// A parked workflow counts as a hit. A decline of its resume changes the
+/// outcome to [`ResidentOutcome::Declined`].
+const fn resident_outcome_before_drive(residency: &crate::resident::Residency) -> ResidentOutcome {
+    match residency {
+        crate::resident::Residency::Parked(_) => ResidentOutcome::Hit,
+        crate::resident::Residency::Missed(reason) => *reason,
+        crate::resident::Residency::Unknown => ResidentOutcome::Cold,
+    }
+}
+
+/// The resident state of a suspension that cannot stay resident (issue
+/// #2007). A hot-swap module wins over `reason`, because it binds around
+/// every drive.
+const fn final_miss(hot_swapped: bool, reason: ResidentOutcome) -> crate::resident::Residency {
+    crate::resident::Residency::Missed(if hot_swapped {
+        ResidentOutcome::HotSwap
+    } else {
+        reason
+    })
+}
+
 /// Puts a taken cache entry back, and drops any displaced entry outside the
 /// lock (issue #1798).
 async fn put_back_cache_entry(
     workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
     exec_uuid: uuid::Uuid,
     state: crate::cache::CachedWorkflowState,
-    resident: Option<crate::resident::ResidentWorkflow>,
+    resident: crate::resident::Residency,
     history_bytes: Option<crate::cache::HistoryBytesMark>,
 ) {
     let displaced = workflow_cache
@@ -21674,7 +21891,9 @@ async fn prepare_workflow_task_with_cache(
         // delta is not the plain run of events the snapshot expects.
         let contiguous = delta_is_contiguous(cached_state.next_event_id, &existing_delta)
             && delta_is_contiguous(existing_delta.next_event_id, &after_ingest);
-        resident = resident.filter(|_| contiguous);
+        if !contiguous && resident.is_parked() {
+            resident = crate::resident::Residency::Missed(ResidentOutcome::Declined);
+        }
 
         // Reconstruct full history: cached snapshot + any pre-existing delta +
         // ingested timer/signal events.
@@ -21727,7 +21946,7 @@ async fn prepare_workflow_task_with_cache(
             was_cache_hit: false,
             cold_history_bytes: Some(history_bytes),
             cached_history_bytes: None,
-            resident: None,
+            resident: crate::resident::Residency::Unknown,
             delta_start,
             resident_enabled,
         }))
@@ -25203,16 +25422,26 @@ async fn process_workflow_task(
     let decision_start_event_id = prepared.next_event_id;
     // Issue #1798: the resident workflow of a warm hit. The first iteration
     // tries to resume it. A decline replays cold, as on a miss.
-    let mut warm_resident = prepared.resident.take();
-    // The resident workflow of the final cycle, kept for the next decision.
-    let mut final_resident: Option<crate::resident::ResidentWorkflow> = None;
+    let warm_residency = std::mem::take(&mut prepared.resident);
+    // Issue #2007: the resident outcome of this decision. The worker
+    // records it once, after the first drive.
+    let mut resident_outcome = prepared.resident_enabled.then(|| {
+        if prepared.was_cache_hit {
+            resident_outcome_before_drive(&warm_residency)
+        } else {
+            ResidentOutcome::Cold
+        }
+    });
+    let mut warm_resident = warm_residency.into_workflow();
+    // The resident state of the final cycle, kept for the next decision.
+    let mut final_resident: crate::resident::Residency;
     // A module-hosted workflow binds its module around one drive only, so
     // it cannot stay resident.
     #[cfg(feature = "hot-code-swap")]
-    let can_stay_resident =
-        prepared.resident_enabled && !crate::hot_swap::is_module_hosted(workflow.handler);
+    let hot_swapped = crate::hot_swap::is_module_hosted(workflow.handler);
     #[cfg(not(feature = "hot-code-swap"))]
-    let can_stay_resident = prepared.resident_enabled;
+    let hot_swapped = false;
+    let can_stay_resident = prepared.resident_enabled && !hot_swapped;
 
     // Issue #678/#1034: external-op ids resolved INLINE during this decision
     // cycle. Set by the mixed-signal arm below (any suspension whose command
@@ -25348,11 +25577,14 @@ async fn process_workflow_task(
                     .await
                 {
                     Ok(drive) => return drive,
-                    Err(reason) => tracing::debug!(
-                        exec_id = %prepared.exec_id,
-                        ?reason,
-                        "resident workflow declined; replaying cold (issue #1798)"
-                    ),
+                    Err(reason) => {
+                        resident_outcome = Some(ResidentOutcome::Declined);
+                        tracing::debug!(
+                            exec_id = %prepared.exec_id,
+                            ?reason,
+                            "resident workflow declined; replaying cold (issue #1798)"
+                        );
+                    }
                 }
             }
             let ctx = crate::executor::build_task_context(
@@ -25420,6 +25652,14 @@ async fn process_workflow_task(
             router: resolved_router,
             resident: iter_resident,
         } = drive;
+        // Issue #2007: one sample per decision, after its first drive.
+        if let Some(outcome) = resident_outcome.take() {
+            telemetry.metrics.record_workflow_resident(
+                &prepared.execution.workflow_name,
+                &task.queue_name,
+                outcome,
+            );
+        }
 
         match run_outcome {
             WorkflowOutcome::Suspended { commands }
@@ -26077,6 +26317,8 @@ async fn process_workflow_task(
                     // Re-acquire a fresh execute_span so persist_workflow_outcome
                     // (via handle_suspended_workflow) gets a valid span reference.
                     let execute_span = tracing::Span::none();
+                    // Issue #2007: an external-op batch cannot stay resident.
+                    final_resident = final_miss(hot_swapped, ResidentOutcome::Unsupported);
                     break (
                         WorkflowOutcome::Suspended {
                             commands: reconstructed_commands,
@@ -26269,6 +26511,8 @@ async fn process_workflow_task(
                 // (via handle_suspended_workflow) gets a valid span reference.
                 // The original span was dropped above.
                 let execute_span = tracing::Span::none();
+                // Issue #2007: an external-op batch cannot stay resident.
+                final_resident = final_miss(hot_swapped, ResidentOutcome::Unsupported);
                 break (
                     WorkflowOutcome::Suspended {
                         commands: remaining_commands_with_unresolved,
@@ -26279,7 +26523,11 @@ async fn process_workflow_task(
                 );
             }
             other => {
-                final_resident = iter_resident;
+                final_resident = if hot_swapped {
+                    final_miss(hot_swapped, ResidentOutcome::HotSwap)
+                } else {
+                    iter_resident
+                };
                 break (other, pending_cmds, execute_span, resolved_router);
             }
         }
@@ -27272,7 +27520,7 @@ async fn process_workflow_task(
                     events: std::mem::take(&mut history_events),
                     next_event_id,
                 },
-                final_resident.take(),
+                std::mem::take(&mut final_resident),
                 history_bytes,
             )
             .await;
@@ -27502,7 +27750,7 @@ async fn store_cache_entry(
     exec_uuid: uuid::Uuid,
     suspended: Option<bool>,
     state: crate::cache::CachedWorkflowState,
-    resident: Option<crate::resident::ResidentWorkflow>,
+    resident: crate::resident::Residency,
     // Issue #1804: the byte mark measured at the start of this decision.
     history_bytes: Option<crate::cache::HistoryBytesMark>,
 ) {
@@ -30167,7 +30415,7 @@ static POLLERS_BY_RECORDER: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<usize, RecorderPollers>>,
 > = std::sync::LazyLock::new(std::sync::Mutex::default);
 
-/// Counts one running poll loop and keeps `harvest.worker.pollers` current
+/// Counts one running claim loop and keeps `harvest.worker.pollers` current
 /// (issue #1815).
 ///
 /// The guard sets the gauge when its loop starts and again when the loop
@@ -32478,6 +32726,55 @@ const fn dispatch_kind_admitted(
     }
 }
 
+/// Which claim loop runs a Postgres poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollRole {
+    /// The poll loop. It owns the listener, the timer and the capacity wake.
+    Leader,
+    /// A follower claim loop. See [`Worker::run_claim_followers`].
+    Follower,
+}
+
+/// Whether a follower claims on one target through Postgres.
+///
+/// The follower claims only where the leader polls Postgres. An unverified
+/// registration claims nothing (see [`may_claim_tasks`]). A per-shard
+/// channel, or a global channel the loop may use, takes the claims. This
+/// mirrors `run_poll_loop` and `run_poll_loop_multi`. A leader in degraded
+/// dispatch mode drains Postgres alone.
+const fn follower_polls_postgres(
+    registration_pending: bool,
+    per_shard_channel: bool,
+    usable_global_channel: bool,
+) -> bool {
+    may_claim_tasks(registration_pending) && !per_shard_channel && !usable_global_channel
+}
+
+/// Whether `claim_loops` in-flight claims can hold every connection of a
+/// pool of `max_size`.
+///
+/// A task, a heartbeat and a persist then wait behind the claims.
+const fn claim_loops_fill_pool(claim_loops: usize, max_size: usize) -> bool {
+    claim_loops >= max_size
+}
+
+/// One Postgres claim target of a follower claim loop.
+///
+/// See [`Worker::run_claim_followers`].
+struct ClaimTarget<'a> {
+    /// The shard that `pool` serves. `None` on a legacy single pool.
+    shard: Option<crate::types::ShardId>,
+    /// The pool the claim runs on.
+    pool: &'a DbPool,
+    /// Set while this shard's registration is not verified.
+    registration_pending: &'a AtomicBool,
+    /// The pool acquisition bound. See [`shard_acquire_bound`].
+    acquire_bound: Option<Duration>,
+    /// Whether the global dispatch channel may serve this target. Only the
+    /// single-pool loop allows it.
+    global_dispatch: bool,
+}
+
 /// What one Postgres poll may claim (issue #1787).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PollAdmission {
@@ -33622,13 +33919,32 @@ impl Worker {
             .map(|(shard, _)| self.shard_dispatch.get(shard).cloned())
             .collect();
 
-        self.run_poll_loop_multi(
-            shard_targets.clone(),
-            shard_listeners,
-            &registration_pending_per_shard,
-            &shard_dispatch,
-        )
-        .await;
+        // The followers poll Postgres where the leader would (no global
+        // channel on this path).
+        let more_work = tokio::sync::Notify::new();
+        let acquire_bound = shard_acquire_bound(true, self.config.poll_interval);
+        let claim_targets: Vec<ClaimTarget<'_>> = shard_targets
+            .iter()
+            .zip(&registration_pending_per_shard)
+            .map(|((shard, shard_pool), pending)| ClaimTarget {
+                shard: Some(*shard),
+                pool: shard_pool,
+                registration_pending: pending,
+                acquire_bound,
+                global_dispatch: false,
+            })
+            .collect();
+        self.warn_if_claim_loops_fill_pools(&claim_targets);
+        tokio::join!(
+            self.run_poll_loop_multi(
+                shard_targets.clone(),
+                shard_listeners,
+                &registration_pending_per_shard,
+                &shard_dispatch,
+                &more_work,
+            ),
+            self.run_claim_followers(&claim_targets, &more_work),
+        );
 
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received (multi-shard)");
 
@@ -33672,12 +33988,16 @@ impl Worker {
     /// anywhere. When all shards are idle we `tokio::select!` across all
     /// per-shard listeners (falling back to a `poll_interval` sleep for shards
     /// without a listener) before the next full scan.
+    ///
+    /// A successful Postgres claim wakes one follower through `more_work`.
+    /// See [`Self::run_claim_followers`].
     async fn run_poll_loop_multi(
         &self,
         shard_targets: Vec<(crate::types::ShardId, DbPool)>,
         mut shard_listeners: Vec<Option<crate::notify::QueueListener>>,
         registration_pending_per_shard: &[Arc<AtomicBool>],
         shard_dispatch: &[Option<crate::dispatch::InstalledDispatch>],
+        more_work: &tokio::sync::Notify,
     ) {
         let _poller = self.poller_guard();
         let n = shard_targets.len();
@@ -33724,14 +34044,17 @@ impl Worker {
                     )
                     .await
                 } else {
-                    u32::from(
-                        self.poll_once(
+                    let claimed = self
+                        .poll_once(
                             &shard_targets[idx].1,
                             shard_acquire_bound(true, self.config.poll_interval),
                             Some(shard_targets[idx].0),
                         )
-                        .await,
-                    )
+                        .await;
+                    if claimed {
+                        more_work.notify_one();
+                    }
+                    u32::from(claimed)
                 };
                 if dispatched > 0 {
                     any_claimed = true;
@@ -34111,7 +34434,7 @@ impl Worker {
         // coverage.
         let dispatch_allowed = self.dispatch_span_allowed();
 
-        self.run_poll_loop(
+        self.run_single_pool_claim_loops(
             pool,
             poll_shard,
             listener,
@@ -35100,6 +35423,7 @@ impl Worker {
                         // only a database with a DR marker (issue #1823).
                         // The fence is pinned before the heartbeat starts.
                         dr_fencing: crate::replication::FenceRegistry::is_enabled(),
+                        claim_loops: self.config.max_concurrent_claims,
                     },
                     payload: self.registry.payload_policy(),
                 }),
@@ -35861,6 +36185,7 @@ impl Worker {
         mut listener: Option<crate::notify::QueueListener>,
         registration_pending: &AtomicBool,
         dispatch_allowed: bool,
+        more_work: &tokio::sync::Notify,
     ) {
         let _poller = self.poller_guard();
         // Dispatch-channel state for this loop (issue #1312). All three are
@@ -35947,6 +36272,8 @@ impl Worker {
                 )
                 .await
             {
+                // More work may wait. Wake one follower claim loop.
+                more_work.notify_one();
                 // Per-shard dispatch counter (issue #961, AC5). Emitted on the
                 // single-shard path too, so `harvest.shard.dispatched` is a
                 // uniform series across deployment shapes whenever the worker
@@ -36750,6 +37077,147 @@ impl Worker {
         exclusions
     }
 
+    /// Run the single-pool leader loop and its followers until shutdown.
+    async fn run_single_pool_claim_loops(
+        &self,
+        pool: &DbPool,
+        shard: Option<crate::types::ShardId>,
+        listener: Option<crate::notify::QueueListener>,
+        registration_pending: &AtomicBool,
+        dispatch_allowed: bool,
+    ) {
+        let more_work = tokio::sync::Notify::new();
+        let claim_targets = [ClaimTarget {
+            shard,
+            pool,
+            registration_pending,
+            acquire_bound: shard_acquire_bound(false, self.config.poll_interval),
+            global_dispatch: dispatch_allowed,
+        }];
+        self.warn_if_claim_loops_fill_pools(&claim_targets);
+        tokio::join!(
+            self.run_poll_loop(
+                pool,
+                shard,
+                listener,
+                registration_pending,
+                dispatch_allowed,
+                &more_work,
+            ),
+            self.run_claim_followers(&claim_targets, &more_work),
+        );
+    }
+
+    /// Warn when the claim loops alone can hold every connection of a claim
+    /// pool. See [`claim_loops_fill_pool`].
+    fn warn_if_claim_loops_fill_pools(&self, targets: &[ClaimTarget<'_>]) {
+        let claim_loops = self.config.max_concurrent_claims;
+        for target in targets {
+            let max_size = target.pool.status().max_size;
+            if claim_loops_fill_pool(claim_loops, max_size) {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    shard = ?target.shard,
+                    max_concurrent_claims = claim_loops,
+                    pool_max_size = max_size,
+                    "the claim loops can hold every pool connection; tasks, heartbeats and \
+                     persists then wait behind them. Use a larger pool or lower \
+                     max_concurrent_claims"
+                );
+            }
+        }
+    }
+
+    /// Run `max_concurrent_claims - 1` follower claim loops beside the leader.
+    ///
+    /// Assay #14 measured claim-loop occupancy at 0.94, which fits one claim
+    /// in flight. That loop capped throughput. A follower adds a claim in flight only while claims return
+    /// work. The leader alone still guarantees progress, so a follower needs
+    /// no timer and no listener. See `DESIGN-claim-concurrency.md`.
+    ///
+    /// The caller joins this future with the leader. The drain therefore
+    /// starts only after every claim loop returns.
+    async fn run_claim_followers(
+        &self,
+        targets: &[ClaimTarget<'_>],
+        more_work: &tokio::sync::Notify,
+    ) {
+        let followers = self.config.max_concurrent_claims.saturating_sub(1);
+        futures::future::join_all(
+            (0..followers).map(|_| self.run_claim_follower(targets, more_work)),
+        )
+        .await;
+    }
+
+    /// One follower claim loop.
+    ///
+    /// It waits for a wake from a successful claim. It then claims until a
+    /// claim returns nothing, and wakes one more follower after each success.
+    async fn run_claim_follower(
+        &self,
+        targets: &[ClaimTarget<'_>],
+        more_work: &tokio::sync::Notify,
+    ) {
+        let _poller = self.poller_guard();
+        let mut start = 0usize;
+        loop {
+            tokio::select! {
+                biased;
+                () = self.shutdown.cancelled() => return,
+                () = more_work.notified() => {}
+            }
+            while !self.shutdown.is_cancelled() && self.follower_claim(targets, &mut start).await {
+                more_work.notify_one();
+            }
+            // This run ended on an empty claim or on shutdown. A wake stored
+            // during the run would only cost one more empty claim. The next
+            // success wakes a follower again.
+            let _ = futures::FutureExt::now_or_never(more_work.notified());
+        }
+    }
+
+    /// One follower claim attempt over `targets`, from a rotating start.
+    ///
+    /// A follower claims only where the leader polls Postgres. It skips a
+    /// target with an unverified registration or with a dispatch channel.
+    /// Returns `true` when it claimed and dispatched one task.
+    async fn follower_claim(&self, targets: &[ClaimTarget<'_>], start: &mut usize) -> bool {
+        let n = targets.len();
+        for i in 0..n {
+            if self.shutdown.is_cancelled() {
+                return false;
+            }
+            let idx = (*start + i) % n;
+            let target = &targets[idx];
+            // Fully qualified: diesel's `RunQueryDsl::load` shadows it.
+            let pending = AtomicBool::load(target.registration_pending, Ordering::Relaxed);
+            let per_shard_channel = target
+                .shard
+                .is_some_and(|shard| self.shard_dispatch.contains_key(&shard));
+            // Read the global channel only where it may serve, as the leader does.
+            let global_channel = target.global_dispatch && self.global_dispatch_binding().is_some();
+            if !follower_polls_postgres(pending, per_shard_channel, global_channel) {
+                continue;
+            }
+            if self
+                .poll_once_as(
+                    PollRole::Follower,
+                    target.pool,
+                    target.acquire_bound,
+                    target.shard,
+                )
+                .await
+            {
+                if let Some(shard) = target.shard {
+                    self.record_shard_dispatched_many(shard, 1);
+                }
+                *start = (idx + 1) % n;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Execute a single poll iteration.
     ///
     /// Claims one task of a kind with a free permit and dispatches it. Returns
@@ -36762,12 +37230,28 @@ impl Worker {
     /// exhausted pool on one shard cannot park the loop and strand its peers.
     /// See `shard_acquire_bound`. A timeout increments
     /// `harvest.db.pool_acquire_timeout{site="claim"}`.
+    async fn poll_once(
+        &self,
+        pool: &DbPool,
+        acquire_bound: Option<Duration>,
+        shard: Option<crate::types::ShardId>,
+    ) -> bool {
+        self.poll_once_as(PollRole::Leader, pool, acquire_bound, shard)
+            .await
+    }
+
+    /// [`Self::poll_once`] for one claim loop `role`.
+    ///
+    /// Only the leader runs the throttle check after an empty claim. A
+    /// follower ends each run with an empty claim, so its check would repeat
+    /// the leader's and count each throttled key once more.
     // significant_drop_tightening: `permits` holds `OwnedSemaphorePermit`s
     // across the claim on purpose (issue #1787). An earlier drop would let a
     // slot tuner shrink take the permit of a row this poll then claims.
     #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
-    async fn poll_once(
+    async fn poll_once_as(
         &self,
+        role: PollRole,
         pool: &DbPool,
         acquire_bound: Option<Duration>,
         shard: Option<crate::types::ShardId>,
@@ -36887,7 +37371,9 @@ impl Worker {
             }
 
             // All queues tried — emit throttle metrics and report idle.
-            self.emit_throttle_metrics(&mut conn).await;
+            if role == PollRole::Leader {
+                self.emit_throttle_metrics(&mut conn).await;
+            }
             return false;
         }
 
@@ -36928,7 +37414,9 @@ impl Worker {
                 true
             }
             Ok(None) => {
-                self.emit_throttle_metrics(&mut conn).await;
+                if role == PollRole::Leader {
+                    self.emit_throttle_metrics(&mut conn).await;
+                }
                 false
             }
             Err(e) => {
@@ -37878,6 +38366,60 @@ impl Worker {
     /// Request graceful shutdown of this worker.
     pub fn shutdown(&self) {
         self.shutdown.cancel();
+    }
+
+    /// Run one poll-loop iteration and wait for the task it claims.
+    ///
+    /// This is a hook for the world simulation of issue #2002. It is not a
+    /// stable API. It runs the Postgres path of `run_poll_loop` once, for
+    /// the first assigned shard only. The simulator then runs one actor at a
+    /// time, so a seed fixes the order of every claim and every decision.
+    ///
+    /// Call [`Self::dst_register`] first. Never call this on a worker that
+    /// runs [`Self::run`]: a drain closes the same task tracker.
+    ///
+    /// Returns `true` when the poll claimed a task. Returns `false` with no
+    /// claim when the worker is not registered, has a slot tuner, or shuts
+    /// down.
+    #[doc(hidden)]
+    pub async fn dst_poll_once(&self, pool: &DbPool) -> bool {
+        let registered = std::sync::atomic::AtomicBool::load(
+            &self.monitoring_started,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        if !registered || self.config.slot_tuner.is_some() || self.shutdown.is_cancelled() {
+            return false;
+        }
+        let shard = match self.config.shard_assignments.as_slice() {
+            [shard, ..] => Some(*shard),
+            [] => None,
+        };
+        let claimed = self.poll_once(pool, None, shard).await;
+        // A closed tracker waits for every body that it holds. It then
+        // reopens, so the next poll can spawn again.
+        self.dispatched.tracker.close();
+        self.dispatched.tracker.wait().await;
+        self.dispatched.tracker.reopen();
+        claimed
+    }
+
+    /// Write this worker's liveness row, as `run` does at startup.
+    ///
+    /// This is a hook for the world simulation of issue #2002. It is not a
+    /// stable API. Returns `true` when the row is written.
+    ///
+    /// The simulation starts no monitoring task. A slot tuner needs those
+    /// tasks to withhold permits, so a worker with a tuner returns `false`.
+    #[doc(hidden)]
+    pub async fn dst_register(&self, pool: &DbPool) -> bool {
+        if self.config.slot_tuner.is_some() {
+            return false;
+        }
+        // No tuner means no permit to withhold, so dispatch may start.
+        self.monitoring_started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // `register_in_fleet` returns whether a retry is pending.
+        !self.register_in_fleet(pool, None).await
     }
 }
 
@@ -40612,6 +41154,7 @@ mod tests {
             shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 10,
             max_concurrent_activities: 20,
+            max_concurrent_claims: DEFAULT_MAX_CONCURRENT_CLAIMS,
             poll_interval: Duration::from_millis(100),
             shutdown_timeout: Duration::from_secs(5),
             cancellation_grace_period: Duration::from_secs(5),
@@ -40723,6 +41266,16 @@ mod tests {
         // a worker that can never dispatch a task must never look healthy.
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("max_slots is 0"));
+    }
+
+    #[test]
+    fn runtime_config_validate_rejects_zero_claim_loops() {
+        let mut cfg = default_runtime_config();
+        cfg.max_concurrent_claims = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("max_concurrent_claims is 0"));
+        cfg.max_concurrent_claims = 1;
+        assert!(cfg.validate().is_ok(), "one serial claim loop is valid");
     }
 
     #[test]
@@ -41486,6 +42039,7 @@ mod tests {
             shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 5,
             max_concurrent_activities: 15,
+            max_concurrent_claims: 3,
             shutdown_timeout: Duration::from_secs(60),
             workflow_cache_size: 500,
             resident_workflows: true,
@@ -41532,6 +42086,7 @@ mod tests {
         );
         assert_eq!(runtime_cfg.max_concurrent_workflows, 5);
         assert_eq!(runtime_cfg.max_concurrent_activities, 15);
+        assert_eq!(runtime_cfg.max_concurrent_claims, 3);
         assert_eq!(runtime_cfg.shutdown_timeout, Duration::from_secs(60));
         assert_eq!(runtime_cfg.poll_interval, Duration::from_millis(500));
         assert_eq!(
@@ -44312,6 +44867,7 @@ mod tests {
                 session_id: None,
                 session_worker_id: None,
                 schedule_to_start_override: None,
+                result_writer: false,
                 result_tx: tx,
             },
         ];
@@ -44334,6 +44890,7 @@ mod tests {
             session_id: Some(session_id),
             session_worker_id: Some("worker-7".to_string()),
             schedule_to_start_override: Some(std::time::Duration::from_secs(30)),
+            result_writer: false,
             result_tx: tx,
         }];
         let scheduled = extract_all_scheduled_activities(&commands)
@@ -44436,6 +44993,7 @@ mod tests {
             session_id: None,
             session_worker_id: None,
             schedule_to_start_override: None,
+            result_writer: false,
             result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
         });
         assert!(
@@ -44566,6 +45124,7 @@ mod tests {
             session_id: None,
             session_worker_id: None,
             schedule_to_start_override: None,
+            result_writer: false,
             result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
         }
     }
@@ -47498,6 +48057,34 @@ mod tests {
         );
     }
 
+    /// A follower polls Postgres only where the leader would.
+    #[test]
+    fn a_follower_polls_postgres_only_where_the_leader_does() {
+        // (registration pending, per-shard channel, usable global channel)
+        for (pending, per_shard, global, polls) in [
+            (false, false, false, true),
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, true, true, false),
+            (true, true, true, false),
+        ] {
+            assert_eq!(
+                follower_polls_postgres(pending, per_shard, global),
+                polls,
+                "pending={pending} per_shard={per_shard} global={global}"
+            );
+        }
+    }
+
+    #[test]
+    fn claim_loops_that_can_fill_the_pool_are_flagged() {
+        assert!(!claim_loops_fill_pool(2, 10));
+        assert!(!claim_loops_fill_pool(9, 10));
+        assert!(claim_loops_fill_pool(10, 10));
+        assert!(claim_loops_fill_pool(4, 2));
+    }
+
     #[test]
     fn an_unregistered_worker_may_not_claim_tasks() {
         // Issue #804, Codex round-54 P1. A worker whose atomic register+
@@ -47619,6 +48206,7 @@ mod tests {
             session_id: None,
             session_worker_id: None,
             schedule_to_start_override: None,
+            result_writer: false,
             result_tx,
         }
     }
@@ -51481,6 +52069,7 @@ mod tests {
             session_id: None,
             session_worker_id: None,
             schedule_to_start_override: None,
+            result_writer: false,
             result_tx: oneshot::channel::<Result<Value, String>>().0,
         }
     }

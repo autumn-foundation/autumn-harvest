@@ -16,14 +16,22 @@
 //! operation then breaks the build of the Postgres replay until it gets a
 //! replay step.
 //!
+//! The [`world`] module drives whole actors instead (issue #2002). Its
+//! Postgres world runs the real `worker.rs` poll loop.
+//!
+//! The [`speculate`] module models speculative decisions over an in-flight
+//! commit (issue #2011). It is an R&D spike with no database.
+//!
 //! See `docs/testing/simulation.md` and
 //! `docs/adr/0004-deterministic-simulation-testing.md`.
 
 mod invariant;
 mod rng;
 mod sim;
+pub mod speculate;
 mod store;
 mod sweep;
+pub mod world;
 
 pub use invariant::{Invariant, Violation};
 pub use rng::SplitMix64;
