@@ -410,8 +410,8 @@
 //!
 //! The ingest is planned before replay. The transaction that persists the
 //! cycle outcome writes it first. So a discarded cycle (non-determinism, a
-//! contained panic under its budget) consumes no signal. A panic seal writes
-//! the signals that its replay saw.
+//! contained panic under its budget) consumes no signal. A panic seal and an
+//! unsupported-feature seal write the signals that their replay saw.
 //!
 //! A signal that the workflow never reads also reaches history. The strict
 //! core `WorkflowReplayer` then reports `NonDeterminismDetected(EarlyCompletion)`,

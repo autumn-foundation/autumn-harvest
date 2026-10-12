@@ -8,7 +8,8 @@ Postgres task-preparation ingest.
 - `worker::SignalIngest` plans the events before replay. The transaction that
   persists the cycle outcome writes them first. A discarded cycle
   (non-determinism, a contained panic under its budget) consumes no signal. A
-  panic seal writes the signals that its replay saw.
+  panic seal and an unsupported-feature seal write the signals that their
+  replay saw.
 - The #476 rule stays. Before each staged signal, the ingest fires each race
   deadline of that name that falls at or before the signal arrival. So a late
   signal cannot win, also when two races share a name. An unrelated due timer

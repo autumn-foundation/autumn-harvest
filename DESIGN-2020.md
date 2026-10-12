@@ -67,6 +67,8 @@ Red tests in `tests/integration/signal_ingest.rs`, on trunk-dev `7a751d6`:
 | R9 | A terminal run on an old file still holds an undelivered row. | The `reuse_policy` tests seed that legacy row. |
 | R10 | A panic seal drops the signals that its replay saw. Codex found it. | The seal applies the plan before `WorkflowFailed`. `a_panic_seal_records_the_signal_that_replay_saw` pins it. |
 | R11 | A corrupt row of any name blocks the run with an unclear error. | The `SqliteError::Corrupt` message names the row. `a_corrupt_staged_row_fails_the_drive_and_stays_staged` pins it. |
+| R12 | An unsupported-feature seal drops the signals that its replay saw. Codex found it. | The seal plans again at the same `now` and applies the plan before `WorkflowFailed`. `an_unsupported_seal_records_the_signal_that_replay_saw` pins it. |
+| R13 | The daemon restores a session that a corrupt row of another name blocks. Codex found it. | The restart checks every staged row as the backend reads it. `an_unreadable_staged_row_of_another_name_is_refused` pins it. |
 
 ### 0.5 Six thinking hats
 
@@ -92,7 +94,7 @@ Red tests in `tests/integration/signal_ingest.rs`, on trunk-dev `7a751d6`:
    Each deadline fires once. Then it adds the signal.
 3. `drive_one_cycle_inner` adds the planned events to the replay history.
 4. The completed, failed, suspended and panic-seal transactions apply the
-   plan first.
+   plan first. The unsupported-feature seal plans again and applies it.
 5. `ingest_awaited_signal` and `peek_pending_signal` go away. `WaitForSignal`
    writes nothing in `apply_commands`.
 

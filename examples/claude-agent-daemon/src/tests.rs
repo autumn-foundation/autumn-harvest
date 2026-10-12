@@ -11469,6 +11469,54 @@ fn a_history_is_read_with_the_engines_own_type() {
 /// signal, `receive_signal_timeout` failed, `agent_session` propagated that,
 /// and the runtime sealed the session `FAILED`. A session a repair could have
 /// saved was made terminal.
+/// Each drive reads every staged row of a session, of any name (issue #2020).
+/// A readable decision beside an unreadable row of another name still fails
+/// every drive, so the restart must refuse the session.
+#[test]
+fn an_unreadable_staged_row_of_another_name_is_refused() {
+    let armed = "tool_approval:2:0:toolu_x";
+    let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
+    conn.execute_batch(
+        "CREATE TABLE harvest_timers (timer_id TEXT, exec_id TEXT, fire_at INTEGER, \
+         fired INTEGER NOT NULL DEFAULT 0, arm_seq INTEGER, \
+         PRIMARY KEY (exec_id, timer_id)); \
+         CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT, \
+         PRIMARY KEY (exec_id, seq)); \
+         CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+         exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
+         delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0); \
+         CREATE TABLE harvest_tasks (task_id TEXT PRIMARY KEY, exec_id TEXT NOT NULL, \
+         activity_id TEXT NOT NULL, name TEXT NOT NULL, input_json TEXT NOT NULL, \
+         queue TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL, \
+         run_at INTEGER NOT NULL, seq INTEGER NOT NULL, max_attempts INTEGER, \
+         retry_policy_json TEXT, start_to_close_ms INTEGER, \
+         scheduled_at INTEGER NOT NULL)",
+    )
+    .expect("the fixture tables are created");
+    conn.execute(
+        "INSERT INTO harvest_timers VALUES (?1, 'e', 9999, 0, 2)",
+        [format!("__signal_timeout:2:{armed}")],
+    )
+    .expect("the armed timer is recorded");
+    conn.execute(
+        "INSERT INTO harvest_signals (exec_id, name, payload_json) VALUES ('e', ?1, ?2)",
+        rusqlite::params![armed, r#"{"approved":true}"#],
+    )
+    .expect("the decision is staged");
+    conn.execute(
+        "INSERT INTO harvest_signals (exec_id, name, payload_json) VALUES ('e', 'noise', '{not json')",
+        [],
+    )
+    .expect("the unreadable row is staged");
+
+    let refused = inspect::outstanding_signal(&conn, "e", 1_000)
+        .expect_err("an unreadable row of any name must refuse the restart");
+    assert!(
+        refused.contains("noise") && refused.contains("every drive fails"),
+        "the refusal must name the row and say why: {refused}"
+    );
+}
+
 #[test]
 fn a_staged_decision_is_read_as_the_type_the_workflow_asks_for() {
     let armed = "tool_approval:2:0:toolu_x";

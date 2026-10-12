@@ -534,3 +534,42 @@ async fn a_panic_seal_records_the_signal_that_replay_saw() {
         "{history:?}"
     );
 }
+
+/// Spawns a child, which this backend does not support, when it reads `spawn`.
+#[workflow]
+async fn spawn_on_signal(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    if ctx
+        .drain_signals_raw("spawn")
+        .map_err(|e| e.to_string())?
+        .is_empty()
+    {
+        return Ok(Value::Null);
+    }
+    ctx.spawn_child_workflow_raw("child", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// An unsupported seal writes the signal that replay saw, ahead of
+/// `WorkflowFailed`.
+#[tokio::test]
+async fn an_unsupported_seal_records_the_signal_that_replay_saw() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("harvest.sqlite3");
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&spawn_on_signal_info());
+    let exec = rt.start_workflow("spawn_on_signal", json!(0)).unwrap();
+    rt.send_signal_as_of(exec, "spawn", json!(1), t0()).unwrap();
+
+    let err = rt.run_until_blocked_as_of(exec, at(1)).await.unwrap_err();
+    assert!(matches!(err, SqliteError::Unsupported(_)), "{err}");
+    assert_eq!(undelivered(&path, exec), 0);
+
+    let history = rt.load_history(exec).unwrap();
+    let n = history.len();
+    assert!(
+        matches!(history[n - 2], WorkflowEvent::SignalReceived { .. })
+            && matches!(history[n - 1], WorkflowEvent::WorkflowFailed { .. }),
+        "{history:?}"
+    );
+}

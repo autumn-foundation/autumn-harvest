@@ -1194,7 +1194,7 @@ impl SqliteRuntime {
     ) -> SqliteResult<RunState> {
         let result = self.drive_one_cycle_inner(exec, now, failure_now).await;
         if let Err(SqliteError::Unsupported(message)) = &result
-            && let Err(seal_error) = self.seal_unsupported(exec, message)
+            && let Err(seal_error) = self.seal_unsupported(exec, message, now)
         {
             // Keep the reason the caller needs. The run stays `RUNNING`, so
             // the next drive meets the feature again and retries the seal.
@@ -1210,7 +1210,12 @@ impl SqliteRuntime {
     /// and `non_retryable = true`. A retry would meet the same feature again.
     /// `details.feature` is a stable token, such as `StartChildWorkflow` or
     /// `ScheduleActivity.session_id`. `details.message` holds the full text.
-    fn seal_unsupported(&mut self, exec: ExecutionId, unsupported: &str) -> SqliteResult<()> {
+    fn seal_unsupported(
+        &mut self,
+        exec: ExecutionId,
+        unsupported: &str,
+        now: i64,
+    ) -> SqliteResult<()> {
         let feature = unsupported
             .split(" — ")
             .next()
@@ -1224,6 +1229,10 @@ impl SqliteRuntime {
             non_retryable: Some(true),
         };
         let tx = self.conn.transaction()?;
+        // The failed cycle replayed the staged signals, and its transaction
+        // rolled back. A new plan at the same `now` gives the same events, so
+        // the terminal history holds the input that met the feature (#2020).
+        worker::SignalIngest::plan(&tx, exec, now)?.apply(&tx, exec)?;
         store::append_event(&tx, exec, &event)?;
         store::set_failed(&tx, exec, &message)?;
         // The cycle's own cleanup, such as a race's loser cancellation, rolled

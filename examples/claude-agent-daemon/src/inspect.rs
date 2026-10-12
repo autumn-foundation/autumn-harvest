@@ -952,6 +952,14 @@ pub fn outstanding_signal(
             "session {exec_id} {reason}, so it cannot be driven again"
         ));
     }
+    // Each drive reads EVERY staged row of the session (issue #2020), of any
+    // name. One row it cannot read fails every drive.
+    if let Some(name) = unreadable_staged_signal(conn, exec_id)? {
+        return Err(format!(
+            "session {exec_id} holds a staged signal for {name} that the engine \
+             cannot read, so every drive fails and a decision can never be taken up"
+        ));
+    }
     // `fired = 0` is the backend's own proof of a wait that is still armed.
     // An approval that timed out leaves its timer behind with `fired = 1`,
     // and a timed-out wait has no answer either. Reading every timer would
@@ -986,6 +994,39 @@ pub fn outstanding_signal(
             continue;
         }
         return Ok(Some(name));
+    }
+    Ok(None)
+}
+
+/// The name of the first staged row that the backend cannot read, if any.
+///
+/// The backend reads `payload_json` as a `String` and parses it as JSON, for
+/// every undelivered row of the run. A non-text class or text that is not JSON
+/// fails that read.
+fn unreadable_staged_signal(conn: &Connection, exec_id: &str) -> Result<Option<String>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT name, payload_json FROM harvest_signals \
+             WHERE exec_id = ?1 AND delivered = 0 \
+             ORDER BY received_at, signal_seq",
+        )
+        .map_err(|e| format!("cannot prepare the staged signal query: {e}"))?;
+    let mut rows = statement
+        .query([exec_id])
+        .map_err(|e| format!("cannot read the staged signals: {e}"))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("cannot read a staged signal: {e}"))?
+    {
+        let name: String = row
+            .get(0)
+            .map_err(|e| format!("cannot read a staged signal name: {e}"))?;
+        let readable = row
+            .get::<_, String>(1)
+            .is_ok_and(|payload| serde_json::from_str::<serde_json::Value>(&payload).is_ok());
+        if !readable {
+            return Ok(Some(name));
+        }
     }
     Ok(None)
 }
