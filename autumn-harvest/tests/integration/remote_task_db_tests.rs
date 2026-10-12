@@ -108,6 +108,10 @@ struct FakeServer {
     /// A read of this task waits for `release`.
     held: Mutex<Option<String>>,
     release: tokio::sync::Notify,
+    /// Every read hangs, as on a server that never answers.
+    hang: std::sync::atomic::AtomicBool,
+    /// The number of reads started.
+    gets: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeServer {
@@ -172,6 +176,12 @@ impl RemoteTaskTransport for FakeTransport {
         handle: &'a RemoteTaskHandle,
     ) -> RemoteFuture<'a, Result<RemoteTaskPoll, RemoteTaskError>> {
         Box::pin(async move {
+            self.0
+                .gets
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.0.hang.load(std::sync::atomic::Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             let held = self.0.held.lock().expect("held").clone();
             if held.as_deref() == Some(handle.task_id.as_str()) {
                 self.0.release.notified().await;
@@ -623,6 +633,23 @@ async fn the_poller_skips_a_run_that_has_ended() {
     .await
     .expect("resolve");
     assert!(!settled, "a push for an ended run settles nothing");
+    // The HTTP push routes call the core functions. They make the same check.
+    let completed = external_task::complete_externally_with_codecs(
+        &mut conn,
+        token,
+        json!({"result": {}}),
+        &PayloadCodecs::default(),
+    )
+    .await
+    .expect("complete");
+    assert!(
+        !completed,
+        "the complete route settles nothing for an ended run"
+    );
+    let failed = external_task::fail_externally(&mut conn, token, "late".into(), false)
+        .await
+        .expect("fail");
+    assert!(!failed, "the fail route settles nothing for an ended run");
     assert_eq!(task_state(url, token).await, "PENDING");
     p.stop().await;
 }
@@ -783,5 +810,32 @@ async fn the_first_read_waits_for_a_short_start_poll_interval() {
     wait_for_token(url, exec_id).await;
     let report = p.poller.poll_once(&p.pool).await.expect("poll");
     assert_eq!(report.polled, 0, "the start asked for 5 seconds");
+    p.stop().await;
+}
+
+/// After one read of a server times out, the poll sends no more reads to
+/// that server. A hanging server costs one wave of reads, not one per task.
+#[tokio::test]
+async fn a_hanging_server_costs_one_wave_per_poll() {
+    let db = setup().await;
+    let url = &db.url;
+    let server = Arc::new(FakeServer::default());
+    let p = Process::start(url, "remote-task-hang", &server);
+    for id in ["report-15", "report-16", "report-17"] {
+        let exec_id = start_run(url, id, json!({})).await;
+        wait_for_token(url, exec_id).await;
+    }
+    server.hang.store(true, std::sync::atomic::Ordering::SeqCst);
+    let poller = RemoteTaskPoller::new(&RemoteTasks::new(FakeTransport(Arc::clone(&server))))
+        .with_concurrency(1)
+        .with_get_timeout(Duration::from_millis(200));
+
+    let report = poller.poll_once(&p.pool).await.expect("poll");
+    assert_eq!(
+        server.gets.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one timeout stops the reads of that server"
+    );
+    assert_eq!((report.errors, report.skipped), (1, 2));
     p.stop().await;
 }

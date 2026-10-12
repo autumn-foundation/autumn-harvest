@@ -132,6 +132,8 @@ The remote server, or a relay, can settle a token without the poller:
   as `false`. `POST /activities/external/{token}/fail` takes
   `{"error": "…", "retryable": false}`.
 
+A push for a run that has ended settles nothing, on each path.
+
 A token is a capability: whoever holds it can settle the call. A relay must
 authenticate each push before it settles a token.
 `remote_task::pending_remote_tasks` lists each pending token with its

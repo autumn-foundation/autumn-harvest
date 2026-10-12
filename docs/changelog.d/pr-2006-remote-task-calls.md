@@ -34,6 +34,12 @@ restart loses nothing.
 **No migration. No new `WorkflowEvent` variant. No new route.** The plan is
 in `DESIGN-2006.md`. The guide is `docs/remote-tasks.md`.
 
+**Fix for every external activity.** `external_task::complete_externally`
+and `fail_externally`, and so the `/activities/external/{token}/complete`
+and `/fail` routes, now return `false` for a run that has ended. Before,
+a late push after a cancel appended an activity event after the terminal
+event.
+
 This change also drops the removed `refuse_erased_source` field from two
 tests, which did not compile on trunk-dev after #2103.
 

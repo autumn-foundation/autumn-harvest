@@ -5,7 +5,7 @@
 //! payload codecs. So the change needs no migration, and it keeps no
 //! plaintext copy of the handle.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -55,15 +55,17 @@ pub struct PendingRemoteTask {
 /// What one poll did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PollReport {
-    /// Remote reads that this poll sent.
+    /// Tokens due for a remote read in this poll.
     pub polled: usize,
     /// Tokens that this poll settled.
     pub settled: usize,
     /// Remote reads and settles that failed. Their tokens stay pending.
     pub errors: usize,
+    /// Due reads not sent, because their server timed out earlier in this
+    /// poll. Their tokens stay pending, with no backoff.
+    pub skipped: usize,
 }
 
-/// One page of the scan.
 /// One row of the page query: token, run, token time, database time.
 type PageRow = (
     uuid::Uuid,
@@ -72,6 +74,7 @@ type PageRow = (
     chrono::DateTime<chrono::Utc>,
 );
 
+/// One page of the scan.
 struct Page {
     items: Vec<PendingRemoteTask>,
     /// The last token that the query returned, decoded or not.
@@ -292,11 +295,11 @@ async fn settle(
             Settle::Fail(format!("remote task cancelled: {}", truncate(message)))
         }
     };
-    // One transaction holds the token row and the execution row, so a cancel
-    // cannot commit between the run check and the settle. The lock order is
-    // the token row, then the execution row, as in `docs/architecture.md`.
-    // The settle wakes the workflow, so the dispatch hint waits for this
-    // commit. The inner buffering scope passes its hints to this one.
+    // One transaction holds the token row from the name check to the settle.
+    // The core settle locks the execution row next and returns `false` for an
+    // ended run, so a cancel cannot slip in between. The settle wakes the
+    // workflow, so the dispatch hint waits for this commit. The inner
+    // buffering scope passes its hints to this one.
     crate::dispatch::buffered_settled(Box::pin(conn.transaction::<bool, HarvestError, _>(
         async |conn| {
             let task = crate::external_task::find_by_token_locked(conn, token)
@@ -306,16 +309,6 @@ async fn settle(
                 return Err(HarvestError::Config(format!(
                     "external task {token} is not a remote task token"
                 )));
-            }
-            let run_state: Option<String> = harvest_workflow_executions::table
-                .find(task.workflow_exec_id)
-                .select(harvest_workflow_executions::state)
-                .for_update()
-                .first(conn)
-                .await
-                .optional_row()?;
-            if !run_state.is_some_and(|s| LIVE_STATES.contains(&s.as_str())) {
-                return Ok(false);
             }
             match action {
                 Settle::Complete(output) => {
@@ -543,20 +536,41 @@ impl RemoteTaskPoller {
             polled: due.len(),
             ..PollReport::default()
         };
+        // A server whose read timed out gets no more reads in this poll. A
+        // hanging server then costs one wave of reads, not one per task, and
+        // the next page comes sooner.
+        let timed_out: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+        let timed_out = &timed_out;
         let mut reads = futures::stream::iter(interleave_by_server(due))
             .map(|pending| async move {
+                let server = &pending.handle.server;
+                if timed_out
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .contains(server)
+                {
+                    return (pending, None);
+                }
                 let read =
                     tokio::time::timeout(self.get_timeout, self.transport.get(&pending.handle))
                         .await
                         .unwrap_or_else(|_| {
+                            timed_out
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .insert(server.clone());
                             Err(RemoteTaskError::retryable("the remote read timed out"))
                         });
-                (pending, read)
+                (pending, Some(read))
             })
             .buffer_unordered(self.concurrency);
         // Settle each ended task when its read lands. A slow read must not
         // keep a result back until the token deadline passes.
         while let Some((pending, read)) = reads.next().await {
+            let Some(read) = read else {
+                report.skipped += 1;
+                continue;
+            };
             match read {
                 Ok(RemoteTaskPoll {
                     state,
