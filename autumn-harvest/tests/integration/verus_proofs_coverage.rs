@@ -228,6 +228,7 @@ fn every_verus_mirror_matches_its_engine_source() {
 }
 
 /// The `.rs` files under `autumn-harvest/src`, relative to the repo root.
+/// Each path joins its parts with `/` on every OS, as a mirror marker does.
 fn engine_files() -> Vec<String> {
     fn walk(dir: &Path, out: &mut Vec<String>) {
         for entry in std::fs::read_dir(dir).expect("read engine dir").flatten() {
@@ -236,7 +237,11 @@ fn engine_files() -> Vec<String> {
                 walk(&path, out);
             } else if path.extension().is_some_and(|e| e == "rs") {
                 let rel = path.strip_prefix(repo_root()).expect("under the repo root");
-                out.push(rel.to_string_lossy().into_owned());
+                let parts: Vec<_> = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                out.push(parts.join("/"));
             }
         }
     }
