@@ -121,6 +121,10 @@ No outcome other than `hit` and `cold` occurred in any run.
   explanation fits: a second workflow task for a run is claimed while the
   first decision holds the cache entry. The runs do not test it.
 - The agent loop ran each 12-turn configuration once.
+- A settled snapshot is a quiet interval, not proof of quiescence. A slow
+  decision attempt can still cross a phase boundary. The worker runs at most
+  eight decisions at once, so each boundary can move at most eight samples.
+  That bound is far below the 64 extra decisions.
 
 ## Next step
 
