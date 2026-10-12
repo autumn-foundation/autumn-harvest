@@ -30,7 +30,14 @@ log=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --checkout) mode=checkout ;;
-    --log) shift; log="${1:-}" ;;
+    --log)
+      if [ $# -lt 2 ] || [ "${2#--}" != "$2" ]; then
+        echo "--log needs a file path" >&2
+        exit 2
+      fi
+      shift
+      log="$1"
+      ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
