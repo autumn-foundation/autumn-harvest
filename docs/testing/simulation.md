@@ -199,7 +199,9 @@ separate steps, so a fire can use a stale snapshot.
 The workload is 3 workers, 3 client workflows and one schedule. A client
 workflow runs an activity, a timer, a signal wait and a second activity.
 Each step awaits one command, so each decision can stay resident. The
-schedule fires every 2 ticks, 3 times.
+schedule fires every 2 ticks, 3 times. Each scheduled run joins two
+activities, so a decision can resume the join with one result and park
+the other (issue #2008).
 
 Faults:
 
@@ -324,6 +326,36 @@ The replay runs the seed twice and prints the full trace. In
 and `w2.4` is worker 2 in its fourth incarnation. `c1` is client
 workflow 1, and `s0` is the first scheduled run. `a1` is the second
 activity of its execution.
+
+## The speculation model
+
+Issue #2011 asks whether a worker can run the next decision while the
+previous commit flushes. `autumn_harvest::dst::speculate` models that
+question. It is an R&D spike with no database. The engine does not use
+it. [The spike report](../rnd/speculative-execution-spike.md) gives
+the results and the verdict.
+
+The model is a discrete-event simulation. Its clock counts virtual
+microseconds, so it can measure latency. A seed fixes every duration and
+fault. The sweep runs every seed twice and compares the traces.
+
+| Knob | Values |
+|---|---|
+| `HARVEST_DST_SPEC_MODE` | `serial` (the engine today), `gated`, `eager` |
+| `HARVEST_DST_SPEC_FENCE` | `epoch`, `prefix-only` |
+| `HARVEST_DST_SPEC_LOGGING` | `full`, `reads-only` |
+| `HARVEST_DST_SPEC_PLANT` | `none`, `keep-on-failure`, `keep-tail` |
+| `HARVEST_DST_SPEC_WORKLOAD` | `chain`, `fan-out` |
+| `HARVEST_DST_SPEC_CHECKS` | a comma-separated list of invariant names |
+
+```sh
+HARVEST_DST_SEEDS=1000 HARVEST_DST_SPEC_MODE=gated \
+  cargo test --release -p autumn-harvest --no-default-features --test dst \
+  speculate::speculation_sweep -- --nocapture
+```
+
+A failure prints the replay command. It sets `HARVEST_DST_SEED` and runs
+`speculate::replay_one_speculation_seed`.
 
 ## Add an operation
 

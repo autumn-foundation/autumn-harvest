@@ -242,7 +242,10 @@ fn spike_switchint_targets_are_all_recorded() {
     let doc = parse_fixture("spike.mir");
     let wf = body(&doc, "wf::{closure#0}");
     // bb0: `switchInt(move _60) -> [0: bb1, 1: bb48, 2: bb47, 3: bb46, otherwise: bb11];`
-    let Terminator::SwitchInt { operand, targets } = &block(wf, "bb0").terminator else {
+    let Terminator::SwitchInt {
+        operand, targets, ..
+    } = &block(wf, "bb0").terminator
+    else {
         panic!("bb0 must end in a SwitchInt");
     };
     assert_eq!(*operand, Operand::Move(local(60)));
@@ -789,6 +792,7 @@ fn terminator_successors_excludes_unwind_edges() {
         Terminator::SwitchInt {
             operand: Operand::Move(local(3)),
             targets: vec!["bb1".into(), "bb2".into()],
+            values: vec!["0".into(), "otherwise".into()],
         }
         .successors(),
         vec!["bb1", "bb2"]

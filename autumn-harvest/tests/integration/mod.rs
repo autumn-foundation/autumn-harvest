@@ -16,6 +16,7 @@ mod activity_interceptor_tests;
 mod activity_outcome_metrics_tests;
 #[cfg(feature = "db")]
 mod activity_pause_tests;
+mod activity_side_effect_schema_tests;
 #[cfg(feature = "db")]
 mod activity_timeout_retry_tests;
 mod adaptive_limit_tests;
@@ -145,6 +146,7 @@ mod drain_release_tests;
 #[cfg(feature = "db")]
 mod dst_differential_tests;
 mod dst_world_tests;
+mod durable_stream_tests;
 mod e2e_bench_cell_timeout_tests;
 mod e2e_bench_support;
 #[cfg(feature = "db")]
@@ -270,6 +272,8 @@ mod replay_verifier_tests;
 mod replayer_integration_tests;
 #[cfg(feature = "testing")]
 mod replayer_tests;
+#[cfg(feature = "db")]
+mod resident_outcome_tests;
 mod retention_overrides_tests;
 mod retention_reclaim_support;
 mod retention_summary_tests;
@@ -319,6 +323,7 @@ mod signal_with_start_tests;
 mod sla_breach_tests;
 mod slo_pack_docs;
 mod slot_tuner_tests;
+mod speculative_execution_docs;
 mod sqlite_feasibility_docs;
 mod standalone_activity_docs;
 #[cfg(feature = "db")]

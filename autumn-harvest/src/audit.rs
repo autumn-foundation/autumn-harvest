@@ -555,6 +555,10 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     // SSE ephemeral workflow progress stream (issue #791): read-only side
     // channel over LISTEN/NOTIFY, never mutates state. NOT admin-gated (AC5).
     ("GET /workflows/{id}/stream", RouteClass::ReadOnly),
+    // Durable output stream (issue #1974): reads stored chunks, writes nothing.
+    ("GET /workflows/{id}/stream/durable", RouteClass::ReadOnly),
+    // Live list signal (issue #1982): read-only, never mutates state.
+    ("GET /workflows/changes/stream", RouteClass::ReadOnly),
     // ── Mutating ── modifies workflow execution or system configuration ───────
     // All of these are covered by the audit trail (harvest_audit_log) or are
     // explicitly listed in EXCLUDED_ROUTES with an audit disposition note.
@@ -1070,6 +1074,11 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     // Ephemeral progress stream (issue #791): read-only, no audit trail
     // (disposable side channel; no open/close audit rows are written).
     "GET /workflows/{id}/stream",
+    // Durable output stream (issue #1974): read-only, not audited.
+    "GET /workflows/{id}/stream/durable",
+    // Live list signal (issue #1982): read-only. Its frames hold a count only,
+    // so the stream writes no audit row.
+    "GET /workflows/changes/stream",
     // Build routing reads and the retire safety check never write audit rows.
     "GET /admin/build-routing",
     "GET /admin/build-routing/compat",
@@ -1314,6 +1323,10 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /executions/{exec_id}/events/stream", None),
     // Ephemeral progress stream (issue #791): read-only, not audited.
     ("GET /workflows/{id}/stream", None),
+    // Durable output stream (issue #1974): read-only, not audited.
+    ("GET /workflows/{id}/stream/durable", None),
+    // Live list signal (issue #1982): read-only, not audited.
+    ("GET /workflows/changes/stream", None),
     // Build routing management (issue #362)
     ("GET /admin/build-routing", None),
     (

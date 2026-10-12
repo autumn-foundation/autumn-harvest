@@ -6223,6 +6223,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }])
             .state(String::from("haunted"))
             .build();
@@ -6435,6 +6437,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         }
     }
 
@@ -6460,6 +6464,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         }
     }
 
@@ -7410,6 +7416,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }])
             .try_build();
         assert!(result.is_ok());
@@ -7708,6 +7716,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         let act2 = ActivityInfo {
             name: "act2",
@@ -7730,6 +7740,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
 
         let result = HarvestBuilder::new()
@@ -7767,6 +7779,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
 
         let result = HarvestBuilder::new().activities(vec![act]).try_build();
@@ -7806,6 +7820,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         let result = HarvestBuilder::new().activities(vec![act]).try_build();
         assert!(
@@ -7852,6 +7868,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         let result = HarvestBuilder::new().activities(vec![act]).try_build();
         assert!(
@@ -7894,6 +7912,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         assert!(
             HarvestBuilder::new()
@@ -7934,6 +7954,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         let result = HarvestBuilder::new().activities(vec![act]).try_build();
         assert!(
@@ -7982,6 +8004,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         }
     }
 

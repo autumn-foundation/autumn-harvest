@@ -179,6 +179,8 @@ fn local_activity_circuit_breaker_is_not_tracked() {
         )),
         requires: None,
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        input_schema: None,
+        output_schema: None,
     };
     let reg = HandlerRegistry::new(vec![], vec![local_with_breaker]);
     let breakers = reg.circuit_breakers();

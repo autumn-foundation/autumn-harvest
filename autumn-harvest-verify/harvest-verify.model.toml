@@ -84,10 +84,11 @@
 # model error, not a warning, because an unexplained rule is how a model rots.
 #
 # The version string is printed with every verdict ("no non-determinism found,
-# under model 2026.10.0, up to boundaries ..."), so a verdict can always be
-# traced to the rules that produced it. Bump the date component when rows change.
+# under model 2026.10.1, up to boundaries ..."), so a verdict can always be
+# traced to the rules that produced it. Bump the date component when rows change,
+# or when the analysis gives another structure manifest for the same MIR.
 
-version = "2026.10.0"
+version = "2026.10.1"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # AMBIENT TYPES — statics of these types are taint roots
@@ -1557,6 +1558,10 @@ reason = "context.rs:3556; test constructor."
 path = "parent_execution_id"
 receiver = "WorkflowContext"
 reason = "context.rs:4069; workflow-execution identity metadata, fixed at start and identical on every replay and every worker."
+[[non_sink]]
+path = "publish_durable_progress"
+receiver = "WorkflowContext"
+reason = "context.rs:13842. Issue #1974. The chunk goes to a side table and is never replayed. On replay the call pushes no command."
 [[non_sink]]
 path = "publish_progress"
 receiver = "WorkflowContext"

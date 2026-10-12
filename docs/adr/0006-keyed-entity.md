@@ -115,8 +115,8 @@ A native primitive stays at rank 13, behind customer pull.
   the first state. Clients send `{}` or no input.
 - A handler panic fails the run, as in any workflow. The next op then
   starts a new entity from the default state.
-- The SQLite backend has no continue-as-new and no queries. It cannot run an
-  entity.
+- The SQLite backend has no queries. It cannot run an entity. (Issue #2023
+  later added `continue_as_new` to it.)
 
 ## Alternatives considered
 

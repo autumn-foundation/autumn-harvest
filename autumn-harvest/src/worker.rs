@@ -52,7 +52,8 @@ use crate::signal;
 use crate::store;
 use crate::telemetry::{
     ATTR_ACTIVITY_NAME, ATTR_ATTEMPT, ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID,
-    ATTR_WORKFLOW_ID, ActivityStatus, DbOp, SlotType, TraceContextCarrier, WorkflowStatus,
+    ATTR_WORKFLOW_ID, ActivityStatus, DbOp, ResidentOutcome, SlotType, TraceContextCarrier,
+    WorkflowStatus,
 };
 use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, IdempotencyKey, ParentClosePolicy, ShardId,
@@ -556,6 +557,8 @@ fn session_internal_activity_info(name: &'static str) -> ActivityInfo {
         circuit_breaker: None,
         requires: None,
         handler: session_internal_stub_handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -1847,6 +1850,7 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::UpsertSearchAttributes { .. } => "UpsertSearchAttributes",
         WorkflowCommand::SetCurrentDetails { .. } => "SetCurrentDetails",
         WorkflowCommand::PublishProgress { .. } => "PublishProgress",
+        WorkflowCommand::PublishDurableProgress { .. } => "PublishDurableProgress",
         WorkflowCommand::RecordLog { .. } => "RecordLog",
         WorkflowCommand::SignalExternalWorkflow { .. } => "SignalExternalWorkflow",
         WorkflowCommand::RequestCancelExternalWorkflow { .. } => "RequestCancelExternalWorkflow",
@@ -1915,6 +1919,7 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::PublishProgress { .. }
+                | WorkflowCommand::PublishDurableProgress { .. }
                 | WorkflowCommand::RecordLog { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
@@ -1938,6 +1943,7 @@ fn only_bookkeeping_commands(commands: &[WorkflowCommand]) -> bool {
                     | WorkflowCommand::UpsertSearchAttributes { .. }
                     | WorkflowCommand::SetCurrentDetails { .. }
                     | WorkflowCommand::PublishProgress { .. }
+                    | WorkflowCommand::PublishDurableProgress { .. }
                     | WorkflowCommand::RecordLog { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                     | WorkflowCommand::CancelRaceLosers { .. }
@@ -1970,6 +1976,7 @@ fn should_handle_mutex_acquire(commands: &[WorkflowCommand]) -> bool {
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
@@ -2050,8 +2057,8 @@ struct PreparedWorkflowTask {
     cold_history_bytes: Option<u64>,
     /// The byte mark taken with a warm cache entry (issue #1804).
     cached_history_bytes: Option<crate::cache::HistoryBytesMark>,
-    /// The resident workflow of a warm hit, if any (issue #1798).
-    resident: Option<crate::resident::ResidentWorkflow>,
+    /// The resident state of a warm hit (issue #1798, issue #2007).
+    resident: crate::resident::Residency,
     /// Index in `history_events` of the first event after the cached
     /// snapshot. The resident workflow resumes with the events from here.
     delta_start: usize,
@@ -2348,13 +2355,14 @@ const fn workflow_command_variant_index(cmd: &WorkflowCommand) -> usize {
         WorkflowCommand::CancelTimer { .. } => 23,
         WorkflowCommand::AcquireMutex { .. } => 24,
         WorkflowCommand::ReleaseMutex { .. } => 25,
+        WorkflowCommand::PublishDurableProgress { .. } => 26,
     }
 }
 
 /// Number of `WorkflowCommand` variants, as indexed by
 /// [`workflow_command_variant_index`].
 #[cfg(test)]
-const WORKFLOW_COMMAND_VARIANTS: usize = 26;
+const WORKFLOW_COMMAND_VARIANTS: usize = 27;
 
 impl TerminalCommandPolicy {
     /// Discriminant label, so the AC4 audit table can state each variant's
@@ -2410,6 +2418,9 @@ pub(crate) const fn terminal_command_policy(cmd: &WorkflowCommand) -> TerminalCo
         }
         WorkflowCommand::PublishProgress { .. } => {
             TerminalCommandPolicy::SidePath("notify_progress_from_commands")
+        }
+        WorkflowCommand::PublishDurableProgress { .. } => {
+            TerminalCommandPolicy::SidePath("persist_durable_stream_from_commands")
         }
         WorkflowCommand::CancelRaceLosers { .. } => {
             TerminalCommandPolicy::SidePath("apply_race_loser_cancellations")
@@ -2848,6 +2859,7 @@ fn extract_single_command<T>(
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::PublishProgress { .. }
+                | WorkflowCommand::PublishDurableProgress { .. }
                 | WorkflowCommand::RecordLog { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
@@ -2881,6 +2893,7 @@ fn extract_all_scheduled_activities(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
@@ -2935,6 +2948,7 @@ fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<Activi
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
@@ -2995,6 +3009,7 @@ fn extract_started_timer_for_suspension(
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::PublishProgress { .. }
+                | WorkflowCommand::PublishDurableProgress { .. }
                 | WorkflowCommand::RecordLog { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
@@ -3025,6 +3040,7 @@ fn extract_all_started_child_workflows(
                     | WorkflowCommand::UpsertSearchAttributes { .. }
                     | WorkflowCommand::SetCurrentDetails { .. }
                     | WorkflowCommand::PublishProgress { .. }
+                    | WorkflowCommand::PublishDurableProgress { .. }
                     | WorkflowCommand::RecordLog { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                     | WorkflowCommand::CancelRaceLosers { .. }
@@ -3150,6 +3166,7 @@ fn extract_child_timeout_race(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
             | WorkflowCommand::ReleaseMutex { .. } => {}
@@ -3307,6 +3324,7 @@ fn extract_mixed_suspension_batch(commands: &[WorkflowCommand]) -> Option<MixedS
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
@@ -3700,6 +3718,7 @@ fn extract_run_local_activity(commands: Vec<WorkflowCommand>) -> LocalActivityCo
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::ReleaseMutex { .. } => {}
             // A resolved ctx.race() CAN co-batch CancelRaceLosers with a local
             // activity. The loser branches started on an earlier cycle, so no
@@ -4029,6 +4048,7 @@ fn split_mixed_signal_batch(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. } => {}
             other => remaining.push(other),
         }
@@ -8242,6 +8262,7 @@ fn first_persist_capability_miss(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SignalExternalWorkflow { .. }
             | WorkflowCommand::RequestCancelExternalWorkflow { .. }
@@ -10522,6 +10543,64 @@ async fn notify_progress_from_commands(
             "progress chunks exceeded per-cycle ceiling; excess dropped (best-effort)"
         );
     }
+}
+
+/// Collect this cycle's durable stream chunks, in emission order (issue #1974).
+///
+/// Pure. The offset is a `u64` call ordinal and the column is an `i64`. The
+/// cast clamps below [`store::DURABLE_STREAM_TRUNCATION_OFFSET`], so a real
+/// chunk can never take the marker slot.
+fn collect_durable_stream_chunks(commands: &[WorkflowCommand]) -> Vec<store::DurableStreamChunk> {
+    commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            WorkflowCommand::PublishDurableProgress { offset, chunk } => {
+                Some(store::DurableStreamChunk {
+                    offset: i64::try_from(*offset)
+                        .unwrap_or(i64::MAX)
+                        .min(store::DURABLE_STREAM_TRUNCATION_OFFSET - 1),
+                    chunk: chunk.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Store this cycle's durable stream chunks and wake their readers
+/// (issue #1974).
+///
+/// **Not best-effort.** The rows go into the persist transaction, and an
+/// error fails the cycle the same way as `persist_current_details_from_commands`.
+/// A committed cycle therefore holds all of its chunks, so a reader sees no
+/// gap. A cycle with no durable chunk runs no statement.
+///
+/// The wake is one note per cycle. The post-commit sender sends it after the
+/// write commits, so a full `NOTIFY` queue cannot fail the write (issue
+/// #1796). A reader treats the wake as a hint and reads the table.
+async fn persist_durable_stream_from_commands(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    commands: &[WorkflowCommand],
+) -> HarvestResult<()> {
+    let chunks = collect_durable_stream_chunks(commands);
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    // One transaction for the rows and the wake. The inline paths call this
+    // on a bare connection, and inside a persist transaction it is a
+    // savepoint.
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |c| {
+        store::append_stream_chunks(
+            c,
+            exec_id,
+            &chunks,
+            crate::context::DURABLE_STREAM_MAX_CHUNKS,
+        )
+        .await?;
+        crate::notify::notify_durable_stream(c, exec_id.as_uuid()).await
+    }))
+    .await
 }
 
 /// Per-decision-cycle ceiling on the number of `ctx.publish_progress` chunks the
@@ -21034,6 +21113,19 @@ async fn handle_suspended_workflow(
         )
         .await;
     }
+    // Store durable stream chunks (issue #1974). An error fails the cycle.
+    if let Err(e) =
+        persist_durable_stream_from_commands(conn, context.persistence.exec_id, commands).await
+    {
+        return fail_execution_on_error(
+            conn,
+            context.persistence.task,
+            context.persistence.worker_id,
+            Err(e),
+            registry.payload_codecs(),
+        )
+        .await;
+    }
     // Persist durable workflow logs (issue #790) — best-effort, never fails
     // the cycle. No-op when the sink is disabled (the default).
     if let Some(policy) = registry.workflow_log_policy {
@@ -21746,13 +21838,36 @@ fn delta_is_contiguous(from_event_id: i32, delta: &store::EventHistory) -> bool 
         .is_ok_and(|span| span == delta.events.len())
 }
 
+/// The resident outcome of a warm hit before its first drive (issue #2007).
+///
+/// A parked workflow counts as a hit. A decline of its resume changes the
+/// outcome to [`ResidentOutcome::Declined`].
+const fn resident_outcome_before_drive(residency: &crate::resident::Residency) -> ResidentOutcome {
+    match residency {
+        crate::resident::Residency::Parked(_) => ResidentOutcome::Hit,
+        crate::resident::Residency::Missed(reason) => *reason,
+        crate::resident::Residency::Unknown => ResidentOutcome::Cold,
+    }
+}
+
+/// The resident state of a suspension that cannot stay resident (issue
+/// #2007). A hot-swap module wins over `reason`, because it binds around
+/// every drive.
+const fn final_miss(hot_swapped: bool, reason: ResidentOutcome) -> crate::resident::Residency {
+    crate::resident::Residency::Missed(if hot_swapped {
+        ResidentOutcome::HotSwap
+    } else {
+        reason
+    })
+}
+
 /// Puts a taken cache entry back, and drops any displaced entry outside the
 /// lock (issue #1798).
 async fn put_back_cache_entry(
     workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
     exec_uuid: uuid::Uuid,
     state: crate::cache::CachedWorkflowState,
-    resident: Option<crate::resident::ResidentWorkflow>,
+    resident: crate::resident::Residency,
     history_bytes: Option<crate::cache::HistoryBytesMark>,
 ) {
     let displaced = workflow_cache
@@ -21877,7 +21992,9 @@ async fn prepare_workflow_task_with_cache(
         // delta is not the plain run of events the snapshot expects.
         let contiguous = delta_is_contiguous(cached_state.next_event_id, &existing_delta)
             && delta_is_contiguous(existing_delta.next_event_id, &after_ingest);
-        resident = resident.filter(|_| contiguous);
+        if !contiguous && resident.is_parked() {
+            resident = crate::resident::Residency::Missed(ResidentOutcome::Declined);
+        }
 
         // Reconstruct full history: cached snapshot + any pre-existing delta +
         // ingested timer/signal events.
@@ -21930,7 +22047,7 @@ async fn prepare_workflow_task_with_cache(
             was_cache_hit: false,
             cold_history_bytes: Some(history_bytes),
             cached_history_bytes: None,
-            resident: None,
+            resident: crate::resident::Residency::Unknown,
             delta_start,
             resident_enabled,
         }))
@@ -24037,6 +24154,7 @@ async fn persist_terminal_outcome_commands(
     .await?;
     persist_search_attrs_from_commands(conn, persistence.exec_id, pending_cmds).await?;
     persist_current_details_from_commands(conn, persistence.exec_id, pending_cmds).await?;
+    persist_durable_stream_from_commands(conn, persistence.exec_id, pending_cmds).await?;
     // Persist durable workflow logs (issue #790) — best-effort, never fails the cycle.
     if let Some(policy) = registry.workflow_log_policy {
         persist_workflow_logs_from_commands(
@@ -25408,16 +25526,26 @@ async fn process_workflow_task(
     let decision_start_event_id = prepared.next_event_id;
     // Issue #1798: the resident workflow of a warm hit. The first iteration
     // tries to resume it. A decline replays cold, as on a miss.
-    let mut warm_resident = prepared.resident.take();
-    // The resident workflow of the final cycle, kept for the next decision.
-    let mut final_resident: Option<crate::resident::ResidentWorkflow> = None;
+    let warm_residency = std::mem::take(&mut prepared.resident);
+    // Issue #2007: the resident outcome of this decision. The worker
+    // records it once, after the first drive.
+    let mut resident_outcome = prepared.resident_enabled.then(|| {
+        if prepared.was_cache_hit {
+            resident_outcome_before_drive(&warm_residency)
+        } else {
+            ResidentOutcome::Cold
+        }
+    });
+    let mut warm_resident = warm_residency.into_workflow();
+    // The resident state of the final cycle, kept for the next decision.
+    let mut final_resident: crate::resident::Residency;
     // A module-hosted workflow binds its module around one drive only, so
     // it cannot stay resident.
     #[cfg(feature = "hot-code-swap")]
-    let can_stay_resident =
-        prepared.resident_enabled && !crate::hot_swap::is_module_hosted(workflow.handler);
+    let hot_swapped = crate::hot_swap::is_module_hosted(workflow.handler);
     #[cfg(not(feature = "hot-code-swap"))]
-    let can_stay_resident = prepared.resident_enabled;
+    let hot_swapped = false;
+    let can_stay_resident = prepared.resident_enabled && !hot_swapped;
 
     // Issue #678/#1034: external-op ids resolved INLINE during this decision
     // cycle. Set by the mixed-signal arm below (any suspension whose command
@@ -25553,11 +25681,14 @@ async fn process_workflow_task(
                     .await
                 {
                     Ok(drive) => return drive,
-                    Err(reason) => tracing::debug!(
-                        exec_id = %prepared.exec_id,
-                        ?reason,
-                        "resident workflow declined; replaying cold (issue #1798)"
-                    ),
+                    Err(reason) => {
+                        resident_outcome = Some(ResidentOutcome::Declined);
+                        tracing::debug!(
+                            exec_id = %prepared.exec_id,
+                            ?reason,
+                            "resident workflow declined; replaying cold (issue #1798)"
+                        );
+                    }
                 }
             }
             let ctx = crate::executor::build_task_context(
@@ -25625,6 +25756,14 @@ async fn process_workflow_task(
             router: resolved_router,
             resident: iter_resident,
         } = drive;
+        // Issue #2007: one sample per decision, after its first drive.
+        if let Some(outcome) = resident_outcome.take() {
+            telemetry.metrics.record_workflow_resident(
+                &prepared.execution.workflow_name,
+                &task.queue_name,
+                outcome,
+            );
+        }
 
         match run_outcome {
             WorkflowOutcome::Suspended { commands }
@@ -25683,6 +25822,8 @@ async fn process_workflow_task(
                 persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await?;
                 // Persist the current_details breadcrumb before inline execution (issue #473).
                 persist_current_details_from_commands(conn, prepared.exec_id, &commands).await?;
+                // Store durable stream chunks before inline execution (issue #1974).
+                persist_durable_stream_from_commands(conn, prepared.exec_id, &commands).await?;
                 // Persist durable workflow logs (issue #790) — best-effort, before inline run.
                 if let Some(policy) = registry.workflow_log_policy {
                     persist_workflow_logs_from_commands(
@@ -26035,6 +26176,7 @@ async fn process_workflow_task(
                             | WorkflowCommand::UpsertSearchAttributes { .. }
                             | WorkflowCommand::SetCurrentDetails { .. }
                             | WorkflowCommand::PublishProgress { .. }
+                            | WorkflowCommand::PublishDurableProgress { .. }
                             | WorkflowCommand::RecordLog { .. }
                             | WorkflowCommand::ReleaseMutex { .. }
                     )
@@ -26099,6 +26241,21 @@ async fn process_workflow_task(
                 }
                 if let Err(e) =
                     persist_current_details_from_commands(conn, prepared.exec_id, &commands).await
+                {
+                    return fail_workflow_execution_clearing_strikes(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(e),
+                        workflow_panic_strikes,
+                        prepared.exec_id.as_uuid(),
+                        registry.payload_codecs(),
+                    )
+                    .await;
+                }
+                // Store durable stream chunks (issue #1974). An error fails the cycle.
+                if let Err(e) =
+                    persist_durable_stream_from_commands(conn, prepared.exec_id, &commands).await
                 {
                     return fail_workflow_execution_clearing_strikes(
                         conn,
@@ -26282,6 +26439,8 @@ async fn process_workflow_task(
                     // Re-acquire a fresh execute_span so persist_workflow_outcome
                     // (via handle_suspended_workflow) gets a valid span reference.
                     let execute_span = tracing::Span::none();
+                    // Issue #2007: an external-op batch cannot stay resident.
+                    final_resident = final_miss(hot_swapped, ResidentOutcome::Unsupported);
                     break (
                         WorkflowOutcome::Suspended {
                             commands: reconstructed_commands,
@@ -26362,6 +26521,21 @@ async fn process_workflow_task(
                 }
                 if let Err(e) =
                     persist_current_details_from_commands(conn, prepared.exec_id, &commands).await
+                {
+                    return fail_workflow_execution_clearing_strikes(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(e),
+                        workflow_panic_strikes,
+                        prepared.exec_id.as_uuid(),
+                        registry.payload_codecs(),
+                    )
+                    .await;
+                }
+                // Store durable stream chunks (issue #1974). An error fails the cycle.
+                if let Err(e) =
+                    persist_durable_stream_from_commands(conn, prepared.exec_id, &commands).await
                 {
                     return fail_workflow_execution_clearing_strikes(
                         conn,
@@ -26474,6 +26648,8 @@ async fn process_workflow_task(
                 // (via handle_suspended_workflow) gets a valid span reference.
                 // The original span was dropped above.
                 let execute_span = tracing::Span::none();
+                // Issue #2007: an external-op batch cannot stay resident.
+                final_resident = final_miss(hot_swapped, ResidentOutcome::Unsupported);
                 break (
                     WorkflowOutcome::Suspended {
                         commands: remaining_commands_with_unresolved,
@@ -26484,7 +26660,11 @@ async fn process_workflow_task(
                 );
             }
             other => {
-                final_resident = iter_resident;
+                final_resident = if hot_swapped {
+                    final_miss(hot_swapped, ResidentOutcome::HotSwap)
+                } else {
+                    iter_resident
+                };
                 break (other, pending_cmds, execute_span, resolved_router);
             }
         }
@@ -27477,7 +27657,7 @@ async fn process_workflow_task(
                     events: std::mem::take(&mut history_events),
                     next_event_id,
                 },
-                final_resident.take(),
+                std::mem::take(&mut final_resident),
                 history_bytes,
             )
             .await;
@@ -27707,7 +27887,7 @@ async fn store_cache_entry(
     exec_uuid: uuid::Uuid,
     suspended: Option<bool>,
     state: crate::cache::CachedWorkflowState,
-    resident: Option<crate::resident::ResidentWorkflow>,
+    resident: crate::resident::Residency,
     // Issue #1804: the byte mark measured at the start of this decision.
     history_bytes: Option<crate::cache::HistoryBytesMark>,
 ) {
@@ -42387,6 +42567,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
 
         let registry = HandlerRegistry::new(vec![wf], vec![act]);
@@ -42493,6 +42675,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }
         }
         let global = crate::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
@@ -42587,6 +42771,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }
         }
 
@@ -42634,6 +42820,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }
         }
 
@@ -43618,6 +43806,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         }
     }
 
@@ -45990,6 +46180,8 @@ mod tests {
             circuit_breaker: None,
             requires: Some("gpu = true"),
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![act]));
         match Worker::new(default_runtime_config(), registry) {
@@ -46021,6 +46213,8 @@ mod tests {
             circuit_breaker: None,
             requires: Some("gpu = true"),
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
 
         let act2 = ActivityInfo {
@@ -46044,6 +46238,8 @@ mod tests {
             circuit_breaker: None,
             requires: Some("region in [us-east-1, us-west-2]"),
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
 
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![act1, act2]));
@@ -48145,6 +48341,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }],
         )
     }
@@ -51868,6 +52066,14 @@ mod tests {
                 "side-path",
             ),
             (
+                "PublishDurableProgress",
+                WorkflowCommand::PublishDurableProgress {
+                    offset: 1,
+                    chunk: Value::Null,
+                },
+                "side-path",
+            ),
+            (
                 "CancelRaceLosers",
                 WorkflowCommand::CancelRaceLosers {
                     activities: Vec::new(),
@@ -52109,6 +52315,10 @@ mod tests {
             ("SetCurrentDetails", "persist_current_details_from_commands"),
             ("RecordLog", "persist_workflow_logs_from_commands"),
             ("PublishProgress", "notify_progress_from_commands"),
+            (
+                "PublishDurableProgress",
+                "persist_durable_stream_from_commands",
+            ),
             ("CancelRaceLosers", "apply_race_loser_cancellations"),
             ("ReleaseMutex", "mutex::sweep_terminal_holder_and_wake"),
         ];

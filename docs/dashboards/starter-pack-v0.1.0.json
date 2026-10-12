@@ -3832,6 +3832,55 @@
           "description": "Warm-cache hit ratio on the worker hot path (issue #235). A low ratio with sticky routing enabled means affinity is not landing."
         },
         {
+          "id": 542904,
+          "type": "timeseries",
+          "title": "Resident workflow hit rate and miss reasons (issue #2007)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 108
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (outcome) (rate(harvest_workflow_resident_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval])) / scalar(sum (rate(harvest_workflow_resident_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval])))",
+              "legendFormat": "{{outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Share of workflow decisions by resident outcome. `hit` resumed the parked workflow. Each other series names why a decision replayed history (issues #1798, #2007, #2008)."
+        },
+        {
           "id": 63,
           "type": "timeseries",
           "title": "Retention deletions by workflow type",
