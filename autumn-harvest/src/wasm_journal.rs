@@ -625,17 +625,36 @@ fn next_outcome(
 }
 
 /// Keep a response within [`MAX_HOST_CALL_BYTES`], or turn it into an error.
-fn bounded_response(response: &Value) -> HostCallOutcome {
-    let text = response.to_string();
-    if text.len() <= MAX_HOST_CALL_BYTES {
-        HostCallOutcome::Ok { response: text }
-    } else {
-        HostCallOutcome::Err {
-            message: format!(
-                "host call response ({} bytes) exceeds the {MAX_HOST_CALL_BYTES}-byte limit",
-                text.len()
-            ),
+///
+/// The encoder writes into a capped buffer and stops at the bound. A large
+/// response is never held whole as text.
+fn bounded_response<T: Serialize + ?Sized>(response: &T) -> HostCallOutcome {
+    let mut out = CappedWriter(Vec::new());
+    let text = serde_json::to_writer(&mut out, response)
+        .ok()
+        .and_then(|()| String::from_utf8(out.0).ok());
+    text.map_or_else(
+        || HostCallOutcome::Err {
+            message: format!("host call response exceeds the {MAX_HOST_CALL_BYTES}-byte limit"),
+        },
+        |response| HostCallOutcome::Ok { response },
+    )
+}
+
+/// A buffer that refuses a write past [`MAX_HOST_CALL_BYTES`].
+struct CappedWriter(Vec<u8>);
+
+impl std::io::Write for CappedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.0.len() + bytes.len() > MAX_HOST_CALL_BYTES {
+            return Err(std::io::Error::other("over the host-call byte bound"));
         }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -1127,6 +1146,41 @@ mod tests {
         };
         let defect = journal_defect(&journal).expect("an oversized entry is a defect");
         assert!(defect.starts_with("journal entry 0"), "{defect}");
+    }
+
+    /// The encoder stops at the bound, so an oversized response is never
+    /// held whole as text.
+    #[test]
+    fn an_oversized_response_stops_encoding_at_the_bound() {
+        struct Endless(std::cell::Cell<usize>);
+        impl Serialize for Endless {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeSeq;
+                let mut seq = serializer.serialize_seq(None)?;
+                for _ in 0..10_000 {
+                    self.0.set(self.0.get() + 1);
+                    seq.serialize_element(&"\u{1}".repeat(1024))?;
+                }
+                seq.end()
+            }
+        }
+
+        let endless = Endless(std::cell::Cell::new(0));
+        let outcome = bounded_response(&endless);
+        assert!(
+            matches!(outcome, HostCallOutcome::Err { .. }),
+            "{outcome:?}"
+        );
+        let per_item = escaped_len(&"\u{1}".repeat(1024));
+        assert!(endless.0.get() <= MAX_HOST_CALL_BYTES / per_item + 2);
+
+        let small = bounded_response(&serde_json::json!({ "ok": "\u{1}" }));
+        assert_eq!(
+            small,
+            HostCallOutcome::Ok {
+                response: r#"{"ok":"\u0001"}"#.into()
+            }
+        );
     }
 
     #[test]
