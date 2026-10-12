@@ -1330,6 +1330,7 @@ pub fn live_effect_refusal(commands: &[WorkflowCommand]) -> Option<&'static str>
         | WorkflowCommand::UpsertSearchAttributes { .. }
         | WorkflowCommand::SetCurrentDetails { .. }
         | WorkflowCommand::PublishProgress { .. }
+        | WorkflowCommand::PublishDurableProgress { .. }
         | WorkflowCommand::RecordLog { .. }
         | WorkflowCommand::AwaitExternalWorkflow { .. }
         | WorkflowCommand::CancelRaceLosers { .. }
@@ -2956,6 +2957,12 @@ mod tests {
             details: json!({}),
         };
         assert_eq!(live_effect_refusal(&[marker]), None);
+        // A durable stream chunk goes to the stream of the fork itself.
+        let chunk = WorkflowCommand::PublishDurableProgress {
+            offset: 0,
+            chunk: json!({ "n": 1 }),
+        };
+        assert_eq!(live_effect_refusal(&[chunk]), None);
         let (lock_tx, _lock_rx) = tokio::sync::oneshot::channel();
         let acquire = WorkflowCommand::AcquireMutex {
             key: "acct-1".to_string(),

@@ -1842,6 +1842,7 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::UpsertSearchAttributes { .. } => "UpsertSearchAttributes",
         WorkflowCommand::SetCurrentDetails { .. } => "SetCurrentDetails",
         WorkflowCommand::PublishProgress { .. } => "PublishProgress",
+        WorkflowCommand::PublishDurableProgress { .. } => "PublishDurableProgress",
         WorkflowCommand::RecordLog { .. } => "RecordLog",
         WorkflowCommand::SignalExternalWorkflow { .. } => "SignalExternalWorkflow",
         WorkflowCommand::RequestCancelExternalWorkflow { .. } => "RequestCancelExternalWorkflow",
@@ -1910,6 +1911,7 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::PublishProgress { .. }
+                | WorkflowCommand::PublishDurableProgress { .. }
                 | WorkflowCommand::RecordLog { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
@@ -1933,6 +1935,7 @@ fn only_bookkeeping_commands(commands: &[WorkflowCommand]) -> bool {
                     | WorkflowCommand::UpsertSearchAttributes { .. }
                     | WorkflowCommand::SetCurrentDetails { .. }
                     | WorkflowCommand::PublishProgress { .. }
+                    | WorkflowCommand::PublishDurableProgress { .. }
                     | WorkflowCommand::RecordLog { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                     | WorkflowCommand::CancelRaceLosers { .. }
@@ -1965,6 +1968,7 @@ fn should_handle_mutex_acquire(commands: &[WorkflowCommand]) -> bool {
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
@@ -2343,13 +2347,14 @@ const fn workflow_command_variant_index(cmd: &WorkflowCommand) -> usize {
         WorkflowCommand::CancelTimer { .. } => 23,
         WorkflowCommand::AcquireMutex { .. } => 24,
         WorkflowCommand::ReleaseMutex { .. } => 25,
+        WorkflowCommand::PublishDurableProgress { .. } => 26,
     }
 }
 
 /// Number of `WorkflowCommand` variants, as indexed by
 /// [`workflow_command_variant_index`].
 #[cfg(test)]
-const WORKFLOW_COMMAND_VARIANTS: usize = 26;
+const WORKFLOW_COMMAND_VARIANTS: usize = 27;
 
 impl TerminalCommandPolicy {
     /// Discriminant label, so the AC4 audit table can state each variant's
@@ -2405,6 +2410,9 @@ pub(crate) const fn terminal_command_policy(cmd: &WorkflowCommand) -> TerminalCo
         }
         WorkflowCommand::PublishProgress { .. } => {
             TerminalCommandPolicy::SidePath("notify_progress_from_commands")
+        }
+        WorkflowCommand::PublishDurableProgress { .. } => {
+            TerminalCommandPolicy::SidePath("persist_durable_stream_from_commands")
         }
         WorkflowCommand::CancelRaceLosers { .. } => {
             TerminalCommandPolicy::SidePath("apply_race_loser_cancellations")
@@ -2843,6 +2851,7 @@ fn extract_single_command<T>(
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::PublishProgress { .. }
+                | WorkflowCommand::PublishDurableProgress { .. }
                 | WorkflowCommand::RecordLog { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
@@ -2876,6 +2885,7 @@ fn extract_all_scheduled_activities(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
@@ -2930,6 +2940,7 @@ fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<Activi
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
@@ -2990,6 +3001,7 @@ fn extract_started_timer_for_suspension(
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::PublishProgress { .. }
+                | WorkflowCommand::PublishDurableProgress { .. }
                 | WorkflowCommand::RecordLog { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
@@ -3020,6 +3032,7 @@ fn extract_all_started_child_workflows(
                     | WorkflowCommand::UpsertSearchAttributes { .. }
                     | WorkflowCommand::SetCurrentDetails { .. }
                     | WorkflowCommand::PublishProgress { .. }
+                    | WorkflowCommand::PublishDurableProgress { .. }
                     | WorkflowCommand::RecordLog { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                     | WorkflowCommand::CancelRaceLosers { .. }
@@ -3145,6 +3158,7 @@ fn extract_child_timeout_race(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
             | WorkflowCommand::ReleaseMutex { .. } => {}
@@ -3302,6 +3316,7 @@ fn extract_mixed_suspension_batch(commands: &[WorkflowCommand]) -> Option<MixedS
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
@@ -3695,6 +3710,7 @@ fn extract_run_local_activity(commands: Vec<WorkflowCommand>) -> LocalActivityCo
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::ReleaseMutex { .. } => {}
             // A resolved ctx.race() CAN co-batch CancelRaceLosers with a local
             // activity. The loser branches started on an earlier cycle, so no
@@ -4024,6 +4040,7 @@ fn split_mixed_signal_batch(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. } => {}
             other => remaining.push(other),
         }
@@ -8237,6 +8254,7 @@ fn first_persist_capability_miss(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SignalExternalWorkflow { .. }
             | WorkflowCommand::RequestCancelExternalWorkflow { .. }
@@ -10517,6 +10535,64 @@ async fn notify_progress_from_commands(
             "progress chunks exceeded per-cycle ceiling; excess dropped (best-effort)"
         );
     }
+}
+
+/// Collect this cycle's durable stream chunks, in emission order (issue #1974).
+///
+/// Pure. The offset is a `u64` call ordinal and the column is an `i64`. The
+/// cast clamps below [`store::DURABLE_STREAM_TRUNCATION_OFFSET`], so a real
+/// chunk can never take the marker slot.
+fn collect_durable_stream_chunks(commands: &[WorkflowCommand]) -> Vec<store::DurableStreamChunk> {
+    commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            WorkflowCommand::PublishDurableProgress { offset, chunk } => {
+                Some(store::DurableStreamChunk {
+                    offset: i64::try_from(*offset)
+                        .unwrap_or(i64::MAX)
+                        .min(store::DURABLE_STREAM_TRUNCATION_OFFSET - 1),
+                    chunk: chunk.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Store this cycle's durable stream chunks and wake their readers
+/// (issue #1974).
+///
+/// **Not best-effort.** The rows go into the persist transaction, and an
+/// error fails the cycle the same way as `persist_current_details_from_commands`.
+/// A committed cycle therefore holds all of its chunks, so a reader sees no
+/// gap. A cycle with no durable chunk runs no statement.
+///
+/// The wake is one note per cycle. The post-commit sender sends it after the
+/// write commits, so a full `NOTIFY` queue cannot fail the write (issue
+/// #1796). A reader treats the wake as a hint and reads the table.
+async fn persist_durable_stream_from_commands(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    commands: &[WorkflowCommand],
+) -> HarvestResult<()> {
+    let chunks = collect_durable_stream_chunks(commands);
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    // One transaction for the rows and the wake. The inline paths call this
+    // on a bare connection, and inside a persist transaction it is a
+    // savepoint.
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |c| {
+        store::append_stream_chunks(
+            c,
+            exec_id,
+            &chunks,
+            crate::context::DURABLE_STREAM_MAX_CHUNKS,
+        )
+        .await?;
+        crate::notify::notify_durable_stream(c, exec_id.as_uuid()).await
+    }))
+    .await
 }
 
 /// Per-decision-cycle ceiling on the number of `ctx.publish_progress` chunks the
@@ -21065,6 +21141,19 @@ async fn handle_suspended_workflow(
         )
         .await;
     }
+    // Store durable stream chunks (issue #1974). An error fails the cycle.
+    if let Err(e) =
+        persist_durable_stream_from_commands(conn, context.persistence.exec_id, commands).await
+    {
+        return fail_execution_on_error(
+            conn,
+            context.persistence.task,
+            context.persistence.worker_id,
+            Err(e),
+            registry.payload_codecs(),
+        )
+        .await;
+    }
     // Persist durable workflow logs (issue #790) — best-effort, never fails
     // the cycle. No-op when the sink is disabled (the default).
     if let Some(policy) = registry.workflow_log_policy {
@@ -24092,6 +24181,7 @@ async fn persist_terminal_outcome_commands(
     .await?;
     persist_search_attrs_from_commands(conn, persistence.exec_id, pending_cmds).await?;
     persist_current_details_from_commands(conn, persistence.exec_id, pending_cmds).await?;
+    persist_durable_stream_from_commands(conn, persistence.exec_id, pending_cmds).await?;
     // Persist durable workflow logs (issue #790) — best-effort, never fails the cycle.
     if let Some(policy) = registry.workflow_log_policy {
         persist_workflow_logs_from_commands(
@@ -25780,6 +25870,8 @@ async fn process_workflow_task(
                 persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await?;
                 // Persist the current_details breadcrumb before inline execution (issue #473).
                 persist_current_details_from_commands(conn, prepared.exec_id, &commands).await?;
+                // Store durable stream chunks before inline execution (issue #1974).
+                persist_durable_stream_from_commands(conn, prepared.exec_id, &commands).await?;
                 // Persist durable workflow logs (issue #790) — best-effort, before inline run.
                 if let Some(policy) = registry.workflow_log_policy {
                     persist_workflow_logs_from_commands(
@@ -26132,6 +26224,7 @@ async fn process_workflow_task(
                             | WorkflowCommand::UpsertSearchAttributes { .. }
                             | WorkflowCommand::SetCurrentDetails { .. }
                             | WorkflowCommand::PublishProgress { .. }
+                            | WorkflowCommand::PublishDurableProgress { .. }
                             | WorkflowCommand::RecordLog { .. }
                             | WorkflowCommand::ReleaseMutex { .. }
                     )
@@ -26196,6 +26289,21 @@ async fn process_workflow_task(
                 }
                 if let Err(e) =
                     persist_current_details_from_commands(conn, prepared.exec_id, &commands).await
+                {
+                    return fail_workflow_execution_clearing_strikes(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(e),
+                        workflow_panic_strikes,
+                        prepared.exec_id.as_uuid(),
+                        registry.payload_codecs(),
+                    )
+                    .await;
+                }
+                // Store durable stream chunks (issue #1974). An error fails the cycle.
+                if let Err(e) =
+                    persist_durable_stream_from_commands(conn, prepared.exec_id, &commands).await
                 {
                     return fail_workflow_execution_clearing_strikes(
                         conn,
@@ -26461,6 +26569,21 @@ async fn process_workflow_task(
                 }
                 if let Err(e) =
                     persist_current_details_from_commands(conn, prepared.exec_id, &commands).await
+                {
+                    return fail_workflow_execution_clearing_strikes(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(e),
+                        workflow_panic_strikes,
+                        prepared.exec_id.as_uuid(),
+                        registry.payload_codecs(),
+                    )
+                    .await;
+                }
+                // Store durable stream chunks (issue #1974). An error fails the cycle.
+                if let Err(e) =
+                    persist_durable_stream_from_commands(conn, prepared.exec_id, &commands).await
                 {
                     return fail_workflow_execution_clearing_strikes(
                         conn,
@@ -51979,6 +52102,14 @@ mod tests {
                 "side-path",
             ),
             (
+                "PublishDurableProgress",
+                WorkflowCommand::PublishDurableProgress {
+                    offset: 1,
+                    chunk: Value::Null,
+                },
+                "side-path",
+            ),
+            (
                 "CancelRaceLosers",
                 WorkflowCommand::CancelRaceLosers {
                     activities: Vec::new(),
@@ -52220,6 +52351,10 @@ mod tests {
             ("SetCurrentDetails", "persist_current_details_from_commands"),
             ("RecordLog", "persist_workflow_logs_from_commands"),
             ("PublishProgress", "notify_progress_from_commands"),
+            (
+                "PublishDurableProgress",
+                "persist_durable_stream_from_commands",
+            ),
             ("CancelRaceLosers", "apply_race_loser_cancellations"),
             ("ReleaseMutex", "mutex::sweep_terminal_holder_and_wake"),
         ];
