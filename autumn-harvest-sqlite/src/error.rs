@@ -56,18 +56,21 @@ pub enum SqliteError {
     #[error("execution not found: {0}")]
     ExecutionNotFound(ExecutionId),
 
-    /// A signal was sent to an execution that is not accepting signals — it has
-    /// reached a terminal state (`COMPLETED`/`FAILED`/…). Mirrors the Postgres
-    /// engine's rejection of a signal to a terminal target
-    /// ([`send_signal`](crate::SqliteRuntime::send_signal)): staging it would
-    /// silently drop the wakeup, since no live `wait_for_signal` will ever consume
-    /// it. An unknown id is [`ExecutionNotFound`](Self::ExecutionNotFound); this
-    /// variant is only for a *present but sealed* run.
+    /// A signal, cancel or terminate targeted an execution in a terminal state
+    /// (`COMPLETED`, `FAILED`, `CANCELLED`, `TERMINATED` and so on).
+    ///
+    /// [`send_signal`](crate::SqliteRuntime::send_signal) mirrors the Postgres
+    /// rejection of a signal to a terminal target. Staging it would drop the
+    /// wakeup, because no live `wait_for_signal` consumes it.
+    /// [`cancel`](crate::SqliteRuntime::cancel) and
+    /// [`terminate`](crate::SqliteRuntime::terminate) also return it (issue
+    /// #2021). An unknown id is [`ExecutionNotFound`](Self::ExecutionNotFound).
+    /// This variant is only for a stored, sealed run.
     #[error(
-        "workflow execution {execution_id} is not running (state: {state}); cannot accept a signal"
+        "workflow execution {execution_id} is not running (state: {state}); cannot accept the request"
     )]
     WorkflowNotRunning {
-        /// The terminal execution the signal targeted.
+        /// The terminal execution the request targeted.
         execution_id: ExecutionId,
         /// Its current (terminal) state — `COMPLETED`, `FAILED`, etc.
         state: String,

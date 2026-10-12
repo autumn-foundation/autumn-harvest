@@ -25,10 +25,11 @@ R&D decision record [`docs/rnd/sqlite-feasibility.md`](rnd/sqlite-feasibility.md
 6. [Starting a workflow](#6-starting-a-workflow)
 7. [The drive model](#7-the-drive-model)
 8. [Signals (pull-only)](#8-signals-pull-only)
-9. [Durability and crash recovery](#9-durability-and-crash-recovery)
-10. [The single-writer / single-server contract](#10-the-single-writer--single-server-contract)
-11. [v0.1 non-goals and follow-ups](#11-v01-non-goals-and-follow-ups)
-12. [Runnable examples](#12-runnable-examples)
+9. [Cancel and terminate](#9-cancel-and-terminate)
+10. [Durability and crash recovery](#10-durability-and-crash-recovery)
+11. [The single-writer / single-server contract](#11-the-single-writer--single-server-contract)
+12. [v0.1 non-goals and follow-ups](#12-v01-non-goals-and-follow-ups)
+13. [Runnable examples](#13-runnable-examples)
 
 ---
 
@@ -138,9 +139,9 @@ let mut rt = SqliteRuntime::open_in_memory()?;
 
 - Use **`open(path)`** for anything that must survive a process restart. Opening
   applies the schema idempotently and reclaims any task stranded `RUNNING` by a
-  previous crash (see [§9](#9-durability-and-crash-recovery)). It first takes the
+  previous crash (see [§10](#10-durability-and-crash-recovery)). It first takes the
   single-writer lock, so a second open of a held file fails with
-  `SqliteError::DatabaseLocked` (see [§10](#10-the-single-writer--single-server-contract)).
+  `SqliteError::DatabaseLocked` (see [§11](#11-the-single-writer--single-server-contract)).
 - Use **`open_in_memory()`** for tests, demos, and throwaway runs. Each call is a
   brand-new database and is **not** reopen-safe — dropping the runtime discards
   all state.
@@ -255,6 +256,8 @@ match rt.run_until_blocked(exec).await? {
     RunState::Failed(err)       => println!("failed: {err}"),
     RunState::WaitingSignal(name) => println!("blocked on signal `{name}`"),
     RunState::WaitingTimer      => println!("blocked on a durable timer"),
+    RunState::Cancelled(reason) => println!("cancelled: {reason}"),
+    RunState::Terminated(reason) => println!("terminated: {reason}"),
     RunState::InProgress        => {} // not returned by run_until_blocked
 }
 
@@ -264,7 +267,7 @@ match rt.outcome(exec)? {
     ExecutionOutcome::Completed(output) => println!("{output}"),
     ExecutionOutcome::Failed(err)       => println!("{err}"),
     ExecutionOutcome::Running           => println!("still running"),
-    ExecutionOutcome::Terminated(state) => println!("terminal ({state}) — superseded/cancelled, no clean output"),
+    ExecutionOutcome::Terminated(state) => println!("terminal ({state}) — superseded, cancelled or terminated"),
 }
 ```
 
@@ -279,7 +282,7 @@ match rt.outcome(exec)? {
   the cadence and inspect the `bool` progress flag yourself.
 
 `poll_once()`/`run_until_idle()` drive every execution in a pass even if an
-earlier one errors — see [§11](#11-v01-non-goals-and-follow-ups) for what
+earlier one errors — see [§12](#12-v01-non-goals-and-follow-ups) for what
 happens to a rejected execution. `run_until_blocked(exec)` is the one
 fail-fast driver, since it already targets a single execution.
 
@@ -331,7 +334,72 @@ rejected rather than silently lost.
 
 ---
 
-## 9. Durability and crash recovery
+## 9. Cancel and terminate
+
+Stop a run with `cancel` (cooperative) or `terminate` (at once). Both take a
+reason. A blank reason gets the Postgres default text.
+
+```rust
+// Cooperative: the body sees the reason on the next drive.
+rt.cancel(exec, "user stopped the session")?;
+match rt.run_until_blocked(exec).await? {
+    RunState::Cancelled(reason) => println!("cancelled: {reason}"),
+    other => println!("still running: {other:?}"),
+}
+
+// At once: the body does not run again.
+rt.terminate(other_exec, "stuck for an hour")?;
+```
+
+**Cancel.** `cancel` stores the request and appends no event. The next drive
+replays the body with `ctx.cancellation_reason()` set. The body can check it
+and run cleanup activities:
+
+```rust
+ctx.execute_activity_raw("step", input, "default").await.map_err(|e| e.to_string())?;
+if let Some(reason) = ctx.cancellation_reason() {
+    ctx.execute_activity_raw("cleanup", json!(reason), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    return Ok(json!("cleaned up"));
+}
+```
+
+The run ends `CANCELLED` when one of these occurs:
+
+- The body returns `Ok` or `Err`.
+- The body blocks on a signal or a timer, and no activity task is left to run.
+  A parked await cannot see the request, so check `cancellation_reason()`
+  before a long wait.
+
+A pending activity task, such as a retry in backoff, still runs. The body sees
+the request when that await resolves. A repeat `cancel` keeps the first
+reason. The request survives a crash and a reopen.
+
+**Terminate.** `terminate` seals the run `TERMINATED` in one transaction. The
+body does not run again, and a pending cancel request is dropped.
+
+**Both paths:**
+
+- The seal appends the core `WorkflowCancelled { reason }` event as the last
+  event, as Postgres does. Cleanup events come before it, so a cancelled
+  history replays on the core `WorkflowReplayer`.
+- The seal deletes pending tasks, unfired timers and staged signals.
+- An unknown id returns `SqliteError::ExecutionNotFound`. A terminal run
+  returns `SqliteError::WorkflowNotRunning`.
+- `outcome(exec)` reports `ExecutionOutcome::Terminated("CANCELLED")` or
+  `ExecutionOutcome::Terminated("TERMINATED")`.
+- `AllowDuplicateFailedOnly` replaces a `CANCELLED` prior, as on Postgres. A
+  `TERMINATED` prior frees its `workflow_id` for every policy.
+
+A terminated history replays on `WorkflowReplayer` only when the body checks
+`is_cancelled()` before its next new command. A body parked on a signal with
+no check reports non-determinism. A Postgres history of the same shape does
+the same.
+
+---
+
+## 10. Durability and crash recovery
 
 All durable state lives in the database. Dropping a runtime and re-`open`-ing the
 **same file** is a faithful crash/restart:
@@ -356,7 +424,7 @@ from history in session 2) and the ship body ran exactly once (session 2 only).
 
 ---
 
-## 10. The single-writer / single-server contract
+## 11. The single-writer / single-server contract
 
 This backend assumes **one writer process** against **one** SQLite file:
 
@@ -366,7 +434,7 @@ This backend assumes **one writer process** against **one** SQLite file:
   exactly-once by construction — no two claimers race.
 - **Polling replaces `LISTEN`/`NOTIFY`** (see [§7](#7-the-drive-model)).
 - **Restart = drop the runtime + reopen the file** (see
-  [§9](#9-durability-and-crash-recovery)).
+  [§10](#10-durability-and-crash-recovery)).
 
 The runtime opens the database with `journal_mode = WAL`, `synchronous = FULL`
 (fsync on every commit — the crash tests depend on it), and a `busy_timeout` so
@@ -412,7 +480,7 @@ next `open`. A single-process design has no heartbeat-timeout reclaimer for a
 
 ---
 
-## 11. v0.1 non-goals and follow-ups
+## 12. v0.1 non-goals and follow-ups
 
 Out-of-subset workflow primitives are rejected **loudly, by name** — never
 silently dropped. A workflow reaching one of these surfaces
@@ -472,7 +540,7 @@ gate no control flow): `ctx.set_current_details(...)` and a re-park
 
 ---
 
-## 12. Runnable examples
+## 13. Runnable examples
 
 - **[`examples/quickstart.rs`](../autumn-harvest-sqlite/examples/quickstart.rs)**
   — a complete order-processing workflow: open in-memory → register a workflow +
@@ -496,7 +564,7 @@ gate no control flow): `ctx.set_current_details(...)` and a re-park
   sessions as durable workflows. It shows the drive loop
   ([§7](#7-the-drive-model)), pull signals with a deadline
   ([§8](#8-signals-pull-only)), and crash recovery
-  ([§9](#9-durability-and-crash-recovery)) in one place, and it runs with no API
+  ([§10](#10-durability-and-crash-recovery)) in one place, and it runs with no API
   key against a scripted offline model.
 
   ```text

@@ -233,10 +233,9 @@
 //! - `AllowDuplicate` — attach to / return any non-sealed prior; else fresh.
 //! - `RejectDuplicate` — [`SqliteError::AlreadyExists`] for any non-sealed prior;
 //!   else fresh (a SEALED-only prior is invisible, so it creates fresh).
-//! - `AllowDuplicateFailedOnly` — replace (seal + fresh) a FAILED prior; return a
-//!   RUNNING/COMPLETED prior unchanged; else fresh. (Core also replaces a
-//!   `CANCELLED` prior, but this backend has no active `CANCELLED` state, so FAILED
-//!   is the only replace case.)
+//! - `AllowDuplicateFailedOnly` — replace (seal + fresh) a FAILED or `CANCELLED`
+//!   prior, as core does; return a RUNNING/COMPLETED prior unchanged; else fresh.
+//!   A `CANCELLED` prior comes from [`SqliteRuntime::cancel`] (issue #2021).
 //! - `TerminateIfRunning` — cancel (record `WorkflowCancelled` + clean up the
 //!   prior's PENDING tasks and unfired timers) then seal a RUNNING prior; seal an
 //!   already-terminal prior without a cancellation event; then start fresh. The
@@ -246,6 +245,19 @@
 //!
 //! See the per-method rustdoc on `start_workflow_with_reuse_policy` for the full
 //! matrix table.
+//!
+//! ## Cancel and terminate (issue #2021)
+//!
+//! [`SqliteRuntime::cancel`] is cooperative. It stores the request, and the next
+//! drive replays the body with `ctx.cancellation_reason()` set. The body can run
+//! cleanup activities. The run seals `CANCELLED` when the body returns, or when it
+//! blocks with no activity task left. [`SqliteRuntime::terminate`] seals the run
+//! `TERMINATED` at once, and the body does not run again.
+//!
+//! Both seals append the core `WorkflowCancelled` event as the last event, as
+//! Postgres does. A cleanup that ran before it therefore replays on the core
+//! `WorkflowReplayer`. Both seals delete pending tasks, unfired timers and staged
+//! signals. The drives report [`RunState::Cancelled`] and [`RunState::Terminated`].
 //!
 //! ## Unsupported workflow primitives — rejected LOUDLY, by name
 //!

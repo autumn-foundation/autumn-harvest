@@ -587,8 +587,8 @@ impl SqliteRuntime {
     /// fresh run was created.
     ///
     /// The single-writer PLAIN-start matrix, restricted to the states this backend
-    /// can hold (none / `RUNNING` / `COMPLETED` / `FAILED`; a replaced prior is
-    /// SEALED to `CONTINUED_AS_NEW`):
+    /// can hold (none / `RUNNING` / `COMPLETED` / `FAILED` / `CANCELLED`; a replaced
+    /// prior is SEALED to `CONTINUED_AS_NEW`):
     ///
     /// | Prior state | `AllowDuplicate` | `RejectDuplicate` | `AllowDuplicateFailedOnly` | `TerminateIfRunning` |
     /// |-------------|------------------|-------------------|----------------------------|----------------------|
@@ -596,6 +596,7 @@ impl SqliteRuntime {
     /// | RUNNING     | existing         | `AlreadyExists`   | existing                   | cancel + fresh       |
     /// | COMPLETED   | existing         | `AlreadyExists`   | existing                   | fresh (no cancel)    |
     /// | FAILED      | existing         | `AlreadyExists`   | **fresh (replace)**        | fresh (no cancel)    |
+    /// | CANCELLED   | existing         | `AlreadyExists`   | **fresh (replace)**        | fresh (no cancel)    |
     ///
     /// - A prior in a SEALED state (`CONTINUED_AS_NEW`/`TERMINATED`) is invisible to
     ///   the reuse check — ALL policies (including `RejectDuplicate`) create fresh
@@ -817,13 +818,7 @@ impl SqliteRuntime {
         // The single-writer runtime holds `SQLite`'s only write handle, so the
         // state read and the stage cannot race a concurrent transition: no other
         // writer exists to seal the execution between the check and the insert.
-        let state = store::execution_state(&self.conn, exec)?;
-        if autumn_harvest::erase::is_terminal_state(&state) {
-            return Err(SqliteError::WorkflowNotRunning {
-                execution_id: exec,
-                state,
-            });
-        }
+        self.refuse_unless_running(exec)?;
         // Enforce the signal-payload cap at INGRESS (issue #252, Codex #1069
         // `runtime.rs:346`), before staging the `harvest_signals` row — otherwise
         // the next `wait_for_signal` records an oversized `SignalReceived` event,
@@ -868,8 +863,8 @@ impl SqliteRuntime {
     /// `"workflow cancellation requested"`, as on Postgres.
     ///
     /// The run seals `CANCELLED` when the body returns `Ok` or `Err`. It also
-    /// seals when the body blocks on a signal or a timer and no activity task
-    /// is left to run, because a parked await cannot see the request. The
+    /// seals when the body blocks on a signal or a timer with no activity task
+    /// left to run. A parked await cannot see the request. The
     /// seal appends `WorkflowCancelled` as the last event and removes pending
     /// tasks, unfired timers and staged signals. The drive that seals the run
     /// returns [`RunState::Cancelled`].
@@ -1320,9 +1315,7 @@ impl SqliteRuntime {
         // The cycle's own cleanup, such as a race's loser cancellation, rolled
         // back with the cycle. This backend has no retention pass, so remove
         // the work no one can use any more, as the `TerminateIfRunning` seal does.
-        queue::delete_pending_tasks_for_execution(&tx, exec)?;
-        queue::delete_unfired_timers_for_execution(&tx, exec)?;
-        queue::delete_undelivered_signals_for_execution(&tx, exec)?;
+        delete_open_rows(&tx, exec)?;
         tx.commit()?;
         self.workflow_panic_strikes.remove(&exec);
         Ok(())
@@ -2168,8 +2161,8 @@ fn reason_or(reason: &str, default: &str) -> String {
 ///
 /// Both seals record the core `WorkflowCancelled` event, as Postgres does for
 /// cancel and terminate. The event is the last one in the history, so a
-/// cleanup that ran before it replays. The seal also removes the pending
-/// tasks, unfired timers and staged signals, because no drive uses them again.
+/// cleanup that ran before it replays. The seal also calls
+/// [`delete_open_rows`].
 fn seal_with_cancel_event(
     conn: &Connection,
     exec: ExecutionId,
@@ -2184,6 +2177,13 @@ fn seal_with_cancel_event(
         },
     )?;
     store::set_sealed_with_reason(conn, exec, state, reason)?;
+    delete_open_rows(conn, exec)
+}
+
+/// Delete the pending tasks, unfired timers and staged signals of a sealed
+/// `exec`, inside the caller's transaction. No drive uses them again, and
+/// this backend has no retention pass.
+fn delete_open_rows(conn: &Connection, exec: ExecutionId) -> SqliteResult<()> {
     queue::delete_pending_tasks_for_execution(conn, exec)?;
     queue::delete_unfired_timers_for_execution(conn, exec)?;
     queue::delete_undelivered_signals_for_execution(conn, exec)?;
