@@ -1818,6 +1818,25 @@ impl RaceBuilder<'_> {
     }
 }
 
+/// Counts one `ctx.race()` call in flight while it lives (issue #2007).
+///
+/// The race future holds it across its awaits. Dropping the future, or the
+/// end of the race, drops it.
+struct OpenRace<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> OpenRace<'a> {
+    fn enter(count: &'a std::sync::atomic::AtomicUsize) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for OpenRace<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// The live-mode receiving end of one race branch (issue #950).
 ///
 /// The four branch kinds park on channels of three different payload types
@@ -2890,6 +2909,14 @@ pub struct WorkflowContext {
     /// stable, unique `race:{seq}` / `race_winner:{seq}` marker names across
     /// replays, mirroring `fan_out_seq`.
     race_seq: Mutex<u32>,
+    /// The number of `ctx.race()` calls in flight (issue #2007). A race
+    /// that suspends cannot stay resident.
+    open_races: std::sync::atomic::AtomicUsize,
+    /// Set while a resident cycle runs with re-parked siblings (issue #2008).
+    /// Such a cycle must not read the replay position.
+    speculative: std::sync::atomic::AtomicBool,
+    /// Set when a speculative cycle reads the replay position.
+    speculation_read_position: std::sync::atomic::AtomicBool,
     /// Monotonically increasing counter for naming worker-session identity
     /// markers (issue #606). Each `create_session()` call increments this once
     /// so each session has a stable, unique `session:{seq}` marker name across
@@ -3377,6 +3404,10 @@ impl WorkflowContext {
     where
         F: FnOnce(&mut HistoryMatcher) -> R,
     {
+        // Every public history read and every command match passes here. In
+        // a speculative cycle each one counts as a position read (issue
+        // #2008).
+        self.note_position_read();
         let result = {
             let mut matcher = self.matcher.lock().expect("matcher lock poisoned");
             f(&mut matcher)
@@ -3596,6 +3627,9 @@ impl WorkflowContext {
             child_placement_seq: Mutex::new(0),
             shard_router: None,
             race_seq: Mutex::new(0),
+            open_races: std::sync::atomic::AtomicUsize::new(0),
+            speculative: std::sync::atomic::AtomicBool::new(false),
+            speculation_read_position: std::sync::atomic::AtomicBool::new(false),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
@@ -3769,6 +3803,9 @@ impl WorkflowContext {
             child_placement_seq: Mutex::new(0),
             shard_router: None,
             race_seq: Mutex::new(0),
+            open_races: std::sync::atomic::AtomicUsize::new(0),
+            speculative: std::sync::atomic::AtomicBool::new(false),
+            speculation_read_position: std::sync::atomic::AtomicBool::new(false),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
@@ -3840,6 +3877,9 @@ impl WorkflowContext {
             child_placement_seq: Mutex::new(0),
             shard_router: None,
             race_seq: Mutex::new(0),
+            open_races: std::sync::atomic::AtomicUsize::new(0),
+            speculative: std::sync::atomic::AtomicBool::new(false),
+            speculation_read_position: std::sync::atomic::AtomicBool::new(false),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
@@ -4610,6 +4650,7 @@ impl WorkflowContext {
     /// The current cursor position in the history events during replay.
     #[must_use]
     pub fn replay_position(&self) -> usize {
+        self.note_position_read();
         self.match_history(|m| m.position())
     }
 
@@ -4878,6 +4919,10 @@ impl WorkflowContext {
     /// ones that lock the matcher directly rather than calling
     /// [`Self::is_replaying`] — so the two spellings can never drift.
     pub(crate) fn replay_suppresses_side_effects(&self) -> bool {
+        // A speculative cycle may be dropped, so it fires no side effect.
+        if self.note_position_read() {
+            return true;
+        }
         let matcher = self.matcher.lock().expect("matcher lock poisoned");
         matcher.is_replaying() || matcher.has_terminal_failure_tail()
     }
@@ -4889,6 +4934,7 @@ impl WorkflowContext {
     /// Used only where the question really is "did the matcher run off the end
     /// of recorded history?", never as a replay-suppression guard.
     fn at_history_frontier(&self) -> bool {
+        self.note_position_read();
         !self
             .matcher
             .lock()
@@ -7267,10 +7313,11 @@ impl WorkflowContext {
 
     /// Returns why this context cannot stay resident, or `None` (issue #1798).
     ///
-    /// A resident workflow resumes its parked future with one new result. A
+    /// A resident workflow resumes its parked future with new results. A
     /// warm decision must then equal a cold replay. Each state below can make
     /// a cold replay read the new events in a way that a parked future cannot:
     ///
+    /// - An open `ctx.race()` settles by a winner marker and cancels losers.
     /// - A held park token resolves only by a replay match.
     /// - A push signal handler runs inside history matching.
     /// - A held mutex depends on the suspension flag of each cycle.
@@ -7278,22 +7325,35 @@ impl WorkflowContext {
     ///   test-clock context changes how replay reads events.
     /// - Unread history means that the cursor is not at the live frontier.
     ///
+    /// The result is the miss reason of the `harvest.workflow.resident`
+    /// counter (issue #2007).
+    ///
     /// # Panics
     ///
     /// Panics if an internal mutex is poisoned.
-    pub(crate) fn resident_blocker(&self) -> Option<&'static str> {
-        if self.parks.is_held() {
-            return Some("a park token is held");
+    pub(crate) fn resident_blocker(&self) -> Option<crate::telemetry::ResidentOutcome> {
+        use crate::telemetry::ResidentOutcome;
+        if self.has_open_race() {
+            return Some(ResidentOutcome::Race);
         }
-        if self.strict_replay || self.canary_mode {
-            return Some("strict or canary replay");
+        if !self
+            .held_mutex_keys
+            .lock()
+            .expect("held_mutex_keys lock poisoned")
+            .is_empty()
+        {
+            return Some(ResidentOutcome::Mutex);
+        }
+        if self.parks.is_held()
+            || self.strict_replay
+            || self.canary_mode
+            || self.cancellation_reason.is_some()
+        {
+            return Some(ResidentOutcome::Blocked);
         }
         #[cfg(any(test, feature = "testing"))]
         if self.timer_clock_elapsed_secs.is_some() {
-            return Some("the advancing test clock is on");
-        }
-        if self.cancellation_reason.is_some() {
-            return Some("the run is cancelled");
+            return Some(ResidentOutcome::Blocked);
         }
         if !self
             .signal_registry
@@ -7302,15 +7362,7 @@ impl WorkflowContext {
             .list_names()
             .is_empty()
         {
-            return Some("a push signal handler is registered");
-        }
-        if !self
-            .held_mutex_keys
-            .lock()
-            .expect("held_mutex_keys lock poisoned")
-            .is_empty()
-        {
-            return Some("a durable mutex is held");
+            return Some(ResidentOutcome::Blocked);
         }
         if self
             .nd_details
@@ -7323,7 +7375,7 @@ impl WorkflowContext {
                 .expect("deferred_nd_error lock poisoned")
                 .is_some()
         {
-            return Some("a non-determinism record is set");
+            return Some(ResidentOutcome::Blocked);
         }
         if self
             .matcher
@@ -7331,7 +7383,7 @@ impl WorkflowContext {
             .expect("matcher lock poisoned")
             .has_buffered_history()
         {
-            return Some("history is not fully read");
+            return Some(ResidentOutcome::Blocked);
         }
         None
     }
@@ -7349,11 +7401,19 @@ impl WorkflowContext {
     /// replay. The call ordinals and sequence counters keep their values. A
     /// replay from the top counts up to the same values.
     ///
+    /// Last, it queues `waits`: the commands that park unresolved activities
+    /// of a join again (issue #2008). A cold replay emits the same commands.
+    /// A cycle with waits is speculative until [`Self::end_speculation`].
+    ///
     /// # Panics
     ///
     /// Panics if the matcher mutex is poisoned.
     #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
-    pub(crate) fn begin_resident_cycle(&self, delta: &[WorkflowEvent]) {
+    pub(crate) fn begin_resident_cycle(
+        &self,
+        delta: &[WorkflowEvent],
+        waits: Vec<WorkflowCommand>,
+    ) {
         self.set_suspending(false);
         self.log_commands_queued
             .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -7363,6 +7423,38 @@ impl WorkflowContext {
             .lock()
             .expect("matcher lock poisoned")
             .append_consumed(delta);
+        self.speculative
+            .store(!waits.is_empty(), std::sync::atomic::Ordering::SeqCst);
+        self.speculation_read_position
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        for wait in waits {
+            self.push_command(wait);
+        }
+    }
+
+    /// Records a read of the replay position in a speculative cycle.
+    ///
+    /// A warm cycle with re-parked siblings consumed the whole delta, but a
+    /// cold replay can stop its cursor at a sibling command (issue #2008).
+    /// So such a read can differ, and the resume must decline. Returns
+    /// whether the cycle is speculative.
+    fn note_position_read(&self) -> bool {
+        let speculative = self.speculative.load(std::sync::atomic::Ordering::SeqCst);
+        if speculative {
+            self.speculation_read_position
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        speculative
+    }
+
+    /// Ends a speculative cycle (issue #2008). Returns whether it read the
+    /// replay position.
+    #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
+    pub(crate) fn end_speculation(&self) -> bool {
+        self.speculative
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.speculation_read_position
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Whether a non-blocking signal claim probed `signal_name` with a scan
@@ -11802,6 +11894,11 @@ impl WorkflowContext {
 
     // ── Race / select (issue #600) ───────────────────────────────────────────
 
+    /// Whether a `ctx.race()` call is in flight (issue #2007).
+    pub(crate) fn has_open_race(&self) -> bool {
+        self.open_races.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
     /// Generate the next race sequence number for marker naming (mirrors
     /// `next_fan_out_seq`).
     fn next_race_seq(&self) -> u32 {
@@ -11824,6 +11921,7 @@ impl WorkflowContext {
 
     #[allow(clippy::too_many_lines)]
     async fn race_impl(&self, branches: Vec<RaceBranch>) -> HarvestResult<RaceWinner> {
+        let _open = OpenRace::enter(&self.open_races);
         self.check_cancellation()?;
 
         if branches.is_empty() {

@@ -2521,7 +2521,16 @@ pub async fn update_search_attrs<S: std::hash::BuildHasher + Sync>(
         .await
         .map_err(crate::error::database_error)?;
 
-    Ok(())
+    // A cycle can change search attributes and append no event, for example
+    // when it then parks on a signal wait. Search attributes are list filters
+    // (issue #1982), so a zero-count wake tells live list views to fetch.
+    crate::notify::notify_workflow_events_appended(
+        conn,
+        exec_id.as_uuid(),
+        0,
+        "SearchAttributesUpserted",
+    )
+    .await
 }
 
 /// Overwrite `current_details` on the execution row (issue #473).
