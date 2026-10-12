@@ -59,8 +59,8 @@ enum OpenEffect {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct EffectLedger {
     /// The ledger schema that wrote this ledger. Schema 1 had no failure
-    /// lists, no teardown list and no cancelled-timer list. An envelope with no schema field is
-    /// schema 1.
+    /// lists and no teardown list. Schemas 1 and 2 listed a cancelled timer
+    /// with the fired ones. An envelope with no schema field is schema 1.
     #[serde(default = "schema_1")]
     schema: u32,
     /// Completed activities, by name, in order.
@@ -102,7 +102,7 @@ struct EffectLedger {
 }
 
 /// The ledger schema that this code writes.
-const LEDGER_SCHEMA: u32 = 2;
+const LEDGER_SCHEMA: u32 = 3;
 
 /// The schema of an envelope with no schema field.
 const fn schema_1() -> u32 {
@@ -126,8 +126,10 @@ impl EffectLedger {
             old.failed_updates.clear();
             old.failed_children.clear();
             old.torn_down_timers.clear();
-            // Schema 1 listed a cancelled timer with the fired ones. The
-            // order between the two kinds is lost, so compare them sorted.
+        }
+        if schema < 3 {
+            // Schemas 1 and 2 listed a cancelled timer with the fired ones.
+            // The order between the two kinds is lost, so compare them sorted.
             old.timers.append(&mut old.cancelled_timers);
             old.timers.sort();
         }
@@ -455,7 +457,7 @@ impl Snapshot {
                 // Check the fields that the stored schema knew, then use
                 // the full ledger that the source gives.
                 let mut stored = snapshot.ledger.clone();
-                if stored.schema < 2 {
+                if stored.schema < 3 {
                     stored.timers.sort();
                 }
                 if rebuilt.project(snapshot.ledger.schema) != stored {
@@ -933,11 +935,9 @@ fn a_failed_child_is_recorded_apart_from_a_completed_one() {
     assert_eq!(ledger.failed_children, [child.to_string()]);
 }
 
-#[test]
-fn a_cancelled_timer_is_recorded_apart_from_a_fired_one() {
-    // Workflow code can branch on fired against cancelled, so a cover rule
-    // must tell the two apart.
-    let history = vec![
+/// A history with one timer that fired and one that code cancelled.
+fn fired_and_cancelled_timers() -> Vec<WorkflowEvent> {
+    vec![
         started(Value::Null),
         WorkflowEvent::TimerStarted {
             timer_id: TimerId::new("fired"),
@@ -953,8 +953,15 @@ fn a_cancelled_timer_is_recorded_apart_from_a_fired_one() {
         WorkflowEvent::TimerCancelled {
             timer_id: TimerId::new("stopped"),
         },
-    ];
-    let ledger = EffectLedger::from_history(&history, &[]).expect("no effect is open");
+    ]
+}
+
+#[test]
+fn a_cancelled_timer_is_recorded_apart_from_a_fired_one() {
+    // Workflow code can branch on fired against cancelled, so a cover rule
+    // must tell the two apart.
+    let ledger =
+        EffectLedger::from_history(&fired_and_cancelled_timers(), &[]).expect("no effect is open");
     assert_eq!(ledger.timers, ["fired"]);
     assert_eq!(ledger.cancelled_timers, ["stopped"]);
 }
@@ -1154,6 +1161,42 @@ fn an_older_ledger_needs_its_source_history() {
     // schema, so the failed update is visible again.
     let (_, ledger) = Snapshot::load::<Tally>(&raw, Some(&history)).expect("the source fills it");
     assert_eq!(ledger.failed_updates, ["bump"]);
+}
+
+/// A signed envelope as a schema-2 writer made it: one timer list that
+/// holds the fired and the cancelled timers.
+fn schema_2_envelope(history: &[WorkflowEvent]) -> Value {
+    let mut raw = Snapshot::save(&Tally { bumps: 0 }, history).expect("quiescent");
+    let ledger = raw["ledger"].as_object_mut().expect("a ledger object");
+    ledger.insert("schema".into(), Value::from(2));
+    let cancelled = ledger.remove("cancelled_timers").expect("a cancelled list");
+    let timers = ledger["timers"].as_array_mut().expect("a timer list");
+    timers.extend(
+        cancelled
+            .as_array()
+            .expect("a cancelled list")
+            .iter()
+            .cloned(),
+    );
+    let old_ledger = raw["ledger"].clone();
+    raw["mac"] = Value::String(sign(&raw["version"], &raw["state"], &old_ledger));
+    raw
+}
+
+#[test]
+fn a_schema_2_ledger_does_not_read_a_cancelled_timer_as_fired() {
+    // Schema 2 listed a cancelled timer with the fired ones. With no
+    // source, nothing can split them, so the loader refuses.
+    let history = fired_and_cancelled_timers();
+    let raw = schema_2_envelope(&history);
+    assert_eq!(
+        Snapshot::load::<Tally>(&raw, None),
+        Err(SnapshotError::LedgerTooOld(2))
+    );
+    // With the source, the loader matches the merged list and splits it.
+    let (_, ledger) = Snapshot::load::<Tally>(&raw, Some(&history)).expect("the source splits it");
+    assert_eq!(ledger.timers, ["fired"]);
+    assert_eq!(ledger.cancelled_timers, ["stopped"]);
 }
 
 #[tokio::test]

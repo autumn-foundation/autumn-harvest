@@ -197,6 +197,7 @@ Each claim names its test in `typed_snapshot_spike_tests.rs`.
 | The ledger records a cancelled timer apart from a fired one. | `a_cancelled_timer_is_recorded_apart_from_a_fired_one` |
 | A snapshot from an older ledger schema still verifies. The loader checks the envelope as written. | `a_snapshot_from_an_older_ledger_schema_still_verifies` |
 | An older ledger schema needs its source history. With the source, the loader rebuilds the ledger under the current schema. | `an_older_ledger_needs_its_source_history` |
+| An older ledger that lists a cancelled timer as fired needs its source history. The source splits the two kinds. | `a_schema_2_ledger_does_not_read_a_cancelled_timer_as_fired` |
 | The loader refuses a snapshot with a wrong engine signature. | `a_forged_snapshot_is_refused` |
 | A forged start input cannot skip the charges. | `a_forged_start_input_cannot_skip_the_charges` |
 | A v1 snapshot loads under v2 code through its upgrade step. | `a_v1_snapshot_loads_under_v2_code` |
