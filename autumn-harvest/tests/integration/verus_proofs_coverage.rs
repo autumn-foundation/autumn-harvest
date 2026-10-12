@@ -227,18 +227,93 @@ fn every_verus_mirror_matches_its_engine_source() {
     }
 }
 
-#[test]
-fn every_mirrored_source_names_its_verus_proof() {
-    for m in mirrors() {
-        let source = read(&m.source_file);
-        assert!(
-            source.contains(&m.verus_file),
-            "{} must name {}, so an editor of `{}` finds its proof",
-            m.source_file,
-            m.verus_file,
-            m.source_fn
-        );
+/// The `.rs` files under `autumn-harvest/src`, relative to the repo root.
+fn engine_files() -> Vec<String> {
+    fn walk(dir: &Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("read engine dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let rel = path.strip_prefix(repo_root()).expect("under the repo root");
+                out.push(rel.to_string_lossy().into_owned());
+            }
+        }
     }
+    let mut out = Vec::new();
+    walk(&repo_root().join("autumn-harvest/src"), &mut out);
+    out.sort();
+    out
+}
+
+/// Each `(fn, Verus file)` pair where the `///` doc block of `fn` names
+/// a file under `formal/verus/src/`.
+fn proof_named_fns(source: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut doc = String::new();
+    for line in source.lines() {
+        let line = line.trim();
+        if let Some(text) = line.strip_prefix("///") {
+            doc.push_str(text);
+            doc.push(' ');
+            continue;
+        }
+        if line.starts_with("#[") {
+            continue;
+        }
+        if let Some(at) = line.find("fn ") {
+            let name: String = line[at + 3..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            let mut rest = doc.as_str();
+            while let Some(i) = rest.find("formal/verus/src/") {
+                let tail = &rest[i..];
+                let end = tail.find(".rs").map_or(tail.len(), |e| e + 3);
+                out.push((name.clone(), tail[..end].to_string()));
+                rest = &tail[end..];
+            }
+        }
+        doc.clear();
+    }
+    out
+}
+
+/// The mirror set must equal the set of engine functions whose doc comment
+/// names a Verus proof. A deleted `// mirror:` marker fails the guard, and
+/// an editor of a proved function finds its proof in the doc comment.
+#[test]
+fn mirror_inventory_matches_the_engine_doc_comments() {
+    use std::collections::BTreeSet;
+    let mut named = BTreeSet::new();
+    for file in engine_files() {
+        for (func, verus_file) in proof_named_fns(&read(&file)) {
+            named.insert((file.clone(), func, verus_file));
+        }
+    }
+    let mirrored: BTreeSet<_> = mirrors()
+        .into_iter()
+        .map(|m| (m.source_file, m.source_fn, m.verus_file))
+        .collect();
+    let unmirrored: Vec<_> = named.difference(&mirrored).collect();
+    let undocumented: Vec<_> = mirrored.difference(&named).collect();
+    assert!(
+        unmirrored.is_empty(),
+        "these functions name a Verus proof, but no `// mirror:` marker copies them: {unmirrored:?}"
+    );
+    assert!(
+        undocumented.is_empty(),
+        "these mirrored functions must name their Verus file in their doc comment: {undocumented:?}"
+    );
+}
+
+#[test]
+fn proof_named_fns_reads_the_doc_block_of_each_fn() {
+    let src = "/// Plain.\nfn a() {}\n/// `formal/verus/src/x.rs` proves it.\n#[inline]\n    pub const fn b(x: u8) {}\n// formal/verus/src/y.rs\nfn c() {}\n";
+    assert_eq!(
+        proof_named_fns(src),
+        [("b".to_string(), "formal/verus/src/x.rs".to_string())]
+    );
 }
 
 /// The tokens of `src` in order. A token is an identifier, one punctuation

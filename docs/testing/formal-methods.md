@@ -555,7 +555,9 @@ it cannot change what the copy computes.
 The guard suite fails in these cases:
 
 - A mirrored body differs from its engine source.
-- An engine source does not name the Verus file that proves it.
+- The mirrored functions differ from the engine functions whose `///` doc
+  comment names a Verus file. A deleted `// mirror:` marker fails, and an
+  editor of a proved function finds its proof in the doc comment.
 - A Verus file uses `assume`, `admit`, `axiom`, `external_body` or another
   way to skip a step. The guard lexes the file and bans every name that
   holds `assume`, `admit`, `axiom`, `external` or `truncate`, so a comment,

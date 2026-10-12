@@ -75,13 +75,16 @@ const fn uniform_inclusive(seed: u64, lo: u64, hi: u64) -> u64 {
 }
 
 /// Full jitter in nanoseconds: a value in `[0, hi]`.
+///
+/// `formal/verus/src/jitter.rs` proves the range for every input.
 const fn full_jitter_nanos(hi: u64, seed: u64) -> u64 {
     uniform_inclusive(seed, 0, hi)
 }
 
 /// Equal jitter in nanoseconds: a value in `[hi/2, hi]`.
 ///
-/// For `hi <= 1` the value is `hi`.
+/// For `hi <= 1` the value is `hi`. `formal/verus/src/jitter.rs` proves
+/// the range for every input.
 const fn equal_jitter_nanos(hi: u64, seed: u64) -> u64 {
     if hi <= 1 {
         return hi;
