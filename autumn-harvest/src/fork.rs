@@ -502,10 +502,18 @@ async fn fork_workflow_id(
     request: &WorkflowForkRequest,
 ) -> Result<String, WorkflowForkError> {
     check_workflow_id(request.workflow_id.as_deref())?;
-    let workflow_id = request
-        .workflow_id
-        .clone()
-        .unwrap_or_else(|| format!("{}-fork-{}", source.workflow_id, Uuid::new_v4().simple()));
+    let workflow_id = request.workflow_id.clone().unwrap_or_else(|| {
+        let router = crate::shard::GLOBAL_SHARD_ROUTER
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned());
+        derived_workflow_id(
+            &source.workflow_name,
+            &source.workflow_id,
+            ShardId::new(source.shard_id),
+            router.as_ref(),
+        )
+    });
     if workflow_id == source.workflow_id {
         return Err(WorkflowForkError::InvalidOverride {
             message: "a fork needs a workflow id other than the source id".to_string(),
@@ -999,6 +1007,45 @@ fn decode_rows(rows: &[HarvestEvent], codecs: &PayloadCodecs) -> HarvestResult<V
     rows.iter()
         .map(|row| codecs.decode_event(row.event_data.clone()))
         .collect()
+}
+
+/// A new workflow id for a fork, derived from the id of its source.
+///
+/// The fork row lives on the shard of its source. A later start that reuses
+/// the returned id routes by hash. If the id hashed to another shard, that
+/// start would miss the fork and make a second active run under the same
+/// id. So the suffix is drawn again until the id hashes to the source shard,
+/// as for an auto-generated id on a pinned start (issue #697).
+///
+/// Unpinned placement never picks a drained or reserved shard, so no draw
+/// can reach one. The loop then keeps the first id. The cap is a backstop
+/// only: with `N` shards, a draw succeeds after about `N` tries.
+fn derived_workflow_id(
+    workflow_name: &str,
+    source_id: &str,
+    source_shard: ShardId,
+    router: Option<&crate::shard::ShardRouter>,
+) -> String {
+    const MINT_CAP: u32 = 10_000;
+    let draw = || format!("{source_id}-fork-{}", Uuid::new_v4().simple());
+    let mut workflow_id = draw();
+    let Some(router) = router.filter(|router| router.accepts_unpinned(source_shard)) else {
+        return workflow_id;
+    };
+    let mut attempts = 0u32;
+    while router.pick_for_new_workflow(workflow_name, &workflow_id) != source_shard {
+        attempts += 1;
+        if attempts > MINT_CAP {
+            tracing::warn!(
+                workflow_name,
+                shard = %source_shard,
+                "could not derive a fork workflow id on the source shard; using the last draw"
+            );
+            break;
+        }
+        workflow_id = draw();
+    }
+    workflow_id
 }
 
 /// Refuse an explicit empty workflow id.
@@ -2926,6 +2973,27 @@ mod tests {
             validate_fork(&source, 2, &twice),
             Err(WorkflowForkError::InvalidOverride { .. })
         ));
+    }
+
+    #[test]
+    fn a_derived_workflow_id_routes_to_the_source_shard() {
+        let shards: Vec<ShardId> = (0..4).map(ShardId::new).collect();
+        let router = crate::shard::ShardRouter::new(shards.clone(), shards, ShardId::new(0));
+        for shard in 0..4 {
+            for _ in 0..8 {
+                let id =
+                    derived_workflow_id("orders", "order-7", ShardId::new(shard), Some(&router));
+                assert!(id.starts_with("order-7-fork-"), "{id}");
+                assert_eq!(
+                    router.pick_for_new_workflow("orders", &id),
+                    ShardId::new(shard),
+                    "{id}"
+                );
+            }
+        }
+        // With no router, the id is derived once, as before.
+        let id = derived_workflow_id("orders", "order-7", ShardId::new(0), None);
+        assert!(id.starts_with("order-7-fork-"), "{id}");
     }
 
     #[test]
