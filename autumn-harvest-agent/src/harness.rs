@@ -425,14 +425,20 @@ impl AgentHarness {
         }
     }
 
-    /// Whether the content of `response` fits the result cap.
+    /// Whether a later hit on `response` fits the result cap.
     ///
-    /// The recorded turn adds the decisions to the content, so a miss here
-    /// means that the turn cannot fit either.
+    /// The check measures the turn that a hit records before its decisions.
+    /// The decisions only add bytes, so a turn that fails here cannot fit.
+    /// A zero cap is no cap, as on a worker.
     fn fits_result_cap(&self, response: &ChatResponse) -> bool {
-        serde_json::to_vec(&response.content).is_ok_and(|bytes| {
-            u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= self.max_result_bytes
-        })
+        let hit = ModelTurn {
+            content: response.content.clone(),
+            stop: response.stop_reason,
+            usage: TokenUsage::default(),
+            decisions: Vec::new(),
+            cache_hit: true,
+        };
+        self.max_result_bytes == 0 || !crate::bounds::exceeds_bytes(&hit, self.max_result_bytes)
     }
 
     /// Store a fresh answer. A fault or a slow cache is only a warning.

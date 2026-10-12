@@ -132,15 +132,14 @@ async fn tenants_do_not_share_an_entry_by_default() {
     assert_eq!(model.calls(), 3, "only the same tenant shares an entry");
 }
 
-/// An answer over the result cap fails its turn, so the cache must not keep
-/// it. A later run with the same request asks the model again.
+/// An answer whose recorded turn is over the result cap fails its turn, so
+/// the cache must not keep it. The content alone fits the cap here, and the
+/// turn envelope does not. A later run with the same request asks the model
+/// again.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_answer_over_the_result_cap_is_not_cached() {
     let (_dir, db) = fresh_db();
-    let model = ScriptedModel::named(
-        "m-1",
-        vec![answer(&"x".repeat(4096), 1), answer("short", 1)],
-    );
+    let model = ScriptedModel::named("m-1", vec![answer(&"x".repeat(990), 1), answer("short", 1)]);
     let store = Arc::new(MemStore::default());
     let harness = AgentHarness::new(model.clone())
         .max_result_bytes(1024)
