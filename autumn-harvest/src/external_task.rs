@@ -305,7 +305,8 @@ pub async fn find_by_token_locked(
 ///
 /// Appends `ActivityCompletedExternally` to the event history and wakes the
 /// parked workflow task.  Returns `true` if the state transition happened,
-/// `false` if the token was already in a terminal state (idempotent).
+/// `false` if the token was already in a terminal state (idempotent), or if
+/// the run has ended. A late push for an ended run writes nothing.
 ///
 /// Delegates to [`complete_externally_with_codecs`] under the identity
 /// registry (issue #1243). A payload-bearing call site should use the
@@ -344,7 +345,7 @@ pub async fn complete_externally_with_codecs(
         async |conn| {
             let task = lock_task(conn, token).await?;
 
-            if task.state != "PENDING" {
+            if task.state != "PENDING" || run_has_ended(conn, task.workflow_exec_id).await? {
                 return Ok(false);
             }
 
@@ -378,7 +379,8 @@ pub async fn complete_externally_with_codecs(
 ///
 /// Appends `ActivityFailedExternally` to the event history and wakes the
 /// parked workflow task.  Returns `true` if the state transition happened,
-/// `false` if the token was already in a terminal state (idempotent).
+/// `false` if the token was already in a terminal state (idempotent), or if
+/// the run has ended. A late push for an ended run writes nothing.
 ///
 /// # Errors
 ///
@@ -397,7 +399,7 @@ pub async fn fail_externally(
         async |conn| {
             let task = lock_task(conn, token).await?;
 
-            if task.state != "PENDING" {
+            if task.state != "PENDING" || run_has_ended(conn, task.workflow_exec_id).await? {
                 return Ok(false);
             }
 
@@ -477,6 +479,23 @@ pub async fn extend_deadline(
         Ok(())
     }))
     .await
+}
+
+/// `true` when the run of an external task has ended or is gone.
+///
+/// The row lock follows the task-row lock, as `docs/architecture.md` requires.
+/// A cancel that commits first is seen here. A later cancel waits for this
+/// transaction, so no event lands after the terminal event.
+async fn run_has_ended(conn: &mut AsyncPgConnection, exec_id: uuid::Uuid) -> HarvestResult<bool> {
+    let state: Option<String> = harvest_workflow_executions::table
+        .find(exec_id)
+        .select(harvest_workflow_executions::state)
+        .for_update()
+        .first(conn)
+        .await
+        .optional()
+        .map_err(database_error)?;
+    Ok(state.is_none_or(|state| crate::erase::is_terminal_state(&state)))
 }
 
 async fn lock_task(

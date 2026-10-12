@@ -149,6 +149,8 @@ fn registry() -> Arc<HandlerRegistry> {
         max_result_bytes: None,
         requires: None,
         handler: call_downstream_handler,
+        input_schema: None,
+        output_schema: None,
     };
     Arc::new(HandlerRegistry::new(vec![wf], vec![act]))
 }

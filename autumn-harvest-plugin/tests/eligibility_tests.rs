@@ -1081,6 +1081,8 @@ async fn test_worker_capabilities_routing_and_triage() {
         circuit_breaker: None,
         requires: Some("gpu = true"),
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        input_schema: None,
+        output_schema: None,
     };
 
     let state = api_state(
@@ -1252,6 +1254,8 @@ fn cb_activity(name: &'static str, queue: &'static str) -> autumn_harvest::info:
         )),
         requires: None,
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -2050,6 +2054,8 @@ async fn test_worker_queue_filtering_for_capable_of() {
         circuit_breaker: None,
         requires: Some("gpu = true"),
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        input_schema: None,
+        output_schema: None,
     };
 
     let state = api_state(
@@ -2147,6 +2153,8 @@ async fn test_worker_queue_filtering_with_explicit_queue_override() {
         circuit_breaker: None,
         requires: Some("gpu = true"),
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        input_schema: None,
+        output_schema: None,
     };
 
     let state = api_state(

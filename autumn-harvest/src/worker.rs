@@ -557,6 +557,8 @@ fn session_internal_activity_info(name: &'static str) -> ActivityInfo {
         circuit_breaker: None,
         requires: None,
         handler: session_internal_stub_handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -16645,6 +16647,7 @@ fn is_worker_local_failure(error_type: &str) -> bool {
         crate::failure::ERROR_TYPE_WASM_TRAP,
         crate::failure::ERROR_TYPE_SANDBOX_DENIED,
         crate::failure::ERROR_TYPE_WASM_OUTPUT_TOO_LARGE,
+        crate::failure::ERROR_TYPE_WASM_JOURNAL_DIVERGENCE,
     ]
     .contains(&error_type)
     {
@@ -17010,6 +17013,7 @@ mod adaptive_limit_gate_tests {
             crate::failure::ERROR_TYPE_WASM_TRAP,
             crate::failure::ERROR_TYPE_SANDBOX_DENIED,
             crate::failure::ERROR_TYPE_WASM_OUTPUT_TOO_LARGE,
+            crate::failure::ERROR_TYPE_WASM_JOURNAL_DIVERGENCE,
         ] {
             assert_eq!(
                 limit_sample_outcome(
@@ -42553,6 +42557,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
 
         let registry = HandlerRegistry::new(vec![wf], vec![act]);
@@ -42659,6 +42665,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }
         }
         let global = crate::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
@@ -42753,6 +42761,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }
         }
 
@@ -42800,6 +42810,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }
         }
 
@@ -43784,6 +43796,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         }
     }
 
@@ -46156,6 +46170,8 @@ mod tests {
             circuit_breaker: None,
             requires: Some("gpu = true"),
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![act]));
         match Worker::new(default_runtime_config(), registry) {
@@ -46187,6 +46203,8 @@ mod tests {
             circuit_breaker: None,
             requires: Some("gpu = true"),
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
 
         let act2 = ActivityInfo {
@@ -46210,6 +46228,8 @@ mod tests {
             circuit_breaker: None,
             requires: Some("region in [us-east-1, us-west-2]"),
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
 
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![act1, act2]));
@@ -48311,6 +48331,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }],
         )
     }
