@@ -14,6 +14,8 @@
 //! - The sweep takes no lock on a live row.
 //! - A terminal workflow row stays while its execution is live, or while a
 //!   dead letter exists for its execution.
+//! - A race loser that a recorded fork holds stays while its execution is
+//!   live (issue #2000).
 //! - A row locked by another transaction is skipped, not waited on.
 //! - `dry_run` deletes nothing and records no metric.
 //! - A disabled janitor deletes nothing and reports `None`.
@@ -595,6 +597,38 @@ async fn a_live_executions_terminal_workflow_row_is_kept() {
     assert!(task_exists(&mut conn, kept_paused).await);
     assert!(!task_exists(&mut conn, gone_activity).await);
     assert!(!task_exists(&mut conn, gone_done).await);
+}
+
+#[tokio::test]
+async fn a_held_fork_race_loser_stays_while_its_execution_is_live() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    // A recorded fork holds a race loser as a marked `CANCELLED` row (issue
+    // #2000). The race finds the mark when its winner fires. That can be
+    // after the window, so the row stays while the execution is live.
+    let running = insert_execution(&mut conn, "RUNNING").await;
+    let done = insert_execution(&mut conn, "COMPLETED").await;
+    let held = insert_task_for(&mut conn, running, "activity", "CANCELLED", days_ago(30)).await;
+    let plain = insert_task_for(&mut conn, running, "activity", "CANCELLED", days_ago(30)).await;
+    let held_done = insert_task_for(&mut conn, done, "activity", "CANCELLED", days_ago(30)).await;
+    for id in [held, held_done] {
+        diesel::sql_query("UPDATE harvest_task_queue SET error = $1 WHERE id = $2")
+            .bind::<Text, _>(autumn_harvest::fork::FORK_HOLD_ERROR)
+            .bind::<SqlUuid, _>(id)
+            .execute(&mut conn)
+            .await
+            .expect("mark the hold");
+    }
+
+    let deleted = queue::sweep_terminal_tasks(&mut conn, days_ago(7), 100, false)
+        .await
+        .expect("sweep");
+    assert_eq!(deleted.get("CANCELLED"), Some(&2));
+    assert!(task_exists(&mut conn, held).await, "the live hold stays");
+    assert!(!task_exists(&mut conn, plain).await);
+    assert!(!task_exists(&mut conn, held_done).await);
 }
 
 #[tokio::test]

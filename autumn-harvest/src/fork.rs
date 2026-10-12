@@ -1675,7 +1675,10 @@ fn source_race_winner(source_events: &[WorkflowEvent], index: usize) -> Option<u
 /// already `CANCELLED`, so `queue::cancel_activity_task` matches this mark
 /// too. The race then records the loser terminal, and no scheduled activity
 /// stays open in the fork history.
-pub(crate) const FORK_HOLD_ERROR: &str = "held by the fork record (issue #2000)";
+///
+/// The terminal-task janitor keeps a marked row while its execution is live.
+/// The winner can fire after the retention window.
+pub const FORK_HOLD_ERROR: &str = "held by the fork record (issue #2000)";
 
 /// The error text of the terminal that `ctx.race()` writes for a loser.
 const RACE_LOSER_ERROR: &str = "lost race to a sibling branch";
