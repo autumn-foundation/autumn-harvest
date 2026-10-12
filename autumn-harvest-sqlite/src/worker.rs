@@ -556,8 +556,8 @@ fn payload_too_large_activity_envelope(activity_name: &str, observed: u64, cap: 
 /// The core arms that deadline timer with the id `__signal_timeout:{seq}:{name}`
 /// (an inline `format!` in `autumn_harvest::context`, issue #476 — there is no
 /// exported constant, so the prefix convention is matched here). Only THAT timer
-/// may be recorded ahead of the signal in [`ingest_awaited_signal`]; an unrelated
-/// durable timer armed in the same batch must not (see the call site).
+/// may be recorded ahead of the signal in [`SignalIngest::plan`]; an unrelated
+/// durable timer armed in the same batch must not.
 ///
 /// Parsed structurally — strip the `__signal_timeout:` prefix, then `split_once`
 /// on the seq's colon so the remainder is the signal name — rather than a `LIKE`
@@ -570,65 +570,89 @@ fn is_signal_timeout_deadline_timer(timer_id: &str, signal_name: &str) -> bool {
         .is_some_and(|(_seq, name)| name == signal_name)
 }
 
-/// Ingest one awaited signal chronologically against the execution's due timers
-/// (issue #476), mirroring the Postgres `merge_wake_events`.
+/// The row that one planned ingest event consumes.
+enum IngestRow {
+    /// A `harvest_timers` row, by timer id.
+    Timer(String),
+    /// A `harvest_signals` row, by `signal_seq`.
+    Signal(i64),
+}
+
+/// Every staged signal of a run, planned as events for one decision cycle
+/// (issue #2020).
 ///
-/// Consumes the oldest undelivered signal named `signal_name` (if any) and
-/// appends its `SignalReceived` — but the **race deadline timer of THIS wait**
-/// (`__signal_timeout:{seq}:{signal_name}`) is fired (`TimerFired`) **first** when
-/// its `fire_at` is at or before the signal's `received_at`, so a signal delivered
-/// *after* an expired `wait_for_signal_timeout` deadline can never retroactively
-/// win the signal-or-deadline race. Two kinds of timer are deliberately NOT fired
-/// ahead of the signal: (1) the race deadline timer whose deadline is *after* the
-/// signal arrived (left for the ordinary [`drain_ready`] pass so an on-time signal
-/// still wins even when the run is only driven past the deadline), and (2) any
-/// **unrelated** durable timer (e.g. a `join!`ed `ctx.timer("t", 5)`) — firing it
-/// before the signal would wedge replay (see the scoping note at the call site).
-/// Runs entirely inside the caller's cycle transaction (`conn` is a `&tx`).
+/// The plan reads storage but writes nothing. Replay sees [`Self::events`] in
+/// memory. The transaction that persists the cycle outcome then calls
+/// [`Self::apply`] first. A discarded cycle thus leaves every signal staged.
 ///
-/// Returns `true` iff any event was appended (a signal was consumed and/or a due
-/// deadline timer fired).
-pub fn ingest_awaited_signal(
-    conn: &Connection,
-    exec_id: ExecutionId,
-    signal_name: &str,
-    now: i64,
-) -> SqliteResult<bool> {
-    // Peek (and eagerly deserialize) BEFORE mutating: a corrupt payload rolls the
-    // whole cycle transaction back with the signal still undelivered (no timer
-    // fired, nothing marked) rather than silently dropped.
-    let Some(signal) = store::peek_pending_signal(conn, exec_id, signal_name)? else {
-        return Ok(false);
-    };
-    // Fire the RACED signal-timeout deadline timer for THIS wait — but ONLY it —
-    // ahead of the signal when its deadline expired at or before the signal
-    // arrived (issue #476; Codex #1069 P2, runtime.rs:699). `due_timers_before_signal`
-    // returns *every* due timer whose deadline is `<= received_at`, but only the
-    // `__signal_timeout:{seq}:{signal_name}` deadline timer of this
-    // `wait_for_signal_timeout` race may be recorded before the `SignalReceived`.
-    // An UNRELATED durable timer armed in the same batch — e.g.
-    // `join!(ctx.wait_for_signal("go"), ctx.timer("t", 5))` — must NOT fire first:
-    // the core `match_signal` path does not skip an interleaved `TimerFired`, so a
-    // `TimerFired(t)` recorded before `SignalReceived(go)` wedges replay (the run
-    // stays parked waiting even though the signal row was delivered). Leave any
-    // such unrelated due timer to the ordinary [`drain_ready`] pass, which fires
-    // it *after* this signal at a history position the workflow's own timer-await
-    // consumes.
-    for timer_id in queue::due_timers_before_signal(conn, exec_id, now, signal.received_at)? {
-        if is_signal_timeout_deadline_timer(&timer_id, signal_name) {
-            fire_timer_within_tx(conn, exec_id, &timer_id)?;
+/// This mirrors the Postgres task-preparation ingest. Every signal reaches
+/// history before the workflow runs, so `drain_signals`, `try_receive_signal`
+/// and push handlers see it.
+#[must_use]
+pub struct SignalIngest {
+    planned: Vec<(WorkflowEvent, IngestRow)>,
+}
+
+impl SignalIngest {
+    /// Plan every undelivered signal of `exec_id`, in arrival order.
+    ///
+    /// The first signal of each name can resolve an open signal-or-deadline
+    /// race (issue #476). Before it, the plan fires each due deadline timer
+    /// of that name whose `fire_at` is at or before the signal arrival. Thus a
+    /// late signal cannot win the race.
+    ///
+    /// Two kinds of timer stay for [`drain_ready`]:
+    ///
+    /// - An unrelated due timer. A `TimerFired` before a `SignalReceived` it
+    ///   does not race wedges replay (issue #1071).
+    /// - A deadline after the first signal of its name. That signal already
+    ///   resolved the race, so the fire is a stray event. Strict replay then
+    ///   reports an early completion.
+    pub fn plan(conn: &Connection, exec_id: ExecutionId, now: i64) -> SqliteResult<Self> {
+        let mut planned = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for signal in store::pending_signals(conn, exec_id)? {
+            let due = if seen.insert(signal.name.clone()) {
+                queue::due_timers_before_signal(conn, exec_id, now, signal.received_at)?
+            } else {
+                Vec::new()
+            };
+            for timer_id in due {
+                if is_signal_timeout_deadline_timer(&timer_id, &signal.name) {
+                    let event = WorkflowEvent::TimerFired {
+                        timer_id: TimerId::new(timer_id.clone()),
+                    };
+                    planned.push((event, IngestRow::Timer(timer_id)));
+                }
+            }
+            let event = WorkflowEvent::SignalReceived {
+                signal_name: signal.name,
+                payload: signal.payload,
+            };
+            planned.push((event, IngestRow::Signal(signal.seq)));
         }
+        Ok(Self { planned })
     }
-    store::append_event(
-        conn,
-        exec_id,
-        &WorkflowEvent::SignalReceived {
-            signal_name: signal_name.to_string(),
-            payload: signal.payload,
-        },
-    )?;
-    store::mark_signal_delivered(conn, signal.seq)?;
-    Ok(true)
+
+    /// The planned events, in history order.
+    pub fn events(&self) -> impl Iterator<Item = &WorkflowEvent> {
+        self.planned.iter().map(|(event, _)| event)
+    }
+
+    /// Append the planned events and consume their rows.
+    ///
+    /// Call it inside the cycle transaction, before any other append. Returns
+    /// `true` if it appended an event.
+    pub fn apply(&self, conn: &Connection, exec_id: ExecutionId) -> SqliteResult<bool> {
+        for (event, row) in &self.planned {
+            store::append_event(conn, exec_id, event)?;
+            match row {
+                IngestRow::Timer(timer_id) => queue::mark_timer_fired(conn, exec_id, timer_id)?,
+                IngestRow::Signal(seq) => store::mark_signal_delivered(conn, *seq)?,
+            }
+        }
+        Ok(!self.planned.is_empty())
+    }
 }
 
 /// Finalize one activity attempt in a **single transaction** (AC7): the audit
@@ -1010,10 +1034,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        commands_open_activity_race, drain_ready, finalize_within_tx, fire_timer,
+        SignalIngest, commands_open_activity_race, drain_ready, finalize_within_tx, fire_timer,
         fire_timer_within_tx, handler_panic_activity_envelope, history_has_unsettled_activity_race,
-        ingest_awaited_signal, is_signal_timeout_deadline_timer,
-        payload_too_large_activity_envelope, schedule_to_close_exceeded, start_to_close_exceeded,
+        is_signal_timeout_deadline_timer, payload_too_large_activity_envelope,
+        schedule_to_close_exceeded, start_to_close_exceeded,
     };
     use crate::queue::{self, ClaimedTask};
     use crate::runtime::ActivitySpec;
@@ -1404,7 +1428,7 @@ mod tests {
         ));
     }
 
-    // FIX 1 (Codex #1069 P2, runtime.rs:699): `ingest_awaited_signal` reorders ONLY
+    // FIX 1 (Codex #1069 P2, runtime.rs:699): the signal ingest reorders ONLY
     // the raced `__signal_timeout:{seq}:{name}` deadline timer ahead of the signal.
     // An UNRELATED due timer (e.g. a `join!`ed `ctx.timer("t", 5)`) is deliberately
     // LEFT UNFIRED here — firing a `TimerFired(t)` before `SignalReceived(go)` would
@@ -1441,7 +1465,10 @@ mod tests {
         // Ingest inside a transaction (the real caller passes a `&tx`); commit so
         // the assertions read the persisted state.
         let tx = conn.unchecked_transaction().unwrap();
-        let produced = ingest_awaited_signal(&tx, exec, "go", 200).unwrap();
+        let produced = SignalIngest::plan(&tx, exec, 200)
+            .unwrap()
+            .apply(&tx, exec)
+            .unwrap();
         tx.commit().unwrap();
         assert!(
             produced,
@@ -1492,6 +1519,61 @@ mod tests {
             t_fired, 0,
             "the unrelated timer `t` must remain unfired after ingest"
         );
+    }
+
+    // Issue #2020: the first signal of a name resolves its race. A deadline
+    // after it stays for `drain_ready`, so no stray `TimerFired` reaches history.
+    #[test]
+    fn ingest_fires_a_deadline_only_ahead_of_the_first_signal_of_its_name() {
+        let conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
+        store::stage_signal(&conn, exec, "go", &serde_json::json!("on_time"), 10).unwrap();
+        store::stage_signal(&conn, exec, "go", &serde_json::json!("late"), 90).unwrap();
+        queue::enqueue_timer(&conn, exec, "__signal_timeout:0:go", 60).unwrap();
+
+        let ingest = SignalIngest::plan(&conn, exec, 120).unwrap();
+        let events: Vec<_> = ingest.events().cloned().collect();
+        assert_eq!(events.len(), 2, "two signals and no timer:\n{events:?}");
+        assert!(
+            events
+                .iter()
+                .all(|e| matches!(e, autumn_harvest::WorkflowEvent::SignalReceived { .. })),
+            "{events:?}"
+        );
+    }
+
+    // Issue #2020: a plan writes nothing. A discarded cycle leaves every signal
+    // staged and every timer armed.
+    #[test]
+    fn a_signal_ingest_plan_writes_nothing() {
+        let conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
+        store::stage_signal(&conn, exec, "go", &serde_json::json!(1), 100).unwrap();
+        queue::enqueue_timer(&conn, exec, "__signal_timeout:0:go", 60).unwrap();
+
+        let ingest = SignalIngest::plan(&conn, exec, 200).unwrap();
+        assert_eq!(ingest.events().count(), 2, "a deadline and a signal");
+        drop(ingest);
+
+        assert!(store::load_history(&conn, exec).unwrap().is_empty());
+        assert_eq!(store::pending_signals(&conn, exec).unwrap().len(), 1);
+        assert!(queue::has_unfired_timer(&conn, exec).unwrap());
     }
 
     // FIX A (Codex #1069 P2, worker.rs:328): a POLICY retry's backoff anchors to the

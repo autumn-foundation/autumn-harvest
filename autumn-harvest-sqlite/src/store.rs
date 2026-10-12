@@ -418,7 +418,7 @@ pub fn load_attempts(
 /// (`received_at`).
 ///
 /// `received_at` is compared against a `wait_for_signal_timeout` deadline timer's
-/// `fire_at` by the wake-event ingest ([`crate::worker::ingest_awaited_signal`]),
+/// `fire_at` by the cycle-start ingest ([`crate::worker::SignalIngest`]),
 /// so it must be on the **same clock** as the deadline: the public
 /// [`send_signal`](crate::SqliteRuntime::send_signal) uses the wall clock (as the
 /// wall-clock drivers do), and the `*_as_of` seam injects a test epoch (as the
@@ -443,64 +443,58 @@ pub fn stage_signal(
     Ok(())
 }
 
-/// A staged signal awaiting delivery: its row id, arrival time, and payload.
+/// A staged signal awaiting delivery.
 pub struct PendingSignal {
-    /// `harvest_signals.signal_seq` — pass to [`mark_signal_delivered`].
+    /// `harvest_signals.signal_seq`. Pass it to [`mark_signal_delivered`].
     pub seq: i64,
+    /// The signal name.
+    pub name: String,
     /// Absolute epoch-millisecond the signal arrived (`received_at`).
     pub received_at: i64,
     /// Deserialized payload.
     pub payload: Value,
 }
 
-/// Peek (without consuming) the EARLIEST-ARRIVED undelivered signal matching
-/// `name`.
+/// Read every undelivered signal of `exec_id`, in arrival order.
 ///
-/// Ordered by `received_at` first, `signal_seq` second (issue #1069 P2, Codex
-/// `store.rs:327`) — NOT by `signal_seq` alone. Insertion order (`signal_seq`) and
-/// arrival order (`received_at`) can differ: a caller may `send_signal_as_of` a
-/// signal with a *later* logical arrival time before one with an *earlier* arrival
-/// time (out-of-order staging), so consuming the lowest `signal_seq` would hand
-/// [`ingest_awaited_signal`](crate::worker::ingest_awaited_signal) the WRONG
-/// arrival time to compare against a `wait_for_signal_timeout` deadline: a late
-/// signal staged first + an on-time signal staged second would let the timeout win
-/// and mark the LATE row delivered while the on-time row stayed queued. Ordering by
-/// `received_at` makes the signal-timeout race use the actual arrival order;
-/// `signal_seq` is the deterministic tie-breaker for equal arrival times (matching
-/// the Postgres `harvest_signals.received_at` ordering).
+/// The order is `received_at`, then `signal_seq` (issue #1069 P2). Insertion
+/// order can differ from arrival order, because `send_signal_as_of` can stage a
+/// later arrival first. The signal-or-deadline race (issue #476) must compare
+/// the real arrival times. `signal_seq` breaks ties, as on Postgres.
 ///
-/// Deserializes the payload eagerly so a corrupt row surfaces as an error
-/// **before** the caller mutates anything (fires a due timer / appends the
-/// `SignalReceived` / marks it delivered), leaving the whole cycle transaction to
-/// roll back with the signal still `delivered = 0` rather than silently dropped —
-/// the same corrupt-payload safety the old `take_pending_signal` had, split so the
-/// wake-event ingest can interleave a due deadline timer between the peek and the
-/// append (issue #476).
-pub fn peek_pending_signal(
+/// Each payload is deserialized here. A corrupt row is an error before the
+/// caller writes anything, so the row stays staged.
+pub fn pending_signals(
     conn: &Connection,
     exec_id: ExecutionId,
-    name: &str,
-) -> SqliteResult<Option<PendingSignal>> {
-    let row: Option<(i64, i64, String)> = conn
-        .query_row(
-            "SELECT signal_seq, received_at, payload_json FROM harvest_signals \
-             WHERE exec_id = ?1 AND name = ?2 AND delivered = 0 \
-             ORDER BY received_at, signal_seq LIMIT 1",
-            params![exec_id.to_string(), name],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
-    match row {
-        Some((seq, received_at, payload)) => Ok(Some(PendingSignal {
+) -> SqliteResult<Vec<PendingSignal>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT signal_seq, name, received_at, payload_json FROM harvest_signals \
+         WHERE exec_id = ?1 AND delivered = 0 \
+         ORDER BY received_at, signal_seq",
+    )?;
+    let rows = stmt.query_map(params![exec_id.to_string()], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (seq, name, received_at, payload) = row?;
+        out.push(PendingSignal {
             seq,
+            name,
             received_at,
             payload: serde_json::from_str(&payload)?,
-        })),
-        None => Ok(None),
+        });
     }
+    Ok(out)
 }
 
-/// Mark a peeked signal delivered (consumed). Call only after the matching
+/// Mark a staged signal delivered (consumed). Call only after the matching
 /// `SignalReceived` has been appended in the same transaction.
 pub fn mark_signal_delivered(conn: &Connection, seq: i64) -> SqliteResult<()> {
     conn.execute(
