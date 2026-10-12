@@ -18640,6 +18640,10 @@ async fn process_activity_task(
                         .telemetry()
                         .metrics
                         .record_activity_concurrency_deferred(activity_name);
+                    // Wake an idle poll loop when the row is due again.
+                    registry
+                        .adaptive_limits()
+                        .wake_when_deferral_due(retry_after);
                 }
                 return Ok(());
             }
@@ -31342,6 +31346,9 @@ pub struct Worker {
     /// Wakes a saturated poll loop when a task releases its permit (issue
     /// #1787). See [`CapacityPermit`].
     capacity_freed: Arc<tokio::sync::Notify>,
+    /// Wakes every idle wait when a task deferred at its adaptive limit is
+    /// due (issue #1836). Unlike `capacity_freed`, no gate holds it back.
+    deferral_due: Arc<tokio::sync::Notify>,
     /// Kinds the poll gate refused since the last claim of that kind (issue
     /// #1787). The slot tuner counts a claimed task's queue wait only when
     /// the gate held its kind back. Otherwise a NOTIFY delay reads as a
@@ -33343,6 +33350,7 @@ impl Worker {
         // The limit registry fires this wake when a limit slot frees (issue
         // #1836). That happens before the attempt writes its result.
         let capacity_freed = registry.adaptive_limits.slot_freed_notify();
+        let deferral_due = registry.adaptive_limits.deferral_due_notify();
 
         let workflow_parts =
             build_dispatch_semaphore(config.max_concurrent_workflows, config.slot_tuner.as_ref());
@@ -33369,6 +33377,7 @@ impl Worker {
             dispatch_reserved_workflow: Arc::new(AtomicUsize::new(0)),
             dispatch_reserved_activity: Arc::new(AtomicUsize::new(0)),
             capacity_freed,
+            deferral_due,
             gate_refused: Arc::new(GateRefused::default()),
             limit_refused: AtomicBool::new(false),
             monitoring_started: std::sync::atomic::AtomicBool::new(false),
@@ -34219,6 +34228,7 @@ impl Worker {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     () = self.capacity_freed.notified(), if capacity_bound => {}
+                    () = self.deferral_due.notified() => {}
                     () = tokio::time::sleep(poll_interval) => {}
                 }
             } else {
@@ -34251,6 +34261,9 @@ impl Worker {
             if capacity_bound
                 && futures::FutureExt::now_or_never(self.capacity_freed.notified()).is_some()
             {
+                break 'notify_wait;
+            }
+            if futures::FutureExt::now_or_never(self.deferral_due.notified()).is_some() {
                 break 'notify_wait;
             }
             let mut broken_idx: Option<usize> = None;
@@ -35956,6 +35969,7 @@ impl Worker {
             tokio::select! {
                 () = self.shutdown.cancelled() => {}
                 () = self.capacity_freed.notified(), if capacity_bound => {}
+                () = self.deferral_due.notified() => {}
                 () = tokio::time::sleep(wait) => {}
             }
         }
@@ -36455,6 +36469,7 @@ impl Worker {
             let capacity_bound = self.capacity_bound();
             tokio::select! {
                 () = self.capacity_freed.notified(), if capacity_bound => {}
+                () = self.deferral_due.notified() => {}
                 () = idle_wait => {}
             }
         }
