@@ -471,14 +471,19 @@
 //! [`SqliteRuntime::register_update`](crate::SqliteRuntime::register_update)
 //! adds a declarative `#[update]`.
 //!
-//! The runtime replays the run to rebuild the handlers. The validator runs
-//! before any write, so a rejection writes no event. The handler then runs to
-//! completion. One transaction appends `UpdateAdmitted` and `UpdateCompleted` or
-//! `UpdateFailed`. A `RecordUpdateResult` command from the workflow body records
+//! The runtime replays the run to rebuild the handlers. The arg schema and the
+//! validator run before any write, so a rejection writes no event. The handler
+//! then runs. One transaction appends `UpdateAdmitted` and then
+//! `UpdateCompleted` or `UpdateFailed`.
+//!
+//! The handler runs on that separate replay. State that the handler writes does
+//! not reach the workflow body. Use an update to compute a result from the
+//! workflow state, not to change that state. A `RecordUpdateResult` command from the workflow body records
 //! the same events in the decision cycle, as on Postgres.
 //!
-//! A handler cannot await a durable command. Such a handler returns
-//! [`SqliteError::UpdateBlocked`] and writes no event.
+//! The handler can await any future, within a 5 second limit. It cannot await
+//! a durable command, such as an activity or a timer. Such a handler returns
+//! [`SqliteError::UpdateTimedOut`] and writes no event.
 //!
 //! # Robustness — healthy-run-killer containment (Codex #1069 / round 8)
 //!

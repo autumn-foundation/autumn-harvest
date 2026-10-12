@@ -98,10 +98,11 @@ A complete, runnable version is in
   deterministic replay. Activity execution is therefore **at-least-once** — write
   activity bodies to be idempotent. See
   [`examples/durability.rs`](examples/durability.rs).
-- **Updates (issue #2025).** `update(exec, name, args)` runs a registered
+- **Updates (issue #2025).** `update(exec, name, input)` runs a registered
   update handler and returns its result. A validator rejection writes no event.
-  An accepted update writes the core `UpdateAdmitted` and `UpdateCompleted`
-  events in one transaction.
+  An accepted update writes `UpdateAdmitted` and then `UpdateCompleted` or
+  `UpdateFailed`, in one transaction. The handler runs on a separate replay,
+  so state that it writes does not reach the workflow body.
 - **Idempotent starts by default (issue #1068).** `start_workflow_with_id`
   applies the `AllowDuplicate` reuse policy. A duplicate `(workflow_name,
   workflow_id)` **attaches** to the existing, non-sealed run instead of

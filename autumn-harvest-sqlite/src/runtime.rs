@@ -172,9 +172,10 @@ pub struct StartOutcome {
 /// which reached an unsupported feature (issue #1834).
 pub const UNSUPPORTED_FEATURE_ERROR_TYPE: &str = "UnsupportedFeature";
 
-/// The time budget for the replay that rebuilds update handlers
-/// (issue #2025). It matches the `WorkflowTestEnv` mid-run budget.
-const UPDATE_REBUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// The time limit for the replay that rebuilds update handlers, and the
+/// default limit for an update handler (issue #2025). It matches the
+/// `WorkflowTestEnv` mid-run limit.
+const UPDATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Maximum driver iterations before declaring a runaway (safety bound only — the
 /// supported scenarios converge in a handful of cycles).
@@ -204,6 +205,8 @@ pub struct SqliteRuntime {
     activities: HashMap<String, ActivitySpec>,
     /// Declarative `#[update]` handlers, keyed by workflow name (issue #2025).
     update_handlers: HashMap<String, Vec<UpdateHandlerInfo>>,
+    /// The time limit for one update handler (issue #2025).
+    update_timeout: std::time::Duration,
     /// Consecutive contained-workflow-panic strike counter, keyed by execution
     /// (issue #782 analog). In-process (reset on restart, like the Postgres
     /// worker's strike map); incremented on each panicked decision cycle and
@@ -324,6 +327,7 @@ impl SqliteRuntime {
             workflows: HashMap::new(),
             activities: HashMap::new(),
             update_handlers: HashMap::new(),
+            update_timeout: UPDATE_TIMEOUT,
             workflow_panic_strikes: HashMap::new(),
             now_fn: std::sync::Arc::new(Utc::now),
             writer_lock,
@@ -482,11 +486,18 @@ impl SqliteRuntime {
         self.activities.insert(name.into(), spec);
     }
 
+    /// Set the time limit for one update handler. The default is 5 seconds.
+    /// A deterministic-test seam only, as [`set_clock`](Self::set_clock) is.
+    #[doc(hidden)]
+    pub const fn set_update_timeout(&mut self, timeout: std::time::Duration) {
+        self.update_timeout = timeout;
+    }
+
     /// Register a declarative `#[update]` handler from its
     /// [`UpdateHandlerInfo`] (issue #2025).
     ///
-    /// The handler serves only runs of `info.workflow`. A second handler with
-    /// the same name for the same workflow is ignored, as in the core.
+    /// The handler serves only runs of `info.workflow`. The runtime keeps the
+    /// first handler for a name and ignores a later one, as the core does.
     pub fn register_update(&mut self, info: &UpdateHandlerInfo) {
         let handlers = self
             .update_handlers
@@ -879,15 +890,16 @@ impl SqliteRuntime {
         )
     }
 
-    /// Run the update `name` with `args` against `exec`, and return its result
-    /// (issue #2025).
+    /// Run the update `name` with `input` against `exec`, and return its
+    /// result (issue #2025).
     ///
     /// The runtime replays the history into a new context, as a query does, so
     /// the workflow body registers its handlers. Declarative handlers from
     /// [`register_update`](Self::register_update) register too. The arg schema
     /// and the validator run first. A rejection writes no event.
     ///
-    /// The handler then runs to completion. One transaction appends
+    /// The handler then runs, with a 5 second limit. It can await any future,
+    /// but not a durable command. One transaction appends
     /// `UpdateAdmitted` and its `UpdateCompleted` or `UpdateFailed`, so a crash
     /// leaves no admitted update without a result. The events are the core
     /// update events, so the history replays on any backend.
@@ -896,8 +908,10 @@ impl SqliteRuntime {
     /// [`run_until_blocked`](Self::run_until_blocked), as after
     /// [`send_signal`](Self::send_signal).
     ///
-    /// The handler runs once, at admission. Replay returns the recorded result
-    /// and does not run the handler again.
+    /// The handler runs once, at admission, on that separate replay. State that
+    /// the handler writes does not reach the workflow body. Use an update to
+    /// compute a result from the workflow state, not to change that state.
+    /// Replay returns the recorded result and does not run the handler again.
     ///
     /// # Errors
     ///
@@ -907,23 +921,25 @@ impl SqliteRuntime {
     /// - [`SqliteError::ExecutionNotFound`] for an unknown id.
     /// - [`SqliteError::WorkflowNotRunning`] for a terminal run.
     /// - [`SqliteError::UnknownWorkflow`] if the workflow is not registered.
-    /// - [`SqliteError::UpdateRejected`] if the arg schema or the validator
-    ///   rejects `args`.
+    /// - [`SqliteError::UpdateInputInvalid`] if `input` fails the arg schema
+    ///   of a declarative handler.
+    /// - [`SqliteError::UpdateRejected`] if the validator rejects `input` or
+    ///   panics.
     /// - [`SqliteError::UpdateHandlerNotFound`] if no handler has the name.
     /// - [`SqliteError::WorkflowPanicked`] or [`SqliteError::TaskFailed`] if
     ///   the replay that rebuilds the handlers panics or does not settle.
-    /// - [`SqliteError::UpdateBlocked`] if the handler awaits a durable
-    ///   command.
+    /// - [`SqliteError::NonDeterministic`] if that replay diverges from the
+    ///   history.
+    /// - [`SqliteError::UpdateTimedOut`] if the handler does not finish in
+    ///   time, for example because it awaits a durable command.
     /// - [`SqliteError::UpdateFailed`] if the handler returns an error or
-    ///   panics. History records `UpdateFailed`.
+    ///   panics. History records `WorkflowEvent::UpdateFailed`.
     /// - A persistence error if the history cannot be read or written.
-    // Owned `args`, as `send_signal` takes its payload.
-    #[allow(clippy::needless_pass_by_value)]
     pub async fn update(
         &mut self,
         exec: ExecutionId,
         name: &str,
-        args: Value,
+        input: Value,
     ) -> SqliteResult<Value> {
         let state = store::execution_state(&self.conn, exec)?;
         if autumn_harvest::erase::is_terminal_state(&state) {
@@ -945,36 +961,48 @@ impl SqliteRuntime {
         };
         // The arg schema runs before the validator, as on Postgres (issue #610).
         if let Some(info) = declarative.iter().find(|h| h.name == name)
-            && let Err(violations) = info.validate_arg(&args)
+            && let Err(violations) = info.validate_arg(&input)
         {
-            let reason = violations
-                .iter()
-                .map(|v| v.message.as_str())
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(rejected(reason));
+            return Err(SqliteError::UpdateInputInvalid {
+                execution_id: exec,
+                name: name.to_string(),
+                violations,
+            });
         }
 
-        let (ctx, input) = self.update_context(exec, &workflow_name, &declarative)?;
-        settle_update_context(exec, &ctx, handler, input).await?;
-        ctx.validate_update(name, &args)
-            .map_err(|error| match error {
-                autumn_harvest::HarvestError::UpdateRejected { reason } => rejected(reason),
-                autumn_harvest::HarvestError::UpdateHandlerNotFound(_) => {
-                    SqliteError::UpdateHandlerNotFound {
-                        execution_id: exec,
-                        name: name.to_string(),
-                    }
+        let (ctx, run_input) = self.update_context(exec, &workflow_name, &declarative)?;
+        settle_update_context(exec, &ctx, handler, run_input).await?;
+        // A validator is user code. Contain its panic, as the handler poll does.
+        let validated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.validate_update(name, &input)
+        }))
+        .map_err(|panic| {
+            rejected(format!(
+                "update validator panicked: {}",
+                autumn_harvest::error::panic_message(panic)
+            ))
+        })?;
+        validated.map_err(|error| match error {
+            autumn_harvest::HarvestError::UpdateRejected { reason } => rejected(reason),
+            autumn_harvest::HarvestError::UpdateHandlerNotFound(_) => {
+                SqliteError::UpdateHandlerNotFound {
+                    execution_id: exec,
+                    name: name.to_string(),
                 }
-                other => rejected(other.to_string()),
-            })?;
+            }
+            other => rejected(other.to_string()),
+        })?;
 
         // The rebuild replayed every event, so the new update has no result in
         // history. `execute_admitted_update` therefore runs the handler live.
         let update_id = UpdateId::new();
-        let run = update::run_handler(ctx.execute_admitted_update(update_id, name, args.clone()));
+        let run = update::run_handler(
+            ctx.execute_admitted_update(update_id, name, input.clone()),
+            self.update_timeout,
+        )
+        .await;
         let update::HandlerRun::Finished(result) = run else {
-            return Err(SqliteError::UpdateBlocked {
+            return Err(SqliteError::UpdateTimedOut {
                 execution_id: exec,
                 name: name.to_string(),
             });
@@ -983,7 +1011,7 @@ impl SqliteRuntime {
         let admitted = WorkflowEvent::UpdateAdmitted {
             update_id,
             name: name.to_string(),
-            input: args,
+            input,
             timestamp: (self.now_fn)(),
         };
         let tx = self.conn.transaction()?;
@@ -1820,10 +1848,12 @@ impl SqliteRuntime {
                     produced = true;
                 }
                 // A body-driven update result (issue #2025). The Postgres worker
-                // appends the same event in command order.
+                // appends the same event in command order. It is not progress:
+                // replay skips update events, so the result cannot unblock the
+                // body. A body that mints a new update id on each cycle then
+                // appends one event per drive, as on Postgres, and does not spin.
                 WorkflowCommand::RecordUpdateResult { update_id, result } => {
                     store::append_event(&tx, exec, &update::result_event(*update_id, result))?;
-                    produced = true;
                 }
                 // Race-loser teardown (issue #476/#600). Emitted when a resolved
                 // `ctx.race()` / `wait_for_signal_timeout` picks a winner and rides
@@ -2301,8 +2331,20 @@ async fn settle_update_context(
     handler: WorkflowHandlerFn,
     input: Value,
 ) -> SqliteResult<()> {
-    match drive_query_replay_async(ctx, handler, input, UPDATE_REBUILD_TIMEOUT).await {
-        QueryReplayOutcome::ReachedTerminal | QueryReplayOutcome::Suspended => Ok(()),
+    match drive_query_replay_async(ctx, handler, input, UPDATE_TIMEOUT).await {
+        // A replay that diverged rebuilds the wrong state. A drive would fail
+        // the same history as non-deterministic, so the update must not run.
+        QueryReplayOutcome::ReachedTerminal | QueryReplayOutcome::Suspended => {
+            let drift = ctx
+                .take_deferred_nd_error()
+                .or_else(|| ctx.take_nd_details().map(|d| format!("{d:?}")));
+            drift.map_or(Ok(()), |details| {
+                Err(SqliteError::NonDeterministic {
+                    execution_id: exec,
+                    details,
+                })
+            })
+        }
         QueryReplayOutcome::Panicked => Err(SqliteError::WorkflowPanicked {
             execution_id: exec,
             details: "the workflow panicked while its update handlers were rebuilt".to_string(),

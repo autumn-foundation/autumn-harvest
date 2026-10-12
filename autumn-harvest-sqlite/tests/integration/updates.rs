@@ -3,6 +3,8 @@
 //! `SqliteRuntime::update` replays the run to rebuild its handlers. It runs
 //! the validator, then the handler. It writes `UpdateAdmitted` and the result
 //! in one transaction. A rejection writes no event.
+//!
+//! No Docker: `SQLite` is embedded (`rusqlite` `bundled`).
 
 // The `#[workflow]` and `#[update]` macros reference their input parameters,
 // and need an `async fn` with a `Result` return.
@@ -13,8 +15,16 @@
 )]
 
 use autumn_harvest::prelude::*;
-use autumn_harvest::testing::{HistorySnapshot, ReplayStatus, WorkflowReplayer};
-use autumn_harvest::{UpdateId, WorkflowHandlerFn};
+use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Poll;
+use std::time::Duration;
+
+use autumn_harvest::testing::{
+    HistorySnapshot, ReplayStatus, TestRunStatus, WorkflowReplayer, WorkflowTestEnv,
+};
+use autumn_harvest::{UpdateId, WorkflowHandlerFn, WorkflowIdReusePolicy};
 use autumn_harvest_sqlite::{
     ExecutionOutcome, RunState, SqliteError, SqliteRuntime, UNSUPPORTED_FEATURE_ERROR_TYPE,
 };
@@ -45,7 +55,71 @@ async fn limit_wf(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
     ctx.register_update_handler_no_validator("boom", |_input: Value| async move {
         panic!("boom handler")
     });
+    ctx.register_update_handler_no_validator("later", |_input: Value| woken_later());
+    ctx.register_update_handler_no_validator("yielder", |_input: Value| yield_then_finish());
+    ctx.register_update_handler(
+        "fragile",
+        |_input: &Value| panic!("validator boom"),
+        |input: Value| async move { Ok(input) },
+    );
     ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
+/// A handler body that a separate thread wakes after 20 ms. It stands for a
+/// timer, I/O or an async lock.
+fn woken_later() -> impl Future<Output = Result<Value, String>> + Send {
+    let mut started = false;
+    let done = Arc::new(AtomicBool::new(false));
+    std::future::poll_fn(move |cx| {
+        if done.load(Ordering::Acquire) {
+            return Poll::Ready(Ok(json!("woken")));
+        }
+        if !started {
+            started = true;
+            let done = Arc::clone(&done);
+            let waker = cx.waker().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                done.store(true, Ordering::Release);
+                waker.wake();
+            });
+        }
+        Poll::Pending
+    })
+}
+
+/// Arms another timer than `timer_wf`. Registered under the name
+/// `timer_wf`, it stands for a changed workflow build.
+#[workflow]
+async fn drifted_timer_wf(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    ctx.register_update_handler_no_validator("set_limit", |input: Value| async move { Ok(input) });
+    ctx.timer("other", 60).await.map_err(|e| e.to_string())?;
+    Ok(json!("fired"))
+}
+
+/// A handler body that yields to the tokio scheduler once. Tokio defers that
+/// wake, so the handler is `Pending` with no wake at first.
+async fn yield_then_finish() -> Result<Value, String> {
+    tokio::task::yield_now().await;
+    Ok(json!("yielded"))
+}
+
+/// Mints a new update id on each cycle, then waits for `go`. The id is not
+/// deterministic, so each replay runs the handler again.
+#[workflow]
+async fn fresh_update_id_wf(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    ctx.register_update_handler_no_validator("echo", |input: Value| async move { Ok(input) });
+    ctx.execute_admitted_update(UpdateId::new(), "echo", json!(1))
+        .await?;
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
+/// Registers `set_limit`, then waits on a 60 second timer.
+#[workflow]
+async fn timer_wf(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    ctx.register_update_handler_no_validator("set_limit", |input: Value| async move { Ok(input) });
+    ctx.timer("t", 60).await.map_err(|e| e.to_string())?;
+    Ok(json!("fired"))
 }
 
 /// Waits for `go`. Declarative handlers serve its updates.
@@ -71,6 +145,13 @@ fn validate_rename(input: &Value) -> Result<(), String> {
 #[update(workflow = "declarative_wf", validator = validate_rename)]
 async fn rename(_ctx: &WorkflowContext, name: String) -> Result<String, String> {
     Ok(format!("renamed to {name}"))
+}
+
+/// Awaits a durable timer, which an update handler cannot do here.
+#[update(workflow = "declarative_wf")]
+async fn slow_rename(ctx: &WorkflowContext, name: String) -> Result<String, String> {
+    ctx.timer("ht", 5).await.map_err(|e| e.to_string())?;
+    Ok(name)
 }
 
 #[update(workflow = "other_wf")]
@@ -106,6 +187,20 @@ async fn body_update_then_return_wf(ctx: &WorkflowContext, _n: i64) -> Result<Va
         .await
 }
 
+/// Runs a body-driven update whose handler fails, then waits for `go`.
+#[workflow]
+async fn body_update_err_then_wait_wf(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    ctx.register_update_handler_no_validator("bad", |_input: Value| async move {
+        Err::<Value, String>("nope".to_string())
+    });
+    let failed = ctx
+        .execute_admitted_update(UpdateId::from_uuid(BODY_UPDATE_ID), "bad", json!(1))
+        .await
+        .unwrap_err();
+    let go = ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+    Ok(json!({ "failed": failed, "go": go }))
+}
+
 /// Registers `set_limit`, waits for `go`, then panics.
 #[workflow]
 async fn panic_after_go_wf(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
@@ -122,6 +217,41 @@ async fn blocked_limit_run() -> (SqliteRuntime, ExecutionId) {
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(matches!(state, RunState::WaitingSignal(ref s) if s == "go"));
     (rt, exec)
+}
+
+/// The serialized history, for a whole-history comparison.
+fn snapshot(rt: &SqliteRuntime, exec: ExecutionId) -> Value {
+    serde_json::to_value(rt.load_history(exec).unwrap()).unwrap()
+}
+
+/// Each update event as `(type, name, payload)`, with ids replaced by their
+/// order of first use. It compares histories across runs and backends.
+fn update_shape(history: &[WorkflowEvent]) -> Vec<(String, usize, Value)> {
+    let mut ids: Vec<UpdateId> = Vec::new();
+    let mut index = |id: &UpdateId| {
+        ids.iter().position(|seen| seen == id).unwrap_or_else(|| {
+            ids.push(*id);
+            ids.len() - 1
+        })
+    };
+    history
+        .iter()
+        .filter_map(|e| match e {
+            WorkflowEvent::UpdateAdmitted {
+                update_id,
+                name,
+                input,
+                ..
+            } => Some((format!("Admitted:{name}"), index(update_id), input.clone())),
+            WorkflowEvent::UpdateCompleted { update_id, output } => {
+                Some(("Completed".to_string(), index(update_id), output.clone()))
+            }
+            WorkflowEvent::UpdateFailed { update_id, error } => {
+                Some(("Failed".to_string(), index(update_id), json!(error)))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn update_events(history: &[WorkflowEvent]) -> Vec<&WorkflowEvent> {
@@ -184,11 +314,19 @@ async fn assert_open_history_replays(
 #[tokio::test]
 async fn accepted_update_returns_its_result_and_is_in_history() {
     let (mut rt, exec) = blocked_limit_run().await;
+    let before = snapshot(&rt, exec);
 
     let result = rt.update(exec, "set_limit", json!(5)).await.unwrap();
     assert_eq!(result, json!({ "limit": 5 }));
 
     let history = rt.load_history(exec).unwrap();
+    let after = serde_json::to_value(&history).unwrap();
+    let prefix = before.as_array().unwrap();
+    assert_eq!(
+        &after.as_array().unwrap()[..prefix.len()],
+        &prefix[..],
+        "the update only appends"
+    );
     let updates = update_events(&history);
     assert_eq!(updates.len(), 2, "admitted and completed:\n{history:?}");
     let WorkflowEvent::UpdateAdmitted {
@@ -271,7 +409,18 @@ async fn update_history_replays_on_the_core_replayer() {
     rt.send_signal(exec, "go", json!("ok")).unwrap();
     rt.run_until_blocked(exec).await.unwrap();
     let history = rt.load_history(exec).unwrap();
-    assert_eq!(update_events(&history).len(), 4, "{history:?}");
+    // Replay skips update events, so check their shape here: each result
+    // pairs with its own admission, and the two ids differ.
+    assert_eq!(
+        update_shape(&history),
+        vec![
+            ("Admitted:set_limit".to_string(), 0, json!(5)),
+            ("Completed".to_string(), 0, json!({ "limit": 5 })),
+            ("Admitted:set_limit".to_string(), 1, json!(13)),
+            ("Failed".to_string(), 1, json!("limit 13 is unlucky")),
+        ],
+        "{history:?}"
+    );
     assert_replays("limit_wf", limit_wf_info().handler, history).await;
 }
 
@@ -289,12 +438,13 @@ async fn handler_error_records_update_failed() {
     );
 
     let history = rt.load_history(exec).unwrap();
-    let updates = update_events(&history);
-    assert_eq!(updates.len(), 2, "{history:?}");
-    assert!(matches!(
-        updates[1],
-        WorkflowEvent::UpdateFailed { error, .. } if error == "limit 13 is unlucky"
-    ));
+    assert_eq!(
+        update_shape(&history),
+        vec![
+            ("Admitted:set_limit".to_string(), 0, json!(13)),
+            ("Failed".to_string(), 0, json!("limit 13 is unlucky")),
+        ]
+    );
 }
 
 /// A handler panic is contained and recorded as `UpdateFailed`.
@@ -321,18 +471,60 @@ async fn handler_panic_records_update_failed() {
     ));
 }
 
-/// A handler that never finishes returns `UpdateBlocked` and writes no event.
+/// A handler that never finishes returns `UpdateTimedOut` and writes no
+/// event.
 #[tokio::test]
-async fn blocked_handler_writes_no_event() {
+async fn handler_that_never_finishes_times_out_and_writes_no_event() {
     let (mut rt, exec) = blocked_limit_run().await;
+    rt.set_update_timeout(Duration::from_millis(100));
     let before = rt.load_history(exec).unwrap().len();
 
     let err = rt.update(exec, "hang", json!(null)).await.unwrap_err();
     assert!(
-        matches!(err, SqliteError::UpdateBlocked { ref name, .. } if name == "hang"),
+        matches!(err, SqliteError::UpdateTimedOut { ref name, .. } if name == "hang"),
         "{err:?}"
     );
     assert_eq!(rt.load_history(exec).unwrap().len(), before);
+}
+
+/// A handler that a timer, I/O or an async lock wakes later still finishes.
+#[tokio::test]
+async fn handler_woken_asynchronously_finishes() {
+    let (mut rt, exec) = blocked_limit_run().await;
+    let result = rt.update(exec, "later", json!(null)).await.unwrap();
+    assert_eq!(result, json!("woken"));
+    assert_eq!(update_events(&rt.load_history(exec).unwrap()).len(), 2);
+}
+
+/// A handler that yields to the scheduler finishes, on the default
+/// current-thread runtime too.
+#[tokio::test]
+async fn handler_that_yields_finishes() {
+    let (mut rt, exec) = blocked_limit_run().await;
+    assert_eq!(
+        rt.update(exec, "yielder", json!(null)).await.unwrap(),
+        json!("yielded")
+    );
+}
+
+/// A declarative handler that awaits a durable timer times out. The timer of
+/// the handler does not leak into history.
+#[tokio::test]
+async fn handler_awaiting_a_durable_command_times_out() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&declarative_wf_info());
+    rt.register_update(&slow_rename_info());
+    rt.set_update_timeout(Duration::from_millis(100));
+    let exec = rt.start_workflow("declarative_wf", json!(0)).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    let before = snapshot(&rt, exec);
+
+    let err = rt
+        .update(exec, "slow_rename", json!("x"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SqliteError::UpdateTimedOut { .. }), "{err:?}");
+    assert_eq!(snapshot(&rt, exec), before, "no event, no leaked timer");
 }
 
 // ───────────────────────────── ingress checks ────────────────────────────────
@@ -420,11 +612,14 @@ async fn declarative_update_runs_validator_and_handler() {
     let ok = rt.update(exec, "rename", json!("bob")).await.unwrap();
     assert_eq!(ok, json!("renamed to bob"));
 
+    let before = snapshot(&rt, exec);
     let err = rt.update(exec, "rename", json!("")).await.unwrap_err();
     assert!(
         matches!(err, SqliteError::UpdateRejected { ref reason, .. } if reason == "name must not be empty"),
         "{err:?}"
     );
+
+    assert_eq!(snapshot(&rt, exec), before, "a rejection writes no event");
 
     // A handler of another workflow type does not answer.
     let err = rt
@@ -469,10 +664,22 @@ async fn update_survives_a_reopen() {
 
     let mut rt = SqliteRuntime::open(&path).unwrap();
     rt.register_workflow(&limit_wf_info());
-    assert_eq!(update_events(&rt.load_history(exec).unwrap()).len(), 2);
+    assert_eq!(
+        update_shape(&rt.load_history(exec).unwrap()),
+        vec![
+            ("Admitted:set_limit".to_string(), 0, json!(7)),
+            ("Completed".to_string(), 0, json!({ "limit": 7 })),
+        ]
+    );
     rt.send_signal(exec, "go", json!("ok")).unwrap();
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    assert_replays(
+        "limit_wf",
+        limit_wf_info().handler,
+        rt.load_history(exec).unwrap(),
+    )
+    .await;
 }
 
 // ───────────────────── RecordUpdateResult in the decision cycle ──────────────
@@ -561,4 +768,294 @@ async fn record_update_result_on_terminal_drain_is_persisted() {
         history,
     )
     .await;
+}
+
+/// A body-driven update whose handler fails records `UpdateFailed` on the
+/// suspend path.
+#[tokio::test]
+async fn record_update_result_error_on_suspend_path_is_persisted() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&body_update_err_then_wait_wf_info());
+    let exec = rt
+        .start_workflow("body_update_err_then_wait_wf", json!(0))
+        .unwrap();
+
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::WaitingSignal(_)), "{state:?}");
+    assert_eq!(
+        update_shape(&rt.load_history(exec).unwrap()),
+        vec![("Failed".to_string(), 0, json!("nope"))]
+    );
+
+    rt.send_signal(exec, "go", json!("ok")).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!({ "failed": "nope", "go": "ok" })),
+        "{state:?}"
+    );
+    assert_replays(
+        "body_update_err_then_wait_wf",
+        body_update_err_then_wait_wf_info().handler,
+        rt.load_history(exec).unwrap(),
+    )
+    .await;
+}
+
+// ──────────────────────────────── atomicity ──────────────────────────────────
+
+/// A failed result write rolls back the admission too (design risk R2).
+#[tokio::test]
+async fn admission_and_result_commit_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("harvest.sqlite3");
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&limit_wf_info());
+    let exec = rt.start_workflow("limit_wf", json!(0)).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    let before = snapshot(&rt, exec);
+
+    // Make the second write of the update fail.
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute_batch(
+        "CREATE TRIGGER fail_result BEFORE INSERT ON harvest_events \
+         WHEN NEW.event_json LIKE '%UpdateCompleted%' \
+         BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+    )
+    .unwrap();
+
+    let err = rt.update(exec, "set_limit", json!(5)).await.unwrap_err();
+    assert!(matches!(err, SqliteError::Sqlite(_)), "{err:?}");
+    assert_eq!(
+        snapshot(&rt, exec),
+        before,
+        "no admitted update without a result"
+    );
+
+    raw.execute_batch("DROP TRIGGER fail_result;").unwrap();
+    assert_eq!(
+        rt.update(exec, "set_limit", json!(5)).await.unwrap(),
+        json!({ "limit": 5 })
+    );
+}
+
+// ──────────────────────────── more ingress checks ────────────────────────────
+
+/// A declarative arg schema rejects a bad input and writes no event.
+#[tokio::test]
+async fn declarative_arg_schema_rejects_and_writes_no_event() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&declarative_wf_info());
+    rt.register_update(&rename_info().with_arg_schema_fn(|| json!({ "type": "string" })));
+    let exec = rt.start_workflow("declarative_wf", json!(0)).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    let before = snapshot(&rt, exec);
+
+    let err = rt.update(exec, "rename", json!(7)).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SqliteError::UpdateInputInvalid { ref violations, .. }
+                if violations.len() == 1 && violations[0].message.contains("string")
+        ),
+        "{err:?}"
+    );
+    assert_eq!(snapshot(&rt, exec), before);
+    assert_eq!(
+        rt.update(exec, "rename", json!("a")).await.unwrap(),
+        json!("renamed to a")
+    );
+}
+
+/// An update to a sealed `CONTINUED_AS_NEW` run is rejected.
+#[tokio::test]
+async fn update_to_sealed_run_is_rejected() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&limit_wf_info());
+    let prior = rt
+        .start_workflow_with_id("limit_wf", "k", json!(0))
+        .unwrap();
+    rt.run_until_blocked(prior).await.unwrap();
+    rt.start_workflow_with_reuse_policy(
+        "limit_wf",
+        "k",
+        json!(0),
+        WorkflowIdReusePolicy::TerminateIfRunning,
+    )
+    .unwrap();
+    let before = snapshot(&rt, prior);
+
+    let err = rt.update(prior, "set_limit", json!(1)).await.unwrap_err();
+    assert!(
+        matches!(err, SqliteError::WorkflowNotRunning { ref state, .. } if state == "CONTINUED_AS_NEW"),
+        "{err:?}"
+    );
+    assert_eq!(snapshot(&rt, prior), before);
+}
+
+/// An update to a run whose workflow is not registered is rejected.
+#[tokio::test]
+async fn update_to_unregistered_workflow_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("harvest.sqlite3");
+    let exec = {
+        let mut rt = SqliteRuntime::open(&path).unwrap();
+        rt.register_workflow(&limit_wf_info());
+        rt.start_workflow("limit_wf", json!(0)).unwrap()
+    };
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    let before = snapshot(&rt, exec);
+
+    let err = rt.update(exec, "set_limit", json!(1)).await.unwrap_err();
+    assert!(
+        matches!(err, SqliteError::UnknownWorkflow(ref w) if w == "limit_wf"),
+        "{err:?}"
+    );
+    assert_eq!(snapshot(&rt, exec), before);
+}
+
+// ──────────────────────────── run states ─────────────────────────────────────
+
+/// An update before the first drive works. The run then completes.
+#[tokio::test]
+async fn update_before_the_first_drive() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&limit_wf_info());
+    let exec = rt.start_workflow("limit_wf", json!(0)).unwrap();
+
+    assert_eq!(
+        rt.update(exec, "set_limit", json!(2)).await.unwrap(),
+        json!({ "limit": 2 })
+    );
+    rt.send_signal(exec, "go", json!("ok")).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    assert_replays(
+        "limit_wf",
+        limit_wf_info().handler,
+        rt.load_history(exec).unwrap(),
+    )
+    .await;
+}
+
+/// An update while a durable timer is pending. The timer still fires and the
+/// run completes.
+#[tokio::test]
+async fn update_while_a_timer_is_pending() {
+    let t0 = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&timer_wf_info());
+    let exec = rt.start_workflow("timer_wf", json!(0)).unwrap();
+    let state = rt.run_until_blocked_as_of(exec, t0).await.unwrap();
+    assert!(matches!(state, RunState::WaitingTimer), "{state:?}");
+
+    assert_eq!(
+        rt.update(exec, "set_limit", json!(3)).await.unwrap(),
+        json!(3)
+    );
+    let state = rt
+        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(61))
+        .await
+        .unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!("fired")),
+        "{state:?}"
+    );
+    assert_replays(
+        "timer_wf",
+        timer_wf_info().handler,
+        rt.load_history(exec).unwrap(),
+    )
+    .await;
+}
+
+// ─────────────────────────────── parity ──────────────────────────────────────
+
+/// The update events match those of the core `WorkflowTestEnv` for the same
+/// steps. Ids and timestamps are left out.
+#[tokio::test]
+async fn update_events_match_the_core_test_env() {
+    let (mut rt, exec) = blocked_limit_run().await;
+    rt.update(exec, "set_limit", json!(5)).await.unwrap();
+    rt.update(exec, "set_limit", json!(13)).await.unwrap_err();
+    rt.update(exec, "set_limit", json!(-1)).await.unwrap_err();
+    rt.send_signal(exec, "go", json!("ok")).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    let sqlite = rt.load_history(exec).unwrap();
+
+    let env = WorkflowTestEnv::new();
+    let mut run = env.start(limit_wf_info().handler, json!(0));
+    assert_eq!(run.run_until_blocked().await, TestRunStatus::Blocked);
+    run.update("set_limit", json!(5)).await.unwrap();
+    run.update("set_limit", json!(13)).await.unwrap_err();
+    run.update("set_limit", json!(-1)).await.unwrap_err();
+    run.signal("go", json!("ok")).unwrap();
+    let core = run.finish().await;
+
+    let types = |h: &[WorkflowEvent]| h.iter().map(WorkflowEvent::type_name).collect::<Vec<_>>();
+    assert_eq!(types(&sqlite), types(core.events()));
+    assert_eq!(update_shape(&sqlite), update_shape(core.events()));
+}
+
+/// A validator panic is contained. It is a rejection and writes no event.
+#[tokio::test]
+async fn validator_panic_is_a_rejection() {
+    let (mut rt, exec) = blocked_limit_run().await;
+    let before = snapshot(&rt, exec);
+
+    let err = rt.update(exec, "fragile", json!(1)).await.unwrap_err();
+    assert!(
+        matches!(err, SqliteError::UpdateRejected { ref reason, .. } if reason.contains("validator boom")),
+        "{err:?}"
+    );
+    assert_eq!(snapshot(&rt, exec), before);
+    assert_eq!(
+        rt.update(exec, "set_limit", json!(1)).await.unwrap(),
+        json!({ "limit": 1 })
+    );
+}
+
+/// A changed build that diverges from history cannot run an update. The
+/// update writes no event.
+#[tokio::test]
+async fn update_on_a_drifted_build_is_non_deterministic() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("harvest.sqlite3");
+    let exec = {
+        let mut rt = SqliteRuntime::open(&path).unwrap();
+        rt.register_workflow(&timer_wf_info());
+        let exec = rt.start_workflow("timer_wf", json!(0)).unwrap();
+        rt.run_until_blocked(exec).await.unwrap();
+        exec
+    };
+
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&WorkflowInfo {
+        name: "timer_wf",
+        ..drifted_timer_wf_info()
+    });
+    let before = snapshot(&rt, exec);
+    let err = rt.update(exec, "set_limit", json!(1)).await.unwrap_err();
+    assert!(
+        matches!(err, SqliteError::NonDeterministic { .. }),
+        "{err:?}"
+    );
+    assert_eq!(snapshot(&rt, exec), before);
+}
+
+/// A body-driven update with a new id on each cycle appends one result per
+/// drive. It does not spin to the iteration bound.
+#[tokio::test]
+async fn record_update_result_does_not_spin_the_drive() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&fresh_update_id_wf_info());
+    let exec = rt.start_workflow("fresh_update_id_wf", json!(0)).unwrap();
+
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::WaitingSignal(ref s) if s == "go"),
+        "{state:?}"
+    );
+    assert_eq!(update_events(&rt.load_history(exec).unwrap()).len(), 1);
 }

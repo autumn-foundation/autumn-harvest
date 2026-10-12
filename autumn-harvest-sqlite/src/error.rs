@@ -64,7 +64,7 @@ pub enum SqliteError {
     /// it. An unknown id is [`ExecutionNotFound`](Self::ExecutionNotFound); this
     /// variant is only for a *present but sealed* run.
     ///
-    /// An update to a terminal run also returns this variant (issue #2025).
+    /// `update` also returns this variant for a terminal run (issue #2025).
     #[error(
         "workflow execution {execution_id} is not running (state: {state}); \
          cannot accept a signal or an update"
@@ -78,7 +78,7 @@ pub enum SqliteError {
 
     /// The workflow has no update handler with this name (issue #2025).
     ///
-    /// No event is written.
+    /// The call writes no event.
     #[error("execution {execution_id} has no update handler named {name:?}")]
     UpdateHandlerNotFound {
         /// The execution the update targeted.
@@ -87,9 +87,28 @@ pub enum SqliteError {
         name: String,
     },
 
-    /// The update failed its arg schema or its validator (issue #2025).
+    /// The input fails the arg schema of a declarative `#[update]` handler
+    /// (issue #2025).
     ///
-    /// No event is written.
+    /// It keeps each violation, as the core
+    /// [`HarvestError::InputValidationFailed`](autumn_harvest::HarvestError::InputValidationFailed)
+    /// does. The call writes no event.
+    #[error(
+        "update {name:?} to execution {execution_id} has an invalid input: {}",
+        violations.iter().map(|v| v.message.as_str()).collect::<Vec<_>>().join("; ")
+    )]
+    UpdateInputInvalid {
+        /// The execution the update targeted.
+        execution_id: ExecutionId,
+        /// The update name.
+        name: String,
+        /// Each way the input fails the schema.
+        violations: Vec<autumn_harvest::info::SchemaViolation>,
+    },
+
+    /// The validator rejects the update, or panics (issue #2025).
+    ///
+    /// The call writes no event.
     #[error("update {name:?} to execution {execution_id} was rejected: {reason}")]
     UpdateRejected {
         /// The execution the update targeted.
@@ -100,10 +119,10 @@ pub enum SqliteError {
         reason: String,
     },
 
-    /// The update handler returned an error or panicked (issue #2025).
+    /// The update handler returns an error or panics (issue #2025).
     ///
-    /// The update was admitted. History holds `UpdateAdmitted` and
-    /// `UpdateFailed` with this error.
+    /// The runtime admitted the update. History holds `UpdateAdmitted` and
+    /// a `WorkflowEvent::UpdateFailed` with this error.
     #[error("update {name:?} to execution {execution_id} failed: {error}")]
     UpdateFailed {
         /// The execution the update targeted.
@@ -114,16 +133,13 @@ pub enum SqliteError {
         error: String,
     },
 
-    /// The update handler stopped before it returned (issue #2025).
+    /// The update handler did not finish within its time limit (issue #2025).
     ///
-    /// This backend runs a handler to completion in one call. A handler that
-    /// awaits a durable command, such as an activity or a timer, cannot
-    /// finish. No event is written.
-    #[error(
-        "update {name:?} to execution {execution_id} is blocked: \
-         an update handler cannot await a durable command on this backend"
-    )]
-    UpdateBlocked {
+    /// The limit is 5 seconds. A handler that awaits a durable command, such
+    /// as an activity or a timer, never finishes on this backend. The call
+    /// writes no event.
+    #[error("update {name:?} to execution {execution_id} did not finish within its time limit")]
+    UpdateTimedOut {
         /// The execution the update targeted.
         execution_id: ExecutionId,
         /// The update name.
@@ -134,6 +150,9 @@ pub enum SqliteError {
     /// (issue #1797). The handler waited too long on a future that is not a
     /// Harvest future. Nothing was persisted and the run stays `RUNNING`, so
     /// a later drive retries it.
+    ///
+    /// `update` also returns this variant when the replay that rebuilds the
+    /// update handlers does not settle (issue #2025). Retry the update.
     #[error("workflow task for execution {execution_id} failed and can be retried: {details}")]
     TaskFailed {
         /// The execution whose task failed.
@@ -219,6 +238,9 @@ pub enum SqliteError {
     /// automatic block-with-backoff of the Postgres engine (issue #603) is a
     /// documented follow-up; a discard-and-surface is the minimal correct
     /// behavior for the single-writer runtime.
+    ///
+    /// `update` also returns this variant when the replay that rebuilds the
+    /// update handlers diverges (issue #2025). The call writes no event.
     #[error(
         "execution {execution_id} hit a replay non-determinism divergence \
          (discarded; resumable after a workflow code fix/rollback): {details}"
@@ -243,6 +265,9 @@ pub enum SqliteError {
     ///
     /// A genuine author `Err(...)` carries no panic flag and still fails terminally
     /// on the first strike, unchanged.
+    ///
+    /// `update` also returns this variant when the replay that rebuilds the
+    /// update handlers panics (issue #2025). That panic adds no strike.
     #[error(
         "execution {execution_id} handler panicked \
          (contained non-terminally; resumable under the panic budget): {details}"

@@ -24,7 +24,8 @@ R&D decision record [`docs/rnd/sqlite-feasibility.md`](rnd/sqlite-feasibility.md
 5. [Registering workflows and activities](#5-registering-workflows-and-activities)
 6. [Starting a workflow](#6-starting-a-workflow)
 7. [The drive model](#7-the-drive-model)
-8. [Signals (pull-only)](#8-signals-pull-only)
+8. [Signals (pull-only)](#8-signals-pull-only), and
+   [updates](#updates-issue-2025)
 9. [Durability and crash recovery](#9-durability-and-crash-recovery)
 10. [The single-writer / single-server contract](#10-the-single-writer--single-server-contract)
 11. [v0.1 non-goals and follow-ups](#11-v01-non-goals-and-follow-ups)
@@ -337,28 +338,39 @@ body, or register a declarative `#[update]` with `register_update`.
 ```rust
 // Inside the workflow — register the handler before the first wait:
 ctx.register_update_handler(
-    "set_limit",
+    "quote",
     |input| if input.as_i64() > Some(0) { Ok(()) } else { Err("must be positive".into()) },
-    |input| async move { Ok(serde_json::json!({ "limit": input })) },
+    |input| async move { Ok(serde_json::json!({ "price": input })) },
 );
 
+// Or register a declarative `#[update(workflow = "...")]` handler:
+// rt.register_update(&quote_info());
+
 // From outside — run the update and get its result:
-let result = rt.update(exec, "set_limit", serde_json::json!(5)).await?;
+let result = rt.update(exec, "quote", serde_json::json!(5)).await?;
 ```
 
-`update` replays the run to rebuild its handlers. The arg schema and the
-validator run first. A rejection is `SqliteError::UpdateRejected` and writes no
-event. The handler then runs to completion. One transaction appends
-`UpdateAdmitted` and `UpdateCompleted`, or `UpdateFailed` for a handler error.
-These are the core update events, so the history replays on the core
-`WorkflowReplayer`.
+`update` replays the run to rebuild its handlers. The arg schema runs first. A
+violation is `SqliteError::UpdateInputInvalid`. The validator runs next. A
+rejection is `SqliteError::UpdateRejected`. Neither writes an event.
+
+The handler then runs. One transaction appends `UpdateAdmitted` and then
+`UpdateCompleted`. If the handler returns an error or panics, the transaction
+appends `UpdateFailed` instead, and the call returns
+`SqliteError::UpdateFailed`. These are the core update events, so the history
+replays on the core `WorkflowReplayer`.
 
 The update does not drive the run. Call `run_until_blocked` after it, as after
-`send_signal`. The handler runs once, at admission. Replay returns the recorded
-result and does not run the handler again.
+`send_signal`.
 
-A handler cannot await a durable command, such as an activity or a timer. Such
-a handler returns `SqliteError::UpdateBlocked` and writes no event.
+The handler runs once, on a separate replay of the run. **State that the
+handler writes does not reach the workflow body.** Use an update to compute a
+result from the workflow state, not to change that state. Replay returns the
+recorded result and does not run the handler again.
+
+The handler can await any future, within a 5 second limit. It cannot await a
+durable command, such as an activity or a timer. Such a handler returns
+`SqliteError::UpdateTimedOut` and writes no event.
 
 ---
 
