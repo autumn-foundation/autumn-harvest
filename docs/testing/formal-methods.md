@@ -561,6 +561,9 @@ The guard suite fails in these cases:
   holds `assume`, `admit`, `axiom`, `external` or `truncate`, so a comment,
   a space or a `use` alias cannot hide one. `macro_rules` is banned too,
   because a local macro can delete a proof before Verus sees it.
+- A Verus proof file holds anything but `use` items and one `verus! { }`
+  block. Verus checks only the code inside the block, so a mirror moved
+  out of it would prove nothing.
 - A Verus file uses an attribute other than `#[trigger]`. A
   `#[verifier::...]` attribute can trust a step, and a `#[cfg(...)]` can
   delete a proof, so a new attribute must be allowed in the guard on

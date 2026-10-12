@@ -366,6 +366,39 @@ fn trust_escape(code: &str) -> Option<String> {
         .find(|word| TRUST_ESCAPES.iter().any(|part| word.contains(part)))
 }
 
+/// Checks that a proof file holds `use` items and then one `verus! { }`
+/// block, with nothing after the block.
+///
+/// Verus checks only the code inside `verus!`. A function outside the
+/// block compiles as plain Rust, so a mirror moved there proves nothing.
+/// With this shape, every function in the file is inside the block.
+fn proof_file_shape(src: &str) -> Result<(), String> {
+    let tokens = code_tokens(src);
+    let mut i = 0;
+    while tokens.get(i).is_some_and(|t| t == "use") {
+        let semi = tokens[i..]
+            .iter()
+            .position(|t| t == ";")
+            .ok_or("a `use` item has no `;`")?;
+        i += semi + 1;
+    }
+    let head: Vec<&str> = tokens[i..].iter().take(3).map(String::as_str).collect();
+    if head != ["verus", "!", "{"] {
+        return Err(format!(
+            "want `verus! {{` after the `use` items, found `{}`",
+            head.join(" ")
+        ));
+    }
+    let close = matching_brace(&tokens, i + 2);
+    if close + 1 != tokens.len() {
+        return Err(format!(
+            "code follows the `verus!` block: `{}`",
+            tokens[close + 1]
+        ));
+    }
+    Ok(())
+}
+
 /// The modules that a crate root declares, in order.
 ///
 /// The root may hold only `mod <name>;` and `pub mod <name>;` items, and
@@ -456,6 +489,33 @@ fn the_trust_escape_check_lexes_the_source() {
     ];
     for code in clean {
         assert_eq!(trust_escape(code), None, "{code}");
+    }
+}
+
+#[test]
+fn every_verus_proof_file_is_one_verus_block() {
+    for file in verus_files() {
+        if file.ends_with("/lib.rs") {
+            continue;
+        }
+        if let Err(e) = proof_file_shape(&read(&file)) {
+            panic!("{file} must hold `use` items and one `verus! {{ }}` block: {e}");
+        }
+    }
+}
+
+#[test]
+fn the_proof_file_shape_check_finds_code_outside_the_block() {
+    let ok = "use vstd::prelude::*;\n// note\nverus! {\nfn f() {}\n} // verus!\n";
+    assert_eq!(proof_file_shape(ok), Ok(()));
+    for bad in [
+        "use vstd::prelude::*;\nfn f() {}\nverus! { }",
+        "use vstd::prelude::*;\nverus! { }\nfn f() {}",
+        "verus! { }\nverus! { }",
+        "fn f() {}",
+        "use a::b",
+    ] {
+        assert!(proof_file_shape(bad).is_err(), "{bad}");
     }
 }
 
