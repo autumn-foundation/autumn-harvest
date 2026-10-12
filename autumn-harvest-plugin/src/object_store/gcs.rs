@@ -379,7 +379,19 @@ impl ObjectBackend for GcsBackend {
             let request = self.http.delete(self.object_url(key));
             let response = self.send("delete", key, request).await?;
             let status = response.status();
-            if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+            if status == reqwest::StatusCode::NOT_FOUND {
+                // A missing object is a success. A missing bucket is a
+                // configuration fault, as on the read path.
+                let body = response.text().await.unwrap_or_default();
+                if is_missing_bucket(&body) {
+                    return Err(ObjectStoreError(format!(
+                        "GCS delete of {key} failed: bucket {} does not exist",
+                        self.bucket
+                    )));
+                }
+                return Ok(());
+            }
+            if status.is_success() {
                 return Ok(());
             }
             Err(status_error("delete", key, response).await)

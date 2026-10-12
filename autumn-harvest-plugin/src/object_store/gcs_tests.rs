@@ -54,7 +54,14 @@ fn fake_gcs(seen: Seen) -> Router {
                         _ => (StatusCode::NOT_FOUND, String::new()),
                     }
                 },
-            ),
+            )
+            .delete(|Path((bucket, _)): Path<(String, String)>| async move {
+                if bucket == "no-such-bucket" {
+                    let body = r#"{"error":{"code":404,"message":"The specified bucket does not exist."}}"#;
+                    return (StatusCode::NOT_FOUND, body);
+                }
+                (StatusCode::NOT_FOUND, "")
+            }),
         )
         .with_state(seen)
 }
@@ -68,6 +75,16 @@ fn a_missing_bucket_is_told_apart_from_a_missing_object() {
         r#"{"error":{"code":404,"message":"No such object: b/history/x.json"}}"#
     ));
     assert!(!super::is_missing_bucket("Not Found"));
+}
+
+#[tokio::test]
+async fn delete_of_a_missing_object_succeeds_but_a_missing_bucket_fails() {
+    let endpoint = serve(fake_gcs(Seen::default())).await;
+    let backend = GcsBackend::new("b", NoAuth).with_endpoint(&endpoint);
+    backend.delete("missing").await.unwrap();
+    let backend = GcsBackend::new("no-such-bucket", NoAuth).with_endpoint(&endpoint);
+    let err = backend.delete("missing").await.unwrap_err();
+    assert!(err.to_string().contains("does not exist"), "{err}");
 }
 
 #[test]
