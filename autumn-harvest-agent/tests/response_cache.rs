@@ -10,8 +10,8 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest_agent::workflow::agent_loop_info;
 use autumn_harvest_agent::{
-    AgentHarness, AgentStop, AgentTask, CacheScope, ModelTurn, TokenUsage, ToolDecision,
-    ToolEffect, sqlite,
+    AgentHarness, AgentStop, AgentTask, CacheScope, ModelTurn, StopReason, TokenUsage,
+    ToolDecision, ToolEffect, sqlite,
 };
 use autumn_harvest_sqlite::{ExecutionId, SqliteRuntime};
 use common::{
@@ -155,6 +155,48 @@ async fn an_answer_over_the_result_cap_is_not_cached() {
     let (_, text) = run(&mut rt, &task).await;
     assert_eq!(text, "short");
     assert_eq!(model.calls(), 2, "the second run must ask the model");
+}
+
+/// The decisions count toward the result cap. A tool-call answer fits the
+/// cap without its decisions and does not fit with them, so the cache must
+/// not keep it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_over_the_cap_with_its_decisions_is_not_cached() {
+    let (_dir, db) = fresh_db();
+    let tool_call = calls(&[("c1", "lookup", json!({}))], 1);
+    let bare = ModelTurn {
+        content: tool_call.clone().unwrap().content,
+        stop: StopReason::ToolUse,
+        usage: TokenUsage::default(),
+        decisions: Vec::new(),
+        cache_hit: true,
+    };
+    let cap = u64::try_from(serde_json::to_vec(&bare).unwrap().len()).unwrap() + 100;
+    let policy = CountingPolicy::new(ToolDecision::Deny {
+        reason: "r".repeat(400),
+    });
+    let model = ScriptedModel::named(
+        "m-1",
+        vec![tool_call, answer("short", 1), answer("short", 1)],
+    );
+    let store = Arc::new(MemStore::default());
+    let harness = AgentHarness::new(model.clone())
+        .policy(policy)
+        .max_result_bytes(cap)
+        .response_cache(response_cache(&store));
+    let mut rt = runtime(&db, harness);
+    let task = AgentTask::new("look it up");
+
+    // The oversized turn may fail the run. Only the cache matters here.
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let _ = rt.run_until_blocked(exec).await;
+
+    let (second, text) = run(&mut rt, &task).await;
+    assert_eq!(text, "short");
+    assert!(
+        !turns(&rt, second)[0].cache_hit,
+        "the oversized tool-call turn must not be served from the cache"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

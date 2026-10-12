@@ -311,6 +311,8 @@ impl AgentHarness {
             None => None,
         };
         let cache_hit = cached.is_some();
+        // A fresh answer waits for its decisions before it reaches the cache.
+        let mut fresh = None;
         let response = if let Some(response) = cached {
             // No model call ran, so the turn spent no tokens.
             ChatResponse {
@@ -319,13 +321,7 @@ impl AgentHarness {
             }
         } else {
             let response = self.call_model(&chat).await?;
-            // An answer over the result cap fails its turn. A cached copy
-            // would fail every later turn with the same request.
-            if let Some(key) = &key
-                && self.fits_result_cap(&response)
-            {
-                self.cache_store(key, &response).await;
-            }
+            fresh = key.map(|key| (key, response.clone()));
             response
         };
         let mut content = response.content;
@@ -372,6 +368,13 @@ impl AgentHarness {
                     reason: format!("the policy did not decide within {:?}", self.policy_timeout),
                 });
             turn.decisions.push(decision);
+        }
+        // A turn over the result cap fails. A cached copy would fail every
+        // later turn with the same request, so only a turn that fits is kept.
+        if let Some((key, response)) = fresh
+            && self.fits_result_cap(&turn)
+        {
+            self.cache_store(&key, &response).await;
         }
         Ok(turn)
     }
@@ -425,18 +428,16 @@ impl AgentHarness {
         }
     }
 
-    /// Whether a later hit on `response` fits the result cap.
+    /// Whether a later hit on the answer of `turn` fits the result cap.
     ///
-    /// The check measures the turn that a hit records before its decisions.
-    /// The decisions only add bytes, so a turn that fails here cannot fit.
-    /// A zero cap is no cap, as on a worker.
-    fn fits_result_cap(&self, response: &ChatResponse) -> bool {
+    /// The check measures the turn as a hit records it: the same content
+    /// and decisions, no usage, and `cache_hit`. A zero cap is no cap, as on
+    /// a worker.
+    fn fits_result_cap(&self, turn: &ModelTurn) -> bool {
         let hit = ModelTurn {
-            content: response.content.clone(),
-            stop: response.stop_reason,
             usage: TokenUsage::default(),
-            decisions: Vec::new(),
             cache_hit: true,
+            ..turn.clone()
         };
         self.max_result_bytes == 0 || !crate::bounds::exceeds_bytes(&hit, self.max_result_bytes)
     }
