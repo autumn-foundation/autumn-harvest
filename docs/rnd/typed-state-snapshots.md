@@ -193,6 +193,7 @@ Each claim names its test in `typed_snapshot_spike_tests.rs`.
 | Only the signed teardown list closes an open timer. A timer that fired in another history does not. | `a_fired_timer_is_not_teardown_evidence_for_another_history` |
 | The ledger records a failed activity, so a cover rule can check a caught failure. | `a_failed_activity_is_recorded_in_the_ledger` |
 | The ledger records a failed update, so a cover rule can check its change. | `a_failed_update_is_recorded_in_the_ledger` |
+| The ledger records a failed child apart from a completed one. | `a_failed_child_is_recorded_apart_from_a_completed_one` |
 | A snapshot from an older ledger schema still verifies. The loader checks the envelope as written. | `a_snapshot_from_an_older_ledger_schema_still_verifies` |
 | The loader refuses a snapshot with a wrong engine signature. | `a_forged_snapshot_is_refused` |
 | A forged start input cannot skip the charges. | `a_forged_start_input_cannot_skip_the_charges` |

@@ -67,8 +67,12 @@ struct EffectLedger {
     failed_activities: Vec<String>,
     /// Timers that fired or were cancelled, by id.
     timers: Vec<String>,
-    /// Children that ended, by id.
+    /// Children that completed, by id.
     children: Vec<String>,
+    /// Children that failed, by id. The parent can catch the failure and
+    /// change the state.
+    #[serde(default)]
+    failed_children: Vec<String>,
     /// Recorded side effects.
     side_effects: u64,
     /// Signals that the run received.
@@ -157,10 +161,14 @@ impl EffectLedger {
                         OpenEffect::Child(child_id.to_string()),
                     ));
                 }
-                WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
-                | WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
+                WorkflowEvent::ChildWorkflowCompleted { child_id, .. } => {
                     if close(&mut open, &child_id.to_string()).is_some() {
                         ledger.children.push(child_id.to_string());
+                    }
+                }
+                WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
+                    if close(&mut open, &child_id.to_string()).is_some() {
+                        ledger.failed_children.push(child_id.to_string());
                     }
                 }
                 WorkflowEvent::UpdateAdmitted {
@@ -819,6 +827,31 @@ fn a_wait_won_by_its_signal_can_checkpoint() {
         Snapshot::load::<OrderV1>(&raw, Some(&history)).expect("the signed ledger closes it too");
     assert_eq!(ledger.torn_down_timers, [deadline]);
     assert_eq!(ledger.timers, Vec::<String>::new());
+}
+
+#[test]
+fn a_failed_child_is_recorded_apart_from_a_completed_one() {
+    // The parent can catch a child failure and change its state, so a
+    // cover rule must tell a failed child from a completed one.
+    let child = ExecutionId::new();
+    let history = vec![
+        started(Value::Null),
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id: child,
+            workflow_name: "ship".into(),
+            input: Value::Null,
+        },
+        WorkflowEvent::ChildWorkflowFailed {
+            child_id: child,
+            error: "no stock".into(),
+            error_type: None,
+            details: None,
+            non_retryable: None,
+        },
+    ];
+    let ledger = EffectLedger::from_history(&history, &[]).expect("no effect is open");
+    assert_eq!(ledger.children, Vec::<String>::new());
+    assert_eq!(ledger.failed_children, [child.to_string()]);
 }
 
 #[test]
