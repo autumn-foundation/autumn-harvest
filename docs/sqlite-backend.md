@@ -331,7 +331,7 @@ rejected rather than silently lost.
 
 ### Queries (issue #2022)
 
-Read a run's live state with `query`. It calls a handler that
+Read a run's state with `query`. It calls a handler that
 `ctx.register_query` registered, and it writes nothing.
 
 ```rust
@@ -345,14 +345,22 @@ let stage = rt.query(exec, "stage", serde_json::Value::Null).await?;
 ```
 
 `query` loads the history and replays the run to its frontier. It then calls
-the handler. It appends no event, changes no row, delivers no staged signal
-and runs no activity body.
+the handler. It appends no event, changes no row, delivers no staged signal,
+fires no timer and runs no activity body.
 
-- A running run answers with the state at its last suspension. A query that
-  the workflow registers past that point is not yet known.
+- A running run answers with the state at its frontier: the first command
+  that the history does not record. The replay does not know a query that
+  the workflow registers past that point.
 - A terminal run answers with the state at its recorded end.
-- The call reads the rows at once. The returned future borrows nothing, so it
-  can go to `tokio::spawn`.
+- The call reads the rows immediately. The returned future borrows nothing,
+  so it can go to `tokio::spawn`. A later `set_query_timeout` does not change
+  it.
+
+> The replay runs workflow code, as a drive does. Code past the last recorded
+> event runs again in each query, a `ctx.side_effect` closure included. Keep
+> that code free of external effects. Put an external effect in an activity.
+
+The future resolves to one of these errors:
 
 | Error | Cause |
 |---|---|
@@ -360,9 +368,10 @@ and runs no activity body.
 | `UnknownWorkflow` | The run's workflow is not registered in this runtime. |
 | `QueryNotFound` | The replay registered no handler with this name. |
 | `QueryFailed` | The handler returned `Err`. |
-| `QueryPanicked` | The handler or the replayed workflow panicked. |
-| `QueryTimedOut` | The replay passed the query timeout. The default is 5 s. Set it with `set_query_timeout`. |
-| `QueryUnavailable` | A terminal run no longer replays to its recorded end, because the workflow code changed. |
+| `QueryPanicked` | The handler panicked, or the workflow panicked during the replay of a running run. |
+| `QueryTimedOut` | The replay passed the query timeout. The default is 5 s. Set it with `set_query_timeout`. The timeout holds only while the replay yields. |
+| `QueryUnavailable` | A terminal run cannot give a stable answer. The workflow code changed, the replay panicked, or an unsupported-feature seal left side effects unrecorded. |
+| Other variants | A row cannot be read. |
 
 ---
 

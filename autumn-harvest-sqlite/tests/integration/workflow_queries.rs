@@ -11,14 +11,21 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{ActivitySpec, RunState, SqliteError, SqliteRuntime};
+use chrono::{DateTime, TimeDelta, Utc};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 
 // ── Test workflows ───────────────────────────────────────────────────────────
+
+/// The typed args of the `typed` query.
+#[derive(serde::Deserialize)]
+struct Probe {
+    k: i64,
+}
 
 fn set(stage: &Mutex<Value>, value: Value) {
     *stage.lock().unwrap() = value;
@@ -36,6 +43,7 @@ async fn staged(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
         Err::<Value, String>("bad query".to_string())
     });
     ctx.register_query("boom", || panic!("query boom"));
+    ctx.register_query_handler("typed", |req: &Probe| Ok::<i64, String>(req.k));
 
     set(&stage, json!("before-activity"));
     let out = ctx
@@ -71,6 +79,49 @@ async fn spinning(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
 async fn panicking(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
     ctx.register_query("stage", || json!("panicking"));
     panic!("workflow boom");
+}
+
+/// Reports its identity. The values come from the execution row.
+#[workflow]
+async fn identity(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let info = ctx.info();
+    let ids = json!([info.workflow_id, info.workflow_type]);
+    ctx.register_query("info", move || ids.clone());
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
+/// Waits on a durable timer.
+#[workflow]
+async fn timed(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let stage = Arc::new(Mutex::new(json!("started")));
+    let read = Arc::clone(&stage);
+    ctx.register_query("stage", move || read.lock().unwrap().clone());
+    set(&stage, json!("before-timer"));
+    ctx.timer("t", 60).await.map_err(|e| e.to_string())?;
+    set(&stage, json!("after-timer"));
+    Ok(json!("done"))
+}
+
+/// Reaches an unsupported feature, so the drive seals the run `FAILED`.
+#[workflow]
+async fn spawns_child(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let stage = Arc::new(Mutex::new(json!("started")));
+    let read = Arc::clone(&stage);
+    ctx.register_query("stage", move || read.lock().unwrap().clone());
+    set(&stage, json!("before-child"));
+    ctx.spawn_child_workflow_raw("child", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Like `spawns_child`, with a side effect in the rolled-back cycle.
+#[workflow]
+async fn spawns_child_after_uuid(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let id = ctx.new_uuid().to_string();
+    ctx.register_query("stage", move || json!(id));
+    ctx.spawn_child_workflow_raw("child", json!({}))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -203,10 +254,19 @@ async fn completed_run_answers_with_its_final_state() {
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(matches!(state, RunState::Completed(_)), "got {state:?}");
 
+    let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let rows_before = snapshot(&reader);
+    let version_before = data_version(&reader);
     let answer = rt.query(exec, "stage", Value::Null).await.unwrap();
     assert_eq!(answer, json!("after-signal"));
     let late = rt.query(exec, "late", Value::Null).await.unwrap();
     assert_eq!(late, json!("late"));
+    assert_eq!(
+        snapshot(&reader),
+        rows_before,
+        "a terminal query changes no row"
+    );
+    assert_eq!(data_version(&reader), version_before);
 }
 
 // ── AC2: a query appends no event and changes no row ─────────────────────────
@@ -328,6 +388,26 @@ async fn handler_error_is_query_failed() {
 }
 
 #[tokio::test]
+async fn typed_handler_with_bad_args_is_query_failed() {
+    let (_dir, path) = temp_db();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut rt = open_staged(&path, &calls);
+    let exec = parked_run(&mut rt).await;
+
+    let good = rt.query(exec, "typed", json!({ "k": 7 })).await.unwrap();
+    assert_eq!(good, json!(7));
+    let err = rt.query(exec, "typed", json!("bad")).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SqliteError::QueryFailed { ref details, .. }
+                if details.contains("failed to deserialize query args")
+        ),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn handler_panic_is_query_panicked() {
     let (_dir, path) = temp_db();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -365,7 +445,13 @@ async fn spinning_replay_is_query_timed_out() {
     rt.set_query_timeout(Duration::from_millis(50));
     let exec = rt.start_workflow("spinning", json!(0)).unwrap();
 
+    let started = Instant::now();
     let err = rt.query(exec, "stage", Value::Null).await.unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the configured timeout must bound the replay, took {:?}",
+        started.elapsed()
+    );
     assert!(
         matches!(
             err,
@@ -432,4 +518,113 @@ async fn query_future_is_send_and_static() {
     drop(rt);
     let answer = tokio::spawn(pending).await.unwrap().unwrap();
     assert_eq!(answer, json!({ "after_activity": 42 }));
+}
+
+// ── More run shapes ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn query_sees_the_run_identity() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&identity_info());
+    let exec = rt
+        .start_workflow_with_id("identity", "biz-1", json!(0))
+        .unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+
+    let ids = rt.query(exec, "info", Value::Null).await.unwrap();
+    assert_eq!(ids, json!(["biz-1", "identity"]));
+}
+
+#[tokio::test]
+async fn query_does_not_fire_a_due_timer() {
+    let (_dir, path) = temp_db();
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&timed_info());
+    let t0 = DateTime::<Utc>::from_timestamp(1_000_000, 0).unwrap();
+    let exec = rt.start_workflow("timed", json!(0)).unwrap();
+    let state = rt.run_until_blocked_as_of(exec, t0).await.unwrap();
+    assert!(matches!(state, RunState::WaitingTimer), "got {state:?}");
+    // The timer is now due. Only a drive may fire it.
+    rt.set_clock(move || t0 + TimeDelta::hours(2));
+
+    let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let rows_before = snapshot(&reader);
+    let answer = rt.query(exec, "stage", Value::Null).await.unwrap();
+    assert_eq!(answer, json!("before-timer"));
+    assert_eq!(snapshot(&reader), rows_before, "a query fires no timer");
+
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "got {state:?}");
+}
+
+#[tokio::test]
+async fn unsupported_sealed_run_serves_state_before_the_feature() {
+    let (_dir, path) = temp_db();
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&spawns_child_info());
+    let exec = rt.start_workflow("spawns_child", json!(0)).unwrap();
+    let err = rt.run_until_blocked(exec).await.unwrap_err();
+    assert!(matches!(err, SqliteError::Unsupported(_)), "got {err:?}");
+
+    let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let rows_before = snapshot(&reader);
+    let version_before = data_version(&reader);
+    let answer = rt.query(exec, "stage", Value::Null).await.unwrap();
+    assert_eq!(answer, json!("before-child"));
+    assert_eq!(
+        snapshot(&reader),
+        rows_before,
+        "a terminal query changes no row"
+    );
+    assert_eq!(data_version(&reader), version_before);
+}
+
+/// The sealed cycle rolled back its side effect. A replay mints a new value
+/// each time, so the query refuses rather than give a changing answer.
+#[tokio::test]
+async fn unrecorded_side_effect_on_a_terminal_run_is_query_unavailable() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&spawns_child_after_uuid_info());
+    let exec = rt
+        .start_workflow("spawns_child_after_uuid", json!(0))
+        .unwrap();
+    rt.run_until_blocked(exec).await.unwrap_err();
+
+    let err = rt.query(exec, "stage", Value::Null).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SqliteError::QueryUnavailable { execution_id, ref details, .. }
+                if execution_id == exec && details.contains("side-effect")
+        ),
+        "got {err:?}"
+    );
+}
+
+/// The panic budget seals the run `FAILED`. A replay panic on a terminal run
+/// recurs on every retry, so it is `QueryUnavailable`, as on Postgres.
+#[tokio::test]
+async fn workflow_panic_on_a_terminal_run_is_query_unavailable() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&panicking_info());
+    let exec = rt.start_workflow("panicking", json!(0)).unwrap();
+    let mut sealed = false;
+    for _ in 0..5 {
+        if let Ok(state) = rt.run_until_blocked(exec).await {
+            assert!(matches!(state, RunState::Failed(_)), "got {state:?}");
+            sealed = true;
+            break;
+        }
+    }
+    assert!(sealed, "the panic budget must seal the run");
+
+    let err = rt.query(exec, "stage", Value::Null).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SqliteError::QueryUnavailable { execution_id, ref details, .. }
+                if execution_id == exec && details.contains("panicked")
+        ),
+        "got {err:?}"
+    );
 }

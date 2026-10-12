@@ -199,8 +199,9 @@ pub enum SqliteError {
 
     /// The run has no query handler with this name (issue #2022).
     ///
-    /// The replay registered every query the workflow reached before its
-    /// frontier. A query registered past the frontier is not yet known.
+    /// The replay registers every query that the workflow reaches before its
+    /// frontier. The replay does not know a query that the workflow registers
+    /// past the frontier.
     #[error("execution {execution_id} has no query handler named {name:?}")]
     QueryNotFound {
         /// The queried execution.
@@ -220,16 +221,17 @@ pub enum SqliteError {
         details: String,
     },
 
-    /// The query handler or the replayed workflow handler panicked
-    /// (issue #2022). The panic does not reach the caller. The run does not
-    /// change.
+    /// The query handler panicked, or the workflow panicked during the replay
+    /// of a running run (issue #2022). The panic does not reach the caller.
+    /// The run does not change.
     #[error("query {name:?} on execution {execution_id} panicked: {details}")]
     QueryPanicked {
         /// The queried execution.
         execution_id: ExecutionId,
         /// The query name.
         name: String,
-        /// The panic message.
+        /// The panic message of a query handler. A workflow panic during the
+        /// replay gives a fixed text, and the core logs the message.
         details: String,
     },
 
@@ -237,7 +239,9 @@ pub enum SqliteError {
     ///
     /// The usual cause is a workflow that spins on a non-Harvest future. Set
     /// the timeout with
-    /// [`set_query_timeout`](crate::SqliteRuntime::set_query_timeout).
+    /// [`set_query_timeout`](crate::SqliteRuntime::set_query_timeout). The
+    /// timeout holds only while the replay yields. A workflow that loops or
+    /// blocks without an `.await` is not bounded.
     #[error("query {name:?} on execution {execution_id} timed out after {timeout_ms} ms")]
     QueryTimedOut {
         /// The queried execution.
@@ -248,11 +252,17 @@ pub enum SqliteError {
         timeout_ms: u64,
     },
 
-    /// A terminal run cannot replay to its recorded end (issue #2022).
+    /// A terminal run cannot give a stable answer (issue #2022).
     ///
-    /// The workflow code changed since the run executed, so the rebuilt
-    /// state does not match the history. The query serves no answer rather
-    /// than a wrong one.
+    /// The query serves no answer rather than a wrong one. There are three
+    /// causes:
+    ///
+    /// - The workflow code changed, so the replay diverges from the history.
+    /// - The workflow panics during the replay. The panic recurs on every
+    ///   retry, as on the Postgres HTTP path.
+    /// - The run was sealed by an unsupported feature. Its last cycle rolled
+    ///   back, so the replay mints side-effect values that the history does
+    ///   not record.
     #[error("query {name:?} on terminal execution {execution_id} is unavailable: {details}")]
     QueryUnavailable {
         /// The queried execution.

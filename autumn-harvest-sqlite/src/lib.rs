@@ -525,9 +525,8 @@
 //! [`SqliteRuntime::query`] calls a handler that `ctx.register_query`
 //! registered. It loads the history, replays the run to its frontier, then
 //! calls the handler. It writes nothing. A running run answers with the state
-//! at its last suspension. A terminal run answers with the state at its
-//! recorded end. One process holds the run, so no routing to a worker is
-//! needed.
+//! at its frontier. A terminal run answers with the state at its recorded
+//! end. One process holds the run, so a query needs no routing to a worker.
 //!
 //! # Deterministic side effects
 //!

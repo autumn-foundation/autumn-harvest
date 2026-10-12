@@ -12,7 +12,7 @@ nothing can call them. This change adds `SqliteRuntime::query`.
 ### 0.1 Facts found before the plan
 
 - The core has a read-only query driver: `executor::drive_query_replay_async`.
-  It replays a handler to its first suspension and appends nothing.
+  It replays a handler to its frontier and appends nothing.
 - The core classifies a query on a terminal run:
   `executor::classify_terminal_query`. The Postgres HTTP path uses it
   (issue #612).
@@ -51,10 +51,13 @@ nothing can call them. This change adds `SqliteRuntime::query`.
 | R4 | The answer is stale or lost after a restart. | The query rebuilds from the database. A test reopens the file. |
 | R5 | The answer shows state from past the frontier. | Replay stops at the first unrecorded command. A test checks it. |
 | R6 | A handler panic unwinds into the caller. | `catch_unwind` maps it to `QueryPanicked`. A test covers it. |
-| R7 | A spinning workflow blocks the query forever. | The replay has a deadline. A test covers `QueryTimedOut`. |
+| R7 | A spinning workflow blocks the query forever. | The replay has a deadline. A test covers `QueryTimedOut`. The deadline holds only while the replay yields. |
 | R8 | A caller cannot tell an unknown name from an unknown run. | Two typed variants. A test checks both. |
 | R9 | The future cannot go to `tokio::spawn`. | A compile-time test checks `Send + 'static`. |
-| R10 | Drift on a terminal run serves a wrong answer. | `classify_terminal_query` maps it to `QueryUnavailable`. |
+| R10 | Drift on a terminal run serves a wrong answer. | `classify_terminal_query` maps it to `QueryUnavailable`. `drifted_terminal_run_is_query_unavailable` covers it. |
+| R11 | An unsupported-feature seal rolls back its last cycle, side effects included. A replay mints new values, so each query answers differently. | A terminal replay that emits `RecordSideEffect` or `RecordMarker` is `QueryUnavailable`. A test covers it. |
+| R12 | A query fires a due timer. | The query never reads the timer queue. A test sets the clock past the deadline and compares the tables. |
+| R13 | Code past the last recorded event, a `side_effect` closure included, runs in each query. | Postgres does the same. The docs state it. A core replay-only mode is a follow-up. |
 
 ### 0.4 Six thinking hats
 
@@ -64,12 +67,13 @@ nothing can call them. This change adds `SqliteRuntime::query`.
   `rt.query(exec, "status", json!(null)).await?`.
 - **Black (risks).** Five new error variants grow the enum. The returned
   future is a point-in-time read: it reads the rows at call time. The core
-  does not catch an imperative handler panic, so this backend must.
+  does not catch an imperative handler panic, so this backend must. Review
+  found R11 and R13 after the first green phase.
 - **Yellow (benefits).** Shared driver and classifier give parity with
   Postgres by construction. One process needs no routing to a worker.
 - **Green (alternatives).** A sync API on `drive_query_replay`. It
-  misclassifies a deferred `yield_now` wake inside a runtime, so it is
-  rejected.
+  misclassifies a deferred `yield_now` wake inside a runtime, so this
+  design rejects it.
 - **Blue (process).** Red: tests against a stub. Green: the real method.
   Refactor: share the context setup with nothing new. Then docs, the
   changelog fragment, the comment-hygiene audit and clippy.
@@ -87,9 +91,11 @@ nothing can call them. This change adds `SqliteRuntime::query`.
    drive does.
 5. Replay with `drive_query_replay_async` under the query timeout.
 6. Running run: a panic is `QueryPanicked`. A timeout is `QueryTimedOut`.
-   Any other outcome serves.
-7. Terminal run: `classify_terminal_query` decides. `HistoryUnavailable` is
-   `QueryUnavailable`.
+   Any other outcome serves. This matches the in-process Postgres query.
+7. Terminal run: `classify_terminal_query` decides, as on the Postgres HTTP
+   path. `HistoryUnavailable`, a replay panic included, is
+   `QueryUnavailable`. A served replay that minted a side-effect value is
+   also `QueryUnavailable` (R11).
 8. Call the handler. An unknown name is `QueryNotFound`. A handler `Err` is
    `QueryFailed`. A handler panic is `QueryPanicked`.
 
@@ -100,15 +106,23 @@ is polled.
 
 `autumn-harvest-sqlite/tests/integration/workflow_queries.rs`:
 
-| Test | AC |
+| Test | AC or risk |
 |------|----|
-| State set before the last suspension is returned; state after it is not. | 1 |
-| The answer survives a restart. | 1 |
-| A completed run answers post-mortem with its final state. | 1 |
-| Every table and `data_version` are unchanged by a query, a staged signal included. | 2 |
-| No activity body runs during a query. | 2 |
-| An unknown query name is `QueryNotFound`. | 3 |
-| An unknown execution is `ExecutionNotFound`. | 3 |
-| Args reach the handler. A handler `Err` is `QueryFailed`. A panic is `QueryPanicked`. | — |
-| A spinning replay is `QueryTimedOut`. | — |
-| The future is `Send + 'static`. | — |
+| State set before the last suspension is returned; state after it is not. | AC1, R5 |
+| The answer survives a restart. | AC1, R4 |
+| A completed run answers post-mortem with its final state. | AC1 |
+| Every table and `data_version` are unchanged by a query, a staged signal included. | AC2, R1, R2 |
+| No activity body runs during a query. | AC2, R3 |
+| A terminal and a sealed run are unchanged by a query. | AC2 |
+| A due timer does not fire during a query. | AC2, R12 |
+| An unknown query name is `QueryNotFound`. | AC3, R8 |
+| An unknown execution is `ExecutionNotFound`. | AC3, R8 |
+| An unregistered workflow is `UnknownWorkflow`. | — |
+| Args reach the handler. Bad typed args and a handler `Err` are `QueryFailed`. | — |
+| A handler panic, or a replay panic on a running run, is `QueryPanicked`. | R6 |
+| A replay panic on a terminal run is `QueryUnavailable`. | R6 |
+| A spinning replay is `QueryTimedOut` within the configured limit. | R7 |
+| Drift on a terminal run is `QueryUnavailable`. | R10 |
+| An unrecorded side effect on a sealed run is `QueryUnavailable`. | R11 |
+| `ctx.info()` gives the stored workflow id and type. | — |
+| The future is `Send + 'static`. | R9 |

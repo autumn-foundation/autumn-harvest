@@ -947,10 +947,15 @@ impl SqliteRuntime {
     /// the handler that `ctx.register_query` registered. It writes nothing:
     /// no event, no row, no staged-signal delivery, no activity body.
     ///
-    /// - A running run answers with the state at its last suspension.
+    /// - A running run answers with the state at its frontier: the first
+    ///   command that the history does not record.
     /// - A terminal run answers with the state at its recorded end.
     ///
-    /// The call reads the rows at once. The returned future then replays
+    /// The replay runs workflow code up to the frontier, as a drive does.
+    /// Code past the last recorded event runs again in each query. That
+    /// includes a `ctx.side_effect` closure the history does not record yet.
+    ///
+    /// The call reads the rows immediately. The returned future then replays
     /// them, so it borrows nothing from the runtime. The answer is a
     /// point-in-time read as of the call.
     ///
@@ -966,15 +971,19 @@ impl SqliteRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id and
-    /// [`SqliteError::UnknownWorkflow`] for an unregistered workflow.
-    /// Returns [`SqliteError::QueryNotFound`] when the replay registers no
-    /// handler named `name`. Returns [`SqliteError::QueryFailed`] when the
-    /// handler returns `Err`, and [`SqliteError::QueryPanicked`] when the
-    /// handler or the replayed workflow panics. Returns
-    /// [`SqliteError::QueryTimedOut`] when the replay passes the query timeout.
-    /// Returns [`SqliteError::QueryUnavailable`] when a terminal run no longer
-    /// replays to its recorded end. Otherwise returns a persistence error.
+    /// The future resolves to an error in these cases:
+    ///
+    /// - [`SqliteError::ExecutionNotFound`]: the id is unknown.
+    /// - [`SqliteError::UnknownWorkflow`]: the workflow is not registered.
+    /// - [`SqliteError::QueryNotFound`]: the replay registers no handler
+    ///   named `name`.
+    /// - [`SqliteError::QueryFailed`]: the handler returns `Err`.
+    /// - [`SqliteError::QueryPanicked`]: the handler panics, or the workflow
+    ///   panics during the replay of a running run.
+    /// - [`SqliteError::QueryTimedOut`]: the replay passes the query timeout.
+    /// - [`SqliteError::QueryUnavailable`]: a terminal run cannot give a
+    ///   stable answer.
+    /// - A persistence error: a row cannot be read.
     pub fn query(
         &self,
         exec: ExecutionId,
@@ -989,6 +998,9 @@ impl SqliteRuntime {
 
     /// Set the time limit of a query replay. The default is
     /// [`DEFAULT_QUERY_TIMEOUT`](crate::DEFAULT_QUERY_TIMEOUT), 5 s.
+    ///
+    /// A future that [`query`](Self::query) already returned keeps the old
+    /// limit. A limit too large to add to the current time means no limit.
     pub const fn set_query_timeout(&mut self, timeout: std::time::Duration) {
         self.query_timeout = timeout;
     }

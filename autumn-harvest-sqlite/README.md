@@ -94,8 +94,8 @@ A complete, runnable version is in
   is terminal or blocked on external input.
 - **Queries (issue #2022).** `rt.query(exec, "name", args).await` calls a
   handler that `ctx.register_query` registered. It replays the stored history
-  to the run's frontier and writes nothing. A terminal run answers with its
-  final state.
+  to the run's frontier and writes nothing. A terminal run answers with the
+  state at its recorded end.
 - **Durability & crash recovery.** All state is in the database. Dropping the
   runtime and re-`open`-ing the same file is a faithful restart: any task left
   `RUNNING` by a crash is reclaimed and the workflow resumes purely by
