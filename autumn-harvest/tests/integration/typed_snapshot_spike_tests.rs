@@ -77,6 +77,10 @@ struct EffectLedger {
     /// change the state, so a cover rule must see each one.
     #[serde(default)]
     updates: Vec<String>,
+    /// Updates that failed, by name, in order. A handler can change the
+    /// state before it fails.
+    #[serde(default)]
+    failed_updates: Vec<String>,
 }
 
 /// Removes the open effect `id` and returns it.
@@ -166,7 +170,10 @@ impl EffectLedger {
                     }
                 }
                 WorkflowEvent::UpdateFailed { update_id, .. } => {
-                    close(&mut open, &update_id.to_string());
+                    if let Some(OpenEffect::Update(name)) = close(&mut open, &update_id.to_string())
+                    {
+                        ledger.failed_updates.push(name);
+                    }
                 }
                 WorkflowEvent::SideEffectRecorded { .. } => ledger.side_effects += 1,
                 WorkflowEvent::SignalReceived { .. } => ledger.signals += 1,
@@ -252,12 +259,28 @@ struct Snapshot {
 }
 
 /// The HMAC of one snapshot body.
-fn engine_mac(version: u32, state: &Value, ledger: &EffectLedger) -> Hmac<Sha256> {
+///
+/// It takes the JSON values of the envelope as written, not a typed form.
+/// A newer loader can add defaulted fields to its types. Re-serializing an
+/// older envelope would then change the signed bytes.
+fn engine_mac(version: &Value, state: &Value, ledger: &Value) -> Hmac<Sha256> {
     let body = serde_json::to_vec(&(version, state, ledger)).expect("a snapshot body encodes");
     let mut mac =
         <Hmac<Sha256> as KeyInit>::new_from_slice(ENGINE_KEY).expect("HMAC takes any key length");
     mac.update(&body);
     mac
+}
+
+/// The hex signature of one envelope body.
+fn sign(version: &Value, state: &Value, ledger: &Value) -> String {
+    engine_mac(version, state, ledger)
+        .finalize()
+        .into_bytes()
+        .iter()
+        .fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
 }
 
 /// Decodes lowercase hex. Returns `None` for any other text.
@@ -306,14 +329,9 @@ impl Snapshot {
             .get("state")
             .cloned()
             .ok_or_else(|| SnapshotError::Decode("no state".into()))?;
-        let mac = engine_mac(version, &state, &ledger)
-            .finalize()
-            .into_bytes()
-            .iter()
-            .fold(String::new(), |mut hex, byte| {
-                let _ = write!(hex, "{byte:02x}");
-                hex
-            });
+        let ledger_value =
+            serde_json::to_value(&ledger).map_err(|e| SnapshotError::Decode(e.to_string()))?;
+        let mac = sign(&Value::from(version), &state, &ledger_value);
         serde_json::to_value(Self {
             version,
             state,
@@ -348,16 +366,22 @@ impl Snapshot {
         raw: &Value,
         source: Option<&[WorkflowEvent]>,
     ) -> Result<(S, EffectLedger), SnapshotError> {
-        let snapshot: Self = serde_json::from_value(raw.clone())
-            .map_err(|e| SnapshotError::Decode(e.to_string()))?;
-        let signed = from_hex(&snapshot.mac).is_some_and(|tag| {
-            engine_mac(snapshot.version, &snapshot.state, &snapshot.ledger)
-                .verify_slice(&tag)
-                .is_ok()
-        });
+        // Verify the envelope as written, before any typed decode.
+        let signed = raw
+            .get("mac")
+            .and_then(Value::as_str)
+            .and_then(from_hex)
+            .is_some_and(|tag| {
+                let field = |name: &str| raw.get(name).cloned().unwrap_or(Value::Null);
+                engine_mac(&field("version"), &field("state"), &field("ledger"))
+                    .verify_slice(&tag)
+                    .is_ok()
+            });
         if !signed {
             return Err(SnapshotError::Forged);
         }
+        let snapshot: Self = serde_json::from_value(raw.clone())
+            .map_err(|e| SnapshotError::Decode(e.to_string()))?;
         if snapshot.version > S::VERSION {
             return Err(SnapshotError::UnknownVersion(snapshot.version));
         }
@@ -791,6 +815,25 @@ fn a_wait_won_by_its_signal_can_checkpoint() {
     assert_eq!(ledger.timers, [deadline]);
 }
 
+#[test]
+fn a_failed_update_is_recorded_in_the_ledger() {
+    // A handler can change the state and then fail, so a cover rule must
+    // see the failed update too.
+    let mut history = vec![started(Value::Null)];
+    let [admitted, _] = update_events("bump");
+    let WorkflowEvent::UpdateAdmitted { update_id, .. } = admitted.clone() else {
+        unreachable!("update_events starts with an admission");
+    };
+    history.push(admitted);
+    history.push(WorkflowEvent::UpdateFailed {
+        update_id,
+        error: "rejected".into(),
+    });
+    let ledger = EffectLedger::from_history(&history, &[]).expect("no effect is open");
+    assert_eq!(ledger.updates, Vec::<String>::new());
+    assert_eq!(ledger.failed_updates, ["bump"]);
+}
+
 // ── Claim 2: versioned save and load ─────────────────────────────────────────
 
 #[test]
@@ -879,6 +922,23 @@ fn a_forged_snapshot_is_refused() {
     assert_eq!(
         Snapshot::load::<Order>(&forged_snapshot(), None),
         Err(SnapshotError::Forged)
+    );
+}
+
+#[test]
+fn a_snapshot_from_an_older_ledger_schema_still_verifies() {
+    // An older writer had no `failed_updates` field. It signed the envelope
+    // it wrote. A newer loader must verify those bytes, not its own
+    // re-serialized form.
+    let history = vec![started(Value::Null)];
+    let mut raw = Snapshot::save(&OrderV1 { charged: 0 }, &history).expect("quiescent");
+    let ledger = raw["ledger"].as_object_mut().expect("a ledger object");
+    ledger.remove("failed_updates");
+    let old_ledger = raw["ledger"].clone();
+    raw["mac"] = Value::String(sign(&raw["version"], &raw["state"], &old_ledger));
+    assert!(
+        Snapshot::load::<OrderV1>(&raw, Some(&history)).is_ok(),
+        "a valid older snapshot must load"
     );
 }
 
