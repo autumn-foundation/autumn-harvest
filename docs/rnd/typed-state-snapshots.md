@@ -195,6 +195,7 @@ Each claim names its test in `typed_snapshot_spike_tests.rs`.
 | The ledger records a failed update, so a cover rule can check its change. | `a_failed_update_is_recorded_in_the_ledger` |
 | The ledger records a failed child apart from a completed one. | `a_failed_child_is_recorded_apart_from_a_completed_one` |
 | A snapshot from an older ledger schema still verifies. The loader checks the envelope as written. | `a_snapshot_from_an_older_ledger_schema_still_verifies` |
+| An older ledger schema needs its source history. With the source, the loader rebuilds the ledger under the current schema. | `an_older_ledger_needs_its_source_history` |
 | The loader refuses a snapshot with a wrong engine signature. | `a_forged_snapshot_is_refused` |
 | A forged start input cannot skip the charges. | `a_forged_start_input_cannot_skip_the_charges` |
 | A v1 snapshot loads under v2 code through its upgrade step. | `a_v1_snapshot_loads_under_v2_code` |
@@ -223,7 +224,8 @@ What the prototype does not prove or cover:
   a fixed test key. They do not check continue-as-new provenance.
 - A source history that is gone. Retention or PII erasure can remove the
   predecessor before a loader re-checks the ledger. The successor must then
-  trust the stored ledger.
+  trust the stored ledger. A ledger from an older schema cannot load then,
+  because it did not track every effect kind.
 
 ## 5. Verdict
 

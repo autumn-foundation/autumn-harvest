@@ -58,6 +58,11 @@ enum OpenEffect {
 /// The engine builds the ledger from history. The author never writes it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct EffectLedger {
+    /// The ledger schema that wrote this ledger. Schema 1 had no failure
+    /// lists and no teardown list. An envelope with no schema field is
+    /// schema 1.
+    #[serde(default = "schema_1")]
+    schema: u32,
     /// Completed activities, by name, in order.
     activities: Vec<String>,
     /// Activities that failed or timed out, by name, in order. Workflow
@@ -92,6 +97,14 @@ struct EffectLedger {
     torn_down_timers: Vec<String>,
 }
 
+/// The ledger schema that this code writes.
+const LEDGER_SCHEMA: u32 = 2;
+
+/// The schema of an envelope with no schema field.
+const fn schema_1() -> u32 {
+    1
+}
+
 /// Removes the open effect `id` and returns it.
 fn close(open: &mut Vec<(String, OpenEffect)>, id: &str) -> Option<OpenEffect> {
     let at = open.iter().position(|(key, _)| key == id)?;
@@ -99,6 +112,20 @@ fn close(open: &mut Vec<(String, OpenEffect)>, id: &str) -> Option<OpenEffect> {
 }
 
 impl EffectLedger {
+    /// This ledger as an older `schema` would have written it. Schema 1
+    /// tracked no failures and no teardowns.
+    fn project(&self, schema: u32) -> Self {
+        let mut old = self.clone();
+        old.schema = schema;
+        if schema < 2 {
+            old.failed_activities.clear();
+            old.failed_updates.clear();
+            old.failed_children.clear();
+            old.torn_down_timers.clear();
+        }
+        old
+    }
+
     /// Builds the ledger of `history`.
     ///
     /// # Errors
@@ -113,7 +140,10 @@ impl EffectLedger {
         history: &[WorkflowEvent],
         torn_down_timers: &[String],
     ) -> Result<Self, OpenEffect> {
-        let mut ledger = Self::default();
+        let mut ledger = Self {
+            schema: LEDGER_SCHEMA,
+            ..Self::default()
+        };
         // Each open effect, by its id, in the order it opened.
         let mut open: Vec<(String, OpenEffect)> = Vec::new();
         for event in history {
@@ -235,6 +265,9 @@ enum SnapshotError {
     Open(OpenEffect),
     /// The snapshot is from a newer schema than this code.
     UnknownVersion(u32),
+    /// The ledger is from an older schema, and no source history can fill
+    /// the effect kinds that it did not track.
+    LedgerTooOld(u32),
     /// The stored ledger differs from the ledger of the source history.
     LedgerMismatch,
     /// The loaded state does not reflect each completed effect.
@@ -398,15 +431,28 @@ impl Snapshot {
         if snapshot.version > S::VERSION {
             return Err(SnapshotError::UnknownVersion(snapshot.version));
         }
-        if let Some(source) = source {
-            // Only the signed teardown list closes a timer that history
-            // leaves open.
-            let expected = EffectLedger::from_history(source, &snapshot.ledger.torn_down_timers)
-                .map_err(SnapshotError::Open)?;
-            if expected != snapshot.ledger {
-                return Err(SnapshotError::LedgerMismatch);
-            }
+        if snapshot.ledger.schema > LEDGER_SCHEMA {
+            return Err(SnapshotError::UnknownVersion(snapshot.ledger.schema));
         }
+        let ledger = match source {
+            Some(source) => {
+                // Only the signed teardown list closes a timer that history
+                // leaves open.
+                let rebuilt = EffectLedger::from_history(source, &snapshot.ledger.torn_down_timers)
+                    .map_err(SnapshotError::Open)?;
+                // Check the fields that the stored schema knew, then use
+                // the full ledger that the source gives.
+                if rebuilt.project(snapshot.ledger.schema) != snapshot.ledger {
+                    return Err(SnapshotError::LedgerMismatch);
+                }
+                rebuilt
+            }
+            // An older ledger cannot show the effect kinds it did not track.
+            None if snapshot.ledger.schema < LEDGER_SCHEMA => {
+                return Err(SnapshotError::LedgerTooOld(snapshot.ledger.schema));
+            }
+            None => snapshot.ledger,
+        };
         let state = if snapshot.version == S::VERSION {
             snapshot.state
         } else {
@@ -414,10 +460,10 @@ impl Snapshot {
         };
         let state: S =
             serde_json::from_value(state).map_err(|e| SnapshotError::Decode(e.to_string()))?;
-        if !state.covers(&snapshot.ledger) {
+        if !state.covers(&ledger) {
             return Err(SnapshotError::NotCovered);
         }
-        Ok((state, snapshot.ledger))
+        Ok((state, ledger))
     }
 }
 
@@ -1004,6 +1050,50 @@ fn a_snapshot_from_an_older_ledger_schema_still_verifies() {
         Snapshot::load::<OrderV1>(&raw, Some(&history)).is_ok(),
         "a valid older snapshot must load"
     );
+}
+
+/// A signed envelope as a schema-1 writer made it: no schema field and no
+/// failure or teardown lists.
+fn schema_1_envelope(history: &[WorkflowEvent]) -> Value {
+    let mut raw = Snapshot::save(&Tally { bumps: 0 }, history).expect("quiescent");
+    let ledger = raw["ledger"].as_object_mut().expect("a ledger object");
+    for newer in [
+        "schema",
+        "failed_activities",
+        "failed_updates",
+        "failed_children",
+        "torn_down_timers",
+    ] {
+        ledger.remove(newer);
+    }
+    let old_ledger = raw["ledger"].clone();
+    raw["mac"] = Value::String(sign(&raw["version"], &raw["state"], &old_ledger));
+    raw
+}
+
+#[test]
+fn an_older_ledger_needs_its_source_history() {
+    // The schema-1 writer did not track failed updates. With no source,
+    // nothing can show that a failed update ran, so the loader refuses.
+    let mut history = vec![started(Value::Null)];
+    let [admitted, _] = update_events("bump");
+    let WorkflowEvent::UpdateAdmitted { update_id, .. } = admitted.clone() else {
+        unreachable!("update_events starts with an admission");
+    };
+    history.push(admitted);
+    history.push(WorkflowEvent::UpdateFailed {
+        update_id,
+        error: "rejected".into(),
+    });
+    let raw = schema_1_envelope(&history);
+    assert_eq!(
+        Snapshot::load::<Tally>(&raw, None),
+        Err(SnapshotError::LedgerTooOld(1))
+    );
+    // With the source, the loader rebuilds the ledger under the current
+    // schema, so the failed update is visible again.
+    let (_, ledger) = Snapshot::load::<Tally>(&raw, Some(&history)).expect("the source fills it");
+    assert_eq!(ledger.failed_updates, ["bump"]);
 }
 
 #[tokio::test]
