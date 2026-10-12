@@ -118,10 +118,14 @@ SELECT l.model, SUM(l.input_tokens), SUM(l.output_tokens), SUM(l.cost_usd_micros
 ## 4. The agent adapter
 
 The `agent_model_turn` activity of `autumn-harvest-agent` records one call
-per model turn. Implement `AgentModel::model_id` to name the model, and
-`AgentModel::cost_usd_micros` to price a call. The defaults are `"unknown"`
-and unpriced. The ledger records a refused model id as `"unknown"`, so the
-tokens still count. See [the agent adapter](agent-adapter.md).
+per model call. Implement `AgentModel::model_id` to name the model, and
+`AgentModel::cost_usd_micros` to price a call. The defaults are no id and
+unpriced. The ledger records no id, or an id that it refuses, as
+`"unknown"`, so the tokens still count.
+
+The response cache also keys on `model_id`. A cache hit calls no model and
+spends no tokens, so it records no call. See
+[the agent adapter](agent-adapter.md).
 
 ## 5. Lifecycle
 

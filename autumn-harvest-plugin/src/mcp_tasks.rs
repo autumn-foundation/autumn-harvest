@@ -1830,6 +1830,15 @@ async fn open_signal_waits(
             });
         }
     }
+    // A wake appends its events and consumes the signal in one transaction.
+    // If that commit lands between the head read and the queue read, the
+    // queue no longer holds the signal. The ended wait then looks open, so
+    // report none this time.
+    if !waits.is_empty()
+        && history_head(api_state, live.id).await?.map(|(at, _)| at) != Some(position)
+    {
+        return Ok((Vec::new(), Some(last_updated_at)));
+    }
     Ok((waits, Some(last_updated_at)))
 }
 

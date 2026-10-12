@@ -31,9 +31,11 @@ the cost per workflow type. `group_by=search_attr:tenant_id` gives the
 cost per tenant. The `harvest usage` table gains `LLM_CALLS`, `LLM_IN`,
 `LLM_OUT`, `LLM_COST_USD` and `LLM_UNPRICED`.
 
-**Agent adapter.** `agent_model_turn` records one call per model turn.
-`AgentModel` gains `model_id()` and `cost_usd_micros(usage)`, with
-defaults, so existing models still compile.
+**Agent adapter.** `agent_model_turn` records one call per model call.
+`AgentModel::model_id()` names the model, and the new
+`AgentModel::cost_usd_micros(usage)` prices it. It has a default, so
+existing models still compile. A response cache hit calls no model, so it
+records no call.
 
 **Lifecycle.** The rows cascade with the run on retention. They move with
 the run on a shard move. The usage report counts a moving run on one shard
@@ -52,7 +54,7 @@ checks the grants on the table.
 **Migration.** `20261009050156_harvest_llm_ledger` adds the table and one
 index on `recorded_at`. No data migration, no `WorkflowEvent` variant, no
 replay impact. See
-[0.8.0 §1.6](../upgrading/0.8.0.md#16-the-usage-report-carries-the-agent-cost-ledger).
+[0.8.0 §1.7](../upgrading/0.8.0.md#17-the-usage-report-carries-the-agent-cost-ledger).
 
 **Also.** The `GET /admin/usage` contract text said that terminal counts
 use `completed_at`. It now says that they count terminal events, as the

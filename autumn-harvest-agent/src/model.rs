@@ -51,13 +51,21 @@ pub trait AgentModel: Send + Sync + std::fmt::Debug {
         request: &'a ChatRequest,
     ) -> BoxFuture<'a, Result<ChatResponse, AgentError>>;
 
-    /// The model id that the agent cost ledger records (issue #1996).
+    /// The id of the model that answers, for example `acme-chat-2026-01`.
     ///
-    /// The ledger stores the id in clear, so do not put PII in it. It must be
-    /// a token of at most 200 bytes: ASCII letters, digits and `._:/@+-`. The
-    /// ledger records any other id as [`UNKNOWN_MODEL_ID`].
-    fn model_id(&self) -> &str {
-        UNKNOWN_MODEL_ID
+    /// The [`ResponseCache`](crate::ResponseCache) puts it in each key. A
+    /// model with no id is never cached. The default is `None`.
+    ///
+    /// The id must change whenever the answer can change for the same
+    /// request. Use a pinned model version, not an alias. Put each client
+    /// setting that [`ChatRequest`] does not hold, such as `top_p`, in the id.
+    ///
+    /// The agent cost ledger records the id in clear (issue #1996), so do
+    /// not put PII in it. The ledger takes a token of at most 200 bytes:
+    /// ASCII letters, digits and `._:/@+-`. It records `None` or any other
+    /// id as [`UNKNOWN_MODEL_ID`].
+    fn model_id(&self) -> Option<&str> {
+        None
     }
 
     /// The cost of one call, in millionths of a US dollar (issue #1996).

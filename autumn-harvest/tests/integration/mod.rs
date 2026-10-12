@@ -16,15 +16,19 @@ mod activity_interceptor_tests;
 mod activity_outcome_metrics_tests;
 #[cfg(feature = "db")]
 mod activity_pause_tests;
+mod activity_side_effect_schema_tests;
 #[cfg(feature = "db")]
 mod activity_timeout_retry_tests;
 mod adaptive_limit_tests;
 mod admission_gate_authoritative_tests;
 mod admission_gate_tests;
+mod agent_code_journal_docs;
 mod alert_pack_docs;
 #[cfg(feature = "db")]
 mod append_only_guard_tests;
 mod assay_rerun_docs;
+#[cfg(feature = "atomicity-spike")]
+mod atomicity_spike_tests;
 #[cfg(feature = "db")]
 mod audit_chain_tests;
 mod audit_export_docs;
@@ -100,6 +104,7 @@ mod completion_trigger_outbox_queue_perf;
 mod concurrency_key_tests;
 mod concurrency_model_ci;
 mod concurrency_supersede_tests;
+mod contention_adaptive_atomicity_docs;
 mod context_headers_tests;
 mod cross_region_dr_docs;
 #[cfg(feature = "db")]
@@ -145,6 +150,7 @@ mod drain_release_tests;
 #[cfg(feature = "db")]
 mod dst_differential_tests;
 mod dst_world_tests;
+mod durable_stream_tests;
 mod e2e_bench_cell_timeout_tests;
 mod e2e_bench_support;
 #[cfg(feature = "db")]
@@ -218,6 +224,7 @@ mod otel_semconv_docs;
 mod panic_containment_tests;
 #[cfg(feature = "db")]
 mod parent_close_cascade_unfinished_handlers_perf;
+mod partition_archive_tests;
 mod partitioned_events_docs;
 mod pause_tests;
 #[cfg(feature = "testing")]
@@ -258,6 +265,10 @@ mod rate_limit_bucket_gc_tests;
 mod rate_limit_key_tests;
 mod redrive_tests;
 #[cfg(all(feature = "testing", feature = "db"))]
+mod remote_task_db_tests;
+#[cfg(feature = "testing")]
+mod remote_task_tests;
+#[cfg(all(feature = "testing", feature = "db"))]
 mod replay_canary_tests;
 #[cfg(feature = "testing")]
 mod replay_drift_tests;
@@ -271,6 +282,8 @@ mod replay_verifier_tests;
 mod replayer_integration_tests;
 #[cfg(feature = "testing")]
 mod replayer_tests;
+#[cfg(feature = "db")]
+mod resident_hit_rate_db_tests;
 #[cfg(feature = "db")]
 mod resident_outcome_tests;
 mod retention_overrides_tests;
@@ -364,6 +377,8 @@ mod transactional_start_tests;
 mod triage_tests;
 #[cfg(feature = "db")]
 mod tx_conflict_retry_tests;
+mod typed_snapshot_docs;
+mod typed_snapshot_spike_tests;
 #[cfg(feature = "db")]
 mod typed_stub_deferred_admission_tests;
 #[cfg(feature = "db")]

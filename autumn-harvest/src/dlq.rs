@@ -2722,6 +2722,31 @@ mod tests {
     }
 
     #[test]
+    fn history_cap_reasons_keep_the_bytes_the_sqlite_backend_mirrors() {
+        // Issue #2023: `autumn_harvest_sqlite::HistoryCapReason` writes these
+        // exact bytes. Its own test pins the same literals.
+        let events = DeadLetterReason::HistoryCapExceeded {
+            count: 12_001,
+            cap: 12_000,
+            workflow_type: "billing_poll".into(),
+        };
+        let bytes = DeadLetterReason::HistoryBytesCapExceeded {
+            bytes: 52_428_801,
+            cap: 52_428_800,
+            workflow_type: "billing_poll".into(),
+        };
+
+        assert_eq!(
+            events.to_string(),
+            r#"{"type":"HistoryCapExceeded","count":12001,"cap":12000,"workflow_type":"billing_poll"}"#
+        );
+        assert_eq!(
+            bytes.to_string(),
+            r#"{"type":"HistoryBytesCapExceeded","bytes":52428801,"cap":52428800,"workflow_type":"billing_poll"}"#
+        );
+    }
+
+    #[test]
     fn dead_letter_reason_poison_pill_is_typed_json() {
         let reason = DeadLetterReason::PoisonPill {
             crash_strikes: 3,

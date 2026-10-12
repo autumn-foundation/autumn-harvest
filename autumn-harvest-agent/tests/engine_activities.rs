@@ -17,7 +17,7 @@ use autumn_harvest_agent::{
     AgentHarness, ChatMessage, ChatRole, ModelTurn, ModelTurnRequest, Rule, StopReason, TokenUsage,
     ToolCall, ToolCallRequest, ToolDecision, ToolEffect, ToolOutcome, ToolRules,
 };
-use common::{Recorder, ScriptedModel, calls, recorded_tool};
+use common::{MemStore, Recorder, ScriptedModel, answer, calls, recorded_tool, response_cache};
 use serde_json::json;
 
 /// A scripted model that names itself and prices each call.
@@ -32,8 +32,8 @@ impl AgentModel for PricedModel {
         self.0.chat(request)
     }
 
-    fn model_id(&self) -> &'static str {
-        "test-model-1"
+    fn model_id(&self) -> Option<&str> {
+        Some("test-model-1")
     }
 
     fn cost_usd_micros(&self, usage: &TokenUsage) -> Option<u64> {
@@ -59,6 +59,7 @@ fn turn_request() -> ModelTurnRequest {
         read_only: false,
         memory_scope: None,
         extra_tools: Vec::new(),
+        tenant: None,
     }
 }
 
@@ -97,6 +98,37 @@ async fn the_model_turn_handler_records_the_reply_and_each_decision() {
     assert_eq!(sent.temperature, Some(0.5));
     assert_eq!(sent.tools.len(), 2);
     assert_eq!(recorder.runs(), Vec::<serde_json::Value>::new());
+}
+
+/// The engine-path handler serves a repeat from the cache, per tenant
+/// (issue #1998). A test context has no run row, so the request tenant
+/// scopes the key.
+#[tokio::test]
+async fn the_model_turn_handler_serves_a_repeat_from_the_cache() {
+    let model = ScriptedModel::named("m-1", vec![answer("one", 3), answer("two", 3)]);
+    let store = Arc::new(MemStore::default());
+    let harness = AgentHarness::new(model.clone()).response_cache(response_cache(&store));
+    let ctx = with_harness(harness);
+    let info = agent_model_turn_info();
+    let turn = |tenant: &str| {
+        let request = ModelTurnRequest {
+            tenant: Some(tenant.to_owned()),
+            ..turn_request()
+        };
+        (info.handler)(&ctx, serde_json::to_value(request).unwrap())
+    };
+
+    let first: ModelTurn = serde_json::from_value(turn("a").await.unwrap()).unwrap();
+    let repeat: ModelTurn = serde_json::from_value(turn("a").await.unwrap()).unwrap();
+    let other: ModelTurn = serde_json::from_value(turn("b").await.unwrap()).unwrap();
+
+    assert!(!first.cache_hit);
+    assert!(repeat.cache_hit);
+    assert_eq!(repeat.content, first.content);
+    assert_eq!(repeat.usage, TokenUsage::default());
+    assert!(!other.cache_hit);
+    assert_eq!(other.text(), "two");
+    assert_eq!(model.calls(), 2);
 }
 
 #[tokio::test]
@@ -430,6 +462,42 @@ async fn the_model_turn_handler_records_one_ledger_call() {
     assert!(ledger[0].latency().is_some(), "the turn times the call");
 }
 
+/// A response cache hit calls no model and spends no tokens, so it records
+/// no ledger call (issues #1996 and #1998).
+#[tokio::test]
+async fn a_cache_hit_records_no_ledger_call() {
+    let model = ScriptedModel::named("m-1", vec![answer("one", 3)]);
+    let store = Arc::new(MemStore::default());
+    let harness = AgentHarness::new(model.clone()).response_cache(response_cache(&store));
+    let ctx = with_harness(harness);
+    let info = agent_model_turn_info();
+    let request = ModelTurnRequest {
+        tenant: Some("a".to_owned()),
+        ..turn_request()
+    };
+
+    let first: ModelTurn = serde_json::from_value(
+        (info.handler)(&ctx, serde_json::to_value(&request).unwrap())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let repeat: ModelTurn = serde_json::from_value(
+        (info.handler)(&ctx, serde_json::to_value(&request).unwrap())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert!(!first.cache_hit);
+    assert!(repeat.cache_hit);
+    assert_eq!(model.calls(), 1);
+    let ledger = ctx.llm_calls();
+    assert_eq!(ledger.len(), 1, "only the miss records a call: {ledger:?}");
+    assert_eq!(ledger[0].model(), "m-1");
+    assert_eq!(ledger[0].input_tokens(), 3);
+}
+
 #[tokio::test]
 async fn a_model_with_no_name_or_price_records_an_unpriced_unknown_call() {
     let model = ScriptedModel::new(vec![calls(&[], 5)]);
@@ -473,8 +541,8 @@ impl AgentModel for BadIdModel {
         self.0.chat(request)
     }
 
-    fn model_id(&self) -> &'static str {
-        "a model id with spaces"
+    fn model_id(&self) -> Option<&str> {
+        Some("a model id with spaces")
     }
 }
 
@@ -536,8 +604,8 @@ impl AgentModel for OverpricedModel {
         self.0.chat(request)
     }
 
-    fn model_id(&self) -> &'static str {
-        "test-model-1"
+    fn model_id(&self) -> Option<&str> {
+        Some("test-model-1")
     }
 
     fn cost_usd_micros(&self, _usage: &TokenUsage) -> Option<u64> {

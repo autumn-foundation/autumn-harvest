@@ -133,6 +133,8 @@ fn activity_info(
         max_input_bytes: None,
         max_result_bytes: None,
         requires: None,
+        input_schema: None,
+        output_schema: None,
         handler,
     }
 }
