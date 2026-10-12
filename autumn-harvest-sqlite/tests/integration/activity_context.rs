@@ -213,6 +213,41 @@ async fn the_last_heartbeat_reaches_the_retry() {
     );
 }
 
+/// Sends far more heartbeats than the channel holds, then fails once.
+#[activity(retry = RetryPolicy::fixed(2, Duration::ZERO))]
+async fn chatty(ctx: &ActivityContext, _n: i64) -> Result<Value, String> {
+    if ctx.attempt() == 1 {
+        for done in 0..500 {
+            ctx.heartbeat(json!({ "done": done }))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        return Err("first attempt".to_string());
+    }
+    let resumed: Option<Value> = ctx.heartbeat_details().map_err(|e| e.to_string())?;
+    Ok(json!({ "resumed": resumed }))
+}
+
+#[workflow]
+async fn chatty_flow(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
+    ctx.execute_activity(&chatty_info(), n)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tokio::test]
+async fn a_heartbeat_burst_neither_blocks_nor_loses_the_last_payload() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&chatty_flow_info());
+    rt.register_activity(&chatty_info());
+    let exec = rt.start_workflow("chatty_flow", json!(0)).unwrap();
+
+    let out = tokio::time::timeout(Duration::from_secs(30), completed(&mut rt, exec))
+        .await
+        .expect("a full heartbeat channel must not block the drive");
+    assert_eq!(out, json!({ "resumed": { "done": 499 } }));
+}
+
 /// Attempt 1 checkpoints and then hangs. Attempt 2 returns the checkpoint.
 #[activity]
 async fn hangs_after_checkpoint(ctx: &ActivityContext, _n: i64) -> Result<Value, String> {

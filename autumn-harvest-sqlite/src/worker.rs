@@ -32,7 +32,7 @@
 //! history a clean, terminal-only, replay-correct log.
 
 use std::collections::HashMap;
-use std::task::{Context, Poll};
+use std::task::Poll;
 
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
 use autumn_harvest::context::{ActivityIdentity, empty_shared_state};
@@ -481,7 +481,7 @@ async fn run_handler(
     std::future::poll_fn(move |cx| {
         let polled =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body.as_mut().poll(cx)));
-        persist_heartbeats(conn, &task.task_id, &mut heartbeats, cx);
+        persist_heartbeats(conn, &task.task_id, &mut heartbeats);
         polled.unwrap_or_else(|payload| Poll::Ready(panicked(payload)))
     })
     .await
@@ -492,14 +492,12 @@ async fn run_handler(
 /// Only the last payload of a batch is written, because last write wins. A
 /// failed write logs a warning and keeps the attempt alive, as the Postgres
 /// flusher does.
-fn persist_heartbeats(
-    conn: &Connection,
-    task_id: &str,
-    heartbeats: &mut mpsc::Receiver<Value>,
-    cx: &mut Context<'_>,
-) {
+///
+/// `try_recv` takes no Tokio coop budget, so the drain always empties the
+/// channel. A body that waits for capacity wakes when the drain frees a slot.
+fn persist_heartbeats(conn: &Connection, task_id: &str, heartbeats: &mut mpsc::Receiver<Value>) {
     let mut latest = None;
-    while let Poll::Ready(Some(details)) = heartbeats.poll_recv(cx) {
+    while let Ok(details) = heartbeats.try_recv() {
         latest = Some(details);
     }
     if let Some(details) = latest
