@@ -3,8 +3,8 @@
 //! The binary runs `autumn_harvest_agent::agent_loop` on one Postgres
 //! worker with sticky routing and resident workflows on. An offline model
 //! asks for one tool call per turn, then answers. The binary needs no API
-//! key and no network. At the end the binary prints the resident hits and the
-//! resident misses by reason.
+//! key and no network. At the end the binary prints the count of each
+//! `outcome` of `harvest.workflow.resident`.
 //!
 //! ```sh
 //! DATABASE_URL=postgres://postgres:postgres@localhost:5432/agent_hit_rate \
@@ -24,7 +24,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use autumn_harvest::migrate;
-use autumn_harvest::telemetry::{MetricsRecorder, NoOpPropagator, TelemetryConfig};
+use autumn_harvest::telemetry::{
+    MetricsRecorder, NoOpPropagator, ResidentOutcome, TelemetryConfig,
+};
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{HarvestBuilder, StartWorkflowParams, WorkerConfig};
@@ -91,7 +93,7 @@ fn reply(turns: usize, request: &ChatRequest) -> ChatResponse {
 /// Counts decisions by outcome. Every other recorder method is a no-op.
 #[derive(Debug, Default)]
 struct Counts {
-    /// `hit`, or the miss reason, to its count.
+    /// Each `outcome` label value to its count.
     resident: Mutex<BTreeMap<String, u64>>,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
@@ -117,12 +119,13 @@ impl MetricsRecorder for Counts {
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn record_workflow_resident_hit(&self, _workflow_name: &str, _queue: &str) {
-        self.add("hit");
-    }
-
-    fn record_workflow_resident_miss(&self, _workflow_name: &str, _queue: &str, reason: &str) {
-        self.add(reason);
+    fn record_workflow_resident(
+        &self,
+        _workflow_name: &str,
+        _queue: &str,
+        outcome: ResidentOutcome,
+    ) {
+        self.add(outcome.as_str());
     }
 }
 

@@ -1,0 +1,13 @@
+//! A module file with no `.rs` extension (issue #2010). MIR spans of its
+//! `async` blocks name `noext`, not `noext.rs`.
+
+pub fn __autumn_workflow_info_wf_step_noext_module() -> u8 {
+    0
+}
+
+/// The forward step returns an `async` block that reads the clock.
+pub async fn wf_step_noext_module(ctx: &super::WorkflowContext) -> super::Out {
+    let mut saga = super::Saga::new(ctx);
+    let a = saga.step(|| async { Ok(super::now_nanos()) }, |_| async { Ok(()) }).await?;
+    ctx.execute_activity_raw("b", a).await
+}

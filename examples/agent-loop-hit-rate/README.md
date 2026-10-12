@@ -4,9 +4,10 @@ Measures how often `autumn_harvest_agent::agent_loop` resumes warm on a
 Postgres worker (issue #2007).
 
 A warm decision can resume the parked workflow and replay nothing. The
-worker counts each decision as `harvest.workflow.resident_hit` or as
-`harvest.workflow.resident_miss{reason}`. This binary installs a recorder
-that counts both, runs the agent loop, and prints a table.
+worker counts each decision in `harvest.workflow.resident{outcome}`. The
+outcome is `hit`, or the reason that the decision replayed history. This
+binary installs a recorder that counts each outcome, runs the agent loop,
+and prints a table.
 
 The model is offline. It asks for one `lookup` tool call per turn, then
 answers. The binary needs no API key and no network.

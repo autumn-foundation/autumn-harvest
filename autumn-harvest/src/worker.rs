@@ -52,7 +52,8 @@ use crate::signal;
 use crate::store;
 use crate::telemetry::{
     ATTR_ACTIVITY_NAME, ATTR_ATTEMPT, ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID,
-    ATTR_WORKFLOW_ID, ActivityStatus, DbOp, SlotType, TraceContextCarrier, WorkflowStatus,
+    ATTR_WORKFLOW_ID, ActivityStatus, DbOp, ResidentOutcome, SlotType, TraceContextCarrier,
+    WorkflowStatus,
 };
 use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, IdempotencyKey, ParentClosePolicy, ShardId,
@@ -2044,9 +2045,8 @@ struct PreparedWorkflowTask {
     cold_history_bytes: Option<u64>,
     /// The byte mark taken with a warm cache entry (issue #1804).
     cached_history_bytes: Option<crate::cache::HistoryBytesMark>,
-    /// The resident workflow of a warm hit (issue #1798). Otherwise the
-    /// reason this decision replays cold (issue #2007).
-    resident: Result<crate::resident::ResidentWorkflow, crate::resident::ResidentMiss>,
+    /// The resident state of a warm hit (issue #1798, issue #2007).
+    resident: crate::resident::Residency,
     /// Index in `history_events` of the first event after the cached
     /// snapshot. The resident workflow resumes with the events from here.
     delta_start: usize,
@@ -21737,13 +21737,36 @@ fn delta_is_contiguous(from_event_id: i32, delta: &store::EventHistory) -> bool 
         .is_ok_and(|span| span == delta.events.len())
 }
 
+/// The resident outcome of a warm hit before its first drive (issue #2007).
+///
+/// A parked workflow counts as a hit. A decline of its resume changes the
+/// outcome to [`ResidentOutcome::Declined`].
+const fn resident_outcome_before_drive(residency: &crate::resident::Residency) -> ResidentOutcome {
+    match residency {
+        crate::resident::Residency::Parked(_) => ResidentOutcome::Hit,
+        crate::resident::Residency::Missed(reason) => *reason,
+        crate::resident::Residency::Unknown => ResidentOutcome::Cold,
+    }
+}
+
+/// The resident state of a suspension that cannot stay resident (issue
+/// #2007). A hot-swap module wins over `reason`, because it binds around
+/// every drive.
+const fn final_miss(hot_swapped: bool, reason: ResidentOutcome) -> crate::resident::Residency {
+    crate::resident::Residency::Missed(if hot_swapped {
+        ResidentOutcome::HotSwap
+    } else {
+        reason
+    })
+}
+
 /// Puts a taken cache entry back, and drops any displaced entry outside the
 /// lock (issue #1798).
 async fn put_back_cache_entry(
     workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
     exec_uuid: uuid::Uuid,
     state: crate::cache::CachedWorkflowState,
-    resident: Result<crate::resident::ResidentWorkflow, crate::resident::ResidentMiss>,
+    resident: crate::resident::Residency,
     history_bytes: Option<crate::cache::HistoryBytesMark>,
 ) {
     let displaced = workflow_cache
@@ -21868,14 +21891,9 @@ async fn prepare_workflow_task_with_cache(
         // delta is not the plain run of events the snapshot expects.
         let contiguous = delta_is_contiguous(cached_state.next_event_id, &existing_delta)
             && delta_is_contiguous(existing_delta.next_event_id, &after_ingest);
-        // A gap is a delta that the parked future cannot read (issue #2007).
-        resident = resident.and_then(|live| {
-            if contiguous {
-                Ok(live)
-            } else {
-                Err(crate::resident::ResidentMiss::Delta)
-            }
-        });
+        if !contiguous && resident.is_parked() {
+            resident = crate::resident::Residency::Missed(ResidentOutcome::Declined);
+        }
 
         // Reconstruct full history: cached snapshot + any pre-existing delta +
         // ingested timer/signal events.
@@ -21928,7 +21946,7 @@ async fn prepare_workflow_task_with_cache(
             was_cache_hit: false,
             cold_history_bytes: Some(history_bytes),
             cached_history_bytes: None,
-            resident: Err(crate::resident::ResidentMiss::Cold),
+            resident: crate::resident::Residency::Unknown,
             delta_start,
             resident_enabled,
         }))
@@ -25402,37 +25420,28 @@ async fn process_workflow_task(
     let mut next_event_id = prepared.next_event_id;
     // Issue #1833: the boundary covers every event this decision appends.
     let decision_start_event_id = prepared.next_event_id;
+    // Issue #1798: the resident workflow of a warm hit. The first iteration
+    // tries to resume it. A decline replays cold, as on a miss.
+    let warm_residency = std::mem::take(&mut prepared.resident);
+    // Issue #2007: the resident outcome of this decision. The worker
+    // records it once, after the first drive.
+    let mut resident_outcome = prepared.resident_enabled.then(|| {
+        if prepared.was_cache_hit {
+            resident_outcome_before_drive(&warm_residency)
+        } else {
+            ResidentOutcome::Cold
+        }
+    });
+    let mut warm_resident = warm_residency.into_workflow();
+    // The resident state of the final cycle, kept for the next decision.
+    let mut final_resident: crate::resident::Residency;
     // A module-hosted workflow binds its module around one drive only, so
     // it cannot stay resident.
     #[cfg(feature = "hot-code-swap")]
-    let can_stay_resident =
-        prepared.resident_enabled && !crate::hot_swap::is_module_hosted(workflow.handler);
+    let hot_swapped = crate::hot_swap::is_module_hosted(workflow.handler);
     #[cfg(not(feature = "hot-code-swap"))]
-    let can_stay_resident = prepared.resident_enabled;
-    // Issue #1798: the resident workflow of a warm hit. The first iteration
-    // tries to resume it. A decline replays cold, as on a miss.
-    //
-    // Issue #2007: the first iteration takes this value and records one
-    // resident sample. It is `None` while the resident path is off, so that
-    // decision records no sample.
-    let mut warm_resident = prepared.resident_enabled.then(|| {
-        let resident = std::mem::replace(
-            &mut prepared.resident,
-            Err(crate::resident::ResidentMiss::Cold),
-        );
-        if can_stay_resident {
-            resident
-        } else {
-            Err(crate::resident::ResidentMiss::HotSwap)
-        }
-    });
-    // The resident workflow of the final cycle, kept for the next decision.
-    // Otherwise the reason the next decision replays cold (issue #2007).
-    // Each iteration sets it.
-    let mut final_resident: Result<
-        crate::resident::ResidentWorkflow,
-        crate::resident::ResidentMiss,
-    >;
+    let hot_swapped = false;
+    let can_stay_resident = prepared.resident_enabled && !hot_swapped;
 
     // Issue #678/#1034: external-op ids resolved INLINE during this decision
     // cycle. Set by the mixed-signal arm below (any suspension whose command
@@ -25558,37 +25567,25 @@ async fn process_workflow_task(
         )
         .await?;
         let workflow_drive = async {
-            if let Some(warm) = warm_resident.take() {
-                let miss = match warm {
-                    Ok(resident) => match resident.wake(
+            if let Some(resident) = warm_resident.take() {
+                match resident
+                    .resume_with(
                         &history_events[prepared.delta_start..],
                         resident_key.as_ref(),
-                    ) {
-                        // The wake is the commit point, so a drive that
-                        // times out still counts its hit.
-                        Ok(woken) => {
-                            telemetry.metrics.record_workflow_resident_hit(
-                                &prepared.execution.workflow_name,
-                                &task.queue_name,
-                            );
-                            return woken.drive(Some(&span_meta)).await;
-                        }
-                        Err(reason) => {
-                            tracing::debug!(
-                                exec_id = %prepared.exec_id,
-                                ?reason,
-                                "resident workflow declined; replaying cold (issue #1798)"
-                            );
-                            crate::resident::ResidentMiss::from(&reason)
-                        }
-                    },
-                    Err(miss) => miss,
-                };
-                telemetry.metrics.record_workflow_resident_miss(
-                    &prepared.execution.workflow_name,
-                    &task.queue_name,
-                    miss.as_str(),
-                );
+                        Some(&span_meta),
+                    )
+                    .await
+                {
+                    Ok(drive) => return drive,
+                    Err(reason) => {
+                        resident_outcome = Some(ResidentOutcome::Declined);
+                        tracing::debug!(
+                            exec_id = %prepared.exec_id,
+                            ?reason,
+                            "resident workflow declined; replaying cold (issue #1798)"
+                        );
+                    }
+                }
             }
             let ctx = crate::executor::build_task_context(
                 prepared.exec_id,
@@ -25655,13 +25652,14 @@ async fn process_workflow_task(
             router: resolved_router,
             resident: iter_resident,
         } = drive;
-        // Issue #2007: only the generic arm below keeps the resident
-        // workflow. Any other suspension stays cold, for the reason of this
-        // cycle.
-        final_resident = Err(match &iter_resident {
-            Ok(_) => crate::resident::ResidentMiss::Command,
-            Err(miss) => *miss,
-        });
+        // Issue #2007: one sample per decision, after its first drive.
+        if let Some(outcome) = resident_outcome.take() {
+            telemetry.metrics.record_workflow_resident(
+                &prepared.execution.workflow_name,
+                &task.queue_name,
+                outcome,
+            );
+        }
 
         match run_outcome {
             WorkflowOutcome::Suspended { commands }
@@ -26319,6 +26317,8 @@ async fn process_workflow_task(
                     // Re-acquire a fresh execute_span so persist_workflow_outcome
                     // (via handle_suspended_workflow) gets a valid span reference.
                     let execute_span = tracing::Span::none();
+                    // Issue #2007: an external-op batch cannot stay resident.
+                    final_resident = final_miss(hot_swapped, ResidentOutcome::Unsupported);
                     break (
                         WorkflowOutcome::Suspended {
                             commands: reconstructed_commands,
@@ -26511,6 +26511,8 @@ async fn process_workflow_task(
                 // (via handle_suspended_workflow) gets a valid span reference.
                 // The original span was dropped above.
                 let execute_span = tracing::Span::none();
+                // Issue #2007: an external-op batch cannot stay resident.
+                final_resident = final_miss(hot_swapped, ResidentOutcome::Unsupported);
                 break (
                     WorkflowOutcome::Suspended {
                         commands: remaining_commands_with_unresolved,
@@ -26521,7 +26523,11 @@ async fn process_workflow_task(
                 );
             }
             other => {
-                final_resident = iter_resident;
+                final_resident = if hot_swapped {
+                    final_miss(hot_swapped, ResidentOutcome::HotSwap)
+                } else {
+                    iter_resident
+                };
                 break (other, pending_cmds, execute_span, resolved_router);
             }
         }
@@ -27514,10 +27520,7 @@ async fn process_workflow_task(
                     events: std::mem::take(&mut history_events),
                     next_event_id,
                 },
-                std::mem::replace(
-                    &mut final_resident,
-                    Err(crate::resident::ResidentMiss::Cold),
-                ),
+                std::mem::take(&mut final_resident),
                 history_bytes,
             )
             .await;
@@ -27747,7 +27750,7 @@ async fn store_cache_entry(
     exec_uuid: uuid::Uuid,
     suspended: Option<bool>,
     state: crate::cache::CachedWorkflowState,
-    resident: Result<crate::resident::ResidentWorkflow, crate::resident::ResidentMiss>,
+    resident: crate::resident::Residency,
     // Issue #1804: the byte mark measured at the start of this decision.
     history_bytes: Option<crate::cache::HistoryBytesMark>,
 ) {

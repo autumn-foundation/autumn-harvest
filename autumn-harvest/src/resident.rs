@@ -5,7 +5,7 @@
 //! grows with history length, and a run of n decisions costs O(n²).
 //!
 //! A resident workflow keeps the suspended handler future and its context
-//! alive between decisions. A warm decision sends the new result to the
+//! alive between decisions. A warm decision sends the new results to the
 //! parked future and polls it once more. It does not replay history, so its
 //! cost does not grow with history length.
 //!
@@ -14,12 +14,13 @@
 //! A warm decision must decide exactly as a cold replay would. The resident
 //! path therefore accepts only a narrow set of suspensions:
 //!
-//! - The cycle awaits exactly one command: an activity, a timer or a signal.
-//!   With one awaited command there is no race whose winner could differ.
+//! - The cycle awaits one command: an activity, a timer or a signal. Or it
+//!   awaits two or more activities, such as a join of parallel tool calls
+//!   (issue #2008). A join resolves branch by branch, so no winner exists.
 //! - Each other command is a marker, a side effect, progress, current
 //!   details, a log line or a search-attribute upsert.
-//! - The context has no park token, push signal handler, held mutex, cancel
-//!   request or non-determinism record, and no unread history.
+//! - The context has no open race, park token, push signal handler, held
+//!   mutex, cancel request or non-determinism record, and no unread history.
 //! - A signal wait is not for a name that a non-blocking claim probed with a
 //!   scan that reached the end of history. A cold replay of the longer
 //!   history could hand the new signal to that probe instead.
@@ -27,11 +28,34 @@
 //! # When a warm decision resumes
 //!
 //! The delta must start with the events of the last suspension, in order.
-//! Then it must hold exactly one event that resolves the awaited command.
-//! That event must be an activity success, a timer fire or a signal. The
-//! start and heartbeat events of the awaited activity may come before it,
-//! because replay skips those too. The live channels carry these payloads
-//! exactly, as a replay reads them. Any other delta declines.
+//! Then it must hold at least one event that resolves a parked await. Each
+//! parked await resolves at most once. A resolving event must be an
+//! activity success, a timer fire or a signal. The start and heartbeat
+//! events of a parked activity may come before its result, because replay
+//! skips those too. The live channels carry these payloads exactly, as a
+//! replay reads them. Any other delta declines.
+//!
+//! # Partial joins
+//!
+//! A delta can resolve only some activities of a join (issue #2008). Each
+//! other activity gets a `WaitForActivity` command again, with its live
+//! sender. A cold replay emits the same command for an activity with no
+//! result, and that command writes no event. Then the executor sees a
+//! parked future and suspends.
+//!
+//! Such a cycle must only wait. A branch that runs a command while a
+//! sibling stays parked can order its commands differently from a cold
+//! replay. A branch that fails can drop a sibling. After the poll, the
+//! resume therefore checks that the cycle suspends with only its re-parked
+//! waits. Otherwise it declines with [`ResumeDeclined::SiblingStillParked`].
+//!
+//! A cold replay can stop its cursor at a sibling command, so a read of
+//! history state can differ too. Such a cycle is a speculation: it fires no
+//! side effect that replay suppresses, and any history read declines it.
+//!
+//! A delta with several results runs as one cycle per result, in history
+//! order. A cold replay matches the results in that order. A branch that
+//! runs on after an early result thus faces the check of its own cycle.
 //!
 //! A warm cycle appends the delta to the matcher as consumed events. The
 //! replay position, the history length and the history scans then match a
@@ -58,6 +82,7 @@ use crate::context::{WorkflowCommand, WorkflowContext};
 use crate::event::{SideEffectKind, WorkflowEvent};
 use crate::executor::{DriveResult, OwnedHandlerFuture, WorkflowExecuteSpanMeta, WorkflowOutcome};
 use crate::info::WorkflowHandlerFn;
+use crate::telemetry::ResidentOutcome;
 use crate::types::{ActivityExecId, ExecutionId, TimerId};
 
 /// Why a resident workflow did not resume (issue #1798).
@@ -72,106 +97,60 @@ pub enum ResumeDeclined {
     KeyChanged,
     /// The delta does not start with the events of the last suspension.
     OwnEventsMismatch,
-    /// The delta holds no event after the events of the last suspension.
+    /// The delta resolves no parked await.
     NoResolution,
-    /// The delta holds more than one event after the events of the last
-    /// suspension.
+    /// The delta holds an event after every parked await resolved, or a
+    /// second result for one await.
     ExtraEvents,
     /// The resolving event has a payload that the live channel cannot carry
     /// exactly, for example an activity failure. Holds the event type.
     InexactResolution(&'static str),
-    /// The event after the own events does not resolve the awaited command.
-    /// Holds the event type.
+    /// An event after the own events neither resolves a parked await nor
+    /// reports its progress. Holds the event type.
     UnexpectedEvent(&'static str),
     /// The parked future no longer waits for the result.
     ReceiverDropped,
+    /// A cycle that re-parked a sibling activity did more than wait for it
+    /// (issue #2008). A branch ran a command, failed or dropped a sibling.
+    /// A cold replay can read that history another way.
+    SiblingStillParked,
 }
 
-/// Why a decision replays cold while resident workflows are on (issue
-/// #2007).
+/// The resident state of one suspension (issue #1798, issue #2007).
 ///
-/// The worker labels `harvest.workflow.resident_miss` with
-/// [`Self::as_str`]. The closed set bounds the label.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum ResidentMiss {
-    /// This worker holds no resident state for the run, for example on the
-    /// first decision or after an eviction.
-    Cold,
-    /// The last suspension awaited two or more commands.
-    MultiAwait,
-    /// The last suspension was part of a race, or dropped a wait.
-    Race,
-    /// The last suspension held or waited for a durable mutex.
-    Mutex,
-    /// The workflow runs in a hot-swapped module.
-    HotSwap,
-    /// The last suspension sent a command that the resident path does not
-    /// take, for example a child workflow.
-    Command,
-    /// The last suspension waited for a condition.
-    Condition,
-    /// A push signal handler is registered.
-    SignalHandler,
-    /// Another context state blocked the capture, for example a cancel
-    /// request.
-    Context,
-    /// A context input changed since the suspension.
-    KeyChanged,
-    /// The new events did not resolve the parked wait exactly.
-    Delta,
-    /// The awaited activity failed or timed out.
-    Failure,
+/// The cache keeps it with the snapshot. The next decision reads it to
+/// resume the workflow, or to report why the decision replays.
+#[derive(Debug, Default)]
+// A cache entry holds one value per run. A box would add an allocation to
+// each suspension.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Residency {
+    /// No capture ran, for example on a terminal cycle or with resident
+    /// state off.
+    #[default]
+    Unknown,
+    /// The suspension stayed resident.
+    Parked(ResidentWorkflow),
+    /// The suspension did not stay resident, for this reason. The reason is
+    /// never `Hit` or `Cold`.
+    Missed(
+        // Only the db-gated worker reads the reason.
+        #[cfg_attr(not(feature = "db"), allow(dead_code))] ResidentOutcome,
+    ),
 }
 
-impl ResidentMiss {
-    /// Every reason, in label order.
-    pub const ALL: [Self; 12] = [
-        Self::Cold,
-        Self::MultiAwait,
-        Self::Race,
-        Self::Mutex,
-        Self::HotSwap,
-        Self::Command,
-        Self::Condition,
-        Self::SignalHandler,
-        Self::Context,
-        Self::KeyChanged,
-        Self::Delta,
-        Self::Failure,
-    ];
-
-    /// The `reason` label value.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
+impl Residency {
+    /// The parked workflow, if any.
+    pub(crate) fn into_workflow(self) -> Option<ResidentWorkflow> {
         match self {
-            Self::Cold => "cold",
-            Self::MultiAwait => "multi_await",
-            Self::Race => "race",
-            Self::Mutex => "mutex",
-            Self::HotSwap => "hot_swap",
-            Self::Command => "command",
-            Self::Condition => "condition",
-            Self::SignalHandler => "signal_handler",
-            Self::Context => "context",
-            Self::KeyChanged => "key_changed",
-            Self::Delta => "delta",
-            Self::Failure => "failure",
+            Self::Parked(workflow) => Some(workflow),
+            Self::Unknown | Self::Missed(_) => None,
         }
     }
-}
 
-impl From<&ResumeDeclined> for ResidentMiss {
-    fn from(declined: &ResumeDeclined) -> Self {
-        match declined {
-            ResumeDeclined::KeyChanged => Self::KeyChanged,
-            ResumeDeclined::InexactResolution(_) => Self::Failure,
-            ResumeDeclined::OwnEventsMismatch
-            | ResumeDeclined::NoResolution
-            | ResumeDeclined::ExtraEvents
-            | ResumeDeclined::UnexpectedEvent(_)
-            | ResumeDeclined::ReceiverDropped => Self::Delta,
-        }
+    /// Whether the suspension stayed resident.
+    pub(crate) const fn is_parked(&self) -> bool {
+        matches!(self, Self::Parked(_))
     }
 }
 
@@ -247,7 +226,7 @@ impl std::fmt::Debug for ResidentKey {
     }
 }
 
-/// The one command that a resident workflow awaits, with its live channel.
+/// One command that a resident workflow awaits, with its live channel.
 enum Awaiting {
     Activity {
         activity_id: ActivityExecId,
@@ -315,6 +294,50 @@ impl Awaiting {
                 | WorkflowEvent::ActivityHeartbeat { activity_id: id, .. }
                 if id == activity_id
         )
+    }
+
+    /// Whether `event` is a terminal event of this await, of any kind.
+    fn is_resolved_by(&self, event: &WorkflowEvent) -> bool {
+        match (self, event) {
+            (
+                Self::Activity { activity_id, .. },
+                WorkflowEvent::ActivityCompleted {
+                    activity_id: id, ..
+                }
+                | WorkflowEvent::ActivityFailed {
+                    activity_id: id, ..
+                }
+                | WorkflowEvent::ActivityTimedOut {
+                    activity_id: id, ..
+                },
+            ) => id == activity_id,
+            (Self::Timer { timer_id, .. }, WorkflowEvent::TimerFired { timer_id: id }) => {
+                id == timer_id
+            }
+            (
+                Self::Signal { signal_name, .. },
+                WorkflowEvent::SignalReceived {
+                    signal_name: name, ..
+                },
+            ) => name == signal_name,
+            _ => false,
+        }
+    }
+
+    /// The command that parks this activity again, with its live sender
+    /// (issue #2008). A cold replay emits the same command for an activity
+    /// with no result. A timer or a signal cannot wait again this way.
+    fn into_wait(self) -> Option<WorkflowCommand> {
+        match self {
+            Self::Activity {
+                activity_id,
+                result_tx,
+            } => Some(WorkflowCommand::WaitForActivity {
+                activity_id,
+                result_tx,
+            }),
+            Self::Timer { .. } | Self::Signal { .. } => None,
+        }
     }
 
     /// Sends the result in `event` to the parked future.
@@ -410,11 +433,26 @@ impl OwnEvent {
     }
 }
 
-/// Reads one suspension's commands. Returns the index of the one awaited
-/// command and the events the worker writes, or why the suspension cannot
-/// stay resident.
-fn plan_suspension(commands: &[WorkflowCommand]) -> Result<(usize, Vec<OwnEvent>), ResidentMiss> {
-    let mut awaited = None;
+/// The awaited commands and own events of one suspension.
+struct SuspensionPlan {
+    /// The index of each awaited command, in command order.
+    awaited: Vec<usize>,
+    /// The events that the worker writes for the suspension.
+    own_events: Vec<OwnEvent>,
+}
+
+/// Whether `cmd` awaits an activity result.
+const fn awaits_activity(cmd: &WorkflowCommand) -> bool {
+    matches!(
+        cmd,
+        WorkflowCommand::ScheduleActivity { .. } | WorkflowCommand::WaitForActivity { .. }
+    )
+}
+
+/// Reads one suspension's commands. Returns its plan, or the reason why the
+/// suspension cannot stay resident.
+fn plan_suspension(commands: &[WorkflowCommand]) -> Result<SuspensionPlan, ResidentOutcome> {
+    let mut awaited = Vec::new();
     let mut own_events = Vec::new();
     for (index, cmd) in commands.iter().enumerate() {
         let awaits = match cmd {
@@ -440,56 +478,64 @@ fn plan_suspension(commands: &[WorkflowCommand]) -> Result<(usize, Vec<OwnEvent>
             | WorkflowCommand::PublishProgress { .. }
             | WorkflowCommand::RecordLog { .. } => false,
             WorkflowCommand::AcquireMutex { .. } | WorkflowCommand::ReleaseMutex { .. } => {
-                return Err(ResidentMiss::Mutex);
+                return Err(ResidentOutcome::Mutex);
             }
-            _ => return Err(ResidentMiss::Command),
+            _ => return Err(ResidentOutcome::Unsupported),
         };
         if awaits {
-            // A wait whose receiver is gone is what a `select!` leaves.
             if !cmd.awaits_result() {
-                return Err(ResidentMiss::Race);
+                return Err(ResidentOutcome::Unsupported);
             }
-            // A second awaited command means a join or a race.
-            if awaited.is_some() {
-                return Err(ResidentMiss::MultiAwait);
-            }
-            awaited = Some(index);
+            awaited.push(index);
         }
     }
-    awaited
-        .map(|index| (index, own_events))
-        .ok_or(ResidentMiss::Command)
+    match awaited.as_slice() {
+        [] => Err(ResidentOutcome::Unsupported),
+        // A join of activities resolves branch by branch (issue #2008).
+        [_] => Ok(SuspensionPlan {
+            awaited,
+            own_events,
+        }),
+        _ if awaited
+            .iter()
+            .all(|&index| awaits_activity(&commands[index])) =>
+        {
+            Ok(SuspensionPlan {
+                awaited,
+                own_events,
+            })
+        }
+        // A timer or a signal next to another await follows other replay
+        // rules. The path does not cover the mix.
+        _ => Err(ResidentOutcome::MultiAwait),
+    }
 }
 
-/// Whether a suspension that cannot stay resident shows a race (issue
-/// #2007).
+/// Whether a cycle that re-parked the activities `reparked` only waits for
+/// them again (issue #2008).
 ///
-/// A `ctx.race()` cycle records its `race:{seq}` open marker on its first
-/// cycle. A race timer has a reserved id. A settled race cancels its losers.
-/// A raw `select!` leaves none of these, so it reads as a join.
-fn is_race(commands: &[WorkflowCommand]) -> bool {
-    commands.iter().any(|cmd| match cmd {
-        WorkflowCommand::CancelRaceLosers { .. } => true,
-        WorkflowCommand::RecordMarker { name, .. } => name
-            .strip_prefix("race:")
-            .is_some_and(|seq| seq.parse::<u32>().is_ok()),
-        WorkflowCommand::StartTimer { timer_id, .. } => {
-            let id = timer_id.as_str();
-            id.starts_with(crate::context::RACE_TIMER_PREFIX)
-                || crate::awaitables::reserved_signal_race_name(id).is_some()
-                || crate::awaitables::reserved_child_race_name(id).is_some()
-        }
-        _ => false,
-    })
+/// The cycle must suspend with exactly these waits, and the capture must
+/// keep each of them. A dropped sibling has a closed receiver, so the
+/// capture refuses it.
+fn only_waits_again(drive: &DriveResult, reparked: &[ActivityExecId]) -> bool {
+    let WorkflowOutcome::Suspended { commands } = &drive.outcome else {
+        return false;
+    };
+    commands.len() == reparked.len()
+        && commands.iter().zip(reparked).all(|(cmd, id)| {
+            matches!(cmd, WorkflowCommand::WaitForActivity { activity_id, .. } if activity_id == id)
+        })
+        && drive.resident.is_parked()
 }
 
 /// A suspended workflow that stays in memory between decisions (issue #1798).
 ///
 /// It holds the parked handler future, its context, and the live channel of
-/// the one command the future awaits. Dropping it drops the future.
+/// each command the future awaits. Dropping it drops the future.
 pub struct ResidentWorkflow {
     future: OwnedHandlerFuture,
-    awaiting: Awaiting,
+    /// The parked awaits, in command order. Two or more are all activities.
+    parked: Vec<Awaiting>,
     own_events: Vec<OwnEvent>,
     key: ResidentKey,
     ctx: Arc<WorkflowContext>,
@@ -499,6 +545,7 @@ impl std::fmt::Debug for ResidentWorkflow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResidentWorkflow")
             .field("execution_id", &self.ctx.execution_id())
+            .field("parked", &self.parked.len())
             .field("own_events", &self.own_events)
             .field("key", &self.key)
             .finish_non_exhaustive()
@@ -508,126 +555,184 @@ impl std::fmt::Debug for ResidentWorkflow {
 impl ResidentWorkflow {
     /// Keeps a suspended cycle resident when a warm decision can resume it.
     ///
-    /// On success the awaited command in `outcome` gets a closed channel,
-    /// and the returned value holds the live one. On an error the caller
-    /// drops `future` as on a cold cycle. The error is the miss reason of the
-    /// next decision (issue #2007).
+    /// On success each awaited command in `outcome` gets a closed channel,
+    /// and the returned value holds the live ones. On an error the caller
+    /// drops `future` as on a cold cycle. The error names the miss reason
+    /// (issue #2007).
     pub(crate) fn capture(
         ctx: &Arc<WorkflowContext>,
         future: OwnedHandlerFuture,
         outcome: &mut WorkflowOutcome,
         key: ResidentKey,
-    ) -> Result<Self, ResidentMiss> {
+    ) -> Result<Self, ResidentOutcome> {
         let WorkflowOutcome::Suspended { commands } = outcome else {
-            return Err(ResidentMiss::Command);
+            return Err(ResidentOutcome::Unsupported);
         };
         if let Some(blocker) = ctx.resident_blocker() {
             return Err(blocker);
         }
-        // A race rejects for its shape. The reason names the race instead.
-        let (index, own_events) = plan_suspension(commands).map_err(|miss| {
-            if ctx.race_waiting() || is_race(commands) {
-                ResidentMiss::Race
-            } else {
-                miss
-            }
-        })?;
+        let SuspensionPlan {
+            awaited,
+            own_events,
+        } = plan_suspension(commands)?;
         // A cold replay could hand the new signal to an earlier probe.
-        if let WorkflowCommand::WaitForSignal { signal_name, .. } = &commands[index]
-            && ctx.signal_probed_at_frontier(signal_name)
-        {
-            return Err(ResidentMiss::Context);
+        for &index in &awaited {
+            if let WorkflowCommand::WaitForSignal { signal_name, .. } = &commands[index]
+                && ctx.signal_probed_at_frontier(signal_name)
+            {
+                return Err(ResidentOutcome::Blocked);
+            }
         }
-        let awaiting = Awaiting::take_from(&mut commands[index]).ok_or(ResidentMiss::Command)?;
+        let parked = awaited
+            .iter()
+            .map(|&index| Awaiting::take_from(&mut commands[index]))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(ResidentOutcome::Unsupported)?;
         Ok(Self {
             future,
-            awaiting,
+            parked,
             own_events,
             key,
             ctx: Arc::clone(ctx),
         })
     }
 
-    /// Returns the event in `delta` that resolves the awaited command.
+    /// Matches `delta` to the parked awaits. Returns the index in `delta` of
+    /// the resolving event of each parked await, or `None` for one that
+    /// stays parked.
+    ///
+    /// This checks the order of events only. [`Awaiting::deliver`] checks
+    /// that the live channel can carry each payload exactly.
     ///
     /// Decision boundaries (issue #1833) are skipped. Replay never reads them.
-    fn resolving_event<'a>(
-        &self,
-        delta: &'a [WorkflowEvent],
-    ) -> Result<&'a WorkflowEvent, ResumeDeclined> {
-        let mut events = delta.iter().filter(|event| !event.is_decision_boundary());
-        // A delta shorter than the own events is checked as far as it goes.
-        let own_match = self
-            .own_events
+    fn resolutions(&self, delta: &[WorkflowEvent]) -> Result<Vec<Option<usize>>, ResumeDeclined> {
+        let mut events = delta
             .iter()
-            .all(|expected| events.next().is_none_or(|event| expected.matches(event)));
+            .enumerate()
+            .filter(|(_, event)| !event.is_decision_boundary());
+        // A delta shorter than the own events is checked as far as it goes.
+        let own_match = self.own_events.iter().all(|expected| {
+            events
+                .next()
+                .is_none_or(|(_, event)| expected.matches(event))
+        });
         if !own_match {
             return Err(ResumeDeclined::OwnEventsMismatch);
         }
-        // Replay skips progress events only up to the resolving event.
-        let mut rest = events.skip_while(|event| self.awaiting.is_progress(event));
-        match (rest.next(), rest.next()) {
-            (Some(event), None) => Ok(event),
-            (Some(_), Some(_)) => Err(ResumeDeclined::ExtraEvents),
-            (None, _) => Err(ResumeDeclined::NoResolution),
+        let mut resolved: Vec<Option<usize>> = vec![None; self.parked.len()];
+        for (at, event) in events {
+            if resolved.iter().all(Option::is_some) {
+                return Err(ResumeDeclined::ExtraEvents);
+            }
+            // Replay skips progress events of an activity only up to its
+            // result.
+            let progress = self
+                .parked
+                .iter()
+                .zip(&resolved)
+                .any(|(parked, result)| result.is_none() && parked.is_progress(event));
+            if progress {
+                continue;
+            }
+            let Some(index) = self
+                .parked
+                .iter()
+                .position(|parked| parked.is_resolved_by(event))
+            else {
+                return Err(ResumeDeclined::UnexpectedEvent(event.type_name()));
+            };
+            if resolved[index].is_some() {
+                return Err(ResumeDeclined::ExtraEvents);
+            }
+            resolved[index] = Some(at);
         }
+        if resolved.iter().all(Option::is_none) {
+            return Err(ResumeDeclined::NoResolution);
+        }
+        Ok(resolved)
     }
 
     /// Resumes this workflow with the events written since it suspended.
     ///
     /// `key` is the key of this decision. `None` skips the key check.
-    #[cfg(any(test, feature = "testing"))]
+    ///
+    /// A delta with several results runs as one step per result, in history
+    /// order (issue #2008). A cold replay matches results in that order. A
+    /// branch that runs on after an early result thus faces the check of its
+    /// own step. Each step but the last must only wait.
     pub(crate) async fn resume_with(
         self,
         delta: &[WorkflowEvent],
         key: Option<&ResidentKey>,
         span_meta: Option<&WorkflowExecuteSpanMeta>,
     ) -> Result<DriveResult, ResumeDeclined> {
-        Ok(self.wake(delta, key)?.drive(span_meta).await)
-    }
-
-    /// Sends the new result to the parked future (issue #2007).
-    ///
-    /// A success is the commit point of a resident hit. The worker records
-    /// the hit here, before the drive, so a drive that times out still
-    /// counts. `key` is the key of this decision. `None` skips the key check.
-    #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
-    pub(crate) fn wake(
-        self,
-        delta: &[WorkflowEvent],
-        key: Option<&ResidentKey>,
-    ) -> Result<WokenWorkflow, ResumeDeclined> {
         if key.is_some_and(|key| *key != self.key) {
             return Err(ResumeDeclined::KeyChanged);
         }
-        let event = self.resolving_event(delta)?;
+        let mut ends: Vec<usize> = self.resolutions(delta)?.into_iter().flatten().collect();
+        ends.sort_unstable();
+        // The last step also takes the progress events after the last result.
+        if let Some(last) = ends.last_mut() {
+            *last = delta.len().saturating_sub(1);
+        }
+        let mut current = self;
+        let mut start = 0;
+        for (step, end) in ends.iter().enumerate() {
+            let drive = current.step(&delta[start..=*end], span_meta).await?;
+            if step + 1 == ends.len() {
+                return Ok(drive);
+            }
+            current = drive
+                .resident
+                .into_workflow()
+                .ok_or(ResumeDeclined::SiblingStillParked)?;
+            start = end + 1;
+        }
+        Err(ResumeDeclined::NoResolution)
+    }
+
+    /// Runs one cycle that delivers the results in `delta`.
+    ///
+    /// Each parked activity with no result waits again. Such a cycle runs
+    /// as a speculation: it must only wait, and it must not read the replay
+    /// position. A cold replay can read either one another way.
+    async fn step(
+        self,
+        delta: &[WorkflowEvent],
+        span_meta: Option<&WorkflowExecuteSpanMeta>,
+    ) -> Result<DriveResult, ResumeDeclined> {
+        let resolved = self.resolutions(delta)?;
         let Self {
             future,
-            awaiting,
+            parked,
             key,
             ctx,
             ..
         } = self;
-        awaiting.deliver(event)?;
-        ctx.begin_resident_cycle(delta);
-        Ok(WokenWorkflow { future, key, ctx })
-    }
-}
-
-/// A resident workflow that holds its new result and waits for its drive
-/// (issue #2007).
-#[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
-pub(crate) struct WokenWorkflow {
-    future: OwnedHandlerFuture,
-    key: ResidentKey,
-    ctx: Arc<WorkflowContext>,
-}
-
-impl WokenWorkflow {
-    /// Polls the parked future for one cycle.
-    #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
-    pub(crate) async fn drive(self, span_meta: Option<&WorkflowExecuteSpanMeta>) -> DriveResult {
-        crate::executor::drive_resumed(self.ctx, self.future, span_meta, self.key).await
+        let mut waits = Vec::new();
+        let mut reparked = Vec::new();
+        for (parked, at) in parked.into_iter().zip(resolved) {
+            if let Some(at) = at {
+                parked.deliver(&delta[at])?;
+                continue;
+            }
+            // Only an activity can wait again. Capture parks a timer or a
+            // signal only alone, and a delta always resolves a lone await.
+            let wait = parked.into_wait().ok_or(ResumeDeclined::NoResolution)?;
+            if let WorkflowCommand::WaitForActivity { activity_id, .. } = &wait {
+                reparked.push(*activity_id);
+            }
+            waits.push(wait);
+        }
+        ctx.begin_resident_cycle(delta, waits);
+        let speculation = Arc::clone(&ctx);
+        let drive = crate::executor::drive_resumed(ctx, future, span_meta, key).await;
+        let read_position = speculation.end_speculation();
+        // Dropping the drive drops the future. The worker then replays cold.
+        if !reparked.is_empty() && (read_position || !only_waits_again(&drive, &reparked)) {
+            return Err(ResumeDeclined::SiblingStillParked);
+        }
+        Ok(drive)
     }
 }
 
@@ -642,10 +747,22 @@ pub async fn start(
     handler: WorkflowHandlerFn,
     input: Value,
 ) -> (WorkflowOutcome, Option<ResidentWorkflow>) {
+    let (outcome, residency) = start_residency(exec_id, history, handler, input).await;
+    (outcome, residency.into_workflow())
+}
+
+/// [`start`] that also returns why the suspension did not stay resident.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) async fn start_residency(
+    exec_id: ExecutionId,
+    history: Vec<WorkflowEvent>,
+    handler: WorkflowHandlerFn,
+    input: Value,
+) -> (WorkflowOutcome, Residency) {
     let ctx = crate::executor::default_task_context(exec_id, history);
     let key = ResidentKey::new(handler, None, &HashMap::new());
     let drive = crate::executor::drive_workflow_keep(ctx, handler, input, None, Some(key)).await;
-    (drive.outcome, drive.resident.ok())
+    (drive.outcome, drive.resident)
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -661,7 +778,7 @@ impl ResidentWorkflow {
         delta: &[WorkflowEvent],
     ) -> Result<(WorkflowOutcome, Option<Self>), ResumeDeclined> {
         let drive = self.resume_with(delta, None, None).await?;
-        Ok((drive.outcome, drive.resident.ok()))
+        Ok((drive.outcome, drive.resident.into_workflow()))
     }
 }
 
@@ -823,6 +940,8 @@ mod tests {
         shapes: Vec<String>,
         history: Vec<WorkflowEvent>,
         resumes: usize,
+        /// The reason of each declined resume, in order.
+        declines: Vec<ResumeDeclined>,
     }
 
     /// Drives a run with a cold replay for every decision.
@@ -840,6 +959,7 @@ mod tests {
                     shapes,
                     history,
                     resumes: 0,
+                    declines: Vec::new(),
                 };
             };
             history.extend(own_events(&commands));
@@ -865,6 +985,7 @@ mod tests {
                     shapes,
                     history,
                     resumes,
+                    declines: Vec::new(),
                 };
             };
             let start_len = history.len();
@@ -1142,17 +1263,29 @@ mod tests {
 
     // ── Shapes that must never stay resident ─────────────────────────
 
-    /// Awaits two activities at once.
-    fn join_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+    /// Awaits an activity and a timer at once.
+    fn mixed_join_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
         Box::pin(async move {
-            let (a, b) = futures::join!(
+            let (a, t) = futures::join!(
                 ctx.execute_activity_raw("a", json!({}), "default"),
-                ctx.execute_activity_raw("b", json!({}), "default"),
+                ctx.timer("t", 5),
             );
-            Ok(json!([
-                a.map_err(|e| e.to_string())?,
-                b.map_err(|e| e.to_string())?
-            ]))
+            t.map_err(|e| e.to_string())?;
+            a.map_err(|e| e.to_string())
+        })
+    }
+
+    /// Races two activities.
+    fn race_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            let winner = ctx
+                .race()
+                .activity_raw("a", json!({}), "default")
+                .activity_raw("b", json!({}), "default")
+                .run()
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(winner.index))
         })
     }
 
@@ -1176,14 +1309,46 @@ mod tests {
         })
     }
 
+    /// Acquires a durable mutex, then awaits an activity.
+    fn mutex_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            let _guard = ctx.mutex("k").acquire().await.map_err(|e| e.to_string())?;
+            ctx.execute_activity_raw("a", json!({}), "default")
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Starts a child workflow.
+    fn child_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            ctx.spawn_child_workflow_raw("child", json!({}))
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
     #[tokio::test]
-    async fn ineligible_suspensions_are_not_resident() {
-        for (name, handler) in [
-            ("join", join_workflow as WorkflowHandlerFn),
-            ("signal handler", handler_workflow),
-            ("condition", condition_workflow),
-        ] {
-            let (outcome, resident) = start(
+    async fn capture_names_why_a_suspension_is_not_resident() {
+        // Issue #2007: each miss reason is the `outcome` label of a decision.
+        let cases: [(&str, WorkflowHandlerFn, ResidentOutcome); 6] = [
+            (
+                "mixed join",
+                mixed_join_workflow,
+                ResidentOutcome::MultiAwait,
+            ),
+            ("race", race_workflow, ResidentOutcome::Race),
+            ("signal handler", handler_workflow, ResidentOutcome::Blocked),
+            ("condition", condition_workflow, ResidentOutcome::Blocked),
+            ("mutex", mutex_workflow, ResidentOutcome::Mutex),
+            (
+                "child workflow",
+                child_workflow,
+                ResidentOutcome::Unsupported,
+            ),
+        ];
+        for (name, handler, expected) in cases {
+            let (outcome, residency) = start_residency(
                 ExecutionId::new(),
                 vec![started(Value::Null)],
                 handler,
@@ -1194,255 +1359,42 @@ mod tests {
                 matches!(outcome, WorkflowOutcome::Suspended { .. }),
                 "{name}: the fixture must suspend: {outcome:?}"
             );
-            assert!(resident.is_none(), "{name}: must not stay resident");
+            assert!(
+                matches!(residency, Residency::Missed(reason) if reason == expected),
+                "{name}: expected the miss reason {expected}, got {residency:?}"
+            );
         }
-    }
-
-    // ── Miss reasons (issue #2007) ───────────────────────────────────
-
-    /// Runs one cold decision and returns why it cannot stay resident.
-    async fn capture_of(handler: WorkflowHandlerFn) -> Result<(), ResidentMiss> {
-        capture_after(vec![started(Value::Null)], handler).await
-    }
-
-    /// Runs one cold decision over `history` and returns why it cannot stay
-    /// resident.
-    async fn capture_after(
-        history: Vec<WorkflowEvent>,
-        handler: WorkflowHandlerFn,
-    ) -> Result<(), ResidentMiss> {
-        let ctx = crate::executor::default_task_context(ExecutionId::new(), history);
-        let key = ResidentKey::new(handler, None, &HashMap::new());
-        crate::executor::drive_workflow_keep(ctx, handler, Value::Null, None, Some(key))
-            .await
-            .resident
-            .map(drop)
-    }
-
-    /// Races two activities with `ctx.race()`.
-    fn activity_race_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
-        Box::pin(async move {
-            let winner = ctx
-                .race()
-                .activity_raw("a", json!({}), "default")
-                .activity_raw("b", json!({}), "default")
-                .run()
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(json!(winner.index))
-        })
-    }
-
-    /// Races an activity against a timer with `ctx.race()`.
-    fn timer_race_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
-        Box::pin(async move {
-            let winner = ctx
-                .race()
-                .activity_raw("a", json!({}), "default")
-                .timer(std::time::Duration::from_secs(60))
-                .run()
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(json!(winner.index))
-        })
-    }
-
-    /// Waits for a signal with a deadline.
-    fn signal_timeout_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
-        Box::pin(async move {
-            ctx.wait_for_signal_timeout("go", std::time::Duration::from_secs(60))
-                .await
-                .map_err(|e| e.to_string())
-                .map(|value| value.unwrap_or(Value::Null))
-        })
-    }
-
-    /// Waits for a durable mutex.
-    fn mutex_wait_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
-        Box::pin(async move {
-            let _guard = ctx
-                .mutex("ledger")
-                .acquire()
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(Value::Null)
-        })
-    }
-
-    /// Holds a durable mutex while it waits for an activity.
-    fn mutex_held_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
-        Box::pin(async move {
-            let _guard = ctx
-                .mutex("ledger")
-                .acquire()
-                .await
-                .map_err(|e| e.to_string())?;
-            ctx.execute_activity_raw("a", json!({}), "default")
-                .await
-                .map_err(|e| e.to_string())
-        })
-    }
-
-    /// Starts a child workflow and waits for it.
-    fn child_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
-        Box::pin(async move {
-            ctx.spawn_child_workflow_raw("child", json!({}))
-                .await
-                .map_err(|e| e.to_string())
-        })
-    }
-
-    /// Waits for a child workflow with a deadline.
-    fn child_timeout_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
-        Box::pin(async move {
-            ctx.spawn_child_workflow_timeout("child", json!({}), std::time::Duration::from_secs(60))
-                .await
-                .map_err(|e| e.to_string())
-                .map(|value| value.unwrap_or(Value::Null))
-        })
-    }
-
-    /// Waits for a signal with a deadline, then runs one activity.
-    fn signal_deadline_then_activity_workflow(
-        ctx: &WorkflowContext,
-        _input: Value,
-    ) -> HandlerFuture<'_> {
-        Box::pin(async move {
-            ctx.wait_for_signal_timeout("go", std::time::Duration::from_secs(60))
-                .await
-                .map_err(|e| e.to_string())?;
-            ctx.execute_activity_raw("a", json!({}), "default")
-                .await
-                .map_err(|e| e.to_string())
-        })
-    }
-
-    /// The history after the first cold decision of `handler`.
-    async fn after_first_decision(handler: WorkflowHandlerFn) -> Vec<WorkflowEvent> {
-        let (outcome, _resident) = start(
-            ExecutionId::new(),
-            vec![started(Value::Null)],
-            handler,
-            Value::Null,
-        )
-        .await;
-        let WorkflowOutcome::Suspended { commands } = outcome else {
-            panic!("the first decision must suspend");
-        };
-        let mut history = vec![started(Value::Null)];
-        history.extend(own_events(&commands));
-        history.push(decision_boundary());
-        history
     }
 
     #[tokio::test]
-    async fn a_race_reports_race_after_its_first_cycle() {
-        // An unrelated wake replays the race before any branch ends.
-        let history = after_first_decision(activity_race_workflow).await;
-        assert_eq!(
-            capture_after(history, activity_race_workflow).await,
-            Err(ResidentMiss::Race),
-            "a pending race on a later cycle"
-        );
-
-        // The signal wins. The next cycle cancels the timer and runs work.
-        let mut history = after_first_decision(signal_deadline_then_activity_workflow).await;
-        history.push(WorkflowEvent::SignalReceived {
-            signal_name: "go".into(),
-            payload: json!(1),
-        });
-        assert_eq!(
-            capture_after(history, signal_deadline_then_activity_workflow).await,
-            Err(ResidentMiss::Race),
-            "work after a settled race"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_suspension_that_cannot_stay_resident_reports_why() {
-        let cases: [(&str, WorkflowHandlerFn, ResidentMiss); 9] = [
-            ("join", join_workflow, ResidentMiss::MultiAwait),
-            ("activity race", activity_race_workflow, ResidentMiss::Race),
-            ("timer race", timer_race_workflow, ResidentMiss::Race),
-            (
-                "signal deadline",
-                signal_timeout_workflow,
-                ResidentMiss::Race,
-            ),
-            ("mutex wait", mutex_wait_workflow, ResidentMiss::Mutex),
-            ("child workflow", child_workflow, ResidentMiss::Command),
-            ("child deadline", child_timeout_workflow, ResidentMiss::Race),
-            (
-                "signal handler",
-                handler_workflow,
-                ResidentMiss::SignalHandler,
-            ),
-            ("condition", condition_workflow, ResidentMiss::Condition),
-        ];
-        for (name, handler, expected) in cases {
-            assert_eq!(capture_of(handler).await, Err(expected), "{name}");
-        }
-        let granted = WorkflowEvent::MutexGranted {
-            key: "ledger".into(),
-            lock_seq: 1,
-            acquired_at: Utc
-                .with_ymd_and_hms(2026, 10, 3, 0, 0, 1)
-                .single()
-                .expect("valid timestamp"),
+    async fn a_race_in_flight_is_a_race_miss_on_a_cold_replay() {
+        // A cold replay of a race in flight emits only waits. The open-race
+        // count still names the miss.
+        let (a, b) = (ActivityExecId::new(), ActivityExecId::new());
+        let scheduled = |id, name: &str| WorkflowEvent::ActivityScheduled {
+            activity_id: id,
+            name: name.into(),
+            input: json!({}),
+            queue: "default".into(),
         };
-        assert_eq!(
-            capture_after(vec![started(Value::Null), granted], mutex_held_workflow).await,
-            Err(ResidentMiss::Mutex),
-            "a held mutex"
-        );
-        assert_eq!(
-            capture_of(one_activity_workflow).await,
-            Ok(()),
-            "one awaited activity stays resident"
-        );
-    }
-
-    #[test]
-    fn each_decline_maps_to_one_miss_reason() {
-        let cases = [
-            (ResumeDeclined::KeyChanged, ResidentMiss::KeyChanged),
-            (ResumeDeclined::OwnEventsMismatch, ResidentMiss::Delta),
-            (ResumeDeclined::NoResolution, ResidentMiss::Delta),
-            (ResumeDeclined::ExtraEvents, ResidentMiss::Delta),
-            (
-                ResumeDeclined::UnexpectedEvent("TimerFired"),
-                ResidentMiss::Delta,
-            ),
-            (ResumeDeclined::ReceiverDropped, ResidentMiss::Delta),
-            (
-                ResumeDeclined::InexactResolution("ActivityFailed"),
-                ResidentMiss::Failure,
-            ),
+        let history = vec![
+            started(Value::Null),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".into(),
+                details: json!(2),
+            },
+            scheduled(a, "a"),
+            scheduled(b, "b"),
         ];
-        for (declined, expected) in cases {
-            assert_eq!(ResidentMiss::from(&declined), expected, "{declined:?}");
-        }
-    }
-
-    #[test]
-    fn miss_reasons_are_a_closed_label_set() {
-        let labels: Vec<&str> = ResidentMiss::ALL.iter().map(|m| m.as_str()).collect();
-        assert_eq!(
-            labels,
-            [
-                "cold",
-                "multi_await",
-                "race",
-                "mutex",
-                "hot_swap",
-                "command",
-                "condition",
-                "signal_handler",
-                "context",
-                "key_changed",
-                "delta",
-                "failure",
-            ]
+        let (outcome, residency) =
+            start_residency(ExecutionId::new(), history, race_workflow, Value::Null).await;
+        assert!(
+            matches!(outcome, WorkflowOutcome::Suspended { .. }),
+            "{outcome:?}"
+        );
+        assert!(
+            matches!(residency, Residency::Missed(ResidentOutcome::Race)),
+            "{residency:?}"
         );
     }
 
@@ -1561,7 +1513,7 @@ mod tests {
             ),
             (
                 "a cancel request",
-                ResumeDeclined::ExtraEvents,
+                ResumeDeclined::UnexpectedEvent("WorkflowCancelled"),
                 Box::new(|own, id| {
                     [
                         own.to_vec(),
@@ -1706,7 +1658,7 @@ mod tests {
         let delta = [own, vec![other, completed(id)]].concat();
         assert_eq!(
             resident.resume(&delta).await.err(),
-            Some(ResumeDeclined::ExtraEvents),
+            Some(ResumeDeclined::UnexpectedEvent("ActivityStarted")),
             "progress of another activity must decline"
         );
     }
@@ -1759,6 +1711,829 @@ mod tests {
         assert!(
             matches!(outcome, WorkflowOutcome::Completed { .. }),
             "{outcome:?}"
+        );
+    }
+
+    // ── Parallel activity awaits (issue #2008) ───────────────────────
+
+    /// Which open awaits one decision resolves.
+    #[derive(Debug, Clone, Copy)]
+    enum Arrival {
+        /// The oldest open await.
+        Oldest,
+        /// The newest open await.
+        Newest,
+        /// Every open await, in one delta.
+        All,
+        /// A random non-empty subset of the open awaits, in random order.
+        /// The value seeds the choice.
+        Shuffled(u64),
+    }
+
+    /// Every arrival order, each with and without progress events.
+    const MODES: [(Arrival, bool); 12] = [
+        (Arrival::Oldest, false),
+        (Arrival::Newest, false),
+        (Arrival::All, false),
+        (Arrival::Shuffled(1), false),
+        (Arrival::Shuffled(2), false),
+        (Arrival::Shuffled(3), false),
+        (Arrival::Oldest, true),
+        (Arrival::Newest, true),
+        (Arrival::All, true),
+        (Arrival::Shuffled(4), true),
+        (Arrival::Shuffled(5), true),
+        (Arrival::Shuffled(6), true),
+    ];
+
+    /// A small deterministic generator for [`Arrival::Shuffled`].
+    fn next_random(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state >> 33
+    }
+
+    /// Picks the resolving events of one decision from `open`.
+    fn pick(open: Vec<WorkflowEvent>, arrival: Arrival, state: &mut u64) -> Vec<WorkflowEvent> {
+        match arrival {
+            Arrival::Oldest => open.into_iter().take(1).collect(),
+            Arrival::Newest => open.into_iter().last().into_iter().collect(),
+            Arrival::All => open,
+            Arrival::Shuffled(_) => {
+                let mut rest = open;
+                let mut picked = Vec::new();
+                while !rest.is_empty() {
+                    let index = usize::try_from(next_random(state)).unwrap_or(0) % rest.len();
+                    picked.push(rest.remove(index));
+                    if next_random(state).is_multiple_of(2) {
+                        break;
+                    }
+                }
+                picked
+            }
+        }
+    }
+
+    /// The progress events a worker writes for the open activities: a start
+    /// for each activity that has none yet.
+    fn starts(history: &[WorkflowEvent], open: &[WorkflowEvent]) -> Vec<WorkflowEvent> {
+        open.iter()
+            .filter_map(|event| match event {
+                WorkflowEvent::ActivityCompleted { activity_id, .. } => Some(*activity_id),
+                _ => None,
+            })
+            .filter(|id| {
+                !history.iter().any(|e| {
+                    matches!(e, WorkflowEvent::ActivityStarted { activity_id, .. } if activity_id == id)
+                })
+            })
+            .map(|activity_id| WorkflowEvent::ActivityStarted {
+                activity_id,
+                worker_id: crate::types::WorkerId::new("w"),
+            })
+            .collect()
+    }
+
+    /// A heartbeat for each open activity that `picked` does not resolve.
+    fn heartbeats(open: &[WorkflowEvent], picked: &[WorkflowEvent]) -> Vec<WorkflowEvent> {
+        let activity = |event: &WorkflowEvent| match event {
+            WorkflowEvent::ActivityCompleted { activity_id, .. } => Some(*activity_id),
+            _ => None,
+        };
+        let resolved: Vec<ActivityExecId> = picked.iter().filter_map(activity).collect();
+        open.iter()
+            .filter_map(activity)
+            .filter(|id| !resolved.contains(id))
+            .map(|activity_id| WorkflowEvent::ActivityHeartbeat {
+                activity_id,
+                details: Value::Null,
+            })
+            .collect()
+    }
+
+    /// Whether `history` holds an event after index `from` that matches.
+    fn later(history: &[WorkflowEvent], from: usize, hit: impl Fn(&WorkflowEvent) -> bool) -> bool {
+        history.iter().skip(from + 1).any(hit)
+    }
+
+    /// The resolving events of the awaits that `history` and the last
+    /// suspension leave open, oldest first.
+    fn open_resolutions(
+        history: &[WorkflowEvent],
+        commands: &[WorkflowCommand],
+    ) -> Vec<WorkflowEvent> {
+        let mut open = Vec::new();
+        for (index, event) in history.iter().enumerate() {
+            match event {
+                WorkflowEvent::ActivityScheduled {
+                    activity_id, input, ..
+                } => {
+                    let done = later(
+                        history,
+                        index,
+                        |e| matches!(e, WorkflowEvent::ActivityCompleted { activity_id: id, .. } if id == activity_id),
+                    );
+                    if !done {
+                        open.push(WorkflowEvent::ActivityCompleted {
+                            activity_id: *activity_id,
+                            output: json!({ "echo": input }),
+                        });
+                    }
+                }
+                WorkflowEvent::TimerStarted { timer_id, .. } => {
+                    let fired = later(
+                        history,
+                        index,
+                        |e| matches!(e, WorkflowEvent::TimerFired { timer_id: id } if id == timer_id),
+                    );
+                    if !fired {
+                        open.push(WorkflowEvent::TimerFired {
+                            timer_id: timer_id.clone(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        for cmd in commands {
+            if let WorkflowCommand::WaitForSignal { signal_name, .. } = cmd {
+                open.push(WorkflowEvent::SignalReceived {
+                    signal_name: signal_name.clone(),
+                    payload: json!({ "signal": signal_name }),
+                });
+            }
+        }
+        open
+    }
+
+    /// The name and input of the activity with `id` in `history`.
+    fn activity_name(history: &[WorkflowEvent], id: ActivityExecId) -> String {
+        history
+            .iter()
+            .find_map(|event| match event {
+                WorkflowEvent::ActivityScheduled {
+                    activity_id,
+                    name,
+                    input,
+                    ..
+                } if *activity_id == id => Some(format!("{name}, {input}")),
+                _ => None,
+            })
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    /// [`outcome_shape`] that names each waited activity, so two runs with
+    /// other random ids compare equal.
+    fn outcome_shape_in(outcome: &WorkflowOutcome, history: &[WorkflowEvent]) -> String {
+        let WorkflowOutcome::Suspended { commands } = outcome else {
+            return outcome_shape(outcome);
+        };
+        let shapes: Vec<String> = commands
+            .iter()
+            .map(|cmd| match cmd {
+                WorkflowCommand::WaitForActivity { activity_id, .. } => {
+                    format!("WaitForActivity({})", activity_name(history, *activity_id))
+                }
+                other => shape(other),
+            })
+            .collect();
+        format!("Suspended[{}]", shapes.join(", "))
+    }
+
+    /// Drives a run. Each decision resolves the awaits that `arrival` picks.
+    ///
+    /// With `progress`, the delta also holds a start for each open activity
+    /// before the results. It holds a heartbeat for each activity that stays
+    /// open after them, as a worker writes them. With `warm`, a decision
+    /// resumes the resident workflow when it can. Otherwise every decision
+    /// replays cold.
+    async fn drive_arrivals(
+        handler: WorkflowHandlerFn,
+        input: Value,
+        (arrival, progress): (Arrival, bool),
+        warm: bool,
+    ) -> Trace {
+        let exec_id = ExecutionId::new();
+        let mut history = vec![started(input.clone())];
+        let mut shapes = Vec::new();
+        let mut resumes = 0;
+        let mut declines = Vec::new();
+        let mut state = match arrival {
+            Arrival::Shuffled(seed) => seed,
+            _ => 0,
+        };
+        let (mut outcome, mut resident) = if warm {
+            start(exec_id, history.clone(), handler, input.clone()).await
+        } else {
+            let cold =
+                crate::executor::run_workflow(exec_id, history.clone(), handler, input.clone())
+                    .await;
+            (cold, None)
+        };
+        for _ in 0..64 {
+            shapes.push(outcome_shape_in(&outcome, &history));
+            let WorkflowOutcome::Suspended { commands } = &outcome else {
+                return Trace {
+                    shapes,
+                    history,
+                    resumes,
+                    declines,
+                };
+            };
+            let start_len = history.len();
+            history.extend(own_events(commands));
+            history.push(decision_boundary());
+            let open = open_resolutions(&history, commands);
+            if progress {
+                let starts = starts(&history, &open);
+                history.extend(starts);
+            }
+            let picked = pick(open.clone(), arrival, &mut state);
+            assert!(!picked.is_empty(), "a suspension must leave an await open");
+            history.extend(picked.iter().cloned());
+            if progress {
+                history.extend(heartbeats(&open, &picked));
+            }
+            let delta = history[start_len..].to_vec();
+            let warm_step = match resident.take() {
+                Some(live) => match live.resume(&delta).await {
+                    Ok(next) => Some(next),
+                    Err(reason) => {
+                        declines.push(reason);
+                        None
+                    }
+                },
+                None => None,
+            };
+            (outcome, resident) = match warm_step {
+                Some(next) => {
+                    resumes += 1;
+                    next
+                }
+                None if warm => start(exec_id, history.clone(), handler, input.clone()).await,
+                None => {
+                    let cold = crate::executor::run_workflow(
+                        exec_id,
+                        history.clone(),
+                        handler,
+                        input.clone(),
+                    )
+                    .await;
+                    (cold, None)
+                }
+            };
+        }
+        panic!("the run did not finish in 64 decisions");
+    }
+
+    /// Asserts that the warm run decides like the cold run for `arrival`,
+    /// and that its history replays cold to the same end.
+    async fn assert_arrivals_match_cold(
+        handler: WorkflowHandlerFn,
+        input: Value,
+        mode: (Arrival, bool),
+    ) -> Trace {
+        let arrival = mode;
+        let cold = drive_arrivals(handler, input.clone(), mode, false).await;
+        let warm = drive_arrivals(handler, input.clone(), mode, true).await;
+        assert_eq!(
+            warm.shapes, cold.shapes,
+            "{arrival:?}: warm decisions must equal cold"
+        );
+        let replayed =
+            crate::executor::run_workflow(ExecutionId::new(), warm.history.clone(), handler, input)
+                .await;
+        assert_eq!(
+            Some(outcome_shape_in(&replayed, &warm.history)),
+            warm.shapes.last().cloned(),
+            "{arrival:?}: the warm history must replay cold to the same end"
+        );
+        warm
+    }
+
+    /// Asserts that every decision after the first resumed warm.
+    fn assert_every_decision_resumes(warm: &Trace, mode: (Arrival, bool)) {
+        assert!(warm.declines.is_empty(), "{mode:?}: {:?}", warm.declines);
+        assert_eq!(
+            warm.resumes,
+            warm.shapes.len() - 1,
+            "{mode:?}: every decision after the first must resume: {:?}",
+            warm.shapes
+        );
+    }
+
+    /// Joins two activities, then runs a third.
+    fn pair_then_c_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            let (a, b) = futures::join!(
+                ctx.execute_activity_raw("a", json!({ "n": 1 }), "default"),
+                ctx.execute_activity_raw("b", json!({ "n": 2 }), "default"),
+            );
+            let a = a.map_err(|e| e.to_string())?;
+            let b = b.map_err(|e| e.to_string())?;
+            let c = ctx
+                .execute_activity_raw("c", json!([a, b]), "default")
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!({ "c": c, "events": ctx.history_event_count() }))
+        })
+    }
+
+    #[tokio::test]
+    async fn an_activity_join_stays_resident() {
+        let (outcome, residency) = start_residency(
+            ExecutionId::new(),
+            vec![started(Value::Null)],
+            pair_then_c_workflow,
+            Value::Null,
+        )
+        .await;
+        assert!(
+            matches!(&outcome, WorkflowOutcome::Suspended { commands } if commands.len() == 2),
+            "{outcome:?}"
+        );
+        assert!(
+            residency.is_parked(),
+            "a join of two activities must stay resident: {residency:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_activity_join_matches_cold_replay_in_every_arrival_order() {
+        for mode in MODES {
+            let warm = assert_arrivals_match_cold(pair_then_c_workflow, Value::Null, mode).await;
+            assert_every_decision_resumes(&warm, mode);
+        }
+        // Two partial results, then the result of `c`.
+        let warm = drive_arrivals(
+            pair_then_c_workflow,
+            Value::Null,
+            (Arrival::Oldest, false),
+            true,
+        )
+        .await;
+        assert_eq!(warm.resumes, 3);
+    }
+
+    /// An agent loop: a model call, then parallel tool calls, per round.
+    fn tool_loop_workflow(ctx: &WorkflowContext, input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            let rounds = input["rounds"].as_u64().ok_or("missing rounds")?;
+            let tools = input["tools"].as_u64().ok_or("missing tools")?;
+            let mut transcript = Vec::new();
+            for round in 0..rounds {
+                let plan = ctx
+                    .execute_activity_raw(
+                        &format!("model{round}"),
+                        json!({ "round": round }),
+                        "default",
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                // With `reuse`, every call has one name, as an agent that
+                // calls one tool twice.
+                let names: Vec<String> = (0..tools)
+                    .map(|tool| {
+                        if input["reuse"] == json!(true) {
+                            "tool".to_string()
+                        } else {
+                            format!("tool{round}.{tool}")
+                        }
+                    })
+                    .collect();
+                let calls = names.iter().zip(0..tools).map(|(name, tool)| {
+                    ctx.execute_activity_raw(name, json!({ "plan": plan, "tool": tool }), "default")
+                });
+                let results = futures::future::try_join_all(calls)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                transcript.push(json!(results));
+            }
+            Ok(json!({ "transcript": transcript, "events": ctx.history_event_count() }))
+        })
+    }
+
+    #[tokio::test]
+    async fn warm_tool_loop_resumes_every_decision_in_every_arrival_order() {
+        for reuse in [false, true] {
+            let input = json!({ "rounds": 2, "tools": 3, "reuse": reuse });
+            for mode in MODES {
+                let warm =
+                    assert_arrivals_match_cold(tool_loop_workflow, input.clone(), mode).await;
+                assert_every_decision_resumes(&warm, mode);
+            }
+        }
+        // Per round: one model result, then three tool results.
+        let input = json!({ "rounds": 2, "tools": 3 });
+        let warm = drive_arrivals(tool_loop_workflow, input, (Arrival::Newest, false), true).await;
+        assert_eq!(warm.resumes, 8);
+    }
+
+    /// Body starts of `counted_tool_loop_workflow`. Only one test runs it.
+    static TOOL_LOOP_BODY_STARTS: AtomicUsize = AtomicUsize::new(0);
+
+    /// `tool_loop_workflow` with a body-start counter.
+    fn counted_tool_loop_workflow(ctx: &WorkflowContext, input: Value) -> HandlerFuture<'_> {
+        TOOL_LOOP_BODY_STARTS.fetch_add(1, Ordering::SeqCst);
+        tool_loop_workflow(ctx, input)
+    }
+
+    #[tokio::test]
+    async fn warm_tool_loop_runs_the_body_once() {
+        let input = json!({ "rounds": 3, "tools": 4 });
+        let warm = drive_arrivals(
+            counted_tool_loop_workflow,
+            input,
+            (Arrival::Shuffled(7), true),
+            true,
+        )
+        .await;
+        assert!(
+            warm.shapes
+                .last()
+                .is_some_and(|s| s.starts_with("Completed(")),
+            "{:?}",
+            warm.shapes.last()
+        );
+        assert_eq!(
+            TOOL_LOOP_BODY_STARTS.load(Ordering::SeqCst),
+            1,
+            "a partial tool result must not replay the body"
+        );
+    }
+
+    /// Fans out three activities with the fan-out helper.
+    fn fan_out_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            let calls = (0..3)
+                .map(|i| {
+                    (
+                        format!("leg{i}"),
+                        json!({ "leg": i }),
+                        "default".to_string(),
+                    )
+                })
+                .collect();
+            let legs = ctx
+                .execute_activity_fan_out_raw(calls)
+                .await
+                .map_err(|e| e.to_string())?;
+            let total = ctx
+                .execute_activity_raw("total", json!(legs), "default")
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!({ "total": total, "events": ctx.history_event_count() }))
+        })
+    }
+
+    #[tokio::test]
+    async fn warm_fan_out_matches_cold_replay_in_every_arrival_order() {
+        for mode in MODES {
+            let warm = assert_arrivals_match_cold(fan_out_workflow, Value::Null, mode).await;
+            assert_every_decision_resumes(&warm, mode);
+        }
+    }
+
+    /// Joins `a` with `b`. A bad result of `a` fails the join while `b`
+    /// is still parked.
+    fn failing_join_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            let checked_a = async {
+                let a = ctx
+                    .execute_activity_raw("a", json!({}), "default")
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if a.get("echo").is_some() {
+                    return Err("a is not valid".to_string());
+                }
+                Ok(a)
+            };
+            let b = async {
+                ctx.execute_activity_raw("b", json!({}), "default")
+                    .await
+                    .map_err(|e| e.to_string())
+            };
+            let (a, b) = futures::try_join!(checked_a, b)?;
+            Ok(json!([a, b]))
+        })
+    }
+
+    /// Joins `a` with a branch that runs `c` after `b`.
+    fn last_branch_runs_on_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            let (a, bc) =
+                futures::join!(ctx.execute_activity_raw("a", json!({}), "default"), async {
+                    ctx.execute_activity_raw("b", json!({}), "default").await?;
+                    ctx.execute_activity_raw("c", json!({}), "default").await
+                },);
+            Ok(json!([
+                a.map_err(|e| e.to_string())?,
+                bc.map_err(|e| e.to_string())?
+            ]))
+        })
+    }
+
+    /// Joins a branch that runs `c` after `a` with `b`. A cold replay
+    /// fails this shape once `a` and `b` are both done.
+    fn first_branch_runs_on_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            let (ac, b) = futures::join!(
+                async {
+                    ctx.execute_activity_raw("a", json!({}), "default").await?;
+                    ctx.execute_activity_raw("c", json!({}), "default").await
+                },
+                ctx.execute_activity_raw("b", json!({}), "default"),
+            );
+            Ok(json!([
+                ac.map_err(|e| e.to_string())?,
+                b.map_err(|e| e.to_string())?
+            ]))
+        })
+    }
+
+    #[tokio::test]
+    async fn a_branch_that_runs_on_while_a_sibling_is_parked_replays_cold() {
+        for (name, handler, arrival) in [
+            (
+                "failing join",
+                failing_join_workflow as WorkflowHandlerFn,
+                Arrival::Oldest,
+            ),
+            (
+                "last branch runs on",
+                last_branch_runs_on_workflow,
+                Arrival::Newest,
+            ),
+            (
+                "first branch runs on",
+                first_branch_runs_on_workflow,
+                Arrival::Oldest,
+            ),
+            // Both results in one delta: the first result runs first, as in
+            // a cold replay, so its branch faces the check.
+            (
+                "first branch runs on, together",
+                first_branch_runs_on_workflow,
+                Arrival::All,
+            ),
+            (
+                "position read",
+                position_in_branch_workflow,
+                Arrival::Oldest,
+            ),
+            (
+                "position read, together",
+                position_in_branch_workflow,
+                Arrival::All,
+            ),
+            ("unread read", unread_in_branch_workflow, Arrival::Oldest),
+        ] {
+            for progress in [false, true] {
+                let warm =
+                    assert_arrivals_match_cold(handler, Value::Null, (arrival, progress)).await;
+                assert!(
+                    warm.declines.contains(&ResumeDeclined::SiblingStillParked),
+                    "{name}: the resume must decline: {:?}",
+                    warm.declines
+                );
+            }
+        }
+    }
+
+    /// Reads the replay position in a branch while `b` is parked, then
+    /// passes it to `c`.
+    fn position_in_branch_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            let (seen, b) = futures::join!(
+                async {
+                    ctx.execute_activity_raw("a", json!({}), "default").await?;
+                    Ok::<_, crate::error::HarvestError>(json!({
+                        "info": ctx.info().history_event_count,
+                        "position": ctx.replay_position(),
+                        "replaying": ctx.is_replaying(),
+                    }))
+                },
+                ctx.execute_activity_raw("b", json!({}), "default"),
+            );
+            let seen = seen.map_err(|e| e.to_string())?;
+            b.map_err(|e| e.to_string())?;
+            ctx.execute_activity_raw("c", seen, "default")
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Asks whether history is unread in a branch while `b` is parked, then
+    /// passes the answer to `c`.
+    fn unread_in_branch_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            let (seen, b) = futures::join!(
+                async {
+                    ctx.execute_activity_raw("a", json!({}), "default").await?;
+                    Ok::<_, crate::error::HarvestError>(json!(ctx.history_has_unconsumed_events()))
+                },
+                ctx.execute_activity_raw("b", json!({}), "default"),
+            );
+            let seen = seen.map_err(|e| e.to_string())?;
+            b.map_err(|e| e.to_string())?;
+            ctx.execute_activity_raw("c", seen, "default")
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Suspends `pair_then_c_workflow` and returns its own events and the
+    /// ids of `a` and `b`.
+    async fn suspended_pair() -> (
+        ResidentWorkflow,
+        Vec<WorkflowEvent>,
+        ActivityExecId,
+        ActivityExecId,
+    ) {
+        let (outcome, resident) = start(
+            ExecutionId::new(),
+            vec![started(Value::Null)],
+            pair_then_c_workflow,
+            Value::Null,
+        )
+        .await;
+        let WorkflowOutcome::Suspended { commands } = outcome else {
+            panic!("the first decision must suspend");
+        };
+        let ids: Vec<ActivityExecId> = commands
+            .iter()
+            .filter_map(|c| match c {
+                WorkflowCommand::ScheduleActivity { activity_id, .. } => Some(*activity_id),
+                _ => None,
+            })
+            .collect();
+        let [a, b] = ids[..] else {
+            panic!("the join schedules two activities: {ids:?}");
+        };
+        let own = own_events(&commands);
+        (resident.expect("a join stays resident"), own, a, b)
+    }
+
+    #[tokio::test]
+    async fn a_partial_delta_re_parks_the_sibling() {
+        let (resident, own, a, b) = suspended_pair().await;
+        let progress = WorkflowEvent::ActivityStarted {
+            activity_id: a,
+            worker_id: crate::types::WorkerId::new("w"),
+        };
+        let delta = [own, vec![progress.clone(), completed(b), progress]].concat();
+        let (outcome, next) = resident
+            .resume(&delta)
+            .await
+            .expect("a partial delta resolves");
+        assert!(
+            matches!(&outcome, WorkflowOutcome::Suspended { commands }
+                if matches!(commands.as_slice(), [WorkflowCommand::WaitForActivity { activity_id, .. }] if *activity_id == a)),
+            "the cycle must wait for `a` only: {outcome:?}"
+        );
+        let next = next.expect("the sibling stays resident");
+        let (outcome, _) = next
+            .resume(&[decision_boundary(), completed(a)])
+            .await
+            .expect("the second result resolves");
+        assert!(
+            matches!(&outcome, WorkflowOutcome::Suspended { commands }
+                if matches!(commands.as_slice(), [WorkflowCommand::ScheduleActivity { name, .. }] if name == "c")),
+            "the join completes and schedules `c`: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_deltas_that_replay_could_read_differently_decline() {
+        type PairDelta = Box<dyn Fn(ActivityExecId, ActivityExecId) -> Vec<WorkflowEvent>>;
+        let started_other = WorkflowEvent::ActivityStarted {
+            activity_id: ActivityExecId::new(),
+            worker_id: crate::types::WorkerId::new("w"),
+        };
+        let failed = |id| WorkflowEvent::ActivityFailed {
+            activity_id: id,
+            error: "boom".into(),
+            attempt: 1,
+            error_type: "Error".into(),
+            details: None,
+            non_retryable: false,
+        };
+        let cases: Vec<(&str, ResumeDeclined, PairDelta)> = vec![
+            (
+                "a result twice",
+                ResumeDeclined::ExtraEvents,
+                Box::new(|a, _b| vec![completed(a), completed(a)]),
+            ),
+            (
+                "a sibling failure",
+                ResumeDeclined::InexactResolution("ActivityFailed"),
+                Box::new(move |a, b| vec![completed(a), failed(b)]),
+            ),
+            (
+                "progress of another activity",
+                ResumeDeclined::UnexpectedEvent("ActivityStarted"),
+                Box::new(move |a, _b| vec![started_other.clone(), completed(a)]),
+            ),
+            (
+                "a sibling timeout",
+                ResumeDeclined::InexactResolution("ActivityTimedOut"),
+                Box::new(|a, b| {
+                    vec![
+                        completed(a),
+                        WorkflowEvent::ActivityTimedOut {
+                            activity_id: b,
+                            timeout_type: crate::error::TimeoutType::StartToClose,
+                        },
+                    ]
+                }),
+            ),
+            (
+                "a result of another activity",
+                ResumeDeclined::UnexpectedEvent("ActivityCompleted"),
+                Box::new(|a, _b| vec![completed(a), completed(ActivityExecId::new())]),
+            ),
+            (
+                "an event after every result",
+                ResumeDeclined::ExtraEvents,
+                Box::new(|a, b| {
+                    vec![
+                        completed(a),
+                        completed(b),
+                        WorkflowEvent::SignalReceived {
+                            signal_name: "x".into(),
+                            payload: Value::Null,
+                        },
+                    ]
+                }),
+            ),
+        ];
+        for (name, expected, build) in cases {
+            let (resident, own, a, b) = suspended_pair().await;
+            let delta = [own, build(a, b)].concat();
+            assert_eq!(
+                resident.resume(&delta).await.err(),
+                Some(expected),
+                "{name}: the resume must decline for this reason"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_join_declines_when_its_context_inputs_change() {
+        let (resident, own, a, _b) = suspended_pair().await;
+        let delta = [own, vec![completed(a)]].concat();
+        let meta = crate::executor::WorkflowExecuteSpanMeta {
+            workflow_name: "moved".into(),
+            workflow_id: String::new(),
+            shard_id: 7,
+            queue_name: String::new(),
+            is_replay: true,
+            link_traceparent: None,
+            build_id: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+        };
+        let key = ResidentKey::new(pair_then_c_workflow, Some(&meta), &HashMap::new());
+        let declined = resident.resume_with(&delta, Some(&key), Some(&meta)).await;
+        assert_eq!(declined.err(), Some(ResumeDeclined::KeyChanged));
+    }
+
+    #[tokio::test]
+    async fn a_sibling_left_parked_by_a_failed_branch_declines() {
+        let (outcome, resident) = start(
+            ExecutionId::new(),
+            vec![started(Value::Null)],
+            failing_join_workflow,
+            Value::Null,
+        )
+        .await;
+        let WorkflowOutcome::Suspended { commands } = outcome else {
+            panic!("the first decision must suspend");
+        };
+        let resident = resident.expect("a join stays resident");
+        let a = commands
+            .iter()
+            .find_map(|c| match c {
+                WorkflowCommand::ScheduleActivity {
+                    activity_id, name, ..
+                } if name == "a" => Some(*activity_id),
+                _ => None,
+            })
+            .expect("the join schedules `a`");
+        let delta = [
+            own_events(&commands),
+            vec![WorkflowEvent::ActivityCompleted {
+                activity_id: a,
+                output: json!({ "echo": {} }),
+            }],
+        ]
+        .concat();
+        assert_eq!(
+            resident.resume(&delta).await.err(),
+            Some(ResumeDeclined::SiblingStillParked),
+            "a failed join leaves `b` parked, so the cycle must replay cold"
         );
     }
 }
