@@ -281,6 +281,8 @@ mod replayer_integration_tests;
 #[cfg(feature = "testing")]
 mod replayer_tests;
 #[cfg(feature = "db")]
+mod resident_hit_rate_db_tests;
+#[cfg(feature = "db")]
 mod resident_outcome_tests;
 mod retention_overrides_tests;
 mod retention_reclaim_support;
@@ -377,6 +379,8 @@ mod transactional_start_tests;
 mod triage_tests;
 #[cfg(feature = "db")]
 mod tx_conflict_retry_tests;
+mod typed_snapshot_docs;
+mod typed_snapshot_spike_tests;
 #[cfg(feature = "db")]
 mod typed_stub_deferred_admission_tests;
 #[cfg(feature = "db")]
