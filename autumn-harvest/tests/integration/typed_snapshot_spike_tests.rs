@@ -59,7 +59,7 @@ enum OpenEffect {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct EffectLedger {
     /// The ledger schema that wrote this ledger. Schema 1 had no failure
-    /// lists and no teardown list. An envelope with no schema field is
+    /// lists, no teardown list and no cancelled-timer list. An envelope with no schema field is
     /// schema 1.
     #[serde(default = "schema_1")]
     schema: u32,
@@ -70,8 +70,12 @@ struct EffectLedger {
     /// see it.
     #[serde(default)]
     failed_activities: Vec<String>,
-    /// Timers that fired or were cancelled, by id.
+    /// Timers that fired, by id.
     timers: Vec<String>,
+    /// Timers that workflow code cancelled, by id. Code can branch on fired
+    /// against cancelled.
+    #[serde(default)]
+    cancelled_timers: Vec<String>,
     /// Children that completed, by id.
     children: Vec<String>,
     /// Children that failed, by id. The parent can catch the failure and
@@ -122,6 +126,10 @@ impl EffectLedger {
             old.failed_updates.clear();
             old.failed_children.clear();
             old.torn_down_timers.clear();
+            // Schema 1 listed a cancelled timer with the fired ones. The
+            // order between the two kinds is lost, so compare them sorted.
+            old.timers.append(&mut old.cancelled_timers);
+            old.timers.sort();
         }
         old
     }
@@ -179,10 +187,14 @@ impl EffectLedger {
                     format!("timer:{}", timer_id.as_str()),
                     OpenEffect::Timer(timer_id.as_str().to_owned()),
                 )),
-                WorkflowEvent::TimerFired { timer_id }
-                | WorkflowEvent::TimerCancelled { timer_id } => {
+                WorkflowEvent::TimerFired { timer_id } => {
                     if close(&mut open, &format!("timer:{}", timer_id.as_str())).is_some() {
                         ledger.timers.push(timer_id.as_str().to_owned());
+                    }
+                }
+                WorkflowEvent::TimerCancelled { timer_id } => {
+                    if close(&mut open, &format!("timer:{}", timer_id.as_str())).is_some() {
+                        ledger.cancelled_timers.push(timer_id.as_str().to_owned());
                     }
                 }
                 WorkflowEvent::ChildWorkflowStarted { child_id, .. } => {
@@ -442,7 +454,11 @@ impl Snapshot {
                     .map_err(SnapshotError::Open)?;
                 // Check the fields that the stored schema knew, then use
                 // the full ledger that the source gives.
-                if rebuilt.project(snapshot.ledger.schema) != snapshot.ledger {
+                let mut stored = snapshot.ledger.clone();
+                if stored.schema < 2 {
+                    stored.timers.sort();
+                }
+                if rebuilt.project(snapshot.ledger.schema) != stored {
                     return Err(SnapshotError::LedgerMismatch);
                 }
                 rebuilt
@@ -918,6 +934,32 @@ fn a_failed_child_is_recorded_apart_from_a_completed_one() {
 }
 
 #[test]
+fn a_cancelled_timer_is_recorded_apart_from_a_fired_one() {
+    // Workflow code can branch on fired against cancelled, so a cover rule
+    // must tell the two apart.
+    let history = vec![
+        started(Value::Null),
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("fired"),
+            duration_secs: 5,
+        },
+        WorkflowEvent::TimerFired {
+            timer_id: TimerId::new("fired"),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("stopped"),
+            duration_secs: 5,
+        },
+        WorkflowEvent::TimerCancelled {
+            timer_id: TimerId::new("stopped"),
+        },
+    ];
+    let ledger = EffectLedger::from_history(&history, &[]).expect("no effect is open");
+    assert_eq!(ledger.timers, ["fired"]);
+    assert_eq!(ledger.cancelled_timers, ["stopped"]);
+}
+
+#[test]
 fn a_failed_update_is_recorded_in_the_ledger() {
     // A handler can change the state and then fail, so a cover rule must
     // see the failed update too.
@@ -1080,6 +1122,7 @@ fn schema_1_envelope(history: &[WorkflowEvent]) -> Value {
         "failed_updates",
         "failed_children",
         "torn_down_timers",
+        "cancelled_timers",
     ] {
         ledger.remove(newer);
     }
