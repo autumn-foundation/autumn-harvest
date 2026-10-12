@@ -191,6 +191,8 @@ fn breaker_activity() -> ActivityInfo {
         )),
         requires: None,
         handler: noop_activity,
+        input_schema: None,
+        output_schema: None,
     }
 }
 

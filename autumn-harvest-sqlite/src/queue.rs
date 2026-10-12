@@ -660,6 +660,22 @@ pub fn delete_undelivered_signals_for_execution(
     )?)
 }
 
+/// Move every undelivered signal of `from` to `to` (issue #2023).
+///
+/// A continue-as-new calls it in the seal transaction, so a signal staged
+/// before the hand-off reaches the successor. Delivered rows stay with `from`
+/// as audit history, as on Postgres. Returns the number of rows moved.
+pub fn move_undelivered_signals(
+    conn: &Connection,
+    from: ExecutionId,
+    to: ExecutionId,
+) -> SqliteResult<usize> {
+    Ok(conn.execute(
+        "UPDATE harvest_signals SET exec_id = ?2 WHERE exec_id = ?1 AND delivered = 0",
+        params![from.to_string(), to.to_string()],
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use rusqlite::{Connection, params};

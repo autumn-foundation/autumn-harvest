@@ -19,6 +19,11 @@ Postgres task-preparation ingest.
 - Behaviour change: a signal that the workflow never reads now reaches
   history. The strict `WorkflowReplayer` then reports
   `NonDeterminismDetected(EarlyCompletion)`, as for a Postgres history.
+- Behaviour change for `continue_as_new` (#2023): the hand-off decision
+  replays every staged signal, so each one stays with the old run, read or
+  not, as on Postgres. Before, unread staged signals moved to the successor.
+  Send a signal meant for the successor after the hand-off. A move could
+  deliver a drained signal twice.
 - Upgrade note: a file from an earlier release can hold signals staged for a
   name that the run never awaited. The first drive after the upgrade appends
   them to history.

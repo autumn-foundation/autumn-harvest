@@ -69,6 +69,7 @@ Red tests in `tests/integration/signal_ingest.rs`, on trunk-dev `7a751d6`:
 | R11 | A corrupt row of any name blocks the run with an unclear error. | The `SqliteError::Corrupt` message names the row. `a_corrupt_staged_row_fails_the_drive_and_stays_staged` pins it. |
 | R12 | An unsupported-feature seal drops the signals that its replay saw. Codex found it. | The seal plans again at the same `now` and applies the plan before `WorkflowFailed`. `an_unsupported_seal_records_the_signal_that_replay_saw` pins it. |
 | R13 | The daemon restores a session that a corrupt row of another name blocks. Codex found it. | The restart checks every staged row as the backend reads it. `an_unreadable_staged_row_of_another_name_is_refused` pins it. |
+| R14 | `continue_as_new` (#2023) moves replayed signals to the successor, so a drained signal runs twice. | The hand-off transaction delivers the plan to the old run first, as on Postgres. The user chose this over a move. `a_drained_signal_is_not_delivered_again_after_the_hand_off` pins it. |
 
 ### 0.5 Six thinking hats
 

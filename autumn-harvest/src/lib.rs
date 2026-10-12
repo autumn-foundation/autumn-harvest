@@ -394,6 +394,8 @@ pub mod migrate;
 /// Durable mutual-exclusion locks for workflow code (`ctx.mutex`, issue #691).
 pub mod mutex;
 pub mod partition;
+/// Export of aged event partitions to object storage (issue #2009).
+pub mod partition_archive;
 pub mod payload_codec;
 pub mod payload_store;
 /// The connection transport a DSN's `sslmode` selects, with TLS through
@@ -695,8 +697,8 @@ pub use history_export::{
 };
 pub use info::{
     ActivityHandlerFn, ActivityInfo, DagInfo, InterfaceHandlerRecord, QueryHandlerFn,
-    QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerFn, UpdateHandlerInfo, UpdateValidatorFn,
-    WorkflowHandlerFn, WorkflowInfo, WorkflowInterfaceRecord,
+    QueryHandlerInfo, SideEffectInfo, SignalHandlerInfo, UpdateHandlerFn, UpdateHandlerInfo,
+    UpdateValidatorFn, WorkflowHandlerFn, WorkflowInfo, WorkflowInterfaceRecord,
 };
 pub use interceptor::{
     ActivityInterceptor, ActivityInterceptorFuture, ActivityInterceptorNext, ActivityInvocation,
@@ -738,8 +740,8 @@ pub use retention::{
 };
 #[cfg(feature = "db")]
 pub use retention::{
-    RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult, release_legal_hold,
-    set_legal_hold,
+    RetentionHooks, RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult,
+    release_legal_hold, set_legal_hold,
 };
 pub use retry_budget::RetryBudgetConfig;
 pub use run_chain::{
@@ -754,10 +756,12 @@ pub use scheduler::{
     register_schedules, register_workflow_schedules, tick_once, trigger_unified_dag,
 };
 pub use schema_contract::{
-    AcknowledgedBreakingChange, ChangeKind, CompatibilityRules, DEFAULT_SCHEMA_CONTRACT_PATH,
-    MAX_DELTAS, SCHEMA_CONTRACT_VERSION, SchemaContractDiff, SchemaContractError, SchemaCoverage,
-    SchemaDelta, SchemaRole, Verdict, WorkflowSchemaContract, WorkflowSchemaEntry,
-    canonicalize_schema, diff_schema_contracts, dropped_acknowledgements, unacknowledged_breaking,
+    AcknowledgedBreakingChange, ActivitySchemaEntry, ChangeKind, CompatibilityRules,
+    DEFAULT_SCHEMA_CONTRACT_PATH, MAX_DELTAS, SCHEMA_CONTRACT_VERSION, SchemaContractDiff,
+    SchemaContractError, SchemaCoverage, SchemaDelta, SchemaRole, SchemaSubject,
+    SideEffectSchemaEntry, Verdict, WorkflowSchemaContract, WorkflowSchemaEntry,
+    canonicalize_schema, diff_schema_contracts, dropped_acknowledgements, subject_label,
+    unacknowledged_breaking,
 };
 #[cfg(feature = "db")]
 pub use shard::ShardedDbPool;

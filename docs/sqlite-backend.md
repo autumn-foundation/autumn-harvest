@@ -255,6 +255,7 @@ match rt.run_until_blocked(exec).await? {
     RunState::Failed(err)       => println!("failed: {err}"),
     RunState::WaitingSignal(name) => println!("blocked on signal `{name}`"),
     RunState::WaitingTimer      => println!("blocked on a durable timer"),
+    RunState::ContinuedAsNew(next) => println!("continued as new; drive {next}"),
     RunState::InProgress        => {} // not returned by run_until_blocked
 }
 
@@ -278,6 +279,7 @@ match rt.outcome(exec)? {
 - **`poll_once()`** for a custom loop — e.g. a background tick where you decide
   the cadence and inspect the `bool` progress flag yourself.
 
+
 `poll_once()`/`run_until_idle()` drive every execution in a pass even if an
 earlier one errors — see [§11](#11-v01-non-goals-and-follow-ups) for what
 happens to a rejected execution. `run_until_blocked(exec)` is the one
@@ -294,6 +296,54 @@ list or a generic `SQLite` error.
 Timers use the real wall clock (read once per decision cycle), so a run blocked
 on a `ctx.timer(...)` that is not yet due returns `WaitingTimer`; drive it again
 after the deadline passes and it proceeds.
+
+### Long-lived runs: `continue_as_new` and the history caps (issue #2023)
+
+Each decision reloads and replays the whole history. A loop workflow, such as
+an agent session or a poller, must therefore bound its history. Call
+`ctx.continue_as_new(input)`. One transaction then does all of this:
+
+- It appends `WorkflowContinuedAsNew` and seals the run `CONTINUED_AS_NEW`.
+- It starts a successor with the same `workflow_name` and `workflow_id`. The
+  successor's `WorkflowStarted` carries `input`.
+- It appends every staged signal to the old run, because the hand-off
+  decision replayed them (issue #2020). A signal stays with the old run, read
+  or not, as on Postgres.
+- It deletes the old run's pending tasks and unfired timers.
+
+`run_until_blocked` returns `RunState::ContinuedAsNew(successor)`. A later
+drive of the old run returns the same successor and starts no other run.
+`run_until_idle` and `poll_once` drive the successor like any other run.
+`start_workflow_with_id` with the same id attaches to the newest run. Send
+later signals to the successor, because the old run is terminal.
+
+`continue_as_new` bounds the replay cost of a run, not the database size. This
+backend has no retention, so each sealed run keeps its history in the file.
+
+`outcome()` of the old run is `ExecutionOutcome::Terminated("CONTINUED_AS_NEW")`.
+`successor(old)` returns the successor id without a drive.
+`ctx.should_continue_as_new()` uses the default threshold of 10,000 events. An
+event cap at or below it logs a warning, because the cap then fails the run
+before the advice turns true.
+
+The #1804 hard caps apply, with the Postgres defaults:
+
+| Cap | Default | Setter | Reason |
+| --- | --- | --- | --- |
+| Events per run | `50_000` | `set_history_event_hard_cap(Some(n))` | `HistoryCapExceeded { count, cap, workflow_type }` |
+| Stored bytes per run | 50 MiB | `set_history_byte_hard_cap(Some(n))` | `HistoryBytesCapExceeded { bytes, cap, workflow_type }` |
+
+`None` removes a cap. A decision that reaches a cap rolls back. The run then
+fails, and the drive returns `RunState::Failed` with the reason JSON. The
+`WorkflowFailed` event holds the same JSON in `error`. The event is
+byte-identical to the one the Postgres worker writes. Parse the JSON as
+`HistoryCapReason`. The seal removes the run's pending tasks, unfired timers
+and staged signals.
+
+A continuing run is exempt, because its successor starts a new history. The
+event count includes the decision's own appends. The byte count is the stored
+event JSON length when the decision starts. Postgres measures
+`pg_column_size` instead, so the two byte counts can differ.
 
 ---
 
@@ -436,8 +486,10 @@ specific command/feature. The run then ends `FAILED` (see below):
   `request_cancel_external_workflow`).
 - **Local activities** (`execute_local_activity`) and **external / task-token
   activities**.
-- **Updates**, **search attributes** (`upsert_search_attributes`), and
-  **`continue_as_new`**.
+- **Updates**, **search attributes** (`upsert_search_attributes`), and a
+  **continue-as-new to a different type** (`continue_as_new_as_type`). The
+  token is `ContinueAsNew.new_workflow_type`. A same-type `continue_as_new` is
+  supported (see [§7](#7-the-drive-model)).
 - **Worker sessions** (`create_session`) and **cancellable durable timers**
   (`start_timer` / `TimerHandle::…` — use the fire-once `ctx.timer(...)`).
 
@@ -459,7 +511,8 @@ That drive still returns `SqliteError::Unsupported`, so the caller sees the
 reason. A later drive returns `RunState::Failed` and does not run the handler
 again. `outcome()` returns `ExecutionOutcome::Failed`.
 
-Only an unsupported feature seals a run. Other errors leave the run `RUNNING`:
+Only an unsupported feature or a history cap seals a run. Other errors leave
+the run `RUNNING`:
 an unregistered workflow or activity, a replay divergence, a contained panic
 under its budget, or a failed task. A fix in the same runtime can then resume
 the run.

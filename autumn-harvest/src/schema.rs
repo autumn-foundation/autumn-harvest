@@ -1208,6 +1208,23 @@ diesel::table! {
 diesel::table! {
     use diesel::sql_types::*;
 
+    /// Durable workflow output-stream chunks (issue #1974).
+    ///
+    /// Written in the worker persist transaction by
+    /// `ctx.publish_durable_progress`. Not part of `harvest_events` and never
+    /// replayed. `stream_offset` is the call ordinal and the resume cursor.
+    harvest_stream_chunks (id) {
+        id               -> Int8,
+        workflow_exec_id -> Uuid,
+        stream_offset    -> Int8,
+        chunk            -> Jsonb,
+        created_at       -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
     /// Durable resume cursor for the lazy payload-codec re-encryption sweep
     /// (issue #948).
     ///
@@ -1294,6 +1311,7 @@ diesel::table! {
     }
 }
 
+diesel::joinable!(harvest_stream_chunks -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_workflow_logs -> harvest_workflow_executions (workflow_exec_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
@@ -1334,6 +1352,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_wasm_modules,
     harvest_mutex_locks,
     harvest_mutex_waiters,
+    harvest_stream_chunks,
     harvest_workflow_logs,
     harvest_codec_rotation_cursor,
     harvest_codec_key_state,

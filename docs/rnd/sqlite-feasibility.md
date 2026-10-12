@@ -199,6 +199,7 @@ Classification rule:
 | `models` | diesel | (c) | Postgres type layer (`Jsonb`/`Timestamptz`/`Interval`/`Uuid`); reimplemented wholesale. |
 | `mutex` | diesel, advisory-lock, to_regclass, interval-sql, raw-pg-sql, raw-sql | (b) | Advisory lock subsumed by the write lock; lease TTL as epoch ms. |
 | `notify` | diesel, listen/notify, raw-pg-sql, raw-sql | (c) | **The one mechanism with no SQLite equivalent at all.** Polling replaces it. |
+| `partition_archive` | advisory-lock, diesel, raw-pg-sql, raw-sql, to_regclass | (c) | Export of aged `harvest_events` partitions before the drop (issue #2009). It exists only to feed `partition`'s drop path, which the SQLite backend does not have. The keyset read, the `to_jsonb` row lines, the `sha256` row checksum under `SHARE`, the export advisory lock and the marker probe all serve that path. Under the SQLite backend the module is unused, like `partition` itself. |
 | `partition` | diesel, raw-pg-sql, raw-sql | (c) | Native Postgres declarative partitioning of `harvest_events` (issue #958). Nothing to translate: SQLite has no partitioned tables, no `ATTACH PARTITION`, and no metadata-only `DROP TABLE`-as-reclamation — and it does not need them. The pain this module removes is dead-tuple bloat and autovacuum pressure from row-level retention deletes, neither of which a single-writer SQLite file exhibits in the same way (`DELETE` there is followed by an incremental vacuum the single writer already owns). The whole module is a no-op under the SQLite backend, which is why it is (c) rather than a port: it is Postgres-specific *relief for a Postgres-specific problem*. |
 | `pg_tls` | diesel | (c) | The transport for the connections Harvest opens itself: `sslmode`, TLS through rustls and the `tokio-postgres` connector. The diesel match is the `AsyncPgConnection` it returns. SQLite is a local file with no network transport, so there is nothing to port. |
 | `poison_pill` | diesel, skip-locked, row-lock, interval-sql, raw-pg-sql, raw-sql | (c) | Crash reclaim keyed on *peer* worker liveness — no peers single-writer. |
@@ -504,7 +505,8 @@ Multi-worker/multi-process; push wakeups (polling latency floor); per-key fleet
 concurrency (#247); sticky routing (#235); poison-pill peer reclaim (#367);
 sharding; management API and Vantage UI; child workflows, external
 signal/cancel, updates, local and external activities, cancellable timers,
-worker sessions, and continue-as-new — each **rejected loudly by name** at the
+worker sessions, and a cross-type continue-as-new (same-type `continue_as_new`
+shipped in #2023) — each **rejected loudly by name** at the
 command layer rather than silently ignored. Activity execution is
 **at-least-once** (a crash mid-body re-runs it on resume), so bodies must be
 idempotent.

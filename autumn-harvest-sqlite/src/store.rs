@@ -310,14 +310,46 @@ pub fn append_event(
 /// Load the full ordered history — the exact `Vec<WorkflowEvent>` handed to
 /// [`run_workflow`](autumn_harvest::run_workflow).
 pub fn load_history(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Vec<WorkflowEvent>> {
+    Ok(load_history_sized(conn, exec_id)?.0)
+}
+
+/// Load the full ordered history and its stored size in bytes (issue #2023).
+///
+/// The size is the sum of the stored event JSON lengths. The byte cap reads
+/// it, so the load costs no second scan.
+pub fn load_history_sized(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> SqliteResult<(Vec<WorkflowEvent>, u64)> {
     let mut stmt = conn
         .prepare_cached("SELECT event_json FROM harvest_events WHERE exec_id = ?1 ORDER BY seq")?;
     let rows = stmt.query_map(params![exec_id.to_string()], |row| row.get::<_, String>(0))?;
     let mut out = Vec::new();
+    let mut bytes = 0_u64;
     for r in rows {
-        out.push(serde_json::from_str(&r?)?);
+        let json = r?;
+        bytes = bytes.saturating_add(json.len() as u64);
+        out.push(serde_json::from_str(&json)?);
     }
-    Ok(out)
+    Ok((out, bytes))
+}
+
+/// The successor that `exec_id` continued as, if any (issue #2023).
+///
+/// Only a run that ends with `WorkflowContinuedAsNew` has one. A reuse-policy
+/// seal shares the `CONTINUED_AS_NEW` state but writes no such event.
+pub fn successor_of(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Option<ExecutionId>> {
+    let last: Option<String> = conn
+        .query_row(
+            "SELECT event_json FROM harvest_events WHERE exec_id = ?1 ORDER BY seq DESC LIMIT 1",
+            params![exec_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match last.map(|json| serde_json::from_str(&json)).transpose()? {
+        Some(WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. }) => Ok(Some(new_exec_id)),
+        _ => Ok(None),
+    }
 }
 
 /// True if history already holds an `ActivityScheduled` for `activity_id` (keeps

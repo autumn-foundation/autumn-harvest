@@ -16,6 +16,7 @@ mod activity_interceptor_tests;
 mod activity_outcome_metrics_tests;
 #[cfg(feature = "db")]
 mod activity_pause_tests;
+mod activity_side_effect_schema_tests;
 #[cfg(feature = "db")]
 mod activity_timeout_retry_tests;
 mod adaptive_limit_tests;
@@ -145,6 +146,7 @@ mod drain_release_tests;
 #[cfg(feature = "db")]
 mod dst_differential_tests;
 mod dst_world_tests;
+mod durable_stream_tests;
 mod e2e_bench_cell_timeout_tests;
 mod e2e_bench_support;
 #[cfg(feature = "db")]
@@ -216,6 +218,7 @@ mod otel_semconv_docs;
 mod panic_containment_tests;
 #[cfg(feature = "db")]
 mod parent_close_cascade_unfinished_handlers_perf;
+mod partition_archive_tests;
 mod partitioned_events_docs;
 mod pause_tests;
 #[cfg(feature = "testing")]
