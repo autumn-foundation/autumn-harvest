@@ -16647,6 +16647,7 @@ fn is_worker_local_failure(error_type: &str) -> bool {
         crate::failure::ERROR_TYPE_WASM_TRAP,
         crate::failure::ERROR_TYPE_SANDBOX_DENIED,
         crate::failure::ERROR_TYPE_WASM_OUTPUT_TOO_LARGE,
+        crate::failure::ERROR_TYPE_WASM_JOURNAL_DIVERGENCE,
     ]
     .contains(&error_type)
     {
@@ -17012,6 +17013,7 @@ mod adaptive_limit_gate_tests {
             crate::failure::ERROR_TYPE_WASM_TRAP,
             crate::failure::ERROR_TYPE_SANDBOX_DENIED,
             crate::failure::ERROR_TYPE_WASM_OUTPUT_TOO_LARGE,
+            crate::failure::ERROR_TYPE_WASM_JOURNAL_DIVERGENCE,
         ] {
             assert_eq!(
                 limit_sample_outcome(

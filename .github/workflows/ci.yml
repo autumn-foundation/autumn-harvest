@@ -651,6 +651,15 @@ jobs:
       - name: Run docs/safety-report.md guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration safety_report_docs::"
 
+      # Issue #2014: the journaled host-call spike report lives under `docs/`,
+      # so a docs-only change skips the `test` matrix. These guards run here.
+      # They check that the report cites each prototype test and each bound.
+      #
+      # Guarded by `agent_code_journal_docs::guards_run_on_docs_only_changes`.
+      # Quoted for the trailing-`::` YAML reason above.
+      - name: Run the agent-code journal report guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration agent_code_journal_docs::"
+
       # Folio corpus harness: internal link check across all of docs/ (see
       # docs/audits/corpus-link-check.py). Same reasoning as the docs-only
       # guards above — a broken link is exactly the change class a docs-only
@@ -1577,16 +1586,20 @@ jobs:
           if grep -q -- '--test connector_sqs_broker' <<<"$plan"; then
             images="$images softwaremill/elasticmq:1.5.2"
           fi
-          # Docker Hub rate-limits anonymous pulls. An official image (no
-          # slash in its name) comes from the ECR Public mirror of the
-          # Docker Official Images first. The tag then gives it the name that
-          # the suites request.
-          mirror="public.ecr.aws/docker/library"
+          # Docker Hub rate-limits anonymous pulls, and the ECR Public mirror
+          # has a data limit. An official image (no slash in its name) comes
+          # from the Google mirror first, then from ECR Public. The tag then
+          # gives it the name that the suites request.
+          mirrors="mirror.gcr.io/library public.ecr.aws/docker/library"
           for image in $images; do
             for attempt in 1 2 3 4 5; do
-              if [[ "$image" != */* ]] && docker pull "$mirror/$image"; then
-                docker tag "$mirror/$image" "$image"
-                continue 2
+              if [[ "$image" != */* ]]; then
+                for mirror in $mirrors; do
+                  if docker pull "$mirror/$image"; then
+                    docker tag "$mirror/$image" "$image"
+                    continue 3
+                  fi
+                done
               fi
               if docker pull "$image"; then
                 continue 2
@@ -1645,9 +1658,9 @@ jobs:
     # connects verbatim, same as `docker compose -f examples/quickstart/compose.yaml up -d`.
     services:
       postgres:
-        # The ECR Public mirror of the official image. Docker Hub rate-limits
-        # anonymous pulls.
-        image: public.ecr.aws/docker/library/postgres:16
+        # The Google mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls, and ECR Public has a data limit.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_USER: quickstart
           POSTGRES_PASSWORD: quickstart
@@ -1802,9 +1815,9 @@ jobs:
     # DATABASE_URL connects as written.
     services:
       postgres:
-        # The ECR Public mirror of the official image. Docker Hub rate-limits
-        # anonymous pulls.
-        image: public.ecr.aws/docker/library/postgres:16
+        # The Google mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls, and ECR Public has a data limit.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_USER: harvest
           POSTGRES_PASSWORD: harvest
@@ -1850,9 +1863,9 @@ jobs:
     timeout-minutes: 60
     services:
       postgres:
-        # The ECR Public mirror of the official image. Docker Hub rate-limits
-        # anonymous pulls.
-        image: public.ecr.aws/docker/library/postgres:16
+        # The Google mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls, and ECR Public has a data limit.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -1902,9 +1915,9 @@ jobs:
     # Matches examples/quickstart/autumn.toml, same as the `quickstart` job.
     services:
       postgres:
-        # The ECR Public mirror of the official image. Docker Hub rate-limits
-        # anonymous pulls.
-        image: public.ecr.aws/docker/library/postgres:16
+        # The Google mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls, and ECR Public has a data limit.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_USER: quickstart
           POSTGRES_PASSWORD: quickstart
@@ -2011,9 +2024,9 @@ jobs:
     # config connects verbatim — the truest AC-2/AC-3 test.
     services:
       postgres:
-        # The ECR Public mirror of the official image. Docker Hub rate-limits
-        # anonymous pulls.
-        image: public.ecr.aws/docker/library/postgres:16
+        # The Google mirror of the official image. Docker Hub rate-limits
+        # anonymous pulls, and ECR Public has a data limit.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_USER: demo_app
           POSTGRES_PASSWORD: demo_app

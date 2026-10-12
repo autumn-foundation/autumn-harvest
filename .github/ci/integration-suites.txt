@@ -46,6 +46,7 @@
 # per-suite `cargo test` runs CI executes. One suite per line. Read by
 # two PRs each appending a line both land with no textual conflict; a
 # union-merge duplicate/reorder is caught (never a conflict) by
+allos        autumn-harvest         integration                      -                          agent_code_journal_docs
 allos        autumn-harvest         integration                      -                          assay_rerun_docs
 allos        autumn-harvest         integration                      -                          benchmarks_docs
 allos        autumn-harvest         integration                      -                          hot_code_swap_docs
