@@ -244,6 +244,7 @@ footer{padding:20px 24px;color:#94a3b8;font-size:12px;text-align:center;border-t
 .timeline-rollup .stat{display:flex;flex-direction:column;gap:2px}
 .timeline-rollup .stat .label{font-size:.7rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.04em}
 .timeline-rollup .stat .value{font-size:1rem;color:#e2e8f0}
+.live-status{font-size:12px;color:#94a3b8;margin:0 0 8px}
 "#;
 
 #[derive(Debug, Deserialize)]
@@ -269,6 +270,9 @@ pub(crate) struct WorkflowListParams {
     /// Free-text prefix/substring match on execution id (UUID string).
     #[serde(default)]
     exec_id_search: Option<String>,
+    /// A `filter` expression (issue #1982).
+    #[serde(default)]
+    filter: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -790,6 +794,8 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<()> {
                 .route_layer(require_admin.clone()),
         )
         .route("/workflows", get(list_workflows_ui))
+        // Issue #1982: the live-refresh script of the list and detail pages.
+        .route("/assets/live.js", get(live_script))
         .route("/workflows/{id}", get(workflow_detail_ui))
         // issue #960: standalone execution timeline / Gantt view (read-only,
         // non-admin — parity with the #739 API and the detail page).
@@ -1487,8 +1493,21 @@ async fn list_workflows_ui(
         .filter(|v| !v.is_empty())
         .map(str::to_lowercase);
 
+    // Issue #1982: a bad filter is not applied, and its error shows inline.
+    // This is the same contract as `parse_started_bound`.
+    let filter_raw = params.filter.as_deref().map_or("", str::trim).to_string();
+    let (filter_expr, filter_error) = if filter_raw.is_empty() {
+        (None, None)
+    } else {
+        match crate::visibility_query::parse(&filter_raw) {
+            Ok(expr) => (Some(expr), None),
+            Err(message) => (None, Some(format!("invalid filter: {message}"))),
+        }
+    };
+
     let fetch_limit = offset.saturating_add(limit).saturating_add(1);
     let mut filters = WorkflowFilters::default().with_limit(fetch_limit);
+    filters.filter.extend(filter_expr);
     if let Some(state) = state_filter.as_deref() {
         filters.states.push(state.to_string());
     }
@@ -1540,7 +1559,56 @@ async fn list_workflows_ui(
         &limit_raw,
         limit_error.as_deref(),
         page_error.as_deref(),
+        &ListFilterField {
+            raw: &filter_raw,
+            error: filter_error.as_deref(),
+        },
     ))
+}
+
+/// The `filter` field of the workflow list page (issue #1982).
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ListFilterField<'a> {
+    /// The text as the operator typed it.
+    pub(crate) raw: &'a str,
+    /// The parse error, if the text is not a valid filter.
+    pub(crate) error: Option<&'a str>,
+}
+
+/// The live-refresh settings of a page (issue #1982).
+///
+/// `layout_live` writes them as `data-live-*` attributes. `assets/live.js`
+/// reads them.
+struct LiveView {
+    /// The script URL, relative to the page.
+    script_src: &'static str,
+    /// The SSE stream URL, relative to the page.
+    stream: String,
+    /// The URL that the script fetches again. `None` means the page URL.
+    self_url: Option<String>,
+    /// The last event that the page shows. The script resumes after it.
+    last_event_id: Option<i32>,
+    /// The shortest gap between two fetches, in milliseconds.
+    gap_ms: u32,
+    /// The gap between two timed fetches, in milliseconds.
+    poll_ms: u32,
+}
+
+/// The live-refresh script of the workflow list and detail pages.
+const LIVE_SCRIPT: &str = include_str!("ui_live.js");
+
+/// `GET /ui/assets/live.js` (issue #1982).
+async fn live_script() -> axum::response::Response {
+    use axum::http::header;
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        LIVE_SCRIPT,
+    )
+        .into_response()
 }
 
 /// Parses the workflow list page's `page` query parameter (zero-based).
@@ -1796,6 +1864,28 @@ async fn render_workflow_detail_page(
     let exec_id = parse_execution_id(id)?;
     let exec_uuid = exec_id.as_uuid();
     let mut conn = db_conn_for_execution(api_state, exec_id).await?;
+
+    // The newest event id (issue #1982). Only a live page needs it. It is read
+    // before the run row and the events. So an event that lands after this
+    // read is past the cursor, and the stream sends it. A failed read makes
+    // the page static. It does not fail the page.
+    let last_event_id: Option<i32> = if rendered_at_action_url {
+        None
+    } else {
+        harvest_events::table
+            .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
+            .select(diesel::dsl::max(harvest_events::event_id))
+            .first(&mut conn)
+            .await
+            .unwrap_or_else(|e| {
+                warn!(
+                    error = %e,
+                    "workflow detail: newest event id read failed; the page is not live"
+                );
+                None
+            })
+    };
+
     let execution = load_execution(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
@@ -2024,7 +2114,7 @@ async fn render_workflow_detail_page(
         };
     }
 
-    Ok(render_workflow_detail(
+    Ok(render_workflow_detail_live(
         &execution,
         total_events,
         &page_events,
@@ -2047,6 +2137,7 @@ async fn render_workflow_detail_page(
         },
         &action_echo,
         rendered_at_action_url,
+        last_event_id,
     ))
 }
 
@@ -5398,6 +5489,7 @@ fn render_workflow_list(
     limit_raw: &str,
     limit_error: Option<&str>,
     page_error: Option<&str>,
+    filter: &ListFilterField<'_>,
 ) -> Markup {
     // Issue #756: name the unreachable shard(s) so a partial list is not read
     // as the authoritative fleet state.
@@ -5409,69 +5501,83 @@ fn render_workflow_list(
     let body = html! {
         h2 { "Workflows" }
 
-        // issue #756: partial cross-shard read banner — shown when a shard was
-        // unreachable, so the list below is known to be incomplete.
-        @if !unavailable_shards.is_empty() {
-            div class="banner Warning" {
-                strong { "⚠ Partial results" }
-                " — "
-                (unavailable_shards.len())
-                @if unavailable_shards.len() == 1 { " shard is" } @else { " shards are" }
-                " unreachable; this list may be incomplete. Unavailable shard(s): "
-                (unavailable_summary)
-            }
-        }
-
-        // issue #377: admission gate banner — shown when any gate is active.
-        @if active_gate_count > 0 {
-            div class="banner Unhealthy" {
-                strong { "⚠ Admission gate active" }
-                " — "
-                (active_gate_count)
-                @if active_gate_count == 1 { " gate is" } @else { " gates are" }
-                " blocking new workflow starts. "
-                a href="../admin/gates" { "Manage gates →" }
-            }
-        }
-
-        (render_filters(state_filter, workflow_name_filter, search_attr_filter, started_after_raw, started_after_error, started_before_raw, started_before_error, exec_id_search, limit, limit_raw, limit_error))
-
-        @if workflows.is_empty() {
-            div.card.empty { "No workflows match this filter." }
-        } @else {
-            table {
-                thead {
-                    tr {
-                        th { "ID" }
-                        th { "Workflow" }
-                        th { "State" }
-                        th { "Queue" }
-                        th { "Started" }
-                        th { "Completed" }
-                    }
+        // Issue #1982: `assets/live.js` swaps each region. The filter form
+        // stays outside, so a swap never removes typed text.
+        div #live-banners data-live-region {
+            // issue #756: partial cross-shard read banner — shown when a shard was
+            // unreachable, so the list below is known to be incomplete.
+            @if !unavailable_shards.is_empty() {
+                div class="banner Warning" {
+                    strong { "⚠ Partial results" }
+                    " — "
+                    (unavailable_shards.len())
+                    @if unavailable_shards.len() == 1 { " shard is" } @else { " shards are" }
+                    " unreachable; this list may be incomplete. Unavailable shard(s): "
+                    (unavailable_summary)
                 }
-                tbody {
-                    @for execution in workflows {
-                        @let id = execution.id.to_string();
+            }
+
+            // issue #377: admission gate banner — shown when any gate is active.
+            @if active_gate_count > 0 {
+                div class="banner Unhealthy" {
+                    strong { "⚠ Admission gate active" }
+                    " — "
+                    (active_gate_count)
+                    @if active_gate_count == 1 { " gate is" } @else { " gates are" }
+                    " blocking new workflow starts. "
+                    a href="../admin/gates" { "Manage gates →" }
+                }
+            }
+        }
+
+        (render_filters(state_filter, workflow_name_filter, search_attr_filter, started_after_raw, started_after_error, started_before_raw, started_before_error, exec_id_search, limit, limit_raw, limit_error, filter))
+
+        div #live-results data-live-region {
+            @if workflows.is_empty() {
+                div.card.empty { "No workflows match this filter." }
+            } @else {
+                table {
+                    thead {
                         tr {
-                            td {
-                                a href={ "workflows/" (id) } { code { (short_id(&id)) } }
+                            th { "ID" }
+                            th { "Workflow" }
+                            th { "State" }
+                            th { "Queue" }
+                            th { "Started" }
+                            th { "Completed" }
+                        }
+                    }
+                    tbody {
+                        @for execution in workflows {
+                            @let id = execution.id.to_string();
+                            tr {
+                                td {
+                                    a href={ "workflows/" (id) } { code { (short_id(&id)) } }
+                                }
+                                td { (execution.workflow_name) }
+                                td { (state_badge(&execution.state)) }
+                                td { code { (execution.queue_name) } }
+                                td { (format_timestamp(Some(execution.started_at))) }
+                                td { (format_timestamp(execution.completed_at)) }
                             }
-                            td { (execution.workflow_name) }
-                            td { (state_badge(&execution.state)) }
-                            td { code { (execution.queue_name) } }
-                            td { (format_timestamp(Some(execution.started_at))) }
-                            td { (format_timestamp(execution.completed_at)) }
                         }
                     }
                 }
             }
-        }
 
-        (render_pagination(page, limit, limit_raw, has_next, state_filter, workflow_name_filter, search_attr_filter, started_after_raw, started_before_raw, exec_id_search, page_error))
+            (render_pagination(page, limit, limit_raw, has_next, state_filter, workflow_name_filter, search_attr_filter, started_after_raw, started_before_raw, exec_id_search, page_error, filter))
+        }
     };
 
-    layout("Workflows · Vantage", &body, "", None)
+    let live = LiveView {
+        script_src: "assets/live.js",
+        stream: "../workflows/changes/stream".to_string(),
+        self_url: None,
+        last_event_id: None,
+        gap_ms: 2000,
+        poll_ms: 10_000,
+    };
+    layout_live("Workflows · Vantage", &body, "", None, Some(&live))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5487,6 +5593,7 @@ fn render_filters(
     limit: i64,
     limit_raw: &str,
     limit_error: Option<&str>,
+    filter: &ListFilterField<'_>,
 ) -> Markup {
     let (attr_key, attr_value) =
         search_attr_filter.map_or(("", ""), |(k, v)| (k.as_str(), v.as_str()));
@@ -5547,6 +5654,15 @@ fn render_filters(
                 "Search attr value"
                 input type="text" name="search_attr_value" value=(attr_value) placeholder="e.g. acme";
             }
+            // Issue #1982: AND, OR and groups over attributes and fields.
+            label {
+                "Filter"
+                input type="text" name="filter" value=(filter.raw) size="48"
+                    placeholder="attrs.phase = 'blocked' OR attrs.amount > 1000";
+                @if let Some(error) = filter.error {
+                    span.field-error role="alert" { (error) }
+                }
+            }
             label {
                 "Per page"
                 // `type="text"`, not `type="number"`. A number input
@@ -5579,8 +5695,9 @@ fn render_pagination(
     started_before_raw: &str,
     exec_id_search: Option<&str>,
     page_error: Option<&str>,
+    filter: &ListFilterField<'_>,
 ) -> Markup {
-    let base_query = build_query_string(
+    let mut base_query = build_query_string(
         limit,
         limit_raw,
         state_filter,
@@ -5590,6 +5707,10 @@ fn render_pagination(
         started_before_raw,
         exec_id_search,
     );
+    // Keep the raw text, valid or not, the same as `started_after`.
+    if !filter.raw.is_empty() {
+        let _ = write!(base_query, "&filter={}", url_encode(filter.raw));
+    }
 
     html! {
         @if let Some(error) = page_error {
@@ -5869,6 +5990,7 @@ fn collect_activity_attempts(events: &[HarvestEvent]) -> Vec<ActivityAttemptRow>
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[cfg(test)]
 fn render_workflow_detail(
     execution: &WorkflowExecution,
     total_events: i64,
@@ -5886,6 +6008,52 @@ fn render_workflow_detail(
     logs: &WorkflowLogsPanelData<'_>,
     action_echo: &WorkflowActionEcho,
     rendered_at_action_url: bool,
+) -> Markup {
+    render_workflow_detail_live(
+        execution,
+        total_events,
+        page_events,
+        activity_events,
+        signal_update_events,
+        signal_update_overflow,
+        children,
+        event_page,
+        blocked_on,
+        flash,
+        event_page_error,
+        jump_event_error,
+        continue_as_new_threshold,
+        logs,
+        action_echo,
+        rendered_at_action_url,
+        None,
+    )
+}
+
+/// Renders the workflow detail page.
+///
+/// `last_event_id` is the newest event of the run (issue #1982). The live
+/// script resumes the #324 stream after it, so the stream sends no backfill.
+/// `None` gives a static page.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn render_workflow_detail_live(
+    execution: &WorkflowExecution,
+    total_events: i64,
+    page_events: &[HarvestEvent],
+    activity_events: &[HarvestEvent],
+    signal_update_events: &[HarvestEvent],
+    signal_update_overflow: bool,
+    children: &[WorkflowExecution],
+    event_page: i64,
+    blocked_on: &BlockedOnData,
+    flash: Option<&str>,
+    event_page_error: Option<&str>,
+    jump_event_error: Option<&str>,
+    continue_as_new_threshold: Option<u64>,
+    logs: &WorkflowLogsPanelData<'_>,
+    action_echo: &WorkflowActionEcho,
+    rendered_at_action_url: bool,
+    last_event_id: Option<i32>,
 ) -> Markup {
     let exec_id_str = execution.id.to_string();
     let title = format!("{} · Vantage", execution.workflow_name);
@@ -5938,10 +6106,15 @@ fn render_workflow_detail(
     let body = html! {
         div.detail-row { a.back href="../workflows" { (PreEscaped("&larr;")) " Back to workflows" } }
 
-        h2 {
-            (execution.workflow_name) " "
-            span class=(detail_badge_class) aria-label={ "Status: " (execution.state) } role="status" {
-                (execution.state)
+        // Issue #1982: `assets/live.js` swaps each region. The flash and the
+        // action forms keep their state: a swap waits while a form has focus
+        // or typed text.
+        div #live-heading data-live-region {
+            h2 {
+                (execution.workflow_name) " "
+                span class=(detail_badge_class) aria-label={ "Status: " (execution.state) } role="status" {
+                    (execution.state)
+                }
             }
         }
 
@@ -5956,408 +6129,410 @@ fn render_workflow_detail(
             span.field-error role="alert" { (error) }
         }
 
-        @if let Some(error) = execution.error.as_deref() {
-            div."error-banner" {
-                strong { "Error:" } " " (error)
+        div #live-detail data-live-region {
+            @if let Some(error) = execution.error.as_deref() {
+                div."error-banner" {
+                    strong { "Error:" } " " (error)
+                }
             }
-        }
 
-        // Operator actions — use the exec_id in action URLs so they resolve correctly
-        // whether the router is mounted at "/" or at a subpath like "/api/harvest/ui".
-        div."operator-actions" {
-            form method="post" action={ (exec_id_str) "/cancel" }
-                  onsubmit="return confirm('Cancel this workflow execution?')" {
-                button.danger type="submit" { "Cancel" }
-            }
-            @let terminal = is_terminal_workflow_state(&execution.state);
-            @if execution.state == "PAUSED" {
-                // Paused executions show a Resume action (issue #383).
-                form method="post" action={ (exec_id_str) "/resume" } {
-                    button type="submit" { "Resume" }
+            // Operator actions — use the exec_id in action URLs so they resolve correctly
+            // whether the router is mounted at "/" or at a subpath like "/api/harvest/ui".
+            div."operator-actions" {
+                form method="post" action={ (exec_id_str) "/cancel" }
+                      onsubmit="return confirm('Cancel this workflow execution?')" {
+                    button.danger type="submit" { "Cancel" }
                 }
-            } @else {
-                // Pause is disabled once the workflow is terminal.
-                form method="post" action={ (exec_id_str) "/pause" }
-                      onsubmit="return confirm('Pause this workflow execution?')" {
-                    button type="submit" disabled[terminal]
-                        title=[terminal.then_some("Workflow is terminal")] { "Pause" }
-                }
-            }
-            // Forceful sibling of Cancel — seals the run TERMINATED (issue #788).
-            // Disabled once the workflow is terminal, exactly like Pause.
-            form method="post" action={ (exec_id_str) "/terminate" }
-                  onsubmit="return confirm('Force-terminate this workflow execution? This seals it as TERMINATED.')" {
-                button.danger type="submit" disabled[terminal]
-                    title=[terminal.then_some("Workflow is terminal")] { "Terminate" }
-            }
-            details style="display:inline-block" open[action_echo.signal_error.is_some()] {
-                summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Send signal" }
-                form method="post" action={ (exec_id_str) "/signal" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
-                    label style="font-size:12px;color:#94a3b8" {
-                        "Signal name"
-                        input type="text" name="signal_name" required placeholder="e.g. approve"
-                            value=(action_echo.signal_name.as_deref().unwrap_or(""))
-                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                @let terminal = is_terminal_workflow_state(&execution.state);
+                @if execution.state == "PAUSED" {
+                    // Paused executions show a Resume action (issue #383).
+                    form method="post" action={ (exec_id_str) "/resume" } {
+                        button type="submit" { "Resume" }
                     }
-                    label style="font-size:12px;color:#94a3b8" {
-                        "Payload (JSON)"
-                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {
-                            (action_echo.signal_payload.as_deref().unwrap_or(""))
-                        }
-                    }
-                    @if let Some(error) = action_echo.signal_error.as_deref() {
-                        span.field-error role="alert" { (error) }
-                    }
-                    button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" { "Send" }
-                }
-            }
-            details style="display:inline-block" open[action_echo.reset_error.is_some()] {
-                summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Reset to event N" }
-                form method="post" action={ (exec_id_str) "/reset" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
-                    label style="font-size:12px;color:#94a3b8" {
-                        "Event # (1-based, as shown in timeline)"
-                        // `type="text"` with `inputmode`/`pattern`, not
-                        // `type="number"` (Codex review, issue #1687). A
-                        // browser's number-input value-sanitization
-                        // algorithm blanks a non-numeric value from the
-                        // visible control. This happens even though the raw
-                        // HTML attribute still carries it. On the exact
-                        // rejected-input case this field exists to
-                        // redisplay, `type="number"` would show an empty
-                        // box. The DOM attribute, and this file's own
-                        // tests, would say otherwise. `inputmode="numeric"`
-                        // still gives mobile browsers a numeric keypad.
-                        // `pattern` is a hint; the server-side parser
-                        // remains the authority, not a replacement for it.
-                        input type="text" inputmode="numeric" pattern="[0-9]*" name="reset_to_event_id" required placeholder="1"
-                            value=(action_echo.reset_event.as_deref().unwrap_or(""))
-                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
-                    }
-                    label style="font-size:12px;color:#94a3b8" {
-                        "Reason"
-                        input type="text" name="reason" placeholder="rollback"
-                            value=(action_echo.reset_reason.as_deref().unwrap_or(""))
-                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
-                    }
-                    @if let Some(error) = action_echo.reset_error.as_deref() {
-                        span.field-error role="alert" { (error) }
-                    }
-                    button type="submit" style="background:#92400e;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" onclick="return confirm('Reset this workflow execution? This is destructive.')" { "Reset" }
-                }
-            }
-            details style="display:inline-block" open[action_echo.update_error.is_some()] {
-                summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Trigger update" }
-                form method="post" action={ (exec_id_str) "/trigger-update" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
-                    label style="font-size:12px;color:#94a3b8" {
-                        "Update name"
-                        input type="text" name="update_name" required placeholder="e.g. set_priority"
-                            value=(action_echo.update_name.as_deref().unwrap_or(""))
-                            style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
-                    }
-                    label style="font-size:12px;color:#94a3b8" {
-                        "Payload (JSON)"
-                        textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {
-                            (action_echo.update_payload.as_deref().unwrap_or(""))
-                        }
-                    }
-                    @if let Some(error) = action_echo.update_error.as_deref() {
-                        span.field-error role="alert" { (error) }
-                    }
-                    button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" { "Submit" }
-                }
-            }
-            // issue #960: link to the standalone execution timeline (Gantt) —
-            // reads as a "Timeline" tab of the execution detail view. The
-            // #slowest fragment scroll-focuses the slowest span on load.
-            a.btn href={ (exec_id_str) "/timeline#slowest" } {
-                "Timeline"
-            }
-            a.btn href={ "../../workflows/" (exec_id_str) "/history/export" } {
-                "Export history"
-            }
-        }
-
-        div.card {
-            h3 { "Metadata" }
-            div.kv {
-                (kv("Execution ID", &exec_id_str, true))
-                (kv("Workflow ID", &execution.workflow_id, true))
-                (kv("Run ID", &execution.run_id.to_string(), true))
-                (kv("Shard ID", &execution.shard_id.to_string(), true))
-                (kv("Queue", &execution.queue_name, true))
-                (kv("Started", &format_timestamp(Some(execution.started_at)), false))
-                (kv("Completed", &format_timestamp(execution.completed_at), false))
-                @if let Some(dur) = &duration {
-                    (kv("Duration", dur, false))
-                }
-                @if let Some(parent) = execution.parent_id {
-                    div.k { "Parent" }
-                    div.v {
-                        a href={ "../../workflows/" (parent.to_string()) } {
-                            code { (short_id(&parent.to_string())) }
-                        }
-                    }
-                }
-                @if let Some(worker) = execution.sticky_worker_id.as_deref() {
-                    (kv("Current worker", worker, true))
-                }
-                @if let Some(timeout) = execution.execution_timeout {
-                    (kv("Execution timeout", &format!("{}s", timeout.num_seconds()), false))
-                }
-                @if let Some(ref build_id) = execution.assigned_build_id {
-                    div.k { "Assigned build" }
-                    div.v {
-                        a href={ "../build-routing?build_id=" (url_encode(build_id)) }
-                           title="View in Build Routing" {
-                            code { (build_id) }
-                        }
-                    }
-                }
-                @if let Some(threshold) = continue_as_new_threshold {
-                    (kv("History events", &format!("{total_events} / threshold: {threshold}"), false))
                 } @else {
-                    (kv("History events", &total_events.to_string(), false))
-                }
-                @if let Some(ref owner) = execution.owner {
-                    div.k { "Owner" }
-                    div.v {
-                        span class="badge badge-owner" { (owner) }
+                    // Pause is disabled once the workflow is terminal.
+                    form method="post" action={ (exec_id_str) "/pause" }
+                          onsubmit="return confirm('Pause this workflow execution?')" {
+                        button type="submit" disabled[terminal]
+                            title=[terminal.then_some("Workflow is terminal")] { "Pause" }
                     }
                 }
-                @if let Some(ref sev) = execution.severity {
-                    @let sev_class = match sev.to_lowercase().as_str() {
-                        "sev1" => "badge-sev-sev1",
-                        "sev2" => "badge-sev-sev2",
-                        "sev3" => "badge-sev-sev3",
-                        "sev4" => "badge-sev-sev4",
-                        _ => "",
-                    };
-                    div.k { "Severity" }
-                    div.v {
-                        span class={ "badge " (sev_class) } { (sev.to_uppercase()) }
+                // Forceful sibling of Cancel — seals the run TERMINATED (issue #788).
+                // Disabled once the workflow is terminal, exactly like Pause.
+                form method="post" action={ (exec_id_str) "/terminate" }
+                      onsubmit="return confirm('Force-terminate this workflow execution? This seals it as TERMINATED.')" {
+                    button.danger type="submit" disabled[terminal]
+                        title=[terminal.then_some("Workflow is terminal")] { "Terminate" }
+                }
+                details style="display:inline-block" open[action_echo.signal_error.is_some()] {
+                    summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Send signal" }
+                    form method="post" action={ (exec_id_str) "/signal" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
+                        label style="font-size:12px;color:#94a3b8" {
+                            "Signal name"
+                            input type="text" name="signal_name" required placeholder="e.g. approve"
+                                value=(action_echo.signal_name.as_deref().unwrap_or(""))
+                                style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        }
+                        label style="font-size:12px;color:#94a3b8" {
+                            "Payload (JSON)"
+                            textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {
+                                (action_echo.signal_payload.as_deref().unwrap_or(""))
+                            }
+                        }
+                        @if let Some(error) = action_echo.signal_error.as_deref() {
+                            span.field-error role="alert" { (error) }
+                        }
+                        button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" { "Send" }
                     }
                 }
-                @if let Some(ref rb) = execution.runbook_url {
-                    div.k { "Runbook" }
-                    div.v {
-                        a href=(rb) target="_blank" rel="noopener noreferrer" { (rb) }
+                details style="display:inline-block" open[action_echo.reset_error.is_some()] {
+                    summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Reset to event N" }
+                    form method="post" action={ (exec_id_str) "/reset" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
+                        label style="font-size:12px;color:#94a3b8" {
+                            "Event # (1-based, as shown in timeline)"
+                            // `type="text"` with `inputmode`/`pattern`, not
+                            // `type="number"` (Codex review, issue #1687). A
+                            // browser's number-input value-sanitization
+                            // algorithm blanks a non-numeric value from the
+                            // visible control. This happens even though the raw
+                            // HTML attribute still carries it. On the exact
+                            // rejected-input case this field exists to
+                            // redisplay, `type="number"` would show an empty
+                            // box. The DOM attribute, and this file's own
+                            // tests, would say otherwise. `inputmode="numeric"`
+                            // still gives mobile browsers a numeric keypad.
+                            // `pattern` is a hint; the server-side parser
+                            // remains the authority, not a replacement for it.
+                            input type="text" inputmode="numeric" pattern="[0-9]*" name="reset_to_event_id" required placeholder="1"
+                                value=(action_echo.reset_event.as_deref().unwrap_or(""))
+                                style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        }
+                        label style="font-size:12px;color:#94a3b8" {
+                            "Reason"
+                            input type="text" name="reason" placeholder="rollback"
+                                value=(action_echo.reset_reason.as_deref().unwrap_or(""))
+                                style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        }
+                        @if let Some(error) = action_echo.reset_error.as_deref() {
+                            span.field-error role="alert" { (error) }
+                        }
+                        button type="submit" style="background:#92400e;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" onclick="return confirm('Reset this workflow execution? This is destructive.')" { "Reset" }
+                    }
+                }
+                details style="display:inline-block" open[action_echo.update_error.is_some()] {
+                    summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Trigger update" }
+                    form method="post" action={ (exec_id_str) "/trigger-update" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
+                        label style="font-size:12px;color:#94a3b8" {
+                            "Update name"
+                            input type="text" name="update_name" required placeholder="e.g. set_priority"
+                                value=(action_echo.update_name.as_deref().unwrap_or(""))
+                                style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
+                        }
+                        label style="font-size:12px;color:#94a3b8" {
+                            "Payload (JSON)"
+                            textarea name="payload" placeholder="{}" rows="3" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:12px" {
+                                (action_echo.update_payload.as_deref().unwrap_or(""))
+                            }
+                        }
+                        @if let Some(error) = action_echo.update_error.as_deref() {
+                            span.field-error role="alert" { (error) }
+                        }
+                        button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" { "Submit" }
+                    }
+                }
+                // issue #960: link to the standalone execution timeline (Gantt) —
+                // reads as a "Timeline" tab of the execution detail view. The
+                // #slowest fragment scroll-focuses the slowest span on load.
+                a.btn href={ (exec_id_str) "/timeline#slowest" } {
+                    "Timeline"
+                }
+                a.btn href={ "../../workflows/" (exec_id_str) "/history/export" } {
+                    "Export history"
+                }
+            }
+
+            div.card {
+                h3 { "Metadata" }
+                div.kv {
+                    (kv("Execution ID", &exec_id_str, true))
+                    (kv("Workflow ID", &execution.workflow_id, true))
+                    (kv("Run ID", &execution.run_id.to_string(), true))
+                    (kv("Shard ID", &execution.shard_id.to_string(), true))
+                    (kv("Queue", &execution.queue_name, true))
+                    (kv("Started", &format_timestamp(Some(execution.started_at)), false))
+                    (kv("Completed", &format_timestamp(execution.completed_at), false))
+                    @if let Some(dur) = &duration {
+                        (kv("Duration", dur, false))
+                    }
+                    @if let Some(parent) = execution.parent_id {
+                        div.k { "Parent" }
+                        div.v {
+                            a href={ "../../workflows/" (parent.to_string()) } {
+                                code { (short_id(&parent.to_string())) }
+                            }
+                        }
+                    }
+                    @if let Some(worker) = execution.sticky_worker_id.as_deref() {
+                        (kv("Current worker", worker, true))
+                    }
+                    @if let Some(timeout) = execution.execution_timeout {
+                        (kv("Execution timeout", &format!("{}s", timeout.num_seconds()), false))
+                    }
+                    @if let Some(ref build_id) = execution.assigned_build_id {
+                        div.k { "Assigned build" }
+                        div.v {
+                            a href={ "../build-routing?build_id=" (url_encode(build_id)) }
+                               title="View in Build Routing" {
+                                code { (build_id) }
+                            }
+                        }
+                    }
+                    @if let Some(threshold) = continue_as_new_threshold {
+                        (kv("History events", &format!("{total_events} / threshold: {threshold}"), false))
+                    } @else {
+                        (kv("History events", &total_events.to_string(), false))
+                    }
+                    @if let Some(ref owner) = execution.owner {
+                        div.k { "Owner" }
+                        div.v {
+                            span class="badge badge-owner" { (owner) }
+                        }
+                    }
+                    @if let Some(ref sev) = execution.severity {
+                        @let sev_class = match sev.to_lowercase().as_str() {
+                            "sev1" => "badge-sev-sev1",
+                            "sev2" => "badge-sev-sev2",
+                            "sev3" => "badge-sev-sev3",
+                            "sev4" => "badge-sev-sev4",
+                            _ => "",
+                        };
+                        div.k { "Severity" }
+                        div.v {
+                            span class={ "badge " (sev_class) } { (sev.to_uppercase()) }
+                        }
+                    }
+                    @if let Some(ref rb) = execution.runbook_url {
+                        div.k { "Runbook" }
+                        div.v {
+                            a href=(rb) target="_blank" rel="noopener noreferrer" { (rb) }
+                        }
                     }
                 }
             }
-        }
 
-        // Blocked-on panel
-        (render_blocked_on_panel(blocked_on))
+            // Blocked-on panel
+            (render_blocked_on_panel(blocked_on))
 
-        (json_card("Input", &execution.input))
-        @if let Some(output) = execution.output.as_ref() {
-            (json_card("Output", output))
-        }
-        @if let Some(memo) = execution.memo.as_ref() {
-            (json_card("Memo", memo))
-        }
-        @if let Some(attrs) = execution.search_attrs.as_ref() {
-            (json_card("Search attributes", attrs))
-        }
+            (json_card("Input", &execution.input))
+            @if let Some(output) = execution.output.as_ref() {
+                (json_card("Output", output))
+            }
+            @if let Some(memo) = execution.memo.as_ref() {
+                (json_card("Memo", memo))
+            }
+            @if let Some(attrs) = execution.search_attrs.as_ref() {
+                (json_card("Search attributes", attrs))
+            }
 
-        // Activity attempts panel
-        @if !activity_attempts.is_empty() {
-            div.card {
-                h3 { "Activity attempts" }
-                table {
-                    thead {
-                        tr {
-                            th { "Activity" }
-                            th { "Attempts" }
-                            th { "Last status" }
-                            th { "Last updated" }
-                        }
-                    }
-                    tbody {
-                        @for row in &activity_attempts {
-                            @let display_name = if row.name.is_empty() { "—".to_string() } else { row.name.clone() };
+            // Activity attempts panel
+            @if !activity_attempts.is_empty() {
+                div.card {
+                    h3 { "Activity attempts" }
+                    table {
+                        thead {
                             tr {
-                                td { (display_name) }
-                                td { (row.attempt_count.max(1)) }
-                                td {
-                                    code { (row.last_status) }
-                                    @if let Some(err) = &row.last_error {
-                                        " — " (truncate_error(err))
+                                th { "Activity" }
+                                th { "Attempts" }
+                                th { "Last status" }
+                                th { "Last updated" }
+                            }
+                        }
+                        tbody {
+                            @for row in &activity_attempts {
+                                @let display_name = if row.name.is_empty() { "—".to_string() } else { row.name.clone() };
+                                tr {
+                                    td { (display_name) }
+                                    td { (row.attempt_count.max(1)) }
+                                    td {
+                                        code { (row.last_status) }
+                                        @if let Some(err) = &row.last_error {
+                                            " — " (truncate_error(err))
+                                        }
                                     }
+                                    td { (row.last_ts) }
                                 }
-                                td { (row.last_ts) }
                             }
                         }
                     }
                 }
             }
-        }
 
-        // Children panel
-        @if !children.is_empty() {
-            div.card {
-                h3 { "Children (" (children.len()) ")" }
-                table {
-                    thead {
-                        tr {
-                            th { "Exec ID" }
-                            th { "Workflow" }
-                            th { "Status" }
-                            th { "Started" }
-                        }
-                    }
-                    tbody {
-                        @for child in children {
-                            @let child_id = child.id.to_string();
+            // Children panel
+            @if !children.is_empty() {
+                div.card {
+                    h3 { "Children (" (children.len()) ")" }
+                    table {
+                        thead {
                             tr {
-                                td {
-                                    a href={ "../../workflows/" (child_id) } {
-                                        code { (short_id(&child_id)) }
+                                th { "Exec ID" }
+                                th { "Workflow" }
+                                th { "Status" }
+                                th { "Started" }
+                            }
+                        }
+                        tbody {
+                            @for child in children {
+                                @let child_id = child.id.to_string();
+                                tr {
+                                    td {
+                                        a href={ "../../workflows/" (child_id) } {
+                                            code { (short_id(&child_id)) }
+                                        }
                                     }
+                                    td { (child.workflow_name) }
+                                    td { (state_badge(&child.state)) }
+                                    td { (format_timestamp(Some(child.started_at))) }
                                 }
-                                td { (child.workflow_name) }
-                                td { (state_badge(&child.state)) }
-                                td { (format_timestamp(Some(child.started_at))) }
                             }
                         }
                     }
                 }
             }
-        }
 
-        // Signals & updates panel
-        @if !signal_update_events.is_empty() {
+            // Signals & updates panel
+            @if !signal_update_events.is_empty() {
+                div.card {
+                    @if signal_update_overflow {
+                        h3 { "Signals & Updates (showing " (SIGNAL_UPDATE_PANEL_LIMIT) " of " (signal_update_label_total) "+)" }
+                    } @else {
+                        h3 { "Signals & Updates" }
+                    }
+                    table {
+                        thead {
+                            tr {
+                                th { "Type" }
+                                th { "Name / ID" }
+                                th { "Timestamp" }
+                            }
+                        }
+                        tbody {
+                            @for event in signal_update_events {
+                                @let label =
+                                    event_human_label(&event.event_type, &event.event_data, &execution.state);
+                                @let name_or_id = event_data_field(&event.event_data, "signal_name")
+                                    .or_else(|| event_data_field(&event.event_data, "update_id"))
+                                    .unwrap_or("—");
+                                tr {
+                                    td { (label) }
+                                    td { code { (name_or_id) } }
+                                    td { (format_timestamp(Some(event.timestamp))) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Durable workflow logs panel (issue #790, AC5)
+            @if logs.admin {
+                (render_workflow_logs_panel(&exec_id_str, logs, event_page))
+            }
+
+            // Event timeline
             div.card {
-                @if signal_update_overflow {
-                    h3 { "Signals & Updates (showing " (SIGNAL_UPDATE_PANEL_LIMIT) " of " (signal_update_label_total) "+)" }
+                h3 { "Event history (" (total_events) " events)" }
+                @if total_events == 0 {
+                    div.empty { "No events recorded yet." }
                 } @else {
-                    h3 { "Signals & Updates" }
-                }
-                table {
-                    thead {
-                        tr {
-                            th { "Type" }
-                            th { "Name / ID" }
-                            th { "Timestamp" }
-                        }
-                    }
-                    tbody {
-                        @for event in signal_update_events {
-                            @let label =
-                                event_human_label(&event.event_type, &event.event_data, &execution.state);
-                            @let name_or_id = event_data_field(&event.event_data, "signal_name")
-                                .or_else(|| event_data_field(&event.event_data, "update_id"))
-                                .unwrap_or("—");
-                            tr {
-                                td { (label) }
-                                td { code { (name_or_id) } }
-                                td { (format_timestamp(Some(event.timestamp))) }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Durable workflow logs panel (issue #790, AC5)
-        @if logs.admin {
-            (render_workflow_logs_panel(&exec_id_str, logs, event_page))
-        }
-
-        // Event timeline
-        div.card {
-            h3 { "Event history (" (total_events) " events)" }
-            @if total_events == 0 {
-                div.empty { "No events recorded yet." }
-            } @else {
-                // Jump controls for large histories
-                @if total_events > DETAIL_EVENT_PAGE_SIZE {
-                    div.pagination style="margin-bottom:12px" {
-                        @if has_prev_page {
-                            a href=(workflow_detail_href(&exec_id_str, event_page - 1, selected_log_level)) {
-                                (PreEscaped("&larr;")) " Previous"
-                            }
-                        } @else {
-                            span.disabled { (PreEscaped("&larr;")) " Previous" }
-                        }
-                        span { " Events " (page_start + 1) "–" (page_end) " of " (total_events) " " }
-                        @if has_next_page {
-                            a href=(workflow_detail_href(&exec_id_str, event_page + 1, selected_log_level)) {
-                                "Next " (PreEscaped("&rarr;"))
-                            }
-                        } @else {
-                            span.disabled { "Next " (PreEscaped("&rarr;")) }
-                        }
-                        a href=(workflow_detail_href(&exec_id_str, last_page, selected_log_level)) { "Jump to latest" }
-                    }
-                }
-                table {
-                    thead {
-                        tr {
-                            th { "#" }
-                            th { "Type" }
-                            th { "Timestamp" }
-                            th { "Data" }
-                        }
-                    }
-                    tbody {
-                        @for event in page_events {
-                            @let label =
-                                event_human_label(&event.event_type, &event.event_data, &execution.state);
-                            @let ts = format_timestamp(Some(event.timestamp));
-                            tr {
-                                td { (event.event_id + 1) }
-                                td title=(event.event_type) {
-                                    span.event-label {
-                                        (label)
-                                        code { "(" (event.event_type) ")" }
-                                    }
+                    // Jump controls for large histories
+                    @if total_events > DETAIL_EVENT_PAGE_SIZE {
+                        div.pagination style="margin-bottom:12px" {
+                            @if has_prev_page {
+                                a href=(workflow_detail_href(&exec_id_str, event_page - 1, selected_log_level)) {
+                                    (PreEscaped("&larr;")) " Previous"
                                 }
-                                td { (ts) }
-                                td {
-                                    details {
-                                        summary { "view payload" }
-                                        pre { (pretty_json(&event.event_data)) }
+                            } @else {
+                                span.disabled { (PreEscaped("&larr;")) " Previous" }
+                            }
+                            span { " Events " (page_start + 1) "–" (page_end) " of " (total_events) " " }
+                            @if has_next_page {
+                                a href=(workflow_detail_href(&exec_id_str, event_page + 1, selected_log_level)) {
+                                    "Next " (PreEscaped("&rarr;"))
+                                }
+                            } @else {
+                                span.disabled { "Next " (PreEscaped("&rarr;")) }
+                            }
+                            a href=(workflow_detail_href(&exec_id_str, last_page, selected_log_level)) { "Jump to latest" }
+                        }
+                    }
+                    table {
+                        thead {
+                            tr {
+                                th { "#" }
+                                th { "Type" }
+                                th { "Timestamp" }
+                                th { "Data" }
+                            }
+                        }
+                        tbody {
+                            @for event in page_events {
+                                @let label =
+                                    event_human_label(&event.event_type, &event.event_data, &execution.state);
+                                @let ts = format_timestamp(Some(event.timestamp));
+                                tr {
+                                    td { (event.event_id + 1) }
+                                    td title=(event.event_type) {
+                                        span.event-label {
+                                            (label)
+                                            code { "(" (event.event_type) ")" }
+                                        }
+                                    }
+                                    td { (ts) }
+                                    td {
+                                        details {
+                                            summary { "view payload" }
+                                            pre { (pretty_json(&event.event_data)) }
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
-                // Bottom pagination with jump-to-event control
-                @if total_events > DETAIL_EVENT_PAGE_SIZE {
-                    div.pagination style="margin-top:12px" {
-                        @if has_prev_page {
-                            a href=(workflow_detail_href(&exec_id_str, event_page - 1, selected_log_level)) {
-                                (PreEscaped("&larr;")) " Previous"
+                    // Bottom pagination with jump-to-event control
+                    @if total_events > DETAIL_EVENT_PAGE_SIZE {
+                        div.pagination style="margin-top:12px" {
+                            @if has_prev_page {
+                                a href=(workflow_detail_href(&exec_id_str, event_page - 1, selected_log_level)) {
+                                    (PreEscaped("&larr;")) " Previous"
+                                }
+                            } @else {
+                                span.disabled { (PreEscaped("&larr;")) " Previous" }
                             }
-                        } @else {
-                            span.disabled { (PreEscaped("&larr;")) " Previous" }
-                        }
-                        span { "Page " (event_page + 1) }
-                        @if has_next_page {
-                            a href=(workflow_detail_href(&exec_id_str, event_page + 1, selected_log_level)) {
-                                "Next " (PreEscaped("&rarr;"))
+                            span { "Page " (event_page + 1) }
+                            @if has_next_page {
+                                a href=(workflow_detail_href(&exec_id_str, event_page + 1, selected_log_level)) {
+                                    "Next " (PreEscaped("&rarr;"))
+                                }
+                            } @else {
+                                span.disabled { "Next " (PreEscaped("&rarr;")) }
                             }
-                        } @else {
-                            span.disabled { "Next " (PreEscaped("&rarr;")) }
-                        }
-                        a href=(workflow_detail_href(&exec_id_str, last_page, selected_log_level)) { "Jump to latest" }
-                        // `action=(exec_id_str)`, not the default omitted
-                        // action (issue #1687 review, Codex finding). A GET
-                        // form with no `action` submits to the document's
-                        // base url with its query replaced. On this page's
-                        // `<base href="..">` fallback (see `layout`'s doc
-                        // comment) that base url is `/workflows/`, not
-                        // `/workflows/{id}`. It drops the execution id the
-                        // same way a bare `workflow_detail_href` link would.
-                        form method="get" action=(exec_id_str) style="display:inline-flex;gap:6px;align-items:center;margin-left:8px" {
-                            label style="font-size:12px;color:#94a3b8;display:inline-flex;align-items:center;gap:6px" {
-                                "Jump to event:"
-                                input type="number" name="jump_event" min="1" max=(total_events) placeholder="N"
-                                    style="width:70px;background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:4px 6px;font-size:12px";
+                            a href=(workflow_detail_href(&exec_id_str, last_page, selected_log_level)) { "Jump to latest" }
+                            // `action=(exec_id_str)`, not the default omitted
+                            // action (issue #1687 review, Codex finding). A GET
+                            // form with no `action` submits to the document's
+                            // base url with its query replaced. On this page's
+                            // `<base href="..">` fallback (see `layout`'s doc
+                            // comment) that base url is `/workflows/`, not
+                            // `/workflows/{id}`. It drops the execution id the
+                            // same way a bare `workflow_detail_href` link would.
+                            form method="get" action=(exec_id_str) style="display:inline-flex;gap:6px;align-items:center;margin-left:8px" {
+                                label style="font-size:12px;color:#94a3b8;display:inline-flex;align-items:center;gap:6px" {
+                                    "Jump to event:"
+                                    input type="number" name="jump_event" min="1" max=(total_events) placeholder="N"
+                                        style="width:70px;background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:4px 6px;font-size:12px";
+                                }
+                                button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer" { "Go" }
                             }
-                            button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer" { "Go" }
                         }
                     }
                 }
@@ -6368,7 +6543,24 @@ fn render_workflow_detail(
     // See `layout`'s own doc comment for why this is a real `<base>`
     // element and not just a string prefix (issue #1687 review).
     let html_base = rendered_at_action_url.then_some("..");
-    layout(&title, &body, "../", html_base)
+    // A run that ended has no more events. A page from a rejected action
+    // holds typed values that a swap must not remove. `last_event_id` is
+    // `None` for a page that is not live.
+    let live = last_event_id
+        .filter(|_| !rendered_at_action_url && !is_terminal_workflow_state(&execution.state))
+        .map(|last_event_id| LiveView {
+            script_src: "../assets/live.js",
+            stream: format!("../../executions/{exec_id_str}/events/stream"),
+            self_url: Some(workflow_detail_href(
+                &exec_id_str,
+                event_page,
+                selected_log_level,
+            )),
+            last_event_id: Some(last_event_id),
+            gap_ms: 3000,
+            poll_ms: 10_000,
+        });
+    layout_live(&title, &body, "../", html_base, live.as_ref())
 }
 
 /// Per-row checkpoint rendering decision for the pending-activities table, after
@@ -6914,6 +7106,20 @@ fn js_escape(s: &str) -> String {
 /// canonical url would give. It fixes all of them at once, rather than
 /// rewriting each link to be mount-depth-aware.
 fn layout(title: &str, body: &Markup, base_href: &str, html_base: Option<&str>) -> Markup {
+    layout_live(title, body, base_href, html_base, None)
+}
+
+/// [`layout`], plus the live-refresh script and its settings (issue #1982).
+///
+/// The page loads the script from the same origin, with `defer`. The page
+/// holds no inline `<script>` element.
+fn layout_live(
+    title: &str,
+    body: &Markup,
+    base_href: &str,
+    html_base: Option<&str>,
+    live: Option<&LiveView>,
+) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
@@ -6925,6 +7131,9 @@ fn layout(title: &str, body: &Markup, base_href: &str, html_base: Option<&str>) 
                 }
                 title { (title) }
                 style { (PreEscaped(STYLE)) }
+                @if let Some(live) = live {
+                    script src=(live.script_src) defer {}
+                }
             }
             body {
                 header {
@@ -6941,7 +7150,17 @@ fn layout(title: &str, body: &Markup, base_href: &str, html_base: Option<&str>) 
                         a href={ (base_href) "build-routing" } { "Build Routing" }
                     }
                 }
-                main { (body) }
+                main {
+                    @if let Some(live) = live {
+                        p #live-status .live-status hidden
+                            data-live-stream=(live.stream)
+                            data-live-self=[live.self_url.as_deref()]
+                            data-live-last-event-id=[live.last_event_id]
+                            data-live-gap-ms=(live.gap_ms)
+                            data-live-poll-ms=(live.poll_ms) {}
+                    }
+                    (body)
+                }
                 footer { "Read-only dashboard — autumn-harvest" }
             }
         }
@@ -13100,6 +13319,7 @@ mod tests {
             DEFAULT_PAGE_SIZE,
             "not-a-number",
             Some("invalid limit 'not-a-number'"),
+            &ListFilterField::default(),
         )
         .into_string();
         assert!(
@@ -17729,9 +17949,13 @@ mod tests {
             "a scoped stylesheet rule must exist for the active filter link, \
              or `class=\"active\"` renders identically to the others"
         );
-        let warn_link = html
-            .find("log_level=warn")
-            .expect("the warn filter link must render");
+        // Search the filter row only. The live root also holds the page URL
+        // (issue #1982).
+        let row = html.find("log-filters\"").expect("the filter row");
+        let warn_link = row
+            + html[row..]
+                .find("log_level=warn")
+                .expect("the warn filter link must render");
         let link_start = html[..warn_link].rfind("<a").expect("anchor open tag");
         assert!(
             html[link_start..warn_link].contains("active"),
@@ -20175,5 +20399,196 @@ mod tests {
                 "the schedule name must never reach the inline handler: {handler}"
             );
         }
+    }
+
+    // ── Issue #1982: the filter field and live refresh ───────────────────────
+
+    fn list_html(filter: &ListFilterField<'_>, has_next: bool) -> String {
+        render_workflow_list(
+            &[],
+            0,
+            DEFAULT_PAGE_SIZE,
+            has_next,
+            None,
+            None,
+            None,
+            "",
+            None,
+            "",
+            None,
+            None,
+            0,
+            &[],
+            "",
+            None,
+            None,
+            filter,
+        )
+        .into_string()
+    }
+
+    #[test]
+    fn workflow_list_loads_the_live_script_and_marks_regions() {
+        let html = list_html(&ListFilterField::default(), false);
+        assert_eq!(html.matches("<script").count(), 1, "{html}");
+        assert!(
+            html.contains(r#"<script src="assets/live.js" defer></script>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"data-live-stream="../workflows/changes/stream""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"id="live-results" data-live-region"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"id="live-banners" data-live-region"#),
+            "{html}"
+        );
+        // The filter form stays outside each region, so a swap never removes
+        // typed text.
+        let form_at = html.find("<form").expect("filter form");
+        let region_at = html.find(r#"id="live-results""#).expect("region");
+        assert!(form_at < region_at, "{html}");
+    }
+
+    #[test]
+    fn workflow_list_filter_field_echoes_and_carries_the_filter() {
+        let field = ListFilterField {
+            raw: "attrs.a = 'x' OR attrs.b > 2",
+            error: None,
+        };
+        let html = list_html(&field, true);
+        assert!(html.contains(r#"name="filter""#), "{html}");
+        assert!(
+            html.contains(r#"value="attrs.a = 'x' OR attrs.b &gt; 2""#),
+            "{html}"
+        );
+        assert!(
+            html.contains("&filter=attrs.a%20%3D%20%27x%27%20OR%20attrs.b%20%3E%202"),
+            "the Next link must keep the filter: {html}"
+        );
+    }
+
+    #[test]
+    fn workflow_list_shows_a_filter_error_inline() {
+        let field = ListFilterField {
+            raw: "attrs.a = ",
+            error: Some("invalid filter: expected a value at byte 10"),
+        };
+        let html = list_html(&field, false);
+        assert!(html.contains("expected a value at byte 10"), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+    }
+
+    fn detail_html(state: &str, rendered_at_action_url: bool) -> (String, String) {
+        let mut execution = stub_execution();
+        execution.state = state.to_string();
+        let id = execution.id.to_string();
+        let blocked = stub_blocked_on();
+        let html = render_workflow_detail_live(
+            &execution,
+            0,
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            0,
+            &blocked,
+            None,
+            None,
+            None,
+            None,
+            &WorkflowLogsPanelData::default(),
+            &WorkflowActionEcho::default(),
+            rendered_at_action_url,
+            Some(41),
+        )
+        .into_string();
+        (id, html)
+    }
+
+    #[test]
+    fn workflow_detail_is_live_while_the_run_is_live() {
+        let (id, html) = detail_html("RUNNING", false);
+        assert!(
+            html.contains(r#"<script src="../assets/live.js" defer></script>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(&format!(
+                r#"data-live-stream="../../executions/{id}/events/stream""#
+            )),
+            "{html}"
+        );
+        assert!(html.contains(r#"data-live-last-event-id="41""#), "{html}");
+        assert!(
+            html.contains(&format!(r#"data-live-self="{id}?event_page=0""#)),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"id="live-heading" data-live-region"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"id="live-detail" data-live-region"#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn workflow_detail_is_static_when_the_run_ended_or_after_a_rejected_action() {
+        let (_, ended) = detail_html("COMPLETED", false);
+        assert!(!ended.contains("<script"), "{ended}");
+        assert!(!ended.contains("data-live-stream"), "{ended}");
+        // The regions stay, so a live page swaps in the final state.
+        assert!(
+            ended.contains(r#"id="live-detail" data-live-region"#),
+            "{ended}"
+        );
+
+        // A rejected action echoes the typed values. A swap must not
+        // remove them.
+        let (_, echoed) = detail_html("RUNNING", true);
+        assert!(!echoed.contains("<script"), "{echoed}");
+    }
+
+    #[tokio::test]
+    async fn live_script_asset_is_served() {
+        use tower::ServiceExt as _;
+        let app = harvest_ui_router(crate::api::HarvestApiState::new());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/assets/live.js")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/javascript; charset=utf-8")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let script = String::from_utf8(body.to_vec()).expect("utf-8");
+        assert!(script.contains("data-live-region"));
+        assert!(script.contains("Last-Event-ID"));
     }
 }
