@@ -557,10 +557,14 @@ The guard suite fails in these cases:
 - A mirrored body differs from its engine source.
 - An engine source does not name the Verus file that proves it.
 - A Verus file uses `assume`, `admit`, `axiom`, `external_body` or another
-  way to skip a step. The guard lexes the file and bans each name as an
-  identifier, so a comment, a space or a `use` alias cannot hide it.
-  `cfg`, `cfg_attr` and `macro_rules` count too, because each can delete a
-  proof before Verus sees it.
+  way to skip a step. The guard lexes the file and bans every name that
+  holds `assume`, `admit`, `axiom`, `external` or `truncate`, so a comment,
+  a space or a `use` alias cannot hide one. `macro_rules` is banned too,
+  because a local macro can delete a proof before Verus sees it.
+- A Verus file uses an attribute other than `#[trigger]`. A
+  `#[verifier::...]` attribute can trust a step, and a `#[cfg(...)]` can
+  delete a proof, so a new attribute must be allowed in the guard on
+  purpose.
 - `formal/verus/src/lib.rs` does not declare a module, so Verus never
   checks it.
 - `ci.yml` does not run the script on every PR.

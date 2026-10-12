@@ -17,29 +17,30 @@ use std::path::Path;
 use super::ci_run_coverage::{parse_workflow, repo_root};
 use super::formal_models_coverage::formal_job_defect;
 
-/// Identifiers that let a proof skip a step. None may appear in code.
+/// Name parts that mark a way to skip a step. No identifier may hold one.
 ///
 /// The guard lexes each file, so comments and literals do not count. A
 /// space or a comment between two tokens cannot hide a name. The guard
-/// bans the name itself, so a `use` alias cannot hide it either.
+/// bans the name itself, so a `use` alias cannot hide it either. A part
+/// matches anywhere in a name, so `external` also bans
+/// `external_body` and `external_trait_specification`.
 const TRUST_ESCAPES: &[&str] = &[
     "assume",
     "admit",
     // `axiom fn f() ensures false;` verifies, and so does every proof
     // that calls it.
     "axiom",
-    "external_body",
     "external",
-    "external_fn_specification",
-    "external_type_specification",
-    "assume_specification",
     "truncate",
-    // Conditional compilation and a local macro can delete a proof before
-    // Verus sees it, while the module still counts as declared.
-    "cfg",
-    "cfg_attr",
+    // A local macro can delete a proof before Verus sees it.
     "macro_rules",
 ];
+
+/// The attributes a proof file may use. Any other attribute fails the
+/// guard. A `#[verifier::...]` attribute can trust a step, and a
+/// `#[cfg(...)]` can delete a proof, so a new one must be allowed here
+/// on purpose.
+const ALLOWED_ATTRIBUTES: &[&str] = &["trigger"];
 
 /// One `// mirror:` marker.
 #[derive(Debug)]
@@ -337,10 +338,32 @@ fn code_tokens(src: &str) -> Vec<String> {
 }
 
 /// The first trust escape in `code`, if any.
-fn trust_escape(code: &str) -> Option<&'static str> {
-    code_tokens(code)
-        .iter()
-        .find_map(|word| TRUST_ESCAPES.iter().copied().find(|e| e == word))
+///
+/// An attribute outside [`ALLOWED_ATTRIBUTES`] reports as `#[<name>]`. A
+/// name that holds a part of [`TRUST_ESCAPES`] reports as itself.
+fn trust_escape(code: &str) -> Option<String> {
+    let tokens = code_tokens(code);
+    for (i, t) in tokens.iter().enumerate() {
+        if t != "#" {
+            continue;
+        }
+        // `#[...]` or `#![...]`.
+        let open = if tokens.get(i + 1).is_some_and(|n| n == "!") {
+            i + 2
+        } else {
+            i + 1
+        };
+        if tokens.get(open).is_some_and(|n| n == "[") {
+            let name = tokens.get(open + 1).map_or("", String::as_str);
+            if !ALLOWED_ATTRIBUTES.contains(&name) {
+                return Some(format!("#[{name}]"));
+            }
+        }
+    }
+    tokens
+        .into_iter()
+        .filter(|t| t.chars().all(|ch| ch.is_alphanumeric() || ch == '_'))
+        .find(|word| TRUST_ESCAPES.iter().any(|part| word.contains(part)))
 }
 
 /// The modules that a crate root declares, in order.
@@ -396,15 +419,30 @@ fn the_trust_escape_check_lexes_the_source() {
             "pub broadcast axiom fn bogus()\n    ensures false;",
             "axiom",
         ),
-        ("#[verifier :: external]\nfn f() {}", "external"),
-        ("#[verifier(external_body)]\nfn f() {}", "external_body"),
+        (
+            "assume_specification[ f ](x: u8) -> u8;",
+            "assume_specification",
+        ),
+        (
+            "use vstd::external_trait_specification as e;",
+            "external_trait_specification",
+        ),
+        ("#[verifier :: external]\nfn f() {}", "#[verifier]"),
+        ("#[verifier(external_body)]\nfn f() {}", "#[verifier]"),
+        (
+            "#[verifier::external_trait_specification]\npub trait T {}",
+            "#[verifier]",
+        ),
+        ("#![verifier::truncate]", "#[verifier]"),
+        ("#[cfg(any())]\nverus! { }", "#[cfg]"),
+        ("macro_rules! hide { ($($t:tt)*) => {}; }", "macro_rules"),
         (
             "fn f<'a>(x: &'a u8) { let q = '\"'; assume(false); }",
             "assume",
         ),
     ];
     for (code, escape) in hidden {
-        assert_eq!(trust_escape(code), Some(escape), "{code}");
+        assert_eq!(trust_escape(code).as_deref(), Some(escape), "{code}");
     }
     let clean = [
         "// assume (false)\nfn f() {}",
@@ -413,6 +451,8 @@ fn the_trust_escape_check_lexes_the_source() {
         "let s = r#\"admit() \" assume\"#;",
         "let c = '\\''; let d = 'x';",
         "proof { assert(x == x); }",
+        "forall|x: u64| #[trigger] f(x) == x",
+        "// #[verifier::external_body]\nfn f() {}",
     ];
     for code in clean {
         assert_eq!(trust_escape(code), None, "{code}");
