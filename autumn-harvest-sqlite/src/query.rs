@@ -89,19 +89,21 @@ impl QueryReplay {
         .with_workflow_id(self.workflow_id);
 
         let outcome = drive_query_replay_async(&ctx, self.handler, self.input, timeout).await;
+        if matches!(outcome, QueryReplayOutcome::Panicked) {
+            return Err(SqliteError::QueryPanicked {
+                execution_id: exec,
+                name,
+                details: "the workflow handler panicked during the query replay".to_string(),
+            });
+        }
         let decision = if self.terminal {
             classify_terminal_query(outcome, sealed, ctx.history_has_unconsumed_events())
+        } else if matches!(outcome, QueryReplayOutcome::TimedOut) {
+            TerminalQueryDecision::TimedOut
         } else {
             // A running run serves the state at its first suspension.
-            match outcome {
-                QueryReplayOutcome::TimedOut => TerminalQueryDecision::TimedOut,
-                QueryReplayOutcome::Panicked => TerminalQueryDecision::HistoryUnavailable,
-                QueryReplayOutcome::ReachedTerminal | QueryReplayOutcome::Suspended => {
-                    TerminalQueryDecision::Serve
-                }
-            }
+            TerminalQueryDecision::Serve
         };
-
         match decision {
             TerminalQueryDecision::Serve => {}
             TerminalQueryDecision::TimedOut => {
@@ -109,15 +111,6 @@ impl QueryReplay {
                     execution_id: exec,
                     name,
                     timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
-                });
-            }
-            TerminalQueryDecision::HistoryUnavailable
-                if matches!(outcome, QueryReplayOutcome::Panicked) =>
-            {
-                return Err(SqliteError::QueryPanicked {
-                    execution_id: exec,
-                    name,
-                    details: "the workflow handler panicked during the query replay".to_string(),
                 });
             }
             TerminalQueryDecision::HistoryUnavailable => {
@@ -134,34 +127,40 @@ impl QueryReplay {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ctx.execute_query_with_args(&name, args)
         }));
-        match result {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(HarvestError::QueryHandlerNotFound(_))) => Err(SqliteError::QueryNotFound {
-                execution_id: exec,
-                name,
-            }),
-            Ok(Err(HarvestError::QueryHandlerPanicked(details))) => {
-                Err(SqliteError::QueryPanicked {
-                    execution_id: exec,
-                    name,
-                    details,
-                })
-            }
-            Ok(Err(HarvestError::QueryHandlerFailed(details))) => Err(SqliteError::QueryFailed {
-                execution_id: exec,
-                name,
-                details,
-            }),
-            Ok(Err(other)) => Err(SqliteError::QueryFailed {
-                execution_id: exec,
-                name,
-                details: other.to_string(),
-            }),
-            Err(payload) => Err(SqliteError::QueryPanicked {
-                execution_id: exec,
-                name,
-                details: autumn_harvest::error::panic_message(payload),
-            }),
+        handler_result(exec, name, result)
+    }
+}
+
+/// Map the handler call to the typed query errors.
+fn handler_result(
+    execution_id: ExecutionId,
+    name: String,
+    result: std::thread::Result<Result<Value, HarvestError>>,
+) -> SqliteResult<Value> {
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(HarvestError::QueryHandlerNotFound(_))) => {
+            Err(SqliteError::QueryNotFound { execution_id, name })
         }
+        Ok(Err(HarvestError::QueryHandlerPanicked(details))) => Err(SqliteError::QueryPanicked {
+            execution_id,
+            name,
+            details,
+        }),
+        Err(payload) => Err(SqliteError::QueryPanicked {
+            execution_id,
+            name,
+            details: autumn_harvest::error::panic_message(payload),
+        }),
+        Ok(Err(HarvestError::QueryHandlerFailed(details))) => Err(SqliteError::QueryFailed {
+            execution_id,
+            name,
+            details,
+        }),
+        Ok(Err(other)) => Err(SqliteError::QueryFailed {
+            execution_id,
+            name,
+            details: other.to_string(),
+        }),
     }
 }

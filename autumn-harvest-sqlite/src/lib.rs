@@ -520,6 +520,15 @@
 //!   shared with the Postgres engine. Put the activity branch first in a mixed
 //!   `join!`.
 //!
+//! # Queries (issue #2022)
+//!
+//! [`SqliteRuntime::query`] calls a handler that `ctx.register_query`
+//! registered. It loads the history, replays the run to its frontier, then
+//! calls the handler. It writes nothing. A running run answers with the state
+//! at its last suspension. A terminal run answers with the state at its
+//! recorded end. One process holds the run, so no routing to a worker is
+//! needed.
+//!
 //! # Deterministic side effects
 //!
 //! `ctx.system_now()`, `ctx.new_uuid()`, `ctx.random_*()`, and `ctx.side_effect()`

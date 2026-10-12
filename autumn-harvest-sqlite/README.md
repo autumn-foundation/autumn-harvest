@@ -92,6 +92,10 @@ A complete, runnable version is in
   `LISTEN`/`NOTIFY` you *drive* the runtime: `poll_once` / `run_until_blocked` /
   `run_until_idle` drain all ready work and re-run the workflow until every run
   is terminal or blocked on external input.
+- **Queries (issue #2022).** `rt.query(exec, "name", args).await` calls a
+  handler that `ctx.register_query` registered. It replays the stored history
+  to the run's frontier and writes nothing. A terminal run answers with its
+  final state.
 - **Durability & crash recovery.** All state is in the database. Dropping the
   runtime and re-`open`-ing the same file is a faithful restart: any task left
   `RUNNING` by a crash is reclaimed and the workflow resumes purely by

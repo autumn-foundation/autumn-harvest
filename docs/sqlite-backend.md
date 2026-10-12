@@ -24,7 +24,7 @@ R&D decision record [`docs/rnd/sqlite-feasibility.md`](rnd/sqlite-feasibility.md
 5. [Registering workflows and activities](#5-registering-workflows-and-activities)
 6. [Starting a workflow](#6-starting-a-workflow)
 7. [The drive model](#7-the-drive-model)
-8. [Signals (pull-only)](#8-signals-pull-only)
+8. [Signals (pull-only) and queries](#8-signals-pull-only-and-queries)
 9. [Durability and crash recovery](#9-durability-and-crash-recovery)
 10. [The single-writer / single-server contract](#10-the-single-writer--single-server-contract)
 11. [v0.1 non-goals and follow-ups](#11-v01-non-goals-and-follow-ups)
@@ -297,7 +297,7 @@ after the deadline passes and it proceeds.
 
 ---
 
-## 8. Signals (pull-only)
+## 8. Signals (pull-only) and queries
 
 Deliver a signal from outside with `send_signal`; consume it inside the workflow
 with a **pull** primitive.
@@ -328,6 +328,41 @@ rejected rather than silently lost.
 > drain APIs (`drain_signals` / `try_receive_signal`) depend on the Postgres
 > task-preparation ingest and are **not** available here — restrict to the pull
 > primitives.
+
+### Queries (issue #2022)
+
+Read a run's live state with `query`. It calls a handler that
+`ctx.register_query` registered, and it writes nothing.
+
+```rust
+// Inside the workflow — expose state:
+let stage = Arc::new(Mutex::new("started"));
+let read = Arc::clone(&stage);
+ctx.register_query("stage", move || serde_json::json!(*read.lock().unwrap()));
+
+// From outside — read it:
+let stage = rt.query(exec, "stage", serde_json::Value::Null).await?;
+```
+
+`query` loads the history and replays the run to its frontier. It then calls
+the handler. It appends no event, changes no row, delivers no staged signal
+and runs no activity body.
+
+- A running run answers with the state at its last suspension. A query that
+  the workflow registers past that point is not yet known.
+- A terminal run answers with the state at its recorded end.
+- The call reads the rows at once. The returned future borrows nothing, so it
+  can go to `tokio::spawn`.
+
+| Error | Cause |
+|---|---|
+| `ExecutionNotFound` | The execution id is unknown. |
+| `UnknownWorkflow` | The run's workflow is not registered in this runtime. |
+| `QueryNotFound` | The replay registered no handler with this name. |
+| `QueryFailed` | The handler returned `Err`. |
+| `QueryPanicked` | The handler or the replayed workflow panicked. |
+| `QueryTimedOut` | The replay passed the query timeout. The default is 5 s. Set it with `set_query_timeout`. |
+| `QueryUnavailable` | A terminal run no longer replays to its recorded end, because the workflow code changed. |
 
 ---
 
@@ -495,7 +530,7 @@ gate no control flow): `ctx.set_current_details(...)` and a re-park
   whole application on this backend: a local daemon that runs Claude agent
   sessions as durable workflows. It shows the drive loop
   ([§7](#7-the-drive-model)), pull signals with a deadline
-  ([§8](#8-signals-pull-only)), and crash recovery
+  ([§8](#8-signals-pull-only-and-queries)), and crash recovery
   ([§9](#9-durability-and-crash-recovery)) in one place, and it runs with no API
   key against a scripted offline model.
 
