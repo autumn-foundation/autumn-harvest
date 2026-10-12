@@ -110,7 +110,8 @@ A complete, runnable version is in
   matrix — reject, replace-if-failed, or terminate-and-restart.
 - **Long-lived runs (issue #2023).** `ctx.continue_as_new(input)` seals the
   run `CONTINUED_AS_NEW` and starts a successor with the same `workflow_id`, in
-  one transaction. Undelivered signals move to the successor.
+  one transaction. Replayed signals stay with the old run, as on Postgres. A
+  backlog past the history caps moves to the successor.
   `run_until_blocked` returns `RunState::ContinuedAsNew(successor)`. The #1804
   history caps apply with the Postgres defaults: 50,000 events and 50 MiB per
   run. A run that reaches a cap fails. Its error is `HistoryCapReason` JSON. Change

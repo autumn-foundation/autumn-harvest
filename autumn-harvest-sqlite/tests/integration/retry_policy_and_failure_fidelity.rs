@@ -642,17 +642,22 @@ async fn approval_gate(ctx: &WorkflowContext, _n: i64) -> Result<String, String>
         .wait_for_signal_timeout("approval", ONE_HOUR)
         .await
         .map_err(|e| e.to_string())?;
+    // Read each later approval. Every staged signal reaches history (issue
+    // #2020), and strict replay rejects a signal that the run never reads.
+    ctx.drain_signals_raw("approval")
+        .map_err(|e| e.to_string())?;
     Ok(decision.map_or_else(
         || "auto_rejected".to_string(),
         |payload| format!("approved:{}", payload.as_str().unwrap_or_default()),
     ))
 }
 
-// RED pre-fix (`store.rs:327`): `peek_pending_signal` ordered by `signal_seq`, so
-// the LATE signal (staged first, lowest seq) was consumed; its late `received_at`
-// let the deadline timer fire first → the race resolved to `auto_rejected` while
-// the on-time signal stayed queued. With `ORDER BY received_at, signal_seq` the
-// on-time signal (earliest arrival) is consumed and wins.
+// RED before issue #1069 P2: the signal read ordered by `signal_seq`.
+// The LATE signal (staged first, lowest seq) was consumed first. Its late
+// `received_at` let the deadline timer fire first. The race resolved to
+// `auto_rejected`, and the on-time signal stayed queued. Under the cycle-start
+// ingest (issue #2020), that order bug gives `approved:late`. With
+// `ORDER BY received_at, signal_seq` the on-time signal comes first and wins.
 #[tokio::test]
 async fn pending_signals_are_consumed_in_arrival_order_not_insertion_order() {
     let (_dir, path) = temp_db();
@@ -684,13 +689,15 @@ async fn pending_signals_are_consumed_in_arrival_order_not_insertion_order() {
     )
     .unwrap();
 
-    // Drive AFTER both arrivals but BEFORE the 1h deadline (t0 + 20s). Arrival-order
-    // consumption (`peek_pending_signal` orders by `received_at`, unfiltered by
-    // `now`) picks the on-time signal (received_at = 10 < deadline 3600), so the
-    // signal WINS the race cleanly — the deadline timer is not yet due, so there is
-    // no stray later `TimerFired` to reason about. With the pre-fix `signal_seq`
-    // ordering the LATE signal (received_at 3700 > deadline) would be consumed and
-    // the deadline timer would fire first → `auto_rejected`.
+    // Drive AFTER both arrivals but BEFORE the 1h deadline (t0 + 20s).
+    // `store::pending_signals` orders by `received_at` and ignores `now`. Thus
+    // the on-time signal (received_at = 10 < deadline 3600) comes first and
+    // WINS the race cleanly. The deadline timer is not yet due, so no stray
+    // `TimerFired` appears. With the pre-fix `signal_seq` order, the LATE
+    // signal (received_at 3700 > deadline) came first. The deadline timer then
+    // fired first, and the result was `auto_rejected`. The late signal is
+    // ingested too, although its `received_at` is after `now`. The ingest
+    // ignores `now`, as the old wait path did.
     let done = rt
         .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(20))
         .await
@@ -709,6 +716,18 @@ async fn pending_signals_are_consumed_in_arrival_order_not_insertion_order() {
             WorkflowEvent::SignalReceived { payload, .. } if payload.as_str() == Some("ontime")
         )),
         "the on-time signal must be the one consumed:\n{history:?}"
+    );
+    let arrivals: Vec<&str> = history
+        .iter()
+        .filter_map(|e| match e {
+            WorkflowEvent::SignalReceived { payload, .. } => payload.as_str(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        arrivals,
+        ["ontime", "late"],
+        "history follows arrival order"
     );
     assert!(
         history

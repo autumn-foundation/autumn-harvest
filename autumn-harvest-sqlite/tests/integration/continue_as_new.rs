@@ -261,41 +261,96 @@ async fn a_reuse_policy_seal_names_no_successor() {
     assert_eq!(rt.successor(prior).unwrap(), None);
 }
 
-// ── AC2: signals staged before the hand-off reach the successor ───────────
+// ── AC2: signals and the hand-off (issue #2020) ───────────────────────────
+//
+// The hand-off decision replays every staged signal, as on Postgres. Those
+// signals stay with the old run, read or not. A signal for the successor goes
+// to the successor after the hand-off.
 
 #[tokio::test]
-async fn signals_staged_before_the_hand_off_reach_the_successor() {
+async fn a_signal_sent_after_the_hand_off_reaches_the_successor() {
     let mut rt = runtime();
     let first = rt.start_workflow("signal_hand_off", json!(0)).unwrap();
     rt.send_signal(first, "first", json!("consumed by run 1"))
         .unwrap();
-    rt.send_signal(first, "second", json!({"for": "run 2"}))
-        .unwrap();
 
     let second = successor_of(&rt.run_until_blocked(first).await.unwrap());
+    rt.send_signal(second, "second", json!({"for": "run 2"}))
+        .unwrap();
     let done = rt.run_until_blocked(second).await.unwrap();
 
     assert!(
         matches!(done, RunState::Completed(ref v) if v == &json!({"for": "run 2"})),
         "{done:?}"
     );
-    // The successor consumed the moved signal.
-    assert!(rt.load_history(second).unwrap().iter().any(
-        |e| matches!(e, WorkflowEvent::SignalReceived { signal_name, .. } if signal_name == "second")
-    ));
-    // The consumed signal stays on the old run. Only the staged one moved.
     let old = rt.load_history(first).unwrap();
     assert!(old.iter().any(
         |e| matches!(e, WorkflowEvent::SignalReceived { signal_name, .. } if signal_name == "first")
-    ));
-    assert!(!old.iter().any(
-        |e| matches!(e, WorkflowEvent::SignalReceived { signal_name, .. } if signal_name == "second")
     ));
     // The old run is terminal, so a late signal to it is refused.
     assert!(matches!(
         rt.send_signal(first, "second", json!(null)),
         Err(SqliteError::WorkflowNotRunning { .. })
     ));
+}
+
+#[tokio::test]
+async fn a_signal_staged_before_the_hand_off_stays_on_the_old_run() {
+    let mut rt = runtime();
+    let first = rt.start_workflow("signal_hand_off", json!(0)).unwrap();
+    rt.send_signal(first, "first", json!(1)).unwrap();
+    rt.send_signal(first, "second", json!(2)).unwrap();
+
+    let second = successor_of(&rt.run_until_blocked(first).await.unwrap());
+
+    // The hand-off decision replayed `second`, so it is in the old history,
+    // as on Postgres. The successor never sees it.
+    assert!(rt.load_history(first).unwrap().iter().any(
+        |e| matches!(e, WorkflowEvent::SignalReceived { signal_name, .. } if signal_name == "second")
+    ));
+    let state = rt.run_until_blocked(second).await.unwrap();
+    assert!(
+        matches!(state, RunState::WaitingSignal(ref s) if s == "second"),
+        "{state:?}"
+    );
+}
+
+/// Phase 0 drains `x`, then continues with the count. Phase 1 drains again.
+#[workflow]
+async fn drain_then_hand_off(ctx: &WorkflowContext, seen: i64) -> Result<Value, String> {
+    let more = ctx.drain_signals_raw("x").map_err(|e| e.to_string())?.len();
+    let total = seen + i64::try_from(more).unwrap_or(i64::MAX);
+    if seen == 0 {
+        ctx.continue_as_new(json!(total))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(json!(total))
+}
+
+/// A drained signal stays with the run that drained it. The successor never
+/// gets it a second time (issue #2020).
+#[tokio::test]
+async fn a_drained_signal_is_not_delivered_again_after_the_hand_off() {
+    let mut rt = runtime();
+    rt.register_workflow(&drain_then_hand_off_info());
+    let first = rt.start_workflow("drain_then_hand_off", json!(0)).unwrap();
+    rt.send_signal(first, "x", json!(1)).unwrap();
+    rt.send_signal(first, "x", json!(2)).unwrap();
+
+    let second = successor_of(&rt.run_until_blocked(first).await.unwrap());
+    let done = rt.run_until_blocked(second).await.unwrap();
+
+    assert!(
+        matches!(done, RunState::Completed(ref v) if v == &json!(2)),
+        "{done:?}"
+    );
+    assert!(
+        !rt.load_history(second)
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::SignalReceived { .. }))
+    );
 }
 
 // ── AC4: both histories replay on the core `WorkflowReplayer` ─────────────
@@ -318,7 +373,6 @@ async fn every_hand_off_shape_replays_on_the_core_replayer() {
     let mut rt = runtime();
     let signal = rt.start_workflow("signal_hand_off", json!(0)).unwrap();
     rt.send_signal(signal, "first", json!(1)).unwrap();
-    rt.send_signal(signal, "second", json!(2)).unwrap();
     let dispatch = rt.start_workflow("dispatch_in_hand_off", json!(0)).unwrap();
     let timer = rt.start_workflow("timer_at_hand_off", json!(0)).unwrap();
 
@@ -328,6 +382,9 @@ async fn every_hand_off_shape_replays_on_the_core_replayer() {
         (timer, timer_at_hand_off_info()),
     ] {
         let second = successor_of(&rt.run_until_blocked(first).await.unwrap());
+        if first == signal {
+            rt.send_signal(second, "second", json!(2)).unwrap();
+        }
         let done = rt.run_until_blocked(second).await.unwrap();
         assert!(matches!(done, RunState::Completed(_)), "{done:?}");
         assert_replays(first, rt.load_history(first).unwrap(), &info).await;
@@ -437,4 +494,56 @@ async fn the_hand_off_keeps_side_effects_and_drops_dispatches() {
         matches!(done, RunState::Completed(ref v) if v == &json!(1)),
         "{done:?}"
     );
+}
+
+/// Drains `x`, then continues while it found any. Returns the total.
+#[workflow]
+async fn drain_until_empty(ctx: &WorkflowContext, seen: i64) -> Result<Value, String> {
+    let more = ctx.drain_signals_raw("x").map_err(|e| e.to_string())?.len();
+    if more == 0 {
+        return Ok(json!(seen));
+    }
+    let total = seen + i64::try_from(more).unwrap_or(i64::MAX);
+    ctx.continue_as_new(json!(total))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(json!(total))
+}
+
+/// A backlog past the history caps reaches the successors in arrival order.
+/// Each run replays only the signals that fit. The rest move on at the
+/// hand-off, so each signal arrives exactly once (issue #2020).
+#[tokio::test]
+async fn a_backlog_past_the_caps_moves_on_at_the_hand_off_exactly_once() {
+    let mut rt = runtime();
+    rt.register_workflow(&drain_until_empty_info());
+    rt.set_history_event_hard_cap(Some(4));
+    let mut exec = rt.start_workflow("drain_until_empty", json!(0)).unwrap();
+    for i in 0..10 {
+        rt.send_signal(exec, "x", json!(i)).unwrap();
+    }
+
+    let mut payloads = Vec::new();
+    let done = loop {
+        let state = rt.run_until_blocked(exec).await.unwrap();
+        payloads.extend(
+            rt.load_history(exec)
+                .unwrap()
+                .into_iter()
+                .filter_map(|e| match e {
+                    WorkflowEvent::SignalReceived { payload, .. } => Some(payload),
+                    _ => None,
+                }),
+        );
+        match state {
+            RunState::ContinuedAsNew(next) => exec = next,
+            other => break other,
+        }
+    };
+
+    assert!(
+        matches!(done, RunState::Completed(ref v) if v == &json!(10)),
+        "{done:?}"
+    );
+    assert_eq!(payloads, (0..10).map(|i| json!(i)).collect::<Vec<_>>());
 }
