@@ -4998,7 +4998,17 @@ impl WorkflowContext {
                         crate::event::SideEffectKind::Now,
                         Some(crate::replay::DEADLINE_PROBE_SIDE_EFFECT_NAME),
                     )
-                    .and_then(|value| value.as_i64())
+                    .and_then(|value| {
+                        let millis = value.as_i64();
+                        if millis.is_none() {
+                            self.record_deferred_nd(
+                                "side-effect drift mismatch: the deadline clock that a scope \
+                                 cancel recorded is not a millisecond count"
+                                    .to_string(),
+                            );
+                        }
+                        millis
+                    })
                     .unwrap_or_else(|| self.deadline_frontier_now_millis());
                 // Record the fresh clock read like `system_now` does at its
                 // `NoMatch` (frontier) branch — append the value + push the
@@ -5420,9 +5430,12 @@ impl WorkflowContext {
             HistoryMatch::NoMatch => {
                 self.check_strict_replay_no_match(&format!("SideEffectRecorded({id})"))?;
 
+                // An invalid captured value fails as a recorded one does.
                 let result = self
                     .captured_scope_record(crate::event::SideEffectKind::Custom, Some(id))
-                    .and_then(|value| serde_json::from_value::<T>(value).ok())
+                    .map(serde_json::from_value::<T>)
+                    .transpose()
+                    .map_err(HarvestError::Serialization)?
                     .unwrap_or_else(f);
                 let output = serde_json::to_value(&result)?;
 
@@ -5579,9 +5592,20 @@ impl WorkflowContext {
                         kind.as_str()
                     ));
                 }
+                // An invalid captured value is drift, as a recorded one is.
                 let result = self
                     .captured_scope_record(kind, None)
-                    .and_then(|value| serde_json::from_value::<T>(value).ok())
+                    .and_then(|value| match serde_json::from_value::<T>(value) {
+                        Ok(value) if is_valid(&value) => Some(value),
+                        _ => {
+                            self.record_deferred_nd(format!(
+                                "side-effect drift mismatch: the {} value that a scope cancel \
+                                 recorded is not valid now",
+                                kind.as_str()
+                            ));
+                            None
+                        }
+                    })
                     .unwrap_or_else(f);
                 // Built-in values (timestamps, UUIDs, u64/f64) always serialise.
                 let value = serde_json::to_value(&result)
@@ -5762,10 +5786,20 @@ impl WorkflowContext {
                             .to_string(),
                     );
                 }
+                // An invalid captured value is drift, as a recorded one is.
                 let captured = self
                     .captured_scope_record(SideEffectKind::Random, None)
-                    .and_then(|value| serde_json::from_value::<T>(value).ok())
-                    .filter(|value| range.contains(value));
+                    .and_then(|value| match serde_json::from_value::<T>(value) {
+                        Ok(value) if range.contains(&value) => Some(value),
+                        _ => {
+                            self.record_deferred_nd(
+                                "side-effect drift mismatch: the random value that a scope \
+                                 cancel recorded is not in the current range"
+                                    .to_string(),
+                            );
+                            None
+                        }
+                    });
                 let result = captured
                     .unwrap_or_else(|| rand::Rng::gen_range(&mut rand::thread_rng(), range));
                 let value = serde_json::to_value(&result)
@@ -5839,9 +5873,19 @@ impl WorkflowContext {
         if self.at_history_frontier()
             && let Some(captured) = self
                 .captured_scope_marker(&crate::replay::version_marker_name(change_id))
-                .and_then(|details| details.as_u64())
-                .and_then(|v| u32::try_from(v).ok())
-                .filter(|v| (min..=max).contains(v))
+                .and_then(|details| {
+                    let version = details
+                        .as_u64()
+                        .and_then(|v| u32::try_from(v).ok())
+                        .filter(|v| (min..=max).contains(v));
+                    if version.is_none() {
+                        self.record_deferred_nd(format!(
+                            "version gate '{change_id}': the version that a scope cancel \
+                             recorded is outside {min}..={max}"
+                        ));
+                    }
+                    version
+                })
         {
             self.push_command(WorkflowCommand::RecordMarker {
                 name: crate::replay::version_marker_name(change_id),
@@ -14775,8 +14819,15 @@ impl WorkflowContext {
         };
         let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
         let scopes = crate::cancellation_scope::cancellable_seqs(&stack);
+        let drift = crate::cancellation_scope::captured_marker_drift(&stack, &cmd);
         let routed = crate::cancellation_scope::route_command(&stack, cmd);
         drop(stack);
+        if let Some(name) = drift {
+            self.record_deferred_nd(format!(
+                "non-deterministic replay: marker '{name}' differs from the one that a \
+                 scope cancel recorded"
+            ));
+        }
         // The caller changes the timer state after this push.
         if let Some(timer_id) = timer_id
             && !scopes.is_empty()

@@ -301,6 +301,39 @@ fn take_captured(
     None
 }
 
+/// The name of a replayed marker that differs from its captured record.
+///
+/// A doomed scope re-derives a withdrawn marker on replay, such as a race or
+/// fan-out decision. Normal replay compares such a marker with history. Here
+/// the captured record takes the place of history, so a deploy that changes
+/// the decision reports drift instead of passing in silence.
+pub(crate) fn captured_marker_drift(stack: &[ScopeFrame], cmd: &WorkflowCommand) -> Option<String> {
+    let WorkflowCommand::RecordMarker { name, details } = cmd else {
+        return None;
+    };
+    for frame in stack.iter().rev() {
+        let ScopeFrame::Cancellable(shared) = frame else {
+            break;
+        };
+        let (holding, captured) = {
+            let inner = shared.lock();
+            let captured = inner.records.iter().find_map(|record| match record {
+                CapturedRecord::Marker { name: n, details } if n == name => Some(details.clone()),
+                _ => None,
+            });
+            (inner.holding, captured)
+        };
+        if !holding {
+            continue;
+        }
+        return match captured {
+            Some(captured) if &captured != details => Some(name.clone()),
+            _ => None,
+        };
+    }
+    None
+}
+
 /// The side-effect value that a cancelled scope recorded here, on replay.
 pub(crate) fn take_captured_side_effect(
     stack: &[ScopeFrame],
@@ -1569,6 +1602,69 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(replay.take_nd_details().is_none());
         assert!(!replay.history_has_unconsumed_events());
+    }
+
+    /// A captured value that the deployed type cannot read fails as a
+    /// recorded one does. The closure does not run again.
+    #[tokio::test]
+    async fn an_unreadable_captured_side_effect_fails_without_a_rerun() {
+        let live = WorkflowContext::new_test();
+        let seen = std::sync::Mutex::new(None);
+        record_then_cancel(&live, &seen, |ctx| {
+            json!(
+                ctx.side_effect("pick", || "text".to_string())
+                    .expect("side effect")
+            )
+        })
+        .await;
+        let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+        let replay = replay_of(details);
+        let replayed = std::sync::Mutex::new(None);
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        record_then_cancel(&replay, &replayed, |ctx| {
+            let result = ctx.side_effect("pick", || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                7_i32
+            });
+            json!(matches!(result, Err(HarvestError::Serialization(_))))
+        })
+        .await;
+
+        assert_eq!(
+            *replayed.lock().expect("replayed lock"),
+            Some(json!(true)),
+            "the captured value fails to read"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A replayed marker that differs from the captured one is drift.
+    #[tokio::test]
+    async fn a_replayed_marker_that_differs_from_the_capture_is_drift() {
+        fn push_winner(ctx: &WorkflowContext, winner: u64) -> Value {
+            ctx.push_command(WorkflowCommand::RecordMarker {
+                name: "race_winner:7".into(),
+                details: json!(winner),
+            });
+            json!(winner)
+        }
+        let live = WorkflowContext::new_test();
+        let seen = std::sync::Mutex::new(None);
+        record_then_cancel(&live, &seen, |ctx| push_winner(ctx, 0)).await;
+        let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+        let same = replay_of(details.clone());
+        let replayed = std::sync::Mutex::new(None);
+        record_then_cancel(&same, &replayed, |ctx| push_winner(ctx, 0)).await;
+        assert!(same.take_nd_details().is_none(), "the same decision passes");
+
+        let changed = replay_of(details);
+        record_then_cancel(&changed, &replayed, |ctx| push_winner(ctx, 1)).await;
+        assert!(
+            changed.take_nd_details().is_some(),
+            "a changed decision is non-determinism"
+        );
     }
 
     #[tokio::test]
