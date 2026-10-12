@@ -504,7 +504,8 @@ Multi-worker/multi-process; push wakeups (polling latency floor); per-key fleet
 concurrency (#247); sticky routing (#235); poison-pill peer reclaim (#367);
 sharding; management API and Vantage UI; child workflows, external
 signal/cancel, updates, local and external activities, cancellable timers,
-worker sessions, and continue-as-new — each **rejected loudly by name** at the
+worker sessions, and a cross-type continue-as-new (same-type `continue_as_new`
+shipped in #2023) — each **rejected loudly by name** at the
 command layer rather than silently ignored. Activity execution is
 **at-least-once** (a crash mid-body re-runs it on resume), so bodies must be
 idempotent.
