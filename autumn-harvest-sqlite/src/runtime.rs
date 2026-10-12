@@ -23,6 +23,7 @@ use serde_json::Value;
 
 use crate::error::{SqliteError, SqliteResult};
 use crate::lock::WriterLock;
+use crate::query::{DEFAULT_QUERY_TIMEOUT, QueryReplay};
 use crate::{lock, queue, schema, store, worker};
 
 /// The activity body a workflow's `execute_activity_raw(name, ...)` resolves to.
@@ -214,6 +215,8 @@ pub struct SqliteRuntime {
     /// The single-writer lock (issue #1834). It is released when the runtime
     /// drops.
     writer_lock: Option<WriterLock>,
+    /// The time limit of one query replay (issue #2022).
+    query_timeout: std::time::Duration,
 }
 
 impl Drop for SqliteRuntime {
@@ -318,6 +321,7 @@ impl SqliteRuntime {
             workflow_panic_strikes: HashMap::new(),
             now_fn: std::sync::Arc::new(Utc::now),
             writer_lock,
+            query_timeout: DEFAULT_QUERY_TIMEOUT,
         })
     }
 
@@ -936,27 +940,57 @@ impl SqliteRuntime {
         }
     }
 
-    /// Run the query `name` on `exec` with `args` (issue #2022).
+    /// Run the query `name` on `exec` with `args`, and return its answer
+    /// (issue #2022).
     ///
-    /// Red-phase stub.
+    /// The query replays the stored history to the run's frontier, then calls
+    /// the handler that `ctx.register_query` registered. It writes nothing:
+    /// no event, no row, no staged-signal delivery, no activity body.
+    ///
+    /// - A running run answers with the state at its last suspension.
+    /// - A terminal run answers with the state at its recorded end.
+    ///
+    /// The call reads the rows at once. The returned future then replays
+    /// them, so it borrows nothing from the runtime. The answer is a
+    /// point-in-time read as of the call.
+    ///
+    /// ```no_run
+    /// # async fn example(
+    /// #     rt: &autumn_harvest_sqlite::SqliteRuntime,
+    /// #     exec: autumn_harvest_sqlite::ExecutionId,
+    /// # ) -> autumn_harvest_sqlite::SqliteResult<()> {
+    /// let stage = rt.query(exec, "stage", serde_json::Value::Null).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
-    /// Always returns [`SqliteError::Unsupported`].
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id and
+    /// [`SqliteError::UnknownWorkflow`] for an unregistered workflow.
+    /// Returns [`SqliteError::QueryNotFound`] when the replay registers no
+    /// handler named `name`. Returns [`SqliteError::QueryFailed`] when the
+    /// handler returns `Err`, and [`SqliteError::QueryPanicked`] when the
+    /// handler or the replayed workflow panics. Returns
+    /// [`SqliteError::QueryTimedOut`] when the replay passes the query timeout.
+    /// Returns [`SqliteError::QueryUnavailable`] when a terminal run no longer
+    /// replays to its recorded end. Otherwise returns a persistence error.
     pub fn query(
         &self,
         exec: ExecutionId,
         name: &str,
         args: Value,
     ) -> impl std::future::Future<Output = SqliteResult<Value>> + Send + 'static {
-        let _ = (exec, args);
+        let loaded = QueryReplay::load(&self.conn, &self.workflows, exec);
         let name = name.to_string();
-        async move { Err(SqliteError::Unsupported(name)) }
+        let timeout = self.query_timeout;
+        async move { loaded?.run(name, args, timeout).await }
     }
 
-    /// Red-phase stub.
+    /// Set the time limit of a query replay. The default is
+    /// [`DEFAULT_QUERY_TIMEOUT`](crate::DEFAULT_QUERY_TIMEOUT), 5 s.
     pub const fn set_query_timeout(&mut self, timeout: std::time::Duration) {
-        let _ = timeout;
+        self.query_timeout = timeout;
     }
 
     // ── Drivers ──────────────────────────────────────────────────────────────

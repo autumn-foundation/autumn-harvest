@@ -537,6 +537,7 @@
 
 mod error;
 mod lock;
+mod query;
 mod queue;
 mod runtime;
 mod schema;
@@ -546,6 +547,7 @@ mod worker;
 pub use autumn_harvest::{ExecutionId, WorkflowEvent};
 
 pub use crate::error::{SqliteError, SqliteResult};
+pub use crate::query::DEFAULT_QUERY_TIMEOUT;
 pub use crate::runtime::{
     ActivityBody, ActivitySpec, ExecutionOutcome, RunState, SqliteRuntime, StartOutcome,
     UNSUPPORTED_FEATURE_ERROR_TYPE,

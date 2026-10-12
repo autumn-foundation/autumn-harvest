@@ -5,6 +5,8 @@
 
 // The `#[workflow]` macro reads the unused `_n` input through its expansion.
 #![allow(clippy::used_underscore_binding)]
+// A `#[workflow]` must be `async`, even when its body has no `.await`.
+#![allow(clippy::unused_async)]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -184,7 +186,11 @@ async fn query_answer_survives_a_restart() {
     rt.register_workflow(&staged_info());
     let answer = rt.query(exec, "stage", Value::Null).await.unwrap();
     assert_eq!(answer, json!({ "after_activity": 42 }));
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "replay runs no activity body");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "replay runs no activity body"
+    );
 }
 
 #[tokio::test]
@@ -235,7 +241,11 @@ async fn query_changes_no_row_in_any_table() {
         serde_json::to_value(rt.load_history(exec).unwrap()).unwrap(),
         history_before
     );
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "a query runs no activity body");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a query runs no activity body"
+    );
 
     // The staged signal is still there for the next drive.
     let state = rt.run_until_blocked(exec).await.unwrap();
@@ -243,6 +253,9 @@ async fn query_changes_no_row_in_any_table() {
         matches!(state, RunState::Completed(ref v) if v == &json!("staged")),
         "got {state:?}"
     );
+    // The probe sees a real write, so the equal reads above are not vacuous.
+    assert_ne!(snapshot(&reader), rows_before);
+    assert_ne!(data_version(&reader), version_before);
 }
 
 // ── AC3: typed errors for an unknown name and an unknown execution ───────────
@@ -289,7 +302,10 @@ async fn query_args_reach_the_handler() {
     let mut rt = open_staged(&path, &calls);
     let exec = parked_run(&mut rt).await;
 
-    let echoed = rt.query(exec, "echo", json!({ "k": [1, 2] })).await.unwrap();
+    let echoed = rt
+        .query(exec, "echo", json!({ "k": [1, 2] }))
+        .await
+        .unwrap();
     assert_eq!(echoed, json!({ "k": [1, 2] }));
 }
 
