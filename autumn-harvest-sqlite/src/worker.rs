@@ -446,11 +446,11 @@ fn freeze_defaults_at_claim(
 /// first dispatch to fix the branch count) with no matching "winner" marker
 /// (`race_winner:{seq}`, recorded by `settle_race` once a winner is known).
 ///
-/// The core lowers an activity/child race onto these two `MarkerRecorded` events
-/// (an inline `format!("race:{seq}")` / `format!("race_winner:{seq}")` in
-/// `autumn_harvest::context` — there is no exported constant, so the naming
-/// convention is matched here, exactly as [`is_signal_timeout_deadline_timer`]
-/// matches the `__signal_timeout:` timer-id convention). The timer+signal race
+/// The core lowers an activity/child race onto these two `MarkerRecorded` events.
+/// They come from an inline `format!("race:{seq}")` / `format!("race_winner:{seq}")`
+/// in `autumn_harvest::context`. There is no exported constant, so this matches
+/// the naming convention, as [`signal_timeout_name`] matches the
+/// `__signal_timeout:` timer-id convention. The timer+signal race
 /// shape (`race_timer_signal_impl`) reuses the `wait_for_signal_timeout` machinery
 /// and records NO `race:` marker, so it is correctly never detected here (it has no
 /// multi-branch drain to gate). Used by `drive_one_cycle` to decide whether
@@ -550,8 +550,8 @@ fn payload_too_large_activity_envelope(activity_name: &str, observed: u64, cap: 
     .into_error_payload()
 }
 
-/// True iff `timer_id` is the deadline timer of a `wait_for_signal_timeout` /
-/// `receive_signal_timeout` race for the signal named `signal_name`.
+/// The signal name of a `wait_for_signal_timeout` / `receive_signal_timeout`
+/// race deadline timer, or `None` if `timer_id` is not one.
 ///
 /// The core arms that deadline timer with the id `__signal_timeout:{seq}:{name}`
 /// (an inline `format!` in `autumn_harvest::context`, issue #476 — there is no
@@ -563,11 +563,11 @@ fn payload_too_large_activity_envelope(activity_name: &str, observed: u64, cap: 
 /// on the seq's colon so the remainder is the signal name — rather than a `LIKE`
 /// pattern, so a signal name that itself contains `:` (or a `LIKE` metacharacter
 /// like `%`/`_`) still matches exactly.
-fn is_signal_timeout_deadline_timer(timer_id: &str, signal_name: &str) -> bool {
+fn signal_timeout_name(timer_id: &str) -> Option<&str> {
     timer_id
         .strip_prefix("__signal_timeout:")
         .and_then(|rest| rest.split_once(':'))
-        .is_some_and(|(_seq, name)| name == signal_name)
+        .map(|(_seq, name)| name)
 }
 
 /// The row that one planned ingest event consumes.
@@ -604,18 +604,31 @@ impl SignalIngest {
     /// An unrelated due timer stays for [`drain_ready`]. A `TimerFired` ahead
     /// of a `SignalReceived` that it does not race wedges replay (issue #1071).
     pub fn plan(conn: &Connection, exec_id: ExecutionId, now: i64) -> SqliteResult<Self> {
+        // One read of the due deadlines, grouped by signal name in `fire_at`
+        // order. Each name keeps a cursor, so the plan is O(signals + timers).
+        let mut deadlines: HashMap<String, std::collections::VecDeque<(String, i64)>> =
+            HashMap::new();
+        for (timer_id, fire_at) in queue::due_timers_with_deadlines(conn, exec_id, now)? {
+            if let Some(name) = signal_timeout_name(&timer_id) {
+                deadlines
+                    .entry(name.to_string())
+                    .or_default()
+                    .push_back((timer_id, fire_at));
+            }
+        }
         let mut planned = Vec::new();
-        let mut fired = std::collections::HashSet::new();
         for signal in store::pending_signals(conn, exec_id)? {
-            for timer_id in queue::due_timers_before_signal(conn, exec_id, now, signal.received_at)?
-            {
-                if is_signal_timeout_deadline_timer(&timer_id, &signal.name)
-                    && fired.insert(timer_id.clone())
+            if let Some(due) = deadlines.get_mut(&signal.name) {
+                while due
+                    .front()
+                    .is_some_and(|(_, fire_at)| *fire_at <= signal.received_at)
                 {
-                    let event = WorkflowEvent::TimerFired {
-                        timer_id: TimerId::new(timer_id.clone()),
-                    };
-                    planned.push((event, IngestRow::Timer(timer_id)));
+                    if let Some((timer_id, _)) = due.pop_front() {
+                        let event = WorkflowEvent::TimerFired {
+                            timer_id: TimerId::new(timer_id.clone()),
+                        };
+                        planned.push((event, IngestRow::Timer(timer_id)));
+                    }
                 }
             }
             let event = WorkflowEvent::SignalReceived {
@@ -1029,8 +1042,8 @@ mod tests {
     use super::{
         SignalIngest, commands_open_activity_race, drain_ready, finalize_within_tx, fire_timer,
         fire_timer_within_tx, handler_panic_activity_envelope, history_has_unsettled_activity_race,
-        is_signal_timeout_deadline_timer, payload_too_large_activity_envelope,
-        schedule_to_close_exceeded, start_to_close_exceeded,
+        payload_too_large_activity_envelope, schedule_to_close_exceeded, signal_timeout_name,
+        start_to_close_exceeded,
     };
     use crate::queue::{self, ClaimedTask};
     use crate::runtime::ActivitySpec;
@@ -1384,41 +1397,30 @@ mod tests {
         assert!(!schedule_to_close_exceeded(1_000, Some(-5)));
     }
 
-    // FIX 1 (Codex #1069 P2, runtime.rs:699): the deadline-timer-name predicate
-    // matches ONLY a `__signal_timeout:{seq}:{name}` race timer for the exact
-    // signal name — including a name that itself contains a colon — and never an
-    // unrelated durable timer.
+    // FIX 1 (issue #1069 P2): the parser reads the signal name only from a
+    // `__signal_timeout:{seq}:{name}` race timer. A name can contain a colon.
+    // An unrelated durable timer has no signal name.
     #[test]
-    fn signal_timeout_deadline_timer_predicate_matches_only_the_raced_timer() {
-        assert!(is_signal_timeout_deadline_timer(
-            "__signal_timeout:0:go",
-            "go"
-        ));
-        assert!(is_signal_timeout_deadline_timer(
-            "__signal_timeout:7:approval",
-            "approval"
-        ));
-        // A signal name that itself contains ':' still matches (structural
+    fn signal_timeout_name_matches_only_a_race_deadline_timer() {
+        assert_eq!(signal_timeout_name("__signal_timeout:0:go"), Some("go"));
+        assert_eq!(
+            signal_timeout_name("__signal_timeout:7:approval"),
+            Some("approval")
+        );
+        // A signal name that itself contains ':' still parses (structural
         // `split_once`, not a fragile suffix/`LIKE` match).
-        assert!(is_signal_timeout_deadline_timer(
-            "__signal_timeout:3:ns:go",
-            "ns:go"
-        ));
-        // Wrong signal name → no match (a deadline timer for a DIFFERENT wait must
-        // not be reordered ahead of THIS signal).
-        assert!(!is_signal_timeout_deadline_timer(
-            "__signal_timeout:0:other",
-            "go"
-        ));
+        assert_eq!(
+            signal_timeout_name("__signal_timeout:3:ns:go"),
+            Some("ns:go")
+        );
+        // A deadline timer for a DIFFERENT name never matches THIS signal.
+        assert_ne!(signal_timeout_name("__signal_timeout:0:other"), Some("go"));
         // An UNRELATED durable timer (`join!(wait_for_signal("go"), timer("t", 5))`)
         // is never a race deadline timer.
-        assert!(!is_signal_timeout_deadline_timer("t", "go"));
-        assert!(!is_signal_timeout_deadline_timer("heartbeat", "go"));
+        assert_eq!(signal_timeout_name("t"), None);
+        assert_eq!(signal_timeout_name("heartbeat"), None);
         // A prefix look-alike that is not the real convention → no match.
-        assert!(!is_signal_timeout_deadline_timer(
-            "__signal_timeout_go",
-            "go"
-        ));
+        assert_eq!(signal_timeout_name("__signal_timeout_go"), None);
     }
 
     // FIX 1 (issue #1069 P2): the signal ingest reorders ONLY

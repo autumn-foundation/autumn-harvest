@@ -533,32 +533,28 @@ pub fn due_timers(conn: &Connection, exec_id: ExecutionId, now: i64) -> SqliteRe
     Ok(out)
 }
 
-/// Return the ids of all unfired timers for `exec_id` that are **both** due
-/// (`fire_at <= now`) **and** whose deadline is at or before `received_at`,
-/// oldest deadline first.
+/// Return every unfired timer of `exec_id` that is due (`fire_at <= now`), with
+/// its `fire_at`, oldest deadline first.
 ///
-/// The "fire this timer BEFORE that signal" half of the wake-event ordering
-/// (issue #476). A `wait_for_signal_timeout` deadline that expired at or before a
-/// signal arrived (`fire_at <= received_at`) must be recorded as `TimerFired`
-/// ahead of the `SignalReceived`, so a late signal cannot retroactively flip the
-/// race to the approval branch. Ties (`fire_at == received_at`) go to the timer,
-/// mirroring the Postgres `merge_wake_events` rule (signal-first iff
-/// `received_at < fires_at`). A due timer whose deadline is *after* the signal
-/// arrived is deliberately excluded here — it is fired *after* the signal by the
-/// ordinary [`drain_ready`](crate::worker::drain_ready) pass.
-pub fn due_timers_before_signal(
+/// The signal ingest ([`SignalIngest`](crate::worker::SignalIngest)) reads this
+/// once per plan (issue #2020). Take a `wait_for_signal_timeout` deadline at or
+/// before a signal arrival (`fire_at <= received_at`). Its `TimerFired` goes
+/// ahead of the `SignalReceived`, so a late signal cannot flip the race (issue
+/// #476). Ties go to the timer, as in the Postgres `merge_wake_events` rule. A due
+/// deadline after the signal arrival fires after it, in
+/// [`drain_ready`](crate::worker::drain_ready).
+pub fn due_timers_with_deadlines(
     conn: &Connection,
     exec_id: ExecutionId,
     now: i64,
-    received_at: i64,
-) -> SqliteResult<Vec<String>> {
+) -> SqliteResult<Vec<(String, i64)>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT timer_id FROM harvest_timers \
-         WHERE exec_id = ?1 AND fired = 0 AND fire_at <= ?2 AND fire_at <= ?3 \
+        "SELECT timer_id, fire_at FROM harvest_timers \
+         WHERE exec_id = ?1 AND fired = 0 AND fire_at <= ?2 \
          ORDER BY fire_at, arm_seq",
     )?;
-    let rows = stmt.query_map(params![exec_id.to_string(), now, received_at], |row| {
-        row.get::<_, String>(0)
+    let rows = stmt.query_map(params![exec_id.to_string(), now], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
     let mut out = Vec::new();
     for r in rows {
@@ -671,7 +667,7 @@ mod tests {
     use autumn_harvest::ExecutionId;
 
     use super::{
-        delete_undelivered_signals_for_execution, due_timers, due_timers_before_signal,
+        delete_undelivered_signals_for_execution, due_timers, due_timers_with_deadlines,
         enqueue_timer,
     };
     use crate::schema;
@@ -738,9 +734,9 @@ mod tests {
         );
         // The signal-interleave query carries the same tie-break.
         assert_eq!(
-            due_timers_before_signal(&conn, exec, 200, 200).unwrap(),
-            vec!["a".to_string(), "z".to_string()],
-            "due_timers_before_signal must apply the same arm_seq tie-break"
+            due_timers_with_deadlines(&conn, exec, 200).unwrap(),
+            vec![("a".to_string(), 100), ("z".to_string(), 100)],
+            "due_timers_with_deadlines must apply the same arm_seq tie-break"
         );
     }
 
