@@ -242,10 +242,10 @@ def compose_value(compose: str, key: str) -> str | None:
     return match.group(1) if match else None
 
 
-# The ECR Public mirror of the Docker Official Images. CI pulls an official
-# image from it, because Docker Hub rate-limits anonymous pulls. The mirror
-# serves the same image, so it matches compose.yaml.
-OFFICIAL_IMAGE_MIRROR = "public.ecr.aws/docker/library/"
+# Mirrors of the Docker Official Images. CI pulls an official image from one
+# of them, because Docker Hub rate-limits anonymous pulls. A mirror serves the
+# same image, so it matches compose.yaml.
+OFFICIAL_IMAGE_MIRRORS = ("mirror.gcr.io/library/", "public.ecr.aws/docker/library/")
 
 
 def check_service_matches_compose(compose: str, ci_job: str) -> list[str]:
@@ -260,7 +260,7 @@ def check_service_matches_compose(compose: str, ci_job: str) -> list[str]:
             continue
         forms = [f"{key}: {value}"]
         if key == "image" and "/" not in value:
-            forms.append(f"{key}: {OFFICIAL_IMAGE_MIRROR}{value}")
+            forms.extend(f"{key}: {mirror}{value}" for mirror in OFFICIAL_IMAGE_MIRRORS)
         needles.append(forms)
     port = re.search(r"(\d+):5432", compose)
     if port is None:
@@ -404,8 +404,9 @@ def self_test() -> int:
     job = "image: postgres:16\nPOSTGRES_USER: u\nPOSTGRES_PASSWORD: p\nPOSTGRES_DB: d\n- 5435:5432\n"
     assert check_service_matches_compose(compose, job) == []
     assert len(check_service_matches_compose(compose, job.replace("16", "17"))) == 1
-    mirrored = job.replace("image: ", "image: public.ecr.aws/docker/library/")
-    assert check_service_matches_compose(compose, mirrored) == []
+    for mirror in ("mirror.gcr.io/library/", "public.ecr.aws/docker/library/"):
+        mirrored = job.replace("image: ", f"image: {mirror}")
+        assert check_service_matches_compose(compose, mirrored) == []
     other = job.replace("image: ", "image: example.com/")
     assert len(check_service_matches_compose(compose, other)) == 1
     # A commented-out CI line does not count as wiring.
