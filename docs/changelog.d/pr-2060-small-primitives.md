@@ -13,6 +13,9 @@ first signal of a name whose payload satisfies the predicate.
 - `HistoryMatcher::match_signal_where` generalises the signal scan. A
   same-name signal that fails the predicate stays in `pending_signals` for a
   later wait.
+- The buffer belongs to the current run. Continue-as-new does not move a
+  rejected signal to the next run, as for any signal in history that the
+  body did not read.
 - Its event index goes to `predicate_rejected_signal_events`. The
   unconsumed-history check excuses it, so strict and canary replay stay
   clean. The `harvest.signal.unhandled` metric still counts it.

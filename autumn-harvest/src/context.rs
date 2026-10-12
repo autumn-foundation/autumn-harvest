@@ -9274,6 +9274,8 @@ impl WorkflowContext {
     /// `step.waitForEvent`. A same-name signal that fails the predicate is
     /// not consumed. It stays buffered, and a later wait for that name can
     /// take it. Signals keep their recorded order.
+    /// The buffer belongs to the current run. Continue-as-new does not move
+    /// a rejected signal to the next run.
     ///
     /// # Determinism contract
     ///

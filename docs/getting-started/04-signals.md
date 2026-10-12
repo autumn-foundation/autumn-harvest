@@ -81,6 +81,9 @@ async fn ship(ctx: &WorkflowContext, order_id: u64) -> HarvestResult<serde_json:
 
 - A same-name signal that fails the predicate is not consumed. It stays
   buffered, and a later wait for that name can take it.
+- The buffer belongs to the current run. Continue-as-new does not move a
+  rejected signal to the next run, as for any signal that history holds but
+  the body did not read. Pass what the next run needs in its input.
 - `ctx.receive_signal_matching::<T, _>` is the typed form. A payload that
   does not decode into `T` is a non-match.
 - The predicate must be a pure function of the payload. Replay runs it
