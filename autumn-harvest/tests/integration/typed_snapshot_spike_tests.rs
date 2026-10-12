@@ -33,6 +33,7 @@ use autumn_harvest::context::WorkflowCommand;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::executor::{WorkflowOutcome, run_workflow};
 use autumn_harvest::info::WorkflowHandlerFn;
+use autumn_harvest::replay::{HistoryMatch, HistoryMatcher, SignalOrTimerMatch};
 use autumn_harvest::types::{ExecutionId, TimerId};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::de::DeserializeOwned;
@@ -859,6 +860,43 @@ fn a_checkpoint_with_an_unread_signal_is_refused() {
             }
         ),
         Err(SnapshotError::Open(OpenEffect::Signal("cancel".into())))
+    );
+}
+
+#[test]
+fn the_engine_unread_count_misses_a_late_race_signal() {
+    // The timer wins the race. The signal arrives after it, and a later wait
+    // can still take it. The engine count excuses that signal, so a stamp
+    // view built from the count alone would let continue-as-new drop it.
+    let timer_id = TimerId::new("__signal_timeout:1:approval");
+    let history = vec![
+        WorkflowEvent::TimerStarted {
+            timer_id: timer_id.clone(),
+            duration_secs: 300,
+        },
+        WorkflowEvent::TimerFired {
+            timer_id: timer_id.clone(),
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "approval".into(),
+            payload: json!({"approved": true}),
+        },
+    ];
+    let mut matcher = HistoryMatcher::new(history);
+    assert_eq!(
+        matcher.match_signal_or_timer("approval", timer_id.as_str(), Some(300)),
+        SignalOrTimerMatch::TimerWon
+    );
+    assert!(
+        matcher.unconsumed_signals_by_name().is_empty(),
+        "the engine count excuses the late signal"
+    );
+    assert_eq!(
+        matcher.match_signal("approval"),
+        HistoryMatch::Matched {
+            output: json!({"approved": true})
+        },
+        "a later wait can still take it, so the stamp must count it as unread"
     );
 }
 

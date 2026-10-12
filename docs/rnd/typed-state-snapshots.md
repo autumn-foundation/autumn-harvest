@@ -155,7 +155,10 @@ The cost is high:
    continue-as-new, such as a join that polls an activity. That command
    has no event, so the stamp also refuses a pending command. The worker
    reads these lists from the replay matcher and the context, because
-   history alone cannot show them.
+   history alone cannot show them. The unread list must also hold a signal
+   that arrived after its race's timer won. A later wait can still take
+   that signal. `HistoryMatcher::unconsumed_signals_by_name` excuses it, so
+   the worker needs a read that counts it.
 5. The successor loads the state. It first checks the signature. An older
    version then passes through the `upgrade` step of the state type. The
    loader refuses a newer version. It then asks the state type whether the
@@ -193,6 +196,7 @@ Each claim names its test in `typed_snapshot_spike_tests.rs`.
 | The stamp refuses an open activity, external activity, timer, child or update. | `a_checkpoint_with_an_open_effect_is_refused` |
 | The stamp refuses a signal that the body has not taken. | `a_checkpoint_with_an_unread_signal_is_refused` |
 | The stamp refuses a command that the checkpoint decision issued. | `a_checkpoint_with_a_command_in_the_same_decision_is_refused` |
+| The engine unread count excuses a late race signal, so the stamp view needs its own read. | `the_engine_unread_count_misses_a_late_race_signal` |
 | A wait won by its signal can checkpoint. The context view closes the torn-down timer. | `a_wait_won_by_its_signal_can_checkpoint` |
 | Only the signed teardown list closes an open timer. A timer that fired in another history does not. | `a_fired_timer_is_not_teardown_evidence_for_another_history` |
 | The ledger records a failed activity, so a cover rule can check a caught failure. | `a_failed_activity_is_recorded_in_the_ledger` |
