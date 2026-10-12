@@ -2187,6 +2187,9 @@ standalone note rather than part of the claim-path attribution table above:
   variant: 2.35% instruction reduction against a >=5% floor) — a negative
   result. An earlier cut of the same variant had a real vertical-tab
   correctness bug, caught by review before it shipped.
+* [`docs/performance-activity-exec-id-hash.md`](performance-activity-exec-id-hash.md)
+  — a one-write `Hash` for `ActivityExecId` in the awaitables projection;
+  `sip::Hasher::write` did not change, so it is a negative result.
 * [`docs/performance-dag-graph.md`](performance-dag-graph.md) — hoisting a
   per-node rebuild out of `GET /dag-run-graph` (issue #690).
 * [`docs/performance-dlq-aggregate.md`](performance-dlq-aggregate.md) — DLQ
