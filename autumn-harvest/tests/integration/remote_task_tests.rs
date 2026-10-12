@@ -276,6 +276,20 @@ fn a2a_task_states_map_to_remote_states() {
     assert!(a2a::parse_task(&polled(RemoteProtocol::A2a, "a"), &json!({"id": "a"})).is_err());
 }
 
+/// A2A `unknown` is an indeterminate state, not an end, so the call waits.
+#[test]
+fn a2a_unknown_state_still_waits() {
+    let task = |state: &str| json!({"id": "a", "status": {"state": state}});
+    for state in ["unknown", "TASK_STATE_UNSPECIFIED"] {
+        assert_eq!(
+            a2a::parse_task(&polled(RemoteProtocol::A2a, "a"), &task(state)),
+            Ok(RemoteTaskState::Working),
+            "{state}"
+        );
+    }
+    assert!(a2a::parse_task(&polled(RemoteProtocol::A2a, "a"), &task("paused-forever")).is_err());
+}
+
 // ── The start activity ──────────────────────────────────────────────────────
 
 /// Records each start key and answers with a fixed result.

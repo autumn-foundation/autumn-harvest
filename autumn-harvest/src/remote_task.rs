@@ -639,7 +639,8 @@ pub mod a2a {
             .replace('_', "-");
         let message = || status_text(task).unwrap_or_else(|| format!("the remote task is {state}"));
         match state.as_str() {
-            "submitted" | "working" => Ok(RemoteTaskState::Working),
+            // `unknown` (v0.3) and `unspecified` (v1) are indeterminate, not an end.
+            "submitted" | "working" | "unknown" | "unspecified" => Ok(RemoteTaskState::Working),
             "input-required" | "auth-required" => Ok(RemoteTaskState::InputRequired),
             "completed" => Ok(RemoteTaskState::Completed(RemoteTaskOutcome {
                 result: task.clone(),
