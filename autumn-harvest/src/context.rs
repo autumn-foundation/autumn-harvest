@@ -5092,8 +5092,20 @@ impl WorkflowContext {
         if self.note_position_read() {
             return true;
         }
+        // Issue #1984: the side effects of a replayed cancel already fired.
+        if self.replays_a_scope_cancel() {
+            return true;
+        }
         let matcher = self.matcher.lock().expect("matcher lock poisoned");
         matcher.is_replaying() || matcher.has_terminal_failure_tail()
+    }
+
+    /// Whether a scope body re-runs the cycle of a recorded cancel (issue
+    /// #1984). The matcher stops at the cancel horizon, so the body sees a
+    /// live frontier, but the live cycle already fired its side effects.
+    pub(crate) fn replays_a_scope_cancel(&self) -> bool {
+        let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
+        crate::cancellation_scope::replays_a_cancel(&stack)
     }
 
     /// Replay gate of [`publish_durable_progress`](Self::publish_durable_progress)
@@ -6203,15 +6215,20 @@ impl WorkflowContext {
                 // terminal `WorkflowCancelled` the lookahead skips), NOT a
                 // live unwind — never count it retroactively, never push a
                 // fresh marker command mid-replay (Codex P2, PR #973 review).
-                if self.is_replay_probe() {
+                // A replayed scope cancel (issue #1984) holds the marker and
+                // checks it against its capture. The live cycle counted it.
+                let replayed_cancel = self.replays_a_scope_cancel();
+                if self.is_replay_probe() && !replayed_cancel {
                     false
                 } else {
                     self.push_command(WorkflowCommand::RecordMarker {
                         name,
                         details: Value::from(pending as u64),
                     });
-                    self.metrics
-                        .record_saga_compensated(&self.workflow_name, &self.queue_name);
+                    if !replayed_cancel {
+                        self.metrics
+                            .record_saga_compensated(&self.workflow_name, &self.queue_name);
+                    }
                     true
                 }
             }
@@ -6257,14 +6274,18 @@ impl WorkflowContext {
             // probe never records into a frontier, even for a counted unwind
             // (its `counted` came from a marker already in history).
             SagaMarkerMatch::LiveFrontier | SagaMarkerMatch::DrainedSignalFrontier
-                if observation.counted && !self.is_replay_probe() =>
+                if observation.counted
+                    && (!self.is_replay_probe() || self.replays_a_scope_cancel()) =>
             {
                 self.push_command(WorkflowCommand::RecordMarker {
                     name,
                     details: Value::from(error_count as u64),
                 });
-                self.metrics
-                    .record_saga_compensation_failed(&self.workflow_name, &self.queue_name);
+                // A replayed scope cancel counted the failure live (issue #1984).
+                if !self.replays_a_scope_cancel() {
+                    self.metrics
+                        .record_saga_compensation_failed(&self.workflow_name, &self.queue_name);
+                }
             }
             // Silent otherwise: Recorded (already counted on the cycle that
             // first recorded the marker), an uncounted unwind's frontier

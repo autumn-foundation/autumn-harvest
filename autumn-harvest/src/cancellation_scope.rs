@@ -431,6 +431,16 @@ pub(crate) fn take_captured_marker(stack: &[ScopeFrame], name: &str) -> Captured
 }
 
 /// The cancellable scopes on `stack` up to the nearest shield, innermost last.
+/// Whether a scope on the stack replays a cancel.
+///
+/// Its body re-runs the cancelling cycle, whose side effects already fired.
+pub(crate) fn replays_a_cancel(stack: &[ScopeFrame]) -> bool {
+    stack.iter().any(|frame| match frame {
+        ScopeFrame::Cancellable(shared) => shared.lock().holding,
+        ScopeFrame::Shield => false,
+    })
+}
+
 pub(crate) fn cancellable_seqs(stack: &[ScopeFrame]) -> Vec<u32> {
     let mut seqs: Vec<u32> = stack
         .iter()
@@ -1839,6 +1849,61 @@ mod tests {
             replayed.lock().expect("replayed lock").take(),
             Some(json!(["ok", "drift"]))
         );
+    }
+
+    /// Counts the saga unwinds that a context reports.
+    #[derive(Default)]
+    struct SagaCount(std::sync::atomic::AtomicU32);
+
+    impl crate::telemetry::MetricsRecorder for SagaCount {
+        fn record_saga_compensated(&self, _workflow_name: &str, _queue: &str) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The live cycle counts a saga unwind once. A replay of its cancel
+    /// checks the withdrawn marker and does not count it again.
+    #[tokio::test]
+    async fn replay_of_a_cancel_does_not_count_a_saga_unwind_again() {
+        let live_count = std::sync::Arc::new(SagaCount::default());
+        let live = WorkflowContext::new_test().with_metrics(live_count.clone());
+        let seen = std::sync::Mutex::new(None);
+        record_then_cancel(&live, &seen, |ctx| {
+            json!(ctx.observe_saga_unwind_start(2).counted)
+        })
+        .await;
+        assert_eq!(live_count.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+        let replay_count = std::sync::Arc::new(SagaCount::default());
+        let replay = replay_of(details).with_metrics(replay_count.clone());
+        let replayed = std::sync::Mutex::new(None);
+        record_then_cancel(&replay, &replayed, |ctx| {
+            json!(ctx.observe_saga_unwind_start(2).counted)
+        })
+        .await;
+
+        assert_eq!(*replayed.lock().expect("replayed lock"), Some(json!(true)));
+        assert_eq!(replay_count.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(replay.take_nd_details().is_none());
+    }
+
+    /// The body of a replayed cancel sees a replay, so logs and metrics
+    /// do not fire again.
+    #[tokio::test]
+    async fn the_body_of_a_replayed_cancel_is_replaying() {
+        let live = WorkflowContext::new_test();
+        let seen = std::sync::Mutex::new(None);
+        record_then_cancel(&live, &seen, |ctx| json!(ctx.is_replaying())).await;
+        assert_eq!(*seen.lock().expect("seen lock"), Some(json!(false)));
+        let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+        let replay = replay_of(details);
+        let replayed = std::sync::Mutex::new(None);
+        record_then_cancel(&replay, &replayed, |ctx| json!(ctx.is_replaying())).await;
+
+        assert_eq!(*replayed.lock().expect("replayed lock"), Some(json!(true)));
+        assert!(!replay.is_replaying(), "the flag ends with the cancel");
     }
 
     /// A member start that the replayed body no longer issues stops the
