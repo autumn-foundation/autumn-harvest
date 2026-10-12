@@ -2,9 +2,10 @@
 
 **What shipped.** `autumn-harvest-agent` gets an opt-in `ResponseCache`.
 Install it with `AgentHarness::response_cache`. A model call that matches an
-earlier call is served from the cache, in any later run. Retries, forks and
-evaluation runs stop paying for identical calls. `docs/agent-adapter.md`
-section 11 shows the pattern.
+earlier call is served from the cache, in any later run. Retries and forks
+stop paying for identical calls. An evaluation (`eval::evaluate`) skips the
+cache, so it measures the live answer of the candidate.
+`docs/agent-adapter.md` section 11 shows the pattern.
 
 **Design.**
 

@@ -1,8 +1,9 @@
 //! A cross-run cache of model answers (issue #1998).
 //!
 //! Replay reads an answer back from the history of one run. This cache serves
-//! an identical request from another run, so a retry, a fork or an evaluation
-//! run does not pay again.
+//! an identical request from another run, so a retry or a fork does not pay
+//! again. An evaluation (`eval::evaluate`) skips the cache, so it measures the
+//! live answer of the candidate.
 //!
 //! The cache is opt-in. Install it with
 //! [`AgentHarness::response_cache`](crate::AgentHarness::response_cache).

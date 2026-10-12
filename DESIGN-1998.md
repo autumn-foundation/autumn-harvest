@@ -57,7 +57,7 @@ that serves an identical call across runs.
 | White | `PayloadStore` is put, get and delete by an opaque key. `PayloadCodecs` is not `db`-gated. `harvest_workflow_executions.tenant` holds the verified tenant (#1977). The activity context has the pool and the execution id of a regular activity. |
 | Red | "The same question, the same tenant, no second bill" is easy to explain. A cache that can answer across tenants is frightening. |
 | Black | Unkeyed hashes let an index reader test a guess. A hit repeats one sample. The engine tenant read costs one query per turn. A rebalance in flight can hide the row. |
-| Yellow | Retries, forks and evaluation runs stop paying for identical calls. Replay does not change. The cost ledger (#1996) can count hits from `cache_hit`. |
+| Yellow | Retries and forks stop paying for identical calls. An evaluation skips the cache, so it measures the live answer. Replay does not change. The cost ledger (#1996) can count hits from `cache_hit`. |
 | Green | A durable `CacheIndex` on Postgres or SQLite can come later. Request coalescing can come later. |
 | Blue | Red: key, scope, codec, cross-run and replay tests. Green: the cache, the harness hook and `run_tenant`. Refactor: docs, changelog, review. |
 

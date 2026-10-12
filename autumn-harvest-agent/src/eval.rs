@@ -11,7 +11,8 @@
 //! - `agent_model_turn` asks the candidate model, then the candidate policy.
 //!   These are the only live calls. A retryable failure retries under the
 //!   retry policy of the activity, as on a worker. A turn over the worker
-//!   result cap fails, as on a worker with no payload store.
+//!   result cap fails, as on a worker with no payload store. The response
+//!   cache is skipped, so every turn asks the candidate.
 //! - `agent_tool_call` returns the recorded outcome of the same call. A call
 //!   with no recorded outcome gets an error stub. No tool runs.
 //! - `agent_memory_snapshot` returns the recorded snapshot, or an empty one.

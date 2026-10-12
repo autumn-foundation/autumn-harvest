@@ -564,7 +564,7 @@ change.
 
 | Activity | In an evaluation |
 |---|---|
-| `agent_model_turn` | The candidate model answers, then the candidate policy decides. These are the only live calls. |
+| `agent_model_turn` | The candidate model answers, then the candidate policy decides. These are the only live calls. The response cache is skipped, so every turn asks the candidate. |
 | `agent_tool_call` | The recorded outcome of the same call, or an error stub. No tool runs. |
 | `agent_memory_snapshot` | The recorded snapshot, or an empty one. |
 | `agent_deliver` | A stub. No report leaves the harness. |
