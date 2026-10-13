@@ -1370,6 +1370,8 @@ impl SqliteRuntime {
         // The body sees a pending cancel here, as on the next drive (issue
         // #2021).
         let cancel_reason = store::cancel_request(&self.conn, exec)?.map(|(reason, _)| reason);
+        // A child sees its parent here, as on a drive (issue #2026).
+        let parent = store::parent_link(&self.conn, exec)?.map(|(parent, _)| parent);
         // The same policy as the drive, so `should_continue_as_new` replays the
         // same branch (issue #2023).
         let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
@@ -1380,6 +1382,7 @@ impl SqliteRuntime {
         )
         .with_workflow_name(workflow_name)
         .with_workflow_id(workflow_id)
+        .with_parent_execution_id(parent)
         .with_pending_cancellation(cancel_reason);
         for info in declarative {
             ctx.register_declarative_update_handler(info);

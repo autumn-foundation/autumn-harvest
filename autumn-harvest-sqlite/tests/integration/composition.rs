@@ -455,6 +455,26 @@ async fn continues_once(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
     Ok(n)
 }
 
+/// Registers `parent`, which returns the parent id that the body saw, then
+/// waits for `go`.
+#[workflow]
+async fn reports_parent_on_update(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let parent = ctx.info().parent_execution_id.map(|p| p.to_string());
+    ctx.register_update_handler_no_validator("parent", move |_input: Value| {
+        let parent = parent.clone();
+        async move { Ok(json!(parent)) }
+    });
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
+/// Starts `reports_parent_on_update` as an attached child.
+#[workflow]
+async fn parent_of_update_target(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    ctx.spawn_child_workflow_raw("reports_parent_on_update", json!(0))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn runtime() -> SqliteRuntime {
@@ -512,6 +532,8 @@ fn fixtures() -> Vec<WorkflowInfo> {
         parent_of_unregistered_info(),
         fails_while_dispatching_info(),
         continues_once_info(),
+        reports_parent_on_update_info(),
+        parent_of_update_target_info(),
     ]
 }
 
@@ -1911,4 +1933,19 @@ async fn an_abandon_child_adds_no_cascade_event_to_the_cap_check() {
     let state = rt.run_until_blocked(parent).await.unwrap();
 
     assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+}
+
+/// An update replays a child with its parent link, as a drive does.
+#[tokio::test]
+async fn an_update_on_a_child_sees_its_parent() {
+    let mut rt = runtime();
+    let parent = rt
+        .start_workflow("parent_of_update_target", json!(0))
+        .unwrap();
+    rt.run_until_blocked(parent).await.unwrap();
+    let child = children_of(&rt, parent)[0];
+
+    let out = rt.update(child, "parent", json!(null)).await.unwrap();
+
+    assert_eq!(out, json!(parent.to_string()));
 }
