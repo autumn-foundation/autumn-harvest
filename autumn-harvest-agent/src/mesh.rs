@@ -432,6 +432,9 @@ impl Mandate {
         if self.depth() != 0 {
             return Err(Refusal::InvalidMandate);
         }
+        // Check each side alone. The meet can drop a bad local entry, so a
+        // check of the result alone would hide a receiver configuration error.
+        self.validate().map_err(|_| Refusal::InvalidMandate)?;
         inbound.validate().map_err(|_| Refusal::InvalidMandate)?;
         let holder = self.holder();
         let mut chain = inbound.chain.clone();
@@ -840,6 +843,20 @@ mod tests {
             .delegate(&Peer::new("researcher", "R."), 0)
             .unwrap();
         assert_eq!(not_root.accept(&inbound), Err(Refusal::InvalidMandate));
+    }
+
+    #[test]
+    fn accept_refuses_a_malformed_local_mandate() {
+        let inbound = Mandate::new("planner").peers(["critic"]).tools(["read"]);
+        // The meet would drop each bad entry, so only a check of the local
+        // mandate itself can find it.
+        let bad_peer = Mandate::new("researcher").peers(["critic", "Bad Name"]);
+        assert_eq!(bad_peer.accept(&inbound), Err(Refusal::InvalidMandate));
+        let bad_tool = Mandate::new("researcher").tools(["read", "a\nb"]);
+        assert_eq!(bad_tool.accept(&inbound), Err(Refusal::InvalidMandate));
+        let bad_holder = Mandate::new("Bad Name");
+        assert_eq!(bad_holder.accept(&inbound), Err(Refusal::InvalidMandate));
+        assert!(Mandate::new("researcher").accept(&inbound).is_ok());
     }
 
     #[test]
