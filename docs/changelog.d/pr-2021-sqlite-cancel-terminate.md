@@ -70,8 +70,8 @@ covers:
 - a check before recorded steps and before a recorded timer;
 - a deadlock and a panic under a pending request;
 - a busy body that ignores the request and keeps running activities;
-- a cleanup that reaches the history cap, and a final batch past the cap or
-  the budget;
+- a cleanup that reaches the history cap, and a final or suspending batch
+  past the cap or the budget;
 - a side effect of the returning cycle, and a second drive of a cancelled run;
 - a signal consumed after a request, and a cancel that wins over
   `continue_as_new`;

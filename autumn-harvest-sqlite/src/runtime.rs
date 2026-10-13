@@ -1050,8 +1050,7 @@ impl SqliteRuntime {
             let tx = self.conn.transaction()?;
             batch.ingest.apply(&tx, exec)?;
             persist_terminal_pending_commands(&tx, exec, batch.pending)?;
-            let count = usize::try_from(store::next_seq(&tx, exec)?).unwrap_or(usize::MAX);
-            if count < batch.budget_end && batch.caps.reached(&tx, exec)?.is_none() {
+            if batch.caps.reached(&tx, exec)?.is_none() {
                 seal_with_cancel_event(&tx, exec, CANCELLED_STATE, reason)?;
                 tx.commit()?;
                 return Ok(RunState::Cancelled(reason.to_string()));
@@ -1844,10 +1843,10 @@ impl SqliteRuntime {
         {
             return self.seal_cancelled(exec, reason, None);
         }
-        let (cancel_reason, budget_end) = cancel.map_or((None, 0), |(reason, from)| {
+        let (cancel_reason, budget_end) = cancel.map_or((None, None), |(reason, from)| {
             (
                 Some(reason),
-                from.saturating_add(CANCEL_CLEANUP_EVENT_BUDGET),
+                Some(from.saturating_add(CANCEL_CLEANUP_EVENT_BUDGET)),
             )
         });
         let ingest = self.plan_ingest(exec, now, history.len(), history_bytes)?;
@@ -1946,9 +1945,22 @@ impl SqliteRuntime {
         self.workflow_panic_strikes.remove(&exec);
 
         // Issue #2023: the #1804 caps. Each arm that writes checks them inside
-        // its transaction, before its terminal event.
+        // its transaction, before its terminal event. Issue #2021: under a
+        // pending cancel the cleanup budget is one more event cap. A
+        // suspending batch and a final batch both stop at it.
+        let policy = match budget_end {
+            Some(end) => {
+                let end = u64::try_from(end).unwrap_or(u64::MAX);
+                let cap = self
+                    .history_policy
+                    .event_hard_cap()
+                    .map_or(end, |cap| cap.min(end));
+                self.history_policy.with_event_hard_cap(cap)
+            }
+            None => self.history_policy,
+        };
         let caps = CapCheck {
-            policy: self.history_policy,
+            policy,
             start_bytes: history_bytes.saturating_add(ingest.bytes()),
             workflow_type: &workflow_name,
         };
@@ -1968,7 +1980,6 @@ impl SqliteRuntime {
                 ingest: &ingest,
                 pending,
                 caps: &caps,
-                budget_end,
             };
             match &outcome {
                 WorkflowOutcome::Completed { .. }
@@ -2710,10 +2721,8 @@ struct CancelBatch<'a> {
     ingest: &'a worker::SignalIngest,
     /// The bookkeeping commands of a cycle that returned.
     pending: &'a [WorkflowCommand],
-    /// The history caps.
+    /// The history caps, with the cleanup budget as one more event cap.
     caps: &'a CapCheck<'a>,
-    /// The history length the cleanup budget allows.
-    budget_end: usize,
 }
 
 /// The most events that a cleanup can add after a cancel request (issue
