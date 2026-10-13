@@ -2386,7 +2386,9 @@ impl SqliteRuntime {
                 };
                 store::append_event(&tx, exec, &terminal)?;
                 store::set_completed(&tx, exec, &output)?;
-                composition::close_execution(&tx, exec, &terminal, now)?;
+                // Read the clock again: the body can run past a parent's child
+                // deadline. Postgres checks `NOW()` at this point (issue #779).
+                composition::close_execution(&tx, exec, &terminal, failure_now())?;
                 tx.commit()?;
                 Ok(RunState::Completed(output))
             }
@@ -2449,7 +2451,8 @@ impl SqliteRuntime {
                 let terminal = WorkflowEvent::workflow_failed_typed(&decoded);
                 store::append_event(&tx, exec, &terminal)?;
                 store::set_failed(&tx, exec, &decoded.message)?;
-                composition::close_execution(&tx, exec, &terminal, now)?;
+                // Read the clock again, as the `Completed` arm does.
+                composition::close_execution(&tx, exec, &terminal, failure_now())?;
                 tx.commit()?;
                 Ok(RunState::Failed(decoded.message))
             }

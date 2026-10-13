@@ -477,6 +477,27 @@ async fn parent_of_update_target(ctx: &WorkflowContext, _n: i64) -> Result<Value
         .map_err(|e| e.to_string())
 }
 
+/// The test clock of `a_long_terminal_cycle_loses_to_a_due_deadline`, in epoch
+/// milliseconds. Only that test reads it.
+static BUSY_CLOCK: AtomicI64 = AtomicI64::new(1_767_225_600_000);
+
+/// Uses 5 s of the test clock in its only cycle, then completes. It stands
+/// for a child whose last cycle does heavy work.
+#[workflow]
+async fn busy_child(_ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    BUSY_CLOCK.fetch_add(5_000, Ordering::SeqCst);
+    Ok(json!("busy-done"))
+}
+
+#[workflow]
+async fn parent_child_timeout_busy(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let out = ctx
+        .spawn_child_workflow_timeout("busy_child", json!(0), std::time::Duration::from_secs(1))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(json!({ "child": out }))
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn runtime() -> SqliteRuntime {
@@ -536,6 +557,8 @@ fn fixtures() -> Vec<WorkflowInfo> {
         continues_once_info(),
         reports_parent_on_update_info(),
         parent_of_update_target_info(),
+        busy_child_info(),
+        parent_child_timeout_busy_info(),
     ]
 }
 
@@ -1965,4 +1988,34 @@ async fn a_query_on_a_child_sees_its_parent() {
     let out = rt.query(child, "parent", json!(null)).await.unwrap();
 
     assert_eq!(out, json!(parent.to_string()));
+}
+
+/// The close reads the clock again when the child ends. A terminal cycle that
+/// runs past the parent's deadline loses to it, as on Postgres.
+#[tokio::test]
+async fn a_long_terminal_cycle_loses_to_a_due_deadline() {
+    let mut rt = runtime();
+    rt.set_clock(|| {
+        chrono::DateTime::from_timestamp_millis(BUSY_CLOCK.load(Ordering::SeqCst)).unwrap()
+    });
+    let parent = rt
+        .start_workflow("parent_child_timeout_busy", json!(0))
+        .unwrap();
+
+    let state = rt.run_until_blocked(parent).await.unwrap();
+
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!({ "child": null })),
+        "the deadline wins: {state:?}"
+    );
+    let history = rt.load_history(parent).unwrap();
+    let fired = history
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::TimerFired { .. }))
+        .expect("the deadline fired");
+    let child_done = history
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::ChildWorkflowCompleted { .. }))
+        .expect("the child result is still recorded");
+    assert!(fired < child_done, "{history:#?}");
 }

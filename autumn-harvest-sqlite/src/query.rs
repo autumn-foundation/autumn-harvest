@@ -97,8 +97,8 @@ impl QueryReplay {
         let exec = self.exec;
         let sealed = self.terminal && history_reached_terminal_seal(&self.history);
         // The drive builds its context with the same name, id, parent, history
-        // policy and pending cancel, so a handler that reads them replays the
-        // same path.
+        // policy and pending cancel. A handler that reads them then replays
+        // the same path.
         let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
             exec,
             self.history,
