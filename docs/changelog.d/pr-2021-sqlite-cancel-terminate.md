@@ -70,7 +70,8 @@ covers:
 - a check before recorded steps and before a recorded timer;
 - a deadlock and a panic under a pending request;
 - a busy body that ignores the request and keeps running activities;
-- an unregistered cleanup activity, and an unregistered workflow;
+- an unregistered cleanup activity, and an unregistered workflow. The
+  activity gets a non-retryable `ActivityFailed`, so the history replays;
 - a cleanup that reaches the history cap, and a final or suspending batch
   past the cap or the budget;
 - a side effect of the returning cycle, and a second drive of a cancelled run;

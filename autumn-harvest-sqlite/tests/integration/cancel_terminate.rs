@@ -1193,6 +1193,32 @@ async fn a_cancel_sealed_while_parked_does_not_replay() {
 }
 
 #[tokio::test]
+async fn an_unregistered_cleanup_history_replays_on_the_core_replayer() {
+    let (_dir, path) = temp_db();
+    let (mut rt, _calls) = runtime(&path);
+    let exec = start_parked(&mut rt, "calls_missing_on_cancel").await;
+    rt.cancel(exec, "stop").unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+
+    let history = rt.load_history(exec).unwrap();
+    let events = history.len();
+    let report = replay(
+        history,
+        "calls_missing_on_cancel",
+        calls_missing_on_cancel_info().handler,
+    )
+    .await;
+
+    // The recorded failure reaches the body, and the body returns it. The
+    // replay consumes every event and does not diverge.
+    assert!(
+        matches!(&report.status, ReplayStatus::WorkflowFailed { error, .. } if error.contains("missing_cleanup")),
+        "the body checked the request first, so the history must replay:\n{report}"
+    );
+    assert_eq!(report.events_replayed, events);
+}
+
+#[tokio::test]
 async fn a_terminated_history_replays_on_the_core_replayer() {
     let (_dir, path) = temp_db();
     let (mut rt, _calls) = runtime(&path);

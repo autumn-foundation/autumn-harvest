@@ -1631,16 +1631,53 @@ impl SqliteRuntime {
         // ends here. A panic keeps its strike budget. A persistence error
         // propagates.
         if let Err(
-            SqliteError::UnregisteredActivity(_)
+            error @ (SqliteError::UnregisteredActivity(_)
             | SqliteError::UnknownWorkflow(_)
-            | SqliteError::Stuck(_),
+            | SqliteError::Stuck(_)),
         ) = &result
             && let Some((reason, _)) = store::cancel_request(&self.conn, exec)?
         {
-            tracing::warn!(%exec, error = ?result, "a pending cancel ends a run the drive cannot advance");
+            tracing::warn!(%exec, ?error, "a pending cancel ends a run the drive cannot advance");
+            if matches!(error, SqliteError::UnregisteredActivity(_)) {
+                return self.seal_cancelled_failing_unregistered(exec, &reason);
+            }
             return self.seal_cancelled(exec, &reason, None);
         }
         result
+    }
+
+    /// End `exec` `CANCELLED`, and first fail each pending task whose activity
+    /// is not registered (issue #2021).
+    ///
+    /// The body awaits such an activity. Without a result, replay parks before
+    /// `WorkflowCancelled` and diverges. A non-retryable `ActivityFailed` lets
+    /// replay resolve the await and reach the terminal event.
+    fn seal_cancelled_failing_unregistered(
+        &mut self,
+        exec: ExecutionId,
+        reason: &str,
+    ) -> SqliteResult<RunState> {
+        let tx = self.conn.transaction()?;
+        for (activity_id, name, attempt) in queue::pending_tasks(&tx, exec)? {
+            if self.activities.contains_key(&name) {
+                continue;
+            }
+            store::append_event(
+                &tx,
+                exec,
+                &WorkflowEvent::ActivityFailed {
+                    activity_id,
+                    error: SqliteError::unregistered(&name).to_string(),
+                    attempt: attempt.saturating_add(1),
+                    error_type: UNREGISTERED_ACTIVITY_ERROR_TYPE.to_string(),
+                    non_retryable: true,
+                    details: None,
+                },
+            )?;
+        }
+        seal_with_cancel_event(&tx, exec, CANCELLED_STATE, reason)?;
+        tx.commit()?;
+        Ok(RunState::Cancelled(reason.to_string()))
     }
 
     /// Seal `exec` `FAILED` with the typed unsupported-feature reason, and
@@ -2750,6 +2787,10 @@ struct CancelBatch<'a> {
 /// #2021). A drive that finds more ends the run `CANCELLED` before replay.
 /// One activity adds two events, so the cleanup has room for about 500.
 const CANCEL_CLEANUP_EVENT_BUDGET: usize = 1_000;
+
+/// The `error_type` of the `ActivityFailed` that a cancel seal records for an
+/// unregistered activity (issue #2021).
+const UNREGISTERED_ACTIVITY_ERROR_TYPE: &str = "UnregisteredActivity";
 
 /// The state a cooperative cancel seals (issue #2021).
 const CANCELLED_STATE: &str = "CANCELLED";
