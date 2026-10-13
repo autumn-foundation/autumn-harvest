@@ -10,11 +10,11 @@ use tokio_util::sync::CancellationToken;
 
 use super::capture::TRUNCATION_MARKER;
 use super::error::SandboxError;
-use super::outcome::SandboxOutcome;
+use super::outcome::{SandboxOutcome, shown};
 use super::protocol::{
     FrameError, GuestErrorKind, GuestErrorMessage, GuestMessage, HostMessage,
-    MAX_CONTROL_FRAME_BYTES, MAX_FRAME_BYTES, OutcomeMessage, RunMessage, read_message,
-    write_message,
+    MAX_CONTROL_FRAME_BYTES, MAX_FRAME_BYTES, OutcomeMessage, PROTOCOL_VERSION, RunMessage,
+    read_message, write_message,
 };
 use super::request::ExecPlan;
 use super::runtime::{BoxFuture, SandboxJob};
@@ -101,11 +101,16 @@ const FRAME_OVERHEAD_BYTES: usize = 64 * 1024;
 
 /// Serve one connection: answer a ping, or run one plan.
 ///
+/// A request that the guest cannot read gets an error frame with an empty
+/// run id, so the host sees a protocol mismatch, not a lost connection. A
+/// run counts as served even when its reply fails, so a single-use guest
+/// never runs a second plan.
+///
 /// # Errors
 ///
 /// Returns the [`FrameError`] of a request that cannot be read, or of a
-/// reply that cannot be written. A failed run is not an error here: the
-/// guest reports it to the host in a [`GuestMessage::Error`].
+/// ping reply that cannot be written. A failed run is not an error here:
+/// the guest reports it to the host in a [`GuestMessage::Error`].
 pub async fn serve_connection<S>(
     stream: &mut S,
     executor: &dyn PlanExecutor,
@@ -114,7 +119,22 @@ pub async fn serve_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let message: HostMessage = read_message(stream, MAX_FRAME_BYTES).await?;
+    let message: HostMessage = match read_message(stream, MAX_FRAME_BYTES).await {
+        Ok(message) => message,
+        Err(FrameError::Malformed(reason)) => {
+            let reply = GuestMessage::Error(GuestErrorMessage {
+                run_id: String::new(),
+                kind: GuestErrorKind::InvalidPlan,
+                message: format!(
+                    "the guest cannot read the request; it speaks protocol version \
+                     {PROTOCOL_VERSION}: {reason}"
+                ),
+            });
+            let _ = write_message(stream, reply, MAX_CONTROL_FRAME_BYTES).await;
+            return Err(FrameError::Malformed(reason));
+        }
+        Err(e) => return Err(e),
+    };
     let run = match message {
         HostMessage::Ping => {
             write_message(stream, GuestMessage::Pong, MAX_CONTROL_FRAME_BYTES).await?;
@@ -133,7 +153,9 @@ where
             message,
         }),
     };
-    write_message(stream, reply, MAX_FRAME_BYTES).await?;
+    if let Err(e) = write_message(stream, reply, MAX_FRAME_BYTES).await {
+        tracing::warn!(error = %e, "the guest could not send the reply of a run");
+    }
     Ok(Served::Run)
 }
 
@@ -269,28 +291,47 @@ where
     match reply {
         GuestMessage::Outcome(message) if message.run_id == job.run_id => Ok(message.outcome),
         GuestMessage::Outcome(message) => Err(SandboxError::Protocol(format!(
-            "the outcome has run id {:?}, not {:?}",
-            message.run_id, job.run_id
+            "the outcome has run id {}, not {:?}",
+            shown(&message.run_id),
+            job.run_id
         ))),
+        GuestMessage::Error(error) if error.run_id.is_empty() => Err(SandboxError::Protocol(
+            format!("the guest refused the request: {}", clean(&error.message)),
+        )),
         GuestMessage::Error(error) if error.run_id != job.run_id => {
             Err(SandboxError::Protocol(format!(
-                "the error has run id {:?}, not {:?}",
-                error.run_id, job.run_id
+                "the error has run id {}, not {:?}",
+                shown(&error.run_id),
+                job.run_id
             )))
         }
         GuestMessage::Error(error) => Err(match error.kind {
-            GuestErrorKind::InvalidPlan => {
-                SandboxError::Protocol(format!("the guest refused the plan: {}", error.message))
-            }
-            GuestErrorKind::SpawnFailed => SandboxError::Denied(error.message),
+            GuestErrorKind::InvalidPlan => SandboxError::Protocol(format!(
+                "the guest refused the plan: {}",
+                clean(&error.message)
+            )),
+            GuestErrorKind::SpawnFailed => SandboxError::Denied(clean(&error.message)),
             GuestErrorKind::Internal => {
-                SandboxError::Unavailable(format!("the guest failed: {}", error.message))
+                SandboxError::Unavailable(format!("the guest failed: {}", clean(&error.message)))
             }
         }),
         GuestMessage::Pong => Err(SandboxError::Protocol(
             "the guest answered a run with a pong".into(),
         )),
     }
+}
+
+/// The longest guest error text that the host keeps, in bytes.
+pub const MAX_GUEST_ERROR_BYTES: usize = 4096;
+
+/// A guest error text for history: at most [`MAX_GUEST_ERROR_BYTES`], with
+/// each NUL as U+FFFD. Postgres `jsonb` rejects `\u0000`.
+fn clean(text: &str) -> String {
+    let mut end = text.len().min(MAX_GUEST_ERROR_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].replace('\0', "\u{fffd}")
 }
 
 /// The host wall clock, in milliseconds since the Unix epoch. A clock before
@@ -479,6 +520,69 @@ mod tests {
         let result = request_run(&mut host, &job()).await;
         server.await.unwrap();
         result
+    }
+
+    #[tokio::test]
+    async fn a_long_guest_error_is_cut_and_has_no_nul() {
+        let reply = envelope(GuestMessage::Error(GuestErrorMessage {
+            run_id: "run-1".into(),
+            kind: GuestErrorKind::SpawnFailed,
+            message: format!("bad\0{}", "x".repeat(100_000)),
+        }));
+        let err = fake_guest_reply(reply).await.unwrap_err().to_string();
+        assert!(
+            err.len() <= MAX_GUEST_ERROR_BYTES + 64,
+            "{} bytes",
+            err.len()
+        );
+        assert!(!err.contains('\0'));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_request_gets_an_error_frame() {
+        let (mut host, mut guest) = tokio::io::duplex(4096);
+        let executor = Recorder {
+            events: Arc::default(),
+            answer: Err(SandboxError::Cancelled),
+        };
+        let server =
+            tokio::spawn(
+                async move { serve_connection(&mut guest, &executor, &UnmanagedKernel).await },
+            );
+        let wrong = serde_json::json!({"version": 99, "message": {"type": "ping"}});
+        write_frame(&mut host, &wrong, 1024).await.unwrap();
+        let reply: GuestMessage = read_message(&mut host, MAX_CONTROL_FRAME_BYTES)
+            .await
+            .unwrap();
+        assert!(
+            matches!(reply, GuestMessage::Error(ref e) if e.run_id.is_empty() && e.message.contains("version")),
+            "{reply:?}"
+        );
+        assert!(server.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_reply_fails_still_counts_as_the_run() {
+        let (mut host, mut guest) = tokio::io::duplex(1 << 20);
+        let executor = Recorder {
+            events: Arc::default(),
+            answer: Ok(outcome(RunStatus::Exited { code: 0 })),
+        };
+        let run = HostMessage::Run(Box::new(RunMessage {
+            run_id: "run-1".into(),
+            entropy: "00".repeat(32),
+            unix_time_ms: 0,
+            plan: job().plan,
+        }));
+        write_message(&mut host, run, MAX_FRAME_BYTES)
+            .await
+            .unwrap();
+        // The host goes away before the reply.
+        drop(host);
+        let served = serve_connection(&mut guest, &executor, &UnmanagedKernel)
+            .await
+            .unwrap();
+        assert_eq!(served, Served::Run);
     }
 
     #[tokio::test]

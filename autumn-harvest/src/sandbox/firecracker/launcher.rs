@@ -406,8 +406,8 @@ impl FirecrackerLauncher {
                 }
                 Ok::<(), SandboxError>(())
             })
-            .await
-            .map(|()| ())
+            .await?;
+        Ok(())
     }
 
     /// Create the VM directory and the command for `id`.
@@ -587,11 +587,7 @@ impl FirecrackerLauncher {
                     "--no-api".into(),
                 ]
             }
-            BootMethod::Api => {
-                api_socket = Some(root.join(super::api::JAILED_API_SOCKET));
-                Vec::new()
-            }
-            BootMethod::Snapshot(_) => {
+            BootMethod::Api | BootMethod::Snapshot(_) => {
                 api_socket = Some(root.join(super::api::JAILED_API_SOCKET));
                 Vec::new()
             }
@@ -1455,13 +1451,11 @@ while True:
     }
 
     #[tokio::test]
-    async fn a_jailed_launch_links_the_image_and_runs_the_jailer() {
+    #[ignore = "needs root; the Sandbox (KVM) workflow runs it with sudo"]
+    async fn root_jailed_launch_links_the_image_and_runs_the_jailer() {
         use std::os::unix::fs::MetadataExt as _;
         // SAFETY: geteuid has no preconditions.
-        if unsafe { libc::geteuid() } != 0 {
-            eprintln!("skipped: a jailed launch needs root");
-            return;
-        }
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
         let dir = temp_dir();
         let jailer = script(
             &dir,
@@ -1597,13 +1591,11 @@ while True:
     }
 
     #[tokio::test]
-    async fn a_golden_snapshot_boots_pings_pauses_and_copies_the_files_out() {
+    #[ignore = "needs root; the Sandbox (KVM) workflow runs it with sudo"]
+    async fn root_golden_snapshot_boots_pings_pauses_and_copies_the_files_out() {
         use std::os::unix::fs::MetadataExt as _;
         // SAFETY: geteuid has no preconditions.
-        if unsafe { libc::geteuid() } != 0 {
-            eprintln!("skipped: a jailed launch needs root");
-            return;
-        }
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
         let dir = temp_dir();
         let server = dir.join("fake_api.py");
         std::fs::write(&server, FAKE_GOLDEN_API_PY).unwrap();

@@ -16,6 +16,11 @@
 //! - rlimits for CPU, data memory, file size, open files and core dumps;
 //! - an empty network namespace when the plan denies the network;
 //! - a dedicated uid and gid when the executor runs as root.
+//!
+//! A process that calls `setsid` leaves the group, and the host executor
+//! cannot kill it. On a root host, concurrent runs share the uid `nobody`
+//! unless `run_as` names another. Inside a microVM, neither matters: the
+//! microVM ends after one run.
 
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::{AsRawFd, FromRawFd as _, OwnedFd};
@@ -119,9 +124,12 @@ pub async fn execute_plan(
     if cancel.is_cancelled() {
         return Err(SandboxError::Cancelled);
     }
-    let run_as = effective_run_as(options);
-    let work = WorkDir::create(&options.scratch_root, run_as)?;
+    let run_as = effective_run_as(options)?;
+    // The work directory belongs to the executor until the files are in
+    // place. So no other process of the code uid can plant a link there.
+    let work = WorkDir::create(&options.scratch_root)?;
     write_files(work.path(), plan, run_as)?;
+    work.hand_over(run_as)?;
 
     let setup = ChildSetup::new(plan, run_as);
     let mut command = tokio::process::Command::new(&plan.argv[0]);
@@ -150,6 +158,8 @@ pub async fn execute_plan(
         .spawn()
         .map_err(|e| spawn_error(&plan.argv[0], &e))?;
     let group = child.id().and_then(|pid| i32::try_from(pid).ok());
+    // A dropped run future kills the whole group, not only the main process.
+    let mut guard = GroupGuard(group);
 
     let stdin = plan.stdin.clone();
     if let Some(mut pipe) = child.stdin.take() {
@@ -170,15 +180,14 @@ pub async fn execute_plan(
     };
     // Kill the group in every case: background processes must not outlive
     // the run, hold the pipes, or keep using the CPU.
-    if let Some(group) = group {
+    if let Some(group) = guard.0.take() {
         kill_group(group);
     }
     if !matches!(end, End::Exited(_)) {
         let _ = child.wait().await;
     }
     let duration = started.elapsed();
-    let stdout = stdout.finish().await;
-    let stderr = stderr.finish().await;
+    let (stdout, stderr) = tokio::join!(stdout.finish(), stderr.finish());
 
     let status = match end {
         End::Cancelled => return Err(SandboxError::Cancelled),
@@ -228,10 +237,33 @@ enum End {
 }
 
 /// The uid and gid of the code: the option, or `nobody` for a root executor.
-fn effective_run_as(options: &ExecOptions) -> Option<(u32, u32)> {
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Config`] for uid 0 or gid 0.
+fn effective_run_as(options: &ExecOptions) -> Result<Option<(u32, u32)>, SandboxError> {
     // SAFETY: geteuid has no preconditions.
     let root = unsafe { libc::geteuid() } == 0;
-    options.run_as.or_else(|| root.then_some(NOBODY))
+    let run_as = options.run_as.or_else(|| root.then_some(NOBODY));
+    if run_as.is_some_and(|(uid, gid)| uid == 0 || gid == 0) {
+        return Err(SandboxError::Config(
+            "the code must not run as uid 0 or gid 0".into(),
+        ));
+    }
+    Ok(run_as)
+}
+
+/// Kills a process group when the run future is dropped. The run takes the
+/// group out after its own kill, because the id can be reused after the
+/// main process is reaped.
+struct GroupGuard(Option<i32>);
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if let Some(group) = self.0.take() {
+            kill_group(group);
+        }
+    }
 }
 
 /// Map a spawn error to a sandbox error.
@@ -451,7 +483,8 @@ struct WorkDir {
 }
 
 impl WorkDir {
-    fn create(root: &Path, run_as: Option<(u32, u32)>) -> Result<Self, SandboxError> {
+    /// Create a new directory with mode `0700` that the executor owns.
+    fn create(root: &Path) -> Result<Self, SandboxError> {
         let path = root.join(format!("harvest-sbx-{}", uuid::Uuid::new_v4().simple()));
         std::fs::DirBuilder::new()
             .mode(0o700)
@@ -462,16 +495,20 @@ impl WorkDir {
                     path.display()
                 ))
             })?;
-        let dir = Self {
+        Ok(Self {
             path,
             removed: false,
-        };
+        })
+    }
+
+    /// Give the directory to the code uid.
+    fn hand_over(&self, run_as: Option<(u32, u32)>) -> Result<(), SandboxError> {
         if let Some((uid, gid)) = run_as {
-            std::os::unix::fs::chown(&dir.path, Some(uid), Some(gid)).map_err(|e| {
+            std::os::unix::fs::chown(&self.path, Some(uid), Some(gid)).map_err(|e| {
                 SandboxError::Unavailable(format!("could not hand the work directory over: {e}"))
             })?;
         }
-        Ok(dir)
+        Ok(())
     }
 
     fn path(&self) -> &Path {
@@ -499,8 +536,8 @@ impl Drop for WorkDir {
     }
 }
 
-/// Write the plan files into `dir`. The directory is new, and no code ran
-/// in it yet, so no link can redirect a write.
+/// Write the plan files into `dir`. The directory is new, and only the
+/// executor can write it, so no link can redirect a write.
 fn write_files(
     dir: &Path,
     plan: &ExecPlan,
@@ -614,6 +651,11 @@ fn read_output(root: &std::fs::File, path: &str, max: u64) -> Result<Vec<u8>, St
     if !meta.is_file() {
         return Err("the path is not a regular file".to_owned());
     }
+    // A hard link can name a file outside the work directory that the code
+    // cannot read. `RESOLVE_BENEATH` does not stop it.
+    if std::os::unix::fs::MetadataExt::nlink(&meta) != 1 {
+        return Err("the file has more than one hard link".to_owned());
+    }
     if meta.len() > max {
         return Err(format!(
             "the file holds {} bytes, over the limit of {max} bytes",
@@ -644,7 +686,8 @@ fn open_beneath(root: &std::fs::File, path: &str) -> io::Result<std::fs::File> {
     how.flags = u64::try_from(flags).unwrap_or(0);
     how.resolve = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS;
     // SAFETY: openat2 reads a valid C string and a valid open_how of the
-    // given size. A non-negative result is a new descriptor that we own.
+    // given size. A non-negative result is a new descriptor that this
+    // function owns.
     let fd = unsafe {
         libc::syscall(
             libc::SYS_openat2,
@@ -683,7 +726,7 @@ fn open_beneath_walk(root: &std::fs::File, path: &str, flags: i32) -> io::Result
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
         };
         // SAFETY: openat reads a valid C string. A non-negative result is a
-        // new descriptor that we own.
+        // new descriptor that this function owns.
         let fd = unsafe { libc::openat(at, name.as_ptr(), component_flags) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -736,6 +779,11 @@ pub async fn network_isolation_available() -> bool {
 
 /// Remove a work directory, and fix the modes that the code changed first.
 ///
+/// `remove_dir_all` does not follow a symbolic link. Root ignores the modes,
+/// so a root executor never runs the path walk below. That walk is not safe
+/// against a live process, so it runs only for a non-root executor, whose
+/// code has the same uid anyway.
+///
 /// # Errors
 ///
 /// Returns the I/O error of the final removal.
@@ -743,7 +791,12 @@ pub fn remove_work_dir(dir: &Path) -> io::Result<()> {
     match std::fs::remove_dir_all(dir) {
         Ok(()) => return Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => {}
+        Err(e) => {
+            // SAFETY: geteuid has no preconditions.
+            if unsafe { libc::geteuid() } == 0 {
+                return Err(e);
+            }
+        }
     }
     // The code can remove the write or search bit of a directory, which
     // blocks the removal for a non-root executor. Restore the owner bits of
@@ -857,7 +910,7 @@ mod tests {
     #[tokio::test]
     async fn a_timeout_kills_the_run_and_is_an_outcome() {
         let started = Instant::now();
-        let out = run(sh("echo before; sleep 30").with_timeout_ms(300)).await;
+        let out = run(sh("echo before; sleep 30").with_timeout_ms(2_000)).await;
         assert_eq!(out.status, RunStatus::TimedOut);
         assert_eq!(out.stdout, "before\n");
         assert!(started.elapsed() < Duration::from_secs(10));
@@ -925,6 +978,35 @@ mod tests {
         let out = run(sh("ln -s /etc/hostname out.txt").with_output("out.txt")).await;
         assert!(out.outputs.is_empty(), "a symlink must not be followed");
         assert_eq!(out.skipped_outputs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_hard_linked_output_is_skipped() {
+        let out = run(sh("echo hi > a.txt; ln a.txt out.txt").with_output("out.txt")).await;
+        assert!(out.outputs.is_empty(), "a hard link must not be returned");
+        assert!(
+            out.skipped_outputs[0].reason.contains("hard link"),
+            "{:?}",
+            out.skipped_outputs
+        );
+    }
+
+    #[tokio::test]
+    async fn uid_zero_for_the_code_is_a_config_error() {
+        let plan = SandboxPolicy::for_development()
+            .with_network(NetworkPolicy::Allow)
+            .plan(&sh("id -u"))
+            .unwrap();
+        for run_as in [(0, 1000), (1000, 0)] {
+            let options = ExecOptions {
+                run_as: Some(run_as),
+                ..ExecOptions::default()
+            };
+            let err = execute_plan(&plan, &options, &CancellationToken::new())
+                .await
+                .expect_err("root");
+            assert!(matches!(err, SandboxError::Config(_)), "{err:?}");
+        }
     }
 
     #[tokio::test]
@@ -1020,20 +1102,23 @@ mod tests {
         // Open a descriptor without close-on-exec, as a careless library
         // might, and move it to a high number.
         let path = std::ffi::CString::new("/dev/null").unwrap();
-        // SAFETY: plain libc calls on a valid C string and our own fds.
+        // SAFETY: plain libc calls on a valid C string and on descriptors
+        // that this test opened. F_DUPFD takes a free number, so the test
+        // never closes a descriptor of another test.
         let leaked = unsafe {
             let fd = libc::open(path.as_ptr(), libc::O_RDONLY);
             assert!(fd >= 0);
-            let high = libc::dup2(fd, 77);
+            let high = libc::fcntl(fd, libc::F_DUPFD, 77);
             libc::close(fd);
             high
         };
-        assert_eq!(leaked, 77);
+        assert!(leaked >= 77, "{leaked}");
         let out = run(sh("ls /proc/$$/fd")).await;
         // SAFETY: closes the descriptor that this test opened.
         unsafe { libc::close(leaked) };
         let fds: Vec<&str> = out.stdout.split_whitespace().collect();
-        assert!(!fds.contains(&"77"), "fd 77 leaked: {fds:?}");
+        let name = leaked.to_string();
+        assert!(!fds.contains(&name.as_str()), "fd {leaked} leaked: {fds:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1109,12 +1194,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs root; the Sandbox (KVM) workflow runs it with sudo"]
     async fn root_runs_the_code_as_nobody() {
         // SAFETY: geteuid has no preconditions.
-        if unsafe { libc::geteuid() } != 0 {
-            eprintln!("skipped: the uid switch needs root");
-            return;
-        }
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
         let out = run(sh("id -u; id -g; id -G")).await;
         let lines: Vec<&str> = out.stdout.lines().collect();
         assert_eq!(
@@ -1125,12 +1208,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_process_limit_stops_a_fork_bomb_under_a_dedicated_uid() {
+    #[ignore = "needs root; the Sandbox (KVM) workflow runs it with sudo"]
+    async fn root_process_limit_stops_a_fork_bomb_under_a_dedicated_uid() {
         // SAFETY: geteuid has no preconditions.
-        if unsafe { libc::geteuid() } != 0 {
-            eprintln!("skipped: the process limit needs a dedicated uid");
-            return;
-        }
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
         let mut policy = SandboxPolicy::for_development().with_network(NetworkPolicy::Allow);
         policy.default_limits.max_processes = 8;
         let plan = policy

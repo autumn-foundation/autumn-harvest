@@ -64,7 +64,12 @@ pub struct RunMessage {
 }
 
 /// A message from the guest to the host.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The host decodes it from untrusted bytes. A derived tagged decoder first
+/// copies the whole message into a tree, which can cost many times the frame
+/// size. The decoder here reads each field as it comes, in any order, and
+/// skips an unknown field without a copy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GuestMessage {
     /// The guest agent is ready.
@@ -73,6 +78,104 @@ pub enum GuestMessage {
     Outcome(OutcomeMessage),
     /// The guest could not run the plan.
     Error(GuestErrorMessage),
+}
+
+/// The fields of a guest message.
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum GuestField {
+    Type,
+    RunId,
+    Outcome,
+    Kind,
+    Message,
+    #[serde(other)]
+    Other,
+}
+
+impl<'de> Deserialize<'de> for GuestMessage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(GuestMessageVisitor)
+    }
+}
+
+/// Reads a guest message field by field.
+struct GuestMessageVisitor;
+
+/// The fields of a guest message, before the type picks the variant.
+#[derive(Default)]
+struct GuestFields {
+    kind: Option<String>,
+    run_id: Option<String>,
+    outcome: Option<SandboxOutcome>,
+    error_kind: Option<GuestErrorKind>,
+    message: Option<String>,
+}
+
+impl<'de> serde::de::Visitor<'de> for GuestMessageVisitor {
+    type Value = GuestMessage;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a guest message object")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<GuestMessage, A::Error> {
+        use serde::de::Error as _;
+        let mut fields = GuestFields::default();
+        while let Some(field) = map.next_key::<GuestField>()? {
+            match field {
+                GuestField::Type => put(&mut fields.kind, map.next_value()?, "type")?,
+                GuestField::RunId => put(&mut fields.run_id, map.next_value()?, "run_id")?,
+                GuestField::Outcome => put(&mut fields.outcome, map.next_value()?, "outcome")?,
+                GuestField::Kind => put(&mut fields.error_kind, map.next_value()?, "kind")?,
+                GuestField::Message => put(&mut fields.message, map.next_value()?, "message")?,
+                GuestField::Other => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        let GuestFields {
+            kind,
+            run_id,
+            outcome,
+            error_kind,
+            message,
+        } = fields;
+        match (kind.as_deref(), run_id, outcome, error_kind, message) {
+            (Some("pong"), None, None, None, None) => Ok(GuestMessage::Pong),
+            (Some("outcome"), Some(run_id), Some(outcome), None, None) => {
+                Ok(GuestMessage::Outcome(OutcomeMessage { run_id, outcome }))
+            }
+            (Some("error"), Some(run_id), None, Some(kind), Some(message)) => {
+                Ok(GuestMessage::Error(GuestErrorMessage {
+                    run_id,
+                    kind,
+                    message,
+                }))
+            }
+            (None, ..) => Err(A::Error::missing_field("type")),
+            (Some(kind @ ("pong" | "outcome" | "error")), ..) => Err(A::Error::custom(format!(
+                "a guest {kind} message has the wrong fields"
+            ))),
+            (Some(other), ..) => Err(A::Error::unknown_variant(
+                other,
+                &["pong", "outcome", "error"],
+            )),
+        }
+    }
+}
+
+/// Store the first value of a field. A second one is an error.
+pub(crate) fn put<T, E: serde::de::Error>(
+    slot: &mut Option<T>,
+    value: T,
+    name: &'static str,
+) -> Result<(), E> {
+    if slot.is_some() {
+        return Err(E::duplicate_field(name));
+    }
+    *slot = Some(value);
+    Ok(())
 }
 
 /// The body of [`GuestMessage::Outcome`].
@@ -413,5 +516,73 @@ mod tests {
             .await
             .expect_err("unknown type");
         assert!(matches!(err, FrameError::Malformed(_)));
+    }
+
+    fn outcome_json() -> serde_json::Value {
+        serde_json::to_value(crate::sandbox::outcome::tests::outcome(
+            crate::sandbox::outcome::RunStatus::Exited { code: 0 },
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_guest_message_decodes_in_any_key_order_and_skips_unknown_fields() {
+        let text = format!(
+            r#"{{"outcome":{},"junk":[1,[2,{{"x":3}}]],"run_id":"r1","type":"outcome"}}"#,
+            outcome_json()
+        );
+        let message: GuestMessage = serde_json::from_str(&text).unwrap();
+        assert!(matches!(message, GuestMessage::Outcome(ref m) if m.run_id == "r1"));
+        let error: GuestMessage = serde_json::from_str(
+            r#"{"message":"no python3","kind":"spawn_failed","type":"error","run_id":"r1"}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(error, GuestMessage::Error(ref e) if e.kind == GuestErrorKind::SpawnFailed)
+        );
+        let pong: GuestMessage = serde_json::from_str(r#"{"type":"pong"}"#).unwrap();
+        assert_eq!(pong, GuestMessage::Pong);
+    }
+
+    #[test]
+    fn a_guest_message_with_the_wrong_fields_is_refused() {
+        for text in [
+            r#"{"type":"pong","run_id":"r1"}"#.to_owned(),
+            r#"{"type":"outcome","run_id":"r1"}"#.to_owned(),
+            r#"{"type":"error","run_id":"r1","kind":"internal"}"#.to_owned(),
+            r#"{"type":"shell"}"#.to_owned(),
+            r#"{"run_id":"r1"}"#.to_owned(),
+            r#"{"type":"pong","type":"pong"}"#.to_owned(),
+            format!(
+                r#"{{"type":"error","run_id":"r1","kind":"internal","message":"m","outcome":{}}}"#,
+                outcome_json()
+            ),
+        ] {
+            assert!(
+                serde_json::from_str::<GuestMessage>(&text).is_err(),
+                "{text} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_run_status_decodes_in_the_key_order_of_jsonb() {
+        use crate::sandbox::outcome::RunStatus;
+        // Postgres `jsonb` sorts keys, so `code` comes before `kind`.
+        let status: RunStatus = serde_json::from_str(r#"{"code":3,"kind":"exited"}"#).unwrap();
+        assert_eq!(status, RunStatus::Exited { code: 3 });
+        let status: RunStatus =
+            serde_json::from_str(r#"{"kind":"signaled","later":[1,2],"signal":9}"#).unwrap();
+        assert_eq!(status, RunStatus::Signaled { signal: 9 });
+        let status: RunStatus = serde_json::from_str(r#"{"kind":"timed_out"}"#).unwrap();
+        assert_eq!(status, RunStatus::TimedOut);
+        for bad in [
+            r#"{"kind":"exited"}"#,
+            r#"{"kind":"timed_out","code":1}"#,
+            r#"{"kind":"exploded"}"#,
+            r#"{"code":1}"#,
+        ] {
+            assert!(serde_json::from_str::<RunStatus>(bad).is_err(), "{bad}");
+        }
     }
 }

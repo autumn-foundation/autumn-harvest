@@ -15,7 +15,11 @@ use super::request::ExecPlan;
 pub const MAX_SKIP_REASON_BYTES: usize = 256;
 
 /// How the code ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The decoder reads the fields in any order, because Postgres `jsonb`
+/// sorts the keys. It skips an unknown field without a copy, as the guest
+/// message decoder does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RunStatus {
     /// The main process exited with this code.
@@ -33,9 +37,77 @@ pub enum RunStatus {
     TimedOut,
 }
 
+/// A guest string for an error message: quoted, escaped, and cut to 64
+/// characters. A guest can send any bytes, and the message goes to history.
+#[must_use]
+pub fn shown(text: &str) -> String {
+    const SHOWN_CHARS: usize = 64;
+    if text.chars().count() <= SHOWN_CHARS {
+        return format!("{text:?}");
+    }
+    let head: String = text.chars().take(SHOWN_CHARS).collect();
+    format!("{head:?}...")
+}
+
+/// The fields of a run status.
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum StatusField {
+    Kind,
+    Code,
+    Signal,
+    #[serde(other)]
+    Other,
+}
+
+impl<'de> Deserialize<'de> for RunStatus {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(RunStatusVisitor)
+    }
+}
+
+/// Reads a run status field by field.
+struct RunStatusVisitor;
+
+impl<'de> serde::de::Visitor<'de> for RunStatusVisitor {
+    type Value = RunStatus;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a run status object")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<RunStatus, A::Error> {
+        use super::protocol::put;
+        use serde::de::Error as _;
+        let (mut kind, mut code, mut signal) = (None::<String>, None, None);
+        while let Some(field) = map.next_key::<StatusField>()? {
+            match field {
+                StatusField::Kind => put(&mut kind, map.next_value()?, "kind")?,
+                StatusField::Code => put(&mut code, map.next_value()?, "code")?,
+                StatusField::Signal => put(&mut signal, map.next_value()?, "signal")?,
+                StatusField::Other => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        match (kind.as_deref(), code, signal) {
+            (Some("exited"), Some(code), None) => Ok(RunStatus::Exited { code }),
+            (Some("signaled"), None, Some(signal)) => Ok(RunStatus::Signaled { signal }),
+            (Some("timed_out"), None, None) => Ok(RunStatus::TimedOut),
+            (None, ..) => Err(A::Error::missing_field("kind")),
+            (Some(kind @ ("exited" | "signaled" | "timed_out")), ..) => Err(A::Error::custom(
+                format!("a {kind} status has the wrong fields"),
+            )),
+            (Some(other), ..) => Err(A::Error::unknown_variant(
+                other,
+                &["exited", "signaled", "timed_out"],
+            )),
+        }
+    }
+}
+
 /// One output file that the run returns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct OutputFile {
     /// The path that the request asked for.
     pub path: String,
@@ -46,7 +118,6 @@ pub struct OutputFile {
 
 /// One output file that the run does not return, and why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SkippedOutput {
     /// The path that the request asked for.
     pub path: String,
@@ -55,8 +126,11 @@ pub struct SkippedOutput {
 }
 
 /// The result of one sandbox run.
+///
+/// History keeps it as the activity result. A decoder skips an unknown
+/// field, so a later release can add a field while an older worker still
+/// reads the result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SandboxOutcome {
     /// How the code ended.
     pub status: RunStatus,
@@ -127,7 +201,7 @@ impl SandboxOutcome {
         let mut seen = std::collections::BTreeSet::new();
         for output in &self.outputs {
             if !plan.outputs.contains(&output.path) {
-                return violation(format!("output {:?} was not asked for", output.path));
+                return violation(format!("output {} was not asked for", shown(&output.path)));
             }
             if !seen.insert(output.path.as_str()) {
                 return violation(format!("output {:?} appears twice", output.path));
@@ -149,13 +223,19 @@ impl SandboxOutcome {
         for skipped in &self.skipped_outputs {
             if !plan.outputs.contains(&skipped.path) {
                 return violation(format!(
-                    "skipped output {:?} was not asked for",
-                    skipped.path
+                    "skipped output {} was not asked for",
+                    shown(&skipped.path)
                 ));
             }
             if skipped.reason.len() > MAX_SKIP_REASON_BYTES {
                 return violation(format!(
                     "skipped output {:?} has a long reason",
+                    skipped.path
+                ));
+            }
+            if skipped.reason.contains('\0') {
+                return violation(format!(
+                    "skipped output {:?} has a NUL byte in its reason",
                     skipped.path
                 ));
             }
@@ -248,6 +328,32 @@ pub(crate) mod tests {
             out.check_bounds(&plan),
             Err(SandboxError::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn a_nul_in_a_skip_reason_breaks_the_bounds() {
+        let plan = plan_with_output("out.txt");
+        let mut out = outcome(RunStatus::Exited { code: 0 });
+        out.skipped_outputs.push(SkippedOutput {
+            path: "out.txt".into(),
+            reason: "gone\0".into(),
+        });
+        assert!(matches!(
+            out.check_bounds(&plan),
+            Err(SandboxError::Protocol(ref m)) if m.contains("NUL")
+        ));
+    }
+
+    #[test]
+    fn a_long_guest_path_is_cut_in_the_error() {
+        let plan = plan_with_output("out.txt");
+        let mut out = outcome(RunStatus::Exited { code: 0 });
+        out.outputs.push(OutputFile {
+            path: "x".repeat(100_000),
+            content: Vec::new(),
+        });
+        let err = out.check_bounds(&plan).unwrap_err().to_string();
+        assert!(err.len() < 200, "{} bytes", err.len());
     }
 
     #[test]

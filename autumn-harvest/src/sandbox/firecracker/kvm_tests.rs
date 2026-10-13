@@ -7,8 +7,8 @@
 //! - `HARVEST_FIRECRACKER_BIN`: the Firecracker binary.
 //! - `HARVEST_GUEST_KERNEL` and `HARVEST_GUEST_ROOTFS`: the guest image from
 //!   `scripts/sandbox/build-guest-image.sh`.
-//! - `HARVEST_JAILER_BIN`: the jailer binary. The jailer tests also need
-//!   root, and they skip without both.
+//! - `HARVEST_JAILER_BIN`: the jailer binary. The tests whose names start
+//!   with `root_` also need root, and they skip without both.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,9 +29,7 @@ use crate::sandbox::runtime::SandboxRuntime;
 const IGNORE: &str = "needs /dev/kvm, Firecracker and a guest image";
 
 fn env_path(name: &str) -> PathBuf {
-    std::env::var_os(name)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("set {name}: {IGNORE}"))
+    std::env::var_os(name).map_or_else(|| panic!("set {name}: {IGNORE}"), PathBuf::from)
 }
 
 fn short_dir() -> PathBuf {
@@ -294,8 +292,53 @@ async fn a_warm_pool_serves_each_run_from_a_new_microvm() {
 }
 
 #[tokio::test]
-#[ignore = "needs /dev/kvm, Firecracker and a guest image"]
-async fn the_jailer_runs_code_and_removes_the_jail() {
+#[ignore = "needs /dev/kvm, Firecracker, a guest image and root"]
+async fn root_snapshot_boots_get_fresh_entropy_and_the_host_clock() {
+    let Some(config) = jailed() else {
+        return;
+    };
+    let launcher = FirecrackerLauncher::new(config.clone()).expect("a launcher");
+    launcher
+        .verify_host(PosturePolicy::Report)
+        .await
+        .expect("a supported Firecracker");
+    let files = launcher
+        .create_golden_snapshot(&short_dir(), Duration::from_secs(30))
+        .await
+        .expect("a golden snapshot");
+    drop(launcher);
+    // The clock in the snapshot falls behind while the files wait.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let mut config = config;
+    config.boot = BootMethod::Snapshot(files);
+    let harness = Harness::new(config, 0).await;
+    let code = "import os, time\nprint(os.urandom(16).hex())\nprint(int(time.time() * 1000))";
+    let mut randoms = Vec::new();
+    for _ in 0..2 {
+        let outcome = harness.run(&SandboxRequest::new("python3", code)).await;
+        exited(&outcome);
+        let mut lines = outcome.stdout.lines();
+        randoms.push(lines.next().expect("a random line").to_owned());
+        let guest_ms: u64 = lines.next().expect("a time line").parse().expect("a time");
+        let host_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock after the epoch")
+                .as_millis(),
+        )
+        .expect("a 64-bit time");
+        assert!(
+            host_ms.abs_diff(guest_ms) < 2_000,
+            "the guest clock is {guest_ms}, the host clock is {host_ms}"
+        );
+    }
+    assert_ne!(randoms[0], randoms[1], "two clones share random state");
+    harness.assert_clean().await;
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm, Firecracker, a guest image and root"]
+async fn root_jailed_microvm_runs_code_and_removes_the_jail() {
     let Some(config) = jailed() else {
         return;
     };

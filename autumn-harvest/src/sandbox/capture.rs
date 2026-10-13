@@ -78,7 +78,11 @@ impl StreamCapture {
         let mut head = self.head;
         let text = if truncated {
             let tail: Vec<u8> = self.tail.into_iter().collect();
-            format!("{}{TRUNCATION_MARKER}{}", decode(&head), decode(&tail))
+            // The cut can split a character at the end of the head and at
+            // the start of the tail. Drop those parts, not as U+FFFD noise.
+            let head = &head[..complete_prefix(&head)];
+            let tail = &tail[continuation_prefix(&tail)..];
+            format!("{}{TRUNCATION_MARKER}{}", decode(head), decode(tail))
         } else {
             // Nothing was dropped, so decode one buffer. Two decodes could
             // split a multi-byte character at the head and tail boundary.
@@ -91,6 +95,35 @@ impl StreamCapture {
             truncated,
         }
     }
+}
+
+/// The length of `bytes` without a split character at its end. At most three
+/// bytes go.
+fn complete_prefix(bytes: &[u8]) -> usize {
+    for back in 1..=bytes.len().min(3) {
+        let at = bytes.len() - back;
+        let byte = bytes[at];
+        if byte & 0xC0 != 0x80 {
+            // A lead byte: keep it only if its character is whole.
+            let need = match byte {
+                0xC0..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                0xF0..=0xF7 => 4,
+                _ => 1,
+            };
+            return if need > back { at } else { bytes.len() };
+        }
+    }
+    bytes.len()
+}
+
+/// The number of continuation bytes at the start of `bytes`, at most three.
+fn continuation_prefix(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .take(3)
+        .take_while(|byte| *byte & 0xC0 == 0x80)
+        .count()
 }
 
 /// Decode bytes as lossy UTF-8, and replace each NUL with U+FFFD.
@@ -189,6 +222,18 @@ mod tests {
         let text = cap.finish();
         assert_eq!(text.text, "a\u{e9}!");
         assert!(!text.truncated);
+    }
+
+    #[test]
+    fn a_truncated_stream_cuts_on_character_boundaries() {
+        // "é" is two bytes. An odd cap splits one at each seam.
+        for cap_bytes in [7, 9, 11] {
+            let mut cap = StreamCapture::new(cap_bytes);
+            cap.push("é".repeat(40).as_bytes());
+            let text = cap.finish().text;
+            assert!(!text.contains('\u{fffd}'), "cap {cap_bytes}: {text:?}");
+            assert!(text.contains(TRUNCATION_MARKER));
+        }
     }
 
     #[test]
