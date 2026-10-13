@@ -49,8 +49,9 @@ The planner sees one more tool, `delegate`. Its input is `agent`, one of the
 peer names, and `task`, the text for the peer. The tool description lists
 each peer with its description. A run with a mandate reserves the name
 `delegate`, so an app tool with that name is hidden. The name stays reserved
-when the lookup finds no peer. The model then sees no `delegate` tool, and a
-call to it gets a refusal.
+when the lookup finds no peer. The model then sees no `delegate` tool. A call
+to it still gets a named verdict and a record, as in section 5, also under a
+tool allowlist or flow rules.
 
 The result of a delegation is JSON:
 

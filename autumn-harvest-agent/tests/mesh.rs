@@ -245,6 +245,63 @@ async fn a_mandate_reserves_the_delegate_name_with_no_known_peer() {
     assert_eq!(report.delegations[0].refusal, Some(Refusal::UnknownPeer));
 }
 
+/// Run a planner with a mandate that names only the missing peer `ghost`.
+/// Returns the report and the model.
+async fn delegate_to_ghost(
+    mandate: Mandate,
+    flow: Option<FlowRules>,
+) -> (autumn_harvest_agent::AgentReport, Arc<ScriptedModel>) {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        delegate("d1", "ghost", "haunt", 1),
+        answer("alone", 1),
+    ]);
+    let mut harness = AgentHarness::new(model.clone()).tool(recorded_tool(
+        "lookup",
+        ToolEffect::ReadOnly,
+        &recorder,
+    ));
+    if let Some(flow) = flow {
+        harness = harness.flow_rules(flow);
+    }
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::start(&mut rt, &AgentTask::new("go").mandate(mandate)).unwrap();
+    (report(rt.run_until_blocked(exec).await.unwrap()), model)
+}
+
+// AC2, AC7
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delegate_call_with_no_known_peer_gets_a_verdict_under_every_bound() {
+    let allowlist = Mandate::new("planner").peers(["ghost"]).tools(["lookup"]);
+    let rule_of_two = Some(FlowRules::rule_of_two());
+    for (case, mandate, flow) in [
+        ("tool allowlist", allowlist, None),
+        (
+            "flow rules",
+            Mandate::new("planner").peers(["ghost"]),
+            rule_of_two,
+        ),
+    ] {
+        let (report, model) = delegate_to_ghost(mandate, flow).await;
+        assert_eq!(report.stop, AgentStop::Completed, "{case}");
+        assert!(
+            !offered(&model.requests()[0]).contains(DELEGATE_TOOL),
+            "{case}: no peer, so no delegate tool is offered"
+        );
+        assert_eq!(
+            report.delegations.len(),
+            1,
+            "{case}: the refusal is recorded"
+        );
+        assert_eq!(
+            report.delegations[0].refusal,
+            Some(Refusal::UnknownPeer),
+            "{case}"
+        );
+    }
+}
+
 // AC2
 #[tokio::test(flavor = "multi_thread")]
 async fn with_no_mandate_an_app_tool_named_delegate_runs() {
@@ -1245,7 +1302,10 @@ async fn a_positional_delegate_call_is_refused_as_invalid_arguments() {
     let report = report(rt.run_until_blocked(exec).await.unwrap());
 
     assert_eq!(report.delegations.len(), 1);
-    assert_eq!(report.delegations[0].refusal, Some(Refusal::InvalidArguments));
+    assert_eq!(
+        report.delegations[0].refusal,
+        Some(Refusal::InvalidArguments)
+    );
     assert_eq!(model.calls(), 2, "no child model call runs");
 }
 
