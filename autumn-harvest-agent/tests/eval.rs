@@ -1181,3 +1181,117 @@ async fn each_segment_sees_its_recorded_memory_snapshot() {
         "the memory write never runs live"
     );
 }
+
+/// A delegation run evaluates with no roster on the candidate: the recorded
+/// peer lookup answers it (agent mesh, AC13).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delegation_run_evaluates_without_divergence() {
+    use autumn_harvest_agent::{DELEGATE_TOOL, Mandate, Peer};
+
+    let (_dir, db) = fresh_db();
+    let script = || {
+        vec![
+            calls(
+                &[(
+                    "d1",
+                    DELEGATE_TOOL,
+                    json!({"agent": "researcher", "task": "dig"}),
+                )],
+                1,
+            ),
+            answer("dug", 1),
+            answer("done", 1),
+        ]
+    };
+    let harness = AgentHarness::new(ScriptedModel::new(script()))
+        .peer(Peer::new("researcher", "Finds facts."));
+    let mut rt = runtime(&db, harness);
+    let task = AgentTask::new("go").mandate(Mandate::new("planner").peers(["researcher"]));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    let source = rt.load_history(exec).unwrap();
+
+    let model = ScriptedModel::new(script());
+    let evaluation = evaluate(&source, &Candidate::new(AgentHarness::new(model.clone())))
+        .await
+        .unwrap();
+
+    assert!(!evaluation.diverged(), "{evaluation:#?}");
+    assert_eq!(evaluation.turns.len(), 3);
+    assert_eq!(model.calls(), 3);
+    let RunEnd::Completed(report) = &evaluation.candidate else {
+        panic!("the candidate completes: {:?}", evaluation.candidate);
+    };
+    assert_eq!(report.delegations.len(), 1);
+}
+
+/// In a delegation run, a recorded tool outcome answers only an equal call of
+/// the same agent (agent mesh, AC13).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_child_call_takes_the_outcome_of_the_same_agent() {
+    use autumn_harvest_agent::{DELEGATE_TOOL, Mandate, Peer, ToolContext};
+
+    let whoami = || {
+        FnTool::with_context(
+            "whoami",
+            "Name the run.",
+            json!({"type": "object"}),
+            |_input, ctx: ToolContext| async move { Ok(json!(ctx.run_id.as_str())) },
+        )
+        .effect(ToolEffect::ReadOnly)
+        .shared()
+    };
+    let script = || {
+        vec![
+            calls(&[("c1", "whoami", json!({}))], 1),
+            calls(
+                &[(
+                    "d1",
+                    DELEGATE_TOOL,
+                    json!({"agent": "researcher", "task": "who?"}),
+                )],
+                1,
+            ),
+            calls(&[("c1", "whoami", json!({}))], 1),
+            answer("child", 1),
+            answer("parent", 1),
+        ]
+    };
+    let (_dir, db) = fresh_db();
+    let harness = AgentHarness::new(ScriptedModel::new(script()))
+        .tool(whoami())
+        .peer(Peer::new("researcher", "Finds facts."));
+    let mut rt = runtime(&db, harness);
+    let task = AgentTask::new("go").mandate(Mandate::new("planner").peers(["researcher"]));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    let source = rt.load_history(exec).unwrap();
+
+    // The candidate parent skips its own call. Without lanes, the child call
+    // would take the parent outcome, which has the same step, name and
+    // arguments.
+    let model = ScriptedModel::new(script().split_off(1));
+    let harness = AgentHarness::new(model.clone()).tool(whoami());
+    let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
+
+    assert_eq!(evaluation.replayed_tool_calls, 1);
+    assert_eq!(evaluation.stubbed_tool_calls, 0);
+    // The second child request carries the replayed outcome.
+    let child = &model.requests()[2];
+    let result = child
+        .messages
+        .last()
+        .and_then(|message| {
+            message.content.iter().find_map(|part| match part {
+                ContentPart::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+        })
+        .expect("the child reads its tool result");
+    assert!(
+        result.contains(":d1"),
+        "the child gets its own outcome: {result}"
+    );
+}

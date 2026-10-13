@@ -69,6 +69,13 @@ pub trait Tool: Send + Sync + std::fmt::Debug {
         ToolEffect::Write
     }
 
+    /// The flow labels of the tool, such as
+    /// [`labels::UNTRUSTED_INPUT`](crate::flow::labels::UNTRUSTED_INPUT).
+    /// [`FlowRules`](crate::flow::FlowRules) read them. The default is none.
+    fn labels(&self) -> &[String] {
+        &[]
+    }
+
     /// The metadata the model sees.
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
@@ -94,6 +101,7 @@ pub struct FnTool {
     description: String,
     schema: serde_json::Value,
     effect: ToolEffect,
+    labels: Vec<String>,
     run: ToolFn,
 }
 
@@ -123,6 +131,7 @@ impl FnTool {
             description: description.into(),
             schema,
             effect: ToolEffect::Write,
+            labels: Vec::new(),
             run: Box::new(move |input, _ctx| Box::pin(run(input))),
         }
     }
@@ -144,6 +153,7 @@ impl FnTool {
             description: description.into(),
             schema,
             effect: ToolEffect::Write,
+            labels: Vec::new(),
             run: Box::new(move |input, ctx| Box::pin(run(input, ctx))),
         }
     }
@@ -152,6 +162,13 @@ impl FnTool {
     #[must_use]
     pub const fn effect(mut self, effect: ToolEffect) -> Self {
         self.effect = effect;
+        self
+    }
+
+    /// Add a flow label. See [`Tool::labels`].
+    #[must_use]
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.labels.push(label.into());
         self
     }
 
@@ -185,6 +202,10 @@ impl Tool for FnTool {
 
     fn effect(&self) -> ToolEffect {
         self.effect
+    }
+
+    fn labels(&self) -> &[String] {
+        &self.labels
     }
 }
 

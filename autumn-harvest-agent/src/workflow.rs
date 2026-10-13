@@ -17,6 +17,7 @@
 //! The loop reads no clock and no state outside its input and the recorded
 //! results. That keeps replay deterministic.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use autumn_harvest::policy::RetryPolicy;
@@ -26,10 +27,13 @@ use crate::approval::{Approval, Decision, approval_signal, await_decision};
 use crate::bounds::{exceeds_bytes, json_len};
 use crate::delivery::{Report, ReportSource, report_text};
 use crate::followup::{self, FOLLOWUP_TOOL, Planned};
-use crate::harness::{AgentHarness, CacheTenant};
+use crate::harness::{AgentHarness, CacheTenant, DEFAULT_TOOL_OUTPUT_LIMIT, truncate};
 use crate::heartbeat::{HeartbeatTask, agent_heartbeat_info};
 use crate::loop_guard::{LoopTracker, LoopVerdict, warning_note};
 use crate::memory::MemoryScope;
+use crate::mesh::{
+    DELEGATE_TOOL, DelegateArgs, DelegationRecord, Mandate, Peer, Refusal, delegate_definition,
+};
 use crate::message::{ChatMessage, ChatRole, ContentPart, RunId, StopReason, TokenUsage, ToolCall};
 use crate::policy::ToolDecision;
 use crate::types::{
@@ -40,17 +44,17 @@ use crate::types::{
 /// The registered workflow name.
 pub const WORKFLOW_NAME: &str = "agent_loop";
 
-/// The state of one run, carried across its segments. Every field is
+/// The state of one agent run, carried across its segments. Every field is
 /// rebuilt from history on replay.
 struct Progress {
     run_id: String,
     messages: Vec<ChatMessage>,
-    /// Tokens of the whole run, earlier segments included.
+    /// Tokens of the whole run, earlier segments and delegations included.
     usage: TokenUsage,
     /// Tool rounds of this segment. `max_steps` bounds it.
     steps: u32,
-    /// Tool rounds of the earlier segments. Approval names and tool steps
-    /// add it, so they never repeat across segments.
+    /// Tool rounds of the earlier segments. Tool steps add it, so they never
+    /// repeat across segments.
     step_base: u32,
     /// Tool calls of the whole run.
     tool_calls: u32,
@@ -67,6 +71,23 @@ struct Progress {
 }
 
 impl Progress {
+    /// A run with `run_id` that continues `messages`.
+    fn new(run_id: String, messages: Vec<ChatMessage>) -> Self {
+        Self {
+            run_id,
+            messages,
+            usage: TokenUsage::default(),
+            steps: 0,
+            step_base: 0,
+            tool_calls: 0,
+            last_text: String::new(),
+            answered: false,
+            tracker: LoopTracker::default(),
+            followup: None,
+            chain: 0,
+        }
+    }
+
     /// Add one model turn to the transcript. Its text becomes the answer.
     fn push_assistant(&mut self, turn: &ModelTurn) {
         let text = turn.text();
@@ -79,7 +100,7 @@ impl Progress {
         });
     }
 
-    fn report(&self, stop: AgentStop) -> AgentReport {
+    fn report(&self, stop: AgentStop, tree: &Tree) -> AgentReport {
         AgentReport {
             stop,
             text: self.last_text.clone(),
@@ -89,7 +110,56 @@ impl Progress {
             messages: without_system(&self.messages),
             followups: self.chain,
             followup_dropped: false,
+            delegations: tree.records.clone(),
         }
+    }
+}
+
+/// The state that every agent of one run tree shares. Every field is rebuilt
+/// from history on replay.
+///
+/// The tree runs one step at a time inside one workflow, so a plain value is
+/// enough. No two children can read it at once.
+struct Tree {
+    /// The run id of the root agent. A child run id adds an ordinal to it.
+    root: String,
+    /// Tool rounds of the whole tree. Approval names use it, so they are
+    /// unique in the tree. With no delegation, it equals the round count of
+    /// the root run, so the names stay as before.
+    rounds: u32,
+    /// Delegations that started in the tree.
+    delegations: u32,
+    /// The flow labels of every call that ran in the tree.
+    exercised: BTreeSet<String>,
+    /// Each delegation, in the order it ended.
+    records: Vec<DelegationRecord>,
+}
+
+/// One agent of a run tree: its mandate, and the peers that its recorded
+/// lookup found.
+struct Agent {
+    mandate: Mandate,
+    peers: Vec<Peer>,
+}
+
+impl Agent {
+    /// The `delegate` tool, when the agent has a peer to ask.
+    fn delegate_tool(&self) -> Option<crate::message::ToolDefinition> {
+        (!self.peers.is_empty()).then(|| delegate_definition(&self.peers))
+    }
+}
+
+/// One agent run: its task and its place in the tree.
+#[derive(Clone, Copy)]
+struct Run<'a> {
+    task: &'a AgentTask,
+    agent: Option<&'a Agent>,
+}
+
+impl Run<'_> {
+    /// The harness tools that the mandate permits. `None` means every tool.
+    fn allowed_tools(&self) -> Option<BTreeSet<String>> {
+        self.agent.and_then(|agent| agent.mandate.tools.clone())
     }
 }
 
@@ -105,13 +175,17 @@ impl Progress {
 /// prompt. The report covers the whole run. Its text is the answer of the
 /// last segment.
 ///
+/// A task with a [`Mandate`] that names peers gets the `delegate` tool. A
+/// delegation runs the peer inline, as a sub-agent. See
+/// [`mesh`](crate::mesh).
+///
 /// The run ends under a named [`AgentStop`] when a bound is reached. A bound
 /// is a normal end, not an error.
 ///
 /// # Errors
 ///
 /// Returns an error when an activity fails for good, for example on a
-/// non-retryable provider failure.
+/// non-retryable provider failure, or when the mandate is not valid.
 #[workflow]
 pub async fn agent_loop(ctx: &WorkflowContext, task: AgentTask) -> Result<AgentReport, String> {
     drive(ctx, &task, ReportSource::Run)
@@ -129,24 +203,29 @@ pub(crate) async fn drive(
     task: &AgentTask,
     source: ReportSource,
 ) -> Result<(AgentReport, u32), String> {
-    let mut progress = Progress {
-        run_id: match task.run_id_source {
-            RunIdSource::ExecutionId => ctx.execution_id().to_string(),
-            // A run recorded before the change keeps its recorded run id.
-            RunIdSource::WorkflowId => ctx.workflow_id().to_owned(),
-        },
-        // A system message inside the history is dropped. Only `task.system`
-        // reaches the model as the system prompt.
-        messages: without_system(&task.history),
-        usage: TokenUsage::default(),
-        steps: 0,
-        step_base: 0,
-        tool_calls: 0,
-        last_text: String::new(),
-        answered: false,
-        tracker: LoopTracker::default(),
-        followup: None,
-        chain: 0,
+    let run_id = match task.run_id_source {
+        RunIdSource::ExecutionId => ctx.execution_id().to_string(),
+        // A run recorded before the change keeps its recorded run id.
+        RunIdSource::WorkflowId => ctx.workflow_id().to_owned(),
+    };
+    // A system message inside the history is dropped. Only `task.system`
+    // reaches the model as the system prompt.
+    let mut progress = Progress::new(run_id, without_system(&task.history));
+    let mut tree = Tree {
+        root: progress.run_id.clone(),
+        rounds: 0,
+        delegations: 0,
+        exercised: BTreeSet::new(),
+        records: Vec::new(),
+    };
+    let agent = match &task.mandate {
+        Some(mandate) => {
+            mandate
+                .validate()
+                .map_err(|err| format!("the task mandate is not valid: {err}"))?;
+            Some(discover(ctx, mandate).await?)
+        }
+        None => None,
     };
     let mut input = task.input.as_str();
     let mut delivered = 0_u32;
@@ -155,6 +234,10 @@ pub(crate) async fn drive(
         // unless the app opts in.
         let woken = progress.chain > 0;
         let read_only = task.read_only
+            || task
+                .mandate
+                .as_ref()
+                .is_some_and(|mandate| mandate.read_only)
             || (woken
                 && !task
                     .followups
@@ -165,8 +248,12 @@ pub(crate) async fn drive(
             history: Vec::new(),
             ..task.clone()
         };
-        let stop = run_segment(ctx, &segment, &mut progress, input).await?;
-        let mut report = progress.report(stop);
+        let run = Run {
+            task: &segment,
+            agent: agent.as_ref(),
+        };
+        let stop = run_segment(ctx, run, &mut progress, &mut tree, input).await?;
+        let mut report = progress.report(stop, &tree);
         if task.deliver {
             let source = if woken {
                 ReportSource::Followup
@@ -216,6 +303,24 @@ pub(crate) async fn drive(
     }
 }
 
+/// Read the peers that `mandate` names, through one recorded activity.
+///
+/// A mandate with no peers needs no lookup, so it records nothing.
+async fn discover(ctx: &WorkflowContext, mandate: &Mandate) -> Result<Agent, String> {
+    let peers = if mandate.peers.is_empty() {
+        Vec::new()
+    } else {
+        let names: Vec<String> = mandate.peers.iter().cloned().collect();
+        ctx.execute_activity(&agent_discover_peers_info(), names)
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    Ok(Agent {
+        mandate: mandate.clone(),
+        peers,
+    })
+}
+
 /// Send one report.
 ///
 /// A failed send never fails the run: the failure is recorded, so replay
@@ -241,10 +346,12 @@ async fn deliver(ctx: &WorkflowContext, report: Report) -> Result<bool, String> 
 /// bound ends it. Returns why the segment ended.
 async fn run_segment(
     ctx: &WorkflowContext,
-    task: &AgentTask,
+    run: Run<'_>,
     progress: &mut Progress,
+    tree: &mut Tree,
     input: &str,
 ) -> Result<AgentStop, String> {
+    let task = run.task;
     let system = system_prompt(ctx, task).await?;
     let mut messages = Vec::with_capacity(progress.messages.len() + 2);
     if let Some(system) = system {
@@ -253,12 +360,23 @@ async fn run_segment(
     messages.append(&mut progress.messages);
     messages.push(ChatMessage::text(ChatRole::User, input));
     progress.messages = messages;
-    let extra_tools = task
+    let extra_tools: Vec<_> = task
         .followups
-        .map(|_| vec![followup::definition()])
-        .unwrap_or_default();
+        .map(|_| followup::definition())
+        .into_iter()
+        .chain(run.agent.and_then(Agent::delegate_tool))
+        .collect();
 
     loop {
+        // A delegation adds the child usage after a turn. A tree over its cap
+        // makes no further call. A run with no delegation never starts a turn
+        // over its cap, so this check changes nothing for it.
+        if task
+            .max_total_tokens
+            .is_some_and(|max| progress.usage.total() > max)
+        {
+            return Ok(AgentStop::TokensExhausted);
+        }
         let request = ModelTurnRequest {
             run_id: progress.run_id.clone(),
             session_id: task.session_id.clone(),
@@ -271,6 +389,9 @@ async fn run_segment(
             memory_scope: task.memory_tool_scope(),
             extra_tools: extra_tools.clone(),
             tenant: task.tenant.clone(),
+            agent: run.agent.map(|agent| agent.mandate.holder().to_owned()),
+            allowed_tools: run.allowed_tools(),
+            exercised: tree.exercised.clone(),
         };
         // A request the engine would refuse is not sent. The refusal is not
         // retryable, so it would fail the run after earlier work was paid for.
@@ -314,11 +435,16 @@ async fn run_segment(
             return Ok(AgentStop::StepsExhausted);
         }
 
-        let step = progress.steps;
+        let slot = Slot {
+            step: progress.steps,
+            round: tree.rounds,
+            position: 0,
+        };
         progress.steps = progress.steps.saturating_add(1);
+        tree.rounds = tree.rounds.saturating_add(1);
         progress.push_assistant(&turn);
 
-        match run_round(ctx, progress, task, step, &turn, calls).await? {
+        match Box::pin(run_round(ctx, run, progress, tree, slot, &turn, calls)).await? {
             RoundEnd::Continue => {}
             RoundEnd::Full => return Ok(AgentStop::TranscriptFull),
             RoundEnd::Loop => return Ok(AgentStop::LoopDetected),
@@ -355,6 +481,17 @@ enum RoundEnd {
     Loop,
 }
 
+/// Where one call sits in its run and in the tree.
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+    /// The tool round (0-based) of the segment.
+    step: u32,
+    /// The tool round of the whole tree. The approval name holds it.
+    round: u32,
+    /// The position of the call in its round.
+    position: usize,
+}
+
 /// Answer every call of one round in ONE tool message.
 ///
 /// The results can pass the request cap. No more calls run then, because the
@@ -363,12 +500,14 @@ enum RoundEnd {
 /// stays valid and shows what ran.
 async fn run_round(
     ctx: &WorkflowContext,
+    run: Run<'_>,
     progress: &mut Progress,
-    task: &AgentTask,
-    step: u32,
+    tree: &mut Tree,
+    slot: Slot,
     turn: &ModelTurn,
     calls: Vec<ToolCall>,
 ) -> Result<RoundEnd, String> {
+    let task = run.task;
     let cap = task.request_cap();
     let mut results = Vec::with_capacity(calls.len());
     let mut spent = 0_u64;
@@ -391,9 +530,11 @@ async fn run_round(
                     .unwrap_or_else(|| ToolDecision::Deny {
                         reason: "no recorded decision".to_owned(),
                     });
+            let labels = turn.labels.get(position).map_or(&[][..], Vec::as_slice);
             let name = call.name.clone();
             let arguments = call.arguments.clone();
-            let mut content = decide(ctx, progress, task, step, position, call, decision)
+            let at = Slot { position, ..slot };
+            let mut content = decide(ctx, run, progress, tree, at, call, (decision, labels))
                 .await?
                 .content;
             match progress
@@ -443,22 +584,28 @@ const NOT_RUN_FULL: &str = "the call did not run: the results passed the request
 const NOT_RUN_LOOP: &str = "the call did not run: the loop guard stopped the run";
 
 /// Act on one recorded policy decision.
+///
+/// `labels` are the recorded flow labels of the call. They join the tree
+/// labels when the call runs.
 async fn decide(
     ctx: &WorkflowContext,
+    run: Run<'_>,
     progress: &mut Progress,
-    task: &AgentTask,
-    step: u32,
-    position: usize,
+    tree: &mut Tree,
+    slot: Slot,
     call: ToolCall,
-    decision: ToolDecision,
+    (decision, labels): (ToolDecision, &[String]),
 ) -> Result<ToolOutcome, String> {
     match decision {
-        ToolDecision::Allow => run_tool(ctx, progress, task, step, call).await,
+        ToolDecision::Allow => {
+            tree.exercised.extend(labels.iter().cloned());
+            run_tool(ctx, run, progress, tree, slot, call).await
+        }
         ToolDecision::Deny { reason } => {
             Ok(ToolOutcome::error(&format!("denied by policy: {reason}")))
         }
         ToolDecision::RequireApproval { .. } => {
-            gated_call(ctx, progress, task, step, position, call).await
+            gated_call(ctx, run, progress, tree, slot, call, labels).await
         }
     }
 }
@@ -471,23 +618,29 @@ async fn decide(
 /// run.
 async fn gated_call(
     ctx: &WorkflowContext,
+    run: Run<'_>,
     progress: &mut Progress,
-    task: &AgentTask,
-    step: u32,
-    position: usize,
+    tree: &mut Tree,
+    slot: Slot,
     mut call: ToolCall,
+    labels: &[String],
 ) -> Result<ToolOutcome, String> {
+    let task = run.task;
     let decision = await_decision::<Approval>(
         ctx,
-        &approval_signal(progress.step_base.saturating_add(step), position, &call.id),
+        &approval_signal(slot.round, slot.position, &call.id),
         Duration::from_secs(task.approval_timeout_secs),
     )
     .await?;
     match decision {
-        Decision::Decided(Approval::Approve) => run_tool(ctx, progress, task, step, call).await,
+        Decision::Decided(Approval::Approve) => {
+            tree.exercised.extend(labels.iter().cloned());
+            run_tool(ctx, run, progress, tree, slot, call).await
+        }
         Decision::Decided(Approval::Edit { arguments }) => {
             call.arguments = arguments;
-            run_tool(ctx, progress, task, step, call).await
+            tree.exercised.extend(labels.iter().cloned());
+            run_tool(ctx, run, progress, tree, slot, call).await
         }
         Decision::Decided(Approval::Reject { reason }) => Ok(ToolOutcome::error(&format!(
             "a reviewer rejected this call: {reason}"
@@ -504,15 +657,17 @@ async fn gated_call(
 
 /// Run one tool call.
 ///
-/// The follow-up tool runs in the workflow: it only books a timer. Every
-/// other call is a durable activity.
+/// The follow-up tool and the delegate tool run in the workflow. Every other
+/// call is a durable activity.
 async fn run_tool(
     ctx: &WorkflowContext,
+    run: Run<'_>,
     progress: &mut Progress,
-    task: &AgentTask,
-    step: u32,
+    tree: &mut Tree,
+    slot: Slot,
     call: ToolCall,
 ) -> Result<ToolOutcome, String> {
+    let task = run.task;
     if let Some(settings) = task.followups.filter(|_| call.name == FOLLOWUP_TOOL) {
         let planned = followup::plan(
             &call.arguments,
@@ -535,19 +690,189 @@ async fn run_tool(
             Err(reason) => ToolOutcome::error(&reason),
         });
     }
+    if let Some(agent) = run
+        .agent
+        .filter(|agent| call.name == DELEGATE_TOOL && !agent.peers.is_empty())
+    {
+        return delegate(ctx, run, agent, progress, tree, &call).await;
+    }
     ctx.execute_activity(
         &agent_tool_call_info(),
         ToolCallRequest {
             run_id: progress.run_id.clone(),
             session_id: task.session_id.clone(),
-            step: progress.step_base.saturating_add(step),
+            step: progress.step_base.saturating_add(slot.step),
             call,
             memory_scope: task.memory_tool_scope(),
             read_only: task.read_only,
+            allowed_tools: run.allowed_tools(),
         },
     )
     .await
     .map_err(|e| e.to_string())
+}
+
+/// Run one `delegate` call: refuse it with a named verdict, or run the peer
+/// inline as a sub-agent.
+///
+/// The child gets the peer prompt, a fresh transcript and the task text. It
+/// sees nothing else of the parent. Its model calls and tool calls are
+/// activities of this workflow, so replay repays none of them. Only its final
+/// answer returns, as the tool result.
+async fn delegate(
+    ctx: &WorkflowContext,
+    run: Run<'_>,
+    agent: &Agent,
+    progress: &mut Progress,
+    tree: &mut Tree,
+    call: &ToolCall,
+) -> Result<ToolOutcome, String> {
+    let args: DelegateArgs = match serde_json::from_value(call.arguments.clone()) {
+        Ok(args) => args,
+        Err(err) => {
+            return Ok(ToolOutcome::error(&format!(
+                "the delegate arguments do not decode: {err}"
+            )));
+        }
+    };
+    let task = run.task;
+    let child = match admit(agent, task, progress, tree, &args.agent) {
+        Ok(child) => child,
+        Err(refusal) => {
+            let mut chain = agent.mandate.chain.clone();
+            chain.push(args.agent.clone());
+            tree.records.push(DelegationRecord {
+                chain,
+                run_id: None,
+                stop: None,
+                refusal: Some(refusal),
+                usage: TokenUsage::default(),
+                steps_used: 0,
+                tool_calls: 0,
+            });
+            return Ok(refused(refusal, &args.agent));
+        }
+    };
+    let Admitted {
+        mandate,
+        peer,
+        max_total_tokens,
+    } = child;
+    tree.delegations = tree.delegations.saturating_add(1);
+    let run_id = format!("{}:d{}", tree.root, tree.delegations);
+    let read_only = task.read_only || mandate.read_only;
+    let child_agent = discover(ctx, &mandate).await?;
+    let child_task = AgentTask {
+        input: args.task,
+        system: peer.system.clone(),
+        history: Vec::new(),
+        session_id: task.session_id.clone(),
+        max_steps: peer.max_steps,
+        max_total_tokens,
+        max_output_tokens: task.max_output_tokens,
+        approval_timeout_secs: task.approval_timeout_secs,
+        max_request_bytes: task.max_request_bytes,
+        deliver: false,
+        memory_scope: None,
+        followups: None,
+        loop_guard: task.loop_guard,
+        read_only,
+        unattended: task.unattended,
+        unattended_memory_writes: false,
+        run_id_source: task.run_id_source,
+        tenant: task.tenant.clone(),
+        mandate: Some(mandate),
+    };
+    let mut child = Progress::new(run_id.clone(), Vec::new());
+    let child_run = Run {
+        task: &child_task,
+        agent: Some(&child_agent),
+    };
+    let stop = Box::pin(run_segment(
+        ctx,
+        child_run,
+        &mut child,
+        tree,
+        &child_task.input,
+    ))
+    .await?;
+    progress.usage = progress.usage.saturating_add(child.usage);
+    tree.records.push(DelegationRecord {
+        chain: child_agent.mandate.chain.clone(),
+        run_id: Some(run_id),
+        stop: Some(stop),
+        refusal: None,
+        usage: child.usage,
+        steps_used: child.steps,
+        tool_calls: child.tool_calls,
+    });
+    let outcome = serde_json::json!({
+        "agent": peer.name,
+        "stop": stop,
+        "answer": truncate(&child.last_text, DEFAULT_TOOL_OUTPUT_LIMIT),
+    })
+    .to_string();
+    Ok(ToolOutcome {
+        content: outcome,
+        is_error: stop != AgentStop::Completed,
+    })
+}
+
+/// A delegation that passed every check.
+struct Admitted<'a> {
+    mandate: Mandate,
+    peer: &'a Peer,
+    max_total_tokens: Option<u32>,
+}
+
+/// Check one delegation to `name`. Returns the child mandate, the peer and
+/// the child token cap.
+///
+/// The checks run in a fixed order: the mandate names the peer, the roster
+/// knows it, the mandate allows the hop, and tokens are left.
+fn admit<'a>(
+    agent: &'a Agent,
+    task: &AgentTask,
+    progress: &Progress,
+    tree: &Tree,
+    name: &str,
+) -> Result<Admitted<'a>, Refusal> {
+    if !agent.mandate.peers.contains(name) {
+        return Err(Refusal::NotPermitted);
+    }
+    let peer = agent
+        .peers
+        .iter()
+        .find(|peer| peer.name == name)
+        .ok_or(Refusal::UnknownPeer)?;
+    let mandate = agent.mandate.delegate(peer, tree.delegations)?;
+    let remainder = task
+        .max_total_tokens
+        .map(|max| max.saturating_sub(progress.usage.total()));
+    if remainder == Some(0) {
+        return Err(Refusal::BudgetExhausted);
+    }
+    let max_total_tokens = match (remainder, peer.max_total_tokens) {
+        (Some(left), Some(own)) => Some(left.min(own)),
+        (left, own) => left.or(own),
+    };
+    Ok(Admitted {
+        mandate,
+        peer,
+        max_total_tokens,
+    })
+}
+
+/// The tool result of a refused delegation. The model reads the verdict.
+fn refused(refusal: Refusal, peer: &str) -> ToolOutcome {
+    ToolOutcome {
+        content: serde_json::json!({
+            "error": refusal.message(peer),
+            "verdict": refusal,
+        })
+        .to_string(),
+        is_error: true,
+    }
 }
 
 /// The installed harness, or an error that names the fix.
@@ -713,6 +1038,25 @@ pub async fn agent_precheck(ctx: &ActivityContext, task: HeartbeatTask) -> Resul
     harness(ctx)?.precheck_tick(task).await
 }
 
+/// The peers of the roster that a mandate names, as an activity.
+///
+/// A run reads its peers once, at its start. Replay reads the record, so a
+/// roster change cannot change a recorded run.
+///
+/// # Errors
+///
+/// Returns an error only when no harness is installed.
+#[activity(
+    start_to_close = "1m",
+    retry = RetryPolicy::exponential(3, Duration::from_secs(1))
+)]
+pub async fn agent_discover_peers(
+    ctx: &ActivityContext,
+    names: Vec<String>,
+) -> Result<Vec<Peer>, String> {
+    Ok(harness(ctx)?.discover_peers(&names))
+}
+
 /// The workflows to register on a `HarvestBuilder`: `agent_loop` and
 /// `agent_heartbeat`.
 #[must_use]
@@ -729,6 +1073,7 @@ pub fn activities() -> Vec<ActivityInfo> {
         agent_memory_snapshot_info(),
         agent_deliver_info(),
         agent_precheck_info(),
+        agent_discover_peers_info(),
     ]
 }
 

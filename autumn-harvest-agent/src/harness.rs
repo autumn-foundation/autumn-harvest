@@ -5,13 +5,18 @@
 //! delivery and the precheck. The engine runs its methods as activities, so
 //! each result is recorded once and replayed after that.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tracing::Instrument;
+
 use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::error::AgentError;
+use crate::flow::{FlowRules, call_labels};
 use crate::heartbeat::{HeartbeatTask, Precheck};
 use crate::memory::{MEMORY_TOOL, MemoryScope, MemoryStore, MemoryTool, render_snapshot};
+use crate::mesh::{Peer, valid_name};
 use crate::message::{ContentPart, RunId, TokenUsage, ToolDefinition};
 use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse, UNKNOWN_MODEL_ID};
 use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
@@ -87,6 +92,8 @@ pub struct AgentHarness {
     delivery: Arc<dyn Delivery>,
     precheck: Option<Arc<dyn Precheck>>,
     cache: Option<ResponseCache>,
+    roster: Vec<Peer>,
+    flow: FlowRules,
 }
 
 impl AgentHarness {
@@ -109,6 +116,8 @@ impl AgentHarness {
             delivery: Arc::new(LogDelivery),
             precheck: None,
             cache: None,
+            roster: Vec::new(),
+            flow: FlowRules::new(),
         }
     }
 
@@ -225,6 +234,44 @@ impl AgentHarness {
         self
     }
 
+    /// Add one peer to the roster. A run whose mandate names the peer can
+    /// delegate to it. A later peer with the same name replaces an earlier
+    /// one.
+    #[must_use]
+    pub fn peer(mut self, peer: Peer) -> Self {
+        self.roster.push(peer);
+        self
+    }
+
+    /// Install flow rules. They gate each tool call against the labels that
+    /// the run tree has exercised.
+    #[must_use]
+    pub fn flow_rules(mut self, rules: FlowRules) -> Self {
+        self.flow = rules;
+        self
+    }
+
+    /// The peers of the roster that `names` lists, in name order.
+    ///
+    /// A name with no peer, or a peer with an invalid name, is left out.
+    #[must_use]
+    pub fn discover_peers(&self, names: &[String]) -> Vec<Peer> {
+        let wanted: BTreeSet<&String> = names.iter().collect();
+        let mut found = BTreeMap::new();
+        for peer in self
+            .roster
+            .iter()
+            .filter(|peer| wanted.contains(&peer.name))
+        {
+            if valid_name(&peer.name) {
+                found.insert(peer.name.clone(), peer.clone());
+            } else {
+                tracing::warn!(peer = %peer.name, "a peer with an invalid name is left out");
+            }
+        }
+        found.into_values().collect()
+    }
+
     /// Set the time budget of one response-cache call. One turn makes at
     /// most three. Keep the sum of the model, policy and cache budgets below
     /// the 15-minute `start_to_close` of `agent_model_turn`.
@@ -309,13 +356,36 @@ impl AgentHarness {
         &self,
         request: ModelTurnRequest,
         tenant: CacheTenant,
+        prepare: impl FnMut(&mut Vec<ContentPart>),
+    ) -> Result<(ModelTurn, Option<Duration>), String> {
+        let span = tracing::info_span!(
+            "agent_model_turn",
+            gen_ai.agent.name = tracing::field::Empty
+        );
+        if let Some(agent) = &request.agent {
+            span.record("gen_ai.agent.name", agent.as_str());
+        }
+        self.model_turn_spanned(request, tenant, prepare)
+            .instrument(span)
+            .await
+    }
+
+    /// The body of [`model_turn_timed_in`](Self::model_turn_timed_in).
+    async fn model_turn_spanned(
+        &self,
+        request: ModelTurnRequest,
+        tenant: CacheTenant,
         mut prepare: impl FnMut(&mut Vec<ContentPart>),
     ) -> Result<(ModelTurn, Option<Duration>), String> {
         let builtins = self.builtins(
             request.memory_scope.as_ref(),
             request.extra_tools.iter().cloned(),
         );
-        let tools: Vec<_> = self.visible(&builtins).map(Tool::definition).collect();
+        let allowed = request.allowed_tools.as_ref();
+        let tools: Vec<_> = self
+            .permitted(&builtins, allowed)
+            .map(Tool::definition)
+            .collect();
         let chat = ChatRequest {
             messages: request.messages,
             tools,
@@ -357,6 +427,7 @@ impl AgentHarness {
                 usage: response.usage,
                 decisions: Vec::new(),
                 cache_hit,
+                labels: Vec::new(),
             };
             let info = RunInfo {
                 run_id: RunId::new(request.run_id.clone()),
@@ -368,7 +439,12 @@ impl AgentHarness {
             self.decide_calls(
                 &mut turn,
                 &info,
-                (request.read_only, &builtins),
+                Scope {
+                    read_only: request.read_only,
+                    builtins: &builtins,
+                    allowed,
+                    exercised: &request.exercised,
+                },
                 &mut policy_budget,
             )
             .await;
@@ -450,9 +526,15 @@ impl AgentHarness {
         &self,
         turn: &mut ModelTurn,
         info: &RunInfo,
-        (read_only, builtins): (bool, &[Arc<dyn Tool>]),
+        scope: Scope<'_>,
         budget: &mut Duration,
     ) {
+        let Scope {
+            read_only,
+            builtins,
+            allowed,
+            exercised,
+        } = scope;
         let started = tokio::time::Instant::now();
         let deadline = started + *budget;
         let read_only_policy: Arc<dyn ToolPolicy>;
@@ -467,14 +549,34 @@ impl AgentHarness {
         } else {
             self.policy.as_ref()
         };
+        // Each call that is not denied may run, so its labels count for the
+        // calls after it in this turn. That fails closed.
+        let mut seen = exercised.clone();
         for call in turn.calls() {
+            if !permits(builtins, allowed, &call.name) {
+                turn.decisions.push(ToolDecision::Deny {
+                    reason: format!("the tool {:?} is not in this agent's mandate", call.name),
+                });
+                if !self.flow.is_empty() {
+                    turn.labels.push(Vec::new());
+                }
+                continue;
+            }
             let tool = self.visible(builtins).find(|tool| tool.name() == call.name);
             let decide = policy.decide(&call, tool, info);
-            let decision = tokio::time::timeout_at(deadline, decide)
+            let mut decision = tokio::time::timeout_at(deadline, decide)
                 .await
                 .unwrap_or_else(|_| ToolDecision::Deny {
                     reason: format!("the policy did not decide within {:?}", self.policy_timeout),
                 });
+            if !self.flow.is_empty() {
+                let labels = call_labels(tool);
+                decision = strictest(decision, self.flow.check(&seen, &labels));
+                if !matches!(decision, ToolDecision::Deny { .. }) {
+                    seen.extend(labels.iter().cloned());
+                }
+                turn.labels.push(labels.into_iter().collect());
+            }
             turn.decisions.push(decision);
         }
         *budget = budget.saturating_sub(started.elapsed());
@@ -569,6 +671,14 @@ impl AgentHarness {
     pub async fn tool_call(&self, request: ToolCallRequest) -> Result<ToolOutcome, String> {
         let call = request.call;
         let builtins = self.builtins(request.memory_scope.as_ref(), std::iter::empty());
+        // A second check of the mandate. The decision and the call can run on
+        // workers with different tool lists.
+        if !permits(&builtins, request.allowed_tools.as_ref(), &call.name) {
+            return Ok(self.error_outcome(&format!(
+                "the tool {:?} is not in this agent's mandate",
+                call.name
+            )));
+        }
         let Some(tool) = self
             .visible(&builtins)
             .find(|tool| tool.name() == call.name)
@@ -698,6 +808,17 @@ impl AgentHarness {
             .collect()
     }
 
+    /// The visible tools that `allowed` permits. A built-in is always
+    /// permitted.
+    fn permitted<'a>(
+        &'a self,
+        builtins: &'a [Arc<dyn Tool>],
+        allowed: Option<&'a BTreeSet<String>>,
+    ) -> impl Iterator<Item = &'a dyn Tool> {
+        self.visible(builtins)
+            .filter(move |tool| permits(builtins, allowed, tool.name()))
+    }
+
     /// The built-in tools, then each app tool whose name no built-in takes.
     ///
     /// A built-in wins a name clash. Two tools with one name would make many
@@ -716,6 +837,37 @@ impl AgentHarness {
                 .map(AsRef::as_ref)
                 .filter(move |tool| !taken(tool.name())),
         )
+    }
+}
+
+/// What bounds the decisions of one turn.
+struct Scope<'a> {
+    /// Apply the read-only rules on top of the policy.
+    read_only: bool,
+    /// The built-in tools of the turn.
+    builtins: &'a [Arc<dyn Tool>],
+    /// The harness tools that the mandate permits. `None` means every tool.
+    allowed: Option<&'a BTreeSet<String>>,
+    /// The flow labels that the run tree exercised before the turn.
+    exercised: &'a BTreeSet<String>,
+}
+
+/// Whether the mandate permits the tool `name`. A built-in is always
+/// permitted. Its own switch, such as the memory scope, governs it.
+fn permits(builtins: &[Arc<dyn Tool>], allowed: Option<&BTreeSet<String>>, name: &str) -> bool {
+    allowed.is_none_or(|allowed| allowed.contains(name))
+        || builtins.iter().any(|tool| tool.name() == name)
+}
+
+/// The stricter of two decisions: a deny, then an approval, then an allow.
+/// Two approvals keep the first reason.
+fn strictest(first: ToolDecision, second: ToolDecision) -> ToolDecision {
+    match (&first, &second) {
+        (ToolDecision::Deny { .. }, _) => first,
+        (_, ToolDecision::Deny { .. }) => second,
+        (ToolDecision::RequireApproval { .. }, _) => first,
+        (_, ToolDecision::RequireApproval { .. }) => second,
+        _ => first,
     }
 }
 
@@ -823,7 +975,7 @@ fn cut_bytes(text: String, max: usize) -> String {
 }
 
 /// Cut `text` to `limit` characters and mark the cut.
-fn truncate(text: &str, limit: usize) -> String {
+pub(crate) fn truncate(text: &str, limit: usize) -> String {
     match text.char_indices().nth(limit) {
         None => text.to_owned(),
         Some((end, _)) => format!("{}{TRUNCATED}", &text[..end]),

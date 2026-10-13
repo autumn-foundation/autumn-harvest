@@ -16,6 +16,8 @@
 //! - `agent_tool_call` returns the recorded outcome of the same call. A call
 //!   with no recorded outcome gets an error stub. No tool runs.
 //! - `agent_memory_snapshot` returns the recorded snapshot, or an empty one.
+//! - `agent_discover_peers` returns the recorded peers for the same names, or
+//!   none. The candidate needs no roster.
 //! - A tool or snapshot activity that failed the source fails the candidate
 //!   at the same activity.
 //! - `agent_deliver` is a stub. No report leaves the harness.
@@ -44,6 +46,8 @@
 //!
 //! A recorded tool outcome answers a call with the same step, tool name and
 //! arguments. A model gives new call ids on each call, so the key holds no id.
+//! In a delegation run, the call must also come from the same agent of the
+//! tree. The child run id suffix, such as `:d1`, names that agent.
 //!
 //! A candidate call that equals the recorded call at the same turn and
 //! position takes the recorded id. The ids change before the policy runs.
@@ -93,14 +97,15 @@ use serde_json::Value;
 
 use crate::bounds::exceeds_bytes;
 use crate::harness::AgentHarness;
+use crate::mesh::Peer;
 use crate::message::{ContentPart, StopReason, ToolCall};
 use crate::policy::ToolDecision;
 use crate::types::{
     AgentReport, AgentTask, ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome,
 };
 use crate::workflow::{
-    WORKFLOW_NAME, agent_deliver_info, agent_loop_info, agent_memory_snapshot_info,
-    agent_model_turn_info, agent_tool_call_info,
+    WORKFLOW_NAME, agent_deliver_info, agent_discover_peers_info, agent_loop_info,
+    agent_memory_snapshot_info, agent_model_turn_info, agent_tool_call_info,
 };
 
 /// The error text of the stub outcome. A candidate call with no recorded
@@ -386,6 +391,8 @@ pub async fn evaluate(
         cap_reached: false,
         tools: recording.tools.clone(),
         snapshots: recording.snapshots.iter().cloned().collect(),
+        peers: recording.peers.clone(),
+        root: None,
         replayed: 0,
         stubbed: 0,
     }));
@@ -407,7 +414,13 @@ pub async fn evaluate(
         }
     };
 
+    let peers = {
+        let session = Arc::clone(&session);
+        move |names: Value| -> Result<Value, String> { encode(&lock(&session).lookup(&names)) }
+    };
+
     let mut env = engine()
+        .mock_activity(agent_discover_peers_info().name, peers)
         .mock_activity(agent_model_turn_info().name, model)
         .mock_activity(agent_tool_call_info().name, tool)
         .mock_activity(agent_memory_snapshot_info().name, snapshot)
@@ -456,12 +469,26 @@ struct Recording {
     snapshots: Vec<Result<String, String>>,
     /// Signals for waits that the source opened, received in time, in order.
     signals: Vec<(String, Value)>,
+    /// The recorded peer lookups: the names asked and the peers found.
+    peers: Vec<RecordedPeers>,
     end: RunEnd,
+}
+
+/// One recorded peer lookup.
+#[derive(Clone)]
+struct RecordedPeers {
+    names: Value,
+    peers: Vec<Peer>,
+    /// A recorded lookup answers one candidate lookup at most.
+    used: bool,
 }
 
 /// One recorded tool call and its outcome.
 #[derive(Clone)]
 struct RecordedTool {
+    /// The agent of the tree that made the call: the run id suffix after the
+    /// root run id. The root agent has an empty lane.
+    lane: String,
     step: u32,
     name: String,
     arguments: Value,
@@ -475,12 +502,9 @@ impl Recording {
     fn read(history: &[WorkflowEvent]) -> Result<Self, EvalError> {
         let task = task_of(history)?;
         let model_name = agent_model_turn_info().name;
-        let tool_name = agent_tool_call_info().name;
-        let snapshot_name = agent_memory_snapshot_info().name;
         let mut scheduled: HashMap<ActivityExecId, (&str, &Value)> = HashMap::new();
         let mut run_id = None;
-        let mut tools = Vec::new();
-        let mut snapshots = Vec::new();
+        let mut effects = Effects::default();
         let mut opened: HashSet<&str> = HashSet::new();
         let mut timed_out: HashSet<&str> = HashSet::new();
         let mut signals = Vec::new();
@@ -518,16 +542,10 @@ impl Recording {
                 WorkflowEvent::ActivityCompleted {
                     activity_id,
                     output,
-                } => match scheduled.get(activity_id) {
-                    Some((name, input)) if *name == tool_name => {
-                        let outcome = decode(output.clone()).map_err(EvalError::Undecodable)?;
-                        tools.push(recorded_tool(input, Ok(outcome))?);
-                    }
-                    Some((name, _)) if *name == snapshot_name => {
-                        snapshots.push(Ok(decode(output.clone()).map_err(EvalError::Undecodable)?));
-                    }
-                    _ => {}
-                },
+                } => {
+                    let scheduled = scheduled.get(activity_id).copied();
+                    effects.completed(scheduled, output, run_id.as_deref())?;
+                }
                 WorkflowEvent::TimerStarted { timer_id, .. } => {
                     if let Some(signal) = deadline_signal(timer_id.as_str()) {
                         opened.insert(signal);
@@ -565,7 +583,12 @@ impl Recording {
         // failure, so the candidate fails at the same activity.
         if let (Some(RunEnd::Failed(_)), Some((activity_id, error))) = (&end, last_failure) {
             let scheduled = scheduled.get(&activity_id).copied();
-            push_failure(scheduled, error, &mut tools, &mut snapshots)?;
+            push_failure(
+                scheduled,
+                error,
+                (&mut effects.tools, &mut effects.snapshots),
+                run_id.as_deref(),
+            )?;
         }
         // Only a signal for a wait that the source opened is sent again. A
         // wait opens with its deadline timer. A signal that arrived before
@@ -577,11 +600,52 @@ impl Recording {
             task,
             run_id,
             turns,
-            tools,
-            snapshots,
+            tools: effects.tools,
+            snapshots: effects.snapshots,
             signals,
+            peers: effects.peers,
             end: end.ok_or(EvalError::InFlightSource)?,
         })
+    }
+}
+
+/// The recorded results of the effect activities of a source run.
+#[derive(Default)]
+struct Effects {
+    tools: Vec<RecordedTool>,
+    /// The recorded snapshots, and the error of a snapshot that failed for
+    /// good.
+    snapshots: Vec<Result<String, String>>,
+    peers: Vec<RecordedPeers>,
+}
+
+impl Effects {
+    /// Record the `output` of the `scheduled` activity, when it is a tool
+    /// call, a snapshot or a peer lookup. `root` is the run id of the root
+    /// agent.
+    fn completed(
+        &mut self,
+        scheduled: Option<(&str, &Value)>,
+        output: &Value,
+        root: Option<&str>,
+    ) -> Result<(), EvalError> {
+        let Some((name, input)) = scheduled else {
+            return Ok(());
+        };
+        if name == agent_tool_call_info().name {
+            let outcome = decode(output.clone()).map_err(EvalError::Undecodable)?;
+            self.tools.push(recorded_tool(input, Ok(outcome), root)?);
+        } else if name == agent_discover_peers_info().name {
+            self.peers.push(RecordedPeers {
+                names: input.clone(),
+                peers: decode(output.clone()).map_err(EvalError::Undecodable)?,
+                used: false,
+            });
+        } else if name == agent_memory_snapshot_info().name {
+            let snapshot = decode(output.clone()).map_err(EvalError::Undecodable)?;
+            self.snapshots.push(Ok(snapshot));
+        }
+        Ok(())
     }
 }
 
@@ -590,12 +654,12 @@ impl Recording {
 fn push_failure(
     scheduled: Option<(&str, &Value)>,
     error: String,
-    tools: &mut Vec<RecordedTool>,
-    snapshots: &mut Vec<Result<String, String>>,
+    (tools, snapshots): (&mut Vec<RecordedTool>, &mut Vec<Result<String, String>>),
+    root: Option<&str>,
 ) -> Result<(), EvalError> {
     match scheduled {
         Some((name, input)) if name == agent_tool_call_info().name => {
-            tools.push(recorded_tool(input, Err(error))?);
+            tools.push(recorded_tool(input, Err(error), root)?);
         }
         Some((name, _)) if name == agent_memory_snapshot_info().name => {
             snapshots.push(Err(error));
@@ -627,18 +691,29 @@ fn task_of(history: &[WorkflowEvent]) -> Result<AgentTask, EvalError> {
 }
 
 /// The recorded tool call of the tool-call activity `input`, with `outcome`.
+/// `root` is the run id of the root agent.
 fn recorded_tool(
     input: &Value,
     outcome: Result<ToolOutcome, String>,
+    root: Option<&str>,
 ) -> Result<RecordedTool, EvalError> {
     let request: ToolCallRequest = decode(input.clone()).map_err(EvalError::Undecodable)?;
     Ok(RecordedTool {
+        lane: lane_of(&request.run_id, root).to_owned(),
         step: request.step,
         name: request.call.name,
         arguments: request.call.arguments,
         outcome,
         used: false,
     })
+}
+
+/// The lane of `run_id` under the root run id `root`: the suffix that names
+/// one agent of a delegation tree. The root agent, and a run id that does not
+/// start with `root`, have the empty lane.
+fn lane_of<'a>(run_id: &'a str, root: Option<&str>) -> &'a str {
+    root.and_then(|root| run_id.strip_prefix(root))
+        .unwrap_or_default()
 }
 
 /// How a terminal event ends a run, or `None` for another event.
@@ -673,6 +748,10 @@ struct Session {
     cap_reached: bool,
     tools: Vec<RecordedTool>,
     snapshots: VecDeque<Result<String, String>>,
+    peers: Vec<RecordedPeers>,
+    /// The run id of the candidate root agent: the run id of its first model
+    /// request.
+    root: Option<String>,
     replayed: u32,
     stubbed: u32,
 }
@@ -701,8 +780,10 @@ impl Session {
     ///
     /// Returns the recorded error of a call that failed for good.
     fn answer(&mut self, request: &ToolCallRequest) -> Result<ToolOutcome, String> {
+        let lane = lane_of(&request.run_id, self.root.as_deref());
         let recorded = self.tools.iter_mut().find(|tool| {
             !tool.used
+                && tool.lane == lane
                 && tool.step == request.step
                 && tool.name == request.call.name
                 && tool.arguments == request.call.arguments
@@ -715,6 +796,18 @@ impl Session {
             self.stubbed = self.stubbed.saturating_add(1);
             Ok(ToolOutcome::error(NOT_RUN))
         }
+    }
+
+    /// The recorded peers for the same `names`, or none.
+    fn lookup(&mut self, names: &Value) -> Vec<Peer> {
+        self.peers
+            .iter_mut()
+            .find(|recorded| !recorded.used && recorded.names == *names)
+            .map(|recorded| {
+                recorded.used = true;
+                recorded.peers.clone()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -789,12 +882,18 @@ fn model_mock(
         .unwrap_or_default();
     move |input: Value| -> Result<Value, String> {
         let mut request: ModelTurnRequest = decode(input)?;
-        // The test engine has its own ids. The policy sees the recorded run
-        // id instead.
-        if let Some(run_id) = &run_id {
-            request.run_id.clone_from(run_id);
-        }
-        let (index, recorded) = lock(&session).next_turn()?;
+        let (index, recorded) = {
+            let mut session = lock(&session);
+            // The root agent makes the first model request.
+            let root = session.root.get_or_insert_with(|| request.run_id.clone());
+            // The test engine has its own ids. The policy sees the recorded
+            // run id instead, with the lane of the same agent.
+            if let Some(run_id) = &run_id {
+                let lane = lane_of(&request.run_id, Some(root.as_str())).to_owned();
+                request.run_id = format!("{run_id}{lane}");
+            }
+            session.next_turn()?
+        };
         let turn = live_turn(
             &handle,
             &harness,
@@ -1079,6 +1178,7 @@ mod tests {
             usage: TokenUsage::default(),
             decisions: Vec::new(),
             cache_hit: false,
+            labels: Vec::new(),
         }
     }
 
@@ -1253,6 +1353,7 @@ mod tests {
                 messages: Vec::new(),
                 followups: 0,
                 followup_dropped: false,
+                delegations: Vec::new(),
             })
         };
         let done = report(crate::AgentStop::Completed);

@@ -270,7 +270,8 @@ example a rejected API key, or four failed attempts.
 The adapter owns the payloads it records: `AgentTask`, `ModelTurnRequest`,
 `ModelTurn`, `ToolCallRequest`, `ToolOutcome`, `AgentReport`,
 `HeartbeatTask`, `HeartbeatReport`, `Report`, `ReportSource`,
-`MemoryScope`, `Followups` and `LoopGuard`. They hold only types this crate
+`MemoryScope`, `Followups`, `LoopGuard`, `Mandate`, `Peer` and
+`DelegationRecord`. They hold only types this crate
 defines, so the crate owns their serde shape. Replay reads these payloads
 back, so add a field only with `#[serde(default)]`. A new field of an
 activity input also needs `skip_serializing_if` at its default, because a
@@ -287,6 +288,8 @@ strict replay compares each recorded input as it was written.
 - **A follow-up chain shares one workflow history.** Each segment adds to
   it. Keep `max_chain` low, or start a new run from the report.
 - **The session entity is separate.** It is a sibling issue.
+- **One agent per harness model.** A delegated peer uses the same model. See
+  [the agent mesh guide](agent-mesh.md).
 - **The cost ledger needs Postgres.** The SQLite path calls the model
   directly, with no activity context, so it writes no ledger rows.
 
@@ -638,3 +641,10 @@ thinking blocks verbatim, which the provider-neutral `ChatMessage` cannot
 carry. It therefore keeps its own turn activity. It takes three parts from
 this crate: the approval signal names, the durable approval wait
 (`approval::await_decision`), and the payload-cap checks.
+
+## 14. Agent mesh
+
+A run can delegate a task to a peer agent. The peer runs as a sub-agent
+inside the same workflow, with its own prompt, tools and budget. A mandate
+bounds the delegation tree. Flow rules gate a dangerous sequence of tool
+calls across the tree. Read [`agent-mesh.md`](agent-mesh.md).

@@ -18,8 +18,8 @@ use crate::harness::AgentHarness;
 use crate::heartbeat::{HEARTBEAT_WORKFLOW_NAME, HeartbeatTask, agent_heartbeat_info};
 use crate::types::AgentTask;
 use crate::workflow::{
-    WORKFLOW_NAME, agent_deliver_info, agent_loop_info, agent_memory_snapshot_info,
-    agent_model_turn_info, agent_precheck_info, agent_tool_call_info,
+    WORKFLOW_NAME, agent_deliver_info, agent_discover_peers_info, agent_loop_info,
+    agent_memory_snapshot_info, agent_model_turn_info, agent_precheck_info, agent_tool_call_info,
 };
 
 /// Register the agent workflows and their activities against `harness`.
@@ -44,6 +44,12 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     let h = Arc::clone(&harness);
     rt.register_activity(&agent_deliver_info(), move |input| {
         call(input, |report| h.deliver(report))
+    });
+    let h = Arc::clone(&harness);
+    rt.register_activity(&agent_discover_peers_info(), move |input| {
+        call(input, |names: Vec<String>| {
+            std::future::ready(Ok::<_, String>(h.discover_peers(&names)))
+        })
     });
     rt.register_activity(&agent_precheck_info(), move |input| {
         call(input, |task| harness.precheck_tick(task))
