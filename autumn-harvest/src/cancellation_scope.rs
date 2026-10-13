@@ -1753,6 +1753,29 @@ mod tests {
         assert!(!replay.history_has_unconsumed_events());
     }
 
+    /// A scope cannot spawn a detached child. A cancel would withdraw the
+    /// spawn, and replay would mint another child id.
+    #[tokio::test]
+    async fn a_scope_cannot_spawn_a_detached_child() {
+        let ctx = WorkflowContext::new_test();
+        let scope = ctx.cancellation_scope();
+        let result = bounded(scope.run(async {
+            ctx.spawn_child_workflow_detached_raw(
+                "audit",
+                Value::Null,
+                crate::types::ParentClosePolicy::Abandon,
+            )
+        }))
+        .await
+        .expect("the scope completes");
+
+        assert!(
+            matches!(&result, Err(HarvestError::Config(m)) if m.contains("cancellation scope")),
+            "{result:?}"
+        );
+        assert!(ctx.drain_commands().is_empty());
+    }
+
     /// A replayed scope whose cancel the code no longer issues keeps its body
     /// parked on an in-flight activity. The cycle counts as parked, and the
     /// unconsumed cancel marker is the drift that the executor reports.

@@ -8728,6 +8728,10 @@ impl WorkflowContext {
         parent_close_policy: crate::types::ParentClosePolicy,
         placement: &crate::shard::ChildPlacement,
     ) -> HarvestResult<ExecutionId> {
+        // Issue #1984: a scope cancel withdraws the spawn, but the body has
+        // the minted id. Replay mints another one, so code after the scope
+        // would see a different child.
+        self.reject_in_cancellable_scope("ctx.spawn_child_workflow_detached")?;
         // Advance on every invocation, before the matcher — see
         // `next_child_placement_seq`.
         let placement_seq = self.next_child_placement_seq();

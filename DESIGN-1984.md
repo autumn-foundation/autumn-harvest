@@ -139,10 +139,11 @@ cancel reason name it. No other worker path changes.
   would strand the late result. A scope cannot create a session: a dropped
   session is never released. A scope cannot run an admitted update either:
   a dropped handler leaves the update without a terminal. The update fails
-  at once, and the cancel keeps its `RecordUpdateResult`.
+  at once, and the cancel keeps its `RecordUpdateResult`. A scope cannot
+  spawn a detached child: a cancel withdraws the spawn, and replay mints
+  another child id.
 - A cancel that arrives when no shield is open is still terminal at once.
   A shield is open from the commit of the cycle that enters it. A cancel
   that commits first discards that cycle, the shield's work included.
-- Local activities, external activities and detached children in a scope
-  are not cancelled. The scope still drops the body, and replay consumes a
+- Local activities and external activities in a scope are not cancelled. The scope still drops the body, and replay consumes a
   late external result.
