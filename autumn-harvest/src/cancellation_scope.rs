@@ -273,6 +273,19 @@ impl ScopeShared {
 /// A resident future keeps its scopes across cycles. A resolved member must
 /// leave the set. Otherwise a later operation that reuses its timer id would
 /// look like a member, and a cancel would tear it down.
+/// Whether a scope that replays a cancel holds a command that parks.
+///
+/// The worker never gets a held command, so it is invisible to the park
+/// check. A held park still means that the cycle waits on Harvest work.
+pub(crate) fn holds_a_park(live: &[std::sync::Weak<ScopeShared>]) -> bool {
+    live.iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .any(|shared| {
+            let inner = shared.lock();
+            inner.holding && inner.held.iter().any(WorkflowCommand::awaits_result)
+        })
+}
+
 pub(crate) fn drop_resolved_members(
     live: &mut Vec<std::sync::Weak<ScopeShared>>,
     delta: &[WorkflowEvent],
@@ -1738,6 +1751,54 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(replay.take_nd_details().is_none());
         assert!(!replay.history_has_unconsumed_events());
+    }
+
+    /// A replayed scope whose cancel the code no longer issues keeps its body
+    /// parked on an in-flight activity. The cycle counts as parked, and the
+    /// unconsumed cancel marker is the drift that the executor reports.
+    #[tokio::test]
+    async fn a_replay_that_drops_the_cancel_of_a_waiting_body_parks_on_drift() {
+        let a = ActivityExecId::new();
+        let live = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![started(), scheduled(a, "charge")],
+        );
+        let result = bounded(run_then_cancel(
+            &live,
+            live.execute_activity_raw("charge", Value::Null, "default"),
+        ))
+        .await;
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+        let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+        let replay = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started(),
+                scheduled(a, "charge"),
+                WorkflowEvent::MarkerRecorded {
+                    name: "cancel_scope:1".into(),
+                    details,
+                },
+            ],
+        );
+        let scope = replay.cancellation_scope();
+        let mut run =
+            Box::pin(scope.run(replay.execute_activity_raw("charge", Value::Null, "default")));
+        let polled = futures::poll!(run.as_mut());
+
+        assert!(polled.is_pending());
+        assert!(replay.parks_on_harvest_work(), "the held park counts");
+        let skipped = replay.first_unconsumed_command_event();
+        assert!(
+            skipped
+                .as_ref()
+                .is_some_and(|(_, name)| name.contains("MarkerRecorded")),
+            "{skipped:?}"
+        );
     }
 
     /// A nested scope with an in-flight activity cancels in the same cycle as

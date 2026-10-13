@@ -14881,6 +14881,12 @@ impl WorkflowContext {
                 .expect("commands lock poisoned")
                 .iter()
                 .any(|buffered| buffered.cmd.awaits_result())
+            // Issue #1984: a replayed scope that never gets its recorded cancel
+            // holds the body's park. The cycle suspends, and the skipped-command
+            // check then reports the unconsumed cancel marker as drift.
+            || crate::cancellation_scope::holds_a_park(
+                &self.live_scopes.lock().expect("live scopes lock poisoned"),
+            )
     }
 
     /// Push a command onto the pending commands queue.
@@ -15095,6 +15101,12 @@ impl WorkflowContext {
     /// Returns the marker's index and details, or `None` at the frontier.
     pub(crate) fn take_marker(&self, name: &str) -> Option<(usize, Value)> {
         self.match_history_unpumped(|m| m.take_marker(name))
+    }
+
+    /// Whether the cycle parks on Harvest work (issue #1984 tests).
+    #[cfg(test)]
+    pub(crate) fn parks_on_harvest_work(&self) -> bool {
+        self.has_parked_harvest_future()
     }
 
     /// The durable chunks queued this cycle (issue #1984 tests).
