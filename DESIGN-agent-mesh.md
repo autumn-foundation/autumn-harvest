@@ -6,10 +6,11 @@ no delegation, no hop or cycle control, no budget split, and no rule over a
 sequence of tool calls. This change adds those primitives to
 `autumn-harvest-agent`.
 
-**No migration. No new `WorkflowEvent` variant. No core engine change except
-the AC16 compile fix.** The change adds one activity, `agent_discover_peers`,
-and new optional fields on recorded payloads. Each new field is left out at
-its default, so a run with no mandate records the same bytes as before.
+**No migration. No new `WorkflowEvent` variant. No core engine change.**
+`trunk-dev` made the AC16 compile fix in #2138. The change adds one
+activity, `agent_discover_peers`, and new optional fields on recorded
+payloads. Each new field is left out at its default, so a run with no
+mandate records the same bytes as before.
 
 ---
 
