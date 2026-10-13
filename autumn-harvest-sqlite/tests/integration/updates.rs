@@ -1128,6 +1128,33 @@ async fn update_at_the_byte_cap_fails_the_run() {
     ));
 }
 
+/// An update that reaches a cap under a pending cancel ends the run
+/// `CANCELLED`, not `FAILED` (issue #2021).
+#[tokio::test]
+async fn update_at_the_event_cap_under_a_pending_cancel_ends_cancelled() {
+    let (mut rt, exec) = blocked_limit_run().await;
+    let len = u64::try_from(rt.load_history(exec).unwrap().len()).unwrap();
+    rt.set_history_event_hard_cap(Some(len + 2));
+    rt.cancel(exec, "stop").unwrap();
+
+    let err = rt.update(exec, "set_limit", json!(5)).await.unwrap_err();
+
+    assert!(
+        matches!(err, SqliteError::UpdateHistoryCapReached { .. }),
+        "{err:?}"
+    );
+    let history = rt.load_history(exec).unwrap();
+    assert!(update_events(&history).is_empty(), "{history:?}");
+    assert!(
+        matches!(history.last(), Some(WorkflowEvent::WorkflowCancelled { reason }) if reason == "stop"),
+        "{history:?}"
+    );
+    assert!(matches!(
+        rt.outcome(exec).unwrap(),
+        ExecutionOutcome::Terminated(state) if state == "CANCELLED"
+    ));
+}
+
 /// An update below the caps is unchanged.
 #[tokio::test]
 async fn update_below_the_caps_succeeds() {

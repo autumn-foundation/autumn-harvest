@@ -1108,7 +1108,7 @@ impl SqliteRuntime {
     ///   time, for example because it awaits a durable command.
     /// - [`SqliteError::UpdateHistoryCapReached`] if the two update events
     ///   would reach a history cap. The run then fails at the cap, as a drive
-    ///   fails it.
+    ///   fails it. Under a pending cancel the run ends `CANCELLED` instead.
     /// - [`SqliteError::UpdateFailed`] if the handler returns an error or
     ///   panics. History records `WorkflowEvent::UpdateFailed`.
     /// - A persistence error if the history cannot be read or written.
@@ -1203,9 +1203,14 @@ impl SqliteRuntime {
         store::append_event(&tx, exec, &admitted)?;
         store::append_event(&tx, exec, &outcome)?;
         if let Some(reason) = caps.reached(&tx, exec)? {
-            // Roll the update back, then fail the run as a drive does.
+            // Roll the update back, then end the run as a drive does. A
+            // pending cancel wins over the cap (issue #2021).
             drop(tx);
-            self.fail_for_history_cap(exec, &reason, now.timestamp_millis())?;
+            if let Some((cancel, _)) = store::cancel_request(&self.conn, exec)? {
+                self.seal_cancelled(exec, &cancel, None)?;
+            } else {
+                self.fail_for_history_cap(exec, &reason, now.timestamp_millis())?;
+            }
             return Err(SqliteError::UpdateHistoryCapReached {
                 execution_id: exec,
                 name: name.to_string(),
