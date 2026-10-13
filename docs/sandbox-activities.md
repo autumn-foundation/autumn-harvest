@@ -134,8 +134,10 @@ The process executor gives each run:
   reserves about 600 MiB of address space at start. The CPU rlimit applies
   to each process;
 - with `ExecOptions::cgroup_root`, a cgroup for each run. Then `cpu_seconds`
-  bounds all processes of the run together, and the end of the run kills
-  each process in the cgroup. The guest agent always sets it;
+  bounds all processes of the run together, and `memory_mib` bounds their
+  memory, with no swap. The end of the run kills each process in the cgroup.
+  The cgroup root must give the memory controller to its children, or the
+  run fails closed. The guest agent always sets it;
 - an empty network namespace when the policy denies the network. When the
   host cannot create one, the run fails closed with `SandboxUnavailable`;
 - a process limit. A root worker runs the code as a dedicated uid. A
@@ -225,7 +227,9 @@ the code as uid 1000 and reboots, and Firecracker exits.
 
 Each run gets its own cgroup in the guest. So `cpu_seconds` bounds the CPU
 time of all processes of the run together. When the run passes it, the agent
-kills each process, and the outcome reports the signal `SIGXCPU`.
+kills each process, and the outcome reports the signal `SIGXCPU`. The cgroup
+also bounds the memory of the run to `memory_mib`. A run past it ends with
+`SIGKILL` from the OOM killer.
 
 ### Configuration
 

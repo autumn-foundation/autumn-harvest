@@ -258,6 +258,26 @@ async fn a_forking_run_cannot_pass_its_cpu_budget() {
 
 #[tokio::test]
 #[ignore = "needs /dev/kvm, Firecracker and a guest image"]
+async fn a_run_cannot_pass_its_memory_limit() {
+    let harness = Harness::new(unjailed(BootMethod::ConfigFile), 0).await;
+    // The data rlimit has 1 GiB of headroom, so only the run cgroup stops this.
+    let mut request = SandboxRequest::new("python3", "b = b'x' * (256 << 20)\nprint('allocated')")
+        .with_timeout_ms(30_000);
+    request.limits.memory_mib = Some(64);
+    let outcome = harness.run(&request).await;
+    assert!(!outcome.stdout.contains("allocated"), "{outcome:?}");
+    assert_eq!(
+        outcome.status,
+        RunStatus::Signaled {
+            signal: libc::SIGKILL
+        },
+        "{outcome:?}"
+    );
+    harness.assert_clean().await;
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm, Firecracker and a guest image"]
 async fn a_cancelled_run_tears_the_microvm_down() {
     let harness = Harness::new(unjailed(BootMethod::ConfigFile), 0).await;
     let cancel = CancellationToken::new();

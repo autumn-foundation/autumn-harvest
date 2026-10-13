@@ -59,7 +59,8 @@ pub struct SandboxLimits {
     /// run share it. The process backend shares it only with a cgroup root.
     /// Without one, each process gets this limit.
     pub cpu_seconds: u64,
-    /// Memory of the code, in bytes.
+    /// Memory of the code, in bytes. A run cgroup bounds it exactly. Without
+    /// one, the data rlimit adds room for JIT reservations.
     pub memory_bytes: u64,
     /// Processes and threads that the code can have at one time.
     pub max_processes: u32,

@@ -163,7 +163,7 @@ pub async fn execute_plan(
     let mut cgroup = options
         .cgroup_root
         .as_deref()
-        .map(RunCgroup::create)
+        .map(|root| RunCgroup::create(root, plan.limits.memory_bytes))
         .transpose()?;
     // The work directory belongs to the executor until the files are in
     // place. So no other process of the code uid can plant a link there.
@@ -328,7 +328,10 @@ struct RunCgroup {
 }
 
 impl RunCgroup {
-    fn create(root: &Path) -> Result<Self, SandboxError> {
+    fn create(root: &Path, memory_bytes: u64) -> Result<Self, SandboxError> {
+        // The parent must give the memory controller to the run cgroup. A
+        // controller that is on already is no error.
+        let _ = std::fs::write(root.join("cgroup.subtree_control"), b"+memory");
         let dir = root.join(format!("harvest-run-{}", uuid::Uuid::new_v4().simple()));
         let opened = std::fs::create_dir(&dir).and_then(|()| {
             std::fs::OpenOptions::new()
@@ -348,6 +351,23 @@ impl RunCgroup {
             procs,
             removed: false,
         };
+        // The data rlimit leaves room for JIT reservations. This bounds the
+        // memory in use, with no swap. A kernel without swap accounting has
+        // no swap file.
+        let bounded = std::fs::write(cgroup.dir.join("memory.max"), memory_bytes.to_string())
+            .and_then(
+                |()| match std::fs::write(cgroup.dir.join("memory.swap.max"), b"0") {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                    other => other,
+                },
+            );
+        if let Err(e) = bounded {
+            return Err(SandboxError::Unavailable(format!(
+                "the run cgroup {} cannot bound the memory: {e}; the cgroup root must give \
+                 the memory controller to its children, so the run fails closed",
+                cgroup.dir.display()
+            )));
+        }
         // A budget that the executor cannot read is no budget.
         if cgroup.cpu_usec().is_none() {
             return Err(SandboxError::Unavailable(format!(
@@ -691,6 +711,38 @@ unsafe fn mark_descriptors_cloexec() -> io::Result<()> {
 ///
 /// Call it only between fork and exec.
 unsafe fn mark_cloexec_from_proc() -> io::Result<()> {
+    // SAFETY: the caller holds the contract of this function.
+    unsafe { walk_proc_fds(set_cloexec) }
+}
+
+/// Mark `fd` close-on-exec. A descriptor that closed meanwhile is fine.
+fn set_cloexec(fd: libc::c_int) -> io::Result<()> {
+    // SAFETY: fcntl reads or sets the flags of a descriptor number. A number
+    // that is not open fails with EBADF.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        let err = io::Error::last_os_error();
+        return if err.raw_os_error() == Some(libc::EBADF) {
+            Ok(())
+        } else {
+            Err(err)
+        };
+    }
+    // SAFETY: as above.
+    if flags & libc::FD_CLOEXEC == 0
+        && unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Call `mark` for each descriptor above 2 in `/proc/self/fd`.
+///
+/// # Safety
+///
+/// The same as [`mark_cloexec_from_proc`].
+unsafe fn walk_proc_fds(mark: impl Fn(libc::c_int) -> io::Result<()>) -> io::Result<()> {
     // The offsets of `d_reclen` and `d_name` in `struct linux_dirent64`.
     const RECLEN_AT: usize = 16;
     const NAME_AT: usize = 19;
@@ -705,7 +757,7 @@ unsafe fn mark_cloexec_from_proc() -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     let mut buf = [0u8; 4096];
-    let result = loop {
+    let result = 'walk: loop {
         // SAFETY: getdents64 writes at most `buf.len()` bytes into `buf`.
         let read = unsafe { libc::syscall(libc::SYS_getdents64, dir, buf.as_mut_ptr(), buf.len()) };
         let Ok(read) = usize::try_from(read) else {
@@ -728,12 +780,9 @@ unsafe fn mark_cloexec_from_proc() -> io::Result<()> {
                 && fd > 2
                 && fd != dir
             {
-                // SAFETY: fcntl on a closed descriptor fails with EBADF only.
-                unsafe {
-                    let flags = libc::fcntl(fd, libc::F_GETFD);
-                    if flags >= 0 {
-                        libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
-                    }
+                // A descriptor that stays open would reach the code.
+                if let Err(e) = mark(fd) {
+                    break 'walk Err(e);
                 }
             }
             at += reclen;
@@ -1293,6 +1342,73 @@ mod tests {
     }
 
     #[test]
+    fn the_descriptor_walk_fails_closed_when_a_flag_update_fails() {
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let target = null.as_raw_fd();
+        // SAFETY: the walk reads /proc/self/fd and calls the closure only.
+        let result = unsafe {
+            walk_proc_fds(|fd| {
+                if fd == target {
+                    Err(io::Error::from_raw_os_error(libc::EPERM))
+                } else {
+                    Ok(())
+                }
+            })
+        };
+        assert!(
+            matches!(result, Err(ref e) if e.raw_os_error() == Some(libc::EPERM)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn set_cloexec_marks_an_open_descriptor_and_skips_a_closed_one() {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        // SAFETY: dup makes a new descriptor without close-on-exec.
+        let fd = unsafe { libc::dup(file.as_raw_fd()) };
+        assert!(fd > 2);
+        set_cloexec(fd).unwrap();
+        // SAFETY: fcntl reads the flags of a valid descriptor.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+        // SAFETY: `fd` is the descriptor that dup made above.
+        unsafe { libc::close(fd) };
+        set_cloexec(fd).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "needs root; the Sandbox (KVM) workflow runs it with sudo"]
+    async fn root_the_run_cgroup_bounds_the_memory() {
+        // SAFETY: geteuid has no preconditions.
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
+        let root = test_cgroup_root();
+        let options = ExecOptions {
+            cgroup_root: Some(root.clone()),
+            ..ExecOptions::default()
+        };
+        // The data rlimit has 1 GiB of headroom, so it allows this.
+        let mut request =
+            sh("python3 -c \"b = b'x' * (256 << 20); print('allocated')\"").with_timeout_ms(30_000);
+        request.limits.memory_mib = Some(64);
+        let out = execute_plan(&plan(&request), &options, &CancellationToken::new()).await;
+        let left = child_cgroups(&root);
+        std::fs::remove_dir(&root).unwrap();
+        let out = out.unwrap();
+        assert!(!out.stdout.contains("allocated"), "{out:?}");
+        // The OOM killer stops Python. The shell then reports 128 + 9.
+        assert!(
+            matches!(
+                out.status,
+                RunStatus::Signaled {
+                    signal: libc::SIGKILL
+                } | RunStatus::Exited { code: 137 }
+            ),
+            "{out:?}"
+        );
+        assert!(left.is_empty(), "the run left {left:?}");
+    }
+
+    #[test]
     fn the_descriptor_walk_marks_a_descriptor_above_the_old_cutoff() {
         use std::os::unix::process::CommandExt as _;
         const HIGH: i32 = 5000;
@@ -1675,6 +1791,8 @@ mod tests {
             .map(|fields| PathBuf::from(fields[1]))
             .expect("a cgroup v2 mount");
         let root = mount.join(format!("harvest-test-{}", uuid::Uuid::new_v4().simple()));
+        // The test cgroup needs the memory controller of the mount root.
+        let _ = std::fs::write(mount.join("cgroup.subtree_control"), "+memory");
         std::fs::create_dir(&root).unwrap();
         root
     }
@@ -1704,12 +1822,11 @@ mod tests {
             .with_timeout_ms(30_000);
         request.limits.cpu_seconds = Some(1);
         let started = Instant::now();
-        let out = execute_plan(&plan(&request), &options, &CancellationToken::new())
-            .await
-            .unwrap();
+        let out = execute_plan(&plan(&request), &options, &CancellationToken::new()).await;
         let elapsed = started.elapsed();
         let left = child_cgroups(&root);
         std::fs::remove_dir(&root).unwrap();
+        let out = out.unwrap();
         assert_eq!(
             out.status,
             RunStatus::Signaled {
@@ -1740,9 +1857,9 @@ mod tests {
             &options,
             &CancellationToken::new(),
         )
-        .await
-        .unwrap();
+        .await;
         std::fs::remove_dir(&root).unwrap();
+        let out = out.unwrap();
         let pid = out.stdout.trim();
         let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .ok()

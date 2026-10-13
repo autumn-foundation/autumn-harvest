@@ -30,8 +30,8 @@ guest image. It is off by default. The guide is
   CPU vulnerabilities, cgroup v2, the jail base and the confinement.
 - **The guest agent.** The new `autumn-harvest-sandbox-guest` crate builds
   the agent that runs as init in the microVM. It serves one run over vsock,
-  then reboots. Each run gets a cgroup in the guest, so `cpu_seconds` bounds
-  the whole run. `scripts/sandbox/build-guest-image.sh` builds the guest
+  then reboots. Each run gets a cgroup in the guest, so `cpu_seconds` and
+  `memory_mib` bound the whole run. `scripts/sandbox/build-guest-image.sh` builds the guest
   image.
 - **The process backend.** For development and CI, it runs the same executor
   as a host process. The run gets rlimits, a private work directory, no host
