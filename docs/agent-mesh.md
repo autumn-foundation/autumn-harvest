@@ -332,7 +332,8 @@ the candidate needs no roster. A lookup that failed the source fails the
 candidate at the same lookup. A recorded tool outcome answers only an equal
 call of the same agent. A candidate call takes a recorded call id only from a
 turn of the same agent, so an approval for a child never releases a root
-call. The run id suffix `:d{n}` names that agent.
+call. An agent is its run id suffix `:d{n}` together with its name. The
+suffix alone counts delegations, so another peer can take the same `n`.
 
 ## 11. Observability
 

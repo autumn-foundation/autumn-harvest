@@ -1489,3 +1489,73 @@ async fn a_recorded_lookup_failure_fails_the_candidate_at_the_same_lookup() {
     assert_eq!(model.calls(), 0, "no model call runs past the failure");
     assert!(!evaluation.diverged(), "{evaluation:#?}");
 }
+
+/// Two peers can hold the same delegation ordinal. A recorded approval and
+/// outcome of one peer never answer a call of the other (agent mesh, AC13).
+#[tokio::test(flavor = "multi_thread")]
+async fn another_peer_at_the_same_ordinal_takes_no_recorded_approval() {
+    use autumn_harvest_agent::mesh::DELEGATE_TOOL;
+    use autumn_harvest_agent::{Mandate, Peer};
+
+    let delegate_to = |peer: &str| {
+        calls(
+            &[("d1", DELEGATE_TOOL, json!({"agent": peer, "task": "pay"}))],
+            1,
+        )
+    };
+    let (_dir, db) = fresh_db();
+    let source_model = ScriptedModel::new(vec![
+        delegate_to("researcher"),
+        calls(&[("c1", "pay", json!({"amount": 1}))], 1),
+        answer("paid", 1),
+        answer("done", 1),
+    ]);
+    let source_harness = AgentHarness::new(source_model)
+        .tool(recorded_tool(
+            "pay",
+            ToolEffect::Write,
+            &Arc::new(Recorder::default()),
+        ))
+        .policy(Arc::new(
+            ToolRules::new().effect(ToolEffect::Write, Rule::Ask),
+        ))
+        .peer(Peer::new("researcher", "R."))
+        .peer(Peer::new("critic", "C."));
+    let mut rt = runtime(&db, source_harness);
+    let task =
+        AgentTask::new("go").mandate(Mandate::new("planner").peers(["researcher", "critic"]));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let RunState::WaitingSignal(signal) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("the researcher pay waits");
+    };
+    assert_eq!(signal, "tool_approval:1:0:c1");
+    sqlite::decide(&mut rt, exec, &signal, &Approval::Approve).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    let source = rt.load_history(exec).unwrap();
+
+    // The candidate asks critic instead. Critic runs as `:d1` too, and makes
+    // the same call in the same slot.
+    let (harness, _recorder, model) = gated_candidate(vec![
+        delegate_to("critic"),
+        calls(&[("x1", "pay", json!({"amount": 1}))], 1),
+        answer("paid", 1),
+        answer("done", 1),
+    ]);
+    let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
+
+    assert!(
+        matches!(evaluation.candidate, RunEnd::Completed(_)),
+        "{:?}",
+        evaluation.candidate
+    );
+    assert_eq!(
+        evaluation.replayed_tool_calls, 0,
+        "researcher's outcome must not answer critic: {evaluation:#?}"
+    );
+    let after_pay = format!("{:?}", model.requests()[2].messages.last());
+    assert!(
+        after_pay.contains("no approval arrived"),
+        "researcher's approval must not release critic's call: {after_pay}"
+    );
+}

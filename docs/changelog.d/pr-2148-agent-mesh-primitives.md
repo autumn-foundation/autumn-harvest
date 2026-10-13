@@ -51,7 +51,8 @@ and `DESIGN-agent-mesh.md` the plan.
   answer, or with the recorded error of a lookup that failed the source. A
   recorded tool outcome answers only an equal call of the same agent. A
   candidate call takes a recorded call id only from a turn of the same
-  agent.
+  agent. An agent is its run id suffix together with its name, so another
+  peer at the same delegation number takes nothing.
 - **Response cache.** A child of a run whose run id is the workflow id skips
   the cache, as its parent does.
 

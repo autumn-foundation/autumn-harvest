@@ -47,7 +47,9 @@
 //! A recorded tool outcome answers a call with the same step, tool name and
 //! arguments. A model gives new call ids on each call, so the key holds no id.
 //! In a delegation run, the call must also come from the same agent of the
-//! tree. The child run id suffix, such as `:d1`, names that agent.
+//! tree. An agent is its lane, the child run id suffix such as `:d1`, with
+//! its name. The lane alone is a delegation ordinal, so another peer can hold
+//! it.
 //!
 //! A candidate call that equals the recorded call at the same turn and
 //! position, of the same agent, takes the recorded id. The ids change before
@@ -387,7 +389,8 @@ pub async fn evaluate(
 
     let session = Arc::new(Mutex::new(Session {
         recorded_calls: recording.turns.iter().map(ModelTurn::calls).collect(),
-        recorded_lanes: recording.turn_lanes.clone(),
+        recorded_agents: recording.turn_agents.clone(),
+        candidate_names: HashMap::new(),
         turn: 0,
         max_turns,
         cap_reached: false,
@@ -473,8 +476,8 @@ struct Recording {
     signals: Vec<(String, Value)>,
     /// The recorded peer lookups: the names asked and the peers found.
     peers: Vec<RecordedPeers>,
-    /// The lane of each recorded model turn, in order.
-    turn_lanes: Vec<String>,
+    /// The agent of each recorded model turn, in order.
+    turn_agents: Vec<AgentKey>,
     end: RunEnd,
 }
 
@@ -491,9 +494,8 @@ struct RecordedPeers {
 /// One recorded tool call and its outcome.
 #[derive(Clone)]
 struct RecordedTool {
-    /// The agent of the tree that made the call: the run id suffix after the
-    /// root run id. The root agent has an empty lane.
-    lane: String,
+    /// The agent of the tree that made the call.
+    agent: AgentKey,
     step: u32,
     name: String,
     arguments: Value,
@@ -596,7 +598,17 @@ impl Recording {
         // then times out, which shows as a divergence.
         signals.retain(|(name, _)| opened.contains(name.as_str()));
         let turns = model_turns(history)?;
-        let turn_lanes = model_turn_lanes(history, run_id.as_deref())?;
+        let turn_agents = model_turn_agents(history, run_id.as_deref())?;
+        // One lane holds one agent in a run, so its model turns name it.
+        let names: HashMap<&str, &Option<String>> = turn_agents
+            .iter()
+            .map(|agent| (agent.lane.as_str(), &agent.name))
+            .collect();
+        for tool in &mut effects.tools {
+            tool.agent.name = names
+                .get(tool.agent.lane.as_str())
+                .and_then(|name| (*name).clone());
+        }
         Ok(Self {
             task,
             run_id,
@@ -605,7 +617,7 @@ impl Recording {
             snapshots: effects.snapshots,
             signals,
             peers: effects.peers,
-            turn_lanes,
+            turn_agents,
             end: end.ok_or(EvalError::InFlightSource)?,
         })
     }
@@ -708,7 +720,11 @@ fn recorded_tool(
 ) -> Result<RecordedTool, EvalError> {
     let request: ToolCallRequest = decode(input.clone()).map_err(EvalError::Undecodable)?;
     Ok(RecordedTool {
-        lane: lane_of(&request.run_id, root).to_owned(),
+        // The name comes from the model turns of the lane, after the read.
+        agent: AgentKey {
+            lane: lane_of(&request.run_id, root).to_owned(),
+            name: None,
+        },
         step: request.step,
         name: request.call.name,
         arguments: request.call.arguments,
@@ -723,6 +739,20 @@ fn recorded_tool(
 fn lane_of<'a>(run_id: &'a str, root: Option<&str>) -> &'a str {
     root.and_then(|root| run_id.strip_prefix(root))
         .unwrap_or_default()
+}
+
+/// One agent of a delegation tree.
+///
+/// The lane is a delegation ordinal, so two runs can give the same lane to
+/// different peers. The name tells them apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AgentKey {
+    /// The run id suffix after the root run id. The root agent has an empty
+    /// lane.
+    lane: String,
+    /// The agent that holds the mandate, or `None` for a run with no
+    /// mandate.
+    name: Option<String>,
 }
 
 /// How a terminal event ends a run, or `None` for another event.
@@ -751,9 +781,11 @@ fn run_end(event: &WorkflowEvent) -> Result<Option<RunEnd>, EvalError> {
 struct Session {
     /// The tool calls of each recorded turn, for id alignment.
     recorded_calls: Vec<Vec<ToolCall>>,
-    /// The lane of each recorded turn. A candidate turn of another lane
+    /// The agent of each recorded turn. A candidate turn of another agent
     /// takes no recorded id.
-    recorded_lanes: Vec<String>,
+    recorded_agents: Vec<AgentKey>,
+    /// The name of the agent in each candidate lane, from its model turns.
+    candidate_names: HashMap<String, Option<String>>,
     /// The index of the next candidate turn.
     turn: usize,
     max_turns: usize,
@@ -769,8 +801,8 @@ struct Session {
 }
 
 impl Session {
-    /// Claim the next candidate turn, of the agent `lane`. Returns its index
-    /// and the recorded calls of the same turn.
+    /// Claim the next candidate turn, of `agent`. Returns its index and the
+    /// recorded calls of the same turn.
     ///
     /// A recorded turn of another agent gives no calls. Its call ids could
     /// otherwise match an approval that a person gave to another agent.
@@ -778,7 +810,7 @@ impl Session {
     /// # Errors
     ///
     /// Returns [`TURN_CAP_ERROR`] when the turn cap is reached.
-    fn next_turn(&mut self, lane: &str) -> Result<(usize, Vec<ToolCall>), String> {
+    fn next_turn(&mut self, agent: &AgentKey) -> Result<(usize, Vec<ToolCall>), String> {
         if self.turn >= self.max_turns {
             self.cap_reached = true;
             return Err(TURN_CAP_ERROR.to_owned());
@@ -786,9 +818,9 @@ impl Session {
         let index = self.turn;
         self.turn += 1;
         let same_agent = self
-            .recorded_lanes
+            .recorded_agents
             .get(index)
-            .is_none_or(|recorded| recorded == lane);
+            .is_none_or(|recorded| recorded == agent);
         let recorded = if same_agent {
             self.recorded_calls.get(index).cloned().unwrap_or_default()
         } else {
@@ -803,10 +835,12 @@ impl Session {
     ///
     /// Returns the recorded error of a call that failed for good.
     fn answer(&mut self, request: &ToolCallRequest) -> Result<ToolOutcome, String> {
-        let lane = lane_of(&request.run_id, self.root.as_deref());
+        let lane = lane_of(&request.run_id, self.root.as_deref()).to_owned();
+        let name = self.candidate_names.get(&lane).cloned().flatten();
+        let agent = AgentKey { lane, name };
         let recorded = self.tools.iter_mut().find(|tool| {
             !tool.used
-                && tool.lane == lane
+                && tool.agent == agent
                 && tool.step == request.step
                 && tool.name == request.call.name
                 && tool.arguments == request.call.arguments
@@ -916,12 +950,19 @@ fn model_mock(
             // The root agent makes the first model request.
             let root = session.root.get_or_insert_with(|| request.run_id.clone());
             let lane = lane_of(&request.run_id, Some(root.as_str())).to_owned();
+            let agent = AgentKey {
+                lane: lane.clone(),
+                name: request.agent.clone(),
+            };
+            session
+                .candidate_names
+                .insert(lane.clone(), request.agent.clone());
             // The test engine has its own ids. The policy sees the recorded
             // run id instead, with the lane of the same agent.
             if let Some(run_id) = &run_id {
                 request.run_id = format!("{run_id}{lane}");
             }
-            session.next_turn(&lane)?
+            session.next_turn(&agent)?
         };
         let turn = live_turn(
             &handle,
@@ -1053,15 +1094,15 @@ fn model_turns(history: &[WorkflowEvent]) -> Result<Vec<ModelTurn>, EvalError> {
     Ok(turns)
 }
 
-/// The lane of each completed model turn of a history, in order. `root` is
+/// The agent of each completed model turn of a history, in order. `root` is
 /// the run id of the root agent.
-fn model_turn_lanes(
+fn model_turn_agents(
     history: &[WorkflowEvent],
     root: Option<&str>,
-) -> Result<Vec<String>, EvalError> {
+) -> Result<Vec<AgentKey>, EvalError> {
     let model_name = agent_model_turn_info().name;
-    let mut scheduled: HashMap<ActivityExecId, String> = HashMap::new();
-    let mut lanes = Vec::new();
+    let mut scheduled: HashMap<ActivityExecId, AgentKey> = HashMap::new();
+    let mut agents = Vec::new();
     for event in history {
         match event {
             WorkflowEvent::ActivityScheduled {
@@ -1072,17 +1113,21 @@ fn model_turn_lanes(
             } if name == model_name => {
                 let request: ModelTurnRequest =
                     decode(input.clone()).map_err(EvalError::Undecodable)?;
-                scheduled.insert(*activity_id, lane_of(&request.run_id, root).to_owned());
+                let agent = AgentKey {
+                    lane: lane_of(&request.run_id, root).to_owned(),
+                    name: request.agent,
+                };
+                scheduled.insert(*activity_id, agent);
             }
             WorkflowEvent::ActivityCompleted { activity_id, .. } => {
-                if let Some(lane) = scheduled.remove(activity_id) {
-                    lanes.push(lane);
+                if let Some(agent) = scheduled.remove(activity_id) {
+                    agents.push(agent);
                 }
             }
             _ => {}
         }
     }
-    Ok(lanes)
+    Ok(agents)
 }
 
 /// Compare the two runs turn by turn.
