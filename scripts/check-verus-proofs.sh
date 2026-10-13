@@ -12,8 +12,8 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-verus_release="0.2026.10.12.4bfc2b4"
-verus_sha256="af2aeac064df83fd8a6ea34cb98de75df3f477415e10bc177c9911853e057138"
+verus_release="0.2026.10.12.781a460"
+verus_sha256="7f4faaae12bdbc171dbef71ed74e65f48e3b4673f7d93a70932d776887e8e672"
 
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
