@@ -50,14 +50,37 @@ pub enum PosturePolicy {
     Report,
 }
 
-/// Read the version from the output of `firecracker --version` or
-/// `jailer --version`, such as `Firecracker v1.17.0` or `Jailer v1.17.0`.
+/// A binary of the Firecracker release that the launcher runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmmBinary {
+    /// The `firecracker` VMM.
+    Firecracker,
+    /// The `jailer`.
+    Jailer,
+}
+
+impl VmmBinary {
+    /// The name that the binary prints before its version.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Firecracker => "Firecracker",
+            Self::Jailer => "Jailer",
+        }
+    }
+}
+
+/// Read the version of `binary` from its `--version` output, such as
+/// `Firecracker v1.17.0` or `Jailer v1.17.0`.
+///
+/// The output must name `binary`. A jailer path that runs Firecracker
+/// passes no version check, so the mistake is a config error at startup.
 #[must_use]
-pub fn parse_version(output: &str) -> Option<Version> {
-    let output = output.trim_start();
+pub fn parse_version(output: &str, binary: VmmBinary) -> Option<Version> {
     let rest = output
-        .strip_prefix("Firecracker v")
-        .or_else(|| output.strip_prefix("Jailer v"))?;
+        .trim_start()
+        .strip_prefix(binary.name())?
+        .strip_prefix(" v")?;
     let core: String = rest
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '.')
@@ -94,13 +117,16 @@ pub fn check_version(version: Version) -> Result<(), SandboxError> {
     }
 }
 
-/// Run `firecracker --version` with no environment and check the result.
+/// Run `<binary> --version` with no environment and check the result.
 ///
 /// # Errors
 ///
 /// Returns [`SandboxError::Config`] when the binary does not run, prints no
 /// version, or is too old.
-pub async fn probe_version(firecracker_bin: &Path) -> Result<Version, SandboxError> {
+pub async fn probe_version(
+    firecracker_bin: &Path,
+    binary: VmmBinary,
+) -> Result<Version, SandboxError> {
     let output = tokio::time::timeout(
         VERSION_PROBE_TIMEOUT,
         tokio::process::Command::new(firecracker_bin)
@@ -119,10 +145,11 @@ pub async fn probe_version(firecracker_bin: &Path) -> Result<Version, SandboxErr
         ))
     })?;
     let text = String::from_utf8_lossy(&output.stdout);
-    let version = parse_version(&text).ok_or_else(|| {
+    let version = parse_version(&text, binary).ok_or_else(|| {
         SandboxError::Config(format!(
-            "{} --version printed no Firecracker version",
-            firecracker_bin.display()
+            "{} --version printed no {} version",
+            firecracker_bin.display(),
+            binary.name()
         ))
     })?;
     check_version(version)?;
@@ -257,14 +284,36 @@ mod tests {
 
     #[test]
     fn versions_are_parsed() {
+        let fc = VmmBinary::Firecracker;
         assert_eq!(
-            parse_version("Firecracker v1.17.0\n\nSupported snapshot versions: v7.0.0"),
+            parse_version(
+                "Firecracker v1.17.0\n\nSupported snapshot versions: v7.0.0",
+                fc
+            ),
             Some((1, 17, 0))
         );
-        assert_eq!(parse_version("Firecracker v1.14.4-dev"), Some((1, 14, 4)));
-        assert_eq!(parse_version("Jailer v1.15.1\n"), Some((1, 15, 1)));
-        assert_eq!(parse_version("cloud-hypervisor v40.0"), None);
-        assert_eq!(parse_version(""), None);
+        assert_eq!(
+            parse_version("Firecracker v1.14.4-dev", fc),
+            Some((1, 14, 4))
+        );
+        assert_eq!(
+            parse_version("Jailer v1.15.1\n", VmmBinary::Jailer),
+            Some((1, 15, 1))
+        );
+        assert_eq!(parse_version("cloud-hypervisor v40.0", fc), None);
+        assert_eq!(parse_version("", fc), None);
+    }
+
+    #[test]
+    fn a_version_of_the_other_binary_is_not_parsed() {
+        assert_eq!(
+            parse_version("Firecracker v1.17.0", VmmBinary::Jailer),
+            None
+        );
+        assert_eq!(
+            parse_version("Jailer v1.17.0", VmmBinary::Firecracker),
+            None
+        );
     }
 
     #[test]
@@ -289,9 +338,15 @@ mod tests {
         write_executable(&good, "#!/bin/sh\necho 'Firecracker v1.17.0'\n");
         let old = dir.join("fc-old");
         write_executable(&old, "#!/bin/sh\necho 'Firecracker v1.14.0'\n");
-        assert_eq!(probe_version(&good).await.unwrap(), (1, 17, 0));
-        assert!(probe_version(&old).await.is_err());
-        assert!(probe_version(&dir.join("missing")).await.is_err());
+        let fc = VmmBinary::Firecracker;
+        assert_eq!(probe_version(&good, fc).await.unwrap(), (1, 17, 0));
+        assert!(probe_version(&old, fc).await.is_err());
+        assert!(probe_version(&dir.join("missing"), fc).await.is_err());
+        // A Firecracker binary given as the jailer is a config error.
+        assert!(matches!(
+            probe_version(&good, VmmBinary::Jailer).await,
+            Err(SandboxError::Config(ref m)) if m.contains("Jailer")
+        ));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

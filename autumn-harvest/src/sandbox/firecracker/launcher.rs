@@ -426,9 +426,10 @@ impl FirecrackerLauncher {
     async fn check_versions(&self) -> Result<(), SandboxError> {
         self.versions_checked
             .get_or_try_init(|| async {
-                super::posture::probe_version(&self.config.firecracker_bin).await?;
+                use super::posture::{VmmBinary, probe_version};
+                probe_version(&self.config.firecracker_bin, VmmBinary::Firecracker).await?;
                 if let Confinement::Jailer(jailer) = &self.config.confinement {
-                    super::posture::probe_version(&jailer.jailer_bin).await?;
+                    probe_version(&jailer.jailer_bin, VmmBinary::Jailer).await?;
                 }
                 Ok::<(), SandboxError>(())
             })
@@ -1648,6 +1649,28 @@ while True:
             .expect_err("old version");
         assert!(
             matches!(err, SandboxError::Config(ref m) if m.contains("CVE-2026-5747")),
+            "{err:?}"
+        );
+        drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_jailer_path_that_runs_firecracker_is_a_config_error() {
+        let dir = temp_dir();
+        let mut config = jailed(&dir);
+        let firecracker = config.firecracker_bin.clone();
+        if let Confinement::Jailer(jail) = &mut config.confinement {
+            jail.jailer_bin = firecracker;
+        }
+        let launcher = FirecrackerLauncher::new(config).unwrap();
+        let err = launcher
+            .launch()
+            .await
+            .map(|_| ())
+            .expect_err("the jailer path runs Firecracker");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("Jailer")),
             "{err:?}"
         );
         drop(launcher);
