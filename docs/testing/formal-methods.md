@@ -535,8 +535,9 @@ product, and a mixer that must be shown to be one to one.
 scripts/check-verus-proofs.sh
 ```
 
-The script downloads the pinned Verus release and checks its SHA-256. To
-use a local binary, set `VERUS=/path/to/verus`. The release names the Rust
+The script downloads the pinned Verus release and checks its SHA-256. Pin
+a weekly release, not a rolling one. Verus deletes each rolling release when
+the next one ships. To use a local binary, set `VERUS=/path/to/verus`. The release names the Rust
 toolchain that it links against, and the script installs that toolchain
 with rustup. The proofs take about 2 seconds. The `verus` job in
 `.github/workflows/ci.yml` runs the script. It skips draft PRs and
