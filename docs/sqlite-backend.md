@@ -510,6 +510,8 @@ fires no timer and runs no activity body.
 - A running run answers with the state at its frontier: the first command
   that the history does not record. The replay does not know a query that
   the workflow registers past that point.
+- A running run with a pending `cancel` replays with that reason, so
+  `ctx.cancellation_reason()` reads as it does on the next drive.
 - A terminal run answers with the state at its recorded end.
 - The call reads the rows immediately. The returned future borrows nothing,
   so it can go to `tokio::spawn`. A later `set_query_timeout` does not change

@@ -39,6 +39,7 @@ pub struct QueryReplay {
     workflow_id: String,
     terminal: bool,
     history_policy: WorkflowHistoryPolicy,
+    pending_cancel: Option<String>,
 }
 
 impl QueryReplay {
@@ -61,6 +62,14 @@ impl QueryReplay {
         let handler = *workflows
             .get(&workflow_name)
             .ok_or_else(|| SqliteError::UnknownWorkflow(workflow_name.clone()))?;
+        let terminal = autumn_harvest::erase::is_terminal_state(&state);
+        // A cancel request is pending only while the run is live (issue
+        // #2021). The next drive sees it, so the query replay sees it too.
+        let pending_cancel = if terminal {
+            None
+        } else {
+            store::cancel_request(conn, exec)?.map(|(reason, _)| reason)
+        };
         Ok(Self {
             exec,
             handler,
@@ -68,8 +77,9 @@ impl QueryReplay {
             input: store::execution_input(conn, exec)?,
             workflow_id: store::workflow_id_of(conn, exec)?,
             workflow_name,
-            terminal: autumn_harvest::erase::is_terminal_state(&state),
+            terminal,
             history_policy,
+            pending_cancel,
         })
     }
 
@@ -83,8 +93,9 @@ impl QueryReplay {
     pub async fn run(self, name: String, args: Value, timeout: Duration) -> SqliteResult<Value> {
         let exec = self.exec;
         let sealed = self.terminal && history_reached_terminal_seal(&self.history);
-        // The drive builds its context with the same name, id and history
-        // policy, so a handler that reads them replays the same path.
+        // The drive builds its context with the same name, id, history policy
+        // and pending cancel, so a handler that reads them replays the same
+        // path.
         let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
             exec,
             self.history,
@@ -92,7 +103,8 @@ impl QueryReplay {
             self.history_policy,
         )
         .with_workflow_name(self.workflow_name)
-        .with_workflow_id(self.workflow_id);
+        .with_workflow_id(self.workflow_id)
+        .with_pending_cancellation(self.pending_cancel);
 
         let outcome = drive_query_replay_async(&ctx, self.handler, self.input, timeout).await;
         let refusal = if self.terminal {

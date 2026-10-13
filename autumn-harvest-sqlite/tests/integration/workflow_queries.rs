@@ -58,6 +58,14 @@ async fn staged(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
     Ok(payload)
 }
 
+/// Registers `reason`, which returns the cancel reason that the body saw.
+#[workflow]
+async fn cancel_aware(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let reason = ctx.cancellation_reason().map(str::to_string);
+    ctx.register_query("reason", move || json!(reason));
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
 /// Completes at once. It replaces `staged` to model a code change.
 #[workflow]
 async fn drifted(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
@@ -786,4 +794,24 @@ async fn query_after_a_declarative_update_serves() {
     assert!(matches!(state, RunState::Completed(_)), "got {state:?}");
     let answer = rt.query(exec, "stage", Value::Null).await.unwrap();
     assert_eq!(answer, json!("waiting"));
+}
+
+/// A query sees a pending cancel, as the next drive does (issue #2021).
+#[tokio::test]
+async fn query_sees_a_pending_cancel() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&cancel_aware_info());
+    let exec = rt.start_workflow("cancel_aware", json!(0)).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    let answer = rt.query(exec, "reason", Value::Null).await.unwrap();
+    assert_eq!(answer, json!(null));
+
+    rt.cancel(exec, "stop").unwrap();
+
+    let answer = rt.query(exec, "reason", Value::Null).await.unwrap();
+    assert_eq!(
+        answer,
+        json!("stop"),
+        "the query replay sees the pending cancel"
+    );
 }
