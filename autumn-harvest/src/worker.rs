@@ -31420,6 +31420,10 @@ pub struct Worker {
     /// wait (issue #1836). The next idle wait then also wakes on
     /// `capacity_freed`, even when the slot freed before the wait began.
     limit_refused: AtomicBool,
+    /// The poll gate refused a kind since the last idle wait (issue #1787).
+    /// The next idle wait then also wakes on `capacity_freed`, even when the
+    /// permit freed during the claim.
+    pool_refused: AtomicBool,
     /// Set the first time `spawn_monitoring_tasks` runs to completion (issue
     /// #548 review). Guards against a hypothetical second invocation (e.g. a
     /// future caller wrapping `run`/`run_with_listener` in a retry loop)
@@ -33442,6 +33446,7 @@ impl Worker {
             deferral_due,
             gate_refused: Arc::new(GateRefused::default()),
             limit_refused: AtomicBool::new(false),
+            pool_refused: AtomicBool::new(false),
             monitoring_started: std::sync::atomic::AtomicBool::new(false),
             shutdown: CancellationToken::new(),
             drain_cancel: CancellationToken::new(),
@@ -36026,8 +36031,11 @@ impl Worker {
         // idle, so it always waits, unchanged.
         if idle {
             let wait = dispatch_read_block(shard_count, self.config.poll_interval);
-            // A full pool also wakes on a released permit (issue #1787).
-            let capacity_bound = self.capacity_bound();
+            // A full pool also wakes on a released permit (issue #1787). A
+            // multi-shard turn waits at most 10 ms here, so it leaves that
+            // wake to the idle wait of its round. Here it would clear the
+            // flag and take the stored wake of an earlier gated shard.
+            let capacity_bound = shard_count == 1 && self.capacity_bound();
             tokio::select! {
                 () = self.shutdown.cancelled() => {}
                 () = self.capacity_freed.notified(), if capacity_bound => {}
@@ -37159,16 +37167,26 @@ impl Worker {
     /// wake, because `Notify` stores it until the wait polls it. The attempt
     /// frees its limit slot before its dispatch permit, so the wake finds
     /// the slot free.
+    ///
+    /// Also true when the gate refused a kind since the last wait. A permit
+    /// can free while the gated poll claims. The pools then look free here,
+    /// but the backlog of the refused kind still waits. `Notify` stores the
+    /// release, so the wait finds it.
     fn capacity_bound(&self) -> bool {
         let limit_refused = self.limit_refused.swap(false, Ordering::Relaxed);
+        let pool_refused = self.pool_refused.swap(false, Ordering::Relaxed);
         self.poll_admission_now() != PollAdmission::Any
             || limit_refused
+            || pool_refused
             || self.registry.adaptive_limits.any_saturated()
     }
 
     /// Mark each kind the gate refuses (issue #1787). See `gate_refused`.
     fn record_gate_refusal(&self, admission: PollAdmission) {
         use crate::queue::TaskType;
+        if admission != PollAdmission::Any {
+            self.pool_refused.store(true, Ordering::Relaxed);
+        }
         let (workflow, activity) = match admission {
             PollAdmission::Saturated => (true, true),
             PollAdmission::Any => (false, false),
@@ -53426,6 +53444,66 @@ mod tests {
         assert_eq!(permits.admission(), PollAdmission::Only(TaskType::Workflow));
         let none = PollPermits::acquire(PollAdmission::Any, &workflow, &activity);
         assert_eq!(none.admission(), PollAdmission::Saturated);
+    }
+
+    /// A permit that frees while a gated poll claims must still wake the idle
+    /// wait (issue #1787). The pools then look free when the wait begins.
+    /// Without the wake, the backlog of the gated kind waits one poll
+    /// interval.
+    #[test]
+    fn a_permit_freed_during_a_gated_poll_still_wakes_the_idle_wait() {
+        use crate::queue::TaskType;
+        let mut cfg = default_runtime_config();
+        cfg.max_concurrent_activities = 1;
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(cfg, registry).expect("valid config");
+
+        let running = Arc::clone(&worker.activity_semaphore)
+            .try_acquire_owned()
+            .expect("one activity permit");
+        let admission = worker.poll_admission_now();
+        assert_eq!(admission, PollAdmission::Only(TaskType::Workflow));
+        worker.record_gate_refusal(admission);
+        // The running activity ends during the claim of the gated poll.
+        drop(running);
+        assert_eq!(worker.poll_admission_now(), PollAdmission::Any);
+        assert!(
+            worker.capacity_bound(),
+            "the idle wait after a gated poll must wake on a freed permit"
+        );
+        // The flag lasts for one idle wait.
+        assert!(!worker.capacity_bound());
+    }
+
+    /// The short closing wait of a multi-shard turn leaves the capacity
+    /// wake to the round's own idle wait (issue #1787). Otherwise a gated
+    /// poll on one shard loses its wake to the drain of the next shard.
+    #[tokio::test(start_paused = true)]
+    async fn a_multi_shard_drain_leaves_the_capacity_wake_to_the_round() {
+        use crate::queue::TaskType;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("listener has a local address");
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new(format!("postgres://silent@{addr}/silent"));
+        let pool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds without connecting");
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        // An earlier shard's poll was gated, and its permit then freed.
+        worker.record_gate_refusal(PollAdmission::Only(TaskType::Workflow));
+        assert_eq!(worker.poll_admission_now(), PollAdmission::Any);
+        let dispatched = worker.drain_postgres(&pool, None, 2).await;
+        assert_eq!(dispatched, 0);
+        assert!(
+            worker.capacity_bound(),
+            "the round's idle wait must still wake on the freed permit"
+        );
     }
 
     /// A slot tuner shrink cannot take the permit a poll holds for its claim
