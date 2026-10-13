@@ -37,6 +37,21 @@ pub enum RunStatus {
     TimedOut,
 }
 
+/// Whether the byte count and the truncation flag of a stream match its
+/// text, for a capture that keeps `cap` bytes.
+///
+/// A whole stream keeps each byte. A valid byte stays one byte of text, and
+/// an invalid run of one to three bytes becomes one U+FFFD of three bytes.
+/// So the text has between one and three bytes for each counted byte. A cut
+/// stream counts more bytes than the cap and holds the truncation marker.
+fn stream_counts_match(text: &str, bytes: u64, truncated: bool, cap: u64) -> bool {
+    if truncated {
+        return bytes > cap && text.contains(super::capture::TRUNCATION_MARKER);
+    }
+    let len = u64::try_from(text.len()).unwrap_or(u64::MAX);
+    bytes <= cap && bytes <= len && len <= bytes.saturating_mul(3)
+}
+
 /// A guest string for an error message: quoted, escaped, and cut to 64
 /// characters. A guest can send any bytes, and the message goes to history.
 #[must_use]
@@ -184,7 +199,21 @@ impl SandboxOutcome {
         let stream_cap = kept
             .saturating_mul(3)
             .saturating_add(super::capture::TRUNCATION_MARKER.len());
-        for (name, text) in [("stdout", &self.stdout), ("stderr", &self.stderr)] {
+        let streams = [
+            (
+                "stdout",
+                &self.stdout,
+                self.stdout_bytes,
+                self.stdout_truncated,
+            ),
+            (
+                "stderr",
+                &self.stderr,
+                self.stderr_bytes,
+                self.stderr_truncated,
+            ),
+        ];
+        for (name, text, bytes, truncated) in streams {
             if text.len() > stream_cap {
                 return violation(format!(
                     "{name} holds {} bytes, over the bound of {stream_cap}",
@@ -193,6 +222,12 @@ impl SandboxOutcome {
             }
             if text.contains('\0') {
                 return violation(format!("{name} holds a NUL byte"));
+            }
+            if !stream_counts_match(text, bytes, truncated, plan.limits.max_output_bytes) {
+                return violation(format!(
+                    "{name} reports {bytes} bytes and truncated={truncated}, which its text \
+                     does not match"
+                ));
             }
         }
         let per_file = usize::try_from(plan.max_output_file_bytes).unwrap_or(usize::MAX);
@@ -317,6 +352,7 @@ pub(crate) mod tests {
         let plan = plan_with_output("out.txt");
         let mut out = outcome(RunStatus::Exited { code: 0 });
         out.stdout = "x".repeat(usize::try_from(plan.limits.max_output_bytes).unwrap());
+        out.stdout_bytes = plan.limits.max_output_bytes;
         out.outputs.push(OutputFile {
             path: "out.txt".into(),
             content: b"ok".to_vec(),
@@ -390,6 +426,39 @@ pub(crate) mod tests {
             out.check_bounds(&plan),
             Err(SandboxError::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn stream_counts_that_contradict_the_text_break_the_bounds() {
+        let plan = plan_with_output("out.txt");
+        let with = |text: &str, bytes: u64, truncated: bool| {
+            let mut out = outcome(RunStatus::Exited { code: 0 });
+            out.skipped_outputs.push(SkippedOutput {
+                path: "out.txt".into(),
+                reason: "missing".into(),
+            });
+            out.stdout = text.into();
+            out.stdout_bytes = bytes;
+            out.stdout_truncated = truncated;
+            out.check_bounds(&plan)
+        };
+        let cap = plan.limits.max_output_bytes;
+        assert!(with("hi\n", 3, false).is_ok());
+        assert!(with("\u{fffd}", 1, false).is_ok(), "one invalid byte");
+        let marker = format!("a{}b", crate::sandbox::capture::TRUNCATION_MARKER);
+        assert!(with(&marker, cap + 10, true).is_ok());
+        for (text, bytes, truncated) in [
+            ("hi\n", 0, false),
+            ("hi\n", 99, false),
+            ("", cap + 1, false),
+            ("hi\n", cap + 1, true),
+            (marker.as_str(), cap, true),
+        ] {
+            assert!(
+                matches!(with(text, bytes, truncated), Err(SandboxError::Protocol(_))),
+                "{text:?} {bytes} {truncated}"
+            );
+        }
     }
 
     #[test]

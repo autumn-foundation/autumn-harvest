@@ -188,6 +188,9 @@ impl Drop for InstanceLease {
     }
 }
 
+/// The most vCPUs that Firecracker gives one microVM.
+const MAX_VCPUS: u8 = 32;
+
 /// The suffix of a lease file.
 const LEASE_SUFFIX: &str = ".lease";
 
@@ -203,9 +206,21 @@ impl FirecrackerLauncher {
     ///
     /// # Errors
     ///
-    /// Returns [`SandboxError::Config`] when a path is missing, when a
-    /// snapshot boot has no jailer, or when the lease cannot be taken.
+    /// Returns [`SandboxError::Config`] in these cases:
+    ///
+    /// - the machine has no memory, or a vCPU count outside 1 to 32;
+    /// - a path is missing;
+    /// - a snapshot boot has no jailer;
+    /// - the lease cannot be taken.
     pub fn new(config: LauncherConfig) -> Result<Self, SandboxError> {
+        // Firecracker refuses these at each launch. Refuse them once, here.
+        let machine = config.machine;
+        if !(1..=MAX_VCPUS).contains(&machine.vcpu_count) || machine.mem_size_mib == 0 {
+            return Err(SandboxError::Config(format!(
+                "a microVM needs 1 to {MAX_VCPUS} vCPUs and some memory, not {} vCPUs and {} MiB",
+                machine.vcpu_count, machine.mem_size_mib
+            )));
+        }
         let mut required = vec![
             ("the Firecracker binary", &config.firecracker_bin),
             ("the guest kernel", &config.image.kernel),
@@ -1531,6 +1546,32 @@ while True:
             guest_port: GUEST_AGENT_PORT,
             api_timeout: Duration::from_secs(5),
         }
+    }
+
+    #[test]
+    fn a_machine_outside_the_firecracker_range_is_a_config_error() {
+        let dir = temp_dir();
+        for machine in [
+            MachineSpec {
+                vcpu_count: 0,
+                mem_size_mib: 512,
+            },
+            MachineSpec {
+                vcpu_count: 33,
+                mem_size_mib: 512,
+            },
+            MachineSpec {
+                vcpu_count: 1,
+                mem_size_mib: 0,
+            },
+        ] {
+            let fc = script(&dir, "firecracker", "exit 0");
+            let mut config = unjailed(&dir, fc, BootMethod::ConfigFile);
+            config.machine = machine;
+            let err = FirecrackerLauncher::new(config).expect_err("bad machine");
+            assert!(matches!(err, SandboxError::Config(_)), "{err:?}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

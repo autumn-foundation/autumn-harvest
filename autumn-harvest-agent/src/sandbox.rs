@@ -313,13 +313,14 @@ mod tests {
             _cancel: CancellationToken,
         ) -> SandboxFuture<'_, Result<SandboxOutcome, SandboxError>> {
             let code = String::from_utf8_lossy(&job.plan.files[0].content).into_owned();
+            let bytes = u64::try_from(code.len()).unwrap();
             self.seen.lock().unwrap().push(job);
             Box::pin(async move {
                 Ok(SandboxOutcome {
                     status: RunStatus::Exited { code: 1 },
                     stdout: code,
                     stderr: "boom".into(),
-                    stdout_bytes: 0,
+                    stdout_bytes: bytes,
                     stderr_bytes: 4,
                     stdout_truncated: false,
                     stderr_truncated: false,
