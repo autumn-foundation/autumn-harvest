@@ -516,6 +516,22 @@ fn measure_export_bytes(document: &mut HistoryExportDocument) -> Result<usize, H
     Ok(previous)
 }
 
+impl HistoryExportDocument {
+    /// Recompute `size_limit.actual_bytes` after a change to the document.
+    ///
+    /// A read path that decodes payload fields changes the byte count. Call
+    /// this after the change, so the field states the size of the document
+    /// that the caller gets (issue #1983).
+    ///
+    /// # Errors
+    ///
+    /// [`HistoryExportError::Serialization`] when the document does not
+    /// serialize.
+    pub fn remeasure(&mut self) -> Result<usize, HistoryExportError> {
+        measure_export_bytes(self)
+    }
+}
+
 fn history_state_is_terminal(state: &str) -> bool {
     matches!(
         state,

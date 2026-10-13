@@ -6,13 +6,15 @@
 # mirrored function matches the engine source.
 #
 # VERUS names a local verus binary. Without it, the script downloads the
-# pinned release and checks its SHA-256. The pin is a weekly release.
-# Verus deletes the asset of each rolling release when the next one ships. The release names the Rust
+# pinned release and checks its SHA-256. The release names the Rust
 # toolchain that it links against, and rustup installs that toolchain.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Pin a weekly release (`release/<version>`), not a rolling one. Verus keeps
+# the assets of only the newest rolling release, so a rolling pin returns 404
+# within a day. Weekly release assets stay.
 verus_release="0.2026.10.04.426d8b0"
 verus_sha256="624018662868563a7bec0dd07be5e4dd0c3d61124b4b55105765884bf2d4d1a0"
 

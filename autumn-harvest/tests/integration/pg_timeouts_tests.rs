@@ -3144,31 +3144,30 @@ async fn a_recently_used_connection_is_handed_out_without_a_ping() {
         &timeouts(5_000, SessionTimeouts::for_role(DbRole::Hot)),
     )
     .expect("engine pool builds");
-    // Connect the admin session first. The idle bound runs from the first
-    // checkout, and a new connection can take longer than the bound.
+    // Open the admin connection first. A new connection on a loaded database
+    // can take longer than `VERIFY_IDLE_AFTER`.
     let mut admin = connect(&url).await;
-    let pid = {
+    let old_pid = {
         let mut conn = pool.get().await.expect("first connection");
         backend_pid(&mut conn).await
     };
     // The checkout follows within the idle bound, so the pool sends no ping.
-    // `pg_stat_activity` keeps the last statement of the backend. A ping
-    // would replace it with `SELECT 1`. This needs no killed backend, so the
-    // client cannot see a closed socket and swap the connection first.
-    let conn = pool
-        .get()
-        .await
-        .expect("the pool hands out the hot connection");
-    let last = diesel::sql_query("SELECT query FROM pg_stat_activity WHERE pid = $1")
-        .bind::<diesel::sql_types::Integer, _>(pid)
+    let new_pid = {
+        let mut conn = pool.get().await.expect("second connection");
+        // The backend keeps the text of its last statement. A ping would leave
+        // `SELECT 1` there in place of the pid query.
+        let last = diesel::sql_query(format!(
+            "SELECT query FROM pg_stat_activity WHERE pid = {old_pid}"
+        ))
         .get_result::<LastQuery>(&mut admin)
         .await
-        .expect("read the last statement of the pooled backend")
-        .query;
-    drop(conn);
-    assert!(
-        last.contains("pg_backend_pid"),
-        "a hot checkout must hand out the connection without a ping, \
-         but the last statement was {last:?}"
-    );
+        .expect("read the pooled backend's last query");
+        assert!(
+            last.query.contains("pg_backend_pid"),
+            "a hot checkout must hand out the connection without a ping, got {:?}",
+            last.query
+        );
+        backend_pid(&mut conn).await
+    };
+    assert_eq!(new_pid, old_pid, "the pool hands out the same connection");
 }

@@ -1,9 +1,8 @@
 ## More formal verification: Verus proofs, more Kani proofs, a fourth Shuttle model
 
 **Verus.** A new `verus` CI job runs `scripts/check-verus-proofs.sh`. The
-script pins the weekly Verus release `0.2026.10.04.426d8b0` by SHA-256 and
-checks `formal/verus/src/lib.rs`. A rolling release does not work as a pin,
-because Verus deletes its asset when the next one ships. The proofs take about 2 seconds.
+script pins the weekly Verus release `0.2026.10.04.426d8b0` by SHA-256 and checks
+`formal/verus/src/lib.rs`. The proofs take about 2 seconds.
 
 - `mixers.rs`: `policy::mix64`, `dlq::mix64` and `chaos::splitmix64` are
   bijections on `u64`. An explicit inverse undoes each one. CBMC did not
