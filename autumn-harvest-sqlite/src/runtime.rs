@@ -1347,7 +1347,8 @@ impl SqliteRuntime {
             if let Some((cancel, _)) = store::cancel_request(&self.conn, exec)? {
                 self.seal_cancelled(exec, &cancel, None, now.timestamp_millis())?;
             } else {
-                self.fail_for_history_cap(exec, &reason, now.timestamp_millis())?;
+                let now = now.timestamp_millis();
+                self.fail_for_history_cap(exec, &reason, now, now)?;
             }
             return Err(SqliteError::UpdateHistoryCapReached {
                 execution_id: exec,
@@ -1947,7 +1948,7 @@ impl SqliteRuntime {
     ) -> SqliteResult<RunState> {
         let result = self.drive_one_cycle_inner(exec, now, failure_now).await;
         if let Err(SqliteError::Unsupported(message)) = &result
-            && let Err(seal_error) = self.seal_unsupported(exec, message, now)
+            && let Err(seal_error) = self.seal_unsupported(exec, message, now, failure_now())
         {
             // Keep the reason the caller needs. The run stays `RUNNING`, so
             // the next drive meets the feature again and retries the seal.
@@ -1965,7 +1966,7 @@ impl SqliteRuntime {
             && let Some((reason, _)) = store::cancel_request(&self.conn, exec)?
         {
             tracing::warn!(%exec, ?error, "a pending cancel ends a run the drive cannot advance");
-            return self.seal_cancelled(exec, &reason, None, now);
+            return self.seal_cancelled(exec, &reason, None, failure_now());
         }
         result
     }
@@ -1995,6 +1996,7 @@ impl SqliteRuntime {
         exec: ExecutionId,
         unsupported: &str,
         now: i64,
+        closed_at: i64,
     ) -> SqliteResult<()> {
         let feature = unsupported
             .split(" — ")
@@ -2008,7 +2010,7 @@ impl SqliteRuntime {
             details: Some(serde_json::json!({ "feature": feature, "message": unsupported })),
             non_retryable: Some(true),
         };
-        self.seal_failed(exec, &event, &message, now, now)
+        self.seal_failed(exec, &event, &message, now, closed_at)
     }
 
     /// Fail `exec` at a history cap (issue #2023).
@@ -2021,11 +2023,12 @@ impl SqliteRuntime {
         exec: ExecutionId,
         reason: &HistoryCapReason,
         now: i64,
+        closed_at: i64,
     ) -> SqliteResult<RunState> {
         let error = reason.to_string();
         tracing::warn!(%exec, %error, "workflow history reached a hard cap; failing the run");
         let event = WorkflowEvent::workflow_failed(error.clone());
-        self.seal_failed(exec, &event, &error, now, now)?;
+        self.seal_failed(exec, &event, &error, now, closed_at)?;
         Ok(RunState::Failed(error))
     }
 
@@ -2327,7 +2330,7 @@ impl SqliteRuntime {
             ..
         } = &outcome
         {
-            return self.contain_workflow_panic(exec, &ingest, error, now);
+            return self.contain_workflow_panic(exec, &ingest, error, decided_at);
         }
         self.workflow_panic_strikes.remove(&exec);
 
@@ -2390,7 +2393,7 @@ impl SqliteRuntime {
                 let cascade = composition::cascade_event_count(&tx, exec)?;
                 if let Some(reason) = caps.reached_with(&tx, exec, cascade)? {
                     drop(tx);
-                    return self.fail_for_history_cap(exec, &reason, now);
+                    return self.fail_for_history_cap(exec, &reason, now, decided_at);
                 }
                 let terminal = WorkflowEvent::WorkflowCompleted {
                     output: output.clone(),
@@ -2455,7 +2458,7 @@ impl SqliteRuntime {
                 let cascade = composition::cascade_event_count(&tx, exec)?;
                 if let Some(reason) = caps.reached_with(&tx, exec, cascade)? {
                     drop(tx);
-                    return self.fail_for_history_cap(exec, &reason, now);
+                    return self.fail_for_history_cap(exec, &reason, now, decided_at);
                 }
                 let terminal = WorkflowEvent::workflow_failed_typed(&decoded);
                 store::append_event(&tx, exec, &terminal)?;
@@ -2561,7 +2564,7 @@ impl SqliteRuntime {
                 if let Some(cancel) = cancel_reason {
                     return self.seal_cancelled(exec, cancel, None, clock.decided_at);
                 }
-                return self.fail_for_history_cap(exec, &reason, now);
+                return self.fail_for_history_cap(exec, &reason, now, clock.decided_at);
             }
         };
         // The batch sealed this run (issue #2026). Run none of its work. The

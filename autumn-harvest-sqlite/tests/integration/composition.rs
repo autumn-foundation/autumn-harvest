@@ -547,6 +547,30 @@ async fn busy_signaller(ctx: &WorkflowContext, target: ExecutionId) -> Result<()
         .map_err(|e| e.to_string())
 }
 
+/// The test clock of `a_long_final_panic_loses_to_a_due_deadline`.
+static PANIC_CLOCK: AtomicI64 = AtomicI64::new(1_767_225_600_000);
+/// How many times `busy_panic` ran.
+static PANIC_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Panics on every run. Its third run, the one that uses up the panic
+/// budget, first uses 5 s of the test clock.
+#[workflow]
+async fn busy_panic(_ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    if PANIC_CALLS.fetch_add(1, Ordering::SeqCst) == 2 {
+        PANIC_CLOCK.fetch_add(5_000, Ordering::SeqCst);
+    }
+    panic!("kaboom")
+}
+
+#[workflow]
+async fn parent_child_timeout_panic(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let out = ctx
+        .spawn_child_workflow_timeout("busy_panic", json!(0), std::time::Duration::from_secs(1))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(json!({ "child": out }))
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn runtime() -> SqliteRuntime {
@@ -612,6 +636,8 @@ fn fixtures() -> Vec<WorkflowInfo> {
         parent_child_timeout_cancel_info(),
         waits_for_go_briefly_info(),
         busy_signaller_info(),
+        busy_panic_info(),
+        parent_child_timeout_panic_info(),
     ]
 }
 
@@ -2123,6 +2149,34 @@ async fn a_signal_sent_after_a_deadline_loses_to_it() {
 
     assert!(
         matches!(state, RunState::Completed(ref v) if v == &json!("timeout")),
+        "the deadline wins: {state:?}"
+    );
+}
+
+/// The panic seal closes the child at the time its last run ends. A last run
+/// that goes past the parent's deadline loses to it.
+#[tokio::test]
+async fn a_long_final_panic_loses_to_a_due_deadline() {
+    let mut rt = runtime();
+    rt.set_clock(|| {
+        chrono::DateTime::from_timestamp_millis(PANIC_CLOCK.load(Ordering::SeqCst)).unwrap()
+    });
+    let parent = rt
+        .start_workflow("parent_child_timeout_panic", json!(0))
+        .unwrap();
+    let state = loop {
+        match rt.run_until_blocked(parent).await {
+            Err(SqliteError::WorkflowPanicked { .. }) => {}
+            other => break other.unwrap(),
+        }
+        assert!(
+            PANIC_CALLS.load(Ordering::SeqCst) < 5,
+            "the budget seals it"
+        );
+    };
+
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!({ "child": null })),
         "the deadline wins: {state:?}"
     );
 }

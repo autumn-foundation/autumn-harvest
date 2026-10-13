@@ -79,7 +79,7 @@ and `harvest_signals.idempotency_key`. An old file gains them on open.
   external events first. Each event is the same, and replay accepts both
   orders.
 
-**Tests.** `autumn-harvest-sqlite/tests/integration/composition.rs` has 53
+**Tests.** `autumn-harvest-sqlite/tests/integration/composition.rs` has 54
 tests. Each test replays every history it asserts on the core
 `WorkflowReplayer`, with the run's ids. They cover:
 
@@ -91,7 +91,8 @@ tests. Each test replays every history it asserts on the core
   dedup after a cancel and across runs;
 - await of completed, failed, cancelled, superseded and unknown targets;
 - the child timeout race, and a late child, a long terminal cycle, a long
-  cancel cleanup or a late signal that loses to its deadline;
+  cancel cleanup, a long final panic or a late signal that loses to its
+  deadline;
 - a reopen, mutual awaits, a blocked target beside a working sibling, and a
   run that its own cancel seals;
 - `join!` of an await and a child in both orders;
