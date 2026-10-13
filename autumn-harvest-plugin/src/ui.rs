@@ -1818,6 +1818,7 @@ async fn workflow_detail_ui(
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
     token: Option<Extension<crate::api_token::TokenPrincipal>>,
+    role: Option<Extension<crate::roles::RolePrincipal>>,
 ) -> axum::response::Response {
     let hint_session = extension_session(maybe_session.clone());
     let page = render_workflow_detail_page(
@@ -1838,7 +1839,8 @@ async fn workflow_detail_ui(
         Ok(markup) => markup.into_response(),
         Err(err) => {
             let token = token.map(|Extension(token)| token);
-            let is_admin = caller_is_harvest_admin(&api_state, token, hint_session).await;
+            let role = role.map(|Extension(role)| role);
+            let is_admin = caller_is_harvest_admin(&api_state, token, role, hint_session).await;
             archived_history_hint(&api_state, &id, err, is_admin)
         }
     }
@@ -1846,14 +1848,20 @@ async fn workflow_detail_ui(
 
 /// Whether the caller passes `require_harvest_admin` (issue #1983).
 ///
-/// The guard admits a verified API token first, then an admin session. This
-/// check does the same, so a token-authenticated admin also gets the link.
+/// The guard admits a verified API token, then a role principal, then an
+/// admin session. This check does the same, so each of them gets the link.
+///
+/// The role layer admits a role on every Vantage `GET` by its scope. So a
+/// role that reached the detail page can also open the archive page.
 async fn caller_is_harvest_admin(
     api_state: &HarvestApiState,
     token: Option<crate::api_token::TokenPrincipal>,
+    role: Option<crate::roles::RolePrincipal>,
     session: Option<Session>,
 ) -> bool {
-    token.is_some() || crate::api::has_harvest_admin_access(api_state, session).await
+    token.is_some()
+        || role.is_some()
+        || crate::api::has_harvest_admin_access(api_state, session).await
 }
 
 /// Turn a 404 on the detail page into a link to the archive (issue #1983).
@@ -13026,8 +13034,16 @@ mod tests {
                 scope: crate::api_token::TokenScope::Read,
                 tenant: None,
             };
-            assert!(caller_is_harvest_admin(&state(true), Some(token), None).await);
-            assert!(!caller_is_harvest_admin(&state(true), None, None).await);
+            assert!(caller_is_harvest_admin(&state(true), Some(token), None, None).await);
+            assert!(!caller_is_harvest_admin(&state(true), None, None, None).await);
+        }
+
+        /// The role layer admits a role on every Vantage `GET` by its scope.
+        /// A role that reached the detail page can open the archive page.
+        #[tokio::test]
+        async fn a_role_principal_counts_as_admin() {
+            let role = crate::roles::RolePrincipal::new(vec!["viewer".to_string()]);
+            assert!(caller_is_harvest_admin(&state(true), None, Some(role), None).await);
         }
 
         #[tokio::test]
