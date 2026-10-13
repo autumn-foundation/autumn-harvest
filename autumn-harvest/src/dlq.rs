@@ -286,11 +286,24 @@ pub fn redrive_spread_offset(
 ) -> std::time::Duration {
     let count = u128::try_from(count.max(1)).unwrap_or(u128::MAX);
     let index = u128::try_from(index).unwrap_or(u128::MAX);
-    let slot = window.as_nanos() / count;
-    // `mix64` is below 2^64, so the jitter is below one slot.
-    let jitter = (slot * u128::from(mix64(seed))) >> 64;
-    let nanos = slot.saturating_mul(index).saturating_add(jitter);
+    let nanos = spread_offset_nanos(index, count, window.as_nanos(), mix64(seed));
     std::time::Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+}
+
+/// The offset of slot `index` of `count` in a window of `window` ns.
+///
+/// The jitter is `floor(slot * mix / 2^64)`, so it is below one slot. The
+/// product `slot * mix` can pass `u128::MAX` for a long window. The code
+/// therefore splits `slot` at bit 64, and no step can overflow.
+/// `formal/verus/src/dlq_spread.rs` proves both claims for every input.
+///
+/// `count` must not be 0.
+fn spread_offset_nanos(index: u128, count: u128, window: u128, mix: u64) -> u128 {
+    let slot = window / count;
+    let mix = u128::from(mix);
+    let high = (slot >> 64) * mix;
+    let low = ((slot & u128::from(u64::MAX)) * mix) >> 64;
+    slot.saturating_mul(index).saturating_add(high + low)
 }
 
 /// The `scheduled_at` for each row of a bulk redrive (issue #1832).
@@ -320,6 +333,8 @@ pub fn redrive_schedule(
 }
 
 /// The `SplitMix64` finalizer. It spreads close seeds over all of `u64`.
+///
+/// It is a bijection. `formal/verus/src/mixers.rs` proves it.
 const fn mix64(seed: u64) -> u64 {
     let mut z = seed;
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -2973,6 +2988,30 @@ mod tests {
             redrive_spread_offset(3, 10, window, 42),
             "the offset is deterministic"
         );
+    }
+
+    /// A window of 2^40 s made `slot * mix64(seed)` pass `u128::MAX`. A
+    /// debug build panicked, and a release build wrapped the jitter.
+    #[test]
+    fn spread_offset_does_not_overflow_for_a_long_window() {
+        let window = StdDuration::from_secs(1 << 40);
+        for seed in [1, 7, u64::MAX] {
+            let offset = redrive_spread_offset(0, 1, window, seed);
+            assert!(offset < window, "seed {seed}: {offset:?} >= {window:?}");
+        }
+        assert!(redrive_spread_offset(0, 1, StdDuration::MAX, u64::MAX) < StdDuration::MAX);
+    }
+
+    /// The split product equals the plain one when the plain one fits.
+    #[test]
+    fn spread_offset_nanos_matches_the_unsplit_formula() {
+        for slot in [0_u128, 1, 999, 60_000_000_000, u128::from(u64::MAX)] {
+            for seed in [0, 1, 42, u64::MAX] {
+                let mix = mix64(seed);
+                let plain = (slot * u128::from(mix)) >> 64;
+                assert_eq!(spread_offset_nanos(0, 1, slot, mix), plain);
+            }
+        }
     }
 
     #[test]

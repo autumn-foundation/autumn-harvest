@@ -439,6 +439,11 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     // (issue #1795). A missing grant does not stop enforcement: the worker
     // fails open and every replica runs every pass, as before the lease.
     ("harvest_scanner_leases", &["SELECT", "INSERT", "UPDATE"]),
+    // Every completion that recorded an LLM call inserts here, in the
+    // completion transaction (issue #1996). A missing grant rolls back the
+    // completion, and the activity runs and pays again. `GET /admin/usage`
+    // reads it, and a shard move deletes a discarded staged copy.
+    ("harvest_llm_ledger", &["SELECT", "INSERT", "DELETE"]),
     // Every applying partition sweep reads the export marker, and an
     // exporting sweep writes it (issue #2009). A missing grant fails every
     // partition maintenance pass.
@@ -2413,6 +2418,10 @@ mod tests {
         assert!(sql.contains("harvest_workers"));
         assert!(sql.contains("harvest_activity_pauses"));
         assert!(sql.contains("harvest_queue_pauses"));
+        assert!(
+            sql.contains("harvest_llm_ledger"),
+            "a completion that records an LLM call writes the ledger (issue #1996)"
+        );
         assert!(sql.contains("INSERT"));
         assert!(sql.contains("UPDATE"));
         assert!(sql.contains("DELETE"));

@@ -8,9 +8,13 @@
 //! await on them. Only the `shuttle` CI job and the command in
 //! `docs/testing/shuttle.md` set that flag.
 //!
-//! Only [`crate::slot_tuner`] and [`crate::heartbeat`] import from this shim.
-//! The rest of the crate keeps its direct tokio imports. See
-//! `docs/testing/shuttle.md`.
+//! Only [`crate::slot_tuner`], [`crate::heartbeat`] and
+//! [`crate::adaptive_limit`] import from this shim. The rest of the crate
+//! keeps its direct tokio imports. See `docs/testing/shuttle.md`.
+//!
+//! The shim also maps the std `Mutex` and `AtomicUsize` of
+//! [`crate::adaptive_limit`]. Shuttle can then switch tasks at each lock and
+//! at each atomic access.
 //!
 //! `select!` is in the shim because tokio's `select!` picks a branch with its
 //! own random number generator. Shuttle cannot replay a schedule that depends
@@ -19,9 +23,13 @@
 // `pub use`, not `pub(crate) use`: the module itself is private, and clippy's
 // `redundant_pub_crate` prefers `pub` here. Same as `loom_sync.rs`.
 #[cfg(shuttle)]
+pub use shuttle::sync::atomic::AtomicUsize;
+#[cfg(shuttle)]
+pub use shuttle::sync::{Mutex, MutexGuard};
+#[cfg(shuttle)]
 pub use shuttle_tokio::select;
 #[cfg(shuttle)]
-pub use shuttle_tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+pub use shuttle_tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 #[cfg(shuttle)]
 pub use shuttle_tokio::task::{JoinHandle, spawn};
 #[cfg(shuttle)]
@@ -30,9 +38,13 @@ pub use shuttle_tokio::time::sleep;
 pub use shuttle_tokio_util::sync::CancellationToken;
 
 #[cfg(not(shuttle))]
+pub use std::sync::atomic::AtomicUsize;
+#[cfg(not(shuttle))]
+pub use std::sync::{Mutex, MutexGuard};
+#[cfg(not(shuttle))]
 pub use tokio::select;
 #[cfg(not(shuttle))]
-pub use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+pub use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 #[cfg(not(shuttle))]
 pub use tokio::task::{JoinHandle, spawn};
 #[cfg(not(shuttle))]
