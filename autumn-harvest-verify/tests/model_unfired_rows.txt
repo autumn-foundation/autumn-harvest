@@ -239,6 +239,9 @@ source:fetch_sub@Atomic
 source:fetch_sub@AtomicU64
 source:fetch_xor@Atomic
 source:fetch_xor@AtomicU64
+# An engine-side drift check for the SQLite query replay (issue #2022). No
+# corpus workflow calls it, as for `history_has_unconsumed_events`.
+source:first_unconsumed_command_event@WorkflowContext
 source:getrandom
 source:history_has_unconsumed_events@WorkflowContext
 source:hostname

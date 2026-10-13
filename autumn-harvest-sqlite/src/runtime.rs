@@ -26,6 +26,7 @@ use serde_json::Value;
 use crate::error::{SqliteError, SqliteResult};
 use crate::history_cap::{CapCheck, HistoryCapReason};
 use crate::lock::WriterLock;
+use crate::query::{DEFAULT_QUERY_TIMEOUT, QueryReplay};
 use crate::{lock, queue, schema, store, update, worker};
 
 /// A synchronous activity body, keyed by name.
@@ -251,6 +252,8 @@ pub struct SqliteRuntime {
     /// The history caps and the soft continue-as-new threshold (issue #2023).
     /// The defaults match the Postgres worker.
     history_policy: WorkflowHistoryPolicy,
+    /// The time limit of one query replay (issue #2022).
+    query_timeout: std::time::Duration,
 }
 
 impl Drop for SqliteRuntime {
@@ -358,6 +361,7 @@ impl SqliteRuntime {
             now_fn: std::sync::Arc::new(Utc::now),
             writer_lock,
             history_policy: WorkflowHistoryPolicy::default(),
+            query_timeout: DEFAULT_QUERY_TIMEOUT,
         })
     }
 
@@ -1459,6 +1463,73 @@ impl SqliteRuntime {
             }
             _ => Ok(ExecutionOutcome::Running),
         }
+    }
+
+    /// Run the query `name` on `exec` with `args`, and return its answer
+    /// (issue #2022).
+    ///
+    /// The query replays the stored history to the run's frontier, then calls
+    /// the handler that `ctx.register_query` registered. It writes nothing:
+    /// no event, no row, no staged-signal delivery, no activity body.
+    ///
+    /// - A running run answers with the state at its frontier: the first
+    ///   command that the history does not record.
+    /// - A terminal run answers with the state at its recorded end.
+    ///
+    /// The replay runs workflow code up to the frontier, as a drive does.
+    /// Code past the last recorded event runs again in each query. That
+    /// includes a `ctx.side_effect` closure the history does not record yet.
+    ///
+    /// The call reads the rows immediately. The returned future then replays
+    /// them, so it borrows nothing from the runtime. The answer is a
+    /// point-in-time read as of the call.
+    ///
+    /// ```no_run
+    /// # async fn example(
+    /// #     rt: &autumn_harvest_sqlite::SqliteRuntime,
+    /// #     exec: autumn_harvest_sqlite::ExecutionId,
+    /// # ) -> autumn_harvest_sqlite::SqliteResult<()> {
+    /// let stage = rt.query(exec, "stage", serde_json::Value::Null).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// The future resolves to an error in these cases:
+    ///
+    /// - [`SqliteError::ExecutionNotFound`]: the id is unknown.
+    /// - [`SqliteError::UnknownWorkflow`]: the workflow is not registered.
+    /// - [`SqliteError::QueryNotFound`]: the replay registers no handler
+    ///   named `name`.
+    /// - [`SqliteError::QueryFailed`]: the handler returns `Err`.
+    /// - [`SqliteError::QueryPanicked`]: the handler panics, or the workflow
+    ///   panics during the replay of a running run.
+    /// - [`SqliteError::QueryTimedOut`]: the replay passes the query timeout.
+    /// - [`SqliteError::QueryUnavailable`]: a terminal run cannot give a
+    ///   stable answer.
+    /// - [`SqliteError::NonDeterministic`]: the workflow code changed, so the
+    ///   replay of a running run diverges. A drive returns the same error.
+    /// - A persistence error: a row cannot be read.
+    pub fn query(
+        &self,
+        exec: ExecutionId,
+        name: &str,
+        args: Value,
+    ) -> impl std::future::Future<Output = SqliteResult<Value>> + Send + 'static {
+        let loaded = QueryReplay::load(&self.conn, &self.workflows, self.history_policy, exec);
+        let name = name.to_string();
+        let timeout = self.query_timeout;
+        async move { loaded?.run(name, args, timeout).await }
+    }
+
+    /// Set the time limit of a query replay. The default is
+    /// [`DEFAULT_QUERY_TIMEOUT`](crate::DEFAULT_QUERY_TIMEOUT), 5 s.
+    ///
+    /// A future that [`query`](Self::query) already returned keeps the old
+    /// limit. A limit too large to add to the current time means no limit.
+    pub const fn set_query_timeout(&mut self, timeout: std::time::Duration) {
+        self.query_timeout = timeout;
     }
 
     // ── Drivers ──────────────────────────────────────────────────────────────
