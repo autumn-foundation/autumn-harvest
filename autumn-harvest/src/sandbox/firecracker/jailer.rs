@@ -43,8 +43,12 @@ pub struct JailerConfig {
     /// More cgroup values, on top of the CPU, memory and pid limits.
     pub extra_cgroups: Vec<(String, String)>,
     /// A network namespace to join. `None` keeps the namespace of the jailer.
+    /// The microVM has no network device either way. An empty namespace,
+    /// such as one from `ip netns add`, also cuts the network of an escaped
+    /// VMM.
     pub netns: Option<PathBuf>,
-    /// The `fsize` rlimit of the VMM, in bytes.
+    /// The `fsize` rlimit of the VMM, in bytes. It must hold a snapshot of
+    /// the guest memory. The default is [`DEFAULT_FSIZE_LIMIT`].
     pub fsize_limit: Option<u64>,
     /// The `no-file` rlimit of the VMM.
     pub nofile_limit: Option<u64>,
@@ -63,11 +67,15 @@ impl JailerConfig {
             cgroup_root: PathBuf::from(DEFAULT_CGROUP_ROOT),
             extra_cgroups: Vec::new(),
             netns: None,
-            fsize_limit: None,
+            fsize_limit: Some(DEFAULT_FSIZE_LIMIT),
             nofile_limit: Some(1024),
         }
     }
 }
+
+/// The default `fsize` rlimit of the VMM: 8 GiB. A larger guest memory needs
+/// a larger limit to write a snapshot.
+pub const DEFAULT_FSIZE_LIMIT: u64 = 8 << 30;
 
 /// The file name of the Firecracker binary. The jailer uses it as a
 /// directory name.
@@ -119,6 +127,8 @@ pub fn cgroup_values(config: &JailerConfig, machine: MachineSpec) -> Vec<(String
         ("cpu.max".to_owned(), format!("{cpu_quota} 100000")),
         ("memory.max".to_owned(), memory.to_string()),
         ("pids.max".to_owned(), VMM_MAX_PIDS.to_string()),
+        // Guest memory must not reach the swap device.
+        ("memory.swap.max".to_owned(), "0".to_owned()),
     ];
     values.extend(config.extra_cgroups.iter().cloned());
     values
@@ -228,6 +238,7 @@ mod tests {
                 ("cpu.max".to_owned(), "200000 100000".to_owned()),
                 ("memory.max".to_owned(), (320u64 * 1024 * 1024).to_string()),
                 ("pids.max".to_owned(), "64".to_owned()),
+                ("memory.swap.max".to_owned(), "0".to_owned()),
                 ("cpuset.cpus".to_owned(), "2-3".to_owned()),
             ]
         );
@@ -270,6 +281,8 @@ mod tests {
             "memory.max=603979776",
             "--cgroup",
             "pids.max=64",
+            "--cgroup",
+            "memory.swap.max=0",
             "--resource-limit",
             "no-file=1024",
             "--resource-limit",

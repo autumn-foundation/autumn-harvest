@@ -100,6 +100,8 @@ impl WarmPool {
 
     /// Stop refilling and tear down each ready microVM.
     pub async fn shutdown(&self) {
+        // The refill task checks `closed` under the `ready` lock before each
+        // push, so the drain below sees each pushed microVM.
         self.inner.closed.store(true, Ordering::SeqCst);
         let task = self
             .inner
@@ -170,15 +172,21 @@ async fn refill(
         match launch_ready(launcher.as_ref(), port, boot_timeout).await {
             Ok(vm) => {
                 backoff = FIRST_REFILL_BACKOFF;
-                if inner.closed.load(Ordering::SeqCst) {
+                // Check `closed` under the lock that `shutdown` drains with,
+                // so no microVM enters the pool after the drain.
+                let refused = {
+                    let mut ready = inner.ready.lock().unwrap_or_else(PoisonError::into_inner);
+                    if inner.closed.load(Ordering::SeqCst) {
+                        Some(vm)
+                    } else {
+                        ready.push_back(vm);
+                        None
+                    }
+                };
+                if let Some(vm) = refused {
                     vm.shutdown().await;
                     return;
                 }
-                inner
-                    .ready
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push_back(vm);
             }
             Err(e) => {
                 tracing::warn!(error = %e, "the sandbox warm pool could not boot a microVM");
@@ -200,7 +208,13 @@ async fn launch_ready(
     let deadline = Instant::now() + boot_timeout;
     let ready = async {
         let mut stream = connect_guest(&path, port, deadline, &mut || vm.exit_status()).await?;
-        ping(&mut stream).await
+        // The guest kernel can finish the handshake while the agent hangs,
+        // so the ping has the same deadline.
+        tokio::time::timeout_at(deadline.into(), ping(&mut stream))
+            .await
+            .map_err(|_| {
+                SandboxError::Unavailable("the guest agent did not answer a ping".into())
+            })?
     }
     .await;
     match ready {
@@ -285,6 +299,20 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(pool.ready_len(), 0);
         assert!(fake.live() <= 1, "failed VMs must be torn down");
+        pool.shutdown().await;
+        assert_eq!(fake.live(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_guest_that_hangs_after_the_handshake_does_not_stop_the_refill() {
+        let fake = launcher(GuestMode::Hang);
+        let pool = WarmPool::start(fake.clone(), 1, 52, Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(pool.ready_len(), 0);
+        assert!(
+            fake.launched() >= 2,
+            "the ping must time out, so the pool tries again"
+        );
         pool.shutdown().await;
         assert_eq!(fake.live(), 0);
     }

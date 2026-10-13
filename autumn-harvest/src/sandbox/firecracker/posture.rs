@@ -50,11 +50,14 @@ pub enum PosturePolicy {
     Report,
 }
 
-/// Read the version from the output of `firecracker --version`, such as
-/// `Firecracker v1.17.0`.
+/// Read the version from the output of `firecracker --version` or
+/// `jailer --version`, such as `Firecracker v1.17.0` or `Jailer v1.17.0`.
 #[must_use]
 pub fn parse_version(output: &str) -> Option<Version> {
-    let rest = output.trim_start().strip_prefix("Firecracker v")?;
+    let output = output.trim_start();
+    let rest = output
+        .strip_prefix("Firecracker v")
+        .or_else(|| output.strip_prefix("Jailer v"))?;
     let core: String = rest
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '.')
@@ -129,7 +132,7 @@ pub async fn probe_version(firecracker_bin: &Path) -> Result<Version, SandboxErr
 /// Inspect the host under `root`, normally `/`.
 ///
 /// Critical: no `/dev/kvm`, KSM on, nested KVM on, a CPU vulnerability that
-/// reports `Vulnerable`, or no cgroup v2. Warning: SMT on.
+/// reports `Vulnerable`, or no cgroup v2. Warning: SMT on, or swap on.
 #[must_use]
 pub fn inspect_host(root: &Path) -> Vec<PostureFinding> {
     let read = |rel: &str| std::fs::read_to_string(root.join(rel)).map(|s| s.trim().to_owned());
@@ -191,7 +194,36 @@ pub fn inspect_host(root: &Path) -> Vec<PostureFinding> {
             Severity::Warning,
         );
     }
+    // The first line of /proc/swaps is a header.
+    if read("proc/swaps").is_ok_and(|v| v.lines().count() > 1) {
+        find(
+            "swap",
+            "swap is on; guest memory can reach the disk".into(),
+            Severity::Warning,
+        );
+    }
     findings
+}
+
+/// Inspect the jail base directory. Critical: it does not belong to root,
+/// or its group or others can write it.
+#[must_use]
+pub fn inspect_jail_base(chroot_base: &Path) -> Vec<PostureFinding> {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(meta) = std::fs::metadata(chroot_base) else {
+        return Vec::new();
+    };
+    if meta.uid() == 0 && meta.mode() & 0o022 == 0 {
+        return Vec::new();
+    }
+    vec![PostureFinding {
+        check: "jail_base".into(),
+        detail: format!(
+            "{} must belong to root, and only root may write it",
+            chroot_base.display()
+        ),
+        severity: Severity::Critical,
+    }]
 }
 
 /// Apply `policy` to `findings`.
@@ -229,6 +261,7 @@ mod tests {
             Some((1, 17, 0))
         );
         assert_eq!(parse_version("Firecracker v1.14.4-dev"), Some((1, 14, 4)));
+        assert_eq!(parse_version("Jailer v1.15.1\n"), Some((1, 15, 1)));
         assert_eq!(parse_version("cloud-hypervisor v40.0"), None);
         assert_eq!(parse_version(""), None);
     }
@@ -297,6 +330,25 @@ mod tests {
     }
 
     #[test]
+    fn a_jail_base_that_others_can_write_is_critical() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = fake_sys();
+        let base = root.join("jail");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let findings = inspect_jail_base(&base);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].severity, Severity::Critical);
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            assert_eq!(inspect_jail_base(&base), []);
+        }
+        assert_eq!(inspect_jail_base(&root.join("missing")), []);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn each_weak_setting_is_found() {
         let root = fake_sys();
         std::fs::remove_file(root.join("dev/kvm")).unwrap();
@@ -309,6 +361,12 @@ mod tests {
         )
         .unwrap();
         std::fs::remove_file(root.join("sys/fs/cgroup/cgroup.controllers")).unwrap();
+        std::fs::create_dir_all(root.join("proc")).unwrap();
+        std::fs::write(
+            root.join("proc/swaps"),
+            "Filename Type Size Used Priority\n/swapfile file 1024 0 -2\n",
+        )
+        .unwrap();
         let findings = inspect_host(&root);
         let checks: Vec<(&str, Severity)> = findings
             .iter()
@@ -321,6 +379,7 @@ mod tests {
             ("cpu_vulnerability", Severity::Critical),
             ("cgroup_v2", Severity::Critical),
             ("smt", Severity::Warning),
+            ("swap", Severity::Warning),
         ] {
             assert!(
                 checks.contains(&expected),

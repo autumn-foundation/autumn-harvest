@@ -65,6 +65,12 @@ pub trait VmLauncher: Send + Sync + 'static {
     fn image_name(&self) -> Option<String> {
         None
     }
+
+    /// The vsock port of the guest agent, when the launcher sets it. The
+    /// backend then uses it in place of its own setting.
+    fn guest_port(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// The two snapshot files of a golden microVM.
@@ -125,6 +131,8 @@ pub struct FirecrackerLauncher {
     exec_name: String,
     owner: String,
     lease: InstanceLease,
+    /// Set after the first version check that passes.
+    versions_checked: tokio::sync::OnceCell<()>,
 }
 
 /// A locked file that marks a live owner of VM directories.
@@ -217,13 +225,16 @@ impl FirecrackerLauncher {
         if let Confinement::Jailer(jailer) = &config.confinement {
             required.push(("the jailer binary", &jailer.jailer_bin));
         }
-        for (what, path) in required {
+        for (what, path) in &required {
             if !path.is_file() {
                 return Err(SandboxError::Config(format!(
                     "{what} {} is not a file",
                     path.display()
                 )));
             }
+        }
+        if let Confinement::Jailer(jailer) = &config.confinement {
+            check_shared_files(&config, jailer.uid)?;
         }
         let exec_name = super::jailer::exec_name(&config.firecracker_bin)?;
         let owner = uuid::Uuid::new_v4().simple().to_string()[..OWNER_TAG_HEX].to_owned();
@@ -238,6 +249,7 @@ impl FirecrackerLauncher {
             exec_name,
             owner,
             lease,
+            versions_checked: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -288,8 +300,19 @@ impl FirecrackerLauncher {
         root: &Path,
         policy: PosturePolicy,
     ) -> Result<Vec<PostureFinding>, SandboxError> {
-        super::posture::probe_version(&self.config.firecracker_bin).await?;
-        let findings = super::posture::inspect_host(root);
+        self.check_versions().await?;
+        let mut findings = super::posture::inspect_host(root);
+        match &self.config.confinement {
+            Confinement::Jailer(jailer) => {
+                findings.extend(super::posture::inspect_jail_base(&jailer.chroot_base));
+            }
+            Confinement::Unjailed { .. } => findings.push(super::posture::PostureFinding {
+                check: "jailer".into(),
+                detail: "Firecracker runs without the jailer: no chroot, no cgroup, no uid change"
+                    .into(),
+                severity: super::posture::Severity::Critical,
+            }),
+        }
         super::posture::enforce(&findings, policy)?;
         for finding in &findings {
             tracing::warn!(
@@ -352,16 +375,45 @@ impl FirecrackerLauncher {
                 removed += 1;
             }
         }
+        // A dropped microVM can leave its cgroup after its jail is gone.
+        if let Confinement::Jailer(jailer) = &self.config.confinement {
+            let parent = jailer.cgroup_root.join(&jailer.cgroup_parent);
+            for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let owner = name
+                    .strip_prefix(VM_ID_PREFIX)
+                    .and_then(|rest| rest.split_once('-'))
+                    .map(|(owner, _)| owner);
+                if owner.is_some_and(|owner| !live.contains(owner)) {
+                    kill_cgroup_now(&entry.path());
+                }
+            }
+        }
         for (path, _locked) in dead_leases {
             let _ = std::fs::remove_file(path);
         }
         removed
     }
 
+    /// Check the Firecracker and jailer versions once. A failed check runs
+    /// again on the next call.
+    async fn check_versions(&self) -> Result<(), SandboxError> {
+        self.versions_checked
+            .get_or_try_init(|| async {
+                super::posture::probe_version(&self.config.firecracker_bin).await?;
+                if let Confinement::Jailer(jailer) = &self.config.confinement {
+                    super::posture::probe_version(&jailer.jailer_bin).await?;
+                }
+                Ok::<(), SandboxError>(())
+            })
+            .await
+            .map(|()| ())
+    }
+
     /// Create the VM directory and the command for `id`.
-    fn prepare(&self, id: &str, boot: &BootMethod) -> Result<Prepared, SandboxError> {
+    async fn prepare(&self, id: &str, boot: &BootMethod) -> Result<Prepared, SandboxError> {
         match &self.config.confinement {
-            Confinement::Jailer(jailer) => self.prepare_jailed(jailer, id, boot),
+            Confinement::Jailer(jailer) => self.prepare_jailed(jailer, id, boot).await,
             Confinement::Unjailed { work_root } => self.prepare_unjailed(work_root, id, boot),
         }
     }
@@ -393,9 +445,10 @@ impl FirecrackerLauncher {
                 "a golden snapshot needs the jailer, so each restore sees the same paths".into(),
             ));
         };
+        self.check_versions().await?;
         let id = new_vm_id(&self.owner);
         validate_vm_id(&id)?;
-        let prepared = self.prepare_jailed(jailer, &id, &BootMethod::Api)?;
+        let prepared = self.prepare_jailed(jailer, &id, &BootMethod::Api).await?;
         let mut vm = RunningVm::spawn(id, prepared)?;
         let result = self
             .snapshot_vm(&mut vm, out_dir, boot_timeout, jailer.gid)
@@ -459,7 +512,7 @@ impl FirecrackerLauncher {
     }
 
     /// Lay out the jail of `id` and build the jailer command.
-    fn prepare_jailed(
+    async fn prepare_jailed(
         &self,
         jailer: &JailerConfig,
         id: &str,
@@ -479,10 +532,44 @@ impl FirecrackerLauncher {
             let _ = crate::sandbox::exec::remove_work_dir(&jail);
             prepare_error(id, what, e)
         };
-        link_or_copy(&config.image.kernel, &root.join(KERNEL_FILE))
-            .map_err(|e| fail("the kernel", &e))?;
-        link_or_copy(&config.image.rootfs, &root.join(ROOTFS_FILE))
-            .map_err(|e| fail("the root file system", &e))?;
+        let mut links = vec![
+            (
+                config.image.kernel.clone(),
+                root.join(KERNEL_FILE),
+                "the kernel",
+            ),
+            (
+                config.image.rootfs.clone(),
+                root.join(ROOTFS_FILE),
+                "the root file system",
+            ),
+        ];
+        if let BootMethod::Snapshot(files) = boot {
+            links.push((
+                files.state.clone(),
+                root.join(SNAPSHOT_STATE_FILE),
+                "the snapshot state",
+            ));
+            links.push((
+                files.memory.clone(),
+                root.join(SNAPSHOT_MEMORY_FILE),
+                "the snapshot memory",
+            ));
+        }
+        // A copy across file systems can take seconds, so it runs off the
+        // async workers.
+        let linked = tokio::task::spawn_blocking(move || {
+            for (from, to, what) in links {
+                link_or_copy(&from, &to).map_err(|e| (what, e))?;
+            }
+            Ok(())
+        })
+        .await;
+        match linked {
+            Ok(Ok(())) => {}
+            Ok(Err((what, e))) => return Err(fail(what, &e)),
+            Err(e) => return Err(fail("the image links", &std::io::Error::other(e))),
+        }
         let mut api_socket = None;
         let firecracker_args: Vec<String> = match boot {
             BootMethod::ConfigFile => {
@@ -504,11 +591,7 @@ impl FirecrackerLauncher {
                 api_socket = Some(root.join(super::api::JAILED_API_SOCKET));
                 Vec::new()
             }
-            BootMethod::Snapshot(files) => {
-                link_or_copy(&files.state, &root.join(SNAPSHOT_STATE_FILE))
-                    .map_err(|e| fail("the snapshot state", &e))?;
-                link_or_copy(&files.memory, &root.join(SNAPSHOT_MEMORY_FILE))
-                    .map_err(|e| fail("the snapshot memory", &e))?;
+            BootMethod::Snapshot(_) => {
                 api_socket = Some(root.join(super::api::JAILED_API_SOCKET));
                 Vec::new()
             }
@@ -648,9 +731,10 @@ impl FirecrackerLauncher {
 impl VmLauncher for FirecrackerLauncher {
     fn launch(&self) -> BoxFuture<'_, Result<Box<dyn LaunchedVm>, SandboxError>> {
         Box::pin(async move {
+            self.check_versions().await?;
             let id = new_vm_id(&self.owner);
             validate_vm_id(&id)?;
-            let prepared = self.prepare(&id, &self.config.boot)?;
+            let prepared = self.prepare(&id, &self.config.boot).await?;
             let mut vm = RunningVm::spawn(id, prepared)?;
             if let Some(socket) = vm.api_socket.clone()
                 && let Err(e) = self
@@ -666,6 +750,10 @@ impl VmLauncher for FirecrackerLauncher {
 
     fn image_name(&self) -> Option<String> {
         self.config.image.name.clone()
+    }
+
+    fn guest_port(&self) -> Option<u32> {
+        Some(self.config.guest_port)
     }
 }
 
@@ -710,6 +798,31 @@ fn copy_out(from: &Path, to: &Path, gid: u32) -> std::io::Result<()> {
     std::os::unix::fs::fchown(&target, None, Some(gid))?;
     target.set_permissions(std::fs::Permissions::from_mode(0o640))?;
     target.sync_all()
+}
+
+/// Check that a jailed VMM cannot change a file that each microVM shares.
+///
+/// The jail holds hard links to the kernel, the root file system and the
+/// snapshot files. A file that the jail uid owns, or that its group or
+/// others can write, lets one escaped VMM change the next microVM.
+fn check_shared_files(config: &LauncherConfig, jail_uid: u32) -> Result<(), SandboxError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut shared = vec![&config.image.kernel, &config.image.rootfs];
+    if let BootMethod::Snapshot(files) = &config.boot {
+        shared.push(&files.state);
+        shared.push(&files.memory);
+    }
+    for path in shared {
+        let meta = std::fs::metadata(path)
+            .map_err(|e| SandboxError::Config(format!("cannot inspect {}: {e}", path.display())))?;
+        if meta.uid() == jail_uid || meta.mode() & 0o022 != 0 {
+            return Err(SandboxError::Config(format!(
+                "{} must not belong to the jail uid {jail_uid}, and only its owner may write it",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Check that the longest socket path of a VM fits a Unix socket address.
@@ -848,11 +961,13 @@ impl RunningVm {
         String::from_utf8_lossy(&bytes).trim().to_owned()
     }
 
+    /// Kill the VMM, then its cgroup, then remove its directory. Each step
+    /// is safe to repeat. `down` is set only at the end, so a drop in the
+    /// middle still runs the rest in [`Drop`].
     async fn teardown(&mut self) {
         if self.down {
             return;
         }
-        self.down = true;
         let _ = self.child.start_kill();
         let _ = tokio::time::timeout(KILL_WAIT, self.child.wait()).await;
         if let Some(cgroup) = &self.cgroup {
@@ -862,11 +977,17 @@ impl RunningVm {
             task.abort();
         }
         let dir = self.vm_dir.clone();
-        let removed =
-            tokio::task::spawn_blocking(move || crate::sandbox::exec::remove_work_dir(&dir)).await;
+        let removed = tokio::task::spawn_blocking(move || {
+            match crate::sandbox::exec::remove_work_dir(&dir) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            }
+        })
+        .await;
         if !matches!(removed, Ok(Ok(()))) {
             tracing::warn!(vm = %self.id, "could not remove a sandbox VM directory");
         }
+        self.down = true;
     }
 }
 
@@ -913,6 +1034,9 @@ impl Drop for RunningVm {
         let _ = self.child.start_kill();
         if let Some(cgroup) = &self.cgroup {
             let _ = std::fs::write(cgroup.join("cgroup.kill"), b"1");
+            // The kill is not instant, so this removal can fail. The next
+            // `sweep_stale` then removes the cgroup.
+            let _ = std::fs::remove_dir(cgroup);
         }
         if let Some(task) = self.stderr_task.take() {
             task.abort();
@@ -970,9 +1094,21 @@ mod tests {
         dir
     }
 
+    /// A fake binary. A fake `firecracker` or `jailer` answers `--version`
+    /// like the real one, unless `body` prints its own version.
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let version = match name {
+            "firecracker" if !body.contains(" v1.") => "Firecracker v1.17.0",
+            "jailer" => "Jailer v1.17.0",
+            _ => "",
+        };
+        let answer = if version.is_empty() {
+            String::new()
+        } else {
+            format!("if [ \"$1\" = --version ]; then echo '{version}'; exit 0; fi\n")
+        };
+        std::fs::write(&path, format!("#!/bin/sh\n{answer}{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
@@ -1366,6 +1502,81 @@ while True:
         assert!(root.join("vm-config.json").exists());
         vm.shutdown().await;
         assert!(!jail_dir.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_launch_refuses_a_firecracker_with_a_known_escape() {
+        let dir = temp_dir();
+        let fc = script(&dir, "firecracker", "echo 'Firecracker v1.14.3'");
+        let launcher =
+            FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
+        let err = launcher
+            .launch()
+            .await
+            .map(|_| ())
+            .expect_err("old version");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("CVE-2026-5747")),
+            "{err:?}"
+        );
+        drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn jailed(dir: &Path) -> LauncherConfig {
+        let mut jail = JailerConfig::new(script(dir, "jailer", "exec sleep 60"), 12_345, 12_345);
+        jail.chroot_base = dir.join("jail");
+        jail.cgroup_root = dir.join("cgroup");
+        LauncherConfig {
+            firecracker_bin: script(dir, "firecracker", "exit 0"),
+            image: image(dir),
+            machine: MachineSpec::default(),
+            boot: BootMethod::ConfigFile,
+            confinement: Confinement::Jailer(jail),
+            guest_port: GUEST_AGENT_PORT,
+            api_timeout: Duration::from_secs(5),
+        }
+    }
+
+    #[test]
+    fn a_shared_image_that_others_can_write_is_a_config_error() {
+        let dir = temp_dir();
+        let config = jailed(&dir);
+        std::fs::set_permissions(&config.image.rootfs, std::fs::Permissions::from_mode(0o666))
+            .unwrap();
+        let err = FirecrackerLauncher::new(config).expect_err("writable image");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("rootfs.ext4")),
+            "{err:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_sweep_kills_the_cgroups_of_dead_owners() {
+        let dir = temp_dir();
+        let config = jailed(&dir);
+        let Confinement::Jailer(jail) = &config.confinement else {
+            unreachable!("a jailed config");
+        };
+        let parent = jail.cgroup_root.join(&jail.cgroup_parent);
+        let dead = parent.join(format!("hsbx-deadbeef-{}", "d".repeat(16)));
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::write(dead.join("cgroup.kill"), b"").unwrap();
+        std::fs::write(dead.join("cgroup.events"), b"populated 0\n").unwrap();
+        let launcher = FirecrackerLauncher::new(config).unwrap();
+        let mine = parent.join(format!("hsbx-{}-{}", launcher.owner(), "e".repeat(16)));
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::write(mine.join("cgroup.kill"), b"").unwrap();
+        launcher.sweep_stale();
+        assert_eq!(std::fs::read(dead.join("cgroup.kill")).unwrap(), b"1");
+        assert_eq!(
+            std::fs::read(mine.join("cgroup.kill")).unwrap(),
+            b"",
+            "a live owner keeps its cgroups"
+        );
+        drop(launcher);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

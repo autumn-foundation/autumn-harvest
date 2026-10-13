@@ -20,7 +20,10 @@ pub const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The default time that the guest gets on top of the wall-clock limit to
 /// send its outcome.
-pub const DEFAULT_RESPONSE_GRACE: Duration = Duration::from_secs(5);
+///
+/// The guest waits up to two seconds for the pipes of the code to close, and
+/// then removes the work directory. The grace covers both.
+pub const DEFAULT_RESPONSE_GRACE: Duration = Duration::from_secs(10);
 
 /// The timing of the backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,7 +80,7 @@ impl FirecrackerBackend {
             self.pool = Some(WarmPool::start(
                 Arc::clone(&self.launcher),
                 size,
-                self.settings.guest_port,
+                self.guest_port(),
                 self.settings.boot_timeout,
             ));
         }
@@ -103,6 +106,14 @@ impl FirecrackerBackend {
         }
     }
 
+    /// The vsock port of the guest agent: the port of the launcher, or the
+    /// port of the settings.
+    fn guest_port(&self) -> u32 {
+        self.launcher
+            .guest_port()
+            .unwrap_or(self.settings.guest_port)
+    }
+
     /// Run `job` on `vm`: connect over vsock, send the plan, read the
     /// outcome.
     async fn run_on(
@@ -117,7 +128,7 @@ impl FirecrackerBackend {
         let mut stream = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(SandboxError::Cancelled),
-            stream = connect_guest(&path, self.settings.guest_port, deadline, &mut exited) => stream?,
+            stream = connect_guest(&path, self.guest_port(), deadline, &mut exited) => stream?,
         };
         let budget = job
             .plan
@@ -153,7 +164,14 @@ impl SandboxBackend for FirecrackerBackend {
         cancel: CancellationToken,
     ) -> BoxFuture<'_, Result<SandboxOutcome, SandboxError>> {
         Box::pin(async move {
-            let warm = self.pool.as_ref().and_then(WarmPool::take);
+            let mut warm = self.pool.as_ref().and_then(WarmPool::take);
+            // A warm microVM can die in the pool, for example by the OOM
+            // killer. Then boot a new one.
+            if warm.as_mut().is_some_and(|vm| vm.exit_status().is_some())
+                && let Some(dead) = warm.take()
+            {
+                dead.shutdown().await;
+            }
             let vm = if let Some(vm) = warm {
                 vm
             } else {
@@ -411,6 +429,26 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(fake.launched(), 3);
+        backend.shutdown().await;
+        assert_eq!(fake.live(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_warm_vm_that_died_in_the_pool_is_replaced() {
+        let fake = launcher(GuestMode::Serve);
+        let backend = FirecrackerBackend::new(fake.clone(), fast()).with_warm_pool(1);
+        let pool = backend.warm_pool().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pool.ready_len() < 1 {
+            assert!(Instant::now() < deadline, "the pool never filled");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        fake.crashed.lock().unwrap().push("fake-0".into());
+        let out = backend
+            .execute(job("echo fresh", 5_000), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, "fresh\n");
         backend.shutdown().await;
         assert_eq!(fake.live(), 0);
     }

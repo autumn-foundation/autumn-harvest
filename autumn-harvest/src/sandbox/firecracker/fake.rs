@@ -43,6 +43,8 @@ pub struct FakeLauncher {
     pub live: Arc<AtomicUsize>,
     pub launched: Arc<AtomicUsize>,
     pub failures_left: AtomicUsize,
+    /// The ids of the VMs whose VMM has exited.
+    pub crashed: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl FakeLauncher {
@@ -59,6 +61,7 @@ impl FakeLauncher {
             live: Arc::new(AtomicUsize::new(0)),
             launched: Arc::new(AtomicUsize::new(0)),
             failures_left: AtomicUsize::new(0),
+            crashed: Arc::default(),
         }
     }
 
@@ -99,6 +102,7 @@ impl VmLauncher for FakeLauncher {
                 task,
                 live: Arc::clone(&self.live),
                 down: false,
+                crashed: Arc::clone(&self.crashed),
             }) as Box<dyn LaunchedVm>)
         })
     }
@@ -194,6 +198,7 @@ pub struct FakeVm {
     task: Option<JoinHandle<()>>,
     live: Arc<AtomicUsize>,
     down: bool,
+    crashed: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl FakeVm {
@@ -220,7 +225,13 @@ impl LaunchedVm for FakeVm {
     }
 
     fn exit_status(&mut self) -> Option<String> {
-        (self.mode == GuestMode::Exited).then(|| "fake vmm exited with status 1".to_owned())
+        let crashed = self
+            .crashed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&self.id);
+        (self.mode == GuestMode::Exited || crashed)
+            .then(|| "fake vmm exited with status 1".to_owned())
     }
 
     fn shutdown(mut self: Box<Self>) -> BoxFuture<'static, ()> {
