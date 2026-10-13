@@ -1035,16 +1035,16 @@ impl WorkDir {
         }
     }
 
-    /// Remove the parent, then the work directory if the code moved it out.
+    /// Remove the work directory, then the parent, wherever the code moved
+    /// them.
     fn remove_now(&self) -> io::Result<()> {
         let mut result = Ok(());
         for (dir, path) in [
-            (&self.parent_handle, &self.parent),
             (&self.handle, &self.path),
+            (&self.parent_handle, &self.parent),
         ] {
-            if let Some(path) = current_path(dir, path)
-                && let Err(e) = remove_work_dir(&path)
-            {
+            let name = path.file_name().unwrap_or_default();
+            if let Err(e) = remove_open_dir(dir, name) {
                 result = Err(e);
             }
         }
@@ -1068,23 +1068,69 @@ fn open_directory(path: &Path) -> io::Result<std::fs::File> {
         .open(path)
 }
 
-/// The path of the open directory `dir` now, or `None` when it is gone.
+/// Remove the open directory `dir` and its contents, wherever it is now.
 ///
-/// The code can move a directory of its own uid. Then `/proc/self/fd` gives
-/// the new path. A path counts only when it names the same directory.
-fn current_path(dir: &std::fs::File, expected: &Path) -> Option<PathBuf> {
+/// The code can move a directory of its own uid, and it can lock a directory
+/// above it. So each step starts at `/proc/self/fd`, which reaches a
+/// directory without a walk from `/`. `name` is the name that the directory
+/// got. A moved directory is found by its inode. The cleanup runs after the
+/// kill of the run, so no process of the code is left.
+fn remove_open_dir(dir: &std::fs::File, name: &std::ffi::OsStr) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
-    let meta = dir.metadata().ok()?;
+    let meta = dir.metadata()?;
+    // A removed directory has no link left.
+    if meta.nlink() == 0 {
+        return Ok(());
+    }
+    let base = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+    add_owner_bits(&base);
+    for entry in std::fs::read_dir(&base)? {
+        let path = entry?.path();
+        if std::fs::symlink_metadata(&path)?.is_dir() {
+            remove_work_dir(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    let holder = base.join("..");
+    add_owner_bits(&holder);
+    // Keep the holder open while its `/proc/self/fd` path is in use.
+    let holder_dir = open_directory(&holder)?;
+    let holder = PathBuf::from(format!("/proc/self/fd/{}", holder_dir.as_raw_fd()));
     let same = |path: &Path| {
         std::fs::symlink_metadata(path).is_ok_and(|found| {
             found.is_dir() && found.dev() == meta.dev() && found.ino() == meta.ino()
         })
     };
-    if same(expected) {
-        return Some(expected.to_path_buf());
+    let expected = holder.join(name);
+    if same(&expected) {
+        return std::fs::remove_dir(expected);
     }
-    let path = std::fs::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd())).ok()?;
-    same(&path).then_some(path)
+    for entry in std::fs::read_dir(&holder)? {
+        let path = entry?.path();
+        if same(&path) {
+            return std::fs::remove_dir(path);
+        }
+    }
+    Ok(())
+}
+
+/// Give the owner of the directory at `path` all its bits again.
+///
+/// A non-root executor shares its uid with the code, so the code can remove
+/// them. Root ignores the modes, so a root executor changes nothing.
+fn add_owner_bits(path: &Path) {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.mode() & 0o700 != 0o700
+    {
+        let _ =
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(meta.mode() | 0o700));
+    }
 }
 
 /// Write the plan files into `dir`. The directory is new, and only the
@@ -1694,6 +1740,39 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert!(left.is_empty(), "the cleanup left {left:?}");
+    }
+
+    #[tokio::test]
+    async fn the_cleanup_finds_a_work_directory_under_a_locked_directory() {
+        let scratch = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            scratch.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o1777),
+        )
+        .unwrap();
+        let options = ExecOptions {
+            scratch_root: scratch.path().to_path_buf(),
+            ..ExecOptions::default()
+        };
+        // A non-root executor shares its uid with the code. So the code can
+        // move the parent under a directory of its own and lock that one.
+        let code = "echo data > kept; p=$(dirname \"$PWD\"); r=$(dirname \"$p\"); \
+                    mkdir \"$r/locked\" && mv \"$p\" \"$r/locked/moved\" 2>/dev/null; \
+                    chmod 000 \"$r/locked\"; true";
+        let out = execute_plan(&plan(&sh(code)), &options, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(out.success(), "{}", out.stderr);
+        let locked = scratch.path().join("locked");
+        let _ =
+            std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o755));
+        let left: Vec<_> = std::fs::read_dir(&locked)
+            .map(|entries| entries.map(|entry| entry.unwrap().file_name()).collect())
+            .unwrap_or_default();
+        assert!(
+            left.is_empty(),
+            "the cleanup left {left:?} under the locked directory"
+        );
     }
 
     #[tokio::test]
