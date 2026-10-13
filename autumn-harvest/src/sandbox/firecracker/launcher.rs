@@ -967,10 +967,24 @@ fn link_or_copy(from: &Path, to: &Path) -> std::io::Result<()> {
     match std::fs::hard_link(from, to) {
         Ok(()) => Ok(()),
         Err(e) if matches!(e.raw_os_error(), Some(libc::EXDEV | libc::EPERM)) => {
-            std::fs::copy(from, to).map(|_| ())
+            copy_keeping_owner(from, to)
         }
         Err(e) => Err(e),
     }
+}
+
+/// Copy `from` to `to` with the owner, group and mode of `from`.
+///
+/// A hard link shares these with the source, and a plain copy takes the
+/// owner of this process. A golden snapshot is mode `0640` for the jailer
+/// group, so a plain copy would lock the jailed VMM out of it.
+fn copy_keeping_owner(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::metadata(from)?;
+    std::fs::copy(from, to)?;
+    std::os::unix::fs::chown(to, Some(meta.uid()), Some(meta.gid()))?;
+    // A change of owner clears the set-id bits, so set the mode again.
+    std::fs::set_permissions(to, meta.permissions())
 }
 
 /// Write a VM document as JSON.
@@ -1926,6 +1940,30 @@ while True:
             with(&|jail| jail.netns = Some(dir.join("missing"))),
             "missing",
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs root; the Sandbox (KVM) workflow runs it with sudo"]
+    fn root_a_copied_image_keeps_the_owner_group_and_mode() {
+        use std::os::unix::fs::MetadataExt as _;
+        // SAFETY: geteuid has no preconditions.
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
+        let dir = temp_dir();
+        // A golden snapshot: mode 0640, and the jailer group may read it.
+        let from = dir.join("snapshot.mem");
+        std::fs::write(&from, b"memory").unwrap();
+        std::os::unix::fs::chown(&from, Some(0), Some(12_345)).unwrap();
+        std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let to = dir.join("copy.mem");
+        copy_keeping_owner(&from, &to).unwrap();
+        let meta = std::fs::metadata(&to).unwrap();
+        assert_eq!(
+            (meta.uid(), meta.gid(), meta.mode() & 0o7777),
+            (0, 12_345, 0o640),
+            "a copy must give the jail the access that a hard link gives"
+        );
+        assert_eq!(std::fs::read(&to).unwrap(), b"memory");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
