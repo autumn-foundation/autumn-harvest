@@ -3138,11 +3138,14 @@ async fn a_recently_used_connection_is_handed_out_without_a_ping() {
         &timeouts(5_000, SessionTimeouts::for_role(DbRole::Hot)),
     )
     .expect("engine pool builds");
+    // Connect the admin session first. A new connection can take most of
+    // `VERIFY_IDLE_AFTER` on a busy runner. Inside the window, it would turn
+    // the second checkout into an idle one that the pool pings.
+    let mut admin = connect(&url).await;
     let old_pid = {
         let mut conn = pool.get().await.expect("first connection");
         backend_pid(&mut conn).await
     };
-    let mut admin = connect(&url).await;
     diesel::sql_query(format!("SELECT pg_terminate_backend({old_pid})"))
         .execute(&mut admin)
         .await
