@@ -88,21 +88,20 @@
 //!   single-server (no fleet to de-synchronize), and retry timing (`run_at`) is not
 //!   recorded in `harvest_events`, so the base delay is behaviorally equivalent with
 //!   ZERO replay / byte-identity impact (Codex #1069 P2, `worker.rs:325`).
-//! - **Activity `start_to_close` timeouts are honored.** The declared/per-call
-//!   `start_to_close` (from `#[activity(start_to_close = "…")]` /
-//!   `execute_activity_with_opts`) flows through the scheduling command's
-//!   `start_to_close_override`; the backend persists it (milliseconds) on the task
-//!   row and the worker enforces it as a **post-execution outcome** (issue #1069 P2):
-//!   a synchronous body cannot be cancelled mid-flight in a single-writer runtime, so
-//!   a body whose real wall-clock runtime exceeds its budget records a **terminal**
-//!   `ActivityTimedOut { StartToClose }` (the workflow observes
-//!   [`HarvestError::Timeout`](autumn_harvest::HarvestError::Timeout) and drives its
-//!   own timeout branch) instead of `ActivityCompleted` — byte-equivalent to the
-//!   durable event the Postgres timeout scanner records. The recorded history is
-//!   byte-equivalent even though the wall-clock behavior (the body runs to completion
-//!   before the timeout is recorded) differs, and it is replay-safe: the outcome is
-//!   recorded once and replay never re-runs the body. `None` = no budget (unbounded,
-//!   the prior behavior for every un-timed activity).
+//! - **Activity `start_to_close` timeouts are honored.** The declared or per-call
+//!   `start_to_close` comes from `#[activity(start_to_close = "…")]` or
+//!   `execute_activity_with_opts`. It flows through the scheduling command's
+//!   `start_to_close_override`. The backend persists it in milliseconds on the task
+//!   row. The worker enforces it as a **post-execution outcome** (issue #1069 P2).
+//!   The drive does not cancel a body mid-flight in a single-writer runtime. So a
+//!   body that runs past its budget records a **terminal**
+//!   `ActivityTimedOut { StartToClose }` instead of `ActivityCompleted`. The
+//!   workflow observes [`HarvestError::Timeout`](autumn_harvest::HarvestError::Timeout)
+//!   and drives its own timeout branch. The event is byte-equivalent to the one the
+//!   Postgres timeout scanner records. The wall-clock behavior differs: the body
+//!   runs to completion before the timeout is recorded. The history stays
+//!   replay-safe, because the outcome is recorded once and replay never re-runs the
+//!   body. `None` means no budget, so the activity is unbounded, as before.
 //! - **Typed workflow failures preserve their metadata.** A `#[workflow]` returning a
 //!   typed [`WorkflowFailure`](autumn_harvest::failure::WorkflowFailure) (issue #767)
 //!   is decoded from its `harvest_workflow_failure_v1` wire envelope before the
@@ -164,13 +163,11 @@
 //!     Ok(greeting)
 //! }
 //!
-//! // The `#[activity]` supplies the macro-generated `say_hello_info()` (name +
-//! // any declared `#[activity(...)]` defaults). This backend runs a caller-supplied
-//! // SYNCHRONOUS body — the async fn body below is a placeholder for the shared
-//! // `ActivityInfo`; the closure registered against it is what actually runs.
+//! // The `#[activity]` body runs with a real `ActivityContext` (issue #2024).
+//! // The same fn runs unchanged on the Postgres backend.
 //! #[activity]
-//! async fn say_hello(_ctx: &ActivityContext, name: String) -> Result<String, String> {
-//!     Ok(format!("hello {name}"))
+//! async fn say_hello(ctx: &ActivityContext, name: String) -> Result<String, String> {
+//!     Ok(format!("hello {name}, attempt {}", ctx.attempt()))
 //! }
 //!
 //! # async fn run() -> Result<(), autumn_harvest_sqlite::SqliteError> {
@@ -178,12 +175,10 @@
 //! rt.register_workflow(&greet_info());
 //! // The audited, `ActivityInfo`-driven registration: any declared `#[activity(...)]`
 //! // default is HONORED (e.g. `schedule_to_close`) or REJECTED LOUDLY at setup, never
-//! // silently dropped. Use `register_activity_raw(name, ActivitySpec::new(..))` for a
-//! // hand-made body that carries no declared defaults.
-//! rt.register_activity(&say_hello_info(), |input| {
-//!     let name: String = serde_json::from_value(input).unwrap_or_default();
-//!     Ok(serde_json::json!(format!("hello {name}")))
-//! });
+//! // silently dropped. Use `register_activity_with_body` to run a synchronous stub
+//! // in place of the body, or `register_activity_raw(name, ActivitySpec::new(..))`
+//! // for a hand-made body that carries no declared defaults.
+//! rt.register_activity(&say_hello_info());
 //!
 //! let exec = rt.start_workflow("greet", serde_json::json!("world"))?;
 //! rt.run_until_blocked(exec).await?;
@@ -411,20 +406,23 @@
 //!     timeout is terminal here. Postgres retries it per the retry policy (issue
 //!     #1809, ADR 0005).
 //!   - `default_queue` — recorded on the task row (single-writer routing is a no-op).
-//! - **REJECTED (a dispatch-admission / cross-worker semantic with no single-writer
-//!   analog, or a cap raiser that would otherwise silently apply the STRICTER global
-//!   cap):** `default_heartbeat_timeout` (no heartbeating in the inline drain — use
-//!   `start_to_close` / `schedule_to_close`), `default_schedule_to_start` (no queue-wait
-//!   scanner), `circuit_breaker` (#369), `rate_limit_*` (#332), `max_concurrent` (#247),
-//!   `requires` (capability routing), `is_local` (local-activity `RunLocalActivity`
-//!   dispatch is a command-layer non-goal), and a raised `max_input_bytes` /
-//!   `max_result_bytes` (#252).
+//! - **REJECTED:** each is a dispatch-admission or cross-worker semantic with no
+//!   single-writer analog, or a cap raiser. A cap raiser would otherwise silently
+//!   apply the STRICTER global cap.
+//!   - `default_heartbeat_timeout`: no scanner times out a silent attempt. Use
+//!     `start_to_close` or `schedule_to_close`. `ctx.heartbeat(..)` itself works and
+//!     stores a checkpoint (issue #2024).
+//!   - `default_schedule_to_start`: no queue-wait scanner.
+//!   - `circuit_breaker` (#369), `rate_limit_*` (#332), `max_concurrent` (#247).
+//!   - `requires`: capability routing.
+//!   - `is_local`: local-activity `RunLocalActivity` dispatch is a command-layer
+//!     non-goal.
+//!   - A raised `max_input_bytes` / `max_result_bytes` (#252).
 //! - **ACCEPTED, inert:** `name` (registration key), `module` (diagnostics), and a lone
-//!   `concurrency_key` (groups a cap that is not set). The core async
-//!   `ActivityInfo::handler` is intentionally NOT used — this backend runs a
-//!   caller-supplied SYNCHRONOUS body (no `ActivityContext`, no I/O framework),
-//!   matching the crate's activity model, so `register_activity` takes both the
-//!   `&ActivityInfo` (for the audit + declared defaults) and the body.
+//!   `concurrency_key` (groups a cap that is not set).
+//! - **RUN:** `handler`. `register_activity` awaits the `#[activity]` body with a
+//!   real `ActivityContext` (issue #2024). `register_activity_with_body` runs a
+//!   synchronous closure in its place, after the same audit.
 //!
 //! **Signals.** Each decision cycle appends every staged signal to history
 //! (as `SignalReceived`) before replay, in arrival order (issue #2020). This

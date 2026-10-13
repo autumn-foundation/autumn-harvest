@@ -51,20 +51,18 @@ async fn process_order(ctx: &WorkflowContext, order: serde_json::Value) -> Resul
     Ok(format!("confirmed: {reservation}"))
 }
 
-// The `#[activity]` async body is a placeholder for the shared `ActivityInfo`;
-// this backend runs a caller-supplied SYNCHRONOUS body registered against it.
+// The `#[activity]` body runs with a real `ActivityContext` (issue #2024). The
+// same fn runs unchanged on the Postgres backend.
 #[activity]
-async fn reserve_inventory(_ctx: &ActivityContext, _order: serde_json::Value) -> Result<String, String> {
-    Ok(String::new())
+async fn reserve_inventory(ctx: &ActivityContext, order: serde_json::Value) -> Result<String, String> {
+    Ok(format!("reserved {order} on attempt {}", ctx.attempt()))
 }
 
 #[tokio::main]
 async fn main() -> Result<(), SqliteError> {
     let mut rt = SqliteRuntime::open_in_memory()?;    // or open("workflows.db") for durability
     rt.register_workflow(&process_order_info());
-    rt.register_activity(&reserve_inventory_info(), |input| {
-        Ok(serde_json::json!(format!("reserved {input}")))
-    });
+    rt.register_activity(&reserve_inventory_info());
 
     let exec = rt.start_workflow("process_order", serde_json::json!({"item": "widget"}))?;
     rt.run_until_idle().await?;                        // drive the polling loop to quiescence

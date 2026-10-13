@@ -6,6 +6,7 @@
 // files as `mod`s cuts CI compile time and disk. Mirrors the core
 // `autumn-harvest` crate's `tests/integration/mod.rs` convention.
 
+mod activity_context;
 mod activity_info_features;
 mod activity_start_to_close;
 mod atomicity;
@@ -20,6 +21,8 @@ mod fleet_fault_isolation;
 mod freeze_activity_defaults;
 mod history_caps;
 mod payload_caps;
+mod portable_activity;
+mod portable_fixture;
 mod race_activities;
 mod race_fairness;
 mod reopen_consistency;
