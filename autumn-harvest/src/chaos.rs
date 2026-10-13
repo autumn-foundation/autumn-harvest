@@ -1347,6 +1347,9 @@ mod controller {
     /// splitmix64 — a fast, value-stable 64-bit mixer. Deliberately hand-rolled
     /// (not `rand::StdRng`) so a recorded reproducer seed stays reproducible
     /// across crate/toolchain versions.
+    ///
+    /// It is a bijection, so two seeds never share a stream value.
+    /// `formal/verus/src/mixers.rs` proves it.
     #[must_use]
     const fn splitmix64(seed: u64) -> u64 {
         let x = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);

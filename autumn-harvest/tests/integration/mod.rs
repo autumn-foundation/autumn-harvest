@@ -189,6 +189,8 @@ mod legal_hold_tests;
 #[cfg(feature = "db")]
 mod lifecycle_model_props;
 mod lineage_store_tests;
+#[cfg(all(feature = "db", feature = "testing"))]
+mod llm_ledger_tests;
 mod lock_order_docs;
 mod macros_activity;
 mod macros_collect;
@@ -392,6 +394,7 @@ mod upgrade_check_db_tests;
 #[cfg(feature = "testing")]
 mod upgrade_check_tests;
 mod usage_report_activity_lookback_tests;
+mod verus_proofs_coverage;
 #[cfg(feature = "wasm-activities")]
 mod wasm_activities_tests;
 mod webhook_trigger_tests;

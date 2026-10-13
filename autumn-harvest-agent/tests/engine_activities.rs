@@ -12,12 +12,34 @@ use std::sync::Arc;
 use autumn_harvest::context::{ActivityContext, SharedStateMap};
 use autumn_harvest::failure::parse_typed_payload;
 use autumn_harvest_agent::workflow::{agent_model_turn_info, agent_tool_call_info};
+use autumn_harvest_agent::{AgentError, AgentModel, ChatRequest, ChatResponse};
 use autumn_harvest_agent::{
     AgentHarness, ChatMessage, ChatRole, ModelTurn, ModelTurnRequest, Rule, StopReason, TokenUsage,
     ToolCall, ToolCallRequest, ToolDecision, ToolEffect, ToolOutcome, ToolRules,
 };
 use common::{MemStore, Recorder, ScriptedModel, answer, calls, recorded_tool, response_cache};
 use serde_json::json;
+
+/// A scripted model that names itself and prices each call.
+#[derive(Debug)]
+struct PricedModel(Arc<ScriptedModel>);
+
+impl AgentModel for PricedModel {
+    fn chat<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+    ) -> autumn_harvest_agent::model::BoxFuture<'a, Result<ChatResponse, AgentError>> {
+        self.0.chat(request)
+    }
+
+    fn model_id(&self) -> Option<&str> {
+        Some("test-model-1")
+    }
+
+    fn cost_usd_micros(&self, usage: &TokenUsage) -> Option<u64> {
+        Some(u64::from(usage.input_tokens) * 3 + u64::from(usage.output_tokens) * 15)
+    }
+}
 
 fn with_harness(harness: AgentHarness) -> ActivityContext {
     let mut state: SharedStateMap = HashMap::new();
@@ -421,6 +443,128 @@ async fn one_deadline_bounds_every_policy_decision_of_a_turn() {
 }
 
 #[tokio::test]
+async fn the_model_turn_handler_records_one_ledger_call() {
+    let model = ScriptedModel::new(vec![calls(&[("r", "read", json!({}))], 3)]);
+    let harness = AgentHarness::new(Arc::new(PricedModel(model)));
+    let ctx = with_harness(harness);
+
+    let info = agent_model_turn_info();
+    (info.handler)(&ctx, serde_json::to_value(turn_request()).unwrap())
+        .await
+        .unwrap();
+
+    let ledger = ctx.llm_calls();
+    assert_eq!(ledger.len(), 1, "{ledger:?}");
+    assert_eq!(ledger[0].model(), "test-model-1");
+    assert_eq!(ledger[0].input_tokens(), 3);
+    assert_eq!(ledger[0].output_tokens(), 0);
+    assert_eq!(ledger[0].cost_usd_micros(), Some(9));
+    assert!(ledger[0].latency().is_some(), "the turn times the call");
+}
+
+/// A response cache hit calls no model and spends no tokens, so it records
+/// no ledger call (issues #1996 and #1998).
+#[tokio::test]
+async fn a_cache_hit_records_no_ledger_call() {
+    let model = ScriptedModel::named("m-1", vec![answer("one", 3)]);
+    let store = Arc::new(MemStore::default());
+    let harness = AgentHarness::new(model.clone()).response_cache(response_cache(&store));
+    let ctx = with_harness(harness);
+    let info = agent_model_turn_info();
+    let request = ModelTurnRequest {
+        tenant: Some("a".to_owned()),
+        ..turn_request()
+    };
+
+    let first: ModelTurn = serde_json::from_value(
+        (info.handler)(&ctx, serde_json::to_value(&request).unwrap())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let repeat: ModelTurn = serde_json::from_value(
+        (info.handler)(&ctx, serde_json::to_value(&request).unwrap())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert!(!first.cache_hit);
+    assert!(repeat.cache_hit);
+    assert_eq!(model.calls(), 1);
+    let ledger = ctx.llm_calls();
+    assert_eq!(ledger.len(), 1, "only the miss records a call: {ledger:?}");
+    assert_eq!(ledger[0].model(), "m-1");
+    assert_eq!(ledger[0].input_tokens(), 3);
+}
+
+#[tokio::test]
+async fn a_model_with_no_name_or_price_records_an_unpriced_unknown_call() {
+    let model = ScriptedModel::new(vec![calls(&[], 5)]);
+    let ctx = with_harness(AgentHarness::new(model));
+
+    let info = agent_model_turn_info();
+    (info.handler)(&ctx, serde_json::to_value(turn_request()).unwrap())
+        .await
+        .unwrap();
+
+    let ledger = ctx.llm_calls();
+    assert_eq!(ledger.len(), 1, "{ledger:?}");
+    assert_eq!(
+        ledger[0].model(),
+        autumn_harvest_agent::model::UNKNOWN_MODEL_ID
+    );
+    assert_eq!(ledger[0].input_tokens(), 5);
+    assert_eq!(ledger[0].cost_usd_micros(), None);
+}
+
+#[tokio::test]
+async fn a_failed_model_turn_records_no_ledger_call() {
+    let model = ScriptedModel::new(Vec::new());
+    let ctx = with_harness(AgentHarness::new(model));
+
+    let info = agent_model_turn_info();
+    let result = (info.handler)(&ctx, serde_json::to_value(turn_request()).unwrap()).await;
+    assert!(result.is_err());
+    assert_eq!(ctx.llm_calls(), Vec::new());
+}
+
+/// A model whose id the ledger refuses.
+#[derive(Debug)]
+struct BadIdModel(Arc<ScriptedModel>);
+
+impl AgentModel for BadIdModel {
+    fn chat<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+    ) -> autumn_harvest_agent::model::BoxFuture<'a, Result<ChatResponse, AgentError>> {
+        self.0.chat(request)
+    }
+
+    fn model_id(&self) -> Option<&str> {
+        Some("a model id with spaces")
+    }
+}
+
+#[tokio::test]
+async fn a_refused_model_id_still_records_the_turn_as_unknown() {
+    let model = ScriptedModel::new(vec![calls(&[], 7)]);
+    let ctx = with_harness(AgentHarness::new(Arc::new(BadIdModel(model))));
+
+    let info = agent_model_turn_info();
+    let result = (info.handler)(&ctx, serde_json::to_value(turn_request()).unwrap()).await;
+    assert!(result.is_ok(), "a ledger refusal never fails the turn");
+
+    let ledger = ctx.llm_calls();
+    assert_eq!(ledger.len(), 1, "{ledger:?}");
+    assert_eq!(
+        ledger[0].model(),
+        autumn_harvest_agent::model::UNKNOWN_MODEL_ID
+    );
+    assert_eq!(ledger[0].input_tokens(), 7);
+}
+
+#[tokio::test]
 async fn a_read_only_call_refuses_a_write_tool_at_run_time() {
     let recorder = Arc::new(Recorder::default());
     let harness = AgentHarness::new(ScriptedModel::new(Vec::new())).tool(recorded_tool(
@@ -446,4 +590,45 @@ async fn a_read_only_call_refuses_a_write_tool_at_run_time() {
     assert!(outcome.is_error);
     assert!(outcome.content.contains("may only read"));
     assert_eq!(recorder.runs(), Vec::<serde_json::Value>::new());
+}
+
+/// A model that reports a cost above the ledger limit.
+#[derive(Debug)]
+struct OverpricedModel(Arc<ScriptedModel>);
+
+impl AgentModel for OverpricedModel {
+    fn chat<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+    ) -> autumn_harvest_agent::model::BoxFuture<'a, Result<ChatResponse, AgentError>> {
+        self.0.chat(request)
+    }
+
+    fn model_id(&self) -> Option<&str> {
+        Some("test-model-1")
+    }
+
+    fn cost_usd_micros(&self, _usage: &TokenUsage) -> Option<u64> {
+        Some(u64::MAX)
+    }
+}
+
+#[tokio::test]
+async fn a_refused_cost_still_records_the_turn_as_unpriced() {
+    let model = ScriptedModel::new(vec![calls(&[], 11)]);
+    let ctx = with_harness(AgentHarness::new(Arc::new(OverpricedModel(model))));
+
+    let info = agent_model_turn_info();
+    let result = (info.handler)(&ctx, serde_json::to_value(turn_request()).unwrap()).await;
+    assert!(result.is_ok(), "a ledger refusal never fails the turn");
+
+    let ledger = ctx.llm_calls();
+    assert_eq!(ledger.len(), 1, "{ledger:?}");
+    assert_eq!(
+        ledger[0].model(),
+        "test-model-1",
+        "the valid model id stays"
+    );
+    assert_eq!(ledger[0].input_tokens(), 11);
+    assert_eq!(ledger[0].cost_usd_micros(), None, "the bad cost is dropped");
 }
