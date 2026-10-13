@@ -24,7 +24,7 @@ R&D decision record [`docs/rnd/sqlite-feasibility.md`](rnd/sqlite-feasibility.md
 5. [Registering workflows and activities](#5-registering-workflows-and-activities)
 6. [Starting a workflow](#6-starting-a-workflow)
 7. [The drive model](#7-the-drive-model)
-8. [Signals](#8-signals), and [updates](#updates-issue-2025)
+8. [Signals, queries and updates](#8-signals-queries-and-updates)
 9. [Durability and crash recovery](#9-durability-and-crash-recovery)
 10. [The single-writer / single-server contract](#10-the-single-writer--single-server-contract)
 11. [v0.1 non-goals and follow-ups](#11-v01-non-goals-and-follow-ups)
@@ -110,17 +110,33 @@ async fn process_order(ctx: &WorkflowContext, order: Order) -> Result<String, St
 }
 
 #[activity]
-async fn reserve_inventory(_ctx: &ActivityContext, _order: Order) -> Result<String, String> {
-    Ok(String::new())
+async fn reserve_inventory(ctx: &ActivityContext, order: Order) -> Result<String, String> {
+    // Stable across retries and re-runs: safe to send to a downstream API.
+    let key = ctx.idempotency_key().map_err(|e| e.to_string())?;
+    Ok(format!("reserved {}x {} ({key})", order.qty, order.item))
 }
 ```
 
-> **Important — activity bodies are separate.** On this backend an activity runs
-> a caller-supplied **synchronous** body registered against the activity's
-> `ActivityInfo`. The `#[activity]` async fn only supplies the macro-generated
-> `*_info()` companion (the name plus any declared `#[activity(...)]` defaults);
-> the closure you register in step 5 is what actually executes. There is no
-> `ActivityContext` I/O framework here — you write plain `Fn(Value) -> Result<Value, String>`.
+> **The `#[activity]` body runs (issue #2024).** `register_activity(&info)` runs
+> the async body itself, on the drive's async runtime, with a real
+> `ActivityContext`. The same fn runs unchanged on this backend and on Postgres.
+> `ctx.info()` reports the same values as the Postgres worker for one process.
+> They are the run, the activity, the 1-based `attempt`, `max_attempts`, the
+> task queue and the task row id. `ctx.heartbeat(..)` stores the latest payload on the task
+> row, so a retry or a reopen resumes from it with `ctx.heartbeat_details()`.
+> `ctx.previous_failure()` is the previous attempt's error. The cancellation
+> token never fires here.
+>
+> Some values differ from Postgres by design:
+>
+> - With no declared `retry`, this backend runs one attempt, so
+>   `max_attempts()` is `1`. Postgres applies its engine default.
+> - A re-run after a crash, or after a dropped drive, keeps its `attempt`
+>   number. Postgres counts the lost attempt.
+> - `ctx.state::<T>()` is always `None`, `ctx.headers()` is empty, and
+>   `ctx.metrics()` records nothing.
+> - `heartbeat_timeout` is rejected at registration. No scanner times out a
+>   silent attempt here.
 
 ---
 
@@ -157,11 +173,7 @@ Registrations live in process memory, not the database, so **every runtime
 
 ```rust
 rt.register_workflow(&process_order_info());
-
-rt.register_activity(&reserve_inventory_info(), |input| {
-    let order: Order = serde_json::from_value(input).map_err(|e| e.to_string())?;
-    Ok(serde_json::json!(format!("reserved {}x {}", order.qty, order.item)))
-});
+rt.register_activity(&reserve_inventory_info());
 ```
 
 - **`register_workflow(&WorkflowInfo)`** retains only the workflow's `name` +
@@ -170,13 +182,26 @@ rt.register_activity(&reserve_inventory_info(), |input| {
   (`execution_timeout`, a workflow-level `retry_policy`, `concurrency`,
   `debounce`, `batch`, `throttle`, a raised `max_input_bytes`), registration
   **panics at setup time** naming the feature — never a silently-dropped setting.
-- **`register_activity(&ActivityInfo, body)`** is the audited path: it honors the
+- **`register_activity(&ActivityInfo)`** is the default. It runs the
+  `#[activity]` body with an `ActivityContext`. It honors the
   declared `#[activity(...)]` defaults it can (`schedule_to_close`, the full
   `retry` policy — `max_attempts` + backoff + non-retryable classification —
   `start_to_close`, `queue`) and **panics** for one it cannot
   (`heartbeat_timeout`, `schedule_to_start`, `circuit_breaker`, `rate_limit_*`,
   `max_concurrent`, `is_local`, …). This keeps a declared setting from taking
   silently-wrong effect.
+- **`register_activity_with_body(&ActivityInfo, body)`** runs the same audit,
+  but runs a synchronous `Fn(Value) -> Result<Value, String>` closure in place of
+  the `#[activity]` body. The closure gets no `ActivityContext`. Use it to stub an
+  activity in a test, or to capture process state that the context cannot carry:
+
+```rust
+rt.register_activity_with_body(&reserve_inventory_info(), |input| {
+    let order: Order = serde_json::from_value(input).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!(format!("stub: {}", order.id)))
+});
+```
+
 - **`register_activity_raw(name, ActivitySpec::new(max_attempts, body))`** is the
   escape hatch — a hand-made body that carries no `ActivityInfo` and runs no
   audit. Use it when you don't have (or don't want) the macro companion:
@@ -440,7 +465,7 @@ event JSON length when the decision starts. Postgres measures
 
 ---
 
-## 8. Signals
+## 8. Signals, queries and updates
 
 Deliver a signal from outside with `send_signal`. Read it inside the workflow
 with any signal API.
@@ -487,6 +512,53 @@ awaited. The first drive after the upgrade appends them to history.
 `SqliteError::ExecutionNotFound` and a terminal one is
 `SqliteError::WorkflowNotRunning`, so a wakeup no drive could ever consume is
 rejected rather than silently lost.
+
+### Queries (issue #2022)
+
+Read a run's state with `query`. It calls a handler that
+`ctx.register_query` registered, and it writes nothing.
+
+```rust
+// Inside the workflow — expose state:
+let stage = Arc::new(Mutex::new("started"));
+let read = Arc::clone(&stage);
+ctx.register_query("stage", move || serde_json::json!(*read.lock().unwrap()));
+
+// From outside — read it:
+let stage = rt.query(exec, "stage", serde_json::Value::Null).await?;
+```
+
+`query` loads the history and replays the run to its frontier. It then calls
+the handler. It appends no event, changes no row, delivers no staged signal,
+fires no timer and runs no activity body.
+
+- A running run answers with the state at its frontier: the first command
+  that the history does not record. The replay does not know a query that
+  the workflow registers past that point.
+- A running run with a pending `cancel` replays with that reason, so
+  `ctx.cancellation_reason()` reads as it does on the next drive.
+- A terminal run answers with the state at its recorded end.
+- The call reads the rows immediately. The returned future borrows nothing,
+  so it can go to `tokio::spawn`. A later `set_query_timeout` does not change
+  it.
+
+> The replay runs workflow code, as a drive does. Code past the last recorded
+> event runs again in each query, a `ctx.side_effect` closure included. Keep
+> that code free of external effects. Put an external effect in an activity.
+
+The future resolves to one of these errors:
+
+| Error | Cause |
+|---|---|
+| `ExecutionNotFound` | The execution id is unknown. |
+| `UnknownWorkflow` | The run's workflow is not registered in this runtime. |
+| `QueryNotFound` | The replay registered no handler with this name. |
+| `QueryFailed` | The handler returned `Err`. |
+| `QueryPanicked` | The handler panicked, or the workflow panicked during the replay of a running run. |
+| `QueryTimedOut` | The replay passed the query timeout. The default is 5 s. Set it with `set_query_timeout`. The timeout holds only while the replay yields. |
+| `NonDeterministic` | The workflow code changed, so the replay of a running run diverges. A drive returns the same error. |
+| `QueryUnavailable` | A terminal run cannot give a stable answer. The workflow code changed, the replay panicked, or a seal for an unsupported feature or a history cap left side effects unrecorded. |
+| Other variants | A row cannot be read. |
 
 ### Updates (issue #2025)
 
@@ -551,7 +623,9 @@ All durable state lives in the database. Dropping a runtime and re-`open`-ing th
 
 This makes activity execution **at-least-once**: a crash *after a body runs but
 before its result commits* re-runs that body on resume. **Write activity bodies
-to be idempotent.**
+to be idempotent.** `ctx.idempotency_key()` is stable across these re-runs. A
+body that checkpoints with `ctx.heartbeat(..)` resumes from the last stored
+payload through `ctx.heartbeat_details()`.
 
 The [`examples/durability.rs`](../autumn-harvest-sqlite/examples/durability.rs)
 example proves resume-vs-restart with side-effect counters: it runs a workflow to
@@ -703,7 +777,7 @@ gate no control flow): `ctx.set_current_details(...)` and a re-park
   whole application on this backend: a local daemon that runs Claude agent
   sessions as durable workflows. It shows the drive loop
   ([§7](#7-the-drive-model)), signals with a deadline
-  ([§8](#8-signals)), and crash recovery
+  ([§8](#8-signals-queries-and-updates)), and crash recovery
   ([§9](#9-durability-and-crash-recovery)) in one place, and it runs with no API
   key against a scripted offline model.
 

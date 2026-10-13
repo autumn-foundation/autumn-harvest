@@ -944,6 +944,11 @@ async fn answers_before_a_moved_deadline_do_not_cut_the_cap() {
 /// A freed adaptive slot must wake the idle poll loop. Otherwise a worker
 /// whose backlog holds only a saturated type waits one full poll interval
 /// after each batch, and the cap stays idle.
+///
+/// The worker has no listener. While no type is at its cap, new work can wait
+/// one poll interval, and that wait is not a missed slot wake. The workflow
+/// task after the last calls always meets it. So the clock stops when the
+/// last call ends, not when the last run ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_freed_slot_wakes_the_poll_loop() {
     const ACTIVITY: &str = "al_fast_capped";
@@ -976,6 +981,15 @@ async fn a_freed_slot_wakes_the_poll_loop() {
             .filter(harvest_workflow_executions::state.ne("COMPLETED"))
             .count()
     };
+    let calls = gauge(ACTIVITY);
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while calls.done() < RUNS {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("every call ends within 60 s");
+    let elapsed = started.elapsed();
     tokio::time::timeout(Duration::from_secs(60), async {
         while open_runs()
             .get_result::<i64>(&mut conn)
@@ -988,13 +1002,12 @@ async fn a_freed_slot_wakes_the_poll_loop() {
     })
     .await
     .expect("every run completes within 60 s");
-    let elapsed = started.elapsed();
     worker.shutdown();
     handle.await.expect("worker joins");
-    // Ten batches of two 20 ms calls. Without a cap the run takes about
-    // 2 s here. Each missed wake adds one second of idle polling.
+    // Ten batches of two 20 ms calls. The calls take about 1 s here. Each
+    // missed wake adds one second of idle polling.
     assert!(
         elapsed < Duration::from_millis(3_500),
-        "{RUNS} runs at a cap of 2 took {elapsed:?}"
+        "{RUNS} calls at a cap of 2 took {elapsed:?}"
     );
 }

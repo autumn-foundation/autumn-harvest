@@ -312,6 +312,8 @@ pub mod dispatch;
 /// Deterministic simulation of the activity claim protocol (issue #1830),
 /// and of the real worker loop (issue #2002).
 pub mod dst;
+/// Durable promises that any caller settles once (issue #1985).
+pub mod durable_promise;
 /// Effective runtime-configuration introspection (issue #695).
 ///
 /// [`effective_config::EffectiveConfigView`] is the serialisable, secret-free
@@ -384,6 +386,8 @@ pub mod info;
 pub mod interceptor;
 /// Every persisted workflow execution state and every sanctioned transition.
 pub mod lifecycle;
+/// LLM token and cost budgets per run and per tenant (issue #1997).
+pub mod llm_budget;
 /// Agent cost ledger: model, tokens, cost and latency per LLM step (issue
 /// #1996).
 pub mod llm_ledger;

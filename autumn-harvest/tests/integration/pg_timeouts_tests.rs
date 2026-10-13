@@ -3145,30 +3145,41 @@ async fn a_recently_used_connection_is_handed_out_without_a_ping() {
         &timeouts(5_000, SessionTimeouts::for_role(DbRole::Hot)),
     )
     .expect("engine pool builds");
-    // Open the admin connection first. A new connection on a loaded database
-    // can take longer than `VERIFY_IDLE_AFTER`.
+    // Connect first, so that only pool work lies between the two checkouts.
     let mut admin = connect(&url).await;
+    // Warm the pool. The timed checkout then reuses the connection and does
+    // not wait for a new one.
+    drop(pool.get().await.expect("warm the pool"));
+    let checked_out = Instant::now();
     let old_pid = {
         let mut conn = pool.get().await.expect("first connection");
         backend_pid(&mut conn).await
     };
+    let mut conn = pool.get().await.expect("second checkout");
+    assert!(
+        checked_out.elapsed() < autumn_harvest::pool::VERIFY_IDLE_AFTER,
+        "the second checkout must follow within the idle bound"
+    );
     // The checkout follows within the idle bound, so the pool sends no ping.
-    let new_pid = {
-        let mut conn = pool.get().await.expect("second connection");
-        // The backend keeps the text of its last statement. A ping would leave
-        // `SELECT 1` there in place of the pid query.
-        let last = diesel::sql_query(format!(
-            "SELECT query FROM pg_stat_activity WHERE pid = {old_pid}"
-        ))
+    // A dead connection can then reach the caller. Its first statement fails,
+    // and the engine retries such a failure. That is the cost of the skip.
+    //
+    // The backend still shows the pid query as its last statement. A ping
+    // would show `SELECT 1`. The test does not kill the backend to prove this. The client can see
+    // the closed socket before the checkout, and then the pool replaces the
+    // connection with or without a ping.
+    let last = diesel::sql_query("SELECT query FROM pg_stat_activity WHERE pid = $1")
+        .bind::<diesel::sql_types::Integer, _>(old_pid)
         .get_result::<LastQuery>(&mut admin)
         .await
         .expect("read the pooled backend's last query");
-        assert!(
-            last.query.contains("pg_backend_pid"),
-            "a hot checkout must hand out the connection without a ping, got {:?}",
-            last.query
-        );
-        backend_pid(&mut conn).await
-    };
-    assert_eq!(new_pid, old_pid, "the pool hands out the same connection");
+    assert_eq!(
+        last.query, "SELECT pg_backend_pid() AS pid",
+        "a hot checkout must hand out the connection without a ping"
+    );
+    assert_eq!(
+        backend_pid(&mut conn).await,
+        old_pid,
+        "the pool hands out the same connection"
+    );
 }

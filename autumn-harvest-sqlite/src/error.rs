@@ -236,6 +236,12 @@ pub enum SqliteError {
         existing_state: String,
     },
 
+    /// A signal broke a rule of its name. A `harvest.promise:` signal must
+    /// carry a [`PromiseSettlement`](autumn_harvest::durable_promise::PromiseSettlement)
+    /// (issue #1985).
+    #[error("invalid signal: {0}")]
+    InvalidSignal(String),
+
     /// A value stored in `SQLite` could not be parsed back into its Rust type.
     #[error("corrupt stored value: {0}")]
     Corrupt(String),
@@ -293,6 +299,82 @@ pub enum SqliteError {
         /// The panicking execution (still `RUNNING`, resumable).
         execution_id: ExecutionId,
         /// The engine's typed `HandlerPanic` error payload / message.
+        details: String,
+    },
+
+    /// The run has no query handler with this name (issue #2022).
+    ///
+    /// The replay registers every query that the workflow reaches before its
+    /// frontier. The replay does not know a query that the workflow registers
+    /// past the frontier.
+    #[error("execution {execution_id} has no query handler named {name:?}")]
+    QueryNotFound {
+        /// The queried execution.
+        execution_id: ExecutionId,
+        /// The query name.
+        name: String,
+    },
+
+    /// The query handler returned an `Err` (issue #2022).
+    #[error("query {name:?} on execution {execution_id} failed: {details}")]
+    QueryFailed {
+        /// The queried execution.
+        execution_id: ExecutionId,
+        /// The query name.
+        name: String,
+        /// The handler's error.
+        details: String,
+    },
+
+    /// The query handler panicked, or the workflow panicked during the replay
+    /// of a running run (issue #2022). The panic does not reach the caller.
+    /// The run does not change.
+    #[error("query {name:?} on execution {execution_id} panicked: {details}")]
+    QueryPanicked {
+        /// The queried execution.
+        execution_id: ExecutionId,
+        /// The query name.
+        name: String,
+        /// The panic message of a query handler. A workflow panic during the
+        /// replay gives a fixed text, and the core logs the message.
+        details: String,
+    },
+
+    /// The query replay did not stop before the query timeout (issue #2022).
+    ///
+    /// The usual cause is a workflow that spins on a non-Harvest future. Set
+    /// the timeout with
+    /// [`set_query_timeout`](crate::SqliteRuntime::set_query_timeout). The
+    /// timeout holds only while the replay yields. A workflow that loops or
+    /// blocks without an `.await` is not bounded.
+    #[error("query {name:?} on execution {execution_id} timed out after {timeout_ms} ms")]
+    QueryTimedOut {
+        /// The queried execution.
+        execution_id: ExecutionId,
+        /// The query name.
+        name: String,
+        /// The timeout that elapsed.
+        timeout_ms: u64,
+    },
+
+    /// A terminal run cannot give a stable answer (issue #2022).
+    ///
+    /// The query serves no answer rather than a wrong one. There are three
+    /// causes:
+    ///
+    /// - The workflow code changed, so the replay diverges from the history.
+    /// - The workflow panics during the replay. The panic recurs on every
+    ///   retry, as on the Postgres HTTP path.
+    /// - A seal for an unsupported feature or a history cap rolled back the
+    ///   last cycle. The replay then mints side-effect values that the
+    ///   history does not record.
+    #[error("query {name:?} on terminal execution {execution_id} is unavailable: {details}")]
+    QueryUnavailable {
+        /// The queried execution.
+        execution_id: ExecutionId,
+        /// The query name.
+        name: String,
+        /// Why the replay cannot serve.
         details: String,
     },
 

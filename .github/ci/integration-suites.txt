@@ -148,6 +148,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          legal_hold_tests
 linux        autumn-harvest         integration                      -                          lifecycle_model_props
 linux        autumn-harvest         integration                      -                          lineage_store_tests
+linux        autumn-harvest         integration                      -                          llm_budget_tests
 linux        autumn-harvest         integration                      -                          metrics_integration
 linux        autumn-harvest         integration                      -                          migrate_tests
 linux        autumn-harvest         integration                      -                          mixed_suspension_tests
@@ -206,6 +207,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          signal_with_start_tests
 linux        autumn-harvest         integration                      -                          sla_breach_tests
 linux        autumn-harvest         integration                      -                          slot_tuner_tests
+linux        autumn-harvest         integration                      -                          sqlite_portable_activity_tests
 linux        autumn-harvest         integration                      -                          standalone_activity_overhead_perf
 linux        autumn-harvest         integration                      -                          start_idempotency_tests
 linux        autumn-harvest         integration                      -                          start_source_tests
@@ -259,6 +261,7 @@ linux        autumn-harvest         integration                      testing    
 linux        autumn-harvest         integration                      testing                    scheduled_time_tests
 linux        autumn-harvest         integration                      testing                    scheduler_carryover_tests
 linux        autumn-harvest         integration                      testing                    shard_rebalance_db_tests
+linux        autumn-harvest         integration                      testing                    small_primitives_db_tests
 linux        autumn-harvest         integration                      testing                    transactional_activity_tests
 linux        autumn-harvest         integration                      testing                    upgrade_check_db_tests
 linux        autumn-harvest         integration                      testing                    worker_session_tests
@@ -312,6 +315,7 @@ linux        autumn-harvest-plugin  outbox_integration               -          
 linux        autumn-harvest-plugin  pacing_override_integration      -                          -
 linux        autumn-harvest-plugin  preflight_integration            -                          -
 linux        autumn-harvest-plugin  progress_stream_integration      -                          -
+linux        autumn-harvest-plugin  promise_routes_integration       -                          -
 linux        autumn-harvest-plugin  query_integration                -                          -
 linux        autumn-harvest-plugin  queue_coverage_integration       -                          -
 linux        autumn-harvest-plugin  queue_pause_integration          -                          -
