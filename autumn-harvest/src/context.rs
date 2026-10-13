@@ -5461,12 +5461,35 @@ impl WorkflowContext {
 
                 // An invalid captured value fails as a recorded one does. Drift
                 // fails before `f` runs.
-                let result = match self
+                let (result, output) = match self
                     .captured_scope_record(crate::event::SideEffectKind::Custom, Some(id))
                 {
-                    crate::cancellation_scope::Captured::NotReplaying => f(),
+                    crate::cancellation_scope::Captured::NotReplaying => {
+                        let result = f();
+                        let output = serde_json::to_value(&result)?;
+
+                        // Enforce side-effect payload cap before recording.
+                        // SideEffectRecorded events are written via pre_suspension_events_from_commands
+                        // using plain store::append_events (no offloader), so the offload bypass must
+                        // NOT apply here even when a PayloadStore is configured.
+                        let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
+                        if observed > self.payload_max_side_effect {
+                            return Err(HarvestError::PayloadTooLarge {
+                                kind: PayloadKind::SideEffectValue,
+                                observed_bytes: observed,
+                                cap_bytes: self.payload_max_side_effect,
+                                workflow_type: self.workflow_name.clone(),
+                                activity_name: None,
+                            });
+                        }
+                        (result, output)
+                    }
+                    // A captured value replays as recorded, as a recorded one does.
+                    // The live cap does not apply to it again.
                     crate::cancellation_scope::Captured::Value(value) => {
-                        serde_json::from_value::<T>(value).map_err(HarvestError::Serialization)?
+                        let result = serde_json::from_value::<T>(value.clone())
+                            .map_err(HarvestError::Serialization)?;
+                        (result, value)
                     }
                     crate::cancellation_scope::Captured::Drift(drift) => {
                         return Err(self.scope_nd_error(
@@ -5475,22 +5498,6 @@ impl WorkflowContext {
                         ));
                     }
                 };
-                let output = serde_json::to_value(&result)?;
-
-                // Enforce side-effect payload cap before recording.
-                // SideEffectRecorded events are written via pre_suspension_events_from_commands
-                // using plain store::append_events (no offloader), so the offload bypass must
-                // NOT apply here even when a PayloadStore is configured.
-                let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
-                if observed > self.payload_max_side_effect {
-                    return Err(HarvestError::PayloadTooLarge {
-                        kind: PayloadKind::SideEffectValue,
-                        observed_bytes: observed,
-                        cap_bytes: self.payload_max_side_effect,
-                        workflow_type: self.workflow_name.clone(),
-                        activity_name: None,
-                    });
-                }
 
                 self.push_command(WorkflowCommand::RecordSideEffect {
                     kind: crate::event::SideEffectKind::Custom,
@@ -15091,8 +15098,11 @@ impl WorkflowContext {
     }
 
     /// Find the details of an unconsumed marker without consuming it.
+    ///
+    /// The read does not pump signal handlers. A scope peeks before it cuts
+    /// history at its horizon, and a signal past the horizon must wait.
     pub(crate) fn peek_marker_details(&self, name: &str) -> Option<Value> {
-        self.match_history(|m| m.unconsumed_marker_details(name))
+        self.match_history_unpumped(|m| m.unconsumed_marker_details(name))
     }
 
     /// Whether an unconsumed marker with this name is in history.

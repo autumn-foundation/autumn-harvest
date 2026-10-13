@@ -2220,6 +2220,82 @@ mod tests {
         assert!(poked.load(std::sync::atomic::Ordering::SeqCst));
     }
 
+    /// A captured side-effect value replays as recorded. A cap lowered after
+    /// the cancel does not fail it, as it does not fail a recorded value.
+    #[tokio::test]
+    async fn a_lowered_cap_does_not_fail_a_captured_side_effect() {
+        let long = "x".repeat(200);
+        let live = WorkflowContext::new_test();
+        let seen = std::sync::Mutex::new(None);
+        let value = long.clone();
+        record_then_cancel(&live, &seen, move |ctx| {
+            json!(
+                ctx.side_effect("pick", move || value)
+                    .expect("live side effect")
+            )
+        })
+        .await;
+        let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+        let replay = replay_of(details).with_payload_caps(u64::MAX, u64::MAX, u64::MAX, 16);
+        let replayed = std::sync::Mutex::new(None);
+        record_then_cancel(&replay, &replayed, |ctx| {
+            json!(
+                ctx.side_effect("pick", String::new)
+                    .map_err(|e| e.to_string())
+            )
+        })
+        .await;
+
+        assert_eq!(
+            *replayed.lock().expect("replayed lock"),
+            Some(json!({ "Ok": long }))
+        );
+        let nd = replay.take_nd_details();
+        assert!(nd.is_none(), "{nd:?}");
+    }
+
+    /// A signal right at the cursor when the scope starts lies past the
+    /// horizon. The scope's peek at its marker does not run its handler.
+    #[tokio::test]
+    async fn the_marker_peek_does_not_run_a_late_signal_handler() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started(),
+                WorkflowEvent::SignalReceived {
+                    signal_name: "poke".into(),
+                    payload: json!(1),
+                },
+                WorkflowEvent::MarkerRecorded {
+                    name: "cancel_scope:1".into(),
+                    details: json!({
+                        "reason": "cancellation scope cancelled",
+                        "horizon": 1,
+                    }),
+                },
+            ],
+        );
+        let poked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&poked);
+        ctx.register_signal_handler_raw("poke", move |_| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let result = bounded(run_then_cancel(&ctx, std::future::pending::<()>())).await;
+
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+        assert!(
+            !poked.load(std::sync::atomic::Ordering::SeqCst),
+            "the handler must not run before the scope returns"
+        );
+        let nd = ctx.take_nd_details();
+        assert!(nd.is_none(), "{nd:?}");
+    }
+
     /// A version gate that matches its marker before the horizon takes no
     /// captured record, so a replayed cancel reports no drift.
     #[tokio::test]
