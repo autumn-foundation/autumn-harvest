@@ -90,7 +90,7 @@ its next poll:
    (`ReleaseMutex` stays). It records the marker `cancel_scope:{seq}` with the
    reason, the horizon, the member ids and the withdrawn recorded decisions:
    `RecordSideEffect` values and `RecordMarker` details, such as a version
-   gate. A withdrawn nested cancel marker passes its records up. A withdrawn timer command restores the timer
+   gate. A withdrawn nested cancel marker passes its records and its decision up. A withdrawn timer command restores the timer
    state that it changed. It pushes
    `CancelRaceLosers { reason: ScopeCancelled, .. }` for the open members.
    It returns

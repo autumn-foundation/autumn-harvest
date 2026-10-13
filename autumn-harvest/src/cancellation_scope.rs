@@ -176,7 +176,8 @@ fn side_effect_label(kind: SideEffectKind, name: Option<&str>) -> String {
 /// A nested scope that cancelled in the same cycle withdrew its own records
 /// into its marker. That marker is withdrawn now, so its records move here.
 /// The push order puts them back among the other records, as the body made
-/// them.
+/// them. The nested cancel decision stays too, without its records, so a
+/// replay that drops the nested cancel reports drift.
 fn captured_records(cmds: &[(u64, WorkflowCommand)]) -> Vec<CapturedRecord> {
     let mut records = Vec::new();
     for (order, cmd) in cmds {
@@ -196,6 +197,11 @@ fn captured_records(cmds: &[(u64, WorkflowCommand)]) -> Vec<CapturedRecord> {
                 if let Ok(inner) = serde_json::from_value::<CancelMarker>(details.clone()) {
                     records.extend(inner.records);
                 }
+                records.push(CapturedRecord::Marker {
+                    order,
+                    name: name.clone(),
+                    details: cancel_decision(details),
+                });
             }
             WorkflowCommand::RecordMarker { name, details } => {
                 records.push(CapturedRecord::Marker {
@@ -364,6 +370,15 @@ fn take_captured(
     Captured::NotReplaying
 }
 
+/// The details of a cancel marker without its captured records.
+fn cancel_decision(details: &Value) -> Value {
+    let mut decision = details.clone();
+    if let Some(fields) = decision.as_object_mut() {
+        fields.remove("records");
+    }
+    decision
+}
+
 /// The drift of a replayed marker against the next captured record.
 ///
 /// A doomed scope re-derives a withdrawn marker on replay, such as a race or
@@ -371,14 +386,20 @@ fn take_captured(
 /// the captured record takes the place of history, so a deploy that changes
 /// the decision reports drift instead of passing in silence. A version gate
 /// takes its record when it is served, so it is not checked here. A nested
-/// cancel marker gave its records to the outer one, so it is not checked.
+/// cancel marker is compared without its records, which moved to the outer
+/// capture.
 pub(crate) fn captured_marker_drift(stack: &[ScopeFrame], cmd: &WorkflowCommand) -> Option<String> {
     let WorkflowCommand::RecordMarker { name, details } = cmd else {
         return None;
     };
-    if name.starts_with(CANCEL_MARKER_PREFIX) || name.starts_with("version:") {
+    if name.starts_with("version:") {
         return None;
     }
+    let replayed = if name.starts_with(CANCEL_MARKER_PREFIX) {
+        cancel_decision(details)
+    } else {
+        details.clone()
+    };
     let asked = format!("MarkerRecorded({name})");
     match take_captured(stack, &asked, |record| match record {
         CapturedRecord::Marker {
@@ -387,7 +408,7 @@ pub(crate) fn captured_marker_drift(stack: &[ScopeFrame], cmd: &WorkflowCommand)
         _ => None,
     }) {
         Captured::NotReplaying => None,
-        Captured::Value(captured) if &captured == details => None,
+        Captured::Value(captured) if captured == replayed => None,
         Captured::Value(_) => Some(format!(
             "marker '{name}' differs from the one that a scope cancel recorded"
         )),
@@ -1696,6 +1717,55 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(replay.take_nd_details().is_none());
         assert!(!replay.history_has_unconsumed_events());
+    }
+
+    /// A nested cancel that the outer cancel withdrew stays in the capture.
+    /// A replay that no longer cancels the nested scope is drift.
+    #[tokio::test]
+    async fn a_replay_that_drops_a_nested_cancel_is_drift() {
+        async fn run(ctx: &WorkflowContext, cancel_inner: bool) -> HarvestResult<()> {
+            let outer = ctx.cancellation_scope();
+            let inner = ctx.cancellation_scope();
+            let body = async {
+                let _ = inner
+                    .run(async {
+                        if cancel_inner {
+                            inner.cancel();
+                        }
+                        std::future::pending::<()>().await;
+                    })
+                    .await;
+                std::future::pending::<()>().await;
+            };
+            let sibling = async {
+                tokio::task::yield_now().await;
+                outer.cancel();
+            };
+            let (result, ()) = bounded(async { tokio::join!(outer.run(body), sibling) }).await;
+            result
+        }
+
+        let live = WorkflowContext::new_test();
+        assert!(matches!(
+            run(&live, true).await,
+            Err(HarvestError::Cancelled(_))
+        ));
+        let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+        let same = replay_of(details.clone());
+        let result = run(&same, true).await;
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+        assert!(same.take_nd_details().is_none());
+
+        let dropped = replay_of(details);
+        let result = run(&dropped, false).await;
+        assert!(
+            matches!(result, Err(HarvestError::NonDeterministic { .. })),
+            "{result:?}"
+        );
     }
 
     /// A captured value that the deployed type cannot read fails as a
