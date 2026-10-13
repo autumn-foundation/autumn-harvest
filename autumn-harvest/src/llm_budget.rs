@@ -34,8 +34,14 @@
 //!   retry starts a new execution, so its run caps start from zero. A reset
 //!   fork keeps the key of its source.
 //! - The tenant scope is `(workflow type, quota key)`, as for quota. It is
-//!   shard-local. The check reads the key of each run, so the rows of a run
-//!   count for its tenant once `quota_reconcile` sets the key.
+//!   shard-local. The check reads the key of each run. Admission sets the key
+//!   when the policy of the type uses one.
+//! - A run that starts before its type has a policy has no key. The tenant
+//!   caps fail open for it, and its rows do not count for its tenant.
+//!   `quota_reconcile` sets the key of such a run while it is `RUNNING` or
+//!   `PAUSED`. A run that ends before the reconciler reaches it keeps no key,
+//!   so its rows never count. This gap closes one reconcile pass after the
+//!   policy rollout.
 //! - A key that does not resolve fails open for the tenant caps. The run caps
 //!   still apply.
 //! - The check reads the policy in its own process. A worker that does not
@@ -209,7 +215,8 @@ impl LlmBudgetExceeded {
 /// scope is the `(workflow_name, quota_key)` of the run. A run with no key
 /// has no tenant spend. The tenant sum joins each ledger row to its run:
 ///
-/// - The rows of a run count once its key is set.
+/// - The rows of a run count once its key is set. A run with no key does not
+///   count. See the module docs for the rollout gap.
 /// - A row is never newer than the end of its run. So only a run that is
 ///   active, or that ended in the window, can hold a row in the window.
 ///   `idx_harvest_we_llm_tenant` finds those runs. The `LATERAL` sum then

@@ -102,6 +102,14 @@ The check sums `harvest_llm_ledger` (#1996). The run spend reads the rows
 of the run by the ledger key. The tenant spend joins each row to its run for
 `(workflow_name, quota_key)`, so the rows of a run count once its key is set.
 
+A run that starts before its type has a policy has no key. `quota_reconcile`
+(#1226) sets it only while the run is `RUNNING` or `PAUSED`. A run that ends
+before the reconciler reaches it never counts for its tenant. The gap lasts one
+reconcile pass after a policy rollout. Two fixes close it, and both are out of
+scope here. The check could set the key of its own run, which needs the payload
+codecs and the shard fence in `ActivityContext`. Or the ledger could store the
+key, which changes the #1996 schema.
+
 A row is never newer than the end of its run. So only a run that is active,
 or that ended in the window, can hold a row in the window. The partial index
 `idx_harvest_we_llm_tenant` on `(workflow_name, quota_key,
