@@ -2287,7 +2287,8 @@ impl SqliteRuntime {
                     now,
                 };
                 persist_terminal_pending_commands(&tx, &drain, exec, &pending)?;
-                if let Some(reason) = caps.reached(&tx, exec)? {
+                let cascade = composition::cascade_event_count(&tx, exec)?;
+                if let Some(reason) = caps.reached_with(&tx, exec, cascade)? {
                     drop(tx);
                     return self.fail_for_history_cap(exec, &reason, now);
                 }
@@ -2351,7 +2352,8 @@ impl SqliteRuntime {
                     now,
                 };
                 persist_terminal_pending_commands(&tx, &drain, exec, &pending)?;
-                if let Some(reason) = caps.reached(&tx, exec)? {
+                let cascade = composition::cascade_event_count(&tx, exec)?;
+                if let Some(reason) = caps.reached_with(&tx, exec, cascade)? {
                     drop(tx);
                     return self.fail_for_history_cap(exec, &reason, now);
                 }

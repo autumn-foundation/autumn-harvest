@@ -84,7 +84,25 @@ impl CapCheck<'_> {
         conn: &Connection,
         exec: ExecutionId,
     ) -> SqliteResult<Option<HistoryCapReason>> {
-        let count = u64::try_from(store::next_seq(conn, exec)?).unwrap_or(0);
+        self.reached_with(conn, exec, 0)
+    }
+
+    /// As [`reached`](Self::reached), with `extra` events that the decision
+    /// writes after its terminal event. The parent-close cascade writes such
+    /// events (issue #2026). Postgres counts them in the same check.
+    ///
+    /// # Errors
+    ///
+    /// Returns a persistence error if the event count cannot be read.
+    pub fn reached_with(
+        &self,
+        conn: &Connection,
+        exec: ExecutionId,
+        extra: u64,
+    ) -> SqliteResult<Option<HistoryCapReason>> {
+        let count = u64::try_from(store::next_seq(conn, exec)?)
+            .unwrap_or(0)
+            .saturating_add(extra);
         Ok(breach(
             self.policy,
             count,

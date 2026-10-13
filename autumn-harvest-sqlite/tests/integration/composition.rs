@@ -1874,3 +1874,41 @@ async fn an_await_follows_a_continue_as_new() {
     assert!(rt.successor(target).unwrap().is_some());
     assert_replays(&rt, awaiter, "await_reports").await;
 }
+
+/// The cap check before a terminal event counts the cascade events that the
+/// close writes, as on Postgres. A parent one event below the cap fails.
+#[tokio::test]
+async fn the_terminal_cap_check_counts_cascade_events() {
+    let mut rt = runtime();
+    // `WorkflowStarted` and `ChildWorkflowSpawnedDetached` come first. The
+    // cascade event then reaches the cap.
+    rt.set_history_event_hard_cap(Some(3));
+    let parent = rt
+        .start_workflow(
+            "parent_spawns_detached",
+            json!({ "policy": "request_cancel" }),
+        )
+        .unwrap();
+
+    let state = rt.run_until_blocked(parent).await.unwrap();
+
+    assert!(
+        matches!(state, RunState::Failed(ref m) if m.contains("HistoryCapExceeded")),
+        "{state:?}"
+    );
+    assert!(children_of(&rt, parent).is_empty(), "the spawn rolls back");
+}
+
+/// An `abandon` child writes no cascade event, so the same parent completes.
+#[tokio::test]
+async fn an_abandon_child_adds_no_cascade_event_to_the_cap_check() {
+    let mut rt = runtime();
+    rt.set_history_event_hard_cap(Some(3));
+    let parent = rt
+        .start_workflow("parent_spawns_detached", json!({ "policy": "abandon" }))
+        .unwrap();
+
+    let state = rt.run_until_blocked(parent).await.unwrap();
+
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+}

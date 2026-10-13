@@ -22,7 +22,8 @@ backend.
   gets its policy. `request_cancel` cancels it with reason `parent closed`.
   `terminate` fails it with `ParentClosed`. `abandon` leaves it running. The
   parent records `ChildWorkflowCascadeApplied`. Every terminal path applies the
-  policy. A worklist carries the cascade down a chain of any depth.
+  policy. The cap check before a terminal event counts these events, as on
+  Postgres. A worklist carries the cascade down a chain of any depth.
 - **Between runs.** `SignalExternalWorkflow`, `RequestCancelExternalWorkflow`
   and `AwaitExternalWorkflow` take effect in the caller's transaction. A
   cancel is a hard seal, as on Postgres: the target ends `CANCELLED` with
@@ -76,7 +77,7 @@ and `harvest_signals.idempotency_key`. An old file gains them on open.
   external events first. Each event is the same, and replay accepts both
   orders.
 
-**Tests.** `autumn-harvest-sqlite/tests/integration/composition.rs` has 46
+**Tests.** `autumn-harvest-sqlite/tests/integration/composition.rs` has 48
 tests. Each test replays every history it asserts on the core
 `WorkflowReplayer`, with the run's ids. They cover:
 
@@ -92,7 +93,8 @@ tests. Each test replays every history it asserts on the core
   run that its own cancel seals;
 - `join!` of an await and a child in both orders;
 - an operator cancel and a terminate of a child, a terminated await target, a
-  child that continues as new, and an await across a continue-as-new.
+  child that continues as new, and an await across a continue-as-new;
+- the terminal cap check with and without cascade events.
 
 Unit tests cover the schema step and a race loser with no row. The core test
 `match_external_await_resolves_past_a_sibling_child` pins the replay fix. The

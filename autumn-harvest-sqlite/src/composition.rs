@@ -304,6 +304,22 @@ pub fn close_execution(
     Ok(())
 }
 
+/// The number of `ChildWorkflowCascadeApplied` events that a close of `exec`
+/// writes now: one per `RUNNING` detached child whose policy is not
+/// `abandon`. The terminal cap check counts them, as Postgres does.
+pub fn cascade_event_count(conn: &Connection, exec: ExecutionId) -> SqliteResult<u64> {
+    let mut count: u64 = 0;
+    for (_, policy) in store::running_detached_children(conn, exec)? {
+        let policy: ParentClosePolicy = policy
+            .parse()
+            .map_err(|_| SqliteError::corrupt("parent_close_policy"))?;
+        if policy != ParentClosePolicy::Abandon {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
+}
+
 /// Write the result of an awaited child to its `RUNNING` parent.
 ///
 /// A child-timeout deadline of the parent that is due at `now` fires first,
