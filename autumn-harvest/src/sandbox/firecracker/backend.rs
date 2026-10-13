@@ -215,11 +215,12 @@ impl SandboxBackend for FirecrackerBackend {
         Box::pin(async move {
             let mut warm = self.pool.as_ref().and_then(WarmPool::take);
             // A warm microVM can die in the pool, for example by the OOM
-            // killer. Then boot a new one.
+            // killer. Then boot a new one. The dead one is torn down in the
+            // background, so its cleanup takes no time from this run.
             if warm.as_mut().is_some_and(|vm| vm.exit_status().is_some())
                 && let Some(dead) = warm.take()
             {
-                dead.shutdown().await;
+                tokio::spawn(dead.shutdown());
             }
             let vm = if let Some(vm) = warm {
                 vm
@@ -619,6 +620,46 @@ mod tests {
         assert_eq!(out.stdout, "fresh\n");
         backend.shutdown().await;
         assert_eq!(fake.live(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_teardown_of_a_dead_warm_vm_takes_no_run_time() {
+        let mut fake = FakeLauncher::new(
+            GuestMode::Serve,
+            Arc::new(HostNetworkExecutor(ProcessExecutor::new(
+                ExecOptions::default(),
+            ))),
+        );
+        fake.crash_teardown = Duration::from_secs(3);
+        let fake = Arc::new(fake);
+        let backend = FirecrackerBackend::new(fake.clone(), fast())
+            .unwrap()
+            .with_warm_pool(1);
+        let pool = backend.warm_pool().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pool.ready_len() < 1 {
+            assert!(Instant::now() < deadline, "the pool never filled");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        fake.crashed.lock().unwrap().push("fake-0".into());
+        let started = Instant::now();
+        let out = backend
+            .execute(job("echo fresh", 5_000), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, "fresh\n");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the run waited for the dead VM: {:?}",
+            started.elapsed()
+        );
+        backend.shutdown().await;
+        // The dead VM still goes away, in the background.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fake.live() > 0 {
+            assert!(Instant::now() < deadline, "the dead VM leaked");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]

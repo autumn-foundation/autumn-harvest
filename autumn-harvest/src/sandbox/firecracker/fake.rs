@@ -70,6 +70,8 @@ pub struct FakeLauncher {
     pub port_queries: AtomicUsize,
     /// The answer of `launch_budget`.
     pub launch_budget: std::time::Duration,
+    /// The time that the shutdown of a crashed VM takes.
+    pub crash_teardown: std::time::Duration,
 }
 
 impl FakeLauncher {
@@ -90,6 +92,7 @@ impl FakeLauncher {
             port: None,
             port_queries: AtomicUsize::new(0),
             launch_budget: std::time::Duration::ZERO,
+            crash_teardown: std::time::Duration::ZERO,
         }
     }
 
@@ -131,6 +134,7 @@ impl VmLauncher for FakeLauncher {
                 live: Arc::clone(&self.live),
                 down: false,
                 crashed: Arc::clone(&self.crashed),
+                crash_teardown: self.crash_teardown,
             }) as Box<dyn LaunchedVm>)
         })
     }
@@ -236,6 +240,7 @@ pub struct FakeVm {
     live: Arc<AtomicUsize>,
     down: bool,
     crashed: Arc<std::sync::Mutex<Vec<String>>>,
+    crash_teardown: std::time::Duration,
 }
 
 impl FakeVm {
@@ -272,8 +277,15 @@ impl LaunchedVm for FakeVm {
     }
 
     fn shutdown(mut self: Box<Self>) -> BoxFuture<'static, ()> {
-        self.tear_down();
-        Box::pin(std::future::ready(()))
+        let wait = if self.exit_status().is_some() {
+            self.crash_teardown
+        } else {
+            std::time::Duration::ZERO
+        };
+        Box::pin(async move {
+            tokio::time::sleep(wait).await;
+            self.tear_down();
+        })
     }
 }
 

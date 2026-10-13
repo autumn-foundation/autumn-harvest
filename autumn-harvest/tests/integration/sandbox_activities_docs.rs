@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use super::docs_guard_support::{check_stanza, prose_sentences, section, step_stanza};
 
 const GUIDE: &str = "docs/sandbox-activities.md";
+const IMAGE_SCRIPT: &str = "scripts/sandbox/build-guest-image.sh";
 const DESIGN: &str = "DESIGN-sandbox-activities.md";
 const FILTER: &str = "--test integration sandbox_activities_docs::";
 const MAX_SENTENCE_WORDS: usize = 25;
@@ -185,12 +186,47 @@ fn a_fakeroot_image_gets_root_owners_on_the_host_too() {
     // gives root the files in the image, not the image files themselves.
     let install = "sudo install -o root -g root -m 0644";
     let guide = read(GUIDE);
-    let script = read("scripts/sandbox/build-guest-image.sh");
+    let script = read(IMAGE_SCRIPT);
     assert!(guide.contains(install), "{GUIDE} must show `{install}`");
     assert!(
         script.contains(install),
         "build-guest-image.sh must print `{install}` after a non-root build"
     );
+}
+
+#[test]
+fn the_image_script_pins_its_default_kernel_by_digest() {
+    // The kernel runs untrusted code, so the script checks each download.
+    let script = read(IMAGE_SCRIPT);
+    let digest = script
+        .lines()
+        .find_map(|line| line.strip_prefix("default_kernel_sha256=\""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("{IMAGE_SCRIPT} must set default_kernel_sha256"));
+    assert_eq!(digest.len(), 64, "{digest}");
+    assert!(digest.chars().all(|c| c.is_ascii_hexdigit()), "{digest}");
+    assert!(
+        !script.contains("if [ -n \"${KERNEL_SHA256:-}\" ]"),
+        "{IMAGE_SCRIPT} must check the kernel digest on every path"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_image_script_refuses_a_kernel_url_without_a_digest() {
+    let out = std::env::temp_dir().join(format!("hsbx-image-{}", std::process::id()));
+    let result = std::process::Command::new("bash")
+        .arg(repo_root().join(IMAGE_SCRIPT))
+        .arg(&out)
+        .env("KERNEL_URL", "file:///nonexistent/vmlinux")
+        .env_remove("KERNEL_SHA256")
+        .env("AGENT_BIN", "/nonexistent/harvest-guest-agent")
+        .output()
+        .expect("bash runs");
+    let _ = std::fs::remove_dir_all(&out);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{stderr}");
+    assert!(stderr.contains("KERNEL_SHA256"), "{stderr}");
 }
 
 #[test]

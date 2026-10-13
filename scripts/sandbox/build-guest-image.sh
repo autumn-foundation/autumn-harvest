@@ -5,7 +5,8 @@
 #
 # - vmlinux: a guest kernel from the Firecracker CI artifacts. Linux 6.1 has
 #   virtio-vsock, virtio-rng and VMGenID, which reseeds the kernel CSPRNG after
-#   a snapshot restore.
+#   a snapshot restore. The kernel runs untrusted code, so the script checks
+#   its SHA-256 digest on each build.
 # - rootfs.ext4: the file system of a container image, with the guest agent at
 #   /sbin/harvest-guest-agent. The microVM mounts it read-only.
 #
@@ -19,9 +20,9 @@
 # Environment:
 #   BASE_IMAGE   the container image (default python:3.12-alpine)
 #   EXTRA_APK    Alpine packages to add (default "bash nodejs"); empty adds none
-#   KERNEL_URL   a kernel URL; the default is the newest 6.1 kernel of the
-#                Firecracker CI series KERNEL_CI_SERIES (default v1.15)
-#   KERNEL_SHA256  the expected digest of the kernel; checked when set
+#   KERNEL_URL   a kernel URL; the default is a pinned 6.1 kernel of the
+#                Firecracker CI artifacts
+#   KERNEL_SHA256  the SHA-256 digest of the kernel; needed with KERNEL_URL
 #   AGENT_BIN    a prebuilt static agent; the default builds one with cargo
 #
 # Needs: docker, mkfs.ext4 (e2fsprogs 1.43 or later), curl, root or
@@ -37,8 +38,21 @@ out="${1:?usage: build-guest-image.sh OUT_DIR}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 base_image="${BASE_IMAGE:-python:3.12-alpine}"
 extra_apk="${EXTRA_APK-bash nodejs}"
-KERNEL_CI_SERIES="${KERNEL_CI_SERIES:-v1.15}"
-s3="https://s3.amazonaws.com/spec.ccfc.min"
+
+# The default kernel, pinned by digest. The Sandbox (KVM) workflow boots it.
+default_kernel_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.155"
+default_kernel_sha256="e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2"
+if [ -n "${KERNEL_URL:-}" ]; then
+  kernel_url="${KERNEL_URL}"
+  kernel_sha256="${KERNEL_SHA256:-}"
+  if [ -z "${kernel_sha256}" ]; then
+    echo "build-guest-image: set KERNEL_SHA256 with KERNEL_URL" >&2
+    exit 1
+  fi
+else
+  kernel_url="${default_kernel_url}"
+  kernel_sha256="${KERNEL_SHA256:-${default_kernel_sha256}}"
+fi
 
 mkdir -p "${out}"
 out="$(cd "${out}" && pwd)"
@@ -65,22 +79,13 @@ if [ -z "${agent}" ]; then
   agent="${root}/target/x86_64-unknown-linux-musl/release/harvest-guest-agent"
 fi
 
-# 2. The kernel: the newest 6.1 build of one Firecracker CI series.
-kernel_url="${KERNEL_URL:-}"
-if [ -z "${kernel_url}" ]; then
-  prefix="firecracker-ci/${KERNEL_CI_SERIES}/x86_64/vmlinux-6.1."
-  key="$(curl -fsSL "${s3}?list-type=2&prefix=${prefix}" \
-    | grep -oP "(?<=<Key>)${prefix//./\\.}[0-9]+(?=</Key>)" | sort -V | tail -1 || true)"
-  if [ -z "${key}" ]; then
-    echo "no 6.1 kernel under ${prefix}" >&2
-    exit 1
-  fi
-  kernel_url="${s3}/${key}"
-fi
+# 2. The kernel, checked against its digest.
 echo "kernel: ${kernel_url}"
 curl -fsSL --retry 3 -o "${out}/vmlinux" "${kernel_url}"
-if [ -n "${KERNEL_SHA256:-}" ]; then
-  echo "${KERNEL_SHA256}  ${out}/vmlinux" | sha256sum -c -
+if ! echo "${kernel_sha256}  ${out}/vmlinux" | sha256sum -c - >/dev/null; then
+  rm -f "${out}/vmlinux"
+  echo "build-guest-image: the kernel digest is not ${kernel_sha256}" >&2
+  exit 1
 fi
 
 # 3. The root file system: export the container file system, add the agent.

@@ -8,8 +8,9 @@
 # The tests whose names start with `root_` need root, so a second step runs
 # the test binary with sudo. They include the jailer and snapshot tests.
 #
-# The Firecracker release, the kernel and the base image have pinned
-# digests. The Alpine packages come from the Alpine repository unpinned.
+# The Firecracker release and the base image have pinned digests. The image
+# script pins its default kernel by digest, so this workflow boots that pin.
+# The Alpine packages come from the Alpine repository unpinned.
 name: Sandbox (KVM)
 
 on:
@@ -50,8 +51,6 @@ env:
   RUST_BACKTRACE: 1
   FIRECRACKER_VERSION: v1.17.0
   FIRECRACKER_SHA256: 06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558
-  KERNEL_URL: https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.155
-  KERNEL_SHA256: e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2
   # The Docker Hub image through its Google mirror, which has no pull limit.
   BASE_IMAGE: mirror.gcr.io/library/python:3.12-alpine@sha256:1b668429b3511ab407d8e00648891631b0b1a4d7e15e3ca70f38ab5b91ad4ab4
 

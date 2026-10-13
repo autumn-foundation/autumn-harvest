@@ -222,6 +222,11 @@ default, plus the guest agent at `/sbin/harvest-guest-agent`. Set
 `BASE_IMAGE` for another image, and pin it by digest. Run the script as root,
 or install `fakeroot`, so root owns the files in the image.
 
+The kernel comes from the Firecracker CI artifacts. The script pins a default
+kernel by its SHA-256 digest and checks the digest on each build. For another
+kernel, set `KERNEL_URL` and `KERNEL_SHA256` together. The script refuses a
+`KERNEL_URL` without a digest.
+
 A jailed launcher also needs root to own `vmlinux` and `rootfs.ext4` on the
 host. Fakeroot does not give them root. After a non-root build, install them
 as root:

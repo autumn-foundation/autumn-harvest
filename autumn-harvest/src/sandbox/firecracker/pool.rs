@@ -111,6 +111,9 @@ impl WarmPool {
             .take();
         if let Some(task) = task {
             task.abort();
+            // A microVM that the task still boots is dropped with the task,
+            // and its drop kills it. So wait until the task is gone.
+            let _ = task.await;
         }
         let ready: Vec<_> = self
             .inner
@@ -315,6 +318,16 @@ mod tests {
         );
         pool.shutdown().await;
         assert_eq!(fake.live(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_tears_down_a_vm_that_is_still_booting() {
+        let fake = launcher(GuestMode::Hang);
+        let pool = WarmPool::start(fake.clone(), 1, 52, Duration::from_secs(30));
+        // The refill task now holds a microVM and waits for its ping.
+        wait_until(|| fake.launched() == 1 && fake.live() == 1).await;
+        pool.shutdown().await;
+        assert_eq!(fake.live(), 0, "the booting microVM outlived the shutdown");
     }
 
     #[tokio::test]
