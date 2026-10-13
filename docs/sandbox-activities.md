@@ -217,9 +217,10 @@ scripts/sandbox/build-guest-image.sh /var/lib/harvest/image
 ```
 
 The script writes `vmlinux`, `rootfs.ext4` and `image.sha256`. It builds
-them in a stage directory first, so a failed build keeps the old image. The
-root file system is a container image, `python:3.12-alpine` with `bash` and
-`nodejs` by default, plus the guest agent at `/sbin/harvest-guest-agent`. Set
+them in a stage directory first, so a failed build keeps the old image. A
+failed final rename puts the old files back. The root file system is a
+container image, `python:3.12-alpine` with `bash` and `nodejs` by default,
+plus the guest agent at `/sbin/harvest-guest-agent`. Set
 `BASE_IMAGE` for another image, and pin it by digest. Run the script as root,
 or install `fakeroot`, so root owns the files in the image.
 

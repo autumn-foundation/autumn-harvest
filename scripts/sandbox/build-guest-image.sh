@@ -120,13 +120,11 @@ docker export "${container}" | "${as_root[@]}" sh -euc '
   mkfs.ext4 -q -F -L harvest-rootfs -d "${rootfs}" "${image}" "${size_mib}M"
 ' build-rootfs "${work}/rootfs" "${agent}" "${stage}/rootfs.ext4"
 
-# 4. The digests, then the new image replaces the old one. Each rename is
-# atomic. A crash between them can mix the files, and image.sha256 then
-# shows it.
+# 4. The digests, then the new image replaces the old one. A failed rename
+# puts the old files back. A crash between the renames can still mix the
+# files, and image.sha256 then shows it.
 (cd "${stage}" && sha256sum vmlinux rootfs.ext4 > image.sha256)
-for file in rootfs.ext4 vmlinux image.sha256; do
-  mv -f "${stage}/${file}" "${out}/${file}"
-done
+bash "${root}/scripts/sandbox/publish-image.sh" "${stage}" "${out}"
 cat "${out}/image.sha256"
 
 if [ "$(id -u)" -ne 0 ]; then

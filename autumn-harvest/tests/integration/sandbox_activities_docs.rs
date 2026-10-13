@@ -22,6 +22,7 @@ use super::docs_guard_support::{check_stanza, prose_sentences, section, step_sta
 
 const GUIDE: &str = "docs/sandbox-activities.md";
 const IMAGE_SCRIPT: &str = "scripts/sandbox/build-guest-image.sh";
+const PUBLISH_SCRIPT: &str = "scripts/sandbox/publish-image.sh";
 const DESIGN: &str = "DESIGN-sandbox-activities.md";
 const FILTER: &str = "--test integration sandbox_activities_docs::";
 const MAX_SENTENCE_WORDS: usize = 25;
@@ -283,6 +284,77 @@ fn a_failed_image_build_keeps_the_old_image() {
             "{case}: a staged file is left"
         );
     }
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_publish_puts_back_the_old_image() {
+    const FILES: [&str; 3] = ["rootfs.ext4", "vmlinux", "image.sha256"];
+    let scratch = std::env::temp_dir().join(format!("hsbx-publish-{}", std::process::id()));
+    let publish = |stage: &Path, out: &Path| {
+        std::process::Command::new("bash")
+            .arg(repo_root().join(PUBLISH_SCRIPT))
+            .arg(stage)
+            .arg(out)
+            .output()
+            .expect("bash runs")
+    };
+    let setup = |case: &str, staged: &[&str]| {
+        let (stage, out) = (
+            scratch.join(case).join("stage"),
+            scratch.join(case).join("out"),
+        );
+        std::fs::create_dir_all(&stage).expect("stage dir");
+        std::fs::create_dir_all(&out).expect("out dir");
+        for file in FILES {
+            std::fs::write(out.join(file), format!("old {file}")).expect("old file");
+        }
+        for file in staged {
+            std::fs::write(stage.join(file), format!("new {file}")).expect("new file");
+        }
+        (stage, out)
+    };
+    let names = |dir: &Path| {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .expect("dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .into_string()
+                    .expect("name")
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    let mut sorted = FILES.map(str::to_owned).to_vec();
+    sorted.sort();
+
+    // The last file is missing, so its move fails after two moves.
+    let (stage, out) = setup("missing", &FILES[..2]);
+    let result = publish(&stage, &out);
+    assert!(!result.status.success(), "a missing staged file must fail");
+    for file in FILES {
+        let kept = std::fs::read_to_string(out.join(file)).unwrap_or_default();
+        assert_eq!(kept, format!("old {file}"), "{file} must be the old one");
+    }
+    assert_eq!(names(&out), sorted, "a backup or staged file is left");
+
+    // A complete stage replaces each file.
+    let (stage, out) = setup("complete", &FILES);
+    let result = publish(&stage, &out);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    for file in FILES {
+        let new = std::fs::read_to_string(out.join(file)).unwrap_or_default();
+        assert_eq!(new, format!("new {file}"));
+    }
+    assert_eq!(names(&out), sorted, "a backup is left");
     let _ = std::fs::remove_dir_all(&scratch);
 }
 

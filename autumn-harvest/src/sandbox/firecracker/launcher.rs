@@ -265,52 +265,7 @@ impl FirecrackerLauncher {
                 "an API or snapshot boot needs an API timeout above zero".into(),
             ));
         }
-        let mut required = vec![
-            ("the Firecracker binary", &config.firecracker_bin),
-            ("the guest kernel", &config.image.kernel),
-            ("the guest root file system", &config.image.rootfs),
-        ];
-        if let BootMethod::Snapshot(files) = &config.boot {
-            required.push(("the snapshot state", &files.state));
-            required.push(("the snapshot memory", &files.memory));
-            // A restore needs the same paths as the snapshot. Only a jail gives
-            // each microVM the same relative paths.
-            if !matches!(config.confinement, Confinement::Jailer(_)) {
-                return Err(SandboxError::Config(
-                    "a snapshot boot needs the jailer, so each restore sees the same paths".into(),
-                ));
-            }
-        }
-        if let Confinement::Jailer(jailer) = &config.confinement {
-            required.push(("the jailer binary", &jailer.jailer_bin));
-        }
-        let mut paths = required.clone();
-        match &config.confinement {
-            Confinement::Unjailed { work_root } => paths.push(("the work root", work_root)),
-            Confinement::Jailer(jailer) => {
-                paths.push(("the jail base", &jailer.chroot_base));
-                paths.push(("the cgroup root", &jailer.cgroup_root));
-                if let Some(netns) = &jailer.netns {
-                    paths.push(("the network namespace", netns));
-                }
-            }
-        }
-        // Firecracker runs in the VM directory, so a relative path would
-        // name another file there.
-        if let Some((what, path)) = paths.iter().find(|(_, path)| !path.is_absolute()) {
-            return Err(SandboxError::Config(format!(
-                "{what} {} must be an absolute path",
-                path.display()
-            )));
-        }
-        for (what, path) in &required {
-            if !path.is_file() {
-                return Err(SandboxError::Config(format!(
-                    "{what} {} is not a file",
-                    path.display()
-                )));
-            }
-        }
+        check_launcher_paths(&config)?;
         if let Confinement::Jailer(jailer) = &config.confinement {
             if jailer.uid == 0 || jailer.gid == 0 {
                 return Err(SandboxError::Config(
@@ -1033,6 +988,66 @@ fn copy_out(from: &Path, to: &Path, gid: u32) -> std::io::Result<()> {
     std::os::unix::fs::fchown(&target, None, Some(gid))?;
     target.set_permissions(std::fs::Permissions::from_mode(0o640))?;
     target.sync_all()
+}
+
+/// Check the paths of `config`: each is absolute and valid UTF-8, and each
+/// binary, image and snapshot is a file. A snapshot boot needs the jailer.
+fn check_launcher_paths(config: &LauncherConfig) -> Result<(), SandboxError> {
+    let mut required = vec![
+        ("the Firecracker binary", &config.firecracker_bin),
+        ("the guest kernel", &config.image.kernel),
+        ("the guest root file system", &config.image.rootfs),
+    ];
+    if let BootMethod::Snapshot(files) = &config.boot {
+        required.push(("the snapshot state", &files.state));
+        required.push(("the snapshot memory", &files.memory));
+        // A restore needs the same paths as the snapshot. Only a jail gives
+        // each microVM the same relative paths.
+        if !matches!(config.confinement, Confinement::Jailer(_)) {
+            return Err(SandboxError::Config(
+                "a snapshot boot needs the jailer, so each restore sees the same paths".into(),
+            ));
+        }
+    }
+    if let Confinement::Jailer(jailer) = &config.confinement {
+        required.push(("the jailer binary", &jailer.jailer_bin));
+    }
+    let mut paths = required.clone();
+    match &config.confinement {
+        Confinement::Unjailed { work_root } => paths.push(("the work root", work_root)),
+        Confinement::Jailer(jailer) => {
+            paths.push(("the jail base", &jailer.chroot_base));
+            paths.push(("the cgroup root", &jailer.cgroup_root));
+            if let Some(netns) = &jailer.netns {
+                paths.push(("the network namespace", netns));
+            }
+        }
+    }
+    // Firecracker runs in the VM directory, so a relative path would
+    // name another file there.
+    if let Some((what, path)) = paths.iter().find(|(_, path)| !path.is_absolute()) {
+        return Err(SandboxError::Config(format!(
+            "{what} {} must be an absolute path",
+            path.display()
+        )));
+    }
+    // Firecracker and the jailer take paths as JSON strings and as
+    // arguments. A lossy conversion would name another file.
+    if let Some((what, path)) = paths.iter().find(|(_, path)| path.to_str().is_none()) {
+        return Err(SandboxError::Config(format!(
+            "{what} {} must be valid UTF-8",
+            path.display()
+        )));
+    }
+    for (what, path) in &required {
+        if !path.is_file() {
+            return Err(SandboxError::Config(format!(
+                "{what} {} is not a file",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Check that no other user can change a path that a jailed launch trusts.
@@ -2317,6 +2332,27 @@ while True:
             .expect_err("a relative kernel");
         assert!(
             matches!(err, SandboxError::Config(ref m) if m.contains("absolute")),
+            "{err:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_launcher_path_that_is_not_utf8_is_a_config_error() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = temp_dir();
+        let fc = script(&dir, "firecracker", "exit 0");
+        let mut config = unjailed(&dir, fc, BootMethod::ConfigFile);
+        // Firecracker takes each path as a JSON string, so a lossy
+        // conversion would name another file.
+        let kernel = dir.join(std::ffi::OsStr::from_bytes(b"vmlinux-\xff"));
+        std::fs::copy(&config.image.kernel, &kernel).unwrap();
+        config.image.kernel = kernel;
+        let err = new_launcher(config)
+            .map(|_| ())
+            .expect_err("a kernel path that is not UTF-8");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("UTF-8")),
             "{err:?}"
         );
         std::fs::remove_dir_all(dir).unwrap();
