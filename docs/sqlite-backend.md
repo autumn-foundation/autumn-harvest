@@ -343,6 +343,8 @@ The run ends `CANCELLED` when one of these occurs:
 - The body blocks on a signal or a timer, and no activity task is left to
   run. A parked await cannot see the request.
 - The cycle diverges or deadlocks. The driver discards that cycle.
+- The drive meets an error that repeats on every drive: an unregistered
+  activity or workflow, or a stuck cycle.
 - The run has added 1,000 events since the request. A body that ignores the
   request and keeps working cannot run forever. The budget leaves room for
   about 500 cleanup activities. The budget acts as one more event cap: a

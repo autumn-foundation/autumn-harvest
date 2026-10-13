@@ -251,6 +251,21 @@ async fn floods_then_waits(ctx: &WorkflowContext, n: i64) -> Result<Value, Strin
     ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
 }
 
+/// When cancelled, it calls an activity that no runtime registers.
+#[workflow]
+async fn calls_missing_on_cancel(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
+    ctx.execute_activity_raw("step", json!(n), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    if ctx.is_cancelled() {
+        ctx.execute_activity_raw("missing_cleanup", json!(n), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(json!("cleaned"));
+    }
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
 /// Counts the calls of each activity and records the cleanup input.
 #[derive(Default)]
 struct Calls {
@@ -288,6 +303,7 @@ fn register(rt: &mut SqliteRuntime, calls: &Arc<Calls>) {
     rt.register_workflow(&spins_info());
     rt.register_workflow(&floods_on_cancel_info());
     rt.register_workflow(&floods_then_waits_info());
+    rt.register_workflow(&calls_missing_on_cancel_info());
     let c = Arc::clone(calls);
     rt.register_activity_raw(
         "step",
@@ -873,6 +889,43 @@ async fn a_final_batch_past_the_history_cap_is_discarded() {
         "the batch that reached the cap is discarded"
     );
     assert_eq!(calls.cleanup.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn an_unregistered_cleanup_activity_still_ends_the_run() {
+    let (_dir, path) = temp_db();
+    let (mut rt, _calls) = runtime(&path);
+    let exec = start_parked(&mut rt, "calls_missing_on_cancel").await;
+
+    rt.cancel(exec, "stop").unwrap();
+    let state = rt.run_until_blocked(exec).await;
+
+    assert!(
+        matches!(&state, Ok(RunState::Cancelled(reason)) if reason == "stop"),
+        "a cleanup that cannot dispatch must not keep the run alive, got {state:?}"
+    );
+    assert_eq!(leftover_rows(&path, exec), (0, 0, 0));
+    assert_eq!(cancelled_events(&rt, exec), 1);
+}
+
+#[tokio::test]
+async fn an_unregistered_workflow_still_ends_the_run() {
+    let (_dir, path) = temp_db();
+    let exec = {
+        let (mut rt, _calls) = runtime(&path);
+        start_parked(&mut rt, "parks").await
+    };
+    // A reopen that registers no workflow cannot replay the body.
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+
+    rt.cancel(exec, "stop").unwrap();
+    let state = rt.run_until_blocked(exec).await;
+
+    assert!(
+        matches!(&state, Ok(RunState::Cancelled(reason)) if reason == "stop"),
+        "got {state:?}"
+    );
+    assert_eq!(cancelled_events(&rt, exec), 1);
 }
 
 #[tokio::test]

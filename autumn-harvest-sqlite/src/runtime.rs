@@ -975,6 +975,8 @@ impl SqliteRuntime {
     ///   start of its replay, so a check before recorded commands diverges.
     /// - The run has added [`CANCEL_CLEANUP_EVENT_BUDGET`] events since the
     ///   request, so a body that ignores the request cannot run forever.
+    /// - The drive meets an error that repeats on every drive: an
+    ///   unregistered activity or workflow, or a stuck cycle.
     ///
     /// The run then gets `WorkflowCancelled` as its last event, and its pending
     /// tasks, unfired timers and staged signals are deleted. The drive that ends
@@ -1618,6 +1620,20 @@ impl SqliteRuntime {
             // Keep the reason the caller needs. The run stays `RUNNING`, so
             // the next drive meets the feature again and retries the seal.
             tracing::warn!(%exec, error = %seal_error, "could not seal an unsupported run FAILED");
+        }
+        // Issue #2021: these errors repeat on every drive until an operator
+        // changes the runtime. A pending cancel must still end the run, so it
+        // ends here. A panic keeps its strike budget. A persistence error
+        // propagates.
+        if let Err(
+            SqliteError::UnregisteredActivity(_)
+            | SqliteError::UnknownWorkflow(_)
+            | SqliteError::Stuck(_),
+        ) = &result
+            && let Some((reason, _)) = store::cancel_request(&self.conn, exec)?
+        {
+            tracing::warn!(%exec, error = ?result, "a pending cancel ends a run the drive cannot advance");
+            return self.seal_cancelled(exec, &reason, None);
         }
         result
     }
