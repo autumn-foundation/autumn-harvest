@@ -169,9 +169,9 @@ runtime refuses a policy that allows the network on a backend without one.
   for the jailer.
 - Absolute paths in `LauncherConfig`. Firecracker runs in the VM directory,
   so the launcher refuses a relative path.
-- Images on the file system of the jail, so each launch links them. The
-  backend overhead allows 10 seconds to lay out a jail, not a copy of a large
-  image.
+- Images and snapshot files on the file system of the jail root, so each
+  launch hard-links them. The launcher refuses a file on another file system,
+  because a copy per launch has no time bound.
 - `JailerConfig::cgroup_root` set to the cgroup v2 mount of the jailer: the
   first `cgroup2` line in `/proc/mounts`. The default is `/sys/fs/cgroup`.
   The launcher refuses another path, because teardown kills the cgroups

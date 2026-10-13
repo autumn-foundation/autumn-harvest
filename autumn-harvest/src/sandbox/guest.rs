@@ -381,6 +381,10 @@ where
 /// The longest guest error text that the host keeps, in bytes.
 pub const MAX_GUEST_ERROR_BYTES: usize = 4096;
 
+/// The most inodes that the guest `/work` tmpfs holds. It bounds the time
+/// that the guest takes to remove a work tree.
+pub const WORK_MAX_INODES: u32 = 65_536;
+
 /// A guest error text for history: at most [`MAX_GUEST_ERROR_BYTES`], with
 /// each NUL as U+FFFD. Postgres `jsonb` rejects `\u0000`.
 fn clean(text: &str) -> String {

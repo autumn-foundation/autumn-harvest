@@ -39,8 +39,8 @@ pub const KILL_WAIT: Duration = Duration::from_secs(5);
 pub const CGROUP_EMPTY_WAIT: Duration = Duration::from_secs(2);
 
 /// The time that a launch can take to lay out its VM directory and start
-/// the VMM. A copy of an image across file systems can take longer, so keep
-/// the images on the file system of the jail.
+/// the VMM. A launch hard-links each image into its jail and copies none,
+/// so the image size does not count.
 pub const LAUNCH_SETUP_ALLOWANCE: Duration = Duration::from_secs(10);
 
 /// The bytes of VMM stderr that a launcher keeps for error reports.
@@ -678,15 +678,16 @@ impl FirecrackerLauncher {
                 "the snapshot memory",
             ));
         }
-        // A copy across file systems can take seconds, so it runs off the
-        // async workers. A dropped launch does not stop this task. So the
-        // task removes the jail again when the guard is gone.
+        // The construction checked that each image is on the file system of
+        // the jail, so a hard link works and nothing is copied. The links run
+        // off the async workers. A dropped launch does not stop this task, so
+        // the task removes the jail again when the guard is gone.
         let abandoned = guard.abandoned();
         let task_jail = jail.clone();
         let linked = tokio::task::spawn_blocking(move || {
-            let linked = links
-                .into_iter()
-                .try_for_each(|(from, to, what)| link_or_copy(&from, &to).map_err(|e| (what, e)));
+            let linked = links.into_iter().try_for_each(|(from, to, what)| {
+                std::fs::hard_link(&from, &to).map_err(|e| (what, e))
+            });
             if abandoned.load(std::sync::atomic::Ordering::SeqCst) {
                 let _ = crate::sandbox::exec::remove_work_dir(&task_jail);
             }
@@ -1073,9 +1074,19 @@ fn check_trusted_files(
         shared.push(&files.state);
         shared.push(&files.memory);
     }
+    // A launch hard-links each image into its jail. A copy across file
+    // systems would take time that no launch budget bounds.
+    let jail_dev = inspect(vm_root)?.dev();
     for path in shared {
         check_trusted_ancestors(path, euid, inspect)?;
         let meta = inspect(path)?;
+        if meta.dev() != jail_dev {
+            return Err(SandboxError::Config(format!(
+                "{} must be on the file system of the jail root {}, so a launch can hard-link it",
+                path.display(),
+                vm_root.display()
+            )));
+        }
         if meta.uid() == jail_uid || meta.mode() & 0o022 != 0 {
             return Err(SandboxError::Config(format!(
                 "{} must not belong to the jail uid {jail_uid}, and only its owner may write it",
@@ -1166,31 +1177,6 @@ fn vm_root_of(confinement: &Confinement, exec_name: &str) -> PathBuf {
         Confinement::Jailer(jailer) => jailer.chroot_base.join(exec_name),
         Confinement::Unjailed { work_root } => work_root.clone(),
     }
-}
-
-/// Hard-link `from` to `to`, or copy it across file systems.
-fn link_or_copy(from: &Path, to: &Path) -> std::io::Result<()> {
-    match std::fs::hard_link(from, to) {
-        Ok(()) => Ok(()),
-        Err(e) if matches!(e.raw_os_error(), Some(libc::EXDEV | libc::EPERM)) => {
-            copy_keeping_owner(from, to)
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// Copy `from` to `to` with the owner, group and mode of `from`.
-///
-/// A hard link shares these with the source, and a plain copy takes the
-/// owner of this process. A golden snapshot is mode `0640` for the jailer
-/// group, so a plain copy would lock the jailed VMM out of it.
-fn copy_keeping_owner(from: &Path, to: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::MetadataExt as _;
-    let meta = std::fs::metadata(from)?;
-    std::fs::copy(from, to)?;
-    std::os::unix::fs::chown(to, Some(meta.uid()), Some(meta.gid()))?;
-    // A change of owner clears the set-id bits, so set the mode again.
-    std::fs::set_permissions(to, meta.permissions())
 }
 
 /// Write a VM document as JSON.
@@ -2308,30 +2294,6 @@ while True:
     }
 
     #[test]
-    #[ignore = "needs root; the Sandbox (KVM) workflow runs it with sudo"]
-    fn root_a_copied_image_keeps_the_owner_group_and_mode() {
-        use std::os::unix::fs::MetadataExt as _;
-        // SAFETY: geteuid has no preconditions.
-        assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
-        let dir = temp_dir();
-        // A golden snapshot: mode 0640, and the jailer group may read it.
-        let from = dir.join("snapshot.mem");
-        std::fs::write(&from, b"memory").unwrap();
-        std::os::unix::fs::chown(&from, Some(0), Some(12_345)).unwrap();
-        std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o640)).unwrap();
-        let to = dir.join("copy.mem");
-        copy_keeping_owner(&from, &to).unwrap();
-        let meta = std::fs::metadata(&to).unwrap();
-        assert_eq!(
-            (meta.uid(), meta.gid(), meta.mode() & 0o7777),
-            (0, 12_345, 0o640),
-            "a copy must give the jail the access that a hard link gives"
-        );
-        assert_eq!(std::fs::read(&to).unwrap(), b"memory");
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
     fn a_relative_launcher_path_is_a_config_error() {
         let dir = temp_dir();
         let fc = script(&dir, "firecracker", "exit 0");
@@ -2472,6 +2434,33 @@ while True:
         let err = new_launcher(config).expect_err("writable image");
         assert!(
             matches!(err, SandboxError::Config(ref m) if m.contains("rootfs.ext4")),
+            "{err:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_image_on_another_file_system_is_a_config_error() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = temp_dir();
+        let mut config = jailed(&dir);
+        // tmpfs at /dev/shm is a file system of its own on Linux.
+        let other = Path::new("/dev/shm");
+        let same_fs = std::fs::metadata(other)
+            .is_ok_and(|meta| meta.dev() == std::fs::metadata(&dir).unwrap().dev());
+        if !other.is_dir() || same_fs {
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        }
+        let kernel = other.join(format!("hl-vmlinux-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::copy(&config.image.kernel, &kernel).unwrap();
+        std::fs::set_permissions(&kernel, std::fs::Permissions::from_mode(0o644)).unwrap();
+        config.image.kernel = kernel.clone();
+        let result = new_launcher(config);
+        let _ = std::fs::remove_file(&kernel);
+        let err = result.expect_err("a kernel on another file system");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("file system")),
             "{err:?}"
         );
         std::fs::remove_dir_all(dir).unwrap();

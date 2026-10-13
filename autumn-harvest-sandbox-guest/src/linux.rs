@@ -57,7 +57,10 @@ pub fn mount_basics() -> io::Result<()> {
 ///
 /// Returns the mount error.
 pub fn mount_work(work_mib: u64) -> io::Result<()> {
-    let options = format!("mode=0755,size={work_mib}m,nr_inodes=65536");
+    let options = format!(
+        "mode=0755,size={work_mib}m,nr_inodes={}",
+        autumn_harvest::sandbox::guest::WORK_MAX_INODES
+    );
     mount(
         "tmpfs",
         "/work",

@@ -23,21 +23,30 @@ pub const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// The guest decodes the request and writes the input files. After the run,
 /// it waits up to two seconds for the pipes of the code to close. Then it
-/// waits up to two seconds for the run cgroup to empty, reads the outputs
-/// and sends the outcome. The grace covers each step, with some margin.
+/// waits up to two seconds for the run cgroup to empty, reads the outputs,
+/// removes the work tree and sends the outcome. The grace covers each step.
 pub const DEFAULT_RESPONSE_GRACE: Duration = Duration::from_secs(15);
 
 /// The time to move one full guest frame over vsock and to decode or encode
 /// it. A frame holds at most 64 MiB, so this assumes at least 16 MiB/s.
 pub const FRAME_IO_ALLOWANCE: Duration = Duration::from_secs(4);
 
+/// The time for the guest to remove a full work tree before it answers.
+///
+/// The `/work` tmpfs holds at most [`WORK_MAX_INODES`] inodes. Their removal
+/// took about 0.2 s on one host CPU, so this keeps a tenfold margin.
+///
+/// [`WORK_MAX_INODES`]: crate::sandbox::guest::WORK_MAX_INODES
+pub const WORK_REMOVE_ALLOWANCE: Duration = Duration::from_secs(2);
+
 /// The shortest response grace.
 ///
-/// It holds the guest pipe wait and the run cgroup wait. It adds one frame
-/// allowance to decode the request and write the input files, and one to
-/// read the outputs and send the outcome.
+/// It holds the guest pipe wait, the run cgroup wait and the removal of the
+/// work tree. It adds one frame allowance to decode the request and write
+/// the input files, and one to read the outputs and send the outcome.
 pub const MIN_RESPONSE_GRACE: Duration = crate::sandbox::exec::PIPE_DRAIN_GRACE
     .saturating_add(crate::sandbox::exec::CGROUP_WAIT)
+    .saturating_add(WORK_REMOVE_ALLOWANCE)
     .saturating_add(FRAME_IO_ALLOWANCE)
     .saturating_add(FRAME_IO_ALLOWANCE);
 
@@ -404,6 +413,7 @@ mod tests {
         // outputs and the outcome frame.
         let need = crate::sandbox::exec::PIPE_DRAIN_GRACE
             + crate::sandbox::exec::CGROUP_WAIT
+            + WORK_REMOVE_ALLOWANCE
             + FRAME_IO_ALLOWANCE * 2;
         assert!(MIN_RESPONSE_GRACE >= need, "{MIN_RESPONSE_GRACE:?}");
         assert!(DEFAULT_RESPONSE_GRACE >= MIN_RESPONSE_GRACE);
