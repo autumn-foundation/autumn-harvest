@@ -2008,7 +2008,7 @@ impl SqliteRuntime {
             details: Some(serde_json::json!({ "feature": feature, "message": unsupported })),
             non_retryable: Some(true),
         };
-        self.seal_failed(exec, &event, &message, now)
+        self.seal_failed(exec, &event, &message, now, now)
     }
 
     /// Fail `exec` at a history cap (issue #2023).
@@ -2025,7 +2025,7 @@ impl SqliteRuntime {
         let error = reason.to_string();
         tracing::warn!(%exec, %error, "workflow history reached a hard cap; failing the run");
         let event = WorkflowEvent::workflow_failed(error.clone());
-        self.seal_failed(exec, &event, &error, now)?;
+        self.seal_failed(exec, &event, &error, now, now)?;
         Ok(RunState::Failed(error))
     }
 
@@ -2045,12 +2045,16 @@ impl SqliteRuntime {
 
     /// Append `event`, set `exec` `FAILED` with `error`, and remove its pending
     /// tasks, unfired timers and staged signals, in one transaction.
+    ///
+    /// `now` is the cycle clock, which the signal plan uses. `closed_at` is
+    /// the instant of the close (issue #2026).
     fn seal_failed(
         &mut self,
         exec: ExecutionId,
         event: &WorkflowEvent,
         error: &str,
         now: i64,
+        closed_at: i64,
     ) -> SqliteResult<()> {
         let tx = self.conn.transaction()?;
         // The failed cycle replayed the staged signals, and its transaction
@@ -2069,7 +2073,7 @@ impl SqliteRuntime {
         // back with the cycle. This backend has no retention pass, so remove
         // the work no one can use any more, as the `TerminateIfRunning` seal does.
         delete_open_rows(&tx, exec)?;
-        composition::close_execution(&tx, exec, event, now)?;
+        composition::close_execution(&tx, exec, event, closed_at)?;
         tx.commit()?;
         self.workflow_panic_strikes.remove(&exec);
         Ok(())
@@ -2296,6 +2300,11 @@ impl SqliteRuntime {
                 None,
             )
             .await;
+        // Read the clock again once the body returns (issue #2026). The body
+        // can take time. Each write that another run reads by time uses this
+        // instant. A close checks the parent's child deadlines at it. A signal
+        // to another run gets it as its arrival time. Postgres uses `NOW()`.
+        let decided_at = failure_now();
 
         // Contained workflow-handler panic gate (issue #782 analog), BEFORE any
         // terminal side effect and beside the non-determinism gate below. A
@@ -2354,9 +2363,11 @@ impl SqliteRuntime {
                 | WorkflowOutcome::Failed {
                     non_deterministic_details: None,
                     ..
-                } => return self.seal_cancelled(exec, reason, Some(batch(&pending)), now),
+                } => {
+                    return self.seal_cancelled(exec, reason, Some(batch(&pending)), decided_at);
+                }
                 WorkflowOutcome::Failed { .. } | WorkflowOutcome::TaskFailed { .. } => {
-                    return self.seal_cancelled(exec, reason, Some(batch(&[])), now);
+                    return self.seal_cancelled(exec, reason, Some(batch(&[])), decided_at);
                 }
                 WorkflowOutcome::Suspended { .. } => {}
             }
@@ -2373,7 +2384,7 @@ impl SqliteRuntime {
                     workflows: &self.workflows,
                     history: &history,
                     cycle: TerminalCycle::Completing,
-                    now,
+                    now: decided_at,
                 };
                 persist_terminal_pending_commands(&tx, &drain, exec, &pending)?;
                 let cascade = composition::cascade_event_count(&tx, exec)?;
@@ -2386,9 +2397,7 @@ impl SqliteRuntime {
                 };
                 store::append_event(&tx, exec, &terminal)?;
                 store::set_completed(&tx, exec, &output)?;
-                // Read the clock again: the body can run past a parent's child
-                // deadline. Postgres checks `NOW()` at this point (issue #779).
-                composition::close_execution(&tx, exec, &terminal, failure_now())?;
+                composition::close_execution(&tx, exec, &terminal, decided_at)?;
                 tx.commit()?;
                 Ok(RunState::Completed(output))
             }
@@ -2440,7 +2449,7 @@ impl SqliteRuntime {
                     workflows: &self.workflows,
                     history: &history,
                     cycle: TerminalCycle::Failing,
-                    now,
+                    now: decided_at,
                 };
                 persist_terminal_pending_commands(&tx, &drain, exec, &pending)?;
                 let cascade = composition::cascade_event_count(&tx, exec)?;
@@ -2451,8 +2460,7 @@ impl SqliteRuntime {
                 let terminal = WorkflowEvent::workflow_failed_typed(&decoded);
                 store::append_event(&tx, exec, &terminal)?;
                 store::set_failed(&tx, exec, &decoded.message)?;
-                // Read the clock again, as the `Completed` arm does.
-                composition::close_execution(&tx, exec, &terminal, failure_now())?;
+                composition::close_execution(&tx, exec, &terminal, decided_at)?;
                 tx.commit()?;
                 Ok(RunState::Failed(decoded.message))
             }
@@ -2465,7 +2473,7 @@ impl SqliteRuntime {
                 if store::parent_link(&self.conn, exec)?.is_some() =>
             {
                 let event = WorkflowEvent::workflow_failed(CHILD_CONTINUE_AS_NEW_ERROR);
-                self.seal_failed(exec, &event, CHILD_CONTINUE_AS_NEW_ERROR, now)?;
+                self.seal_failed(exec, &event, CHILD_CONTINUE_AS_NEW_ERROR, now, decided_at)?;
                 Ok(RunState::Failed(CHILD_CONTINUE_AS_NEW_ERROR.to_string()))
             }
             WorkflowOutcome::ContinuedAsNew {
@@ -2508,7 +2516,7 @@ impl SqliteRuntime {
                     &history,
                     &commands,
                     &caps,
-                    now,
+                    CycleClock { now, decided_at },
                     failure_now,
                     cancel_reason.as_deref(),
                 )
@@ -2540,17 +2548,18 @@ impl SqliteRuntime {
         history: &[WorkflowEvent],
         commands: &[WorkflowCommand],
         caps: &CapCheck<'_>,
-        now: i64,
+        clock: CycleClock,
         failure_now: &(dyn Fn() -> i64 + Send + Sync),
         cancel_reason: Option<&str>,
     ) -> SqliteResult<RunState> {
-        let applied = match self.apply_commands(exec, ingest, history, commands, caps, now)? {
+        let now = clock.now;
+        let applied = match self.apply_commands(exec, ingest, history, commands, caps, clock)? {
             Applied::Committed { produced } => produced,
             Applied::CapReached(reason) => {
                 // Issue #2021: a pending cancel wins over a cap that its
                 // cleanup reaches. The seal adds only `WorkflowCancelled`.
                 if let Some(cancel) = cancel_reason {
-                    return self.seal_cancelled(exec, cancel, None, now);
+                    return self.seal_cancelled(exec, cancel, None, clock.decided_at);
                 }
                 return self.fail_for_history_cap(exec, &reason, now);
             }
@@ -2577,7 +2586,8 @@ impl SqliteRuntime {
         if let Some(reason) = cancel_reason
             && !queue::has_pending_activity(&self.conn, exec)?
         {
-            return self.seal_cancelled(exec, reason, None, now);
+            // The drain can take time, so read the clock again for the close.
+            return self.seal_cancelled(exec, reason, None, failure_now());
         }
         self.classify_block(exec, commands)
     }
@@ -2607,8 +2617,9 @@ impl SqliteRuntime {
         history: &[WorkflowEvent],
         commands: &[WorkflowCommand],
         caps: &CapCheck<'_>,
-        now: i64,
+        clock: CycleClock,
     ) -> SqliteResult<Applied> {
+        let now = clock.now;
         let tx = self.conn.transaction()?;
         // The planned signals come first. Replay read them ahead of this
         // cycle's commands (issue #2020).
@@ -2757,7 +2768,8 @@ impl SqliteRuntime {
                     children,
                     timers,
                 } => {
-                    if apply_cancel_race_losers(&tx, exec, activities, children, timers, now)? {
+                    let at = clock.decided_at;
+                    if apply_cancel_race_losers(&tx, exec, activities, children, timers, at)? {
                         produced = true;
                     }
                 }
@@ -2768,7 +2780,8 @@ impl SqliteRuntime {
                 | WorkflowCommand::SignalExternalWorkflow { .. }
                 | WorkflowCommand::RequestCancelExternalWorkflow { .. }
                 | WorkflowCommand::AwaitExternalWorkflow { .. }) => {
-                    if composition::apply_command(&tx, &self.workflows, exec, history, cmd, now)? {
+                    let at = clock.decided_at;
+                    if composition::apply_command(&tx, &self.workflows, exec, history, cmd, at)? {
                         produced = true;
                     }
                     // A cancel can reach this run through a parent-close cascade.
@@ -3439,6 +3452,16 @@ async fn settle_update_context(
             details: "the replay that rebuilds the update handlers did not settle".to_string(),
         }),
     }
+}
+
+/// The two clock readings of one decision cycle (issue #2026).
+#[derive(Debug, Clone, Copy)]
+struct CycleClock {
+    /// The start of the cycle. Timers and activity tasks use it.
+    now: i64,
+    /// The instant the body returned. A write that another run reads by time
+    /// uses it, such as a signal to another run or a close.
+    decided_at: i64,
 }
 
 /// How a terminal cycle ends. Only a failing cycle records an abandoned child.

@@ -498,6 +498,55 @@ async fn parent_child_timeout_busy(ctx: &WorkflowContext, _n: i64) -> Result<Val
     Ok(json!({ "child": out }))
 }
 
+/// The test clock of `a_long_cancel_cleanup_loses_to_a_due_deadline`.
+static CANCEL_CLOCK: AtomicI64 = AtomicI64::new(1_767_225_600_000);
+
+/// Waits for `go`. Under a cancel request it uses 5 s of the test clock in
+/// its cleanup, then returns.
+#[workflow]
+async fn busy_cancel_cleanup(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    if ctx.cancellation_reason().is_some() {
+        CANCEL_CLOCK.fetch_add(5_000, Ordering::SeqCst);
+        return Ok(json!("cleaned up"));
+    }
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
+#[workflow]
+async fn parent_child_timeout_cancel(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let out = ctx
+        .spawn_child_workflow_timeout(
+            "busy_cancel_cleanup",
+            json!(0),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(json!({ "child": out }))
+}
+
+/// The test clock of `a_signal_sent_after_a_deadline_loses_to_it`.
+static SIGNAL_CLOCK: AtomicI64 = AtomicI64::new(1_767_225_600_000);
+
+/// Waits 1 s for `go`. Reports which branch won.
+#[workflow]
+async fn waits_for_go_briefly(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let got = ctx
+        .wait_for_signal_timeout("go", std::time::Duration::from_secs(1))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(json!(if got.is_some() { "signal" } else { "timeout" }))
+}
+
+/// Uses 5 s of the test clock, then signals `go` to `target`.
+#[workflow]
+async fn busy_signaller(ctx: &WorkflowContext, target: ExecutionId) -> Result<(), String> {
+    SIGNAL_CLOCK.fetch_add(5_000, Ordering::SeqCst);
+    ctx.signal_external_workflow(target, "go", json!(1))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn runtime() -> SqliteRuntime {
@@ -559,6 +608,10 @@ fn fixtures() -> Vec<WorkflowInfo> {
         parent_of_update_target_info(),
         busy_child_info(),
         parent_child_timeout_busy_info(),
+        busy_cancel_cleanup_info(),
+        parent_child_timeout_cancel_info(),
+        waits_for_go_briefly_info(),
+        busy_signaller_info(),
     ]
 }
 
@@ -2018,4 +2071,58 @@ async fn a_long_terminal_cycle_loses_to_a_due_deadline() {
         .position(|e| matches!(e, WorkflowEvent::ChildWorkflowCompleted { .. }))
         .expect("the child result is still recorded");
     assert!(fired < child_done, "{history:#?}");
+}
+
+/// A cancelled child closes at the time its cleanup ends. A cleanup that
+/// runs past the parent's deadline loses to it.
+#[tokio::test]
+async fn a_long_cancel_cleanup_loses_to_a_due_deadline() {
+    let mut rt = runtime();
+    rt.set_clock(|| {
+        chrono::DateTime::from_timestamp_millis(CANCEL_CLOCK.load(Ordering::SeqCst)).unwrap()
+    });
+    let parent = rt
+        .start_workflow("parent_child_timeout_cancel", json!(0))
+        .unwrap();
+    rt.run_until_blocked(parent).await.unwrap();
+    let child = children_of(&rt, parent)[0];
+
+    rt.cancel(child, "ops").unwrap();
+    let state = rt.run_until_blocked(parent).await.unwrap();
+
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!({ "child": null })),
+        "the deadline wins: {state:?}"
+    );
+    let history = rt.load_history(parent).unwrap();
+    let fired = history
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::TimerFired { .. }))
+        .expect("the deadline fired");
+    let child_done = history
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::ChildWorkflowFailed { .. }))
+        .expect("the child result is still recorded");
+    assert!(fired < child_done, "{history:#?}");
+}
+
+/// A signal from another run arrives when the sender writes it. A sender
+/// cycle that runs past the target's deadline loses to it.
+#[tokio::test]
+async fn a_signal_sent_after_a_deadline_loses_to_it() {
+    let mut rt = runtime();
+    rt.set_clock(|| {
+        chrono::DateTime::from_timestamp_millis(SIGNAL_CLOCK.load(Ordering::SeqCst)).unwrap()
+    });
+    let target = rt.start_workflow("waits_for_go_briefly", json!(0)).unwrap();
+    rt.run_until_blocked(target).await.unwrap();
+    let sender = rt.start_workflow("busy_signaller", json!(target)).unwrap();
+
+    rt.run_until_blocked(sender).await.unwrap();
+    let state = rt.run_until_blocked(target).await.unwrap();
+
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!("timeout")),
+        "the deadline wins: {state:?}"
+    );
 }

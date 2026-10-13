@@ -18,7 +18,8 @@ backend.
   child reports `child workflow cancelled: <reason>`, and a terminated child
   `child workflow terminated: <reason>`. A due child-timeout
   deadline fires before a late child's result, as on Postgres (issue #779).
-  The close reads the clock again when the child ends.
+  The backend reads the clock again when a body returns. A close and a
+  signal to another run use that instant, as Postgres uses `NOW()`.
 - **Parent-close policy.** When a parent ends, each running detached child
   gets its policy. `request_cancel` cancels it with reason `parent closed`.
   `terminate` fails it with `ParentClosed`. `abandon` leaves it running. The
@@ -78,7 +79,7 @@ and `harvest_signals.idempotency_key`. An old file gains them on open.
   external events first. Each event is the same, and replay accepts both
   orders.
 
-**Tests.** `autumn-harvest-sqlite/tests/integration/composition.rs` has 51
+**Tests.** `autumn-harvest-sqlite/tests/integration/composition.rs` has 53
 tests. Each test replays every history it asserts on the core
 `WorkflowReplayer`, with the run's ids. They cover:
 
@@ -89,8 +90,8 @@ tests. Each test replays every history it asserts on the core
 - signal and cancel by execution id and by workflow id, keyed signals, and
   dedup after a cancel and across runs;
 - await of completed, failed, cancelled, superseded and unknown targets;
-- the child timeout race, and a late child or a long terminal cycle that
-  loses to its deadline;
+- the child timeout race, and a late child, a long terminal cycle, a long
+  cancel cleanup or a late signal that loses to its deadline;
 - a reopen, mutual awaits, a blocked target beside a working sibling, and a
   run that its own cancel seals;
 - `join!` of an await and a child in both orders;
