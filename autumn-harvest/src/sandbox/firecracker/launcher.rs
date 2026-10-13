@@ -38,9 +38,6 @@ pub const KILL_WAIT: Duration = Duration::from_secs(5);
 /// The time that teardown waits for a killed cgroup to empty.
 pub const CGROUP_EMPTY_WAIT: Duration = Duration::from_secs(2);
 
-/// The vsock wildcard port. A guest that binds it gets a free port.
-const VMADDR_PORT_ANY: u32 = u32::MAX;
-
 /// The bytes of VMM stderr that a launcher keeps for error reports.
 pub const STDERR_TAIL_BYTES: usize = 2048;
 
@@ -238,9 +235,9 @@ impl FirecrackerLauncher {
                 machine.vcpu_count, machine.mem_size_mib
             )));
         }
-        super::config::check_extra_boot_args(&config.image)?;
+        super::config::check_boot_args(&config.image)?;
         // The guest would listen on a port of its own choice.
-        if config.guest_port == VMADDR_PORT_ANY {
+        if config.guest_port == super::vsock::VMADDR_PORT_ANY {
             return Err(SandboxError::Config(
                 "the guest port u32::MAX is VMADDR_PORT_ANY, which no host can connect to".into(),
             ));

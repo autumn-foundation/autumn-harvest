@@ -16,6 +16,10 @@ use crate::sandbox::error::SandboxError;
 /// The longest reply line that the host reads.
 pub const MAX_CONNECT_REPLY_BYTES: usize = 32;
 
+/// The vsock wildcard port. A guest that binds it gets a free port, so no
+/// host can know where to connect.
+pub const VMADDR_PORT_ANY: u32 = u32::MAX;
+
 /// The first wait between two connect attempts.
 pub const FIRST_RETRY_DELAY: Duration = Duration::from_millis(5);
 

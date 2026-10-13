@@ -64,10 +64,11 @@ pub struct GuestImage {
     pub kernel: PathBuf,
     /// An ext4 root file system on the host. The microVM opens it read-only.
     pub rootfs: PathBuf,
-    /// The init path in the root file system.
+    /// The init path in the root file system: one word with no quote.
     pub init: String,
     /// More kernel arguments. An argument may not use a key that the
-    /// launcher sets, such as `init` or `harvest.port`.
+    /// launcher sets, such as `init` or `harvest.port`, and it may not hold
+    /// a double quote.
     pub extra_boot_args: Vec<String>,
     /// A name for the image, such as a digest. Outcomes report it.
     pub name: Option<String>,
@@ -216,12 +217,27 @@ fn launcher_boot_args(image: &GuestImage, port: u32) -> Vec<String> {
     ]
 }
 
-/// Check that no extra boot argument replaces an argument of the launcher.
+/// Check that the init path is one kernel word, and that no extra boot
+/// argument replaces an argument of the launcher.
 ///
 /// # Errors
 ///
 /// Returns [`SandboxError::Config`] that names the argument.
-pub fn check_extra_boot_args(image: &GuestImage) -> Result<(), SandboxError> {
+pub fn check_boot_args(image: &GuestImage) -> Result<(), SandboxError> {
+    // The kernel splits the line at whitespace and removes double quotes.
+    // So a space or a quote can add an argument, such as a second `init=`.
+    let unsafe_word = |word: &str| word.contains('"') || word.chars().any(char::is_whitespace);
+    if image.init.is_empty() || unsafe_word(&image.init) {
+        return Err(SandboxError::Config(format!(
+            "the init path {:?} must be one word with no quote",
+            image.init
+        )));
+    }
+    if let Some(arg) = image.extra_boot_args.iter().find(|arg| arg.contains('"')) {
+        return Err(SandboxError::Config(format!(
+            "the extra boot argument {arg:?} has a quote, which the kernel removes"
+        )));
+    }
     // The kernel and the guest agent take the last value of a key. So an
     // extra argument with a launcher key would win, for example the port.
     let key = |arg: &str| arg.split_once('=').map_or(arg, |(key, _)| key).to_owned();
@@ -403,13 +419,37 @@ mod tests {
             let mut image = image();
             image.extra_boot_args.push(reserved.into());
             assert!(
-                matches!(check_extra_boot_args(&image), Err(SandboxError::Config(_))),
+                matches!(check_boot_args(&image), Err(SandboxError::Config(_))),
                 "{reserved}"
             );
         }
         let mut image = image();
         image.extra_boot_args.push("harvest.debug=1".into());
-        check_extra_boot_args(&image).unwrap();
+        check_boot_args(&image).unwrap();
+    }
+
+    #[test]
+    fn the_init_path_is_one_kernel_word() {
+        for init in [
+            "",
+            "/sbin/agent init=/bin/false",
+            "/sbin/a\tb",
+            "/sbin/\"a\"",
+        ] {
+            let mut image = image();
+            image.init = init.into();
+            assert!(
+                matches!(check_boot_args(&image), Err(SandboxError::Config(_))),
+                "{init:?}"
+            );
+        }
+        // The kernel removes the quotes, so this would set init.
+        let mut image = image();
+        image.extra_boot_args.push("\"init=/bin/sh\"".into());
+        assert!(
+            matches!(check_boot_args(&image), Err(SandboxError::Config(_))),
+            "a quoted extra argument"
+        );
     }
 
     #[test]

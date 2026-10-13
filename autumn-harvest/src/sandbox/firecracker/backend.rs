@@ -72,12 +72,19 @@ impl FirecrackerBackend {
     ///
     /// # Errors
     ///
-    /// Returns [`SandboxError::Config`] for a boot timeout of zero, or a
-    /// response grace under [`MIN_RESPONSE_GRACE`].
+    /// Returns [`SandboxError::Config`] for a boot timeout of zero, a
+    /// response grace under [`MIN_RESPONSE_GRACE`], or the wildcard guest
+    /// port.
     pub fn new(
         launcher: Arc<dyn VmLauncher>,
         settings: BackendSettings,
     ) -> Result<Self, SandboxError> {
+        // A launcher without a port of its own uses this one.
+        if settings.guest_port == super::vsock::VMADDR_PORT_ANY {
+            return Err(SandboxError::Config(
+                "the guest port u32::MAX is VMADDR_PORT_ANY, which no host can connect to".into(),
+            ));
+        }
         // A zero boot timeout expires before any guest can answer.
         if settings.boot_timeout.is_zero() {
             return Err(SandboxError::Config(
@@ -302,6 +309,20 @@ mod tests {
             ..fast()
         };
         FirecrackerBackend::new(launcher(GuestMode::Serve), settings).unwrap();
+    }
+
+    #[test]
+    fn a_wildcard_guest_port_is_a_config_error() {
+        let settings = BackendSettings {
+            guest_port: u32::MAX,
+            ..fast()
+        };
+        let err = FirecrackerBackend::new(launcher(GuestMode::Serve), settings)
+            .expect_err("VMADDR_PORT_ANY");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("port")),
+            "{err:?}"
+        );
     }
 
     #[test]

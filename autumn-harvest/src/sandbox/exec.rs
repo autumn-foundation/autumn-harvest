@@ -838,6 +838,10 @@ impl WorkDir {
             .create(&parent)
             .and_then(|()| open_directory(&parent))
             .and_then(|parent_handle| {
+                // The umask can remove the search bit of the code uid, so set
+                // the mode again.
+                parent_handle
+                    .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o711))?;
                 std::fs::DirBuilder::new().mode(0o700).create(&path)?;
                 Ok((parent_handle, open_directory(&path)?))
             });
@@ -1422,6 +1426,29 @@ mod tests {
             dir.display()
         );
         assert!(!parent.exists(), "{} must be removed", parent.display());
+    }
+
+    #[test]
+    fn the_work_directory_parent_ignores_the_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().to_path_buf();
+        let mode = std::thread::spawn(move || {
+            // SAFETY: CLONE_FS gives this thread its own umask, so no other
+            // test sees the change.
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_FS) }, 0);
+            // SAFETY: umask has no preconditions.
+            unsafe { libc::umask(0o077) };
+            let work = WorkDir::create(&root).unwrap();
+            std::fs::metadata(&work.parent)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        })
+        .join()
+        .unwrap();
+        assert_eq!(mode, 0o711, "the code uid must be able to pass the parent");
     }
 
     #[tokio::test]
