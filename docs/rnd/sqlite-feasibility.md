@@ -195,6 +195,7 @@ Classification rule:
 | `hot_swap` | diesel | (a) | **Nothing to port: the match is a doc comment.** The runtime workflow-module registry (issue #967, behind the `hot-code-swap` feature) is a purely in-process table of compiled WASM modules and never touches a connection. `diesel_async` appears once, in prose explaining why the method is named `load_module` rather than `load` — `RunQueryDsl`'s blanket impl would otherwise capture the shorter name. Kept as a row rather than an exclusion because the audit is grep-level by design and will keep finding it. |
 | `hot_swap_store` | diesel, raw-sql | (b) | The `harvest_workflow_modules` table (issue #967, `hot-code-swap` feature): publish, fetch, list, retire. The raw SQL is upserts and one `UPDATE`; the only constructs needing a rewrite are `octet_length` → `length`, `now()` → `datetime('now')` and `ON CONFLICT DO NOTHING`, which SQLite spells identically. No Postgres-only syntax was identified, hence (b) rather than (c) — but it hand-writes SQL, so not (a). |
 | `lib` | diesel | (a) | `embed_migrations!()` only. |
+| `llm_ledger` | diesel | (a) | Agent cost ledger (issue #1996). One Diesel `insert_into` of plain rows, inside the caller's completion transaction. No hand-written SQL. |
 | `migrate` | diesel, raw-sql, to_regclass | (c) | Applies the Postgres migration set to a dedicated Harvest database (issue #1240). The ledger CRUD and the `to_regclass` probe are mechanical (`sqlite_master`), but the payload is 96 files of Postgres DDL: `autumn-harvest-sqlite` declares its own schema rather than translating them, so there is nothing here to port. |
 | `models` | diesel | (c) | Postgres type layer (`Jsonb`/`Timestamptz`/`Interval`/`Uuid`); reimplemented wholesale. |
 | `mutex` | diesel, advisory-lock, to_regclass, interval-sql, raw-pg-sql, raw-sql | (b) | Advisory lock subsumed by the write lock; lease TTL as epoch ms. |
@@ -505,7 +506,7 @@ re-opened, not extended.
 Multi-worker/multi-process; push wakeups (polling latency floor); per-key fleet
 concurrency (#247); sticky routing (#235); poison-pill peer reclaim (#367);
 sharding; management API and Vantage UI; child workflows, external
-signal/cancel, updates, local and external activities, cancellable timers,
+signal/cancel, local and external activities, cancellable timers,
 worker sessions, and a cross-type continue-as-new (same-type `continue_as_new`
 shipped in #2023) — each **rejected loudly by name** at the
 command layer rather than silently ignored. Activity execution is
