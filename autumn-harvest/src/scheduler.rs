@@ -1588,17 +1588,20 @@ pub async fn trigger_unified_dag(
         // successor of this schedule too, not just same-named runs -- a manual
         // trigger must not double-dispatch a schedule whose active run has
         // already changed type mid-chain.
-        let running: i64 = schedule_running_basis(conn, dag_name, schedule.id).await?;
-        // `AllowAll` ignores `max_active_runs` here too (issue #1985).
+        // `AllowAll` ignores `max_active_runs` here too (issue #1985). It skips
+        // the count, so a failed count query cannot block its trigger.
         let allow_all =
             OverlapPolicy::from_db(&schedule.overlap_policy) == OverlapPolicy::AllowAll;
-        if !allow_all && running >= i64::from(schedule.max_active_runs) {
-            return Err(HarvestError::UpdateRejected {
-                reason: format!(
-                    "DAG '{dag_name}' max_active_runs reached ({running}/{}); manual trigger is deferred",
-                    schedule.max_active_runs
-                ),
-            });
+        if !allow_all {
+            let running: i64 = schedule_running_basis(conn, dag_name, schedule.id).await?;
+            if running >= i64::from(schedule.max_active_runs) {
+                return Err(HarvestError::UpdateRejected {
+                    reason: format!(
+                        "DAG '{dag_name}' max_active_runs reached ({running}/{}); manual trigger is deferred",
+                        schedule.max_active_runs
+                    ),
+                });
+            }
         }
     }
 
@@ -4277,11 +4280,17 @@ async fn tick_one_workflow_schedule(
     // Tick-exact running basis (RUNNING/PAUSED count, `schedule_id`-scoped
     // cross-type successors included per issue #1160, plus the #607 pending-
     // throttle backlog) -- see `schedule_running_basis`.
-    let mut running: i64 = schedule_running_basis(conn, wf_name, schedule.id).await?;
+    // `AllowAll` ignores `max_active_runs`, so it skips the count (issue
+    // #1985). A failed count query then cannot block its firing.
     let overlap_policy = OverlapPolicy::from_db(&schedule.overlap_policy);
     let allow_all = overlap_policy == OverlapPolicy::AllowAll;
+    let mut running: i64 = if allow_all {
+        0
+    } else {
+        schedule_running_basis(conn, wf_name, schedule.id).await?
+    };
 
-    if running >= i64::from(schedule.max_active_runs) {
+    if !allow_all && running >= i64::from(schedule.max_active_runs) {
         let mut buffered = parse_buffered_runs(&schedule.buffered_runs);
         let buffer_all_max = usize::try_from(schedule.buffer_all_max.max(1)).unwrap_or(usize::MAX);
 
@@ -4542,7 +4551,8 @@ async fn tick_one_workflow_schedule(
                 "skipped",
                 limit_reason,
                 Some(serde_json::json!({
-                    "running_runs": running,
+                    // `AllowAll` does not count its running runs.
+                    "running_runs": (!allow_all).then_some(running),
                     "dispatched_runs": dispatched,
                     "max_active_runs": schedule.max_active_runs,
                     "deferred_slot": original_slot,

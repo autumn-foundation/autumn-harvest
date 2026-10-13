@@ -537,6 +537,48 @@ async fn skip_manual_trigger_is_rejected_at_max_active_runs() {
     assert!(manual_trigger(&url, "overlap_wf").await.is_err());
 }
 
+/// Makes every running-basis count fail.
+///
+/// The pending-throttle count reads `harvest_start_throttle.workflow_name`.
+/// A renamed column fails that query the way a statement timeout would.
+async fn break_the_running_count(url: &str) {
+    let mut conn = connect(url).await;
+    conn.batch_execute(
+        "ALTER TABLE harvest_start_throttle RENAME COLUMN workflow_name TO workflow_name_off",
+    )
+    .await
+    .expect("break the running count");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn allow_all_tick_fires_when_the_running_count_fails() {
+    let (url, _c) = setup().await;
+    let schedule_id = insert_schedule(&url, "overlap_wf", "allow_all", false).await;
+    start_with_schedule(&url, "overlap_wf", "already-running", Some(schedule_id)).await;
+    break_the_running_count(&url).await;
+
+    tick(&url).await;
+
+    assert_eq!(
+        executions(&url, "overlap_wf").await.len(),
+        2,
+        "AllowAll must not need the running count to fire"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn allow_all_manual_trigger_succeeds_when_the_running_count_fails() {
+    let (url, _c) = setup().await;
+    let schedule_id = insert_schedule(&url, "overlap_wf", "allow_all", false).await;
+    start_with_schedule(&url, "overlap_wf", "already-running", Some(schedule_id)).await;
+    break_the_running_count(&url).await;
+
+    manual_trigger(&url, "overlap_wf")
+        .await
+        .expect("AllowAll must not need the running count to trigger");
+    assert_eq!(executions(&url, "overlap_wf").await.len(), 2);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn allow_all_drains_a_buffered_slot_at_max_active_runs() {
     use autumn_harvest::schema::harvest_schedules::dsl;
