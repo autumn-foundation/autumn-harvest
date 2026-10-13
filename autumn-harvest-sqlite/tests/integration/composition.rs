@@ -571,6 +571,23 @@ async fn parent_child_timeout_panic(ctx: &WorkflowContext, _n: i64) -> Result<Va
     Ok(json!({ "child": out }))
 }
 
+/// Spawns a detached child under `request_cancel`, then waits for `go`. Under
+/// a cancel request it records a side effect as cleanup and returns.
+#[workflow]
+async fn spawns_then_cleans_up(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    ctx.spawn_child_workflow_detached_raw(
+        "waits_for_go",
+        json!(0),
+        ParentClosePolicy::RequestCancel,
+    )
+    .map_err(|e| e.to_string())?;
+    if ctx.cancellation_reason().is_some() {
+        let _ticket = ctx.new_uuid();
+        return Ok(json!("cleaned up"));
+    }
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn runtime() -> SqliteRuntime {
@@ -638,6 +655,7 @@ fn fixtures() -> Vec<WorkflowInfo> {
         busy_signaller_info(),
         busy_panic_info(),
         parent_child_timeout_panic_info(),
+        spawns_then_cleans_up_info(),
     ]
 }
 
@@ -2179,4 +2197,36 @@ async fn a_long_final_panic_loses_to_a_due_deadline() {
         matches!(state, RunState::Completed(ref v) if v == &json!({ "child": null })),
         "the deadline wins: {state:?}"
     );
+}
+
+/// The cap check of a cancel's cleanup batch counts the cascade events of the
+/// seal. A batch that would reach the cap with them rolls back, and the seal
+/// adds only `WorkflowCancelled` and the cascade.
+#[tokio::test]
+async fn the_cancel_cap_check_counts_cascade_events() {
+    let mut rt = runtime();
+    // `WorkflowStarted` and `ChildWorkflowSpawnedDetached` come first. The
+    // side effect and the cascade event then reach the cap.
+    rt.set_history_event_hard_cap(Some(4));
+    let parent = rt
+        .start_workflow("spawns_then_cleans_up", json!(0))
+        .unwrap();
+    rt.run_until_blocked(parent).await.unwrap();
+
+    rt.cancel(parent, "ops").unwrap();
+    let state = rt.run_until_blocked(parent).await.unwrap();
+
+    assert!(matches!(state, RunState::Cancelled(_)), "{state:?}");
+    let history = rt.load_history(parent).unwrap();
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::SideEffectRecorded { .. })),
+        "the cleanup batch rolls back: {history:#?}"
+    );
+    let cascades = history
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ChildWorkflowCascadeApplied { .. }))
+        .count();
+    assert_eq!(cascades, 1, "{history:#?}");
 }

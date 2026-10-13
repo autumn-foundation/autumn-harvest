@@ -1167,9 +1167,12 @@ impl SqliteRuntime {
                 now,
             };
             persist_terminal_pending_commands(&tx, &drain, exec, batch.pending)?;
-            if batch.caps.reached(&tx, exec)?.is_none() {
+            // The seal writes one cascade event per detached child it closes.
+            // Both checks count them, as the terminal arms do (issue #2026).
+            let cascade = composition::cascade_event_count(&tx, exec)?;
+            if batch.caps.reached_with(&tx, exec, cascade)?.is_none() {
                 fail_dropped_tasks(&tx, exec, &self.activities)?;
-                if caps.reached(&tx, exec)?.is_none() {
+                if caps.reached_with(&tx, exec, cascade)?.is_none() {
                     seal_with_cancel_event(&tx, exec, CANCELLED_STATE, reason, now)?;
                     tx.commit()?;
                     return Ok(RunState::Cancelled(reason.to_string()));
