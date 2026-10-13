@@ -71,6 +71,9 @@ const USERNS_FAILED: i32 = libc::EUSERS;
 /// cgroup. No other setup step returns it.
 const CGROUP_FAILED: i32 = libc::EBADSLT;
 
+/// The time between two exit checks when no pidfd is available.
+const EXIT_POLL: Duration = Duration::from_millis(10);
+
 /// The longest time between two reads of the CPU time of a run cgroup.
 const CPU_POLL: Duration = Duration::from_millis(50);
 
@@ -202,7 +205,7 @@ pub async fn execute_plan(
     let cpu_budget = Duration::from_secs(plan.limits.cpu_seconds);
     let exit_fd = group.and_then(open_pidfd);
     let end = tokio::select! {
-        exit = main_exit(&mut child, exit_fd.as_ref()) => End::Exited(exit),
+        exit = main_exit(&mut child, group, exit_fd.as_ref()) => End::Exited(exit),
         () = tokio::time::sleep(plan.limits.wall_clock()) => End::TimedOut,
         () = cancel.cancelled() => End::Cancelled,
         () = cpu_spent(cgroup.as_ref(), cpu_budget) => End::CpuSpent,
@@ -281,22 +284,57 @@ fn open_pidfd(pid: i32) -> Option<tokio::io::unix::AsyncFd<OwnedFd>> {
     tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE).ok()
 }
 
-/// Wait until the main process exits.
+/// Wait until the main process `pid` exits, and do not reap it.
 ///
-/// With a pidfd, the process stays a zombie, so its pid and process group
-/// stay taken until the executor kills the group and reaps it. Without one,
-/// this reaps the process and returns its status.
+/// The process stays a zombie, so its pid and process group stay taken until
+/// the executor kills the group and reaps it. A pidfd reports the exit at
+/// once. Without one, `waitid` with `WNOWAIT` checks for it each
+/// [`EXIT_POLL`]. Only a child with no pid is reaped here, and it has no
+/// group to kill.
 async fn main_exit(
     child: &mut tokio::process::Child,
+    pid: Option<i32>,
     pidfd: Option<&tokio::io::unix::AsyncFd<OwnedFd>>,
 ) -> Option<io::Result<std::process::ExitStatus>> {
-    match pidfd {
-        Some(pidfd) => {
-            let _ = pidfd.readable().await;
-            None
-        }
-        None => Some(child.wait().await),
+    if let Some(pidfd) = pidfd {
+        let _ = pidfd.readable().await;
+        return None;
     }
+    let Some(pid) = pid else {
+        return Some(child.wait().await);
+    };
+    while !has_exited(pid) {
+        tokio::time::sleep(EXIT_POLL).await;
+    }
+    None
+}
+
+/// Whether the child `pid` has exited. `WNOWAIT` leaves it a zombie.
+///
+/// An error other than `EINTR` counts as an exit, so the executor kills the
+/// group and reaps the child. That is safe, because the child is not reaped
+/// yet.
+fn has_exited(pid: i32) -> bool {
+    let Ok(id) = libc::id_t::try_from(pid) else {
+        return true;
+    };
+    // SAFETY: siginfo_t is plain data, and all zeros is a valid value.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: waitid writes only into `info`. WNOWAIT reaps nothing.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            id,
+            &raw mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc != 0 {
+        return io::Error::last_os_error().kind() != io::ErrorKind::Interrupted;
+    }
+    // SAFETY: waitid filled `info`. With WNOHANG, si_pid stays 0 while the
+    // child runs.
+    unsafe { info.si_pid() != 0 }
 }
 
 /// The command that runs `plan` in `work` with `setup`.
@@ -1825,15 +1863,28 @@ mod tests {
         let pid = i32::try_from(child.id().unwrap()).unwrap();
         let pidfd = open_pidfd(pid);
         assert!(pidfd.is_some(), "this kernel has pidfd_open");
-        let exit = main_exit(&mut child, pidfd.as_ref()).await;
+        let exit = main_exit(&mut child, Some(pid), pidfd.as_ref()).await;
         assert!(exit.is_none(), "the exit must not reap the process");
         // The zombie still holds its pid, so its process group stays taken.
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-        let state = stat
-            .rsplit_once(") ")
-            .and_then(|(_, rest)| rest.chars().next());
-        assert_eq!(state, Some('Z'));
+        assert_eq!(process_state(pid), Some('Z'));
         assert!(child.wait().await.unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn the_wait_without_a_pidfd_does_not_reap_the_main_process() {
+        let mut child = tokio::process::Command::new("true").spawn().unwrap();
+        let pid = i32::try_from(child.id().unwrap()).unwrap();
+        let exit = main_exit(&mut child, Some(pid), None).await;
+        assert!(exit.is_none(), "the exit must not reap the process");
+        assert_eq!(process_state(pid), Some('Z'));
+        assert!(child.wait().await.unwrap().success());
+    }
+
+    /// The state letter of `pid` in `/proc`, such as `Z` for a zombie.
+    fn process_state(pid: i32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.rsplit_once(") ")
+            .and_then(|(_, rest)| rest.chars().next())
     }
 
     #[test]

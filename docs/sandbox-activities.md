@@ -314,9 +314,11 @@ jailer, so each restore sees the same paths.
 `FirecrackerLauncher::create_golden_snapshot` boots a golden microVM, waits
 for its agent, pauses it and saves the files. No code runs in it. The files
 hold the guest memory, so the golden microVM must hold no secret. The new
-pair replaces an old pair only after both copies are complete. Create it
-before the launchers that use it start, because a launch between the two
-renames can see a mixed pair.
+pair replaces an old pair only after both copies are complete, and a failed
+rename puts the old file back. Create it before the launchers that use it
+start, because a launch between the two renames can see a mixed pair. A host
+crash between the two renames can also leave a mixed pair, so create the
+snapshot again after such a crash.
 
 Clones of one snapshot share their user-space random state. Each run
 therefore carries fresh host entropy, and VMGenID reseeds the kernel on Linux

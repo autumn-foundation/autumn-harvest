@@ -457,7 +457,9 @@ impl FirecrackerLauncher {
                 vm_dirs.push((owner.to_owned(), name.clone(), entry.path()));
             }
         }
-        // An owner is live when another process holds its lease lock.
+        // An owner is live when another process holds its lease lock. An
+        // owner whose lease cannot be opened also stays live, so a failed
+        // check never kills the VMs of a running launcher.
         let mut live = std::collections::BTreeSet::new();
         live.insert(self.owner.clone());
         let mut dead_leases = Vec::new();
@@ -470,7 +472,14 @@ impl FirecrackerLauncher {
                 Ok(_) => {
                     live.insert(owner);
                 }
-                Err(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        lease = %path.display(),
+                        error = %e,
+                        "cannot check a sandbox lease"
+                    );
+                    live.insert(owner);
+                }
             }
         }
         let mut removed = 0;
@@ -542,8 +551,10 @@ impl FirecrackerLauncher {
     /// hold no secret.
     ///
     /// Both files replace an old pair only after both copies are complete.
-    /// A launch that starts between the two renames can see a mixed pair.
-    /// So create a snapshot before the launchers that use it start.
+    /// A failed rename puts the old file back. A launch that starts between
+    /// the two renames can see a mixed pair. So create a snapshot before the
+    /// launchers that use it start. A host crash between the two renames can
+    /// also leave a mixed pair, so create the snapshot again after it.
     ///
     /// # Errors
     ///
@@ -918,28 +929,27 @@ const SNAPSHOT_MEMORY_FILE: &str = "snapshot.mem";
 /// the whole guest memory.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Copy a file that a jailed VMM wrote to `to`, with mode `0640` and group
-/// `gid`.
-///
-/// The VMM can write its jail, so the source must be a regular file and not
-/// a symbolic link.
 /// Copy each snapshot file to its target, and replace the old files only
 /// when every copy is complete.
 ///
 /// Each copy goes to a temporary name next to its target and is synced.
-/// So a failed copy, such as on a full disk, keeps the old pair.
+/// So a failed copy, such as on a full disk, keeps the old pair. A failed
+/// rename puts back the old file that already moved, so it keeps the old
+/// pair too.
 fn publish_snapshot(copies: &[(PathBuf, PathBuf)], gid: u32) -> std::io::Result<()> {
     let mut staged = Vec::new();
     let mut publish = || {
         for (from, to) in copies {
-            let name = to.file_name().unwrap_or_default().to_string_lossy();
-            let temp = to.with_file_name(format!(".{name}.{}", uuid::Uuid::new_v4().simple()));
+            let temp = staging_name(to);
             staged.push(temp.clone());
             copy_out(from, &temp, gid)?;
         }
-        for (temp, (_, to)) in staged.iter().zip(copies) {
-            std::fs::rename(temp, to)?;
-        }
+        let moves: Vec<_> = staged
+            .iter()
+            .cloned()
+            .zip(copies.iter().map(|(_, to)| to.clone()))
+            .collect();
+        replace_all(&moves)?;
         // Sync the directory, so the new names survive a crash.
         if let Some(dir) = copies.first().and_then(|(_, to)| to.parent()) {
             std::fs::File::open(dir)?.sync_all()?;
@@ -955,6 +965,51 @@ fn publish_snapshot(copies: &[(PathBuf, PathBuf)], gid: u32) -> std::io::Result<
     result
 }
 
+/// Rename each staged file over its target.
+///
+/// Each old target first gets a hard link, so a failed rename can put back
+/// the targets that already moved. The old set then stays whole.
+fn replace_all(moves: &[(PathBuf, PathBuf)]) -> std::io::Result<()> {
+    let mut backups = Vec::new();
+    let result = (|| {
+        for (_, to) in moves {
+            let backup = staging_name(to);
+            match std::fs::hard_link(to, &backup) {
+                Ok(()) => backups.push(Some(backup)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => backups.push(None),
+                Err(e) => return Err(e),
+            }
+        }
+        for (done, (temp, to)) in moves.iter().enumerate() {
+            if let Err(e) = std::fs::rename(temp, to) {
+                for ((_, to), backup) in moves[..done].iter().zip(&backups) {
+                    let _ = backup.as_ref().map_or_else(
+                        || std::fs::remove_file(to),
+                        |backup| std::fs::rename(backup, to),
+                    );
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
+    })();
+    for backup in backups.into_iter().flatten() {
+        let _ = std::fs::remove_file(backup);
+    }
+    result
+}
+
+/// A new hidden name next to `to`.
+fn staging_name(to: &Path) -> PathBuf {
+    let name = to.file_name().unwrap_or_default().to_string_lossy();
+    to.with_file_name(format!(".{name}.{}", uuid::Uuid::new_v4().simple()))
+}
+
+/// Copy a file that a jailed VMM wrote to `to`, with mode `0640` and group
+/// `gid`.
+///
+/// The VMM can write its jail, so the source must be a regular file and not
+/// a symbolic link.
 fn copy_out(from: &Path, to: &Path, gid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let mut source = std::fs::OpenOptions::new()
@@ -1663,6 +1718,60 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn a_failed_second_rename_keeps_the_old_pair() {
+        let dir = temp_dir();
+        let out = dir.join("golden");
+        std::fs::create_dir_all(out.join("memory")).unwrap();
+        std::fs::write(out.join("state"), b"old state").unwrap();
+        std::fs::write(dir.join("new-state"), b"new state").unwrap();
+        std::fs::write(dir.join("new-memory"), b"new memory").unwrap();
+        // SAFETY: getegid has no preconditions.
+        let gid = unsafe { libc::getegid() };
+        // The memory target is a directory, so its rename fails.
+        let copies = [
+            (dir.join("new-state"), out.join("state")),
+            (dir.join("new-memory"), out.join("memory")),
+        ];
+        publish_snapshot(&copies, gid).expect_err("a directory in the way");
+        assert_eq!(std::fs::read(out.join("state")).unwrap(), b"old state");
+        assert!(out.join("memory").is_dir());
+        assert_eq!(
+            std::fs::read_dir(&out).unwrap().count(),
+            2,
+            "a temporary file is left"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_rename_that_fails_puts_back_the_targets_that_moved() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("state"), b"old state").unwrap();
+        std::fs::write(dir.join("memory"), b"old memory").unwrap();
+        std::fs::write(dir.join("new-state"), b"new state").unwrap();
+        std::fs::write(dir.join("new-file"), b"new file").unwrap();
+        // The second staged file is missing, so its rename fails after the
+        // first rename and the third target is new.
+        let moves = [
+            (dir.join("new-state"), dir.join("state")),
+            (dir.join("new-file"), dir.join("file")),
+            (dir.join("missing-memory"), dir.join("memory")),
+        ];
+        replace_all(&moves).expect_err("a missing staged file");
+        assert_eq!(std::fs::read(dir.join("state")).unwrap(), b"old state");
+        assert_eq!(std::fs::read(dir.join("memory")).unwrap(), b"old memory");
+        assert!(!dir.join("file").exists(), "a new target is removed");
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        // The moved staged files are gone, and no backup is left.
+        assert_eq!(names, ["memory", "state"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A fake Firecracker API: it logs each request line and answers 204.
     const FAKE_API_PY: &str = r#"
 import os, socket, sys
@@ -1724,6 +1833,23 @@ while True:
         assert!(!root.join("hsbx-deadbeef.lease").exists());
         assert!(unrelated.exists());
         drop((live, sweeper));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_sweep_keeps_the_vms_of_an_owner_whose_lease_it_cannot_open() {
+        let dir = temp_dir();
+        let fc = script(&dir, "firecracker", "exit 0");
+        let sweeper = new_launcher(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
+        let root = sweeper.vm_root();
+        // A link to itself fails to open with ELOOP, even for root.
+        let lease = root.join("hsbx-cafef00d.lease");
+        std::os::unix::fs::symlink(&lease, &lease).unwrap();
+        let vm = root.join(format!("hsbx-cafef00d-{}", "d".repeat(16)));
+        std::fs::create_dir_all(&vm).unwrap();
+        assert_eq!(sweeper.sweep_stale(), 0);
+        assert!(vm.exists(), "an owner that cannot be checked stays live");
+        drop(sweeper);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
