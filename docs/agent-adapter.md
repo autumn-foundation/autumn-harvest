@@ -602,8 +602,8 @@ change.
 | `agent_discover_peers` | The recorded peers for the same names, or none. The candidate needs no roster. |
 | Any other activity, such as `agent_precheck` | No mock. The candidate run fails. |
 
-A tool or snapshot activity that failed the source fails the candidate at the
-same activity.
+A tool, snapshot or peer-lookup activity that failed the source fails the
+candidate at the same activity.
 
 The policy runs live, so use a policy with no side effects. It sees the
 recorded run id and the aligned call ids. A retryable model failure retries

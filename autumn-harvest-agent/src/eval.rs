@@ -18,8 +18,8 @@
 //! - `agent_memory_snapshot` returns the recorded snapshot, or an empty one.
 //! - `agent_discover_peers` returns the recorded peers for the same names, or
 //!   none. The candidate needs no roster.
-//! - A tool or snapshot activity that failed the source fails the candidate
-//!   at the same activity.
+//! - A tool, snapshot or peer-lookup activity that failed the source fails
+//!   the candidate at the same activity.
 //! - `agent_deliver` is a stub. No report leaves the harness.
 //! - Any other activity has no mock, so it fails the candidate run.
 //!
@@ -418,7 +418,7 @@ pub async fn evaluate(
 
     let peers = {
         let session = Arc::clone(&session);
-        move |names: Value| -> Result<Value, String> { encode(&lock(&session).lookup(&names)) }
+        move |names: Value| -> Result<Value, String> { encode(&lock(&session).lookup(&names)?) }
     };
 
     let mut env = engine()
@@ -482,7 +482,8 @@ struct Recording {
 #[derive(Clone)]
 struct RecordedPeers {
     names: Value,
-    peers: Vec<Peer>,
+    /// The peers found, or the error of a lookup that failed for good.
+    peers: Result<Vec<Peer>, String>,
     /// A recorded lookup answers one candidate lookup at most.
     used: bool,
 }
@@ -583,16 +584,11 @@ impl Recording {
                 }
             }
         }
-        // A source that failed on a tool or snapshot activity replays that
-        // failure, so the candidate fails at the same activity.
+        // A source that failed on a tool, snapshot or peer-lookup activity
+        // replays that failure, so the candidate fails at the same activity.
         if let (Some(RunEnd::Failed(_)), Some((activity_id, error))) = (&end, last_failure) {
             let scheduled = scheduled.get(&activity_id).copied();
-            push_failure(
-                scheduled,
-                error,
-                (&mut effects.tools, &mut effects.snapshots),
-                run_id.as_deref(),
-            )?;
+            effects.failed(scheduled, error, run_id.as_deref())?;
         }
         // Only a signal for a wait that the source opened is sent again. A
         // wait opens with its deadline timer. A signal that arrived before
@@ -644,7 +640,7 @@ impl Effects {
         } else if name == agent_discover_peers_info().name {
             self.peers.push(RecordedPeers {
                 names: input.clone(),
-                peers: decode(output.clone()).map_err(EvalError::Undecodable)?,
+                peers: Ok(decode(output.clone()).map_err(EvalError::Undecodable)?),
                 used: false,
             });
         } else if name == agent_memory_snapshot_info().name {
@@ -653,26 +649,33 @@ impl Effects {
         }
         Ok(())
     }
-}
 
-/// Record the terminal failure of the `scheduled` activity, when it is a
-/// tool call or a snapshot.
-fn push_failure(
-    scheduled: Option<(&str, &Value)>,
-    error: String,
-    (tools, snapshots): (&mut Vec<RecordedTool>, &mut Vec<Result<String, String>>),
-    root: Option<&str>,
-) -> Result<(), EvalError> {
-    match scheduled {
-        Some((name, input)) if name == agent_tool_call_info().name => {
-            tools.push(recorded_tool(input, Err(error), root)?);
+    /// Record the terminal failure of the `scheduled` activity, when it is a
+    /// tool call, a snapshot or a peer lookup.
+    fn failed(
+        &mut self,
+        scheduled: Option<(&str, &Value)>,
+        error: String,
+        root: Option<&str>,
+    ) -> Result<(), EvalError> {
+        match scheduled {
+            Some((name, input)) if name == agent_tool_call_info().name => {
+                self.tools.push(recorded_tool(input, Err(error), root)?);
+            }
+            Some((name, _)) if name == agent_memory_snapshot_info().name => {
+                self.snapshots.push(Err(error));
+            }
+            Some((name, input)) if name == agent_discover_peers_info().name => {
+                self.peers.push(RecordedPeers {
+                    names: input.clone(),
+                    peers: Err(error),
+                    used: false,
+                });
+            }
+            _ => {}
         }
-        Some((name, _)) if name == agent_memory_snapshot_info().name => {
-            snapshots.push(Err(error));
-        }
-        _ => {}
+        Ok(())
     }
-    Ok(())
 }
 
 /// The task of an agent run history.
@@ -819,15 +822,21 @@ impl Session {
     }
 
     /// The recorded peers for the same `names`, or none.
-    fn lookup(&mut self, names: &Value) -> Vec<Peer> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the recorded error of a lookup that failed the source.
+    fn lookup(&mut self, names: &Value) -> Result<Vec<Peer>, String> {
         self.peers
             .iter_mut()
             .find(|recorded| !recorded.used && recorded.names == *names)
-            .map(|recorded| {
-                recorded.used = true;
-                recorded.peers.clone()
-            })
-            .unwrap_or_default()
+            .map_or_else(
+                || Ok(Vec::new()),
+                |recorded| {
+                    recorded.used = true;
+                    recorded.peers.clone()
+                },
+            )
     }
 }
 

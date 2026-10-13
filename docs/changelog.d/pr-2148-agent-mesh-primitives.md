@@ -48,7 +48,7 @@ and `DESIGN-agent-mesh.md` the plan.
   a child never share a signal name. A run with no delegation keeps its old
   names.
 - **Evaluation.** `eval::evaluate` mocks the peer lookup with the recorded
-  answer. A recorded tool outcome answers only an equal call of the same
+  answer, or with the recorded error of a lookup that failed the source. A recorded tool outcome answers only an equal call of the same
   agent. A candidate call takes a recorded call id only from a turn of the
   same agent.
 - **Response cache.** A child of a run whose run id is the workflow id skips
@@ -73,5 +73,5 @@ rules, the wire form and the flow check.
 SQLite. It covers isolation, refusals, budgets, the tool allowlist, flow
 rules in both directions and across runs, and the same-turn delegation case.
 It also covers tree-unique approval names, a restart inside a child and the
-model-turn span. Four `eval` tests cover delegation runs, per-agent
-outcome matching and per-agent call ids.
+model-turn span. Five `eval` tests cover delegation runs, per-agent
+outcome matching, per-agent call ids and a failed lookup.

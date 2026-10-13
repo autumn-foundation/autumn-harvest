@@ -1435,3 +1435,57 @@ async fn a_child_approval_never_releases_a_root_call_in_the_candidate() {
         "the child approval must not release the root call: {results:?}"
     );
 }
+
+/// A source that failed for good at its peer lookup fails the candidate at
+/// the same lookup. No model call runs past it (agent mesh, AC13).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recorded_lookup_failure_fails_the_candidate_at_the_same_lookup() {
+    use autumn_harvest_agent::Mandate;
+
+    let task = AgentTask::new("go").mandate(Mandate::new("planner").peers(["researcher"]));
+    let mut source = record(&task, vec![answer("done", 1)]).await;
+    let lookup = source
+        .iter()
+        .position(|event| {
+            matches!(event, WorkflowEvent::ActivityScheduled { name, .. }
+                if name == "agent_discover_peers")
+        })
+        .unwrap();
+    let WorkflowEvent::ActivityScheduled { activity_id, .. } = source[lookup].clone() else {
+        unreachable!();
+    };
+    let completed = source
+        .iter()
+        .position(|event| {
+            matches!(event, WorkflowEvent::ActivityCompleted { activity_id: id, .. }
+                if *id == activity_id)
+        })
+        .unwrap();
+    source.truncate(completed);
+    source.push(WorkflowEvent::ActivityFailed {
+        activity_id,
+        error: "no agent harness is registered".into(),
+        attempt: 3,
+        error_type: "Error".into(),
+        non_retryable: true,
+        details: None,
+    });
+    source.push(WorkflowEvent::WorkflowFailed {
+        error: "no agent harness is registered".into(),
+        error_type: None,
+        details: None,
+        non_retryable: None,
+    });
+    let model = ScriptedModel::new(vec![answer("done", 1)]);
+    let (harness, _) = candidate(model.clone());
+
+    let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
+
+    assert!(
+        matches!(evaluation.candidate, RunEnd::Failed(_)),
+        "the candidate fails at the lookup: {:?}",
+        evaluation.candidate
+    );
+    assert_eq!(model.calls(), 0, "no model call runs past the failure");
+    assert!(!evaluation.diverged(), "{evaluation:#?}");
+}

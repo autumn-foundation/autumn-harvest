@@ -327,7 +327,8 @@ again. A roster change after the lookup does not change a recorded run.
 `a_restart_inside_a_child_resends_nothing_and_looks_up_nothing` proves this.
 
 `eval::evaluate` re-drives a delegation run. The recorded lookups answer, so
-the candidate needs no roster. A recorded tool outcome answers only an equal
+the candidate needs no roster. A lookup that failed the source fails the
+candidate at the same lookup. A recorded tool outcome answers only an equal
 call of the same agent. A candidate call takes a recorded call id only from a
 turn of the same agent, so an approval for a child never releases a root
 call. The run id suffix `:d{n}` names that agent.
