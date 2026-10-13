@@ -28,7 +28,9 @@ first signal of a name whose payload satisfies the predicate.
 **Durable promise.** `ctx.new_promise()` and `ctx.promise(key)` return a
 `DurablePromise`. Its token is `<execution-id>/<key>`. Any caller settles it
 once with `durable_promise::resolve` / `reject`, `ctx.resolve_promise` /
-`ctx.reject_promise`, or the HTTP signal route.
+`ctx.reject_promise`, or the HTTP signal route. `resolve_with_codecs` and
+`reject_with_codecs` encode the stored settlement under column encoding
+(#1979).
 
 - A promise is a signal named `harvest.promise:<key>`. The idempotency key is
   the same string, so the first settlement wins.

@@ -409,6 +409,9 @@ pub fn settlement_idempotency_key<'a>(
 /// Returns `Ok(true)` for the first settlement and `Ok(false)` when the
 /// promise already has one. `conn` must reach the shard that holds the run.
 ///
+/// This form takes no codec registry, so it stores the settlement in clear.
+/// Use [`resolve_with_codecs`] to honour column encoding (issue #1979).
+///
 /// # Errors
 ///
 /// Returns [`crate::HarvestError::NotFound`] if the run does not exist. Returns
@@ -420,13 +423,32 @@ pub async fn resolve(
     id: &PromiseId,
     value: Value,
 ) -> HarvestResult<bool> {
-    settle(conn, id, &PromiseSettlement::resolved(value)).await
+    resolve_with_codecs(conn, id, value, &crate::store::DEFAULT_PAYLOAD_CODECS).await
+}
+
+/// [`resolve`], encoding the stored settlement with `codecs` (issue #1979).
+///
+/// # Errors
+///
+/// Same as [`resolve`], plus a codec error when the settlement cannot be
+/// encoded.
+#[cfg(feature = "db")]
+pub async fn resolve_with_codecs(
+    conn: &mut diesel_async::AsyncPgConnection,
+    id: &PromiseId,
+    value: Value,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<bool> {
+    settle(conn, id, &PromiseSettlement::resolved(value), codecs).await
 }
 
 /// Rejects a promise with `error`.
 ///
 /// Returns `Ok(true)` for the first settlement and `Ok(false)` when the
 /// promise already has one.
+///
+/// This form takes no codec registry, so it stores the settlement in clear.
+/// Use [`reject_with_codecs`] to honour column encoding (issue #1979).
 ///
 /// # Errors
 ///
@@ -437,7 +459,22 @@ pub async fn reject(
     id: &PromiseId,
     error: impl Into<String>,
 ) -> HarvestResult<bool> {
-    settle(conn, id, &PromiseSettlement::rejected(error)).await
+    reject_with_codecs(conn, id, error, &crate::store::DEFAULT_PAYLOAD_CODECS).await
+}
+
+/// [`reject`], encoding the stored settlement with `codecs` (issue #1979).
+///
+/// # Errors
+///
+/// Same as [`resolve_with_codecs`].
+#[cfg(feature = "db")]
+pub async fn reject_with_codecs(
+    conn: &mut diesel_async::AsyncPgConnection,
+    id: &PromiseId,
+    error: impl Into<String>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<bool> {
+    settle(conn, id, &PromiseSettlement::rejected(error), codecs).await
 }
 
 #[cfg(feature = "db")]
@@ -445,13 +482,15 @@ async fn settle(
     conn: &mut diesel_async::AsyncPgConnection,
     id: &PromiseId,
     settlement: &PromiseSettlement,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<bool> {
-    crate::signal::send_signal_idempotent(
+    crate::signal::send_signal_idempotent_with_codecs(
         conn,
         id.execution_id(),
         &id.signal_name(),
         settlement.to_value(),
         Some(&id.idempotency_key()),
+        codecs,
     )
     .await
 }

@@ -60,6 +60,10 @@ let first = durable_promise::resolve(&mut conn, &id, serde_json::json!("ops")).a
 durable_promise::reject(&mut conn, &id, "budget exceeded").await?;
 ```
 
+`resolve` and `reject` store the settlement in clear. With column encoding
+on (issue #1979), call `resolve_with_codecs` or `reject_with_codecs` with
+the deployment's codec registry.
+
 **From another workflow:** `ctx.resolve_promise(&id, value)` or
 `ctx.reject_promise(&id, error)`.
 
