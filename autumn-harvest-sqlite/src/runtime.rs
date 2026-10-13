@@ -1950,6 +1950,10 @@ impl SqliteRuntime {
         failure_now: &(dyn Fn() -> i64 + Send + Sync),
     ) -> SqliteResult<RunState> {
         let result = self.drive_one_cycle_inner(exec, now, failure_now).await;
+        // A cycle can seal other runs, such as a cancel target or a detached
+        // child (issue #2026). No drive reaches a sealed run again, so forget
+        // its strikes here.
+        self.forget_sealed_strikes()?;
         if let Err(SqliteError::Unsupported(message)) = &result
             && let Err(seal_error) = self.seal_unsupported(exec, message, now, failure_now())
         {
@@ -1972,6 +1976,24 @@ impl SqliteRuntime {
             return self.seal_cancelled(exec, &reason, None, failure_now());
         }
         result
+    }
+
+    /// Drop the panic strikes of each run that is no longer `RUNNING` (issue
+    /// #2026). The map holds only runs with a recent panic, so it stays small.
+    fn forget_sealed_strikes(&mut self) -> SqliteResult<()> {
+        if self.workflow_panic_strikes.is_empty() {
+            return Ok(());
+        }
+        let mut sealed = Vec::new();
+        for exec in self.workflow_panic_strikes.keys() {
+            if composition::state_of(&self.conn, *exec)?.as_deref() != Some("RUNNING") {
+                sealed.push(*exec);
+            }
+        }
+        for exec in sealed {
+            self.workflow_panic_strikes.remove(&exec);
+        }
+        Ok(())
     }
 
     /// The history policy of a cycle (issue #2021). Under a pending cancel,
@@ -4724,6 +4746,52 @@ mod feature_gate_tests {
         assert!(
             matches!(err, super::SqliteError::WorkflowNotRunning { .. }),
             "got {err:?}"
+        );
+    }
+}
+
+/// The panic strike map forgets a run that another run seals (issue #2026).
+#[cfg(test)]
+// The `#[workflow]` macro references the input param through its expansion.
+#[allow(clippy::used_underscore_binding, clippy::unused_async)]
+mod panic_strike_tests {
+    use autumn_harvest::prelude::*;
+    use serde_json::json;
+
+    use super::{RunState, SqliteError, SqliteRuntime};
+
+    #[workflow]
+    async fn always_panics(_ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+        panic!("kaboom")
+    }
+
+    #[workflow]
+    async fn cancels_target(ctx: &WorkflowContext, target: ExecutionId) -> Result<(), String> {
+        ctx.request_cancel_external_workflow(target)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    #[tokio::test]
+    async fn a_run_cancelled_by_another_run_loses_its_strikes() {
+        let mut rt = SqliteRuntime::open_in_memory().unwrap();
+        rt.register_workflow(&always_panics_info());
+        rt.register_workflow(&cancels_target_info());
+        let target = rt.start_workflow("always_panics", json!(0)).unwrap();
+        let err = rt.run_until_blocked(target).await.unwrap_err();
+        assert!(
+            matches!(err, SqliteError::WorkflowPanicked { .. }),
+            "{err:?}"
+        );
+        assert_eq!(rt.workflow_panic_strikes.get(&target), Some(&1));
+
+        let canceller = rt.start_workflow("cancels_target", json!(target)).unwrap();
+        let state = rt.run_until_blocked(canceller).await.unwrap();
+
+        assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+        assert!(
+            rt.workflow_panic_strikes.is_empty(),
+            "the sealed run is forgotten"
         );
     }
 }
