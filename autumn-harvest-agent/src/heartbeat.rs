@@ -353,6 +353,32 @@ mod tests {
     }
 
     #[test]
+    fn a_tick_carries_the_flow_labels_of_earlier_ticks() {
+        assert_eq!(
+            HeartbeatTask::new().agent_task().flow_labels,
+            BTreeSet::new()
+        );
+        let carried = HeartbeatTask {
+            flow_labels: BTreeSet::from(["untrusted_input".to_owned()]),
+            ..HeartbeatTask::new()
+        };
+        assert_eq!(
+            carried.agent_task().flow_labels,
+            BTreeSet::from(["untrusted_input".to_owned()]),
+            "a tick starts with the labels of the earlier ticks"
+        );
+        let old = serde_json::json!({"prompt": "tick"});
+        let decoded: HeartbeatTask = serde_json::from_value(old).unwrap();
+        assert_eq!(decoded.flow_labels, BTreeSet::new());
+        assert!(
+            serde_json::to_value(&decoded)
+                .unwrap()
+                .get("flow_labels")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn a_tick_passes_its_tenant_to_the_run() {
         assert_eq!(HeartbeatTask::new().agent_task().tenant, None);
         let task = HeartbeatTask::new().tenant("acme").agent_task();
