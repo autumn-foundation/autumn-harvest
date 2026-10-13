@@ -42,8 +42,9 @@ pub struct JailerConfig {
     pub cgroup_root: PathBuf,
     /// More cgroup values, on top of the CPU, memory and pid limits.
     pub extra_cgroups: Vec<(String, String)>,
-    /// A network namespace to join. `None` keeps the namespace of the jailer.
-    /// The microVM has no network device either way. An empty namespace,
+    /// A network namespace to join. `None` keeps the namespace of the jailer,
+    /// and `verify_host` reports that as critical. The microVM has no network
+    /// device either way. An empty namespace,
     /// such as one from `ip netns add`, also cuts the network of an escaped
     /// VMM. Give the path under `/run/netns`. The launcher refuses a symbolic
     /// link in the path, and `/var/run` is one on most hosts.

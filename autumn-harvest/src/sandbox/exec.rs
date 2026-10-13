@@ -69,9 +69,6 @@ const USERNS_FAILED: i32 = libc::EUSERS;
 /// limit stops a runaway heap, and the microVM size bounds the memory in use.
 pub const DATA_HEADROOM_BYTES: u64 = 1 << 30;
 
-/// The highest descriptor that the close-on-exec fallback marks.
-const CLOEXEC_FALLBACK_MAX_FD: i32 = 4096;
-
 /// How the executor runs plans.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecOptions {
@@ -413,7 +410,7 @@ impl ChildSetup {
                 };
                 return Err(io::Error::from_raw_os_error(failed));
             }
-            mark_descriptors_cloexec();
+            mark_descriptors_cloexec()?;
             set_limit(libc::RLIMIT_CORE, 0, 0)?;
             set_limit(
                 libc::RLIMIT_CPU,
@@ -467,13 +464,18 @@ unsafe fn set_limit(resource: Resource, soft: libc::rlim_t, hard: libc::rlim_t) 
 
 /// Mark each descriptor above 2 close-on-exec.
 ///
-/// `close_range` with `CLOSE_RANGE_CLOEXEC` needs Linux 5.11. Older kernels
-/// get a loop of `fcntl` calls.
+/// `close_range` with `CLOSE_RANGE_CLOEXEC` needs Linux 5.11, and seccomp
+/// can block it. Then a walk of `/proc/self/fd` marks each open descriptor.
+///
+/// # Errors
+///
+/// Returns an error when neither step works. The spawn then fails, because
+/// the child could keep a host descriptor.
 ///
 /// # Safety
 ///
 /// Call it only between fork and exec.
-unsafe fn mark_descriptors_cloexec() {
+unsafe fn mark_descriptors_cloexec() -> io::Result<()> {
     // SAFETY: close_range only changes descriptor flags.
     let done = unsafe {
         libc::syscall(
@@ -483,17 +485,96 @@ unsafe fn mark_descriptors_cloexec() {
             libc::CLOSE_RANGE_CLOEXEC,
         )
     } == 0;
-    if !done {
-        for fd in 3..CLOEXEC_FALLBACK_MAX_FD {
-            // SAFETY: fcntl on a closed descriptor fails with EBADF only.
-            unsafe {
-                let flags = libc::fcntl(fd, libc::F_GETFD);
-                if flags >= 0 {
-                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+    if done {
+        return Ok(());
+    }
+    // SAFETY: the caller runs between fork and exec.
+    unsafe { mark_cloexec_from_proc() }
+}
+
+/// Mark each descriptor above 2 close-on-exec by walking `/proc/self/fd`.
+///
+/// It reads the directory with raw `getdents64` calls into a stack buffer,
+/// so it allocates nothing and is safe between fork and exec.
+///
+/// # Errors
+///
+/// Returns the error of `open` or `getdents64`, for example when `/proc` is
+/// not mounted. The caller then fails the spawn.
+///
+/// # Safety
+///
+/// Call it only between fork and exec.
+unsafe fn mark_cloexec_from_proc() -> io::Result<()> {
+    // The offsets of `d_reclen` and `d_name` in `struct linux_dirent64`.
+    const RECLEN_AT: usize = 16;
+    const NAME_AT: usize = 19;
+    // SAFETY: open reads a NUL-terminated path.
+    let dir = unsafe {
+        libc::open(
+            c"/proc/self/fd".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if dir < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut buf = [0u8; 4096];
+    let result = loop {
+        // SAFETY: getdents64 writes at most `buf.len()` bytes into `buf`.
+        let read = unsafe { libc::syscall(libc::SYS_getdents64, dir, buf.as_mut_ptr(), buf.len()) };
+        let Ok(read) = usize::try_from(read) else {
+            break Err(io::Error::last_os_error());
+        };
+        if read == 0 {
+            break Ok(());
+        }
+        let mut at = 0;
+        while at + NAME_AT < read {
+            let reclen = usize::from(u16::from_ne_bytes([
+                buf[at + RECLEN_AT],
+                buf[at + RECLEN_AT + 1],
+            ]));
+            if reclen == 0 {
+                break;
+            }
+            let name = &buf[at + NAME_AT..(at + reclen).min(read)];
+            if let Some(fd) = parse_fd(name)
+                && fd > 2
+                && fd != dir
+            {
+                // SAFETY: fcntl on a closed descriptor fails with EBADF only.
+                unsafe {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags >= 0 {
+                        libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                    }
                 }
             }
+            at += reclen;
         }
+    };
+    // SAFETY: `dir` is the descriptor that open returned above.
+    unsafe { libc::close(dir) };
+    result
+}
+
+/// The descriptor number in a NUL-terminated directory entry name, or
+/// `None` for `.`, `..` or any other name.
+fn parse_fd(name: &[u8]) -> Option<i32> {
+    let mut fd: i32 = 0;
+    let mut digits = 0;
+    for &byte in name {
+        if byte == 0 {
+            break;
+        }
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        fd = fd.checked_mul(10)?.checked_add(i32::from(byte - b'0'))?;
+        digits += 1;
     }
+    (digits > 0).then_some(fd)
 }
 
 /// A stream capture that a task fills and the executor reads.
@@ -938,6 +1019,56 @@ mod tests {
         assert!(!release_at_least("5.4.0-150-generic", (5, 14)));
         assert!(!release_at_least("4.18.0", (5, 14)));
         assert!(!release_at_least("garbage", (5, 14)));
+    }
+
+    #[test]
+    fn only_a_decimal_entry_name_is_a_descriptor() {
+        assert_eq!(parse_fd(b"12\0"), Some(12));
+        assert_eq!(parse_fd(b"7"), Some(7));
+        assert_eq!(parse_fd(b".\0"), None);
+        assert_eq!(parse_fd(b"..\0"), None);
+        assert_eq!(parse_fd(b"\0"), None);
+        assert_eq!(parse_fd(b"99999999999\0"), None, "over i32");
+    }
+
+    #[test]
+    fn the_descriptor_walk_marks_a_descriptor_above_the_old_cutoff() {
+        use std::os::unix::process::CommandExt as _;
+        const HIGH: i32 = 5000;
+        // A test needs room for a descriptor above 4096.
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit and setrlimit read and write a valid stack value.
+        unsafe {
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit), 0);
+            if limit.rlim_max <= libc::rlim_t::from(HIGH.unsigned_abs()) {
+                return;
+            }
+            if limit.rlim_cur <= libc::rlim_t::from(HIGH.unsigned_abs()) {
+                limit.rlim_cur = limit.rlim_max.min(8192);
+                assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit), 0);
+            }
+        }
+        let null = std::fs::File::open("/dev/null").unwrap();
+        // SAFETY: dup2 copies a valid descriptor, without close-on-exec.
+        assert_eq!(unsafe { libc::dup2(null.as_raw_fd(), HIGH) }, HIGH);
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "ls /proc/self/fd"]);
+        // SAFETY: the walk makes raw system calls only.
+        unsafe {
+            command.pre_exec(|| mark_cloexec_from_proc());
+        }
+        let out = command.output().unwrap();
+        // SAFETY: HIGH is the descriptor that dup2 made above.
+        unsafe { libc::close(HIGH) };
+        let listed = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{listed}");
+        assert!(
+            !listed.lines().any(|l| l == HIGH.to_string()),
+            "descriptor {HIGH} reached the child: {listed}"
+        );
     }
 
     #[test]

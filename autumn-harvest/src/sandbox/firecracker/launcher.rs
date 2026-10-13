@@ -331,6 +331,16 @@ impl FirecrackerLauncher {
         match &self.config.confinement {
             Confinement::Jailer(jailer) => {
                 findings.extend(super::posture::inspect_jail_base(&jailer.chroot_base));
+                if jailer.netns.is_none() {
+                    findings.push(super::posture::PostureFinding {
+                        check: "netns".into(),
+                        detail: "the jailer keeps Firecracker in the worker network namespace, \
+                                 so an escaped VMM has the host network; set JailerConfig::netns \
+                                 to an empty namespace"
+                            .into(),
+                        severity: super::posture::Severity::Critical,
+                    });
+                }
             }
             Confinement::Unjailed { .. } => findings.push(super::posture::PostureFinding {
                 check: "jailer".into(),
@@ -1555,6 +1565,40 @@ while True:
             .await
             .unwrap();
         assert_ne!(findings, []);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn verify_host_flags_a_jail_without_a_network_namespace() {
+        let dir = temp_dir();
+        let empty = dir.join("empty-root");
+        std::fs::create_dir_all(&empty).unwrap();
+        let netns_findings = |config: LauncherConfig| {
+            let launcher = FirecrackerLauncher::new(config).unwrap();
+            let root = empty.clone();
+            async move {
+                launcher
+                    .verify_host_at(&root, PosturePolicy::Report)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|f| f.check == "netns")
+                    .collect::<Vec<_>>()
+            }
+        };
+        // Without a namespace, an escaped VMM keeps the host network.
+        let found = netns_findings(jailed(&dir)).await;
+        assert!(
+            matches!(found.as_slice(), [f] if f.severity == super::super::posture::Severity::Critical),
+            "{found:?}"
+        );
+        let netns = dir.join("netns-vm");
+        std::fs::write(&netns, b"").unwrap();
+        let mut config = jailed(&dir);
+        if let Confinement::Jailer(jail) = &mut config.confinement {
+            jail.netns = Some(netns);
+        }
+        assert_eq!(netns_findings(config).await, []);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

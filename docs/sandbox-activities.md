@@ -125,7 +125,9 @@ The process executor gives each run:
 - no host environment;
 - a new session, and a kill of the whole process group at exit, timeout,
   cancel and drop;
-- close-on-exec on each inherited descriptor, and an empty signal mask;
+- close-on-exec on each inherited descriptor, and an empty signal mask. On a
+  kernel without `close_range`, a walk of `/proc/self/fd` marks them. When
+  neither works, the run fails closed;
 - `PR_SET_NO_NEW_PRIVS`;
 - rlimits for CPU time, data memory, file size, open files and core dumps.
   The data rlimit is the memory limit plus 1 GiB, because V8 in Node 24
@@ -179,7 +181,8 @@ runtime refuses a policy that allows the network on a backend without one.
 
 Call `verify_host` before the first run. It checks the versions and the host.
 Under `PosturePolicy::Enforce`, the default, it refuses a critical finding.
-An unjailed launcher is a critical finding too. SMT and swap give warnings.
+An unjailed launcher is a critical finding too, and so is a jailer with no
+network namespace. SMT and swap give warnings.
 
 ### The guest image
 
@@ -210,13 +213,16 @@ use autumn_harvest::sandbox::firecracker::{
 };
 use autumn_harvest::sandbox::{SandboxPolicy, SandboxRuntime};
 
+let mut jail = JailerConfig::new("/usr/local/bin/jailer", 10_000, 10_000);
+// An empty namespace from `ip netns add harvest-sandbox`.
+jail.netns = Some("/run/netns/harvest-sandbox".into());
 let launcher = FirecrackerLauncher::new(LauncherConfig {
     firecracker_bin: "/usr/local/bin/firecracker".into(),
     image: GuestImage::new("/var/lib/harvest/image/vmlinux", "/var/lib/harvest/image/rootfs.ext4")
         .with_name("rootfs-sha256:..."),
     machine: MachineSpec { vcpu_count: 1, mem_size_mib: 512 },
     boot: BootMethod::ConfigFile,
-    confinement: Confinement::Jailer(JailerConfig::new("/usr/local/bin/jailer", 10_000, 10_000)),
+    confinement: Confinement::Jailer(jail),
     guest_port: 52,
     api_timeout: Duration::from_secs(5),
 })?;
