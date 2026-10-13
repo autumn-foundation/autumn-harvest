@@ -1995,6 +1995,44 @@ mod tests {
         assert!(nd.is_none(), "{nd:?}");
     }
 
+    /// An update inside a scope fails at once. Its terminal result stays
+    /// queued when the scope is cancelled, so the caller does not wait forever.
+    #[tokio::test]
+    async fn an_update_inside_a_scope_fails_and_keeps_its_result() {
+        let ctx = WorkflowContext::new_test();
+        let update_id = crate::types::UpdateId::new();
+        let seen = std::sync::Mutex::new(None);
+        let result = bounded(run_then_cancel(&ctx, async {
+            *seen.lock().expect("seen lock") = Some(
+                ctx.execute_admitted_update(update_id, "rename", json!(1))
+                    .await,
+            );
+            std::future::pending::<()>().await;
+        }))
+        .await;
+
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+        let answer = seen.lock().expect("seen lock").take().expect("ran");
+        assert!(
+            answer
+                .as_ref()
+                .is_err_and(|e| e.contains("cancellation scope")),
+            "{answer:?}"
+        );
+        let commands = ctx.drain_commands();
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::RecordUpdateResult { update_id: id, result: Err(_) }
+                    if *id == update_id
+            )),
+            "{commands:?}"
+        );
+    }
+
     /// Counts each serialization of a durable chunk.
     struct CountedChunk<'a>(&'a std::sync::atomic::AtomicU32);
 

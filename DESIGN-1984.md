@@ -137,7 +137,9 @@ cancel reason name it. No other worker path changes.
   durable mutex: a dropped acquire would block the key's waiter queue. A
   scope cannot signal, cancel or await an external workflow: a dropped body
   would strand the late result. A scope cannot create a session: a dropped
-  session is never released.
+  session is never released. A scope cannot run an admitted update either:
+  a dropped handler leaves the update without a terminal. The update fails
+  at once, and the cancel keeps its `RecordUpdateResult`.
 - A cancel that arrives when no shield is open is still terminal at once.
   A shield is open from the commit of the cycle that enters it. A cancel
   that commits first discards that cycle, the shield's work included.

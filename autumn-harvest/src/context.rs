@@ -14347,6 +14347,20 @@ impl WorkflowContext {
             }
         }
 
+        // Issue #1984: a scope cancel would drop a running handler, and the
+        // admitted update would wait forever. So the update fails at once.
+        // Its result survives the cancel, as `withdraw_scope_commands` keeps it.
+        if self.in_cancellable_scope() {
+            let result = Err(format!(
+                "update '{name}' cannot run inside a cancellation scope"
+            ));
+            self.push_command(WorkflowCommand::RecordUpdateResult {
+                update_id,
+                result: result.clone(),
+            });
+            return result;
+        }
+
         // Live path: invoke the registered handler.
         let handler_opt = {
             let registry = self
@@ -15018,6 +15032,7 @@ impl WorkflowContext {
     /// Remove the buffered commands that scope `seq` issued, and return them.
     ///
     /// `ReleaseMutex` stays, so a guard dropped in the body still releases.
+    /// `RecordUpdateResult` stays, so an admitted update gets its terminal.
     pub(crate) fn withdraw_scope_commands(&self, seq: u32) -> Vec<(u64, WorkflowCommand)> {
         let mut cmds = self.commands.lock().expect("commands lock poisoned");
         let (withdrawn, kept): (Vec<_>, Vec<_>) =
@@ -15025,7 +15040,11 @@ impl WorkflowContext {
                 .into_iter()
                 .partition(|buffered| {
                     buffered.scopes.contains(&seq)
-                        && !matches!(buffered.cmd, WorkflowCommand::ReleaseMutex { .. })
+                        && !matches!(
+                            buffered.cmd,
+                            WorkflowCommand::ReleaseMutex { .. }
+                                | WorkflowCommand::RecordUpdateResult { .. }
+                        )
                 });
         *cmds = kept;
         drop(cmds);
