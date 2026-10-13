@@ -6,8 +6,9 @@
 //! for development.
 //!
 //! Teardown kills the process, kills the cgroup with `cgroup.kill`, and
-//! removes the VM directory, in that order. The host never reads a pid from
-//! the jail, because the jailed VMM can write there.
+//! removes the VM directory, in that order. Without `cgroup.kill`, teardown
+//! freezes the cgroup and kills each process in it. The host never reads a
+//! pid from the jail, because the jailed VMM can write there.
 //!
 //! Each launcher holds an owner lease: a locked file next to its VM
 //! directories. [`FirecrackerLauncher::sweep_stale`] removes the VMs of each
@@ -36,6 +37,9 @@ pub const KILL_WAIT: Duration = Duration::from_secs(5);
 
 /// The time that teardown waits for a killed cgroup to empty.
 pub const CGROUP_EMPTY_WAIT: Duration = Duration::from_secs(2);
+
+/// The vsock wildcard port. A guest that binds it gets a free port.
+const VMADDR_PORT_ANY: u32 = u32::MAX;
 
 /// The bytes of VMM stderr that a launcher keeps for error reports.
 pub const STDERR_TAIL_BYTES: usize = 2048;
@@ -118,7 +122,8 @@ pub struct LauncherConfig {
     pub boot: BootMethod,
     /// Where to run.
     pub confinement: Confinement,
-    /// The vsock port of the guest agent.
+    /// The vsock port of the guest agent. It must not be `u32::MAX`, the
+    /// wildcard port.
     pub guest_port: u32,
     /// The time limit of the API socket and of each API call.
     pub api_timeout: Duration,
@@ -234,6 +239,12 @@ impl FirecrackerLauncher {
             )));
         }
         super::config::check_extra_boot_args(&config.image)?;
+        // The guest would listen on a port of its own choice.
+        if config.guest_port == VMADDR_PORT_ANY {
+            return Err(SandboxError::Config(
+                "the guest port u32::MAX is VMADDR_PORT_ANY, which no host can connect to".into(),
+            ));
+        }
         if matches!(config.boot, BootMethod::Api | BootMethod::Snapshot(_))
             && config.api_timeout.is_zero()
         {
@@ -1225,10 +1236,9 @@ impl Drop for RunningVm {
         // be cleaned without waiting. The next sweep removes the rest.
         let _ = self.child.start_kill();
         if let Some(cgroup) = &self.cgroup {
-            let _ = std::fs::write(cgroup.join("cgroup.kill"), b"1");
             // The kill is not instant, so this removal can fail. The next
             // `sweep_stale` then removes the cgroup.
-            let _ = std::fs::remove_dir(cgroup);
+            crate::sandbox::cgroup::kill_and_remove(cgroup, Duration::ZERO);
         }
         if let Some(task) = self.stderr_task.take() {
             task.abort();
@@ -1238,34 +1248,19 @@ impl Drop for RunningVm {
 }
 
 /// Kill every process in the cgroup at `dir`, wait for it to empty, and
-/// remove it.
+/// remove it. See [`crate::sandbox::cgroup::kill`] for a kernel without
+/// `cgroup.kill`.
 pub async fn kill_cgroup(dir: &Path) {
-    if std::fs::write(dir.join("cgroup.kill"), b"1").is_err() {
-        return;
-    }
-    let deadline = std::time::Instant::now() + CGROUP_EMPTY_WAIT;
-    while !cgroup_is_empty(dir) && std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    let _ = std::fs::remove_dir(dir);
-}
-
-/// Kill the cgroup at `dir` and try to remove it, without waiting.
-fn kill_cgroup_now(dir: &Path) {
-    if std::fs::write(dir.join("cgroup.kill"), b"1").is_ok() {
-        let deadline = std::time::Instant::now() + CGROUP_EMPTY_WAIT;
-        while !cgroup_is_empty(dir) && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let _ = std::fs::remove_dir(dir);
-    }
-}
-
-/// Whether `cgroup.events` reports no process left.
-fn cgroup_is_empty(dir: &Path) -> bool {
-    std::fs::read_to_string(dir.join("cgroup.events")).map_or(true, |events| {
-        events.lines().any(|line| line == "populated 0")
+    let dir = dir.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || {
+        crate::sandbox::cgroup::kill_and_remove(&dir, CGROUP_EMPTY_WAIT);
     })
+    .await;
+}
+
+/// Kill the cgroup at `dir`, wait for it to empty, and remove it.
+fn kill_cgroup_now(dir: &Path) {
+    crate::sandbox::cgroup::kill_and_remove(dir, CGROUP_EMPTY_WAIT);
 }
 
 #[cfg(test)]
@@ -1662,6 +1657,24 @@ while True:
     }
 
     #[tokio::test]
+    async fn a_cgroup_without_cgroup_kill_has_each_process_killed() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let cgroup = temp_dir();
+        // A directory makes the kill write fail, as on Linux before 5.14.
+        std::fs::create_dir(cgroup.join("cgroup.kill")).unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .unwrap();
+        std::fs::write(cgroup.join("cgroup.procs"), format!("{}\n", child.id())).unwrap();
+        let waiter = std::thread::spawn(move || child.wait().unwrap());
+        kill_cgroup(&cgroup).await;
+        let status = waiter.join().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+        std::fs::remove_dir_all(cgroup).unwrap();
+    }
+
+    #[tokio::test]
     async fn kill_cgroup_writes_the_kill_file() {
         let dir = temp_dir();
         let cgroup = dir.join("hsbx-x");
@@ -1997,6 +2010,20 @@ while True:
             "a copy must give the jail the access that a hard link gives"
         );
         assert_eq!(std::fs::read(&to).unwrap(), b"memory");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_wildcard_vsock_port_is_a_config_error() {
+        let dir = temp_dir();
+        let fc = script(&dir, "firecracker", "exit 0");
+        let mut config = unjailed(&dir, fc, BootMethod::ConfigFile);
+        config.guest_port = u32::MAX;
+        let err = new_launcher(config).expect_err("VMADDR_PORT_ANY");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("port")),
+            "{err:?}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

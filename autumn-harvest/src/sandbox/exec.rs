@@ -20,7 +20,12 @@
 //! - a dedicated uid and gid when the executor runs as root, or else a new
 //!   user namespace, so the process limit counts only this run.
 //!
-//! A process that calls `setsid` leaves the group, and the host executor
+//! With [`ExecOptions::cgroup_root`], each run also gets its own cgroup. It
+//! bounds the CPU time of the whole run, and the end of the run kills each
+//! process in it.
+//!
+//! Without a cgroup, a process that calls `setsid` leaves the group, and the
+//! host executor
 //! cannot kill it. On a root host, concurrent runs share the uid `nobody`
 //! unless `run_as` names another. Inside a microVM, neither matters: the
 //! microVM ends after one run.
@@ -62,6 +67,19 @@ const NETNS_FAILED: i32 = libc::ENETDOWN;
 /// namespace for a non-root run. No other setup step returns it.
 const USERNS_FAILED: i32 = libc::EUSERS;
 
+/// The errno that the child setup reports when it cannot join the run
+/// cgroup. No other setup step returns it.
+const CGROUP_FAILED: i32 = libc::EBADSLT;
+
+/// The time between two reads of the CPU time of a run cgroup.
+const CPU_POLL: Duration = Duration::from_millis(50);
+
+/// The time that the cleanup waits for a killed run cgroup to empty.
+const CGROUP_WAIT: Duration = Duration::from_secs(2);
+
+/// The time that a dropped run waits for its killed cgroup to empty.
+const CGROUP_DROP_WAIT: Duration = Duration::from_millis(200);
+
 /// The data rlimit on top of the memory limit.
 ///
 /// `RLIMIT_DATA` counts address space that a JIT runtime reserves but does
@@ -77,6 +95,11 @@ pub struct ExecOptions {
     /// The uid and gid of the code. `None` keeps the uid of the executor, or
     /// uses [`NOBODY`] when the executor runs as root.
     pub run_as: Option<(u32, u32)>,
+    /// A cgroup v2 directory that the executor can write. Each run gets its
+    /// own cgroup in it. Then `cpu_seconds` bounds all processes of the run
+    /// together, and the end of the run kills each of them. `None` gives
+    /// each process its own CPU limit. The guest agent always sets it.
+    pub cgroup_root: Option<PathBuf>,
 }
 
 impl Default for ExecOptions {
@@ -84,6 +107,7 @@ impl Default for ExecOptions {
         Self {
             scratch_root: std::env::temp_dir(),
             run_as: None,
+            cgroup_root: None,
         }
     }
 }
@@ -136,36 +160,24 @@ pub async fn execute_plan(
         return Err(SandboxError::Cancelled);
     }
     let run_as = effective_run_as(options)?;
+    let mut cgroup = options
+        .cgroup_root
+        .as_deref()
+        .map(RunCgroup::create)
+        .transpose()?;
     // The work directory belongs to the executor until the files are in
     // place. So no other process of the code uid can plant a link there.
     let work = WorkDir::create(&options.scratch_root)?;
     write_files(work.path(), plan, run_as)?;
     work.hand_over(run_as)?;
 
-    let setup = ChildSetup::new(plan, run_as);
-    let mut command = tokio::process::Command::new(&plan.argv[0]);
-    command
-        .args(&plan.argv[1..])
-        .env_clear()
-        .env("PATH", &plan.path_env)
-        .env("HOME", work.path())
-        .env("TMPDIR", work.path())
-        .env("PWD", work.path())
-        .env("LANG", "C.UTF-8")
-        .envs(&plan.env)
-        .current_dir(work.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    // SAFETY: `ChildSetup::apply` runs between fork and exec. It makes only
-    // async-signal-safe system calls on values computed before the fork,
-    // and it allocates nothing.
-    unsafe {
-        command.pre_exec(move || setup.apply());
-    }
+    let setup = ChildSetup::new(
+        plan,
+        run_as,
+        cgroup.as_ref().map(|cgroup| cgroup.procs.as_raw_fd()),
+    );
     let started = Instant::now();
-    let mut child = command
+    let mut child = command(plan, work.path(), setup)
         .spawn()
         .map_err(|e| spawn_error(&plan.argv[0], &e))?;
     let group = child.id().and_then(|pid| i32::try_from(pid).ok());
@@ -184,36 +196,32 @@ pub async fn execute_plan(
     let stdout = spawn_capture(child.stdout.take(), cap);
     let stderr = spawn_capture(child.stderr.take(), cap);
 
+    let cpu_budget = Duration::from_secs(plan.limits.cpu_seconds);
     let end = tokio::select! {
         status = child.wait() => End::Exited(status),
         () = tokio::time::sleep(plan.limits.wall_clock()) => End::TimedOut,
         () = cancel.cancelled() => End::Cancelled,
+        () = cpu_spent(cgroup.as_ref(), cpu_budget) => End::CpuSpent,
     };
     // Kill the group in every case: background processes must not outlive
-    // the run, hold the pipes, or keep using the CPU.
+    // the run, hold the pipes, or keep using the CPU. The cgroup also holds
+    // each process that left the group.
     if let Some(group) = guard.0.take() {
         kill_group(group);
+    }
+    if let Some(cgroup) = &cgroup {
+        cgroup.kill();
     }
     if !matches!(end, End::Exited(_)) {
         let _ = child.wait().await;
     }
     let duration = started.elapsed();
     let (stdout, stderr) = tokio::join!(stdout.finish(), stderr.finish());
+    if let Some(cgroup) = cgroup.take() {
+        cgroup.remove().await;
+    }
 
-    let status = match end {
-        End::Cancelled => return Err(SandboxError::Cancelled),
-        End::TimedOut => RunStatus::TimedOut,
-        End::Exited(Err(e)) => {
-            return Err(SandboxError::Unavailable(format!(
-                "could not wait for the child: {e}"
-            )));
-        }
-        End::Exited(Ok(status)) => match (status.code(), status.signal()) {
-            (Some(code), _) => RunStatus::Exited { code },
-            (None, Some(signal)) => RunStatus::Signaled { signal },
-            (None, None) => RunStatus::Signaled { signal: 0 },
-        },
-    };
+    let status = run_status(end)?;
 
     let (outputs, skipped_outputs) = {
         let root = work.handle.try_clone().map_err(|e| {
@@ -247,6 +255,149 @@ enum End {
     Exited(io::Result<std::process::ExitStatus>),
     TimedOut,
     Cancelled,
+    CpuSpent,
+}
+
+/// The command that runs `plan` in `work` with `setup`.
+fn command(plan: &ExecPlan, work: &Path, setup: ChildSetup) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(&plan.argv[0]);
+    command
+        .args(&plan.argv[1..])
+        .env_clear()
+        .env("PATH", &plan.path_env)
+        .env("HOME", work)
+        .env("TMPDIR", work)
+        .env("PWD", work)
+        .env("LANG", "C.UTF-8")
+        .envs(&plan.env)
+        .current_dir(work)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    // SAFETY: `ChildSetup::apply` runs between fork and exec. It makes only
+    // async-signal-safe system calls on values computed before the fork,
+    // and it allocates nothing.
+    unsafe {
+        command.pre_exec(move || setup.apply());
+    }
+    command
+}
+
+/// The status of a run that ended with `end`.
+fn run_status(end: End) -> Result<RunStatus, SandboxError> {
+    Ok(match end {
+        End::Cancelled => return Err(SandboxError::Cancelled),
+        End::TimedOut => RunStatus::TimedOut,
+        // The run as a whole used its CPU time, as `RLIMIT_CPU` reports for
+        // one process.
+        End::CpuSpent => RunStatus::Signaled {
+            signal: libc::SIGXCPU,
+        },
+        End::Exited(Err(e)) => {
+            return Err(SandboxError::Unavailable(format!(
+                "could not wait for the child: {e}"
+            )));
+        }
+        End::Exited(Ok(status)) => match (status.code(), status.signal()) {
+            (Some(code), _) => RunStatus::Exited { code },
+            (None, Some(signal)) => RunStatus::Signaled { signal },
+            (None, None) => RunStatus::Signaled { signal: 0 },
+        },
+    })
+}
+
+/// Wait until the processes in `cgroup` have used `budget` of CPU time. Without
+/// a cgroup, wait forever.
+async fn cpu_spent(cgroup: Option<&RunCgroup>, budget: Duration) {
+    let Some(cgroup) = cgroup else {
+        return std::future::pending().await;
+    };
+    let budget = u64::try_from(budget.as_micros()).unwrap_or(u64::MAX);
+    while cgroup.cpu_usec().is_none_or(|used| used < budget) {
+        tokio::time::sleep(CPU_POLL).await;
+    }
+}
+
+/// The cgroup of one run, in [`ExecOptions::cgroup_root`].
+struct RunCgroup {
+    dir: PathBuf,
+    /// `cgroup.procs`. The child writes `0` to it before it drops root.
+    procs: std::fs::File,
+    removed: bool,
+}
+
+impl RunCgroup {
+    fn create(root: &Path) -> Result<Self, SandboxError> {
+        let dir = root.join(format!("harvest-run-{}", uuid::Uuid::new_v4().simple()));
+        let opened = std::fs::create_dir(&dir).and_then(|()| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_CLOEXEC)
+                .open(dir.join("cgroup.procs"))
+        });
+        let procs = opened.map_err(|e| {
+            let _ = std::fs::remove_dir(&dir);
+            SandboxError::Unavailable(format!(
+                "could not create the run cgroup {}: {e}; the run fails closed",
+                dir.display()
+            ))
+        })?;
+        let cgroup = Self {
+            dir,
+            procs,
+            removed: false,
+        };
+        // A budget that the executor cannot read is no budget.
+        if cgroup.cpu_usec().is_none() {
+            return Err(SandboxError::Unavailable(format!(
+                "the run cgroup {} reports no CPU time; the run fails closed",
+                cgroup.dir.display()
+            )));
+        }
+        Ok(cgroup)
+    }
+
+    /// The CPU time of each process that ran in the cgroup, in microseconds.
+    fn cpu_usec(&self) -> Option<u64> {
+        usage_usec(&std::fs::read_to_string(self.dir.join("cpu.stat")).ok()?)
+    }
+
+    /// Kill each process in the cgroup, without waiting.
+    fn kill(&self) {
+        crate::sandbox::cgroup::kill(&self.dir, Duration::ZERO);
+    }
+
+    /// Kill each process in the cgroup, wait for it to empty, and remove it.
+    async fn remove(mut self) {
+        self.removed = true;
+        let dir = self.dir.clone();
+        let removed = tokio::task::spawn_blocking(move || {
+            crate::sandbox::cgroup::kill_and_remove(&dir, CGROUP_WAIT);
+            !dir.exists()
+        })
+        .await;
+        if !matches!(removed, Ok(true)) {
+            tracing::warn!(path = %self.dir.display(), "could not remove a sandbox run cgroup");
+        }
+    }
+}
+
+impl Drop for RunCgroup {
+    fn drop(&mut self) {
+        if !self.removed {
+            crate::sandbox::cgroup::kill_and_remove(&self.dir, CGROUP_DROP_WAIT);
+        }
+    }
+}
+
+/// The `usage_usec` value of a `cpu.stat` file.
+fn usage_usec(stat: &str) -> Option<u64> {
+    stat.lines()
+        .find_map(|line| line.strip_prefix("usage_usec "))?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// The uid and gid of the code: the option, or `nobody` for a root executor.
@@ -341,6 +492,9 @@ fn spawn_error(command: &str, err: &io::Error) -> SandboxError {
              namespace; the run fails closed"
                 .into(),
         ),
+        Some(CGROUP_FAILED) => SandboxError::Unavailable(
+            "the child could not join the run cgroup; the run fails closed".into(),
+        ),
         Some(USERNS_FAILED) => SandboxError::Unavailable(
             "a non-root executor needs a user namespace to bound the processes, and this host \
              does not allow one; the run fails closed"
@@ -369,6 +523,8 @@ fn kill_group(group: i32) {
 /// The values that the child setup needs, computed before the fork.
 #[derive(Debug, Clone, Copy)]
 struct ChildSetup {
+    /// `cgroup.procs` of the run cgroup, or -1.
+    cgroup_procs: libc::c_int,
     deny_network: bool,
     root: bool,
     run_as: Option<(u32, u32)>,
@@ -380,9 +536,10 @@ struct ChildSetup {
 }
 
 impl ChildSetup {
-    fn new(plan: &ExecPlan, run_as: Option<(u32, u32)>) -> Self {
+    fn new(plan: &ExecPlan, run_as: Option<(u32, u32)>, cgroup_procs: Option<i32>) -> Self {
         let limits = &plan.limits;
         Self {
+            cgroup_procs: cgroup_procs.unwrap_or(-1),
             deny_network: plan.network == NetworkPolicy::Deny,
             // SAFETY: geteuid has no preconditions.
             root: unsafe { libc::geteuid() } == 0,
@@ -400,6 +557,13 @@ impl ChildSetup {
         // SAFETY: each call below is an async-signal-safe system call on
         // plain values. The child has one thread here.
         unsafe {
+            // Join the run cgroup first, while the child has the rights of
+            // the executor. Each process of the code then starts in it.
+            if self.cgroup_procs >= 0
+                && libc::write(self.cgroup_procs, b"0".as_ptr().cast(), 1) != 1
+            {
+                return Err(io::Error::from_raw_os_error(CGROUP_FAILED));
+            }
             if libc::setsid() < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -1449,6 +1613,120 @@ mod tests {
         assert!(total <= 512 * 1024, "{total}");
         assert_eq!(out.outputs.len() + out.skipped_outputs.len(), 3);
         assert_ne!(out.skipped_outputs, []);
+    }
+
+    #[test]
+    fn the_run_cpu_time_comes_from_cpu_stat() {
+        let stat = "usage_usec 1500000\nuser_usec 1000000\nsystem_usec 500000\n";
+        assert_eq!(usage_usec(stat), Some(1_500_000));
+        assert_eq!(usage_usec("user_usec 1\n"), None);
+        assert_eq!(usage_usec("usage_usec x\n"), None);
+    }
+
+    #[tokio::test]
+    async fn a_cgroup_root_that_does_not_exist_fails_closed() {
+        let options = ExecOptions {
+            cgroup_root: Some(PathBuf::from("/nonexistent/harvest-cgroup")),
+            ..ExecOptions::default()
+        };
+        let err = execute_plan(&plan(&sh("echo ran")), &options, &CancellationToken::new())
+            .await
+            .expect_err("no run cgroup");
+        assert!(
+            matches!(err, SandboxError::Unavailable(ref m) if m.contains("cgroup")),
+            "{err:?}"
+        );
+    }
+
+    /// A new cgroup for a `root_` test, in the cgroup v2 mount.
+    fn test_cgroup_root() -> PathBuf {
+        let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap();
+        let mount = mounts
+            .lines()
+            .map(|line| line.split(' ').collect::<Vec<_>>())
+            .find(|fields| fields.get(2) == Some(&"cgroup2"))
+            .map(|fields| PathBuf::from(fields[1]))
+            .expect("a cgroup v2 mount");
+        let root = mount.join(format!("harvest-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&root).unwrap();
+        root
+    }
+
+    /// The child cgroups left in `root`.
+    fn child_cgroups(root: &Path) -> Vec<std::ffi::OsString> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().unwrap().is_dir())
+            .map(|entry| entry.file_name())
+            .collect()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs root; the Sandbox (KVM) workflow runs it with sudo"]
+    async fn root_a_forking_run_cannot_pass_its_cpu_budget() {
+        // SAFETY: geteuid has no preconditions.
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
+        let root = test_cgroup_root();
+        let options = ExecOptions {
+            cgroup_root: Some(root.clone()),
+            ..ExecOptions::default()
+        };
+        // Each subshell spins until its own CPU limit stops it.
+        let mut request = sh("for i in 1 2 3 4 5; do (while :; do :; done); done; echo survived")
+            .with_timeout_ms(30_000);
+        request.limits.cpu_seconds = Some(1);
+        let started = Instant::now();
+        let out = execute_plan(&plan(&request), &options, &CancellationToken::new())
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        let left = child_cgroups(&root);
+        std::fs::remove_dir(&root).unwrap();
+        assert_eq!(
+            out.status,
+            RunStatus::Signaled {
+                signal: libc::SIGXCPU
+            },
+            "{out:?}"
+        );
+        assert!(!out.stdout.contains("survived"), "{out:?}");
+        assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
+        assert!(left.is_empty(), "the run left {left:?}");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs root; the Sandbox (KVM) workflow runs it with sudo"]
+    async fn root_the_run_cgroup_kills_a_process_that_left_the_group() {
+        // SAFETY: geteuid has no preconditions.
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
+        let root = test_cgroup_root();
+        let options = ExecOptions {
+            cgroup_root: Some(root.clone()),
+            ..ExecOptions::default()
+        };
+        let out = execute_plan(
+            &plan(&sh(
+                "setsid sh -c 'echo $$ > pid; exec sleep 30' </dev/null >/dev/null 2>&1 & \
+                 while [ ! -s pid ]; do sleep 0.01; done; cat pid",
+            )),
+            &options,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        let pid = out.stdout.trim();
+        let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(") ")
+                    .and_then(|(_, rest)| rest.chars().next())
+            });
+        assert!(
+            matches!(state, None | Some('Z' | 'X')),
+            "process {pid} is still alive: {state:?}"
+        );
     }
 
     #[tokio::test]

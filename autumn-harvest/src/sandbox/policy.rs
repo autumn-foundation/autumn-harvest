@@ -55,7 +55,9 @@ pub enum NetworkPolicy {
 pub struct SandboxLimits {
     /// Wall-clock time of the run, in milliseconds.
     pub wall_clock_ms: u64,
-    /// CPU time of the run, in seconds.
+    /// CPU time of the run, in seconds. In a microVM, all processes of the
+    /// run share it. The process backend shares it only with a cgroup root.
+    /// Without one, each process gets this limit.
     pub cpu_seconds: u64,
     /// Memory of the code, in bytes.
     pub memory_bytes: u64,

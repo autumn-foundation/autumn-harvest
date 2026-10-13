@@ -35,6 +35,8 @@
 
 pub mod activity;
 pub mod capture;
+#[cfg(target_os = "linux")]
+pub mod cgroup;
 pub mod error;
 #[cfg(target_os = "linux")]
 pub mod exec;

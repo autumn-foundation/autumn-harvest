@@ -26,8 +26,11 @@ struct RandPoolInfo {
     buf: [u8; 32],
 }
 
-/// Mount `/proc`, `/sys`, `/dev` and `/tmp`. A mount that already exists is
-/// not an error.
+/// The cgroup v2 mount. Each run gets its own cgroup in it.
+pub const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// Mount `/proc`, `/sys`, the cgroup v2 file system, `/dev` and `/tmp`. A
+/// mount that already exists is not an error.
 ///
 /// # Errors
 ///
@@ -36,6 +39,7 @@ pub fn mount_basics() -> io::Result<()> {
     let hardened = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
     mount("proc", "/proc", "proc", hardened, "")?;
     mount("sysfs", "/sys", "sysfs", hardened, "")?;
+    mount("cgroup2", CGROUP_ROOT, "cgroup2", hardened, "")?;
     mount("devtmpfs", "/dev", "devtmpfs", libc::MS_NOSUID, "mode=0755")?;
     mount(
         "tmpfs",

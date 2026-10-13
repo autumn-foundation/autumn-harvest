@@ -131,7 +131,11 @@ The process executor gives each run:
 - `PR_SET_NO_NEW_PRIVS`;
 - rlimits for CPU time, data memory, file size, open files and core dumps.
   The data rlimit is the memory limit plus 1 GiB, because V8 in Node 24
-  reserves about 600 MiB of address space at start;
+  reserves about 600 MiB of address space at start. The CPU rlimit applies
+  to each process;
+- with `ExecOptions::cgroup_root`, a cgroup for each run. Then `cpu_seconds`
+  bounds all processes of the run together, and the end of the run kills
+  each process in the cgroup. The guest agent always sets it;
 - an empty network namespace when the policy denies the network. When the
   host cannot create one, the run fails closed with `SandboxUnavailable`;
 - a process limit. A root worker runs the code as a dedicated uid. A
@@ -145,8 +149,8 @@ The process backend has these limits. Inside a microVM, none of them
 matters, because the microVM ends after one run.
 
 - It has no seccomp filter, no mount namespace and no cgroup.
-- A process that calls `setsid` leaves the group, and the executor cannot
-  kill it.
+- Without `ExecOptions::cgroup_root`, a process that calls `setsid` leaves
+  the group, and the executor cannot kill it.
 - The code can write wherever its uid can write, such as `/tmp`. The
   executor removes only the work directory, also when the code moves it.
 - On a root host, concurrent runs share the uid `nobody`, unless `run_as`
@@ -206,11 +210,15 @@ default, plus the guest agent at `/sbin/harvest-guest-agent`. Set
 `BASE_IMAGE` for another image, and pin it by digest. Run the script as root,
 or install `fakeroot`, so root owns the image files.
 
-The guest agent is process 1. It mounts `/proc`, `/sys`, `/dev`, `/tmp` and a
-`/work` tmpfs. It listens on vsock port 52. Each run mixes 32 bytes of host
-entropy into the kernel pool and forces a reseed. Each run also sets the
-guest clock from the host clock. Then the agent runs the code as uid 1000 and
-reboots, and Firecracker exits.
+The guest agent is process 1. It mounts `/proc`, `/sys`, the cgroup v2 file
+system, `/dev`, `/tmp` and a `/work` tmpfs. It listens on vsock port 52. Each
+run mixes 32 bytes of host entropy into the kernel pool and forces a reseed.
+Each run also sets the guest clock from the host clock. Then the agent runs
+the code as uid 1000 and reboots, and Firecracker exits.
+
+Each run gets its own cgroup in the guest. So `cpu_seconds` bounds the CPU
+time of all processes of the run together. When the run passes it, the agent
+kills each process, and the outcome reports the signal `SIGXCPU`.
 
 ### Configuration
 

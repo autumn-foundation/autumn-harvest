@@ -235,6 +235,29 @@ async fn a_microvm_times_out_and_is_torn_down() {
 
 #[tokio::test]
 #[ignore = "needs /dev/kvm, Firecracker and a guest image"]
+async fn a_forking_run_cannot_pass_its_cpu_budget() {
+    let harness = Harness::new(unjailed(BootMethod::ConfigFile), 0).await;
+    // Each subshell spins until its own CPU limit stops it.
+    let mut request = SandboxRequest::new(
+        "sh",
+        "for i in 1 2 3 4 5; do (while :; do :; done); done; echo survived",
+    )
+    .with_timeout_ms(30_000);
+    request.limits.cpu_seconds = Some(1);
+    let outcome = harness.run(&request).await;
+    assert_eq!(
+        outcome.status,
+        RunStatus::Signaled {
+            signal: libc::SIGXCPU
+        },
+        "{outcome:?}"
+    );
+    assert!(!outcome.stdout.contains("survived"), "{outcome:?}");
+    harness.assert_clean().await;
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm, Firecracker and a guest image"]
 async fn a_cancelled_run_tears_the_microvm_down() {
     let harness = Harness::new(unjailed(BootMethod::ConfigFile), 0).await;
     let cancel = CancellationToken::new();
