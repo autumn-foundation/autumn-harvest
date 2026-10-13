@@ -772,9 +772,25 @@ impl<F: Future> Future for ScopeRun<'_, F> {
             // that completes in it. This includes a cancel by the body itself.
             // Replay sees the same flag, so both take one path.
             if let Poll::Ready(value) = polled {
-                if horizon.is_none() && !this.shared.lock().cancel_requested {
+                if !this.shared.lock().cancel_requested {
+                    if horizon.is_none() {
+                        this.finish();
+                        return Poll::Ready(Ok(value));
+                    }
+                    // A body that completes without a cancel records no
+                    // marker. So a replayed body that does so has lost the
+                    // recorded cancel, and the scope would wait forever.
+                    this.body = None;
+                    let seq = this.shared.seq;
+                    let err = ctx.scope_nd_error(
+                        format!(
+                            "cancellation scope {seq}: the recorded run cancelled the \
+                             scope, but the replayed body completed without a cancel"
+                        ),
+                        cancel_marker_name(seq),
+                    );
                     this.finish();
-                    return Poll::Ready(Ok(value));
+                    return Poll::Ready(Err(err));
                 }
                 // The cancel came first, live or on replay.
                 this.body = None;
@@ -1717,6 +1733,28 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(replay.take_nd_details().is_none());
         assert!(!replay.history_has_unconsumed_events());
+    }
+
+    /// A replayed body that completes without the recorded cancel is drift.
+    /// The scope does not wait forever.
+    #[tokio::test]
+    async fn a_replay_that_drops_the_cancel_call_is_drift() {
+        let live = WorkflowContext::new_test();
+        let result = bounded(run_then_cancel(&live, std::future::pending::<()>())).await;
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+        let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+        let replay = replay_of(details);
+        let scope = replay.cancellation_scope();
+        let result = bounded(scope.run(async { 7 })).await;
+
+        assert!(
+            matches!(result, Err(HarvestError::NonDeterministic { .. })),
+            "{result:?}"
+        );
     }
 
     /// A nested cancel that the outer cancel withdrew stays in the capture.
