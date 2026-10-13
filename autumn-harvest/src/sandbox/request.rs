@@ -16,6 +16,9 @@ use super::policy::{NetworkPolicy, RuntimeSpec, SandboxLimits, SandboxPolicy};
 /// The most bytes in one path of a file or of an output.
 pub const MAX_PATH_BYTES: usize = 512;
 
+/// The longest component of a path, in bytes: the Linux `NAME_MAX`.
+pub const MAX_NAME_BYTES: usize = 255;
+
 /// The most components in one path.
 pub const MAX_PATH_DEPTH: usize = 16;
 
@@ -295,6 +298,11 @@ pub fn validate_relative_path(path: &str) -> Result<(), SandboxError> {
         match component {
             "" => return deny("has an empty component"),
             "." | ".." => return deny("has a '.' or '..' component"),
+            name if name.len() > MAX_NAME_BYTES => {
+                return deny(&format!(
+                    "has a component longer than {MAX_NAME_BYTES} bytes"
+                ));
+            }
             _ => {}
         }
     }
@@ -625,6 +633,16 @@ mod tests {
         assert_eq!(plan.limits.cpu_seconds, 2);
         assert_eq!(plan.limits.max_output_bytes, 10);
         assert_eq!(plan.limits.max_processes, DEFAULT_LIMITS.max_processes);
+    }
+
+    #[test]
+    fn a_path_component_over_name_max_is_denied() {
+        assert!(validate_relative_path(&"a".repeat(255)).is_ok());
+        assert!(validate_relative_path(&format!("d/{}", "a".repeat(256))).is_err());
+        let mut policy = SandboxPolicy::default();
+        let spec = policy.runtimes.get_mut("sh").unwrap();
+        spec.file_name = "b".repeat(256);
+        assert!(matches!(policy.validate(), Err(SandboxError::Config(_))));
     }
 
     #[test]

@@ -361,10 +361,27 @@ impl SandboxPolicy {
             .saturating_add(count(self.sizes.max_args))
             .saturating_add(count(self.sizes.max_env))
             .saturating_mul(ITEM_JSON_BYTES);
+        // The plan also holds the command of the largest runtime and the
+        // `PATH` value, escaped.
+        let runtime = self
+            .runtimes
+            .values()
+            .map(|spec| {
+                spec.argv
+                    .iter()
+                    .map(|arg| count(arg.len()).saturating_add(ITEM_JSON_BYTES))
+                    .fold(count(spec.file_name.len()), u64::saturating_add)
+            })
+            .max()
+            .unwrap_or(0);
+        let host = runtime
+            .saturating_add(count(self.path_env.len()))
+            .saturating_mul(6);
         input
             .saturating_add(args.saturating_add(env).saturating_mul(6))
             .saturating_add(paths)
             .saturating_add(items)
+            .saturating_add(host)
             .saturating_add(OUTCOME_ENVELOPE_BYTES)
     }
 }
@@ -530,6 +547,22 @@ mod tests {
         let streams = 2 * 6 * policy.max_limits.max_output_bytes;
         let files = policy.sizes.max_output_files_total_bytes.div_ceil(3) * 4;
         assert!(policy.max_outcome_json_bytes() >= streams + files);
+    }
+
+    #[test]
+    fn a_runtime_too_large_for_a_frame_is_a_config_error() {
+        let policy = SandboxPolicy::default().with_runtime(
+            "big",
+            RuntimeSpec {
+                argv: vec!["sh".into(), "x".repeat(12 * 1024 * 1024)],
+                file_name: "main.sh".into(),
+            },
+        );
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("frame")),
+            "{:?}",
+            policy.validate()
+        );
     }
 
     #[test]

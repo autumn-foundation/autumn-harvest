@@ -233,10 +233,13 @@ impl SandboxOutcome {
         let per_file = usize::try_from(plan.max_output_file_bytes).unwrap_or(usize::MAX);
         let total_cap = usize::try_from(plan.max_output_files_total_bytes).unwrap_or(usize::MAX);
         let mut total = 0usize;
-        // Each requested output must appear once: returned or skipped.
+        // Each requested output must appear once: returned or skipped. A set
+        // keeps the check fast for a plan with many outputs.
+        let requested: std::collections::BTreeSet<&str> =
+            plan.outputs.iter().map(String::as_str).collect();
         let mut seen = std::collections::BTreeSet::new();
         for output in &self.outputs {
-            if !plan.outputs.contains(&output.path) {
+            if !requested.contains(output.path.as_str()) {
                 return violation(format!("output {} was not asked for", shown(&output.path)));
             }
             if !seen.insert(output.path.as_str()) {
@@ -257,7 +260,7 @@ impl SandboxOutcome {
             ));
         }
         for skipped in &self.skipped_outputs {
-            if !plan.outputs.contains(&skipped.path) {
+            if !requested.contains(skipped.path.as_str()) {
                 return violation(format!(
                     "skipped output {} was not asked for",
                     shown(&skipped.path)

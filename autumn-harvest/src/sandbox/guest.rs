@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::capture::TRUNCATION_MARKER;
 use super::error::SandboxError;
-use super::outcome::{SandboxOutcome, shown};
+use super::outcome::{MAX_SKIP_REASON_BYTES, SandboxOutcome, shown};
 use super::protocol::{
     FrameError, GuestErrorKind, GuestErrorMessage, GuestMessage, HostMessage,
     MAX_CONTROL_FRAME_BYTES, MAX_FRAME_BYTES, OutcomeMessage, PROTOCOL_VERSION, RunMessage,
@@ -89,11 +89,40 @@ pub fn max_outcome_frame_bytes(plan: &ExecPlan) -> usize {
         .unwrap_or(usize::MAX)
         .div_ceil(3)
         .saturating_mul(4);
+    // Each requested output appears once, with its escaped path, an
+    // escaped skip reason and its JSON structure.
+    let outputs = plan
+        .outputs
+        .iter()
+        .map(|path| {
+            path.len()
+                .saturating_add(MAX_SKIP_REASON_BYTES)
+                .saturating_mul(6)
+                .saturating_add(OUTPUT_ITEM_BYTES)
+        })
+        .fold(0usize, usize::saturating_add);
     stream
         .saturating_mul(2)
         .saturating_add(files)
+        .saturating_add(outputs)
         .saturating_add(FRAME_OVERHEAD_BYTES)
         .min(MAX_FRAME_BYTES)
+}
+
+/// Room for the JSON structure of one output entry.
+const OUTPUT_ITEM_BYTES: usize = 64;
+
+/// Map a failed write of a run frame to a sandbox error.
+///
+/// A run over the frame cap fails the same way on each attempt, so it is a
+/// denial. Any other write failure is a fault of the connection.
+fn run_write_error(err: &FrameError) -> SandboxError {
+    match err {
+        FrameError::TooLarge { declared, max } => SandboxError::Denied(format!(
+            "the run takes {declared} bytes, over the {max}-byte guest frame; send smaller input"
+        )),
+        other => SandboxError::Unavailable(format!("could not send the run: {other}")),
+    }
 }
 
 /// Room for the envelope, the run id, the paths and the other fields.
@@ -277,7 +306,7 @@ where
     }));
     write_message(stream, run, MAX_FRAME_BYTES)
         .await
-        .map_err(|e| SandboxError::Unavailable(format!("could not send the run: {e}")))?;
+        .map_err(|e| run_write_error(&e))?;
     let reply: GuestMessage = read_message(stream, max_outcome_frame_bytes(&job.plan))
         .await
         .map_err(|e| match e {
@@ -699,5 +728,50 @@ mod tests {
         let size = serde_json::to_vec(&message).unwrap().len();
         assert!(max_outcome_frame_bytes(&plan) >= size, "{size}");
         assert!(max_outcome_frame_bytes(&plan) <= MAX_FRAME_BYTES);
+    }
+
+    #[test]
+    fn the_frame_bound_covers_many_skipped_outputs_with_long_paths() {
+        let mut sizes = crate::sandbox::policy::DEFAULT_SIZE_BOUNDS;
+        sizes.max_outputs = 200;
+        let mut tiny = crate::sandbox::policy::DEFAULT_LIMITS;
+        tiny.max_output_bytes = 1;
+        let policy = SandboxPolicy::default()
+            .with_sizes(sizes)
+            .with_limits(tiny, crate::sandbox::policy::MAX_LIMITS);
+        let mut request = SandboxRequest::new("sh", "");
+        let paths: Vec<String> = (0..200)
+            .map(|i| format!("{i:03}/{}/{}", "\u{1}".repeat(250), "p".repeat(250)))
+            .collect();
+        for path in &paths {
+            request = request.with_output(path.clone());
+        }
+        let plan = policy.plan(&request).unwrap();
+        let mut skipped = outcome(RunStatus::Exited { code: 0 });
+        for path in paths {
+            skipped
+                .skipped_outputs
+                .push(crate::sandbox::outcome::SkippedOutput {
+                    path,
+                    reason: "\u{1}".repeat(crate::sandbox::outcome::MAX_SKIP_REASON_BYTES),
+                });
+        }
+        let message = envelope(GuestMessage::Outcome(OutcomeMessage {
+            run_id: "r".repeat(64),
+            outcome: skipped,
+        }));
+        let size = serde_json::to_vec(&message).unwrap().len();
+        assert!(max_outcome_frame_bytes(&plan) >= size, "{size}");
+    }
+
+    #[test]
+    fn a_run_too_large_for_a_frame_is_a_denial_not_a_retry() {
+        let err = run_write_error(&FrameError::TooLarge {
+            declared: 1 << 30,
+            max: MAX_FRAME_BYTES,
+        });
+        assert!(matches!(err, SandboxError::Denied(_)), "{err:?}");
+        let err = run_write_error(&FrameError::Closed);
+        assert!(matches!(err, SandboxError::Unavailable(_)), "{err:?}");
     }
 }
