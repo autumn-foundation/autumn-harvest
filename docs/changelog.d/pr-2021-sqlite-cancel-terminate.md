@@ -11,7 +11,7 @@ the agent daemon, could not stop a stuck run.
   next drive replays the body with `ctx.cancellation_reason()` set, so the
   body can run cleanup activities.
 - A cancel always ends the run `CANCELLED`. The run ends when the body
-  returns `Ok` or `Err`. It also ends when the body blocks on a signal or a
+  returns `Ok` or `Err`, or continues as new. No successor starts. It also ends when the body blocks on a signal or a
   timer with no activity task left, because a parked await cannot see the
   request. It also ends when the cycle diverges or deadlocks: the driver
   discards that cycle.
@@ -65,6 +65,8 @@ covers:
 - a check before recorded steps and before a recorded timer;
 - a deadlock and a panic under a pending request;
 - a side effect of the returning cycle, and a second drive of a cancelled run;
+- a signal consumed after a request, and a cancel that wins over
+  `continue_as_new`;
 - idempotence, blank and padded reasons, an `Err` return and the fleet driver;
 - row cleanup, unknown and terminal targets, and each reuse policy over a
   cancelled prior;

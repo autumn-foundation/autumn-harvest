@@ -191,6 +191,8 @@ fn hang_info(
         max_result_bytes: None,
         requires: None,
         handler: hang,
+        input_schema: None,
+        output_schema: None,
     }
 }
 

@@ -1,14 +1,17 @@
-# Formal methods: TLA+ models and Kani proofs
+# Formal methods: TLA+ models, Kani proofs and Verus proofs
 
-Issue #1819 adds two tools:
+Issue #1819 adds two tools, and a third tool follows it:
 
 - **TLA+ and TLC** check the design of the core protocols. TLC explores every
   interleaving of a small, bounded model and checks safety invariants in each
   state.
 - **Kani** proves bounds on pure Rust kernels. It checks every input of the
   real function, not a sample.
+- **Verus** proves integer kernels with an SMT solver. It handles the
+  128-bit products and the mixer that CBMC cannot finish. See
+  [Run the Verus proofs](#run-the-verus-proofs).
 
-Neither tool replaces the Docker-backed integration tests. A model checks the
+No tool replaces the Docker-backed integration tests. A model checks the
 design. The integration tests check that the SQL implements it.
 [`simulation.md`](simulation.md) covers a seeded harness that checks the
 `ActivityClaim` invariants on an oracle. A differential test checks the
@@ -446,6 +449,13 @@ kani_proofs` beside the code that it proves.
 | `equal_jitter_stays_in_upper_half` | `policy.rs` | Equal jitter stays in `[base/2, base]`. |
 | `retry_delay_never_exceeds_max_interval` | `policy.rs` | `compute_retry_delay` does not panic. |
 | `seeded_action_respects_caps_and_never_holds` | `chaos.rs` | A seeded plan picks only an allowed action, and never `Hold`, for every stream. |
+| `execution_id_round_trips_every_encodable_shard` | `types.rs` | An id built for an encodable shard decodes to that shard, for every UUID. The other 14 bytes stay. |
+| `supersede_count_sheds_exactly_down_to_the_cap` | `concurrency.rs` | The shed count is the least that meets the limit, up to `usize::MAX`. |
+| `supersede_plan_sheds_only_candidates_and_meets_the_limit` | `concurrency.rs` | A latest-wins plan sheds at most the candidates and the scan limit. A full shed meets the limit. |
+| `apply_action_stays_in_band_and_reports_the_move` | `slot_tuner.rs` | A tuner step lands in the band, even a degenerate band, and its decision names the real move. |
+| `initial_target_lands_in_the_band` | `slot_tuner.rs` | The initial target is in the band, and a target in the band keeps its value. |
+| `slot_occupancy_partitions_the_target` | `slot_tuner.rs` | `in_use + available == target` for every semaphore reading. |
+| `counter_growth_is_one_byte_at_a_power_of_ten` | `entity.rs` | A counter grows by 1 byte exactly when `n + 1` gains a digit, else by 0. |
 
 ### Scope of each proof
 
@@ -473,11 +483,18 @@ A proof is only as wide as its inputs. These limits are deliberate:
   initial interval and `max_interval` are at most `u32::MAX` milliseconds.
   The final `min` makes the bound true by construction. The proof shows
   that no float conversion panics on the way.
-- **The `splitmix64` bijection is not proved.** CBMC did not finish in
-  5 minutes. The chaos proof holds for every stream instead, so it holds for
-  any mixer.
+- **The chaos proof does not use the mixer.** CBMC did not prove the
+  `splitmix64` bijection in 5 minutes. The chaos proof holds for every
+  stream instead, so it holds for any mixer. Verus proves the bijection.
+- **The supersede proof found an overflow.** `supersede_count` added 1 to
+  any `usize`, and `supersede_plan` added two counts. `supersede_count`
+  now subtracts `cap - 1` from the count, so it never adds 1.
+  `supersede_plan` saturates its sum. The proof covers every `usize`.
+- **The entity proof checks a table, not `ilog10`.** A harness that called
+  `ilog10` and `pow` did not finish in 10 minutes. A table of the powers
+  of 10 finishes in about 6 seconds.
 
-Two kernels that issue #1819 names have no Kani proof:
+Three kernels have no Kani proof. Issue #1819 names the first two:
 
 - **`lifecycle::TRANSITIONS`.** The domain is 10 × 10 state pairs, so a
   unit test is exhaustive and runs in microseconds. `lifecycle.rs` holds
@@ -485,6 +502,9 @@ Two kernels that issue #1819 names have no Kani proof:
 - **`failure_signature`.** Kani is slow on UTF-8 string code. A proof of
   `truncate_chars` on 3-byte inputs did not finish in 5 minutes. Unit tests,
   proptests and the `fuzz_failure_signature` target cover it.
+- **`FailureTolerance::max_failures`.** It divides any `usize` by 100.
+  CBMC did not finish that divide in 10 minutes. The fan-out unit tests
+  cover it.
 
 ### Add a Kani proof
 
@@ -502,6 +522,117 @@ Two kernels that issue #1819 names have no Kani proof:
    split the function.
 6. Add a row to the table above. The guard suite checks that this page
    names every proof.
+
+## Run the Verus proofs
+
+[Verus](https://github.com/verus-lang/verus) proves Rust code against a
+specification with the Z3 SMT solver. A Kani proof checks a bounded
+input space. A Verus proof covers every input by deduction. Verus fits the
+integer kernels that make CBMC time out: a 64-bit multiply, a 128-bit
+product, and a mixer that must be shown to be one to one.
+
+```bash
+scripts/check-verus-proofs.sh
+```
+
+The script downloads the pinned Verus release and checks its SHA-256. To
+use a local binary, set `VERUS=/path/to/verus`. The release names the Rust
+toolchain that it links against, and the script installs that toolchain
+with rustup. The proofs take about 2 seconds. The `verus` job in
+`.github/workflows/ci.yml` runs the script. It skips draft PRs and
+docs-only changes, like `lint`.
+
+The script fails when Verus reports an error, or when it verifies nothing.
+
+### Mirrors
+
+Verus cannot compile the engine crate, so each proof checks a copy of an
+engine function in `formal/verus/src/`. A `// mirror: <path> <fn>` line
+marks each copy. The guard suite
+`autumn-harvest/tests/integration/verus_proofs_coverage.rs` removes
+comments, whitespace and `proof { }` blocks from both bodies. The bodies
+must then be equal. A `proof { }` block is ghost code. Verus erases it, so
+it cannot change what the copy computes.
+
+The guard suite fails in these cases:
+
+- A mirrored body differs from its engine source.
+- The mirrored functions differ from the engine functions whose `///` doc
+  comment names a Verus file. A deleted `// mirror:` marker fails, and an
+  editor of a proved function finds its proof in the doc comment.
+- A Verus file uses `assume`, `admit`, `axiom`, `external_body` or another
+  way to skip a step. The guard lexes the file and bans every name that
+  holds `assume`, `admit`, `axiom`, `external` or `truncate`, so a comment,
+  a space or a `use` alias cannot hide one. `macro_rules` is banned too,
+  because a local macro can delete a proof before Verus sees it.
+- A Verus proof file holds anything but `use` items and one `verus! { }`
+  block. Verus checks only the code inside the block, so a mirror moved
+  out of it would prove nothing.
+- A Verus file uses an attribute other than `#[trigger]`. A
+  `#[verifier::...]` attribute can trust a step, and a `#[cfg(...)]` can
+  delete a proof, so a new attribute must be allowed in the guard on
+  purpose.
+- A Verus contract differs from its line in `formal/verus/contracts.txt`.
+  The list holds the signature and the `requires`, `ensures` and
+  `decreases` clauses of each function, and the whole of each `spec fn`.
+  A weaker `ensures` clause still verifies, so this guard makes it a
+  visible change to a second, generated file. A deleted lemma fails the
+  same way. Do not edit the list by hand. Rewrite it with
+  `UPDATE_VERUS_CONTRACTS=1 cargo test -p autumn-harvest --test integration verus_proofs_coverage::every_verus_contract_matches_the_stored_list`.
+- `formal/verus/src/lib.rs` does not declare a module, so Verus never
+  checks it.
+- A Verus file sits below `formal/verus/src`, or a proof file loads
+  another file with `mod <name>;` or `include!`. No guard would read that
+  file.
+- `ci.yml` does not run the script on every PR.
+- This page does not name a Verus file or a mirrored function.
+
+A change to a mirrored function therefore fails the no-DB suite until the
+copy matches. Port the change, then run the script.
+
+### The proofs
+
+| File | Mirrors | Property |
+|---|---|---|
+| `mixers.rs` | `mix64` in `policy.rs` and `dlq.rs`, `splitmix64` in `chaos.rs` | Each mixer is a bijection on `u64`. An explicit inverse undoes it. |
+| `jitter.rs` | `uniform_inclusive`, `full_jitter_nanos`, `equal_jitter_nanos` in `policy.rs` | The jitter stays in its range for every input, with the real mixer. |
+| `dlq_spread.rs` | `spread_offset_nanos` in `dlq.rs` | No step overflows. The jitter is exact and below one slot. Row `index` of `count` stays in its slot and in the window. |
+
+**The mixer inverse.** Each step of the `SplitMix64` finalizer has an
+inverse. A right xor-shift by `s` bits is undone by shifts of `s` and
+`2s` bits. Each odd multiplier has an inverse modulo 2^64. Bit-vector
+lemmas prove the shifts. Integer lemmas prove the multiplies. The Kani
+jitter proofs stub the mixer with any `u64`, and the bijection shows
+that the stub loses no case.
+
+**The jitter without a stub.** The Kani proofs of `uniform_inclusive`
+stub the mixer. The Verus proofs call the verified copy of `mix64`
+itself.
+
+**The redrive spread overflow.** The Verus proof found a defect in
+`dlq::redrive_spread_offset` (issue #1832). It computed the jitter as
+`(slot * mix64(seed)) >> 64` in `u128`. For a window over about 2^34
+seconds, the product passed `u128::MAX`. A debug build panicked. A
+release build wrapped, and the row could leave its slot. The callers cap
+the window at `MAX_REDRIVE_SPREAD_SECS`, so no production path reached
+it, but the function is public. `spread_offset_nanos` now splits `slot`
+at bit 64. The proof shows that the split gives the exact jitter, and
+that no step overflows. The unit test
+`spread_offset_does_not_overflow_for_a_long_window` pins the case.
+
+### Add a Verus proof
+
+1. Pick an integer kernel with no I/O. A Verus proof cannot cover a
+   `Duration`, a `String` or a float. Extract an integer kernel first, as
+   `spread_offset_nanos` does.
+2. Copy the function into a file in `formal/verus/src/`. Put a
+   `// mirror: <path> <fn>` line above it, and declare the module in
+   `lib.rs`.
+3. Write the property as an `ensures` clause. Put proof hints in
+   `proof { }` blocks, or in separate lemmas.
+4. Name the Verus file in a comment on the engine function.
+5. Run the script, then the guard suite.
+6. Add a row to the table above.
 
 ## Not modelled yet
 

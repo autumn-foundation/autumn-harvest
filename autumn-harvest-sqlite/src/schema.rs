@@ -28,14 +28,14 @@
 //!   core `HistoryMatcher::match_timer` scans for its own `TimerFired` but STOPS at
 //!   an unconsumed sibling `TimerFired`, so a reversed fire order would wedge replay
 //!   (issue #1069 P2).
-//! - `harvest_signals` — staged inbound signals awaiting a matching
-//!   `wait_for_signal`. Each row records the absolute epoch-millisecond the signal
-//!   arrived (`received_at`, issue #1069 P2 — millisecond precision so an on-time
-//!   signal cannot lose a deadline race near a second boundary), which the
-//!   wake-event ingest interleaves against a deadline timer's `fire_at` so a
-//!   signal delivered *after* an expired `wait_for_signal_timeout` deadline cannot
-//!   retroactively win the race (issue #476; mirrors the Postgres `merge_wake_events`
-//!   `received_at` vs `fires_at` ordering).
+//! - `harvest_signals` — staged inbound signals. The next drive appends each one
+//!   to history (issue #2020). Each row records the epoch-millisecond the signal
+//!   arrived (`received_at`, issue #1069 P2). Millisecond precision keeps an
+//!   on-time signal from losing a deadline race near a second boundary. The
+//!   ingest compares `received_at` with the `fire_at` of a deadline timer. So a
+//!   signal delivered after an expired `wait_for_signal_timeout` deadline cannot
+//!   win the race (issue #476). This mirrors the Postgres `merge_wake_events`
+//!   order of `received_at` and `fires_at`.
 //! - `harvest_activity_attempts` — a per-attempt audit log. **Retryable** activity
 //!   failures live here, not in `harvest_events`, mirroring the Postgres engine's
 //!   `requeue_for_retry` (which stores the attempt error on the task-queue row,
@@ -201,13 +201,16 @@ CREATE TABLE IF NOT EXISTS harvest_signals (
     received_at  INTEGER NOT NULL DEFAULT 0   -- absolute epoch-millisecond the signal arrived
 );
 
--- Without this, every exec_id/delivered-scoped query here (peek_pending_signal,
+-- Without this, every exec_id/delivered-scoped query here (the signal read,
 -- delete_undelivered_signals_for_execution) scans the whole table, unlike
 -- harvest_timers, whose (exec_id, timer_id) PRIMARY KEY already covers this.
--- `CREATE INDEX IF NOT EXISTS` is idempotent and applied on every open
--- (including a pre-existing file), needing no separate migration.
-CREATE INDEX IF NOT EXISTS idx_harvest_signals_exec_delivered
-    ON harvest_signals (exec_id, delivered);
+-- The trailing columns serve the arrival order of the signal read (issue
+-- #2020). Without them, the read sorts the whole backlog before its first row.
+-- It replaces the (exec_id, delivered) index of earlier files. Both statements
+-- are idempotent and run on every open, so no separate migration is needed.
+CREATE INDEX IF NOT EXISTS idx_harvest_signals_exec_arrival
+    ON harvest_signals (exec_id, delivered, received_at, signal_seq);
+DROP INDEX IF EXISTS idx_harvest_signals_exec_delivered;
 
 CREATE TABLE IF NOT EXISTS harvest_activity_attempts (
     attempt_seq INTEGER PRIMARY KEY AUTOINCREMENT,

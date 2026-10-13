@@ -439,6 +439,18 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     // (issue #1795). A missing grant does not stop enforcement: the worker
     // fails open and every replica runs every pass, as before the lease.
     ("harvest_scanner_leases", &["SELECT", "INSERT", "UPDATE"]),
+    // Every completion that recorded an LLM call inserts here, in the
+    // completion transaction (issue #1996). A missing grant rolls back the
+    // completion, and the activity runs and pays again. `GET /admin/usage`
+    // reads it, and a shard move deletes a discarded staged copy.
+    ("harvest_llm_ledger", &["SELECT", "INSERT", "DELETE"]),
+    // Every applying partition sweep reads the export marker, and an
+    // exporting sweep writes it (issue #2009). A missing grant fails every
+    // partition maintenance pass.
+    ("harvest_partition_export", &["SELECT", "INSERT"]),
+    // The drop of an exported partition inserts its record here, in the
+    // drop transaction (issue #2009).
+    ("harvest_partition_exports", &["SELECT", "INSERT"]),
     // Claim-path gate tables. The claim CTE reads all four unconditionally on
     // every poll, so a storage role missing `SELECT` on any one of them makes
     // `claim_task` error and the worker claim *nothing* -- a missing grant
@@ -2406,6 +2418,10 @@ mod tests {
         assert!(sql.contains("harvest_workers"));
         assert!(sql.contains("harvest_activity_pauses"));
         assert!(sql.contains("harvest_queue_pauses"));
+        assert!(
+            sql.contains("harvest_llm_ledger"),
+            "a completion that records an LLM call writes the ledger (issue #1996)"
+        );
         assert!(sql.contains("INSERT"));
         assert!(sql.contains("UPDATE"));
         assert!(sql.contains("DELETE"));
@@ -2436,6 +2452,22 @@ mod tests {
     /// a new gate table to the claim path *cannot* silently skip the probe:
     /// this test fails until the table is registered here (issue #807 review,
     /// Codex P1).
+    /// Every applying partition sweep reads the export marker, and an
+    /// exporting sweep writes it (issue #2009).
+    #[test]
+    fn the_partition_export_marker_is_covered_by_the_privilege_probe() {
+        let covered = HARVEST_WRITE_PRIVILEGE_REQUIREMENTS
+            .iter()
+            .find(|(name, _)| *name == "harvest_partition_export")
+            .map(|(_, privileges)| *privileges);
+        assert_eq!(covered, Some(&["SELECT", "INSERT"][..]));
+        let log = HARVEST_WRITE_PRIVILEGE_REQUIREMENTS
+            .iter()
+            .find(|(name, _)| *name == "harvest_partition_exports")
+            .map(|(_, privileges)| *privileges);
+        assert_eq!(log, Some(&["SELECT", "INSERT"][..]));
+    }
+
     #[test]
     fn every_table_the_claim_path_reads_is_covered_by_the_privilege_probe() {
         let sql = autumn_harvest::queue::claim_task_query();

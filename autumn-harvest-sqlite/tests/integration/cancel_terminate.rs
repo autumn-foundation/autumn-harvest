@@ -189,6 +189,19 @@ async fn panics_on_cancel(ctx: &WorkflowContext, n: i64) -> Result<Value, String
     ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
 }
 
+/// Runs `step`, waits for `go`, then continues as new.
+#[workflow]
+async fn continues(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
+    ctx.execute_activity_raw("step", json!(n), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+    ctx.continue_as_new(json!(n + 1))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(json!("unreachable"))
+}
+
 /// Counts the calls of each activity and records the cleanup input.
 #[derive(Default)]
 struct Calls {
@@ -222,6 +235,7 @@ fn register(rt: &mut SqliteRuntime, calls: &Arc<Calls>) {
     rt.register_workflow(&mints_on_cancel_info());
     rt.register_workflow(&hangs_on_cancel_info());
     rt.register_workflow(&panics_on_cancel_info());
+    rt.register_workflow(&continues_info());
     let c = Arc::clone(calls);
     rt.register_activity_raw(
         "step",
@@ -666,6 +680,50 @@ async fn a_body_that_completes_after_a_cancel_request_seals_cancelled() {
         "the request wins over a late completion, got {state:?}"
     );
     assert_eq!(cancelled_events(&rt, exec), 1);
+    let history = rt.load_history(exec).unwrap();
+    assert!(
+        matches!(
+            &history[history.len() - 2..],
+            [
+                WorkflowEvent::SignalReceived { signal_name, .. },
+                WorkflowEvent::WorkflowCancelled { .. }
+            ] if signal_name == "go"
+        ),
+        "the consumed signal stays in history before the seal: {history:?}"
+    );
+    let report = replay(history, "parks", parks_info().handler).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn a_cancel_wins_over_continue_as_new() {
+    let (_dir, path) = temp_db();
+    let (mut rt, _calls) = runtime(&path);
+    let exec = start_parked(&mut rt, "continues").await;
+
+    rt.cancel(exec, "stop").unwrap();
+    rt.send_signal(exec, "go", json!(1)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+
+    assert!(
+        matches!(&state, RunState::Cancelled(reason) if reason == "stop"),
+        "a cancelled run starts no successor, got {state:?}"
+    );
+    assert_eq!(rt.successor(exec).unwrap(), None);
+    assert!(
+        !rt.load_history(exec)
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowContinuedAsNew { .. })),
+        "the cancel event is the only terminal event"
+    );
+    rt.run_until_idle().await.unwrap();
+    assert!(
+        matches!(rt.outcome(exec).unwrap(), ExecutionOutcome::Terminated(s) if s == "CANCELLED")
+    );
 }
 
 #[tokio::test]
