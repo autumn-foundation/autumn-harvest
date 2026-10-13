@@ -12,8 +12,10 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-verus_release="0.2026.10.12.4bfc2b4"
-verus_sha256="af2aeac064df83fd8a6ea34cb98de75df3f477415e10bc177c9911853e057138"
+# Pin a weekly release. Verus deletes the assets of an older rolling
+# build, so a rolling pin returns 404 within days.
+verus_release="0.2026.10.04.426d8b0"
+verus_sha256="624018662868563a7bec0dd07be5e4dd0c3d61124b4b55105765884bf2d4d1a0"
 
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
@@ -22,7 +24,7 @@ verus="${VERUS:-}"
 if [ -z "${verus}" ]; then
   zip="${work}/verus.zip"
   curl -fsSL --retry 3 -o "${zip}" \
-    "https://github.com/verus-lang/verus/releases/download/release%2Frolling%2F${verus_release}/verus-${verus_release}-x86-linux.zip"
+    "https://github.com/verus-lang/verus/releases/download/release%2F${verus_release}/verus-${verus_release}-x86-linux.zip"
   echo "${verus_sha256}  ${zip}" | sha256sum --check --quiet
   unzip -q "${zip}" -d "${work}"
   rm -f "${zip}"
