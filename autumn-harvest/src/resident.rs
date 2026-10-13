@@ -1699,6 +1699,7 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_execution_id: None,
+            cancellation_reason: None,
         };
         let key = ResidentKey::new(one_activity_workflow, Some(&meta), &HashMap::new());
         let declined = resident.resume_with(&delta, Some(&key), Some(&meta)).await;
@@ -2515,6 +2516,7 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_execution_id: None,
+            cancellation_reason: None,
         };
         let key = ResidentKey::new(pair_then_c_workflow, Some(&meta), &HashMap::new());
         let declined = resident.resume_with(&delta, Some(&key), Some(&meta)).await;

@@ -59,9 +59,17 @@ CREATE TABLE IF NOT EXISTS harvest_executions (
                                            -- distinct per run (mirrors the Postgres worker,
                                            -- which injects StartWorkflowParams.workflow_id).
     input_json    TEXT NOT NULL,
-    state         TEXT NOT NULL,          -- RUNNING | COMPLETED | FAILED
+    state         TEXT NOT NULL,          -- RUNNING | COMPLETED | FAILED | CANCELLED |
+                                           -- TERMINATED | CONTINUED_AS_NEW
     output_json   TEXT,
-    error         TEXT
+    error         TEXT,
+    cancel_reason TEXT,                    -- a cooperative cancel request (issue #2021).
+                                           -- NULL until `cancel` stores a request. The
+                                           -- drive reads it only while the run is
+                                           -- RUNNING. A terminal run keeps the value.
+    cancel_from_seq INTEGER                -- the history length when `cancel` stored
+                                           -- the request (issue #2021). It bounds the
+                                           -- events that a cleanup can add.
 );
 
 -- Non-unique lookup index for the (workflow_name, workflow_id) reuse-policy probe
@@ -242,6 +250,9 @@ use crate::error::SqliteResult;
 ///   resolved-defaults flag). Both are nullable/defaulted, so a pre-#1068 row is
 ///   valid unchanged and is treated as "defaults not yet frozen" (its next claim
 ///   resolves and freezes them).
+/// - **issue #2021** — `harvest_executions.cancel_reason`, the stored cooperative
+///   cancel request, and `cancel_from_seq`, the history length at the request.
+///   Both are nullable, so an old row has no pending cancel.
 ///
 /// # Errors
 ///
@@ -260,6 +271,19 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
         "harvest_tasks",
         "defaults_frozen",
         "ALTER TABLE harvest_tasks ADD COLUMN defaults_frozen INTEGER NOT NULL DEFAULT 0",
+    )?;
+    // issue #2021: store a cooperative cancel request until the seal.
+    add_column_if_absent(
+        conn,
+        "harvest_executions",
+        "cancel_reason",
+        "ALTER TABLE harvest_executions ADD COLUMN cancel_reason TEXT",
+    )?;
+    add_column_if_absent(
+        conn,
+        "harvest_executions",
+        "cancel_from_seq",
+        "ALTER TABLE harvest_executions ADD COLUMN cancel_from_seq INTEGER",
     )?;
     Ok(())
 }
@@ -312,6 +336,13 @@ mod tests {
             seq INTEGER NOT NULL, max_attempts INTEGER, retry_policy_json TEXT, \
             start_to_close_ms INTEGER, scheduled_at INTEGER NOT NULL)";
 
+    // The pre-#2021 `harvest_executions` shape (no `cancel_reason`).
+    const OLD_HARVEST_EXECUTIONS_DDL: &str = "\
+        CREATE TABLE harvest_executions (\
+            exec_id TEXT PRIMARY KEY, workflow_name TEXT NOT NULL, \
+            workflow_id TEXT NOT NULL DEFAULT '', input_json TEXT NOT NULL, \
+            state TEXT NOT NULL, output_json TEXT, error TEXT)";
+
     // A fresh database already has the freeze columns from `SCHEMA`, so `migrate` is
     // a pure no-op (idempotent).
     #[test]
@@ -325,6 +356,38 @@ mod tests {
         migrate(&conn).unwrap();
         assert!(column_exists(&conn, "harvest_tasks", "schedule_to_close_at").unwrap());
         assert!(column_exists(&conn, "harvest_tasks", "defaults_frozen").unwrap());
+        assert!(column_exists(&conn, "harvest_executions", "cancel_reason").unwrap());
+        assert!(column_exists(&conn, "harvest_executions", "cancel_from_seq").unwrap());
+    }
+
+    // Issue #2021: an old `harvest_executions` gets `cancel_reason`. The old row
+    // keeps its data and has no pending cancel.
+    #[test]
+    fn migrate_adds_cancel_reason_to_an_old_executions_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(OLD_HARVEST_EXECUTIONS_DDL).unwrap();
+        conn.execute_batch(OLD_HARVEST_TASKS_DDL).unwrap();
+        conn.execute(
+            "INSERT INTO harvest_executions (exec_id, workflow_name, input_json, state) \
+             VALUES ('e1', 'wf', '{}', 'RUNNING')",
+            [],
+        )
+        .unwrap();
+        assert!(!column_exists(&conn, "harvest_executions", "cancel_reason").unwrap());
+
+        migrate(&conn).unwrap();
+
+        let (state, reason, from): (String, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT state, cancel_reason, cancel_from_seq FROM harvest_executions \
+                 WHERE exec_id = 'e1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "RUNNING");
+        assert_eq!(reason, None);
+        assert_eq!(from, None);
     }
 
     // An old-schema `harvest_tasks` (missing the freeze columns) is brought up to
@@ -332,6 +395,7 @@ mod tests {
     #[test]
     fn migrate_adds_freeze_columns_to_an_old_schema_table() {
         let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(OLD_HARVEST_EXECUTIONS_DDL).unwrap();
         conn.execute_batch(OLD_HARVEST_TASKS_DDL).unwrap();
         // Seed a pre-existing row to prove data survives the ALTER.
         conn.execute(

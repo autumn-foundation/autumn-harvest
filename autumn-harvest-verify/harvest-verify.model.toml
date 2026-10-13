@@ -1711,6 +1711,10 @@ path = "with_payload_offload_threshold"
 receiver = "WorkflowContext"
 reason = "context.rs:3702; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
 [[non_sink]]
+path = "with_pending_cancellation"
+receiver = "WorkflowContext"
+reason = "context.rs:4262; builder-style setter called by the executor or a backend before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
 path = "with_queue_name"
 receiver = "WorkflowContext"
 reason = "context.rs:3779; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
