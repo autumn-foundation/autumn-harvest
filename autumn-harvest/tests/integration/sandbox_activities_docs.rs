@@ -180,6 +180,20 @@ fn the_guide_names_the_enforced_firecracker_minimums() {
 }
 
 #[test]
+fn a_fakeroot_image_gets_root_owners_on_the_host_too() {
+    // A jailed launcher trusts only image files that root owns. Fakeroot
+    // gives root the files in the image, not the image files themselves.
+    let install = "sudo install -o root -g root -m 0644";
+    let guide = read(GUIDE);
+    let script = read("scripts/sandbox/build-guest-image.sh");
+    assert!(guide.contains(install), "{GUIDE} must show `{install}`");
+    assert!(
+        script.contains(install),
+        "build-guest-image.sh must print `{install}` after a non-root build"
+    );
+}
+
+#[test]
 fn the_guide_names_the_kernel_arguments_that_the_config_sets() {
     let guide = read(GUIDE);
     let config = read("autumn-harvest/src/sandbox/firecracker/config.rs");

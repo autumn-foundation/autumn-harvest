@@ -27,6 +27,10 @@
 # Needs: docker, mkfs.ext4 (e2fsprogs 1.43 or later), curl, root or
 # fakeroot, and for the agent build the rustup target
 # x86_64-unknown-linux-musl.
+#
+# Fakeroot gives root the files in the image, not the image files. A jailed
+# launcher trusts only image files that root owns. So after a non-root build,
+# root must install vmlinux and rootfs.ext4; the script prints the command.
 set -euo pipefail
 
 out="${1:?usage: build-guest-image.sh OUT_DIR}"
@@ -113,3 +117,8 @@ docker export "${container}" | "${as_root[@]}" sh -euc '
 # 4. The digests.
 (cd "${out}" && sha256sum vmlinux rootfs.ext4 > image.sha256)
 cat "${out}/image.sha256"
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "build-guest-image: a jailed launcher needs root to own the image files:" >&2
+  echo "  sudo install -o root -g root -m 0644 ${out}/vmlinux ${out}/rootfs.ext4 DIR" >&2
+fi

@@ -220,7 +220,15 @@ The script writes `vmlinux`, `rootfs.ext4` and `image.sha256`. The root file
 system is a container image, `python:3.12-alpine` with `bash` and `nodejs` by
 default, plus the guest agent at `/sbin/harvest-guest-agent`. Set
 `BASE_IMAGE` for another image, and pin it by digest. Run the script as root,
-or install `fakeroot`, so root owns the image files.
+or install `fakeroot`, so root owns the files in the image.
+
+A jailed launcher also needs root to own `vmlinux` and `rootfs.ext4` on the
+host. Fakeroot does not give them root. After a non-root build, install them
+as root:
+
+```sh
+sudo install -o root -g root -m 0644 image/vmlinux image/rootfs.ext4 /srv/harvest-image/
+```
 
 The guest agent is process 1. It mounts `/proc`, `/sys`, the cgroup v2 file
 system, `/dev`, `/tmp` and a `/work` tmpfs. It listens on vsock port 52. Each

@@ -71,8 +71,11 @@ const USERNS_FAILED: i32 = libc::EUSERS;
 /// cgroup. No other setup step returns it.
 const CGROUP_FAILED: i32 = libc::EBADSLT;
 
-/// The time between two reads of the CPU time of a run cgroup.
+/// The longest time between two reads of the CPU time of a run cgroup.
 const CPU_POLL: Duration = Duration::from_millis(50);
+
+/// The shortest time between two reads of the CPU time of a run cgroup.
+const MIN_CPU_POLL: Duration = Duration::from_millis(1);
 
 /// The time that the cleanup waits for a killed run cgroup to empty.
 pub const CGROUP_WAIT: Duration = Duration::from_secs(2);
@@ -307,6 +310,15 @@ fn run_status(end: End) -> Result<RunStatus, SandboxError> {
     })
 }
 
+/// The time to the next read of the CPU time of a run cgroup.
+///
+/// Each CPU can work for the run between two reads. So the wait is the
+/// budget left, shared by the CPUs. Near the budget the reads come faster,
+/// so a run passes its budget by at most [`MIN_CPU_POLL`] on each CPU.
+fn next_cpu_poll(left_usec: u64, cpus: u64) -> Duration {
+    Duration::from_micros(left_usec / cpus.max(1)).clamp(MIN_CPU_POLL, CPU_POLL)
+}
+
 /// Wait until the processes in `cgroup` have used `budget` of CPU time. Without
 /// a cgroup, wait forever.
 async fn cpu_spent(cgroup: Option<&RunCgroup>, budget: Duration) {
@@ -314,8 +326,14 @@ async fn cpu_spent(cgroup: Option<&RunCgroup>, budget: Duration) {
         return std::future::pending().await;
     };
     let budget = u64::try_from(budget.as_micros()).unwrap_or(u64::MAX);
-    while cgroup.cpu_usec().is_none_or(|used| used < budget) {
-        tokio::time::sleep(CPU_POLL).await;
+    let cpus = std::thread::available_parallelism()
+        .map_or(1, |n| u64::try_from(n.get()).unwrap_or(u64::MAX));
+    loop {
+        let used = cgroup.cpu_usec().unwrap_or(0);
+        if used >= budget {
+            return;
+        }
+        tokio::time::sleep(next_cpu_poll(budget - used, cpus)).await;
     }
 }
 
@@ -1756,6 +1774,15 @@ mod tests {
         assert!(total <= 512 * 1024, "{total}");
         assert_eq!(out.outputs.len() + out.skipped_outputs.len(), 3);
         assert_ne!(out.skipped_outputs, []);
+    }
+
+    #[test]
+    fn the_cpu_poll_shrinks_with_the_budget_left_and_the_cpus() {
+        // 32 CPUs can use 1 s in 31.25 ms.
+        assert_eq!(next_cpu_poll(1_000_000, 32), Duration::from_micros(31_250));
+        assert_eq!(next_cpu_poll(10_000_000, 1), CPU_POLL);
+        assert_eq!(next_cpu_poll(0, 4), MIN_CPU_POLL);
+        assert_eq!(next_cpu_poll(500, 0), MIN_CPU_POLL);
     }
 
     #[test]
