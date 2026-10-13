@@ -143,10 +143,9 @@ A worker with a payload cap other than the default must say so. Set
   precheck. The default is 30 seconds.
 - `cache_timeout(d)` — the time budget of one response-cache call. The
   default is 5 seconds.
-- `ledger_timeout(d)` — the time budget of one LLM budget check or ledger
-  write (issue #1997). The default is 10 seconds. A check over it is a
-  retryable failure, before the model call. A write over it logs a warning
-  and keeps the turn.
+- `budget_timeout(d)` — the time budget of the LLM budget check of one
+  turn (issue #1997). The default is 10 seconds. A check over it is a
+  retryable failure, before the model call.
 - `memory(store)` — the `MemoryStore` for runs with a memory scope.
 - `delivery(delivery)` — where reports go. The default is `LogDelivery`.
 - `precheck(precheck)` — the cheap check that can skip a heartbeat tick.
@@ -160,6 +159,24 @@ no memory tool.
 
 A tool error is cut to fit the result cap too, so a huge error message
 cannot fail the run.
+
+### The cost ledger
+
+On Postgres, each model turn writes one row to the
+[agent cost ledger](llm-cost-ledger.md) (issue #1996). The row holds the
+model id, the tokens, the cost and the call latency. It is outside the
+encrypted turn output, so the usage report can sum it per tenant. Two
+`AgentModel` methods fill it in:
+
+- `model_id()` — the model id, which the response cache also keys on. The
+  default is `None`. The ledger stores the id in clear, so do not put PII
+  in it. It takes a token of ASCII letters, digits and `._:/@+-`, and
+  records `None` or any other id as `"unknown"`.
+- `cost_usd_micros(usage)` — the cost of one call, in millionths of a US
+  dollar. The default is `None`, which counts the call as unpriced.
+
+A response cache hit calls no model and spends no tokens, so it writes no
+ledger row.
 
 `AgentTask` sets the run. Its bounds are `max_steps` (default 8, per
 segment), `max_total_tokens` (per run), `max_output_tokens`,
@@ -257,19 +274,15 @@ example a rejected API key, or four failed attempts.
 `max_total_tokens` bounds one run inside the workflow. A budget on the
 Postgres engine also bounds a tenant across runs, and it can bound cost.
 
-Each model turn checks the budget before the call. After a call that
-returns, the turn records one row in `harvest_llm_ledger`: the model id, the
-tokens, the cost and the latency. A call that fails or times out records
-nothing, even when the provider charges for it.
+Each model turn checks the budget before the call. The budget sums the
+[cost ledger](#the-cost-ledger) rows of the run and of its tenant. The cost
+caps are in millionths of a US dollar, as `cost_usd_micros` is. An unpriced
+call adds no cost, so only the token caps apply to it. Price the cache
+counts in `cost_usd_micros` if your provider bills them at another rate.
 
-Implement two methods of `AgentModel` to fill the row:
-
-- `model_id` gives the model id. The id is your configuration, not the id
-  that the provider reports. The response cache uses it too. With no id,
-  the ledger records `"unknown"`.
-- `cost_micros` prices one call, in millionths of a currency unit. The
-  default is zero, so only the token caps apply. Price the cache counts
-  there if your provider bills them at another rate.
+The ledger writes the calls of a completed attempt only. A call in an
+attempt that fails or times out is not counted, even when the provider
+charges for it.
 
 The budget counts `input_tokens` plus `output_tokens`. `input_tokens` must
 count the whole prompt, cached tokens included. Some providers report the
@@ -279,9 +292,8 @@ A response cache hit calls no model. It spends no tokens and records no
 row. The budget check still runs before the cache lookup, so a spent cap
 refuses a turn that the cache could answer.
 
-A failed ledger write logs a warning and keeps the answer, because a retry
-would pay for the call again. A failed spend read retries the turn, and
-uses one of its four attempts.
+A failed spend read retries the turn, and uses one of its four attempts.
+The turn calls no model before the check passes, so the retry pays nothing.
 
 Declare the caps on `agent_loop`, and set the tenant on each task:
 
@@ -293,7 +305,7 @@ use autumn_harvest_agent::workflow::{activities, agent_loop_info};
 
 let budget = QuotaPolicy::new("tenant")
     .with_max_run_llm_tokens(200_000)
-    .with_max_tenant_llm_cost_micros(50_000_000) // 50 currency units a day
+    .with_max_tenant_llm_cost_usd_micros(50_000_000) // 50 US dollars a day
     .with_tenant_llm_window_secs(86_400);
 let built = HarvestBuilder::new()
     .workflows(vec![agent_loop_info().with_quota(budget)])
@@ -341,10 +353,9 @@ strict replay compares each recorded input as it was written.
   list changes only later turns. Recorded turns replay as they were.
 - **A follow-up chain shares one workflow history.** Each segment adds to
   it. Keep `max_chain` low, or start a new run from the report.
-- **The session entity is separate.** It is a sibling issue. Per-step token
-  cost belongs to the agent cost ledger (#1996).
-- **The ledger is in clear.** See
-  [`security-posture.md`](security-posture.md#the-llm-ledger-is-in-clear-issue-1997).
+- **The session entity is separate.** It is a sibling issue.
+- **The cost ledger needs Postgres.** The SQLite path calls the model
+  directly, with no activity context, so it writes no ledger rows.
 
 ## 10. Always-on agents
 

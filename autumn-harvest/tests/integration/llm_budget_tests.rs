@@ -3,14 +3,16 @@
 //! A real worker runs a small agent-shaped loop against Postgres. Each loop
 //! step is the `llm_step` activity. The step checks the budget, then records
 //! the usage of one fake model call in the ledger. The loop stops when a step
-//! is refused, and returns how many steps ran.
+//! is refused, and returns how many steps ran. The calls go to the agent
+//! cost ledger of issue #1996, which the budget sums.
 //!
 //! - A run cap stops further steps of one run. Another run is not affected.
 //! - A tenant cap stops steps across runs of one key. Another key is not
 //!   affected.
 //! - A cost cap works as a token cap does.
 //! - Spend outside the tenant window does not count.
-//! - The ledger row holds the usage in clear columns.
+//! - The ledger row holds the usage of the step.
+//! - A failed attempt records nothing, so its call does not count.
 //! - With no LLM cap, no step is refused.
 //! - A key that does not resolve fails open for the tenant caps only.
 //!
@@ -32,7 +34,8 @@ use std::time::Duration;
 
 use autumn_harvest::execution::{StartWorkflowParams, start_or_load_workflow_execution};
 use autumn_harvest::info::{ActivityHandlerFn, ActivityInfo, WorkflowHandlerFn, WorkflowInfo};
-use autumn_harvest::llm_budget::{LlmBudgetExceeded, LlmUsage};
+use autumn_harvest::llm_budget::LlmBudgetExceeded;
+use autumn_harvest::llm_ledger::LlmCall;
 use autumn_harvest::quota::QuotaPolicy;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::types::{
@@ -84,22 +87,20 @@ fn llm_step(ctx: &ActivityContext, input: Value) -> BoxFut<'_> {
             .entry(ctx.execution_id())
             .or_default() += 1;
         ctx.check_llm_budget().await?;
-        let usage = LlmUsage::new(
+        let call = LlmCall::new(
             MODEL,
             input["input_tokens"].as_u64().unwrap_or(0),
             input["output_tokens"].as_u64().unwrap_or(0),
         )
-        .with_cost_micros(input["cost_micros"].as_u64().unwrap_or(0))
+        .with_cost_usd_micros(input["cost_usd_micros"].as_u64().unwrap_or(0))
         .with_latency(Duration::from_millis(42));
-        let recorded = ctx
-            .record_llm_usage(&usage)
-            .await
+        ctx.record_llm_call(call)
             .map_err(|error| error.to_string())?;
         // A paid call that then fails, as a provider fault after the answer.
         if input["fail_first"].as_bool() == Some(true) && ctx.attempt() == 1 {
             return Err("transient fault after a paid call".to_owned());
         }
-        Ok(json!({ "recorded": recorded }))
+        Ok(json!({ "recorded": true }))
     })
 }
 
@@ -405,7 +406,7 @@ impl MetricsRecorder for RejectedMetrics {
 
 /// 60 input and 40 output tokens, no cost.
 fn hundred_tokens() -> Value {
-    json!({ "input_tokens": 60, "output_tokens": 40, "cost_micros": 0 })
+    json!({ "input_tokens": 60, "output_tokens": 40, "cost_usd_micros": 0 })
 }
 
 async fn ledger_rows(url: &str, exec_id: ExecutionId) -> i64 {
@@ -415,12 +416,13 @@ async fn ledger_rows(url: &str, exec_id: ExecutionId) -> i64 {
         n: i64,
     }
     let mut conn = connect(url).await;
-    let row: Count =
-        diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_llm_ledger WHERE execution_id = $1")
-            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-            .get_result(&mut conn)
-            .await
-            .expect("count ledger rows");
+    let row: Count = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_llm_ledger WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(&mut conn)
+    .await
+    .expect("count ledger rows");
     row.n
 }
 
@@ -498,20 +500,20 @@ async fn a_tenant_budget_stops_llm_steps_across_runs() {
 async fn a_cost_budget_stops_llm_steps() {
     let _serial = TEST_SERIAL.lock().await;
     let policy = QuotaPolicy::new("tenant")
-        .with_max_run_llm_cost_micros(2_500)
-        .with_max_tenant_llm_cost_micros(4_500);
+        .with_max_run_llm_cost_usd_micros(2_500)
+        .with_max_tenant_llm_cost_usd_micros(4_500);
     let harness = Harness::new("llm_cost_cap", Some(policy)).await;
-    let step = json!({ "input_tokens": 1, "output_tokens": 1, "cost_micros": 1_000 });
+    let step = json!({ "input_tokens": 1, "output_tokens": 1, "cost_usd_micros": 1_000 });
 
     // The run cap: 0, 1,000 and 2,000 pass. 3,000 reaches 2,500.
     let (_, output) = harness.run(Some("acme"), 10, step.clone()).await;
     assert_eq!(output["ran"], 3, "{output}");
-    assert_eq!(refused(&output), Some("run_llm_cost_micros"));
+    assert_eq!(refused(&output), Some("run_llm_cost_usd_micros"));
 
     // The tenant cap: 3,000 and 4,000 pass. 5,000 reaches 4,500.
     let (_, output) = harness.run(Some("acme"), 10, step).await;
     assert_eq!(output["ran"], 2, "{output}");
-    assert_eq!(refused(&output), Some("tenant_llm_cost_micros"));
+    assert_eq!(refused(&output), Some("tenant_llm_cost_usd_micros"));
     assert_eq!(output["refused"]["current"], 5_000);
     harness.stop().await;
 }
@@ -535,7 +537,7 @@ async fn spend_outside_the_window_does_not_count() {
     let mut conn = connect(&harness.url).await;
     diesel::sql_query(
         "UPDATE harvest_llm_ledger SET recorded_at = recorded_at - INTERVAL '2 hours' \
-         WHERE execution_id = $1",
+         WHERE workflow_exec_id = $1",
     )
     .bind::<diesel::sql_types::Uuid, _>(first.as_uuid())
     .execute(&mut conn)
@@ -549,88 +551,64 @@ async fn spend_outside_the_window_does_not_count() {
 }
 
 #[tokio::test]
-async fn the_ledger_row_holds_the_usage_in_clear_columns() {
+async fn the_ledger_row_holds_the_usage_of_the_step() {
     let _serial = TEST_SERIAL.lock().await;
-    // A tenant cap makes the run use its key, so the row copies it.
     let policy = QuotaPolicy::new("tenant")
         .with_max_run_llm_tokens(1_000)
         .with_max_tenant_llm_tokens(1_000_000);
     let harness = Harness::new("llm_ledger_row", Some(policy)).await;
-    let step = json!({ "input_tokens": 7, "output_tokens": 5, "cost_micros": 1_234 });
+    let step = json!({ "input_tokens": 7, "output_tokens": 5, "cost_usd_micros": 1_234 });
     let (exec_id, output) = harness.run(Some("acme"), 1, step).await;
     assert_eq!(output["ran"], 1, "{output}");
 
     #[derive(diesel::QueryableByName, Debug)]
     struct Row {
         #[diesel(sql_type = diesel::sql_types::Text)]
-        workflow_name: String,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-        quota_key: Option<String>,
-        #[diesel(sql_type = diesel::sql_types::Text)]
         activity_name: String,
-        #[diesel(sql_type = diesel::sql_types::Integer)]
-        attempt: i32,
         #[diesel(sql_type = diesel::sql_types::Text)]
         model: String,
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         input_tokens: i64,
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         output_tokens: i64,
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        cost_micros: i64,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+        cost_usd_micros: Option<i64>,
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         latency_ms: i64,
     }
     let mut conn = connect(&harness.url).await;
     let row: Row = diesel::sql_query(
-        "SELECT workflow_name, quota_key, activity_name, attempt, model, input_tokens, \
-         output_tokens, cost_micros, latency_ms FROM harvest_llm_ledger WHERE execution_id = $1",
+        "SELECT activity_name, model, input_tokens, output_tokens, cost_usd_micros, latency_ms \
+         FROM harvest_llm_ledger WHERE workflow_exec_id = $1",
     )
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
     .get_result(&mut conn)
     .await
     .expect("one ledger row");
-    assert_eq!(row.workflow_name, harness.name);
-    assert_eq!(row.quota_key.as_deref(), Some("acme"));
     assert_eq!(row.activity_name, STEP);
-    assert_eq!(row.attempt, 1);
     assert_eq!(row.model, MODEL);
     assert_eq!((row.input_tokens, row.output_tokens), (7, 5));
-    assert_eq!(row.cost_micros, 1_234);
+    assert_eq!(row.cost_usd_micros, Some(1_234));
     assert_eq!(row.latency_ms, 42);
     harness.stop().await;
 }
 
 #[tokio::test]
-async fn a_retry_that_pays_again_records_again_and_counts() {
+async fn a_failed_attempt_records_nothing_and_does_not_count() {
     let _serial = TEST_SERIAL.lock().await;
     let policy = QuotaPolicy::new("tenant").with_max_run_llm_tokens(150);
     let harness = Harness::new("llm_retry", Some(policy)).await;
     let mut step = hundred_tokens();
     step["fail_first"] = json!(true);
 
-    // Attempt 1 pays 100 and fails. Attempt 2 passes the check at 100 and
-    // pays 100 more. The next step then reads 200 and is refused.
+    // Attempt 1 of each step records 100 and fails, so the ledger keeps
+    // nothing of it. Attempt 2 records 100 and completes. The first two
+    // steps pass the check at 0 and at 100. The third reads 200.
     let (exec_id, output) = harness.run(Some("acme"), 5, step).await;
-    assert_eq!(output["ran"], 1, "{output}");
+    assert_eq!(output["ran"], 2, "{output}");
     assert_eq!(refused(&output), Some("run_llm_tokens"));
     assert_eq!(output["refused"]["current"], 200);
-
-    #[derive(diesel::QueryableByName)]
-    struct Attempt {
-        #[diesel(sql_type = diesel::sql_types::Integer)]
-        attempt: i32,
-    }
-    let mut conn = connect(&harness.url).await;
-    let attempts: Vec<Attempt> = diesel::sql_query(
-        "SELECT attempt FROM harvest_llm_ledger WHERE execution_id = $1 ORDER BY id",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-    .load(&mut conn)
-    .await
-    .expect("ledger attempts");
-    let attempts: Vec<i32> = attempts.into_iter().map(|row| row.attempt).collect();
-    assert_eq!(attempts, vec![1, 2]);
+    assert_eq!(ledger_rows(&harness.url, exec_id).await, 2);
     harness.stop().await;
 }
 
@@ -718,7 +696,7 @@ async fn a_run_with_no_llm_cap_is_never_refused() {
     let harness = Harness::new("llm_no_cap", None).await;
     let (exec_id, output) = harness.run(Some("acme"), 5, hundred_tokens()).await;
     assert_eq!(output["ran"], 5, "{output}");
-    // The usage is still recorded, with no key.
+    // The usage is still recorded.
     assert_eq!(ledger_rows(&harness.url, exec_id).await, 5);
     harness.stop().await;
 }

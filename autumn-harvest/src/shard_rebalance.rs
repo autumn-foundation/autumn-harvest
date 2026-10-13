@@ -520,8 +520,7 @@ pub const COPIED_RELATIONS: &[&str] = &[
 /// there is no longer anything to abort. A column mismatch discovered there
 /// would leave the run `RUNNING` on the target with no task row on either shard,
 /// so `harvest_task_queue` has to be checked here, before the seal, even though
-/// it is not part of the staged copy. `harvest_llm_ledger` is checked for the
-/// same reason: activation copies it to the target (issue #1997).
+/// it is not part of the staged copy.
 pub const SCHEMA_PARITY_RELATIONS: &[&str] = &[
     "harvest_workflow_executions",
     "harvest_events",
@@ -1309,54 +1308,6 @@ mod db {
         Ok(pages)
     }
 
-    /// Rows in one page of [`read_llm_ledger_pages`].
-    const LLM_LEDGER_COPY_PAGE: i64 = 1_000;
-
-    /// Read an execution's LLM ledger rows (issue #1997) as JSON pages, in
-    /// `id` order.
-    ///
-    /// The ledger has no row cap: a long run records one row for each model
-    /// call. One `jsonb_agg` over every row could pass the `jsonb` size limit.
-    /// Pages of 1,000 rows keep each query result and each insert small.
-    async fn read_llm_ledger_pages(
-        conn: &mut AsyncPgConnection,
-        exec_id: ExecutionId,
-    ) -> HarvestResult<Vec<Value>> {
-        let mut pages = Vec::new();
-        let mut after = 0_i64;
-        loop {
-            let row: JsonRow = diesel::sql_query(
-                "SELECT COALESCE(jsonb_agg(to_jsonb(g) ORDER BY g.id), '[]'::jsonb) AS payload \
-                 FROM (SELECT * FROM harvest_llm_ledger \
-                       WHERE execution_id = $1 AND id > $2 \
-                       ORDER BY id LIMIT $3) g",
-            )
-            .bind::<SqlUuid, _>(exec_id.as_uuid())
-            .bind::<BigInt, _>(after)
-            .bind::<BigInt, _>(LLM_LEDGER_COPY_PAGE)
-            .get_result(conn)
-            .await
-            .map_err(database_error)?;
-            let Some(rows) = row.payload.as_array() else {
-                break;
-            };
-            let Some(last) = rows
-                .last()
-                .and_then(|r| r.get("id"))
-                .and_then(Value::as_i64)
-            else {
-                break;
-            };
-            let full = i64::try_from(rows.len()).unwrap_or(i64::MAX) >= LLM_LEDGER_COPY_PAGE;
-            after = last;
-            pages.push(row.payload);
-            if !full {
-                break;
-            }
-        }
-        Ok(pages)
-    }
-
     /// Insert stream chunk pages from [`read_stream_chunk_pages`].
     ///
     /// Stream chunks take an explicit column list: `id` is a shard-local
@@ -1480,6 +1431,15 @@ mod db {
         )
         .await?;
 
+        // Issue #1996: the agent cost ledger moves with the run. The usage
+        // report skips the sealed source, so a row left there drops out.
+        let llm_ledger = read_json(
+            source,
+            "SELECT COALESCE(jsonb_agg(to_jsonb(l)), '[]'::jsonb) AS payload \
+             FROM harvest_llm_ledger l WHERE l.workflow_exec_id = $1",
+            exec_id,
+        )
+        .await?;
         // Durable stream chunks (issue #1974). Copied for the same reason as
         // the logs: they are author output, and erasure must reach them on
         // the execution's own shard.
@@ -1655,6 +1615,7 @@ mod db {
                 ("harvest_timers", &timers),
                 ("harvest_signals", &signals),
                 ("harvest_payload_refs", &payload_refs),
+                ("harvest_llm_ledger", &llm_ledger),
             ] {
                 diesel::sql_query(format!(
                     "INSERT INTO {table} SELECT * FROM \
@@ -1830,7 +1791,7 @@ mod db {
         "DELETE FROM harvest_signals WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_payload_refs WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_workflow_logs WHERE workflow_exec_id = $1",
-        "DELETE FROM harvest_llm_ledger WHERE execution_id = $1",
+        "DELETE FROM harvest_llm_ledger WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_stream_chunks WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_task_queue WHERE workflow_exec_id = $1",
     ];
@@ -2790,7 +2751,6 @@ mod db {
         // always executes to completion whether or not the primary query reads
         // them; only the seal's row count is needed to answer "did the cutover
         // happen?".
-
         let sql = format!(
             "WITH sealed AS ( \
                  UPDATE harvest_workflow_executions e \
@@ -3025,8 +2985,6 @@ mod db {
             ))
         })?;
         let staged_task: Option<Value> = staged.payload;
-        // The LLM ledger of the run, still on the source (issue #1997).
-        let llm_ledger_pages = read_llm_ledger_pages(source, exec_id).await?;
 
         // Durable stream chunks stored after the copy (issue #1974). A
         // decision between verification and cutover can store chunks and park
@@ -3070,48 +3028,6 @@ mod db {
                 .execute(&mut *conn)
                 .await
                 .map_err(database_error)?;
-
-                // The LLM ledger moves here, not at stage time (issue #1997).
-                // Until now the source counted the spend of the run for its
-                // tenant. Each row keeps its own `quota_key`, so a row recorded
-                // before its run had a key still counts for no tenant. The
-                // target mints a new `id`, and `recorded_at` keeps its value.
-                // A resumed activation finds the rows already on the target
-                // and copies nothing twice. The check runs once, before the
-                // first page, because each page adds rows for this run.
-                let copied: ExistsRow = diesel::sql_query(
-                    "SELECT EXISTS ( \
-                         SELECT 1 FROM harvest_llm_ledger WHERE execution_id = $1 \
-                     ) AS value",
-                )
-                .bind::<SqlUuid, _>(exec_id.as_uuid())
-                .get_result(&mut *conn)
-                .await
-                .map_err(database_error)?;
-                if !copied.value {
-                    for page in &llm_ledger_pages {
-                        diesel::sql_query(
-                            "INSERT INTO harvest_llm_ledger \
-                                 (execution_id, workflow_name, quota_key, activity_name, \
-                                  activity_id, attempt, model, input_tokens, output_tokens, \
-                                  cost_micros, latency_ms, recorded_at) \
-                             SELECT execution_id, workflow_name, quota_key, activity_name, \
-                                    activity_id, attempt, model, input_tokens, output_tokens, \
-                                    cost_micros, latency_ms, recorded_at \
-                             FROM jsonb_to_recordset($1::jsonb) AS r( \
-                                 id bigint, execution_id uuid, workflow_name text, \
-                                 quota_key text, activity_name text, activity_id uuid, \
-                                 attempt integer, model text, input_tokens bigint, \
-                                 output_tokens bigint, cost_micros bigint, latency_ms bigint, \
-                                 recorded_at timestamptz) \
-                             ORDER BY id",
-                        )
-                        .bind::<Jsonb, _>(page)
-                        .execute(&mut *conn)
-                        .await
-                        .map_err(database_error)?;
-                    }
-                }
 
                 // Staging can have vacated an unrelated same-key row to free
                 // the target's active-uniqueness slot for this copy (issue
@@ -3234,21 +3150,6 @@ mod db {
             if fenced && let Some(settle) = settle {
                 crate::replication::assert_fence(conn, settle.source_shard).await?;
             }
-            // The target holds the LLM ledger now (issue #1997). The source
-            // drops its copy in the commit that settles the move, so the
-            // tenant spend never counts on two shards after it. A crash
-            // before this commit counts it on both shards for a while, never
-            // on none.
-            diesel::sql_query(
-                "DELETE FROM harvest_llm_ledger g \
-                  WHERE g.execution_id = $1 \
-                    AND EXISTS (SELECT 1 FROM harvest_shard_migrations m \
-                                WHERE m.execution_id = $1 AND m.phase = 'COMMITTED')",
-            )
-            .bind::<SqlUuid, _>(exec_id.as_uuid())
-            .execute(&mut *conn)
-            .await
-            .map_err(database_error)?;
             let settled = diesel::sql_query(
                 "UPDATE harvest_shard_migrations \
                     SET phase = 'DONE', staged_task = NULL, updated_at = NOW() \

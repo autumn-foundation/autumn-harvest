@@ -8,6 +8,8 @@
 //!   permits.
 //! * [`run_heartbeat_flusher`] drains a real `mpsc` channel while an activity
 //!   sends heartbeats.
+//! * [`AdaptiveLimitRegistry`] admits attempts while other attempts finish
+//!   and move the cap. Its slot-freed wake is a real `Notify`.
 //!
 //! Under `cfg(shuttle)`, `crate::shuttle_sync` swaps the tokio types for the
 //! `shuttle-tokio` types. Each model runs under the random scheduler and under
@@ -32,8 +34,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use autumn_harvest::adaptive_limit::{
+    Acquire, AdaptiveLimitConfig, AdaptiveLimitRegistry, LimitSnapshot, SampleOutcome,
+};
 use autumn_harvest::heartbeat::{FlushOutcome, FlusherExit, HeartbeatSink, run_heartbeat_flusher};
+use autumn_harvest::policy::AdaptiveLimitPolicy;
 use autumn_harvest::slot_tuner::TunedSlotRuntime;
+use autumn_harvest::telemetry::MetricsRecorder;
 use serde_json::{Value, json};
 use shuttle::future::{block_on, yield_now};
 use shuttle_tokio::sync::{Semaphore, mpsc};
@@ -319,4 +326,175 @@ fn heartbeat_lease_lost_stops_the_flusher_random() {
 #[test]
 fn heartbeat_lease_lost_stops_the_flusher_pct() {
     shuttle::check_pct(heartbeat_lease_lost_model, PCT_ITERATIONS, PCT_DEPTH);
+}
+
+// ---------------------------------------------------------------------------
+// adaptive_limit
+// ---------------------------------------------------------------------------
+
+/// The activity types of the adaptive limit model.
+const LIMITED_TYPES: [&str; 2] = ["charge_card", "send_email"];
+/// The cap moves between 1 and this value.
+const LIMIT_MAX: u32 = 2;
+
+/// How one attempt of the adaptive limit model ends.
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    /// Report an overload.
+    Overload,
+    /// Report an answer.
+    Answer,
+    /// Drop the permit with no sample.
+    Drop,
+}
+
+/// The attempts of each type, in start order.
+///
+/// A window closes after 4 samples, and one overload makes it overloaded.
+/// The first window therefore holds at least 3 overloads, and cuts the cap
+/// from 2 to 1. At cap 1, no attempt starts until the last overload lands,
+/// so it lands within the first 6 samples. The window of samples 9 to 12
+/// then holds only answers, and raises the cap back to 2.
+const STEPS: [Step; 14] = [
+    Step::Overload,
+    Step::Overload,
+    Step::Drop,
+    Step::Overload,
+    Step::Overload,
+    Step::Answer,
+    Step::Answer,
+    Step::Drop,
+    Step::Answer,
+    Step::Answer,
+    Step::Answer,
+    Step::Answer,
+    Step::Answer,
+    Step::Answer,
+];
+
+/// Records every cap the registry publishes, per type.
+#[derive(Default)]
+struct CapLog(Mutex<Vec<(String, u32)>>);
+
+impl CapLog {
+    fn caps(&self, name: &str) -> Vec<u32> {
+        self.0
+            .lock()
+            .expect("not poisoned")
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|&(_, cap)| cap)
+            .collect()
+    }
+}
+
+impl MetricsRecorder for CapLog {
+    fn record_activity_concurrency_limit(&self, activity: &str, state: &LimitSnapshot) {
+        self.0
+            .lock()
+            .expect("not poisoned")
+            .push((activity.to_owned(), state.limit));
+    }
+}
+
+/// One poll loop starts the attempts of `STEPS` for each of two types
+/// (issue #1836).
+///
+/// Attempts finish in parallel. Their overloads cut the cap from 2 to 1, and
+/// their answers raise it back to 2. Some attempts drop the permit. When
+/// every remaining type is at its cap, the loop waits on the slot-freed
+/// wake. The worker's real wait also has a poll timer. The model has none,
+/// so a lost wake leaves the loop blocked, and Shuttle reports a deadlock.
+///
+/// The model checks four properties:
+///
+/// 1. No type runs more attempts than its cap allows, and never more than
+///    `LIMIT_MAX` at once.
+/// 2. Every attempt starts. The slot-freed wake loses no free slot.
+/// 3. The cap of each type falls to 1 and returns to `LIMIT_MAX`.
+/// 4. At the end, no type holds a slot or counts as saturated.
+fn adaptive_limit_model() {
+    block_on(async {
+        let policy = AdaptiveLimitPolicy::new(1, LIMIT_MAX);
+        let caps = Arc::new(CapLog::default());
+        let registry = Arc::new(
+            AdaptiveLimitRegistry::new(AdaptiveLimitConfig::disabled().with_default(Some(policy)))
+                .with_metrics(Arc::clone(&caps) as Arc<dyn MetricsRecorder>),
+        );
+        let wake = registry.slot_freed_notify();
+        let running: Arc<[AtomicUsize; 2]> = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let mut next = [0_usize; 2];
+        let mut attempts = Vec::new();
+
+        while next.iter().any(|&n| n < STEPS.len()) {
+            let mut started = false;
+            for (kind, name) in LIMITED_TYPES.iter().enumerate() {
+                if next[kind] == STEPS.len() {
+                    continue;
+                }
+                let permit = match registry.try_acquire(name) {
+                    Acquire::Acquired(permit) => permit,
+                    Acquire::Limited { .. } => continue,
+                    other => panic!("{name} must have a limit, got {other:?}"),
+                };
+                let step = STEPS[next[kind]];
+                next[kind] += 1;
+                started = true;
+                let running = Arc::clone(&running);
+                attempts.push(shuttle_tokio::spawn(async move {
+                    let now = running[kind].fetch_add(1, Ordering::SeqCst) + 1;
+                    assert!(
+                        now <= LIMIT_MAX as usize,
+                        "{now} attempts of one type run at once"
+                    );
+                    yield_now().await;
+                    running[kind].fetch_sub(1, Ordering::SeqCst);
+                    match step {
+                        Step::Overload => {
+                            permit.complete(Duration::from_millis(5), SampleOutcome::Overloaded);
+                        }
+                        Step::Answer => {
+                            permit.complete(Duration::from_millis(5), SampleOutcome::Answered);
+                        }
+                        Step::Drop => drop(permit),
+                    }
+                }));
+            }
+            if !started {
+                wake.notified().await;
+            }
+        }
+
+        for attempt in attempts {
+            attempt.await.expect("an attempt panicked");
+        }
+        for name in LIMITED_TYPES {
+            let snapshot = registry.snapshot(name).expect("the type has state");
+            assert_eq!(snapshot.in_flight, 0, "{name} still holds a slot");
+            let seen = caps.caps(name);
+            assert!(
+                seen.contains(&1),
+                "the overloads must cut the cap of {name} to 1: {seen:?}"
+            );
+            assert_eq!(
+                snapshot.limit, LIMIT_MAX,
+                "the answers must raise the cap of {name} back: {seen:?}"
+            );
+        }
+        assert!(
+            !registry.any_saturated(),
+            "the saturated count must return to 0"
+        );
+        assert!(registry.saturated().is_empty());
+    });
+}
+
+#[test]
+fn adaptive_limit_wakes_the_poll_loop_random() {
+    shuttle::check_random(adaptive_limit_model, RANDOM_ITERATIONS);
+}
+
+#[test]
+fn adaptive_limit_wakes_the_poll_loop_pct() {
+    shuttle::check_pct(adaptive_limit_model, PCT_ITERATIONS, PCT_DEPTH);
 }

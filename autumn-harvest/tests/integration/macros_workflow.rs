@@ -469,9 +469,9 @@ fn workflow_info_declared_dependency_builders_set_fields() {
 #[workflow(quota(
     key = "input.tenant",
     max_run_llm_tokens = 20000,
-    max_run_llm_cost_micros = 500000,
+    max_run_llm_cost_usd_micros = 500000,
     max_tenant_llm_tokens = 1000000,
-    max_tenant_llm_cost_micros = 25000000,
+    max_tenant_llm_cost_usd_micros = 25000000,
     tenant_llm_window_secs = 3600
 ))]
 async fn llm_budget_workflow(_ctx: &WorkflowContext, _input: String) -> Result<(), String> {
@@ -489,9 +489,9 @@ fn quota_llm_keys_set_the_llm_caps() {
         .quota
         .expect("quota is declared");
     assert_eq!(policy.max_run_llm_tokens, Some(20_000));
-    assert_eq!(policy.max_run_llm_cost_micros, Some(500_000));
+    assert_eq!(policy.max_run_llm_cost_usd_micros, Some(500_000));
     assert_eq!(policy.max_tenant_llm_tokens, Some(1_000_000));
-    assert_eq!(policy.max_tenant_llm_cost_micros, Some(25_000_000));
+    assert_eq!(policy.max_tenant_llm_cost_usd_micros, Some(25_000_000));
     assert_eq!(policy.tenant_llm_window_secs, 3_600);
     assert!(policy.has_llm_budget());
     assert!(!policy.has_any_cap());

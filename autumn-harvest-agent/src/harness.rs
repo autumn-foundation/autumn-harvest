@@ -13,13 +13,12 @@ use crate::error::AgentError;
 use crate::heartbeat::{HeartbeatTask, Precheck};
 use crate::memory::{MEMORY_TOOL, MemoryScope, MemoryStore, MemoryTool, render_snapshot};
 use crate::message::{ContentPart, RunId, TokenUsage, ToolDefinition};
-use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse};
+use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse, UNKNOWN_MODEL_ID};
 use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
 use crate::response_cache::{CacheKey, KeyTenant, ResponseCache};
 use crate::tool::{Tool, ToolContext, ToolEffect};
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
-use autumn_harvest::llm_budget::LlmUsage;
 
 use crate::types::{ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome};
 
@@ -29,8 +28,8 @@ pub const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 8_000;
 /// The default time budget of one model call: 13 minutes.
 ///
 /// With [`DEFAULT_POLICY_TIMEOUT`], three [`DEFAULT_CACHE_TIMEOUT`] budgets
-/// and two [`DEFAULT_LEDGER_TIMEOUT`] budgets, it stays below the 15-minute
-/// `start_to_close` of `agent_model_turn`. A slow call therefore ends as a
+/// and one [`DEFAULT_BUDGET_TIMEOUT`], it stays below the 15-minute `start_to_close` of
+/// `agent_model_turn`. A slow call therefore ends as a
 /// retryable failure that the harness reports. It does not end as an engine
 /// timeout, which SQLite reports only after the body returns.
 pub const DEFAULT_MODEL_TIMEOUT: Duration = Duration::from_secs(13 * 60);
@@ -61,14 +60,13 @@ pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 /// the store. Each call has this budget. A cache call over it is a miss.
 pub const DEFAULT_CACHE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The default time budget of one LLM budget check or ledger write: 10
-/// seconds (issue #1997).
+/// The default time budget of the LLM budget check of one turn: 10 seconds
+/// (issue #1997).
 ///
-/// One turn makes one check before the model call and one write after it.
-/// Without a budget, a slow pool or a slow spend read could end the activity
-/// after the model answers. The retry would then pay for the call again,
-/// and the first call would stay unrecorded.
-pub const DEFAULT_LEDGER_TIMEOUT: Duration = Duration::from_secs(10);
+/// The check reads the spend of the run and of its tenant before the model
+/// call. Without a budget, a slow pool or a slow read could use up the
+/// `start_to_close` of the turn.
+pub const DEFAULT_BUDGET_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The bytes that the `ToolOutcome` JSON adds around its content.
 const OUTCOME_ENVELOPE_BYTES: u64 = 64;
@@ -93,7 +91,7 @@ pub struct AgentHarness {
     policy_timeout: Duration,
     hook_timeout: Duration,
     cache_timeout: Duration,
-    ledger_timeout: Duration,
+    budget_timeout: Duration,
     memory: Option<Arc<dyn MemoryStore>>,
     delivery: Arc<dyn Delivery>,
     precheck: Option<Arc<dyn Precheck>>,
@@ -116,7 +114,7 @@ impl AgentHarness {
             policy_timeout: DEFAULT_POLICY_TIMEOUT,
             hook_timeout: DEFAULT_HOOK_TIMEOUT,
             cache_timeout: DEFAULT_CACHE_TIMEOUT,
-            ledger_timeout: DEFAULT_LEDGER_TIMEOUT,
+            budget_timeout: DEFAULT_BUDGET_TIMEOUT,
             memory: None,
             delivery: Arc::new(LogDelivery),
             precheck: None,
@@ -238,7 +236,7 @@ impl AgentHarness {
     }
 
     /// Set the time budget of one response-cache call. One turn makes at
-    /// most three. Keep the sum of the model, policy, cache and ledger
+    /// most three. Keep the sum of the model, policy, cache and budget-check
     /// budgets below the 15-minute `start_to_close` of `agent_model_turn`.
     #[must_use]
     pub const fn cache_timeout(mut self, timeout: Duration) -> Self {
@@ -246,14 +244,30 @@ impl AgentHarness {
         self
     }
 
-    /// Set the time budget of one LLM budget check or ledger write (issue
-    /// #1997). One turn makes one of each. Keep the sum of the model,
-    /// policy, cache and ledger budgets below the 15-minute `start_to_close`
-    /// of `agent_model_turn`.
+    /// Set the time budget of the LLM budget check of one turn (issue
+    /// #1997). Keep the sum of the model, policy, cache and budget-check
+    /// budgets below the 15-minute `start_to_close` of `agent_model_turn`.
     #[must_use]
-    pub const fn ledger_timeout(mut self, timeout: Duration) -> Self {
-        self.ledger_timeout = timeout;
+    pub const fn budget_timeout(mut self, timeout: Duration) -> Self {
+        self.budget_timeout = timeout;
         self
+    }
+
+    /// Run the LLM budget check of one turn (issue #1997).
+    ///
+    /// A refusal returns the refusal. A check over the budget time fails as
+    /// a retryable `LlmBudgetCheckFailed`. Either way, the turn calls no
+    /// model, so a retry pays nothing.
+    pub(crate) async fn check_budget<F>(&self, check: impl FnOnce() -> F) -> Result<(), String>
+    where
+        F: std::future::Future<Output = Result<(), String>>,
+    {
+        let budget = self.budget_timeout;
+        let Ok(checked) = tokio::time::timeout(budget, check()).await else {
+            let reason = format!("the read took longer than {budget:?}");
+            return Err(autumn_harvest::llm_budget::check_failed(&reason).into_error_payload());
+        };
+        checked
     }
 
     /// Whether a turn can use the response cache: the harness has a cache,
@@ -288,61 +302,6 @@ impl AgentHarness {
         self.model_turn_in(request, tenant, |_content| {}).await
     }
 
-    /// One model turn between an LLM budget check and a ledger write (issue
-    /// #1997).
-    ///
-    /// `check` runs first. A refusal returns at once, and the model is not
-    /// called. After a turn that returns, `record` writes its usage. A failed
-    /// write logs a warning and keeps the turn, because a retry would pay for
-    /// the call again. A call that fails or times out records nothing.
-    ///
-    /// Each of `check` and `record` has the ledger time budget. A check over
-    /// it fails the attempt as retryable, before the model call. A write over
-    /// it logs a warning and keeps the turn.
-    ///
-    /// A response cache hit calls no model and spends no tokens, so it
-    /// records nothing.
-    pub(crate) async fn metered_turn<C, CF, R, RF>(
-        &self,
-        request: ModelTurnRequest,
-        tenant: CacheTenant,
-        check: C,
-        record: R,
-    ) -> Result<ModelTurn, String>
-    where
-        C: FnOnce() -> CF,
-        CF: std::future::Future<Output = Result<(), String>>,
-        R: FnOnce(LlmUsage) -> RF,
-        RF: std::future::Future<Output = Result<bool, String>>,
-    {
-        let budget = self.ledger_timeout;
-        let Ok(checked) = tokio::time::timeout(budget, check()).await else {
-            let reason = format!("the read took longer than {budget:?}");
-            return Err(autumn_harvest::llm_budget::check_failed(&reason).into_error_payload());
-        };
-        checked?;
-        let (turn, latency) = self
-            .timed_model_turn(request, tenant, |_content| {})
-            .await?;
-        if turn.cache_hit {
-            return Ok(turn);
-        }
-        let written = tokio::time::timeout(budget, record(self.ledger_usage(&turn.usage, latency)));
-        match written.await {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(error = %error, "could not record the LLM usage of a model turn");
-            }
-            Err(_) => {
-                tracing::warn!(
-                    budget = ?budget,
-                    "the LLM ledger write of a model turn took longer than its budget"
-                );
-            }
-        }
-        Ok(turn)
-    }
-
     /// Run one model call, let `prepare` edit the model content, then ask
     /// the policy about each tool call.
     ///
@@ -371,19 +330,23 @@ impl AgentHarness {
         tenant: CacheTenant,
         prepare: impl FnMut(&mut Vec<ContentPart>),
     ) -> Result<ModelTurn, String> {
-        self.timed_model_turn(request, tenant, prepare)
+        self.model_turn_timed_in(request, tenant, prepare)
             .await
-            .map(|(turn, _)| turn)
+            .map(|(turn, _latency)| turn)
     }
 
-    /// [`model_turn_in`](Self::model_turn_in), with the time that the model
-    /// call took. A cache hit calls no model, so its time is zero.
-    pub(crate) async fn timed_model_turn(
+    /// [`model_turn_in`](Self::model_turn_in), with the latency of the model
+    /// call (issue #1996).
+    ///
+    /// The latency covers the model call only, not the cache or the policy.
+    /// It is `None` when a cache hit answers the turn, because no model call
+    /// ran.
+    pub(crate) async fn model_turn_timed_in(
         &self,
         request: ModelTurnRequest,
         tenant: CacheTenant,
         mut prepare: impl FnMut(&mut Vec<ContentPart>),
-    ) -> Result<(ModelTurn, Duration), String> {
+    ) -> Result<(ModelTurn, Option<Duration>), String> {
         let builtins = self.builtins(
             request.memory_scope.as_ref(),
             request.extra_tools.iter().cloned(),
@@ -404,7 +367,7 @@ impl AgentHarness {
         // miss, so the second pass asks the model. Both passes share one
         // policy budget, so the turn stays inside `start_to_close`.
         let mut policy_budget = self.policy_timeout;
-        let mut latency = Duration::ZERO;
+        let mut latency = None;
         loop {
             let cache_hit = cached.is_some();
             // A fresh answer waits for its decisions before it reaches the cache.
@@ -418,7 +381,7 @@ impl AgentHarness {
             } else {
                 let started = std::time::Instant::now();
                 let response = self.call_model(&chat).await?;
-                latency = started.elapsed();
+                latency = Some(started.elapsed());
                 fresh = key.as_ref().map(|key| (key, response.clone()));
                 response
             };
@@ -458,6 +421,58 @@ impl AgentHarness {
                 self.cache_store(key, &response).await;
             }
             return Ok((turn, latency));
+        }
+    }
+
+    /// Record one model call in the agent cost ledger (issue #1996).
+    ///
+    /// A ledger refusal does not fail the turn, because the reply is already
+    /// paid for. The turn records its tokens even when the model metadata is
+    /// bad:
+    /// - no model id, or one that the ledger refuses, becomes
+    ///   [`UNKNOWN_MODEL_ID`];
+    /// - a cost that the ledger refuses is dropped, so the call is unpriced.
+    ///
+    /// Each refusal logs a warning.
+    pub(crate) fn record_turn(
+        &self,
+        ctx: &autumn_harvest::context::ActivityContext,
+        usage: &TokenUsage,
+        latency: Duration,
+    ) {
+        use autumn_harvest::llm_ledger::LlmCall;
+
+        let mut model = self.client.model_id().unwrap_or(UNKNOWN_MODEL_ID);
+        if let Err(err) = LlmCall::new(model, 0, 0).validate() {
+            tracing::warn!(
+                error = %err,
+                "the agent cost ledger refused the model id; recording the turn as {UNKNOWN_MODEL_ID:?}"
+            );
+            model = UNKNOWN_MODEL_ID;
+        }
+        let cost = self.client.cost_usd_micros(usage).filter(|&cost| {
+            let check = LlmCall::new(UNKNOWN_MODEL_ID, 0, 0)
+                .with_cost_usd_micros(cost)
+                .validate();
+            if let Err(err) = &check {
+                tracing::warn!(
+                    error = %err,
+                    "the agent cost ledger refused the cost; recording the turn as unpriced"
+                );
+            }
+            check.is_ok()
+        });
+        let mut call = LlmCall::new(
+            model,
+            u64::from(usage.input_tokens),
+            u64::from(usage.output_tokens),
+        )
+        .with_latency(latency);
+        if let Some(cost) = cost {
+            call = call.with_cost_usd_micros(cost);
+        }
+        if let Err(err) = ctx.record_llm_call(call) {
+            tracing::warn!(error = %err, "the agent cost ledger refused a model turn");
         }
     }
 
@@ -636,21 +651,6 @@ impl AgentHarness {
         let cap = self.max_result_bytes.saturating_sub(OUTCOME_ENVELOPE_BYTES);
         let max = usize::try_from(cap / 12).unwrap_or(usize::MAX);
         ToolOutcome::error(&cut_bytes(message, max))
-    }
-
-    /// The ledger usage of one model call (issue #1997).
-    ///
-    /// The model id is the id that [`AgentModel::model_id`] configures, or
-    /// `"unknown"`. The `input_tokens` count already holds the cached prompt
-    /// tokens, so this function does not add the cache counts again.
-    pub(crate) fn ledger_usage(&self, usage: &TokenUsage, latency: Duration) -> LlmUsage {
-        LlmUsage::new(
-            self.client.model_id().unwrap_or("unknown"),
-            u64::from(usage.input_tokens),
-            u64::from(usage.output_tokens),
-        )
-        .with_cost_micros(self.client.cost_micros(usage))
-        .with_latency(latency)
     }
 
     /// Load the memory of `scope` and render it as the frozen snapshot.
@@ -872,290 +872,6 @@ mod tests {
     use crate::bounds::json_len;
     use crate::error::ErrorKind;
 
-    /// A model with a fixed id and a price of one micro per token.
-    #[derive(Debug)]
-    struct PricedModel;
-
-    impl AgentModel for PricedModel {
-        fn chat<'a>(
-            &'a self,
-            _request: &'a ChatRequest,
-        ) -> crate::model::BoxFuture<'a, Result<crate::model::ChatResponse, AgentError>> {
-            Box::pin(async { Err(AgentError::new(ErrorKind::Provider, "unused")) })
-        }
-
-        fn model_id(&self) -> Option<&str> {
-            Some("priced-1")
-        }
-
-        fn cost_micros(&self, usage: &TokenUsage) -> u64 {
-            u64::from(usage.total())
-        }
-    }
-
-    #[test]
-    fn the_ledger_usage_reads_the_model_id_the_cost_and_the_latency() {
-        let harness = AgentHarness::new(Arc::new(PricedModel));
-        let usage = TokenUsage {
-            input_tokens: 30,
-            output_tokens: 12,
-            cache_read_tokens: 20,
-            cache_write_tokens: 0,
-        };
-        let ledger = harness.ledger_usage(&usage, Duration::from_millis(1_500));
-        assert_eq!(ledger.model, "priced-1");
-        // The input count already holds the cached tokens.
-        assert_eq!((ledger.input_tokens, ledger.output_tokens), (30, 12));
-        assert_eq!(ledger.cost_micros, 42);
-        assert_eq!(ledger.latency_ms, 1_500);
-    }
-
-    #[test]
-    fn a_model_with_the_defaults_records_an_unknown_id_and_no_cost() {
-        let model = PricedModelDefaults;
-        assert_eq!(model.model_id(), None);
-        assert_eq!(model.cost_micros(&TokenUsage::new(5, 5)), 0);
-        let harness = AgentHarness::new(Arc::new(PricedModelDefaults));
-        let ledger = harness.ledger_usage(&TokenUsage::new(5, 5), Duration::ZERO);
-        assert_eq!(ledger.model, "unknown");
-    }
-
-    #[derive(Debug)]
-    struct PricedModelDefaults;
-
-    impl AgentModel for PricedModelDefaults {
-        fn chat<'a>(
-            &'a self,
-            _request: &'a ChatRequest,
-        ) -> crate::model::BoxFuture<'a, Result<crate::model::ChatResponse, AgentError>> {
-            Box::pin(async { Err(AgentError::new(ErrorKind::Provider, "unused")) })
-        }
-    }
-
-    /// A model that answers with a fixed usage and counts its calls.
-    #[derive(Debug, Default)]
-    struct CountingModel {
-        calls: std::sync::atomic::AtomicUsize,
-    }
-
-    impl AgentModel for CountingModel {
-        fn chat<'a>(
-            &'a self,
-            _request: &'a ChatRequest,
-        ) -> crate::model::BoxFuture<'a, Result<crate::model::ChatResponse, AgentError>> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Box::pin(async {
-                Ok(crate::model::ChatResponse {
-                    content: vec![crate::message::ContentPart::Text("hi".into())],
-                    stop_reason: crate::message::StopReason::EndTurn,
-                    usage: TokenUsage::new(7, 3),
-                })
-            })
-        }
-
-        fn model_id(&self) -> Option<&str> {
-            Some("counted-1")
-        }
-
-        fn cost_micros(&self, usage: &TokenUsage) -> u64 {
-            u64::from(usage.total()) * 2
-        }
-    }
-
-    fn turn_request() -> ModelTurnRequest {
-        ModelTurnRequest {
-            run_id: "run-1".into(),
-            session_id: None,
-            steps_used: 0,
-            max_steps: 4,
-            usage: TokenUsage::default(),
-            messages: vec![crate::message::ChatMessage::text(
-                crate::message::ChatRole::User,
-                "go",
-            )],
-            max_output_tokens: None,
-            read_only: false,
-            memory_scope: None,
-            extra_tools: Vec::new(),
-            tenant: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn a_refused_turn_never_calls_the_model_or_records() {
-        let model = Arc::new(CountingModel::default());
-        let harness = AgentHarness::new(model.clone());
-        let recorded = std::sync::Mutex::new(Vec::new());
-        let outcome = harness
-            .metered_turn(
-                turn_request(),
-                CacheTenant::None,
-                || async { Err("refused".to_owned()) },
-                |usage| {
-                    recorded.lock().unwrap().push(usage);
-                    async { Ok(true) }
-                },
-            )
-            .await;
-        assert_eq!(outcome, Err("refused".to_owned()));
-        assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert!(recorded.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_turn_records_its_usage_once_after_the_call() {
-        let model = Arc::new(CountingModel::default());
-        let harness = AgentHarness::new(model.clone());
-        let recorded = std::sync::Mutex::new(Vec::new());
-        let turn = harness
-            .metered_turn(
-                turn_request(),
-                CacheTenant::None,
-                || async {
-                    // The check runs before the call.
-                    assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-                    Ok(())
-                },
-                |usage| {
-                    recorded.lock().unwrap().push(usage);
-                    async { Ok(true) }
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(turn.usage, TokenUsage::new(7, 3));
-        assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        let recorded = recorded.into_inner().unwrap();
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].model, "counted-1");
-        assert_eq!(
-            (recorded[0].input_tokens, recorded[0].output_tokens),
-            (7, 3)
-        );
-        assert_eq!(recorded[0].cost_micros, 20);
-    }
-
-    #[tokio::test]
-    async fn a_failed_ledger_write_keeps_the_paid_turn() {
-        let model = Arc::new(CountingModel::default());
-        let harness = AgentHarness::new(model.clone());
-        let turn = harness
-            .metered_turn(
-                turn_request(),
-                CacheTenant::None,
-                || async { Ok(()) },
-                |_| async { Err("ledger down".to_owned()) },
-            )
-            .await;
-        assert!(turn.is_ok(), "{turn:?}");
-        assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn a_stalled_check_fails_retryable_before_the_model_call() {
-        let model = Arc::new(CountingModel::default());
-        let harness = AgentHarness::new(model.clone()).ledger_timeout(Duration::from_millis(20));
-        let outcome = harness
-            .metered_turn(
-                turn_request(),
-                CacheTenant::None,
-                std::future::pending::<Result<(), String>>,
-                |_| async { Ok(true) },
-            )
-            .await;
-        let failure = autumn_harvest::failure::parse_typed_payload(&outcome.unwrap_err()).unwrap();
-        assert_eq!(
-            failure.error_type,
-            autumn_harvest::llm_budget::ERROR_TYPE_LLM_BUDGET_CHECK_FAILED
-        );
-        assert!(!failure.non_retryable);
-        assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn a_stalled_ledger_write_keeps_the_paid_turn() {
-        let model = Arc::new(CountingModel::default());
-        let harness = AgentHarness::new(model.clone()).ledger_timeout(Duration::from_millis(20));
-        let turn = harness
-            .metered_turn(
-                turn_request(),
-                CacheTenant::None,
-                || async { Ok(()) },
-                |_| std::future::pending::<Result<bool, String>>(),
-            )
-            .await;
-        assert_eq!(turn.unwrap().usage, TokenUsage::new(7, 3));
-        assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    /// A payload store in memory, for the response cache.
-    #[derive(Debug, Default)]
-    struct MemStore {
-        blobs: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
-    }
-
-    impl autumn_harvest::payload_store::PayloadStore for MemStore {
-        fn put(
-            &self,
-            bytes: &[u8],
-        ) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, String> {
-            let key = {
-                let mut blobs = self.blobs.lock().unwrap();
-                let key = format!("blob-{}", blobs.len());
-                blobs.insert(key.clone(), bytes.to_vec());
-                key
-            };
-            Box::pin(std::future::ready(Ok(key)))
-        }
-
-        fn get(&self, key: &str) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, Vec<u8>> {
-            let found = self.blobs.lock().unwrap().get(key).cloned();
-            Box::pin(std::future::ready(found.ok_or_else(|| {
-                autumn_harvest::payload_store::PayloadStoreError(format!("no blob {key}"))
-            })))
-        }
-
-        fn delete(&self, key: &str) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, ()> {
-            self.blobs.lock().unwrap().remove(key);
-            Box::pin(std::future::ready(Ok(())))
-        }
-    }
-
-    #[tokio::test]
-    async fn a_cache_hit_checks_the_budget_but_records_nothing() {
-        let model = Arc::new(CountingModel::default());
-        let cache = ResponseCache::new(
-            Arc::new(MemStore::default()),
-            Arc::new(crate::response_cache::InMemoryCacheIndex::default()),
-            autumn_harvest::payload_codec::PayloadCodecs::default(),
-        );
-        let harness = AgentHarness::new(model.clone()).response_cache(cache);
-        let tenant = || CacheTenant::Verified("acme".to_owned());
-        let checks = std::sync::atomic::AtomicUsize::new(0);
-        let recorded = std::sync::Mutex::new(Vec::new());
-        for _ in 0..2 {
-            harness
-                .metered_turn(
-                    turn_request(),
-                    tenant(),
-                    || {
-                        checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        async { Ok(()) }
-                    },
-                    |usage| {
-                        recorded.lock().unwrap().push(usage);
-                        async { Ok(true) }
-                    },
-                )
-                .await
-                .unwrap();
-        }
-        // The second turn is a hit. It calls no model and spends nothing.
-        assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(checks.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert_eq!(recorded.into_inner().unwrap().len(), 1);
-    }
-
     #[test]
     fn retryable_kinds_are_marked_retryable() {
         for (kind, retryable) in [
@@ -1196,8 +912,46 @@ mod tests {
         let turn = DEFAULT_MODEL_TIMEOUT
             + DEFAULT_POLICY_TIMEOUT
             + 3 * DEFAULT_CACHE_TIMEOUT
-            + 2 * DEFAULT_LEDGER_TIMEOUT;
+            + DEFAULT_BUDGET_TIMEOUT;
         assert!(turn < Duration::from_secs(15 * 60), "{turn:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_budget_check_fails_retryable() {
+        let harness =
+            AgentHarness::new(Arc::new(NoModel)).budget_timeout(Duration::from_millis(20));
+        let outcome = harness
+            .check_budget(std::future::pending::<Result<(), String>>)
+            .await;
+        let failure = autumn_harvest::failure::parse_typed_payload(&outcome.unwrap_err()).unwrap();
+        assert_eq!(
+            failure.error_type,
+            autumn_harvest::llm_budget::ERROR_TYPE_LLM_BUDGET_CHECK_FAILED
+        );
+        assert!(!failure.non_retryable);
+    }
+
+    #[tokio::test]
+    async fn a_budget_refusal_passes_through() {
+        let harness = AgentHarness::new(Arc::new(NoModel));
+        let outcome = harness
+            .check_budget(|| async { Err("refused".to_owned()) })
+            .await;
+        assert_eq!(outcome, Err("refused".to_owned()));
+        assert_eq!(harness.check_budget(|| async { Ok(()) }).await, Ok(()));
+    }
+
+    /// A model that the budget tests never call.
+    #[derive(Debug)]
+    struct NoModel;
+
+    impl AgentModel for NoModel {
+        fn chat<'a>(
+            &'a self,
+            _request: &'a ChatRequest,
+        ) -> crate::model::BoxFuture<'a, Result<crate::model::ChatResponse, AgentError>> {
+            Box::pin(async { Err(AgentError::new(ErrorKind::Provider, "unused")) })
+        }
     }
 
     #[test]

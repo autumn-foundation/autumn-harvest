@@ -15204,6 +15204,11 @@ pub struct ActivityContext {
     /// is available, so the first liveness ping (before any manual heartbeat)
     /// preserves the durable checkpoint (issue #151).
     last_heartbeat_payload: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    /// The LLM calls this attempt recorded (issue #1996).
+    ///
+    /// The engine takes them when the attempt completes and writes them to
+    /// `harvest_llm_ledger` in the completion transaction.
+    llm_calls: crate::llm_ledger::LlmCallSlot,
 }
 
 /// RAII guard returned by [`ActivityContext::start_auto_heartbeat`] /
@@ -15300,6 +15305,7 @@ impl ActivityContext {
             deadline: None,
             heartbeat_timeout: None,
             last_heartbeat_payload: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            llm_calls: crate::llm_ledger::LlmCallSlot::new(),
         }
     }
 
@@ -15356,6 +15362,7 @@ impl ActivityContext {
             deadline: None,
             heartbeat_timeout: None,
             last_heartbeat_payload,
+            llm_calls: crate::llm_ledger::LlmCallSlot::new(),
         }
     }
 
@@ -15395,6 +15402,7 @@ impl ActivityContext {
             deadline: None,
             heartbeat_timeout: None,
             last_heartbeat_payload: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            llm_calls: crate::llm_ledger::LlmCallSlot::new(),
         }
     }
 
@@ -15712,6 +15720,49 @@ impl ActivityContext {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    // ── Agent cost ledger (issue #1996) ───────────────────────────────────────
+
+    /// Record one model call for the agent cost ledger (issue #1996).
+    ///
+    /// The engine writes the call to `harvest_llm_ledger` when this attempt
+    /// completes. The row commits with the completion event. A failed attempt
+    /// writes no row. The ledger is outside the event payload, so the codec
+    /// does not encrypt it.
+    ///
+    /// A call with no latency gets the time since the previous call, or
+    /// since the attempt started.
+    ///
+    /// In a [`Self::run_transactional`] activity, record the calls before the
+    /// commit. The commit writes the calls that exist at that time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::llm_ledger::LlmCallError`] when the call fails its
+    /// check, or when this attempt already recorded
+    /// [`crate::llm_ledger::MAX_LLM_CALLS_PER_ATTEMPT`] calls. The error
+    /// converts to a non-retryable activity failure, so `?` in an activity
+    /// fails the attempt without a retry.
+    pub fn record_llm_call(
+        &self,
+        call: crate::llm_ledger::LlmCall,
+    ) -> Result<(), crate::llm_ledger::LlmCallError> {
+        self.llm_calls.record(call)
+    }
+
+    /// The LLM calls this attempt recorded so far (issue #1996).
+    #[must_use]
+    pub fn llm_calls(&self) -> Vec<crate::llm_ledger::LlmCall> {
+        self.llm_calls.snapshot()
+    }
+
+    /// Take the recorded calls and empty the slot.
+    ///
+    /// The engine calls this when it writes the completion.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
+    pub(crate) fn take_llm_calls(&self) -> Vec<crate::llm_ledger::LlmCall> {
+        self.llm_calls.take()
+    }
+
     /// The stable idempotency key for this logical activity invocation.
     ///
     /// Identical across all retry attempts for the same logical invocation
@@ -15898,7 +15949,8 @@ impl ActivityContext {
     /// Refuse this LLM step when its run or its tenant has spent a budget
     /// (issue #1997).
     ///
-    /// Call it before the model call. The caps come from the
+    /// Call it before the model call, and record the call with
+    /// [`Self::record_llm_call`] after it. The caps come from the
     /// [`QuotaPolicy`](crate::quota::QuotaPolicy) of the workflow type. With
     /// no LLM cap, it returns at once and reads no row. A spent cap gives a
     /// non-retryable failure payload of type
@@ -15949,44 +16001,6 @@ impl ActivityContext {
             }
         }
         Ok(())
-    }
-
-    /// Record the usage of one model call in the LLM ledger (issue #1997).
-    ///
-    /// Call it after the model call, once for each call. A retry that pays
-    /// again records again. Returns `false` when nothing is recorded: the
-    /// context has no database, or the run row does not exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns the database error when the write fails. Do not fail the step
-    /// on it. The provider already charged for the call, so a retry pays
-    /// again. Log the error and keep the answer.
-    // Without `db`, the body has no await: it returns `false`.
-    #[cfg_attr(
-        not(feature = "db"),
-        allow(clippy::unused_async, clippy::unused_async_trait_impl)
-    )]
-    pub async fn record_llm_usage(
-        &self,
-        usage: &crate::llm_budget::LlmUsage,
-    ) -> crate::error::HarvestResult<bool> {
-        #[cfg(feature = "db")]
-        if let Some(state) = self.transactional_state.as_ref() {
-            let site = crate::llm_budget::LlmCallSite {
-                exec_id: state.exec_id,
-                activity_name: self.activity_type(),
-                activity_id: self.activity_id(),
-                attempt: self.attempt(),
-            };
-            return async {
-                let mut conn = crate::pool::acquire_within_pool_bound(&state.pool).await?;
-                crate::llm_budget::record_llm_usage(&mut conn, site, usage).await
-            }
-            .await;
-        }
-        let _ = usage;
-        Ok(false)
     }
 
     /// `true` when this activity is running inline as a local activity.
@@ -16760,6 +16774,8 @@ impl ActivityContext {
         // to a no-op passthrough when nested. So a nested transaction's
         // hint would flush with the outer task's outcome, instead of this
         // transaction's own.
+        // Issue #1996: how many recorded LLM calls the commit writes.
+        let committed_llm_calls = std::sync::atomic::AtomicUsize::new(0);
         let result = crate::dispatch::buffered_checkpoint(Box::pin(
             conn.transaction::<T, TxError, _>(async |conn| {
                 // Run user domain writes.
@@ -16892,6 +16908,20 @@ impl ActivityContext {
                 )
                 .await?;
 
+                // Issue #1996: the recorded LLM calls commit with the event.
+                // A copy, so a rollback keeps them in the slot. The slot is
+                // emptied only after the commit.
+                let llm_calls = self.llm_calls();
+                crate::llm_ledger::insert_ledger_rows(
+                    conn,
+                    exec_id,
+                    history.next_event_id,
+                    &self.identity.activity_type,
+                    &llm_calls,
+                )
+                .await?;
+                committed_llm_calls.store(llm_calls.len(), std::sync::atomic::Ordering::SeqCst);
+
                 // Mark the task COMPLETED. The row lock above keeps the claim
                 // current, so a lost lease here is a bug, and the error rolls
                 // back.
@@ -16918,6 +16948,11 @@ impl ActivityContext {
                 // leaves it false so the failure flows through the normal path.
                 self.transactional_commit_occurred
                     .store(true, std::sync::atomic::Ordering::SeqCst);
+                // The commit wrote the first calls of the slot (issue #1996).
+                // A call recorded during the commit stays, so the worker logs
+                // it as dropped.
+                self.llm_calls
+                    .remove_first(committed_llm_calls.load(std::sync::atomic::Ordering::SeqCst));
                 Ok(value)
             }
             Err(e) => Err(match e {

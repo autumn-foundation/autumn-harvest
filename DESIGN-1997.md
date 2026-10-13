@@ -15,16 +15,18 @@ replay change. No change to the claim or dispatch path.**
 ### 0.1 The dependency on the cost ledger (#1996)
 
 The budgets need a durable record of what each LLM step spent. That record is
-the cost ledger of issue #1996, which is still open. This change ships the
-part of the ledger that the budgets need:
+the cost ledger of issue #1996. The first version of this change shipped its
+own ledger table, because #1996 was still open. #1996 (PR #2092) merged
+first, so this change now reads its ledger:
 
-- the `harvest_llm_ledger` side table, with clear columns for the model,
-  the tokens, the cost and the latency;
-- `ActivityContext::record_llm_usage`, which writes one row;
-- the statement in `docs/security-posture.md` of which ledger fields are in
-  clear.
+- `harvest_llm_ledger` holds one row per recorded call, keyed by the run,
+  the completion event and the call index. It has no tenant column.
+- `ActivityContext::record_llm_call` records a call. The engine writes the
+  row when the attempt completes.
+- The cost is in millionths of a US dollar, or `NULL` for an unpriced call.
 
-Issue #1996 keeps the roll-up in the usage reports and its replay test.
+The budget check joins each ledger row to its run for the tenant key. A new
+partial index on the runs keeps that read bounded. See §1.2.
 
 ### 0.2 Brainstorm — where can a budget live?
 
@@ -43,14 +45,14 @@ Issue #1996 keeps the roll-up in the usage reports and its replay test.
 |---|--------------|------------|
 | R1 | Concurrent steps all read the spend before any of them records. | The budget is a soft cap. The last step that passes can pass the cap by its whole usage. Steps in flight can add to that. The docs say so. |
 | R2 | A tenant budget with no window blocks the tenant for ever. | The tenant cap counts a rolling window. The default is one day. |
-| R3 | A failed ledger write hides a spend. | `record_llm_usage` returns a `HarvestResult`, not an activity payload, so `?` cannot turn it into a retry. The `agent_model_turn` activity logs it and keeps the answer, because a retry would pay for the call again. |
-| R4 | A retry or a resume re-runs a paid call and the ledger misses it. | Each recorded call writes its own row with its attempt number. A retry that pays again counts again. A call that fails or times out records nothing, because it returns no usage. The docs say so. |
+| R3 | A slow budget read uses up the time of the step, and the step times out after the model call. | The agent check has its own time budget, `AgentHarness::budget_timeout`. A check over it fails as retryable before the model call, so the retry pays nothing. |
+| R4 | A retry or a resume re-runs a paid call and the ledger misses it. | The ledger writes the calls of a completed attempt only (#1996). A call in an attempt that fails is not counted. That loosens the cap by at most the failed attempts. The docs say so. |
 | R5 | The step fails as retryable, so the retry policy runs it again. | The failure is non-retryable. The circuit breaker ignores non-retryable failures. |
 | R6 | A tenant key from caller input aliases another tenant. | The key follows the quota rules: bounded length, scoped by workflow type, fail-open when it does not resolve. |
 | R7 | The budget check costs every activity a query. | Only a step that calls `check_llm_budget` pays. With no LLM cap declared, the check reads no row. |
 | R8 | Retention deletes a run, and the tenant spend drops. | The ledger cascades with its run. Keep retention longer than the window. The docs say so. |
 | R9 | The activity runs in a process that does not register the workflow type, so it cannot read the caps. | The check passes and logs one warning for each type. The docs say to register the workflow on each worker that runs its LLM steps. |
-| R10 | A shard rebalance moves a run without its ledger, so the run cap starts again. | Activation copies the ledger rows of the run, with their `recorded_at`, after the source reaches `COMMITTED`. The settle transaction deletes the source copy, so the tenant spend does not count twice. A test proves both. |
+| R10 | A shard rebalance moves a run without its ledger, so the run cap starts again, or the tenant spend counts twice. | The #1996 move copies the ledger rows with the run. The tenant read uses the usage-report rule: the staged `MIGRATING` copy does not count, and the sealed `MIGRATED` source counts until the move is `DONE`. |
 | R11 | A huge recorded value overflows the sum, and every check fails as a read error. | The sums are `NUMERIC`, clamped to the `BIGINT` range. |
 | R12 | A zero window counts nothing, so the tenant caps never refuse. | The macro rejects 0. The builder raises 0 to one second. |
 
@@ -86,9 +88,9 @@ Four optional caps and one window on `QuotaPolicy`:
 | Builder | Cap |
 |---|---|
 | `with_max_run_llm_tokens(n)` | Tokens of one run. |
-| `with_max_run_llm_cost_micros(n)` | Cost of one run, in millionths of a currency unit. |
+| `with_max_run_llm_cost_usd_micros(n)` | Cost of one run, in millionths of a US dollar. |
 | `with_max_tenant_llm_tokens(n)` | Tokens of one key in the window. |
-| `with_max_tenant_llm_cost_micros(n)` | Cost of one key in the window. |
+| `with_max_tenant_llm_cost_usd_micros(n)` | Cost of one key in the window. |
 | `with_tenant_llm_window_secs(s)` | The rolling window. Default 86,400 s. |
 
 The `#[workflow(quota(...))]` macro takes the same names. `has_any_cap`
@@ -96,13 +98,15 @@ keeps its meaning: an admission cap. `has_llm_budget` reports an LLM cap.
 
 ### 1.2 The ledger
 
-`harvest_llm_ledger` holds one row for each recorded call. A row holds:
+The check sums `harvest_llm_ledger` (#1996). The run spend reads the rows
+of the run by the ledger key. The tenant spend joins each row to its run for
+`(workflow_name, quota_key)`, so the rows of a run count once its key is set.
 
-- the run, the workflow type and the `quota_key`;
-- the activity and the attempt;
-- the model, the input and output tokens, the cost and the latency.
-
-The row cascades with its run. A shard rebalance moves it.
+A row is never newer than the end of its run. So only a run that is active,
+or that ended in the window, can hold a row in the window. The partial index
+`idx_harvest_we_llm_tenant` on `(workflow_name, quota_key,
+COALESCE(completed_at, 'infinity'))` finds those runs. Without it, the check
+reads every run of the tenant that retention keeps, before each LLM step.
 
 ### 1.3 The check
 
@@ -124,12 +128,11 @@ register the workflow type passes the check and logs one warning.
 
 ### 1.4 The agent adapter
 
-- `AgentModel` gets the provided method `cost_micros`. The ledger reads
-  the model id from `model_id`, which the response cache (#1998) added. A
-  model with no id records `"unknown"`.
-- `agent_model_turn` checks the budget, calls the model, then records the
-  usage with the latency. A response cache hit calls no model, so it
-  records nothing.
+- `agent_model_turn` checks the budget, then calls the model. The #1996
+  recording of each turn is unchanged. `AgentModel::cost_usd_micros`
+  prices the call. A response cache hit calls no model, so it records
+  nothing.
+- The check has its own time budget, `AgentHarness::budget_timeout`.
 - `QuotaPolicy::new("tenant")` reads `AgentTask::tenant`, which the
   response cache (#1998) added.
 - The loop ends under `AgentStop::BudgetExceeded` when a step is refused.
@@ -144,11 +147,10 @@ register the workflow type passes the check and logs one warning.
 | Per-tenant budget, across runs | `llm_budget_tests::a_tenant_budget_stops_llm_steps_across_runs` |
 | Cost (dollar) budget | `llm_budget_tests::a_cost_budget_stops_llm_steps` |
 | Window | `llm_budget_tests::spend_outside_the_window_does_not_count` |
-| Ledger in clear | `llm_budget_tests::the_ledger_row_holds_the_usage_in_clear_columns` |
-| A retry records again | `llm_budget_tests::a_retry_that_pays_again_records_again_and_counts` |
+| The step records to the ledger | `llm_budget_tests::the_ledger_row_holds_the_usage_of_the_step` |
+| A failed attempt does not count | `llm_budget_tests::a_failed_attempt_records_nothing_and_does_not_count` |
 | No policy, no effect | `llm_budget_tests::a_run_with_no_llm_cap_is_never_refused` |
-| Rebalance keeps the spend | `shard_rebalance_db_tests::the_llm_ledger_moves_with_the_run` |
 | Pure rules | `quota::tests` and `llm_budget::tests` |
 | Macro keys | `macros_workflow` and the `quota_llm_zero_window` compile-fail case |
-| Agent order | `harness::tests` on `metered_turn` |
+| Agent check budget | `harness::tests` on `check_budget` |
 | Agent stop | `autumn-harvest-agent/tests/llm_budget.rs` |

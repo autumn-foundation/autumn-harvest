@@ -1257,8 +1257,8 @@ pub const METRIC_ADMISSION_GATES_ACTIVE: &str = "harvest.admission.gates_active"
 ///   - `"resource"` (= [`METRIC_LABEL_RESOURCE`]) — which cap was exhausted,
 ///     per [`crate::quota::QuotaResource::as_str`]. A start rejection gives
 ///     `"active_executions"`, `"history_bytes"` or `"dead_letters"`. An LLM
-///     refusal gives `"run_llm_tokens"`, `"run_llm_cost_micros"`,
-///     `"tenant_llm_tokens"` or `"tenant_llm_cost_micros"`.
+///     refusal gives `"run_llm_tokens"`, `"run_llm_cost_usd_micros"`,
+///     `"tenant_llm_tokens"` or `"tenant_llm_cost_usd_micros"`.
 ///
 /// The *resolved tenant key* is deliberately **not** a label — it is
 /// caller/tenant-controlled input and would be unbounded cardinality. Per-key

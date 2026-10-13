@@ -1,15 +1,15 @@
 //! LLM token and cost budgets per run and per tenant (issue #1997).
 //!
-//! A runaway agent loop can spend without limit. A declared budget stops it. The caps
-//! live on [`QuotaPolicy`], so a budget uses the quota key, the quota
-//! violation rule and the quota metric (issue #946).
+//! A runaway agent loop can spend without limit. A declared budget stops it.
+//! The caps live on [`QuotaPolicy`], so a budget uses the quota key, the
+//! quota violation rule and the quota metric (issue #946).
 //!
 //! # The two calls
 //!
 //! An LLM step is an activity that makes one model call. It calls
 //! [`ActivityContext::check_llm_budget`](crate::context::ActivityContext::check_llm_budget)
-//! before the model call. It calls
-//! [`ActivityContext::record_llm_usage`](crate::context::ActivityContext::record_llm_usage)
+//! before the model call. It records the call with
+//! [`ActivityContext::record_llm_call`](crate::context::ActivityContext::record_llm_call)
 //! after it. The check refuses the step when the run or the tenant has spent
 //! its cap. The refusal is a non-retryable failure of type
 //! [`ERROR_TYPE_LLM_BUDGET_EXCEEDED`]. Workflow code tests for it with
@@ -18,29 +18,31 @@
 //!
 //! # The ledger
 //!
-//! Each recorded call is one row of `harvest_llm_ledger`. The row holds the
-//! model, the tokens, the cost and the latency in clear columns, outside the
-//! encrypted payload. SQL can sum them without the codec key. The row is not
-//! an event, so replay does not change.
+//! The check sums the agent cost ledger, `harvest_llm_ledger` (issue #1996).
+//! See [`crate::llm_ledger`]. The engine writes one row per recorded call
+//! when the attempt completes. The cost caps are in millionths of a US
+//! dollar, as the ledger is. An unpriced call adds no cost.
 //!
 //! # Limits of the guarantee
 //!
 //! - The budget is a soft cap. The last step that passes the check can pass
 //!   the cap by its whole usage. Steps that run at the same time can all pass
 //!   the check before any of them records.
+//! - The ledger writes the calls of a completed attempt only. A call in an
+//!   attempt that fails or times out is not counted.
 //! - A run is one execution. A continue-as-new, a reset, a fork or a workflow
 //!   retry starts a new execution, so its run caps start from zero. A reset
 //!   fork keeps the key of its source.
 //! - The tenant scope is `(workflow type, quota key)`, as for quota. It is
-//!   shard-local. A shard rebalance moves the ledger rows of a run.
+//!   shard-local. The check reads the key of each run, so the rows of a run
+//!   count for its tenant once `quota_reconcile` sets the key.
 //! - A key that does not resolve fails open for the tenant caps. The run caps
-//!   still apply. A row that a run records before `quota_reconcile` sets its
-//!   key never counts for the tenant.
+//!   still apply.
 //! - The check reads the policy in its own process. A worker that does not
 //!   register the workflow type does not enforce the budget. It logs one
 //!   warning for each such type.
-//! - A check with a tenant cap sums every ledger row of the tenant in the
-//!   window. A policy with only run caps skips that sum.
+//! - A check with a tenant cap reads the runs of the tenant that are active
+//!   or ended in the window. A policy with only run caps skips that read.
 //! - A ledger row cascades with its run. Keep retention longer than the
 //!   tenant window.
 //! - An activity that does not call the check is not budgeted. The budget
@@ -70,60 +72,6 @@ pub fn check_failed(error: &dyn std::fmt::Display) -> ActivityFailure {
     )
 }
 
-/// The usage of one model call, as the ledger records it.
-///
-/// Build it with [`Self::new`]. Later releases can add fields.
-#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[non_exhaustive]
-pub struct LlmUsage {
-    /// The model id. The caller chooses it, for example from its
-    /// configuration or from the provider response.
-    pub model: String,
-    /// Prompt tokens.
-    pub input_tokens: u64,
-    /// Output tokens.
-    pub output_tokens: u64,
-    /// The cost, in millionths of a currency unit.
-    pub cost_micros: u64,
-    /// The time of the call, in milliseconds.
-    pub latency_ms: u64,
-}
-
-impl LlmUsage {
-    /// Usage with a model id and token counts. The cost and the latency are
-    /// zero.
-    #[must_use]
-    pub fn new(model: impl Into<String>, input_tokens: u64, output_tokens: u64) -> Self {
-        Self {
-            model: model.into(),
-            input_tokens,
-            output_tokens,
-            cost_micros: 0,
-            latency_ms: 0,
-        }
-    }
-
-    /// Set the cost, in millionths of a currency unit.
-    #[must_use]
-    pub const fn with_cost_micros(mut self, cost_micros: u64) -> Self {
-        self.cost_micros = cost_micros;
-        self
-    }
-
-    /// Set the latency of the call.
-    #[must_use]
-    pub fn with_latency(mut self, latency: std::time::Duration) -> Self {
-        self.latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
-        self
-    }
-
-    /// Input plus output tokens.
-    #[must_use]
-    pub const fn total_tokens(&self) -> u64 {
-        self.input_tokens.saturating_add(self.output_tokens)
-    }
-}
-
 /// What a run and its tenant spent, as the check reads it.
 ///
 /// The fields are `i64`, as Postgres sums them. A negative value counts as
@@ -132,12 +80,12 @@ impl LlmUsage {
 pub struct LlmSpend {
     /// Tokens of the run.
     pub run_tokens: i64,
-    /// Cost of the run.
-    pub run_cost_micros: i64,
+    /// Cost of the run, in millionths of a US dollar.
+    pub run_cost_usd_micros: i64,
     /// Tokens of the key in the window.
     pub tenant_tokens: i64,
-    /// Cost of the key in the window.
-    pub tenant_cost_micros: i64,
+    /// Cost of the key in the window, in millionths of a US dollar.
+    pub tenant_cost_usd_micros: i64,
 }
 
 /// Compare a spend with the LLM caps of a policy.
@@ -156,9 +104,9 @@ pub fn check_llm_budget(spend: &LlmSpend, policy: &QuotaPolicy) -> Option<QuotaV
             spend.run_tokens,
         ),
         (
-            QuotaResource::RunLlmCostMicros,
-            policy.max_run_llm_cost_micros,
-            spend.run_cost_micros,
+            QuotaResource::RunLlmCostUsdMicros,
+            policy.max_run_llm_cost_usd_micros,
+            spend.run_cost_usd_micros,
         ),
         (
             QuotaResource::TenantLlmTokens,
@@ -166,9 +114,9 @@ pub fn check_llm_budget(spend: &LlmSpend, policy: &QuotaPolicy) -> Option<QuotaV
             spend.tenant_tokens,
         ),
         (
-            QuotaResource::TenantLlmCostMicros,
-            policy.max_tenant_llm_cost_micros,
-            spend.tenant_cost_micros,
+            QuotaResource::TenantLlmCostUsdMicros,
+            policy.max_tenant_llm_cost_usd_micros,
+            spend.tenant_cost_usd_micros,
         ),
     ]
     .into_iter()
@@ -256,8 +204,20 @@ impl LlmBudgetExceeded {
 ///
 /// `$1` is the run. `$2` is the tenant window in seconds. `$3` is false when
 /// the policy declares no tenant cap. The planner then skips the tenant sum.
-/// The tenant scope is the `(workflow_name, quota_key)` of the run. A run with no key has no
-/// tenant spend. Each sum reads one index of `harvest_llm_ledger`.
+///
+/// The run sum reads the ledger key, which starts with the run. The tenant
+/// scope is the `(workflow_name, quota_key)` of the run. A run with no key
+/// has no tenant spend. The tenant sum joins each ledger row to its run:
+///
+/// - The rows of a run count once its key is set.
+/// - A row is never newer than the end of its run. So only a run that is
+///   active, or that ended in the window, can hold a row in the window.
+///   `idx_harvest_we_llm_tenant` finds those runs. The `LATERAL` sum then
+///   reads the ledger of each run by its key, so the read never scans the
+///   rows of other tenants.
+/// - A run in a shard move counts on one shard only, as in the usage report
+///   (issue #1996). The staged `MIGRATING` copy does not count. The sealed
+///   `MIGRATED` source counts until the move is `DONE`.
 ///
 /// The sums are `NUMERIC`, clamped to the `BIGINT` range. A huge recorded
 /// value then reads as a spent cap, not as a read error.
@@ -268,33 +228,53 @@ const LLM_SPEND_SQL: &str = "\
     ), run_spend AS ( \
         SELECT LEAST(COALESCE(SUM(input_tokens::NUMERIC + output_tokens), 0), \
                      9223372036854775807)::BIGINT AS tokens, \
-               LEAST(COALESCE(SUM(cost_micros::NUMERIC), 0), \
-                     9223372036854775807)::BIGINT AS cost_micros \
-        FROM harvest_llm_ledger WHERE execution_id = $1 \
+               LEAST(COALESCE(SUM(cost_usd_micros::NUMERIC), 0), \
+                     9223372036854775807)::BIGINT AS cost_usd_micros \
+        FROM harvest_llm_ledger WHERE workflow_exec_id = $1 \
     ), tenant_spend AS ( \
-        SELECT LEAST(COALESCE(SUM(l.input_tokens::NUMERIC + l.output_tokens), 0), \
-                     9223372036854775807)::BIGINT AS tokens, \
-               LEAST(COALESCE(SUM(l.cost_micros::NUMERIC), 0), \
-                     9223372036854775807)::BIGINT AS cost_micros \
-        FROM harvest_llm_ledger l JOIN run r \
-          ON l.workflow_name = r.workflow_name AND l.quota_key = r.quota_key \
+        SELECT LEAST(COALESCE(SUM(s.tokens), 0), 9223372036854775807)::BIGINT AS tokens, \
+               LEAST(COALESCE(SUM(s.cost_usd_micros), 0), \
+                     9223372036854775807)::BIGINT AS cost_usd_micros \
+        FROM run r \
+        JOIN harvest_workflow_executions w \
+          ON w.workflow_name = r.workflow_name AND w.quota_key = r.quota_key \
+        CROSS JOIN LATERAL ( \
+            SELECT SUM(l.input_tokens::NUMERIC + l.output_tokens) AS tokens, \
+                   SUM(l.cost_usd_micros::NUMERIC) AS cost_usd_micros \
+            FROM harvest_llm_ledger l \
+            WHERE l.workflow_exec_id = w.id \
+              AND l.recorded_at >= NOW() - ($2::BIGINT * INTERVAL '1 second') \
+        ) s \
         WHERE $3::BOOLEAN \
-          AND l.recorded_at >= NOW() - ($2::BIGINT * INTERVAL '1 second') \
+          AND COALESCE(w.completed_at, 'infinity'::timestamptz) \
+              >= NOW() - ($2::BIGINT * INTERVAL '1 second') \
+          AND ( \
+              w.state NOT IN ('MIGRATING', 'MIGRATED') \
+              OR (w.state = 'MIGRATED' AND EXISTS ( \
+                  SELECT 1 FROM harvest_shard_migrations m \
+                  WHERE m.execution_id = w.id AND m.phase = 'COMMITTED' \
+              )) \
+          ) \
     ) \
-    SELECT run_spend.tokens AS run_tokens, run_spend.cost_micros AS run_cost_micros, \
-           tenant_spend.tokens AS tenant_tokens, tenant_spend.cost_micros AS tenant_cost_micros \
+    SELECT run_spend.tokens AS run_tokens, \
+           run_spend.cost_usd_micros AS run_cost_usd_micros, \
+           tenant_spend.tokens AS tenant_tokens, \
+           tenant_spend.cost_usd_micros AS tenant_cost_usd_micros \
     FROM run_spend, tenant_spend";
 
-/// Write one ledger row. The run row gives the workflow type and the key.
+/// The planner setting of the tenant read.
 ///
-/// No row is written when the run does not exist.
+/// **JIT off.** The planner cannot see which runs of a tenant fall in the
+/// window, so it can estimate thousands of runs where a few match. That
+/// estimate can pass `jit_above_cost`. JIT then compiles the plan on every
+/// LLM step, for a read that runs in well under a millisecond. On a fixture
+/// of 200,000 runs, JIT took the read from 0.2 ms to 65 ms. The claim path
+/// turns JIT off for the same reason (`queue::CLAIM_PLAN_SETTINGS_SQL`).
+///
+/// `SET LOCAL` ends with the transaction, so the session settings of the
+/// connection do not change.
 #[cfg(feature = "db")]
-const RECORD_LLM_USAGE_SQL: &str = "\
-    INSERT INTO harvest_llm_ledger \
-        (execution_id, workflow_name, quota_key, activity_name, activity_id, attempt, \
-         model, input_tokens, output_tokens, cost_micros, latency_ms) \
-    SELECT id, workflow_name, quota_key, $2, $3, $4, $5, $6, $7, $8, $9 \
-    FROM harvest_workflow_executions WHERE id = $1";
+const SPEND_PLAN_SETTINGS_SQL: &str = "SET LOCAL jit = off";
 
 #[cfg(feature = "db")]
 #[derive(Debug, diesel::QueryableByName)]
@@ -302,17 +282,18 @@ struct LlmSpendRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     run_tokens: i64,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
-    run_cost_micros: i64,
+    run_cost_usd_micros: i64,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     tenant_tokens: i64,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
-    tenant_cost_micros: i64,
+    tenant_cost_usd_micros: i64,
 }
 
 /// Read the spend of a run and of its tenant.
 ///
 /// With `with_tenant` false, the tenant spend reads as zero and costs no
-/// scan.
+/// scan. With it true, the read runs in a short transaction that turns JIT
+/// off. See `SPEND_PLAN_SETTINGS_SQL`.
 ///
 /// # Errors
 ///
@@ -324,66 +305,37 @@ pub async fn load_llm_spend(
     window_secs: u32,
     with_tenant: bool,
 ) -> crate::error::HarvestResult<LlmSpend> {
-    use diesel_async::RunQueryDsl as _;
+    use diesel_async::{AsyncConnection as _, RunQueryDsl as _};
 
-    let row: LlmSpendRow = diesel::sql_query(LLM_SPEND_SQL)
-        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-        .bind::<diesel::sql_types::BigInt, _>(i64::from(window_secs))
-        .bind::<diesel::sql_types::Bool, _>(with_tenant)
-        .get_result(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let read = async |conn: &mut diesel_async::AsyncPgConnection| {
+        diesel::sql_query(LLM_SPEND_SQL)
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .bind::<diesel::sql_types::BigInt, _>(i64::from(window_secs))
+            .bind::<diesel::sql_types::Bool, _>(with_tenant)
+            .get_result::<LlmSpendRow>(conn)
+            .await
+            .map_err(crate::error::database_error)
+    };
+    let row = if with_tenant {
+        Box::pin(
+            conn.transaction::<_, crate::error::HarvestError, _>(async move |conn| {
+                diesel::sql_query(SPEND_PLAN_SETTINGS_SQL)
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+                read(conn).await
+            }),
+        )
+        .await?
+    } else {
+        read(conn).await?
+    };
     Ok(LlmSpend {
         run_tokens: row.run_tokens,
-        run_cost_micros: row.run_cost_micros,
+        run_cost_usd_micros: row.run_cost_usd_micros,
         tenant_tokens: row.tenant_tokens,
-        tenant_cost_micros: row.tenant_cost_micros,
+        tenant_cost_usd_micros: row.tenant_cost_usd_micros,
     })
-}
-
-/// The attempt that recorded a ledger row.
-#[cfg(feature = "db")]
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct LlmCallSite<'a> {
-    /// The run.
-    pub exec_id: crate::types::ExecutionId,
-    /// The activity type.
-    pub activity_name: &'a str,
-    /// The activity invocation, stable across retries.
-    pub activity_id: crate::types::ActivityExecId,
-    /// The attempt, from 1.
-    pub attempt: u32,
-}
-
-/// Write one ledger row. Returns `false` when the run does not exist.
-///
-/// # Errors
-///
-/// Returns a database error when the write fails.
-#[cfg(feature = "db")]
-pub(crate) async fn record_llm_usage(
-    conn: &mut diesel_async::AsyncPgConnection,
-    site: LlmCallSite<'_>,
-    usage: &LlmUsage,
-) -> crate::error::HarvestResult<bool> {
-    use diesel::sql_types::{BigInt, Integer, Text, Uuid};
-    use diesel_async::RunQueryDsl as _;
-
-    let clamp = |n: u64| -> i64 { i64::try_from(n).unwrap_or(i64::MAX) };
-    let written = diesel::sql_query(RECORD_LLM_USAGE_SQL)
-        .bind::<Uuid, _>(site.exec_id.as_uuid())
-        .bind::<Text, _>(site.activity_name)
-        .bind::<Uuid, _>(site.activity_id.as_uuid())
-        .bind::<Integer, _>(i32::try_from(site.attempt.max(1)).unwrap_or(i32::MAX))
-        .bind::<Text, _>(usage.model.as_str())
-        .bind::<BigInt, _>(clamp(usage.input_tokens))
-        .bind::<BigInt, _>(clamp(usage.output_tokens))
-        .bind::<BigInt, _>(clamp(usage.cost_micros))
-        .bind::<BigInt, _>(clamp(usage.latency_ms))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-    Ok(written > 0)
 }
 
 /// The LLM budget of a workflow type, if it declares one.
@@ -435,16 +387,16 @@ mod tests {
     fn all_caps() -> QuotaPolicy {
         QuotaPolicy::new("tenant")
             .with_max_run_llm_tokens(100)
-            .with_max_run_llm_cost_micros(1_000)
+            .with_max_run_llm_cost_usd_micros(1_000)
             .with_max_tenant_llm_tokens(500)
-            .with_max_tenant_llm_cost_micros(5_000)
+            .with_max_tenant_llm_cost_usd_micros(5_000)
     }
 
     #[test]
     fn only_a_tenant_cap_needs_the_tenant_sum() {
         let run_only = QuotaPolicy::new("tenant")
             .with_max_run_llm_tokens(1)
-            .with_max_run_llm_cost_micros(1);
+            .with_max_run_llm_cost_usd_micros(1);
         assert!(!run_only.has_tenant_llm_cap());
         assert!(
             QuotaPolicy::new("t")
@@ -453,7 +405,7 @@ mod tests {
         );
         assert!(
             QuotaPolicy::new("t")
-                .with_max_tenant_llm_cost_micros(1)
+                .with_max_tenant_llm_cost_usd_micros(1)
                 .has_tenant_llm_cap()
         );
     }
@@ -474,9 +426,9 @@ mod tests {
         let base = QuotaPolicy::new("tenant");
         for policy in [
             base.with_max_run_llm_tokens(1),
-            base.with_max_run_llm_cost_micros(1),
+            base.with_max_run_llm_cost_usd_micros(1),
             base.with_max_tenant_llm_tokens(1),
-            base.with_max_tenant_llm_cost_micros(1),
+            base.with_max_tenant_llm_cost_usd_micros(1),
         ] {
             assert!(policy.has_llm_budget());
             assert!(!policy.has_any_cap());
@@ -496,9 +448,9 @@ mod tests {
     fn a_spend_under_every_cap_passes() {
         let spend = LlmSpend {
             run_tokens: 99,
-            run_cost_micros: 999,
+            run_cost_usd_micros: 999,
             tenant_tokens: 499,
-            tenant_cost_micros: 4_999,
+            tenant_cost_usd_micros: 4_999,
         };
         assert_eq!(check_llm_budget(&spend, &all_caps()), None);
     }
@@ -519,21 +471,21 @@ mod tests {
     fn the_caps_are_checked_in_a_fixed_order() {
         let mut spend = LlmSpend {
             run_tokens: 0,
-            run_cost_micros: 0,
+            run_cost_usd_micros: 0,
             tenant_tokens: 0,
-            tenant_cost_micros: 9_000,
+            tenant_cost_usd_micros: 9_000,
         };
         let order = [
-            QuotaResource::TenantLlmCostMicros,
+            QuotaResource::TenantLlmCostUsdMicros,
             QuotaResource::TenantLlmTokens,
-            QuotaResource::RunLlmCostMicros,
+            QuotaResource::RunLlmCostUsdMicros,
             QuotaResource::RunLlmTokens,
         ];
         let mut seen = Vec::new();
         seen.push(check_llm_budget(&spend, &all_caps()).unwrap().resource);
         spend.tenant_tokens = 900;
         seen.push(check_llm_budget(&spend, &all_caps()).unwrap().resource);
-        spend.run_cost_micros = 9_000;
+        spend.run_cost_usd_micros = 9_000;
         seen.push(check_llm_budget(&spend, &all_caps()).unwrap().resource);
         spend.run_tokens = 900;
         seen.push(check_llm_budget(&spend, &all_caps()).unwrap().resource);
@@ -544,16 +496,16 @@ mod tests {
     fn an_undeclared_cap_is_never_checked() {
         let spend = LlmSpend {
             run_tokens: i64::MAX,
-            run_cost_micros: i64::MAX,
+            run_cost_usd_micros: i64::MAX,
             tenant_tokens: i64::MAX,
-            tenant_cost_micros: i64::MAX,
+            tenant_cost_usd_micros: i64::MAX,
         };
-        let only_tenant_cost = QuotaPolicy::new("tenant").with_max_tenant_llm_cost_micros(10);
+        let only_tenant_cost = QuotaPolicy::new("tenant").with_max_tenant_llm_cost_usd_micros(10);
         assert_eq!(
             check_llm_budget(&spend, &only_tenant_cost)
                 .unwrap()
                 .resource,
-            QuotaResource::TenantLlmCostMicros
+            QuotaResource::TenantLlmCostUsdMicros
         );
         assert_eq!(check_llm_budget(&spend, &QuotaPolicy::new("tenant")), None);
     }
@@ -562,13 +514,13 @@ mod tests {
     fn a_cap_above_the_ledger_ceiling_is_still_reachable() {
         // The ledger sums saturate at `i64::MAX`, so a larger cap must refuse
         // there instead of never.
-        let policy = QuotaPolicy::new("tenant").with_max_tenant_llm_cost_micros(u64::MAX);
+        let policy = QuotaPolicy::new("tenant").with_max_tenant_llm_cost_usd_micros(u64::MAX);
         let spend = LlmSpend {
-            tenant_cost_micros: i64::MAX,
+            tenant_cost_usd_micros: i64::MAX,
             ..LlmSpend::default()
         };
         let violation = check_llm_budget(&spend, &policy).unwrap();
-        assert_eq!(violation.resource, QuotaResource::TenantLlmCostMicros);
+        assert_eq!(violation.resource, QuotaResource::TenantLlmCostUsdMicros);
         assert_eq!(violation.limit, i64::MAX.unsigned_abs());
     }
 
@@ -655,20 +607,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_context_with_no_database_passes_and_records_nothing() {
+    async fn a_context_with_no_database_passes() {
         let ctx = crate::context::ActivityContext::new_test();
         assert_eq!(ctx.check_llm_budget().await, Ok(()));
-        let recorded = ctx.record_llm_usage(&LlmUsage::new("m", 1, 1)).await;
-        assert!(!recorded.expect("no database, no error"));
-    }
-
-    #[test]
-    fn usage_saturates_and_converts_latency() {
-        let usage = LlmUsage::new("m", u64::MAX, 1)
-            .with_cost_micros(7)
-            .with_latency(std::time::Duration::from_millis(1_250));
-        assert_eq!(usage.total_tokens(), u64::MAX);
-        assert_eq!(usage.cost_micros, 7);
-        assert_eq!(usage.latency_ms, 1_250);
     }
 }

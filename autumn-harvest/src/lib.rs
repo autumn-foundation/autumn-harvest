@@ -383,6 +383,9 @@ pub mod interceptor;
 pub mod lifecycle;
 /// LLM token and cost budgets per run and per tenant (issue #1997).
 pub mod llm_budget;
+/// Agent cost ledger: model, tokens, cost and latency per LLM step (issue
+/// #1996).
+pub mod llm_ledger;
 /// `cfg(loom)` synchronization-primitive shim (std under normal builds).
 ///
 /// Contained to the modules that opt into loom model checking; see

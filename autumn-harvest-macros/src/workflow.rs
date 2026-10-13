@@ -53,9 +53,9 @@ struct ThrottleArgs {
 /// `QuotaPolicy` builder of the same name with a `with_` prefix.
 const LLM_QUOTA_KEYS: [&str; 5] = [
     "max_run_llm_tokens",
-    "max_run_llm_cost_micros",
+    "max_run_llm_cost_usd_micros",
     "max_tenant_llm_tokens",
-    "max_tenant_llm_cost_micros",
+    "max_tenant_llm_cost_usd_micros",
     "tenant_llm_window_secs",
 ];
 
@@ -663,8 +663,8 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
                 } else {
                     Err(inner.error(
                         "expected `key`, `max_active_executions`, `max_history_bytes`, \
-                         `max_dead_letters`, `max_run_llm_tokens`, `max_run_llm_cost_micros`, \
-                         `max_tenant_llm_tokens`, `max_tenant_llm_cost_micros`, or \
+                         `max_dead_letters`, `max_run_llm_tokens`, `max_run_llm_cost_usd_micros`, \
+                         `max_tenant_llm_tokens`, `max_tenant_llm_cost_usd_micros`, or \
                          `tenant_llm_window_secs`",
                     ))
                 }

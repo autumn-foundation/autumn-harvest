@@ -1377,9 +1377,9 @@ impl HandlerRegistry {
                         quota.max_history_bytes,
                         quota.max_dead_letters,
                         quota.max_run_llm_tokens,
-                        quota.max_run_llm_cost_micros,
+                        quota.max_run_llm_cost_usd_micros,
                         quota.max_tenant_llm_tokens,
-                        quota.max_tenant_llm_cost_micros,
+                        quota.max_tenant_llm_cost_usd_micros,
                         quota.tenant_llm_window_secs,
                     ])),
                     "execution_timeout": info
@@ -4803,10 +4803,17 @@ async fn append_frontier_resolution(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // Issue #1996: the activity name and the LLM calls that the first event,
+    // a `LocalActivityCompleted`, writes. `None` writes no ledger row.
+    ledger: Option<(&str, &[crate::llm_ledger::LlmCall])>,
 ) -> HarvestResult<()> {
     let owned: Vec<WorkflowEvent> = events.to_vec();
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
         store::append_events_with_codecs(conn, exec_id, &owned, event_start, codecs).await?;
+        if let Some((activity_name, calls)) = ledger {
+            crate::llm_ledger::insert_ledger_rows(conn, exec_id, event_start, activity_name, calls)
+                .await?;
+        }
         queue::reset_capability_misses_after_inline_progress(
             conn,
             frontier.task_id,
@@ -5200,6 +5207,7 @@ async fn run_local_activity_inline(
                     *next_event_id,
                     frontier,
                     registry.payload_codecs(),
+                    Some((run.name.as_str(), ctx.take_llm_calls().as_slice())),
                 )
                 .await?;
                 *next_event_id += 1;
@@ -5289,6 +5297,7 @@ async fn run_local_activity_inline(
                         *next_event_id,
                         frontier,
                         registry.payload_codecs(),
+                        None,
                     )
                     .await?;
                     *next_event_id += i32::try_from(terminal_pair.len())
@@ -14726,6 +14735,7 @@ pub async fn finalize_activity_completion(
         offloader,
         codecs,
         None,
+        &[],
     )
     .await
     .map(|_| ())
@@ -14750,6 +14760,8 @@ async fn finalize_activity_completion_write(
     offloader: Option<&crate::payload_store::PayloadOffloader>,
     codecs: &crate::payload_codec::PayloadCodecs,
     stored: Option<&crate::fan_out::StoredResult>,
+    // Issue #1996: written after the event, in the same transaction.
+    llm_calls: &[crate::llm_ledger::LlmCall],
 ) -> HarvestResult<queue::ClaimWrite> {
     let Some(activity_name) = task.activity_name.as_deref() else {
         return Ok(queue::ClaimWrite::LeaseLost);
@@ -14797,6 +14809,14 @@ async fn finalize_activity_completion_write(
                 history.next_event_id,
                 offloader,
                 codecs,
+            )
+            .await?;
+            crate::llm_ledger::insert_ledger_rows(
+                conn,
+                exec_id,
+                history.next_event_id,
+                activity_name,
+                llm_calls,
             )
             .await?;
             queue::complete_claimed_task(conn, &claim_of_task(task)?, output)
@@ -16109,6 +16129,21 @@ async fn record_schedule_to_close_activity_timeout(
     .await
 }
 
+/// Log the LLM calls an activity recorded after its transactional commit.
+///
+/// The commit already wrote the completion, so the engine drops these calls
+/// (issue #1996).
+fn warn_llm_calls_after_commit(activity_name: &str, dropped: usize) {
+    if dropped > 0 {
+        tracing::warn!(
+            activity = activity_name,
+            dropped,
+            "LLM calls recorded after run_transactional committed are not in the ledger; \
+             record them before the commit"
+        );
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 async fn handle_activity_result(
@@ -16129,6 +16164,8 @@ async fn handle_activity_result(
     codecs: &crate::payload_codec::PayloadCodecs,
     // Issue #1986: the result writer's reference, written before the call.
     stored: Option<&crate::fan_out::StoredResult>,
+    // Issue #1996: the LLM calls a completion writes with its event.
+    llm_calls: &[crate::llm_ledger::LlmCall],
 ) -> HarvestResult<queue::ClaimWrite> {
     match activity_result {
         // Issue #1986: a writer row that this worker cannot write records the
@@ -16187,6 +16224,7 @@ async fn handle_activity_result(
                 offloader,
                 codecs,
                 stored,
+                llm_calls,
             )
             .await
         }
@@ -16311,6 +16349,7 @@ pub async fn write_activity_result_for_task(
         crate::builder::DEFAULT_RETRY_AFTER_CEILING,
         codecs,
         None,
+        &[],
     )
     .await
 }
@@ -18037,6 +18076,7 @@ async fn handle_session_acquire(
         None,
         codecs,
         None,
+        &[],
     )
     .await
     .map(Some)
@@ -18107,6 +18147,7 @@ async fn handle_session_release(
         None,
         codecs,
         None,
+        &[],
     )
     .await
     .map(Some)
@@ -18990,6 +19031,7 @@ async fn process_activity_task(
                 activity_id,
                 worker_id,
                 activity_name,
+                llm_calls: &[],
             };
             write_activity_result(
                 pool,
@@ -19475,6 +19517,18 @@ async fn process_activity_task(
     // resolved. On non-`db` builds `run_transactional` does not exist, so the
     // flag is always false.
     let committed_transactionally = ctx.transactional_commit_occurred();
+    // Issue #1996: a completion writes the recorded LLM calls with its event.
+    // A failure drops them. A transactional commit already wrote its calls,
+    // so a call left in the slot came after the commit.
+    let llm_calls = ctx.take_llm_calls();
+    let llm_calls = if committed_transactionally {
+        warn_llm_calls_after_commit(activity_name, llm_calls.len());
+        Vec::new()
+    } else if activity_result.is_ok() {
+        llm_calls
+    } else {
+        Vec::new()
+    };
     // The adaptive limit reads a timeout as overload (issue #1836).
     let attempt_deadline = ctx.deadline();
 
@@ -19797,6 +19851,7 @@ async fn process_activity_task(
         activity_id,
         worker_id,
         activity_name,
+        llm_calls: &llm_calls,
     };
     let finalized = write_activity_result(
         pool,
@@ -19993,6 +20048,9 @@ struct ActivityAttempt<'a> {
     activity_id: ActivityExecId,
     worker_id: &'a str,
     activity_name: &'a str,
+    /// The LLM calls the attempt recorded (issue #1996). A completion
+    /// writes them with its event. A failure drops them.
+    llm_calls: &'a [crate::llm_ledger::LlmCall],
 }
 
 /// Write the result of an activity attempt that has started (issue #1788).
@@ -20026,6 +20084,7 @@ async fn write_activity_result(
         activity_id,
         worker_id,
         activity_name,
+        llm_calls,
     } = *attempt_of;
     let mut conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
     // A handler failure and an inline output upload nothing. The count
@@ -20068,6 +20127,7 @@ async fn write_activity_result(
             registry.retry_after_ceiling,
             registry.payload_codecs(),
             stored.as_ref(),
+            llm_calls,
         )
         .await;
         match outcome {
