@@ -4255,9 +4255,11 @@ impl WorkflowContext {
     /// Set a cancel request that the history does not hold yet (issue #2021).
     ///
     /// A `WorkflowCancelled` event in the history wins, so this call cannot
-    /// replace a recorded reason. `None` changes nothing.
+    /// replace a recorded reason. `None` changes nothing. A backend that
+    /// rebuilds a context outside the executor, such as for an update, calls
+    /// it directly.
     #[must_use]
-    pub(crate) fn with_pending_cancellation(mut self, reason: Option<String>) -> Self {
+    pub fn with_pending_cancellation(mut self, reason: Option<String>) -> Self {
         if self.cancellation_reason.is_none() {
             self.cancellation_reason = reason;
         }

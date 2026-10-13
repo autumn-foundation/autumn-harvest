@@ -1278,6 +1278,9 @@ impl SqliteRuntime {
         let (history, history_bytes) = store::load_history_sized(&self.conn, exec)?;
         let input = store::execution_input(&self.conn, exec)?;
         let workflow_id = store::workflow_id_of(&self.conn, exec)?;
+        // The body sees a pending cancel here, as on the next drive (issue
+        // #2021).
+        let cancel_reason = store::cancel_request(&self.conn, exec)?.map(|(reason, _)| reason);
         // The same policy as the drive, so `should_continue_as_new` replays the
         // same branch (issue #2023).
         let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
@@ -1287,7 +1290,8 @@ impl SqliteRuntime {
             self.history_policy,
         )
         .with_workflow_name(workflow_name)
-        .with_workflow_id(workflow_id);
+        .with_workflow_id(workflow_id)
+        .with_pending_cancellation(cancel_reason);
         for info in declarative {
             ctx.register_declarative_update_handler(info);
         }

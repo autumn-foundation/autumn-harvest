@@ -65,6 +65,17 @@ async fn limit_wf(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
     ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
 }
 
+/// Registers `status`, which returns the cancel reason that the body saw.
+#[workflow]
+async fn cancel_aware_wf(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let reason = ctx.cancellation_reason().map(str::to_string);
+    ctx.register_update_handler_no_validator("status", move |_input: Value| {
+        let reason = reason.clone();
+        async move { Ok(json!(reason)) }
+    });
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
 /// A handler body that a separate thread wakes after 20 ms. It stands for a
 /// timer, I/O or an async lock.
 fn woken_later() -> impl Future<Output = Result<Value, String>> + Send {
@@ -1153,6 +1164,27 @@ async fn update_at_the_event_cap_under_a_pending_cancel_ends_cancelled() {
         rt.outcome(exec).unwrap(),
         ExecutionOutcome::Terminated(state) if state == "CANCELLED"
     ));
+}
+
+/// The update replay sees a pending cancel, as the next drive does (issue
+/// #2021).
+#[tokio::test]
+async fn an_update_sees_a_pending_cancel() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&cancel_aware_wf_info());
+    let exec = rt.start_workflow("cancel_aware_wf", json!(0)).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    assert_eq!(
+        rt.update(exec, "status", json!(null)).await.unwrap(),
+        json!(null)
+    );
+
+    rt.cancel(exec, "stop").unwrap();
+
+    assert_eq!(
+        rt.update(exec, "status", json!(null)).await.unwrap(),
+        json!("stop")
+    );
 }
 
 /// An update below the caps is unchanged.

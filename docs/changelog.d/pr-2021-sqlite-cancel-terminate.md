@@ -22,6 +22,8 @@ the agent daemon, could not stop a stuck run.
   `CANCELLED`, not `FAILED`.
 - A pending activity task, such as a retry in backoff, still runs. A repeat
   cancel keeps the first reason. The request survives a reopen.
+- An `update` replays the body with the pending request, so its handlers
+  see `cancellation_reason()`.
 - `SqliteRuntime::terminate(exec, reason)` ends the run `TERMINATED` in one
   transaction. The body does not run again.
 - Both paths append the core `WorkflowCancelled { reason }` event as the last
@@ -44,7 +46,8 @@ command recorded after that event therefore diverges on replay. The request
 is stored outside the event log until the run ends. The core gains one seam,
 `WorkflowExecuteSpanMeta::cancellation_reason`. It sets
 `ctx.cancellation_reason()` on each decision cycle while the request is
-pending. A recorded `WorkflowCancelled` wins. Every other caller passes
+pending. A recorded `WorkflowCancelled` wins. The update replay calls the public
+`WorkflowContext::with_pending_cancellation` for the same effect. Every other caller passes
 `None`, so Postgres behavior does not change. See `DESIGN-2021.md`.
 
 **Breaking changes.** `WorkflowExecuteSpanMeta` has a new public field.

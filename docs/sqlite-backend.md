@@ -361,7 +361,8 @@ So every cancel ends the run. Cleanup can run activities, but it must not
 wait on a timer or a signal: that wait ends the run. A pending activity task,
 such as a retry in backoff, still runs, and the body sees the request when
 that await resolves. A repeat `cancel` keeps the first reason. The request
-survives a crash and a reopen.
+survives a crash and a reopen. An update replays the body with the pending
+request too, so its handlers see `cancellation_reason()`.
 
 **Terminate.** `terminate` ends the run `TERMINATED` in one transaction. The
 body does not run again, and `terminate` drops a pending cancel request.
