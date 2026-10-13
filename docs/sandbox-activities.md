@@ -152,6 +152,12 @@ runtime refuses a policy that allows the network on a backend without one.
   `Vulnerable`.
 - A jail base directory that belongs to root, and that only root can write.
 - SMT off on a host that serves more than one tenant. Swap off.
+- An empty network namespace for the jailer, through `JailerConfig::netns`.
+  The microVM has no network device. The namespace also cuts the network of
+  an escaped VMM.
+- One launcher per tenant, each with its own jail uid and gid. The microVMs
+  of one launcher share their uid, so an escaped VMM can signal its
+  siblings.
 
 Call `verify_host` before the first run. It checks the versions and the host.
 Under `PosturePolicy::Enforce`, the default, it refuses a critical finding.
