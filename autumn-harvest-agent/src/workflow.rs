@@ -59,6 +59,11 @@ struct Progress {
     step_base: u32,
     /// Tool calls of the whole run.
     tool_calls: u32,
+    /// Tool rounds of every agent under this one. They do not count against
+    /// `max_steps`, which bounds each agent alone.
+    delegated_steps: u32,
+    /// Tool calls of every agent under this one.
+    delegated_tool_calls: u32,
     last_text: String,
     /// The segment ended on a turn with no tool calls, so `last_text` is its
     /// answer.
@@ -81,6 +86,8 @@ impl Progress {
             steps: 0,
             step_base: 0,
             tool_calls: 0,
+            delegated_steps: 0,
+            delegated_tool_calls: 0,
             last_text: String::new(),
             answered: false,
             tracker: LoopTracker::default(),
@@ -105,8 +112,11 @@ impl Progress {
         AgentReport {
             stop,
             text: self.last_text.clone(),
-            steps_used: self.step_base.saturating_add(self.steps),
-            tool_calls: self.tool_calls,
+            steps_used: self
+                .step_base
+                .saturating_add(self.steps)
+                .saturating_add(self.delegated_steps),
+            tool_calls: self.tool_calls.saturating_add(self.delegated_tool_calls),
             usage: self.usage,
             messages: without_system(&self.messages),
             followups: self.chain,
@@ -844,15 +854,20 @@ async fn delegate(
         &child_task.input,
     ))
     .await?;
+    // The parent counts the whole subtree, as it does for usage.
+    let steps = child.steps.saturating_add(child.delegated_steps);
+    let tool_calls = child.tool_calls.saturating_add(child.delegated_tool_calls);
     progress.usage = progress.usage.saturating_add(child.usage);
+    progress.delegated_steps = progress.delegated_steps.saturating_add(steps);
+    progress.delegated_tool_calls = progress.delegated_tool_calls.saturating_add(tool_calls);
     tree.records.push(DelegationRecord {
         chain: child_agent.mandate.chain.clone(),
         run_id: Some(run_id),
         stop: Some(stop),
         refusal: None,
         usage: child.usage,
-        steps_used: child.steps,
-        tool_calls: child.tool_calls,
+        steps_used: steps,
+        tool_calls,
     });
     let outcome = serde_json::json!({
         "agent": peer.name,

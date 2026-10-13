@@ -28,7 +28,8 @@ and `DESIGN-agent-mesh.md` the plan.
 - **Budgets.** A child cap is the smaller of the peer cap and the parent
   remainder. A cap of zero is refused. The parent adds the child usage, and
   stops before another model call when the tree passes its cap.
-  `AgentReport::delegations` lists each delegation with its subtree usage.
+  `AgentReport::delegations` lists each delegation with its subtree usage,
+  rounds and calls. The report counters cover the whole tree.
 - **Flow rules.** `Tool::labels` and `FlowRules` gate the call that completes
   a forbidden label set in one run tree. Each later call that touches the set
   needs its own approval. `FlowRules::rule_of_two()` follows Meta's Agents

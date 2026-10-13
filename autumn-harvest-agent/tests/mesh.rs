@@ -591,6 +591,48 @@ async fn a_nested_delegation_keeps_the_chain_and_rolls_usage_up() {
     );
 }
 
+// AC9
+#[tokio::test(flavor = "multi_thread")]
+async fn the_report_counts_the_rounds_and_calls_of_the_whole_tree() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        delegate("d1", "researcher", "dig", 1),
+        delegate("d2", "critic", "check", 1),
+        calls(&[("c1", "lookup", json!({}))], 1),
+        answer("checked", 1),
+        answer("dug", 1),
+        answer("planned", 1),
+    ]);
+    let harness = AgentHarness::new(model)
+        .tool(recorded_tool("lookup", ToolEffect::ReadOnly, &recorder))
+        .peer(researcher().peers(["critic"]))
+        .peer(Peer::new("critic", "Checks claims."));
+    let mut rt = runtime(&db, harness);
+
+    let task = AgentTask::new("go").mandate(
+        Mandate::new("planner")
+            .peers(["researcher", "critic"])
+            .max_depth(2),
+    );
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.stop, AgentStop::Completed);
+    assert_eq!(recorder.runs().len(), 1);
+    // One round and one call for each of the three agents.
+    assert_eq!(report.steps_used, 3, "the report counts every agent");
+    assert_eq!(report.tool_calls, 3, "the report counts every agent");
+    let critic = &report.delegations[0];
+    assert_eq!((critic.steps_used, critic.tool_calls), (1, 1));
+    let researcher = &report.delegations[1];
+    assert_eq!(
+        (researcher.steps_used, researcher.tool_calls),
+        (2, 2),
+        "a record counts its whole subtree, as its usage does"
+    );
+}
+
 /// A read-only tool that returns content from outside, with private data.
 fn inbox() -> Arc<dyn autumn_harvest_agent::Tool> {
     FnTool::new(

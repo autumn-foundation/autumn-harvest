@@ -632,10 +632,10 @@ pub struct DelegationRecord {
     /// Tokens of the child and of every agent under it.
     #[serde(default)]
     pub usage: TokenUsage,
-    /// Tool rounds of the child.
+    /// Tool rounds of the child and of every agent under it.
     #[serde(default)]
     pub steps_used: u32,
-    /// Tool calls of the child.
+    /// Tool calls of the child and of every agent under it.
     #[serde(default)]
     pub tool_calls: u32,
 }

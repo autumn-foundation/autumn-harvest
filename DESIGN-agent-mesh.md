@@ -148,7 +148,7 @@ its default, so a run with no mandate records the same bytes as before.
 | AC6 | A child cannot run a tool outside its mandate. The turn hides it, the decision denies it, and the tool-call activity refuses it. |
 | AC7 | A refused delegation returns a distinct verdict: `unknown_peer`, `not_permitted`, `cycle`, `depth_exceeded`, `fan_out_exhausted` or `budget_exhausted`. |
 | AC8 | The child token cap is the smaller of the peer cap and the parent remainder. The parent adds the child usage and stops before another model call when the tree passes its cap. |
-| AC9 | `AgentReport::delegations` lists each delegation with its chain, run id, stop or verdict, and subtree usage. |
+| AC9 | `AgentReport::delegations` lists each delegation with its chain, run id, stop or verdict, and subtree usage, rounds and calls. The report counters cover the whole tree. |
 | AC10 | With `FlowRules::rule_of_two()`, a call that completes the forbidden label set needs approval. Each later call that touches the set needs its own approval. Labels that a child exercises count for its parent, and the reverse. |
 | AC11 | A mandate encodes under `io.autumn-harvest/mandate`. `Mandate::accept` narrows a local mandate by an inbound one. It refuses a cycle and a depth overflow. |
 | AC12 | A gated call inside a child waits on a signal name that is unique in the run tree. A run with no delegation keeps its old names. |

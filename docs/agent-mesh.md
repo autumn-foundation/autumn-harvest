@@ -173,9 +173,11 @@ order each ended:
 | `stop` | How the child ended. `None` for a refusal. |
 | `refusal` | The verdict of a refused delegation |
 | `usage` | Tokens of the child and of every agent under it |
-| `steps_used`, `tool_calls` | The rounds and calls of the child itself |
+| `steps_used`, `tool_calls` | The rounds and calls of the child and of every agent under it |
 
-`AgentReport::usage` covers the whole tree.
+`AgentReport::usage`, `steps_used` and `tool_calls` cover the whole tree.
+Each agent still has its own step bound, so a child round never counts
+against the `max_steps` of its parent.
 
 ## 7. Flow rules
 
@@ -335,8 +337,8 @@ call. The run id suffix `:d{n}` names that agent.
 A run with a mandate records the acting agent in each model-turn request, as
 `agent`. The model-turn span `agent_model_turn` carries
 `gen_ai.agent.name`. On Postgres, the cost ledger counts child turns in the
-run of the root agent. `DelegationRecord::usage` gives the tokens per
-subtree.
+run of the root agent. A `DelegationRecord` gives the tokens, rounds and
+calls per subtree.
 
 ## 12. Limits
 

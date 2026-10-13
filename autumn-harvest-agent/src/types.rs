@@ -507,10 +507,12 @@ pub struct AgentReport {
     pub stop: AgentStop,
     /// The last text the model produced.
     pub text: String,
-    /// Tool rounds used in the whole run, follow-ups included.
+    /// Tool rounds used in the whole run, follow-ups and delegations
+    /// included. Each agent has its own step bound.
     pub steps_used: u32,
-    /// Tool calls answered in the whole run, whether they ran or not. A round
-    /// cut at the request cap answers its remaining calls with an error.
+    /// Tool calls answered in the whole run, delegations included, whether
+    /// they ran or not. A round cut at the request cap answers its remaining
+    /// calls with an error.
     pub tool_calls: u32,
     /// Provider-reported tokens for the whole run, follow-ups included.
     pub usage: TokenUsage,
