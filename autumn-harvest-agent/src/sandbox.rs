@@ -33,18 +33,19 @@ use crate::tool::{Tool, ToolContext, ToolEffect};
 /// The default tool name.
 pub const DEFAULT_TOOL_NAME: &str = "run_code";
 
-/// The characters of each stream in the view of the model.
+/// The JSON characters of each stream in the view of the model.
 pub const VIEW_STREAM_CHARS: usize = 2000;
 
-/// The characters of all output entries together in the view of the model:
-/// paths, skip reasons and file text.
+/// The JSON characters of all output entries together in the view of the
+/// model: paths, skip reasons, file text and structure.
 pub const VIEW_OUTPUTS_CHARS: usize = 1500;
 
-/// The characters of each path and each skip reason in the view.
+/// The JSON characters of each path and each skip reason in the view.
 const VIEW_LABEL_CHARS: usize = 80;
 
-/// Room for the JSON structure of one output entry, in characters.
-const VIEW_ENTRY_CHARS: usize = 48;
+/// Room for the JSON structure of one output entry, with a 20-digit byte
+/// count and the comma after it.
+const VIEW_ENTRY_CHARS: usize = 72;
 
 /// A tool that runs code on a [`SandboxRuntime`].
 #[derive(Debug, Clone)]
@@ -220,6 +221,9 @@ impl Tool for SandboxTool {
 /// does not fit is only counted, in `outputs_more` or `skipped_more`. Each
 /// stream keeps a head and a tail of [`VIEW_STREAM_CHARS`]. The byte counts
 /// stay exact.
+///
+/// Each size counts the characters of the JSON text, because the harness
+/// cuts that text. JSON writes a control character as six characters.
 #[must_use]
 pub fn model_view(outcome: &SandboxOutcome) -> serde_json::Value {
     let mut budget = VIEW_OUTPUTS_CHARS;
@@ -228,7 +232,7 @@ pub fn model_view(outcome: &SandboxOutcome) -> serde_json::Value {
     let entries = outcome.outputs.len() + outcome.skipped_outputs.len();
     for (index, file) in outcome.outputs.iter().enumerate() {
         let path = cut(&file.path, VIEW_LABEL_CHARS);
-        let cost = path.chars().count() + VIEW_ENTRY_CHARS;
+        let cost = json_chars(&path) + VIEW_ENTRY_CHARS;
         if cost > budget {
             outputs_more += 1;
             continue;
@@ -240,7 +244,7 @@ pub fn model_view(outcome: &SandboxOutcome) -> serde_json::Value {
                 // Share the rest evenly, so one large file leaves room for
                 // the entries after it.
                 let shown = cut(text, budget / (entries - index));
-                budget -= shown.chars().count();
+                budget = budget.saturating_sub(json_chars(&shown));
                 serde_json::json!({
                     "path": path,
                     "bytes": file.content.len(),
@@ -256,7 +260,7 @@ pub fn model_view(outcome: &SandboxOutcome) -> serde_json::Value {
     for skip in &outcome.skipped_outputs {
         let path = cut(&skip.path, VIEW_LABEL_CHARS);
         let reason = cut(&skip.reason, VIEW_LABEL_CHARS);
-        let cost = path.chars().count() + reason.chars().count() + VIEW_ENTRY_CHARS;
+        let cost = json_chars(&path) + json_chars(&reason) + VIEW_ENTRY_CHARS;
         if cost > budget {
             skipped_more += 1;
             continue;
@@ -289,18 +293,65 @@ pub fn model_view(outcome: &SandboxOutcome) -> serde_json::Value {
     view
 }
 
-/// `text` with at most `max` characters: the head and the tail around a
-/// marker.
+/// `text` in at most `max` characters of JSON: the head and the tail around
+/// a marker. When the marker does not fit, only a head stays.
 fn cut(text: &str, max: usize) -> String {
-    let count = text.chars().count();
-    if count <= max {
+    if json_chars(text) <= max {
         return text.to_owned();
     }
-    let marker = format!("\n[... {} characters cut ...]\n", count - max);
-    let keep = max.saturating_sub(marker.chars().count());
-    let head: String = text.chars().take(keep.div_ceil(2)).collect();
-    let tail: String = text.chars().skip(count - keep / 2).collect();
-    format!("{head}{marker}{tail}")
+    let count = text.chars().count();
+    // The marker never names more characters than the text holds.
+    let Some(keep) = max.checked_sub(json_chars(&cut_marker(count))) else {
+        return head_within(text, max).to_owned();
+    };
+    let head = head_within(text, keep.div_ceil(2));
+    let tail = tail_within(&text[head.len()..], keep - json_chars(head));
+    let dropped = count - head.chars().count() - tail.chars().count();
+    format!("{head}{}{tail}", cut_marker(dropped))
+}
+
+/// The marker for `dropped` characters that [`cut`] removed.
+fn cut_marker(dropped: usize) -> String {
+    format!("\n[... {dropped} characters cut ...]\n")
+}
+
+/// The longest start of `text` that fits `max` characters of JSON.
+fn head_within(text: &str, max: usize) -> &str {
+    let mut used = 0;
+    for (at, c) in text.char_indices() {
+        used += json_char_len(c);
+        if used > max {
+            return &text[..at];
+        }
+    }
+    text
+}
+
+/// The longest end of `text` that fits `max` characters of JSON.
+fn tail_within(text: &str, max: usize) -> &str {
+    let mut used = 0;
+    for (at, c) in text.char_indices().rev() {
+        used += json_char_len(c);
+        if used > max {
+            return &text[at + c.len_utf8()..];
+        }
+    }
+    text
+}
+
+/// The characters of JSON for `text` inside a string, without the quotes.
+fn json_chars(text: &str) -> usize {
+    text.chars().map(json_char_len).sum()
+}
+
+/// The characters of JSON for `c` inside a string. `serde_json` escapes the
+/// quote, the backslash and each control character, and nothing else.
+const fn json_char_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        '\0'..='\u{1f}' => 6,
+        _ => 1,
+    }
 }
 
 #[cfg(test)]
@@ -492,6 +543,116 @@ mod tests {
             "status at {status}, stderr at {stderr}"
         );
         assert!(text.contains("\"outputs_more\""), "{text}");
+    }
+
+    #[test]
+    fn escaped_characters_do_not_push_the_status_out_of_the_cut() {
+        // JSON writes each of these control characters as six characters.
+        let junk = |n: usize| "\u{1}".repeat(n);
+        let mut outcome = SandboxOutcome {
+            status: RunStatus::Exited { code: 1 },
+            stdout: junk(10_000),
+            stderr: format!("{}Traceback: boom", junk(10_000)),
+            stdout_bytes: 10_000,
+            stderr_bytes: 10_015,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            outputs: Vec::new(),
+            skipped_outputs: Vec::new(),
+            duration_ms: 5,
+            isolation: IsolationLevel::MicroVm,
+            image: None,
+        };
+        for i in 0..8 {
+            outcome.outputs.push(OutputFile {
+                path: format!("{i}{}", junk(100)),
+                content: junk(1500).into_bytes(),
+            });
+            outcome.skipped_outputs.push(SkippedOutput {
+                path: format!("{i}{}", "\"".repeat(100)),
+                reason: junk(256),
+            });
+        }
+        let text = model_view(&outcome).to_string();
+        let chars = text.chars().count();
+        assert!(
+            chars <= crate::harness::DEFAULT_TOOL_OUTPUT_LIMIT,
+            "{chars} characters"
+        );
+        let status = text.find("\"status\"").unwrap();
+        let stderr = text.find("Traceback: boom").unwrap();
+        assert!(
+            status < 3000 && stderr < 5000,
+            "status at {status}, stderr at {stderr}"
+        );
+    }
+
+    #[test]
+    fn a_small_share_never_overdraws_the_budget() {
+        // The last entries get a share smaller than the cut marker. They
+        // must not wrap the budget and let later entries in.
+        let mut outcome = SandboxOutcome {
+            status: RunStatus::Exited { code: 0 },
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            outputs: Vec::new(),
+            skipped_outputs: Vec::new(),
+            duration_ms: 5,
+            isolation: IsolationLevel::MicroVm,
+            image: None,
+        };
+        for i in 0..40 {
+            outcome.outputs.push(OutputFile {
+                path: format!("{i:02}"),
+                content: vec![b'x'; 5000],
+            });
+        }
+        let view = model_view(&outcome);
+        let outputs = serde_json::to_string(&view["outputs"]).unwrap();
+        assert!(
+            outputs.chars().count() <= VIEW_OUTPUTS_CHARS + VIEW_ENTRY_CHARS,
+            "{} characters",
+            outputs.chars().count()
+        );
+    }
+
+    #[test]
+    fn the_json_size_matches_serde_json() {
+        let probes = (0u32..0x80)
+            .chain([0x7f, 0xe9, 0x2028, 0x2029, 0xfffd, 0x1_f600])
+            .filter_map(char::from_u32);
+        for c in probes {
+            let written = serde_json::to_string(&c.to_string()).unwrap();
+            assert_eq!(json_char_len(c), written.chars().count() - 2, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn a_cut_never_exceeds_its_json_size() {
+        let text = "a\u{1}\"\u{e9}\n\u{1f600}".repeat(200);
+        for max in 0..400 {
+            let shown = cut(&text, max);
+            let written = serde_json::to_string(&shown).unwrap().chars().count() - 2;
+            assert!(written <= max, "max {max}: {written}");
+        }
+        assert_eq!(cut("short", 5), "short");
+    }
+
+    #[test]
+    fn the_entry_room_holds_the_largest_entry_structure() {
+        for entry in [
+            json!({"path": "", "bytes": u64::MAX, "text": "", "truncated": false}),
+            json!({"path": "", "bytes": u64::MAX, "binary": true}),
+            json!({"path": "", "reason": ""}),
+        ] {
+            // One more character for the comma between entries.
+            let chars = entry.to_string().chars().count() + 1;
+            assert!(chars <= VIEW_ENTRY_CHARS, "{entry}: {chars}");
+        }
     }
 
     #[test]

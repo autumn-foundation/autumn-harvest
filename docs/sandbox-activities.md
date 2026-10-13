@@ -159,10 +159,11 @@ runtime refuses a policy that allows the network on a backend without one.
 - KSM off, nested KVM off, and no CPU vulnerability that reports
   `Vulnerable`.
 - A jail base directory that belongs to root, and that only root can write.
-- A kernel, root file system and snapshot that belong to root, with no
-  symbolic link in their paths. Only root may write each directory above
-  them, except a sticky directory such as /tmp. The launcher refuses other
-  files, and it refuses a jail uid or gid of 0.
+- Firecracker and jailer binaries, a kernel, a root file system and a
+  snapshot that belong to root, with no symbolic link in their paths. Only
+  root may write each directory above them, except a sticky directory such
+  as /tmp. The launcher refuses other files, and it refuses a jail uid or
+  gid of 0.
 - SMT off on a host that serves more than one tenant. Swap off.
 - An empty network namespace for the jailer, through `JailerConfig::netns`.
   The microVM has no network device. The namespace also cuts the network of
@@ -290,7 +291,9 @@ let harness = AgentHarness::new(model).tool(SandboxTool::new(Arc::new(runtime)).
 A non-zero exit is a tool result. A denial is a tool error that the model can
 read. The harness cuts a long tool result. So the tool returns a bounded
 view. It holds the status, a head and a tail of each stream, and a short part
-of each text output file.
+of each text output file. The bounds count the JSON text, so escaped
+characters cannot push the status out of the cut. An output entry that does
+not fit is only counted.
 
 ## Durability
 

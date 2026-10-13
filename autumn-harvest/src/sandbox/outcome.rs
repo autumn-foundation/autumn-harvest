@@ -45,11 +45,18 @@ pub enum RunStatus {
 ///
 /// A whole stream keeps each byte. A valid byte stays one byte of text, and
 /// an invalid run of one to three bytes becomes one U+FFFD of three bytes.
-/// So the text has between one and three bytes for each counted byte. A cut
-/// stream counts more bytes than the cap and holds the truncation marker.
+/// So the text has between one and three bytes for each counted byte.
+///
+/// A cut stream counts more bytes than the cap and holds the truncation
+/// marker. The capture keeps `cap` bytes and drops at most three at each side
+/// of the cut. So the text also holds at least `cap - 6` bytes besides the
+/// marker.
 fn stream_counts_match(text: &str, bytes: u64, truncated: bool, cap: u64) -> bool {
+    const SEAM_LOSS: u64 = 6;
     if truncated {
-        return bytes > cap && text.contains(super::capture::TRUNCATION_MARKER);
+        let marker = super::capture::TRUNCATION_MARKER;
+        let kept = u64::try_from(text.len().saturating_sub(marker.len())).unwrap_or(u64::MAX);
+        return bytes > cap && text.contains(marker) && kept >= cap.saturating_sub(SEAM_LOSS);
     }
     let len = u64::try_from(text.len()).unwrap_or(u64::MAX);
     bytes <= cap && bytes <= len && len <= bytes.saturating_mul(3)
@@ -497,19 +504,66 @@ pub(crate) mod tests {
         let cap = plan.limits.max_output_bytes;
         assert!(with("hi\n", 3, false).is_ok());
         assert!(with("\u{fffd}", 1, false).is_ok(), "one invalid byte");
+        let real = captured(cap, &"x".repeat(usize::try_from(cap).unwrap() + 10));
+        assert!(with(&real.text, real.bytes, true).is_ok());
         let marker = format!("a{}b", crate::sandbox::capture::TRUNCATION_MARKER);
-        assert!(with(&marker, cap + 10, true).is_ok());
         for (text, bytes, truncated) in [
             ("hi\n", 0, false),
             ("hi\n", 99, false),
             ("", cap + 1, false),
             ("hi\n", cap + 1, true),
-            (marker.as_str(), cap, true),
+            (real.text.as_str(), cap, true),
+            (marker.as_str(), cap + 10, true),
         ] {
             assert!(
                 matches!(with(text, bytes, truncated), Err(SandboxError::Protocol(_))),
                 "{text:?} {bytes} {truncated}"
             );
+        }
+    }
+
+    /// The text that a real capture of `cap` bytes makes of `stream`.
+    fn captured(cap: u64, stream: &str) -> crate::sandbox::capture::CapturedText {
+        let mut capture =
+            crate::sandbox::capture::StreamCapture::new(usize::try_from(cap).unwrap());
+        capture.push(stream.as_bytes());
+        capture.finish()
+    }
+
+    #[test]
+    fn a_truncated_stream_holds_the_bytes_that_the_capture_kept() {
+        let mut plan = plan_with_output("out.txt");
+        let with = |plan: &ExecPlan, text: &str, bytes: u64| {
+            let mut out = outcome(RunStatus::Exited { code: 0 });
+            out.skipped_outputs.push(SkippedOutput {
+                path: "out.txt".into(),
+                reason: "missing".into(),
+            });
+            out.stderr = text.into();
+            out.stderr_bytes = bytes;
+            out.stderr_truncated = true;
+            out.check_bounds(plan)
+        };
+        // An odd cap splits a character at each seam, and the capture drops
+        // both parts. The bound allows that loss.
+        for cap in [7, 9, 11, 64] {
+            plan.limits.max_output_bytes = cap;
+            for stream in ["\u{e9}".repeat(40), "\u{1f600}".repeat(40)] {
+                let real = captured(cap, &stream);
+                assert!(real.truncated);
+                assert!(
+                    with(&plan, &real.text, real.bytes).is_ok(),
+                    "{cap} {real:?}"
+                );
+                let marker_only = crate::sandbox::capture::TRUNCATION_MARKER;
+                assert!(
+                    matches!(
+                        with(&plan, marker_only, real.bytes),
+                        Err(SandboxError::Protocol(_))
+                    ),
+                    "{cap}: a bare marker hides the kept bytes"
+                );
+            }
         }
     }
 

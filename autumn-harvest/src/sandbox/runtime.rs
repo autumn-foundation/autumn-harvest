@@ -87,6 +87,9 @@ pub struct SandboxRuntime {
     max_concurrent: usize,
     overhead: Duration,
     queue_wait: Duration,
+    /// The image name that `new` checked. Each outcome carries this copy,
+    /// so a backend cannot change it later.
+    image: Option<String>,
 }
 
 impl std::fmt::Debug for SandboxRuntime {
@@ -122,7 +125,8 @@ impl SandboxRuntime {
                 policy.min_isolation
             )));
         }
-        if let Some(image) = backend.image()
+        let image = backend.image();
+        if let Some(image) = &image
             && (image.len() > MAX_IMAGE_NAME_BYTES || image.chars().any(char::is_control))
         {
             return Err(SandboxError::Config(format!(
@@ -142,6 +146,7 @@ impl SandboxRuntime {
             max_concurrent: DEFAULT_MAX_CONCURRENT,
             overhead: DEFAULT_BACKEND_OVERHEAD,
             queue_wait: DEFAULT_QUEUE_WAIT,
+            image,
         })
     }
 
@@ -303,7 +308,7 @@ impl SandboxRuntime {
         let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         outcome.duration_ms = outcome.duration_ms.min(elapsed);
         outcome.isolation = self.backend.isolation();
-        outcome.image = self.backend.image();
+        outcome.image.clone_from(&self.image);
         Ok(outcome)
     }
 
@@ -349,6 +354,7 @@ pub(crate) mod tests {
         pub peak: AtomicUsize,
         pub delay: Duration,
         pub answer: Mutex<Option<Result<SandboxOutcome, SandboxError>>>,
+        pub image: Mutex<String>,
     }
 
     impl FakeBackend {
@@ -360,6 +366,7 @@ pub(crate) mod tests {
                 peak: AtomicUsize::new(0),
                 delay: Duration::ZERO,
                 answer: Mutex::new(None),
+                image: Mutex::new("fake:1".into()),
             }
         }
     }
@@ -370,7 +377,7 @@ pub(crate) mod tests {
         }
 
         fn image(&self) -> Option<String> {
-            Some("fake:1".into())
+            Some(self.image.lock().unwrap().clone())
         }
 
         fn supports_network(&self) -> bool {
@@ -505,6 +512,20 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(out.isolation, IsolationLevel::Process);
+        assert_eq!(out.image.as_deref(), Some("fake:1"));
+    }
+
+    #[tokio::test]
+    async fn the_outcome_carries_the_image_name_that_new_checked() {
+        let (backend, runtime) = runtime(FakeBackend::new(IsolationLevel::Process));
+        *backend.image.lock().unwrap() = "x\0".repeat(MAX_IMAGE_NAME_BYTES);
+        let out = runtime
+            .run(
+                &SandboxRequest::new("sh", "true"),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
         assert_eq!(out.image.as_deref(), Some("fake:1"));
     }
 

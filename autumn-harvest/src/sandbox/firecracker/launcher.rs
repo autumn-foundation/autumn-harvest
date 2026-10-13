@@ -211,6 +211,8 @@ impl FirecrackerLauncher {
     /// - the machine has no memory, or a vCPU count outside 1 to 32;
     /// - a path is missing;
     /// - a snapshot boot has no jailer;
+    /// - the jail uid or gid is 0;
+    /// - another user can change a binary or an image of a jailed launch;
     /// - the lease cannot be taken.
     pub fn new(config: LauncherConfig) -> Result<Self, SandboxError> {
         // Firecracker refuses these at each launch. Refuse them once, here.
@@ -255,7 +257,7 @@ impl FirecrackerLauncher {
                         .into(),
                 ));
             }
-            check_shared_files(&config, jailer.uid)?;
+            check_trusted_files(&config, jailer)?;
         }
         let exec_name = super::jailer::exec_name(&config.firecracker_bin)?;
         let owner = uuid::Uuid::new_v4().simple().to_string()[..OWNER_TAG_HEX].to_owned();
@@ -817,26 +819,32 @@ fn copy_out(from: &Path, to: &Path, gid: u32) -> std::io::Result<()> {
     target.sync_all()
 }
 
-/// Check that a jailed VMM cannot change a file that each microVM shares.
+/// Check that no other user can change a file that a jailed launch trusts.
+///
+/// The launcher runs the Firecracker and jailer binaries as root, before the
+/// jailer drops to the jail uid. A user who can change one runs code as root.
 ///
 /// The jail holds hard links to the kernel, the root file system and the
 /// snapshot files. A file that the jail uid owns, or that its group or
 /// others can write, lets one escaped VMM change the next microVM.
-fn check_shared_files(config: &LauncherConfig, jail_uid: u32) -> Result<(), SandboxError> {
+fn check_trusted_files(config: &LauncherConfig, jailer: &JailerConfig) -> Result<(), SandboxError> {
     use std::os::unix::fs::MetadataExt as _;
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    let inspect = |what: &Path| {
+        std::fs::symlink_metadata(what)
+            .map_err(|e| SandboxError::Config(format!("cannot inspect {}: {e}", what.display())))
+    };
+    for binary in [&config.firecracker_bin, &jailer.jailer_bin] {
+        check_trusted_ancestors(binary, euid, inspect)?;
+    }
+    let jail_uid = jailer.uid;
     let mut shared = vec![&config.image.kernel, &config.image.rootfs];
     if let BootMethod::Snapshot(files) = &config.boot {
         shared.push(&files.state);
         shared.push(&files.memory);
     }
-    // SAFETY: geteuid has no preconditions.
-    let euid = unsafe { libc::geteuid() };
     for path in shared {
-        let inspect = |what: &Path| {
-            std::fs::symlink_metadata(what).map_err(|e| {
-                SandboxError::Config(format!("cannot inspect {}: {e}", what.display()))
-            })
-        };
         check_trusted_ancestors(path, euid, inspect)?;
         let meta = inspect(path)?;
         if meta.uid() == jail_uid || meta.mode() & 0o022 != 0 {
@@ -849,10 +857,10 @@ fn check_shared_files(config: &LauncherConfig, jail_uid: u32) -> Result<(), Sand
     Ok(())
 }
 
-/// Check the path of a shared file and each of its parent directories.
+/// Check the path of a trusted file and each of its parent directories.
 ///
 /// A user who can write a parent can replace the file between the check and
-/// the link. So the path must hold no symbolic link, and each part must
+/// its use. So the path must hold no symbolic link, and each part must
 /// belong to root or to this process. A directory that others can write
 /// must be sticky, such as /tmp, so each entry stays with its owner.
 fn check_trusted_ancestors(
@@ -1671,6 +1679,43 @@ while True:
             matches!(err, SandboxError::Config(ref m) if m.contains("symbolic link")),
             "{err:?}"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_launcher_binary_that_others_can_change_is_a_config_error() {
+        let dir = temp_dir();
+        let config = jailed(&dir);
+        let Confinement::Jailer(jail) = &config.confinement else {
+            unreachable!("a jailed config");
+        };
+        let jailer_bin = jail.jailer_bin.clone();
+        let link = dir.join("bin-link");
+        for bin in [config.firecracker_bin.clone(), jailer_bin] {
+            let name = bin.file_name().unwrap().to_str().unwrap().to_owned();
+            let set = |config: &mut LauncherConfig, path: PathBuf| match &mut config.confinement {
+                Confinement::Jailer(jail) if name == "jailer" => jail.jailer_bin = path,
+                _ => config.firecracker_bin = path,
+            };
+            // The launcher runs each binary as root, before the jailer
+            // drops to the jail uid.
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o757)).unwrap();
+            let err = FirecrackerLauncher::new(config.clone()).expect_err("writable binary");
+            assert!(
+                matches!(err, SandboxError::Config(ref m) if m.contains(&name)),
+                "{name}: {err:?}"
+            );
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&bin, &link).unwrap();
+            let mut linked = config.clone();
+            set(&mut linked, link.clone());
+            let err = FirecrackerLauncher::new(linked).expect_err("linked binary");
+            assert!(
+                matches!(err, SandboxError::Config(ref m) if m.contains("symbolic link")),
+                "{name}: {err:?}"
+            );
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
