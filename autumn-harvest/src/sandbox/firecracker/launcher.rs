@@ -513,9 +513,10 @@ impl FirecrackerLauncher {
     ///
     /// # Errors
     ///
-    /// Returns [`SandboxError::Config`] without the jailer or with an API
-    /// timeout of zero, and [`SandboxError::Unavailable`] when a step fails.
-    /// The golden microVM is torn down on each path.
+    /// Returns [`SandboxError::Config`] without the jailer, or with an API
+    /// timeout or a boot timeout of zero. Returns
+    /// [`SandboxError::Unavailable`] when a step fails. The golden microVM is
+    /// torn down on each path.
     pub async fn create_golden_snapshot(
         &self,
         out_dir: &Path,
@@ -532,6 +533,12 @@ impl FirecrackerLauncher {
             return Err(SandboxError::Config(
                 "a golden snapshot boots through the API, so it needs an API timeout above zero"
                     .into(),
+            ));
+        }
+        // A zero boot timeout has expired before the first connect.
+        if boot_timeout.is_zero() {
+            return Err(SandboxError::Config(
+                "a golden snapshot needs a boot timeout above zero".into(),
             ));
         }
         self.check_versions().await?;
@@ -2551,6 +2558,21 @@ while True:
             .await;
         assert!(
             matches!(result, Err(SandboxError::Config(ref m)) if m.contains("API timeout")),
+            "{result:?}"
+        );
+        drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_golden_snapshot_needs_a_boot_timeout() {
+        let dir = temp_dir();
+        let launcher = new_launcher(jailed(&dir)).unwrap();
+        let result = launcher
+            .create_golden_snapshot(&dir.join("golden"), Duration::ZERO)
+            .await;
+        assert!(
+            matches!(result, Err(SandboxError::Config(ref m)) if m.contains("boot timeout")),
             "{result:?}"
         );
         drop(launcher);
