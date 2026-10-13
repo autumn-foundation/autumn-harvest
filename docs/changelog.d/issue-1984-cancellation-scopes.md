@@ -52,7 +52,9 @@ non-determinism. A withdrawn timer command restores the timer state.
 A scope cannot acquire a durable mutex, or signal, cancel or await an
 external workflow. A scope cannot create a session, spawn a detached child or run an admitted update. Such an update fails at once, and its result survives the cancel. A cancel that finds no open block is
 still terminal at once. A scope does not cancel local activities or external
-activities.
+activities. On SQLite, a cooperative cancel request is hidden from
+`is_cancelled()` inside a block, so the block's cleanup runs. SQLite still
+ends such a run `CANCELLED` when the body returns.
 
 **Tests.**
 

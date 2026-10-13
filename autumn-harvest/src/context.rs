@@ -3201,6 +3201,9 @@ pub struct WorkflowContext {
     /// yields [`HarvestError::Cancelled`]. Cooperative: the workflow function is
     /// expected to consult these at strategic points to run cleanup logic.
     cancellation_reason: Option<String>,
+    /// `true` when `cancellation_reason` is a pending request, not a recorded
+    /// `WorkflowCancelled` (issue #1984). A non-cancellable block hides it.
+    cancellation_pending: bool,
     /// When `true`, activity and local-activity dispatch compares the input
     /// payload against what was recorded in history, in addition to the name.
     /// Set by the `WorkflowReplayer` to detect non-deterministic input changes.
@@ -3792,6 +3795,7 @@ impl WorkflowContext {
             signal_registry: Mutex::new(SignalHandlerRegistry::new()),
             signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason,
+            cancellation_pending: false,
             strict_replay: false,
             canary_mode: false,
             workflow_name: String::new(),
@@ -3977,6 +3981,7 @@ impl WorkflowContext {
             signal_registry: Mutex::new(SignalHandlerRegistry::new()),
             signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason,
+            cancellation_pending: false,
             strict_replay: false,
             canary_mode: false,
             workflow_name: String::new(),
@@ -4060,6 +4065,7 @@ impl WorkflowContext {
             signal_registry: Mutex::new(SignalHandlerRegistry::new()),
             signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason: None,
+            cancellation_pending: false,
             strict_replay: false,
             canary_mode: false,
             workflow_name: String::new(),
@@ -4363,6 +4369,7 @@ impl WorkflowContext {
     #[must_use]
     pub fn with_pending_cancellation(mut self, reason: Option<String>) -> Self {
         if self.cancellation_reason.is_none() {
+            self.cancellation_pending = reason.is_some();
             self.cancellation_reason = reason;
         }
         self
@@ -5277,9 +5284,27 @@ impl WorkflowContext {
     /// [`HarvestError::Cancelled`] when their result channels are dropped as
     /// part of the cancellation flow; this accessor is the analogous hook
     /// for code paths that never suspend.
+    ///
+    /// A pending request is hidden inside a non-cancellable block (issue
+    /// #1984), so the block's cleanup does not stop on it.
     #[must_use]
-    pub const fn is_cancelled(&self) -> bool {
-        self.cancellation_reason.is_some()
+    pub fn is_cancelled(&self) -> bool {
+        self.visible_cancellation_reason().is_some()
+    }
+
+    /// The cancellation reason that the workflow body sees (issue #1984).
+    fn visible_cancellation_reason(&self) -> Option<&str> {
+        if self.cancellation_pending
+            && self
+                .scope_stack
+                .lock()
+                .expect("scope stack lock poisoned")
+                .iter()
+                .any(|frame| matches!(frame, crate::cancellation_scope::ScopeFrame::Shield))
+        {
+            return None;
+        }
+        self.cancellation_reason.as_deref()
     }
 
     /// Recorded cancellation reason when [`is_cancelled`](Self::is_cancelled)
@@ -5289,7 +5314,7 @@ impl WorkflowContext {
     /// to read the original message or reason that initiated the abort.
     #[must_use]
     pub fn cancellation_reason(&self) -> Option<&str> {
-        self.cancellation_reason.as_deref()
+        self.visible_cancellation_reason()
     }
 
     /// Fail fast with [`HarvestError::Cancelled`] when the workflow has been
@@ -5322,7 +5347,7 @@ impl WorkflowContext {
     /// Returns [`HarvestError::Cancelled`] when
     /// [`is_cancelled`](Self::is_cancelled) is true.
     pub fn check_cancellation(&self) -> HarvestResult<()> {
-        if let Some(reason) = self.cancellation_reason.as_deref() {
+        if let Some(reason) = self.visible_cancellation_reason() {
             return Err(HarvestError::Cancelled(reason.to_string()));
         }
         Ok(())

@@ -145,5 +145,9 @@ cancel reason name it. No other worker path changes.
 - A cancel that arrives when no shield is open is still terminal at once.
   A shield is open from the commit of the cycle that enters it. A cancel
   that commits first discards that cycle, the shield's work included.
+- On SQLite, a cancel is cooperative (#2021): the body sees a pending request
+  in `is_cancelled()`. A shield hides that request, so its cleanup runs.
+  SQLite still seals the run `CANCELLED` when the body returns, also after a
+  final shield.
 - Local activities and external activities in a scope are not cancelled. The scope still drops the body, and replay consumes a
   late external result.

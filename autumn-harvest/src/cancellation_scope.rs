@@ -454,10 +454,20 @@ pub(crate) fn captured_marker_drift(stack: &[ScopeFrame], cmd: &WorkflowCommand)
         details.clone()
     };
     let asked = format!("MarkerRecorded({name})");
+    // A `patched(id)` gate also matches a recorded `version:{id}` marker, as
+    // the history matcher does. Its value does not matter then.
+    let version_alias = name
+        .strip_prefix("patch:")
+        .map(crate::replay::version_marker_name);
     match take_captured(stack, &asked, |record| match record {
         CapturedRecord::Marker {
-            name: n, details, ..
-        } if n == name => Some(details.clone()),
+            name: n,
+            details: captured,
+            ..
+        } if n == name => Some(captured.clone()),
+        CapturedRecord::Marker { name: n, .. } if version_alias.as_deref() == Some(n.as_str()) => {
+            Some(replayed.clone())
+        }
         _ => None,
     }) {
         Captured::NotReplaying => None,
@@ -2253,6 +2263,48 @@ mod tests {
         // The next history read delivers the signal.
         let _ = ctx.history_event_count();
         assert!(poked.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A deploy moves a gate from `version` to `patched`, as documented. A
+    /// captured `version:` marker still matches the replayed `patch:` gate.
+    #[tokio::test]
+    async fn a_patched_gate_matches_a_captured_version_marker() {
+        let live = WorkflowContext::new_test();
+        let seen = std::sync::Mutex::new(None);
+        record_then_cancel(&live, &seen, |ctx| json!(ctx.version("rollout", 1, 2))).await;
+        let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+        let replay = replay_of(details);
+        let replayed = std::sync::Mutex::new(None);
+        record_then_cancel(&replay, &replayed, |ctx| json!(ctx.patched("rollout"))).await;
+
+        assert_eq!(*replayed.lock().expect("replayed lock"), Some(json!(true)));
+        let nd = replay.take_nd_details();
+        assert!(nd.is_none(), "{nd:?}");
+    }
+
+    /// A pending cancel request (the SQLite cooperative cancel) is hidden
+    /// inside a non-cancellable block, so its cleanup does not stop on it.
+    #[tokio::test]
+    async fn a_shield_hides_a_pending_cancel_request() {
+        let ctx = WorkflowContext::new_test().with_pending_cancellation(Some("stop".into()));
+        assert!(ctx.is_cancelled());
+
+        let inside = bounded(ctx.non_cancellable(async {
+            (
+                ctx.is_cancelled(),
+                ctx.check_cancellation().is_ok(),
+                ctx.cancellation_reason().map(str::to_string),
+            )
+        }))
+        .await
+        .expect("the block completes");
+
+        assert_eq!(inside, (false, true, None));
+        assert!(
+            ctx.is_cancelled(),
+            "the request is visible again after the block"
+        );
     }
 
     /// A withdrawn scope gives back the whole log budget, also for log calls
