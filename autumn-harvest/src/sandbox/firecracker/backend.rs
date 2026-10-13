@@ -25,6 +25,11 @@ pub const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(10);
 /// then removes the work directory. The grace covers both.
 pub const DEFAULT_RESPONSE_GRACE: Duration = Duration::from_secs(10);
 
+/// The shortest response grace: the guest pipe wait, and one second to send
+/// the outcome.
+pub const MIN_RESPONSE_GRACE: Duration =
+    crate::sandbox::exec::PIPE_DRAIN_GRACE.saturating_add(Duration::from_secs(1));
+
 /// The timing of the backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackendSettings {
@@ -67,7 +72,8 @@ impl FirecrackerBackend {
     ///
     /// # Errors
     ///
-    /// Returns [`SandboxError::Config`] for a boot timeout of zero.
+    /// Returns [`SandboxError::Config`] for a boot timeout of zero, or a
+    /// response grace under [`MIN_RESPONSE_GRACE`].
     pub fn new(
         launcher: Arc<dyn VmLauncher>,
         settings: BackendSettings,
@@ -77,6 +83,14 @@ impl FirecrackerBackend {
             return Err(SandboxError::Config(
                 "the boot timeout must be above zero".into(),
             ));
+        }
+        // After the wall clock, the guest can wait for the pipes before it
+        // answers. A shorter grace drops a valid outcome.
+        if settings.response_grace < MIN_RESPONSE_GRACE {
+            return Err(SandboxError::Config(format!(
+                "the response grace must be at least {MIN_RESPONSE_GRACE:?}, not {:?}",
+                settings.response_grace
+            )));
         }
         Ok(Self {
             launcher,
@@ -256,7 +270,7 @@ mod tests {
         BackendSettings {
             guest_port: GUEST_AGENT_PORT,
             boot_timeout: Duration::from_millis(500),
-            response_grace: Duration::from_millis(500),
+            response_grace: MIN_RESPONSE_GRACE,
         }
     }
 
@@ -269,6 +283,25 @@ mod tests {
             entropy: [1; 32],
             plan,
         }
+    }
+
+    #[test]
+    fn a_response_grace_shorter_than_the_guest_cleanup_is_a_config_error() {
+        let settings = BackendSettings {
+            response_grace: crate::sandbox::exec::PIPE_DRAIN_GRACE,
+            ..fast()
+        };
+        let err = FirecrackerBackend::new(launcher(GuestMode::Serve), settings)
+            .expect_err("short response grace");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("response grace")),
+            "{err:?}"
+        );
+        let settings = BackendSettings {
+            response_grace: MIN_RESPONSE_GRACE,
+            ..fast()
+        };
+        FirecrackerBackend::new(launcher(GuestMode::Serve), settings).unwrap();
     }
 
     #[test]

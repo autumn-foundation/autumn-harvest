@@ -229,7 +229,12 @@ pub fn check_extra_boot_args(image: &GuestImage) -> Result<(), SandboxError> {
         .iter()
         .map(|arg| key(arg))
         .collect();
-    for arg in &image.extra_boot_args {
+    // The launcher joins the arguments with spaces, so check each word.
+    for arg in image
+        .extra_boot_args
+        .iter()
+        .flat_map(|arg| arg.split_whitespace())
+    {
         let name = key(arg);
         if reserved.contains(&name) {
             return Err(SandboxError::Config(format!(
@@ -392,6 +397,8 @@ mod tests {
             "init=/bin/sh",
             "8250.nr_uarts=1",
             "panic=0",
+            // The launcher joins the arguments with spaces.
+            "debug harvest.port=53",
         ] {
             let mut image = image();
             image.extra_boot_args.push(reserved.into());
