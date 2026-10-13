@@ -10,7 +10,7 @@ use super::launcher::{LaunchedVm, VmLauncher};
 use super::pool::WarmPool;
 use super::vsock::connect_guest;
 use crate::sandbox::error::SandboxError;
-use crate::sandbox::guest::request_run;
+use crate::sandbox::guest::{read_outcome, send_run};
 use crate::sandbox::outcome::SandboxOutcome;
 use crate::sandbox::policy::IsolationLevel;
 use crate::sandbox::runtime::{BoxFuture, SandboxBackend, SandboxJob};
@@ -21,17 +21,25 @@ pub const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The default time that the guest gets on top of the wall-clock limit to
 /// send its outcome.
 ///
-/// The guest waits up to two seconds for the pipes of the code to close.
-/// Then it waits up to two seconds for the run cgroup to empty, and removes
-/// the work directory. The grace covers each step.
-pub const DEFAULT_RESPONSE_GRACE: Duration = Duration::from_secs(10);
+/// The guest decodes the request and writes the input files. After the run,
+/// it waits up to two seconds for the pipes of the code to close. Then it
+/// waits up to two seconds for the run cgroup to empty, reads the outputs
+/// and sends the outcome. The grace covers each step, with some margin.
+pub const DEFAULT_RESPONSE_GRACE: Duration = Duration::from_secs(15);
 
-/// The shortest response grace. It holds the guest pipe wait and the run
-/// cgroup wait. It adds one second to read the outputs, remove the work
-/// directory and send the outcome.
+/// The time to move one full guest frame over vsock and to decode or encode
+/// it. A frame holds at most 64 MiB, so this assumes at least 16 MiB/s.
+pub const FRAME_IO_ALLOWANCE: Duration = Duration::from_secs(4);
+
+/// The shortest response grace.
+///
+/// It holds the guest pipe wait and the run cgroup wait. It adds one frame
+/// allowance to decode the request and write the input files, and one to
+/// read the outputs and send the outcome.
 pub const MIN_RESPONSE_GRACE: Duration = crate::sandbox::exec::PIPE_DRAIN_GRACE
     .saturating_add(crate::sandbox::exec::CGROUP_WAIT)
-    .saturating_add(Duration::from_secs(1));
+    .saturating_add(FRAME_IO_ALLOWANCE)
+    .saturating_add(FRAME_IO_ALLOWANCE);
 
 /// The timing of the backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,16 +181,46 @@ impl FirecrackerBackend {
             .limits
             .wall_clock()
             .saturating_add(self.settings.response_grace);
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => Err(SandboxError::Cancelled),
-            outcome = tokio::time::timeout(budget, request_run(&mut stream, job)) => {
-                outcome.unwrap_or_else(|_| {
-                    Err(SandboxError::Unavailable(format!(
-                        "the guest sent no outcome within {budget:?}"
-                    )))
-                })
-            }
+        exchange(&mut stream, job, FRAME_IO_ALLOWANCE, budget, cancel).await
+    }
+}
+
+/// Send `job` on `stream` and wait for its outcome.
+///
+/// The request write has its own limit, `send_limit`. The outcome `budget`
+/// starts when the write ends, so a large request takes no time from the
+/// code. A write ends only when the guest has read all but the socket
+/// buffer.
+async fn exchange<S>(
+    stream: &mut S,
+    job: &SandboxJob,
+    send_limit: Duration,
+    budget: Duration,
+    cancel: &CancellationToken,
+) -> Result<SandboxOutcome, SandboxError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err(SandboxError::Cancelled),
+        sent = tokio::time::timeout(send_limit, send_run(stream, job)) => {
+            sent.unwrap_or_else(|_| {
+                Err(SandboxError::Unavailable(format!(
+                    "the guest did not take the request within {send_limit:?}"
+                )))
+            })?;
+        }
+    }
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(SandboxError::Cancelled),
+        outcome = tokio::time::timeout(budget, read_outcome(stream, job)) => {
+            outcome.unwrap_or_else(|_| {
+                Err(SandboxError::Unavailable(format!(
+                    "the guest sent no outcome within {budget:?}"
+                )))
+            })
         }
     }
 }
@@ -192,12 +230,13 @@ impl SandboxBackend for FirecrackerBackend {
         IsolationLevel::MicroVm
     }
 
-    /// The launch, a boot, the response grace, and the teardown of the VMM
-    /// and its cgroup.
+    /// The launch, a boot, the request transfer, the response grace, and
+    /// the teardown of the VMM and its cgroup.
     fn overhead(&self) -> Duration {
         self.launcher
             .launch_budget()
             .saturating_add(self.settings.boot_timeout)
+            .saturating_add(FRAME_IO_ALLOWANCE)
             .saturating_add(self.settings.response_grace)
             .saturating_add(super::launcher::KILL_WAIT)
             .saturating_add(super::launcher::CGROUP_EMPTY_WAIT)
@@ -337,6 +376,7 @@ mod tests {
         };
         let backend = FirecrackerBackend::new(launcher(GuestMode::Serve), settings).unwrap();
         let need = Duration::from_secs(60)
+            + FRAME_IO_ALLOWANCE
             + settings.response_grace
             + super::super::launcher::KILL_WAIT
             + super::super::launcher::CGROUP_EMPTY_WAIT;
@@ -359,11 +399,14 @@ mod tests {
     }
 
     #[test]
-    fn the_minimum_grace_covers_the_guest_cleanup() {
-        let cleanup = crate::sandbox::exec::PIPE_DRAIN_GRACE
+    fn the_minimum_grace_covers_the_guest_setup_and_cleanup() {
+        // One frame for the request decode and the input files, one for the
+        // outputs and the outcome frame.
+        let need = crate::sandbox::exec::PIPE_DRAIN_GRACE
             + crate::sandbox::exec::CGROUP_WAIT
-            + Duration::from_secs(1);
-        assert!(MIN_RESPONSE_GRACE >= cleanup, "{MIN_RESPONSE_GRACE:?}");
+            + FRAME_IO_ALLOWANCE * 2;
+        assert!(MIN_RESPONSE_GRACE >= need, "{MIN_RESPONSE_GRACE:?}");
+        assert!(DEFAULT_RESPONSE_GRACE >= MIN_RESPONSE_GRACE);
     }
 
     #[test]
@@ -660,6 +703,85 @@ mod tests {
             assert!(Instant::now() < deadline, "the dead VM leaked");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// A guest on `stream` that waits `before_read`, reads the request,
+    /// waits `before_reply`, and sends an outcome.
+    fn slow_guest(
+        mut stream: tokio::io::DuplexStream,
+        before_read: Duration,
+        before_reply: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        use crate::sandbox::protocol::{
+            GuestMessage, HostMessage, MAX_FRAME_BYTES, OutcomeMessage, read_message, write_message,
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(before_read).await;
+            let message: HostMessage = read_message(&mut stream, MAX_FRAME_BYTES).await.unwrap();
+            let HostMessage::Run(run) = message else {
+                panic!("not a run");
+            };
+            tokio::time::sleep(before_reply).await;
+            let outcome = SandboxOutcome {
+                status: RunStatus::Exited { code: 0 },
+                stdout: String::new(),
+                stderr: String::new(),
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+                stdout_truncated: false,
+                stderr_truncated: false,
+                outputs: Vec::new(),
+                skipped_outputs: Vec::new(),
+                duration_ms: 0,
+                isolation: IsolationLevel::MicroVm,
+                image: None,
+            };
+            let reply = GuestMessage::Outcome(OutcomeMessage {
+                run_id: run.run_id,
+                outcome,
+            });
+            write_message(&mut stream, reply, MAX_FRAME_BYTES)
+                .await
+                .unwrap();
+        })
+    }
+
+    #[tokio::test]
+    async fn a_slow_request_transfer_takes_no_time_from_the_outcome_budget() {
+        // A small pipe makes the request write wait until the guest reads.
+        let (mut host, guest) = tokio::io::duplex(64);
+        let guest = slow_guest(
+            guest,
+            Duration::from_millis(800),
+            Duration::from_millis(700),
+        );
+        let outcome = exchange(
+            &mut host,
+            &job("true", 1_000),
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        guest.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_guest_that_does_not_take_the_request_is_unavailable() {
+        let (mut host, _guest) = tokio::io::duplex(64);
+        let started = Instant::now();
+        let err = exchange(
+            &mut host,
+            &job("true", 1_000),
+            Duration::from_millis(300),
+            Duration::from_secs(30),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("no reader");
+        assert!(matches!(err, SandboxError::Unavailable(_)), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[tokio::test]

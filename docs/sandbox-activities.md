@@ -361,7 +361,11 @@ not fit is only counted.
 - The registration sets `start_to_close` to `max_attempt_time`. That is the
   queue wait, the wall-clock ceiling, the backend overhead and the cleanup
   grace together. The backend overhead is at least what the backend needs:
-  for Firecracker, the boot timeout, the response grace and the teardown.
+  for Firecracker, the boot timeout, the request transfer, the response grace
+  and the teardown.
+- The Firecracker backend starts the response grace after the guest takes
+  the request, so a large request takes no time from the code. The grace
+  covers the guest setup, the cleanup and the outcome of a full 64 MiB frame.
 - The handler gives the runtime the time left in the attempt. The runtime
   keeps the cleanup grace for teardown. It does not start code that cannot
   finish in the rest. So a retry does not overlap a live run.

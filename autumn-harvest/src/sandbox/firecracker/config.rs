@@ -226,16 +226,23 @@ fn launcher_boot_args(image: &GuestImage, port: u32) -> Vec<String> {
 pub fn check_boot_args(image: &GuestImage) -> Result<(), SandboxError> {
     // The kernel splits the line at whitespace and removes double quotes.
     // So a space or a quote can add an argument, such as a second `init=`.
-    let unsafe_word = |word: &str| word.contains('"') || word.chars().any(char::is_whitespace);
+    // The line also ends at a NUL, so no argument may hold a control
+    // character.
+    let unsafe_char = |c: char| c == '"' || c.is_control();
+    let unsafe_word = |word: &str| word.chars().any(|c| unsafe_char(c) || c.is_whitespace());
     if image.init.is_empty() || unsafe_word(&image.init) {
         return Err(SandboxError::Config(format!(
-            "the init path {:?} must be one word with no quote",
+            "the init path {:?} must be one word with no quote and no control character",
             image.init
         )));
     }
-    if let Some(arg) = image.extra_boot_args.iter().find(|arg| arg.contains('"')) {
+    if let Some(arg) = image
+        .extra_boot_args
+        .iter()
+        .find(|arg| arg.chars().any(unsafe_char))
+    {
         return Err(SandboxError::Config(format!(
-            "the extra boot argument {arg:?} has a quote, which the kernel removes"
+            "the extra boot argument {arg:?} has a quote or a control character"
         )));
     }
     // The kernel and the guest agent take the last value of a key. So an
@@ -435,6 +442,9 @@ mod tests {
             "/sbin/agent init=/bin/false",
             "/sbin/a\tb",
             "/sbin/\"a\"",
+            // The kernel command line ends at a NUL.
+            "/sbin/harvest-guest-agent\0x",
+            "/sbin/a\u{7f}b",
         ] {
             let mut image = image();
             image.init = init.into();
@@ -449,6 +459,12 @@ mod tests {
         assert!(
             matches!(check_boot_args(&image), Err(SandboxError::Config(_))),
             "a quoted extra argument"
+        );
+        let mut with_nul = self::tests::image();
+        with_nul.extra_boot_args.push("harvest.debug=1\0".into());
+        assert!(
+            matches!(check_boot_args(&with_nul), Err(SandboxError::Config(_))),
+            "an extra argument with a NUL"
         );
     }
 

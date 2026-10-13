@@ -298,6 +298,20 @@ pub async fn request_run<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    send_run(stream, job).await?;
+    read_outcome(stream, job).await
+}
+
+/// Send the run request of `job` to the guest.
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Unavailable`] when the stream fails, and
+/// [`SandboxError::Denied`] when the request is too large.
+pub async fn send_run<S>(stream: &mut S, job: &SandboxJob) -> Result<(), SandboxError>
+where
+    S: AsyncWrite + Unpin + Send,
+{
     let run = HostMessage::Run(Box::new(RunMessage {
         run_id: job.run_id.clone(),
         entropy: format_entropy(&job.entropy),
@@ -306,7 +320,21 @@ where
     }));
     write_message(stream, run, MAX_FRAME_BYTES)
         .await
-        .map_err(|e| run_write_error(&e))?;
+        .map_err(|e| run_write_error(&e))
+}
+
+/// Read the outcome of `job` from the guest.
+///
+/// # Errors
+///
+/// The same as [`request_run`], except the errors of the request write.
+pub async fn read_outcome<S>(
+    stream: &mut S,
+    job: &SandboxJob,
+) -> Result<SandboxOutcome, SandboxError>
+where
+    S: AsyncRead + Unpin + Send,
+{
     let reply: GuestMessage = read_message(stream, max_outcome_frame_bytes(&job.plan))
         .await
         .map_err(|e| match e {
