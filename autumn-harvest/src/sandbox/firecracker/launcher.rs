@@ -211,11 +211,18 @@ impl FirecrackerLauncher {
     /// - the machine has no memory, or a vCPU count outside 1 to 32;
     /// - a path is missing;
     /// - a snapshot boot has no jailer;
-    /// - the jail uid or gid is 0;
+    /// - the jail uid or gid is 0, or this process is not root with a jail;
+    /// - the jail cannot read an image;
     /// - another user can change a binary, an image, the jail root or the
     ///   network namespace of a jailed launch;
     /// - the lease cannot be taken.
     pub fn new(config: LauncherConfig) -> Result<Self, SandboxError> {
+        // SAFETY: geteuid has no preconditions.
+        Self::new_with_euid(config, unsafe { libc::geteuid() })
+    }
+
+    /// [`Self::new`] for a process with the effective uid `euid`.
+    fn new_with_euid(config: LauncherConfig, euid: u32) -> Result<Self, SandboxError> {
         // Firecracker refuses these at each launch. Refuse them once, here.
         let machine = config.machine;
         if !(1..=MAX_VCPUS).contains(&machine.vcpu_count) || machine.mem_size_mib == 0 {
@@ -251,13 +258,21 @@ impl FirecrackerLauncher {
                 )));
             }
         }
-        if let Confinement::Jailer(jailer) = &config.confinement
-            && (jailer.uid == 0 || jailer.gid == 0)
-        {
-            return Err(SandboxError::Config(
-                "the jailer must drop to a non-root uid and gid, or an escaped VMM keeps root"
-                    .into(),
-            ));
+        if let Confinement::Jailer(jailer) = &config.confinement {
+            if jailer.uid == 0 || jailer.gid == 0 {
+                return Err(SandboxError::Config(
+                    "the jailer must drop to a non-root uid and gid, or an escaped VMM keeps root"
+                        .into(),
+                ));
+            }
+            // The jailer makes the chroot and the cgroup, then drops to the
+            // jail uid. Each step needs root, so another uid fails each launch.
+            if euid != 0 {
+                return Err(SandboxError::Config(format!(
+                    "the jailer needs root, and this process runs as uid {euid}; run the worker \
+                     as root or use Confinement::Unjailed"
+                )));
+            }
         }
         let exec_name = super::jailer::exec_name(&config.firecracker_bin)?;
         let owner = uuid::Uuid::new_v4().simple().to_string()[..OWNER_TAG_HEX].to_owned();
@@ -887,6 +902,17 @@ fn check_trusted_files(
                 path.display()
             )));
         }
+        // The VMM opens the file after the jailer drops to the jail uid and
+        // gid, and the jail uid never owns it.
+        let readable =
+            meta.mode() & 0o004 != 0 || (meta.gid() == jailer.gid && meta.mode() & 0o040 != 0);
+        if !readable {
+            return Err(SandboxError::Config(format!(
+                "the jail uid {jail_uid} and gid {} cannot read {}",
+                jailer.gid,
+                path.display()
+            )));
+        }
     }
     Ok(())
 }
@@ -1312,8 +1338,7 @@ mod tests {
             "firecracker",
             "printf '%s\\n' \"$@\" > args.txt; env > env.txt; exec sleep 60",
         );
-        let launcher =
-            FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
+        let launcher = new_launcher(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
         let vm = launcher.launch().await.unwrap();
         let vm_dir = launcher.vm_root().join(vm.id());
         assert!(vm.id().starts_with(&format!("hsbx-{}-", launcher.owner())));
@@ -1353,8 +1378,7 @@ mod tests {
     async fn shutdown_kills_the_vmm_process() {
         let dir = temp_dir();
         let fc = script(&dir, "firecracker", "echo $$ > pid.txt; exec sleep 60");
-        let launcher =
-            FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
+        let launcher = new_launcher(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
         let vm = launcher.launch().await.unwrap();
         let vm_dir = launcher.vm_root().join(vm.id());
         wait_for(&vm_dir.join("pid.txt")).await;
@@ -1376,8 +1400,7 @@ mod tests {
     async fn a_vmm_that_exits_at_once_reports_its_status() {
         let dir = temp_dir();
         let fc = script(&dir, "firecracker", "echo 'bad kernel' >&2; exit 3");
-        let launcher =
-            FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
+        let launcher = new_launcher(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
         let mut vm = launcher.launch().await.unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         let status = loop {
@@ -1399,7 +1422,7 @@ mod tests {
         let fc = script(&dir, "firecracker", "exec sleep 60");
         let mut config = unjailed(&dir, fc, BootMethod::Api);
         config.api_timeout = Duration::from_millis(200);
-        let launcher = FirecrackerLauncher::new(config).unwrap();
+        let launcher = new_launcher(config).unwrap();
         let err = launcher.launch().await.err().expect("no api socket");
         assert!(matches!(err, SandboxError::Unavailable(_)));
         let left: Vec<_> = std::fs::read_dir(launcher.vm_root())
@@ -1429,7 +1452,7 @@ mod tests {
             "firecracker",
             &format!("exec python3 {} \"$@\"", server.display()),
         );
-        let launcher = FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::Api)).unwrap();
+        let launcher = new_launcher(unjailed(&dir, fc, BootMethod::Api)).unwrap();
         let vm = launcher.launch().await.unwrap();
         let log =
             std::fs::read_to_string(launcher.vm_root().join(vm.id()).join("requests.log")).unwrap();
@@ -1488,8 +1511,7 @@ while True:
     fn the_sweep_removes_only_the_vms_of_dead_owners() {
         let dir = temp_dir();
         let fc = script(&dir, "firecracker", "exit 0");
-        let live =
-            FirecrackerLauncher::new(unjailed(&dir, fc.clone(), BootMethod::ConfigFile)).unwrap();
+        let live = new_launcher(unjailed(&dir, fc.clone(), BootMethod::ConfigFile)).unwrap();
         let root = live.vm_root();
         let live_vm = root.join(format!("hsbx-{}-{}", live.owner(), "a".repeat(16)));
         std::fs::create_dir_all(&live_vm).unwrap();
@@ -1502,7 +1524,7 @@ while True:
         let unrelated = root.join("keep-me");
         std::fs::create_dir_all(&unrelated).unwrap();
 
-        let sweeper = FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
+        let sweeper = new_launcher(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
         assert_eq!(sweeper.sweep_stale(), 2);
         assert!(live_vm.exists(), "a live owner keeps its VMs");
         assert!(live.lease_path().exists());
@@ -1534,10 +1556,7 @@ while True:
         let fc = script(&dir, "firecracker", "exit 0");
         let mut config = unjailed(&dir, fc, BootMethod::ConfigFile);
         config.image.rootfs = dir.join("missing.ext4");
-        assert!(matches!(
-            FirecrackerLauncher::new(config),
-            Err(SandboxError::Config(_))
-        ));
+        assert!(matches!(new_launcher(config), Err(SandboxError::Config(_))));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1549,7 +1568,7 @@ while True:
         let deep = dir.join("d".repeat(80));
         std::fs::create_dir_all(&deep).unwrap();
         config.confinement = Confinement::Unjailed { work_root: deep };
-        let err = FirecrackerLauncher::new(config).expect_err("too long");
+        let err = new_launcher(config).expect_err("too long");
         assert!(
             matches!(err, SandboxError::Config(ref m) if m.contains("Unix socket")),
             "{err:?}"
@@ -1561,8 +1580,7 @@ while True:
     async fn verify_host_checks_the_version_and_the_posture() {
         let dir = temp_dir();
         let fc = script(&dir, "firecracker", "echo 'Firecracker v1.17.0'");
-        let launcher =
-            FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
+        let launcher = new_launcher(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
         // An empty root has no /dev/kvm and no cgroup v2: critical findings.
         let empty = dir.join("empty-root");
         std::fs::create_dir_all(&empty).unwrap();
@@ -1588,7 +1606,7 @@ while True:
         let empty = dir.join("empty-root");
         std::fs::create_dir_all(&empty).unwrap();
         let netns_findings = |config: LauncherConfig| {
-            let launcher = FirecrackerLauncher::new(config).unwrap();
+            let launcher = new_launcher(config).unwrap();
             let root = empty.clone();
             async move {
                 launcher
@@ -1620,8 +1638,7 @@ while True:
     async fn verify_host_refuses_an_old_firecracker_even_when_reporting() {
         let dir = temp_dir();
         let fc = script(&dir, "firecracker", "echo 'Firecracker v1.14.0'");
-        let launcher =
-            FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
+        let launcher = new_launcher(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
         let err = launcher
             .verify_host_at(&dir, PosturePolicy::Report)
             .await
@@ -1670,7 +1687,7 @@ while True:
             guest_port: GUEST_AGENT_PORT,
             api_timeout: Duration::from_secs(5),
         };
-        let launcher = FirecrackerLauncher::new(config).unwrap();
+        let launcher = new_launcher(config).unwrap();
         let vm = launcher.launch().await.unwrap();
         let jail_dir = dir.join("jail/firecracker").join(vm.id());
         let root = jail_dir.join("root");
@@ -1698,8 +1715,7 @@ while True:
     async fn a_launch_refuses_a_firecracker_with_a_known_escape() {
         let dir = temp_dir();
         let fc = script(&dir, "firecracker", "echo 'Firecracker v1.14.3'");
-        let launcher =
-            FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
+        let launcher = new_launcher(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
         let err = launcher
             .launch()
             .await
@@ -1721,7 +1737,7 @@ while True:
         if let Confinement::Jailer(jail) = &mut config.confinement {
             jail.jailer_bin = firecracker;
         }
-        let launcher = FirecrackerLauncher::new(config).unwrap();
+        let launcher = new_launcher(config).unwrap();
         let err = launcher
             .launch()
             .await
@@ -1733,6 +1749,12 @@ while True:
         );
         drop(launcher);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A launcher for `config`, built as if this process were root. A
+    /// jailed launcher needs root, and most tests run without it.
+    fn new_launcher(config: LauncherConfig) -> Result<FirecrackerLauncher, SandboxError> {
+        FirecrackerLauncher::new_with_euid(config, 0)
     }
 
     fn jailed(dir: &Path) -> LauncherConfig {
@@ -1770,7 +1792,7 @@ while True:
             let fc = script(&dir, "firecracker", "exit 0");
             let mut config = unjailed(&dir, fc, BootMethod::ConfigFile);
             config.machine = machine;
-            let err = FirecrackerLauncher::new(config).expect_err("bad machine");
+            let err = new_launcher(config).expect_err("bad machine");
             assert!(matches!(err, SandboxError::Config(_)), "{err:?}");
         }
         std::fs::remove_dir_all(dir).unwrap();
@@ -1785,7 +1807,7 @@ while True:
                 jail.uid = uid;
                 jail.gid = gid;
             }
-            let err = FirecrackerLauncher::new(config).expect_err("root jail identity");
+            let err = new_launcher(config).expect_err("root jail identity");
             assert!(
                 matches!(err, SandboxError::Config(ref m) if m.contains("root")),
                 "{err:?}"
@@ -1800,14 +1822,14 @@ while True:
         let config = jailed(&dir);
         let parent = config.image.rootfs.parent().unwrap().to_path_buf();
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let err = FirecrackerLauncher::new(config.clone()).expect_err("writable parent");
+        let err = new_launcher(config.clone()).expect_err("writable parent");
         assert!(
             matches!(err, SandboxError::Config(ref m) if m.contains("write")),
             "{err:?}"
         );
         // A sticky directory, such as /tmp, keeps each entry to its owner.
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o1777)).unwrap();
-        FirecrackerLauncher::new(config).unwrap();
+        new_launcher(config).unwrap();
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1819,7 +1841,7 @@ while True:
         let link = dir.join("rootfs-link.ext4");
         std::os::unix::fs::symlink(&config.image.rootfs, &link).unwrap();
         config.image.rootfs = link;
-        let err = FirecrackerLauncher::new(config).expect_err("symlink");
+        let err = new_launcher(config).expect_err("symlink");
         assert!(
             matches!(err, SandboxError::Config(ref m) if m.contains("symbolic link")),
             "{err:?}"
@@ -1845,7 +1867,7 @@ while True:
             // The launcher runs each binary as root, before the jailer
             // drops to the jail uid.
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o757)).unwrap();
-            let err = FirecrackerLauncher::new(config.clone()).expect_err("writable binary");
+            let err = new_launcher(config.clone()).expect_err("writable binary");
             assert!(
                 matches!(err, SandboxError::Config(ref m) if m.contains(&name)),
                 "{name}: {err:?}"
@@ -1855,7 +1877,7 @@ while True:
             std::os::unix::fs::symlink(&bin, &link).unwrap();
             let mut linked = config.clone();
             set(&mut linked, link.clone());
-            let err = FirecrackerLauncher::new(linked).expect_err("linked binary");
+            let err = new_launcher(linked).expect_err("linked binary");
             assert!(
                 matches!(err, SandboxError::Config(ref m) if m.contains("symbolic link")),
                 "{name}: {err:?}"
@@ -1867,7 +1889,7 @@ while True:
     #[tokio::test]
     async fn a_launch_dropped_while_it_links_the_image_leaves_no_jail() {
         let dir = temp_dir();
-        let launcher = FirecrackerLauncher::new(jailed(&dir)).unwrap();
+        let launcher = new_launcher(jailed(&dir)).unwrap();
         let vm_root = dir.join("jail/firecracker");
         let jails = || -> Vec<PathBuf> {
             std::fs::read_dir(&vm_root)
@@ -1912,7 +1934,7 @@ while True:
             if let Confinement::Jailer(jail) = &mut config.confinement {
                 change(jail);
             }
-            FirecrackerLauncher::new(config)
+            new_launcher(config)
         };
         let refused = |result: Result<FirecrackerLauncher, SandboxError>, what: &str| {
             let err = result.expect_err(what);
@@ -1968,12 +1990,46 @@ while True:
     }
 
     #[test]
+    fn a_jailed_launcher_needs_root() {
+        let dir = temp_dir();
+        let err = FirecrackerLauncher::new_with_euid(jailed(&dir), 1000)
+            .expect_err("the jailer needs root");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("root")),
+            "{err:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_shared_image_that_the_jail_cannot_read_is_a_config_error() {
+        let dir = temp_dir();
+        let config = jailed(&dir);
+        std::fs::set_permissions(&config.image.rootfs, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let err = new_launcher(config.clone()).expect_err("unreadable image");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("read")),
+            "{err:?}"
+        );
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            // The jail group may read a 0640 file of its group.
+            std::os::unix::fs::chown(&config.image.rootfs, None, Some(12_345)).unwrap();
+            std::fs::set_permissions(&config.image.rootfs, std::fs::Permissions::from_mode(0o640))
+                .unwrap();
+            new_launcher(config).unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_shared_image_that_others_can_write_is_a_config_error() {
         let dir = temp_dir();
         let config = jailed(&dir);
         std::fs::set_permissions(&config.image.rootfs, std::fs::Permissions::from_mode(0o666))
             .unwrap();
-        let err = FirecrackerLauncher::new(config).expect_err("writable image");
+        let err = new_launcher(config).expect_err("writable image");
         assert!(
             matches!(err, SandboxError::Config(ref m) if m.contains("rootfs.ext4")),
             "{err:?}"
@@ -1993,7 +2049,7 @@ while True:
         std::fs::create_dir_all(&dead).unwrap();
         std::fs::write(dead.join("cgroup.kill"), b"").unwrap();
         std::fs::write(dead.join("cgroup.events"), b"populated 0\n").unwrap();
-        let launcher = FirecrackerLauncher::new(config).unwrap();
+        let launcher = new_launcher(config).unwrap();
         let mine = parent.join(format!("hsbx-{}-{}", launcher.owner(), "e".repeat(16)));
         std::fs::create_dir_all(&mine).unwrap();
         std::fs::write(mine.join("cgroup.kill"), b"").unwrap();
@@ -2012,7 +2068,7 @@ while True:
     async fn a_golden_snapshot_needs_the_jailer() {
         let dir = temp_dir();
         let fc = script(&dir, "firecracker", "exit 0");
-        let launcher = FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::Api)).unwrap();
+        let launcher = new_launcher(unjailed(&dir, fc, BootMethod::Api)).unwrap();
         let result = launcher
             .create_golden_snapshot(&dir.join("golden"), Duration::from_secs(5))
             .await;
@@ -2054,7 +2110,7 @@ while True:
             guest_port: GUEST_AGENT_PORT,
             api_timeout: Duration::from_secs(5),
         };
-        let launcher = FirecrackerLauncher::new(config).unwrap();
+        let launcher = new_launcher(config).unwrap();
         let out = dir.join("golden");
         let files = launcher
             .create_golden_snapshot(&out, Duration::from_secs(10))

@@ -169,6 +169,10 @@ runtime refuses a policy that allows the network on a backend without one.
   holds a symbolic link. Only root may write each directory above them,
   except a sticky directory such as /tmp. The launcher refuses other paths,
   and it refuses a jail uid or gid of 0.
+- A kernel, root file system and snapshot that the jail gid or others can
+  read. A golden snapshot gets mode `0640` and the jail group.
+- A worker that runs as root. The launcher refuses a jailed configuration in
+  any other process, because the jailer needs root.
 - SMT off on a host that serves more than one tenant. Swap off.
 - An empty network namespace for the jailer, through `JailerConfig::netns`.
   Give its path under `/run/netns`, because `/var/run` is a symbolic link on
