@@ -402,6 +402,8 @@ impl Mandate {
     /// # Errors
     ///
     /// Returns the [`Refusal`] when the holder may not delegate to `peer`.
+    /// Returns [`Refusal::InvalidMandate`] when the result fails
+    /// [`Mandate::validate`], so the receiver could not read it.
     pub fn outbound(
         &self,
         peer: &Peer,
@@ -411,6 +413,7 @@ impl Mandate {
         let mut child = self.delegate(peer, used)?;
         child.max_delegations = self.max_delegations.saturating_sub(used.saturating_add(1));
         child.flow_labels.extend(flow_labels.iter().cloned());
+        child.validate().map_err(|_| Refusal::InvalidMandate)?;
         Ok(child)
     }
 
@@ -798,6 +801,22 @@ mod tests {
         assert_eq!(
             parent.outbound(&Peer::new("researcher", "R."), 10, &labels),
             Err(Refusal::FanOutExhausted)
+        );
+    }
+
+    #[test]
+    fn outbound_refuses_a_mandate_that_the_receiver_cannot_read() {
+        let parent = Mandate::new("planner").peers(["researcher"]);
+        let peer = Peer::new("researcher", "R.");
+        let control = set(&["bad\u{7}label"]);
+        assert_eq!(
+            parent.outbound(&peer, 0, &control),
+            Err(Refusal::InvalidMandate)
+        );
+        let many: BTreeSet<String> = (0..=MAX_SET_LEN).map(|n| format!("l{n}")).collect();
+        assert_eq!(
+            parent.outbound(&peer, 0, &many),
+            Err(Refusal::InvalidMandate)
         );
     }
 
