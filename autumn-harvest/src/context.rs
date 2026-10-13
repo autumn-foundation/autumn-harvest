@@ -5130,6 +5130,11 @@ impl WorkflowContext {
         if self.note_position_read() {
             return true;
         }
+        // Issue #1984: a replayed cancel withdraws the chunk again, so the
+        // chunk is not serialized. The offset is claimed before this check.
+        if self.replays_a_scope_cancel() {
+            return true;
+        }
         let matcher = self.matcher.lock().expect("matcher lock poisoned");
         matcher.would_replay_after_prepare() || matcher.has_terminal_failure_tail()
     }
@@ -5894,11 +5899,15 @@ impl WorkflowContext {
             min <= max,
             "version gate '{change_id}': min version {min} must not exceed max version {max}"
         );
-        let version = self.match_history(|m| m.match_version(change_id, min, max));
+        let (live, version) = self.match_history(|m| {
+            let live = m.version_gate_is_live();
+            (live, m.match_version(change_id, min, max))
+        });
 
         // Issue #1984: a scope cancel withdrew the gate's marker. Replay keeps
         // the version that the live cycle chose, even after a deploy raises max.
-        if self.at_history_frontier()
+        // A gate that matched its marker in history takes no captured record.
+        if live
             && let Some(captured) = self
                 .captured_or_drift(
                     self.captured_scope_marker(&crate::replay::version_marker_name(change_id)),
@@ -15020,6 +15029,16 @@ impl WorkflowContext {
                 });
         *cmds = kept;
         drop(cmds);
+        // A withdrawn chunk or log line leaves the queue, so it no longer
+        // counts toward the queue bound of this cycle.
+        for buffered in &withdrawn {
+            let counter = match buffered.cmd {
+                WorkflowCommand::PublishDurableProgress { .. } => &self.durable_progress_queued,
+                WorkflowCommand::RecordLog { .. } => &self.log_commands_queued,
+                _ => continue,
+            };
+            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
         withdrawn
             .into_iter()
             .map(|buffered| (buffered.order, buffered.cmd))
@@ -15051,7 +15070,29 @@ impl WorkflowContext {
     ///
     /// Returns the marker's index and details, or `None` at the frontier.
     pub(crate) fn take_marker(&self, name: &str) -> Option<(usize, Value)> {
-        self.match_history(|m| m.take_marker(name))
+        self.match_history_unpumped(|m| m.take_marker(name))
+    }
+
+    /// The durable chunks queued this cycle (issue #1984 tests).
+    #[cfg(test)]
+    pub(crate) fn durable_chunks_queued(&self) -> u64 {
+        self.durable_progress_queued
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Run `f` on the matcher, but do not pump signal handlers (issue #1984).
+    ///
+    /// A scope or shield marker can lie past signals that other writers
+    /// appended after the recording cycle. That cycle did not see them.
+    /// Their handlers therefore run at the next history read, after the
+    /// marker, as in the live run.
+    fn match_history_unpumped<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut HistoryMatcher) -> R,
+    {
+        self.note_position_read();
+        let mut matcher = self.matcher.lock().expect("matcher lock poisoned");
+        f(&mut matcher)
     }
 
     /// Consume the events of a cancelled scope's members on replay.
@@ -15060,7 +15101,7 @@ impl WorkflowContext {
         members: &crate::cancellation_scope::ScopeMembers,
         timer_window: std::ops::Range<usize>,
     ) {
-        self.match_history(|m| m.consume_scope_members(members, timer_window));
+        self.match_history_unpumped(|m| m.consume_scope_members(members, timer_window));
     }
 
     /// Consume the start and heartbeat events of members cancelled live.

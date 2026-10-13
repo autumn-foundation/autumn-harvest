@@ -5926,6 +5926,13 @@ impl HistoryMatcher {
             .unwrap_or_default()
     }
 
+    /// Whether a `version` gate here is past history, as
+    /// [`Self::match_version`] decides it (issue #1984).
+    pub(crate) fn version_gate_is_live(&mut self) -> bool {
+        self.advance_to_next_unconsumed_event();
+        !self.is_replaying()
+    }
+
     /// Versioning mechanism for safe workflow code changes.
     ///
     /// Checks the recorded history for a version marker. If the marker is present

@@ -1906,6 +1906,137 @@ mod tests {
         assert!(!replay.is_replaying(), "the flag ends with the cancel");
     }
 
+    /// A signal that lands between the horizon and the cancel marker reaches
+    /// its handler after `run` returns. The cancelling cycle did not see it.
+    #[tokio::test]
+    async fn a_signal_after_the_horizon_waits_until_the_scope_returns() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started(),
+                WorkflowEvent::MarkerRecorded {
+                    name: "version:gate".into(),
+                    details: json!(1),
+                },
+                WorkflowEvent::SignalReceived {
+                    signal_name: "poke".into(),
+                    payload: json!(1),
+                },
+                WorkflowEvent::MarkerRecorded {
+                    name: "cancel_scope:1".into(),
+                    details: json!({
+                        "reason": "cancellation scope cancelled",
+                        "horizon": 2,
+                    }),
+                },
+            ],
+        );
+        let poked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&poked);
+        ctx.register_signal_handler_raw("poke", move |_| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(!poked.load(std::sync::atomic::Ordering::SeqCst));
+
+        let result = bounded(run_then_cancel(&ctx, async {
+            assert_eq!(ctx.version("gate", 1, 1), 1);
+            std::future::pending::<()>().await;
+        }))
+        .await;
+
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+        assert!(
+            !poked.load(std::sync::atomic::Ordering::SeqCst),
+            "the handler must not run inside the replayed cancel"
+        );
+        let nd = ctx.take_nd_details();
+        assert!(nd.is_none(), "{nd:?}");
+        // The next history read delivers the signal.
+        let _ = ctx.has_unconsumed_marker("none");
+        assert!(poked.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A version gate that matches its marker before the horizon takes no
+    /// captured record, so a replayed cancel reports no drift.
+    #[tokio::test]
+    async fn a_version_gate_in_history_takes_no_captured_record() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started(),
+                WorkflowEvent::MarkerRecorded {
+                    name: "version:gate".into(),
+                    details: json!(1),
+                },
+                WorkflowEvent::MarkerRecorded {
+                    name: "cancel_scope:1".into(),
+                    details: json!({
+                        "reason": "cancellation scope cancelled",
+                        "horizon": 2,
+                    }),
+                },
+            ],
+        );
+
+        let result = bounded(run_then_cancel(&ctx, async {
+            assert_eq!(ctx.version("gate", 1, 2), 1);
+            std::future::pending::<()>().await;
+        }))
+        .await;
+
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+        let nd = ctx.take_nd_details();
+        assert!(nd.is_none(), "{nd:?}");
+    }
+
+    /// Counts each serialization of a durable chunk.
+    struct CountedChunk<'a>(&'a std::sync::atomic::AtomicU32);
+
+    impl serde::Serialize for CountedChunk<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            serializer.serialize_u32(1)
+        }
+    }
+
+    /// A withdrawn durable chunk leaves the queue count. A replay of the
+    /// cancel does not serialize the chunk again.
+    #[tokio::test]
+    async fn a_replayed_cancel_does_not_serialize_a_durable_chunk() {
+        let serialized = std::sync::atomic::AtomicU32::new(0);
+        let live = WorkflowContext::new_test();
+        let seen = std::sync::Mutex::new(None);
+        record_then_cancel(&live, &seen, |ctx| {
+            json!(
+                ctx.publish_durable_progress(CountedChunk(&serialized))
+                    .is_ok()
+            )
+        })
+        .await;
+        assert_eq!(serialized.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(live.durable_chunks_queued(), 0, "the chunk is withdrawn");
+        let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+        let replay = replay_of(details);
+        let replayed = std::sync::Mutex::new(None);
+        record_then_cancel(&replay, &replayed, |ctx| {
+            json!(
+                ctx.publish_durable_progress(CountedChunk(&serialized))
+                    .is_ok()
+            )
+        })
+        .await;
+
+        assert_eq!(*replayed.lock().expect("replayed lock"), Some(json!(true)));
+        assert_eq!(serialized.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     /// A member start that the replayed body no longer issues stops the
     /// scan for the cancel marker, so the removed command is drift.
     #[tokio::test]
