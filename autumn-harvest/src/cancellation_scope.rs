@@ -307,8 +307,13 @@ pub(crate) fn route_command(
         })
         .collect();
     // The outermost holding scope lives longest, so it keeps the command.
-    if let Some(holder) = scopes.iter().rev().find(|shared| shared.lock().holding) {
-        holder.lock().held.push(cmd);
+    // Each scope inside it still records the member. Its re-derived cancel
+    // marker then names the same members as the live one.
+    if let Some(at) = scopes.iter().rposition(|shared| shared.lock().holding) {
+        for shared in &scopes[..at] {
+            shared.lock().members.add_from(&cmd);
+        }
+        scopes[at].lock().held.push(cmd);
         return None;
     }
     let mut tags = Vec::with_capacity(scopes.len());
@@ -1733,6 +1738,70 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(replay.take_nd_details().is_none());
         assert!(!replay.history_has_unconsumed_events());
+    }
+
+    /// A nested scope with an in-flight activity cancels in the same cycle as
+    /// its outer scope. Replay re-derives the nested marker with the same
+    /// members, so it matches the capture.
+    #[tokio::test]
+    async fn a_nested_cancel_with_a_member_replays_cleanly() {
+        async fn run(ctx: &WorkflowContext) -> HarvestResult<()> {
+            let outer = ctx.cancellation_scope();
+            let inner = ctx.cancellation_scope();
+            let body = async {
+                let (_, ()) = tokio::join!(
+                    inner.run(ctx.execute_activity_raw("charge", Value::Null, "default")),
+                    async {
+                        tokio::task::yield_now().await;
+                        inner.cancel();
+                    }
+                );
+                std::future::pending::<()>().await;
+            };
+            let sibling = async {
+                tokio::task::yield_now().await;
+                tokio::task::yield_now().await;
+                outer.cancel();
+            };
+            let (result, ()) = bounded(async { tokio::join!(outer.run(body), sibling) }).await;
+            result
+        }
+
+        let a = ActivityExecId::new();
+        let live = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![started(), scheduled(a, "charge")],
+        );
+        let result = run(&live).await;
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+        let commands = live.drain_commands();
+        assert!(
+            marker(&commands, "cancel_scope:2").is_none(),
+            "{commands:?}"
+        );
+        let details = marker(&commands, "cancel_scope:1").expect("recorded");
+
+        let replay = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started(),
+                scheduled(a, "charge"),
+                WorkflowEvent::MarkerRecorded {
+                    name: "cancel_scope:1".into(),
+                    details,
+                },
+            ],
+        );
+        let result = run(&replay).await;
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+        let nd = replay.take_nd_details();
+        assert!(nd.is_none(), "{nd:?}");
     }
 
     /// A replayed body that completes without the recorded cancel is drift.
