@@ -577,6 +577,43 @@ async fn the_rule_of_two_gates_the_send_after_an_untrusted_read() {
 
 // AC10
 #[tokio::test(flavor = "multi_thread")]
+async fn one_approval_releases_one_send() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        calls(&[("c1", "inbox", json!({}))], 1),
+        calls(&[("c2", "send", json!({"to": "x"}))], 1),
+        calls(&[("c3", "send", json!({"to": "y"}))], 1),
+        answer("sent twice", 1),
+    ]);
+    let harness = AgentHarness::new(model)
+        .tool(inbox())
+        .tool(recorded_tool("send", ToolEffect::External, &recorder))
+        .flow_rules(FlowRules::rule_of_two());
+    let mut rt = runtime(&db, harness);
+
+    let exec = sqlite::start(&mut rt, &AgentTask::new("triage")).unwrap();
+    let RunState::WaitingSignal(first) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("the first send waits for a person");
+    };
+    sqlite::decide(&mut rt, exec, &first, &Approval::Approve).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    let RunState::WaitingSignal(second) = state else {
+        panic!("the second send waits for a person too: {state:?}");
+    };
+    assert_ne!(first, second);
+    assert_eq!(recorder.runs(), vec![json!({"to": "x"})]);
+    sqlite::decide(&mut rt, exec, &second, &Approval::Approve).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+    assert_eq!(report.stop, AgentStop::Completed);
+    assert_eq!(
+        recorder.runs(),
+        vec![json!({"to": "x"}), json!({"to": "y"})]
+    );
+}
+
+// AC10
+#[tokio::test(flavor = "multi_thread")]
 async fn with_no_untrusted_read_the_send_runs_at_once() {
     let (_dir, db) = fresh_db();
     let recorder = Arc::new(Recorder::default());

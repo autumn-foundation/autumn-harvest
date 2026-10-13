@@ -50,9 +50,10 @@
 //! tree. The child run id suffix, such as `:d1`, names that agent.
 //!
 //! A candidate call that equals the recorded call at the same turn and
-//! position takes the recorded id. The ids change before the policy runs.
-//! Approval signal names hold the id, so the recorded approvals stay valid. Any other candidate call gets a new id with
-//! the prefix `eval_`. A recorded approval therefore never releases it.
+//! position, of the same agent, takes the recorded id. The ids change before
+//! the policy runs. Approval signal names hold the id, so the recorded
+//! approvals stay valid. Any other candidate call gets a new id with the
+//! prefix `eval_`. A recorded approval therefore never releases it.
 //!
 //! # The diff
 //!
@@ -386,6 +387,7 @@ pub async fn evaluate(
 
     let session = Arc::new(Mutex::new(Session {
         recorded_calls: recording.turns.iter().map(ModelTurn::calls).collect(),
+        recorded_lanes: recording.turn_lanes.clone(),
         turn: 0,
         max_turns,
         cap_reached: false,
@@ -471,6 +473,8 @@ struct Recording {
     signals: Vec<(String, Value)>,
     /// The recorded peer lookups: the names asked and the peers found.
     peers: Vec<RecordedPeers>,
+    /// The lane of each recorded model turn, in order.
+    turn_lanes: Vec<String>,
     end: RunEnd,
 }
 
@@ -596,6 +600,7 @@ impl Recording {
         // then times out, which shows as a divergence.
         signals.retain(|(name, _)| opened.contains(name.as_str()));
         let turns = model_turns(history)?;
+        let turn_lanes = model_turn_lanes(history, run_id.as_deref())?;
         Ok(Self {
             task,
             run_id,
@@ -604,6 +609,7 @@ impl Recording {
             snapshots: effects.snapshots,
             signals,
             peers: effects.peers,
+            turn_lanes,
             end: end.ok_or(EvalError::InFlightSource)?,
         })
     }
@@ -742,6 +748,9 @@ fn run_end(event: &WorkflowEvent) -> Result<Option<RunEnd>, EvalError> {
 struct Session {
     /// The tool calls of each recorded turn, for id alignment.
     recorded_calls: Vec<Vec<ToolCall>>,
+    /// The lane of each recorded turn. A candidate turn of another lane
+    /// takes no recorded id.
+    recorded_lanes: Vec<String>,
     /// The index of the next candidate turn.
     turn: usize,
     max_turns: usize,
@@ -757,20 +766,31 @@ struct Session {
 }
 
 impl Session {
-    /// Claim the next candidate turn. Returns its index and the recorded
-    /// calls of the same turn.
+    /// Claim the next candidate turn, of the agent `lane`. Returns its index
+    /// and the recorded calls of the same turn.
+    ///
+    /// A recorded turn of another agent gives no calls. Its call ids could
+    /// otherwise match an approval that a person gave to another agent.
     ///
     /// # Errors
     ///
     /// Returns [`TURN_CAP_ERROR`] when the turn cap is reached.
-    fn next_turn(&mut self) -> Result<(usize, Vec<ToolCall>), String> {
+    fn next_turn(&mut self, lane: &str) -> Result<(usize, Vec<ToolCall>), String> {
         if self.turn >= self.max_turns {
             self.cap_reached = true;
             return Err(TURN_CAP_ERROR.to_owned());
         }
         let index = self.turn;
         self.turn += 1;
-        let recorded = self.recorded_calls.get(index).cloned().unwrap_or_default();
+        let same_agent = self
+            .recorded_lanes
+            .get(index)
+            .is_none_or(|recorded| recorded == lane);
+        let recorded = if same_agent {
+            self.recorded_calls.get(index).cloned().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         Ok((index, recorded))
     }
 
@@ -886,13 +906,13 @@ fn model_mock(
             let mut session = lock(&session);
             // The root agent makes the first model request.
             let root = session.root.get_or_insert_with(|| request.run_id.clone());
+            let lane = lane_of(&request.run_id, Some(root.as_str())).to_owned();
             // The test engine has its own ids. The policy sees the recorded
             // run id instead, with the lane of the same agent.
             if let Some(run_id) = &run_id {
-                let lane = lane_of(&request.run_id, Some(root.as_str())).to_owned();
                 request.run_id = format!("{run_id}{lane}");
             }
-            session.next_turn()?
+            session.next_turn(&lane)?
         };
         let turn = live_turn(
             &handle,
@@ -1022,6 +1042,38 @@ fn model_turns(history: &[WorkflowEvent]) -> Result<Vec<ModelTurn>, EvalError> {
         }
     }
     Ok(turns)
+}
+
+/// The lane of each completed model turn of a history, in order. `root` is
+/// the run id of the root agent.
+fn model_turn_lanes(
+    history: &[WorkflowEvent],
+    root: Option<&str>,
+) -> Result<Vec<String>, EvalError> {
+    let model_name = agent_model_turn_info().name;
+    let mut scheduled: HashMap<ActivityExecId, String> = HashMap::new();
+    let mut lanes = Vec::new();
+    for event in history {
+        match event {
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name,
+                input,
+                ..
+            } if name == model_name => {
+                let request: ModelTurnRequest =
+                    decode(input.clone()).map_err(EvalError::Undecodable)?;
+                scheduled.insert(*activity_id, lane_of(&request.run_id, root).to_owned());
+            }
+            WorkflowEvent::ActivityCompleted { activity_id, .. } => {
+                if let Some(lane) = scheduled.remove(activity_id) {
+                    lanes.push(lane);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(lanes)
 }
 
 /// Compare the two runs turn by turn.

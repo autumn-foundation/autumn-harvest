@@ -5,7 +5,8 @@
 //! also carries the label of its [`ToolEffect`]. A run tree records the labels
 //! of every call that the decision lets run. A [`FlowRule`] names a label set
 //! and what happens to the call that completes it: a person decides, or the
-//! call is refused.
+//! call is refused. After that, each call with a label of the set trips the
+//! rule again. One approval releases one call.
 //!
 //! The workflow holds the exercised labels, and the model-turn activity
 //! records each decision. Model output cannot remove a label. Replay reads the
@@ -70,7 +71,7 @@ impl FlowRule {
         &self.labels
     }
 
-    /// What happens to the call that completes the set.
+    /// What happens to a call that trips the rule.
     #[must_use]
     pub const fn rule(&self) -> &Rule {
         &self.rule
@@ -91,7 +92,8 @@ impl FlowRules {
     }
 
     /// Add a rule. A call that completes `labels` in one run tree gets
-    /// `rule`. [`Rule::Allow`] and an empty set add nothing.
+    /// `rule`. Each later call with one of `labels` gets `rule` too.
+    /// [`Rule::Allow`] and an empty set add nothing.
     #[must_use]
     pub fn forbid<I, S>(self, labels: I, rule: Rule) -> Self
     where
@@ -109,7 +111,9 @@ impl FlowRules {
 
     /// The Agents Rule of Two. A run tree needs a person before it holds all
     /// three of untrusted input, private data, and a write or external
-    /// effect. The call that completes the three waits for a person.
+    /// effect. The call that completes the three waits for a person. Each
+    /// later call with one of the labels waits too, so each send needs its own
+    /// approval.
     #[must_use]
     pub fn rule_of_two() -> Self {
         let read = [labels::UNTRUSTED_INPUT, labels::PRIVATE_DATA];
@@ -140,8 +144,11 @@ impl FlowRules {
     /// exercised `exercised`.
     ///
     /// A rule trips when its set is inside `exercised` plus `call`, and the
-    /// call adds at least one label of the set. The strictest tripped rule
-    /// wins. With no tripped rule, the answer is [`ToolDecision::Allow`].
+    /// call carries at least one label of the set. The label can already be
+    /// in `exercised`. A complete set thus gates each later call that touches
+    /// it, and one approval never releases the next call. The strictest
+    /// tripped rule wins. With no tripped rule, the answer is
+    /// [`ToolDecision::Allow`].
     #[must_use]
     pub fn check(&self, exercised: &BTreeSet<String>, call: &BTreeSet<String>) -> ToolDecision {
         let mut verdict = ToolDecision::Allow;
@@ -216,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rule_trips_only_on_the_call_that_completes_it() {
+    fn a_rule_trips_on_the_call_that_completes_it() {
         let rules = FlowRules::new().forbid(["a", "b"], Rule::Deny("no a and b".into()));
         assert_eq!(rules.check(&set(&[]), &set(&["a"])), ToolDecision::Allow);
         assert_eq!(
@@ -233,6 +240,22 @@ mod tests {
         );
         // A call that adds no label of the set passes, even after the set is
         // complete.
+        assert_eq!(
+            rules.check(&set(&["a", "b"]), &set(&["c"])),
+            ToolDecision::Allow
+        );
+    }
+
+    #[test]
+    fn a_complete_set_gates_each_later_call_that_carries_one_of_its_labels() {
+        let rules = FlowRules::new().forbid(["a", "b"], Rule::Ask);
+        let ask = ToolDecision::RequireApproval {
+            reason: "this call completes the flow labels a, b".into(),
+        };
+        // One approval releases one call. A later call with a label of the
+        // set asks again, even when the tree already holds that label.
+        assert_eq!(rules.check(&set(&["a", "b"]), &set(&["a"])), ask);
+        assert_eq!(rules.check(&set(&["a", "b"]), &set(&["b", "c"])), ask);
         assert_eq!(
             rules.check(&set(&["a", "b"]), &set(&["c"])),
             ToolDecision::Allow

@@ -29,8 +29,9 @@ and `DESIGN-agent-mesh.md` the plan.
   stops before another model call when the tree passes its cap.
   `AgentReport::delegations` lists each delegation with its subtree usage.
 - **Flow rules.** `Tool::labels` and `FlowRules` gate the call that completes
-  a forbidden label set in one run tree. `FlowRules::rule_of_two()` follows
-  Meta's Agents Rule of Two. The workflow holds the exercised labels, so model
+  a forbidden label set in one run tree. Each later call that touches the set
+  needs its own approval. `FlowRules::rule_of_two()` follows Meta's Agents
+  Rule of Two. The workflow holds the exercised labels, so model
   output cannot remove one. A call after a delegation in the same turn does
   not run on a stale decision. With flow rules, an unknown tool is denied.
   The tool-call activity refuses a tool whose labels grew after the
@@ -46,7 +47,8 @@ and `DESIGN-agent-mesh.md` the plan.
   names.
 - **Evaluation.** `eval::evaluate` mocks the peer lookup with the recorded
   answer. A recorded tool outcome answers only an equal call of the same
-  agent.
+  agent. A candidate call takes a recorded call id only from a turn of the
+  same agent.
 - **Response cache.** A child of a run whose run id is the workflow id skips
   the cache, as its parent does.
 - **Fix.** `remote_task::activities` set `input_schema` and `output_schema`
@@ -69,5 +71,5 @@ rules, the wire form and the flow check.
 SQLite. It covers isolation, refusals, budgets, the tool allowlist, flow
 rules in both directions and across runs, and the same-turn delegation case.
 It also covers tree-unique approval names, a restart inside a child and the
-model-turn span. Three `eval` tests cover delegation runs and per-agent
-outcome matching.
+model-turn span. Four `eval` tests cover delegation runs, per-agent
+outcome matching and per-agent call ids.

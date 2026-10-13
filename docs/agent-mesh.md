@@ -20,7 +20,7 @@ The plan is in [`DESIGN-agent-mesh.md`](../DESIGN-agent-mesh.md).
 | Mandate | `Mandate` | Bounds depth, delegations, peers and tools. A child gets the meet. |
 | Refusal | `Refusal` | Names why a delegation did not run. |
 | Budget roll-up | `AgentReport::delegations` | Cuts the child cap from the parent remainder. Adds the child usage to the parent. |
-| Flow rules | `FlowRules`, `Tool::labels` | Gate the call that completes a forbidden label set in the tree. |
+| Flow rules | `FlowRules`, `Tool::labels` | Gate the call that completes a forbidden label set in the tree, and each later call that touches the set. |
 | Label carry | `AgentReport::flow_labels`, `AgentTask::flow_labels` | Keeps the labels of a conversation from one run to the next. |
 | Wire form | `MANDATE_META_KEY`, `Mandate::outbound`, `Mandate::accept` | Carries a mandate to another process. The receiver can only narrow it. |
 
@@ -205,7 +205,8 @@ Each call also carries the label of its effect: `effect:read_only`,
 `FlowRules::rule_of_two()` follows Meta's Agents Rule of Two. A run tree
 needs a person before it holds all three of untrusted input, private data,
 and a write or external effect. The call that completes the three waits for
-a person.
+a person. Each later call with one of the labels waits too. One approval
+releases one call, so a second send needs a second approval.
 
 Write your own rule with `FlowRules::new().forbid(labels, rule)`.
 `Rule::Ask` waits for a person. `Rule::Deny(reason)` refuses the call.
@@ -213,8 +214,10 @@ Write your own rule with `FlowRules::new().forbid(labels, rule)`.
 
 How the check works:
 
-- A rule trips when the call adds a label of the set, and the call completes
-  the set.
+- A rule trips when the call carries a label of the set, and the set is
+  complete with the call. The label can already be in the tree. So after the
+  set is complete, each call that touches it trips the rule again. A call
+  with no label of the set passes.
 - The strictest tripped rule wins, and the policy answer still counts.
 - A label counts once the decision lets its call run: an allow, or an
   approval. It counts even when the tool then fails. A denied, rejected or
@@ -321,7 +324,9 @@ again. A roster change after the lookup does not change a recorded run.
 
 `eval::evaluate` re-drives a delegation run. The recorded lookups answer, so
 the candidate needs no roster. A recorded tool outcome answers only an equal
-call of the same agent. The run id suffix `:d{n}` names that agent.
+call of the same agent. A candidate call takes a recorded call id only from a
+turn of the same agent, so an approval for a child never releases a root
+call. The run id suffix `:d{n}` names that agent.
 
 ## 11. Observability
 

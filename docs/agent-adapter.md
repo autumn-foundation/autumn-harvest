@@ -612,7 +612,7 @@ with no payload store.
 
 A recorded outcome answers a call with the same step, tool name and
 arguments. A candidate call that equals the recorded call at the same turn
-and position takes the recorded call id. Approval signal names hold the call
+and position, of the same agent, takes the recorded call id. Approval signal names hold the call
 id, so the recorded approvals stay valid. Any other call gets a new `eval_`
 id, so no recorded approval can release it. The harness sends again only an
 approval for a wait that the source opened, when it arrived before the

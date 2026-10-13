@@ -1373,3 +1373,65 @@ async fn nested_and_refused_delegations_evaluate_without_divergence() {
     assert_eq!(shape(report), shape(recorded));
     assert_eq!(report.delegations.len(), 3);
 }
+
+/// A recorded approval of a child call never releases a candidate call of
+/// another agent, even at the same round, position and arguments.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_child_approval_never_releases_a_root_call_in_the_candidate() {
+    use autumn_harvest_agent::mesh::DELEGATE_TOOL;
+    use autumn_harvest_agent::{Mandate, Peer};
+
+    let (_dir, db) = fresh_db();
+    let source_model = ScriptedModel::new(vec![
+        calls(
+            &[(
+                "d1",
+                DELEGATE_TOOL,
+                json!({"agent": "researcher", "task": "pay"}),
+            )],
+            1,
+        ),
+        calls(&[("c1", "pay", json!({"amount": 1}))], 1),
+        answer("paid", 1),
+        answer("done", 1),
+    ]);
+    let source_harness = AgentHarness::new(source_model)
+        .tool(recorded_tool(
+            "pay",
+            ToolEffect::Write,
+            &Arc::new(Recorder::default()),
+        ))
+        .policy(Arc::new(
+            ToolRules::new().effect(ToolEffect::Write, Rule::Ask),
+        ))
+        .peer(Peer::new("researcher", "R."));
+    let mut rt = runtime(&db, source_harness);
+    let task = AgentTask::new("go").mandate(Mandate::new("planner").peers(["researcher"]));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let RunState::WaitingSignal(signal) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("the child pay waits");
+    };
+    assert_eq!(signal, "tool_approval:1:0:c1");
+    sqlite::decide(&mut rt, exec, &signal, &Approval::Approve).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    let source = rt.load_history(exec).unwrap();
+
+    // The candidate root does not delegate. Its second turn makes the same
+    // call as the recorded child, in the same tool slot of the tree.
+    let (harness, _recorder, _model) = gated_candidate(vec![
+        calls(&[("x0", "lookup", json!({}))], 1),
+        calls(&[("x1", "pay", json!({"amount": 1}))], 1),
+        answer("finished", 1),
+    ]);
+    let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
+
+    let RunEnd::Completed(report) = &evaluation.candidate else {
+        panic!("the candidate completes: {:?}", evaluation.candidate);
+    };
+    let results = tool_results(report);
+    assert!(
+        results[1].contains("no approval arrived"),
+        "the child approval must not release the root call: {results:?}"
+    );
+}
