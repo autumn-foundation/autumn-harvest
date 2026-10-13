@@ -3464,6 +3464,11 @@ impl WorkflowContext {
     /// strict replay the matcher is never locked, so no `pump_signal_handlers`
     /// side effect is introduced on the non-strict path.
     fn strict_replay_no_match_is_divergence(&self) -> bool {
+        // Issue #1984: a replayed scope cancel cuts history at its horizon.
+        // The live cycle parked there, so a no-match there is not drift.
+        if self.replays_a_scope_cancel() {
+            return false;
+        }
         self.strict_replay
             && !(self.canary_mode && self.match_history(|m| m.position() >= m.len()))
             // Issue #952 — the FAILING-FRONTIER exception. A history sealed by a
