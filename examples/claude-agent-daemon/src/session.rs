@@ -469,9 +469,10 @@ fn report(answer: &str, turns: u32, tool_calls: u32, stop: &str) -> SessionRepor
 }
 
 // The two `#[activity]` functions below supply the macro-generated `*_info()`
-// companions: the activity name plus the declared defaults. This backend runs
-// the synchronous closure registered against that info, so the async bodies
-// here never execute. See `claude::activity_body` and `tools::activity_body`.
+// companions: the activity name plus the declared defaults. The daemon registers
+// a synchronous closure against that info with `register_activity_with_body`,
+// so the async bodies here never execute. See `claude::activity_body` and
+// `tools::activity_body`.
 
 /// One Messages API request.
 ///

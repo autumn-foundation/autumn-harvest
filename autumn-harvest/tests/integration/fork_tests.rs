@@ -2165,3 +2165,30 @@ async fn fork_refuses_a_workflow_id_in_use() {
         "unexpected error: {error}"
     );
 }
+
+/// A reset keeps the quota key of its source, so its LLM spend still counts
+/// for the tenant (issue #1997). A fork passes the key of its own admission
+/// through the same row insert, so the reset path must not drop the key.
+#[tokio::test]
+async fn a_reset_keeps_the_quota_key_of_its_source() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("reset-quota-key");
+    let mut conn = connect(&url).await;
+    let source = seed_run_with(&mut conn, &queue, &json!({ "n": 1 }), None, None).await;
+    diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
+        .set(harvest_workflow_executions::quota_key.eq("tenant-a"))
+        .execute(&mut conn)
+        .await
+        .expect("set the source key");
+
+    let reset = reset_workflow_execution(&mut conn, source, reset_request(), None)
+        .await
+        .expect("reset");
+    let key: Option<String> = harvest_workflow_executions::table
+        .find(reset.new_exec_id.as_uuid())
+        .select(harvest_workflow_executions::quota_key)
+        .first(&mut conn)
+        .await
+        .expect("read the reset row");
+    assert_eq!(key.as_deref(), Some("tenant-a"));
+}

@@ -1476,7 +1476,8 @@ in clear:
 | `recorded_at` | The completion time, equal to the completion event's `timestamp`. |
 
 The fields are in clear by design. SQL usage reports sum them without a key,
-so a report never decrypts an event. An operator who reads the database
+so a report never decrypts an event. The LLM budgets (issue #1997) sum the
+same rows, joined to the run for its tenant key. An operator who reads the database
 sees which models a tenant uses, how many tokens it spends and what it
 costs. Accept that before your activities record calls.
 

@@ -1504,7 +1504,13 @@ async fn insert_fork_execution(
                 crate::types::StartSource::Reset
             },
             completion_callbacks: source.completion_callbacks.clone(),
-            quota_key: None,
+            // The reset keeps the key of its source (issue #1997). The key is
+            // the same value that `quota_reconcile` would backfill from the
+            // same input. Without it the reset would read no tenant LLM spend,
+            // and its ledger rows would never count for the tenant. The copy
+            // needs no workflow registry, so a reset from an API-only process
+            // keeps it too.
+            quota_key: source.quota_key.as_deref(),
             assigned_build_id: source.assigned_build_id.clone(),
         },
     )
@@ -1523,8 +1529,8 @@ pub(crate) struct ForkRow<'a> {
     pub(crate) start_source: crate::types::StartSource,
     /// A recorded fork drops the targets, so that it sends no notification.
     pub(crate) completion_callbacks: Option<Value>,
-    /// The quota key that admitted the row. A reset passes `None`. A fork
-    /// passes the key of its quota admission (issue #946).
+    /// The quota key of the row. A reset passes the key of its source
+    /// (issue #1997). A fork passes the key of its quota admission (#946).
     pub(crate) quota_key: Option<&'a str>,
     /// The build that runs the row. A carried history needs a build that can
     /// replay it, so a reset keeps the source build.
@@ -1623,14 +1629,11 @@ pub(crate) async fn insert_fork_row(
         // enforcement) -- issue #946 AC3 scopes quota enforcement to
         // registry-aware *start* paths (plain start, signal-/update-with-start,
         // batch, schedule tick/backfill, debounce/throttle fires), which does
-        // not include reset. `None` here keeps the fork invisible to quota
-        // accounting rather than silently double-counting it against
-        // whatever key its original admission resolved: `load_quota_usage`'s
-        // `WHERE quota_key = $2` never matches NULL, and `list_quota_usage`
-        // filters `WHERE quota_key IS NOT NULL`, so a reset fork neither
-        // consumes headroom nor is blocked by one. A fork of issue #2000 is
-        // new work beside its source, so it passes the key it was admitted
-        // under.
+        // not include reset. The fork is never refused here.
+        //
+        // `spec.quota_key` carries the key. A reset keeps the key of its
+        // source (issue #1997). A fork of issue #2000 passes the key of its
+        // own admission.
         quota_key: spec.quota_key,
         // A reset fork belongs to the tenant of its source (issue #1977).
         tenant: source.tenant.as_deref(),

@@ -24,10 +24,9 @@
 //! re-executing it), and the ship body runs **once** (session 2 only). The run
 //! resumed exactly where it left off.
 
-// The `#[activity]` macro expands the await-free placeholder bodies (this backend
-// runs the registered closures, not the async fn bodies) into code that consumes
-// the `_`-prefixed params — both are proc-macro artifacts of the placeholder
-// pattern, not the hand-written example logic, so they are allowed file-wide.
+// This example registers counting closures with `register_activity_with_body`,
+// so the `#[activity]` bodies are stubs. The macro needs an `async fn` and reads
+// its `_`-prefixed params, so both lints are allowed file-wide.
 #![allow(clippy::unused_async, clippy::used_underscore_binding)]
 
 use std::sync::Arc;
@@ -90,7 +89,7 @@ fn register(rt: &mut SqliteRuntime, reserve_runs: &Arc<AtomicUsize>, ship_runs: 
     rt.register_workflow(&fulfill_order_info());
 
     let reserve_runs = Arc::clone(reserve_runs);
-    rt.register_activity(&reserve_stock_info(), move |input| {
+    rt.register_activity_with_body(&reserve_stock_info(), move |input| {
         reserve_runs.fetch_add(1, Ordering::SeqCst);
         let order: Order = serde_json::from_value(input).map_err(|e| e.to_string())?;
         Ok(serde_json::json!(format!(
@@ -100,7 +99,7 @@ fn register(rt: &mut SqliteRuntime, reserve_runs: &Arc<AtomicUsize>, ship_runs: 
     });
 
     let ship_runs = Arc::clone(ship_runs);
-    rt.register_activity(&ship_order_info(), move |input| {
+    rt.register_activity_with_body(&ship_order_info(), move |input| {
         ship_runs.fetch_add(1, Ordering::SeqCst);
         let order: Order = serde_json::from_value(input).map_err(|e| e.to_string())?;
         Ok(serde_json::json!(format!("shipped {}", order.id)))
