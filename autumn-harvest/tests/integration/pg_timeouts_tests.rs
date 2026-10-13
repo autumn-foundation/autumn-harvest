@@ -3132,9 +3132,10 @@ async fn an_idle_connection_that_the_server_killed_is_replaced_at_checkout() {
 async fn a_recently_used_connection_is_handed_out_without_a_ping() {
     #[derive(diesel::QueryableByName)]
     struct LastQuery {
-        #[diesel(sql_type = Text)]
+        #[diesel(sql_type = diesel::sql_types::Text)]
         query: String,
     }
+
     let (url, _container) = setup_db().await;
     let pool = engine_pool(
         url.clone(),

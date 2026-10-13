@@ -255,6 +255,8 @@ match rt.run_until_blocked(exec).await? {
     RunState::Failed(err)       => println!("failed: {err}"),
     RunState::WaitingSignal(name) => println!("blocked on signal `{name}`"),
     RunState::WaitingTimer      => println!("blocked on a durable timer"),
+    RunState::Cancelled(reason) => println!("cancelled: {reason}"),
+    RunState::Terminated(reason) => println!("terminated: {reason}"),
     RunState::ContinuedAsNew(next) => println!("continued as new; drive {next}"),
     RunState::InProgress        => {} // not returned by run_until_blocked
 }
@@ -265,7 +267,7 @@ match rt.outcome(exec)? {
     ExecutionOutcome::Completed(output) => println!("{output}"),
     ExecutionOutcome::Failed(err)       => println!("{err}"),
     ExecutionOutcome::Running           => println!("still running"),
-    ExecutionOutcome::Terminated(state) => println!("terminal ({state}) — superseded/cancelled, no clean output"),
+    ExecutionOutcome::Terminated(state) => println!("terminal ({state}) — superseded, cancelled or terminated"),
 }
 ```
 
@@ -296,6 +298,96 @@ list or a generic `SQLite` error.
 Timers use the real wall clock (read once per decision cycle), so a run blocked
 on a `ctx.timer(...)` that is not yet due returns `WaitingTimer`; drive it again
 after the deadline passes and it proceeds.
+
+### Cancel and terminate
+
+Stop a run with `cancel` (cooperative) or `terminate` (at once). Both take a
+reason. A blank reason gets the Postgres default text.
+
+```rust
+// Cooperative: the body sees the reason on the next drive.
+rt.cancel(exec, "user stopped the session")?;
+match rt.run_until_blocked(exec).await? {
+    RunState::Cancelled(reason) => println!("cancelled: {reason}"),
+    other => println!("not ended yet: {other:?}"),
+}
+
+// At once: the body does not run again.
+rt.terminate(other_exec, "stuck for an hour")?;
+```
+
+**Cancel.** `cancel` stores the request and appends no event. The next drive
+replays the body with `ctx.cancellation_reason()` set. The body can check it
+and run cleanup activities:
+
+```rust
+ctx.execute_activity_raw("step", input, "default").await.map_err(|e| e.to_string())?;
+if let Some(reason) = ctx.cancellation_reason() {
+    ctx.execute_activity_raw("cleanup", json!(reason), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    return Ok(json!("cleaned up"));
+}
+ctx.wait_for_signal("next").await.map_err(|e| e.to_string())
+```
+
+The body sees the request from the start of its replay, not from the point
+where the request arrived. Put the check after the last await that records
+history, as above, just before a signal wait. A check that runs before
+recorded commands, such as a check at the top of a loop, diverges on replay.
+
+The run ends `CANCELLED` when one of these occurs:
+
+- The body returns `Ok` or `Err`, or continues as new. The output of an `Ok`
+  is not kept, and no successor starts.
+- The body blocks on a signal or a timer, and no activity task is left to
+  run. A parked await cannot see the request.
+- The cycle diverges or deadlocks. The driver discards that cycle.
+- The drive meets an error that repeats on every drive: an unregistered
+  activity or workflow, or a stuck cycle.
+- The run has added 1,000 events since the request. A body that ignores the
+  request and keeps working cannot run forever. The budget leaves room for
+  about 500 cleanup activities. The budget acts as one more event cap: a
+  cycle whose events reach it, or reach a history cap, is discarded.
+
+The seal drops each pending task. Each one first gets a non-retryable
+`ActivityFailed`, so a body that awaits it still replays. The error type
+is `UnregisteredActivity` for an unregistered activity, and `CancelSealed`
+otherwise. These failures must fit the history caps, but not the cleanup
+budget. Failures that reach a cap roll back, and the seal then adds only
+`WorkflowCancelled`. `terminate` adds no failures, as on Postgres.
+
+So every cancel ends the run. Cleanup can run activities, but it must not
+wait on a timer or a signal: that wait ends the run. A pending activity task,
+such as a retry in backoff, still runs, and the body sees the request when
+that await resolves. A repeat `cancel` keeps the first reason. The request
+survives a crash and a reopen. An update replays the body with the pending
+request too, so its handlers see `cancellation_reason()`.
+
+**Terminate.** `terminate` ends the run `TERMINATED` in one transaction. The
+body does not run again, and `terminate` drops a pending cancel request.
+
+**Both paths:**
+
+- The run gets the core `WorkflowCancelled { reason }` event as its last
+  event, as on Postgres. Cleanup events come before it.
+- The pending tasks, unfired timers and staged signals are deleted.
+- An unknown id returns `SqliteError::ExecutionNotFound`. A terminal run
+  returns `SqliteError::WorkflowNotRunning`. Postgres treats a repeat call on
+  a terminal run as a no-op, but this backend refuses it.
+- `outcome(exec)` reports `ExecutionOutcome::Terminated("CANCELLED")` or
+  `ExecutionOutcome::Terminated("TERMINATED")`. The drive returns the reason
+  in `RunState::Cancelled` or `RunState::Terminated`.
+- `AllowDuplicateFailedOnly` replaces a `CANCELLED` prior, as on Postgres. A
+  `TERMINATED` prior frees its `workflow_id` for every policy.
+- A cleanup or an `update` that reaches a history cap or the cleanup budget
+  ends the run `CANCELLED`, not `FAILED`. An unsupported command or a used-up panic budget during cleanup
+  ends the run `FAILED`, as without a cancel.
+
+A cancelled or terminated history replays on the core `WorkflowReplayer` only
+when the body checks `is_cancelled()` before its next new command. A body
+parked on a signal with no check reports non-determinism. A Postgres history
+of the same shape does the same.
 
 ### Long-lived runs: `continue_as_new` and the history caps (issue #2023)
 

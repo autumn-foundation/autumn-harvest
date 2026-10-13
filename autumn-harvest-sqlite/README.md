@@ -113,6 +113,12 @@ A complete, runnable version is in
   starting a second one. The new call's input is discarded. Use
   `start_workflow_with_reuse_policy` for the full `WorkflowIdReusePolicy`
   matrix — reject, replace-if-failed, or terminate-and-restart.
+- **Cancel and terminate (issue #2021).** `cancel(exec, reason)` is
+  cooperative. The next drive replays the body with
+  `ctx.cancellation_reason()` set, so the body can run cleanup activities. The
+  run then ends `CANCELLED`. `terminate(exec, reason)` ends the run
+  `TERMINATED` at once. Both record the core `WorkflowCancelled` event, as
+  Postgres does.
 - **Long-lived runs (issue #2023).** `ctx.continue_as_new(input)` seals the
   run `CONTINUED_AS_NEW` and starts a successor with the same `workflow_id`, in
   one transaction. Replayed signals stay with the old run, as on Postgres. A

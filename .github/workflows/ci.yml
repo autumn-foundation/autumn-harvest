@@ -112,8 +112,13 @@ jobs:
     # "Ready for review" when final, so CI runs once per PR at the end plus any
     # post-ready fixes. Push events (e.g. trunk-dev) always run via the
     # `github.event_name != 'pull_request'` clause. Lint intentionally runs on
-    # docs-only changes (it's a single cheap job); the expensive build/test jobs
-    # below additionally gate on the `changes` guard.
+    # docs-only changes; the expensive build/test jobs below additionally gate
+    # on the `changes` guard.
+    #
+    # Clippy and the snippet compile checks run in parallel jobs (`clippy-*`,
+    # `doc-snippets`), and `lint-compile` gathers their results. In this one
+    # job they ran one after another for over an hour. `test` needs only this
+    # job, so the test matrix starts after the fast checks, not after clippy.
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     steps:
       # Full history: the comment-hygiene step below diffs against the merge
@@ -258,232 +263,16 @@ jobs:
         # as an untracked file one `git add -A` away from being committed.
         # See scripts/check-agentd-runtime-artifacts-ignored.sh.
         run: ./scripts/check-agentd-runtime-artifacts-ignored.sh
-      - name: Check signals chapter's clean await_condition example
-        # Guards two real, reproduced-live compile failures an Onramp
-        # clean-room pass found in chapter 4's "Clean Declarative
-        # await_condition" example (collect_approvals_clean) -- the pattern
-        # the chapter explicitly recommends over the "tedious" manual loop
-        # right above it. Neither is a syntax error, so
-        # docs/audits/doc-snippet-syntax.py's rustfmt-only check passed both
-        # blocks clean: (1) racing wait_for_signal against
-        # await_condition_timeout with futures::future::select needs
-        # #[workflow(allow_nondeterministic_apis)], or HVG010 hard-blocks
-        # the build; (2) a plain `let mut approvals` captured by the
-        # condition closure can never also be reassigned by the loop body
-        # while that borrow is live (E0506). E0506 is a borrow-checker
-        # property, not a syntax shape, so this actually compiles the
-        # pinned block with `cargo check` (see the script's own docstring
-        # for why a text heuristic proved gameable in review) rather than
-        # pattern-matching stand-in text -- one extra `cargo check
-        # --example` in a job that already builds this crate for clippy
-        # below. See scripts/check-signals-clean-approval-example-determinism.sh.
-        run: ./scripts/check-signals-clean-approval-example-determinism.sh
-      - name: Check reliability-knobs continue_as_new checkpoint example
-        # Guards a real, reproduced-live compile failure an Onramp
-        # clean-room pass found in chapter 7's flagship deadline-aware
-        # checkpoint example: `ctx.continue_as_new(...).await?` inside a
-        # `Result<_, String>` workflow, with no real conversion from the
-        # `HarvestError` continue_as_new returns first (E0277, no
-        # `From<HarvestError> for String`). Not a syntax error, so
-        # doc-snippet-syntax.py's rustfmt-only check passed it clean. The
-        # same broken snippet also lived, unenforced, inside
-        # autumn-harvest/examples/long_lived_entity_deadline.rs's own
-        # ```rust,ignore``` module-doc illustration, so this checks both.
-        # Whether a `.map_err(...)` closure actually produces `String` is a
-        # type-checker property, not a text shape (review found two
-        # text-heuristic attempts gameable in a row -- a loose window, then
-        # an `.await.map_err(|e| e)?` identity closure), so this compiles
-        # each pinned snippet with `cargo check` rather than pattern-
-        # matching stand-in text. See
-        # scripts/check-continue-as-new-checkpoint-example.sh.
-        run: ./scripts/check-continue-as-new-checkpoint-example.sh
-      - name: Check operations chapter's preflight declared-deps example
-        # Guards two real, reproduced-live compile failures an Onramp
-        # clean-room pass found in chapter 10's flagship
-        # "Catching a forgotten registration before rollout" example: (1)
-        # `ctx.execute_activity(...).await?` and the spawn_child_workflow
-        # call below it are `HarvestResult<_>`, but the workflow returns
-        # `Result<_, String>` with no `From<HarvestError> for String` --
-        # same defect class as chapter 7's continue_as_new example (PR
-        # #1700); (2) even with `.map_err(...)` added, execute_activity's
-        # generic output type is left unconstrained by a discarded bare
-        # statement, which current stable rustc denies by default on every
-        # edition (`dependency_on_unit_never_type_fallback`), confirmed
-        # live against a standalone edition-2021 crate matching chapter 1's
-        # own pinned tutorial edition. Neither is a syntax error, so
-        # doc-snippet-syntax.py's rustfmt-only check passes this block
-        # clean. This actually compiles the pinned block with `cargo check`
-        # rather than pattern-matching stand-in text, matching the sibling
-        # guards above. See
-        # scripts/check-preflight-declared-deps-example.sh.
-        run: ./scripts/check-preflight-declared-deps-example.sh
-      - name: Check sqlite-backend guide's outcome-match example
-        # Guards a real, reproduced-live compile failure in
-        # docs/sqlite-backend.md's §7 "drive model" example:
-        # `ExecutionOutcome::Terminated` and this doc were both added in the
-        # same commit (3abb5b6, issue #1348), but the guide's own
-        # `match rt.outcome(exec)? { ... }` never got the new arm, so it has
-        # been non-exhaustive (E0004) since the day it was written. This
-        # file is outside doc-snippet-syntax.py's corpus (getting-started/
-        # and README.md only), and E0004 is a type-checker property, not a
-        # syntax error, so nothing else in CI ever compiled it --
-        # examples/quickstart.rs has the correct four-arm match, which is
-        # why the crate's own tests stayed green throughout. This actually
-        # compiles the pinned block with `cargo check` rather than counting
-        # match arms textually. See
-        # scripts/check-sqlite-outcome-match-example.sh.
-        run: ./scripts/check-sqlite-outcome-match-example.sh
-      - name: Check chapter 8 and 11 snippets compile
-        # Guards two getting-started snippets that declared the workflow
-        # input as `_: ()`. `#[workflow]` silently dropped the `_` pattern,
-        # so the generated call passed one argument to a two-argument
-        # function. rustc reported E0061 "takes 5 arguments" on the
-        # attribute line. See scripts/check-underscore-input-snippets.sh.
-        run: ./scripts/check-underscore-input-snippets.sh
-      - name: Check README schedule and retry snippets compile
-        # Guards two front-door README snippets. The cron-schedule block
-        # called `.workflows(..)` and `.workflow_schedule(..)` on
-        # `autumn_web::app()`, which has neither method. The retry block
-        # used `Duration` without importing it. See
-        # scripts/check-readme-front-door-snippets.sh.
-        run: ./scripts/check-readme-front-door-snippets.sh
-      - name: Check webhooks chapter documents the webhooks feature
-        # Guards a real, reproduced-live defect an Onramp clean-room pass
-        # found in chapter 12: it showed the `#[webhook]` mapping function
-        # and `.webhooks(webhooks![...])` plugin wiring with no mention
-        # that `autumn-harvest-plugin` needs `features = ["webhooks"]` --
-        # unlike the sibling chapter 13 (broker connectors), which states
-        # its `connectors` feature requirement up front in its own
-        # "Features:" table. A newcomer who scaffolds per chapter 1 (no
-        # extra features) and pastes chapter 12's code verbatim hits, at
-        # the .webhooks(...) call:
-        #   error[E0599]: no method named `webhooks` found for struct
-        #   `HarvestPlugin`
-        # which names neither "webhooks" nor this chapter. This compiles
-        # the doc's own snippets with `cargo check` twice -- once with
-        # default features (must fail, proving the feature really is
-        # required) and once with `--features webhooks` (must pass) --
-        # and greps for the fix's own "Enable the feature" note landing
-        # before step 3, so neither the code nor the note can regress
-        # silently. See scripts/check-webhooks-feature-example.sh.
-        run: ./scripts/check-webhooks-feature-example.sh
-      - name: Check chapter 5 and 6 flagship examples compile
-        # Guards two hard compile failures a clean-room pass found on the
-        # getting-started path: chapter 5 passed a workflow id to
-        # `spawn_child_workflow_raw` (E0061; the method takes name + input),
-        # and chapter 6's `charge_card` used `.map_err(|e| e.to_string())?`
-        # in a `HarvestResult` function (E0277; no `From<String>`).
-        # See scripts/check-child-idempotency-examples.sh.
-        run: ./scripts/check-child-idempotency-examples.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
-      - name: Clippy autumn-harvest
-        run: cargo clippy -p autumn-harvest --all-features --tests -- -D warnings
-      - name: Clippy autumn-harvest-plugin
-        run: cargo clippy -p autumn-harvest-plugin --all-targets -- -D warnings
-      - name: Clippy autumn-harvest-plugin (mcp feature)
-        run: cargo clippy -p autumn-harvest-plugin --all-targets --features mcp,unified-dag-execution -- -D warnings
-      - name: Clippy autumn-harvest-plugin (metrics feature)
-        run: cargo clippy -p autumn-harvest-plugin --all-targets --features metrics -- -D warnings
-      - name: Clippy autumn-harvest-plugin (webhooks feature)
-        run: cargo clippy -p autumn-harvest-plugin --all-targets --features webhooks -- -D warnings
-      # issue #525. Both tiers are linted: `dev-runtime-managed` compiles the
-      # archive-download path, which `dev-runtime` alone `cfg`s out entirely.
-      - name: Clippy autumn-harvest-plugin (dev-runtime feature)
-        run: cargo clippy -p autumn-harvest-plugin --all-targets --features dev-runtime -- -D warnings
-      - name: Clippy autumn-harvest-plugin (dev-runtime-managed feature)
-        run: cargo clippy -p autumn-harvest-plugin --all-targets --features dev-runtime-managed -- -D warnings
-      # issue #944. `connectors` alone is the broker-agnostic layer (no broker
-      # client), so it lints without any system dependency. `kafka` needs the
-      # libcurl headers vendored librdkafka's cmake build looks for.
-      - name: Clippy autumn-harvest-plugin (connectors feature)
-        run: cargo clippy -p autumn-harvest-plugin --all-targets --features connectors -- -D warnings
-      - name: Clippy autumn-harvest-plugin (sqs feature)
-        run: cargo clippy -p autumn-harvest-plugin --all-targets --features sqs -- -D warnings
-      - name: Clippy autumn-harvest-plugin (aws-kms feature, issue #1825)
-        run: cargo clippy -p autumn-harvest-plugin --all-targets --features aws-kms -- -D warnings
-      - name: Clippy autumn-harvest-plugin (vault-transit feature, issue #1981)
-        run: cargo clippy -p autumn-harvest-plugin --all-targets --features vault-transit -- -D warnings
-      # Issue #1978: the OIDC login module is `cfg`d out of the default build.
-      - name: Clippy autumn-harvest-plugin (oidc feature, issue #1978)
-        run: cargo clippy -p autumn-harvest-plugin --all-targets --features oidc -- -D warnings
-      # The OIDC gate on the MCP tool routes compiles only with both features.
-      - name: Clippy autumn-harvest-plugin (oidc and mcp features, issue #1978)
-        run: cargo clippy -p autumn-harvest-plugin --all-targets --features oidc,mcp,unified-dag-execution -- -D warnings
-      # Issue #1312: the runtime wiring for the Redis dispatch channel is
-      # `cfg`d out of the default build, so only this step compiles it.
-      - name: Clippy autumn-harvest-plugin (redis feature)
-        run: cargo clippy -p autumn-harvest-plugin --all-targets --features redis -- -D warnings
-      - name: Install librdkafka build deps
-        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
-      - name: Clippy autumn-harvest-plugin (kafka feature)
-        run: cargo clippy -p autumn-harvest-plugin --all-targets --features kafka -- -D warnings
-      - name: Clippy autumn-harvest-macros
-        run: cargo clippy -p autumn-harvest-macros -- -D warnings
-      - name: Clippy autumn-harvest-cli
-        run: cargo clippy -p autumn-harvest-cli --all-targets -- -D warnings
-      - name: Clippy autumn-harvest-sqlite
-        run: cargo clippy -p autumn-harvest-sqlite --all-targets -- -D warnings
-      # Issue #1973. `--no-deps`: the core crate without `db` has dead-code
-      # warnings of its own, which the core's own clippy step owns.
-      - name: Clippy autumn-harvest-agent (issue #1973)
-        run: cargo clippy -p autumn-harvest-agent --all-targets --no-deps -- -D warnings
-      - name: Clippy autumn-harvest-agent (sqlite feature)
-        run: cargo clippy -p autumn-harvest-agent --all-targets --features sqlite --no-deps -- -D warnings
-      - name: Clippy autumn-harvest-agent (eval feature, issue #2001)
-        run: cargo clippy -p autumn-harvest-agent --all-targets --features eval --no-deps -- -D warnings
-      - name: Clippy autumn-harvest-agent (sqlite and eval features, issue #2001)
-        run: cargo clippy -p autumn-harvest-agent --all-targets --features sqlite,eval --no-deps -- -D warnings
       - name: Check autumn-harvest-agent depends on no Autumn crate outside the engine
         run: ./scripts/check-agent-adapter-deps.sh
-      # Same issue #962 rule as every other crate on this page: a workspace
-      # member gets NO clippy coverage without its own step, and these three
-      # standalone example crates (each its own `examples/*/Cargo.toml`
-      # workspace member, not a `--example` target under `autumn-harvest`)
-      # never got one. Unlike claude-agent-daemon/autumn-harvest-redis below,
-      # no `--no-deps` is needed: all three use `autumn-harvest`'s default
-      # features (plus `db`/`testing`), so they do not inherit that crate's
-      # no-default-features warnings.
-      - name: Clippy saga-choreography example
-        run: cargo clippy -p saga-choreography --all-targets -- -D warnings
-      - name: Clippy billing-autumn-web example
-        run: cargo clippy -p billing-autumn-web --all-targets -- -D warnings
-      - name: Clippy standalone-runner example
-        run: cargo clippy -p standalone-runner --all-targets -- -D warnings
-      - name: "Clippy standalone-quickstart example (issue #1614)"
-        run: cargo clippy -p standalone-quickstart --all-targets -- -D warnings
-      - name: "Clippy agent-loop-hit-rate example (issue #2007)"
-        run: cargo clippy -p agent-loop-hit-rate --all-targets -- -D warnings
-      # Same issue #962 rule as the verify and redis crates below: a new
-      # workspace member gets NO clippy coverage without its own step here.
-      # `--no-deps` scopes the deny to the example, because it depends on
-      # `autumn-harvest` with `default-features = false`, and the core crate
-      # carries pre-existing warnings in that configuration.
-      - name: Clippy claude-agent-daemon example
-        run: cargo clippy -p claude-agent-daemon --all-targets --no-deps -- -D warnings
-      # Issue #1312: the Redis dispatch channel. Same issue #962 rule as the
-      # verify crate below -- a workspace member gets NO clippy coverage
-      # without its own step here.
-      #
-      # `--no-deps` scopes the deny to this crate. `autumn-harvest-redis`
-      # depends on `autumn-harvest` with `default-features = false`, and the
-      # core crate carries pre-existing lint warnings in that configuration
-      # (dead code behind the `db` feature, and pedantic suggestions). Without
-      # `--no-deps` this step would deny those, so it would report the core
-      # crate's no-default-features debt as a redis-crate failure.
-      - name: Clippy autumn-harvest-redis
-        run: cargo clippy -p autumn-harvest-redis --all-targets --no-deps -- -D warnings
-      # Issue #962: a new workspace member gets NO clippy coverage unless a step
-      # is added here — there is no `--workspace` clippy invocation in this job,
-      # only per-crate ones. The verify crate opts into the workspace's pedantic
-      # + nursery lints, which `-D warnings` makes effectively deny.
-      - name: Clippy autumn-harvest-verify
-        run: cargo clippy -p autumn-harvest-verify --all-targets -- -D warnings
+
       # Issue #786: the `docs/performance.md` prose-vs-table guards must run on
       # DOCS-ONLY pull requests — which is the change class most likely to break
       # them, and the one the `test` matrix below skips entirely (every step
-      # there is gated on `changes.outputs.code == 'true'`). The Clippy step
-      # above only *compiles* these tests; it never executes them. So they run
+      # there is gated on `changes.outputs.code == 'true'`). The `clippy-core`
+      # job only *compiles* these tests; it never executes them. So they run
       # here, in the job that is deliberately ungated.
       #
       # Unconditional rather than `if: code == 'false'`: "the guards always run"
@@ -1126,6 +915,11 @@ jobs:
       - name: Run plugin lib tests (aws-kms feature, issue #1825)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-plugin --features aws-kms --lib aws_kms
+      # Issue #1983. The adapter unit tests use an in-memory backend and a
+      # local fake GCS server, so they need no cloud account and no Docker.
+      - name: Run plugin lib tests (s3 and gcs features, issue #1983)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        run: cargo test -p autumn-harvest-plugin --features s3,gcs --lib object_store
       # Issue #1981. The Vault Transit binding runs the same KMS conformance
       # suite as AWS, against a local fake Vault server.
       - name: Run plugin lib tests (vault-transit feature, issue #1981)
@@ -1592,6 +1386,15 @@ jobs:
           plan="$(DRY_RUN=1 bash .github/ci/run-suites.sh run linux)"
           if grep -q -- '--test connector_sqs_broker' <<<"$plan"; then
             images="$images softwaremill/elasticmq:1.5.2"
+          fi
+          # Issue #1983: the object-store emulators, only on the shards that
+          # run their suites. The official MinIO images are no longer
+          # published, so the suite uses the `pgsty/minio` community build.
+          if grep -q -- '--test object_store_s3_minio' <<<"$plan"; then
+            images="$images pgsty/minio:RELEASE.2026-08-04T00-00-00Z"
+          fi
+          if grep -q -- '--test object_store_gcs_emulator' <<<"$plan"; then
+            images="$images fsouza/fake-gcs-server:1.56.1"
           fi
           # Docker Hub rate-limits anonymous pulls, and the ECR Public mirror
           # has a data limit. An official image (no slash in its name) comes
@@ -2117,6 +1920,381 @@ jobs:
           done
           echo "::error::workflow did not reach COMPLETED within the timeout"; exit 1
 
+  clippy-core:
+    name: Clippy (autumn-harvest)
+    runs-on: ubuntu-latest
+    # The core crate with every feature and its tests. It is the slowest
+    # single clippy step, so it has a job of its own.
+    # Draft-skip, as in `lint`. Not gated on `changes`: a docs-only PR
+    # runs it too, as it did when these steps lived in `lint`.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # A red step still leaves a useful dependency cache. Without this,
+          # one failure throws away the whole cold build.
+          cache-on-failure: true
+      - name: Clippy autumn-harvest
+        run: cargo clippy -p autumn-harvest --all-features --tests -- -D warnings
+
+  clippy-plugin:
+    name: Clippy (plugin default, mcp, metrics, webhooks, oidc)
+    runs-on: ubuntu-latest
+    # Draft-skip, as in `lint`. Not gated on `changes`: a docs-only PR
+    # runs it too, as it did when these steps lived in `lint`.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # A red step still leaves a useful dependency cache. Without this,
+          # one failure throws away the whole cold build.
+          cache-on-failure: true
+      - name: Clippy autumn-harvest-plugin
+        run: cargo clippy -p autumn-harvest-plugin --all-targets -- -D warnings
+      - name: Clippy autumn-harvest-plugin (mcp feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features mcp,unified-dag-execution -- -D warnings
+      - name: Clippy autumn-harvest-plugin (metrics feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features metrics -- -D warnings
+      - name: Clippy autumn-harvest-plugin (webhooks feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features webhooks -- -D warnings
+      # Issue #1978: the OIDC login module is `cfg`d out of the default build.
+      - name: Clippy autumn-harvest-plugin (oidc feature, issue #1978)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features oidc -- -D warnings
+      # The OIDC gate on the MCP tool routes compiles only with both features.
+      - name: Clippy autumn-harvest-plugin (oidc and mcp features, issue #1978)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features oidc,mcp,unified-dag-execution -- -D warnings
+
+  clippy-plugin-backends:
+    name: Clippy (plugin dev runtime, connectors, redis, kafka)
+    runs-on: ubuntu-latest
+    # Draft-skip, as in `lint`. Not gated on `changes`: a docs-only PR
+    # runs it too, as it did when these steps lived in `lint`.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # A red step still leaves a useful dependency cache. Without this,
+          # one failure throws away the whole cold build.
+          cache-on-failure: true
+      # issue #525. Both tiers are linted: `dev-runtime-managed` compiles the
+      # archive-download path, which `dev-runtime` alone `cfg`s out entirely.
+      - name: Clippy autumn-harvest-plugin (dev-runtime feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features dev-runtime -- -D warnings
+      - name: Clippy autumn-harvest-plugin (dev-runtime-managed feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features dev-runtime-managed -- -D warnings
+      # issue #944. `connectors` alone is the broker-agnostic layer (no broker
+      # client), so it lints without any system dependency. `kafka` needs the
+      # libcurl headers vendored librdkafka's cmake build looks for.
+      - name: Clippy autumn-harvest-plugin (connectors feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features connectors -- -D warnings
+      # Issue #1312: the runtime wiring for the Redis dispatch channel is
+      # `cfg`d out of the default build, so only this step compiles it.
+      - name: Clippy autumn-harvest-plugin (redis feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features redis -- -D warnings
+      - name: Install librdkafka build deps
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+      - name: Clippy autumn-harvest-plugin (kafka feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features kafka -- -D warnings
+
+  clippy-plugin-cloud:
+    name: Clippy (plugin sqs, aws-kms, vault-transit)
+    runs-on: ubuntu-latest
+    # The AWS SDK features. sqs alone is the slowest plugin step.
+    # Draft-skip, as in `lint`. Not gated on `changes`: a docs-only PR
+    # runs it too, as it did when these steps lived in `lint`.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # A red step still leaves a useful dependency cache. Without this,
+          # one failure throws away the whole cold build.
+          cache-on-failure: true
+      - name: Clippy autumn-harvest-plugin (sqs feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features sqs -- -D warnings
+      - name: Clippy autumn-harvest-plugin (aws-kms feature, issue #1825)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features aws-kms -- -D warnings
+      # Issue #1983. `object-store` is the backend-agnostic layer with no
+      # client. `s3,gcs` adds both backends and the emulator suites.
+      - name: Clippy autumn-harvest-plugin (object-store feature, issue #1983)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features object-store -- -D warnings
+      - name: Clippy autumn-harvest-plugin (s3 and gcs features, issue #1983)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features s3,gcs -- -D warnings
+      - name: Clippy autumn-harvest-plugin (vault-transit feature, issue #1981)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features vault-transit -- -D warnings
+
+  clippy-crates:
+    name: Clippy (macros, cli, sqlite, agent, redis, verify)
+    runs-on: ubuntu-latest
+    # Draft-skip, as in `lint`. Not gated on `changes`: a docs-only PR
+    # runs it too, as it did when these steps lived in `lint`.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # A red step still leaves a useful dependency cache. Without this,
+          # one failure throws away the whole cold build.
+          cache-on-failure: true
+      - name: Clippy autumn-harvest-macros
+        run: cargo clippy -p autumn-harvest-macros -- -D warnings
+      - name: Clippy autumn-harvest-cli
+        run: cargo clippy -p autumn-harvest-cli --all-targets -- -D warnings
+      - name: Clippy autumn-harvest-sqlite
+        run: cargo clippy -p autumn-harvest-sqlite --all-targets -- -D warnings
+      # Issue #1973. `--no-deps`: the core crate without `db` has dead-code
+      # warnings of its own, which the core's own clippy step owns.
+      - name: Clippy autumn-harvest-agent (issue #1973)
+        run: cargo clippy -p autumn-harvest-agent --all-targets --no-deps -- -D warnings
+      - name: Clippy autumn-harvest-agent (sqlite feature)
+        run: cargo clippy -p autumn-harvest-agent --all-targets --features sqlite --no-deps -- -D warnings
+      - name: Clippy autumn-harvest-agent (eval feature, issue #2001)
+        run: cargo clippy -p autumn-harvest-agent --all-targets --features eval --no-deps -- -D warnings
+      - name: Clippy autumn-harvest-agent (sqlite and eval features, issue #2001)
+        run: cargo clippy -p autumn-harvest-agent --all-targets --features sqlite,eval --no-deps -- -D warnings
+      # Issue #1312: the Redis dispatch channel. Same issue #962 rule as the
+      # verify crate below -- a workspace member gets NO clippy coverage
+      # without its own step here.
+      #
+      # `--no-deps` scopes the deny to this crate. `autumn-harvest-redis`
+      # depends on `autumn-harvest` with `default-features = false`, and the
+      # core crate carries pre-existing lint warnings in that configuration
+      # (dead code behind the `db` feature, and pedantic suggestions). Without
+      # `--no-deps` this step would deny those, so it would report the core
+      # crate's no-default-features debt as a redis-crate failure.
+      - name: Clippy autumn-harvest-redis
+        run: cargo clippy -p autumn-harvest-redis --all-targets --no-deps -- -D warnings
+      # Issue #962: a new workspace member gets NO clippy coverage unless a step
+      # is added to one of the clippy jobs — there is no `--workspace` clippy
+      # invocation, only per-crate ones. The verify crate opts into the workspace's pedantic
+      # + nursery lints, which `-D warnings` makes effectively deny.
+      - name: Clippy autumn-harvest-verify
+        run: cargo clippy -p autumn-harvest-verify --all-targets -- -D warnings
+
+  clippy-examples:
+    name: Clippy (example crates)
+    runs-on: ubuntu-latest
+    # Draft-skip, as in `lint`. Not gated on `changes`: a docs-only PR
+    # runs it too, as it did when these steps lived in `lint`.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # A red step still leaves a useful dependency cache. Without this,
+          # one failure throws away the whole cold build.
+          cache-on-failure: true
+      # Same issue #962 rule as every other crate on this page: a workspace
+      # member gets NO clippy coverage without its own step, and these three
+      # standalone example crates (each its own `examples/*/Cargo.toml`
+      # workspace member, not a `--example` target under `autumn-harvest`)
+      # never got one. Unlike claude-agent-daemon below and autumn-harvest-redis,
+      # no `--no-deps` is needed: all three use `autumn-harvest`'s default
+      # features (plus `db`/`testing`), so they do not inherit that crate's
+      # no-default-features warnings.
+      - name: Clippy saga-choreography example
+        run: cargo clippy -p saga-choreography --all-targets -- -D warnings
+      - name: Clippy billing-autumn-web example
+        run: cargo clippy -p billing-autumn-web --all-targets -- -D warnings
+      - name: Clippy standalone-runner example
+        run: cargo clippy -p standalone-runner --all-targets -- -D warnings
+      - name: "Clippy standalone-quickstart example (issue #1614)"
+        run: cargo clippy -p standalone-quickstart --all-targets -- -D warnings
+      - name: "Clippy agent-loop-hit-rate example (issue #2007)"
+        run: cargo clippy -p agent-loop-hit-rate --all-targets -- -D warnings
+      # Same issue #962 rule as the verify and redis crates in `clippy-crates`:
+      # a new workspace member gets NO clippy coverage without its own step.
+      # `--no-deps` scopes the deny to the example, because it depends on
+      # `autumn-harvest` with `default-features = false`, and the core crate
+      # carries pre-existing warnings in that configuration.
+      - name: Clippy claude-agent-daemon example
+        run: cargo clippy -p claude-agent-daemon --all-targets --no-deps -- -D warnings
+
+  doc-snippets:
+    name: Doc snippets compile
+    runs-on: ubuntu-latest
+    # Each script pins a docs snippet and compiles it with `cargo check`.
+    # Plain `cargo check` shares no workspace build with clippy, so these
+    # steps gain nothing from a clippy job and run on their own.
+    # Draft-skip, as in `lint`. Not gated on `changes`: a docs-only PR
+    # runs it too, as it did when these steps lived in `lint`.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+          components: rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # A red step still leaves a useful dependency cache. Without this,
+          # one failure throws away the whole cold build.
+          cache-on-failure: true
+      - name: Check signals chapter's clean await_condition example
+        # Guards two real, reproduced-live compile failures an Onramp
+        # clean-room pass found in chapter 4's "Clean Declarative
+        # await_condition" example (collect_approvals_clean) -- the pattern
+        # the chapter explicitly recommends over the "tedious" manual loop
+        # right above it. Neither is a syntax error, so
+        # docs/audits/doc-snippet-syntax.py's rustfmt-only check passed both
+        # blocks clean: (1) racing wait_for_signal against
+        # await_condition_timeout with futures::future::select needs
+        # #[workflow(allow_nondeterministic_apis)], or HVG010 hard-blocks
+        # the build; (2) a plain `let mut approvals` captured by the
+        # condition closure can never also be reassigned by the loop body
+        # while that borrow is live (E0506). E0506 is a borrow-checker
+        # property, not a syntax shape, so this actually compiles the
+        # pinned block with `cargo check` (see the script's own docstring
+        # for why a text heuristic proved gameable in review) rather than
+        # pattern-matching stand-in text. See
+        # scripts/check-signals-clean-approval-example-determinism.sh.
+        run: ./scripts/check-signals-clean-approval-example-determinism.sh
+      - name: Check reliability-knobs continue_as_new checkpoint example
+        # Guards a real, reproduced-live compile failure an Onramp
+        # clean-room pass found in chapter 7's flagship deadline-aware
+        # checkpoint example: `ctx.continue_as_new(...).await?` inside a
+        # `Result<_, String>` workflow, with no real conversion from the
+        # `HarvestError` continue_as_new returns first (E0277, no
+        # `From<HarvestError> for String`). Not a syntax error, so
+        # doc-snippet-syntax.py's rustfmt-only check passed it clean. The
+        # same broken snippet also lived, unenforced, inside
+        # autumn-harvest/examples/long_lived_entity_deadline.rs's own
+        # ```rust,ignore``` module-doc illustration, so this checks both.
+        # Whether a `.map_err(...)` closure actually produces `String` is a
+        # type-checker property, not a text shape (review found two
+        # text-heuristic attempts gameable in a row -- a loose window, then
+        # an `.await.map_err(|e| e)?` identity closure), so this compiles
+        # each pinned snippet with `cargo check` rather than pattern-
+        # matching stand-in text. See
+        # scripts/check-continue-as-new-checkpoint-example.sh.
+        run: ./scripts/check-continue-as-new-checkpoint-example.sh
+      - name: Check operations chapter's preflight declared-deps example
+        # Guards two real, reproduced-live compile failures an Onramp
+        # clean-room pass found in chapter 10's flagship
+        # "Catching a forgotten registration before rollout" example: (1)
+        # `ctx.execute_activity(...).await?` and the spawn_child_workflow
+        # call below it are `HarvestResult<_>`, but the workflow returns
+        # `Result<_, String>` with no `From<HarvestError> for String` --
+        # same defect class as chapter 7's continue_as_new example (PR
+        # #1700); (2) even with `.map_err(...)` added, execute_activity's
+        # generic output type is left unconstrained by a discarded bare
+        # statement, which current stable rustc denies by default on every
+        # edition (`dependency_on_unit_never_type_fallback`), confirmed
+        # live against a standalone edition-2021 crate matching chapter 1's
+        # own pinned tutorial edition. Neither is a syntax error, so
+        # doc-snippet-syntax.py's rustfmt-only check passes this block
+        # clean. This actually compiles the pinned block with `cargo check`
+        # rather than pattern-matching stand-in text, matching the sibling
+        # guards above. See
+        # scripts/check-preflight-declared-deps-example.sh.
+        run: ./scripts/check-preflight-declared-deps-example.sh
+      - name: Check sqlite-backend guide's outcome-match example
+        # Guards a real, reproduced-live compile failure in
+        # docs/sqlite-backend.md's §7 "drive model" example:
+        # `ExecutionOutcome::Terminated` and this doc were both added in the
+        # same commit (3abb5b6, issue #1348), but the guide's own
+        # `match rt.outcome(exec)? { ... }` never got the new arm, so it has
+        # been non-exhaustive (E0004) since the day it was written. This
+        # file is outside doc-snippet-syntax.py's corpus (getting-started/
+        # and README.md only), and E0004 is a type-checker property, not a
+        # syntax error, so nothing else in CI ever compiled it --
+        # examples/quickstart.rs has the correct four-arm match, which is
+        # why the crate's own tests stayed green throughout. This actually
+        # compiles the pinned block with `cargo check` rather than counting
+        # match arms textually. See
+        # scripts/check-sqlite-outcome-match-example.sh.
+        run: ./scripts/check-sqlite-outcome-match-example.sh
+      - name: Check chapter 8 and 11 snippets compile
+        # Guards two getting-started snippets that declared the workflow
+        # input as `_: ()`. `#[workflow]` silently dropped the `_` pattern,
+        # so the generated call passed one argument to a two-argument
+        # function. rustc reported E0061 "takes 5 arguments" on the
+        # attribute line. See scripts/check-underscore-input-snippets.sh.
+        run: ./scripts/check-underscore-input-snippets.sh
+      - name: Check README schedule and retry snippets compile
+        # Guards two front-door README snippets. The cron-schedule block
+        # called `.workflows(..)` and `.workflow_schedule(..)` on
+        # `autumn_web::app()`, which has neither method. The retry block
+        # used `Duration` without importing it. See
+        # scripts/check-readme-front-door-snippets.sh.
+        run: ./scripts/check-readme-front-door-snippets.sh
+      - name: Check webhooks chapter documents the webhooks feature
+        # Guards a real, reproduced-live defect an Onramp clean-room pass
+        # found in chapter 12: it showed the `#[webhook]` mapping function
+        # and `.webhooks(webhooks![...])` plugin wiring with no mention
+        # that `autumn-harvest-plugin` needs `features = ["webhooks"]` --
+        # unlike the sibling chapter 13 (broker connectors), which states
+        # its `connectors` feature requirement up front in its own
+        # "Features:" table. A newcomer who scaffolds per chapter 1 (no
+        # extra features) and pastes chapter 12's code verbatim hits, at
+        # the .webhooks(...) call:
+        #   error[E0599]: no method named `webhooks` found for struct
+        #   `HarvestPlugin`
+        # which names neither "webhooks" nor this chapter. This compiles
+        # the doc's own snippets with `cargo check` twice -- once with
+        # default features (must fail, proving the feature really is
+        # required) and once with `--features webhooks` (must pass) --
+        # and greps for the fix's own "Enable the feature" note landing
+        # before step 3, so neither the code nor the note can regress
+        # silently. See scripts/check-webhooks-feature-example.sh.
+        run: ./scripts/check-webhooks-feature-example.sh
+      - name: Check chapter 5 and 6 flagship examples compile
+        # Guards two hard compile failures a clean-room pass found on the
+        # getting-started path: chapter 5 passed a workflow id to
+        # `spawn_child_workflow_raw` (E0061; the method takes name + input),
+        # and chapter 6's `charge_card` used `.map_err(|e| e.to_string())?`
+        # in a `HarvestResult` function (E0277; no `From<String>`).
+        # See scripts/check-child-idempotency-examples.sh.
+        run: ./scripts/check-child-idempotency-examples.sh
+
+  # One check for branch protection to require in place of every leg above.
+  # A skipped leg (a draft PR) counts as a pass, as a skipped job does
+  # everywhere else in this file.
+  lint-compile:
+    name: Lint (compile)
+    runs-on: ubuntu-latest
+    needs: [clippy-core, clippy-plugin, clippy-plugin-backends, clippy-plugin-cloud, clippy-crates, clippy-examples, doc-snippets]
+    if: always()
+    steps:
+      - name: Every compile-checking lint job passed or was skipped
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Results: $RESULTS"
+          for result in $RESULTS; do
+            case "$result" in
+              success|skipped) ;;
+              *) echo "::error::A compile-checking lint job ended with '$result'."; exit 1 ;;
+            esac
+          done
+
   msrv:
     name: MSRV (1.88.0)
     needs: changes
@@ -2144,6 +2322,10 @@ jobs:
       # `runner.rs` never reach the MSRV compiler. Issue #1312.
       - name: Check MSRV compiles (autumn-harvest-plugin redis feature, issue #1312)
         run: cargo check -p autumn-harvest-plugin --features redis
+      # Issue #1983. The locked `aws-sdk-s3` declares Rust 1.88, the MSRV
+      # itself. This step makes a lockfile bump past it fail.
+      - name: Check MSRV compiles (autumn-harvest-plugin s3 and gcs features, issue #1983)
+        run: cargo check -p autumn-harvest-plugin --features s3,gcs
 
   # Concurrency model checking (issue #1800). The loom and Shuttle targets
   # compile to empty crates unless RUSTFLAGS sets their cfg, so a normal
