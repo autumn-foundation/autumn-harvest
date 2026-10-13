@@ -479,6 +479,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     // Paginated, filterable single-execution history (issue #529): read-only cursor walk.
     ("GET /workflows/{id}/history", RouteClass::ReadOnly),
     ("GET /workflows/{id}/history/export", RouteClass::ReadOnly),
+    // Issue #1983: read back an archived history. Admin only.
+    ("GET /workflows/{id}/archived-history", RouteClass::ReadOnly),
     // Completion-callback delivery listing (issue #605): read-only, no audit.
     (
         "GET /workflows/{id}/completion-deliveries",
@@ -555,6 +557,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     // SSE ephemeral workflow progress stream (issue #791): read-only side
     // channel over LISTEN/NOTIFY, never mutates state. NOT admin-gated (AC5).
     ("GET /workflows/{id}/stream", RouteClass::ReadOnly),
+    // Durable output stream (issue #1974): reads stored chunks, writes nothing.
+    ("GET /workflows/{id}/stream/durable", RouteClass::ReadOnly),
     // Live list signal (issue #1982): read-only, never mutates state.
     ("GET /workflows/changes/stream", RouteClass::ReadOnly),
     // ── Mutating ── modifies workflow execution or system configuration ───────
@@ -1016,6 +1020,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "POST /workflows/{id}/update/{update_name}",
     "GET /workflows/{id}/history",
     "GET /workflows/{id}/history/export",
+    "GET /workflows/{id}/archived-history",
     "GET /workflows/{id}/completion-deliveries",
     "GET /dags",
     "GET /dags/{dag_name}/runs",
@@ -1072,6 +1077,8 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     // Ephemeral progress stream (issue #791): read-only, no audit trail
     // (disposable side channel; no open/close audit rows are written).
     "GET /workflows/{id}/stream",
+    // Durable output stream (issue #1974): read-only, not audited.
+    "GET /workflows/{id}/stream/durable",
     // Live list signal (issue #1982): read-only. Its frames hold a count only,
     // so the stream writes no audit row.
     "GET /workflows/changes/stream",
@@ -1193,6 +1200,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /workflows/{id}/result", None),
     ("GET /workflows/{id}/history", None),
     ("GET /workflows/{id}/history/export", None),
+    ("GET /workflows/{id}/archived-history", None),
     ("GET /workflows/{id}/completion-deliveries", None),
     (
         "POST /workflows/{id}/completion-deliveries/{delivery_id}/redrive",
@@ -1319,6 +1327,8 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /executions/{exec_id}/events/stream", None),
     // Ephemeral progress stream (issue #791): read-only, not audited.
     ("GET /workflows/{id}/stream", None),
+    // Durable output stream (issue #1974): read-only, not audited.
+    ("GET /workflows/{id}/stream/durable", None),
     // Live list signal (issue #1982): read-only, not audited.
     ("GET /workflows/changes/stream", None),
     // Build routing management (issue #362)

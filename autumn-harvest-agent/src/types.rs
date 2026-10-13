@@ -95,6 +95,12 @@ pub struct AgentTask {
     /// started before the change replays as it ran.
     #[serde(default)]
     pub run_id_source: RunIdSource,
+    /// The tenant that scopes the response cache.
+    ///
+    /// On Postgres, the verified tenant of the run wins over this field. Set
+    /// it on SQLite, or for a run that has no verified tenant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 /// Where the run id of a task comes from.
@@ -131,7 +137,16 @@ impl AgentTask {
             unattended: false,
             unattended_memory_writes: false,
             run_id_source: RunIdSource::ExecutionId,
+            tenant: None,
         }
+    }
+
+    /// Set the tenant that scopes the response cache. See
+    /// [`tenant`](Self::tenant).
+    #[must_use]
+    pub fn tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = Some(tenant.into());
+        self
     }
 
     /// Send the final answer to the harness delivery.
@@ -294,6 +309,10 @@ pub struct ModelTurnRequest {
     /// Tools that the workflow handles itself, such as `schedule_followup`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_tools: Vec<ToolDefinition>,
+    /// The tenant of [`AgentTask::tenant`]. It scopes the response cache. On
+    /// Postgres, the verified tenant of the run wins over it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 /// The recorded result of one model-turn activity.
@@ -311,6 +330,10 @@ pub struct ModelTurn {
     /// The calls themselves are read from `content`, so the arguments are
     /// recorded once.
     pub decisions: Vec<ToolDecision>,
+    /// `true` when the response cache gave the answer. No model call ran,
+    /// so `usage` is zero.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cache_hit: bool,
 }
 
 impl ModelTurn {
@@ -539,6 +562,7 @@ mod tests {
             stop: StopReason::ToolUse,
             usage: TokenUsage::default(),
             decisions: vec![ToolDecision::Allow],
+            cache_hit: false,
         };
         assert_eq!(turn.text(), "ab");
         let calls = turn.calls();
@@ -559,7 +583,7 @@ mod tests {
         // The new fields are left out at their defaults, so a recorded input
         // from before them still matches on strict replay.
         let fields = encoded.as_object_mut().unwrap();
-        for key in ["read_only", "memory_scope", "extra_tools"] {
+        for key in ["read_only", "memory_scope", "extra_tools", "tenant"] {
             assert!(!fields.contains_key(key), "{key}");
         }
         let old_call = json!({
@@ -570,6 +594,36 @@ mod tests {
         let encoded = serde_json::to_value(&call).unwrap();
         assert!(encoded.get("read_only").is_none());
         assert!(encoded.get("memory_scope").is_none());
+    }
+
+    #[test]
+    fn the_cache_fields_keep_the_recorded_shape() {
+        let task = AgentTask::new("hi");
+        assert!(serde_json::to_value(&task).unwrap().get("tenant").is_none());
+        let old = serde_json::to_value(&task).unwrap();
+        let decoded: AgentTask = serde_json::from_value(old).unwrap();
+        assert_eq!(decoded.tenant, None);
+        assert_eq!(
+            AgentTask::new("hi").tenant("t").tenant.as_deref(),
+            Some("t")
+        );
+
+        let turn = json!({
+            "content": [], "stop": "end_turn",
+            "usage": {
+                "input_tokens": 1, "output_tokens": 2,
+                "cache_read_tokens": 0, "cache_write_tokens": 0,
+            },
+            "decisions": [],
+        });
+        let decoded: ModelTurn = serde_json::from_value(turn.clone()).unwrap();
+        assert!(!decoded.cache_hit);
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), turn);
+        let hit = ModelTurn {
+            cache_hit: true,
+            ..decoded
+        };
+        assert_eq!(serde_json::to_value(&hit).unwrap()["cache_hit"], true);
     }
 
     #[test]

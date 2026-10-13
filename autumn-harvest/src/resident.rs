@@ -476,6 +476,7 @@ fn plan_suspension(commands: &[WorkflowCommand]) -> Result<SuspensionPlan, Resid
             WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. } => false,
             WorkflowCommand::AcquireMutex { .. } | WorkflowCommand::ReleaseMutex { .. } => {
                 return Err(ResidentOutcome::Mutex);
@@ -905,6 +906,9 @@ mod tests {
             }
             WorkflowCommand::PublishProgress { seq, chunk } => {
                 format!("PublishProgress({seq}, {chunk})")
+            }
+            WorkflowCommand::PublishDurableProgress { offset, chunk } => {
+                format!("PublishDurableProgress({offset}, {chunk})")
             }
             WorkflowCommand::RecordMarker { name, .. } => format!("RecordMarker({name})"),
             WorkflowCommand::RecordSideEffect { kind, name, .. } => {
@@ -1678,6 +1682,7 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_execution_id: None,
+            cancellation_reason: None,
         };
         let key = ResidentKey::new(one_activity_workflow, Some(&meta), &HashMap::new());
         let declined = resident.resume_with(&delta, Some(&key), Some(&meta)).await;
@@ -2494,6 +2499,7 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_execution_id: None,
+            cancellation_reason: None,
         };
         let key = ResidentKey::new(pair_then_c_workflow, Some(&meta), &HashMap::new());
         let declined = resident.resume_with(&delta, Some(&key), Some(&meta)).await;

@@ -28,14 +28,14 @@
 //!   core `HistoryMatcher::match_timer` scans for its own `TimerFired` but STOPS at
 //!   an unconsumed sibling `TimerFired`, so a reversed fire order would wedge replay
 //!   (issue #1069 P2).
-//! - `harvest_signals` — staged inbound signals awaiting a matching
-//!   `wait_for_signal`. Each row records the absolute epoch-millisecond the signal
-//!   arrived (`received_at`, issue #1069 P2 — millisecond precision so an on-time
-//!   signal cannot lose a deadline race near a second boundary), which the
-//!   wake-event ingest interleaves against a deadline timer's `fire_at` so a
-//!   signal delivered *after* an expired `wait_for_signal_timeout` deadline cannot
-//!   retroactively win the race (issue #476; mirrors the Postgres `merge_wake_events`
-//!   `received_at` vs `fires_at` ordering).
+//! - `harvest_signals` — staged inbound signals. The next drive appends each one
+//!   to history (issue #2020). Each row records the epoch-millisecond the signal
+//!   arrived (`received_at`, issue #1069 P2). Millisecond precision keeps an
+//!   on-time signal from losing a deadline race near a second boundary. The
+//!   ingest compares `received_at` with the `fire_at` of a deadline timer. So a
+//!   signal delivered after an expired `wait_for_signal_timeout` deadline cannot
+//!   win the race (issue #476). This mirrors the Postgres `merge_wake_events`
+//!   order of `received_at` and `fires_at`.
 //! - `harvest_activity_attempts` — a per-attempt audit log. **Retryable** activity
 //!   failures live here, not in `harvest_events`, mirroring the Postgres engine's
 //!   `requeue_for_retry` (which stores the attempt error on the task-queue row,
@@ -59,9 +59,17 @@ CREATE TABLE IF NOT EXISTS harvest_executions (
                                            -- distinct per run (mirrors the Postgres worker,
                                            -- which injects StartWorkflowParams.workflow_id).
     input_json    TEXT NOT NULL,
-    state         TEXT NOT NULL,          -- RUNNING | COMPLETED | FAILED
+    state         TEXT NOT NULL,          -- RUNNING | COMPLETED | FAILED | CANCELLED |
+                                           -- TERMINATED | CONTINUED_AS_NEW
     output_json   TEXT,
-    error         TEXT
+    error         TEXT,
+    cancel_reason TEXT,                    -- a cooperative cancel request (issue #2021).
+                                           -- NULL until `cancel` stores a request. The
+                                           -- drive reads it only while the run is
+                                           -- RUNNING. A terminal run keeps the value.
+    cancel_from_seq INTEGER                -- the history length when `cancel` stored
+                                           -- the request (issue #2021). It bounds the
+                                           -- events that a cleanup can add.
 );
 
 -- Non-unique lookup index for the (workflow_name, workflow_id) reuse-policy probe
@@ -202,13 +210,16 @@ CREATE TABLE IF NOT EXISTS harvest_signals (
     received_at  INTEGER NOT NULL DEFAULT 0   -- absolute epoch-millisecond the signal arrived
 );
 
--- Without this, every exec_id/delivered-scoped query here (peek_pending_signal,
+-- Without this, every exec_id/delivered-scoped query here (the signal read,
 -- delete_undelivered_signals_for_execution) scans the whole table, unlike
 -- harvest_timers, whose (exec_id, timer_id) PRIMARY KEY already covers this.
--- `CREATE INDEX IF NOT EXISTS` is idempotent and applied on every open
--- (including a pre-existing file), needing no separate migration.
-CREATE INDEX IF NOT EXISTS idx_harvest_signals_exec_delivered
-    ON harvest_signals (exec_id, delivered);
+-- The trailing columns serve the arrival order of the signal read (issue
+-- #2020). Without them, the read sorts the whole backlog before its first row.
+-- It replaces the (exec_id, delivered) index of earlier files. Both statements
+-- are idempotent and run on every open, so no separate migration is needed.
+CREATE INDEX IF NOT EXISTS idx_harvest_signals_exec_arrival
+    ON harvest_signals (exec_id, delivered, received_at, signal_seq);
+DROP INDEX IF EXISTS idx_harvest_signals_exec_delivered;
 
 CREATE TABLE IF NOT EXISTS harvest_activity_attempts (
     attempt_seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -247,6 +258,9 @@ use crate::error::SqliteResult;
 ///   resolved-defaults flag). Both are nullable/defaulted, so a pre-#1068 row is
 ///   valid unchanged and is treated as "defaults not yet frozen" (its next claim
 ///   resolves and freezes them).
+/// - **issue #2021** — `harvest_executions.cancel_reason`, the stored cooperative
+///   cancel request, and `cancel_from_seq`, the history length at the request.
+///   Both are nullable, so an old row has no pending cancel.
 ///
 /// # Errors
 ///
@@ -278,6 +292,19 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
         "harvest_tasks",
         "last_error",
         "ALTER TABLE harvest_tasks ADD COLUMN last_error TEXT",
+    )?;
+    // issue #2021: store a cooperative cancel request until the seal.
+    add_column_if_absent(
+        conn,
+        "harvest_executions",
+        "cancel_reason",
+        "ALTER TABLE harvest_executions ADD COLUMN cancel_reason TEXT",
+    )?;
+    add_column_if_absent(
+        conn,
+        "harvest_executions",
+        "cancel_from_seq",
+        "ALTER TABLE harvest_executions ADD COLUMN cancel_from_seq INTEGER",
     )?;
     Ok(())
 }
@@ -330,6 +357,13 @@ mod tests {
             seq INTEGER NOT NULL, max_attempts INTEGER, retry_policy_json TEXT, \
             start_to_close_ms INTEGER, scheduled_at INTEGER NOT NULL)";
 
+    // The pre-#2021 `harvest_executions` shape (no `cancel_reason`).
+    const OLD_HARVEST_EXECUTIONS_DDL: &str = "\
+        CREATE TABLE harvest_executions (\
+            exec_id TEXT PRIMARY KEY, workflow_name TEXT NOT NULL, \
+            workflow_id TEXT NOT NULL DEFAULT '', input_json TEXT NOT NULL, \
+            state TEXT NOT NULL, output_json TEXT, error TEXT)";
+
     // A fresh database already has the freeze columns from `SCHEMA`, so `migrate` is
     // a pure no-op (idempotent).
     #[test]
@@ -343,6 +377,38 @@ mod tests {
         migrate(&conn).unwrap();
         assert!(column_exists(&conn, "harvest_tasks", "schedule_to_close_at").unwrap());
         assert!(column_exists(&conn, "harvest_tasks", "defaults_frozen").unwrap());
+        assert!(column_exists(&conn, "harvest_executions", "cancel_reason").unwrap());
+        assert!(column_exists(&conn, "harvest_executions", "cancel_from_seq").unwrap());
+    }
+
+    // Issue #2021: an old `harvest_executions` gets `cancel_reason`. The old row
+    // keeps its data and has no pending cancel.
+    #[test]
+    fn migrate_adds_cancel_reason_to_an_old_executions_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(OLD_HARVEST_EXECUTIONS_DDL).unwrap();
+        conn.execute_batch(OLD_HARVEST_TASKS_DDL).unwrap();
+        conn.execute(
+            "INSERT INTO harvest_executions (exec_id, workflow_name, input_json, state) \
+             VALUES ('e1', 'wf', '{}', 'RUNNING')",
+            [],
+        )
+        .unwrap();
+        assert!(!column_exists(&conn, "harvest_executions", "cancel_reason").unwrap());
+
+        migrate(&conn).unwrap();
+
+        let (state, reason, from): (String, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT state, cancel_reason, cancel_from_seq FROM harvest_executions \
+                 WHERE exec_id = 'e1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "RUNNING");
+        assert_eq!(reason, None);
+        assert_eq!(from, None);
     }
 
     // An old-schema `harvest_tasks` (missing the freeze columns) is brought up to
@@ -350,6 +416,7 @@ mod tests {
     #[test]
     fn migrate_adds_freeze_columns_to_an_old_schema_table() {
         let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(OLD_HARVEST_EXECUTIONS_DDL).unwrap();
         conn.execute_batch(OLD_HARVEST_TASKS_DDL).unwrap();
         // Seed a pre-existing row to prove data survives the ALTER.
         conn.execute(
@@ -390,6 +457,7 @@ mod tests {
     #[test]
     fn migrate_adds_the_heartbeat_and_error_columns() {
         let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(OLD_HARVEST_EXECUTIONS_DDL).unwrap();
         conn.execute_batch(OLD_HARVEST_TASKS_DDL).unwrap();
         conn.execute(
             "INSERT INTO harvest_tasks \

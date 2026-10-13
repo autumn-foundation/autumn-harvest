@@ -761,6 +761,8 @@ fn act_info_with_breaker(
         max_result_bytes: None,
         requires: None,
         handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 

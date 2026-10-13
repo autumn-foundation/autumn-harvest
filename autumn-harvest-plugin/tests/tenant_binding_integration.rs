@@ -505,6 +505,47 @@ async fn tenant_token_reaches_only_its_own_runs_without_an_authorizer() {
 
 /// A tenant token is refused, with an audit row, off the tenant-scoped
 /// routes. That covers list routes, token mint, Vantage and other start paths.
+/// Issue #1974: a tenant-bound reader can open the durable stream of its own
+/// run. The per-run tenant check still hides another tenant's run.
+#[tokio::test]
+async fn tenant_token_reads_the_durable_stream_of_its_own_run() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    let state = api_state(&pool);
+    let app = standalone_app(&state);
+    let acme = mint_for_tenant(&boundary_app(&state), "read", "acme").await;
+    let own = start_run_for(&mut conn, &unique("acme"), Some("acme")).await;
+    let other = start_run_for(&mut conn, &unique("globex"), Some("globex")).await;
+    // A finished run streams its stored chunks and ends, so the body is finite.
+    for run in [own, other] {
+        diesel::sql_query(
+            "UPDATE harvest_workflow_executions
+                SET state = 'COMPLETED', completed_at = NOW()
+              WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(run.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("complete");
+    }
+
+    let (status, body) = send(
+        &app,
+        Call::new("GET", &format!("/workflows/{own}/stream/durable")).bearer(&acme),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+
+    let (status, body) = send(
+        &app,
+        Call::new("GET", &format!("/workflows/{other}/stream/durable")).bearer(&acme),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body:?}");
+}
+
 #[tokio::test]
 async fn tenant_token_is_refused_off_the_tenant_scoped_routes() {
     let (url, _c) = setup_database().await;

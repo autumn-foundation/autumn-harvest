@@ -297,11 +297,41 @@ pub type ArchiverFuture<'a> = std::pin::Pin<
     >,
 >;
 
+/// Future type returned by [`HistoryArchiver::fetch`] (issue #1983).
+///
+/// `Ok(None)` means that the archive has no document for the run.
+pub type ArchiveFetchFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<
+                    Option<crate::history_export::HistoryExportDocument>,
+                    ArchiveFetchError,
+                >,
+            > + Send
+            + 'a,
+    >,
+>;
+
+/// Error returned by [`HistoryArchiver::fetch`] (issue #1983).
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ArchiveFetchError {
+    /// The archiver can write but cannot read back.
+    #[error("the history archiver does not support read-back")]
+    Unsupported,
+    /// The store or the decode fails.
+    #[error("archived history read failed: {0}")]
+    Backend(Box<dyn std::error::Error + Send + Sync>),
+}
+
 /// Trait for pre-retention workflow history cold storage archivers.
 ///
 /// Implementations of this trait are invoked by the retention janitor to ship
 /// a completed workflow execution's event history to cold storage *before* it
 /// is permanently deleted from the database.
+///
+/// Payload fields in the document are in their stored form. With a payload
+/// codec on, they are codec envelopes (ciphertext). Issue #1983.
 pub trait HistoryArchiver: Send + Sync + 'static {
     /// Ship the history export document to cold storage.
     ///
@@ -309,6 +339,16 @@ pub trait HistoryArchiver: Send + Sync + 'static {
     /// workflow execution and its associated events on this tick, retrying
     /// on the next tick to prevent data loss.
     fn archive(&self, doc: &crate::history_export::HistoryExportDocument) -> ArchiverFuture<'_>;
+
+    /// Read back the archived document for `execution_id` (issue #1983).
+    ///
+    /// The management API and Vantage call this to show a pruned run.
+    /// The default returns [`ArchiveFetchError::Unsupported`], so an
+    /// archiver that only writes still compiles.
+    fn fetch(&self, execution_id: &crate::types::ExecutionId) -> ArchiveFetchFuture<'_> {
+        let _ = execution_id;
+        Box::pin(async { Err(ArchiveFetchError::Unsupported) })
+    }
 }
 
 /// Configuration for the background retention job.
@@ -1564,6 +1604,7 @@ async fn run_partition_maintenance_pass(
     owner: crate::scanner_health::ScannerOwner,
     shutdown: &CancellationToken,
     tick_fenced: bool,
+    partition_archiver: Option<&Arc<dyn crate::partition_archive::PartitionArchiver>>,
 ) {
     if !config.partitions.enabled {
         return;
@@ -1689,13 +1730,27 @@ async fn run_partition_maintenance_pass(
             // Issue #1823: the connection predates the pass, so it joins it.
             // A lost guard then ends its backend.
             let _member = crate::replication::join_fenced_pass(pool, &mut conn).await;
-            crate::partition::maintain_with_progress(
+            // Issue #2009: with an archiver, each drop waits for a checked
+            // export. The shard ID goes into each key. A dry run drops
+            // nothing, so it takes no archiver. An exporting pass would
+            // write the marker, and the marker outlives the dry run.
+            let export = partition_archiver
+                .filter(|_| !config.dry_run)
+                .map(|archiver| {
+                    crate::partition_archive::PartitionExport::new(
+                        Arc::clone(archiver),
+                        shard.as_i32(),
+                    )
+                    .with_io_timeout(config.archival_timeout())
+                });
+            crate::partition::maintain_exporting(
                 &mut conn,
                 now,
                 config.partitions.lookahead_cohorts,
                 &sweep_opts,
                 cursor.resume_after,
                 cursor.catch_up_target,
+                export.as_ref(),
                 &mut tick_partition,
             )
             .await
@@ -1789,6 +1844,64 @@ pub struct RetentionRuntime {
     monitor: RetentionMonitor,
 }
 
+/// The optional hooks a [`RetentionRuntime`] calls.
+///
+/// Start from [`RetentionHooks::default`] and add hooks with the `with_*`
+/// calls. The struct is `non_exhaustive`, so a new hook is not a breaking
+/// change.
+#[cfg(feature = "db")]
+#[derive(Clone, Default)]
+#[non_exhaustive]
+pub struct RetentionHooks {
+    /// Gets each run's history before retention deletes the run.
+    pub archiver: Option<Arc<dyn HistoryArchiver>>,
+    /// Inflates offloaded payloads for the archive, and collects their blobs.
+    pub offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
+    /// Gets each aged event partition before the sweep drops it (issue #2009).
+    pub partition_archiver: Option<Arc<dyn crate::partition_archive::PartitionArchiver>>,
+}
+
+#[cfg(feature = "db")]
+impl RetentionHooks {
+    /// Set the history archiver.
+    #[must_use]
+    pub fn with_archiver(mut self, archiver: Option<Arc<dyn HistoryArchiver>>) -> Self {
+        self.archiver = archiver;
+        self
+    }
+
+    /// Set the payload offloader.
+    #[must_use]
+    pub fn with_offloader(
+        mut self,
+        offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
+    ) -> Self {
+        self.offloader = offloader;
+        self
+    }
+
+    /// Set the partition archiver (issue #2009).
+    #[must_use]
+    pub fn with_partition_archiver(
+        mut self,
+        archiver: Option<Arc<dyn crate::partition_archive::PartitionArchiver>>,
+    ) -> Self {
+        self.partition_archiver = archiver;
+        self
+    }
+}
+
+#[cfg(feature = "db")]
+impl std::fmt::Debug for RetentionHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetentionHooks")
+            .field("archiver", &self.archiver.is_some())
+            .field("offloader", &self.offloader.is_some())
+            .field("partition_archiver", &self.partition_archiver.is_some())
+            .finish()
+    }
+}
+
 #[cfg(feature = "db")]
 impl RetentionRuntime {
     /// Returns `None` when nothing in `config` is enabled.
@@ -1800,7 +1913,6 @@ impl RetentionRuntime {
     /// phase is gated on `loosest_cutoff_age()` and is simply skipped. The
     /// terminal-task janitor (issue #1811) also spawns the runtime on its own.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
     pub fn spawn(
         pools: ShardedDbPool,
         config: RetentionConfig,
@@ -1808,6 +1920,50 @@ impl RetentionRuntime {
         archiver: Option<Arc<dyn HistoryArchiver>>,
         offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
     ) -> Option<Self> {
+        Self::spawn_inner(
+            pools,
+            config,
+            metrics,
+            RetentionHooks::default()
+                .with_archiver(archiver)
+                .with_offloader(offloader),
+        )
+    }
+
+    /// The same as [`Self::spawn`], with every hook in one struct.
+    ///
+    /// Use it to set a partition archiver (issue #2009).
+    #[must_use]
+    pub fn spawn_with_hooks(
+        pools: ShardedDbPool,
+        config: RetentionConfig,
+        metrics: Arc<dyn MetricsRecorder>,
+        hooks: RetentionHooks,
+    ) -> Option<Self> {
+        Self::spawn_inner(pools, config, metrics, hooks)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn spawn_inner(
+        pools: ShardedDbPool,
+        config: RetentionConfig,
+        metrics: Arc<dyn MetricsRecorder>,
+        hooks: RetentionHooks,
+    ) -> Option<Self> {
+        let RetentionHooks {
+            archiver,
+            offloader,
+            partition_archiver,
+        } = hooks;
+        // Issue #2009: an export turns the straggler delete off, because no
+        // export holds the rows it removes. `try_build` refuses the pair, but
+        // a direct caller can still set both.
+        if partition_archiver.is_some() && config.partitions.straggler_grace_secs.is_some() {
+            tracing::warn!(
+                "partitions.straggler_grace_secs has no effect with a partition archiver; \
+                 the sweep skips straggler deletes while it exports"
+            );
+        }
         if !config.enabled() {
             return None;
         }
@@ -1903,6 +2059,7 @@ impl RetentionRuntime {
                 owner,
                 &shutdown_task,
                 false,
+                partition_archiver.as_ref(),
             )
             .await;
             if shutdown_task.is_cancelled() {
@@ -2079,6 +2236,7 @@ impl RetentionRuntime {
                         owner,
                         &shutdown_task,
                         true,
+                        partition_archiver.as_ref(),
                     )
                     .await;
 
@@ -2977,20 +3135,20 @@ async fn run_shard_tick(
             let mut doc = None;
             if !config.dry_run && archiver.is_some() {
                 let exec_id = crate::types::ExecutionId::from_uuid(candidate.id);
-                // Inflate offloaded envelopes before archiving so the archived
-                // document contains real payloads, not blob references that will
-                // be deleted moments later. Issue #524.
-                let load_result = if offloader.is_some() {
-                    crate::store::load_history_inflated(
-                        &mut conn,
-                        exec_id,
-                        &crate::payload_codec::PayloadCodecs::default(),
-                        offloader.as_deref(),
-                    )
-                    .await
-                } else {
-                    crate::store::load_history(&mut conn, exec_id).await
-                };
+                // Inflate offloaded references before archiving. The archive then
+                // holds the payload bytes, not references to blobs that retention
+                // deletes next. Issue #524.
+                //
+                // Do not decode codec envelopes. The archive keeps the stored
+                // form, so a codec keeps the payloads ciphertext. A decode with
+                // the identity registry also fails on the first envelope, and
+                // retention then never archives the run. Issue #1983.
+                let load_result = crate::store::load_history_inflated_undecoded(
+                    &mut conn,
+                    exec_id,
+                    offloader.as_deref(),
+                )
+                .await;
                 match load_result {
                     Ok(history) => {
                         let req = crate::history_export::HistoryExportRequest {
@@ -5775,5 +5933,30 @@ mod tests {
             .len();
         assert_eq!(left, 0);
         guard.active = false;
+    }
+}
+
+#[cfg(test)]
+mod archive_fetch_tests {
+    use super::{ArchiveFetchError, ArchiverFuture, HistoryArchiver};
+    use crate::history_export::HistoryExportDocument;
+    use crate::types::ExecutionId;
+
+    /// An archiver that writes only, as every archiver did before issue #1983.
+    struct WriteOnly;
+
+    impl HistoryArchiver for WriteOnly {
+        fn archive(&self, _doc: &HistoryExportDocument) -> ArchiverFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn default_fetch_is_unsupported() {
+        let result = WriteOnly.fetch(&ExecutionId::new()).await;
+        assert!(
+            matches!(result, Err(ArchiveFetchError::Unsupported)),
+            "a write-only archiver reports that it cannot read back"
+        );
     }
 }

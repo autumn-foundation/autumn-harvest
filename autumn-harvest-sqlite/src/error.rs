@@ -56,27 +56,120 @@ pub enum SqliteError {
     #[error("execution not found: {0}")]
     ExecutionNotFound(ExecutionId),
 
-    /// A signal was sent to an execution that is not accepting signals — it has
-    /// reached a terminal state (`COMPLETED`/`FAILED`/…). Mirrors the Postgres
-    /// engine's rejection of a signal to a terminal target
-    /// ([`send_signal`](crate::SqliteRuntime::send_signal)): staging it would
-    /// silently drop the wakeup, since no live `wait_for_signal` will ever consume
-    /// it. An unknown id is [`ExecutionNotFound`](Self::ExecutionNotFound); this
-    /// variant is only for a *present but sealed* run.
+    /// A signal, update, cancel or terminate targeted an execution in a
+    /// terminal state (`COMPLETED`, `FAILED`, `CANCELLED`, `TERMINATED` or
+    /// `CONTINUED_AS_NEW`).
+    ///
+    /// [`send_signal`](crate::SqliteRuntime::send_signal) mirrors the Postgres
+    /// rejection of a signal to a terminal target. No drive consumes a row
+    /// staged for a sealed run, so the wakeup would be lost silently. `update`
+    /// also returns it (issue #2025), and so do
+    /// [`cancel`](crate::SqliteRuntime::cancel) and
+    /// [`terminate`](crate::SqliteRuntime::terminate) (issue #2021). An unknown
+    /// id is [`ExecutionNotFound`](Self::ExecutionNotFound). This variant is
+    /// only for a stored, terminal run.
     #[error(
-        "workflow execution {execution_id} is not running (state: {state}); cannot accept a signal"
+        "workflow execution {execution_id} is not running (state: {state}); cannot accept the request"
     )]
     WorkflowNotRunning {
-        /// The terminal execution the signal targeted.
+        /// The terminal execution the request targeted.
         execution_id: ExecutionId,
-        /// Its current (terminal) state — `COMPLETED`, `FAILED`, etc.
+        /// Its current terminal state, for example `COMPLETED` or `CANCELLED`.
         state: String,
+    },
+
+    /// The workflow has no update handler with this name (issue #2025).
+    ///
+    /// The call writes no event.
+    #[error("execution {execution_id} has no update handler named {name:?}")]
+    UpdateHandlerNotFound {
+        /// The execution the update targeted.
+        execution_id: ExecutionId,
+        /// The update name.
+        name: String,
+    },
+
+    /// The input fails the arg schema of a declarative `#[update]` handler
+    /// (issue #2025).
+    ///
+    /// It keeps each violation, as the core
+    /// [`HarvestError::InputValidationFailed`](autumn_harvest::HarvestError::InputValidationFailed)
+    /// does. The call writes no event.
+    #[error(
+        "update {name:?} to execution {execution_id} has an invalid input: {}",
+        violations.iter().map(|v| v.message.as_str()).collect::<Vec<_>>().join("; ")
+    )]
+    UpdateInputInvalid {
+        /// The execution the update targeted.
+        execution_id: ExecutionId,
+        /// The update name.
+        name: String,
+        /// Each way the input fails the schema.
+        violations: Vec<autumn_harvest::info::SchemaViolation>,
+    },
+
+    /// The validator rejects the update, or panics (issue #2025).
+    ///
+    /// The call writes no event.
+    #[error("update {name:?} to execution {execution_id} was rejected: {reason}")]
+    UpdateRejected {
+        /// The execution the update targeted.
+        execution_id: ExecutionId,
+        /// The update name.
+        name: String,
+        /// Why the update was rejected.
+        reason: String,
+    },
+
+    /// The update handler returns an error or panics (issue #2025).
+    ///
+    /// The runtime admitted the update. History holds `UpdateAdmitted` and
+    /// a `WorkflowEvent::UpdateFailed` with this error.
+    #[error("update {name:?} to execution {execution_id} failed: {error}")]
+    UpdateFailed {
+        /// The execution the update targeted.
+        execution_id: ExecutionId,
+        /// The update name.
+        name: String,
+        /// The handler error.
+        error: String,
+    },
+
+    /// The update would reach a history cap, so the run fails at the cap
+    /// (issues #2025 and #2023).
+    ///
+    /// The call writes no update event. It seals the run `FAILED` with the
+    /// cap reason, as a drive that reaches the cap does.
+    #[error("update {name:?} to execution {execution_id} reached a history cap: {reason}")]
+    UpdateHistoryCapReached {
+        /// The execution the update targeted. It is now `FAILED`.
+        execution_id: ExecutionId,
+        /// The update name.
+        name: String,
+        /// The cap that the update would reach.
+        reason: crate::HistoryCapReason,
+    },
+
+    /// The update handler did not finish within its time limit (issue #2025).
+    ///
+    /// The limit is 5 seconds. A handler that awaits a durable command, such
+    /// as an activity or a timer, never finishes on this backend. The call
+    /// writes no event.
+    #[error("update {name:?} to execution {execution_id} did not finish within its time limit")]
+    UpdateTimedOut {
+        /// The execution the update targeted.
+        execution_id: ExecutionId,
+        /// The update name.
+        name: String,
     },
 
     /// A decision cycle failed the workflow **task**, not the run
     /// (issue #1797). The handler waited too long on a future that is not a
     /// Harvest future. Nothing was persisted and the run stays `RUNNING`, so
     /// a later drive retries it.
+    ///
+    /// `update` also returns this variant when the replay that rebuilds the
+    /// update handlers does not settle (issue #2025). Retry the update.
     #[error("workflow task for execution {execution_id} failed and can be retried: {details}")]
     TaskFailed {
         /// The execution whose task failed.
@@ -162,6 +255,9 @@ pub enum SqliteError {
     /// automatic block-with-backoff of the Postgres engine (issue #603) is a
     /// documented follow-up; a discard-and-surface is the minimal correct
     /// behavior for the single-writer runtime.
+    ///
+    /// `update` also returns this variant when the replay that rebuilds the
+    /// update handlers diverges (issue #2025). The call writes no event.
     #[error(
         "execution {execution_id} hit a replay non-determinism divergence \
          (discarded; resumable after a workflow code fix/rollback): {details}"
@@ -186,6 +282,9 @@ pub enum SqliteError {
     ///
     /// A genuine author `Err(...)` carries no panic flag and still fails terminally
     /// on the first strike, unchanged.
+    ///
+    /// `update` also returns this variant when the replay that rebuilds the
+    /// update handlers panics (issue #2025). That panic adds no strike.
     #[error(
         "execution {execution_id} handler panicked \
          (contained non-terminally; resumable under the panic budget): {details}"

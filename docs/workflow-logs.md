@@ -271,7 +271,7 @@ replays or what it computes.
 
 | Want | Use instead |
 |---|---|
-| A live tail of a running workflow's output | `GET /workflows/{id}/stream` (issue #791) |
+| A live tail of a running workflow's output | `GET /workflows/{id}/stream` (issue #791), or `GET /workflows/{id}/stream/durable` to resume after a disconnect (issue #1974) |
 | A single "what is it doing right now" status string | `ctx.set_current_details` (issues #473/#593) |
 | Engine machinery (activity scheduled/completed, timers) | `GET /workflows/{id}/history` |
 | Where the time went | `GET /workflows/{id}/timeline` (issue #739) |

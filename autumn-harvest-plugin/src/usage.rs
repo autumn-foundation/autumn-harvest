@@ -50,7 +50,8 @@ use crate::shard_fanout::{self, FanoutStatus, ShardObservation};
 /// place, alongside `workflow_count`'s and `workflow_reachability`'s reports.
 pub type UsageReportStatus = FanoutStatus;
 
-/// One merged usage record — exactly the fields named in issue #596's AC.
+/// One merged usage record: the fields of issue #596's AC, plus the agent
+/// cost ledger sums (issue #1996).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct UsageGroupRecord {
     pub group: String,
@@ -66,6 +67,18 @@ pub struct UsageGroupRecord {
     pub activity_executions: i64,
     pub activity_executions_failed: i64,
     pub activity_compute_seconds: f64,
+    /// Agent cost ledger rows in the window (issue #1996).
+    pub llm_calls: i64,
+    /// Sum of ledger input tokens.
+    pub llm_input_tokens: i64,
+    /// Sum of ledger output tokens.
+    pub llm_output_tokens: i64,
+    /// Sum of priced ledger costs, in millionths of a US dollar.
+    pub llm_cost_usd_micros: i64,
+    /// Ledger rows with no cost.
+    pub llm_unpriced_calls: i64,
+    /// Sum of ledger latencies, in milliseconds.
+    pub llm_latency_ms: i64,
 }
 
 /// The full `GET /admin/usage` response (issue #596).
@@ -225,6 +238,12 @@ pub fn build_usage_response(
                     activity_executions: 0,
                     activity_executions_failed: 0,
                     activity_compute_seconds: 0.0,
+                    llm_calls: 0,
+                    llm_input_tokens: 0,
+                    llm_output_tokens: 0,
+                    llm_cost_usd_micros: 0,
+                    llm_unpriced_calls: 0,
+                    llm_latency_ms: 0,
                 });
             entry.workflow_starts += row.workflow_starts;
             entry.completed += row.completed;
@@ -234,6 +253,20 @@ pub fn build_usage_response(
             entry.activity_executions += row.activity_executions;
             entry.activity_executions_failed += row.activity_executions_failed;
             entry.activity_compute_seconds += row.activity_compute_seconds;
+            // Issue #1996: each shard sum saturates in SQL, so the merge
+            // saturates too rather than wrap.
+            entry.llm_calls = entry.llm_calls.saturating_add(row.llm_calls);
+            entry.llm_input_tokens = entry.llm_input_tokens.saturating_add(row.llm_input_tokens);
+            entry.llm_output_tokens = entry
+                .llm_output_tokens
+                .saturating_add(row.llm_output_tokens);
+            entry.llm_cost_usd_micros = entry
+                .llm_cost_usd_micros
+                .saturating_add(row.llm_cost_usd_micros);
+            entry.llm_unpriced_calls = entry
+                .llm_unpriced_calls
+                .saturating_add(row.llm_unpriced_calls);
+            entry.llm_latency_ms = entry.llm_latency_ms.saturating_add(row.llm_latency_ms);
         }
     }
 
@@ -364,6 +397,31 @@ mod tests {
             activity_executions: 0,
             activity_executions_failed: 0,
             activity_compute_seconds: 0.0,
+            llm_calls: 0,
+            llm_input_tokens: 0,
+            llm_output_tokens: 0,
+            llm_cost_usd_micros: 0,
+            llm_unpriced_calls: 0,
+            llm_latency_ms: 0,
+        }
+    }
+
+    /// A row that carries only agent cost ledger figures (issue #1996).
+    fn llm_row(
+        group: &str,
+        calls: i64,
+        tokens: (i64, i64),
+        cost: i64,
+        unpriced: i64,
+    ) -> UsageShardRow {
+        UsageShardRow {
+            llm_calls: calls,
+            llm_input_tokens: tokens.0,
+            llm_output_tokens: tokens.1,
+            llm_cost_usd_micros: cost,
+            llm_unpriced_calls: unpriced,
+            llm_latency_ms: calls * 100,
+            ..row(group, 0, 0, 0)
         }
     }
 
@@ -750,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn record_serializes_exactly_the_nine_ac_fields() {
+    fn record_serializes_the_issue_596_fields_and_the_ledger_fields() {
         let record = UsageGroupRecord {
             group: "acme".to_string(),
             workflow_starts: 1,
@@ -761,6 +819,12 @@ mod tests {
             activity_executions: 2,
             activity_executions_failed: 0,
             activity_compute_seconds: 3.5,
+            llm_calls: 1,
+            llm_input_tokens: 10,
+            llm_output_tokens: 2,
+            llm_cost_usd_micros: 30,
+            llm_unpriced_calls: 0,
+            llm_latency_ms: 400,
         };
         let value = serde_json::to_value(&record).unwrap();
         let obj = value.as_object().unwrap();
@@ -768,6 +832,12 @@ mod tests {
         keys.sort_unstable();
         let mut expected = vec![
             "group",
+            "llm_calls",
+            "llm_input_tokens",
+            "llm_output_tokens",
+            "llm_cost_usd_micros",
+            "llm_unpriced_calls",
+            "llm_latency_ms",
             "workflow_starts",
             "completed",
             "failed",
@@ -779,6 +849,54 @@ mod tests {
         ];
         expected.sort_unstable();
         assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn merge_sums_the_llm_ledger_fields_across_shards() {
+        let response = build_usage_response(
+            at(0),
+            at(3600),
+            &UsageGroupBy::SearchAttr("tenant_id".to_string()),
+            vec![
+                obs(0, vec![llm_row("acme", 2, (1_000, 200), 5_000, 0)], None),
+                obs(1, vec![llm_row("acme", 1, (50, 5), 0, 1)], None),
+            ],
+            TEST_MAX_GROUPS,
+        )
+        .unwrap();
+        let value = serde_json::to_value(&response).unwrap();
+        let acme = &value["groups"][0];
+        assert_eq!(acme["group"], "acme");
+        assert_eq!(acme["llm_calls"], 3);
+        assert_eq!(acme["llm_input_tokens"], 1_050);
+        assert_eq!(acme["llm_output_tokens"], 205);
+        assert_eq!(acme["llm_cost_usd_micros"], 5_000);
+        assert_eq!(acme["llm_unpriced_calls"], 1);
+        assert_eq!(acme["llm_latency_ms"], 300);
+    }
+
+    #[test]
+    fn a_group_with_no_ledger_rows_reports_zero_llm_figures() {
+        let response = build_usage_response(
+            at(0),
+            at(3600),
+            &UsageGroupBy::WorkflowName,
+            vec![obs(0, vec![row("billing", 4, 4, 0)], None)],
+            TEST_MAX_GROUPS,
+        )
+        .unwrap();
+        let value = serde_json::to_value(&response).unwrap();
+        let billing = &value["groups"][0];
+        for field in [
+            "llm_calls",
+            "llm_input_tokens",
+            "llm_output_tokens",
+            "llm_cost_usd_micros",
+            "llm_unpriced_calls",
+            "llm_latency_ms",
+        ] {
+            assert_eq!(billing[field], 0, "{field}");
+        }
     }
 
     #[test]
