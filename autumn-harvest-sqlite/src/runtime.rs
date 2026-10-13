@@ -936,6 +936,9 @@ impl SqliteRuntime {
             }
         };
         tx.commit()?;
+        // A replaced prior closes, and its cascade can seal descendants
+        // (issue #2026).
+        self.forget_sealed_strikes()?;
         Ok(outcome)
     }
 
@@ -1112,8 +1115,8 @@ impl SqliteRuntime {
         let now = (self.now_fn)().timestamp_millis();
         seal_with_cancel_event(&tx, exec, TERMINATED_STATE, &reason, now)?;
         tx.commit()?;
-        self.workflow_panic_strikes.remove(&exec);
-        Ok(())
+        // The cascade can seal detached descendants too (issue #2026).
+        self.forget_sealed_strikes()
     }
 
     /// Returns `Ok` only when `exec` is a stored, non-terminal execution.
@@ -1353,6 +1356,7 @@ impl SqliteRuntime {
                 let now = now.timestamp_millis();
                 self.fail_for_history_cap(exec, &reason, now, now)?;
             }
+            self.forget_sealed_strikes()?;
             return Err(SqliteError::UpdateHistoryCapReached {
                 execution_id: exec,
                 name: name.to_string(),
@@ -4755,8 +4759,9 @@ mod feature_gate_tests {
 // The `#[workflow]` macro references the input param through its expansion.
 #[allow(clippy::used_underscore_binding, clippy::unused_async)]
 mod panic_strike_tests {
+    use autumn_harvest::ParentClosePolicy;
     use autumn_harvest::prelude::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{RunState, SqliteError, SqliteRuntime};
 
@@ -4792,6 +4797,45 @@ mod panic_strike_tests {
         assert!(
             rt.workflow_panic_strikes.is_empty(),
             "the sealed run is forgotten"
+        );
+    }
+
+    /// Spawns `always_panics` detached under `request_cancel`, then waits.
+    #[workflow]
+    async fn spawns_panicker(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+        ctx.spawn_child_workflow_detached_raw(
+            "always_panics",
+            json!(0),
+            ParentClosePolicy::RequestCancel,
+        )
+        .map_err(|e| e.to_string())?;
+        ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+    }
+
+    #[tokio::test]
+    async fn a_terminate_cascade_forgets_the_strikes_of_descendants() {
+        let mut rt = SqliteRuntime::open_in_memory().unwrap();
+        rt.register_workflow(&always_panics_info());
+        rt.register_workflow(&spawns_panicker_info());
+        let parent = rt.start_workflow("spawns_panicker", json!(0)).unwrap();
+        rt.run_until_blocked(parent).await.unwrap();
+        let child = rt
+            .load_history(parent)
+            .unwrap()
+            .iter()
+            .find_map(|e| match e {
+                WorkflowEvent::ChildWorkflowSpawnedDetached { child_id, .. } => Some(*child_id),
+                _ => None,
+            })
+            .unwrap();
+        rt.run_until_blocked(child).await.unwrap_err();
+        assert_eq!(rt.workflow_panic_strikes.get(&child), Some(&1));
+
+        rt.terminate(parent, "ops").unwrap();
+
+        assert!(
+            rt.workflow_panic_strikes.is_empty(),
+            "the cascade is forgotten"
         );
     }
 }
