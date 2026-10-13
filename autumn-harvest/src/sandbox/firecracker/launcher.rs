@@ -513,9 +513,9 @@ impl FirecrackerLauncher {
     ///
     /// # Errors
     ///
-    /// Returns [`SandboxError::Config`] without the jailer, and
-    /// [`SandboxError::Unavailable`] when a step fails. The golden microVM
-    /// is torn down on each path.
+    /// Returns [`SandboxError::Config`] without the jailer or with an API
+    /// timeout of zero, and [`SandboxError::Unavailable`] when a step fails.
+    /// The golden microVM is torn down on each path.
     pub async fn create_golden_snapshot(
         &self,
         out_dir: &Path,
@@ -526,6 +526,14 @@ impl FirecrackerLauncher {
                 "a golden snapshot needs the jailer, so each restore sees the same paths".into(),
             ));
         };
+        // The golden microVM boots through the API, whatever the boot method
+        // of this launcher is.
+        if self.config.api_timeout.is_zero() {
+            return Err(SandboxError::Config(
+                "a golden snapshot boots through the API, so it needs an API timeout above zero"
+                    .into(),
+            ));
+        }
         self.check_versions().await?;
         let id = new_vm_id(&self.owner);
         validate_vm_id(&id)?;
@@ -2524,6 +2532,26 @@ while True:
             std::fs::read(mine.join("cgroup.kill")).unwrap(),
             b"",
             "a live owner keeps its cgroups"
+        );
+        drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_golden_snapshot_needs_an_api_timeout() {
+        // A config-file launcher may have no API timeout, but a golden
+        // microVM always boots through the API.
+        let dir = temp_dir();
+        let mut config = jailed(&dir);
+        config.boot = BootMethod::ConfigFile;
+        config.api_timeout = Duration::ZERO;
+        let launcher = new_launcher(config).unwrap();
+        let result = launcher
+            .create_golden_snapshot(&dir.join("golden"), Duration::from_secs(5))
+            .await;
+        assert!(
+            matches!(result, Err(SandboxError::Config(ref m)) if m.contains("API timeout")),
+            "{result:?}"
         );
         drop(launcher);
         std::fs::remove_dir_all(dir).unwrap();
