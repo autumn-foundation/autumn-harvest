@@ -258,15 +258,34 @@ enum End {
 fn effective_run_as(options: &ExecOptions) -> Result<Option<(u32, u32)>, SandboxError> {
     // SAFETY: geteuid has no preconditions.
     let root = unsafe { libc::geteuid() } == 0;
+    let run_as = run_as_for(options, root)?;
+    if !root && !release_at_least(&kernel_release(), (5, 14)) {
+        return Err(SandboxError::Config(
+            "a non-root executor needs Linux 5.14 or later to bound the processes of a run".into(),
+        ));
+    }
+    Ok(run_as)
+}
+
+/// The uid and gid of the code for an executor that is `root` or not.
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Config`] for uid 0 or gid 0, and for `run_as` on
+/// a non-root executor.
+fn run_as_for(options: &ExecOptions, root: bool) -> Result<Option<(u32, u32)>, SandboxError> {
+    // A non-root executor runs the code in a user namespace with no uid
+    // map. There, setuid and setgid fail, so a run_as fails on every run.
+    if !root && options.run_as.is_some() {
+        return Err(SandboxError::Config(
+            "run_as needs a root executor; a non-root executor runs the code under its own uid"
+                .into(),
+        ));
+    }
     let run_as = options.run_as.or_else(|| root.then_some(NOBODY));
     if run_as.is_some_and(|(uid, gid)| uid == 0 || gid == 0) {
         return Err(SandboxError::Config(
             "the code must not run as uid 0 or gid 0".into(),
-        ));
-    }
-    if !root && !release_at_least(&kernel_release(), (5, 14)) {
-        return Err(SandboxError::Config(
-            "a non-root executor needs Linux 5.14 or later to bound the processes of a run".into(),
         ));
     }
     Ok(run_as)
@@ -1014,6 +1033,26 @@ mod tests {
             Err(SandboxError::Unavailable(m)) if m.contains("user namespace") => {}
             Err(e) => panic!("{e:?}"),
         }
+    }
+
+    #[test]
+    fn an_explicit_identity_needs_a_root_executor() {
+        let options = ExecOptions {
+            run_as: Some((54_321, 54_321)),
+            ..ExecOptions::default()
+        };
+        // A non-root executor runs the code in a user namespace with no
+        // uid map, so setuid and setgid fail on every run.
+        assert!(matches!(
+            run_as_for(&options, false),
+            Err(SandboxError::Config(ref m)) if m.contains("run_as")
+        ));
+        assert_eq!(run_as_for(&options, true).unwrap(), Some((54_321, 54_321)));
+        assert_eq!(run_as_for(&ExecOptions::default(), false).unwrap(), None);
+        assert_eq!(
+            run_as_for(&ExecOptions::default(), true).unwrap(),
+            Some(NOBODY)
+        );
     }
 
     #[test]

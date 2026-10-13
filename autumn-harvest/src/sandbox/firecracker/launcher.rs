@@ -210,6 +210,7 @@ impl FirecrackerLauncher {
     ///
     /// - the machine has no memory, or a vCPU count outside 1 to 32;
     /// - an API or snapshot boot has an API timeout of zero;
+    /// - an extra boot argument would replace a launcher argument;
     /// - a path is missing;
     /// - a snapshot boot has no jailer;
     /// - the jail uid or gid is 0, or this process is not root with a jail;
@@ -232,6 +233,7 @@ impl FirecrackerLauncher {
                 machine.vcpu_count, machine.mem_size_mib
             )));
         }
+        super::config::check_extra_boot_args(&config.image)?;
         if matches!(config.boot, BootMethod::Api | BootMethod::Snapshot(_))
             && config.api_timeout.is_zero()
         {

@@ -148,7 +148,7 @@ matters, because the microVM ends after one run.
 - A process that calls `setsid` leaves the group, and the executor cannot
   kill it.
 - On a root host, concurrent runs share the uid `nobody`, unless `run_as`
-  names another uid.
+  names another uid. A non-root worker refuses `run_as`.
 
 The process backend is the only backend that can give code a network. A
 runtime refuses a policy that allows the network on a backend without one.
@@ -232,7 +232,7 @@ let launcher = FirecrackerLauncher::new(LauncherConfig {
 })?;
 launcher.verify_host(PosturePolicy::Enforce).await?;
 launcher.sweep_stale();
-let backend = FirecrackerBackend::new(Arc::new(launcher), BackendSettings::default())
+let backend = FirecrackerBackend::new(Arc::new(launcher), BackendSettings::default())?
     .with_warm_pool(4);
 let runtime = SandboxRuntime::new(Arc::new(backend), SandboxPolicy::default())?;
 ```

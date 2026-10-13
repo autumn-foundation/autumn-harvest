@@ -64,13 +64,25 @@ impl std::fmt::Debug for FirecrackerBackend {
 
 impl FirecrackerBackend {
     /// A backend that launches a new microVM for each run.
-    #[must_use]
-    pub fn new(launcher: Arc<dyn VmLauncher>, settings: BackendSettings) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::Config`] for a boot timeout of zero.
+    pub fn new(
+        launcher: Arc<dyn VmLauncher>,
+        settings: BackendSettings,
+    ) -> Result<Self, SandboxError> {
+        // A zero boot timeout expires before any guest can answer.
+        if settings.boot_timeout.is_zero() {
+            return Err(SandboxError::Config(
+                "the boot timeout must be above zero".into(),
+            ));
+        }
+        Ok(Self {
             launcher,
             pool: None,
             settings,
-        }
+        })
     }
 
     /// Keep `size` booted microVMs ready. Call it inside a Tokio runtime.
@@ -259,10 +271,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_zero_boot_timeout_is_a_config_error() {
+        let settings = BackendSettings {
+            boot_timeout: Duration::ZERO,
+            ..fast()
+        };
+        let err = FirecrackerBackend::new(launcher(GuestMode::Serve), settings)
+            .expect_err("zero boot timeout");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("boot timeout")),
+            "{err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_run_boots_a_vm_runs_the_code_and_tears_the_vm_down() {
         let fake = launcher(GuestMode::Serve);
-        let backend = FirecrackerBackend::new(fake.clone(), fast());
+        let backend = FirecrackerBackend::new(fake.clone(), fast()).unwrap();
         let out = backend
             .execute(
                 job("echo in the vm; exit 7", 5_000),
@@ -279,7 +305,7 @@ mod tests {
     #[tokio::test]
     async fn each_run_gets_a_new_vm() {
         let fake = launcher(GuestMode::Serve);
-        let backend = FirecrackerBackend::new(fake.clone(), fast());
+        let backend = FirecrackerBackend::new(fake.clone(), fast()).unwrap();
         for _ in 0..3 {
             backend
                 .execute(job("true", 5_000), CancellationToken::new())
@@ -292,7 +318,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_backend_reports_microvm_isolation_and_the_image() {
-        let backend = FirecrackerBackend::new(launcher(GuestMode::Serve), fast());
+        let backend = FirecrackerBackend::new(launcher(GuestMode::Serve), fast()).unwrap();
         assert_eq!(backend.isolation(), IsolationLevel::MicroVm);
         assert_eq!(backend.image().as_deref(), Some("fake-image"));
     }
@@ -300,7 +326,7 @@ mod tests {
     #[tokio::test]
     async fn a_guest_that_never_listens_is_unavailable_at_the_boot_deadline() {
         let fake = launcher(GuestMode::NeverListen);
-        let backend = FirecrackerBackend::new(fake.clone(), fast());
+        let backend = FirecrackerBackend::new(fake.clone(), fast()).unwrap();
         let started = Instant::now();
         let err = backend
             .execute(job("true", 5_000), CancellationToken::new())
@@ -316,7 +342,7 @@ mod tests {
         let fake = launcher(GuestMode::Exited);
         let mut settings = fast();
         settings.boot_timeout = Duration::from_secs(30);
-        let backend = FirecrackerBackend::new(fake.clone(), settings);
+        let backend = FirecrackerBackend::new(fake.clone(), settings).unwrap();
         let started = Instant::now();
         let err = backend
             .execute(job("true", 5_000), CancellationToken::new())
@@ -333,7 +359,7 @@ mod tests {
     #[tokio::test]
     async fn a_garbage_answer_is_a_protocol_violation() {
         let fake = launcher(GuestMode::Garbage);
-        let backend = FirecrackerBackend::new(fake.clone(), fast());
+        let backend = FirecrackerBackend::new(fake.clone(), fast()).unwrap();
         let err = backend
             .execute(job("true", 5_000), CancellationToken::new())
             .await
@@ -345,7 +371,7 @@ mod tests {
     #[tokio::test]
     async fn a_guest_that_never_answers_is_unavailable_after_the_grace() {
         let fake = launcher(GuestMode::Hang);
-        let backend = FirecrackerBackend::new(fake.clone(), fast());
+        let backend = FirecrackerBackend::new(fake.clone(), fast()).unwrap();
         let started = Instant::now();
         let err = backend
             .execute(job("true", 100), CancellationToken::new())
@@ -359,7 +385,7 @@ mod tests {
     #[tokio::test]
     async fn a_cancel_during_the_run_tears_the_vm_down() {
         let fake = launcher(GuestMode::Serve);
-        let backend = FirecrackerBackend::new(fake.clone(), fast());
+        let backend = FirecrackerBackend::new(fake.clone(), fast()).unwrap();
         let cancel = CancellationToken::new();
         let trigger = cancel.clone();
         tokio::spawn(async move {
@@ -377,7 +403,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_the_run_tears_the_vm_down() {
         let fake = launcher(GuestMode::Serve);
-        let backend = Arc::new(FirecrackerBackend::new(fake.clone(), fast()));
+        let backend = Arc::new(FirecrackerBackend::new(fake.clone(), fast()).unwrap());
         let task = {
             let backend = Arc::clone(&backend);
             tokio::spawn(async move {
@@ -401,7 +427,7 @@ mod tests {
         let fake = launcher(GuestMode::Serve);
         fake.failures_left
             .store(1, std::sync::atomic::Ordering::SeqCst);
-        let backend = FirecrackerBackend::new(fake.clone(), fast());
+        let backend = FirecrackerBackend::new(fake.clone(), fast()).unwrap();
         let err = backend
             .execute(job("true", 5_000), CancellationToken::new())
             .await
@@ -412,7 +438,9 @@ mod tests {
     #[tokio::test]
     async fn a_warm_pool_serves_a_booted_vm_and_refills() {
         let fake = launcher(GuestMode::Serve);
-        let backend = FirecrackerBackend::new(fake.clone(), fast()).with_warm_pool(2);
+        let backend = FirecrackerBackend::new(fake.clone(), fast())
+            .unwrap()
+            .with_warm_pool(2);
         let pool = backend.warm_pool().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while pool.ready_len() < 2 {
@@ -436,7 +464,9 @@ mod tests {
     #[tokio::test]
     async fn a_warm_vm_that_died_in_the_pool_is_replaced() {
         let fake = launcher(GuestMode::Serve);
-        let backend = FirecrackerBackend::new(fake.clone(), fast()).with_warm_pool(1);
+        let backend = FirecrackerBackend::new(fake.clone(), fast())
+            .unwrap()
+            .with_warm_pool(1);
         let pool = backend.warm_pool().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while pool.ready_len() < 1 {
@@ -456,7 +486,7 @@ mod tests {
     #[tokio::test]
     async fn the_runtime_accepts_the_backend_under_the_default_policy() {
         let fake = launcher(GuestMode::Serve);
-        let backend = Arc::new(FirecrackerBackend::new(fake, fast()));
+        let backend = Arc::new(FirecrackerBackend::new(fake, fast()).unwrap());
         let runtime = SandboxRuntime::new(backend, SandboxPolicy::default()).unwrap();
         let out = runtime
             .run(

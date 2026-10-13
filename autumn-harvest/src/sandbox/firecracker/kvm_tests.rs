@@ -92,7 +92,8 @@ impl Harness {
             .verify_host(PosturePolicy::Report)
             .await
             .expect("a supported Firecracker");
-        let mut backend = FirecrackerBackend::new(launcher.clone(), BackendSettings::default());
+        let mut backend =
+            FirecrackerBackend::new(launcher.clone(), BackendSettings::default()).unwrap();
         if pool > 0 {
             backend = backend.with_warm_pool(pool);
         }

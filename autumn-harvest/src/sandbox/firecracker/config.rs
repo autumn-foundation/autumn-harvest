@@ -66,7 +66,8 @@ pub struct GuestImage {
     pub rootfs: PathBuf,
     /// The init path in the root file system.
     pub init: String,
-    /// More kernel arguments.
+    /// More kernel arguments. An argument may not use a key that the
+    /// launcher sets, such as `init` or `harvest.port`.
     pub extra_boot_args: Vec<String>,
     /// A name for the image, such as a digest. Outcomes report it.
     pub name: Option<String>,
@@ -192,7 +193,14 @@ impl VmPaths {
 ///   its vsock port.
 #[must_use]
 pub fn boot_args(image: &GuestImage, port: u32) -> String {
-    let mut args = vec![
+    let mut args = launcher_boot_args(image, port);
+    args.extend(image.extra_boot_args.iter().cloned());
+    args.join(" ")
+}
+
+/// The boot arguments that the launcher sets, before the extra ones.
+fn launcher_boot_args(image: &GuestImage, port: u32) -> Vec<String> {
+    vec![
         "reboot=k".to_owned(),
         "panic=1".to_owned(),
         "nomodule".to_owned(),
@@ -205,9 +213,31 @@ pub fn boot_args(image: &GuestImage, port: u32) -> String {
         "loglevel=1".to_owned(),
         format!("init={}", image.init),
         format!("harvest.port={port}"),
-    ];
-    args.extend(image.extra_boot_args.iter().cloned());
-    args.join(" ")
+    ]
+}
+
+/// Check that no extra boot argument replaces an argument of the launcher.
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Config`] that names the argument.
+pub fn check_extra_boot_args(image: &GuestImage) -> Result<(), SandboxError> {
+    // The kernel and the guest agent take the last value of a key. So an
+    // extra argument with a launcher key would win, for example the port.
+    let key = |arg: &str| arg.split_once('=').map_or(arg, |(key, _)| key).to_owned();
+    let reserved: Vec<String> = launcher_boot_args(image, 0)
+        .iter()
+        .map(|arg| key(arg))
+        .collect();
+    for arg in &image.extra_boot_args {
+        let name = key(arg);
+        if reserved.contains(&name) {
+            return Err(SandboxError::Config(format!(
+                "the extra boot argument {arg:?} would replace the launcher argument {name:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Build the VM document for `image` at `paths`.
@@ -353,6 +383,26 @@ mod tests {
         let mut image = image();
         image.extra_boot_args.push("harvest.debug=1".into());
         assert!(boot_args(&image, 52).ends_with(" harvest.debug=1"));
+    }
+
+    #[test]
+    fn an_extra_boot_arg_cannot_replace_a_launcher_arg() {
+        for reserved in [
+            "harvest.port=53",
+            "init=/bin/sh",
+            "8250.nr_uarts=1",
+            "panic=0",
+        ] {
+            let mut image = image();
+            image.extra_boot_args.push(reserved.into());
+            assert!(
+                matches!(check_extra_boot_args(&image), Err(SandboxError::Config(_))),
+                "{reserved}"
+            );
+        }
+        let mut image = image();
+        image.extra_boot_args.push("harvest.debug=1".into());
+        check_extra_boot_args(&image).unwrap();
     }
 
     #[test]
