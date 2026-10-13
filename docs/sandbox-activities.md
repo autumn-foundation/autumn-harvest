@@ -121,7 +121,9 @@ The process executor gives each run:
   cancel and drop;
 - close-on-exec on each inherited descriptor, and an empty signal mask;
 - `PR_SET_NO_NEW_PRIVS`;
-- rlimits for CPU time, data memory, file size, open files and core dumps;
+- rlimits for CPU time, data memory, file size, open files and core dumps.
+  The data rlimit is the memory limit plus 1 GiB, because V8 in Node 24
+  reserves about 600 MiB of address space at start;
 - an empty network namespace when the policy denies the network. When the
   host cannot create one, the run fails closed with `SandboxUnavailable`;
 - uid and gid `65534` when the worker runs as root. The executor refuses
@@ -214,7 +216,8 @@ The backend takes the guest port from the launcher.
 What each microVM gets:
 
 - one vCPU and 512 MiB by default, with `cpu.max`, `memory.max`,
-  `memory.swap.max` and `pids.max` on its cgroup;
+  `memory.swap.max` and `pids.max` on its cgroup. The microVM size bounds
+  the memory that the code uses;
 - a read-only root drive, a vsock device and a virtio-rng device;
 - no network device, no metadata service and no serial console;
 - the kernel arguments `reboot=k panic=1 8250.nr_uarts=0`;

@@ -13,7 +13,8 @@
 //! - every inherited descriptor above 2 marked close-on-exec;
 //! - an empty signal mask;
 //! - `PR_SET_NO_NEW_PRIVS`;
-//! - rlimits for CPU, data memory, file size, open files and core dumps;
+//! - rlimits for CPU, data memory, file size, open files and core dumps. The
+//!   data rlimit adds [`DATA_HEADROOM_BYTES`] for JIT reservations;
 //! - an empty network namespace when the plan denies the network;
 //! - a dedicated uid and gid when the executor runs as root.
 //!
@@ -54,6 +55,13 @@ pub const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// network namespace. No other setup step returns it, so the parent can name
 /// the cause.
 const NETNS_FAILED: i32 = libc::ENETDOWN;
+
+/// The data rlimit on top of the memory limit.
+///
+/// `RLIMIT_DATA` counts address space that a JIT runtime reserves but does
+/// not use. V8 in Node 24 reserves about 600 MiB before any code runs. So the
+/// limit stops a runaway heap, and the microVM size bounds the memory in use.
+pub const DATA_HEADROOM_BYTES: u64 = 1 << 30;
 
 /// The highest descriptor that the close-on-exec fallback marks.
 const CLOEXEC_FALLBACK_MAX_FD: i32 = 4096;
@@ -312,7 +320,7 @@ impl ChildSetup {
             root: unsafe { libc::geteuid() } == 0,
             run_as,
             cpu_seconds: limits.cpu_seconds,
-            data_bytes: limits.memory_bytes,
+            data_bytes: limits.memory_bytes.saturating_add(DATA_HEADROOM_BYTES),
             file_bytes: limits.max_file_bytes,
             open_files: libc::rlim_t::from(limits.max_open_files),
             processes: libc::rlim_t::from(limits.max_processes),
@@ -1072,6 +1080,15 @@ mod tests {
         let mut lines = out.stdout.lines();
         assert_eq!(lines.next(), Some("153"), "128 + SIGXFSZ");
         assert_eq!(lines.next().map(str::trim), Some("100000"));
+    }
+
+    #[tokio::test]
+    async fn the_data_limit_leaves_room_for_jit_reservations() {
+        // The default memory limit is 512 MiB. Node 24 reserves about 600
+        // MiB of data at start, so the limit adds the headroom.
+        let out = run(sh("ulimit -d")).await;
+        let kib = (512 * 1024 * 1024 + DATA_HEADROOM_BYTES) / 1024;
+        assert_eq!(out.stdout.trim(), kib.to_string());
     }
 
     #[tokio::test]

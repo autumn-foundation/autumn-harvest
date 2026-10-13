@@ -104,6 +104,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_runtime_runs_node_under_the_default_limits_when_the_host_has_it() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipped: node is not installed");
+            return;
+        }
+        let out = runtime()
+            .run(
+                &SandboxRequest::new("node", "console.log(6 * 7)"),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.status, RunStatus::Exited { code: 0 }, "{}", out.stderr);
+        assert_eq!(out.stdout, "42\n");
+    }
+
+    #[tokio::test]
     async fn a_python_traceback_is_an_outcome_not_a_failure() {
         if std::process::Command::new("python3")
             .arg("--version")
