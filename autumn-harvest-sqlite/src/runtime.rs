@@ -2106,7 +2106,14 @@ impl SqliteRuntime {
     ) -> SqliteResult<RunState> {
         let applied = match self.apply_commands(exec, ingest, history, commands, caps, now)? {
             Applied::Committed { produced } => produced,
-            Applied::CapReached(reason) => return self.fail_for_history_cap(exec, &reason, now),
+            Applied::CapReached(reason) => {
+                // Issue #2021: a pending cancel wins over a cap that its
+                // cleanup reaches. The seal adds only `WorkflowCancelled`.
+                if let Some(cancel) = cancel_reason {
+                    return self.seal_cancelled(exec, cancel, None, &[]);
+                }
+                return self.fail_for_history_cap(exec, &reason, now);
+            }
         };
         let settle_after_first_terminal = worker::activity_race_in_flight(history, commands);
         let drained = worker::drain_ready(

@@ -18,6 +18,8 @@ the agent daemon, could not stop a stuck run.
   request, so a body that ignores the request and keeps working cannot run
   forever. `harvest_executions.cancel_from_seq` stores the history length at
   the request.
+- A cleanup that reaches a history cap ends the run `CANCELLED`, not
+  `FAILED`.
 - A pending activity task, such as a retry in backoff, still runs. A repeat
   cancel keeps the first reason. The request survives a reopen.
 - `SqliteRuntime::terminate(exec, reason)` ends the run `TERMINATED` in one
@@ -68,6 +70,7 @@ covers:
 - a check before recorded steps and before a recorded timer;
 - a deadlock and a panic under a pending request;
 - a busy body that ignores the request and keeps running activities;
+- a cleanup that reaches the history cap;
 - a side effect of the returning cycle, and a second drive of a cancelled run;
 - a signal consumed after a request, and a cancel that wins over
   `continue_as_new`;

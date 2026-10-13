@@ -369,8 +369,9 @@ body does not run again, and `terminate` drops a pending cancel request.
   in `RunState::Cancelled` or `RunState::Terminated`.
 - `AllowDuplicateFailedOnly` replaces a `CANCELLED` prior, as on Postgres. A
   `TERMINATED` prior frees its `workflow_id` for every policy.
-- An unsupported command or a used-up panic budget during cleanup ends the
-  run `FAILED`, as without a cancel.
+- A cleanup that reaches a history cap ends the run `CANCELLED`, not
+  `FAILED`. An unsupported command or a used-up panic budget during cleanup
+  ends the run `FAILED`, as without a cancel.
 
 A cancelled or terminated history replays on the core `WorkflowReplayer` only
 when the body checks `is_cancelled()` before its next new command. A body

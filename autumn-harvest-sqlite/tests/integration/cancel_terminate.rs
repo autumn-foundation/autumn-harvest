@@ -765,6 +765,25 @@ async fn a_body_that_ignores_the_cancel_and_keeps_working_still_ends() {
 }
 
 #[tokio::test]
+async fn a_cleanup_that_reaches_the_history_cap_still_ends_cancelled() {
+    let (_dir, path) = temp_db();
+    let (mut rt, calls) = runtime(&path);
+    let exec = start_parked(&mut rt, "cleans_up").await;
+    let prefix = rt.load_history(exec).unwrap();
+    // The cleanup's `ActivityScheduled` would be the event at the cap.
+    rt.set_history_event_hard_cap(Some(u64::try_from(prefix.len() + 1).unwrap()));
+
+    rt.cancel(exec, "stop").unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+
+    assert!(
+        matches!(&state, RunState::Cancelled(reason) if reason == "stop"),
+        "a pending cancel wins over a cap that its cleanup reaches, got {state:?}"
+    );
+    assert_sealed_without_cleanup(&rt, &calls, exec, &prefix, "stop");
+}
+
+#[tokio::test]
 async fn a_repeat_cancel_keeps_the_first_reason() {
     let (_dir, path) = temp_db();
     let (mut rt, _calls) = runtime(&path);
