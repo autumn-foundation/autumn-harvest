@@ -192,15 +192,49 @@ impl VmPaths {
 ///   its vsock port.
 #[must_use]
 pub fn boot_args(image: &GuestImage, port: u32) -> String {
-    let _ = (image, port);
-    todo!("boot_args")
+    let mut args = vec![
+        "reboot=k".to_owned(),
+        "panic=1".to_owned(),
+        "nomodule".to_owned(),
+        "8250.nr_uarts=0".to_owned(),
+        "i8042.noaux".to_owned(),
+        "i8042.nomux".to_owned(),
+        "i8042.dumbkbd".to_owned(),
+        "swiotlb=noforce".to_owned(),
+        "quiet".to_owned(),
+        "loglevel=1".to_owned(),
+        format!("init={}", image.init),
+        format!("harvest.port={port}"),
+    ];
+    args.extend(image.extra_boot_args.iter().cloned());
+    args.join(" ")
 }
 
 /// Build the VM document for `image` at `paths`.
 #[must_use]
 pub fn vm_config(image: &GuestImage, machine: MachineSpec, paths: &VmPaths, port: u32) -> VmConfigFile {
-    let _ = (image, machine, paths, port);
-    todo!("vm_config")
+    VmConfigFile {
+        boot_source: BootSource {
+            kernel_image_path: paths.kernel.clone(),
+            boot_args: boot_args(image, port),
+        },
+        drives: vec![Drive {
+            drive_id: ROOT_DRIVE_ID.to_owned(),
+            path_on_host: paths.rootfs.clone(),
+            is_root_device: true,
+            is_read_only: true,
+        }],
+        machine_config: MachineConfig {
+            vcpu_count: machine.vcpu_count,
+            mem_size_mib: machine.mem_size_mib,
+            smt: false,
+        },
+        vsock: Vsock {
+            guest_cid: GUEST_CID,
+            uds_path: paths.vsock.clone(),
+        },
+        entropy: Entropy {},
+    }
 }
 
 /// Check a VM id: 1 to 64 bytes of ASCII letters, digits or `-`.
@@ -209,16 +243,35 @@ pub fn vm_config(image: &GuestImage, machine: MachineSpec, paths: &VmPaths, port
 ///
 /// Returns [`SandboxError::Config`] that names the id.
 pub fn validate_vm_id(id: &str) -> Result<(), SandboxError> {
-    let _ = id;
-    todo!("validate_vm_id")
+    let valid = (1..=64).contains(&id.len())
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    if valid {
+        Ok(())
+    } else {
+        Err(SandboxError::Config(format!(
+            "VM id {id:?} is not 1 to 64 bytes of ASCII letters, digits or '-'"
+        )))
+    }
 }
 
-/// A new VM id: [`VM_ID_PREFIX`], the owner tag, `-`, then 32 hex digits.
+/// A new VM id: [`VM_ID_PREFIX`], the owner tag, `-`, then 16 hex digits.
+///
+/// The id is short on purpose. It is part of each socket path, and a Unix
+/// socket path holds at most [`MAX_SOCKET_PATH_BYTES`] bytes.
 #[must_use]
 pub fn new_vm_id(owner: &str) -> String {
-    let _ = owner;
-    todo!("new_vm_id")
+    let random = uuid::Uuid::new_v4().simple().to_string();
+    format!("{VM_ID_PREFIX}{owner}-{}", &random[..VM_ID_RANDOM_HEX])
 }
+
+/// The hex digits of the random part of a VM id: 64 bits.
+pub const VM_ID_RANDOM_HEX: usize = 16;
+
+/// The length of an owner tag in a VM id.
+pub const OWNER_TAG_HEX: usize = 8;
+
+/// The longest path that a Unix socket address holds, without the NUL.
+pub const MAX_SOCKET_PATH_BYTES: usize = 107;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

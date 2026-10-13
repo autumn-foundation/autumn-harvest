@@ -1,11 +1,13 @@
 //! The Firecracker backend: one single-use microVM per run.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
 use super::config::GUEST_AGENT_PORT;
+use super::vsock::connect_guest;
+use crate::sandbox::guest::request_run;
 use super::launcher::{LaunchedVm, VmLauncher};
 use super::pool::WarmPool;
 use crate::sandbox::error::SandboxError;
@@ -70,9 +72,16 @@ impl FirecrackerBackend {
 
     /// Keep `size` booted microVMs ready. Call it inside a Tokio runtime.
     #[must_use]
-    pub fn with_warm_pool(self, size: usize) -> Self {
-        let _ = size;
-        todo!("FirecrackerBackend::with_warm_pool")
+    pub fn with_warm_pool(mut self, size: usize) -> Self {
+        if size > 0 {
+            self.pool = Some(WarmPool::start(
+                Arc::clone(&self.launcher),
+                size,
+                self.settings.guest_port,
+                self.settings.boot_timeout,
+            ));
+        }
+        self
     }
 
     /// The warm pool, when the backend has one.
@@ -89,7 +98,43 @@ impl FirecrackerBackend {
 
     /// Stop the warm pool and tear down its microVMs.
     pub async fn shutdown(&self) {
-        todo!("FirecrackerBackend::shutdown")
+        if let Some(pool) = &self.pool {
+            pool.shutdown().await;
+        }
+    }
+
+    /// Run `job` on `vm`: connect over vsock, send the plan, read the
+    /// outcome.
+    async fn run_on(
+        &self,
+        vm: &mut Box<dyn LaunchedVm>,
+        job: &SandboxJob,
+        cancel: &CancellationToken,
+    ) -> Result<SandboxOutcome, SandboxError> {
+        let path = vm.vsock_path().to_path_buf();
+        let deadline = Instant::now() + self.settings.boot_timeout;
+        let mut exited = || vm.exit_status();
+        let mut stream = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(SandboxError::Cancelled),
+            stream = connect_guest(&path, self.settings.guest_port, deadline, &mut exited) => stream?,
+        };
+        let budget = job
+            .plan
+            .limits
+            .wall_clock()
+            .saturating_add(self.settings.response_grace);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(SandboxError::Cancelled),
+            outcome = tokio::time::timeout(budget, request_run(&mut stream, job)) => {
+                outcome.unwrap_or_else(|_| {
+                    Err(SandboxError::Unavailable(format!(
+                        "the guest sent no outcome within {budget:?}"
+                    )))
+                })
+            }
+        }
     }
 }
 
@@ -107,8 +152,49 @@ impl SandboxBackend for FirecrackerBackend {
         job: SandboxJob,
         cancel: CancellationToken,
     ) -> BoxFuture<'_, Result<SandboxOutcome, SandboxError>> {
-        let _ = (job, cancel, std::marker::PhantomData::<Box<dyn LaunchedVm>>);
-        todo!("FirecrackerBackend::execute")
+        Box::pin(async move {
+            let vm = match self.pool.as_ref().and_then(WarmPool::take) {
+                Some(vm) => vm,
+                None => tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return Err(SandboxError::Cancelled),
+                    vm = self.launcher.launch() => vm?,
+                },
+            };
+            // Every path below ends in one teardown. A dropped future tears
+            // the microVM down through the guard.
+            let mut guard = VmGuard(Some(vm));
+            let result = match guard.0.as_mut() {
+                Some(vm) => self.run_on(vm, &job, &cancel).await,
+                None => Err(SandboxError::Unavailable("the microVM is gone".into())),
+            };
+            guard.shutdown().await;
+            result
+        })
+    }
+}
+
+/// Tears a microVM down on every path, the dropped future included.
+struct VmGuard(Option<Box<dyn LaunchedVm>>);
+
+impl VmGuard {
+    async fn shutdown(&mut self) {
+        if let Some(vm) = self.0.take() {
+            vm.shutdown().await;
+        }
+    }
+}
+
+impl Drop for VmGuard {
+    fn drop(&mut self) {
+        let Some(vm) = self.0.take() else {
+            return;
+        };
+        // Run the async teardown when a runtime exists. Otherwise the drop
+        // of the microVM kills it at once.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(vm.shutdown());
+        }
     }
 }
 

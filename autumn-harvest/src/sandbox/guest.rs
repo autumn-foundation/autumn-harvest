@@ -5,8 +5,6 @@
 //! over the stream, so tests use an in-memory pipe and the microVM uses
 //! vsock.
 
-use std::sync::Arc;
-
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 
@@ -50,9 +48,24 @@ pub enum Served {
 /// envelope and the other fields fit in 64 KiB.
 #[must_use]
 pub fn max_outcome_frame_bytes(plan: &ExecPlan) -> usize {
-    let _ = (plan, TRUNCATION_MARKER);
-    todo!("max_outcome_frame_bytes")
+    let kept = usize::try_from(plan.limits.max_output_bytes).unwrap_or(usize::MAX);
+    let stream = kept
+        .saturating_mul(3)
+        .saturating_add(TRUNCATION_MARKER.len())
+        .saturating_mul(6);
+    let files = usize::try_from(plan.max_output_files_total_bytes)
+        .unwrap_or(usize::MAX)
+        .div_ceil(3)
+        .saturating_mul(4);
+    stream
+        .saturating_mul(2)
+        .saturating_add(files)
+        .saturating_add(FRAME_OVERHEAD_BYTES)
+        .min(MAX_FRAME_BYTES)
 }
+
+/// Room for the envelope, the run id, the paths and the other fields.
+const FRAME_OVERHEAD_BYTES: usize = 64 * 1024;
 
 /// Serve one connection: answer a ping, or run one plan.
 ///
@@ -69,8 +82,55 @@ pub async fn serve_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let _ = (stream, executor, reseed, Arc::new(()));
-    todo!("serve_connection")
+    let message: HostMessage = read_message(stream, MAX_FRAME_BYTES).await?;
+    let run = match message {
+        HostMessage::Ping => {
+            write_message(stream, GuestMessage::Pong, MAX_CONTROL_FRAME_BYTES).await?;
+            return Ok(Served::Ping);
+        }
+        HostMessage::Run(run) => run,
+    };
+    let reply = match run_plan(&run, executor, reseed).await {
+        Ok(outcome) => GuestMessage::Outcome(OutcomeMessage {
+            run_id: run.run_id,
+            outcome,
+        }),
+        Err((kind, message)) => GuestMessage::Error(GuestErrorMessage {
+            run_id: run.run_id,
+            kind,
+            message,
+        }),
+    };
+    write_message(stream, reply, MAX_FRAME_BYTES).await?;
+    Ok(Served::Run)
+}
+
+/// Check the run, reseed the random pool, then run the plan.
+async fn run_plan(
+    run: &RunMessage,
+    executor: &dyn PlanExecutor,
+    reseed: &ReseedFn,
+) -> Result<SandboxOutcome, (GuestErrorKind, String)> {
+    let entropy = parse_entropy(&run.entropy).map_err(|e| (GuestErrorKind::InvalidPlan, e))?;
+    run.plan
+        .validate()
+        .map_err(|e| (GuestErrorKind::InvalidPlan, e.to_string()))?;
+    // The code must not run on cloned random state, so a failed reseed
+    // stops the run.
+    reseed(&entropy).map_err(|e| {
+        (
+            GuestErrorKind::Internal,
+            format!("could not reseed the random pool: {e}"),
+        )
+    })?;
+    let cancel = CancellationToken::new();
+    executor
+        .execute(&run.plan, &cancel)
+        .await
+        .map_err(|e| match e {
+            SandboxError::Denied(message) => (GuestErrorKind::SpawnFailed, message),
+            other => (GuestErrorKind::Internal, other.to_string()),
+        })
 }
 
 /// Parse 64 lowercase hex characters into 32 bytes.
@@ -79,15 +139,30 @@ where
 ///
 /// Returns a message for any other input.
 pub fn parse_entropy(hex: &str) -> Result<[u8; 32], String> {
-    let _ = hex;
-    todo!("parse_entropy")
+    let digits = hex.as_bytes();
+    if digits.len() != 64 {
+        return Err(format!("entropy must be 64 hex digits, got {}", digits.len()));
+    }
+    let nibble = |c: u8| match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        _ => Err("entropy must be lowercase hex".to_owned()),
+    };
+    let mut bytes = [0u8; 32];
+    for (byte, pair) in bytes.iter_mut().zip(digits.chunks_exact(2)) {
+        *byte = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    }
+    Ok(bytes)
 }
 
 /// Format 32 bytes as 64 lowercase hex characters.
 #[must_use]
 pub fn format_entropy(bytes: &[u8; 32]) -> String {
-    let _ = bytes;
-    todo!("format_entropy")
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::with_capacity(64), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
 }
 
 /// Ask the guest agent whether it is ready.
@@ -100,8 +175,16 @@ pub async fn ping<S>(stream: &mut S) -> Result<(), SandboxError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let _ = (stream, MAX_CONTROL_FRAME_BYTES);
-    todo!("ping")
+    write_message(stream, HostMessage::Ping, MAX_CONTROL_FRAME_BYTES)
+        .await
+        .map_err(|e| SandboxError::Unavailable(format!("could not ping the guest: {e}")))?;
+    match read_message::<_, GuestMessage>(stream, MAX_CONTROL_FRAME_BYTES).await {
+        Ok(GuestMessage::Pong) => Ok(()),
+        Ok(other) => Err(SandboxError::Unavailable(format!(
+            "the guest answered a ping with {other:?}"
+        ))),
+        Err(e) => Err(SandboxError::Unavailable(format!("no pong from the guest: {e}"))),
+    }
 }
 
 /// Send `job` to the guest and read its outcome.
@@ -117,28 +200,54 @@ pub async fn request_run<S>(stream: &mut S, job: &SandboxJob) -> Result<SandboxO
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let _ = (
-        stream,
-        job,
-        MAX_FRAME_BYTES,
-        std::marker::PhantomData::<(
-            GuestErrorKind,
-            GuestErrorMessage,
-            GuestMessage,
-            HostMessage,
-            OutcomeMessage,
-            RunMessage,
-        )>,
-    );
-    let _ = read_message::<tokio::io::Empty, HostMessage>;
-    let _ = write_message::<tokio::io::Sink, HostMessage>;
-    todo!("request_run")
+    let run = HostMessage::Run(RunMessage {
+        run_id: job.run_id.clone(),
+        entropy: format_entropy(&job.entropy),
+        plan: job.plan.clone(),
+    });
+    write_message(stream, run, MAX_FRAME_BYTES)
+        .await
+        .map_err(|e| SandboxError::Unavailable(format!("could not send the run: {e}")))?;
+    let reply: GuestMessage = read_message(stream, max_outcome_frame_bytes(&job.plan))
+        .await
+        .map_err(|e| match e {
+            FrameError::Closed | FrameError::Io(_) => SandboxError::Unavailable(format!(
+                "the guest closed the connection without an outcome: {e}"
+            )),
+            FrameError::TooLarge { .. } | FrameError::Malformed(_) => {
+                SandboxError::Protocol(format!("bad outcome frame: {e}"))
+            }
+        })?;
+    match reply {
+        GuestMessage::Outcome(message) if message.run_id == job.run_id => Ok(message.outcome),
+        GuestMessage::Outcome(message) => Err(SandboxError::Protocol(format!(
+            "the outcome has run id {:?}, not {:?}",
+            message.run_id, job.run_id
+        ))),
+        GuestMessage::Error(error) if error.run_id != job.run_id => Err(SandboxError::Protocol(
+            format!("the error has run id {:?}, not {:?}", error.run_id, job.run_id),
+        )),
+        GuestMessage::Error(error) => Err(match error.kind {
+            GuestErrorKind::InvalidPlan => SandboxError::Protocol(format!(
+                "the guest refused the plan: {}",
+                error.message
+            )),
+            GuestErrorKind::SpawnFailed => SandboxError::Denied(error.message),
+            GuestErrorKind::Internal => SandboxError::Unavailable(format!(
+                "the guest failed: {}",
+                error.message
+            )),
+        }),
+        GuestMessage::Pong => Err(SandboxError::Protocol(
+            "the guest answered a run with a pong".into(),
+        )),
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::sandbox::outcome::RunStatus;

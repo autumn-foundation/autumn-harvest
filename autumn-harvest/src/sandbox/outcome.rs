@@ -11,6 +11,9 @@ use super::error::SandboxError;
 use super::policy::IsolationLevel;
 use super::request::ExecPlan;
 
+/// The longest reason of a skipped output, in bytes.
+pub const MAX_SKIP_REASON_BYTES: usize = 256;
+
 /// How the code ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -100,8 +103,61 @@ impl SandboxOutcome {
     ///
     /// Returns [`SandboxError::Protocol`] for the first broken bound.
     pub fn check_bounds(&self, plan: &ExecPlan) -> Result<(), SandboxError> {
-        let _ = plan;
-        todo!("SandboxOutcome::check_bounds")
+        let violation = |what: String| Err(SandboxError::Protocol(what));
+        // Lossy decoding turns one invalid byte into three bytes of U+FFFD,
+        // and the capture adds one truncation marker.
+        let kept = usize::try_from(plan.limits.max_output_bytes).unwrap_or(usize::MAX);
+        let stream_cap = kept
+            .saturating_mul(3)
+            .saturating_add(super::capture::TRUNCATION_MARKER.len());
+        for (name, text) in [("stdout", &self.stdout), ("stderr", &self.stderr)] {
+            if text.len() > stream_cap {
+                return violation(format!(
+                    "{name} holds {} bytes, over the bound of {stream_cap}",
+                    text.len()
+                ));
+            }
+            if text.contains('\0') {
+                return violation(format!("{name} holds a NUL byte"));
+            }
+        }
+        let per_file = usize::try_from(plan.max_output_file_bytes).unwrap_or(usize::MAX);
+        let total_cap = usize::try_from(plan.max_output_files_total_bytes).unwrap_or(usize::MAX);
+        let mut total = 0usize;
+        let mut seen = std::collections::BTreeSet::new();
+        for output in &self.outputs {
+            if !plan.outputs.contains(&output.path) {
+                return violation(format!("output {:?} was not asked for", output.path));
+            }
+            if !seen.insert(output.path.as_str()) {
+                return violation(format!("output {:?} appears twice", output.path));
+            }
+            if output.content.len() > per_file {
+                return violation(format!(
+                    "output {:?} holds {} bytes, over the bound of {per_file}",
+                    output.path,
+                    output.content.len()
+                ));
+            }
+            total = total.saturating_add(output.content.len());
+        }
+        if total > total_cap {
+            return violation(format!(
+                "outputs hold {total} bytes, over the bound of {total_cap}"
+            ));
+        }
+        for skipped in &self.skipped_outputs {
+            if !plan.outputs.contains(&skipped.path) {
+                return violation(format!("skipped output {:?} was not asked for", skipped.path));
+            }
+            if skipped.reason.len() > MAX_SKIP_REASON_BYTES {
+                return violation(format!("skipped output {:?} has a long reason", skipped.path));
+            }
+        }
+        if self.outputs.len() + self.skipped_outputs.len() > plan.outputs.len() {
+            return violation("more outputs than the plan asked for".into());
+        }
+        Ok(())
     }
 }
 

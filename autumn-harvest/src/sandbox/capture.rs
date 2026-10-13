@@ -36,14 +36,32 @@ impl StreamCapture {
     /// A capture that keeps at most `cap` bytes.
     #[must_use]
     pub fn new(cap: usize) -> Self {
-        let _ = cap;
-        todo!("StreamCapture::new")
+        let head_cap = cap.div_ceil(2);
+        Self {
+            head: Vec::new(),
+            tail: VecDeque::new(),
+            head_cap,
+            tail_cap: cap - head_cap,
+            total: 0,
+        }
     }
 
     /// Add bytes from the stream.
     pub fn push(&mut self, bytes: &[u8]) {
-        let _ = bytes;
-        todo!("StreamCapture::push")
+        self.total = self
+            .total
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        let room = self.head_cap - self.head.len();
+        let (to_head, rest) = bytes.split_at(room.min(bytes.len()));
+        self.head.extend_from_slice(to_head);
+        if self.tail_cap == 0 {
+            return;
+        }
+        // Keep only the last `tail_cap` bytes of the rest.
+        let rest = &rest[rest.len().saturating_sub(self.tail_cap)..];
+        let overflow = (self.tail.len() + rest.len()).saturating_sub(self.tail_cap);
+        self.tail.drain(..overflow);
+        self.tail.extend(rest);
     }
 
     /// All bytes that the stream carried so far.
@@ -55,8 +73,32 @@ impl StreamCapture {
     /// End the capture and decode the kept bytes.
     #[must_use]
     pub fn finish(self) -> CapturedText {
-        todo!("StreamCapture::finish")
+        let kept = self.head.len() + self.tail.len();
+        let truncated = u64::try_from(kept).unwrap_or(u64::MAX) < self.total;
+        let mut head = self.head;
+        let text = if truncated {
+            let tail: Vec<u8> = self.tail.into_iter().collect();
+            format!("{}{TRUNCATION_MARKER}{}", decode(&head), decode(&tail))
+        } else {
+            // Nothing was dropped, so decode one buffer. Two decodes could
+            // split a multi-byte character at the head and tail boundary.
+            head.extend(self.tail);
+            decode(&head)
+        };
+        CapturedText {
+            text,
+            bytes: self.total,
+            truncated,
+        }
     }
+}
+
+/// Decode bytes as lossy UTF-8, and replace each NUL with U+FFFD.
+///
+/// Postgres `jsonb` rejects `\u0000`, so a NUL in a recorded outcome would
+/// fail the result insert.
+fn decode(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).replace('\0', "\u{fffd}")
 }
 
 /// Read `reader` to its end into a capture of `cap` bytes.
@@ -138,6 +180,15 @@ mod tests {
         assert_eq!(cap.total(), 97_000);
         let text = cap.finish();
         assert!(text.text.len() <= 10 + TRUNCATION_MARKER.len());
+    }
+
+    #[test]
+    fn a_character_across_the_head_and_tail_boundary_survives() {
+        let mut cap = StreamCapture::new(4);
+        cap.push("a\u{e9}!".as_bytes());
+        let text = cap.finish();
+        assert_eq!(text.text, "a\u{e9}!");
+        assert!(!text.truncated);
     }
 
     #[test]

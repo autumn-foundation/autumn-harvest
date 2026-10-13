@@ -1,5 +1,6 @@
 //! The sandbox runtime: the policy, a backend and a concurrency bound.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use super::error::SandboxError;
 use super::outcome::SandboxOutcome;
 use super::policy::{IsolationLevel, SandboxPolicy};
-use super::request::{ExecPlan, SandboxRequest};
+use super::request::{ExecPlan, RESERVED_ENV_PREFIX, SandboxRequest};
 
 /// A boxed, sendable future.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -22,6 +23,9 @@ pub const DEFAULT_MAX_CONCURRENT: usize = 8;
 /// The time that a backend gets on top of the wall-clock limit of a run, for
 /// boot, setup and teardown. The runtime stops waiting after it.
 pub const DEFAULT_BACKEND_OVERHEAD: Duration = Duration::from_secs(30);
+
+/// The time that a backend gets to tear down after the runtime cancels it.
+pub const CLEANUP_GRACE: Duration = Duration::from_secs(10);
 
 /// One run for a backend: a checked plan, a run id and fresh entropy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,15 +86,30 @@ impl SandboxRuntime {
         backend: Arc<dyn SandboxBackend>,
         policy: SandboxPolicy,
     ) -> Result<Self, SandboxError> {
-        let _ = (backend, policy);
-        todo!("SandboxRuntime::new")
+        policy.validate()?;
+        let isolation = backend.isolation();
+        if isolation < policy.min_isolation {
+            return Err(SandboxError::Config(format!(
+                "the backend isolation {isolation} is weaker than the policy minimum {}",
+                policy.min_isolation
+            )));
+        }
+        Ok(Self {
+            backend,
+            policy: Arc::new(policy),
+            permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT)),
+            max_concurrent: DEFAULT_MAX_CONCURRENT,
+            overhead: DEFAULT_BACKEND_OVERHEAD,
+        })
     }
 
     /// Bound the runs at one time. A value of 0 becomes 1.
     #[must_use]
-    pub fn with_max_concurrent(self, max_concurrent: usize) -> Self {
-        let _ = max_concurrent;
-        todo!("SandboxRuntime::with_max_concurrent")
+    pub fn with_max_concurrent(mut self, max_concurrent: usize) -> Self {
+        let max_concurrent = max_concurrent.max(1);
+        self.permits = Arc::new(Semaphore::new(max_concurrent));
+        self.max_concurrent = max_concurrent;
+        self
     }
 
     /// Set the time that the backend gets on top of the wall-clock limit.
@@ -137,8 +156,67 @@ impl SandboxRuntime {
         request: &SandboxRequest,
         cancel: &CancellationToken,
     ) -> Result<SandboxOutcome, SandboxError> {
-        let _ = (request, cancel);
-        todo!("SandboxRuntime::run")
+        self.run_with_engine_env(request, BTreeMap::new(), cancel)
+            .await
+    }
+
+    /// Like [`Self::run`], and add engine variables to the environment of
+    /// the code after the request check.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::run`]. A variable name without the `HARVEST_`
+    /// prefix is a [`SandboxError::Config`].
+    pub async fn run_with_engine_env(
+        &self,
+        request: &SandboxRequest,
+        engine_env: BTreeMap<String, String>,
+        cancel: &CancellationToken,
+    ) -> Result<SandboxOutcome, SandboxError> {
+        let mut plan = self.policy.plan(request)?;
+        for (name, value) in engine_env {
+            if !name.starts_with(RESERVED_ENV_PREFIX) {
+                return Err(SandboxError::Config(format!(
+                    "engine variable {name:?} must start with {RESERVED_ENV_PREFIX}"
+                )));
+            }
+            plan.env.insert(name, value);
+        }
+        plan.validate()?;
+        let _permit = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(SandboxError::Cancelled),
+            permit = Arc::clone(&self.permits).acquire_owned() => permit.map_err(|_| {
+                SandboxError::Unavailable("the sandbox runtime is closed".into())
+            })?,
+        };
+        let mut entropy = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut entropy);
+        let job = SandboxJob {
+            run_id: uuid::Uuid::new_v4().to_string(),
+            entropy,
+            plan: plan.clone(),
+        };
+        let backend_cancel = cancel.child_token();
+        let budget = plan.limits.wall_clock().saturating_add(self.overhead);
+        let execute = self.backend.execute(job, backend_cancel.clone());
+        tokio::pin!(execute);
+        let result = tokio::select! {
+            result = &mut execute => result,
+            () = tokio::time::sleep(budget) => {
+                // Cancel the backend, and give it time to tear down.
+                backend_cancel.cancel();
+                let _ = tokio::time::timeout(CLEANUP_GRACE, &mut execute).await;
+                Err(SandboxError::Unavailable(format!(
+                    "the backend did not finish within {budget:?}"
+                )))
+            }
+        };
+        let mut outcome = result?;
+        outcome.check_bounds(&plan)?;
+        outcome.isolation = self.backend.isolation();
+        outcome.image = self.backend.image();
+        Ok(outcome)
     }
 }
 

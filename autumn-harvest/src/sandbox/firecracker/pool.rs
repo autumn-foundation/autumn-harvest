@@ -7,10 +7,17 @@
 //! delay that doubles up to [`MAX_REFILL_BACKOFF`].
 
 use std::collections::VecDeque;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
+
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 use super::launcher::{LaunchedVm, VmLauncher};
+use super::vsock::connect_guest;
+use crate::sandbox::error::SandboxError;
+use crate::sandbox::guest::ping;
 
 /// The first wait after a failed boot.
 pub const FIRST_REFILL_BACKOFF: Duration = Duration::from_millis(50);
@@ -24,12 +31,17 @@ pub struct WarmPool {
 }
 
 struct PoolInner {
-    ready: std::sync::Mutex<VecDeque<Box<dyn LaunchedVm>>>,
+    ready: Mutex<VecDeque<Box<dyn LaunchedVm>>>,
+    wake: Notify,
+    closed: AtomicBool,
+    task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for WarmPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WarmPool").finish_non_exhaustive()
+        f.debug_struct("WarmPool")
+            .field("ready", &self.ready_len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -44,32 +56,159 @@ impl WarmPool {
         port: u32,
         boot_timeout: Duration,
     ) -> Self {
-        let _ = (launcher, target, port, boot_timeout);
-        todo!("WarmPool::start")
+        let inner = Arc::new(PoolInner {
+            ready: Mutex::new(VecDeque::with_capacity(target)),
+            wake: Notify::new(),
+            closed: AtomicBool::new(false),
+            task: Mutex::new(None),
+        });
+        let task = tokio::spawn(refill(
+            Arc::clone(&inner),
+            launcher,
+            target,
+            port,
+            boot_timeout,
+        ));
+        *inner.task.lock().unwrap_or_else(PoisonError::into_inner) = Some(task);
+        Self { inner }
     }
 
     /// Take a ready microVM, if one exists. The pool then boots a new one.
     #[must_use]
     pub fn take(&self) -> Option<Box<dyn LaunchedVm>> {
-        let _ = &self.inner;
-        todo!("WarmPool::take")
+        let vm = self
+            .inner
+            .ready
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front();
+        if vm.is_some() {
+            self.inner.wake.notify_one();
+        }
+        vm
     }
 
     /// The number of ready microVMs.
     #[must_use]
     pub fn ready_len(&self) -> usize {
-        todo!("WarmPool::ready_len")
+        self.inner
+            .ready
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     /// Stop refilling and tear down each ready microVM.
     pub async fn shutdown(&self) {
-        todo!("WarmPool::shutdown")
+        self.inner.closed.store(true, Ordering::SeqCst);
+        if let Some(task) = self
+            .inner
+            .task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            task.abort();
+        }
+        let ready: Vec<_> = self
+            .inner
+            .ready
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain(..)
+            .collect();
+        for vm in ready {
+            vm.shutdown().await;
+        }
     }
 }
 
 impl Drop for WarmPool {
     fn drop(&mut self) {
-        let _ = &self.inner;
+        self.inner.closed.store(true, Ordering::SeqCst);
+        if let Some(task) = self
+            .inner
+            .task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            task.abort();
+        }
+        // Dropping a microVM kills it at once; each one cleans the rest up
+        // in its own drop.
+        self.inner
+            .ready
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+}
+
+/// Keep the pool at `target` ready microVMs until it closes.
+async fn refill(
+    inner: Arc<PoolInner>,
+    launcher: Arc<dyn VmLauncher>,
+    target: usize,
+    port: u32,
+    boot_timeout: Duration,
+) {
+    let mut backoff = FIRST_REFILL_BACKOFF;
+    loop {
+        if inner.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        let ready = inner
+            .ready
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        if ready >= target {
+            inner.wake.notified().await;
+            continue;
+        }
+        match launch_ready(launcher.as_ref(), port, boot_timeout).await {
+            Ok(vm) => {
+                backoff = FIRST_REFILL_BACKOFF;
+                if inner.closed.load(Ordering::SeqCst) {
+                    vm.shutdown().await;
+                    return;
+                }
+                inner
+                    .ready
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push_back(vm);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "the sandbox warm pool could not boot a microVM");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_REFILL_BACKOFF);
+            }
+        }
+    }
+}
+
+/// Launch a microVM and wait until its guest agent answers a ping.
+async fn launch_ready(
+    launcher: &dyn VmLauncher,
+    port: u32,
+    boot_timeout: Duration,
+) -> Result<Box<dyn LaunchedVm>, SandboxError> {
+    let mut vm = launcher.launch().await?;
+    let path = vm.vsock_path().to_path_buf();
+    let deadline = Instant::now() + boot_timeout;
+    let ready = async {
+        let mut stream = connect_guest(&path, port, deadline, &mut || vm.exit_status()).await?;
+        ping(&mut stream).await
+    }
+    .await;
+    match ready {
+        Ok(()) => Ok(vm),
+        Err(e) => {
+            vm.shutdown().await;
+            Err(e)
+        }
     }
 }
 

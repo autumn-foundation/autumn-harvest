@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 use super::launcher::{LaunchedVm, VmLauncher};
 use crate::sandbox::error::SandboxError;
 use crate::sandbox::guest::{PlanExecutor, Served, serve_connection};
+use crate::sandbox::protocol::{HostMessage, MAX_FRAME_BYTES, read_message};
 use crate::sandbox::runtime::BoxFuture;
 
 /// How a fake guest behaves.
@@ -46,7 +47,7 @@ pub(crate) struct FakeLauncher {
 
 impl FakeLauncher {
     pub(crate) fn new(mode: GuestMode, executor: Arc<dyn PlanExecutor>) -> Self {
-        let dir = std::env::temp_dir().join(format!("harvest-fakevm-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("hfv-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
         std::fs::create_dir_all(&dir).expect("temp dir");
         Self {
             dir,
@@ -76,11 +77,7 @@ impl Drop for FakeLauncher {
 impl VmLauncher for FakeLauncher {
     fn launch(&self) -> BoxFuture<'_, Result<Box<dyn LaunchedVm>, SandboxError>> {
         Box::pin(async move {
-            if self
-                .failures_left
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok()
-            {
+            if take_one(&self.failures_left) {
                 return Err(SandboxError::Unavailable("fake launch failure".into()));
             }
             let n = self.launched.fetch_add(1, Ordering::SeqCst);
@@ -109,6 +106,18 @@ impl VmLauncher for FakeLauncher {
     }
 }
 
+/// Take one from a positive counter. Returns `false` at zero.
+fn take_one(counter: &AtomicUsize) -> bool {
+    let mut current = counter.load(Ordering::SeqCst);
+    while current > 0 {
+        match counter.compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+    false
+}
+
 fn spawn_muxer(path: &Path, mode: GuestMode, executor: Arc<dyn PlanExecutor>) -> JoinHandle<()> {
     let listener = UnixListener::bind(path).expect("bind fake vsock");
     tokio::spawn(async move {
@@ -125,6 +134,8 @@ fn spawn_muxer(path: &Path, mode: GuestMode, executor: Arc<dyn PlanExecutor>) ->
                 GuestMode::NeverListen | GuestMode::Exited => continue,
                 GuestMode::Garbage => {
                     let _ = stream.write_all(b"OK 1073741824\n").await;
+                    let _: Result<HostMessage, _> =
+                        read_message(&mut stream, MAX_FRAME_BYTES).await;
                     let _ = stream.write_all(&[0, 0, 0, 3, b'{', b'x', b'}']).await;
                 }
                 GuestMode::Hang => {

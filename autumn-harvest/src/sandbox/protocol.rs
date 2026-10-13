@@ -138,8 +138,23 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    let _ = (writer, message, max);
-    todo!("write_frame")
+    let body = serde_json::to_vec(message)
+        .map_err(|e| FrameError::Malformed(format!("cannot encode the frame: {e}")))?;
+    let cap = max.min(MAX_FRAME_BYTES);
+    let declared = u32::try_from(body.len())
+        .ok()
+        .filter(|_| body.len() <= cap)
+        .ok_or(FrameError::TooLarge {
+            declared: u64::try_from(body.len()).unwrap_or(u64::MAX),
+            max: cap,
+        })?;
+    // One buffer and one write, so a reader never sees a header alone.
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&declared.to_be_bytes());
+    frame.extend_from_slice(&body);
+    writer.write_all(&frame).await?;
+    writer.flush().await?;
+    Ok(())
 }
 
 /// Read one frame and decode it as `T`.
@@ -154,8 +169,35 @@ where
     R: AsyncRead + Unpin,
     T: DeserializeOwned,
 {
-    let _ = (reader, max, std::marker::PhantomData::<T>);
-    todo!("read_frame")
+    let mut header = [0u8; 4];
+    let first = reader.read(&mut header).await?;
+    if first == 0 {
+        return Err(FrameError::Closed);
+    }
+    reader.read_exact(&mut header[first..]).await?;
+    let declared = u32::from_be_bytes(header);
+    let cap = max.min(MAX_FRAME_BYTES);
+    let length = usize::try_from(declared)
+        .ok()
+        .filter(|length| *length <= cap)
+        .ok_or(FrameError::TooLarge {
+            declared: u64::from(declared),
+            max: cap,
+        })?;
+    // Grow the buffer as bytes arrive. A peer that declares a large frame
+    // and sends less never gets the host to allocate the declared size.
+    let mut body = Vec::new();
+    reader
+        .take(u64::from(declared))
+        .read_to_end(&mut body)
+        .await?;
+    if body.len() != length {
+        return Err(FrameError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("the frame declared {length} bytes and carried {}", body.len()),
+        )));
+    }
+    serde_json::from_slice(&body).map_err(|e| FrameError::Malformed(e.to_string()))
 }
 
 /// Wrap `message` in an envelope of this protocol version.

@@ -78,8 +78,75 @@ impl ApiClient {
         path: &str,
         body: Option<&[u8]>,
     ) -> Result<ApiResponse, SandboxError> {
-        let _ = (method, path, body);
-        todo!("ApiClient::request")
+        let fail = |what: String| {
+            SandboxError::Unavailable(format!("firecracker API {method} {path}: {what}"))
+        };
+        tokio::time::timeout(self.timeout, self.exchange(method, path, body))
+            .await
+            .map_err(|_| fail(format!("no answer within {:?}", self.timeout)))?
+            .map_err(fail)
+    }
+
+    /// One request and one response, unbounded in time.
+    async fn exchange(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> Result<ApiResponse, String> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let mut stream = tokio::net::UnixStream::connect(&self.socket)
+            .await
+            .map_err(|e| format!("cannot connect to {}: {e}", self.socket.display()))?;
+        let body = body.unwrap_or_default();
+        let mut request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n"
+        );
+        if !body.is_empty() {
+            request.push_str("Content-Type: application/json\r\n");
+        }
+        request.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+        let mut bytes = request.into_bytes();
+        bytes.extend_from_slice(body);
+        stream
+            .write_all(&bytes)
+            .await
+            .map_err(|e| format!("cannot send the request: {e}"))?;
+
+        // Read the head byte by byte up to the blank line, so no body byte is
+        // consumed by mistake. The head is short.
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if head.len() >= MAX_API_HEADER_BYTES {
+                return Err(format!("the response head exceeds {MAX_API_HEADER_BYTES} bytes"));
+            }
+            let n = stream
+                .read(&mut byte)
+                .await
+                .map_err(|e| format!("cannot read the response: {e}"))?;
+            if n == 0 {
+                return Err("the connection closed before the response head ended".into());
+            }
+            head.push(byte[0]);
+        }
+        let (status, length) = parse_head(&head)?;
+        let length = match length {
+            Some(length) if length > MAX_API_BODY_BYTES => {
+                return Err(format!(
+                    "the response body of {length} bytes exceeds {MAX_API_BODY_BYTES}"
+                ));
+            }
+            Some(length) => length,
+            None => 0,
+        };
+        let mut body = vec![0u8; length];
+        stream
+            .read_exact(&mut body)
+            .await
+            .map_err(|e| format!("cannot read the response body: {e}"))?;
+        Ok(ApiResponse { status, body })
     }
 
     /// Send `body` as JSON and expect a 2xx status.
@@ -94,8 +161,11 @@ impl ApiClient {
         path: &str,
         body: &T,
     ) -> Result<(), SandboxError> {
-        let _ = (method, path, serde_json::to_vec(body));
-        todo!("ApiClient::send")
+        let body = serde_json::to_vec(body).map_err(|e| {
+            SandboxError::Config(format!("cannot encode the body of {method} {path}: {e}"))
+        })?;
+        let response = self.request(method, path, Some(&body)).await?;
+        check_status(method, path, &response)
     }
 
     /// `GET` a JSON document.
@@ -105,8 +175,11 @@ impl ApiClient {
     /// Returns [`SandboxError::Unavailable`] for an error status or a body
     /// that is not JSON.
     pub async fn get(&self, path: &str) -> Result<serde_json::Value, SandboxError> {
-        let _ = path;
-        todo!("ApiClient::get")
+        let response = self.request("GET", path, None).await?;
+        check_status("GET", path, &response)?;
+        serde_json::from_slice(&response.body).map_err(|e| {
+            SandboxError::Unavailable(format!("firecracker API GET {path}: the body is not JSON: {e}"))
+        })
     }
 
     /// Configure a fresh process from `config`: the machine, the kernel, the
@@ -116,8 +189,15 @@ impl ApiClient {
     ///
     /// Returns the error of the first failed `PUT`.
     pub async fn configure(&self, config: &VmConfigFile) -> Result<(), SandboxError> {
-        let _ = (config, ROOT_DRIVE_ID);
-        todo!("ApiClient::configure")
+        self.send("PUT", "/machine-config", &config.machine_config).await?;
+        self.send("PUT", "/boot-source", &config.boot_source).await?;
+        for drive in &config.drives {
+            let path = format!("/drives/{}", drive.drive_id);
+            self.send("PUT", &path, drive).await?;
+        }
+        debug_assert!(config.drives.iter().any(|d| d.drive_id == ROOT_DRIVE_ID));
+        self.send("PUT", "/vsock", &config.vsock).await?;
+        self.send("PUT", "/entropy", &config.entropy).await
     }
 
     /// Start the configured microVM.
@@ -126,7 +206,12 @@ impl ApiClient {
     ///
     /// Returns the error of the `PUT /actions`.
     pub async fn start(&self) -> Result<(), SandboxError> {
-        todo!("ApiClient::start")
+        self.send(
+            "PUT",
+            "/actions",
+            &serde_json::json!({"action_type": "InstanceStart"}),
+        )
+        .await
     }
 
     /// Load a snapshot into a fresh process and resume it.
@@ -136,8 +221,16 @@ impl ApiClient {
     /// Returns the error of the `PUT /snapshot/load`. Firecracker ends the
     /// process after a failed load.
     pub async fn load_snapshot(&self, state: &str, memory: &str) -> Result<(), SandboxError> {
-        let _ = (state, memory);
-        todo!("ApiClient::load_snapshot")
+        self.send(
+            "PUT",
+            "/snapshot/load",
+            &serde_json::json!({
+                "snapshot_path": state,
+                "mem_backend": {"backend_type": "File", "backend_path": memory},
+                "resume_vm": true
+            }),
+        )
+        .await
     }
 
     /// Pause the running microVM.
@@ -146,7 +239,8 @@ impl ApiClient {
     ///
     /// Returns the error of the `PATCH /vm`.
     pub async fn pause(&self) -> Result<(), SandboxError> {
-        todo!("ApiClient::pause")
+        self.send("PATCH", "/vm", &serde_json::json!({"state": "Paused"}))
+            .await
     }
 
     /// Write a full snapshot of the paused microVM.
@@ -155,8 +249,16 @@ impl ApiClient {
     ///
     /// Returns the error of the `PUT /snapshot/create`.
     pub async fn create_snapshot(&self, state: &str, memory: &str) -> Result<(), SandboxError> {
-        let _ = (state, memory);
-        todo!("ApiClient::create_snapshot")
+        self.send(
+            "PUT",
+            "/snapshot/create",
+            &serde_json::json!({
+                "snapshot_type": "Full",
+                "snapshot_path": state,
+                "mem_file_path": memory
+            }),
+        )
+        .await
     }
 }
 
@@ -166,8 +268,51 @@ impl ApiClient {
 ///
 /// Returns a message for a malformed status line or header.
 pub fn parse_head(head: &[u8]) -> Result<(u16, Option<usize>), String> {
-    let _ = head;
-    todo!("parse_head")
+    let text = std::str::from_utf8(head).map_err(|_| "the response head is not UTF-8".to_owned())?;
+    let mut lines = text.split("\r\n");
+    let status_line = lines.next().unwrap_or_default();
+    let mut parts = status_line.splitn(3, ' ');
+    let (Some(version), Some(code)) = (parts.next(), parts.next()) else {
+        return Err(format!("malformed status line {status_line:?}"));
+    };
+    if !version.starts_with("HTTP/1.") {
+        return Err(format!("malformed status line {status_line:?}"));
+    }
+    let status = code
+        .parse::<u16>()
+        .ok()
+        .filter(|s| (100..=599).contains(s))
+        .ok_or_else(|| format!("malformed status code {code:?}"))?;
+    let mut length = None;
+    for line in lines.filter(|l| !l.is_empty()) {
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(format!("malformed header {line:?}"));
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            let value = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| format!("malformed content length {value:?}"))?;
+            length = Some(value);
+        }
+    }
+    Ok((status, length))
+}
+
+/// Turn a non-2xx response into an error that holds its `fault_message`.
+fn check_status(method: &str, path: &str, response: &ApiResponse) -> Result<(), SandboxError> {
+    if (200..300).contains(&response.status) {
+        return Ok(());
+    }
+    let fault = serde_json::from_slice::<serde_json::Value>(&response.body)
+        .ok()
+        .and_then(|v| v.get("fault_message")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| String::from_utf8_lossy(&response.body).into_owned());
+    Err(SandboxError::Unavailable(format!(
+        "firecracker API {method} {path} returned {}: {}",
+        response.status,
+        fault.chars().take(512).collect::<String>()
+    )))
 }
 
 #[cfg(test)]
@@ -202,7 +347,7 @@ pub(crate) mod tests {
     /// Serve `replies` in order, one per connection. A reply of `None` reads
     /// the request and never answers.
     pub(crate) fn fake_api(replies: Vec<Option<Vec<u8>>>) -> FakeApi {
-        let dir = std::env::temp_dir().join(format!("harvest-api-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("hapi-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
         std::fs::create_dir_all(&dir).unwrap();
         let listener = UnixListener::bind(dir.join("api.sock")).unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));

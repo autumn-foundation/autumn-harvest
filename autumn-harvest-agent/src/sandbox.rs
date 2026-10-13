@@ -12,9 +12,12 @@
 //! [`SandboxRequest`]: autumn_harvest::sandbox::SandboxRequest
 //! [`SandboxOutcome`]: autumn_harvest::sandbox::SandboxOutcome
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use autumn_harvest::sandbox::activity::IDEMPOTENCY_KEY_ENV;
 use autumn_harvest::sandbox::{NetworkPolicy, SandboxError, SandboxRequest, SandboxRuntime};
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{AgentError, ErrorKind};
 use crate::model::BoxFuture;
@@ -35,8 +38,26 @@ impl SandboxTool {
     /// A `run_code` tool on `runtime`.
     #[must_use]
     pub fn new(runtime: Arc<SandboxRuntime>) -> Self {
-        let _ = runtime;
-        todo!("SandboxTool::new")
+        let policy = runtime.policy();
+        let runtimes: Vec<&str> = policy.runtimes.keys().map(String::as_str).collect();
+        let network = match policy.network {
+            NetworkPolicy::Deny => "has no network",
+            NetworkPolicy::Allow => "has network access",
+        };
+        let description = format!(
+            "Run code in a new, isolated sandbox and get its exit status, stdout, stderr and \
+             output files. Runtimes: {}. The sandbox {network}. Each call starts clean. A \
+             non-zero exit is a normal result: read stderr and fix the code. The wall clock \
+             limit is {} ms by default and {} ms at most.",
+            runtimes.join(", "),
+            policy.default_limits.wall_clock_ms,
+            policy.max_limits.wall_clock_ms,
+        );
+        Self {
+            runtime,
+            name: DEFAULT_TOOL_NAME.to_owned(),
+            description,
+        }
     }
 
     /// Rename the tool.
@@ -60,8 +81,12 @@ impl SandboxTool {
 /// error is a configuration error.
 #[must_use]
 pub fn tool_error(err: &SandboxError) -> AgentError {
-    let _ = (err, ErrorKind::Tool);
-    todo!("tool_error")
+    let kind = match err {
+        SandboxError::Denied(_) | SandboxError::Protocol(_) => ErrorKind::Tool,
+        SandboxError::Config(_) => ErrorKind::Config,
+        SandboxError::Unavailable(_) | SandboxError::Cancelled => ErrorKind::Unavailable,
+    };
+    AgentError::new(kind, err.to_string())
 }
 
 impl Tool for SandboxTool {
@@ -74,7 +99,51 @@ impl Tool for SandboxTool {
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        todo!("SandboxTool::input_schema")
+        let runtimes: Vec<&str> = self
+            .runtime
+            .policy()
+            .runtimes
+            .keys()
+            .map(String::as_str)
+            .collect();
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "runtime": {"type": "string", "enum": runtimes, "description": "The language runtime."},
+                "code": {"type": "string", "description": "The program."},
+                "args": {"type": "array", "items": {"type": "string"}, "description": "Arguments after the program file."},
+                "stdin": {"type": "string", "description": "Text for stdin."},
+                "files": {
+                    "type": "array",
+                    "description": "Input files, relative to the work directory. Set text or base64.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "text": {"type": "string"},
+                            "base64": {"type": "string"},
+                            "executable": {"type": "boolean"}
+                        },
+                        "required": ["path"],
+                        "additionalProperties": false
+                    }
+                },
+                "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Environment variables."},
+                "outputs": {"type": "array", "items": {"type": "string"}, "description": "Relative paths of files to return."},
+                "limits": {
+                    "type": "object",
+                    "properties": {
+                        "timeout_ms": {"type": "integer", "minimum": 1},
+                        "cpu_seconds": {"type": "integer", "minimum": 1},
+                        "memory_mib": {"type": "integer", "minimum": 1},
+                        "max_output_bytes": {"type": "integer", "minimum": 1}
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "required": ["runtime"],
+            "additionalProperties": false
+        })
     }
 
     fn execute<'a>(
@@ -82,14 +151,33 @@ impl Tool for SandboxTool {
         input: serde_json::Value,
         ctx: &'a ToolContext,
     ) -> BoxFuture<'a, Result<serde_json::Value, AgentError>> {
-        let _ = (input, ctx, std::marker::PhantomData::<SandboxRequest>);
-        todo!("SandboxTool::execute")
+        Box::pin(async move {
+            let request: SandboxRequest = serde_json::from_value(input).map_err(|e| {
+                AgentError::new(ErrorKind::Tool, format!("the input is not a valid request: {e}"))
+            })?;
+            // The run, the step and the call id form an idempotency key.
+            let mut engine_env = BTreeMap::new();
+            engine_env.insert(
+                IDEMPOTENCY_KEY_ENV.to_owned(),
+                format!("{}:{}:{}", ctx.run_id.as_str(), ctx.step, ctx.call_id),
+            );
+            let outcome = self
+                .runtime
+                .run_with_engine_env(&request, engine_env, &CancellationToken::new())
+                .await
+                .map_err(|e| tool_error(&e))?;
+            serde_json::to_value(outcome).map_err(|e| {
+                AgentError::new(ErrorKind::Tool, format!("cannot encode the outcome: {e}"))
+            })
+        })
     }
 
     /// No network means that the code changes only its own sandbox.
     fn effect(&self) -> ToolEffect {
-        let _ = NetworkPolicy::Deny;
-        todo!("SandboxTool::effect")
+        match self.runtime.policy().network {
+            NetworkPolicy::Deny => ToolEffect::Internal,
+            NetworkPolicy::Allow => ToolEffect::External,
+        }
     }
 }
 
@@ -232,6 +320,21 @@ mod tests {
             .await
             .expect_err("unknown field");
         assert_eq!(err.kind(), ErrorKind::Tool);
+    }
+
+    #[tokio::test]
+    async fn the_code_gets_an_idempotency_key_from_the_call() {
+        let backend = Arc::new(EchoBackend::default());
+        let runtime = SandboxRuntime::new(backend.clone(), SandboxPolicy::default()).unwrap();
+        let tool = SandboxTool::new(Arc::new(runtime));
+        tool.execute(json!({"runtime": "sh", "code": "true"}), &ctx())
+            .await
+            .unwrap();
+        let jobs = backend.seen.lock().unwrap();
+        assert_eq!(
+            jobs[0].plan.env.get(IDEMPOTENCY_KEY_ENV).map(String::as_str),
+            Some("run-1:0:call-1")
+        );
     }
 
     #[test]

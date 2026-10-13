@@ -35,15 +35,27 @@ impl SandboxError {
     /// Can a retry of the same request succeed?
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
-        let _ = self;
-        panic!("not implemented: SandboxError::is_retryable")
+        matches!(self, Self::Unavailable(_) | Self::Cancelled)
     }
 }
 
 impl From<SandboxError> for ActivityFailure {
     fn from(err: SandboxError) -> Self {
-        let _ = err;
-        todo!("ActivityFailure::from(SandboxError)")
+        use crate::failure::{
+            ERROR_TYPE_SANDBOX_CANCELLED, ERROR_TYPE_SANDBOX_PROTOCOL_VIOLATION,
+            ERROR_TYPE_SANDBOX_UNAVAILABLE,
+        };
+        let message = err.to_string();
+        match err {
+            SandboxError::Denied(_) | SandboxError::Config(_) => Self::sandbox_denied(message),
+            SandboxError::Unavailable(_) => {
+                Self::retryable(ERROR_TYPE_SANDBOX_UNAVAILABLE, message)
+            }
+            SandboxError::Protocol(_) => {
+                Self::non_retryable(ERROR_TYPE_SANDBOX_PROTOCOL_VIOLATION, message)
+            }
+            SandboxError::Cancelled => Self::retryable(ERROR_TYPE_SANDBOX_CANCELLED, message),
+        }
     }
 }
 

@@ -209,8 +209,58 @@ impl ExecPlan {
     ///
     /// Returns [`SandboxError::Denied`] for the first defect found.
     pub fn validate(&self) -> Result<(), SandboxError> {
-        let _ = self;
-        todo!("ExecPlan::validate")
+        if self.argv.is_empty() || self.argv[0].is_empty() {
+            return Err(SandboxError::Denied("the plan has no command".into()));
+        }
+        for arg in &self.argv {
+            check_no_nul("argument", arg)?;
+        }
+        let mut paths = BTreeSet::new();
+        for file in &self.files {
+            validate_relative_path(&file.path)?;
+            if !paths.insert(file.path.as_str()) {
+                return Err(SandboxError::Denied(format!(
+                    "file path {:?} appears twice",
+                    file.path
+                )));
+            }
+        }
+        check_no_nested_files(&paths)?;
+        for output in &self.outputs {
+            validate_relative_path(output)?;
+        }
+        for (name, value) in &self.env {
+            // The engine adds `HARVEST_*` variables after the request check,
+            // so the plan check admits that prefix.
+            if !name.starts_with(RESERVED_ENV_PREFIX) {
+                validate_env_name(name)?;
+            } else if name.len() > 128
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            {
+                return Err(SandboxError::Denied(format!(
+                    "engine variable name {name:?} is not valid"
+                )));
+            }
+            check_no_nul("environment value", value)?;
+        }
+        check_no_nul("PATH", &self.path_env)?;
+        let limits = &self.limits;
+        let zero = [
+            ("wall_clock_ms", limits.wall_clock_ms),
+            ("cpu_seconds", limits.cpu_seconds),
+            ("memory_bytes", limits.memory_bytes),
+            ("max_processes", u64::from(limits.max_processes)),
+            ("max_file_bytes", limits.max_file_bytes),
+            ("max_open_files", u64::from(limits.max_open_files)),
+        ]
+        .into_iter()
+        .find(|(_, value)| *value == 0);
+        if let Some((name, _)) = zero {
+            return Err(SandboxError::Denied(format!("limit {name} must not be zero")));
+        }
+        Ok(())
     }
 }
 
@@ -224,8 +274,60 @@ impl ExecPlan {
 ///
 /// Returns [`SandboxError::Denied`] that names the defect.
 pub fn validate_relative_path(path: &str) -> Result<(), SandboxError> {
-    let _ = path;
-    todo!("validate_relative_path")
+    let deny = |why: &str| Err(SandboxError::Denied(format!("path {path:?} {why}")));
+    if path.is_empty() {
+        return deny("is empty");
+    }
+    if path.len() > MAX_PATH_BYTES {
+        return deny(&format!("is longer than {MAX_PATH_BYTES} bytes"));
+    }
+    if path.contains('\0') {
+        return deny("holds a NUL byte");
+    }
+    if path.starts_with('/') {
+        return deny("is absolute; use a path relative to the work directory");
+    }
+    let mut depth = 0;
+    for component in path.split('/') {
+        depth += 1;
+        match component {
+            "" => return deny("has an empty component"),
+            "." | ".." => return deny("has a '.' or '..' component"),
+            _ => {}
+        }
+    }
+    if depth > MAX_PATH_DEPTH {
+        return deny(&format!("is deeper than {MAX_PATH_DEPTH} components"));
+    }
+    Ok(())
+}
+
+/// Deny `value` when it holds a NUL byte. `execve` cannot pass one.
+fn check_no_nul(what: &str, value: &str) -> Result<(), SandboxError> {
+    if value.contains('\0') {
+        return Err(SandboxError::Denied(format!("{what} holds a NUL byte")));
+    }
+    Ok(())
+}
+
+/// Deny a file whose path is a directory of another file, such as `a` and
+/// `a/b`. The executor could not create both.
+fn check_no_nested_files(paths: &BTreeSet<&str>) -> Result<(), SandboxError> {
+    for path in paths {
+        let mut prefix = String::new();
+        for component in path.split('/') {
+            if !prefix.is_empty() && paths.contains(prefix.as_str()) {
+                return Err(SandboxError::Denied(format!(
+                    "file path {path:?} is inside the file {prefix:?}"
+                )));
+            }
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+        }
+    }
+    Ok(())
 }
 
 /// Check that `name` is a valid environment name that a request can set.
@@ -234,8 +336,26 @@ pub fn validate_relative_path(path: &str) -> Result<(), SandboxError> {
 ///
 /// Returns [`SandboxError::Denied`] that names the defect.
 pub fn validate_env_name(name: &str) -> Result<(), SandboxError> {
-    let _ = name;
-    todo!("validate_env_name")
+    let deny = |why: &str| Err(SandboxError::Denied(format!("environment name {name:?} {why}")));
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return deny("is empty");
+    };
+    if name.len() > 128 {
+        return deny("is longer than 128 bytes");
+    }
+    if !(first.is_ascii_alphabetic() || first == b'_')
+        || !bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return deny("must match [A-Za-z_][A-Za-z0-9_]*");
+    }
+    if name.starts_with("LD_") || name.starts_with("DYLD_") {
+        return deny("is a loader variable");
+    }
+    if name.starts_with(RESERVED_ENV_PREFIX) || EXECUTOR_ENV.contains(&name) {
+        return deny("is reserved");
+    }
+    Ok(())
 }
 
 impl SandboxPolicy {
@@ -247,8 +367,174 @@ impl SandboxPolicy {
     /// breaks. The message names the rule and the limit, so an agent can
     /// correct its request.
     pub fn plan(&self, request: &SandboxRequest) -> Result<ExecPlan, SandboxError> {
-        let _ = (self, request, BTreeSet::<String>::new());
-        todo!("SandboxPolicy::plan")
+        let deny = |message: String| Err(SandboxError::Denied(message));
+        let Some(spec) = self.runtimes.get(&request.runtime) else {
+            let allowed: Vec<&str> = self.runtimes.keys().map(String::as_str).collect();
+            return deny(format!(
+                "runtime {:?} is not allowed; allowed runtimes: {}",
+                request.runtime,
+                allowed.join(", ")
+            ));
+        };
+        let sizes = &self.sizes;
+        let limits = self.resolve_limits(&request.limits)?;
+
+        // The code file comes first, then the request files.
+        if request.files.len().saturating_add(1) > sizes.max_files {
+            return deny(format!(
+                "{} files exceed the limit of {} (the code file counts as one)",
+                request.files.len() + 1,
+                sizes.max_files
+            ));
+        }
+        let mut files = Vec::with_capacity(request.files.len() + 1);
+        files.push(PlanFile {
+            path: spec.file_name.clone(),
+            content: request.code.clone().into_bytes(),
+            executable: false,
+        });
+        for file in &request.files {
+            validate_relative_path(&file.path)?;
+            let content = match (&file.text, &file.base64) {
+                (Some(text), None) => text.clone().into_bytes(),
+                (None, Some(encoded)) => {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .map_err(|e| {
+                            SandboxError::Denied(format!(
+                                "file {:?} is not valid base64: {e}",
+                                file.path
+                            ))
+                        })?
+                }
+                _ => {
+                    return deny(format!(
+                        "file {:?} must set exactly one of `text` and `base64`",
+                        file.path
+                    ));
+                }
+            };
+            files.push(PlanFile {
+                path: file.path.clone(),
+                content,
+                executable: file.executable,
+            });
+        }
+        let stdin = request.stdin.clone().unwrap_or_default().into_bytes();
+        let input_bytes = files
+            .iter()
+            .map(|f| f.content.len())
+            .sum::<usize>()
+            .saturating_add(stdin.len());
+        if u64::try_from(input_bytes).unwrap_or(u64::MAX) > sizes.max_input_bytes {
+            return deny(format!(
+                "the code, files and stdin hold {input_bytes} bytes, over the limit of {}",
+                sizes.max_input_bytes
+            ));
+        }
+
+        if request.args.len() > sizes.max_args {
+            return deny(format!(
+                "{} arguments exceed the limit of {}",
+                request.args.len(),
+                sizes.max_args
+            ));
+        }
+        let arg_bytes: usize = request.args.iter().map(String::len).sum();
+        if arg_bytes > sizes.max_arg_bytes {
+            return deny(format!(
+                "the arguments hold {arg_bytes} bytes, over the limit of {}",
+                sizes.max_arg_bytes
+            ));
+        }
+        if request.env.len() > sizes.max_env {
+            return deny(format!(
+                "{} environment variables exceed the limit of {}",
+                request.env.len(),
+                sizes.max_env
+            ));
+        }
+        let env_bytes: usize = request.env.iter().map(|(k, v)| k.len() + v.len()).sum();
+        if env_bytes > sizes.max_env_bytes {
+            return deny(format!(
+                "the environment holds {env_bytes} bytes, over the limit of {}",
+                sizes.max_env_bytes
+            ));
+        }
+        if request.outputs.len() > sizes.max_outputs {
+            return deny(format!(
+                "{} outputs exceed the limit of {}",
+                request.outputs.len(),
+                sizes.max_outputs
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for output in &request.outputs {
+            validate_relative_path(output)?;
+            if !seen.insert(output.as_str()) {
+                return deny(format!("output {output:?} appears twice"));
+            }
+        }
+
+        let mut argv = spec.argv.clone();
+        argv.push(spec.file_name.clone());
+        argv.extend(request.args.iter().cloned());
+        let plan = ExecPlan {
+            argv,
+            files,
+            stdin,
+            env: request.env.clone(),
+            path_env: self.path_env.clone(),
+            limits,
+            outputs: request.outputs.clone(),
+            max_output_file_bytes: sizes.max_output_file_bytes,
+            max_output_files_total_bytes: sizes.max_output_files_total_bytes,
+            network: self.network,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    /// Resolve the requested limits against the defaults and the ceilings.
+    fn resolve_limits(&self, requested: &RequestedLimits) -> Result<SandboxLimits, SandboxError> {
+        let pick = |name: &str, asked: Option<u64>, default: u64, max: u64, scale: u64| {
+            let Some(value) = asked else {
+                return Ok(default);
+            };
+            if value == 0 {
+                return Err(SandboxError::Denied(format!("limit {name} must not be zero")));
+            }
+            let scaled = value.saturating_mul(scale);
+            if scaled > max {
+                return Err(SandboxError::Denied(format!(
+                    "limit {name} {value} exceeds the policy maximum {}",
+                    max / scale
+                )));
+            }
+            Ok(scaled)
+        };
+        let d = &self.default_limits;
+        let m = &self.max_limits;
+        Ok(SandboxLimits {
+            wall_clock_ms: pick("timeout_ms", requested.timeout_ms, d.wall_clock_ms, m.wall_clock_ms, 1)?,
+            cpu_seconds: pick("cpu_seconds", requested.cpu_seconds, d.cpu_seconds, m.cpu_seconds, 1)?,
+            memory_bytes: pick(
+                "memory_mib",
+                requested.memory_mib,
+                d.memory_bytes,
+                m.memory_bytes,
+                1024 * 1024,
+            )?,
+            max_output_bytes: pick(
+                "max_output_bytes",
+                requested.max_output_bytes,
+                d.max_output_bytes,
+                m.max_output_bytes,
+                1,
+            )?,
+            ..*d
+        })
     }
 }
 

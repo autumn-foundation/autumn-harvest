@@ -76,15 +76,22 @@ impl JailerConfig {
 ///
 /// Returns [`SandboxError::Config`] for a path without a UTF-8 file name.
 pub fn exec_name(firecracker_bin: &Path) -> Result<String, SandboxError> {
-    let _ = firecracker_bin;
-    todo!("exec_name")
+    firecracker_bin
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            SandboxError::Config(format!(
+                "the Firecracker path {} has no UTF-8 file name",
+                firecracker_bin.display()
+            ))
+        })
 }
 
 /// The jail directory of one VM: `<chroot_base>/<exec name>/<id>`.
 #[must_use]
 pub fn jail_dir(config: &JailerConfig, exec_name: &str, vm_id: &str) -> PathBuf {
-    let _ = (config, exec_name, vm_id);
-    todo!("jail_dir")
+    config.chroot_base.join(exec_name).join(vm_id)
 }
 
 /// The chroot root of one VM: `<jail dir>/root`.
@@ -96,8 +103,7 @@ pub fn chroot_root(config: &JailerConfig, exec_name: &str, vm_id: &str) -> PathB
 /// The cgroup directory of one VM: `<cgroup_root>/<parent>/<id>`.
 #[must_use]
 pub fn cgroup_dir(config: &JailerConfig, vm_id: &str) -> PathBuf {
-    let _ = (config, vm_id);
-    todo!("cgroup_dir")
+    config.cgroup_root.join(&config.cgroup_parent).join(vm_id)
 }
 
 /// The cgroup values for a VM of size `machine`.
@@ -107,8 +113,15 @@ pub fn cgroup_dir(config: &JailerConfig, vm_id: &str) -> PathBuf {
 /// values follow.
 #[must_use]
 pub fn cgroup_values(config: &JailerConfig, machine: MachineSpec) -> Vec<(String, String)> {
-    let _ = (config, machine);
-    todo!("cgroup_values")
+    let cpu_quota = u64::from(machine.vcpu_count) * 100_000;
+    let memory = (u64::from(machine.mem_size_mib) + VMM_MEMORY_OVERHEAD_MIB) * 1024 * 1024;
+    let mut values = vec![
+        ("cpu.max".to_owned(), format!("{cpu_quota} 100000")),
+        ("memory.max".to_owned(), memory.to_string()),
+        ("pids.max".to_owned(), VMM_MAX_PIDS.to_string()),
+    ];
+    values.extend(config.extra_cgroups.iter().cloned());
+    values
 }
 
 /// The jailer arguments that run `firecracker_bin` as `vm_id`.
@@ -124,8 +137,41 @@ pub fn jailer_args(
     machine: MachineSpec,
     firecracker_args: &[String],
 ) -> Vec<String> {
-    let _ = (config, firecracker_bin, vm_id, machine, firecracker_args);
-    todo!("jailer_args")
+    let mut args = vec![
+        "--id".to_owned(),
+        vm_id.to_owned(),
+        "--exec-file".to_owned(),
+        firecracker_bin.display().to_string(),
+        "--uid".to_owned(),
+        config.uid.to_string(),
+        "--gid".to_owned(),
+        config.gid.to_string(),
+        "--chroot-base-dir".to_owned(),
+        config.chroot_base.display().to_string(),
+        "--cgroup-version".to_owned(),
+        "2".to_owned(),
+        "--parent-cgroup".to_owned(),
+        config.cgroup_parent.clone(),
+    ];
+    for (key, value) in cgroup_values(config, machine) {
+        args.push("--cgroup".to_owned());
+        args.push(format!("{key}={value}"));
+    }
+    if let Some(nofile) = config.nofile_limit {
+        args.push("--resource-limit".to_owned());
+        args.push(format!("no-file={nofile}"));
+    }
+    if let Some(fsize) = config.fsize_limit {
+        args.push("--resource-limit".to_owned());
+        args.push(format!("fsize={fsize}"));
+    }
+    if let Some(netns) = &config.netns {
+        args.push("--netns".to_owned());
+        args.push(netns.display().to_string());
+    }
+    args.push("--".to_owned());
+    args.extend(firecracker_args.iter().cloned());
+    args
 }
 
 #[cfg(test)]

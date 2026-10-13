@@ -2104,9 +2104,18 @@ impl HarvestBuilder {
     /// See [`crate::sandbox`].
     #[cfg(feature = "sandbox-activities")]
     #[must_use]
-    pub fn sandbox_activity(self, activity: crate::sandbox::SandboxActivity) -> Self {
-        let _ = activity;
-        todo!("HarvestBuilder::sandbox_activity")
+    pub fn sandbox_activity(mut self, activity: crate::sandbox::SandboxActivity) -> Self {
+        // A later registration of the same name replaces the earlier one.
+        self.activities.retain(|info| info.name != activity.name);
+        self.activities.push(activity.activity_info());
+        let registry = self
+            .state
+            .entry(TypeId::of::<crate::sandbox::SandboxActivities>())
+            .or_insert_with(|| Box::new(crate::sandbox::SandboxActivities::default()));
+        if let Some(registry) = registry.downcast_mut::<crate::sandbox::SandboxActivities>() {
+            registry.insert(activity);
+        }
+        self
     }
 
     /// Trust WASM modules signed by this Ed25519 public key (issue #1838).

@@ -14,16 +14,20 @@
 //!   outcome never fails the result cap.
 //! - `max_input_bytes` is the request bound of the policy.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::context::ActivityContext;
 use crate::info::ActivityInfo;
 use crate::policy::RetryPolicy;
 
+use super::error::SandboxError;
+use super::request::SandboxRequest;
 use super::runtime::SandboxRuntime;
 
 /// The variable that carries the activity idempotency key to the code.
@@ -99,7 +103,11 @@ impl SandboxActivity {
     /// the policy plus the backend overhead.
     #[must_use]
     pub fn start_to_close(&self) -> Duration {
-        todo!("SandboxActivity::start_to_close")
+        self.runtime
+            .policy()
+            .max_limits
+            .wall_clock()
+            .saturating_add(self.runtime.backend_overhead())
     }
 
     /// The [`ActivityInfo`] of this activity.
@@ -109,7 +117,36 @@ impl SandboxActivity {
     /// bounded.
     #[must_use]
     pub fn activity_info(&self) -> ActivityInfo {
-        todo!("SandboxActivity::activity_info")
+        let name: &'static str = Box::leak(self.name.clone().into_boxed_str());
+        let queue: Option<&'static str> = self
+            .queue
+            .as_ref()
+            .map(|q| &*Box::leak(q.clone().into_boxed_str()));
+        let policy = self.runtime.policy();
+        ActivityInfo {
+            name,
+            module: "sandbox",
+            default_retry_policy: Some(self.retry.clone()),
+            default_start_to_close: Some(self.start_to_close()),
+            default_heartbeat_timeout: self.heartbeat_timeout,
+            default_schedule_to_start: None,
+            default_queue: queue,
+            max_concurrent: None,
+            concurrency_key: None,
+            default_schedule_to_close: self.schedule_to_close,
+            is_local: false,
+            max_input_bytes: Some(policy.max_request_json_bytes()),
+            max_result_bytes: Some(policy.max_outcome_json_bytes()),
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            rate_limit_key_expr: None,
+            circuit_breaker: None,
+            requires: None,
+            handler: sandbox_activity_handler,
+            input_schema: None,
+            output_schema: None,
+        }
     }
 
     /// Run one request for `ctx`, with its cancellation, idempotency key and
@@ -123,8 +160,45 @@ impl SandboxActivity {
         ctx: &ActivityContext,
         input: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let _ = (ctx, input);
-        todo!("SandboxActivity::run")
+        let request: SandboxRequest = serde_json::from_value(input).map_err(|e| {
+            failure(SandboxError::Denied(format!(
+                "the input is not a sandbox request: {e}"
+            )))
+        })?;
+        let mut engine_env = BTreeMap::new();
+        if let Ok(key) = ctx.idempotency_key() {
+            engine_env.insert(IDEMPOTENCY_KEY_ENV.to_owned(), key.to_string());
+        }
+        engine_env.insert(ATTEMPT_ENV.to_owned(), ctx.attempt().to_string());
+
+        let cancel = CancellationToken::new();
+        let run = self
+            .runtime
+            .run_with_engine_env(&request, engine_env, &cancel);
+        tokio::pin!(run);
+        let mut heartbeat = self
+            .heartbeat_timeout
+            .map(|timeout| tokio::time::interval((timeout / 3).max(Duration::from_millis(100))));
+        loop {
+            tokio::select! {
+                result = &mut run => {
+                    let outcome = result.map_err(failure)?;
+                    return serde_json::to_value(outcome).map_err(|e| {
+                        failure(SandboxError::Unavailable(format!("cannot encode the outcome: {e}")))
+                    });
+                }
+                () = tokio::time::sleep(CANCEL_POLL_INTERVAL) => {
+                    if ctx.is_cancelled() {
+                        cancel.cancel();
+                    }
+                }
+                () = tick(heartbeat.as_mut()) => {
+                    // A failed heartbeat must not stop the run. The heartbeat
+                    // timeout reports a stuck worker.
+                    let _ = ctx.heartbeat(serde_json::json!({"sandbox": "running"})).await;
+                }
+            }
+        }
     }
 }
 
@@ -183,8 +257,34 @@ pub(crate) fn sandbox_activity_handler(
     ctx: &ActivityContext,
     input: serde_json::Value,
 ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + '_>> {
-    let _ = (ctx, input);
-    todo!("sandbox_activity_handler")
+    Box::pin(async move {
+        let activity = ctx
+            .state::<SandboxActivities>()
+            .and_then(|registry| registry.get(ctx.activity_type()))
+            .ok_or_else(|| {
+                failure(SandboxError::Config(format!(
+                    "no sandbox activity named {:?} is registered on this worker",
+                    ctx.activity_type()
+                )))
+            })?;
+        activity.run(ctx, input).await
+    })
+}
+
+/// The typed error payload of a sandbox error.
+fn failure(err: SandboxError) -> String {
+    use crate::failure::IntoActivityErrorString as _;
+    crate::failure::ActivityFailure::from(err).into_error_payload()
+}
+
+/// Wait for the next tick, or forever with no interval.
+async fn tick(interval: Option<&mut tokio::time::Interval>) {
+    match interval {
+        Some(interval) => {
+            interval.tick().await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 #[cfg(test)]

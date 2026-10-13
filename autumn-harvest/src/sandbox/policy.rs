@@ -25,6 +25,15 @@ pub enum IsolationLevel {
     MicroVm,
 }
 
+impl std::fmt::Display for IsolationLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Process => "process",
+            Self::MicroVm => "micro_vm",
+        })
+    }
+}
+
 /// Network access for sandboxed code.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -253,8 +262,38 @@ impl SandboxPolicy {
     /// ceiling, when a limit is zero, when no runtime exists, or when a
     /// runtime name or spec is not valid.
     pub fn validate(&self) -> Result<(), SandboxError> {
-        let _ = self;
-        todo!("SandboxPolicy::validate")
+        if self.runtimes.is_empty() {
+            return Err(SandboxError::Config("the policy names no runtime".into()));
+        }
+        for (name, spec) in &self.runtimes {
+            if !is_valid_runtime_name(name) {
+                return Err(SandboxError::Config(format!(
+                    "runtime name {name:?} is not 1 to 32 bytes of a-z, 0-9, '_' or '-'"
+                )));
+            }
+            if spec.argv.is_empty() || spec.argv.iter().any(|a| a.is_empty() || a.contains('\0')) {
+                return Err(SandboxError::Config(format!(
+                    "runtime {name:?} needs a command, and no argument may be empty or hold NUL"
+                )));
+            }
+            super::request::validate_relative_path(&spec.file_name).map_err(|e| {
+                SandboxError::Config(format!("runtime {name:?} has a bad file name: {e}"))
+            })?;
+        }
+        for (field, default, max) in limit_pairs(&self.default_limits, &self.max_limits) {
+            if default == 0 || max == 0 {
+                return Err(SandboxError::Config(format!("limit {field} must not be zero")));
+            }
+            if default > max {
+                return Err(SandboxError::Config(format!(
+                    "default {field} {default} exceeds its ceiling {max}"
+                )));
+            }
+        }
+        if self.path_env.contains('\0') {
+            return Err(SandboxError::Config("the PATH value holds NUL".into()));
+        }
+        Ok(())
     }
 
     /// The most bytes that the JSON of one outcome can have.
@@ -264,15 +303,34 @@ impl SandboxPolicy {
     /// raise its result cap to fit it.
     #[must_use]
     pub fn max_outcome_json_bytes(&self) -> u64 {
-        let _ = self;
-        todo!("SandboxPolicy::max_outcome_json_bytes")
+        // Each kept stream byte can decode to three bytes of U+FFFD, and each
+        // of those can escape to six bytes of JSON.
+        let streams = self
+            .max_limits
+            .max_output_bytes
+            .saturating_mul(2 * 3 * 6);
+        let files = self
+            .sizes
+            .max_output_file_bytes
+            .max(self.sizes.max_output_files_total_bytes)
+            .div_ceil(3)
+            .saturating_mul(4);
+        streams
+            .saturating_add(files)
+            .saturating_add(OUTCOME_ENVELOPE_BYTES)
     }
 
     /// The most bytes that the JSON of one request can have.
     #[must_use]
     pub fn max_request_json_bytes(&self) -> u64 {
-        let _ = self;
-        todo!("SandboxPolicy::max_request_json_bytes")
+        // Text escapes to at most six bytes a byte, and base64 to 4/3, so six
+        // times the input covers both. Arguments and variables escape too.
+        let input = self.sizes.max_input_bytes.saturating_mul(6);
+        let args = u64::try_from(self.sizes.max_arg_bytes).unwrap_or(u64::MAX);
+        let env = u64::try_from(self.sizes.max_env_bytes).unwrap_or(u64::MAX);
+        input
+            .saturating_add(args.saturating_add(env).saturating_mul(6))
+            .saturating_add(OUTCOME_ENVELOPE_BYTES)
     }
 }
 
@@ -280,8 +338,34 @@ impl SandboxPolicy {
 /// `_` or `-`.
 #[must_use]
 pub fn is_valid_runtime_name(name: &str) -> bool {
-    let _ = name;
-    todo!("is_valid_runtime_name")
+    (1..=32).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// Room for the fixed fields of an outcome or a request, in bytes.
+const OUTCOME_ENVELOPE_BYTES: u64 = 64 * 1024;
+
+/// Each limit as `(name, default, ceiling)`.
+fn limit_pairs(default: &SandboxLimits, max: &SandboxLimits) -> [(&'static str, u64, u64); 7] {
+    [
+        ("wall_clock_ms", default.wall_clock_ms, max.wall_clock_ms),
+        ("cpu_seconds", default.cpu_seconds, max.cpu_seconds),
+        ("memory_bytes", default.memory_bytes, max.memory_bytes),
+        (
+            "max_processes",
+            u64::from(default.max_processes),
+            u64::from(max.max_processes),
+        ),
+        ("max_file_bytes", default.max_file_bytes, max.max_file_bytes),
+        (
+            "max_open_files",
+            u64::from(default.max_open_files),
+            u64::from(max.max_open_files),
+        ),
+        ("max_output_bytes", default.max_output_bytes, max.max_output_bytes),
+    ]
 }
 
 #[cfg(test)]

@@ -40,8 +40,71 @@ pub async fn connect_guest(
     deadline: Instant,
     exited: &mut (dyn FnMut() -> Option<String> + Send),
 ) -> Result<UnixStream, SandboxError> {
-    let _ = (uds, port, deadline, exited);
-    todo!("connect_guest")
+    let mut delay = FIRST_RETRY_DELAY;
+    let mut last = String::from("no attempt finished");
+    loop {
+        if let Some(status) = exited() {
+            return Err(SandboxError::Unavailable(format!(
+                "the VMM stopped before the guest agent accepted: {status}"
+            )));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(SandboxError::Unavailable(format!(
+                "the guest agent did not accept on vsock port {port} in time: {last}"
+            )));
+        }
+        let limit = ATTEMPT_TIMEOUT.min(deadline - now);
+        match tokio::time::timeout(limit, attempt(uds, port)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(reason)) => last = reason,
+            Err(_) => last = "the attempt timed out".to_owned(),
+        }
+        let pause = delay.min(deadline.saturating_duration_since(Instant::now()));
+        tokio::time::sleep(pause).await;
+        delay = (delay * 2).min(MAX_RETRY_DELAY);
+    }
+}
+
+/// One `CONNECT` attempt. The reply line is read byte by byte, so no
+/// payload byte after the line is consumed.
+async fn attempt(uds: &Path, port: u32) -> Result<UnixStream, String> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let mut stream = UnixStream::connect(uds)
+        .await
+        .map_err(|e| format!("cannot connect to {}: {e}", uds.display()))?;
+    // One write: Firecracker reads the line from a non-blocking socket.
+    stream
+        .write_all(format!("CONNECT {port}\n").as_bytes())
+        .await
+        .map_err(|e| format!("cannot send CONNECT: {e}"))?;
+    let mut line = Vec::with_capacity(MAX_CONNECT_REPLY_BYTES);
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream
+            .read(&mut byte)
+            .await
+            .map_err(|e| format!("cannot read the CONNECT reply: {e}"))?;
+        if n == 0 {
+            return Err("the VMM closed the connection; nothing listens yet".to_owned());
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        if line.len() >= MAX_CONNECT_REPLY_BYTES {
+            return Err("the CONNECT reply is too long".to_owned());
+        }
+        line.push(byte[0]);
+    }
+    if line.starts_with(b"OK ") {
+        Ok(stream)
+    } else {
+        Err(format!(
+            "unexpected CONNECT reply {:?}",
+            String::from_utf8_lossy(&line)
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -68,7 +131,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("harvest-vsock-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("hvs-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

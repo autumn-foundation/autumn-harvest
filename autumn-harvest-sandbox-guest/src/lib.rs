@@ -61,8 +61,43 @@ impl Default for GuestConfig {
 /// values keep their defaults.
 #[must_use]
 pub fn parse_cmdline(cmdline: &str) -> GuestConfig {
-    let _ = cmdline;
-    todo!("parse_cmdline")
+    let mut config = GuestConfig::default();
+    for arg in cmdline.split_whitespace() {
+        let Some((key, value)) = arg.split_once('=') else {
+            continue;
+        };
+        match key {
+            "harvest.port" => {
+                if let Ok(port) = value.parse() {
+                    config.port = port;
+                }
+            }
+            // Root is never the uid or the gid of the code.
+            "harvest.uid" => {
+                if let Ok(uid) = value.parse::<u32>()
+                    && uid != 0
+                {
+                    config.run_as.0 = uid;
+                }
+            }
+            "harvest.gid" => {
+                if let Ok(gid) = value.parse::<u32>()
+                    && gid != 0
+                {
+                    config.run_as.1 = gid;
+                }
+            }
+            "harvest.work_mib" => {
+                if let Ok(mib) = value.parse::<u64>()
+                    && mib > 0
+                {
+                    config.work_mib = mib;
+                }
+            }
+            _ => {}
+        }
+    }
+    config
 }
 
 /// Serve connections from `accept` until one run is done, or forever when
@@ -82,9 +117,30 @@ where
     A: FnMut() -> F,
     F: std::future::Future<Output = std::io::Result<S>>,
 {
-    let _ = (&mut accept, executor, reseed, single_use, Served::Run);
-    let _ = serve_connection::<tokio::io::DuplexStream>;
-    todo!("serve")
+    use tokio::io::AsyncReadExt as _;
+    loop {
+        let mut stream = accept().await?;
+        match serve_connection(&mut stream, executor, reseed).await {
+            Ok(Served::Ping) => {}
+            Ok(Served::Run) => {
+                // Wait until the host closes, so the vsock device delivers
+                // the last bytes of the outcome before a reboot.
+                let mut sink = [0u8; 256];
+                let _ = tokio::time::timeout(CLOSE_WAIT, async {
+                    while let Ok(n) = stream.read(&mut sink).await {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                })
+                .await;
+                if single_use {
+                    return Ok(());
+                }
+            }
+            Err(e) => eprintln!("harvest-guest-agent: a connection failed: {e}"),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
