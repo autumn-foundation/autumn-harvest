@@ -24,8 +24,9 @@
 #   KERNEL_SHA256  the expected digest of the kernel; checked when set
 #   AGENT_BIN    a prebuilt static agent; the default builds one with cargo
 #
-# Needs: docker, mkfs.ext4 (e2fsprogs 1.43 or later), curl, and for the agent
-# build the rustup target x86_64-unknown-linux-musl.
+# Needs: docker, mkfs.ext4 (e2fsprogs 1.43 or later), curl, root or
+# fakeroot, and for the agent build the rustup target
+# x86_64-unknown-linux-musl.
 set -euo pipefail
 
 out="${1:?usage: build-guest-image.sh OUT_DIR}"
@@ -86,14 +87,28 @@ else
 fi
 docker start -a "${container}" >/dev/null
 mkdir -p "${work}/rootfs"
-docker export "${container}" | tar -x -C "${work}/rootfs"
-rm -f "${work}/rootfs/.dockerenv"
-install -D -m 0755 "${agent}" "${work}/rootfs/sbin/harvest-guest-agent"
-mkdir -p "${work}/rootfs/work" "${work}/rootfs/proc" "${work}/rootfs/sys" \
-  "${work}/rootfs/dev" "${work}/rootfs/tmp"
-size_mib=$(( $(du -sm "${work}/rootfs" | cut -f1) + 64 ))
 rm -f "${out}/rootfs.ext4"
-mkfs.ext4 -q -F -L harvest-rootfs -d "${work}/rootfs" "${out}/rootfs.ext4" "${size_mib}M"
+# The image files must keep their owners, mostly root. Without root, tar
+# makes the caller the owner of each file, and the caller can have the uid
+# of the code. So a non-root build runs the extraction and mkfs under
+# fakeroot, which records the owners from the archive.
+as_root=()
+if [ "$(id -u)" -ne 0 ]; then
+  if ! command -v fakeroot >/dev/null; then
+    echo "build-guest-image: run as root, or install fakeroot" >&2
+    exit 1
+  fi
+  as_root=(fakeroot --)
+fi
+docker export "${container}" | "${as_root[@]}" sh -euc '
+  rootfs="$1"; agent="$2"; image="$3"
+  tar --numeric-owner -x -C "${rootfs}"
+  rm -f "${rootfs}/.dockerenv"
+  install -D -o 0 -g 0 -m 0755 "${agent}" "${rootfs}/sbin/harvest-guest-agent"
+  mkdir -p "${rootfs}/work" "${rootfs}/proc" "${rootfs}/sys" "${rootfs}/dev" "${rootfs}/tmp"
+  size_mib=$(( $(du -sm "${rootfs}" | cut -f1) + 64 ))
+  mkfs.ext4 -q -F -L harvest-rootfs -d "${rootfs}" "${image}" "${size_mib}M"
+' build-rootfs "${work}/rootfs" "${agent}" "${out}/rootfs.ext4"
 
 # 4. The digests.
 (cd "${out}" && sha256sum vmlinux rootfs.ext4 > image.sha256)

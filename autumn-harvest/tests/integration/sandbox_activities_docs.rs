@@ -218,6 +218,7 @@ fn each_acceptance_criterion_has_evidence_that_exists() {
             .find(|line| line.starts_with(&format!("| {id} |")))
             .unwrap_or_else(|| panic!("{DESIGN} has no evidence row for {id}"));
         let cited = cited_tests(row);
+        assert!(!cited.is_empty(), "{id} cites no test: {row}");
         let missing: Vec<&String> = cited.difference(&functions).collect();
         assert!(
             missing.is_empty(),

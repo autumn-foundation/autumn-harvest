@@ -19,28 +19,36 @@ guest image. It is off by default. The guide is
   and a virtio-rng device. It has no network device, no metadata service and
   no serial console. Teardown kills the process, then the cgroup, then
   removes the jail, on every path. A lease file and a stale sweep remove the
-  microVMs of a crashed worker. A warm pool and a snapshot boot cut the start
-  time. The backend refuses Firecracker versions with a known escape CVE, and
-  it checks the host posture.
+  microVMs and cgroups of a crashed worker.
+- **Speed.** A warm pool boots microVMs ahead.
+  `FirecrackerLauncher::create_golden_snapshot` makes a golden snapshot for
+  `BootMethod::Snapshot`. Each run carries fresh host entropy and the host
+  clock, so clones of one snapshot do not share random state or a stale
+  clock.
+- **Host checks.** The first launch refuses a Firecracker or jailer version
+  with a known escape CVE. `verify_host` also checks KVM, KSM, nested KVM,
+  CPU vulnerabilities, cgroup v2, the jail base and the confinement.
 - **The guest agent.** The new `autumn-harvest-sandbox-guest` crate builds
   the agent that runs as init in the microVM. It serves one run over vsock,
-  reseeds the kernel random pool from host entropy, and reboots.
-  `scripts/sandbox/build-guest-image.sh` builds the guest image.
+  then reboots. `scripts/sandbox/build-guest-image.sh` builds the guest
+  image.
 - **The process backend.** For development and CI, it runs the same executor
-  as a host process with rlimits, a private work directory, no host
+  as a host process. The run gets rlimits, a private work directory, no host
   environment, no new privileges and an empty network namespace. The default
   policy refuses it.
 - **The activity and the tool.** `HarvestBuilder::sandbox_activity`
-  registers a normal activity. Its timeouts and result cap follow the policy,
-  and it passes `HARVEST_IDEMPOTENCY_KEY` and `HARVEST_ATTEMPT` to the code.
-  The `sandbox` feature of `autumn-harvest-agent` adds `SandboxTool`
-  (`run_code`).
+  registers a normal activity. Its `start_to_close` covers the queue wait,
+  the wall clock, the overhead and the cleanup grace. The handler passes the
+  time left in the attempt, so a retry does not overlap a live run. The code
+  gets `HARVEST_IDEMPOTENCY_KEY` and `HARVEST_ATTEMPT`. The `sandbox` feature
+  of `autumn-harvest-agent` adds `SandboxTool` (`run_code`).
 
-No migration, no new `WorkflowEvent` variant, and no worker change. History
-records the request and the outcome, and replay never runs the code again.
+No migration, no new `WorkflowEvent` variant, and no worker change other than
+the adaptive-limit list. History records the request and the outcome, and
+replay never runs the code again.
 
 Evidence: the sandbox unit tests run on every OS in `test-nodb`, with a fake
 VMM, fake `firecracker` and `jailer` scripts and a fake API server. The new
-`Sandbox (KVM)` workflow boots real microVMs and runs
-`sandbox::firecracker::kvm_tests`. The `sandbox_activities_docs` guards check
-the guide against the code.
+`Sandbox (KVM)` workflow boots real microVMs, and it runs the `root_` tests
+with sudo. The `sandbox_activities_docs` guards check the guide and the
+design record against the code.

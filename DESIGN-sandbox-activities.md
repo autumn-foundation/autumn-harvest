@@ -30,8 +30,9 @@ From the codebase:
   raises it for one activity.
 - The agent crate runs each tool call as an activity, through the `Tool`
   trait.
-- CI builds `--all-features` on Linux, macOS and Windows. No CI runner has
-  `/dev/kvm`, and this development host has none either.
+- CI builds `--all-features` on Linux, macOS and Windows. The default CI
+  jobs have no `/dev/kvm`, and this development host has none either. A
+  GitHub Linux runner can enable `/dev/kvm` with a udev rule.
 
 From the research (four reports; sources are in `docs/sandbox-activities.md`):
 
@@ -78,7 +79,7 @@ From the research (four reports; sources are in `docs/sandbox-activities.md`):
 | B11 | A non-zero exit, a signal or a timeout is an outcome. | **Adopted.** The agent reads stderr and fixes its code. Only infrastructure faults retry. |
 | B12 | A new history event for a sandbox run. | Rejected. An activity already records input and output. |
 | B13 | An agent `Tool` that runs code. | **Adopted.** The agent crate gets a `sandbox` feature. |
-| B14 | Network egress through a filtering proxy. | Deferred. The first version denies the network. `NetworkPolicy::Allow` exists for an operator who provides a filtered network. |
+| B14 | Network egress through a filtering proxy. | Deferred. The first version denies the network. `NetworkPolicy::Allow` works only on the process backend. A runtime refuses it on a backend with no network. |
 | B15 | Hand-roll the Firecracker client instead of an SDK crate. | **Adopted.** The SDK crates are young or stale. About 150 lines of HTTP/1.1 over a Unix socket cover the API. |
 
 ### 0.3 Reverse brainstorm — how can this design do harm?
@@ -88,7 +89,7 @@ From the research (four reports; sources are in `docs/sandbox-activities.md`):
 | R1 | A guest declares a 4 GiB frame, and the host allocates it. | The reader checks the length against a cap before it reads the body, and it never preallocates. |
 | R2 | Code floods stdout and fills host memory. | A capture keeps a fixed head and tail, counts the rest and drains the pipe. |
 | R3 | Code prints a NUL byte, and the `jsonb` insert of the result fails. | The capture replaces NUL with U+FFFD. |
-| R4 | Code leaves a background process that outlives the run. | The child is a session leader. The executor kills the whole group at exit, timeout and cancel. The microVM dies after one run. |
+| R4 | Code leaves a background process that outlives the run. | The microVM dies after one run. In the process backend, the child is a session leader, and the executor kills the group at exit, timeout, cancel and drop. A process that calls `setsid` escapes the group there, and the guide says so. |
 | R5 | Code spins forever. | A host-side wall-clock limit kills it. The outcome says `timed_out`. |
 | R6 | Code reads host secrets from the environment. | `env_clear`. The code sees only `PATH`, `HOME`, `TMPDIR`, `LANG` and the request variables. |
 | R7 | A request file path writes outside the work directory (`../`, `/`). | Paths must be relative, with normal components only. The guest checks them again. Files open with `O_EXCL` and `O_NOFOLLOW`. |
@@ -107,21 +108,26 @@ From the research (four reports; sources are in `docs/sandbox-activities.md`):
 | R20 | Code inherits a host file descriptor. | The child marks every descriptor above 2 close-on-exec. |
 | R21 | Code inherits a blocked signal mask. | The child resets its signal mask. |
 | R22 | A compromised VMM rewrites the jail pid file to make the host kill a process. | The host never reads a pid from the jail. It kills through its own child handle and the cgroup. |
-| R23 | The host runs a Firecracker with a known escape CVE. | The backend refuses a version below the patched minimum. |
+| R23 | The host runs a Firecracker or a jailer with a known escape CVE. | The first launch checks both versions and refuses one below the patched minimum, with or without `verify_host`. |
 | R24 | The guest prints to the serial console without end. | The kernel arguments disable the serial port. |
-| R25 | The sandbox run outlives the activity timeout, so a retry runs the code twice. | The registration sets `start_to_close` above the wall-clock ceiling plus the backend overhead. |
+| R25 | The sandbox run outlives the activity timeout, so a retry runs the code twice. | `start_to_close` is the queue wait, the wall-clock ceiling, the overhead and the cleanup grace. The runtime bounds the queue wait, takes the time left in the attempt, and does not start code that cannot finish in it. |
 | R26 | An outcome is over the activity result cap. | The registration raises `max_result_bytes` to the policy outcome bound. |
+| R27 | A guest sends a frame of junk arrays, and a tagged serde decoder copies it into a tree many times larger. | The host decodes a guest message and a run status field by field, and skips unknown fields without a copy. |
+| R28 | A leftover process of the code uid plants a link in a new work directory, and the root executor writes through it. | The work directory belongs to the executor until the input files are in place. |
+| R29 | Code hard-links a host file into an output path. | The executor skips an output with more than one hard link. |
+| R30 | A microVM restored from a snapshot runs code with the clock of the snapshot. | Each run carries the host clock, and the guest sets its clock before the code runs. |
+| R31 | An operator runs an unjailed VMM or a writable shared image in production. | `verify_host` reports an unjailed launcher as critical. A jailed launcher refuses a shared image that the jail uid owns or can write. |
 
 ### 0.4 Six thinking hats
 
 | Hat | Notes |
 |-----|-------|
-| White | Firecracker gives a guest kernel per run, in about 125 ms, for about 5 MiB. Snapshots restore in about 3 ms. No CI runner here has KVM. The engine already records activity input and output. |
+| White | Firecracker gives a guest kernel per run, in about 125 ms, for about 5 MiB. Snapshots restore in about 3 ms. The default CI jobs have no KVM. The engine already records activity input and output. |
 | Red | Teams fear LLM code on a production host. They want "it just runs Python". They also fear a sandbox that is too slow to use in a loop. |
-| Black | KVM is absent in CI and in many cloud VMs. Building a kernel and a rootfs is operator work. The process backend is weak. The real KVM path cannot run in this CI, so a fake VMM must stand in. |
+| Black | KVM is absent in the default CI jobs and in many cloud VMs. Building a kernel and a rootfs is operator work. The process backend is weak. A fake VMM must stand in for most tests. |
 | Yellow | Any language, a real kernel boundary, and output that the agent can read. Replay never runs code again. The engine needs no change. |
 | Green | A warm pool and snapshots for speed. One executor inside and outside the VM. A gVisor backend and an egress proxy later. Head-and-tail capture for tracebacks. |
-| Blue | Ship the runtime, both backends, the guest agent, the activity and the agent tool. Prove each defense with a test. Mark the KVM path as verified by a fake VMM, plus an opt-in real test. |
+| Blue | Ship the runtime, both backends, the guest agent, the activity and the agent tool. Prove each defense with a test. A dedicated workflow boots real microVMs on a runner with KVM. |
 
 ### 0.5 Decisions
 
@@ -142,11 +148,28 @@ From the research (four reports; sources are in `docs/sandbox-activities.md`):
   lets a fake VMM stand in for tests.
 - No PCI, no network device, no MMDS, no serial console.
 
+### 0.6 Review
+
+Four review agents read the work: security, correctness and concurrency,
+engine integration, and docs, tests and CI. The fixes changed these
+decisions. R25, R27 to R31 and the new rows of §3 record them.
+
+- The runtime owns the time budget of an attempt, not the registration
+  alone.
+- The host decodes guest data field by field, and bounds and cleans each
+  guest string that can reach history.
+- The version gate runs at the first launch, not only in `verify_host`.
+- Tests that need root carry a `root_` prefix. The `Sandbox (KVM)`
+  workflow runs them with sudo.
+- The agent tool returns a bounded view, and its effect follows the
+  isolation.
+- A golden snapshot has a creator, `create_golden_snapshot`, and a KVM test.
+
 ---
 
 ## 1. Acceptance criteria
 
-The evidence column is filled in when the work is done. See §3.
+Section 3 lists the evidence for each criterion.
 
 | AC | Statement |
 |----|-----------|
@@ -166,11 +189,11 @@ The evidence column is filled in when the work is done. See §3.
 | AC14 | The vsock connector sends `CONNECT` in one write and retries until the boot deadline. |
 | AC15 | Each microVM serves one run. Teardown runs on success, error, timeout, cancel and drop, and it removes the jail and the cgroup. |
 | AC16 | A warm pool keeps booted microVMs ready, hands out each one once, refills, and kills all at shutdown. |
-| AC17 | A snapshot boot method loads a golden snapshot through the API, and each run carries fresh entropy. |
+| AC17 | A launcher creates a golden snapshot, and a snapshot boot loads it through the API. Each run carries fresh entropy and the host clock. |
 | AC18 | The backend refuses a Firecracker version below the patched minimum, and it reports host posture risks. |
-| AC19 | A runtime bounds the runs at one time, and a cancel ends the wait for a slot. |
-| AC20 | `HarvestBuilder::sandbox_activity` registers a normal activity. Its handler honors cancellation, injects the idempotency key, and sets timeouts and the result cap from the policy. |
-| AC21 | The agent crate offers a `Tool` that runs code through the runtime. Its effect follows the network policy. |
+| AC19 | A runtime bounds the runs at one time and the wait for a slot. A cancel ends the wait. |
+| AC20 | `HarvestBuilder::sandbox_activity` registers a normal activity. Its handler honors cancellation and the attempt deadline, and injects the idempotency key. The registration sets timeouts and the result cap from the policy. |
+| AC21 | The agent crate offers a `Tool` that runs code through the runtime. Its effect follows the network policy and the isolation. |
 | AC22 | A guide, this design record and the changelog fragment exist in ASD-STE100 style, and the comment hygiene gate passes. |
 | AC23 | CI runs the new tests on every OS where they apply. A dedicated workflow runs the KVM tests on real microVMs, and the guide documents them. |
 
@@ -178,9 +201,9 @@ The evidence column is filled in when the work is done. See §3.
 
 ## 2. TDD map
 
-Red: each test below is written first and fails against a stub. Green: the
-implementation makes it pass. Refactor: the code is cleaned with the tests
-green.
+Red: the author writes each test below first, and it fails against a stub.
+Green: the implementation makes it pass. Refactor: the author cleans the
+code while the tests stay green.
 
 | Area | Tests | Proves |
 |------|-------|--------|
@@ -190,17 +213,47 @@ green.
 | Capture | `sandbox::capture::tests` | AC5, R2, R3 |
 | Errors | `sandbox::error::tests` | AC7, R14 |
 | Protocol | `sandbox::protocol::tests` | AC10, R1, R19 |
-| Runtime | `sandbox::runtime::tests` | AC4, AC19, R11, R12, R17 |
-| Executor | `sandbox::exec::tests` | AC5, AC6, AC8, AC9, R4 to R8, R10, R20, R21 |
-| Guest | `sandbox::guest::tests` | AC11, R16 |
-| Firecracker | `sandbox::firecracker::*::tests` | AC12 to AC18, R13, R15, R18, R22 to R24 |
+| Protocol decoders | `sandbox::protocol::tests`, `sandbox::outcome::tests` | R27 |
+| Runtime | `sandbox::runtime::tests` | AC4, AC19, R11, R12, R17, R25 |
+| Executor | `sandbox::exec::tests` | AC5, AC6, AC8, AC9, R4 to R8, R10, R20, R21, R28, R29 |
+| Guest | `sandbox::guest::tests` | AC11, R16, R30 |
+| Firecracker | `sandbox::firecracker::*::tests` | AC12 to AC18, R13, R15, R18, R22 to R24, R31 |
 | Activity | `sandbox::activity::tests` | AC20, R25, R26 |
 | Agent tool | `autumn-harvest-agent` `sandbox` tests | AC21 |
 | Docs | `sandbox_activities_docs` guard suite | AC22 |
-| Real microVMs | `sandbox::firecracker::kvm_tests`, ignored without KVM | AC12, AC15, AC16, AC23 |
+| Real microVMs | `sandbox::firecracker::kvm_tests`, ignored without KVM | AC12, AC15, AC16, AC17, AC23, R30 |
 
 ---
 
 ## 3. Evidence
 
-Filled in at the end of the work.
+Each row names the tests that prove the criterion. The guard
+`each_acceptance_criterion_has_evidence_that_exists` checks that each named
+test exists. CI runs each test in `test-nodb` on Linux, macOS and Windows,
+or in the `Sandbox (KVM)` workflow.
+
+| AC | Evidence |
+|----|----------|
+| AC1 | `sandbox-activities` is not a default feature, and it adds only `libc`. CI runs the guide commands on three operating systems: `each_guide_test_command_runs_in_ci`. The guest crate tests compile on each of them. |
+| AC2 | `unknown_request_fields_are_rejected_by_serde`, `a_python_request_becomes_a_plan_with_the_code_file`, `base64_files_are_decoded_and_bad_base64_is_denied`, `every_schema_field_is_a_request_field`. |
+| AC3 | `an_unknown_runtime_is_denied_and_names_the_allowed_ones`, `a_limit_over_the_ceiling_is_denied_and_names_the_ceiling`, `traversal_and_absolute_paths_are_denied`, `too_many_files_args_env_or_outputs_are_denied`, `bad_input_is_a_denial`. |
+| AC4 | `the_default_policy_requires_a_microvm_and_denies_the_network`, `the_default_policy_refuses_a_process_backend`, `a_policy_that_allows_the_network_needs_a_backend_with_one`. |
+| AC5 | `a_timeout_kills_the_run_and_is_an_outcome`, `a_python_traceback_is_an_outcome_not_a_failure`, `a_long_stream_keeps_the_head_and_the_tail`, `a_truncated_stream_cuts_on_character_boundaries`, `a_nul_byte_never_reaches_the_outcome`, `a_nul_in_a_skip_reason_breaks_the_bounds`. |
+| AC6 | `requested_outputs_are_returned`, `a_symlinked_output_is_skipped`, `a_hard_linked_output_is_skipped`, `a_fifo_output_is_skipped_without_blocking`, `the_total_output_budget_is_enforced`. |
+| AC7 | `a_denial_and_a_config_error_are_not_retryable`, `an_unavailable_backend_is_retryable`, `a_protocol_violation_is_not_retryable`, `an_activity_cancel_stops_the_run`, `a_cancel_kills_the_run`. |
+| AC8 | `the_child_sees_no_host_environment`, `the_work_directory_is_private_and_removed`, `the_cpu_limit_ends_a_spinning_run`, `the_child_leads_its_own_session`, `an_inherited_descriptor_does_not_reach_the_child`, `the_signal_mask_is_reset`, `no_new_privileges_is_set`, `a_background_process_is_killed_when_the_main_process_exits`. |
+| AC9 | `the_network_is_denied_or_the_run_fails_closed`. In a real microVM: `a_microvm_has_no_network`. |
+| AC10 | `a_frame_is_a_big_endian_length_and_json`, `an_oversized_declared_length_is_rejected_before_the_body`, `a_wrong_version_is_malformed`, `a_wrong_run_id_is_a_protocol_violation`, `a_guest_message_decodes_in_any_key_order_and_skips_unknown_fields`. |
+| AC11 | `a_ping_gets_a_pong`, `a_run_sets_the_clock_after_the_reseed_and_before_the_code`, `a_failed_reseed_stops_the_run`, `a_plan_that_fails_the_guest_check_is_a_protocol_violation`, `the_agent_serves_pings_then_one_run_then_stops`. |
+| AC12 | `the_config_file_has_the_documented_shape`, `the_config_has_no_network_and_no_metadata_service`, `the_boot_args_stop_on_reboot_drop_serial_and_start_the_agent`, `the_arguments_use_cgroup_v2_and_pass_firecracker_args_last`. A real boot: `the_api_boot_runs_code`. |
+| AC13 | `a_put_sends_one_request_with_a_content_length_body`, `an_error_status_reports_the_fault_message`, `an_oversized_body_is_refused`, `a_server_that_never_answers_times_out`. |
+| AC14 | `the_handshake_hands_back_a_raw_stream`, `a_closed_attempt_is_retried_until_the_guest_listens`, `garbage_and_endless_replies_never_succeed`, `a_stopped_vmm_ends_the_wait_at_once`. |
+| AC15 | `a_run_boots_a_vm_runs_the_code_and_tears_the_vm_down`, `dropping_the_run_tears_the_vm_down`, `the_sweep_removes_only_the_vms_of_dead_owners`, `the_sweep_kills_the_cgroups_of_dead_owners`. On KVM: `a_microvm_times_out_and_is_torn_down`, `root_jailed_microvm_runs_code_and_removes_the_jail`. |
+| AC16 | `each_vm_is_handed_out_once_and_the_pool_refills`, `a_guest_that_hangs_after_the_handshake_does_not_stop_the_refill`, `a_warm_vm_that_died_in_the_pool_is_replaced`. On KVM: `a_warm_pool_serves_each_run_from_a_new_microvm`. |
+| AC17 | `a_snapshot_load_resumes_from_a_file_backend`, `root_golden_snapshot_boots_pings_pauses_and_copies_the_files_out`, `each_job_gets_a_fresh_run_id_and_fresh_entropy`. On KVM: `root_snapshot_boots_get_fresh_entropy_and_the_host_clock`. |
+| AC18 | `versions_with_known_escapes_are_refused`, `a_launch_refuses_a_firecracker_with_a_known_escape`, `each_weak_setting_is_found`, `a_jail_base_that_others_can_write_is_critical`, `a_shared_image_that_others_can_write_is_a_config_error`. |
+| AC19 | `runs_at_one_time_never_exceed_the_bound`, `a_cancel_while_waiting_for_a_slot_returns_cancelled`, `a_full_runtime_is_unavailable_after_the_queue_wait`. |
+| AC20 | `the_builder_registers_the_activity_and_its_runtime`, `the_info_sets_bounds_from_the_policy`, `the_code_gets_the_idempotency_key_and_the_attempt`, `an_attempt_deadline_too_close_for_the_run_is_a_retryable_failure`, `the_info_carries_the_routing_options`. |
+| AC21 | `the_tool_is_named_run_code_and_describes_itself`, `the_effect_follows_the_network_and_the_isolation`, `a_failing_program_is_a_result_not_a_tool_error`, `the_view_keeps_the_status_and_stderr_within_the_harness_cut`. |
+| AC22 | `the_pages_keep_sentences_short`, `the_guide_has_a_failure_row_per_error_type`, `the_guide_names_the_enforced_firecracker_minimums`. The comment hygiene gate passes. |
+| AC23 | `guards_run_on_docs_only_changes`, `each_guide_test_command_runs_in_ci`. The `Sandbox (KVM)` workflow runs `a_microvm_runs_python_and_returns_an_output_file` and the other KVM tests. |
