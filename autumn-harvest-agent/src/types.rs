@@ -440,6 +440,11 @@ pub struct ToolCallRequest {
     /// The harness tools that this agent may call. `None` means every tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<BTreeSet<String>>,
+    /// The flow labels that the decision recorded for the call. The tool-call
+    /// activity refuses a tool whose labels grew after the decision. `None`
+    /// when the decision had no flow rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<BTreeSet<String>>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -661,6 +666,7 @@ mod tests {
         assert!(encoded.get("read_only").is_none());
         assert!(encoded.get("memory_scope").is_none());
         assert!(encoded.get("allowed_tools").is_none());
+        assert!(encoded.get("labels").is_none());
     }
 
     #[test]

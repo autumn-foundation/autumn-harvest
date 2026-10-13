@@ -189,3 +189,5 @@ API and docs, and test quality. Each row names a finding and its fix.
 | F9 | `accept` drops the chain prefix of a local mandate that is not a root. | `accept` needs a root. | AC19 |
 | F10 | A child of a workflow-id run uses the response cache. | `shares_run_id` covers `{root}:d{n}`. | AC13 |
 | F11 | Docs: a non-compiling example, stale adapter docs, loose claims, long sentences. | Corrected. `Refusal` implements `Error`. | AC15 |
+| F12 | Codex: the tool-call worker does not check the labels that the decision saw. A deploy can change a tool between the two. | `ToolCallRequest::labels` carries the recorded labels. The activity refuses a tool whose labels grew. | AC10 |
+| F13 | CI: the `verus` job fails on `trunk-dev` too. The pinned rolling Verus release has no assets now. | Pin the weekly release `0.2026.10.04.426d8b0`. All 33 proofs verify with it. | AC16 |

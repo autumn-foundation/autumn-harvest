@@ -150,6 +150,7 @@ async fn the_tool_handler_runs_the_named_tool_with_its_context() {
         memory_scope: None,
         read_only: false,
         allowed_tools: None,
+        labels: None,
         call: ToolCall {
             id: "c1".into(),
             name: "read".into(),
@@ -360,6 +361,7 @@ async fn a_huge_tool_error_still_fits_the_result_cap() {
             memory_scope: None,
             read_only: false,
             allowed_tools: None,
+            labels: None,
             call: ToolCall {
                 id: "c".into(),
                 name: "fail".into(),
@@ -586,6 +588,7 @@ async fn a_read_only_call_refuses_a_write_tool_at_run_time() {
             memory_scope: None,
             read_only: true,
             allowed_tools: None,
+            labels: None,
             call: ToolCall {
                 id: "c".into(),
                 name: "write".into(),

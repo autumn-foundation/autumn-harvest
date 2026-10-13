@@ -33,6 +33,8 @@ and `DESIGN-agent-mesh.md` the plan.
   Meta's Agents Rule of Two. The workflow holds the exercised labels, so model
   output cannot remove one. A call after a delegation in the same turn does
   not run on a stale decision. With flow rules, an unknown tool is denied.
+  The tool-call activity refuses a tool whose labels grew after the
+  decision.
 - **Label carry.** `AgentReport::flow_labels` returns the labels of a run.
   `AgentTask::flow_labels` and `HeartbeatTask::flow_labels` seed the next
   run of the same conversation.
@@ -50,6 +52,9 @@ and `DESIGN-agent-mesh.md` the plan.
 - **Fix.** `remote_task::activities` set `input_schema` and `output_schema`
   twice, so the workspace did not compile. This PR removes the duplicate
   pair.
+- **Fix.** The `verus` CI job pinned a rolling Verus release whose assets
+  Verus deleted, so the download failed with 404. The script now pins the
+  weekly release `0.2026.10.04.426d8b0`.
 
 **Invariants.** No new `WorkflowEvent` variant. No migration. No route. Each
 new field of a recorded payload is left out at its default, so a run with no

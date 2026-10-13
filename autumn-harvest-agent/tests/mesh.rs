@@ -405,6 +405,7 @@ async fn the_tool_call_activity_checks_the_mandate_again() {
             memory_scope: None,
             read_only: false,
             allowed_tools: Some(BTreeSet::from(["lookup".to_owned()])),
+            labels: None,
         })
         .await
         .unwrap();
@@ -1604,5 +1605,71 @@ async fn the_model_turn_span_names_the_agent() {
             "researcher".to_owned()
         )),
         "{kept:?}"
+    );
+}
+
+// AC10: the tool-call worker refuses a tool whose labels grew after the
+// decision, for example in a rolling deploy.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_tool_call_activity_refuses_a_tool_whose_labels_grew() {
+    let sends = Arc::new(Recorder::default());
+    let harness = AgentHarness::new(ScriptedModel::new(Vec::new())).tool(recorded_tool(
+        "send",
+        ToolEffect::External,
+        &sends,
+    ));
+    let request = |labels: &[&str]| ToolCallRequest {
+        run_id: "r".into(),
+        session_id: None,
+        step: 0,
+        call: ToolCall {
+            id: "c".into(),
+            name: "send".into(),
+            arguments: json!({}),
+        },
+        memory_scope: None,
+        read_only: false,
+        allowed_tools: None,
+        labels: Some(labels.iter().map(|label| (*label).to_owned()).collect()),
+    };
+    // The deciding worker saw a read-only tool.
+    let grown = harness
+        .tool_call(request(&["effect:read_only"]))
+        .await
+        .unwrap();
+    assert!(grown.is_error);
+    assert!(
+        grown.content.contains("labels changed"),
+        "{}",
+        grown.content
+    );
+    assert_eq!(sends.runs(), Vec::<Value>::new());
+    let same = harness
+        .tool_call(request(&["effect:external"]))
+        .await
+        .unwrap();
+    assert!(!same.is_error, "{}", same.content);
+    assert_eq!(sends.runs().len(), 1);
+}
+
+// AC10: with flow rules, the workflow passes the recorded labels to the
+// tool-call activity.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_workflow_passes_the_recorded_labels_to_the_tool_call() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        calls(&[("c1", "inbox", json!({}))], 1),
+        answer("read", 1),
+    ]);
+    let harness = AgentHarness::new(model)
+        .tool(inbox())
+        .flow_rules(FlowRules::rule_of_two());
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::start(&mut rt, &AgentTask::new("read")).unwrap();
+    report(rt.run_until_blocked(exec).await.unwrap());
+    let history = rt.load_history(exec).unwrap();
+    assert_eq!(
+        scheduled(&history, "agent_tool_call")[0]["labels"],
+        json!(["effect:read_only", "private_data", "untrusted_input"])
     );
 }

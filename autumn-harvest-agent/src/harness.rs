@@ -700,6 +700,14 @@ impl AgentHarness {
         if request.read_only && tool.effect() >= ToolEffect::Write {
             return Ok(self.error_outcome("this run may only read data"));
         }
+        // The same reason applies to the flow labels. A tool that gained a
+        // label after the decision did not pass the flow rules with it.
+        if let Some(recorded) = &request.labels
+            && !call_labels(Some(tool)).is_subset(recorded)
+        {
+            return Ok(self
+                .error_outcome("the tool labels changed after the decision; call the tool again"));
+        }
         let ctx = ToolContext {
             run_id: RunId::new(request.run_id),
             call_id: call.id,

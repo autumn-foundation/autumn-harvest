@@ -227,6 +227,9 @@ How the check works:
   new labels.
 - With flow rules, the decision denies a call to an unknown tool, because the
   worker cannot label it.
+- The tool-call activity gets the recorded labels of the call. It refuses a
+  tool that gained a label after the decision, for example in a rolling
+  deploy. The model reads that it must call again.
 - One label set spans the tree. A child answer enters the parent context, and
   a parent task text enters the child. So labels flow both ways.
 

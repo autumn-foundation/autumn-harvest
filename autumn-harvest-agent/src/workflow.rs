@@ -447,6 +447,7 @@ async fn run_segment(
             step: progress.steps,
             round: tree.rounds,
             position: 0,
+            labels: None,
         };
         progress.steps = progress.steps.saturating_add(1);
         tree.rounds = tree.rounds.saturating_add(1);
@@ -489,15 +490,29 @@ enum RoundEnd {
     Loop,
 }
 
-/// Where one call sits in its run and in the tree.
+/// Where one call sits in its run and in the tree, with its recorded flow
+/// labels.
 #[derive(Debug, Clone, Copy)]
-struct Slot {
+struct Slot<'a> {
     /// The tool round (0-based) of the segment.
     step: u32,
     /// The tool round of the whole tree. The approval name holds it.
     round: u32,
     /// The position of the call in its round.
     position: usize,
+    /// The flow labels that the decision recorded for the call. `None` when
+    /// the turn recorded no labels, because its worker had no flow rules.
+    labels: Option<&'a BTreeSet<String>>,
+}
+
+impl Slot<'_> {
+    /// Add the recorded labels of the call to the tree. The decision lets
+    /// the call run, so its labels count.
+    fn exercise(self, tree: &mut Tree) {
+        if let Some(labels) = self.labels {
+            tree.exercised.extend(labels.iter().cloned());
+        }
+    }
 }
 
 /// Answer every call of one round in ONE tool message.
@@ -511,7 +526,7 @@ async fn run_round(
     run: Run<'_>,
     progress: &mut Progress,
     tree: &mut Tree,
-    slot: Slot,
+    slot: Slot<'_>,
     turn: &ModelTurn,
     calls: Vec<ToolCall>,
 ) -> Result<RoundEnd, String> {
@@ -522,7 +537,6 @@ async fn run_round(
     let mut full = false;
     let mut looped = false;
     let mut stale = false;
-    let no_labels = BTreeSet::new();
     for (position, call) in calls.into_iter().enumerate() {
         progress.tool_calls = progress.tool_calls.saturating_add(1);
         let call_id = call.id.clone();
@@ -542,16 +556,20 @@ async fn run_round(
                     .unwrap_or_else(|| ToolDecision::Deny {
                         reason: "no recorded decision".to_owned(),
                     });
-            let labels = turn.labels.get(position).unwrap_or(&no_labels);
+            let labels = turn.labels.get(position);
             // With flow rules, the turn decided each call against the labels
             // before the round. A delegation can add the labels of its child.
             // The calls after it then hold a stale decision, so they do not run.
             let expected: Option<BTreeSet<String>> =
-                (!turn.labels.is_empty()).then(|| tree.exercised.union(labels).cloned().collect());
+                labels.map(|labels| tree.exercised.union(labels).cloned().collect());
             let name = call.name.clone();
             let arguments = call.arguments.clone();
-            let at = Slot { position, ..slot };
-            let mut content = decide(ctx, run, progress, tree, at, call, (decision, labels))
+            let at = Slot {
+                position,
+                labels,
+                ..slot
+            };
+            let mut content = decide(ctx, run, progress, tree, at, call, decision)
                 .await?
                 .content;
             stale = expected.is_some_and(|expected| !tree.exercised.is_subset(&expected));
@@ -608,27 +626,27 @@ const NOT_RUN_STALE: &str = "the call did not run: a delegation earlier in this 
 
 /// Act on one recorded policy decision.
 ///
-/// `labels` are the recorded flow labels of the call. They join the tree
-/// labels when the call runs.
+/// The recorded flow labels of the call join the tree labels when the
+/// decision lets the call run.
 async fn decide(
     ctx: &WorkflowContext,
     run: Run<'_>,
     progress: &mut Progress,
     tree: &mut Tree,
-    slot: Slot,
+    slot: Slot<'_>,
     call: ToolCall,
-    (decision, labels): (ToolDecision, &BTreeSet<String>),
+    decision: ToolDecision,
 ) -> Result<ToolOutcome, String> {
     match decision {
         ToolDecision::Allow => {
-            tree.exercised.extend(labels.iter().cloned());
+            slot.exercise(tree);
             run_tool(ctx, run, progress, tree, slot, call).await
         }
         ToolDecision::Deny { reason } => {
             Ok(ToolOutcome::error(&format!("denied by policy: {reason}")))
         }
         ToolDecision::RequireApproval { .. } => {
-            gated_call(ctx, run, progress, tree, slot, call, labels).await
+            gated_call(ctx, run, progress, tree, slot, call).await
         }
     }
 }
@@ -644,9 +662,8 @@ async fn gated_call(
     run: Run<'_>,
     progress: &mut Progress,
     tree: &mut Tree,
-    slot: Slot,
+    slot: Slot<'_>,
     mut call: ToolCall,
-    labels: &BTreeSet<String>,
 ) -> Result<ToolOutcome, String> {
     let task = run.task;
     let decision = await_decision::<Approval>(
@@ -657,12 +674,12 @@ async fn gated_call(
     .await?;
     match decision {
         Decision::Decided(Approval::Approve) => {
-            tree.exercised.extend(labels.iter().cloned());
+            slot.exercise(tree);
             run_tool(ctx, run, progress, tree, slot, call).await
         }
         Decision::Decided(Approval::Edit { arguments }) => {
             call.arguments = arguments;
-            tree.exercised.extend(labels.iter().cloned());
+            slot.exercise(tree);
             run_tool(ctx, run, progress, tree, slot, call).await
         }
         Decision::Decided(Approval::Reject { reason }) => Ok(ToolOutcome::error(&format!(
@@ -687,7 +704,7 @@ async fn run_tool(
     run: Run<'_>,
     progress: &mut Progress,
     tree: &mut Tree,
-    slot: Slot,
+    slot: Slot<'_>,
     call: ToolCall,
 ) -> Result<ToolOutcome, String> {
     let task = run.task;
@@ -729,6 +746,7 @@ async fn run_tool(
             memory_scope: task.memory_tool_scope(),
             read_only: task.read_only,
             allowed_tools: run.allowed_tools(),
+            labels: slot.labels.cloned(),
         },
     )
     .await
