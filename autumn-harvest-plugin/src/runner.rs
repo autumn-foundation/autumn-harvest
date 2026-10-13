@@ -1379,6 +1379,9 @@ impl HarvestRunner {
         let scheduler_monitor = scheduler
             .as_ref()
             .map_or_else(SchedulerMonitor::offline, SchedulerRuntime::monitor);
+        // The API reads archived history back through the same archiver
+        // (issue #1983).
+        let api_history_archiver = prepared.history_archiver.clone();
         let retention = if prepared.retention_config.enabled() {
             RetentionRuntime::spawn_with_hooks(
                 prepared.storage_pool.sharded_pool().clone(),
@@ -1427,7 +1430,7 @@ impl HarvestRunner {
                 prepared.worker_runtime_config.poll_interval,
             ))
         };
-        let api_runtime = HarvestApiRuntime::new(
+        let mut api_runtime = HarvestApiRuntime::new(
             registry,
             dag_catalog,
             workflow_schedules,
@@ -1443,6 +1446,9 @@ impl HarvestRunner {
         )
         .with_registered_dag_names(prepared.registered_dag_names.iter().cloned())
         .with_effective_config(prepared.effective_config.clone());
+        if let Some(archiver) = api_history_archiver {
+            api_runtime = api_runtime.with_history_archiver(archiver);
+        }
 
         Ok(Self {
             api_runtime,

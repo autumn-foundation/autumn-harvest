@@ -287,6 +287,7 @@ mod replayer_tests;
 mod resident_hit_rate_db_tests;
 #[cfg(feature = "db")]
 mod resident_outcome_tests;
+mod retention_archive_codec_tests;
 mod retention_overrides_tests;
 mod retention_reclaim_support;
 mod retention_summary_tests;
