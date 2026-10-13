@@ -829,6 +829,121 @@ async fn retry_backoff_is_honoured_by_the_channel() {
     );
 }
 
+/// A channel whose acks take `ack_delay`, as a slow channel's do.
+#[derive(Debug)]
+struct SlowAckDispatch {
+    inner: Arc<MemoryDispatch>,
+    ack_delay: Duration,
+}
+
+#[async_trait::async_trait]
+impl TaskDispatch for SlowAckDispatch {
+    async fn publish(
+        &self,
+        hints: &[autumn_harvest::dispatch::DispatchHint],
+    ) -> autumn_harvest::HarvestResult<()> {
+        self.inner.publish(hints).await
+    }
+
+    async fn next(
+        &self,
+        queues: &[String],
+        consumer: &str,
+        max: usize,
+        wait: Duration,
+    ) -> autumn_harvest::HarvestResult<Vec<autumn_harvest::dispatch::DispatchLease>> {
+        self.inner.next(queues, consumer, max, wait).await
+    }
+
+    async fn ack(
+        &self,
+        lease: &autumn_harvest::dispatch::DispatchLease,
+    ) -> autumn_harvest::HarvestResult<()> {
+        tokio::time::sleep(self.ack_delay).await;
+        self.inner.ack(lease).await
+    }
+
+    async fn ack_many(
+        &self,
+        leases: &[autumn_harvest::dispatch::DispatchLease],
+    ) -> autumn_harvest::HarvestResult<()> {
+        tokio::time::sleep(self.ack_delay).await;
+        self.inner.ack_many(leases).await
+    }
+
+    async fn release(
+        &self,
+        lease: &autumn_harvest::dispatch::DispatchLease,
+        delay: Duration,
+    ) -> autumn_harvest::HarvestResult<()> {
+        self.inner.release(lease, delay).await
+    }
+
+    async fn maintain(
+        &self,
+        queues: &[String],
+    ) -> autumn_harvest::HarvestResult<autumn_harvest::dispatch::DispatchMaintenance> {
+        self.inner.maintain(queues).await
+    }
+}
+
+/// A task that puts its own row back to `PENDING` before the worker acks its
+/// reference keeps a reference for the row. A retry does this when the
+/// activity fails fast. The channel drops a publish for a reference it has
+/// leased out, so a body that ran before the ack lost the hint. The row then
+/// waited for the reconcile sweep.
+#[tokio::test]
+async fn a_row_put_back_before_the_ack_keeps_its_reference() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let inner = Arc::new(MemoryDispatch::new());
+    let channel = Arc::new(SlowAckDispatch {
+        inner: Arc::clone(&inner),
+        ack_delay: Duration::from_millis(500),
+    });
+    autumn_harvest::dispatch::install(
+        channel as Arc<dyn TaskDispatch>,
+        DispatchSettings {
+            poll_interval: Duration::from_millis(20),
+            reconcile_interval: Duration::from_secs(30),
+            reconcile_batch: 100,
+            release_backoff_cap: Duration::from_secs(30),
+        },
+    );
+    let _guard = InstalledGuard;
+
+    let log = Arc::new(ActivityLog::default());
+    let shared = shared_state_with(Arc::clone(&log));
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, "dispatch_retrying").await;
+
+    let pool = build_pool(&url);
+    let worker = Arc::new(make_worker(
+        vec![wf_info("dispatch_retrying", retrying_activity_workflow)],
+        vec![act_info(
+            "flaky",
+            fail_once_activity,
+            Some(RetryPolicy::fixed(3, Duration::from_millis(100)).with_jitter(JitterPolicy::None)),
+        )],
+        shared,
+    ));
+
+    let mut check = connect(&url).await;
+    let started = std::time::Instant::now();
+    with_worker(worker, pool, async {
+        wait_for_state(&mut check, exec_id, &["COMPLETED"], Duration::from_secs(40)).await;
+    })
+    .await;
+    let elapsed = started.elapsed();
+    assert_eq!(AtomicUsize::load(&log.runs, Ordering::SeqCst), 2);
+    // A few 500 ms acks and one 100 ms backoff. The 30 s reconcile sweep
+    // would take far longer.
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the retry waited for the reconcile sweep: {elapsed:?}"
+    );
+}
+
 /// A multi-shard worker cannot use the dispatch channel in v1.
 #[tokio::test]
 async fn multi_shard_worker_rejects_dispatch() {
