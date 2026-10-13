@@ -56,23 +56,25 @@ pub enum SqliteError {
     #[error("execution not found: {0}")]
     ExecutionNotFound(ExecutionId),
 
-    /// A signal was sent to an execution that is not accepting signals — it has
-    /// reached a terminal state (`COMPLETED`/`FAILED`/…). Mirrors the Postgres
-    /// engine's rejection of a signal to a terminal target
-    /// ([`send_signal`](crate::SqliteRuntime::send_signal)). No drive ever
-    /// consumes a row staged for a sealed run, so the wakeup would be lost
-    /// silently. An unknown id is [`ExecutionNotFound`](Self::ExecutionNotFound); this
-    /// variant is only for a *present but sealed* run.
+    /// A signal, update, cancel or terminate targeted an execution in a
+    /// terminal state (`COMPLETED`, `FAILED`, `CANCELLED`, `TERMINATED` or
+    /// `CONTINUED_AS_NEW`).
     ///
-    /// `update` also returns this variant for a terminal run (issue #2025).
+    /// [`send_signal`](crate::SqliteRuntime::send_signal) mirrors the Postgres
+    /// rejection of a signal to a terminal target. No drive consumes a row
+    /// staged for a sealed run, so the wakeup would be lost silently. `update`
+    /// also returns it (issue #2025), and so do
+    /// [`cancel`](crate::SqliteRuntime::cancel) and
+    /// [`terminate`](crate::SqliteRuntime::terminate) (issue #2021). An unknown
+    /// id is [`ExecutionNotFound`](Self::ExecutionNotFound). This variant is
+    /// only for a stored, terminal run.
     #[error(
-        "workflow execution {execution_id} is not running (state: {state}); \
-         cannot accept a signal or an update"
+        "workflow execution {execution_id} is not running (state: {state}); cannot accept the request"
     )]
     WorkflowNotRunning {
-        /// The terminal execution the signal or update targeted.
+        /// The terminal execution the request targeted.
         execution_id: ExecutionId,
-        /// Its current (terminal) state — `COMPLETED`, `FAILED`, etc.
+        /// Its current terminal state, for example `COMPLETED` or `CANCELLED`.
         state: String,
     },
 

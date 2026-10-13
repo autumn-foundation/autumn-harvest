@@ -925,6 +925,11 @@ jobs:
       - name: Run plugin lib tests (aws-kms feature, issue #1825)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-plugin --features aws-kms --lib aws_kms
+      # Issue #1983. The adapter unit tests use an in-memory backend and a
+      # local fake GCS server, so they need no cloud account and no Docker.
+      - name: Run plugin lib tests (s3 and gcs features, issue #1983)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        run: cargo test -p autumn-harvest-plugin --features s3,gcs --lib object_store
       # Issue #1981. The Vault Transit binding runs the same KMS conformance
       # suite as AWS, against a local fake Vault server.
       - name: Run plugin lib tests (vault-transit feature, issue #1981)
@@ -1401,6 +1406,15 @@ jobs:
           plan="$(DRY_RUN=1 bash .github/ci/run-suites.sh run linux)"
           if grep -q -- '--test connector_sqs_broker' <<<"$plan"; then
             images="$images softwaremill/elasticmq:1.5.2"
+          fi
+          # Issue #1983: the object-store emulators, only on the shards that
+          # run their suites. The official MinIO images are no longer
+          # published, so the suite uses the `pgsty/minio` community build.
+          if grep -q -- '--test object_store_s3_minio' <<<"$plan"; then
+            images="$images pgsty/minio:RELEASE.2026-08-04T00-00-00Z"
+          fi
+          if grep -q -- '--test object_store_gcs_emulator' <<<"$plan"; then
+            images="$images fsouza/fake-gcs-server:1.56.1"
           fi
           # Docker Hub rate-limits anonymous pulls, and the ECR Public mirror
           # has a data limit. An official image (no slash in its name) comes
@@ -2039,6 +2053,12 @@ jobs:
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features sqs -- -D warnings
       - name: Clippy autumn-harvest-plugin (aws-kms feature, issue #1825)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features aws-kms -- -D warnings
+      # Issue #1983. `object-store` is the backend-agnostic layer with no
+      # client. `s3,gcs` adds both backends and the emulator suites.
+      - name: Clippy autumn-harvest-plugin (object-store feature, issue #1983)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features object-store -- -D warnings
+      - name: Clippy autumn-harvest-plugin (s3 and gcs features, issue #1983)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features s3,gcs -- -D warnings
       - name: Clippy autumn-harvest-plugin (vault-transit feature, issue #1981)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features vault-transit -- -D warnings
 
@@ -2328,6 +2348,10 @@ jobs:
       # `runner.rs` never reach the MSRV compiler. Issue #1312.
       - name: Check MSRV compiles (autumn-harvest-plugin redis feature, issue #1312)
         run: cargo check -p autumn-harvest-plugin --features redis
+      # Issue #1983. The locked `aws-sdk-s3` declares Rust 1.88, the MSRV
+      # itself. This step makes a lockfile bump past it fail.
+      - name: Check MSRV compiles (autumn-harvest-plugin s3 and gcs features, issue #1983)
+        run: cargo check -p autumn-harvest-plugin --features s3,gcs
 
   # Concurrency model checking (issue #1800). The loom and Shuttle targets
   # compile to empty crates unless RUSTFLAGS sets their cfg, so a normal
