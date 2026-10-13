@@ -8,12 +8,16 @@
 # VERUS names a local verus binary. Without it, the script downloads the
 # pinned release and checks its SHA-256. The release names the Rust
 # toolchain that it links against, and rustup installs that toolchain.
+#
+# Pin a weekly `release/` tag, not a `release/rolling/` tag. Verus deletes
+# the assets of old rolling releases, so a rolling pin starts to fail with
+# HTTP 404 after a few days.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-verus_release="0.2026.10.12.4bfc2b4"
-verus_sha256="af2aeac064df83fd8a6ea34cb98de75df3f477415e10bc177c9911853e057138"
+verus_release="0.2026.10.04.426d8b0"
+verus_sha256="624018662868563a7bec0dd07be5e4dd0c3d61124b4b55105765884bf2d4d1a0"
 
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
@@ -22,7 +26,7 @@ verus="${VERUS:-}"
 if [ -z "${verus}" ]; then
   zip="${work}/verus.zip"
   curl -fsSL --retry 3 -o "${zip}" \
-    "https://github.com/verus-lang/verus/releases/download/release%2Frolling%2F${verus_release}/verus-${verus_release}-x86-linux.zip"
+    "https://github.com/verus-lang/verus/releases/download/release%2F${verus_release}/verus-${verus_release}-x86-linux.zip"
   echo "${verus_sha256}  ${zip}" | sha256sum --check --quiet
   unzip -q "${zip}" -d "${work}"
   rm -f "${zip}"
