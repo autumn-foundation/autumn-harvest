@@ -330,8 +330,16 @@ impl SandboxPolicy {
             .max(self.sizes.max_output_files_total_bytes)
             .div_ceil(3)
             .saturating_mul(4);
+        // Each output appears once, returned or skipped, with an escaped
+        // path, an escaped skip reason and its JSON structure.
+        let reason = u64::try_from(super::outcome::MAX_SKIP_REASON_BYTES).unwrap_or(u64::MAX);
+        let per_output = path_json_bytes()
+            .saturating_add(reason.saturating_mul(6))
+            .saturating_add(ITEM_JSON_BYTES);
+        let outputs = count(self.sizes.max_outputs).saturating_mul(per_output);
         streams
             .saturating_add(files)
+            .saturating_add(outputs)
             .saturating_add(OUTCOME_ENVELOPE_BYTES)
     }
 
@@ -343,8 +351,20 @@ impl SandboxPolicy {
         let input = self.sizes.max_input_bytes.saturating_mul(6);
         let args = u64::try_from(self.sizes.max_arg_bytes).unwrap_or(u64::MAX);
         let env = u64::try_from(self.sizes.max_env_bytes).unwrap_or(u64::MAX);
+        // Each file and each output adds an escaped path. Each item of any
+        // list adds its JSON structure.
+        let paths = count(self.sizes.max_files)
+            .saturating_add(count(self.sizes.max_outputs))
+            .saturating_mul(path_json_bytes());
+        let items = count(self.sizes.max_files)
+            .saturating_add(count(self.sizes.max_outputs))
+            .saturating_add(count(self.sizes.max_args))
+            .saturating_add(count(self.sizes.max_env))
+            .saturating_mul(ITEM_JSON_BYTES);
         input
             .saturating_add(args.saturating_add(env).saturating_mul(6))
+            .saturating_add(paths)
+            .saturating_add(items)
             .saturating_add(OUTCOME_ENVELOPE_BYTES)
     }
 }
@@ -361,6 +381,22 @@ pub fn is_valid_runtime_name(name: &str) -> bool {
 
 /// Room for the fixed fields of an outcome or a request, in bytes.
 const OUTCOME_ENVELOPE_BYTES: u64 = 64 * 1024;
+
+/// Room for the JSON structure of one list item: keys, quotes, braces and
+/// commas.
+const ITEM_JSON_BYTES: u64 = 64;
+
+/// The most bytes of one escaped path in JSON.
+fn path_json_bytes() -> u64 {
+    u64::try_from(super::request::MAX_PATH_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(6)
+}
+
+/// A count as `u64`.
+fn count(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
 
 /// Each limit as `(name, default, ceiling)`.
 fn limit_pairs(default: &SandboxLimits, max: &SandboxLimits) -> [(&'static str, u64, u64); 7] {
@@ -494,6 +530,28 @@ mod tests {
         let streams = 2 * 6 * policy.max_limits.max_output_bytes;
         let files = policy.sizes.max_output_files_total_bytes.div_ceil(3) * 4;
         assert!(policy.max_outcome_json_bytes() >= streams + files);
+    }
+
+    #[test]
+    fn the_bounds_count_each_path_and_each_item() {
+        let base = SandboxPolicy::default();
+        let mut sizes = DEFAULT_SIZE_BOUNDS;
+        sizes.max_outputs += 1;
+        let more = SandboxPolicy::default().with_sizes(sizes);
+        let path = u64::try_from(crate::sandbox::request::MAX_PATH_BYTES).unwrap();
+        assert!(more.max_request_json_bytes() >= base.max_request_json_bytes() + 6 * path);
+        assert!(more.max_outcome_json_bytes() >= base.max_outcome_json_bytes() + 6 * path);
+        // Many outputs with tiny byte budgets still cannot fit a frame.
+        let mut sizes = DEFAULT_SIZE_BOUNDS;
+        sizes.max_outputs = 200_000;
+        sizes.max_output_file_bytes = 1;
+        sizes.max_output_files_total_bytes = 1;
+        let policy = SandboxPolicy::default().with_sizes(sizes);
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("frame")),
+            "{:?}",
+            policy.validate()
+        );
     }
 
     #[test]
