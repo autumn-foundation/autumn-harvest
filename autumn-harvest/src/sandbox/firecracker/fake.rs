@@ -1,10 +1,10 @@
 //! A fake VMM for tests. No KVM needed.
 //!
-//! Each fake microVM is a task that listens on a Unix socket like the
-//! Firecracker vsock muxer: it reads `CONNECT <port>\n`, answers `OK`, and
-//! hands the stream to the real [`crate::sandbox::guest::serve_connection`].
-//! So a test runs the real host backend and the real guest code, and only the
-//! VMM is fake.
+//! Each fake microVM is a task on a Unix socket. It acts like the
+//! Firecracker vsock muxer: it reads `CONNECT <port>\n` and answers `OK`.
+//! Then it hands the stream to the real
+//! [`crate::sandbox::guest::serve_connection`]. So a test runs the real host
+//! backend and the real guest code, and only the VMM is fake.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use crate::sandbox::runtime::BoxFuture;
 
 /// How a fake guest behaves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GuestMode {
+pub enum GuestMode {
     /// Serve pings, then one run.
     Serve,
     /// Never accept: close each connection.
@@ -36,7 +36,7 @@ pub(crate) enum GuestMode {
 }
 
 /// A launcher of fake microVMs.
-pub(crate) struct FakeLauncher {
+pub struct FakeLauncher {
     pub dir: PathBuf,
     pub mode: GuestMode,
     pub executor: Arc<dyn PlanExecutor>,
@@ -46,8 +46,11 @@ pub(crate) struct FakeLauncher {
 }
 
 impl FakeLauncher {
-    pub(crate) fn new(mode: GuestMode, executor: Arc<dyn PlanExecutor>) -> Self {
-        let dir = std::env::temp_dir().join(format!("hfv-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
+    pub fn new(mode: GuestMode, executor: Arc<dyn PlanExecutor>) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "hfv-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         Self {
             dir,
@@ -59,11 +62,11 @@ impl FakeLauncher {
         }
     }
 
-    pub(crate) fn live(&self) -> usize {
+    pub fn live(&self) -> usize {
         self.live.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn launched(&self) -> usize {
+    pub fn launched(&self) -> usize {
         self.launched.load(Ordering::SeqCst)
     }
 }
@@ -85,9 +88,8 @@ impl VmLauncher for FakeLauncher {
             let vm_dir = self.dir.join(&id);
             std::fs::create_dir_all(&vm_dir).expect("vm dir");
             let vsock = vm_dir.join("v.sock");
-            let task = (self.mode != GuestMode::Exited).then(|| {
-                spawn_muxer(&vsock, self.mode, Arc::clone(&self.executor))
-            });
+            let task = (self.mode != GuestMode::Exited)
+                .then(|| spawn_muxer(&vsock, self.mode, Arc::clone(&self.executor)));
             self.live.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(FakeVm {
                 id,
@@ -131,7 +133,7 @@ fn spawn_muxer(path: &Path, mode: GuestMode, executor: Arc<dyn PlanExecutor>) ->
                 continue;
             }
             match mode {
-                GuestMode::NeverListen | GuestMode::Exited => continue,
+                GuestMode::NeverListen | GuestMode::Exited => {}
                 GuestMode::Garbage => {
                     let _ = stream.write_all(b"OK 1073741824\n").await;
                     let _: Result<HostMessage, _> =
@@ -161,7 +163,7 @@ fn spawn_muxer(path: &Path, mode: GuestMode, executor: Arc<dyn PlanExecutor>) ->
 }
 
 /// One fake microVM.
-pub(crate) struct FakeVm {
+pub struct FakeVm {
     id: String,
     dir: PathBuf,
     vsock: PathBuf,

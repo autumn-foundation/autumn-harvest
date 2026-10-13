@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use super::config::GUEST_AGENT_PORT;
-use super::vsock::connect_guest;
-use crate::sandbox::guest::request_run;
 use super::launcher::{LaunchedVm, VmLauncher};
 use super::pool::WarmPool;
+use super::vsock::connect_guest;
 use crate::sandbox::error::SandboxError;
+use crate::sandbox::guest::request_run;
 use crate::sandbox::outcome::SandboxOutcome;
 use crate::sandbox::policy::IsolationLevel;
 use crate::sandbox::runtime::{BoxFuture, SandboxBackend, SandboxJob};
@@ -153,13 +153,15 @@ impl SandboxBackend for FirecrackerBackend {
         cancel: CancellationToken,
     ) -> BoxFuture<'_, Result<SandboxOutcome, SandboxError>> {
         Box::pin(async move {
-            let vm = match self.pool.as_ref().and_then(WarmPool::take) {
-                Some(vm) => vm,
-                None => tokio::select! {
+            let warm = self.pool.as_ref().and_then(WarmPool::take);
+            let vm = if let Some(vm) = warm {
+                vm
+            } else {
+                tokio::select! {
                     biased;
                     () = cancel.cancelled() => return Err(SandboxError::Cancelled),
                     vm = self.launcher.launch() => vm?,
-                },
+                }
             };
             // Every path below ends in one teardown. A dropped future tears
             // the microVM down through the guard.
@@ -245,7 +247,10 @@ mod tests {
         let fake = launcher(GuestMode::Serve);
         let backend = FirecrackerBackend::new(fake.clone(), fast());
         let out = backend
-            .execute(job("echo in the vm; exit 7", 5_000), CancellationToken::new())
+            .execute(
+                job("echo in the vm; exit 7", 5_000),
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert_eq!(out.status, RunStatus::Exited { code: 7 });
@@ -300,7 +305,10 @@ mod tests {
             .execute(job("true", 5_000), CancellationToken::new())
             .await
             .expect_err("exited");
-        assert!(matches!(err, SandboxError::Unavailable(ref m) if m.contains("status 1")), "{err:?}");
+        assert!(
+            matches!(err, SandboxError::Unavailable(ref m) if m.contains("status 1")),
+            "{err:?}"
+        );
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(fake.live(), 0);
     }
@@ -374,7 +382,8 @@ mod tests {
     #[tokio::test]
     async fn a_launch_failure_is_unavailable() {
         let fake = launcher(GuestMode::Serve);
-        fake.failures_left.store(1, std::sync::atomic::Ordering::SeqCst);
+        fake.failures_left
+            .store(1, std::sync::atomic::Ordering::SeqCst);
         let backend = FirecrackerBackend::new(fake.clone(), fast());
         let err = backend
             .execute(job("true", 5_000), CancellationToken::new())
@@ -411,10 +420,16 @@ mod tests {
     async fn the_runtime_accepts_the_backend_under_the_default_policy() {
         let fake = launcher(GuestMode::Serve);
         let backend = Arc::new(FirecrackerBackend::new(fake, fast()));
-        let runtime = SandboxRuntime::new(backend, SandboxPolicy::default().with_network(NetworkPolicy::Allow))
-            .unwrap();
+        let runtime = SandboxRuntime::new(
+            backend,
+            SandboxPolicy::default().with_network(NetworkPolicy::Allow),
+        )
+        .unwrap();
         let out = runtime
-            .run(&SandboxRequest::new("sh", "echo ok"), &CancellationToken::new())
+            .run(
+                &SandboxRequest::new("sh", "echo ok"),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert_eq!(out.isolation, IsolationLevel::MicroVm);

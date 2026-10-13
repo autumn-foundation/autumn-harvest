@@ -35,7 +35,7 @@ pub struct CapturedText {
 impl StreamCapture {
     /// A capture that keeps at most `cap` bytes.
     #[must_use]
-    pub fn new(cap: usize) -> Self {
+    pub const fn new(cap: usize) -> Self {
         let head_cap = cap.div_ceil(2);
         Self {
             head: Vec::new(),

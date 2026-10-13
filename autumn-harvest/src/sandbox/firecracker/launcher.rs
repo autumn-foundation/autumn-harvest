@@ -23,8 +23,8 @@ use std::time::Duration;
 use super::api::ApiClient;
 use super::config::{
     CONFIG_FILE, GuestImage, KERNEL_FILE, MAX_SOCKET_PATH_BYTES, MachineSpec, OWNER_TAG_HEX,
-    ROOTFS_FILE, VM_ID_PREFIX, VM_ID_RANDOM_HEX, VSOCK_SOCKET, VmPaths, new_vm_id,
-    validate_vm_id, vm_config,
+    ROOTFS_FILE, VM_ID_PREFIX, VM_ID_RANDOM_HEX, VSOCK_SOCKET, VmPaths, new_vm_id, validate_vm_id,
+    vm_config,
 };
 use super::jailer::JailerConfig;
 use super::posture::{PostureFinding, PosturePolicy};
@@ -271,7 +271,10 @@ impl FirecrackerLauncher {
     ///
     /// Returns [`SandboxError::Config`] for a version with a known escape,
     /// or for a critical finding under [`PosturePolicy::Enforce`].
-    pub async fn verify_host(&self, policy: PosturePolicy) -> Result<Vec<PostureFinding>, SandboxError> {
+    pub async fn verify_host(
+        &self,
+        policy: PosturePolicy,
+    ) -> Result<Vec<PostureFinding>, SandboxError> {
         self.verify_host_at(Path::new("/"), policy).await
     }
 
@@ -357,120 +360,146 @@ impl FirecrackerLauncher {
 
     /// Create the VM directory and the command for `id`.
     fn prepare(&self, id: &str) -> Result<Prepared, SandboxError> {
+        match &self.config.confinement {
+            Confinement::Jailer(jailer) => self.prepare_jailed(jailer, id),
+            Confinement::Unjailed { work_root } => self.prepare_unjailed(work_root, id),
+        }
+    }
+
+    /// Lay out the jail of `id` and build the jailer command.
+    fn prepare_jailed(&self, jailer: &JailerConfig, id: &str) -> Result<Prepared, SandboxError> {
         use std::os::unix::fs::DirBuilderExt as _;
         let config = &self.config;
-        let port = config.guest_port;
-        let io = |what: &str, e: std::io::Error| {
-            SandboxError::Unavailable(format!("cannot prepare {what} of VM {id}: {e}"))
+        let jail = super::jailer::jail_dir(jailer, &self.exec_name, id);
+        let root = jail.join("root");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&root)
+            .map_err(|e| prepare_error(id, "the jail", &e))?;
+        // A failed step removes the jail, so a failed launch leaves nothing.
+        let fail = |what: &str, e: &std::io::Error| {
+            let _ = crate::sandbox::exec::remove_work_dir(&jail);
+            prepare_error(id, what, e)
         };
-        match &config.confinement {
-            Confinement::Jailer(jailer) => {
-                let jail = super::jailer::jail_dir(jailer, &self.exec_name, id);
-                let root = jail.join("root");
-                std::fs::DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o700)
-                    .create(&root)
-                    .map_err(|e| io("the jail", e))?;
-                let mut prepared = Prepared {
-                    vm_dir: jail.clone(),
-                    vsock: root.join(VSOCK_SOCKET),
-                    api_socket: None,
-                    cgroup: Some(super::jailer::cgroup_dir(jailer, id)),
-                    command: tokio::process::Command::new(&jailer.jailer_bin),
-                };
-                let fail = |e| {
-                    let _ = crate::sandbox::exec::remove_work_dir(&jail);
-                    e
-                };
-                link_or_copy(&config.image.kernel, &root.join(KERNEL_FILE))
-                    .map_err(|e| fail(io("the kernel", e)))?;
-                link_or_copy(&config.image.rootfs, &root.join(ROOTFS_FILE))
-                    .map_err(|e| fail(io("the root file system", e)))?;
-                let firecracker_args: Vec<String> = match &config.boot {
-                    BootMethod::ConfigFile => {
-                        let document = vm_config(&config.image, config.machine, &VmPaths::jailed(), port);
-                        write_config(&root.join(CONFIG_FILE), &document).map_err(|e| fail(io("the config", e)))?;
-                        vec!["--config-file".into(), CONFIG_FILE.into(), "--no-api".into()]
-                    }
-                    BootMethod::Api => {
-                        prepared.api_socket = Some(root.join(super::api::JAILED_API_SOCKET));
-                        Vec::new()
-                    }
-                    BootMethod::Snapshot(files) => {
-                        link_or_copy(&files.state, &root.join(SNAPSHOT_STATE_FILE))
-                            .map_err(|e| fail(io("the snapshot state", e)))?;
-                        link_or_copy(&files.memory, &root.join(SNAPSHOT_MEMORY_FILE))
-                            .map_err(|e| fail(io("the snapshot memory", e)))?;
-                        prepared.api_socket = Some(root.join(super::api::JAILED_API_SOCKET));
-                        Vec::new()
-                    }
-                };
-                prepared
-                    .command
-                    .args(super::jailer::jailer_args(
-                        jailer,
-                        &config.firecracker_bin,
-                        id,
-                        config.machine,
-                        &firecracker_args,
-                    ))
-                    .current_dir(&jail);
-                Ok(prepared)
+        link_or_copy(&config.image.kernel, &root.join(KERNEL_FILE))
+            .map_err(|e| fail("the kernel", &e))?;
+        link_or_copy(&config.image.rootfs, &root.join(ROOTFS_FILE))
+            .map_err(|e| fail("the root file system", &e))?;
+        let mut api_socket = None;
+        let firecracker_args: Vec<String> = match &config.boot {
+            BootMethod::ConfigFile => {
+                let document = vm_config(
+                    &config.image,
+                    config.machine,
+                    &VmPaths::jailed(),
+                    config.guest_port,
+                );
+                write_config(&root.join(CONFIG_FILE), &document)
+                    .map_err(|e| fail("the config", &e))?;
+                vec![
+                    "--config-file".into(),
+                    CONFIG_FILE.into(),
+                    "--no-api".into(),
+                ]
             }
-            Confinement::Unjailed { work_root } => {
-                let dir = work_root.join(id);
-                std::fs::DirBuilder::new()
-                    .mode(0o700)
-                    .create(&dir)
-                    .map_err(|e| io("the VM directory", e))?;
-                let fail = |e| {
-                    let _ = crate::sandbox::exec::remove_work_dir(&dir);
-                    e
-                };
-                let mut prepared = Prepared {
-                    vm_dir: dir.clone(),
-                    vsock: dir.join(VSOCK_SOCKET),
-                    api_socket: None,
-                    cgroup: None,
-                    command: tokio::process::Command::new(&config.firecracker_bin),
-                };
-                let mut args = vec!["--id".to_owned(), id.to_owned()];
-                match &config.boot {
-                    BootMethod::ConfigFile => {
-                        let paths = self.unjailed_paths(&dir).map_err(|e| fail(io("the paths", e)))?;
-                        let document = vm_config(&config.image, config.machine, &paths, port);
-                        let path = dir.join(CONFIG_FILE);
-                        write_config(&path, &document).map_err(|e| fail(io("the config", e)))?;
-                        args.extend([
-                            "--config-file".to_owned(),
-                            path.display().to_string(),
-                            "--no-api".to_owned(),
-                        ]);
-                    }
-                    BootMethod::Api | BootMethod::Snapshot(_) => {
-                        let socket = dir.join(UNJAILED_API_SOCKET);
-                        args.extend(["--api-sock".to_owned(), socket.display().to_string()]);
-                        prepared.api_socket = Some(socket);
-                    }
-                }
-                prepared.command.args(args).current_dir(&dir);
-                Ok(prepared)
+            BootMethod::Api => {
+                api_socket = Some(root.join(super::api::JAILED_API_SOCKET));
+                Vec::new()
+            }
+            BootMethod::Snapshot(files) => {
+                link_or_copy(&files.state, &root.join(SNAPSHOT_STATE_FILE))
+                    .map_err(|e| fail("the snapshot state", &e))?;
+                link_or_copy(&files.memory, &root.join(SNAPSHOT_MEMORY_FILE))
+                    .map_err(|e| fail("the snapshot memory", &e))?;
+                api_socket = Some(root.join(super::api::JAILED_API_SOCKET));
+                Vec::new()
+            }
+        };
+        let mut command = tokio::process::Command::new(&jailer.jailer_bin);
+        command
+            .args(super::jailer::jailer_args(
+                jailer,
+                &config.firecracker_bin,
+                id,
+                config.machine,
+                &firecracker_args,
+            ))
+            .current_dir(&jail);
+        Ok(Prepared {
+            vm_dir: jail,
+            vsock: root.join(VSOCK_SOCKET),
+            api_socket,
+            cgroup: Some(super::jailer::cgroup_dir(jailer, id)),
+            command,
+        })
+    }
+
+    /// Create the directory of `id` and build the Firecracker command.
+    fn prepare_unjailed(&self, work_root: &Path, id: &str) -> Result<Prepared, SandboxError> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let config = &self.config;
+        let dir = work_root.join(id);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|e| prepare_error(id, "the VM directory", &e))?;
+        let fail = |what: &str, e: &std::io::Error| {
+            let _ = crate::sandbox::exec::remove_work_dir(&dir);
+            prepare_error(id, what, e)
+        };
+        let mut args = vec!["--id".to_owned(), id.to_owned()];
+        let mut api_socket = None;
+        match &config.boot {
+            BootMethod::ConfigFile => {
+                let paths = self
+                    .unjailed_paths(&dir)
+                    .map_err(|e| fail("the paths", &e))?;
+                let document = vm_config(&config.image, config.machine, &paths, config.guest_port);
+                let path = dir.join(CONFIG_FILE);
+                write_config(&path, &document).map_err(|e| fail("the config", &e))?;
+                args.extend([
+                    "--config-file".to_owned(),
+                    path.display().to_string(),
+                    "--no-api".to_owned(),
+                ]);
+            }
+            BootMethod::Api | BootMethod::Snapshot(_) => {
+                let socket = dir.join(UNJAILED_API_SOCKET);
+                args.extend(["--api-sock".to_owned(), socket.display().to_string()]);
+                api_socket = Some(socket);
             }
         }
+        let mut command = tokio::process::Command::new(&config.firecracker_bin);
+        command.args(args).current_dir(&dir);
+        Ok(Prepared {
+            vm_dir: dir.clone(),
+            vsock: dir.join(VSOCK_SOCKET),
+            api_socket,
+            cgroup: None,
+            command,
+        })
     }
 
     /// The host paths of an unjailed VM, absolute.
     fn unjailed_paths(&self, dir: &Path) -> std::io::Result<VmPaths> {
         Ok(VmPaths {
-            kernel: std::path::absolute(&self.config.image.kernel)?.display().to_string(),
-            rootfs: std::path::absolute(&self.config.image.rootfs)?.display().to_string(),
+            kernel: std::path::absolute(&self.config.image.kernel)?
+                .display()
+                .to_string(),
+            rootfs: std::path::absolute(&self.config.image.rootfs)?
+                .display()
+                .to_string(),
             vsock: dir.join(VSOCK_SOCKET).display().to_string(),
         })
     }
 
     /// Configure and start, or restore, a VM through its API socket.
-    async fn boot_through_api(&self, vm: &mut RunningVm, socket: &Path) -> Result<(), SandboxError> {
+    async fn boot_through_api(
+        &self,
+        vm: &mut RunningVm,
+        socket: &Path,
+    ) -> Result<(), SandboxError> {
         let deadline = std::time::Instant::now() + self.config.api_timeout;
         loop {
             if let Some(status) = vm.exit_status() {
@@ -491,29 +520,25 @@ impl FirecrackerLauncher {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let client = ApiClient::new(socket).with_timeout(self.config.api_timeout);
-        match &self.config.boot {
-            BootMethod::Snapshot(_) => {
-                client
-                    .load_snapshot(SNAPSHOT_STATE_FILE, SNAPSHOT_MEMORY_FILE)
-                    .await
-            }
-            _ => {
-                let paths = match &self.config.confinement {
-                    Confinement::Jailer(_) => VmPaths::jailed(),
-                    Confinement::Unjailed { .. } => self
-                        .unjailed_paths(&vm.vm_dir)
-                        .map_err(|e| SandboxError::Unavailable(format!("bad VM paths: {e}")))?,
-                };
-                let document = vm_config(
-                    &self.config.image,
-                    self.config.machine,
-                    &paths,
-                    self.config.guest_port,
-                );
-                client.configure(&document).await?;
-                client.start().await
-            }
+        if let BootMethod::Snapshot(_) = &self.config.boot {
+            return client
+                .load_snapshot(SNAPSHOT_STATE_FILE, SNAPSHOT_MEMORY_FILE)
+                .await;
         }
+        let paths = match &self.config.confinement {
+            Confinement::Jailer(_) => VmPaths::jailed(),
+            Confinement::Unjailed { .. } => self
+                .unjailed_paths(&vm.vm_dir)
+                .map_err(|e| SandboxError::Unavailable(format!("bad VM paths: {e}")))?,
+        };
+        let document = vm_config(
+            &self.config.image,
+            self.config.machine,
+            &paths,
+            self.config.guest_port,
+        );
+        client.configure(&document).await?;
+        client.start().await
     }
 }
 
@@ -568,6 +593,11 @@ fn check_socket_paths(vm_root: &Path, confinement: &Confinement) -> Result<(), S
         )));
     }
     Ok(())
+}
+
+/// The error of a failed launch step.
+fn prepare_error(id: &str, what: &str, e: &std::io::Error) -> SandboxError {
+    SandboxError::Unavailable(format!("cannot prepare {what} of VM {id}: {e}"))
 }
 
 /// The VM directory root of a confinement.
@@ -669,8 +699,13 @@ impl RunningVm {
     }
 
     fn stderr_tail(&self) -> String {
-        let tail = self.stderr.lock().unwrap_or_else(PoisonError::into_inner);
-        let bytes: Vec<u8> = tail.iter().copied().collect();
+        let bytes: Vec<u8> = self
+            .stderr
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .copied()
+            .collect();
         String::from_utf8_lossy(&bytes).trim().to_owned()
     }
 
@@ -710,11 +745,17 @@ impl LaunchedVm for RunningVm {
         // Give the stderr reader a moment to take the last lines, so the
         // report holds the reason that the VMM printed.
         let first_seen = *self.exited_at.get_or_insert_with(std::time::Instant::now);
-        let reader_done = self.stderr_task.as_ref().is_none_or(tokio::task::JoinHandle::is_finished);
+        let reader_done = self
+            .stderr_task
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished);
         if !reader_done && first_seen.elapsed() < Duration::from_millis(200) {
             return None;
         }
-        Some(format!("firecracker exited with {status}: {}", self.stderr_tail()))
+        Some(format!(
+            "firecracker exited with {status}: {}",
+            self.stderr_tail()
+        ))
     }
 
     fn shutdown(self: Box<Self>) -> BoxFuture<'static, ()> {
@@ -767,8 +808,9 @@ fn kill_cgroup_now(dir: &Path) {
 
 /// Whether `cgroup.events` reports no process left.
 fn cgroup_is_empty(dir: &Path) -> bool {
-    std::fs::read_to_string(dir.join("cgroup.events"))
-        .map_or(true, |events| events.lines().any(|line| line == "populated 0"))
+    std::fs::read_to_string(dir.join("cgroup.events")).map_or(true, |events| {
+        events.lines().any(|line| line == "populated 0")
+    })
 }
 
 #[cfg(test)]
@@ -781,7 +823,10 @@ mod tests {
     use crate::sandbox::firecracker::config::GUEST_AGENT_PORT;
 
     fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("hl-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
+        let dir = std::env::temp_dir().join(format!(
+            "hl-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -816,7 +861,11 @@ mod tests {
     async fn wait_for(path: &Path) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !path.exists() {
-            assert!(Instant::now() < deadline, "{} never appeared", path.display());
+            assert!(
+                Instant::now() < deadline,
+                "{} never appeared",
+                path.display()
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         // Let the writer finish the file.
@@ -831,7 +880,8 @@ mod tests {
             "firecracker",
             "printf '%s\\n' \"$@\" > args.txt; env > env.txt; exec sleep 60",
         );
-        let launcher = FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
+        let launcher =
+            FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
         let vm = launcher.launch().await.unwrap();
         let vm_dir = launcher.vm_root().join(vm.id());
         assert!(vm.id().starts_with(&format!("hsbx-{}-", launcher.owner())));
@@ -841,7 +891,13 @@ mod tests {
         let config_path = vm_dir.join("vm-config.json");
         assert_eq!(
             args.lines().collect::<Vec<_>>(),
-            ["--id", vm.id(), "--config-file", config_path.to_str().unwrap(), "--no-api"]
+            [
+                "--id",
+                vm.id(),
+                "--config-file",
+                config_path.to_str().unwrap(),
+                "--no-api"
+            ]
         );
         let env = std::fs::read_to_string(vm_dir.join("env.txt")).unwrap();
         assert!(!env.contains("CARGO"), "the host env leaked: {env}");
@@ -852,7 +908,10 @@ mod tests {
             config["boot-source"]["kernel_image_path"],
             dir.join("vmlinux").to_str().unwrap()
         );
-        assert_eq!(config["vsock"]["uds_path"], vm_dir.join("v.sock").to_str().unwrap());
+        assert_eq!(
+            config["vsock"]["uds_path"],
+            vm_dir.join("v.sock").to_str().unwrap()
+        );
         vm.shutdown().await;
         assert!(!vm_dir.exists(), "teardown must remove the VM directory");
         std::fs::remove_dir_all(dir).unwrap();
@@ -862,7 +921,8 @@ mod tests {
     async fn shutdown_kills_the_vmm_process() {
         let dir = temp_dir();
         let fc = script(&dir, "firecracker", "echo $$ > pid.txt; exec sleep 60");
-        let launcher = FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
+        let launcher =
+            FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
         let vm = launcher.launch().await.unwrap();
         let vm_dir = launcher.vm_root().join(vm.id());
         wait_for(&vm_dir.join("pid.txt")).await;
@@ -884,7 +944,8 @@ mod tests {
     async fn a_vmm_that_exits_at_once_reports_its_status() {
         let dir = temp_dir();
         let fc = script(&dir, "firecracker", "echo 'bad kernel' >&2; exit 3");
-        let launcher = FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
+        let launcher =
+            FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
         let mut vm = launcher.launch().await.unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         let status = loop {
@@ -920,7 +981,11 @@ mod tests {
 
     #[tokio::test]
     async fn an_api_launch_configures_and_starts_the_vm() {
-        if std::process::Command::new("python3").arg("-V").output().is_err() {
+        if std::process::Command::new("python3")
+            .arg("-V")
+            .output()
+            .is_err()
+        {
             eprintln!("skipped: the fake API server needs python3");
             return;
         }
@@ -934,8 +999,8 @@ mod tests {
         );
         let launcher = FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::Api)).unwrap();
         let vm = launcher.launch().await.unwrap();
-        let log = std::fs::read_to_string(launcher.vm_root().join(vm.id()).join("requests.log"))
-            .unwrap();
+        let log =
+            std::fs::read_to_string(launcher.vm_root().join(vm.id()).join("requests.log")).unwrap();
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(
             lines,
@@ -991,7 +1056,8 @@ while True:
     fn the_sweep_removes_only_the_vms_of_dead_owners() {
         let dir = temp_dir();
         let fc = script(&dir, "firecracker", "exit 0");
-        let live = FirecrackerLauncher::new(unjailed(&dir, fc.clone(), BootMethod::ConfigFile)).unwrap();
+        let live =
+            FirecrackerLauncher::new(unjailed(&dir, fc.clone(), BootMethod::ConfigFile)).unwrap();
         let root = live.vm_root();
         let live_vm = root.join(format!("hsbx-{}-{}", live.owner(), "a".repeat(16)));
         std::fs::create_dir_all(&live_vm).unwrap();
@@ -1020,7 +1086,10 @@ while True:
     fn a_lease_is_exclusive_and_removed_on_drop() {
         let dir = temp_dir();
         let lease = InstanceLease::acquire(&dir, "0123abcd").unwrap();
-        assert!(InstanceLease::acquire(&dir, "0123abcd").is_err(), "the lock is held");
+        assert!(
+            InstanceLease::acquire(&dir, "0123abcd").is_err(),
+            "the lock is held"
+        );
         let path = lease.path().to_path_buf();
         drop(lease);
         assert!(!path.exists());
@@ -1049,7 +1118,10 @@ while True:
         std::fs::create_dir_all(&deep).unwrap();
         config.confinement = Confinement::Unjailed { work_root: deep };
         let err = FirecrackerLauncher::new(config).expect_err("too long");
-        assert!(matches!(err, SandboxError::Config(ref m) if m.contains("Unix socket")), "{err:?}");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("Unix socket")),
+            "{err:?}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1057,7 +1129,8 @@ while True:
     async fn verify_host_checks_the_version_and_the_posture() {
         let dir = temp_dir();
         let fc = script(&dir, "firecracker", "echo 'Firecracker v1.17.0'");
-        let launcher = FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
+        let launcher =
+            FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
         // An empty root has no /dev/kvm and no cgroup v2: critical findings.
         let empty = dir.join("empty-root");
         std::fs::create_dir_all(&empty).unwrap();
@@ -1065,12 +1138,15 @@ while True:
             .verify_host_at(&empty, PosturePolicy::Enforce)
             .await
             .expect_err("critical findings");
-        assert!(matches!(err, SandboxError::Config(ref m) if m.contains("kvm")), "{err:?}");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("kvm")),
+            "{err:?}"
+        );
         let findings = launcher
             .verify_host_at(&empty, PosturePolicy::Report)
             .await
             .unwrap();
-        assert!(!findings.is_empty());
+        assert_ne!(findings, []);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1078,12 +1154,16 @@ while True:
     async fn verify_host_refuses_an_old_firecracker_even_when_reporting() {
         let dir = temp_dir();
         let fc = script(&dir, "firecracker", "echo 'Firecracker v1.14.0'");
-        let launcher = FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
+        let launcher =
+            FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
         let err = launcher
             .verify_host_at(&dir, PosturePolicy::Report)
             .await
             .expect_err("old version");
-        assert!(matches!(err, SandboxError::Config(ref m) if m.contains("CVE-")), "{err:?}");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("CVE-")),
+            "{err:?}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1101,6 +1181,7 @@ while True:
 
     #[tokio::test]
     async fn a_jailed_launch_links_the_image_and_runs_the_jailer() {
+        use std::os::unix::fs::MetadataExt as _;
         // SAFETY: geteuid has no preconditions.
         if unsafe { libc::geteuid() } != 0 {
             eprintln!("skipped: a jailed launch needs root");
@@ -1133,10 +1214,15 @@ while True:
         wait_for(&jail_dir.join("jailer-args.txt")).await;
         let args = std::fs::read_to_string(jail_dir.join("jailer-args.txt")).unwrap();
         assert!(args.lines().any(|l| l == "--cgroup-version"));
-        assert!(args.ends_with("--\n--config-file\nvm-config.json\n--no-api\n"), "{args}");
-        use std::os::unix::fs::MetadataExt as _;
+        assert!(
+            args.ends_with("--\n--config-file\nvm-config.json\n--no-api\n"),
+            "{args}"
+        );
         let original = std::fs::metadata(dir.join("rootfs.ext4")).unwrap().ino();
-        assert_eq!(std::fs::metadata(root.join("rootfs.ext4")).unwrap().ino(), original);
+        assert_eq!(
+            std::fs::metadata(root.join("rootfs.ext4")).unwrap().ino(),
+            original
+        );
         assert!(root.join("vmlinux").exists());
         assert!(root.join("vm-config.json").exists());
         vm.shutdown().await;

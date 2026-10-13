@@ -212,7 +212,12 @@ pub fn boot_args(image: &GuestImage, port: u32) -> String {
 
 /// Build the VM document for `image` at `paths`.
 #[must_use]
-pub fn vm_config(image: &GuestImage, machine: MachineSpec, paths: &VmPaths, port: u32) -> VmConfigFile {
+pub fn vm_config(
+    image: &GuestImage,
+    machine: MachineSpec,
+    paths: &VmPaths,
+    port: u32,
+) -> VmConfigFile {
     VmConfigFile {
         boot_source: BootSource {
             kernel_image_path: paths.kernel.clone(),
@@ -243,8 +248,8 @@ pub fn vm_config(image: &GuestImage, machine: MachineSpec, paths: &VmPaths, port
 ///
 /// Returns [`SandboxError::Config`] that names the id.
 pub fn validate_vm_id(id: &str) -> Result<(), SandboxError> {
-    let valid = (1..=64).contains(&id.len())
-        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    let valid =
+        (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
     if valid {
         Ok(())
     } else {
@@ -308,8 +313,19 @@ mod tests {
     fn the_config_has_no_network_and_no_metadata_service() {
         let config = vm_config(&image(), MachineSpec::default(), &VmPaths::jailed(), 52);
         let json = serde_json::to_value(&config).unwrap();
-        let keys: Vec<&str> = json.as_object().unwrap().keys().map(String::as_str).collect();
-        for absent in ["network-interfaces", "mmds-config", "balloon", "logger", "metrics"] {
+        let keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for absent in [
+            "network-interfaces",
+            "mmds-config",
+            "balloon",
+            "logger",
+            "metrics",
+        ] {
             assert!(!keys.contains(&absent), "{absent} must be absent");
         }
     }
@@ -324,7 +340,10 @@ mod tests {
             "init=/sbin/harvest-guest-agent",
             "harvest.port=52",
         ] {
-            assert!(args.split(' ').any(|a| a == part), "{part} missing from {args}");
+            assert!(
+                args.split(' ').any(|a| a == part),
+                "{part} missing from {args}"
+            );
         }
         assert!(!args.contains("console=ttyS0"));
     }

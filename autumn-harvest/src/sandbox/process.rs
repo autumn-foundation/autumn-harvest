@@ -65,7 +65,10 @@ mod tests {
     #[tokio::test]
     async fn the_runtime_runs_shell_code_on_the_process_backend() {
         let out = runtime()
-            .run(&SandboxRequest::new("sh", "echo $((6 * 7))"), &CancellationToken::new())
+            .run(
+                &SandboxRequest::new("sh", "echo $((6 * 7))"),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert_eq!(out.status, RunStatus::Exited { code: 0 });
@@ -85,7 +88,10 @@ mod tests {
         }
         let code = "import json, sys\nprint(json.dumps({'sum': sum(range(10))}))\nsys.exit(4)";
         let out = runtime()
-            .run(&SandboxRequest::new("python3", code), &CancellationToken::new())
+            .run(
+                &SandboxRequest::new("python3", code),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert_eq!(out.status, RunStatus::Exited { code: 4 });
@@ -103,7 +109,10 @@ mod tests {
             return;
         }
         let out = runtime()
-            .run(&SandboxRequest::new("python3", "1 / 0"), &CancellationToken::new())
+            .run(
+                &SandboxRequest::new("python3", "1 / 0"),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert_eq!(out.status, RunStatus::Exited { code: 1 });

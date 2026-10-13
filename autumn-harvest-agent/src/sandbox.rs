@@ -153,7 +153,10 @@ impl Tool for SandboxTool {
     ) -> BoxFuture<'a, Result<serde_json::Value, AgentError>> {
         Box::pin(async move {
             let request: SandboxRequest = serde_json::from_value(input).map_err(|e| {
-                AgentError::new(ErrorKind::Tool, format!("the input is not a valid request: {e}"))
+                AgentError::new(
+                    ErrorKind::Tool,
+                    format!("the input is not a valid request: {e}"),
+                )
             })?;
             // The run, the step and the call id form an idempotency key.
             let mut engine_env = BTreeMap::new();
@@ -251,7 +254,11 @@ mod tests {
     fn the_tool_is_named_run_code_and_describes_itself() {
         let tool = tool(SandboxPolicy::default());
         assert_eq!(tool.name(), "run_code");
-        assert!(tool.description().contains("python3"), "{}", tool.description());
+        assert!(
+            tool.description().contains("python3"),
+            "{}",
+            tool.description()
+        );
         assert_eq!(tool.with_name("exec").name(), "exec");
     }
 
@@ -289,7 +296,10 @@ mod tests {
 
     #[test]
     fn the_effect_follows_the_network_policy() {
-        assert_eq!(tool(SandboxPolicy::default()).effect(), ToolEffect::Internal);
+        assert_eq!(
+            tool(SandboxPolicy::default()).effect(),
+            ToolEffect::Internal
+        );
         let open = SandboxPolicy::default().with_network(NetworkPolicy::Allow);
         assert_eq!(tool(open).effect(), ToolEffect::External);
     }
@@ -298,7 +308,10 @@ mod tests {
     async fn a_failing_program_is_a_result_not_a_tool_error() {
         let tool = tool(SandboxPolicy::default());
         let out = tool
-            .execute(json!({"runtime": "python3", "code": "raise SystemExit(1)"}), &ctx())
+            .execute(
+                json!({"runtime": "python3", "code": "raise SystemExit(1)"}),
+                &ctx(),
+            )
             .await
             .unwrap();
         assert_eq!(out["status"], json!({"kind": "exited", "code": 1}));
@@ -332,17 +345,34 @@ mod tests {
             .unwrap();
         let jobs = backend.seen.lock().unwrap();
         assert_eq!(
-            jobs[0].plan.env.get(IDEMPOTENCY_KEY_ENV).map(String::as_str),
+            jobs[0]
+                .plan
+                .env
+                .get(IDEMPOTENCY_KEY_ENV)
+                .map(String::as_str),
             Some("run-1:0:call-1")
         );
     }
 
     #[test]
     fn errors_map_to_tool_kinds() {
-        assert_eq!(tool_error(&SandboxError::Denied("x".into())).kind(), ErrorKind::Tool);
-        assert_eq!(tool_error(&SandboxError::Protocol("x".into())).kind(), ErrorKind::Tool);
-        assert_eq!(tool_error(&SandboxError::Config("x".into())).kind(), ErrorKind::Config);
-        assert!(tool_error(&SandboxError::Unavailable("x".into())).kind().is_retryable());
+        assert_eq!(
+            tool_error(&SandboxError::Denied("x".into())).kind(),
+            ErrorKind::Tool
+        );
+        assert_eq!(
+            tool_error(&SandboxError::Protocol("x".into())).kind(),
+            ErrorKind::Tool
+        );
+        assert_eq!(
+            tool_error(&SandboxError::Config("x".into())).kind(),
+            ErrorKind::Config
+        );
+        assert!(
+            tool_error(&SandboxError::Unavailable("x".into()))
+                .kind()
+                .is_retryable()
+        );
         assert!(tool_error(&SandboxError::Cancelled).kind().is_retryable());
     }
 }

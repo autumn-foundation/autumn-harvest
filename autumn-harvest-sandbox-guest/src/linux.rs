@@ -37,7 +37,13 @@ pub fn mount_basics() -> io::Result<()> {
     mount("proc", "/proc", "proc", hardened, "")?;
     mount("sysfs", "/sys", "sysfs", hardened, "")?;
     mount("devtmpfs", "/dev", "devtmpfs", libc::MS_NOSUID, "mode=0755")?;
-    mount("tmpfs", "/tmp", "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, "mode=1777,size=64m")
+    mount(
+        "tmpfs",
+        "/tmp",
+        "tmpfs",
+        libc::MS_NOSUID | libc::MS_NODEV,
+        "mode=1777,size=64m",
+    )
 }
 
 /// Mount the `/work` tmpfs of `work_mib` MiB. The guest memory bounds it
@@ -48,10 +54,22 @@ pub fn mount_basics() -> io::Result<()> {
 /// Returns the mount error.
 pub fn mount_work(work_mib: u64) -> io::Result<()> {
     let options = format!("mode=0755,size={work_mib}m,nr_inodes=65536");
-    mount("tmpfs", "/work", "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, &options)
+    mount(
+        "tmpfs",
+        "/work",
+        "tmpfs",
+        libc::MS_NOSUID | libc::MS_NODEV,
+        &options,
+    )
 }
 
-fn mount(source: &str, target: &str, kind: &str, flags: libc::c_ulong, data: &str) -> io::Result<()> {
+fn mount(
+    source: &str,
+    target: &str,
+    kind: &str,
+    flags: libc::c_ulong,
+    data: &str,
+) -> io::Result<()> {
     let c = |s: &str| CString::new(s).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL));
     let (source, target_c, kind, data) = (c(source)?, c(target)?, c(kind)?, c(data)?);
     // The root file system is read-only, so the image must hold each mount
@@ -74,7 +92,10 @@ fn mount(source: &str, target: &str, kind: &str, flags: libc::c_ulong, data: &st
     if err.raw_os_error() == Some(libc::EBUSY) {
         return Ok(());
     }
-    Err(io::Error::new(err.kind(), format!("cannot mount {target}: {err}")))
+    Err(io::Error::new(
+        err.kind(),
+        format!("cannot mount {target}: {err}"),
+    ))
 }
 
 /// Mix 32 bytes of host entropy into the kernel pool, credit them, and force
@@ -84,7 +105,9 @@ fn mount(source: &str, target: &str, kind: &str, flags: libc::c_ulong, data: &st
 ///
 /// Returns the error of the open or of an ioctl.
 pub fn reseed_kernel(entropy: &[u8; 32]) -> io::Result<()> {
-    let file = std::fs::OpenOptions::new().write(true).open("/dev/urandom")?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/urandom")?;
     let info = RandPoolInfo {
         entropy_count: 256,
         buf_size: 32,
@@ -187,11 +210,22 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(
+        clippy::useless_conversion,
+        reason = "Ioctl is u64 on glibc and i32 on musl"
+    )]
     fn the_ioctl_numbers_match_the_kernel_macros() {
         // _IOC(dir, type, nr, size) = dir << 30 | size << 16 | type << 8 | nr.
-        let ioc = |dir: u64, kind: u64, nr: u64, size: u64| (dir << 30) | (size << 16) | (kind << 8) | nr;
-        assert_eq!(u64::try_from(RNDADDENTROPY).ok(), Some(ioc(1, u64::from(b'R'), 0x03, 8)));
-        assert_eq!(u64::try_from(RNDRESEEDCRNG).ok(), Some(ioc(0, u64::from(b'R'), 0x07, 0)));
+        let ioc =
+            |dir: u64, kind: u64, nr: u64, size: u64| (dir << 30) | (size << 16) | (kind << 8) | nr;
+        assert_eq!(
+            u64::try_from(RNDADDENTROPY).ok(),
+            Some(ioc(1, u64::from(b'R'), 0x03, 8))
+        );
+        assert_eq!(
+            u64::try_from(RNDRESEEDCRNG).ok(),
+            Some(ioc(0, u64::from(b'R'), 0x07, 0))
+        );
     }
 
     #[test]

@@ -41,8 +41,8 @@ pub struct Envelope<T> {
 pub enum HostMessage {
     /// Ask whether the guest agent is ready.
     Ping,
-    /// Run a plan.
-    Run(RunMessage),
+    /// Run a plan. Boxed, because a plan is large and a ping is empty.
+    Run(Box<RunMessage>),
 }
 
 /// The body of [`HostMessage::Run`].
@@ -135,8 +135,8 @@ pub enum FrameError {
 /// the I/O error of the write.
 pub async fn write_frame<W, T>(writer: &mut W, message: &T, max: usize) -> Result<(), FrameError>
 where
-    W: AsyncWrite + Unpin,
-    T: Serialize,
+    W: AsyncWrite + Unpin + Send,
+    T: Serialize + Sync,
 {
     let body = serde_json::to_vec(message)
         .map_err(|e| FrameError::Malformed(format!("cannot encode the frame: {e}")))?;
@@ -144,7 +144,7 @@ where
     let declared = u32::try_from(body.len())
         .ok()
         .filter(|_| body.len() <= cap)
-        .ok_or(FrameError::TooLarge {
+        .ok_or_else(|| FrameError::TooLarge {
             declared: u64::try_from(body.len()).unwrap_or(u64::MAX),
             max: cap,
         })?;
@@ -161,12 +161,14 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`FrameError::Closed`] at a clean end of stream,
-/// [`FrameError::TooLarge`] before it reads an oversized body,
-/// [`FrameError::Malformed`] for a body that is not valid, or the I/O error.
+/// - [`FrameError::Closed`]: a clean end of stream.
+/// - [`FrameError::TooLarge`]: an oversized body. The reader reads none of
+///   it.
+/// - [`FrameError::Malformed`]: a body that is not valid.
+/// - [`FrameError::Io`]: the stream failed.
 pub async fn read_frame<R, T>(reader: &mut R, max: usize) -> Result<T, FrameError>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + Send,
     T: DeserializeOwned,
 {
     let mut header = [0u8; 4];
@@ -180,7 +182,7 @@ where
     let length = usize::try_from(declared)
         .ok()
         .filter(|length| *length <= cap)
-        .ok_or(FrameError::TooLarge {
+        .ok_or_else(|| FrameError::TooLarge {
             declared: u64::from(declared),
             max: cap,
         })?;
@@ -194,7 +196,10 @@ where
     if body.len() != length {
         return Err(FrameError::Io(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
-            format!("the frame declared {length} bytes and carried {}", body.len()),
+            format!(
+                "the frame declared {length} bytes and carried {}",
+                body.len()
+            ),
         )));
     }
     serde_json::from_slice(&body).map_err(|e| FrameError::Malformed(e.to_string()))
@@ -217,7 +222,7 @@ pub const fn envelope<T>(message: T) -> Envelope<T> {
 /// version that is not [`PROTOCOL_VERSION`].
 pub async fn read_message<R, T>(reader: &mut R, max: usize) -> Result<T, FrameError>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + Send,
     T: DeserializeOwned,
 {
     let envelope: Envelope<T> = read_frame(reader, max).await?;
@@ -237,8 +242,8 @@ where
 /// Returns the errors of [`write_frame`].
 pub async fn write_message<W, T>(writer: &mut W, message: T, max: usize) -> Result<(), FrameError>
 where
-    W: AsyncWrite + Unpin,
-    T: Serialize,
+    W: AsyncWrite + Unpin + Send,
+    T: Serialize + Send + Sync,
 {
     write_frame(writer, &envelope(message), max).await
 }
@@ -252,11 +257,15 @@ mod tests {
 
     async fn round_trip<T>(message: &T) -> T
     where
-        T: Serialize + DeserializeOwned,
+        T: Serialize + DeserializeOwned + Sync,
     {
         let mut buf = Vec::new();
-        write_frame(&mut buf, message, MAX_FRAME_BYTES).await.unwrap();
-        read_frame(&mut buf.as_slice(), MAX_FRAME_BYTES).await.unwrap()
+        write_frame(&mut buf, message, MAX_FRAME_BYTES)
+            .await
+            .unwrap();
+        read_frame(&mut buf.as_slice(), MAX_FRAME_BYTES)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -274,11 +283,11 @@ mod tests {
         let plan = SandboxPolicy::default()
             .plan(&SandboxRequest::new("sh", "echo hi"))
             .unwrap();
-        let run = HostMessage::Run(RunMessage {
+        let run = HostMessage::Run(Box::new(RunMessage {
             run_id: "r1".into(),
             entropy: "00".repeat(32),
             plan,
-        });
+        }));
         assert_eq!(round_trip(&envelope(run.clone())).await.message, run);
         let ping = envelope(HostMessage::Ping);
         assert_eq!(

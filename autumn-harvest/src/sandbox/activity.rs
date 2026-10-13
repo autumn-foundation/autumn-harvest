@@ -307,7 +307,8 @@ mod tests {
 
     fn activity(backend: FakeBackend) -> (Arc<FakeBackend>, SandboxActivity) {
         let backend = Arc::new(backend);
-        let runtime = SandboxRuntime::new(backend.clone(), SandboxPolicy::for_development()).unwrap();
+        let runtime =
+            SandboxRuntime::new(backend.clone(), SandboxPolicy::for_development()).unwrap();
         (backend, SandboxActivity::new("run_code", Arc::new(runtime)))
     }
 
@@ -369,7 +370,7 @@ mod tests {
         let key = ctx.idempotency_key().unwrap().to_string();
         let input = serde_json::to_value(SandboxRequest::new("sh", "true")).unwrap();
         sandbox_activity_handler(&ctx, input).await.unwrap();
-        let jobs = backend.jobs.lock().unwrap();
+        let jobs = backend.jobs.lock().unwrap().clone();
         let env = &jobs[0].plan.env;
         assert_eq!(env.get(IDEMPOTENCY_KEY_ENV), Some(&key));
         assert_eq!(env.get(ATTEMPT_ENV).map(String::as_str), Some("2"));
@@ -407,7 +408,9 @@ mod tests {
         let (_, activity) = activity(backend);
         let ctx = ctx_for(state_with(activity), CancellationToken::new());
         let input = serde_json::to_value(SandboxRequest::new("sh", "true")).unwrap();
-        let err = sandbox_activity_handler(&ctx, input).await.expect_err("fault");
+        let err = sandbox_activity_handler(&ctx, input)
+            .await
+            .expect_err("fault");
         let failure = parse_error_payload_full(&err);
         assert_eq!(failure.error_type, ERROR_TYPE_SANDBOX_UNAVAILABLE);
         assert!(!failure.non_retryable);
@@ -426,9 +429,14 @@ mod tests {
         });
         let input = serde_json::to_value(SandboxRequest::new("sh", "sleep 60")).unwrap();
         let started = std::time::Instant::now();
-        let err = sandbox_activity_handler(&ctx, input).await.expect_err("cancelled");
+        let err = sandbox_activity_handler(&ctx, input)
+            .await
+            .expect_err("cancelled");
         assert!(started.elapsed() < Duration::from_secs(5));
-        assert_eq!(parse_error_payload_full(&err).error_type, ERROR_TYPE_SANDBOX_CANCELLED);
+        assert_eq!(
+            parse_error_payload_full(&err).error_type,
+            ERROR_TYPE_SANDBOX_CANCELLED
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(backend.running.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
@@ -437,7 +445,12 @@ mod tests {
     fn the_builder_registers_the_activity_and_its_runtime() {
         let (_, activity) = activity(FakeBackend::new(IsolationLevel::Process));
         let builder = crate::builder::HarvestBuilder::new().sandbox_activity(activity);
-        assert!(builder.activity_infos().iter().any(|a| a.name == "run_code"));
+        assert!(
+            builder
+                .activity_infos()
+                .iter()
+                .any(|a| a.name == "run_code")
+        );
         let built = builder.build();
         assert_eq!(built.activity_count(), 1);
         let registry = built.state::<SandboxActivities>().expect("registry state");

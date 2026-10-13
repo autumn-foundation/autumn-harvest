@@ -148,10 +148,16 @@ impl SandboxOutcome {
         }
         for skipped in &self.skipped_outputs {
             if !plan.outputs.contains(&skipped.path) {
-                return violation(format!("skipped output {:?} was not asked for", skipped.path));
+                return violation(format!(
+                    "skipped output {:?} was not asked for",
+                    skipped.path
+                ));
             }
             if skipped.reason.len() > MAX_SKIP_REASON_BYTES {
-                return violation(format!("skipped output {:?} has a long reason", skipped.path));
+                return violation(format!(
+                    "skipped output {:?} has a long reason",
+                    skipped.path
+                ));
             }
         }
         if self.outputs.len() + self.skipped_outputs.len() > plan.outputs.len() {
@@ -168,7 +174,7 @@ pub(crate) mod tests {
     use crate::sandbox::policy::SandboxPolicy;
     use crate::sandbox::request::SandboxRequest;
 
-    pub(crate) fn outcome(status: RunStatus) -> SandboxOutcome {
+    pub fn outcome(status: RunStatus) -> SandboxOutcome {
         SandboxOutcome {
             status,
             stdout: String::new(),
@@ -238,7 +244,10 @@ pub(crate) mod tests {
         let mut out = outcome(RunStatus::Exited { code: 0 });
         // Lossy decoding can turn one byte into three, so 3x is the bound.
         out.stderr = "x".repeat(3 * max + 64 + 1);
-        assert!(matches!(out.check_bounds(&plan), Err(SandboxError::Protocol(_))));
+        assert!(matches!(
+            out.check_bounds(&plan),
+            Err(SandboxError::Protocol(_))
+        ));
     }
 
     #[test]
@@ -249,7 +258,10 @@ pub(crate) mod tests {
             path: "/etc/shadow".into(),
             content: b"root".to_vec(),
         });
-        assert!(matches!(out.check_bounds(&plan), Err(SandboxError::Protocol(_))));
+        assert!(matches!(
+            out.check_bounds(&plan),
+            Err(SandboxError::Protocol(_))
+        ));
     }
 
     #[test]
@@ -261,7 +273,10 @@ pub(crate) mod tests {
             path: "out.txt".into(),
             content: vec![0; too_big],
         });
-        assert!(matches!(out.check_bounds(&plan), Err(SandboxError::Protocol(_))));
+        assert!(matches!(
+            out.check_bounds(&plan),
+            Err(SandboxError::Protocol(_))
+        ));
     }
 
     #[test]
@@ -274,6 +289,9 @@ pub(crate) mod tests {
                 content: b"1".to_vec(),
             });
         }
-        assert!(matches!(out.check_bounds(&plan), Err(SandboxError::Protocol(_))));
+        assert!(matches!(
+            out.check_bounds(&plan),
+            Err(SandboxError::Protocol(_))
+        ));
     }
 }

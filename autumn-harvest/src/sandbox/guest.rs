@@ -141,7 +141,10 @@ async fn run_plan(
 pub fn parse_entropy(hex: &str) -> Result<[u8; 32], String> {
     let digits = hex.as_bytes();
     if digits.len() != 64 {
-        return Err(format!("entropy must be 64 hex digits, got {}", digits.len()));
+        return Err(format!(
+            "entropy must be 64 hex digits, got {}",
+            digits.len()
+        ));
     }
     let nibble = |c: u8| match c {
         b'0'..=b'9' => Ok(c - b'0'),
@@ -149,8 +152,9 @@ pub fn parse_entropy(hex: &str) -> Result<[u8; 32], String> {
         _ => Err("entropy must be lowercase hex".to_owned()),
     };
     let mut bytes = [0u8; 32];
-    for (byte, pair) in bytes.iter_mut().zip(digits.chunks_exact(2)) {
-        *byte = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    let (pairs, _) = digits.as_chunks::<2>();
+    for (byte, [high, low]) in bytes.iter_mut().zip(pairs) {
+        *byte = (nibble(*high)? << 4) | nibble(*low)?;
     }
     Ok(bytes)
 }
@@ -183,7 +187,9 @@ where
         Ok(other) => Err(SandboxError::Unavailable(format!(
             "the guest answered a ping with {other:?}"
         ))),
-        Err(e) => Err(SandboxError::Unavailable(format!("no pong from the guest: {e}"))),
+        Err(e) => Err(SandboxError::Unavailable(format!(
+            "no pong from the guest: {e}"
+        ))),
     }
 }
 
@@ -196,15 +202,18 @@ where
 /// - [`SandboxError::Denied`] when the runtime command could not start.
 /// - [`SandboxError::Protocol`] for a malformed or oversized frame, a wrong
 ///   run id, a wrong message type or a refused plan.
-pub async fn request_run<S>(stream: &mut S, job: &SandboxJob) -> Result<SandboxOutcome, SandboxError>
+pub async fn request_run<S>(
+    stream: &mut S,
+    job: &SandboxJob,
+) -> Result<SandboxOutcome, SandboxError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let run = HostMessage::Run(RunMessage {
+    let run = HostMessage::Run(Box::new(RunMessage {
         run_id: job.run_id.clone(),
         entropy: format_entropy(&job.entropy),
         plan: job.plan.clone(),
-    });
+    }));
     write_message(stream, run, MAX_FRAME_BYTES)
         .await
         .map_err(|e| SandboxError::Unavailable(format!("could not send the run: {e}")))?;
@@ -224,19 +233,20 @@ where
             "the outcome has run id {:?}, not {:?}",
             message.run_id, job.run_id
         ))),
-        GuestMessage::Error(error) if error.run_id != job.run_id => Err(SandboxError::Protocol(
-            format!("the error has run id {:?}, not {:?}", error.run_id, job.run_id),
-        )),
+        GuestMessage::Error(error) if error.run_id != job.run_id => {
+            Err(SandboxError::Protocol(format!(
+                "the error has run id {:?}, not {:?}",
+                error.run_id, job.run_id
+            )))
+        }
         GuestMessage::Error(error) => Err(match error.kind {
-            GuestErrorKind::InvalidPlan => SandboxError::Protocol(format!(
-                "the guest refused the plan: {}",
-                error.message
-            )),
+            GuestErrorKind::InvalidPlan => {
+                SandboxError::Protocol(format!("the guest refused the plan: {}", error.message))
+            }
             GuestErrorKind::SpawnFailed => SandboxError::Denied(error.message),
-            GuestErrorKind::Internal => SandboxError::Unavailable(format!(
-                "the guest failed: {}",
-                error.message
-            )),
+            GuestErrorKind::Internal => {
+                SandboxError::Unavailable(format!("the guest failed: {}", error.message))
+            }
         }),
         GuestMessage::Pong => Err(SandboxError::Protocol(
             "the guest answered a run with a pong".into(),
@@ -307,12 +317,11 @@ mod tests {
             }
         };
         let (mut host, mut guest) = tokio::io::duplex(1 << 20);
-        let server = tokio::spawn(async move {
-            serve_connection(&mut guest, &executor, &reseed).await
-        });
+        let server =
+            tokio::spawn(async move { serve_connection(&mut guest, &executor, &reseed).await });
         let result = request_run(&mut host, &job).await;
-        let served = server.await.unwrap().unwrap();
-        assert_eq!(served, Served::Run);
+        let what = server.await.unwrap().unwrap();
+        assert_eq!(what, Served::Run);
         let log = events.lock().unwrap().clone();
         (result, log)
     }
@@ -342,8 +351,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_reseed_stops_the_run() {
-        let (result, log) = exchange(job(), Ok(outcome(RunStatus::Exited { code: 0 })), false).await;
-        assert!(matches!(result, Err(SandboxError::Unavailable(_))), "{result:?}");
+        let (result, log) =
+            exchange(job(), Ok(outcome(RunStatus::Exited { code: 0 })), false).await;
+        assert!(
+            matches!(result, Err(SandboxError::Unavailable(_))),
+            "{result:?}"
+        );
         assert_eq!(log, ["reseed 7"], "the code must not run without a reseed");
     }
 
@@ -352,13 +365,17 @@ mod tests {
         let mut bad = job();
         bad.plan.files[0].path = "../../etc/passwd".into();
         let (result, log) = exchange(bad, Ok(outcome(RunStatus::Exited { code: 0 })), true).await;
-        assert!(matches!(result, Err(SandboxError::Protocol(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(SandboxError::Protocol(_))),
+            "{result:?}"
+        );
         assert!(log.iter().all(|e| !e.starts_with("execute")));
     }
 
     #[tokio::test]
     async fn a_command_that_cannot_start_is_denied() {
-        let (result, _) = exchange(job(), Err(SandboxError::Denied("no python3".into())), true).await;
+        let (result, _) =
+            exchange(job(), Err(SandboxError::Denied("no python3".into())), true).await;
         assert!(matches!(result, Err(SandboxError::Denied(ref m)) if m.contains("no python3")));
     }
 
@@ -376,7 +393,9 @@ mod tests {
         let (mut host, mut guest) = tokio::io::duplex(1 << 20);
         let server = tokio::spawn(async move {
             let _: HostMessage = read_message(&mut guest, MAX_FRAME_BYTES).await.unwrap();
-            write_frame(&mut guest, &reply, MAX_FRAME_BYTES).await.unwrap();
+            write_frame(&mut guest, &reply, MAX_FRAME_BYTES)
+                .await
+                .unwrap();
         });
         let result = request_run(&mut host, &job()).await;
         server.await.unwrap();
@@ -407,15 +426,18 @@ mod tests {
 
     #[tokio::test]
     async fn an_oversized_answer_is_a_protocol_violation_without_reading_it() {
+        use tokio::io::AsyncWriteExt as _;
         let (mut host, mut guest) = tokio::io::duplex(1 << 16);
         let server = tokio::spawn(async move {
             let _: HostMessage = read_message(&mut guest, MAX_FRAME_BYTES).await.unwrap();
-            use tokio::io::AsyncWriteExt as _;
             guest.write_all(&[0x7f, 0xff, 0xff, 0xff]).await.unwrap();
             guest
         });
         let result = request_run(&mut host, &job()).await;
-        assert!(matches!(result, Err(SandboxError::Protocol(ref m)) if m.contains("exceeds")), "{result:?}");
+        assert!(
+            matches!(result, Err(SandboxError::Protocol(ref m)) if m.contains("exceeds")),
+            "{result:?}"
+        );
         drop(server.await.unwrap());
     }
 
@@ -424,7 +446,10 @@ mod tests {
         let (mut host, guest) = tokio::io::duplex(1 << 20);
         drop(guest);
         let result = request_run(&mut host, &job()).await;
-        assert!(matches!(result, Err(SandboxError::Unavailable(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(SandboxError::Unavailable(_))),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -449,12 +474,14 @@ mod tests {
             serve_connection(&mut guest, &executor, &|_: &[u8; 32]| Ok(())).await
         });
         let job = job();
-        let run = HostMessage::Run(RunMessage {
+        let run = HostMessage::Run(Box::new(RunMessage {
             run_id: job.run_id,
             entropy: "not-hex".into(),
             plan: job.plan,
-        });
-        write_message(&mut host, run, MAX_FRAME_BYTES).await.unwrap();
+        }));
+        write_message(&mut host, run, MAX_FRAME_BYTES)
+            .await
+            .unwrap();
         let reply: GuestMessage = read_message(&mut host, MAX_FRAME_BYTES).await.unwrap();
         assert!(matches!(
             reply,

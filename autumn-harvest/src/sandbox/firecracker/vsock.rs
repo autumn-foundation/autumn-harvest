@@ -58,7 +58,7 @@ pub async fn connect_guest(
         match tokio::time::timeout(limit, attempt(uds, port)).await {
             Ok(Ok(stream)) => return Ok(stream),
             Ok(Err(reason)) => last = reason,
-            Err(_) => last = "the attempt timed out".to_owned(),
+            Err(_) => "the attempt timed out".clone_into(&mut last),
         }
         let pause = delay.min(deadline.saturating_duration_since(Instant::now()));
         tokio::time::sleep(pause).await;
@@ -121,7 +121,7 @@ pub(crate) mod tests {
 
     /// How the fake muxer answers.
     #[derive(Clone, Copy)]
-    pub(crate) enum Muxer {
+    pub enum Muxer {
         /// Close the first `n` connections, then answer `OK` and echo.
         RefuseThenEcho(usize),
         /// Reply with a line that is not `OK`.
@@ -130,8 +130,11 @@ pub(crate) mod tests {
         Endless,
     }
 
-    pub(crate) fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("hvs-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
+    pub fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hvs-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

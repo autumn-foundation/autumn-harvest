@@ -258,9 +258,11 @@ impl SandboxPolicy {
     ///
     /// # Errors
     ///
-    /// Returns [`SandboxError::Config`] when a default limit is over its
-    /// ceiling, when a limit is zero, when no runtime exists, or when a
-    /// runtime name or spec is not valid.
+    /// Returns [`SandboxError::Config`] for one of these defects:
+    ///
+    /// - a default limit is over its ceiling, or a limit is zero;
+    /// - no runtime exists;
+    /// - a runtime name or spec is not valid.
     pub fn validate(&self) -> Result<(), SandboxError> {
         if self.runtimes.is_empty() {
             return Err(SandboxError::Config("the policy names no runtime".into()));
@@ -282,7 +284,9 @@ impl SandboxPolicy {
         }
         for (field, default, max) in limit_pairs(&self.default_limits, &self.max_limits) {
             if default == 0 || max == 0 {
-                return Err(SandboxError::Config(format!("limit {field} must not be zero")));
+                return Err(SandboxError::Config(format!(
+                    "limit {field} must not be zero"
+                )));
             }
             if default > max {
                 return Err(SandboxError::Config(format!(
@@ -305,10 +309,7 @@ impl SandboxPolicy {
     pub fn max_outcome_json_bytes(&self) -> u64 {
         // Each kept stream byte can decode to three bytes of U+FFFD, and each
         // of those can escape to six bytes of JSON.
-        let streams = self
-            .max_limits
-            .max_output_bytes
-            .saturating_mul(2 * 3 * 6);
+        let streams = self.max_limits.max_output_bytes.saturating_mul(2 * 3 * 6);
         let files = self
             .sizes
             .max_output_file_bytes
@@ -364,7 +365,11 @@ fn limit_pairs(default: &SandboxLimits, max: &SandboxLimits) -> [(&'static str, 
             u64::from(default.max_open_files),
             u64::from(max.max_open_files),
         ),
-        ("max_output_bytes", default.max_output_bytes, max.max_output_bytes),
+        (
+            "max_output_bytes",
+            default.max_output_bytes,
+            max.max_output_bytes,
+        ),
     ]
 }
 
@@ -407,7 +412,9 @@ mod tests {
         let mut low = MAX_LIMITS;
         low.wall_clock_ms = 1_000;
         let policy = SandboxPolicy::default().with_limits(DEFAULT_LIMITS, low);
-        let err = policy.validate().expect_err("the default exceeds the ceiling");
+        let err = policy
+            .validate()
+            .expect_err("the default exceeds the ceiling");
         assert!(matches!(err, SandboxError::Config(ref m) if m.contains("wall_clock_ms")));
     }
 
@@ -428,8 +435,8 @@ mod tests {
 
     #[test]
     fn a_runtime_with_an_unsafe_file_name_is_a_config_error() {
-        let policy = SandboxPolicy::default()
-            .with_runtime("evil", RuntimeSpec::new(&["sh"], "../main.sh"));
+        let policy =
+            SandboxPolicy::default().with_runtime("evil", RuntimeSpec::new(&["sh"], "../main.sh"));
         assert!(matches!(policy.validate(), Err(SandboxError::Config(_))));
         let policy = SandboxPolicy::default().with_runtime("empty", RuntimeSpec::new(&[], "a.sh"));
         assert!(matches!(policy.validate(), Err(SandboxError::Config(_))));
@@ -443,7 +450,8 @@ mod tests {
         assert!(!is_valid_runtime_name("Python"));
         assert!(!is_valid_runtime_name("py thon"));
         assert!(!is_valid_runtime_name(&"a".repeat(33)));
-        let policy = SandboxPolicy::default().with_runtime("Bad Name", RuntimeSpec::new(&["sh"], "a"));
+        let policy =
+            SandboxPolicy::default().with_runtime("Bad Name", RuntimeSpec::new(&["sh"], "a"));
         assert!(matches!(policy.validate(), Err(SandboxError::Config(_))));
     }
 

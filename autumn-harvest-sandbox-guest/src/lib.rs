@@ -226,7 +226,11 @@ mod tests {
         assert_eq!(outcome.status, RunStatus::Exited { code: 0 });
         assert_eq!(outcome.stdout, "guest\n");
         agent.await.unwrap().unwrap();
-        assert_eq!(accepted.load(Ordering::SeqCst), 3, "the agent stops after one run");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            3,
+            "the agent stops after one run"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

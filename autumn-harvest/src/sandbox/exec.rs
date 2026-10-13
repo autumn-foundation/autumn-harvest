@@ -102,11 +102,14 @@ impl PlanExecutor for ProcessExecutor {
 ///
 /// # Errors
 ///
-/// Returns [`SandboxError::Denied`] when the plan fails its check or the
-/// command cannot start, [`SandboxError::Unavailable`] when the executor
-/// cannot isolate the network or set up the work directory, and
-/// [`SandboxError::Cancelled`] when `cancel` fires. The executor kills the
-/// process group and removes the work directory in each case.
+/// - [`SandboxError::Denied`]: the plan fails its check, or the command
+///   cannot start.
+/// - [`SandboxError::Unavailable`]: the executor cannot isolate the network
+///   or set up the work directory.
+/// - [`SandboxError::Cancelled`]: `cancel` fires.
+///
+/// The executor kills the process group and removes the work directory in
+/// each case.
 pub async fn execute_plan(
     plan: &ExecPlan,
     options: &ExecOptions,
@@ -143,7 +146,9 @@ pub async fn execute_plan(
         command.pre_exec(move || setup.apply());
     }
     let started = Instant::now();
-    let mut child = command.spawn().map_err(|e| spawn_error(&plan.argv[0], &e))?;
+    let mut child = command
+        .spawn()
+        .map_err(|e| spawn_error(&plan.argv[0], &e))?;
     let group = child.id().and_then(|pid| i32::try_from(pid).ok());
 
     let stdin = plan.stdin.clone();
@@ -226,7 +231,7 @@ enum End {
 fn effective_run_as(options: &ExecOptions) -> Option<(u32, u32)> {
     // SAFETY: geteuid has no preconditions.
     let root = unsafe { libc::geteuid() } == 0;
-    options.run_as.or(root.then_some(NOBODY))
+    options.run_as.or_else(|| root.then_some(NOBODY))
 }
 
 /// Map a spawn error to a sandbox error.
@@ -292,7 +297,8 @@ impl ChildSetup {
             }
             let mut empty: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&raw mut empty);
-            if libc::pthread_sigmask(libc::SIG_SETMASK, &raw const empty, std::ptr::null_mut()) != 0 {
+            if libc::pthread_sigmask(libc::SIG_SETMASK, &raw const empty, std::ptr::null_mut()) != 0
+            {
                 return Err(io::Error::last_os_error());
             }
             if self.deny_network {
@@ -347,11 +353,7 @@ type Resource = libc::c_int;
 /// # Safety
 ///
 /// Call it only between fork and exec, or in a single-threaded process.
-unsafe fn set_limit(
-    resource: Resource,
-    soft: libc::rlim_t,
-    hard: libc::rlim_t,
-) -> io::Result<()> {
+unsafe fn set_limit(resource: Resource, soft: libc::rlim_t, hard: libc::rlim_t) -> io::Result<()> {
     let limit = libc::rlimit {
         rlim_cur: soft,
         rlim_max: hard,
@@ -419,7 +421,10 @@ impl CaptureTask {
 }
 
 /// Read `pipe` to its end into a bounded capture.
-fn spawn_capture<R: AsyncRead + Unpin + Send + 'static>(pipe: Option<R>, cap: usize) -> CaptureTask {
+fn spawn_capture<R: AsyncRead + Unpin + Send + 'static>(
+    pipe: Option<R>,
+    cap: usize,
+) -> CaptureTask {
     let capture = Arc::new(Mutex::new(StreamCapture::new(cap)));
     let task = pipe.map(|mut pipe| {
         let capture = Arc::clone(&capture);
@@ -496,7 +501,11 @@ impl Drop for WorkDir {
 
 /// Write the plan files into `dir`. The directory is new, and no code ran
 /// in it yet, so no link can redirect a write.
-fn write_files(dir: &Path, plan: &ExecPlan, run_as: Option<(u32, u32)>) -> Result<(), SandboxError> {
+fn write_files(
+    dir: &Path,
+    plan: &ExecPlan,
+    run_as: Option<(u32, u32)>,
+) -> Result<(), SandboxError> {
     let fail = |e: io::Error, what: &str| {
         SandboxError::Unavailable(format!("could not write the input file {what}: {e}"))
     };
@@ -526,9 +535,11 @@ fn write_files(dir: &Path, plan: &ExecPlan, run_as: Option<(u32, u32)>) -> Resul
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&path)
             .map_err(|e| fail(e, &file.path))?;
-        out.write_all(&file.content).map_err(|e| fail(e, &file.path))?;
+        out.write_all(&file.content)
+            .map_err(|e| fail(e, &file.path))?;
         if let Some((uid, gid)) = run_as {
-            std::os::unix::fs::fchown(&out, Some(uid), Some(gid)).map_err(|e| fail(e, &file.path))?;
+            std::os::unix::fs::fchown(&out, Some(uid), Some(gid))
+                .map_err(|e| fail(e, &file.path))?;
         }
     }
     Ok(())
@@ -551,7 +562,11 @@ fn collect_outputs(dir: &Path, plan: &ExecPlan) -> (Vec<OutputFile>, Vec<Skipped
         Ok(root) => root,
         Err(e) => {
             for path in &plan.outputs {
-                skip(&mut skipped, path, format!("the work directory is gone: {e}"));
+                skip(
+                    &mut skipped,
+                    path,
+                    format!("the work directory is gone: {e}"),
+                );
             }
             return (outputs, skipped);
         }
@@ -565,8 +580,7 @@ fn collect_outputs(dir: &Path, plan: &ExecPlan) -> (Vec<OutputFile>, Vec<Skipped
                         &mut skipped,
                         path,
                         format!(
-                            "{size} bytes do not fit the {} bytes left of the output budget",
-                            budget
+                            "{size} bytes do not fit the {budget} bytes left of the output budget"
                         ),
                     );
                 } else {
@@ -601,7 +615,10 @@ fn read_output(root: &std::fs::File, path: &str, max: u64) -> Result<Vec<u8>, St
         return Err("the path is not a regular file".to_owned());
     }
     if meta.len() > max {
-        return Err(format!("the file holds {} bytes, over the limit of {max} bytes", meta.len()));
+        return Err(format!(
+            "the file holds {} bytes, over the limit of {max} bytes",
+            meta.len()
+        ));
     }
     let mut content = Vec::new();
     file.take(max.saturating_add(1))
@@ -620,7 +637,8 @@ fn read_output(root: &std::fs::File, path: &str, max: u64) -> Result<Vec<u8>, St
 /// older kernel gets an `openat` walk with `O_NOFOLLOW` on each component.
 fn open_beneath(root: &std::fs::File, path: &str) -> io::Result<std::fs::File> {
     let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-    let c_path = std::ffi::CString::new(path).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let c_path =
+        std::ffi::CString::new(path).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
     // SAFETY: open_how is a plain C struct, and zero is a valid value.
     let mut how: libc::open_how = unsafe { std::mem::zeroed() };
     how.flags = u64::try_from(flags).unwrap_or(0);
@@ -656,7 +674,9 @@ fn open_beneath_walk(root: &std::fs::File, path: &str, flags: i32) -> io::Result
         let last = components.peek().is_none();
         let name = std::ffi::CString::new(component)
             .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-        let at = dir.as_ref().map_or(root.as_raw_fd(), AsRawFd::as_raw_fd);
+        let at = dir
+            .as_ref()
+            .map_or_else(|| root.as_raw_fd(), AsRawFd::as_raw_fd);
         let component_flags = if last {
             flags
         } else {
@@ -677,7 +697,6 @@ fn open_beneath_walk(root: &std::fs::File, path: &str, flags: i32) -> io::Result
     }
     Err(io::Error::from_raw_os_error(libc::EINVAL))
 }
-
 
 /// Whether this host lets the executor create an empty network namespace.
 ///
@@ -737,10 +756,8 @@ pub fn remove_work_dir(dir: &Path) -> io::Result<()> {
         if !meta.is_dir() {
             continue;
         }
-        let _ = std::fs::set_permissions(
-            &path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o700),
-        );
+        let _ =
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o700));
         if let Ok(entries) = std::fs::read_dir(&path) {
             stack.extend(entries.filter_map(Result::ok).map(|entry| entry.path()));
         }
@@ -893,13 +910,13 @@ mod tests {
         assert_eq!(out.outputs.len(), 1);
         assert_eq!(out.outputs[0].path, "out/a.txt");
         assert_eq!(out.outputs[0].content, b"hi");
-        assert!(out.skipped_outputs.is_empty());
+        assert_eq!(out.skipped_outputs, []);
     }
 
     #[tokio::test]
     async fn a_missing_output_is_skipped() {
         let out = run(sh("true").with_output("nope.txt")).await;
-        assert!(out.outputs.is_empty());
+        assert_eq!(out.outputs, []);
         assert_eq!(out.skipped_outputs[0].path, "nope.txt");
     }
 
@@ -913,14 +930,17 @@ mod tests {
     #[tokio::test]
     async fn a_symlinked_directory_in_an_output_path_is_skipped() {
         let out = run(sh("ln -s /etc d").with_output("d/hostname")).await;
-        assert!(out.outputs.is_empty(), "a symlinked parent must not be followed");
+        assert!(
+            out.outputs.is_empty(),
+            "a symlinked parent must not be followed"
+        );
     }
 
     #[tokio::test]
     async fn a_fifo_output_is_skipped_without_blocking() {
         let started = Instant::now();
         let out = run(sh("mkfifo pipe").with_output("pipe")).await;
-        assert!(out.outputs.is_empty());
+        assert_eq!(out.outputs, []);
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 
@@ -928,7 +948,7 @@ mod tests {
     async fn an_oversized_output_is_skipped() {
         let request = sh("head -c 300000 /dev/zero > big").with_output("big");
         let out = run(request).await;
-        assert!(out.outputs.is_empty());
+        assert_eq!(out.outputs, []);
         assert!(out.skipped_outputs[0].reason.contains("bytes"));
     }
 
@@ -942,7 +962,7 @@ mod tests {
         let total: usize = out.outputs.iter().map(|o| o.content.len()).sum();
         assert!(total <= 512 * 1024, "{total}");
         assert_eq!(out.outputs.len() + out.skipped_outputs.len(), 3);
-        assert!(!out.skipped_outputs.is_empty());
+        assert_ne!(out.skipped_outputs, []);
     }
 
     #[tokio::test]
@@ -982,7 +1002,11 @@ mod tests {
     async fn the_child_leads_its_own_session() {
         let out = run(sh("echo $$; cut -d' ' -f6 /proc/$$/stat")).await;
         let mut lines = out.stdout.lines();
-        assert_eq!(lines.next(), lines.next(), "the shell must be its session leader");
+        assert_eq!(
+            lines.next(),
+            lines.next(),
+            "the shell must be its session leader"
+        );
     }
 
     #[tokio::test]
@@ -1043,7 +1067,10 @@ mod tests {
         let err = execute_plan(&plan, &options(), &CancellationToken::new())
             .await
             .expect_err("no such command");
-        assert!(matches!(err, SandboxError::Denied(ref m) if m.contains("could not start")), "{err:?}");
+        assert!(
+            matches!(err, SandboxError::Denied(ref m) if m.contains("could not start")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1090,7 +1117,11 @@ mod tests {
         }
         let out = run(sh("id -u; id -g; id -G")).await;
         let lines: Vec<&str> = out.stdout.lines().collect();
-        assert_eq!(lines, ["65534", "65534", "65534"], "no supplementary groups");
+        assert_eq!(
+            lines,
+            ["65534", "65534", "65534"],
+            "no supplementary groups"
+        );
     }
 
     #[tokio::test]
@@ -1103,7 +1134,9 @@ mod tests {
         let mut policy = SandboxPolicy::for_development().with_network(NetworkPolicy::Allow);
         policy.default_limits.max_processes = 8;
         let plan = policy
-            .plan(&sh("i=0; while [ $i -lt 50 ]; do sleep 5 & i=$((i+1)); done; echo done"))
+            .plan(&sh(
+                "i=0; while [ $i -lt 50 ]; do sleep 5 & i=$((i+1)); done; echo done",
+            ))
             .unwrap();
         let options = ExecOptions {
             run_as: Some((54_321, 54_321)),
@@ -1121,13 +1154,9 @@ mod tests {
         std::fs::create_dir_all(root.join("locked/inner")).unwrap();
         std::fs::write(root.join("locked/inner/f"), b"x").unwrap();
         // A mode of 0 blocks the removal for a non-root user.
-        std::os::unix::fs::PermissionsExt::set_mode(
-            &mut std::fs::metadata(root.join("locked")).unwrap().permissions(),
-            0,
-        );
         std::fs::set_permissions(
             root.join("locked"),
-            std::os::unix::fs::PermissionsExt::from_mode(0),
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
         )
         .unwrap();
         remove_work_dir(&root).unwrap();
@@ -1137,11 +1166,9 @@ mod tests {
     fn process_is_gone(pid: i32) -> bool {
         // A killed orphan can stay a zombie until init reaps it, which counts
         // as gone: it runs no code.
-        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Err(_) => true,
-            Ok(stat) => stat
-                .rsplit_once(") ")
-                .is_some_and(|(_, rest)| rest.starts_with('Z') || rest.starts_with('X')),
-        }
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, rest)| rest.starts_with('Z') || rest.starts_with('X'))
+        })
     }
 }

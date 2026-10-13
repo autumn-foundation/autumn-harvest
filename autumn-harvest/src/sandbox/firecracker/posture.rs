@@ -171,11 +171,7 @@ pub fn inspect_host(root: &Path) -> Vec<PostureFinding> {
             if state.trim_start().starts_with("Vulnerable") {
                 find(
                     "cpu_vulnerability",
-                    format!(
-                        "{}: {}",
-                        entry.file_name().to_string_lossy(),
-                        state.trim()
-                    ),
+                    format!("{}: {}", entry.file_name().to_string_lossy(), state.trim()),
                     Severity::Critical,
                 );
             }
@@ -228,7 +224,10 @@ mod tests {
 
     #[test]
     fn versions_are_parsed() {
-        assert_eq!(parse_version("Firecracker v1.17.0\n\nSupported snapshot versions: v7.0.0"), Some((1, 17, 0)));
+        assert_eq!(
+            parse_version("Firecracker v1.17.0\n\nSupported snapshot versions: v7.0.0"),
+            Some((1, 17, 0))
+        );
         assert_eq!(parse_version("Firecracker v1.14.4-dev"), Some((1, 14, 4)));
         assert_eq!(parse_version("cloud-hypervisor v40.0"), None);
         assert_eq!(parse_version(""), None);
@@ -238,7 +237,10 @@ mod tests {
     fn versions_with_known_escapes_are_refused() {
         for bad in [(1, 13, 1), (1, 14, 0), (1, 14, 3), (1, 15, 0), (0, 25, 0)] {
             let err = check_version(bad).unwrap_err();
-            assert!(matches!(err, SandboxError::Config(ref m) if m.contains("CVE-")), "{bad:?}");
+            assert!(
+                matches!(err, SandboxError::Config(ref m) if m.contains("CVE-")),
+                "{bad:?}"
+            );
         }
         for good in [(1, 14, 4), (1, 15, 1), (1, 16, 0), (1, 17, 0), (2, 0, 0)] {
             assert!(check_version(good).is_ok(), "{good:?}");
@@ -254,7 +256,8 @@ mod tests {
         let old = dir.join("fc-old");
         std::fs::write(&old, "#!/bin/sh\necho 'Firecracker v1.14.0'\n").unwrap();
         for path in [&good, &old] {
-            std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
         }
         assert_eq!(probe_version(&good).await.unwrap(), (1, 17, 0));
         assert!(probe_version(&old).await.is_err());
@@ -273,8 +276,14 @@ mod tests {
         write("sys/kernel/mm/ksm/run", "0\n");
         write("sys/module/kvm_intel/parameters/nested", "N\n");
         write("sys/devices/system/cpu/smt/active", "0\n");
-        write("sys/devices/system/cpu/vulnerabilities/spectre_v2", "Mitigation: Enhanced IBRS\n");
-        write("sys/devices/system/cpu/vulnerabilities/l1tf", "Not affected\n");
+        write(
+            "sys/devices/system/cpu/vulnerabilities/spectre_v2",
+            "Mitigation: Enhanced IBRS\n",
+        );
+        write(
+            "sys/devices/system/cpu/vulnerabilities/l1tf",
+            "Not affected\n",
+        );
         write("sys/fs/cgroup/cgroup.controllers", "cpu memory pids\n");
         root
     }
@@ -313,7 +322,10 @@ mod tests {
             ("cgroup_v2", Severity::Critical),
             ("smt", Severity::Warning),
         ] {
-            assert!(checks.contains(&expected), "{expected:?} missing from {checks:?}");
+            assert!(
+                checks.contains(&expected),
+                "{expected:?} missing from {checks:?}"
+            );
         }
         let err = enforce(&findings, PosturePolicy::Enforce).unwrap_err();
         assert!(matches!(err, SandboxError::Config(ref m) if m.contains("vmscape")));

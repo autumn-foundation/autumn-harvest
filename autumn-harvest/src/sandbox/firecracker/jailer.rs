@@ -202,14 +202,19 @@ mod tests {
 
     #[test]
     fn the_exec_name_is_the_file_name() {
-        assert_eq!(exec_name(Path::new("/opt/fc/firecracker")).unwrap(), "firecracker");
+        assert_eq!(
+            exec_name(Path::new("/opt/fc/firecracker")).unwrap(),
+            "firecracker"
+        );
         assert!(exec_name(Path::new("/")).is_err());
     }
 
     #[test]
     fn the_cgroup_values_bound_cpu_memory_and_pids() {
         let mut config = config();
-        config.extra_cgroups.push(("cpuset.cpus".into(), "2-3".into()));
+        config
+            .extra_cgroups
+            .push(("cpuset.cpus".into(), "2-3".into()));
         let values = cgroup_values(
             &config,
             MachineSpec {
@@ -238,7 +243,11 @@ mod tests {
             Path::new("/opt/fc/firecracker"),
             "hsbx-a-1",
             MachineSpec::default(),
-            &["--config-file".into(), "vm-config.json".into(), "--no-api".into()],
+            &[
+                "--config-file".into(),
+                "vm-config.json".into(),
+                "--no-api".into(),
+            ],
         );
         let expected: Vec<String> = [
             "--id",

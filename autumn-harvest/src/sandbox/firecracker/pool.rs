@@ -101,13 +101,13 @@ impl WarmPool {
     /// Stop refilling and tear down each ready microVM.
     pub async fn shutdown(&self) {
         self.inner.closed.store(true, Ordering::SeqCst);
-        if let Some(task) = self
+        let task = self
             .inner
             .task
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
+            .take();
+        if let Some(task) = task {
             task.abort();
         }
         let ready: Vec<_> = self
@@ -126,13 +126,13 @@ impl WarmPool {
 impl Drop for WarmPool {
     fn drop(&mut self) {
         self.inner.closed.store(true, Ordering::SeqCst);
-        if let Some(task) = self
+        let task = self
             .inner
             .task
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
+            .take();
+        if let Some(task) = task {
             task.abort();
         }
         // Dropping a microVM kills it at once; each one cleans the rest up

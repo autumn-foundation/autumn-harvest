@@ -231,7 +231,7 @@ pub(crate) mod tests {
     use crate::sandbox::outcome::{OutputFile, RunStatus};
 
     /// A backend that records each job and answers with a fixed outcome.
-    pub(crate) struct FakeBackend {
+    pub struct FakeBackend {
         pub isolation: IsolationLevel,
         pub jobs: Mutex<Vec<SandboxJob>>,
         pub running: AtomicUsize,
@@ -241,7 +241,7 @@ pub(crate) mod tests {
     }
 
     impl FakeBackend {
-        pub(crate) fn new(isolation: IsolationLevel) -> Self {
+        pub fn new(isolation: IsolationLevel) -> Self {
             Self {
                 isolation,
                 jobs: Mutex::new(Vec::new()),
@@ -297,7 +297,10 @@ pub(crate) mod tests {
     fn the_default_policy_refuses_a_process_backend() {
         let backend = Arc::new(FakeBackend::new(IsolationLevel::Process));
         let err = SandboxRuntime::new(backend, SandboxPolicy::default()).expect_err("too weak");
-        assert!(matches!(err, SandboxError::Config(ref m) if m.contains("micro_vm")), "{err:?}");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("micro_vm")),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -352,7 +355,10 @@ pub(crate) mod tests {
         backend.answer = Mutex::new(Some(Ok(lying)));
         let (_, runtime) = runtime(backend);
         let out = runtime
-            .run(&SandboxRequest::new("sh", "true"), &CancellationToken::new())
+            .run(
+                &SandboxRequest::new("sh", "true"),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert_eq!(out.isolation, IsolationLevel::Process);
@@ -370,7 +376,10 @@ pub(crate) mod tests {
         backend.answer = Mutex::new(Some(Ok(bad)));
         let (_, runtime) = runtime(backend);
         let err = runtime
-            .run(&SandboxRequest::new("sh", "true"), &CancellationToken::new())
+            .run(
+                &SandboxRequest::new("sh", "true"),
+                &CancellationToken::new(),
+            )
             .await
             .expect_err("bounds");
         assert!(matches!(err, SandboxError::Protocol(_)));
@@ -387,7 +396,10 @@ pub(crate) mod tests {
             let runtime = Arc::clone(&runtime);
             tasks.push(tokio::spawn(async move {
                 runtime
-                    .run(&SandboxRequest::new("sh", "true"), &CancellationToken::new())
+                    .run(
+                        &SandboxRequest::new("sh", "true"),
+                        &CancellationToken::new(),
+                    )
                     .await
             }));
         }
@@ -408,7 +420,10 @@ pub(crate) mod tests {
             let runtime = Arc::clone(&runtime);
             tokio::spawn(async move {
                 runtime
-                    .run(&SandboxRequest::new("sh", "true"), &CancellationToken::new())
+                    .run(
+                        &SandboxRequest::new("sh", "true"),
+                        &CancellationToken::new(),
+                    )
                     .await
             })
         };

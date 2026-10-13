@@ -12,10 +12,11 @@
 //!   Firecracker microVM. The microVM has its own guest kernel, no network
 //!   device and a read-only root file system. This is the security boundary
 //!   for hostile code.
-//! - `ProcessBackend` (Linux) runs the code as a host process with resource
-//!   limits, a private work directory, no host environment and, by default,
-//!   an empty network namespace. It shares the host kernel, so it is for
-//!   development and tests only. The default policy refuses it.
+//! - `ProcessBackend` (Linux) runs the code as a host process. The process
+//!   gets resource limits, a private work directory and no host environment.
+//!   By default it also gets an empty network namespace. It shares the host
+//!   kernel, so it is for development and tests only. The default policy
+//!   refuses it.
 //!
 //! The guest agent inside each microVM runs the plan with the same process
 //! executor. The microVM is the boundary, and the executor limits are a

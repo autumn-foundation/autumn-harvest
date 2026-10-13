@@ -3,15 +3,15 @@
 //!
 //! A [`SandboxRequest`] is untrusted input. [`SandboxPolicy::plan`] checks it
 //! against the policy and turns it into an [`ExecPlan`]. The guest checks the
-//! plan again with [`ExecPlan::validate`] before it writes a file, because the
-//! guest must not trust the host process more than it needs to.
+//! plan again with [`ExecPlan::validate`] before it writes a file. The guest
+//! must not trust the host process more than it needs to.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
 use super::error::SandboxError;
-use super::policy::{NetworkPolicy, SandboxLimits, SandboxPolicy};
+use super::policy::{NetworkPolicy, RuntimeSpec, SandboxLimits, SandboxPolicy};
 
 /// The most bytes in one path of a file or of an output.
 pub const MAX_PATH_BYTES: usize = 512;
@@ -258,7 +258,9 @@ impl ExecPlan {
         .into_iter()
         .find(|(_, value)| *value == 0);
         if let Some((name, _)) = zero {
-            return Err(SandboxError::Denied(format!("limit {name} must not be zero")));
+            return Err(SandboxError::Denied(format!(
+                "limit {name} must not be zero"
+            )));
         }
         Ok(())
     }
@@ -302,6 +304,25 @@ pub fn validate_relative_path(path: &str) -> Result<(), SandboxError> {
     Ok(())
 }
 
+/// The content of one request file: exactly one of `text` and `base64`.
+fn decode_file(file: &SandboxFile) -> Result<Vec<u8>, SandboxError> {
+    match (&file.text, &file.base64) {
+        (Some(text), None) => Ok(text.clone().into_bytes()),
+        (None, Some(encoded)) => {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|e| {
+                    SandboxError::Denied(format!("file {:?} is not valid base64: {e}", file.path))
+                })
+        }
+        _ => Err(SandboxError::Denied(format!(
+            "file {:?} must set exactly one of `text` and `base64`",
+            file.path
+        ))),
+    }
+}
+
 /// Deny `value` when it holds a NUL byte. `execve` cannot pass one.
 fn check_no_nul(what: &str, value: &str) -> Result<(), SandboxError> {
     if value.contains('\0') {
@@ -336,7 +357,11 @@ fn check_no_nested_files(paths: &BTreeSet<&str>) -> Result<(), SandboxError> {
 ///
 /// Returns [`SandboxError::Denied`] that names the defect.
 pub fn validate_env_name(name: &str) -> Result<(), SandboxError> {
-    let deny = |why: &str| Err(SandboxError::Denied(format!("environment name {name:?} {why}")));
+    let deny = |why: &str| {
+        Err(SandboxError::Denied(format!(
+            "environment name {name:?} {why}"
+        )))
+    };
     let mut bytes = name.bytes();
     let Some(first) = bytes.next() else {
         return deny("is empty");
@@ -367,116 +392,17 @@ impl SandboxPolicy {
     /// breaks. The message names the rule and the limit, so an agent can
     /// correct its request.
     pub fn plan(&self, request: &SandboxRequest) -> Result<ExecPlan, SandboxError> {
-        let deny = |message: String| Err(SandboxError::Denied(message));
         let Some(spec) = self.runtimes.get(&request.runtime) else {
             let allowed: Vec<&str> = self.runtimes.keys().map(String::as_str).collect();
-            return deny(format!(
+            return Err(SandboxError::Denied(format!(
                 "runtime {:?} is not allowed; allowed runtimes: {}",
                 request.runtime,
                 allowed.join(", ")
-            ));
+            )));
         };
-        let sizes = &self.sizes;
         let limits = self.resolve_limits(&request.limits)?;
-
-        // The code file comes first, then the request files.
-        if request.files.len().saturating_add(1) > sizes.max_files {
-            return deny(format!(
-                "{} files exceed the limit of {} (the code file counts as one)",
-                request.files.len() + 1,
-                sizes.max_files
-            ));
-        }
-        let mut files = Vec::with_capacity(request.files.len() + 1);
-        files.push(PlanFile {
-            path: spec.file_name.clone(),
-            content: request.code.clone().into_bytes(),
-            executable: false,
-        });
-        for file in &request.files {
-            validate_relative_path(&file.path)?;
-            let content = match (&file.text, &file.base64) {
-                (Some(text), None) => text.clone().into_bytes(),
-                (None, Some(encoded)) => {
-                    use base64::Engine as _;
-                    base64::engine::general_purpose::STANDARD
-                        .decode(encoded)
-                        .map_err(|e| {
-                            SandboxError::Denied(format!(
-                                "file {:?} is not valid base64: {e}",
-                                file.path
-                            ))
-                        })?
-                }
-                _ => {
-                    return deny(format!(
-                        "file {:?} must set exactly one of `text` and `base64`",
-                        file.path
-                    ));
-                }
-            };
-            files.push(PlanFile {
-                path: file.path.clone(),
-                content,
-                executable: file.executable,
-            });
-        }
-        let stdin = request.stdin.clone().unwrap_or_default().into_bytes();
-        let input_bytes = files
-            .iter()
-            .map(|f| f.content.len())
-            .sum::<usize>()
-            .saturating_add(stdin.len());
-        if u64::try_from(input_bytes).unwrap_or(u64::MAX) > sizes.max_input_bytes {
-            return deny(format!(
-                "the code, files and stdin hold {input_bytes} bytes, over the limit of {}",
-                sizes.max_input_bytes
-            ));
-        }
-
-        if request.args.len() > sizes.max_args {
-            return deny(format!(
-                "{} arguments exceed the limit of {}",
-                request.args.len(),
-                sizes.max_args
-            ));
-        }
-        let arg_bytes: usize = request.args.iter().map(String::len).sum();
-        if arg_bytes > sizes.max_arg_bytes {
-            return deny(format!(
-                "the arguments hold {arg_bytes} bytes, over the limit of {}",
-                sizes.max_arg_bytes
-            ));
-        }
-        if request.env.len() > sizes.max_env {
-            return deny(format!(
-                "{} environment variables exceed the limit of {}",
-                request.env.len(),
-                sizes.max_env
-            ));
-        }
-        let env_bytes: usize = request.env.iter().map(|(k, v)| k.len() + v.len()).sum();
-        if env_bytes > sizes.max_env_bytes {
-            return deny(format!(
-                "the environment holds {env_bytes} bytes, over the limit of {}",
-                sizes.max_env_bytes
-            ));
-        }
-        if request.outputs.len() > sizes.max_outputs {
-            return deny(format!(
-                "{} outputs exceed the limit of {}",
-                request.outputs.len(),
-                sizes.max_outputs
-            ));
-        }
-        let mut seen = BTreeSet::new();
-        for output in &request.outputs {
-            validate_relative_path(output)?;
-            if !seen.insert(output.as_str()) {
-                return deny(format!("output {output:?} appears twice"));
-            }
-        }
-
+        let (files, stdin) = self.plan_input(spec, request)?;
+        self.check_counts(request)?;
         let mut argv = spec.argv.clone();
         argv.push(spec.file_name.clone());
         argv.extend(request.args.iter().cloned());
@@ -488,12 +414,94 @@ impl SandboxPolicy {
             path_env: self.path_env.clone(),
             limits,
             outputs: request.outputs.clone(),
-            max_output_file_bytes: sizes.max_output_file_bytes,
-            max_output_files_total_bytes: sizes.max_output_files_total_bytes,
+            max_output_file_bytes: self.sizes.max_output_file_bytes,
+            max_output_files_total_bytes: self.sizes.max_output_files_total_bytes,
             network: self.network,
         };
         plan.validate()?;
         Ok(plan)
+    }
+
+    /// Decode the code, the files and stdin, and check their sizes. The code
+    /// file comes first.
+    fn plan_input(
+        &self,
+        spec: &RuntimeSpec,
+        request: &SandboxRequest,
+    ) -> Result<(Vec<PlanFile>, Vec<u8>), SandboxError> {
+        let sizes = &self.sizes;
+        if request.files.len().saturating_add(1) > sizes.max_files {
+            return Err(SandboxError::Denied(format!(
+                "{} files exceed the limit of {} (the code file counts as one)",
+                request.files.len() + 1,
+                sizes.max_files
+            )));
+        }
+        let mut files = Vec::with_capacity(request.files.len() + 1);
+        files.push(PlanFile {
+            path: spec.file_name.clone(),
+            content: request.code.clone().into_bytes(),
+            executable: false,
+        });
+        for file in &request.files {
+            validate_relative_path(&file.path)?;
+            files.push(PlanFile {
+                path: file.path.clone(),
+                content: decode_file(file)?,
+                executable: file.executable,
+            });
+        }
+        let stdin = request.stdin.clone().unwrap_or_default().into_bytes();
+        let input_bytes = files
+            .iter()
+            .map(|f| f.content.len())
+            .sum::<usize>()
+            .saturating_add(stdin.len());
+        if u64::try_from(input_bytes).unwrap_or(u64::MAX) > sizes.max_input_bytes {
+            return Err(SandboxError::Denied(format!(
+                "the code, files and stdin hold {input_bytes} bytes, over the limit of {}",
+                sizes.max_input_bytes
+            )));
+        }
+        Ok((files, stdin))
+    }
+
+    /// Check the counts and sizes of the arguments, the environment and the
+    /// outputs.
+    fn check_counts(&self, request: &SandboxRequest) -> Result<(), SandboxError> {
+        let sizes = &self.sizes;
+        let over = |what: &str, count: usize, max: usize| {
+            Err(SandboxError::Denied(format!(
+                "{count} {what} exceed the limit of {max}"
+            )))
+        };
+        if request.args.len() > sizes.max_args {
+            return over("arguments", request.args.len(), sizes.max_args);
+        }
+        let arg_bytes: usize = request.args.iter().map(String::len).sum();
+        if arg_bytes > sizes.max_arg_bytes {
+            return over("argument bytes", arg_bytes, sizes.max_arg_bytes);
+        }
+        if request.env.len() > sizes.max_env {
+            return over("environment variables", request.env.len(), sizes.max_env);
+        }
+        let env_bytes: usize = request.env.iter().map(|(k, v)| k.len() + v.len()).sum();
+        if env_bytes > sizes.max_env_bytes {
+            return over("environment bytes", env_bytes, sizes.max_env_bytes);
+        }
+        if request.outputs.len() > sizes.max_outputs {
+            return over("outputs", request.outputs.len(), sizes.max_outputs);
+        }
+        let mut seen = BTreeSet::new();
+        for output in &request.outputs {
+            validate_relative_path(output)?;
+            if !seen.insert(output.as_str()) {
+                return Err(SandboxError::Denied(format!(
+                    "output {output:?} appears twice"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Resolve the requested limits against the defaults and the ceilings.
@@ -503,7 +511,9 @@ impl SandboxPolicy {
                 return Ok(default);
             };
             if value == 0 {
-                return Err(SandboxError::Denied(format!("limit {name} must not be zero")));
+                return Err(SandboxError::Denied(format!(
+                    "limit {name} must not be zero"
+                )));
             }
             let scaled = value.saturating_mul(scale);
             if scaled > max {
@@ -517,8 +527,20 @@ impl SandboxPolicy {
         let d = &self.default_limits;
         let m = &self.max_limits;
         Ok(SandboxLimits {
-            wall_clock_ms: pick("timeout_ms", requested.timeout_ms, d.wall_clock_ms, m.wall_clock_ms, 1)?,
-            cpu_seconds: pick("cpu_seconds", requested.cpu_seconds, d.cpu_seconds, m.cpu_seconds, 1)?,
+            wall_clock_ms: pick(
+                "timeout_ms",
+                requested.timeout_ms,
+                d.wall_clock_ms,
+                m.wall_clock_ms,
+                1,
+            )?,
+            cpu_seconds: pick(
+                "cpu_seconds",
+                requested.cpu_seconds,
+                d.cpu_seconds,
+                m.cpu_seconds,
+                1,
+            )?,
             memory_bytes: pick(
                 "memory_mib",
                 requested.memory_mib,
@@ -542,7 +564,7 @@ impl SandboxPolicy {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::sandbox::policy::{DEFAULT_LIMITS, MAX_LIMITS, RuntimeSpec};
+    use crate::sandbox::policy::{DEFAULT_LIMITS, MAX_LIMITS};
 
     fn denied(result: Result<ExecPlan, SandboxError>) -> String {
         match result {
@@ -562,7 +584,7 @@ mod tests {
         assert_eq!(plan.files[0].content, b"print(1)");
         assert_eq!(plan.limits, DEFAULT_LIMITS);
         assert_eq!(plan.network, NetworkPolicy::Deny);
-        assert!(plan.stdin.is_empty());
+        assert_eq!(plan.stdin, b"");
     }
 
     #[test]
@@ -579,7 +601,10 @@ mod tests {
             SandboxRequest::new("sh", "true").with_timeout_ms(MAX_LIMITS.wall_clock_ms + 1);
         let message = denied(policy.plan(&request));
         assert!(message.contains("timeout_ms"), "{message}");
-        assert!(message.contains(&MAX_LIMITS.wall_clock_ms.to_string()), "{message}");
+        assert!(
+            message.contains(&MAX_LIMITS.wall_clock_ms.to_string()),
+            "{message}"
+        );
     }
 
     #[test]
@@ -605,7 +630,15 @@ mod tests {
     #[test]
     fn traversal_and_absolute_paths_are_denied() {
         for path in [
-            "../x", "a/../../x", "/etc/passwd", "a//b", "a/./b", ".", "", "a/", "a\0b",
+            "../x",
+            "a/../../x",
+            "/etc/passwd",
+            "a//b",
+            "a/./b",
+            ".",
+            "",
+            "a/",
+            "a\0b",
         ] {
             assert!(
                 matches!(validate_relative_path(path), Err(SandboxError::Denied(_))),
@@ -715,7 +748,14 @@ mod tests {
             assert!(validate_env_name(name).is_ok(), "{name}");
         }
         for name in [
-            "", "1A", "A-B", "A B", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "HOME", "PATH",
+            "",
+            "1A",
+            "A-B",
+            "A B",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "HOME",
+            "PATH",
             "HARVEST_IDEMPOTENCY_KEY",
         ] {
             assert!(validate_env_name(name).is_err(), "{name:?} must be denied");
@@ -802,7 +842,8 @@ mod tests {
 
     #[test]
     fn a_custom_runtime_runs_its_own_command() {
-        let policy = SandboxPolicy::default().with_runtime("ruby", RuntimeSpec::new(&["ruby"], "main.rb"));
+        let policy =
+            SandboxPolicy::default().with_runtime("ruby", RuntimeSpec::new(&["ruby"], "main.rb"));
         let plan = policy.plan(&SandboxRequest::new("ruby", "puts 1")).unwrap();
         assert_eq!(plan.argv, ["ruby", "main.rb"]);
     }

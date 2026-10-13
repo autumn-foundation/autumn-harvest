@@ -94,19 +94,20 @@ impl ApiClient {
         path: &str,
         body: Option<&[u8]>,
     ) -> Result<ApiResponse, String> {
+        use std::fmt::Write as _;
+
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let mut stream = tokio::net::UnixStream::connect(&self.socket)
             .await
             .map_err(|e| format!("cannot connect to {}: {e}", self.socket.display()))?;
         let body = body.unwrap_or_default();
-        let mut request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n"
-        );
+        let mut request =
+            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n");
         if !body.is_empty() {
             request.push_str("Content-Type: application/json\r\n");
         }
-        request.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+        let _ = write!(request, "Content-Length: {}\r\n\r\n", body.len());
         let mut bytes = request.into_bytes();
         bytes.extend_from_slice(body);
         stream
@@ -120,7 +121,9 @@ impl ApiClient {
         let mut byte = [0u8; 1];
         while !head.ends_with(b"\r\n\r\n") {
             if head.len() >= MAX_API_HEADER_BYTES {
-                return Err(format!("the response head exceeds {MAX_API_HEADER_BYTES} bytes"));
+                return Err(format!(
+                    "the response head exceeds {MAX_API_HEADER_BYTES} bytes"
+                ));
             }
             let n = stream
                 .read(&mut byte)
@@ -155,7 +158,7 @@ impl ApiClient {
     ///
     /// Returns [`SandboxError::Unavailable`] that holds the `fault_message`
     /// of an error response.
-    pub async fn send<T: Serialize + ?Sized>(
+    pub async fn send<T: Serialize + Sync + ?Sized>(
         &self,
         method: &str,
         path: &str,
@@ -178,7 +181,9 @@ impl ApiClient {
         let response = self.request("GET", path, None).await?;
         check_status("GET", path, &response)?;
         serde_json::from_slice(&response.body).map_err(|e| {
-            SandboxError::Unavailable(format!("firecracker API GET {path}: the body is not JSON: {e}"))
+            SandboxError::Unavailable(format!(
+                "firecracker API GET {path}: the body is not JSON: {e}"
+            ))
         })
     }
 
@@ -189,8 +194,10 @@ impl ApiClient {
     ///
     /// Returns the error of the first failed `PUT`.
     pub async fn configure(&self, config: &VmConfigFile) -> Result<(), SandboxError> {
-        self.send("PUT", "/machine-config", &config.machine_config).await?;
-        self.send("PUT", "/boot-source", &config.boot_source).await?;
+        self.send("PUT", "/machine-config", &config.machine_config)
+            .await?;
+        self.send("PUT", "/boot-source", &config.boot_source)
+            .await?;
         for drive in &config.drives {
             let path = format!("/drives/{}", drive.drive_id);
             self.send("PUT", &path, drive).await?;
@@ -268,7 +275,8 @@ impl ApiClient {
 ///
 /// Returns a message for a malformed status line or header.
 pub fn parse_head(head: &[u8]) -> Result<(u16, Option<usize>), String> {
-    let text = std::str::from_utf8(head).map_err(|_| "the response head is not UTF-8".to_owned())?;
+    let text =
+        std::str::from_utf8(head).map_err(|_| "the response head is not UTF-8".to_owned())?;
     let mut lines = text.split("\r\n");
     let status_line = lines.next().unwrap_or_default();
     let mut parts = status_line.splitn(3, ' ');
@@ -327,13 +335,13 @@ pub(crate) mod tests {
     use crate::sandbox::firecracker::config::{GuestImage, MachineSpec, VmPaths, vm_config};
 
     /// A fake API server: it records each request and plays back replies.
-    pub(crate) struct FakeApi {
+    pub struct FakeApi {
         pub dir: PathBuf,
         pub requests: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeApi {
-        pub(crate) fn socket(&self) -> PathBuf {
+        pub fn socket(&self) -> PathBuf {
             self.dir.join("api.sock")
         }
     }
@@ -346,8 +354,11 @@ pub(crate) mod tests {
 
     /// Serve `replies` in order, one per connection. A reply of `None` reads
     /// the request and never answers.
-    pub(crate) fn fake_api(replies: Vec<Option<Vec<u8>>>) -> FakeApi {
-        let dir = std::env::temp_dir().join(format!("hapi-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
+    pub fn fake_api(replies: Vec<Option<Vec<u8>>>) -> FakeApi {
+        let dir = std::env::temp_dir().join(format!(
+            "hapi-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let listener = UnixListener::bind(dir.join("api.sock")).unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -392,30 +403,36 @@ pub(crate) mod tests {
         format!("{head}{}", String::from_utf8_lossy(&body))
     }
 
-    pub(crate) fn no_content() -> Option<Vec<u8>> {
-        Some(b"HTTP/1.1 204 No Content\r\nServer: Firecracker API\r\nConnection: keep-alive\r\n\r\n".to_vec())
+    pub fn no_content() -> Vec<u8> {
+        b"HTTP/1.1 204 No Content\r\nServer: Firecracker API\r\nConnection: keep-alive\r\n\r\n"
+            .to_vec()
     }
 
-    fn json_reply(status: &str, body: &str) -> Option<Vec<u8>> {
-        Some(
-            format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            )
-            .into_bytes(),
+    fn json_reply(status: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
         )
+        .into_bytes()
     }
 
     #[tokio::test]
     async fn a_put_sends_one_request_with_a_content_length_body() {
-        let api = fake_api(vec![no_content()]);
+        let api = fake_api(vec![Some(no_content())]);
         ApiClient::new(api.socket())
-            .send("PUT", "/actions", &serde_json::json!({"action_type": "InstanceStart"}))
+            .send(
+                "PUT",
+                "/actions",
+                &serde_json::json!({"action_type": "InstanceStart"}),
+            )
             .await
             .unwrap();
-        let requests = api.requests.lock().unwrap();
+        let requests = api.requests.lock().unwrap().clone();
         let request = &requests[0];
-        assert!(request.starts_with("PUT /actions HTTP/1.1\r\n"), "{request}");
+        assert!(
+            request.starts_with("PUT /actions HTTP/1.1\r\n"),
+            "{request}"
+        );
         assert!(request.contains("\r\nHost: localhost\r\n"));
         assert!(request.contains("\r\nContent-Type: application/json\r\n"));
         assert!(request.contains("\r\nContent-Length: 31\r\n"));
@@ -424,10 +441,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn an_error_status_reports_the_fault_message() {
-        let api = fake_api(vec![json_reply(
+        let api = fake_api(vec![Some(json_reply(
             "400 Bad Request",
             r#"{"fault_message":"The kernel file cannot be opened"}"#,
-        )]);
+        ))]);
         let err = ApiClient::new(api.socket())
             .send("PUT", "/boot-source", &serde_json::json!({}))
             .await
@@ -440,10 +457,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_get_returns_the_json_body() {
-        let api = fake_api(vec![json_reply(
+        let api = fake_api(vec![Some(json_reply(
             "200 OK",
             r#"{"app_name":"Firecracker","state":"Running"}"#,
-        )]);
+        ))]);
         let value = ApiClient::new(api.socket()).get("/").await.unwrap();
         assert_eq!(value["state"], "Running");
     }
@@ -455,7 +472,10 @@ pub(crate) mod tests {
             MAX_API_BODY_BYTES + 1
         );
         let api = fake_api(vec![Some(reply.into_bytes())]);
-        let err = ApiClient::new(api.socket()).get("/").await.expect_err("too big");
+        let err = ApiClient::new(api.socket())
+            .get("/")
+            .await
+            .expect_err("too big");
         assert!(matches!(err, SandboxError::Unavailable(_)));
     }
 
@@ -464,7 +484,10 @@ pub(crate) mod tests {
         let mut reply = b"HTTP/1.1 200 OK\r\nX-Junk: ".to_vec();
         reply.extend(std::iter::repeat_n(b'a', MAX_API_HEADER_BYTES + 10));
         let api = fake_api(vec![Some(reply)]);
-        let err = ApiClient::new(api.socket()).get("/").await.expect_err("too big");
+        let err = ApiClient::new(api.socket())
+            .get("/")
+            .await
+            .expect_err("too big");
         assert!(matches!(err, SandboxError::Unavailable(_)));
     }
 
@@ -507,7 +530,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn configure_puts_each_part_in_order_then_start_boots() {
-        let api = fake_api(vec![no_content(); 6]);
+        let api = fake_api(vec![Some(no_content()); 6]);
         let client = ApiClient::new(api.socket());
         let config = vm_config(
             &GuestImage::new("/k", "/r"),
@@ -517,7 +540,7 @@ pub(crate) mod tests {
         );
         client.configure(&config).await.unwrap();
         client.start().await.unwrap();
-        let requests = api.requests.lock().unwrap();
+        let requests = api.requests.lock().unwrap().clone();
         let lines: Vec<&str> = requests.iter().map(|r| r.lines().next().unwrap()).collect();
         assert_eq!(
             lines,
@@ -536,12 +559,12 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_snapshot_load_resumes_from_a_file_backend() {
-        let api = fake_api(vec![no_content()]);
+        let api = fake_api(vec![Some(no_content())]);
         ApiClient::new(api.socket())
             .load_snapshot("snapshot.state", "snapshot.mem")
             .await
             .unwrap();
-        let requests = api.requests.lock().unwrap();
+        let requests = api.requests.lock().unwrap().clone();
         let body = requests[0].split("\r\n\r\n").nth(1).unwrap();
         let json: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(
@@ -556,14 +579,14 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn pause_and_snapshot_create_use_the_documented_bodies() {
-        let api = fake_api(vec![no_content(), no_content()]);
+        let api = fake_api(vec![Some(no_content()), Some(no_content())]);
         let client = ApiClient::new(api.socket());
         client.pause().await.unwrap();
         client
             .create_snapshot("snapshot.state", "snapshot.mem")
             .await
             .unwrap();
-        let requests = api.requests.lock().unwrap();
+        let requests = api.requests.lock().unwrap().clone();
         assert!(requests[0].starts_with("PATCH /vm HTTP/1.1"));
         assert!(requests[0].ends_with(r#"{"state":"Paused"}"#));
         assert!(requests[1].starts_with("PUT /snapshot/create HTTP/1.1"));
