@@ -48,6 +48,9 @@ An agent sends a request as JSON. Unknown fields are an error.
 | `outputs` | Relative paths of files to return. |
 | `limits` | `timeout_ms`, `cpu_seconds`, `memory_mib` and `max_output_bytes`. Each must be at most the policy ceiling. |
 
+The policy bounds the size of each request and each outcome. Both bounds must
+fit the 64 MiB guest frame, or the policy is not valid.
+
 The outcome is JSON too:
 
 ```json
@@ -74,7 +77,8 @@ The outcome is JSON too:
 - The outcome keeps the head and the tail of each stream. The `*_bytes`
   fields count every byte. A NUL byte becomes U+FFFD, because Postgres
   `jsonb` rejects `\u0000`.
-- `skipped_outputs` names each output that the run does not return, with the
+- Each requested output appears once: in `outputs` or in `skipped_outputs`.
+  `skipped_outputs` names each output that the run does not return, with the
   reason. A file can be missing, too large, a symbolic link, a hard link, or
   not a regular file.
 - The host sets `isolation` and `image`. The guest cannot change them.

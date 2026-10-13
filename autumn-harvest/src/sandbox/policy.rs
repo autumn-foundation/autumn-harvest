@@ -297,6 +297,20 @@ impl SandboxPolicy {
         if self.path_env.contains('\0') {
             return Err(SandboxError::Config("the PATH value holds NUL".into()));
         }
+        // Each request and each outcome must fit one guest frame. Otherwise
+        // an accepted request fails late, as a retryable fault.
+        let frame = u64::try_from(super::protocol::MAX_FRAME_BYTES).unwrap_or(u64::MAX);
+        for (what, bound) in [
+            ("request", self.max_request_json_bytes()),
+            ("outcome", self.max_outcome_json_bytes()),
+        ] {
+            if bound > frame {
+                return Err(SandboxError::Config(format!(
+                    "the size bounds allow a {what} of {bound} bytes, over the {frame}-byte guest \
+                     frame; lower the bounds"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -416,6 +430,25 @@ mod tests {
             .validate()
             .expect_err("the default exceeds the ceiling");
         assert!(matches!(err, SandboxError::Config(ref m) if m.contains("wall_clock_ms")));
+    }
+
+    #[test]
+    fn bounds_that_cannot_fit_a_guest_frame_are_a_config_error() {
+        let mut sizes = DEFAULT_SIZE_BOUNDS;
+        sizes.max_input_bytes = 64 * 1024 * 1024;
+        let policy = SandboxPolicy::default().with_sizes(sizes);
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("frame")),
+            "a request"
+        );
+        let mut max = MAX_LIMITS;
+        max.max_output_bytes = 4 * 1024 * 1024;
+        let policy = SandboxPolicy::default().with_limits(DEFAULT_LIMITS, max);
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("frame")),
+            "an outcome"
+        );
+        SandboxPolicy::default().validate().unwrap();
     }
 
     #[test]

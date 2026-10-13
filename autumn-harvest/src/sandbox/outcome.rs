@@ -198,6 +198,7 @@ impl SandboxOutcome {
         let per_file = usize::try_from(plan.max_output_file_bytes).unwrap_or(usize::MAX);
         let total_cap = usize::try_from(plan.max_output_files_total_bytes).unwrap_or(usize::MAX);
         let mut total = 0usize;
+        // Each requested output must appear once: returned or skipped.
         let mut seen = std::collections::BTreeSet::new();
         for output in &self.outputs {
             if !plan.outputs.contains(&output.path) {
@@ -239,9 +240,15 @@ impl SandboxOutcome {
                     skipped.path
                 ));
             }
+            if !seen.insert(skipped.path.as_str()) {
+                return violation(format!("output {:?} appears twice", skipped.path));
+            }
         }
-        if self.outputs.len() + self.skipped_outputs.len() > plan.outputs.len() {
-            return violation("more outputs than the plan asked for".into());
+        if seen.len() != plan.outputs.len() {
+            return violation(format!(
+                "the outcome omits {} requested output(s)",
+                plan.outputs.len() - seen.len()
+            ));
         }
         Ok(())
     }
@@ -383,6 +390,45 @@ pub(crate) mod tests {
             out.check_bounds(&plan),
             Err(SandboxError::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn each_requested_output_appears_exactly_once() {
+        let plan = SandboxPolicy::default()
+            .plan(
+                &SandboxRequest::new("sh", "true")
+                    .with_output("a.txt")
+                    .with_output("b.txt"),
+            )
+            .unwrap();
+        let file = |path: &str| OutputFile {
+            path: path.into(),
+            content: b"1".to_vec(),
+        };
+        let skip = |path: &str| SkippedOutput {
+            path: path.into(),
+            reason: "missing".into(),
+        };
+        // Returned and skipped at once, and `b.txt` left out.
+        let mut out = outcome(RunStatus::Exited { code: 0 });
+        out.outputs.push(file("a.txt"));
+        out.skipped_outputs.push(skip("a.txt"));
+        assert!(matches!(
+            out.check_bounds(&plan),
+            Err(SandboxError::Protocol(ref m)) if m.contains("twice")
+        ));
+        // `b.txt` left out.
+        let mut out = outcome(RunStatus::Exited { code: 0 });
+        out.outputs.push(file("a.txt"));
+        assert!(matches!(
+            out.check_bounds(&plan),
+            Err(SandboxError::Protocol(ref m)) if m.contains("omits")
+        ));
+        // Each path once.
+        let mut out = outcome(RunStatus::Exited { code: 0 });
+        out.outputs.push(file("a.txt"));
+        out.skipped_outputs.push(skip("b.txt"));
+        assert!(out.check_bounds(&plan).is_ok());
     }
 
     #[test]
