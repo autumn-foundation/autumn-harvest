@@ -47,7 +47,8 @@ backend.
   cooperative `cancel`, `terminate`, a history cap and every other seal close
   the run, so its parent and detached children get the result. A child that
   continues as new fails with the Postgres text, `continue_as_new is not
-  supported in child workflows in this release`. An await follows a target
+  supported in child workflows in this release`. Its last cycle keeps its
+  bookkeeping, as any failing cycle does. An await follows a target
   that continues as new to its last run. A `TERMINATED` target gives
   `target_terminated`.
 - **Reuse policy.** `AllowDuplicateFailedOnly` replaces a `CANCELLED` prior,
@@ -79,7 +80,7 @@ and `harvest_signals.idempotency_key`. An old file gains them on open.
   external events first. Each event is the same, and replay accepts both
   orders.
 
-**Tests.** `autumn-harvest-sqlite/tests/integration/composition.rs` has 56
+**Tests.** `autumn-harvest-sqlite/tests/integration/composition.rs` has 57
 tests. Each test replays every history it asserts on the core
 `WorkflowReplayer`, with the run's ids. They cover:
 

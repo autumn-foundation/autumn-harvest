@@ -603,6 +603,16 @@ async fn spawns_then_waits_on_missing(ctx: &WorkflowContext, _n: i64) -> Result<
         .map_err(|e| e.to_string())
 }
 
+/// Mints a value, then continues as new. A child run of it fails.
+#[workflow]
+async fn mints_then_continues(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    let _ticket = ctx.new_uuid();
+    ctx.continue_as_new(json!(1))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(0)
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn runtime() -> SqliteRuntime {
@@ -672,6 +682,7 @@ fn fixtures() -> Vec<WorkflowInfo> {
         parent_child_timeout_panic_info(),
         spawns_then_cleans_up_info(),
         spawns_then_waits_on_missing_info(),
+        mints_then_continues_info(),
     ]
 }
 
@@ -2280,4 +2291,31 @@ async fn the_fallback_cancel_cap_check_counts_cascade_events() {
         .filter(|e| matches!(e, WorkflowEvent::ChildWorkflowCascadeApplied { .. }))
         .count();
     assert_eq!(cascades, 1, "{history:#?}");
+}
+
+/// A child that continues as new keeps the bookkeeping of its last cycle. The
+/// side effect precedes the failure, as for any failing cycle.
+#[tokio::test]
+async fn a_child_continue_as_new_keeps_its_side_effects() {
+    let mut rt = runtime();
+    let parent = rt
+        .start_workflow(
+            "parent_reports_child_failure",
+            json!("mints_then_continues"),
+        )
+        .unwrap();
+
+    rt.run_until_blocked(parent).await.unwrap();
+
+    let child = children_of(&rt, parent)[0];
+    let history = rt.load_history(child).unwrap();
+    let minted = history
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::SideEffectRecorded { .. }))
+        .expect("the side effect is recorded");
+    let failed = history
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. }))
+        .expect("the child failed");
+    assert!(minted < failed, "{history:#?}");
 }

@@ -1983,6 +1983,39 @@ impl SqliteRuntime {
         result
     }
 
+    /// End a failing terminal cycle in one transaction.
+    ///
+    /// The planned signals and the cycle's bookkeeping come first, then
+    /// `failure.terminal`. The run closes at `clock.decided_at` (issue #2026).
+    /// A cycle that reaches a history cap rolls back and fails for the cap.
+    fn fail_cycle(
+        &mut self,
+        exec: ExecutionId,
+        failure: &CycleFailure<'_>,
+        pending: &[&WorkflowCommand],
+        clock: CycleClock,
+    ) -> SqliteResult<RunState> {
+        let tx = self.conn.transaction()?;
+        failure.ingest.apply(&tx, exec)?;
+        let drain = TerminalDrain {
+            workflows: &self.workflows,
+            history: failure.history,
+            cycle: TerminalCycle::Failing,
+            now: clock.decided_at,
+        };
+        persist_terminal_pending_commands(&tx, &drain, exec, pending.iter().copied())?;
+        let cascade = composition::cascade_event_count(&tx, exec)?;
+        if let Some(reason) = failure.caps.reached_with(&tx, exec, cascade)? {
+            drop(tx);
+            return self.fail_for_history_cap(exec, &reason, clock.now, clock.decided_at);
+        }
+        store::append_event(&tx, exec, &failure.terminal)?;
+        store::set_failed(&tx, exec, &failure.message)?;
+        composition::close_execution(&tx, exec, &failure.terminal, clock.decided_at)?;
+        tx.commit()?;
+        Ok(RunState::Failed(failure.message.clone()))
+    }
+
     /// Drop the panic strikes of each run that is no longer `RUNNING` (issue
     /// #2026). The map holds only runs with a recent panic, so it stays small.
     fn forget_sealed_strikes(&mut self) -> SqliteResult<()> {
@@ -2476,38 +2509,36 @@ impl SqliteRuntime {
                 // untyped `Err(String)` decodes to `message = error` with all typed
                 // fields `None`, so its stored form is unchanged.
                 let decoded = autumn_harvest::failure::decode_workflow_failure(&error);
-                let tx = self.conn.transaction()?;
-                ingest.apply(&tx, exec)?;
-                let drain = TerminalDrain {
-                    workflows: &self.workflows,
+                let failure = CycleFailure {
+                    ingest: &ingest,
                     history: &history,
-                    cycle: TerminalCycle::Failing,
-                    now: decided_at,
+                    caps: &caps,
+                    terminal: WorkflowEvent::workflow_failed_typed(&decoded),
+                    message: decoded.message,
                 };
-                persist_terminal_pending_commands(&tx, &drain, exec, &pending)?;
-                let cascade = composition::cascade_event_count(&tx, exec)?;
-                if let Some(reason) = caps.reached_with(&tx, exec, cascade)? {
-                    drop(tx);
-                    return self.fail_for_history_cap(exec, &reason, now, decided_at);
-                }
-                let terminal = WorkflowEvent::workflow_failed_typed(&decoded);
-                store::append_event(&tx, exec, &terminal)?;
-                store::set_failed(&tx, exec, &decoded.message)?;
-                composition::close_execution(&tx, exec, &terminal, decided_at)?;
-                tx.commit()?;
-                Ok(RunState::Failed(decoded.message))
+                let all: Vec<&WorkflowCommand> = pending.iter().collect();
+                self.fail_cycle(exec, &failure, &all, CycleClock { now, decided_at })
             }
             // Issue #2023. A continuing run is exempt from the caps: its
             // successor starts a new history.
             // A child cannot continue as new, as on Postgres (issue #2026). A new
             // run would orphan the parent's wait. The child fails instead, and
             // an awaiting parent records the failure.
+            // The cycle's bookkeeping persists, as for any failing cycle. Its
+            // dispatches drop, as a continue-as-new drops them.
             WorkflowOutcome::ContinuedAsNew { .. }
                 if store::parent_link(&self.conn, exec)?.is_some() =>
             {
-                let event = WorkflowEvent::workflow_failed(CHILD_CONTINUE_AS_NEW_ERROR);
-                self.seal_failed(exec, &event, CHILD_CONTINUE_AS_NEW_ERROR, now, decided_at)?;
-                Ok(RunState::Failed(CHILD_CONTINUE_AS_NEW_ERROR.to_string()))
+                let failure = CycleFailure {
+                    ingest: &ingest,
+                    history: &history,
+                    caps: &caps,
+                    terminal: WorkflowEvent::workflow_failed(CHILD_CONTINUE_AS_NEW_ERROR),
+                    message: CHILD_CONTINUE_AS_NEW_ERROR.to_string(),
+                };
+                let kept: Vec<&WorkflowCommand> =
+                    pending.iter().filter(|cmd| !is_dispatch(cmd)).collect();
+                self.fail_cycle(exec, &failure, &kept, CycleClock { now, decided_at })
             }
             WorkflowOutcome::ContinuedAsNew {
                 input,
@@ -3485,6 +3516,20 @@ async fn settle_update_context(
             details: "the replay that rebuilds the update handlers did not settle".to_string(),
         }),
     }
+}
+
+/// A failing terminal cycle (issue #2026).
+struct CycleFailure<'a> {
+    /// The signals that the cycle replayed.
+    ingest: &'a worker::SignalIngest,
+    /// The history that the cycle replayed.
+    history: &'a [WorkflowEvent],
+    /// The history caps of the cycle.
+    caps: &'a CapCheck<'a>,
+    /// The `WorkflowFailed` event that ends the run.
+    terminal: WorkflowEvent,
+    /// The error text that the run row stores.
+    message: String,
 }
 
 /// The two clock readings of one decision cycle (issue #2026).
