@@ -51,7 +51,7 @@ Issue #1983 asks for three things:
 | R3 | Change the `store_id` default. Old references then fail to inflate. | The default stays `"default"`, the trait default. `with_store_id` overrides it. |
 | R4 | Retire a codec key. Archives encoded under it become unreadable. | The docs say: keep a retired key registered while its archives must stay readable. |
 | R5 | Show archived payloads to a non-admin. | The route needs admin. Payload decode uses the same gate as live history. |
-| R6 | Let an object key escape the prefix. | Keys come from an `ExecutionId` or a SHA-256 hex digest only. GCS names are percent-encoded. |
+| R6 | Let an object key escape the prefix. | Keys come from an `ExecutionId` or a random UUID only. GCS names are percent-encoded. |
 | R7 | A missing object returns an error, not "not found". | Both backends map 404 / `NoSuchKey` to `None`. The API returns 404. |
 | R8 | Delete fails on a missing blob, and retention GC loops. | Delete of a missing object is success on both backends. |
 | R9 | A slow store hangs a request. | The API bounds `fetch` with the retention archival timeout. |
@@ -81,7 +81,9 @@ Features: `object-store` (generic adapters), `s3` and `gcs` (backends).
 - `ObjectBackend`: `put(key, bytes, content_type)`, `get(key) -> Option`,
   `delete(key)`. A missing object is `None` on `get` and success on `delete`.
 - `ObjectPayloadStore<B>` implements `PayloadStore`. The key is
-  `{prefix}{sha256-hex}`, so identical bytes share a key.
+  `{prefix}{uuid}`, new for each upload. A content-addressed key is not
+  safe: an append uploads before it commits its reference, so retention
+  could delete a shared blob in that window.
 - `ObjectHistoryArchiver<B>` implements `HistoryArchiver`. The key is
   `{prefix}{execution_id}.json`. A re-archive overwrites the same key.
 - `S3Backend` wraps an `aws_sdk_s3::Client` and a bucket.

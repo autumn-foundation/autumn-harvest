@@ -58,18 +58,24 @@ async fn payload_store_round_trips() {
     assert_eq!(store.get(&key).await.unwrap(), b"hello");
 }
 
+/// Retention deletes a blob when no committed reference remains. An append
+/// uploads its blob before it commits the reference. A shared key lets
+/// retention delete a blob that the append is about to reference.
 #[tokio::test]
-async fn payload_store_is_content_addressed_under_the_prefix() {
+async fn payload_store_gives_each_put_its_own_key_under_the_prefix() {
     let backend = Arc::new(MemoryBackend::default());
     let store = ObjectPayloadStore::new(Arc::clone(&backend)).with_prefix("blobs/");
     let first = store.put(b"same").await.unwrap();
     let second = store.put(b"same").await.unwrap();
-    let other = store.put(b"other").await.unwrap();
-    assert_eq!(first, second, "identical bytes share a key");
-    assert_ne!(first, other, "different bytes get different keys");
+    assert_ne!(first, second, "identical bytes get different keys");
     assert!(first.starts_with("blobs/"), "key uses the prefix: {first}");
-    assert_eq!(first.len(), "blobs/".len() + 64, "prefix plus SHA-256 hex");
-    assert!(backend.get(&first).await.unwrap().is_some());
+
+    store.delete(&first).await.unwrap();
+    assert_eq!(
+        store.get(&second).await.unwrap(),
+        b"same",
+        "deleting one key keeps the other blob"
+    );
 }
 
 #[tokio::test]

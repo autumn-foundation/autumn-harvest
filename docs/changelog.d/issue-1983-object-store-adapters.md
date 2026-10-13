@@ -6,6 +6,10 @@
   JSON API, with `GceMetadataToken`, `StaticToken` and `NoAuth` token sources.
   Feature `object-store` holds the adapters and `MemoryBackend` and adds no
   client. The core crate keeps no cloud dependency.
+- **Blob keys.** `ObjectPayloadStore` writes each blob under a new
+  `{prefix}{uuid}` key. It does not share a key between identical bytes. An
+  append uploads before it commits its reference, so retention could
+  otherwise delete a shared blob that a new run is about to reference.
 - **Codec.** An offloaded blob is a codec envelope when a codec is on.
   `ObjectHistoryArchiver::with_codecs` also encodes the whole archive
   document under the active key.

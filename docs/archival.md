@@ -205,7 +205,7 @@ implement `GcsTokenSource`.
 
 | Adapter | Key | Note |
 |---------|-----|------|
-| `ObjectPayloadStore` | `{prefix}{sha256-hex}` | Identical bytes share one object. Retention deletes a blob when no run refers to it. |
+| `ObjectPayloadStore` | `{prefix}{uuid}` | Each upload gets a new key. Identical bytes do not share an object, so retention cannot delete a blob that a new run is about to reference. |
 | `ObjectHistoryArchiver` | `{prefix}{execution_id}.json` | A second archive of a run overwrites the object. |
 
 `ObjectHistoryArchiver::fetch` reads a missing object as `None`, and the API

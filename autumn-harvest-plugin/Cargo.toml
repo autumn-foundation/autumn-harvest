@@ -48,7 +48,7 @@ aws-kms = ["dep:aws-sdk-kms", "dep:async-trait"]
 # `s3` adds an `aws-sdk-s3` backend. `gcs` adds a GCS JSON API backend on the
 # `reqwest` client that this crate already uses. The core crate gains no
 # cloud dependency (`tests/connector_dependency_graph.rs`).
-object-store = ["dep:sha2"]
+object-store = []
 s3 = ["object-store", "dep:aws-sdk-s3"]
 gcs = ["object-store"]
 # HashiCorp Vault Transit binding for the same codec (issue #1981).

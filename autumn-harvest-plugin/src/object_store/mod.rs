@@ -45,7 +45,6 @@ use autumn_harvest::retention::{
     ArchiveFetchError, ArchiveFetchFuture, ArchiverFuture, HistoryArchiver,
 };
 use autumn_harvest::types::ExecutionId;
-use sha2::{Digest, Sha256};
 
 #[cfg(feature = "gcs")]
 pub mod gcs;
@@ -156,8 +155,13 @@ impl ObjectBackend for MemoryBackend {
 
 /// A [`PayloadStore`] over an [`ObjectBackend`].
 ///
-/// The key of a blob is `{prefix}{sha256-hex}`, so identical bytes share one
-/// object. Retention deletes a blob only when no run refers to its key.
+/// Each `put` writes a new object under `{prefix}{uuid}`. Identical bytes do
+/// not share an object.
+///
+/// Retention deletes a blob when no committed reference to its key remains.
+/// An append uploads its blob before it commits the reference. With a shared
+/// key, retention could delete a blob that a new run is about to reference.
+/// A key per upload makes that race impossible.
 pub struct ObjectPayloadStore<B> {
     backend: Arc<B>,
     prefix: String,
@@ -199,7 +203,7 @@ impl<B: ObjectBackend> PayloadStore for ObjectPayloadStore<B> {
     }
 
     fn put(&self, bytes: &[u8]) -> PayloadStoreFuture<'_, String> {
-        let key = format!("{}{}", self.prefix, hex_sha256(bytes));
+        let key = format!("{}{}", self.prefix, uuid::Uuid::new_v4().simple());
         let bytes = bytes.to_vec();
         Box::pin(async move {
             self.backend
@@ -354,16 +358,6 @@ impl<B: ObjectBackend> HistoryArchiver for ObjectHistoryArchiver<B> {
             Ok(Some(doc))
         })
     }
-}
-
-fn hex_sha256(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }
 
 #[cfg(test)]
