@@ -207,16 +207,18 @@ mod tests {
 
     use super::*;
     use crate::sandbox::exec::{ExecOptions, ProcessExecutor};
-    use crate::sandbox::firecracker::fake::{FakeLauncher, GuestMode};
+    use crate::sandbox::firecracker::fake::{FakeLauncher, GuestMode, HostNetworkExecutor};
     use crate::sandbox::outcome::RunStatus;
-    use crate::sandbox::policy::{NetworkPolicy, SandboxPolicy};
+    use crate::sandbox::policy::SandboxPolicy;
     use crate::sandbox::request::SandboxRequest;
     use crate::sandbox::runtime::SandboxRuntime;
 
     fn launcher(mode: GuestMode) -> Arc<FakeLauncher> {
         Arc::new(FakeLauncher::new(
             mode,
-            Arc::new(ProcessExecutor::new(ExecOptions::default())),
+            Arc::new(HostNetworkExecutor(ProcessExecutor::new(
+                ExecOptions::default(),
+            ))),
         ))
     }
 
@@ -229,10 +231,7 @@ mod tests {
     }
 
     fn job(code: &str, timeout_ms: u64) -> SandboxJob {
-        // The fake microVM shares the host network, so this test plan allows
-        // it. A real microVM has no network device.
         let plan = SandboxPolicy::default()
-            .with_network(NetworkPolicy::Allow)
             .plan(&SandboxRequest::new("sh", code).with_timeout_ms(timeout_ms))
             .unwrap();
         SandboxJob {
@@ -420,11 +419,7 @@ mod tests {
     async fn the_runtime_accepts_the_backend_under_the_default_policy() {
         let fake = launcher(GuestMode::Serve);
         let backend = Arc::new(FirecrackerBackend::new(fake, fast()));
-        let runtime = SandboxRuntime::new(
-            backend,
-            SandboxPolicy::default().with_network(NetworkPolicy::Allow),
-        )
-        .unwrap();
+        let runtime = SandboxRuntime::new(backend, SandboxPolicy::default()).unwrap();
         let out = runtime
             .run(
                 &SandboxRequest::new("sh", "echo ok"),

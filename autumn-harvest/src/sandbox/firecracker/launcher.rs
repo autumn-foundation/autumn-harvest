@@ -359,15 +359,112 @@ impl FirecrackerLauncher {
     }
 
     /// Create the VM directory and the command for `id`.
-    fn prepare(&self, id: &str) -> Result<Prepared, SandboxError> {
+    fn prepare(&self, id: &str, boot: &BootMethod) -> Result<Prepared, SandboxError> {
         match &self.config.confinement {
-            Confinement::Jailer(jailer) => self.prepare_jailed(jailer, id),
-            Confinement::Unjailed { work_root } => self.prepare_unjailed(work_root, id),
+            Confinement::Jailer(jailer) => self.prepare_jailed(jailer, id, boot),
+            Confinement::Unjailed { work_root } => self.prepare_unjailed(work_root, id, boot),
         }
     }
 
+    /// Boot a golden microVM and save a full snapshot of it in `out_dir`.
+    ///
+    /// The golden microVM boots through the API with the image, machine and
+    /// jailer of this launcher. The host waits for a pong from the guest
+    /// agent, then pauses the microVM and takes the snapshot. No code runs
+    /// in it. Give the files to [`BootMethod::Snapshot`] in a launcher with
+    /// the same image, machine and jailer.
+    ///
+    /// The files get mode `0640` and the jailer group, so each jailed VMM
+    /// can read them. They hold the guest memory, so the golden microVM must
+    /// hold no secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::Config`] without the jailer, and
+    /// [`SandboxError::Unavailable`] when a step fails. The golden microVM
+    /// is torn down on each path.
+    pub async fn create_golden_snapshot(
+        &self,
+        out_dir: &Path,
+        boot_timeout: Duration,
+    ) -> Result<SnapshotFiles, SandboxError> {
+        let Confinement::Jailer(jailer) = &self.config.confinement else {
+            return Err(SandboxError::Config(
+                "a golden snapshot needs the jailer, so each restore sees the same paths".into(),
+            ));
+        };
+        let id = new_vm_id(&self.owner);
+        validate_vm_id(&id)?;
+        let prepared = self.prepare_jailed(jailer, &id, &BootMethod::Api)?;
+        let mut vm = RunningVm::spawn(id, prepared)?;
+        let result = self
+            .snapshot_vm(&mut vm, out_dir, boot_timeout, jailer.gid)
+            .await;
+        vm.teardown().await;
+        result
+    }
+
+    /// Boot `vm`, wait for its guest agent, pause it, snapshot it, and copy
+    /// the files to `out_dir`.
+    async fn snapshot_vm(
+        &self,
+        vm: &mut RunningVm,
+        out_dir: &Path,
+        boot_timeout: Duration,
+        gid: u32,
+    ) -> Result<SnapshotFiles, SandboxError> {
+        let socket = vm.api_socket.clone().ok_or_else(|| {
+            SandboxError::Unavailable("the golden microVM has no API socket".into())
+        })?;
+        self.boot_through_api(vm, &socket, &BootMethod::Api).await?;
+        let deadline = std::time::Instant::now() + boot_timeout;
+        let vsock = vm.vsock.clone();
+        let mut exited = || vm.exit_status();
+        let mut stream =
+            super::vsock::connect_guest(&vsock, self.config.guest_port, deadline, &mut exited)
+                .await?;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        tokio::time::timeout(remaining, crate::sandbox::guest::ping(&mut stream))
+            .await
+            .map_err(|_| {
+                SandboxError::Unavailable("the golden guest agent did not answer a ping".into())
+            })??;
+        drop(stream);
+        let client = ApiClient::new(&socket).with_timeout(SNAPSHOT_TIMEOUT);
+        client.pause().await?;
+        client
+            .create_snapshot(SNAPSHOT_STATE_FILE, SNAPSHOT_MEMORY_FILE)
+            .await?;
+        let root = vm.vm_dir.join("root");
+        let files = SnapshotFiles {
+            state: out_dir.join(SNAPSHOT_STATE_FILE),
+            memory: out_dir.join(SNAPSHOT_MEMORY_FILE),
+        };
+        let copies = [
+            (root.join(SNAPSHOT_STATE_FILE), files.state.clone()),
+            (root.join(SNAPSHOT_MEMORY_FILE), files.memory.clone()),
+        ];
+        let out = out_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&out)?;
+            for (from, to) in &copies {
+                copy_out(from, to, gid)?;
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .map_err(|e| SandboxError::Unavailable(format!("the snapshot copy failed: {e}")))?
+        .map_err(|e| SandboxError::Unavailable(format!("cannot copy the snapshot: {e}")))?;
+        Ok(files)
+    }
+
     /// Lay out the jail of `id` and build the jailer command.
-    fn prepare_jailed(&self, jailer: &JailerConfig, id: &str) -> Result<Prepared, SandboxError> {
+    fn prepare_jailed(
+        &self,
+        jailer: &JailerConfig,
+        id: &str,
+        boot: &BootMethod,
+    ) -> Result<Prepared, SandboxError> {
         use std::os::unix::fs::DirBuilderExt as _;
         let config = &self.config;
         let jail = super::jailer::jail_dir(jailer, &self.exec_name, id);
@@ -387,7 +484,7 @@ impl FirecrackerLauncher {
         link_or_copy(&config.image.rootfs, &root.join(ROOTFS_FILE))
             .map_err(|e| fail("the root file system", &e))?;
         let mut api_socket = None;
-        let firecracker_args: Vec<String> = match &config.boot {
+        let firecracker_args: Vec<String> = match boot {
             BootMethod::ConfigFile => {
                 let document = vm_config(
                     &config.image,
@@ -436,7 +533,12 @@ impl FirecrackerLauncher {
     }
 
     /// Create the directory of `id` and build the Firecracker command.
-    fn prepare_unjailed(&self, work_root: &Path, id: &str) -> Result<Prepared, SandboxError> {
+    fn prepare_unjailed(
+        &self,
+        work_root: &Path,
+        id: &str,
+        boot: &BootMethod,
+    ) -> Result<Prepared, SandboxError> {
         use std::os::unix::fs::DirBuilderExt as _;
         let config = &self.config;
         let dir = work_root.join(id);
@@ -450,7 +552,7 @@ impl FirecrackerLauncher {
         };
         let mut args = vec!["--id".to_owned(), id.to_owned()];
         let mut api_socket = None;
-        match &config.boot {
+        match boot {
             BootMethod::ConfigFile => {
                 let paths = self
                     .unjailed_paths(&dir)
@@ -499,6 +601,7 @@ impl FirecrackerLauncher {
         &self,
         vm: &mut RunningVm,
         socket: &Path,
+        boot: &BootMethod,
     ) -> Result<(), SandboxError> {
         let deadline = std::time::Instant::now() + self.config.api_timeout;
         loop {
@@ -520,7 +623,7 @@ impl FirecrackerLauncher {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let client = ApiClient::new(socket).with_timeout(self.config.api_timeout);
-        if let BootMethod::Snapshot(_) = &self.config.boot {
+        if let BootMethod::Snapshot(_) = boot {
             return client
                 .load_snapshot(SNAPSHOT_STATE_FILE, SNAPSHOT_MEMORY_FILE)
                 .await;
@@ -547,10 +650,12 @@ impl VmLauncher for FirecrackerLauncher {
         Box::pin(async move {
             let id = new_vm_id(&self.owner);
             validate_vm_id(&id)?;
-            let prepared = self.prepare(&id)?;
+            let prepared = self.prepare(&id, &self.config.boot)?;
             let mut vm = RunningVm::spawn(id, prepared)?;
             if let Some(socket) = vm.api_socket.clone()
-                && let Err(e) = self.boot_through_api(&mut vm, &socket).await
+                && let Err(e) = self
+                    .boot_through_api(&mut vm, &socket, &self.config.boot)
+                    .await
             {
                 vm.teardown().await;
                 return Err(e);
@@ -572,6 +677,40 @@ const SNAPSHOT_STATE_FILE: &str = "snapshot.state";
 
 /// The snapshot memory file name in the chroot.
 const SNAPSHOT_MEMORY_FILE: &str = "snapshot.mem";
+
+/// The time limit of the pause and snapshot calls. A full snapshot writes
+/// the whole guest memory.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Copy a file that a jailed VMM wrote to `to`, with mode `0640` and group
+/// `gid`.
+///
+/// The VMM can write its jail, so the source must be a regular file and not
+/// a symbolic link.
+fn copy_out(from: &Path, to: &Path, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let mut source = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(from)?;
+    if !source.metadata()?.is_file() {
+        return Err(std::io::Error::other(format!(
+            "{} is not a regular file",
+            from.display()
+        )));
+    }
+    let mut target = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o640)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(to)?;
+    std::io::copy(&mut source, &mut target)?;
+    std::os::unix::fs::fchown(&target, None, Some(gid))?;
+    target.set_permissions(std::fs::Permissions::from_mode(0o640))?;
+    target.sync_all()
+}
 
 /// Check that the longest socket path of a VM fits a Unix socket address.
 ///
@@ -1229,4 +1368,148 @@ while True:
         assert!(!jail_dir.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
+
+    #[tokio::test]
+    async fn a_golden_snapshot_needs_the_jailer() {
+        let dir = temp_dir();
+        let fc = script(&dir, "firecracker", "exit 0");
+        let launcher = FirecrackerLauncher::new(unjailed(&dir, fc, BootMethod::Api)).unwrap();
+        let result = launcher
+            .create_golden_snapshot(&dir.join("golden"), Duration::from_secs(5))
+            .await;
+        assert!(
+            matches!(result, Err(SandboxError::Config(ref m)) if m.contains("jailer")),
+            "{result:?}"
+        );
+        drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_golden_snapshot_boots_pings_pauses_and_copies_the_files_out() {
+        use std::os::unix::fs::MetadataExt as _;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: a jailed launch needs root");
+            return;
+        }
+        let dir = temp_dir();
+        let server = dir.join("fake_api.py");
+        std::fs::write(&server, FAKE_GOLDEN_API_PY).unwrap();
+        let jailer = script(
+            &dir,
+            "jailer",
+            &format!(
+                "cd root && mkdir -p run && exec python3 {} --api-sock run/firecracker.socket",
+                server.display()
+            ),
+        );
+        let fc = script(&dir, "firecracker", "exit 0");
+        let mut jail = JailerConfig::new(jailer, 12_345, 23_456);
+        jail.chroot_base = dir.join("jail");
+        jail.cgroup_root = dir.join("cgroup");
+        let config = LauncherConfig {
+            firecracker_bin: fc,
+            image: image(&dir),
+            machine: MachineSpec::default(),
+            boot: BootMethod::ConfigFile,
+            confinement: Confinement::Jailer(jail),
+            guest_port: GUEST_AGENT_PORT,
+            api_timeout: Duration::from_secs(5),
+        };
+        let launcher = FirecrackerLauncher::new(config).unwrap();
+        let out = dir.join("golden");
+        let files = launcher
+            .create_golden_snapshot(&out, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(files.state, out.join("snapshot.state"));
+        assert_eq!(files.memory, out.join("snapshot.mem"));
+        assert_eq!(std::fs::read(&files.state).unwrap(), b"state");
+        assert_eq!(std::fs::read(&files.memory).unwrap(), b"memory");
+        for file in [&files.state, &files.memory] {
+            let meta = std::fs::metadata(file).unwrap();
+            assert_eq!(meta.mode() & 0o777, 0o640, "{}", file.display());
+            assert_eq!(meta.gid(), 23_456, "the jailed VMM reads it by group");
+        }
+        let jails = std::fs::read_dir(launcher.vm_root())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .count();
+        assert_eq!(jails, 0, "the golden VM is torn down");
+        drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A fake jailed Firecracker for a golden snapshot. It answers the API
+    /// with 204, starts a fake guest agent on `PUT /actions`, refuses a
+    /// snapshot of a running VM, and writes the snapshot files.
+    const FAKE_GOLDEN_API_PY: &str = r#"
+import json, os, socket, struct, sys, threading
+args = sys.argv[1:]
+sock_path = args[args.index("--api-sock") + 1]
+state = {"paused": False}
+
+def guest():
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind("v.sock")
+    srv.listen(8)
+    while True:
+        conn, _ = srv.accept()
+        line = b""
+        while not line.endswith(b"\n"):
+            chunk = conn.recv(1)
+            if not chunk:
+                break
+            line += chunk
+        if line != b"CONNECT 52\n":
+            conn.close()
+            continue
+        conn.sendall(b"OK 1\n")
+        head = conn.recv(4, socket.MSG_WAITALL)
+        conn.recv(struct.unpack(">I", head)[0], socket.MSG_WAITALL)
+        body = json.dumps({"version": 1, "message": {"type": "pong"}}).encode()
+        conn.sendall(struct.pack(">I", len(body)) + body)
+        conn.close()
+
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sock_path)
+srv.listen(8)
+while True:
+    conn, _ = srv.accept()
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    if not data:
+        conn.close()
+        continue
+    head, _, body = data.partition(b"\r\n\r\n")
+    length = 0
+    for line in head.split(b"\r\n")[1:]:
+        k, _, v = line.partition(b":")
+        if k.strip().lower() == b"content-length":
+            length = int(v.strip())
+    while len(body) < length:
+        body += conn.recv(4096)
+    method, path = head.split(b"\r\n")[0].split(b" ")[:2]
+    reply = b"HTTP/1.1 204 No Content\r\n\r\n"
+    if path == b"/actions":
+        threading.Thread(target=guest, daemon=True).start()
+    elif path == b"/vm":
+        state["paused"] = json.loads(body)["state"] == "Paused"
+    elif path == b"/snapshot/create":
+        if not state["paused"]:
+            fault = b'{"fault_message":"the VM is not paused"}'
+            reply = b"HTTP/1.1 400 Bad Request\r\nContent-Length: %d\r\n\r\n%s" % (len(fault), fault)
+        else:
+            request = json.loads(body)
+            open(request["snapshot_path"], "w").write("state")
+            open(request["mem_file_path"], "w").write("memory")
+    conn.sendall(reply)
+    conn.close()
+"#;
 }

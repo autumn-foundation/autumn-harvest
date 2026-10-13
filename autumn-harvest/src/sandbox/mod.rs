@@ -49,14 +49,16 @@ pub mod protocol;
 pub mod request;
 pub mod runtime;
 
-pub use activity::{SandboxActivities, SandboxActivity, run_sandbox_activity};
+pub use activity::{
+    ATTEMPT_ENV, IDEMPOTENCY_KEY_ENV, SandboxActivities, SandboxActivity, run_sandbox_activity,
+};
 pub use error::SandboxError;
 pub use outcome::{OutputFile, RunStatus, SandboxOutcome, SkippedOutput};
 pub use policy::{
     IsolationLevel, NetworkPolicy, RuntimeSpec, SandboxLimits, SandboxPolicy, SizeBounds,
 };
 pub use request::{ExecPlan, PlanFile, RequestedLimits, SandboxFile, SandboxRequest};
-pub use runtime::{BoxFuture, SandboxBackend, SandboxJob, SandboxRuntime};
+pub use runtime::{RunOptions, SandboxBackend, SandboxJob, SandboxRuntime};
 
 /// Serde helpers that write bytes as standard base64 text.
 pub(crate) mod b64 {

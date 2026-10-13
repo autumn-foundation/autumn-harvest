@@ -2105,8 +2105,11 @@ impl HarvestBuilder {
     #[cfg(feature = "sandbox-activities")]
     #[must_use]
     pub fn sandbox_activity(mut self, activity: crate::sandbox::SandboxActivity) -> Self {
-        // A later registration of the same name replaces the earlier one.
-        self.activities.retain(|info| info.name != activity.name);
+        // A later sandbox registration of the same name replaces the earlier
+        // one. Another kind of activity with the name stays, as for the
+        // other registrations: the worker keeps the later one.
+        self.activities
+            .retain(|info| info.module != "sandbox" || info.name != activity.name);
         self.activities.push(activity.activity_info());
         let registry = self
             .state

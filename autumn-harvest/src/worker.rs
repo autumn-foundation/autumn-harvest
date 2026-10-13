@@ -16692,6 +16692,19 @@ fn is_worker_local_failure(error_type: &str) -> bool {
     {
         return true;
     }
+    // A sandbox fault, such as a host without KVM or a broken guest, is not
+    // pressure from a dependency either.
+    #[cfg(feature = "sandbox-activities")]
+    if [
+        crate::failure::ERROR_TYPE_SANDBOX_DENIED,
+        crate::failure::ERROR_TYPE_SANDBOX_UNAVAILABLE,
+        crate::failure::ERROR_TYPE_SANDBOX_PROTOCOL_VIOLATION,
+        crate::failure::ERROR_TYPE_SANDBOX_CANCELLED,
+    ]
+    .contains(&error_type)
+    {
+        return true;
+    }
     false
 }
 

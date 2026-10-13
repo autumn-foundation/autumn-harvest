@@ -114,7 +114,8 @@ pub const ERROR_TYPE_WORKFLOW_TASK_TIMED_OUT: &str = "WorkflowTaskTimedOut";
 /// later attempt without a policy change.
 ///
 /// A sandboxed code activity uses the same type for a request that breaks its
-/// policy. See [`crate::sandbox`].
+/// policy, and for a worker configuration that is not valid. See the
+/// `sandbox` module.
 #[cfg(any(feature = "wasm-activities", feature = "sandbox-activities"))]
 pub const ERROR_TYPE_SANDBOX_DENIED: &str = "SandboxDenied";
 

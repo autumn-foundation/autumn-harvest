@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use autumn_harvest::sandbox::guest::{PlanExecutor, ReseedFn, Served, serve_connection};
+use autumn_harvest::sandbox::guest::{GuestKernel, PlanExecutor, Served, serve_connection};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// The default vsock port.
@@ -109,7 +109,7 @@ pub fn parse_cmdline(cmdline: &str) -> GuestConfig {
 pub async fn serve<S, A, F>(
     mut accept: A,
     executor: &dyn PlanExecutor,
-    reseed: &ReseedFn,
+    kernel: &dyn GuestKernel,
     single_use: bool,
 ) -> std::io::Result<()>
 where
@@ -120,7 +120,7 @@ where
     use tokio::io::AsyncReadExt as _;
     loop {
         let mut stream = accept().await?;
-        match serve_connection(&mut stream, executor, reseed).await {
+        match serve_connection(&mut stream, executor, kernel).await {
             Ok(Served::Ping) => {}
             Ok(Served::Run) => {
                 // Wait until the host closes, so the vsock device delivers
@@ -149,14 +149,6 @@ pub mod linux;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use autumn_harvest::sandbox::guest::{ping, request_run};
-    use autumn_harvest::sandbox::runtime::SandboxJob;
-    use autumn_harvest::sandbox::{NetworkPolicy, RunStatus, SandboxPolicy, SandboxRequest};
-    use tokio::net::{UnixListener, UnixStream};
-
     use super::*;
 
     #[test]
@@ -182,8 +174,22 @@ mod tests {
         let config = parse_cmdline("harvest.uid=0 harvest.gid=0");
         assert_eq!(config.run_as, DEFAULT_RUN_AS);
     }
+}
 
-    #[cfg(target_os = "linux")]
+/// The serve loop over a Unix socket and the Linux process executor.
+#[cfg(all(test, target_os = "linux"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod linux_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use autumn_harvest::sandbox::guest::{UnmanagedKernel, ping, request_run};
+    use autumn_harvest::sandbox::runtime::SandboxJob;
+    use autumn_harvest::sandbox::{NetworkPolicy, RunStatus, SandboxPolicy, SandboxRequest};
+    use tokio::net::{UnixListener, UnixStream};
+
+    use super::*;
+
     #[tokio::test]
     async fn the_agent_serves_pings_then_one_run_then_stops() {
         let dir = std::env::temp_dir().join(format!("harvest-guest-{}", uuid_like()));
@@ -201,7 +207,7 @@ mod tests {
                     async move { listener.accept().await.map(|(stream, _)| stream) }
                 },
                 &executor,
-                &|_: &[u8; 32]| Ok(()),
+                &UnmanagedKernel,
                 true,
             )
             .await

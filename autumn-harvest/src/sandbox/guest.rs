@@ -29,8 +29,40 @@ pub trait PlanExecutor: Send + Sync {
     ) -> BoxFuture<'a, Result<SandboxOutcome, SandboxError>>;
 }
 
-/// Mixes host entropy into the guest random pool.
-pub type ReseedFn = dyn Fn(&[u8; 32]) -> std::io::Result<()> + Send + Sync;
+/// The kernel duties of the guest agent before each run.
+pub trait GuestKernel: Send + Sync {
+    /// Mix 32 bytes of host entropy into the random pool, and force a
+    /// reseed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the kernel call. The run stops.
+    fn reseed(&self, entropy: &[u8; 32]) -> std::io::Result<()>;
+
+    /// Set the wall clock to the host time, in milliseconds since the Unix
+    /// epoch. A microVM restored from a snapshot starts with the clock of
+    /// the snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the kernel call. The run stops.
+    fn set_clock(&self, unix_time_ms: u64) -> std::io::Result<()>;
+}
+
+/// A kernel that the agent does not manage, such as the host kernel in
+/// development mode. Both duties do nothing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnmanagedKernel;
+
+impl GuestKernel for UnmanagedKernel {
+    fn reseed(&self, _entropy: &[u8; 32]) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn set_clock(&self, _unix_time_ms: u64) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// What one connection carried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,7 +109,7 @@ const FRAME_OVERHEAD_BYTES: usize = 64 * 1024;
 pub async fn serve_connection<S>(
     stream: &mut S,
     executor: &dyn PlanExecutor,
-    reseed: &ReseedFn,
+    kernel: &dyn GuestKernel,
 ) -> Result<Served, FrameError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -90,7 +122,7 @@ where
         }
         HostMessage::Run(run) => run,
     };
-    let reply = match run_plan(&run, executor, reseed).await {
+    let reply = match run_plan(&run, executor, kernel).await {
         Ok(outcome) => GuestMessage::Outcome(OutcomeMessage {
             run_id: run.run_id,
             outcome,
@@ -105,11 +137,11 @@ where
     Ok(Served::Run)
 }
 
-/// Check the run, reseed the random pool, then run the plan.
+/// Check the run, reseed the random pool, set the clock, then run the plan.
 async fn run_plan(
     run: &RunMessage,
     executor: &dyn PlanExecutor,
-    reseed: &ReseedFn,
+    kernel: &dyn GuestKernel,
 ) -> Result<SandboxOutcome, (GuestErrorKind, String)> {
     let entropy = parse_entropy(&run.entropy).map_err(|e| (GuestErrorKind::InvalidPlan, e))?;
     run.plan
@@ -117,10 +149,16 @@ async fn run_plan(
         .map_err(|e| (GuestErrorKind::InvalidPlan, e.to_string()))?;
     // The code must not run on cloned random state, so a failed reseed
     // stops the run.
-    reseed(&entropy).map_err(|e| {
+    kernel.reseed(&entropy).map_err(|e| {
         (
             GuestErrorKind::Internal,
             format!("could not reseed the random pool: {e}"),
+        )
+    })?;
+    kernel.set_clock(run.unix_time_ms).map_err(|e| {
+        (
+            GuestErrorKind::Internal,
+            format!("could not set the clock: {e}"),
         )
     })?;
     let cancel = CancellationToken::new();
@@ -212,6 +250,7 @@ where
     let run = HostMessage::Run(Box::new(RunMessage {
         run_id: job.run_id.clone(),
         entropy: format_entropy(&job.entropy),
+        unix_time_ms: unix_time_ms(),
         plan: job.plan.clone(),
     }));
     write_message(stream, run, MAX_FRAME_BYTES)
@@ -252,6 +291,14 @@ where
             "the guest answered a run with a pong".into(),
         )),
     }
+}
+
+/// The host wall clock, in milliseconds since the Unix epoch. A clock before
+/// the epoch gives zero.
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
@@ -307,18 +354,13 @@ mod tests {
             events: Arc::clone(&events),
             answer,
         };
-        let seen = Arc::clone(&events);
-        let reseed = move |bytes: &[u8; 32]| {
-            seen.lock().unwrap().push(format!("reseed {}", bytes[0]));
-            if reseed_ok {
-                Ok(())
-            } else {
-                Err(std::io::Error::other("no entropy device"))
-            }
+        let kernel = FakeKernel {
+            events: Arc::clone(&events),
+            reseed_ok,
         };
         let (mut host, mut guest) = tokio::io::duplex(1 << 20);
         let server =
-            tokio::spawn(async move { serve_connection(&mut guest, &executor, &reseed).await });
+            tokio::spawn(async move { serve_connection(&mut guest, &executor, &kernel).await });
         let result = request_run(&mut host, &job).await;
         let what = server.await.unwrap().unwrap();
         assert_eq!(what, Served::Run);
@@ -333,20 +375,57 @@ mod tests {
             events: Arc::default(),
             answer: Err(SandboxError::Cancelled),
         };
-        let server = tokio::spawn(async move {
-            serve_connection(&mut guest, &executor, &|_: &[u8; 32]| Ok(())).await
-        });
+        let server =
+            tokio::spawn(
+                async move { serve_connection(&mut guest, &executor, &UnmanagedKernel).await },
+            );
         ping(&mut host).await.unwrap();
         assert_eq!(server.await.unwrap().unwrap(), Served::Ping);
     }
 
+    /// A guest kernel that records its calls.
+    struct FakeKernel {
+        events: Arc<Mutex<Vec<String>>>,
+        reseed_ok: bool,
+    }
+
+    impl GuestKernel for FakeKernel {
+        fn reseed(&self, entropy: &[u8; 32]) -> std::io::Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("reseed {}", entropy[0]));
+            if self.reseed_ok {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("no entropy device"))
+            }
+        }
+
+        fn set_clock(&self, unix_time_ms: u64) -> std::io::Result<()> {
+            let now = u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap();
+            let near = now.abs_diff(unix_time_ms) < 60_000;
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("clock near={near}"));
+            Ok(())
+        }
+    }
+
     #[tokio::test]
-    async fn a_run_returns_the_outcome_after_the_reseed() {
+    async fn a_run_sets_the_clock_after_the_reseed_and_before_the_code() {
         let mut answer = outcome(RunStatus::Exited { code: 0 });
         answer.stdout = "hi\n".into();
         let (result, log) = exchange(job(), Ok(answer.clone()), true).await;
         assert_eq!(result.unwrap(), answer);
-        assert_eq!(log, ["reseed 7", "execute sh main.sh"]);
+        assert_eq!(log, ["reseed 7", "clock near=true", "execute sh main.sh"]);
     }
 
     #[tokio::test]
@@ -470,13 +549,15 @@ mod tests {
             events: Arc::default(),
             answer: Ok(outcome(RunStatus::Exited { code: 0 })),
         };
-        let server = tokio::spawn(async move {
-            serve_connection(&mut guest, &executor, &|_: &[u8; 32]| Ok(())).await
-        });
+        let server =
+            tokio::spawn(
+                async move { serve_connection(&mut guest, &executor, &UnmanagedKernel).await },
+            );
         let job = job();
         let run = HostMessage::Run(Box::new(RunMessage {
             run_id: job.run_id,
             entropy: "not-hex".into(),
+            unix_time_ms: 0,
             plan: job.plan,
         }));
         write_message(&mut host, run, MAX_FRAME_BYTES)

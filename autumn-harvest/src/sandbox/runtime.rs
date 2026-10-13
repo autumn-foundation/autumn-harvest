@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::error::SandboxError;
 use super::outcome::SandboxOutcome;
-use super::policy::{IsolationLevel, SandboxPolicy};
+use super::policy::{IsolationLevel, NetworkPolicy, SandboxPolicy};
 use super::request::{ExecPlan, RESERVED_ENV_PREFIX, SandboxRequest};
 
 /// A boxed, sendable future.
@@ -26,6 +26,19 @@ pub const DEFAULT_BACKEND_OVERHEAD: Duration = Duration::from_secs(30);
 
 /// The time that a backend gets to tear down after the runtime cancels it.
 pub const CLEANUP_GRACE: Duration = Duration::from_secs(10);
+
+/// The default time that a run waits for a free slot.
+pub const DEFAULT_QUEUE_WAIT: Duration = Duration::from_secs(30);
+
+/// What the engine adds to one run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunOptions {
+    /// Variables for the code, added after the request check. Each name must
+    /// start with `HARVEST_`.
+    pub engine_env: BTreeMap<String, String>,
+    /// The time left in the activity attempt. `None` is no bound.
+    pub time_left: Option<Duration>,
+}
 
 /// One run for a backend: a checked plan, a run id and fresh entropy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +61,13 @@ pub trait SandboxBackend: Send + Sync + 'static {
         None
     }
 
+    /// Whether the backend can give code a network. `false` by default. A
+    /// runtime refuses a policy that allows the network on a backend
+    /// without one.
+    fn supports_network(&self) -> bool {
+        false
+    }
+
     /// Run `job`. Stop and clean up when `cancel` fires.
     fn execute(
         &self,
@@ -63,6 +83,7 @@ pub struct SandboxRuntime {
     permits: Arc<Semaphore>,
     max_concurrent: usize,
     overhead: Duration,
+    queue_wait: Duration,
 }
 
 impl std::fmt::Debug for SandboxRuntime {
@@ -71,6 +92,7 @@ impl std::fmt::Debug for SandboxRuntime {
             .field("isolation", &self.backend.isolation())
             .field("max_concurrent", &self.max_concurrent)
             .field("overhead", &self.overhead)
+            .field("queue_wait", &self.queue_wait)
             .finish_non_exhaustive()
     }
 }
@@ -80,8 +102,9 @@ impl SandboxRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`SandboxError::Config`] when the policy is not valid, or when
-    /// the backend isolation is weaker than `policy.min_isolation`.
+    /// Returns [`SandboxError::Config`] when the policy is not valid, when
+    /// the backend isolation is weaker than `policy.min_isolation`, or when
+    /// the policy allows the network on a backend without one.
     pub fn new(
         backend: Arc<dyn SandboxBackend>,
         policy: SandboxPolicy,
@@ -94,12 +117,18 @@ impl SandboxRuntime {
                 policy.min_isolation
             )));
         }
+        if policy.network == NetworkPolicy::Allow && !backend.supports_network() {
+            return Err(SandboxError::Config(
+                "the policy allows the network, but the backend gives code no network".into(),
+            ));
+        }
         Ok(Self {
             backend,
             policy: Arc::new(policy),
             permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT)),
             max_concurrent: DEFAULT_MAX_CONCURRENT,
             overhead: DEFAULT_BACKEND_OVERHEAD,
+            queue_wait: DEFAULT_QUEUE_WAIT,
         })
     }
 
@@ -117,6 +146,33 @@ impl SandboxRuntime {
     pub const fn with_backend_overhead(mut self, overhead: Duration) -> Self {
         self.overhead = overhead;
         self
+    }
+
+    /// Set the time that a run waits for a free slot. After it, the run is
+    /// [`SandboxError::Unavailable`], and the activity retries later.
+    #[must_use]
+    pub const fn with_queue_wait(mut self, queue_wait: Duration) -> Self {
+        self.queue_wait = queue_wait;
+        self
+    }
+
+    /// The time that a run waits for a free slot.
+    #[must_use]
+    pub const fn queue_wait(&self) -> Duration {
+        self.queue_wait
+    }
+
+    /// The longest time that one run takes: the queue wait, the wall-clock
+    /// ceiling of the policy, the backend overhead and the cleanup grace.
+    ///
+    /// An activity attempt with at least this time never times out while
+    /// its sandbox still runs.
+    #[must_use]
+    pub fn max_attempt_time(&self) -> Duration {
+        self.queue_wait
+            .saturating_add(self.policy.max_limits.wall_clock())
+            .saturating_add(self.overhead)
+            .saturating_add(CLEANUP_GRACE)
     }
 
     /// The policy.
@@ -149,32 +205,41 @@ impl SandboxRuntime {
     ///
     /// Returns [`SandboxError::Denied`] for a request that breaks the policy,
     /// [`SandboxError::Cancelled`] when `cancel` fires, and the backend error
-    /// otherwise. A backend that runs past the wall-clock limit plus the
-    /// overhead is [`SandboxError::Unavailable`].
+    /// otherwise. These are [`SandboxError::Unavailable`]:
+    ///
+    /// - no free slot within the queue wait;
+    /// - a backend that runs past the wall-clock limit plus the overhead.
     pub async fn run(
         &self,
         request: &SandboxRequest,
         cancel: &CancellationToken,
     ) -> Result<SandboxOutcome, SandboxError> {
-        self.run_with_engine_env(request, BTreeMap::new(), cancel)
-            .await
+        self.run_with(request, RunOptions::default(), cancel).await
     }
 
-    /// Like [`Self::run`], and add engine variables to the environment of
-    /// the code after the request check.
+    /// Like [`Self::run`], with engine variables and the time left in the
+    /// activity attempt.
+    ///
+    /// The runtime keeps [`CLEANUP_GRACE`] of the time left for teardown.
+    /// It does not start the code when the rest is shorter than the
+    /// wall-clock limit plus the overhead.
     ///
     /// # Errors
     ///
     /// The errors of [`Self::run`]. A variable name without the `HARVEST_`
-    /// prefix is a [`SandboxError::Config`].
-    pub async fn run_with_engine_env(
+    /// prefix is a [`SandboxError::Config`]. Too little time left is
+    /// [`SandboxError::Unavailable`].
+    pub async fn run_with(
         &self,
         request: &SandboxRequest,
-        engine_env: BTreeMap<String, String>,
+        options: RunOptions,
         cancel: &CancellationToken,
     ) -> Result<SandboxOutcome, SandboxError> {
+        let deadline = options
+            .time_left
+            .map(|left| tokio::time::Instant::now() + left.saturating_sub(CLEANUP_GRACE));
         let mut plan = self.policy.plan(request)?;
-        for (name, value) in engine_env {
+        for (name, value) in options.engine_env {
             if !name.starts_with(RESERVED_ENV_PREFIX) {
                 return Err(SandboxError::Config(format!(
                     "engine variable {name:?} must start with {RESERVED_ENV_PREFIX}"
@@ -183,13 +248,16 @@ impl SandboxRuntime {
             plan.env.insert(name, value);
         }
         plan.validate()?;
-        let _permit = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Err(SandboxError::Cancelled),
-            permit = Arc::clone(&self.permits).acquire_owned() => permit.map_err(|_| {
-                SandboxError::Unavailable("the sandbox runtime is closed".into())
-            })?,
-        };
+        let _permit = self.acquire_slot(deadline, cancel).await?;
+        let budget = plan.limits.wall_clock().saturating_add(self.overhead);
+        if let Some(deadline) = deadline {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left < budget {
+                return Err(SandboxError::Unavailable(format!(
+                    "the attempt has {left:?} left, under the {budget:?} that the run can take"
+                )));
+            }
+        }
         let mut entropy = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut entropy);
         let job = SandboxJob {
@@ -198,18 +266,20 @@ impl SandboxRuntime {
             plan: plan.clone(),
         };
         let backend_cancel = cancel.child_token();
-        let budget = plan.limits.wall_clock().saturating_add(self.overhead);
         let execute = self.backend.execute(job, backend_cancel.clone());
         tokio::pin!(execute);
         let result = tokio::select! {
             result = &mut execute => result,
             () = tokio::time::sleep(budget) => {
-                // Cancel the backend, and give it time to tear down.
+                // Cancel the backend, and give it time to tear down. An
+                // outcome that arrives in the grace is still an outcome.
                 backend_cancel.cancel();
-                let _ = tokio::time::timeout(CLEANUP_GRACE, &mut execute).await;
-                Err(SandboxError::Unavailable(format!(
-                    "the backend did not finish within {budget:?}"
-                )))
+                match tokio::time::timeout(CLEANUP_GRACE, &mut execute).await {
+                    Ok(Ok(outcome)) => Ok(outcome),
+                    _ => Err(SandboxError::Unavailable(format!(
+                        "the backend did not finish within {budget:?}"
+                    ))),
+                }
             }
         };
         let mut outcome = result?;
@@ -217,6 +287,29 @@ impl SandboxRuntime {
         outcome.isolation = self.backend.isolation();
         outcome.image = self.backend.image();
         Ok(outcome)
+    }
+
+    /// Wait for a free slot until the queue wait or `deadline` ends.
+    async fn acquire_slot(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+        cancel: &CancellationToken,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, SandboxError> {
+        let mut wait_until = tokio::time::Instant::now() + self.queue_wait;
+        if let Some(deadline) = deadline {
+            wait_until = wait_until.min(deadline);
+        }
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(SandboxError::Cancelled),
+            permit = Arc::clone(&self.permits).acquire_owned() => permit.map_err(|_| {
+                SandboxError::Unavailable("the sandbox runtime is closed".into())
+            }),
+            () = tokio::time::sleep_until(wait_until) => Err(SandboxError::Unavailable(format!(
+                "no free sandbox slot within {:?}; {} runs are active",
+                self.queue_wait, self.max_concurrent
+            ))),
+        }
     }
 }
 
@@ -262,6 +355,10 @@ pub(crate) mod tests {
             Some("fake:1".into())
         }
 
+        fn supports_network(&self) -> bool {
+            true
+        }
+
         fn execute(
             &self,
             job: SandboxJob,
@@ -291,6 +388,34 @@ pub(crate) mod tests {
         let runtime = SandboxRuntime::new(backend.clone(), SandboxPolicy::for_development())
             .expect("valid runtime");
         (backend, runtime)
+    }
+
+    /// A backend with no network device.
+    struct NoNetworkBackend;
+
+    impl SandboxBackend for NoNetworkBackend {
+        fn isolation(&self) -> IsolationLevel {
+            IsolationLevel::MicroVm
+        }
+
+        fn execute(
+            &self,
+            _job: SandboxJob,
+            _cancel: CancellationToken,
+        ) -> BoxFuture<'_, Result<SandboxOutcome, SandboxError>> {
+            Box::pin(async { Err(SandboxError::Cancelled) })
+        }
+    }
+
+    #[test]
+    fn a_policy_that_allows_the_network_needs_a_backend_with_one() {
+        let policy = SandboxPolicy::default().with_network(NetworkPolicy::Allow);
+        let err = SandboxRuntime::new(Arc::new(NoNetworkBackend), policy).expect_err("no NIC");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("network")),
+            "{err:?}"
+        );
+        SandboxRuntime::new(Arc::new(NoNetworkBackend), SandboxPolicy::default()).unwrap();
     }
 
     #[test]
@@ -429,11 +554,19 @@ pub(crate) mod tests {
         };
         tokio::time::sleep(Duration::from_millis(20)).await;
         let cancel = CancellationToken::new();
+        let waiting = {
+            let runtime = Arc::clone(&runtime);
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                runtime
+                    .run(&SandboxRequest::new("sh", "true"), &cancel)
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "the run waits for the busy slot");
         cancel.cancel();
-        let err = runtime
-            .run(&SandboxRequest::new("sh", "true"), &cancel)
-            .await
-            .expect_err("cancelled");
+        let err = waiting.await.unwrap().expect_err("cancelled");
         assert_eq!(err, SandboxError::Cancelled);
         busy.abort();
     }
@@ -473,6 +606,111 @@ pub(crate) mod tests {
         // The watchdog cancels the backend, so the run does not leak.
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(backend.running.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_full_runtime_is_unavailable_after_the_queue_wait() {
+        let mut backend = FakeBackend::new(IsolationLevel::Process);
+        backend.delay = Duration::from_secs(60);
+        let (backend, runtime) = runtime(backend);
+        let runtime = Arc::new(
+            runtime
+                .with_max_concurrent(1)
+                .with_queue_wait(Duration::from_millis(50)),
+        );
+        let busy = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                runtime
+                    .run(
+                        &SandboxRequest::new("sh", "true"),
+                        &CancellationToken::new(),
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let err = runtime
+            .run(
+                &SandboxRequest::new("sh", "true"),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("no slot");
+        assert!(
+            matches!(err, SandboxError::Unavailable(ref m) if m.contains("slot")),
+            "{err:?}"
+        );
+        assert_eq!(backend.jobs.lock().unwrap().len(), 1);
+        busy.abort();
+    }
+
+    #[tokio::test]
+    async fn an_attempt_without_time_for_the_run_is_unavailable_before_the_code_runs() {
+        let (backend, runtime) = runtime(FakeBackend::new(IsolationLevel::Process));
+        let request = SandboxRequest::new("sh", "true").with_timeout_ms(10_000);
+        let options = RunOptions {
+            time_left: Some(CLEANUP_GRACE + Duration::from_secs(5)),
+            ..RunOptions::default()
+        };
+        let err = runtime
+            .run_with(&request, options, &CancellationToken::new())
+            .await
+            .expect_err("too little time");
+        assert!(
+            matches!(err, SandboxError::Unavailable(ref m) if m.contains("left")),
+            "{err:?}"
+        );
+        assert_eq!(backend.jobs.lock().unwrap().len(), 0, "the code never ran");
+    }
+
+    #[test]
+    fn the_attempt_time_covers_the_queue_the_run_and_the_cleanup() {
+        let (_, runtime) = runtime(FakeBackend::new(IsolationLevel::Process));
+        let runtime = runtime
+            .with_queue_wait(Duration::from_secs(7))
+            .with_backend_overhead(Duration::from_secs(11));
+        assert_eq!(
+            runtime.max_attempt_time(),
+            runtime.policy().max_limits.wall_clock()
+                + Duration::from_secs(7)
+                + Duration::from_secs(11)
+                + CLEANUP_GRACE
+        );
+    }
+
+    /// A backend that answers late after a cancel.
+    struct LateBackend;
+
+    impl SandboxBackend for LateBackend {
+        fn isolation(&self) -> IsolationLevel {
+            IsolationLevel::Process
+        }
+
+        fn execute(
+            &self,
+            _job: SandboxJob,
+            cancel: CancellationToken,
+        ) -> BoxFuture<'_, Result<SandboxOutcome, SandboxError>> {
+            Box::pin(async move {
+                cancel.cancelled().await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(outcome(RunStatus::TimedOut))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_outcome_inside_the_cleanup_grace_is_kept() {
+        let runtime = SandboxRuntime::new(Arc::new(LateBackend), SandboxPolicy::for_development())
+            .unwrap()
+            .with_backend_overhead(Duration::from_millis(30));
+        let request = SandboxRequest::new("sh", "true").with_timeout_ms(10);
+        let out = runtime
+            .run(&request, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(out.status, RunStatus::TimedOut);
     }
 
     #[test]

@@ -221,12 +221,14 @@ mod tests {
 
     use super::*;
     use crate::sandbox::exec::{ExecOptions, ProcessExecutor};
-    use crate::sandbox::firecracker::fake::{FakeLauncher, GuestMode};
+    use crate::sandbox::firecracker::fake::{FakeLauncher, GuestMode, HostNetworkExecutor};
 
     fn launcher(mode: GuestMode) -> Arc<FakeLauncher> {
         Arc::new(FakeLauncher::new(
             mode,
-            Arc::new(ProcessExecutor::new(ExecOptions::default())),
+            Arc::new(HostNetworkExecutor(ProcessExecutor::new(
+                ExecOptions::default(),
+            ))),
         ))
     }
 

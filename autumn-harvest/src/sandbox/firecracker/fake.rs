@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 
 use super::launcher::{LaunchedVm, VmLauncher};
 use crate::sandbox::error::SandboxError;
-use crate::sandbox::guest::{PlanExecutor, Served, serve_connection};
+use crate::sandbox::guest::{PlanExecutor, Served, UnmanagedKernel, serve_connection};
 use crate::sandbox::protocol::{HostMessage, MAX_FRAME_BYTES, read_message};
 use crate::sandbox::runtime::BoxFuture;
 
@@ -120,6 +120,30 @@ fn take_one(counter: &AtomicUsize) -> bool {
     false
 }
 
+/// A guest executor that runs each plan with the host network.
+///
+/// A real microVM has no network device, and its executor adds an empty
+/// network namespace as a second layer. The fake microVM shares the host,
+/// where a test may not create a namespace. So the fake skips that layer.
+pub struct HostNetworkExecutor<E>(pub E);
+
+impl<E: PlanExecutor> PlanExecutor for HostNetworkExecutor<E> {
+    fn execute<'a>(
+        &'a self,
+        plan: &'a crate::sandbox::request::ExecPlan,
+        cancel: &'a tokio_util::sync::CancellationToken,
+    ) -> crate::sandbox::runtime::BoxFuture<
+        'a,
+        Result<crate::sandbox::outcome::SandboxOutcome, crate::sandbox::error::SandboxError>,
+    > {
+        Box::pin(async move {
+            let mut plan = plan.clone();
+            plan.network = crate::sandbox::policy::NetworkPolicy::Allow;
+            self.0.execute(&plan, cancel).await
+        })
+    }
+}
+
 fn spawn_muxer(path: &Path, mode: GuestMode, executor: Arc<dyn PlanExecutor>) -> JoinHandle<()> {
     let listener = UnixListener::bind(path).expect("bind fake vsock");
     tokio::spawn(async move {
@@ -150,8 +174,7 @@ fn spawn_muxer(path: &Path, mode: GuestMode, executor: Arc<dyn PlanExecutor>) ->
                         continue;
                     }
                     let served =
-                        serve_connection(&mut stream, executor.as_ref(), &|_: &[u8; 32]| Ok(()))
-                            .await;
+                        serve_connection(&mut stream, executor.as_ref(), &UnmanagedKernel).await;
                     if matches!(served, Ok(Served::Run)) {
                         // A real guest reboots after one run, and the VMM exits.
                         return;

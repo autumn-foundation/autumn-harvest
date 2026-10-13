@@ -37,6 +37,11 @@ impl SandboxBackend for ProcessBackend {
         IsolationLevel::Process
     }
 
+    /// The code shares the host network unless the policy denies it.
+    fn supports_network(&self) -> bool {
+        true
+    }
+
     fn execute(
         &self,
         job: SandboxJob,

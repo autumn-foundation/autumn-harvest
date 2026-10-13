@@ -55,6 +55,10 @@ pub struct RunMessage {
     /// its kernel random pool before the code runs, so two microVMs restored
     /// from one snapshot do not share random state.
     pub entropy: String,
+    /// The host wall clock, in milliseconds since the Unix epoch. The guest
+    /// sets its clock from it, because a microVM restored from a snapshot
+    /// starts with the clock of the snapshot.
+    pub unix_time_ms: u64,
     /// The plan to run.
     pub plan: ExecPlan,
 }
@@ -286,6 +290,7 @@ mod tests {
         let run = HostMessage::Run(Box::new(RunMessage {
             run_id: "r1".into(),
             entropy: "00".repeat(32),
+            unix_time_ms: 1_700_000_000_000,
             plan,
         }));
         assert_eq!(round_trip(&envelope(run.clone())).await.message, run);

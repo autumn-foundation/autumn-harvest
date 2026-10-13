@@ -15,6 +15,7 @@ fn agent_main() -> std::process::ExitCode {
     use std::sync::Arc;
 
     use autumn_harvest::sandbox::exec::{ExecOptions, ProcessExecutor};
+    use autumn_harvest::sandbox::guest::UnmanagedKernel;
     use autumn_harvest_sandbox_guest::{linux, parse_cmdline, serve};
 
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -38,7 +39,7 @@ fn agent_main() -> std::process::ExitCode {
             serve(
                 || async { listener.accept().await.map(|(stream, _)| stream) },
                 &ProcessExecutor::default(),
-                &|_: &[u8; 32]| Ok(()),
+                &UnmanagedKernel,
                 false,
             )
             .await
@@ -66,7 +67,7 @@ fn agent_main() -> std::process::ExitCode {
         serve(
             || linux::accept_vsock(&listener),
             &executor,
-            &linux::reseed_kernel,
+            &linux::VmKernel,
             true,
         )
         .await

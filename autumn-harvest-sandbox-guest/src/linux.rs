@@ -126,6 +126,55 @@ pub fn reseed_kernel(entropy: &[u8; 32]) -> io::Result<()> {
     Ok(())
 }
 
+/// Set the wall clock to `unix_time_ms` when it is off by more than
+/// [`CLOCK_TOLERANCE_MS`].
+///
+/// # Errors
+///
+/// Returns the error of `clock_gettime` or `clock_settime`.
+pub fn set_clock(unix_time_ms: u64) -> io::Result<()> {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes one valid timespec.
+    if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &raw mut now) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let current_ms = i128::from(now.tv_sec) * 1000 + i128::from(now.tv_nsec) / 1_000_000;
+    if (current_ms - i128::from(unix_time_ms)).abs() <= i128::from(CLOCK_TOLERANCE_MS) {
+        return Ok(());
+    }
+    let invalid = || io::Error::from_raw_os_error(libc::EINVAL);
+    let target = libc::timespec {
+        tv_sec: libc::time_t::try_from(unix_time_ms / 1000).map_err(|_| invalid())?,
+        tv_nsec: libc::c_long::try_from((unix_time_ms % 1000) * 1_000_000)
+            .map_err(|_| invalid())?,
+    };
+    // SAFETY: clock_settime reads one valid timespec.
+    if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &raw const target) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The clock drift that [`set_clock`] accepts, in milliseconds.
+pub const CLOCK_TOLERANCE_MS: u64 = 1000;
+
+/// The kernel of the microVM: the agent is process 1 and has the rights.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VmKernel;
+
+impl autumn_harvest::sandbox::guest::GuestKernel for VmKernel {
+    fn reseed(&self, entropy: &[u8; 32]) -> io::Result<()> {
+        reseed_kernel(entropy)
+    }
+
+    fn set_clock(&self, unix_time_ms: u64) -> io::Result<()> {
+        set_clock(unix_time_ms)
+    }
+}
+
 /// Bind and listen on a vsock port of any local context id.
 ///
 /// # Errors
@@ -226,6 +275,16 @@ mod tests {
             u64::try_from(RNDRESEEDCRNG).ok(),
             Some(ioc(0, u64::from(b'R'), 0x07, 0))
         );
+    }
+
+    #[test]
+    fn a_clock_within_the_tolerance_is_left_alone() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after the epoch");
+        let now_ms = u64::try_from(now.as_millis()).expect("a 64-bit time");
+        // No change is needed, so the call succeeds without CAP_SYS_TIME.
+        set_clock(now_ms).expect("no change");
     }
 
     #[test]

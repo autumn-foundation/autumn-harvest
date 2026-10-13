@@ -7,9 +7,11 @@
 //!
 //! The registration sets the bounds that keep a run durable:
 //!
-//! - `start_to_close` is the wall-clock ceiling plus the backend overhead,
-//!   so the activity never times out while its sandbox still runs. A retry
-//!   therefore never overlaps a live run.
+//! - `start_to_close` is [`SandboxRuntime::max_attempt_time`]: the queue
+//!   wait, the wall-clock ceiling, the backend overhead and the cleanup
+//!   grace. The handler gives the runtime the time left in the attempt. The
+//!   runtime does not start code that cannot finish in it, so a retry does
+//!   not overlap a live run.
 //! - `max_result_bytes` is the outcome bound of the policy, so a large
 //!   outcome never fails the result cap.
 //! - `max_input_bytes` is the request bound of the policy.
@@ -28,7 +30,7 @@ use crate::policy::RetryPolicy;
 
 use super::error::SandboxError;
 use super::request::SandboxRequest;
-use super::runtime::SandboxRuntime;
+use super::runtime::{RunOptions, SandboxRuntime};
 
 /// The variable that carries the activity idempotency key to the code.
 pub const IDEMPOTENCY_KEY_ENV: &str = "HARVEST_IDEMPOTENCY_KEY";
@@ -52,9 +54,17 @@ pub struct SandboxActivity {
     pub retry: RetryPolicy,
     /// A bound on all attempts together.
     pub schedule_to_close: Option<Duration>,
-    /// A heartbeat timeout. The handler heartbeats three times per timeout
-    /// while the code runs.
+    /// The default heartbeat timeout. While the code runs, the handler
+    /// heartbeats on the interval that the attempt timeout gives.
     pub heartbeat_timeout: Option<Duration>,
+    /// A bound on the time in the queue before a worker claims a task.
+    pub schedule_to_start: Option<Duration>,
+    /// A bound on the tasks of this activity that one worker runs at one
+    /// time.
+    pub max_concurrent: Option<u32>,
+    /// A label expression that a worker must meet to claim a task, such as
+    /// `"kvm"`. A worker without KVM then leaves the tasks to others.
+    pub requires: Option<String>,
 }
 
 impl SandboxActivity {
@@ -68,6 +78,9 @@ impl SandboxActivity {
             retry: RetryPolicy::default(),
             schedule_to_close: None,
             heartbeat_timeout: None,
+            schedule_to_start: None,
+            max_concurrent: None,
+            requires: None,
         }
     }
 
@@ -85,29 +98,46 @@ impl SandboxActivity {
         self
     }
 
-    /// Bound all attempts together.
+    /// Bound all attempts together. `None` is no bound.
     #[must_use]
-    pub const fn with_schedule_to_close(mut self, bound: Duration) -> Self {
-        self.schedule_to_close = Some(bound);
+    pub const fn with_schedule_to_close(mut self, bound: Option<Duration>) -> Self {
+        self.schedule_to_close = bound;
         self
     }
 
-    /// Set a heartbeat timeout.
+    /// Set the default heartbeat timeout.
     #[must_use]
     pub const fn with_heartbeat_timeout(mut self, timeout: Duration) -> Self {
         self.heartbeat_timeout = Some(timeout);
         self
     }
 
-    /// The start-to-close timeout of one attempt: the wall-clock ceiling of
-    /// the policy plus the backend overhead.
+    /// Bound the time in the queue. `None` is no bound.
+    #[must_use]
+    pub const fn with_schedule_to_start(mut self, bound: Option<Duration>) -> Self {
+        self.schedule_to_start = bound;
+        self
+    }
+
+    /// Bound the tasks that one worker runs at one time.
+    #[must_use]
+    pub const fn with_max_concurrent(mut self, max: u32) -> Self {
+        self.max_concurrent = Some(max);
+        self
+    }
+
+    /// Require worker labels, such as `"kvm"`.
+    #[must_use]
+    pub fn with_requires(mut self, requires: impl Into<String>) -> Self {
+        self.requires = Some(requires.into());
+        self
+    }
+
+    /// The start-to-close timeout of one attempt:
+    /// [`SandboxRuntime::max_attempt_time`].
     #[must_use]
     pub fn start_to_close(&self) -> Duration {
-        self.runtime
-            .policy()
-            .max_limits
-            .wall_clock()
-            .saturating_add(self.runtime.backend_overhead())
+        self.runtime.max_attempt_time()
     }
 
     /// The [`ActivityInfo`] of this activity.
@@ -118,10 +148,9 @@ impl SandboxActivity {
     #[must_use]
     pub fn activity_info(&self) -> ActivityInfo {
         let name: &'static str = Box::leak(self.name.clone().into_boxed_str());
-        let queue: Option<&'static str> = self
-            .queue
-            .as_ref()
-            .map(|q| &*Box::leak(q.clone().into_boxed_str()));
+        let leak = |text: &String| -> &'static str { Box::leak(text.clone().into_boxed_str()) };
+        let queue = self.queue.as_ref().map(leak);
+        let requires = self.requires.as_ref().map(leak);
         let policy = self.runtime.policy();
         ActivityInfo {
             name,
@@ -129,9 +158,9 @@ impl SandboxActivity {
             default_retry_policy: Some(self.retry.clone()),
             default_start_to_close: Some(self.start_to_close()),
             default_heartbeat_timeout: self.heartbeat_timeout,
-            default_schedule_to_start: None,
+            default_schedule_to_start: self.schedule_to_start,
             default_queue: queue,
-            max_concurrent: None,
+            max_concurrent: self.max_concurrent,
             concurrency_key: None,
             default_schedule_to_close: self.schedule_to_close,
             is_local: false,
@@ -142,7 +171,7 @@ impl SandboxActivity {
             rate_limit_key: None,
             rate_limit_key_expr: None,
             circuit_breaker: None,
-            requires: None,
+            requires,
             handler: sandbox_activity_handler,
             input_schema: None,
             output_schema: None,
@@ -171,14 +200,16 @@ impl SandboxActivity {
         }
         engine_env.insert(ATTEMPT_ENV.to_owned(), ctx.attempt().to_string());
 
+        let options = RunOptions {
+            engine_env,
+            time_left: ctx.time_remaining(),
+        };
+        // The engine ticker heartbeats on the interval of the attempt
+        // timeout. An attempt without a heartbeat timeout gets no ticker.
+        let _heartbeat = ctx.start_auto_heartbeat_default().ok();
         let cancel = CancellationToken::new();
-        let run = self
-            .runtime
-            .run_with_engine_env(&request, engine_env, &cancel);
+        let run = self.runtime.run_with(&request, options, &cancel);
         tokio::pin!(run);
-        let mut heartbeat = self
-            .heartbeat_timeout
-            .map(|timeout| tokio::time::interval((timeout / 3).max(Duration::from_millis(100))));
         loop {
             tokio::select! {
                 result = &mut run => {
@@ -191,11 +222,6 @@ impl SandboxActivity {
                     if ctx.is_cancelled() {
                         cancel.cancel();
                     }
-                }
-                () = tick(heartbeat.as_mut()) => {
-                    // A failed heartbeat must not stop the run. The heartbeat
-                    // timeout reports a stuck worker.
-                    let _ = ctx.heartbeat(serde_json::json!({"sandbox": "running"})).await;
                 }
             }
         }
@@ -277,16 +303,6 @@ fn failure(err: SandboxError) -> String {
     crate::failure::ActivityFailure::from(err).into_error_payload()
 }
 
-/// Wait for the next tick, or forever with no interval.
-async fn tick(interval: Option<&mut tokio::time::Interval>) {
-    match interval {
-        Some(interval) => {
-            interval.tick().await;
-        }
-        None => std::future::pending().await,
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -346,7 +362,7 @@ mod tests {
         assert!(!info.is_local);
         let start_to_close = info.default_start_to_close.unwrap();
         assert!(start_to_close > policy.max_limits.wall_clock());
-        assert_eq!(start_to_close, activity.start_to_close());
+        assert_eq!(start_to_close, activity.runtime.max_attempt_time());
         assert_eq!(info.max_result_bytes, Some(policy.max_outcome_json_bytes()));
         assert_eq!(info.max_input_bytes, Some(policy.max_request_json_bytes()));
         assert!(info.default_retry_policy.is_some());
@@ -414,6 +430,44 @@ mod tests {
         let failure = parse_error_payload_full(&err);
         assert_eq!(failure.error_type, ERROR_TYPE_SANDBOX_UNAVAILABLE);
         assert!(!failure.non_retryable);
+    }
+
+    #[tokio::test]
+    async fn an_attempt_deadline_too_close_for_the_run_is_a_retryable_failure() {
+        let (backend, activity) = activity(FakeBackend::new(IsolationLevel::Process));
+        let deadline = chrono::Utc::now() + chrono::Duration::seconds(15);
+        let ctx =
+            ctx_for(state_with(activity), CancellationToken::new()).with_deadline(Some(deadline));
+        let request = SandboxRequest::new("sh", "true").with_timeout_ms(30_000);
+        let input = serde_json::to_value(request).unwrap();
+        let err = sandbox_activity_handler(&ctx, input)
+            .await
+            .expect_err("too little time");
+        let failure = parse_error_payload_full(&err);
+        assert_eq!(failure.error_type, ERROR_TYPE_SANDBOX_UNAVAILABLE);
+        assert!(!failure.non_retryable);
+        assert_eq!(backend.jobs.lock().unwrap().len(), 0, "the code never ran");
+    }
+
+    #[test]
+    fn the_info_carries_the_routing_options() {
+        let (_, activity) = activity(FakeBackend::new(IsolationLevel::Process));
+        let info = activity
+            .with_requires("kvm")
+            .with_max_concurrent(4)
+            .with_schedule_to_start(Some(Duration::from_secs(60)))
+            .with_schedule_to_close(Some(Duration::from_secs(900)))
+            .activity_info();
+        assert_eq!(info.requires, Some("kvm"));
+        assert_eq!(info.max_concurrent, Some(4));
+        assert_eq!(
+            info.default_schedule_to_start,
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            info.default_schedule_to_close,
+            Some(Duration::from_secs(900))
+        );
     }
 
     #[tokio::test]
