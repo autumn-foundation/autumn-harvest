@@ -120,6 +120,18 @@ fn undelivered_signal_count(path: &std::path::Path, exec: ExecutionId) -> i64 {
     .unwrap()
 }
 
+/// Stage an undelivered signal on a terminal `exec`, as an earlier release left
+/// it. Before issue #2020 a run could end with a signal staged but never read.
+fn stage_legacy_signal(path: &std::path::Path, exec: ExecutionId) {
+    let raw = rusqlite::Connection::open(path).unwrap();
+    raw.execute(
+        "INSERT INTO harvest_signals (exec_id, name, payload_json, delivered, received_at) \
+         VALUES (?1, 'never_consumed', '{}', 0, 0)",
+        rusqlite::params![exec.to_string()],
+    )
+    .unwrap();
+}
+
 /// Directly seed a pre-#1068 RUNNING `harvest_executions` row (bypassing the reuse
 /// matrix, which the public start path now enforces) for `(name, id)` on the file
 /// at `path`, plus its `WorkflowStarted` event so a driver can replay/run it, plus
@@ -499,9 +511,9 @@ async fn terminate_if_running_orphans_an_undelivered_signal_across_repeated_cycl
     );
 }
 
-// A signal staged while the prior is RUNNING can outlive it. This happens even
-// when the prior reaches COMPLETED on its own: the workflow completes without
-// ever awaiting that signal name. That prior is sealed via the same
+// A signal staged while the prior is RUNNING can outlive it. Before issue #2020
+// this happened even when the prior reached COMPLETED on its own, if the
+// workflow never awaited that signal name. Old files still hold such rows. That prior is sealed via the same
 // "already-terminal" path, which skips the cancellation branch. So the signal
 // cleanup must not live inside that branch.
 #[tokio::test]
@@ -520,18 +532,17 @@ async fn terminate_if_running_orphans_an_undelivered_signal_on_an_already_comple
         "prior has one staged, undelivered signal"
     );
 
-    // ...then let it run to completion WITHOUT ever consuming that signal.
+    // ...then let it run to completion. The workflow never awaits that name.
     let state = rt.run_until_blocked(prior).await.unwrap();
     assert!(
         matches!(state, RunState::Completed(_)),
         "echo_wf completes immediately, got {state:?}"
     );
     assert_eq!(raw_state(&path, prior), "COMPLETED");
-    assert_eq!(
-        undelivered_signal_count(&path, prior),
-        1,
-        "the signal is still undelivered after the prior completed on its own"
-    );
+    // The completing cycle ingests the signal (issue #2020). A file from an
+    // earlier release can still hold an undelivered row here.
+    assert_eq!(undelivered_signal_count(&path, prior), 0);
+    stage_legacy_signal(&path, prior);
 
     let out = rt
         .start_workflow_with_reuse_policy(
@@ -840,14 +851,13 @@ async fn allow_duplicate_failed_only_orphans_an_undelivered_signal_on_the_replac
         "prior has one staged, undelivered signal"
     );
 
-    // ...then let it run to FAILED on its own, without ever consuming that signal.
+    // ...then let it run to FAILED on its own. The workflow never awaits that name.
     let _ = rt.run_until_blocked(prior).await;
     assert_eq!(raw_state(&path, prior), "FAILED");
-    assert_eq!(
-        undelivered_signal_count(&path, prior),
-        1,
-        "the signal is still undelivered after the prior failed on its own"
-    );
+    // The failing cycle ingests the signal (issue #2020). A file from an
+    // earlier release can still hold an undelivered row here.
+    assert_eq!(undelivered_signal_count(&path, prior), 0);
+    stage_legacy_signal(&path, prior);
 
     let out = rt
         .start_workflow_with_reuse_policy(

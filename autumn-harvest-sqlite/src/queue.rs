@@ -113,6 +113,15 @@ pub struct ClaimedTask {
     /// to `true`. The activity BODY is always resolved from the registry regardless —
     /// only the policy/deadline scalars are frozen.
     pub defaults_frozen: bool,
+    /// The task's queue (issue #2024). `ActivityContext::info().queue_name`
+    /// reports it.
+    pub queue: String,
+    /// The latest persisted heartbeat payload (issue #2024). It is the
+    /// checkpoint that `ActivityContext::heartbeat_details` returns.
+    pub heartbeat_details: Option<Value>,
+    /// The previous attempt's error message (issue #2024). `None` on the
+    /// first attempt.
+    pub last_error: Option<String>,
 }
 
 fn next_task_seq(conn: &Connection) -> SqliteResult<i64> {
@@ -135,6 +144,26 @@ fn next_timer_arm_seq(conn: &Connection) -> SqliteResult<i64> {
             row.get(0)
         })?;
     Ok(max.map_or(0, |m| m + 1))
+}
+
+/// Reclaim the tasks of `exec_id` that a dropped drive left `RUNNING` (issue
+/// #2024).
+///
+/// The drain awaits an `#[activity]` body after its claim commits. A caller can
+/// drop the drive future during that await, for example with a timeout. The row
+/// then stays `RUNNING`, and no later drive in this process claims it. Drives
+/// are serialised by `&mut SqliteRuntime`, so a `RUNNING` row at the start of a
+/// drive has no live owner. The body re-runs, as after a crash. Returns the
+/// number of rows reclaimed.
+pub fn reclaim_running_for_execution(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> SqliteResult<usize> {
+    let n = conn.execute(
+        "UPDATE harvest_tasks SET state = 'PENDING' WHERE state = 'RUNNING' AND exec_id = ?1",
+        params![exec_id.to_string()],
+    )?;
+    Ok(n)
 }
 
 /// Reclaim tasks stranded `RUNNING` by a crash, flipping them back to `PENDING`.
@@ -289,7 +318,7 @@ pub fn claim_next_ready_task_tx(
         .query_row(
             "SELECT task_id, activity_id, name, input_json, attempt, max_attempts, \
              retry_policy_json, start_to_close_ms, scheduled_at, schedule_to_close_at, \
-             defaults_frozen \
+             defaults_frozen, queue, heartbeat_details, last_error \
              FROM harvest_tasks WHERE state = 'PENDING' AND exec_id = ?1 AND run_at <= ?2 \
              ORDER BY seq LIMIT 1",
             params![exec_id.to_string(), now],
@@ -306,6 +335,11 @@ pub fn claim_next_ready_task_tx(
                     row.get::<_, i64>(8)?,
                     row.get::<_, Option<i64>>(9)?,
                     row.get::<_, i64>(10)?,
+                    (
+                        row.get::<_, String>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
+                    ),
                 ))
             },
         )
@@ -323,6 +357,7 @@ pub fn claim_next_ready_task_tx(
         scheduled_at,
         schedule_to_close_at,
         defaults_frozen,
+        (queue, heartbeat_json, last_error),
     )) = row
     else {
         // No ready task — commit the empty read tx to release the lock cleanly.
@@ -341,6 +376,10 @@ pub fn claim_next_ready_task_tx(
     let retry_policy = retry_policy_json
         .as_deref()
         .map(serde_json::from_str::<RetryPolicy>)
+        .transpose()?;
+    let heartbeat_details = heartbeat_json
+        .as_deref()
+        .map(serde_json::from_str::<Value>)
         .transpose()?;
 
     // Flip to RUNNING but do NOT commit — the caller freezes the resolved defaults
@@ -366,6 +405,9 @@ pub fn claim_next_ready_task_tx(
         // registered spec, anchored to `scheduled_at`).
         schedule_to_close_at,
         defaults_frozen: defaults_frozen != 0,
+        queue,
+        heartbeat_details,
+        last_error,
     };
     Ok(Some((tx, task)))
 }
@@ -412,6 +454,35 @@ pub fn has_pending_activity(conn: &Connection, exec_id: ExecutionId) -> SqliteRe
     Ok(exists)
 }
 
+/// List the PENDING tasks of `exec_id` in queue order, as
+/// `(activity_id, name, attempt)` (issue #2021).
+pub fn pending_tasks(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> SqliteResult<Vec<(ActivityExecId, String, u32)>> {
+    let mut stmt = conn.prepare(
+        "SELECT activity_id, name, attempt FROM harvest_tasks \
+         WHERE exec_id = ?1 AND state = 'PENDING' ORDER BY seq",
+    )?;
+    let rows = stmt.query_map(params![exec_id.to_string()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut tasks = Vec::new();
+    for row in rows {
+        let (activity_id, name, attempt) = row?;
+        let activity_id = activity_id
+            .parse()
+            .map_err(|_| SqliteError::corrupt("activity_id"))?;
+        let attempt = u32::try_from(attempt).map_err(|_| SqliteError::corrupt("attempt"))?;
+        tasks.push((activity_id, name, attempt));
+    }
+    Ok(tasks)
+}
+
 /// Requeue a task for another attempt at `run_at`, recording the consumed
 /// attempt. The task's `seq` (its ready-queue ordering key) is **preserved** — use
 /// this for a FUTURE-`run_at` backoff retry, which yields to siblings naturally
@@ -419,15 +490,20 @@ pub fn has_pending_activity(conn: &Connection, exec_id: ExecutionId) -> SqliteRe
 /// window this pass), so keeping its low `seq` is correct and leaves existing
 /// ordering undisturbed. For an IMMEDIATE (zero-delay) retry, use
 /// [`requeue_task_to_back`] instead.
+///
+/// `last_error` is the failed attempt's message. The next attempt reads it as
+/// `ActivityContext::previous_failure` (issue #2024).
 pub fn requeue_task(
     conn: &Connection,
     task_id: &str,
     attempt: u32,
     run_at: i64,
+    last_error: &str,
 ) -> SqliteResult<()> {
     conn.execute(
-        "UPDATE harvest_tasks SET state = 'PENDING', attempt = ?2, run_at = ?3 WHERE task_id = ?1",
-        params![task_id, i64::from(attempt), run_at],
+        "UPDATE harvest_tasks SET state = 'PENDING', attempt = ?2, run_at = ?3, last_error = ?4 \
+         WHERE task_id = ?1",
+        params![task_id, i64::from(attempt), run_at, last_error],
     )?;
     Ok(())
 }
@@ -449,17 +525,32 @@ pub fn requeue_task(
 /// ready sibling before returning to it — round-robin fairness. Outside a race a
 /// zero-delay-retrying activity has no siblings, so the bump is harmless: it is
 /// simply re-claimed immediately anyway.
+///
+/// `last_error` has the same role as in [`requeue_task`].
 pub fn requeue_task_to_back(
     conn: &Connection,
     task_id: &str,
     attempt: u32,
     run_at: i64,
+    last_error: &str,
 ) -> SqliteResult<()> {
     let seq = next_task_seq(conn)?;
     conn.execute(
-        "UPDATE harvest_tasks SET state = 'PENDING', attempt = ?2, run_at = ?3, seq = ?4 \
-         WHERE task_id = ?1",
-        params![task_id, i64::from(attempt), run_at, seq],
+        "UPDATE harvest_tasks SET state = 'PENDING', attempt = ?2, run_at = ?3, seq = ?4, \
+         last_error = ?5 WHERE task_id = ?1",
+        params![task_id, i64::from(attempt), run_at, seq, last_error],
+    )?;
+    Ok(())
+}
+
+/// Persist `details` as the task's latest heartbeat checkpoint (issue #2024).
+///
+/// Last write wins. The write is one autocommit `UPDATE`, because the body
+/// runs outside any transaction.
+pub fn record_heartbeat(conn: &Connection, task_id: &str, details: &Value) -> SqliteResult<()> {
+    conn.execute(
+        "UPDATE harvest_tasks SET heartbeat_details = ?2 WHERE task_id = ?1",
+        params![task_id, serde_json::to_string(details)?],
     )?;
     Ok(())
 }
@@ -533,32 +624,28 @@ pub fn due_timers(conn: &Connection, exec_id: ExecutionId, now: i64) -> SqliteRe
     Ok(out)
 }
 
-/// Return the ids of all unfired timers for `exec_id` that are **both** due
-/// (`fire_at <= now`) **and** whose deadline is at or before `received_at`,
-/// oldest deadline first.
+/// Return every unfired timer of `exec_id` that is due (`fire_at <= now`), with
+/// its `fire_at`, oldest deadline first.
 ///
-/// The "fire this timer BEFORE that signal" half of the wake-event ordering
-/// (issue #476). A `wait_for_signal_timeout` deadline that expired at or before a
-/// signal arrived (`fire_at <= received_at`) must be recorded as `TimerFired`
-/// ahead of the `SignalReceived`, so a late signal cannot retroactively flip the
-/// race to the approval branch. Ties (`fire_at == received_at`) go to the timer,
-/// mirroring the Postgres `merge_wake_events` rule (signal-first iff
-/// `received_at < fires_at`). A due timer whose deadline is *after* the signal
-/// arrived is deliberately excluded here — it is fired *after* the signal by the
-/// ordinary [`drain_ready`](crate::worker::drain_ready) pass.
-pub fn due_timers_before_signal(
+/// The signal ingest ([`SignalIngest`](crate::worker::SignalIngest)) reads this
+/// once per plan (issue #2020). Take a `wait_for_signal_timeout` deadline at or
+/// before a signal arrival (`fire_at <= received_at`). Its `TimerFired` goes
+/// ahead of the `SignalReceived`, so a late signal cannot flip the race (issue
+/// #476). Ties go to the timer, as in the Postgres `merge_wake_events` rule. A due
+/// deadline after the signal arrival fires after it, in
+/// [`drain_ready`](crate::worker::drain_ready).
+pub fn due_timers_with_deadlines(
     conn: &Connection,
     exec_id: ExecutionId,
     now: i64,
-    received_at: i64,
-) -> SqliteResult<Vec<String>> {
+) -> SqliteResult<Vec<(String, i64)>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT timer_id FROM harvest_timers \
-         WHERE exec_id = ?1 AND fired = 0 AND fire_at <= ?2 AND fire_at <= ?3 \
+        "SELECT timer_id, fire_at FROM harvest_timers \
+         WHERE exec_id = ?1 AND fired = 0 AND fire_at <= ?2 \
          ORDER BY fire_at, arm_seq",
     )?;
-    let rows = stmt.query_map(params![exec_id.to_string(), now, received_at], |row| {
-        row.get::<_, String>(0)
+    let rows = stmt.query_map(params![exec_id.to_string(), now], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
     let mut out = Vec::new();
     for r in rows {
@@ -669,6 +756,22 @@ pub fn delete_undelivered_signals_for_execution(
     )?)
 }
 
+/// Move every undelivered signal of `from` to `to` (issue #2023).
+///
+/// A continue-as-new calls it in the seal transaction, so a signal staged
+/// before the hand-off reaches the successor. Delivered rows stay with `from`
+/// as audit history, as on Postgres. Returns the number of rows moved.
+pub fn move_undelivered_signals(
+    conn: &Connection,
+    from: ExecutionId,
+    to: ExecutionId,
+) -> SqliteResult<usize> {
+    Ok(conn.execute(
+        "UPDATE harvest_signals SET exec_id = ?2 WHERE exec_id = ?1 AND delivered = 0",
+        params![from.to_string(), to.to_string()],
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use rusqlite::{Connection, params};
@@ -676,13 +779,13 @@ mod tests {
     use autumn_harvest::ExecutionId;
 
     use super::{
-        delete_undelivered_signals_for_execution, due_timers, due_timers_before_signal,
+        delete_undelivered_signals_for_execution, due_timers, due_timers_with_deadlines,
         enqueue_timer,
     };
     use crate::schema;
 
     // harvest_signals has no index beyond signal_seq, so this exec-scoped delete
-    // would be a full table SCAN without idx_harvest_signals_exec_delivered.
+    // would be a full table SCAN without idx_harvest_signals_exec_arrival.
     #[test]
     fn signal_cleanup_delete_uses_an_index_not_a_full_scan() {
         let conn = open();
@@ -697,13 +800,38 @@ mod tests {
             )
             .unwrap();
         assert!(
-            plan.contains("USING INDEX idx_harvest_signals_exec_delivered"),
+            plan.contains("USING INDEX idx_harvest_signals_exec_arrival"),
             "expected an index search, got plan: {plan}"
         );
         assert!(
             !plan.contains("SCAN"),
             "expected no full-table scan, got plan: {plan}"
         );
+    }
+
+    // Issue #2020: the bounded signal read must stream rows in arrival order.
+    // A temporary sort would first load every staged row, payload and all.
+    #[test]
+    fn the_pending_signal_read_uses_an_index_for_its_order() {
+        let conn = open();
+        let exec = ExecutionId::new();
+        let mut stmt = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                crate::store::PENDING_SIGNALS_SQL
+            ))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(params![exec.to_string()], |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let plan = plan.join(" | ");
+        assert!(
+            plan.contains("USING INDEX"),
+            "expected an index search: {plan}"
+        );
+        assert!(!plan.contains("TEMP B-TREE"), "expected no sort: {plan}");
     }
 
     fn open() -> Connection {
@@ -743,9 +871,9 @@ mod tests {
         );
         // The signal-interleave query carries the same tie-break.
         assert_eq!(
-            due_timers_before_signal(&conn, exec, 200, 200).unwrap(),
-            vec!["a".to_string(), "z".to_string()],
-            "due_timers_before_signal must apply the same arm_seq tie-break"
+            due_timers_with_deadlines(&conn, exec, 200).unwrap(),
+            vec![("a".to_string(), 100), ("z".to_string(), 100)],
+            "due_timers_with_deadlines must apply the same arm_seq tie-break"
         );
     }
 

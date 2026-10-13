@@ -8,9 +8,9 @@
 //! `command_name` and fell through the generic catch-all).
 //!
 //! This backend supports only fire-once `ctx.timer(...)` durable timers. The
-//! crate docs list the other unsupported primitives as v0.1 non-goals, such as
-//! local activities, updates, search attributes and cancellable timers.
-//! `command_name` rejects each of them BY NAME through its exhaustive match.
+//! crate docs list the other unsupported primitives as v0.1 non-goals. They are
+//! local activities, search attributes and cancellable timers. The exhaustive
+//! match in `command_name` rejects each one BY NAME.
 //!
 //! No Docker: `SQLite` is embedded (`rusqlite` `bundled`).
 

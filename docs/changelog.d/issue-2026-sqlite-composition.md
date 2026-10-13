@@ -15,7 +15,8 @@ backend.
 - **Results.** An awaited child's terminal writes `ChildWorkflowCompleted` or
   `ChildWorkflowFailed` to its `RUNNING` parent in the same transaction. A
   typed failure keeps `error_type`, `details` and `non_retryable`. A cancelled
-  child reports `child workflow cancelled: <reason>`. A due child-timeout
+  child reports `child workflow cancelled: <reason>`, and a terminated child
+  `child workflow terminated: <reason>`. A due child-timeout
   deadline fires before a late child's result, as on Postgres (issue #779).
 - **Parent-close policy.** When a parent ends, each running detached child
   gets its policy. `request_cancel` cancels it with reason `parent closed`.
@@ -39,6 +40,13 @@ backend.
   the new `RunState::WaitingWorkflow(target)`. `run_until_blocked` drives each
   such target in the same call, with a cycle budget per run. The fleet drivers
   treat it as blocked.
+- **Cancel, terminate and continue-as-new (issues #2021, #2023).** The
+  cooperative `cancel`, `terminate`, a history cap and every other seal close
+  the run, so its parent and detached children get the result. A child that
+  continues as new fails with the Postgres text, `continue_as_new is not
+  supported in child workflows in this release`. An await follows a target
+  that continues as new to its last run. A `TERMINATED` target gives
+  `target_terminated`.
 - **Reuse policy.** `AllowDuplicateFailedOnly` replaces a `CANCELLED` prior,
   as core does.
 - **Core replay fix.** `HistoryMatcher` now resolves a stashed await whose
@@ -68,7 +76,7 @@ and `harvest_signals.idempotency_key`. An old file gains them on open.
   external events first. Each event is the same, and replay accepts both
   orders.
 
-**Tests.** `autumn-harvest-sqlite/tests/integration/composition.rs` has 41
+**Tests.** `autumn-harvest-sqlite/tests/integration/composition.rs` has 46
 tests. Each test replays every history it asserts on the core
 `WorkflowReplayer`, with the run's ids. They cover:
 
@@ -82,7 +90,9 @@ tests. Each test replays every history it asserts on the core
 - the child timeout race, and a late child that loses to its deadline;
 - a reopen, mutual awaits, a blocked target beside a working sibling, and a
   run that its own cancel seals;
-- `join!` of an await and a child in both orders.
+- `join!` of an await and a child in both orders;
+- an operator cancel and a terminate of a child, a terminated await target, a
+  child that continues as new, and an await across a continue-as-new.
 
 Unit tests cover the schema step and a race loser with no row. The core test
 `match_external_await_resolves_past_a_sibling_child` pins the replay fix. The

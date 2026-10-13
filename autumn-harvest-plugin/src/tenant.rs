@@ -115,6 +115,7 @@ pub const TENANT_SCOPED_ROUTES: &[&str] = &[
     "GET /workflows/{id}/queries",
     "POST /workflows/{id}/update/{update_name}",
     "GET /workflows/{id}/update/{update_id}/result",
+    "GET /workflows/{id}/stream/durable",
 ];
 
 /// The one start route a tenant-bound caller may use.

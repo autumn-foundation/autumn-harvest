@@ -17,7 +17,7 @@ use autumn_harvest::testing::WorkflowReplayer;
 use autumn_harvest::{
     AcknowledgedBreakingChange, DetCheckReport, DetSeverity, SchemaContractDiff, SchemaDelta,
     SchemaRole, WorkflowSchemaContract, check_paths, diff_schema_contracts,
-    dropped_acknowledgements, unacknowledged_breaking,
+    dropped_acknowledgements, subject_label, unacknowledged_breaking,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use diesel_async::AsyncPgConnection;
@@ -391,6 +391,10 @@ pub enum PartitionCommand {
     /// sweeps droppable cohorts. The retention janitor does exactly this every
     /// tick; this exists for incident response and for a deployment that runs
     /// with history retention disabled (where no janitor is running to do it).
+    ///
+    /// This command never exports a partition. On a shard whose engine exports
+    /// aged partitions (issue #2009), it drops nothing and reports
+    /// `export required, but no archiver is set`.
     Maintain {
         /// A shard database DSN. Repeat once per shard.
         #[arg(long = "shard", value_name = "DSN", required = true)]
@@ -7558,18 +7562,32 @@ async fn run_dr_promote(shards: &[String], format: DrFormat) -> Result<(), CliEr
 
 /// Reads and parses a schema-contract document, naming the path on failure.
 fn read_schema_contract(path: &Path) -> Result<WorkflowSchemaContract, CliError> {
+    read_schema_contract_and_shape(path).map(|(contract, _)| contract)
+}
+
+/// Reads a schema-contract document, and reports whether it is a bare
+/// `GET /workflows/registered` array (issue #1994).
+///
+/// A bare array has no activity or side-effect section, so the guard in
+/// [`guard_empty_current`] needs to know the shape.
+fn read_schema_contract_and_shape(path: &Path) -> Result<(WorkflowSchemaContract, bool), CliError> {
     let raw = std::fs::read_to_string(path).map_err(|e| {
         CliError::InvalidInput(format!(
             "failed to read schema contract `{}`: {e}",
             path.display()
         ))
     })?;
+    let bare = raw.trim_start().starts_with('[');
     WorkflowSchemaContract::parse(&raw)
+        .map(|contract| (contract, bare))
         .map_err(|e| CliError::InvalidInput(format!("`{}` is not usable: {e}", path.display())))
 }
 
-/// Renders a schema diff as `workflow.role: <field> — <verdict> — <reason>`
+/// Renders a schema diff as `subject.role: <field> — <verdict> — <reason>`
 /// lines, one per delta, plus a summary line.
+///
+/// The subject is a workflow name, `activity:<name>` or
+/// `<workflow>/side_effect:<id>` (issue #1994).
 #[must_use]
 pub fn format_schema_diff_text(diff: &SchemaContractDiff) -> String {
     use std::fmt::Write as _;
@@ -7586,7 +7604,7 @@ pub fn format_schema_diff_text(diff: &SchemaContractDiff) -> String {
         let _ = writeln!(
             out,
             "{}.{}: {} — {} — {}",
-            d.workflow,
+            subject_label(d.subject, &d.workflow, d.side_effect.as_deref()),
             role,
             field,
             d.verdict.as_str(),
@@ -7651,8 +7669,8 @@ pub fn run_schema_check(
     acknowledged_in: Option<&Path>,
 ) -> Result<(), CliError> {
     let base = read_schema_contract(baseline)?;
-    let cur = read_schema_contract(current)?;
-    guard_empty_current(&base, &cur, current)?;
+    let (cur, is_bare_registry) = read_schema_contract_and_shape(current)?;
+    guard_empty_current(&base, &cur, current, is_bare_registry)?;
     let diff = diff_schema_contracts(&base, &cur);
 
     match format {
@@ -7737,9 +7755,10 @@ pub fn run_schema_check(
     // Two siblings are deliberately NOT compared here. `version` records which
     // BUILD produced the artifact rather than what the gate checks, so tying
     // currency to it would force a regeneration on every crate version bump for
-    // no safety gain. `contract_version` needs no check at all — `parse` already
-    // hard-refuses a value this build does not implement — and `workflows` and
-    // `coverage` are rebuilt from the entries on parse.
+    // no safety gain. `contract_version` needs no check at all. `parse` refuses
+    // a value this build does not implement. It also refuses a legacy `1` that
+    // carries activity or side-effect content (issue #1994). `parse` rebuilds
+    // `workflows`, `activities`, `side_effects` and `coverage` from the entries.
     //
     // Reported before the delta staleness below because it is the stronger
     // claim: a stale schema means the artifact is behind, while a doctored
@@ -7790,7 +7809,7 @@ fn format_unacknowledged(missing: &[&SchemaDelta]) -> String {
         let _ = writeln!(
             out,
             "  {}{role}{}: {} — {}",
-            d.workflow,
+            subject_label(d.subject, &d.workflow, d.side_effect.as_deref()),
             d.field_path,
             d.change.as_str(),
             d.reason
@@ -7810,7 +7829,7 @@ fn format_dropped(dropped: &[&AcknowledgedBreakingChange]) -> String {
         let _ = writeln!(
             out,
             "  {}{role}{}: {} — recorded as {:?}",
-            a.workflow,
+            subject_label(a.subject, &a.workflow, a.side_effect.as_deref()),
             a.field_path,
             a.change.as_str(),
             a.reason
@@ -7836,6 +7855,7 @@ fn guard_empty_current(
     base: &WorkflowSchemaContract,
     cur: &WorkflowSchemaContract,
     current: &Path,
+    is_bare_registry: bool,
 ) -> Result<(), CliError> {
     if cur.workflows.is_empty() && !base.workflows.is_empty() {
         return Err(CliError::InvalidInput(format!(
@@ -7847,6 +7867,40 @@ fn guard_empty_current(
             current.display(),
             base.workflows.len(),
             base.workflows.len()
+        )));
+    }
+    // A bare `GET /workflows/registered` array has no activity or side-effect
+    // section (issue #1994). Diffed as is, it reports every one as removed and
+    // buries the real cause. A generated contract that drops a section is not
+    // refused here: each removal is then a delta of its own.
+    if !is_bare_registry {
+        return Ok(());
+    }
+    let missing: Vec<(&str, usize)> = [
+        ("activities", base.activities.len(), cur.activities.len()),
+        (
+            "side effects",
+            base.side_effects.len(),
+            cur.side_effects.len(),
+        ),
+    ]
+    .into_iter()
+    .filter(|&(_, in_base, in_cur)| in_base > 0 && in_cur == 0)
+    .map(|(section, in_base, _)| (section, in_base))
+    .collect();
+    if !missing.is_empty() {
+        let sections: Vec<&str> = missing.iter().map(|&(section, _)| section).collect();
+        let counts: Vec<String> = missing
+            .iter()
+            .map(|(section, n)| format!("{section} ({n})"))
+            .collect();
+        return Err(CliError::InvalidInput(format!(
+            "`{}` is a bare `GET /workflows/registered` body, so it publishes no {}, but the \
+             baseline has {}. Generate `--current` with \
+             `WorkflowSchemaContract::with_activities` and `with_side_effects` instead.",
+            current.display(),
+            sections.join(" and "),
+            counts.join(" and ")
         )));
     }
     Ok(())
@@ -7904,10 +7958,10 @@ pub fn run_schema_update(
     recorded_in: Option<&str>,
 ) -> Result<(), CliError> {
     let base = read_schema_contract(baseline)?;
-    let cur = read_schema_contract(current)?;
+    let (cur, is_bare_registry) = read_schema_contract_and_shape(current)?;
     // Refuse here too: `update` is the path that would OVERWRITE the baseline
     // with the empty document and disarm the gate for every later run.
-    guard_empty_current(&base, &cur, current)?;
+    guard_empty_current(&base, &cur, current, is_bare_registry)?;
     let diff = diff_schema_contracts(&base, &cur);
 
     // The core recomputes the diff internally rather than accepting ours: it is
@@ -8808,6 +8862,11 @@ fn format_usage_table(value: &Value) -> String {
         "ACT_EXEC",
         "ACT_FAILED",
         "COMPUTE_S",
+        "LLM_CALLS",
+        "LLM_IN",
+        "LLM_OUT",
+        "LLM_COST_USD",
+        "LLM_UNPRICED",
     ]
     .iter()
     .map(ToString::to_string)
@@ -8825,6 +8884,11 @@ fn format_usage_table(value: &Value) -> String {
             cell_number(group.get("activity_executions")),
             cell_number(group.get("activity_executions_failed")),
             format_f64(group.get("activity_compute_seconds")),
+            cell_number(group.get("llm_calls")),
+            cell_number(group.get("llm_input_tokens")),
+            cell_number(group.get("llm_output_tokens")),
+            format_usd_micros(group.get("llm_cost_usd_micros")),
+            cell_number(group.get("llm_unpriced_calls")),
         ]);
     }
 
@@ -8981,6 +9045,19 @@ fn format_rate_limit_table(value: &Value) -> String {
     }
 
     render_table(&rows)
+}
+
+/// Millionths of a US dollar as dollars with six decimals (issue #1996).
+///
+/// An absent field, as from an older server, stays blank.
+fn format_usd_micros(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_i64)
+        .map_or_else(String::new, |micros| {
+            let sign = if micros < 0 { "-" } else { "" };
+            let abs = micros.unsigned_abs();
+            format!("{sign}{}.{:06}", abs / 1_000_000, abs % 1_000_000)
+        })
 }
 
 fn format_f64(value: Option<&Value>) -> String {
@@ -16728,6 +16805,76 @@ mod usage_cli_tests {
         assert!(rendered.contains("group_by: workflow_name"));
         assert!(rendered.contains("onboarding"));
         assert!(rendered.contains("123.46"));
+    }
+
+    #[test]
+    fn format_usage_table_renders_the_llm_ledger_columns() {
+        let value = serde_json::json!({
+            "status": "complete",
+            "from": "2026-01-01T00:00:00Z",
+            "to": "2026-02-01T00:00:00Z",
+            "group_by": "search_attr:tenant_id",
+            "groups": [
+                {
+                    "group": "acme",
+                    "workflow_starts": 1,
+                    "completed": 1,
+                    "failed": 0,
+                    "cancelled": 0,
+                    "timed_out": 0,
+                    "activity_executions": 2,
+                    "activity_executions_failed": 0,
+                    "activity_compute_seconds": 1.0,
+                    "llm_calls": 3,
+                    "llm_input_tokens": 1_250,
+                    "llm_output_tokens": 340,
+                    "llm_cost_usd_micros": 1_234_567,
+                    "llm_unpriced_calls": 0,
+                    "llm_latency_ms": 900
+                }
+            ],
+            "unavailable_shards": []
+        });
+        let rendered = format_usage_table(&value);
+        for column in [
+            "LLM_CALLS",
+            "LLM_IN",
+            "LLM_OUT",
+            "LLM_COST_USD",
+            "LLM_UNPRICED",
+        ] {
+            assert!(rendered.contains(column), "{column}: {rendered}");
+        }
+        assert!(rendered.contains("1250"), "{rendered}");
+        assert!(rendered.contains("340"), "{rendered}");
+        assert!(rendered.contains("1.234567"), "{rendered}");
+    }
+
+    #[test]
+    fn format_usage_table_leaves_llm_cells_blank_for_an_older_server() {
+        let value = serde_json::json!({
+            "status": "complete",
+            "from": "2026-01-01T00:00:00Z",
+            "to": "2026-02-01T00:00:00Z",
+            "group_by": "workflow_name",
+            "groups": [{"group": "onboarding", "workflow_starts": 1}],
+            "unavailable_shards": []
+        });
+        let rendered = format_usage_table(&value);
+        assert!(rendered.contains("LLM_COST_USD"), "{rendered}");
+        assert!(!rendered.contains("0.000000"), "{rendered}");
+    }
+
+    #[test]
+    fn format_usd_micros_prints_dollars_with_six_decimals() {
+        let cell = |v: serde_json::Value| format_usd_micros(Some(&v));
+        assert_eq!(cell(serde_json::json!(0)), "0.000000");
+        assert_eq!(cell(serde_json::json!(5)), "0.000005");
+        assert_eq!(cell(serde_json::json!(1_234_567)), "1.234567");
+        assert_eq!(cell(serde_json::json!(-1_500_000)), "-1.500000");
+        assert_eq!(cell(serde_json::json!(i64::MAX)), "9223372036854.775807");
+        assert_eq!(cell(serde_json::json!(u64::MAX)), "", "not an i64");
+        assert_eq!(format_usd_micros(None), "");
     }
 
     #[test]

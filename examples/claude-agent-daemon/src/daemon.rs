@@ -231,8 +231,8 @@ pub async fn serve(options: Options) -> Result<(), String> {
     // off another daemon's file in every slower case.
     lock.still_names(&options.db)?;
     runtime.register_workflow(&session::agent_session_info());
-    runtime.register_activity(&session::claude_turn_info(), claude::activity_body(model));
-    runtime.register_activity(
+    runtime.register_activity_with_body(&session::claude_turn_info(), claude::activity_body(model));
+    runtime.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(options.workspace.clone()),
     );
@@ -1815,8 +1815,19 @@ async fn drive_one(
             // of it, which is text this daemon did not write.
             tracing::error!(%exec, error = %crate::one_line(&error), "session failed");
         }
+        // Issue #2021: a cancelled or terminated run cannot be driven again.
+        Ok(RunState::Cancelled(reason) | RunState::Terminated(reason)) => {
+            retire(blocked, live, exec);
+            tracing::info!(%exec, reason = %crate::one_line(&reason), "session stopped");
+        }
         Ok(RunState::InProgress) => {
             blocked.remove(&exec);
+        }
+        // Issue #2023: the old run is sealed. Drive the successor instead.
+        Ok(RunState::ContinuedAsNew(successor)) => {
+            retire(blocked, live, exec);
+            enlist(live, successor);
+            tracing::info!(%exec, %successor, "session continued as new");
         }
         // A drive failure carries the activity's own message, which holds
         // the same untrusted text one step further in.

@@ -617,7 +617,7 @@ The shipped tree passes the check: a bare `harvest det-check` at the repo root r
 
 `det-check` covers non-deterministic **code**. The sibling hazard is a
 non-deterministic **payload**: renaming, retyping, or adding a required field to
-a workflow's input/output/error type compiles green but silently breaks every
+a workflow, activity or side-effect payload type compiles green but silently breaks every
 in-flight execution, whose recorded `harvest_events` JSON no longer deserializes.
 
 That is gated by **`harvest schema check`**
@@ -631,7 +631,7 @@ $ cargo run --quiet --bin dump-schema-contract > /tmp/current.json
 $ harvest schema check --current /tmp/current.json
 ```
 
-`dump-schema-contract` is a **three-line binary you add to your own crate** —
+`dump-schema-contract` is a **short binary you add to your own crate** —
 Harvest is a library, so only your process can enumerate the workflow registry.
 [The schema-contract guide](workflow-schema-contract-guide.md#generating---current)
 has the snippet; `autumn-harvest/examples/schema_workflow.rs --emit-contract` is

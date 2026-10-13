@@ -326,7 +326,9 @@ fn notify_parent(
             worker::fire_timer_within_tx(conn, parent, &timer_id)?;
         }
     }
-    if let Some(event) = child_result_event(exec, terminal) {
+    // `terminate` writes `WorkflowCancelled` too. Only the state tells it apart.
+    let terminated = store::execution_state(conn, exec)? == "TERMINATED";
+    if let Some(event) = child_result_event(exec, terminal, terminated) {
         store::append_event(conn, parent, &event)?;
     }
     Ok(())
@@ -335,8 +337,13 @@ fn notify_parent(
 /// The event an awaited child's terminal writes to its parent.
 ///
 /// A completion maps to `ChildWorkflowCompleted`. A failure keeps its typed
-/// fields. A cancel becomes an untyped `ChildWorkflowFailed`, as on Postgres.
-fn child_result_event(child_id: ExecutionId, terminal: &WorkflowEvent) -> Option<WorkflowEvent> {
+/// fields. A cancel or a terminate becomes an untyped `ChildWorkflowFailed`,
+/// as on Postgres. `terminated` selects the terminate text.
+fn child_result_event(
+    child_id: ExecutionId,
+    terminal: &WorkflowEvent,
+    terminated: bool,
+) -> Option<WorkflowEvent> {
     match terminal {
         WorkflowEvent::WorkflowCompleted { output } => {
             Some(WorkflowEvent::ChildWorkflowCompleted {
@@ -359,7 +366,11 @@ fn child_result_event(child_id: ExecutionId, terminal: &WorkflowEvent) -> Option
         // A reuse-policy seal also cancels, as the Postgres pre-check path does.
         WorkflowEvent::WorkflowCancelled { reason } => Some(WorkflowEvent::ChildWorkflowFailed {
             child_id,
-            error: format!("child workflow cancelled: {reason}"),
+            error: if terminated {
+                format!("child workflow terminated: {reason}")
+            } else {
+                format!("child workflow cancelled: {reason}")
+            },
             error_type: None,
             details: None,
             non_retryable: None,
@@ -644,7 +655,7 @@ fn await_outcome(
     await_id: ExternalAwaitId,
     target: ExecutionId,
 ) -> SqliteResult<Option<WorkflowEvent>> {
-    let Some(state) = state_of(conn, target)? else {
+    let Some((target, state)) = current_run(conn, target)? else {
         return Ok(Some(await_failed(await_id, "target_unknown", None)));
     };
     let event = match state.as_str() {
@@ -664,11 +675,42 @@ fn await_outcome(
             "target_timed_out",
             store::execution_error(conn, target)?,
         ),
+        "TERMINATED" => await_failed(
+            await_id,
+            "target_terminated",
+            store::execution_error(conn, target)?,
+        ),
         // A reuse-policy seal (`CONTINUED_AS_NEW`) records no successor here.
         // Report the run's own last terminal event instead.
         _ => sealed_target(conn, await_id, target)?,
     };
     Ok(Some(event))
+}
+
+/// The most recent run in the continue-as-new chain of `target`, and its state.
+///
+/// A run that continued as new hands the await to its successor, as on
+/// Postgres (issue #2023). A reuse-policy seal has no successor, so the chain
+/// stops there. `None` means that `target` has no row.
+fn current_run(
+    conn: &Connection,
+    target: ExecutionId,
+) -> SqliteResult<Option<(ExecutionId, String)>> {
+    let mut run = target;
+    loop {
+        let Some(state) = state_of(conn, run)? else {
+            return Ok(None);
+        };
+        let successor = if state == "CONTINUED_AS_NEW" {
+            store::successor_of(conn, run)?
+        } else {
+            None
+        };
+        match successor {
+            Some(next) => run = next,
+            None => return Ok(Some((run, state))),
+        }
+    }
 }
 
 /// `ExternalAwaitFailed` for a target that ended `FAILED`, with the typed
@@ -775,12 +817,17 @@ pub fn awaited_running_runs(
 ) -> SqliteResult<Vec<ExecutionId>> {
     let mut running = Vec::new();
     for cmd in commands {
-        let id = match cmd {
-            WorkflowCommand::StartChildWorkflow { child_id, .. } => *child_id,
-            WorkflowCommand::AwaitExternalWorkflow { target, .. } => *target,
+        let current = match cmd {
+            WorkflowCommand::StartChildWorkflow { child_id, .. } => {
+                state_of(conn, *child_id)?.map(|state| (*child_id, state))
+            }
+            WorkflowCommand::AwaitExternalWorkflow { target, .. } => current_run(conn, *target)?,
             _ => continue,
         };
-        if !running.contains(&id) && state_of(conn, id)?.as_deref() == Some("RUNNING") {
+        if let Some((id, state)) = current
+            && state == "RUNNING"
+            && !running.contains(&id)
+        {
             running.push(id);
         }
     }

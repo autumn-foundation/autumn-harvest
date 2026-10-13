@@ -981,6 +981,7 @@ It can use only the routes in `TENANT_SCOPED_ROUTES`:
 - `POST /workflows/{id}/signal/{name}`.
 - `GET` and `POST /workflows/{id}/query/{name}`, and `GET /workflows/{id}/queries`.
 - `POST /workflows/{id}/update/{name}` and `GET /workflows/{id}/update/{update_id}/result`.
+- `GET /workflows/{id}/stream/durable`, the durable progress stream (#1974).
 
 Public routes such as `/health` also answer. The token scope still applies,
 so a `read` tenant token cannot cancel.
@@ -1307,6 +1308,9 @@ the codec encrypts. Set it with `WorkflowFailure::with_details` or
 `ActivityFailure::with_details`. A plain `Err(String)` sets no `details`. The
 other variants have no encrypted field for failure data.
 
+The agent cost ledger stays in clear too. See
+[LLM cost ledger](#llm-cost-ledger-issue-1996).
+
 Event types, ids, timestamps and workflow names also stay in clear. So do the
 build id and the worker id in `DecisionCommitted` (issue #1833). A worker id
 often holds a host name or a pod name. The redacted export keeps both. Do not put
@@ -1319,6 +1323,38 @@ The associated data binds the version and the key id, not the row. A writer
 with access to `harvest_events` can copy a ciphertext to another field, event
 or execution under the same key, and it decodes. Restrict write access to the
 Harvest database.
+
+### Agent response cache (issue #1998)
+
+The agent response cache is opt-in. It stores each answer in the embedder's
+`PayloadStore`, encoded by the `PayloadCodecs` that the embedder passes in.
+Pass a clone of the engine registry, so an active codec encrypts each entry.
+A registry with no active codec stores entries in clear. The entry holds the
+answer, its stop reason and its token usage. It holds no prompt. With an
+active codec, a read refuses an entry that is not a codec envelope.
+
+These cache fields stay in clear:
+
+- The cache key. It is an unkeyed SHA-256 hash of the request and the tenant.
+  A reader of the index can test a guessed prompt against a key. Set a secret
+  `ResponseCache::namespace` to stop that.
+- The blob key that the `PayloadStore` returns.
+
+The default scope is the tenant. On Postgres, the activity reads the verified
+tenant of the run (issue #1977). `AgentTask::tenant` cannot change it. A run
+with no verified tenant uses `AgentTask::tenant` as a declared tenant. Only a
+principal with no tenant binding can start such a run. A declared tenant
+never shares an entry with a verified tenant of the same name. A local
+activity cannot read the tenant, so it skips the cache.
+
+`CacheScope::Shared` lets every tenant read every entry. A hit records
+`cache_hit: true` in the run history. A tenant can therefore learn that
+another tenant sent the same request.
+
+Erasure (issue #495) does not reach the cache. Key rotation (issue #948) does
+not re-encrypt cache entries. `ResponseCache::max_age` limits what the cache
+serves, not what the store keeps. Give the cache its own store, with an
+expiry of at least `max_age`.
 
 ### Column coverage (issue #1979)
 
@@ -1383,6 +1419,7 @@ a `JSONB` column has no row here. Gaps marked #2043 are follow-up work.
 | `harvest_schedules.buffered_runs` | Clear | Fire times only. |
 | `harvest_schedules.retry_policy` | Clear | Engine configuration, not payload. |
 | `harvest_signals.payload` | Covered | The signal payload. Signal ingest decodes it before it records `SignalReceived`. |
+| `harvest_stream_chunks.chunk` | Clear | Durable output chunks (#1974). The stream route sends them as stored. PII erasure deletes them. Do not put secrets in a chunk. |
 | `harvest_dead_letters.input` | Covered | The failed task input. A completion-callback entry copies the clear webhook body, so it stays in clear. Follow-up #2043. |
 | `harvest_workers.queues` | Clear | Worker registration, not payload. |
 | `harvest_workers.shard_assignments` | Clear | Worker registration, not payload. |
@@ -1415,6 +1452,38 @@ a `JSONB` column has no row here. Gaps marked #2043 are follow-up work.
 
 The SQLite and Redis backends do not use the codec. The connector dead-letter
 table, `harvest_connector_dead_letters`, stores raw message bytes in clear.
+
+### LLM cost ledger (issue #1996)
+
+The [agent cost ledger](llm-cost-ledger.md) stores one row per LLM call in
+`harvest_llm_ledger`. The codec does not cover this table. Every column is
+in clear:
+
+| Column | Holds |
+|---|---|
+| `workflow_exec_id`, `event_id`, `call_index` | The run, its completion event and the call order. |
+| `activity_name` | The activity type of the step. |
+| `model` | The model id that the activity or the agent model names. |
+| `input_tokens`, `output_tokens` | The token counts. |
+| `cost_usd_micros` | The cost in millionths of a US dollar, or `NULL`. |
+| `latency_ms` | The call latency. |
+| `recorded_at` | The completion time, equal to the completion event's `timestamp`. |
+
+The fields are in clear by design. SQL usage reports sum them without a key,
+so a report never decrypts an event. The LLM budgets (issue #1997) sum the
+same rows, joined to the run for its tenant key. An operator who reads the database
+sees which models a tenant uses, how many tokens it spends and what it
+costs. Accept that before your activities record calls.
+
+The ledger holds no prompt and no answer. Those stay in the encrypted
+`input` and `output` fields. The model id is the only free-form text. The
+engine accepts only a token of 1 to 200 bytes: ASCII letters, digits and
+`._:/@+-`. A prompt or a sentence does not fit, but the engine cannot detect
+PII. Keep PII out of the model id.
+
+Erasure (issue #495) keeps the rows, because they hold no payload.
+Retention deletes them with the run. The cross-region DR publication copies
+them to the standby. The history archive does not hold them.
 
 ### Key providers
 

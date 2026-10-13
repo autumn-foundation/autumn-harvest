@@ -24,7 +24,7 @@ R&D decision record [`docs/rnd/sqlite-feasibility.md`](rnd/sqlite-feasibility.md
 5. [Registering workflows and activities](#5-registering-workflows-and-activities)
 6. [Starting a workflow](#6-starting-a-workflow)
 7. [The drive model](#7-the-drive-model)
-8. [Signals (pull-only)](#8-signals-pull-only)
+8. [Signals](#8-signals), and [updates](#updates-issue-2025)
 9. [Child workflows and commands between runs](#9-child-workflows-and-commands-between-runs)
 10. [Durability and crash recovery](#10-durability-and-crash-recovery)
 11. [The single-writer / single-server contract](#11-the-single-writer--single-server-contract)
@@ -111,17 +111,33 @@ async fn process_order(ctx: &WorkflowContext, order: Order) -> Result<String, St
 }
 
 #[activity]
-async fn reserve_inventory(_ctx: &ActivityContext, _order: Order) -> Result<String, String> {
-    Ok(String::new())
+async fn reserve_inventory(ctx: &ActivityContext, order: Order) -> Result<String, String> {
+    // Stable across retries and re-runs: safe to send to a downstream API.
+    let key = ctx.idempotency_key().map_err(|e| e.to_string())?;
+    Ok(format!("reserved {}x {} ({key})", order.qty, order.item))
 }
 ```
 
-> **Important — activity bodies are separate.** On this backend an activity runs
-> a caller-supplied **synchronous** body registered against the activity's
-> `ActivityInfo`. The `#[activity]` async fn only supplies the macro-generated
-> `*_info()` companion (the name plus any declared `#[activity(...)]` defaults);
-> the closure you register in step 5 is what actually executes. There is no
-> `ActivityContext` I/O framework here — you write plain `Fn(Value) -> Result<Value, String>`.
+> **The `#[activity]` body runs (issue #2024).** `register_activity(&info)` runs
+> the async body itself, on the drive's async runtime, with a real
+> `ActivityContext`. The same fn runs unchanged on this backend and on Postgres.
+> `ctx.info()` reports the same values as the Postgres worker for one process.
+> They are the run, the activity, the 1-based `attempt`, `max_attempts`, the
+> task queue and the task row id. `ctx.heartbeat(..)` stores the latest payload on the task
+> row, so a retry or a reopen resumes from it with `ctx.heartbeat_details()`.
+> `ctx.previous_failure()` is the previous attempt's error. The cancellation
+> token never fires here.
+>
+> Some values differ from Postgres by design:
+>
+> - With no declared `retry`, this backend runs one attempt, so
+>   `max_attempts()` is `1`. Postgres applies its engine default.
+> - A re-run after a crash, or after a dropped drive, keeps its `attempt`
+>   number. Postgres counts the lost attempt.
+> - `ctx.state::<T>()` is always `None`, `ctx.headers()` is empty, and
+>   `ctx.metrics()` records nothing.
+> - `heartbeat_timeout` is rejected at registration. No scanner times out a
+>   silent attempt here.
 
 ---
 
@@ -158,11 +174,7 @@ Registrations live in process memory, not the database, so **every runtime
 
 ```rust
 rt.register_workflow(&process_order_info());
-
-rt.register_activity(&reserve_inventory_info(), |input| {
-    let order: Order = serde_json::from_value(input).map_err(|e| e.to_string())?;
-    Ok(serde_json::json!(format!("reserved {}x {}", order.qty, order.item)))
-});
+rt.register_activity(&reserve_inventory_info());
 ```
 
 - **`register_workflow(&WorkflowInfo)`** retains only the workflow's `name` +
@@ -171,13 +183,26 @@ rt.register_activity(&reserve_inventory_info(), |input| {
   (`execution_timeout`, a workflow-level `retry_policy`, `concurrency`,
   `debounce`, `batch`, `throttle`, a raised `max_input_bytes`), registration
   **panics at setup time** naming the feature — never a silently-dropped setting.
-- **`register_activity(&ActivityInfo, body)`** is the audited path: it honors the
+- **`register_activity(&ActivityInfo)`** is the default. It runs the
+  `#[activity]` body with an `ActivityContext`. It honors the
   declared `#[activity(...)]` defaults it can (`schedule_to_close`, the full
   `retry` policy — `max_attempts` + backoff + non-retryable classification —
   `start_to_close`, `queue`) and **panics** for one it cannot
   (`heartbeat_timeout`, `schedule_to_start`, `circuit_breaker`, `rate_limit_*`,
   `max_concurrent`, `is_local`, …). This keeps a declared setting from taking
   silently-wrong effect.
+- **`register_activity_with_body(&ActivityInfo, body)`** runs the same audit,
+  but runs a synchronous `Fn(Value) -> Result<Value, String>` closure in place of
+  the `#[activity]` body. The closure gets no `ActivityContext`. Use it to stub an
+  activity in a test, or to capture process state that the context cannot carry:
+
+```rust
+rt.register_activity_with_body(&reserve_inventory_info(), |input| {
+    let order: Order = serde_json::from_value(input).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!(format!("stub: {}", order.id)))
+});
+```
+
 - **`register_activity_raw(name, ActivitySpec::new(max_attempts, body))`** is the
   escape hatch — a hand-made body that carries no `ActivityInfo` and runs no
   audit. Use it when you don't have (or don't want) the macro companion:
@@ -257,6 +282,9 @@ match rt.run_until_blocked(exec).await? {
     RunState::WaitingSignal(name) => println!("blocked on signal `{name}`"),
     RunState::WaitingTimer      => println!("blocked on a durable timer"),
     RunState::WaitingWorkflow(other) => println!("blocked on run {other}"),
+    RunState::Cancelled(reason) => println!("cancelled: {reason}"),
+    RunState::Terminated(reason) => println!("terminated: {reason}"),
+    RunState::ContinuedAsNew(next) => println!("continued as new; drive {next}"),
     RunState::InProgress        => {} // not returned by run_until_blocked
 }
 
@@ -266,7 +294,7 @@ match rt.outcome(exec)? {
     ExecutionOutcome::Completed(output) => println!("{output}"),
     ExecutionOutcome::Failed(err)       => println!("{err}"),
     ExecutionOutcome::Running           => println!("still running"),
-    ExecutionOutcome::Terminated(state) => println!("terminal ({state}) — superseded/cancelled, no clean output"),
+    ExecutionOutcome::Terminated(state) => println!("terminal ({state}) — superseded, cancelled or terminated"),
 }
 ```
 
@@ -279,6 +307,7 @@ match rt.outcome(exec)? {
   pending work now" call. Follow it with `outcome(exec)` for a pure read.
 - **`poll_once()`** for a custom loop — e.g. a background tick where you decide
   the cadence and inspect the `bool` progress flag yourself.
+
 
 `poll_once()`/`run_until_idle()` drive every execution in a pass even if an
 earlier one errors — see [§12](#12-v01-non-goals-and-follow-ups) for what
@@ -299,12 +328,151 @@ Timers use the real wall clock (read once per decision cycle), so a run blocked
 on a `ctx.timer(...)` that is not yet due returns `WaitingTimer`; drive it again
 after the deadline passes and it proceeds.
 
+### Cancel and terminate
+
+Stop a run with `cancel` (cooperative) or `terminate` (at once). Both take a
+reason. A blank reason gets the Postgres default text.
+
+```rust
+// Cooperative: the body sees the reason on the next drive.
+rt.cancel(exec, "user stopped the session")?;
+match rt.run_until_blocked(exec).await? {
+    RunState::Cancelled(reason) => println!("cancelled: {reason}"),
+    other => println!("not ended yet: {other:?}"),
+}
+
+// At once: the body does not run again.
+rt.terminate(other_exec, "stuck for an hour")?;
+```
+
+**Cancel.** `cancel` stores the request and appends no event. The next drive
+replays the body with `ctx.cancellation_reason()` set. The body can check it
+and run cleanup activities:
+
+```rust
+ctx.execute_activity_raw("step", input, "default").await.map_err(|e| e.to_string())?;
+if let Some(reason) = ctx.cancellation_reason() {
+    ctx.execute_activity_raw("cleanup", json!(reason), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    return Ok(json!("cleaned up"));
+}
+ctx.wait_for_signal("next").await.map_err(|e| e.to_string())
+```
+
+The body sees the request from the start of its replay, not from the point
+where the request arrived. Put the check after the last await that records
+history, as above, just before a signal wait. A check that runs before
+recorded commands, such as a check at the top of a loop, diverges on replay.
+
+The run ends `CANCELLED` when one of these occurs:
+
+- The body returns `Ok` or `Err`, or continues as new. The output of an `Ok`
+  is not kept, and no successor starts.
+- The body blocks on a signal, a timer or another run (issue #2026), and no
+  activity task is left to run. A parked await cannot see the request.
+- The cycle diverges or deadlocks. The driver discards that cycle.
+- The drive meets an error that repeats on every drive: an unregistered
+  activity or workflow, or a stuck cycle.
+- The run has added 1,000 events since the request. A body that ignores the
+  request and keeps working cannot run forever. The budget leaves room for
+  about 500 cleanup activities. The budget acts as one more event cap: a
+  cycle whose events reach it, or reach a history cap, is discarded.
+
+The seal drops each pending task. Each one first gets a non-retryable
+`ActivityFailed`, so a body that awaits it still replays. The error type
+is `UnregisteredActivity` for an unregistered activity, and `CancelSealed`
+otherwise. These failures must fit the history caps, but not the cleanup
+budget. Failures that reach a cap roll back, and the seal then adds only
+`WorkflowCancelled`. `terminate` adds no failures, as on Postgres.
+
+So every cancel ends the run. Cleanup can run activities, but it must not
+wait on a timer or a signal: that wait ends the run. A pending activity task,
+such as a retry in backoff, still runs, and the body sees the request when
+that await resolves. A repeat `cancel` keeps the first reason. The request
+survives a crash and a reopen. An update replays the body with the pending
+request too, so its handlers see `cancellation_reason()`.
+
+**Terminate.** `terminate` ends the run `TERMINATED` in one transaction. The
+body does not run again, and `terminate` drops a pending cancel request.
+
+**Both paths:**
+
+- The run gets the core `WorkflowCancelled { reason }` event as its last
+  event, as on Postgres. Cleanup events come before it.
+- The pending tasks, unfired timers and staged signals are deleted.
+- An unknown id returns `SqliteError::ExecutionNotFound`. A terminal run
+  returns `SqliteError::WorkflowNotRunning`. Postgres treats a repeat call on
+  a terminal run as a no-op, but this backend refuses it.
+- `outcome(exec)` reports `ExecutionOutcome::Terminated("CANCELLED")` or
+  `ExecutionOutcome::Terminated("TERMINATED")`. The drive returns the reason
+  in `RunState::Cancelled` or `RunState::Terminated`.
+- `AllowDuplicateFailedOnly` replaces a `CANCELLED` prior, as on Postgres. A
+  `TERMINATED` prior frees its `workflow_id` for every policy.
+- A cleanup or an `update` that reaches a history cap or the cleanup budget
+  ends the run `CANCELLED`, not `FAILED`. An unsupported command or a used-up panic budget during cleanup
+  ends the run `FAILED`, as without a cancel.
+
+A cancelled or terminated history replays on the core `WorkflowReplayer` only
+when the body checks `is_cancelled()` before its next new command. A body
+parked on a signal with no check reports non-determinism. A Postgres history
+of the same shape does the same.
+
+### Long-lived runs: `continue_as_new` and the history caps (issue #2023)
+
+Each decision reloads and replays the whole history. A loop workflow, such as
+an agent session or a poller, must therefore bound its history. Call
+`ctx.continue_as_new(input)`. One transaction then does all of this:
+
+- It appends `WorkflowContinuedAsNew` and seals the run `CONTINUED_AS_NEW`.
+- It starts a successor with the same `workflow_name` and `workflow_id`. The
+  successor's `WorkflowStarted` carries `input`.
+- It appends the staged signals that the hand-off decision replayed to the
+  old run (issue #2020). Such a signal stays with the old run, read or not,
+  as on Postgres. A backlog past the room the history caps leave was not
+  replayed. It moves to the successor, so each signal arrives exactly once.
+- It deletes the old run's pending tasks and unfired timers.
+
+`run_until_blocked` returns `RunState::ContinuedAsNew(successor)`. A later
+drive of the old run returns the same successor and starts no other run.
+`run_until_idle` and `poll_once` drive the successor like any other run.
+`start_workflow_with_id` with the same id attaches to the newest run. Send
+later signals to the successor, because the old run is terminal.
+
+`continue_as_new` bounds the replay cost of a run, not the database size. This
+backend has no retention, so each sealed run keeps its history in the file.
+
+`outcome()` of the old run is `ExecutionOutcome::Terminated("CONTINUED_AS_NEW")`.
+`successor(old)` returns the successor id without a drive.
+`ctx.should_continue_as_new()` uses the default threshold of 10,000 events. An
+event cap at or below it logs a warning, because the cap then fails the run
+before the advice turns true.
+
+The #1804 hard caps apply, with the Postgres defaults:
+
+| Cap | Default | Setter | Reason |
+| --- | --- | --- | --- |
+| Events per run | `50_000` | `set_history_event_hard_cap(Some(n))` | `HistoryCapExceeded { count, cap, workflow_type }` |
+| Stored bytes per run | 50 MiB | `set_history_byte_hard_cap(Some(n))` | `HistoryBytesCapExceeded { bytes, cap, workflow_type }` |
+
+`None` removes a cap. A decision that reaches a cap rolls back. The run then
+fails, and the drive returns `RunState::Failed` with the reason JSON. The
+`WorkflowFailed` event holds the same JSON in `error`. The event is
+byte-identical to the one the Postgres worker writes. Parse the JSON as
+`HistoryCapReason`. The seal removes the run's pending tasks, unfired timers
+and staged signals.
+
+A continuing run is exempt, because its successor starts a new history. The
+event count includes the decision's own appends. The byte count is the stored
+event JSON length when the decision starts. Postgres measures
+`pg_column_size` instead, so the two byte counts can differ.
+
 ---
 
-## 8. Signals (pull-only)
+## 8. Signals
 
-Deliver a signal from outside with `send_signal`; consume it inside the workflow
-with a **pull** primitive.
+Deliver a signal from outside with `send_signal`. Read it inside the workflow
+with any signal API.
 
 ```rust
 // Inside the workflow — block until the signal arrives:
@@ -316,22 +484,84 @@ rt.send_signal(exec, "approve", serde_json::json!(true))?;
 rt.run_until_blocked(exec).await?;
 ```
 
-A staged signal is appended to history (as `SignalReceived`) **only when a
-workflow reaches a pull primitive that consumes it** — this backend is
-pull-only. The supported pull surface is the plain waits
-(`wait_for_signal` / `receive_signal`) and the signal-or-deadline waits
-(`wait_for_signal_timeout` / `receive_signal_timeout`, which race the signal
-against a durable deadline timer).
+Each drive appends every staged signal to history (as `SignalReceived`)
+before the workflow runs, in arrival order. Postgres does the same at task
+preparation. So every signal API works here:
+
+- the blocking waits `wait_for_signal` / `receive_signal`;
+- the non-blocking reads `drain_signals` / `try_receive_signal`;
+- push handlers (`register_signal_handler`), also with `await_condition`;
+- the signal-or-deadline waits `wait_for_signal_timeout` /
+  `receive_signal_timeout`. They race the signal against a durable deadline
+  timer, and arrival time decides the winner.
+
+A push handler runs at the next durable call (a timer, an activity or a signal
+read) after it registers. Put such a call between the registration and a read
+of its state. A run parked on `await_condition` emits no command, so a drive
+before the signal returns `SqliteError::Stuck`. `poll_once` and
+`run_until_idle` report it as a per-execution error and still drive the other
+runs. The run stays `RUNNING`. Drive it again after `send_signal`.
+
+The history caps bound this ingest. A drive reads staged signals only up to
+the room the caps leave. A signal flood thus fails the run at the cap, as on
+Postgres, and never loads past it into memory.
+
+A signal that the workflow never reads also reaches history. The strict core
+`WorkflowReplayer` then reports `NonDeterminismDetected(EarlyCompletion)`, as
+for a Postgres history. A signal that lost a deadline race is exempt. A file
+from an earlier release can hold signals staged for a name that the run never
+awaited. The first drive after the upgrade appends them to history.
 
 `send_signal` validates the target at the boundary: an unknown execution is
 `SqliteError::ExecutionNotFound` and a terminal one is
-`SqliteError::WorkflowNotRunning`, so a wakeup no live wait could ever consume is
+`SqliteError::WorkflowNotRunning`, so a wakeup no drive could ever consume is
 rejected rather than silently lost.
 
-> Push-based signal *handlers* (`register_signal_handler`) and the non-blocking
-> drain APIs (`drain_signals` / `try_receive_signal`) depend on the Postgres
-> task-preparation ingest and are **not** available here — restrict to the pull
-> primitives.
+### Updates (issue #2025)
+
+An update is a request with a result. Register the handler in the workflow
+body, or register a declarative `#[update]` with `register_update`.
+
+```rust
+// Inside the workflow — register the handler before the first wait:
+ctx.register_update_handler(
+    "quote",
+    |input| if input.as_i64() > Some(0) { Ok(()) } else { Err("must be positive".into()) },
+    |input| async move { Ok(serde_json::json!({ "price": input })) },
+);
+
+// Or register a declarative `#[update(workflow = "...")]` handler:
+// rt.register_update(&quote_info());
+
+// From outside — run the update and get its result:
+let result = rt.update(exec, "quote", serde_json::json!(5)).await?;
+```
+
+`update` replays the run to rebuild its handlers. The arg schema runs first. A
+violation is `SqliteError::UpdateInputInvalid`. The validator runs next. A
+rejection is `SqliteError::UpdateRejected`. Neither writes an event.
+
+The handler then runs. One transaction appends `UpdateAdmitted` and then
+`UpdateCompleted`. If the handler returns an error or panics, the transaction
+appends `UpdateFailed` instead, and the call returns
+`SqliteError::UpdateFailed`. These are the core update events, so the history
+replays on the core `WorkflowReplayer`.
+
+The update does not drive the run. Call `run_until_blocked` after it, as after
+`send_signal`.
+
+The history caps count the two update events. An update that would reach a
+cap writes no update event. The run then fails at the cap, as a drive fails
+it, and the call returns `SqliteError::UpdateHistoryCapReached`.
+
+The handler runs once, on a separate replay of the run. **State that the
+handler writes does not reach the workflow body.** Use an update to compute a
+result from the workflow state, not to change that state. Replay returns the
+recorded result and does not run the handler again.
+
+The handler can await any future, within a 5 second limit. It cannot await a
+durable command, such as an activity or a timer. Such a handler returns
+`SqliteError::UpdateTimedOut` and writes no event.
 
 ---
 
@@ -373,7 +603,8 @@ let report = ctx.await_external_workflow_value(audit).await.map_err(|e| e.to_str
 | Cancel | `WorkflowCancelled`, then `CANCELLED` | `Ok(())`, also for a terminal target |
 
 Signal, cancel and await get `target_unknown` at once for a run that does not
-exist.
+exist. An await follows a target that continues as new to its last run, as on
+Postgres. A `TERMINATED` target gives `target_terminated`.
 Postgres waits a grace window first, because another shard can still create
 the run. One file has no other shard, so its answer is final.
 
@@ -381,7 +612,10 @@ the run. One file has no other shard, so its answer is final.
 `ctx.info().parent_execution_id` names its parent. A child failure reaches
 the parent as `HarvestError::WorkflowFailed`, with the child's `error_type`,
 `details` and `non_retryable`. A cancelled child fails the parent's wait with
-`child workflow cancelled: <reason>`. Under `spawn_child_workflow_timeout`, a
+`child workflow cancelled: <reason>`. A terminated child fails it with
+`child workflow terminated: <reason>`. A child cannot continue as new. It
+fails with `continue_as_new is not supported in child workflows in this
+release`, as on Postgres. Under `spawn_child_workflow_timeout`, a
 deadline that is due fires before a late child's result, so the deadline wins,
 as on Postgres. A drive that starts an unregistered child workflow returns
 `SqliteError::UnknownWorkflow`. The cycle rolls back, and the parent stays
@@ -394,13 +628,15 @@ its policy. `request_cancel` cancels it with reason `parent closed`.
 cascade reaches every level of a chain of detached children. An attached child
 is left running, as on Postgres.
 
-**Cancel is a hard seal.** The target ends `CANCELLED` at once. The backend
+**A cancel from another run is a hard seal.** It differs from the
+cooperative `rt.cancel` (see [Cancel and terminate](#cancel-and-terminate)).
+The target ends `CANCELLED` at once. The backend
 deletes its pending tasks, unfired timers and unkeyed staged signals. A keyed
 signal row stays, so a duplicate send still dedups. The target's body does not
 run again, so `ctx.cancellation_reason()` stays unobserved. This matches the
 Postgres external cancel. A run that its own cancel seals, through a
 parent-close cascade, applies no more of its batch. A drive of a cancelled run
-returns `RunState::Failed` naming the state, and `outcome()` returns
+returns `RunState::Cancelled` with the reason, and `outcome()` returns
 `Terminated("CANCELLED")`. `AllowDuplicateFailedOnly` replaces a cancelled run,
 as core does.
 
@@ -444,7 +680,9 @@ All durable state lives in the database. Dropping a runtime and re-`open`-ing th
 
 This makes activity execution **at-least-once**: a crash *after a body runs but
 before its result commits* re-runs that body on resume. **Write activity bodies
-to be idempotent.**
+to be idempotent.** `ctx.idempotency_key()` is stable across these re-runs. A
+body that checkpoints with `ctx.heartbeat(..)` resumes from the last stored
+payload through `ctx.heartbeat_details()`.
 
 The [`examples/durability.rs`](../autumn-harvest-sqlite/examples/durability.rs)
 example proves resume-vs-restart with side-effect counters: it runs a workflow to
@@ -519,8 +757,10 @@ specific command/feature. The run then ends `FAILED` (see below):
 
 - **Local activities** (`execute_local_activity`) and **external / task-token
   activities**.
-- **Updates**, **search attributes** (`upsert_search_attributes`), and
-  **`continue_as_new`**.
+- **Search attributes** (`upsert_search_attributes`) and a **continue-as-new
+  to a different type** (`continue_as_new_as_type`). The token is
+  `ContinueAsNew.new_workflow_type`. A same-type `continue_as_new` is
+  supported (see [§7](#7-the-drive-model)).
 - **Worker sessions** (`create_session`) and **cancellable durable timers**
   (`start_timer` / `TimerHandle::…` — use the fire-once `ctx.timer(...)`).
 
@@ -543,8 +783,8 @@ reason. When the sealed run is a child or await target, the waiter's drive does
 not return the error. The waiter records the typed failure instead. A later drive returns `RunState::Failed` and does not run the handler
 again. `outcome()` returns `ExecutionOutcome::Failed`.
 
-Among drive errors, only an unsupported feature seals a run. Other errors
-leave the run `RUNNING`:
+Only an unsupported feature or a history cap seals a run. Other errors leave
+the run `RUNNING`:
 an unregistered workflow or activity, a replay divergence, a contained panic
 under its budget, or a failed task. A fix in the same runtime can then resume
 the run.
@@ -593,8 +833,8 @@ gate no control flow): `ctx.set_current_details(...)` and a re-park
 - **[`examples/claude-agent-daemon/`](../examples/claude-agent-daemon/)** — a
   whole application on this backend: a local daemon that runs Claude agent
   sessions as durable workflows. It shows the drive loop
-  ([§7](#7-the-drive-model)), pull signals with a deadline
-  ([§8](#8-signals-pull-only)), and crash recovery
+  ([§7](#7-the-drive-model)), signals with a deadline
+  ([§8](#8-signals)), and crash recovery
   ([§10](#10-durability-and-crash-recovery)) in one place, and it runs with no API
   key against a scripted offline model.
 

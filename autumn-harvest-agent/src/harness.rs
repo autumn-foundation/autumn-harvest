@@ -12,9 +12,10 @@ use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::error::AgentError;
 use crate::heartbeat::{HeartbeatTask, Precheck};
 use crate::memory::{MEMORY_TOOL, MemoryScope, MemoryStore, MemoryTool, render_snapshot};
-use crate::message::{ContentPart, RunId, ToolDefinition};
-use crate::model::{AgentModel, BoxFuture, ChatRequest};
+use crate::message::{ContentPart, RunId, TokenUsage, ToolDefinition};
+use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse, UNKNOWN_MODEL_ID};
 use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
+use crate::response_cache::{CacheKey, KeyTenant, ResponseCache};
 use crate::tool::{Tool, ToolContext, ToolEffect};
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
@@ -26,8 +27,9 @@ pub const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 8_000;
 
 /// The default time budget of one model call: 13 minutes.
 ///
-/// With [`DEFAULT_POLICY_TIMEOUT`], it stays below the 15-minute
-/// `start_to_close` of `agent_model_turn`. A slow call therefore ends as a
+/// With [`DEFAULT_POLICY_TIMEOUT`], three [`DEFAULT_CACHE_TIMEOUT`] budgets
+/// and one [`DEFAULT_BUDGET_TIMEOUT`], it stays below the 15-minute `start_to_close` of
+/// `agent_model_turn`. A slow call therefore ends as a
 /// retryable failure that the harness reports. It does not end as an engine
 /// timeout, which SQLite reports only after the body returns.
 pub const DEFAULT_MODEL_TIMEOUT: Duration = Duration::from_secs(13 * 60);
@@ -52,6 +54,20 @@ pub const DEFAULT_POLICY_TIMEOUT: Duration = Duration::from_secs(60);
 /// activities. SQLite cannot end a stalled call from outside.
 pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The default time budget of one response-cache call: 5 seconds.
+///
+/// One turn makes at most three cache calls: the tenant read, the lookup and
+/// the store. Each call has this budget. A cache call over it is a miss.
+pub const DEFAULT_CACHE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The default time budget of the LLM budget check of one turn: 10 seconds
+/// (issue #1997).
+///
+/// The check reads the spend of the run and of its tenant before the model
+/// call. Without a budget, a slow pool or a slow read could use up the
+/// `start_to_close` of the turn.
+pub const DEFAULT_BUDGET_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The bytes that the `ToolOutcome` JSON adds around its content.
 const OUTCOME_ENVELOPE_BYTES: u64 = 64;
 
@@ -74,9 +90,12 @@ pub struct AgentHarness {
     tool_timeout: Duration,
     policy_timeout: Duration,
     hook_timeout: Duration,
+    cache_timeout: Duration,
+    budget_timeout: Duration,
     memory: Option<Arc<dyn MemoryStore>>,
     delivery: Arc<dyn Delivery>,
     precheck: Option<Arc<dyn Precheck>>,
+    cache: Option<ResponseCache>,
 }
 
 impl AgentHarness {
@@ -94,9 +113,12 @@ impl AgentHarness {
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
             policy_timeout: DEFAULT_POLICY_TIMEOUT,
             hook_timeout: DEFAULT_HOOK_TIMEOUT,
+            cache_timeout: DEFAULT_CACHE_TIMEOUT,
+            budget_timeout: DEFAULT_BUDGET_TIMEOUT,
             memory: None,
             delivery: Arc::new(LogDelivery),
             precheck: None,
+            cache: None,
         }
     }
 
@@ -200,10 +222,75 @@ impl AgentHarness {
         self
     }
 
+    /// Serve an identical model call from `cache`, across runs.
+    ///
+    /// The model must name itself through [`AgentModel::model_id`]. A model
+    /// with no id is never cached.
+    #[must_use]
+    pub fn response_cache(mut self, cache: ResponseCache) -> Self {
+        if self.client.model_id().is_none() {
+            tracing::warn!("the model has no model_id, so the response cache serves nothing");
+        }
+        self.cache = Some(cache);
+        self
+    }
+
+    /// Set the time budget of one response-cache call. One turn makes at
+    /// most three. Keep the sum of the model, policy, cache and budget-check
+    /// budgets below the 15-minute `start_to_close` of `agent_model_turn`.
+    #[must_use]
+    pub const fn cache_timeout(mut self, timeout: Duration) -> Self {
+        self.cache_timeout = timeout;
+        self
+    }
+
+    /// Set the time budget of the LLM budget check of one turn (issue
+    /// #1997). Keep the sum of the model, policy, cache and budget-check
+    /// budgets below the 15-minute `start_to_close` of `agent_model_turn`.
+    #[must_use]
+    pub const fn budget_timeout(mut self, timeout: Duration) -> Self {
+        self.budget_timeout = timeout;
+        self
+    }
+
+    /// Run the LLM budget check of one turn (issue #1997).
+    ///
+    /// A refusal returns the refusal. A check over the budget time fails as
+    /// a retryable `LlmBudgetCheckFailed`. Either way, the turn calls no
+    /// model, so a retry pays nothing.
+    pub(crate) async fn check_budget<F>(&self, check: impl FnOnce() -> F) -> Result<(), String>
+    where
+        F: std::future::Future<Output = Result<(), String>>,
+    {
+        let budget = self.budget_timeout;
+        let Ok(checked) = tokio::time::timeout(budget, check()).await else {
+            let reason = format!("the read took longer than {budget:?}");
+            return Err(autumn_harvest::llm_budget::check_failed(&reason).into_error_payload());
+        };
+        checked
+    }
+
+    /// Whether a turn can use the response cache: the harness has a cache,
+    /// and the model has an id.
+    pub(crate) fn cache_active(&self) -> bool {
+        self.cache.is_some() && self.client.model_id().is_some()
+    }
+
+    /// The time budget of one response-cache call, the tenant read included.
+    pub(crate) const fn cache_budget(&self) -> Duration {
+        self.cache_timeout
+    }
+
     /// Run one model call, then ask the policy about each tool call.
     ///
     /// The decisions are part of the result. Replay reads them back, so a
     /// policy that reads changing state cannot change a recorded run.
+    ///
+    /// With a response cache, `request.tenant` scopes the key. This method
+    /// does not read the verified tenant of the run. The `agent_model_turn`
+    /// activity does, so register [`activities`](crate::activities) on
+    /// Postgres. A hit skips the model call. The policy still decides each
+    /// tool call.
     ///
     /// # Errors
     ///
@@ -211,23 +298,55 @@ impl AgentHarness {
     /// retryable: a rate limit, a transport fault, a provider outage, or the
     /// time budget. Every other failure is not.
     pub async fn model_turn(&self, request: ModelTurnRequest) -> Result<ModelTurn, String> {
-        self.model_turn_with(request, |_content| {}).await
+        let tenant = CacheTenant::declared(request.tenant.as_deref());
+        self.model_turn_in(request, tenant, |_content| {}).await
     }
 
     /// Run one model call, let `prepare` edit the model content, then ask
     /// the policy about each tool call.
     ///
     /// The evaluation harness uses `prepare` to set the recorded call ids
-    /// before the policy reads them.
+    /// before the policy reads them. It skips the response cache, because an
+    /// evaluation measures the live answer of the candidate.
     ///
     /// # Errors
     ///
     /// The errors of [`model_turn`](Self::model_turn).
+    #[cfg(feature = "eval")]
     pub(crate) async fn model_turn_with(
         &self,
         request: ModelTurnRequest,
-        prepare: impl FnOnce(&mut Vec<ContentPart>),
+        prepare: impl FnMut(&mut Vec<ContentPart>),
     ) -> Result<ModelTurn, String> {
+        self.model_turn_in(request, CacheTenant::Skip, prepare)
+            .await
+    }
+
+    /// [`model_turn_with`](Self::model_turn_with), with the tenant that
+    /// scopes the response cache.
+    pub(crate) async fn model_turn_in(
+        &self,
+        request: ModelTurnRequest,
+        tenant: CacheTenant,
+        prepare: impl FnMut(&mut Vec<ContentPart>),
+    ) -> Result<ModelTurn, String> {
+        self.model_turn_timed_in(request, tenant, prepare)
+            .await
+            .map(|(turn, _latency)| turn)
+    }
+
+    /// [`model_turn_in`](Self::model_turn_in), with the latency of the model
+    /// call (issue #1996).
+    ///
+    /// The latency covers the model call only, not the cache or the policy.
+    /// It is `None` when a cache hit answers the turn, because no model call
+    /// ran.
+    pub(crate) async fn model_turn_timed_in(
+        &self,
+        request: ModelTurnRequest,
+        tenant: CacheTenant,
+        mut prepare: impl FnMut(&mut Vec<ContentPart>),
+    ) -> Result<(ModelTurn, Option<Duration>), String> {
         let builtins = self.builtins(
             request.memory_scope.as_ref(),
             request.extra_tools.iter().cloned(),
@@ -239,54 +358,154 @@ impl AgentHarness {
             max_tokens: request.max_output_tokens,
             temperature: self.temperature,
         };
-        let response = match tokio::time::timeout(self.model_timeout, self.client.chat(&chat)).await
-        {
-            Ok(response) => response.map_err(|err| model_failure(&err))?,
-            Err(_) => {
-                return Err(ActivityFailure::retryable(
-                    "ModelTimeout",
-                    format!("the model did not answer within {:?}", self.model_timeout),
-                )
-                .into_error_payload());
+        let key = self.cache_key(&tenant, &chat);
+        let mut cached = match &key {
+            Some(key) => self.cache_lookup(key).await,
+            None => None,
+        };
+        // At most two passes. A hit whose turn is over the result cap is a
+        // miss, so the second pass asks the model. Both passes share one
+        // policy budget, so the turn stays inside `start_to_close`.
+        let mut policy_budget = self.policy_timeout;
+        let mut latency = None;
+        loop {
+            let cache_hit = cached.is_some();
+            // A fresh answer waits for its decisions before it reaches the cache.
+            let mut fresh = None;
+            let response = if let Some(response) = cached.take() {
+                // No model call ran, so the turn spent no tokens.
+                ChatResponse {
+                    usage: TokenUsage::default(),
+                    ..response
+                }
+            } else {
+                let started = std::time::Instant::now();
+                let response = self.call_model(&chat).await?;
+                latency = Some(started.elapsed());
+                fresh = key.as_ref().map(|key| (key, response.clone()));
+                response
+            };
+            let mut content = response.content;
+            prepare(&mut content);
+            let mut turn = ModelTurn {
+                content,
+                stop: response.stop_reason,
+                usage: response.usage,
+                decisions: Vec::new(),
+                cache_hit,
+            };
+            let info = RunInfo {
+                run_id: RunId::new(request.run_id.clone()),
+                session_id: request.session_id.clone(),
+                steps_used: request.steps_used,
+                max_steps: request.max_steps,
+                usage: request.usage.saturating_add(response.usage),
+            };
+            self.decide_calls(
+                &mut turn,
+                &info,
+                (request.read_only, &builtins),
+                &mut policy_budget,
+            )
+            .await;
+            // A turn over the result cap fails. The cache serves and keeps
+            // only a turn that fits, so no identical request fails from it.
+            let fits = self.fits_result_cap(&turn);
+            if cache_hit && !fits {
+                tracing::warn!("a cached answer does not fit the result cap; calling the model");
+                continue;
             }
-        };
-        let mut content = response.content;
-        prepare(&mut content);
-        let mut turn = ModelTurn {
-            content,
-            stop: response.stop_reason,
-            usage: response.usage,
-            decisions: Vec::new(),
-        };
-        let info = RunInfo {
-            run_id: RunId::new(request.run_id),
-            session_id: request.session_id,
-            steps_used: request.steps_used,
-            max_steps: request.max_steps,
-            usage: request.usage.saturating_add(response.usage),
-        };
-        // One deadline bounds the whole decision phase. A per-call budget
-        // would let many stalled calls add up past `start_to_close`.
-        let deadline = tokio::time::Instant::now() + self.policy_timeout;
-        let read_only: Arc<dyn ToolPolicy>;
-        let policy: &dyn ToolPolicy = if request.read_only {
+            if let Some((key, response)) = fresh
+                && fits
+            {
+                self.cache_store(key, &response).await;
+            }
+            return Ok((turn, latency));
+        }
+    }
+
+    /// Record one model call in the agent cost ledger (issue #1996).
+    ///
+    /// A ledger refusal does not fail the turn, because the reply is already
+    /// paid for. The turn records its tokens even when the model metadata is
+    /// bad:
+    /// - no model id, or one that the ledger refuses, becomes
+    ///   [`UNKNOWN_MODEL_ID`];
+    /// - a cost that the ledger refuses is dropped, so the call is unpriced.
+    ///
+    /// Each refusal logs a warning.
+    pub(crate) fn record_turn(
+        &self,
+        ctx: &autumn_harvest::context::ActivityContext,
+        usage: &TokenUsage,
+        latency: Duration,
+    ) {
+        use autumn_harvest::llm_ledger::LlmCall;
+
+        let mut model = self.client.model_id().unwrap_or(UNKNOWN_MODEL_ID);
+        if let Err(err) = LlmCall::new(model, 0, 0).validate() {
+            tracing::warn!(
+                error = %err,
+                "the agent cost ledger refused the model id; recording the turn as {UNKNOWN_MODEL_ID:?}"
+            );
+            model = UNKNOWN_MODEL_ID;
+        }
+        let cost = self.client.cost_usd_micros(usage).filter(|&cost| {
+            let check = LlmCall::new(UNKNOWN_MODEL_ID, 0, 0)
+                .with_cost_usd_micros(cost)
+                .validate();
+            if let Err(err) = &check {
+                tracing::warn!(
+                    error = %err,
+                    "the agent cost ledger refused the cost; recording the turn as unpriced"
+                );
+            }
+            check.is_ok()
+        });
+        let mut call = LlmCall::new(
+            model,
+            u64::from(usage.input_tokens),
+            u64::from(usage.output_tokens),
+        )
+        .with_latency(latency);
+        if let Some(cost) = cost {
+            call = call.with_cost_usd_micros(cost);
+        }
+        if let Err(err) = ctx.record_llm_call(call) {
+            tracing::warn!(error = %err, "the agent cost ledger refused a model turn");
+        }
+    }
+
+    /// Ask the policy about each tool call of `turn`, in order.
+    ///
+    /// One deadline bounds the whole decision phase. A per-call budget would
+    /// let many stalled calls add up past `start_to_close`. The phase spends
+    /// from `budget` and leaves the rest in it for a second pass. A stalled
+    /// policy denies the call. That fails closed, and the model reads why.
+    async fn decide_calls(
+        &self,
+        turn: &mut ModelTurn,
+        info: &RunInfo,
+        (read_only, builtins): (bool, &[Arc<dyn Tool>]),
+        budget: &mut Duration,
+    ) {
+        let started = tokio::time::Instant::now();
+        let deadline = started + *budget;
+        let read_only_policy: Arc<dyn ToolPolicy>;
+        let policy: &dyn ToolPolicy = if read_only {
             // The read-only rules go first. Their deny ends the decision, so
             // the app policy is not asked about a call that cannot run.
-            read_only = Arc::new(Strictest::new(vec![
+            read_only_policy = Arc::new(Strictest::new(vec![
                 Arc::new(ToolRules::read_only()),
                 Arc::clone(&self.policy),
             ]));
-            read_only.as_ref()
+            read_only_policy.as_ref()
         } else {
             self.policy.as_ref()
         };
         for call in turn.calls() {
-            let tool = self
-                .visible(&builtins)
-                .find(|tool| tool.name() == call.name);
-            let decide = policy.decide(&call, tool, &info);
-            // A stalled policy denies the call. That fails closed, and the
-            // model reads why.
+            let tool = self.visible(builtins).find(|tool| tool.name() == call.name);
+            let decide = policy.decide(&call, tool, info);
             let decision = tokio::time::timeout_at(deadline, decide)
                 .await
                 .unwrap_or_else(|_| ToolDecision::Deny {
@@ -294,7 +513,84 @@ impl AgentHarness {
                 });
             turn.decisions.push(decision);
         }
-        Ok(turn)
+        *budget = budget.saturating_sub(started.elapsed());
+    }
+
+    /// Send `chat` to the model within the model time budget.
+    async fn call_model(&self, chat: &ChatRequest) -> Result<ChatResponse, String> {
+        tokio::time::timeout(self.model_timeout, self.client.chat(chat))
+            .await
+            .map_err(|_| {
+                ActivityFailure::retryable(
+                    "ModelTimeout",
+                    format!("the model did not answer within {:?}", self.model_timeout),
+                )
+                .into_error_payload()
+            })?
+            .map_err(|err| model_failure(&err))
+    }
+
+    /// The cache key of `chat`, or `None` when this turn skips the cache.
+    ///
+    /// The turn skips the cache when the harness has no cache, the model has
+    /// no id, or the tenant says to skip.
+    fn cache_key(&self, tenant: &CacheTenant, chat: &ChatRequest) -> Option<CacheKey> {
+        let cache = self.cache.as_ref()?;
+        let model_id = self.client.model_id()?;
+        let tenant = match tenant {
+            CacheTenant::None => KeyTenant::None,
+            CacheTenant::Verified(name) => KeyTenant::Verified(name),
+            CacheTenant::Declared(name) => KeyTenant::Declared(name),
+            CacheTenant::Skip => return None,
+        };
+        cache
+            .key(tenant, model_id, chat)
+            .inspect_err(|err| tracing::warn!(error = %err, "the response cache skips this turn"))
+            .ok()
+    }
+
+    /// The cached answer for `key`. A fault or a slow cache is a miss.
+    async fn cache_lookup(&self, key: &CacheKey) -> Option<ChatResponse> {
+        let cache = self.cache.as_ref()?;
+        match tokio::time::timeout(self.cache_timeout, cache.lookup(key)).await {
+            Ok(Ok(found)) => found,
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, "response cache read failed; calling the model");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(budget = ?self.cache_timeout, "response cache read timed out; calling the model");
+                None
+            }
+        }
+    }
+
+    /// Whether a later hit on the answer of `turn` fits the result cap.
+    ///
+    /// The check measures the turn as a hit records it: the same content
+    /// and decisions, no usage, and `cache_hit`. A zero cap is no cap, as on
+    /// a worker.
+    fn fits_result_cap(&self, turn: &ModelTurn) -> bool {
+        let hit = ModelTurn {
+            usage: TokenUsage::default(),
+            cache_hit: true,
+            ..turn.clone()
+        };
+        self.max_result_bytes == 0 || !crate::bounds::exceeds_bytes(&hit, self.max_result_bytes)
+    }
+
+    /// Store a fresh answer. A fault or a slow cache is only a warning.
+    async fn cache_store(&self, key: &CacheKey, response: &ChatResponse) {
+        let Some(cache) = &self.cache else {
+            return;
+        };
+        match tokio::time::timeout(self.cache_timeout, cache.store(key, response)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::warn!(error = %err, "response cache write failed"),
+            Err(_) => {
+                tracing::warn!(budget = ?self.cache_timeout, "response cache write timed out");
+            }
+        }
     }
 
     /// Run one tool call.
@@ -459,6 +755,27 @@ impl AgentHarness {
     }
 }
 
+/// The tenant that scopes the response cache for one turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CacheTenant {
+    /// The run has no tenant.
+    None,
+    /// The engine verified this tenant for the run.
+    Verified(String),
+    /// The task names this tenant.
+    Declared(String),
+    /// The turn skips the cache. For example, the activity cannot read the
+    /// verified tenant.
+    Skip,
+}
+
+impl CacheTenant {
+    /// The tenant that a task field names, if any.
+    pub(crate) fn declared(task: Option<&str>) -> Self {
+        task.map_or(Self::None, |name| Self::Declared(name.to_owned()))
+    }
+}
+
 /// A tool that the workflow runs itself, such as `schedule_followup`.
 ///
 /// The policy sees it as a known tool with the `Internal` effect. The harness
@@ -588,6 +905,53 @@ mod tests {
         }
         assert_eq!(fit_result("short".into(), cap), "short");
         assert!(fit_result("x".repeat(100), 300).ends_with(TRUNCATED));
+    }
+
+    #[test]
+    fn the_default_budgets_fit_the_model_turn_start_to_close() {
+        let turn = DEFAULT_MODEL_TIMEOUT
+            + DEFAULT_POLICY_TIMEOUT
+            + 3 * DEFAULT_CACHE_TIMEOUT
+            + DEFAULT_BUDGET_TIMEOUT;
+        assert!(turn < Duration::from_secs(15 * 60), "{turn:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_budget_check_fails_retryable() {
+        let harness =
+            AgentHarness::new(Arc::new(NoModel)).budget_timeout(Duration::from_millis(20));
+        let outcome = harness
+            .check_budget(std::future::pending::<Result<(), String>>)
+            .await;
+        let failure = autumn_harvest::failure::parse_typed_payload(&outcome.unwrap_err()).unwrap();
+        assert_eq!(
+            failure.error_type,
+            autumn_harvest::llm_budget::ERROR_TYPE_LLM_BUDGET_CHECK_FAILED
+        );
+        assert!(!failure.non_retryable);
+    }
+
+    #[tokio::test]
+    async fn a_budget_refusal_passes_through() {
+        let harness = AgentHarness::new(Arc::new(NoModel));
+        let outcome = harness
+            .check_budget(|| async { Err("refused".to_owned()) })
+            .await;
+        assert_eq!(outcome, Err("refused".to_owned()));
+        assert_eq!(harness.check_budget(|| async { Ok(()) }).await, Ok(()));
+    }
+
+    /// A model that the budget tests never call.
+    #[derive(Debug)]
+    struct NoModel;
+
+    impl AgentModel for NoModel {
+        fn chat<'a>(
+            &'a self,
+            _request: &'a ChatRequest,
+        ) -> crate::model::BoxFuture<'a, Result<crate::model::ChatResponse, AgentError>> {
+            Box::pin(async { Err(AgentError::new(ErrorKind::Provider, "unused")) })
+        }
     }
 
     #[test]

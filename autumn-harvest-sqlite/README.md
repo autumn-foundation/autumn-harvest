@@ -51,20 +51,18 @@ async fn process_order(ctx: &WorkflowContext, order: serde_json::Value) -> Resul
     Ok(format!("confirmed: {reservation}"))
 }
 
-// The `#[activity]` async body is a placeholder for the shared `ActivityInfo`;
-// this backend runs a caller-supplied SYNCHRONOUS body registered against it.
+// The `#[activity]` body runs with a real `ActivityContext` (issue #2024). The
+// same fn runs unchanged on the Postgres backend.
 #[activity]
-async fn reserve_inventory(_ctx: &ActivityContext, _order: serde_json::Value) -> Result<String, String> {
-    Ok(String::new())
+async fn reserve_inventory(ctx: &ActivityContext, order: serde_json::Value) -> Result<String, String> {
+    Ok(format!("reserved {order} on attempt {}", ctx.attempt()))
 }
 
 #[tokio::main]
 async fn main() -> Result<(), SqliteError> {
     let mut rt = SqliteRuntime::open_in_memory()?;    // or open("workflows.db") for durability
     rt.register_workflow(&process_order_info());
-    rt.register_activity(&reserve_inventory_info(), |input| {
-        Ok(serde_json::json!(format!("reserved {input}")))
-    });
+    rt.register_activity(&reserve_inventory_info());
 
     let exec = rt.start_workflow("process_order", serde_json::json!({"item": "widget"}))?;
     rt.run_until_idle().await?;                        // drive the polling loop to quiescence
@@ -98,12 +96,31 @@ A complete, runnable version is in
   deterministic replay. Activity execution is therefore **at-least-once** — write
   activity bodies to be idempotent. See
   [`examples/durability.rs`](examples/durability.rs).
+- **Updates (issue #2025).** `update(exec, name, input)` runs a registered
+  update handler and returns its result. A validator rejection writes no event.
+  An accepted update writes `UpdateAdmitted` and then `UpdateCompleted` or
+  `UpdateFailed`, in one transaction. The handler runs on a separate replay,
+  so state that it writes does not reach the workflow body.
 - **Idempotent starts by default (issue #1068).** `start_workflow_with_id`
   applies the `AllowDuplicate` reuse policy. A duplicate `(workflow_name,
   workflow_id)` **attaches** to the existing, non-sealed run instead of
   starting a second one. The new call's input is discarded. Use
   `start_workflow_with_reuse_policy` for the full `WorkflowIdReusePolicy`
   matrix — reject, replace-if-failed, or terminate-and-restart.
+- **Cancel and terminate (issue #2021).** `cancel(exec, reason)` is
+  cooperative. The next drive replays the body with
+  `ctx.cancellation_reason()` set, so the body can run cleanup activities. The
+  run then ends `CANCELLED`. `terminate(exec, reason)` ends the run
+  `TERMINATED` at once. Both record the core `WorkflowCancelled` event, as
+  Postgres does.
+- **Long-lived runs (issue #2023).** `ctx.continue_as_new(input)` seals the
+  run `CONTINUED_AS_NEW` and starts a successor with the same `workflow_id`, in
+  one transaction. Replayed signals stay with the old run, as on Postgres. A
+  backlog past the history caps moves to the successor.
+  `run_until_blocked` returns `RunState::ContinuedAsNew(successor)`. The #1804
+  history caps apply with the Postgres defaults: 50,000 events and 50 MiB per
+  run. A run that reaches a cap fails. Its error is `HistoryCapReason` JSON. Change
+  the caps with `set_history_event_hard_cap` and `set_history_byte_hard_cap`.
 
 ## v0.1 non-goals
 
@@ -112,10 +129,10 @@ Out of scope for this backend (tracked as issue #1068 follow-ups):
 - Distributed / multi-writer workers; multi-server crash recovery.
 - `LISTEN`/`NOTIFY` push wake-ups.
 - Schedules, the management API, DAGs, worker sessions, retention, sharding.
-- Local activities, updates, search attributes, and `continue_as_new` — a
-  workflow reaching one of these is rejected **loudly, by name**, never
-  silently dropped. The run then ends `FAILED` with
-  `error_type = "UnsupportedFeature"` (issue #1834).
+- Local activities, search attributes, and a continue-as-new to a different
+  workflow type (`continue_as_new_as_type`) — a workflow reaching one of these
+  is rejected **loudly, by name**, never silently dropped. The run then ends
+  `FAILED` with `error_type = "UnsupportedFeature"` (issue #1834).
 
 Since issue #2026, the backend supports child workflows and signal, cancel and
 await between runs. See

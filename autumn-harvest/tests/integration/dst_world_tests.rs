@@ -260,6 +260,8 @@ fn add_info() -> ActivityInfo {
         is_local: false,
         max_input_bytes: None,
         max_result_bytes: None,
+        input_schema: None,
+        output_schema: None,
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,

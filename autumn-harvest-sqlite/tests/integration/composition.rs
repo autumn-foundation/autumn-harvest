@@ -443,6 +443,18 @@ async fn fails_while_dispatching(ctx: &WorkflowContext, _n: i64) -> Result<(), S
     Ok(())
 }
 
+/// Continues as new once, then returns its input. A child cannot continue as
+/// new, so a child run of it fails.
+#[workflow]
+async fn continues_once(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    if n == 0 {
+        ctx.continue_as_new(json!(1))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(n)
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn runtime() -> SqliteRuntime {
@@ -499,6 +511,7 @@ fn fixtures() -> Vec<WorkflowInfo> {
         parent_of_awaiting_child_info(),
         parent_of_unregistered_info(),
         fails_while_dispatching_info(),
+        continues_once_info(),
     ]
 }
 
@@ -1755,4 +1768,109 @@ async fn a_late_child_loses_to_a_due_deadline() {
         .expect("the child result is still recorded");
     assert!(fired < child_done, "{history:#?}");
     assert_replays(&rt, parent, "parent_child_timeout_slow").await;
+}
+
+// ── Cancel, terminate and continue-as-new (issues #2021, #2023) ─────────────
+
+/// An operator cancel of a child is cooperative. The child ends `CANCELLED`
+/// at its next drive, and its parent sees the cancel.
+#[tokio::test]
+async fn an_operator_cancel_of_a_child_reaches_its_parent() {
+    let mut rt = runtime();
+    let parent = rt
+        .start_workflow("parent_reports_waiter", json!(0))
+        .unwrap();
+    rt.run_until_blocked(parent).await.unwrap();
+    let child = children_of(&rt, parent)[0];
+
+    rt.cancel(child, "ops").unwrap();
+    rt.run_until_idle().await.unwrap();
+
+    assert!(matches!(
+        rt.outcome(child).unwrap(),
+        ExecutionOutcome::Terminated(ref s) if s == "CANCELLED"
+    ));
+    assert_eq!(
+        completed(&rt, parent),
+        json!("child workflow cancelled: ops")
+    );
+    assert_replays(&rt, parent, "parent_reports_waiter").await;
+}
+
+/// A terminate of a child reaches its parent with the Postgres text.
+#[tokio::test]
+async fn a_terminate_of_a_child_reaches_its_parent() {
+    let mut rt = runtime();
+    let parent = rt
+        .start_workflow("parent_reports_waiter", json!(0))
+        .unwrap();
+    rt.run_until_blocked(parent).await.unwrap();
+    let child = children_of(&rt, parent)[0];
+
+    rt.terminate(child, "ops").unwrap();
+    rt.run_until_idle().await.unwrap();
+
+    assert_eq!(
+        completed(&rt, parent),
+        json!("child workflow terminated: ops")
+    );
+    assert_replays(&rt, parent, "parent_reports_waiter").await;
+}
+
+/// A terminated await target reports `target_terminated`, as on Postgres.
+#[tokio::test]
+async fn an_await_of_a_terminated_target_reports_it() {
+    let mut rt = runtime();
+    let target = rt.start_workflow("waits_for_go", json!(0)).unwrap();
+    let awaiter = rt.start_workflow("await_reports", json!(target)).unwrap();
+    rt.run_until_blocked(awaiter).await.unwrap();
+
+    rt.terminate(target, "ops").unwrap();
+    rt.run_until_blocked(awaiter).await.unwrap();
+
+    let out = completed(&rt, awaiter);
+    assert_eq!(out["error_type"], json!("target_terminated"));
+    assert_eq!(out["failed"], json!("ops"));
+    assert_replays(&rt, awaiter, "await_reports").await;
+}
+
+/// A child that continues as new fails with the Postgres text. Its parent
+/// sees the failure.
+#[tokio::test]
+async fn a_child_cannot_continue_as_new() {
+    let mut rt = runtime();
+    let parent = rt
+        .start_workflow("parent_reports_child_failure", json!("continues_once"))
+        .unwrap();
+
+    rt.run_until_blocked(parent).await.unwrap();
+
+    let out = completed(&rt, parent);
+    assert_eq!(
+        out["reason"],
+        json!("continue_as_new is not supported in child workflows in this release")
+    );
+    let child = children_of(&rt, parent)[0];
+    assert!(matches!(
+        rt.outcome(child).unwrap(),
+        ExecutionOutcome::Failed(_)
+    ));
+    assert_eq!(rt.successor(child).unwrap(), None);
+    assert_replays(&rt, parent, "parent_reports_child_failure").await;
+}
+
+/// An await follows its target across a continue-as-new, as on Postgres. It
+/// resolves with the output of the last run.
+#[tokio::test]
+async fn an_await_follows_a_continue_as_new() {
+    let mut rt = runtime();
+    let target = rt.start_workflow("continues_once", json!(0)).unwrap();
+    let awaiter = rt.start_workflow("await_reports", json!(target)).unwrap();
+
+    let state = rt.run_until_blocked(awaiter).await.unwrap();
+
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    assert_eq!(completed(&rt, awaiter), json!({ "ok": 1 }));
+    assert!(rt.successor(target).unwrap().is_some());
+    assert_replays(&rt, awaiter, "await_reports").await;
 }

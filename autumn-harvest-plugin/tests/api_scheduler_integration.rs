@@ -383,6 +383,8 @@ fn recording_activity_info(name: &'static str) -> ActivityInfo {
         circuit_breaker: None,
         requires: None,
         handler: record_activity,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -408,6 +410,8 @@ fn blocking_activity_info(name: &'static str, start_to_close: Duration) -> Activ
         circuit_breaker: None,
         requires: None,
         handler: wait_on_barrier_activity,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -6036,6 +6040,8 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             circuit_breaker: None,
             requires: None,
             handler: record_activity,
+            input_schema: None,
+            output_schema: None,
         }],
         Arc::new(state),
     ));

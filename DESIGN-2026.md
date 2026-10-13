@@ -37,8 +37,12 @@ Postgres worker writes.
   a terminal event. Postgres resolves a same-shard target in one transaction.
 - An external cancel is a hard seal. The target gets `WorkflowCancelled`
   with reason `cancelled by external request`. It ends `CANCELLED`.
-- The cancel API of issue #2021 does not exist yet. This change adds the
-  internal cancel step that #2021 can expose later.
+- The cancel API of issue #2021 did not exist when this plan started. It
+  later shipped as a cooperative cancel. The cancel between runs stays a hard
+  seal, because the Postgres external cancel is one. Every #2021 seal closes
+  the run, so a parent sees a cancelled or terminated child.
+- Issue #2023 later added `continue_as_new`. A child that continues as new
+  fails, as on Postgres. An await follows the continue-as-new chain.
 - `ctx.info().parent_execution_id` is set for a child on Postgres.
 
 ### 0.2 Brainstorm — how can one process run composition?

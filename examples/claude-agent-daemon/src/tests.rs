@@ -88,8 +88,8 @@ fn counting_model(
 fn runtime(db: &Path, workspace: &Path, calls: &Arc<AtomicUsize>) -> SqliteRuntime {
     let mut rt = SqliteRuntime::open(db).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity(&session::claude_turn_info(), counting_model(calls.clone()));
-    rt.register_activity(
+    rt.register_activity_with_body(&session::claude_turn_info(), counting_model(calls.clone()));
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.to_path_buf()),
     );
@@ -261,8 +261,8 @@ async fn a_transcript_too_large_to_send_ends_the_session() {
 
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity(&session::claude_turn_info(), model);
-    rt.register_activity(
+    rt.register_activity_with_body(&session::claude_turn_info(), model);
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
     );
@@ -896,7 +896,7 @@ async fn a_truncated_turn_never_reports_a_clean_finish() {
     // `max_tokens` stop reason the API reports for a truncated turn.
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity(&session::claude_turn_info(), |_input| {
+    rt.register_activity_with_body(&session::claude_turn_info(), |_input| {
         serde_json::to_value(TurnReply {
             content: json!([{ "type": "text", "text": "half an ans" }]),
             stop_reason: "max_tokens".to_string(),
@@ -905,7 +905,7 @@ async fn a_truncated_turn_never_reports_a_clean_finish() {
         })
         .map_err(|e| format!("bad reply: {e}"))
     });
-    rt.register_activity(
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
     );
@@ -1987,7 +1987,7 @@ async fn the_full_view_shows_a_write_that_the_status_trims() {
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
     let written = payload.clone();
-    rt.register_activity(&session::claude_turn_info(), move |_input| {
+    rt.register_activity_with_body(&session::claude_turn_info(), move |_input| {
         let input = json!({ "path": "notes.md", "content": written });
         serde_json::to_value(TurnReply {
             content: json!([
@@ -2003,7 +2003,7 @@ async fn the_full_view_shows_a_write_that_the_status_trims() {
         })
         .map_err(|e| format!("bad reply: {e}"))
     });
-    rt.register_activity(
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
     );
@@ -2188,8 +2188,8 @@ async fn a_session_refuses_to_continue_on_another_model() {
 
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity(&session::claude_turn_info(), claude::activity_body(model));
-    rt.register_activity(
+    rt.register_activity_with_body(&session::claude_turn_info(), claude::activity_body(model));
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
     );
@@ -7283,7 +7283,7 @@ async fn a_tool_call_under_an_unknown_stop_reason_is_not_run() {
     // still not what the stop reason asked for, so it must not run.
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity(&session::claude_turn_info(), |_input| {
+    rt.register_activity_with_body(&session::claude_turn_info(), |_input| {
         serde_json::to_value(TurnReply {
             content: json!([]),
             stop_reason: "pause_turn".to_string(),
@@ -7296,7 +7296,7 @@ async fn a_tool_call_under_an_unknown_stop_reason_is_not_run() {
         })
         .map_err(|e| format!("bad reply: {e}"))
     });
-    rt.register_activity(
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
     );
@@ -11469,6 +11469,63 @@ fn a_history_is_read_with_the_engines_own_type() {
 /// signal, `receive_signal_timeout` failed, `agent_session` propagated that,
 /// and the runtime sealed the session `FAILED`. A session a repair could have
 /// saved was made terminal.
+/// Each drive reads every staged row of a session, of any name (issue #2020).
+/// A readable decision beside an unreadable row of another name still fails
+/// every drive, so the restart must refuse the session.
+#[test]
+fn an_unreadable_staged_row_of_another_name_is_refused() {
+    let armed = "tool_approval:2:0:toolu_x";
+    let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
+    conn.execute_batch(
+        "CREATE TABLE harvest_timers (timer_id TEXT, exec_id TEXT, fire_at INTEGER, \
+         fired INTEGER NOT NULL DEFAULT 0, arm_seq INTEGER, \
+         PRIMARY KEY (exec_id, timer_id)); \
+         CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT, \
+         PRIMARY KEY (exec_id, seq)); \
+         CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+         exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
+         delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0); \
+         CREATE TABLE harvest_tasks (task_id TEXT PRIMARY KEY, exec_id TEXT NOT NULL, \
+         activity_id TEXT NOT NULL, name TEXT NOT NULL, input_json TEXT NOT NULL, \
+         queue TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL, \
+         run_at INTEGER NOT NULL, seq INTEGER NOT NULL, max_attempts INTEGER, \
+         retry_policy_json TEXT, start_to_close_ms INTEGER, \
+         scheduled_at INTEGER NOT NULL)",
+    )
+    .expect("the fixture tables are created");
+    conn.execute(
+        "INSERT INTO harvest_timers VALUES (?1, 'e', 9999, 0, 2)",
+        [format!("__signal_timeout:2:{armed}")],
+    )
+    .expect("the armed timer is recorded");
+    conn.execute(
+        "INSERT INTO harvest_signals (exec_id, name, payload_json) VALUES ('e', ?1, ?2)",
+        rusqlite::params![armed, r#"{"approved":true}"#],
+    )
+    .expect("the decision is staged");
+    // A payload that is not JSON, and an arrival time that is not an integer.
+    for (label, payload, received_at) in [
+        ("text that is not JSON", "{not json", "0"),
+        ("an arrival time that is text", "{}", "'soon'"),
+    ] {
+        let sql = format!(
+            "INSERT INTO harvest_signals (exec_id, name, payload_json, received_at) \
+             VALUES ('e', 'noise', ?1, {received_at})"
+        );
+        conn.execute(&sql, [payload])
+            .expect("the unreadable row is staged");
+
+        let refused = inspect::outstanding_signal(&conn, "e", 1_000)
+            .expect_err("an unreadable row of any name must refuse the restart");
+        assert!(
+            refused.contains("noise") && refused.contains("every drive fails"),
+            "[{label}] the refusal must name the row and say why: {refused}"
+        );
+        conn.execute("DELETE FROM harvest_signals WHERE name = 'noise'", [])
+            .expect("the row is removed");
+    }
+}
+
 #[test]
 fn a_staged_decision_is_read_as_the_type_the_workflow_asks_for() {
     let armed = "tool_approval:2:0:toolu_x";
@@ -11818,8 +11875,8 @@ async fn one_turn_runs_no_more_calls_than_a_turn_may_run() {
 
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity(&session::claude_turn_info(), model);
-    rt.register_activity(
+    rt.register_activity_with_body(&session::claude_turn_info(), model);
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
     );
@@ -12051,8 +12108,8 @@ async fn a_batch_of_exactly_the_bound_is_answered() {
 
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity(&session::claude_turn_info(), model);
-    rt.register_activity(
+    rt.register_activity_with_body(&session::claude_turn_info(), model);
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
     );

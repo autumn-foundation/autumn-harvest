@@ -6,18 +6,24 @@
 // files as `mod`s cuts CI compile time and disk. Mirrors the core
 // `autumn-harvest` crate's `tests/integration/mod.rs` convention.
 
+mod activity_context;
 mod activity_info_features;
 mod activity_start_to_close;
 mod atomicity;
+mod cancel_terminate;
 mod cancellable_timer_unsupported;
 mod composition;
+mod continue_as_new;
 mod cross_backend;
 mod docs_start_contract;
 mod drive_clock_refresh;
 mod durability;
 mod fleet_fault_isolation;
 mod freeze_activity_defaults;
+mod history_caps;
 mod payload_caps;
+mod portable_activity;
+mod portable_fixture;
 mod race_activities;
 mod race_fairness;
 mod reopen_consistency;
@@ -26,9 +32,11 @@ mod reuse_policy;
 mod review_fixes;
 mod review_fixes_48d54b2;
 mod runtime_robustness;
+mod signal_ingest;
 mod signal_timeout;
 mod single_writer_lock;
 mod subsecond_timer;
 mod unknown_execution_id;
 mod unsupported_terminal;
+mod updates;
 mod workflow_info_features;

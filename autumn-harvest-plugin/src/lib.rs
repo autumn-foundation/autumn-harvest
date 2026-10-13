@@ -55,6 +55,8 @@ pub mod embedding;
 #[cfg(all(test, any(feature = "aws-kms", feature = "vault-transit")))]
 mod kms_conformance;
 pub mod lineage;
+#[cfg(feature = "object-store")]
+pub mod object_store;
 /// OIDC login for Vantage and the management API (issue #1978).
 #[cfg(feature = "oidc")]
 pub mod oidc;
@@ -107,6 +109,10 @@ pub mod mcp_tools;
 /// MCP Tasks for `#[workflow(mcp)]` workflows (issue #2005).
 #[cfg(feature = "mcp")]
 pub mod mcp_tasks;
+
+/// JSON-RPC client for remote MCP and A2A tasks (issue #2006).
+#[cfg(feature = "mcp")]
+pub mod remote_tasks;
 
 /// OpenAPI 3.1 document for the management API (issue #694).
 ///
