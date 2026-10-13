@@ -567,6 +567,11 @@ fn harness(ctx: &ActivityContext) -> Result<&AgentHarness, String> {
 /// A rate limit, a transport fault, an outage or a timeout retries with
 /// backoff. Any other failure fails the call at once.
 ///
+/// A turn that calls the model records one call in the agent cost ledger
+/// (issue #1996). `AgentModel::model_id` names the model, and
+/// `AgentModel::cost_usd_micros` prices the call. A response cache hit calls
+/// no model and spends no tokens, so it records no call.
+///
 /// # Errors
 ///
 /// Returns the provider failure as an activity error payload.
@@ -580,7 +585,13 @@ pub async fn agent_model_turn(
 ) -> Result<ModelTurn, String> {
     let harness = harness(ctx)?;
     let tenant = cache_tenant(ctx, harness, &request).await;
-    harness.model_turn_in(request, tenant, |_content| {}).await
+    let (turn, latency) = harness
+        .model_turn_timed_in(request, tenant, |_content| {})
+        .await?;
+    if let Some(latency) = latency {
+        harness.record_turn(ctx, &turn.usage, latency);
+    }
+    Ok(turn)
 }
 
 /// The tenant that scopes the response cache for one turn (issue #1998).

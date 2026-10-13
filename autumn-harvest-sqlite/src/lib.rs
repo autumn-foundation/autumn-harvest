@@ -269,7 +269,6 @@
 //!   (`RequestCancelExternalWorkflow`).
 //! - **Local activities** — `ctx.execute_local_activity(...)` (`RunLocalActivity`).
 //! - **External activities** — task-token activities (`ScheduleExternalActivity`).
-//! - **Updates** — admitted-update results (`RecordUpdateResult`).
 //! - **Search attributes** — `ctx.upsert_search_attributes(...)`
 //!   (`UpsertSearchAttributes`).
 //! - **A cross-type continue-as-new** — `ctx.continue_as_new_as_type(...)`
@@ -503,6 +502,27 @@
 //! open scheduled work (or reject such histories) so a run isn't wedged — that is
 //! a follow-up.
 //!
+//! # Updates (issue #2025)
+//!
+//! [`SqliteRuntime::update`](crate::SqliteRuntime::update) runs an update and
+//! returns its result. The workflow body registers the handler, or
+//! [`SqliteRuntime::register_update`](crate::SqliteRuntime::register_update)
+//! adds a declarative `#[update]`.
+//!
+//! The runtime replays the run to rebuild the handlers. The arg schema and the
+//! validator run before any write, so a rejection writes no event. The handler
+//! then runs. One transaction appends `UpdateAdmitted` and then
+//! `UpdateCompleted` or `UpdateFailed`.
+//!
+//! The handler runs on that separate replay. State that the handler writes does
+//! not reach the workflow body. Use an update to compute a result from the
+//! workflow state, not to change that state. A `RecordUpdateResult` command from the workflow body records
+//! the same events in the decision cycle, as on Postgres.
+//!
+//! The handler can await any future, within a 5 second limit. It cannot await
+//! a durable command, such as an activity or a timer. Such a handler returns
+//! [`SqliteError::UpdateTimedOut`] and writes no event.
+//!
 //! # Robustness — healthy-run-killer containment (Codex #1069 / round 8)
 //!
 //! Failure modes that would otherwise WEDGE (or wrongly seal) a healthy run are
@@ -589,6 +609,7 @@ mod queue;
 mod runtime;
 mod schema;
 mod store;
+mod update;
 mod worker;
 
 pub use autumn_harvest::{ExecutionId, WorkflowEvent};

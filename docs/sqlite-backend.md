@@ -24,7 +24,7 @@ R&D decision record [`docs/rnd/sqlite-feasibility.md`](rnd/sqlite-feasibility.md
 5. [Registering workflows and activities](#5-registering-workflows-and-activities)
 6. [Starting a workflow](#6-starting-a-workflow)
 7. [The drive model](#7-the-drive-model)
-8. [Signals and queries](#8-signals-and-queries)
+8. [Signals, queries and updates](#8-signals-queries-and-updates)
 9. [Durability and crash recovery](#9-durability-and-crash-recovery)
 10. [The single-writer / single-server contract](#10-the-single-writer--single-server-contract)
 11. [v0.1 non-goals and follow-ups](#11-v01-non-goals-and-follow-ups)
@@ -348,7 +348,7 @@ event JSON length when the decision starts. Postgres measures
 
 ---
 
-## 8. Signals and queries
+## 8. Signals, queries and updates
 
 Deliver a signal from outside with `send_signal`. Read it inside the workflow
 with any signal API.
@@ -440,6 +440,52 @@ The future resolves to one of these errors:
 | `NonDeterministic` | The workflow code changed, so the replay of a running run diverges. A drive returns the same error. |
 | `QueryUnavailable` | A terminal run cannot give a stable answer. The workflow code changed, the replay panicked, or a seal for an unsupported feature or a history cap left side effects unrecorded. |
 | Other variants | A row cannot be read. |
+
+### Updates (issue #2025)
+
+An update is a request with a result. Register the handler in the workflow
+body, or register a declarative `#[update]` with `register_update`.
+
+```rust
+// Inside the workflow — register the handler before the first wait:
+ctx.register_update_handler(
+    "quote",
+    |input| if input.as_i64() > Some(0) { Ok(()) } else { Err("must be positive".into()) },
+    |input| async move { Ok(serde_json::json!({ "price": input })) },
+);
+
+// Or register a declarative `#[update(workflow = "...")]` handler:
+// rt.register_update(&quote_info());
+
+// From outside — run the update and get its result:
+let result = rt.update(exec, "quote", serde_json::json!(5)).await?;
+```
+
+`update` replays the run to rebuild its handlers. The arg schema runs first. A
+violation is `SqliteError::UpdateInputInvalid`. The validator runs next. A
+rejection is `SqliteError::UpdateRejected`. Neither writes an event.
+
+The handler then runs. One transaction appends `UpdateAdmitted` and then
+`UpdateCompleted`. If the handler returns an error or panics, the transaction
+appends `UpdateFailed` instead, and the call returns
+`SqliteError::UpdateFailed`. These are the core update events, so the history
+replays on the core `WorkflowReplayer`.
+
+The update does not drive the run. Call `run_until_blocked` after it, as after
+`send_signal`.
+
+The history caps count the two update events. An update that would reach a
+cap writes no update event. The run then fails at the cap, as a drive fails
+it, and the call returns `SqliteError::UpdateHistoryCapReached`.
+
+The handler runs once, on a separate replay of the run. **State that the
+handler writes does not reach the workflow body.** Use an update to compute a
+result from the workflow state, not to change that state. Replay returns the
+recorded result and does not run the handler again.
+
+The handler can await any future, within a 5 second limit. It cannot await a
+durable command, such as an activity or a timer. Such a handler returns
+`SqliteError::UpdateTimedOut` and writes no event.
 
 ---
 
@@ -536,9 +582,9 @@ specific command/feature. The run then ends `FAILED` (see below):
   `request_cancel_external_workflow`).
 - **Local activities** (`execute_local_activity`) and **external / task-token
   activities**.
-- **Updates**, **search attributes** (`upsert_search_attributes`), and a
-  **continue-as-new to a different type** (`continue_as_new_as_type`). The
-  token is `ContinueAsNew.new_workflow_type`. A same-type `continue_as_new` is
+- **Search attributes** (`upsert_search_attributes`) and a **continue-as-new
+  to a different type** (`continue_as_new_as_type`). The token is
+  `ContinueAsNew.new_workflow_type`. A same-type `continue_as_new` is
   supported (see [§7](#7-the-drive-model)).
 - **Worker sessions** (`create_session`) and **cancellable durable timers**
   (`start_timer` / `TimerHandle::…` — use the fire-once `ctx.timer(...)`).
@@ -610,7 +656,7 @@ gate no control flow): `ctx.set_current_details(...)` and a re-park
   whole application on this backend: a local daemon that runs Claude agent
   sessions as durable workflows. It shows the drive loop
   ([§7](#7-the-drive-model)), signals with a deadline
-  ([§8](#8-signals-and-queries)), and crash recovery
+  ([§8](#8-signals-queries-and-updates)), and crash recovery
   ([§9](#9-durability-and-crash-recovery)) in one place, and it runs with no API
   key against a scripted offline model.
 

@@ -2251,6 +2251,25 @@ jobs:
       - name: Run Kani proofs
         run: scripts/check-kani-proofs.sh
 
+  # Verus proofs of the integer kernels for every input. The script pins
+  # the Verus release by SHA-256 and installs its Rust toolchain. The guard
+  # suite verus_proofs_coverage.rs checks that each proved copy matches the
+  # engine source. See docs/testing/formal-methods.md.
+  verus:
+    name: Verus proofs
+    needs: changes
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    # The download takes most of the time. The proofs take about 2 seconds.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify the Verus proofs
+        run: scripts/check-verus-proofs.sh
+
   # Dependency ledger harness (Ballast). Runs `cargo deny check` against
   # `deny.toml`: advisories (RUSTSEC, joined against the lockfile — every
   # `ignore` entry in deny.toml carries a reachability verdict and a revisit

@@ -168,6 +168,18 @@ async fn skipped_activity(ctx: &WorkflowContext, _n: i64) -> Result<Value, Strin
     ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
 }
 
+/// Exposes a query and waits for `go`. A declarative update serves it.
+#[workflow]
+async fn updatable(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    ctx.register_query("stage", || json!("waiting"));
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
+#[update(workflow = "updatable")]
+async fn relabel(_ctx: &WorkflowContext, name: String) -> Result<String, String> {
+    Ok(format!("relabeled {name}"))
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn temp_db() -> (tempfile::TempDir, PathBuf) {
@@ -753,4 +765,25 @@ async fn running_run_that_skips_a_recorded_command_is_non_deterministic() {
         matches!(err, SqliteError::NonDeterministic { execution_id, .. } if execution_id == exec),
         "got {err:?}"
     );
+}
+
+/// A recorded declarative update (issue #2025) does not make the query
+/// replay diverge, before or after the run ends.
+#[tokio::test]
+async fn query_after_a_declarative_update_serves() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&updatable_info());
+    rt.register_update(&relabel_info());
+    let exec = rt.start_workflow("updatable", json!(0)).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    rt.update(exec, "relabel", json!("a")).await.unwrap();
+
+    let answer = rt.query(exec, "stage", Value::Null).await.unwrap();
+    assert_eq!(answer, json!("waiting"));
+
+    rt.send_signal(exec, "go", json!("done")).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "got {state:?}");
+    let answer = rt.query(exec, "stage", Value::Null).await.unwrap();
+    assert_eq!(answer, json!("waiting"));
 }

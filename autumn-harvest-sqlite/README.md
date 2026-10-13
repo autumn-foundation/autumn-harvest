@@ -102,6 +102,11 @@ A complete, runnable version is in
   deterministic replay. Activity execution is therefore **at-least-once** — write
   activity bodies to be idempotent. See
   [`examples/durability.rs`](examples/durability.rs).
+- **Updates (issue #2025).** `update(exec, name, input)` runs a registered
+  update handler and returns its result. A validator rejection writes no event.
+  An accepted update writes `UpdateAdmitted` and then `UpdateCompleted` or
+  `UpdateFailed`, in one transaction. The handler runs on a separate replay,
+  so state that it writes does not reach the workflow body.
 - **Idempotent starts by default (issue #1068).** `start_workflow_with_id`
   applies the `AllowDuplicate` reuse policy. A duplicate `(workflow_name,
   workflow_id)` **attaches** to the existing, non-sealed run instead of
@@ -124,8 +129,8 @@ Out of scope for this backend (tracked as issue #1068 follow-ups):
 - Distributed / multi-writer workers; multi-server crash recovery.
 - `LISTEN`/`NOTIFY` push wake-ups.
 - Schedules, the management API, DAGs, worker sessions, retention, sharding.
-- Child workflows, external signals/cancels, local activities, updates,
-  search attributes, and a continue-as-new to a different workflow type
+- Child workflows, external signals/cancels, local activities, search
+  attributes, and a continue-as-new to a different workflow type
   (`continue_as_new_as_type`) — a workflow reaching one of these is
   rejected **loudly, by name**, never silently dropped. The run then ends
   `FAILED` with `error_type = "UnsupportedFeature"` (issue #1834).
