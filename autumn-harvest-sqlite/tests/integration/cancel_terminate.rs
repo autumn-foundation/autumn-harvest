@@ -266,6 +266,45 @@ async fn calls_missing_on_cancel(ctx: &WorkflowContext, n: i64) -> Result<Value,
     ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
 }
 
+/// When cancelled, it fans out an unregistered cleanup activity and then a
+/// registered one.
+#[workflow]
+async fn fans_out_mixed_on_cancel(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
+    ctx.execute_activity_raw("step", json!(n), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    if ctx.is_cancelled() {
+        let (missing, cleanup) = tokio::join!(
+            ctx.execute_activity_raw("missing_cleanup", json!(n), "default"),
+            ctx.execute_activity_raw("cleanup", json!(n), "default"),
+        );
+        missing.map_err(|e| e.to_string())?;
+        cleanup.map_err(|e| e.to_string())?;
+        return Ok(json!("cleaned"));
+    }
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
+/// When cancelled, it fans out three unregistered cleanup activities.
+#[workflow]
+async fn fans_out_missing_on_cancel(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
+    ctx.execute_activity_raw("step", json!(n), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    if ctx.is_cancelled() {
+        let (a, b, c) = tokio::join!(
+            ctx.execute_activity_raw("missing_a", json!(n), "default"),
+            ctx.execute_activity_raw("missing_b", json!(n), "default"),
+            ctx.execute_activity_raw("missing_c", json!(n), "default"),
+        );
+        a.map_err(|e| e.to_string())?;
+        b.map_err(|e| e.to_string())?;
+        c.map_err(|e| e.to_string())?;
+        return Ok(json!("cleaned"));
+    }
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
 /// Counts the calls of each activity and records the cleanup input.
 #[derive(Default)]
 struct Calls {
@@ -304,6 +343,8 @@ fn register(rt: &mut SqliteRuntime, calls: &Arc<Calls>) {
     rt.register_workflow(&floods_on_cancel_info());
     rt.register_workflow(&floods_then_waits_info());
     rt.register_workflow(&calls_missing_on_cancel_info());
+    rt.register_workflow(&fans_out_mixed_on_cancel_info());
+    rt.register_workflow(&fans_out_missing_on_cancel_info());
     let c = Arc::clone(calls);
     rt.register_activity_raw(
         "step",
@@ -1216,6 +1257,61 @@ async fn an_unregistered_cleanup_history_replays_on_the_core_replayer() {
         "the body checked the request first, so the history must replay:\n{report}"
     );
     assert_eq!(report.events_replayed, events);
+}
+
+#[tokio::test]
+async fn a_mixed_cleanup_fan_out_history_replays_on_the_core_replayer() {
+    let (_dir, path) = temp_db();
+    let (mut rt, _calls) = runtime(&path);
+    let exec = start_parked(&mut rt, "fans_out_mixed_on_cancel").await;
+    rt.cancel(exec, "stop").unwrap();
+    let state = rt.run_until_blocked(exec).await;
+    assert!(matches!(&state, Ok(RunState::Cancelled(reason)) if reason == "stop"));
+
+    let history = rt.load_history(exec).unwrap();
+    let events = history.len();
+    let report = replay(
+        history,
+        "fans_out_mixed_on_cancel",
+        fans_out_mixed_on_cancel_info().handler,
+    )
+    .await;
+
+    // The seal resolves the registered task that it drops, too.
+    assert!(
+        matches!(&report.status, ReplayStatus::WorkflowFailed { .. }),
+        "every activity that the seal drops must resolve on replay:\n{report}"
+    );
+    assert_eq!(report.events_replayed, events);
+    assert_eq!(leftover_rows(&path, exec), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn failures_past_the_history_cap_leave_a_cancel_only_seal() {
+    let (_dir, path) = temp_db();
+    let (mut rt, _calls) = runtime(&path);
+    let exec = start_parked(&mut rt, "fans_out_missing_on_cancel").await;
+    let prefix = rt.load_history(exec).unwrap();
+    // The three schedules fit under the cap. Their three failures reach it.
+    rt.set_history_event_hard_cap(Some(u64::try_from(prefix.len() + 5).unwrap()));
+
+    rt.cancel(exec, "stop").unwrap();
+    let state = rt.run_until_blocked(exec).await;
+
+    assert!(matches!(&state, Ok(RunState::Cancelled(reason)) if reason == "stop"));
+    let history = rt.load_history(exec).unwrap();
+    assert_eq!(history.len(), prefix.len() + 4, "{history:#?}");
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityFailed { .. })),
+        "a failure batch that reaches the cap rolls back:\n{history:#?}"
+    );
+    assert!(matches!(
+        history.last(),
+        Some(WorkflowEvent::WorkflowCancelled { reason }) if reason == "stop"
+    ));
+    assert_eq!(leftover_rows(&path, exec), (0, 0, 0));
 }
 
 #[tokio::test]
