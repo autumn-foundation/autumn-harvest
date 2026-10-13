@@ -11,7 +11,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::error::SandboxError;
 use super::outcome::SandboxOutcome;
-use super::policy::{IsolationLevel, NetworkPolicy, SandboxPolicy};
+use super::policy::{
+    IsolationLevel, MAX_ENGINE_ENV_BYTES, MAX_ENGINE_ENV_VARS, NetworkPolicy, SandboxPolicy,
+};
 use super::request::{ExecPlan, RESERVED_ENV_PREFIX, SandboxRequest};
 
 /// A boxed, sendable future.
@@ -37,7 +39,8 @@ pub const DEFAULT_QUEUE_WAIT: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunOptions {
     /// Variables for the code, added after the request check. Each name must
-    /// start with `HARVEST_`.
+    /// start with `HARVEST_`. At most [`MAX_ENGINE_ENV_VARS`] variables with
+    /// [`MAX_ENGINE_ENV_BYTES`] bytes in all.
     pub engine_env: BTreeMap<String, String>,
     /// The time left in the activity attempt. `None` is no bound.
     pub time_left: Option<Duration>,
@@ -254,7 +257,8 @@ impl SandboxRuntime {
     /// # Errors
     ///
     /// The errors of [`Self::run`]. A variable name without the `HARVEST_`
-    /// prefix is a [`SandboxError::Config`]. Too little time left is
+    /// prefix, or engine variables over their bounds, are a
+    /// [`SandboxError::Config`]. Too little time left is
     /// [`SandboxError::Unavailable`].
     pub async fn run_with(
         &self,
@@ -266,6 +270,20 @@ impl SandboxRuntime {
             .time_left
             .map(|left| tokio::time::Instant::now() + left.saturating_sub(CLEANUP_GRACE));
         let mut plan = self.policy.plan(request)?;
+        // The request check does not see these variables, so they have
+        // bounds of their own. The request frame bound keeps room for them.
+        let engine_bytes: usize = options
+            .engine_env
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum();
+        if options.engine_env.len() > MAX_ENGINE_ENV_VARS || engine_bytes > MAX_ENGINE_ENV_BYTES {
+            return Err(SandboxError::Config(format!(
+                "the engine variables are {} with {engine_bytes} bytes, over the bound of \
+                 {MAX_ENGINE_ENV_VARS} with {MAX_ENGINE_ENV_BYTES} bytes",
+                options.engine_env.len()
+            )));
+        }
         for (name, value) in options.engine_env {
             if !name.starts_with(RESERVED_ENV_PREFIX) {
                 return Err(SandboxError::Config(format!(
@@ -794,6 +812,36 @@ pub(crate) mod tests {
             matches!(err, SandboxError::Unavailable(ref m) if m.contains("left")),
             "{err:?}"
         );
+        assert_eq!(backend.jobs.lock().unwrap().len(), 0, "the code never ran");
+    }
+
+    #[tokio::test]
+    async fn oversized_engine_variables_are_a_config_error() {
+        let (backend, runtime) = runtime(FakeBackend::new(IsolationLevel::Process));
+        let request = SandboxRequest::new("sh", "true");
+        let big = RunOptions {
+            engine_env: BTreeMap::from([(
+                "HARVEST_BIG".to_owned(),
+                "x".repeat(MAX_ENGINE_ENV_BYTES),
+            )]),
+            ..RunOptions::default()
+        };
+        let many = RunOptions {
+            engine_env: (0..=MAX_ENGINE_ENV_VARS)
+                .map(|i| (format!("HARVEST_V{i}"), String::new()))
+                .collect(),
+            ..RunOptions::default()
+        };
+        for options in [big, many] {
+            let err = runtime
+                .run_with(&request, options, &CancellationToken::new())
+                .await
+                .expect_err("too much engine data");
+            assert!(
+                matches!(err, SandboxError::Config(ref m) if m.contains("engine variables")),
+                "{err:?}"
+            );
+        }
         assert_eq!(backend.jobs.lock().unwrap().len(), 0, "the code never ran");
     }
 

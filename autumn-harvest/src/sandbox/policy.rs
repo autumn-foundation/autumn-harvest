@@ -392,14 +392,26 @@ impl SandboxPolicy {
         let host = runtime
             .saturating_add(count(self.path_env.len()))
             .saturating_mul(6);
+        // The runtime adds the engine variables after this check.
+        let engine = count(MAX_ENGINE_ENV_BYTES)
+            .saturating_mul(6)
+            .saturating_add(count(MAX_ENGINE_ENV_VARS).saturating_mul(ITEM_JSON_BYTES));
         input
             .saturating_add(args.saturating_add(env).saturating_mul(6))
             .saturating_add(paths)
             .saturating_add(items)
             .saturating_add(host)
+            .saturating_add(engine)
             .saturating_add(OUTCOME_ENVELOPE_BYTES)
     }
 }
+
+/// The most engine variables, such as `HARVEST_ATTEMPT`, that one run gets.
+pub const MAX_ENGINE_ENV_VARS: usize = 8;
+
+/// The most bytes of all engine variables of one run, names and values. The
+/// engine sets an idempotency key and an attempt number, far under this.
+pub const MAX_ENGINE_ENV_BYTES: usize = 4096;
 
 /// Check that `name` is a valid runtime name: 1 to 32 bytes of `a-z`, `0-9`,
 /// `_` or `-`.
@@ -663,6 +675,26 @@ mod tests {
             matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("frame")),
             "{:?}",
             policy.validate()
+        );
+    }
+
+    #[test]
+    fn the_request_bound_covers_the_engine_variables() {
+        // A policy with no input, arguments, variables, files or outputs
+        // still sends the engine variables, escaped.
+        let mut policy = SandboxPolicy::default();
+        policy.sizes.max_input_bytes = 0;
+        policy.sizes.max_arg_bytes = 0;
+        policy.sizes.max_env_bytes = 0;
+        policy.sizes.max_files = 0;
+        policy.sizes.max_outputs = 0;
+        policy.sizes.max_args = 0;
+        policy.sizes.max_env = 0;
+        let engine = u64::try_from(MAX_ENGINE_ENV_BYTES * 6).unwrap();
+        assert!(
+            policy.max_request_json_bytes() >= engine + OUTCOME_ENVELOPE_BYTES,
+            "{}",
+            policy.max_request_json_bytes()
         );
     }
 
