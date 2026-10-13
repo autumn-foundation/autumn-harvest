@@ -48,17 +48,12 @@ and `DESIGN-agent-mesh.md` the plan.
   a child never share a signal name. A run with no delegation keeps its old
   names.
 - **Evaluation.** `eval::evaluate` mocks the peer lookup with the recorded
-  answer, or with the recorded error of a lookup that failed the source. A recorded tool outcome answers only an equal call of the same
-  agent. A candidate call takes a recorded call id only from a turn of the
-  same agent.
+  answer, or with the recorded error of a lookup that failed the source. A
+  recorded tool outcome answers only an equal call of the same agent. A
+  candidate call takes a recorded call id only from a turn of the same
+  agent.
 - **Response cache.** A child of a run whose run id is the workflow id skips
   the cache, as its parent does.
-- **Fix.** `remote_task::activities` set `input_schema` and `output_schema`
-  twice, so the workspace did not compile. This PR removes the duplicate
-  pair.
-- **Fix.** The `verus` CI job pinned a rolling Verus release whose assets
-  Verus deleted, so the download failed with 404. The script now pins the
-  weekly release `0.2026.10.04.426d8b0`.
 
 **Invariants.** No new `WorkflowEvent` variant. No migration. No route. Each
 new field of a recorded payload is left out at its default, so a run with no

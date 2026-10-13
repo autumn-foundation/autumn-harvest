@@ -35,8 +35,9 @@ its default, so a run with no mandate records the same bytes as before.
   fails the evaluation.
 - `SqliteRuntime::load_history` returns the events of a run, so a test can
   count recorded activities.
-- The base branch does not compile: `remote_task::activities` sets
-  `input_schema` and `output_schema` twice. That is a merge artifact.
+- When this work started, the base branch did not compile:
+  `remote_task::activities` set `input_schema` and `output_schema` twice.
+  `trunk-dev` removed the duplicate pair in #2138.
 
 ### 0.2 Brainstorm — how can Harvest adopt mesh primitives?
 
@@ -155,7 +156,7 @@ its default, so a run with no mandate records the same bytes as before.
 | AC13 | Old histories decode. All existing tests pass. `eval` re-drives a delegation run. |
 | AC14 | Each model turn records the acting agent name. The model-turn span carries `gen_ai.agent.name`. |
 | AC15 | The user guide, the research note, this plan and a changelog fragment exist. Comments and docs use ASD-STE100 style. The comment-hygiene audit passes. |
-| AC16 | The workspace compiles. This PR removes the duplicate `ActivityInfo` fields in `remote_task.rs`. |
+| AC16 | The workspace compiles. `trunk-dev` removed the duplicate `ActivityInfo` fields in `remote_task.rs` (#2138), so this PR carries no fix for them. |
 | AC17 | Flow labels carry across runs. `AgentReport::flow_labels` returns them, and `AgentTask::flow_labels`, `HeartbeatTask::flow_labels` and the wire mandate seed them. |
 | AC18 | A call after a delegation in the same turn never runs on a decision that predates the child labels. |
 | AC19 | The wire form is strict and bounded. `from_meta` refuses an unknown key. `validate` bounds names and set sizes. `accept` needs a root. `outbound` sends the remainder of the fan-out. |
@@ -190,4 +191,4 @@ API and docs, and test quality. Each row names a finding and its fix.
 | F10 | A child of a workflow-id run uses the response cache. | `shares_run_id` covers `{root}:d{n}`. | AC13 |
 | F11 | Docs: a non-compiling example, stale adapter docs, loose claims, long sentences. | Corrected. `Refusal` implements `Error`. | AC15 |
 | F12 | Codex: the tool-call worker does not check the labels that the decision saw. A deploy can change a tool between the two. | `ToolCallRequest::labels` carries the recorded labels. The activity refuses a tool whose labels grew. | AC10 |
-| F13 | CI: the `verus` job fails on `trunk-dev` too. The pinned rolling Verus release has no assets now. | Pin the weekly release `0.2026.10.04.426d8b0`. All 33 proofs verify with it. | AC16 |
+| F13 | CI: the `verus` job fails on `trunk-dev` too. The pinned rolling Verus release has no assets now. | Pin the weekly release `0.2026.10.04.426d8b0`. All 33 proofs verify with it. `trunk-dev` made the same pin in #2138, and the merge keeps its version. | AC16 |

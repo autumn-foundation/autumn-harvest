@@ -412,6 +412,35 @@ pub fn has_pending_activity(conn: &Connection, exec_id: ExecutionId) -> SqliteRe
     Ok(exists)
 }
 
+/// List the PENDING tasks of `exec_id` in queue order, as
+/// `(activity_id, name, attempt)` (issue #2021).
+pub fn pending_tasks(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> SqliteResult<Vec<(ActivityExecId, String, u32)>> {
+    let mut stmt = conn.prepare(
+        "SELECT activity_id, name, attempt FROM harvest_tasks \
+         WHERE exec_id = ?1 AND state = 'PENDING' ORDER BY seq",
+    )?;
+    let rows = stmt.query_map(params![exec_id.to_string()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut tasks = Vec::new();
+    for row in rows {
+        let (activity_id, name, attempt) = row?;
+        let activity_id = activity_id
+            .parse()
+            .map_err(|_| SqliteError::corrupt("activity_id"))?;
+        let attempt = u32::try_from(attempt).map_err(|_| SqliteError::corrupt("attempt"))?;
+        tasks.push((activity_id, name, attempt));
+    }
+    Ok(tasks)
+}
+
 /// Requeue a task for another attempt at `run_at`, recording the consumed
 /// attempt. The task's `seq` (its ready-queue ordering key) is **preserved** — use
 /// this for a FUTURE-`run_at` backoff retry, which yields to siblings naturally

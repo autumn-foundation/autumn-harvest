@@ -12,8 +12,9 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# A weekly release, not a rolling one. Verus deletes the assets of an old
-# rolling release, so a pinned rolling download fails with 404.
+# Pin a weekly release (`release/<version>`), not a rolling one. Verus keeps
+# the assets of only the newest rolling release, so a rolling pin returns 404
+# within a day. Weekly release assets stay.
 verus_release="0.2026.10.04.426d8b0"
 verus_sha256="624018662868563a7bec0dd07be5e4dd0c3d61124b4b55105765884bf2d4d1a0"
 
