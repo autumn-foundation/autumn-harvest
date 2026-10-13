@@ -269,7 +269,6 @@
 //!   (`RequestCancelExternalWorkflow`).
 //! - **Local activities** — `ctx.execute_local_activity(...)` (`RunLocalActivity`).
 //! - **External activities** — task-token activities (`ScheduleExternalActivity`).
-//! - **Updates** — admitted-update results (`RecordUpdateResult`).
 //! - **Search attributes** — `ctx.upsert_search_attributes(...)`
 //!   (`UpsertSearchAttributes`).
 //! - **A cross-type continue-as-new** — `ctx.continue_as_new_as_type(...)`
@@ -307,8 +306,10 @@
 //! ## Long-lived runs (issue #2023)
 //!
 //! `ctx.continue_as_new(input)` seals the run `CONTINUED_AS_NEW` and starts a
-//! successor with the same `workflow_id`, in one transaction. Undelivered
-//! signals move to the successor. The drive returns
+//! successor with the same `workflow_id`, in one transaction. The staged
+//! signals that the hand-off decision replayed stay with the old run, as on
+//! Postgres (issue #2020). A backlog past the history caps moves to the
+//! successor. The drive returns
 //! [`RunState::ContinuedAsNew`] with the successor id.
 //!
 //! The #1804 history caps apply, with the Postgres defaults: 50,000 events and
@@ -410,32 +411,61 @@
 //!   matching the crate's activity model, so `register_activity` takes both the
 //!   `&ActivityInfo` (for the audit + declared defaults) and the body.
 //!
-//! **Signals are pull-only.** A staged signal is appended to history (as
-//! `SignalReceived`) only when a workflow reaches a pull primitive that consumes
-//! it. The supported pull surface is:
-//! - the plain waits `ctx.wait_for_signal` / `ctx.receive_signal`; and
+//! **Signals.** Each decision cycle appends every staged signal to history
+//! (as `SignalReceived`) before replay, in arrival order (issue #2020). This
+//! mirrors the Postgres task-preparation ingest, but an unrelated due timer
+//! fires after the signals of the cycle (issue #1071). So every signal API
+//! works:
+//! - the plain waits `ctx.wait_for_signal` / `ctx.receive_signal`;
+//! - the non-blocking reads `ctx.drain_signals` / `ctx.try_receive_signal`
+//!   (#775);
+//! - the push handlers of `ctx.register_signal_handler` (#546), also with
+//!   `ctx.await_condition`; and
 //! - the signal-or-deadline waits `ctx.wait_for_signal_timeout` /
-//!   `ctx.receive_signal_timeout` (issue #476), which race the signal against a
-//!   durable deadline timer — the signal wins if it arrives first, else the timer
-//!   fires and the wait resolves to `None`. The winner is decided by **arrival
-//!   time** (at millisecond precision, issue #1069 P2), not consumption order: the
-//!   wake ingest interleaves a staged signal's `received_at` against the deadline
-//!   timer's `fire_at` (mirroring the Postgres `merge_wake_events`), AND pending
-//!   same-name signals are consumed in ARRIVAL order (`peek_pending_signal` orders
-//!   by `received_at`, not insertion `signal_seq`, issue #1069 P2), so an on-time
-//!   signal staged *after* a late one still wins the race. So a signal
-//!   delivered *after* an expired deadline records its `TimerFired` FIRST and the
-//!   timeout wins (the late signal stays recorded, observable to a later plain
-//!   wait), while an on-time signal wins even when the run is only driven past the
-//!   deadline. **Only the raced deadline timer of THIS wait** (the core's
-//!   `__signal_timeout:{seq}:{name}` row) is reordered ahead of the signal (issue
-//!   #1069 P2); an unrelated durable timer is never fired ahead of a consumed
-//!   signal. When the **signal** wins, the
-//!   core emits a `CancelRaceLosers` bookkeeping command to durably delete the
-//!   losing deadline timer; this backend handles it (deleting the `harvest_timers`
-//!   row in the same cycle transaction — whether it rides a suspending batch or the
-//!   terminal drain), so the run completes cleanly and no orphaned timer is left
-//!   behind.
+//!   `ctx.receive_signal_timeout` (issue #476).
+//!
+//! The ingest is planned before replay. The transaction that persists the
+//! cycle outcome writes it first. So a discarded cycle (non-determinism, a
+//! contained panic under its budget) consumes no signal. A panic seal and an
+//! unsupported-feature seal write the signals that their replay saw.
+//!
+//! A signal that the workflow never reads also reaches history. The strict
+//! core `WorkflowReplayer` then reports `NonDeterminismDetected(EarlyCompletion)`,
+//! as for a Postgres history. A signal that lost a deadline race is exempt. A
+//! file from an earlier release can hold signals staged for a name that the
+//! run never awaited. The first drive after the upgrade appends them.
+//!
+//! A push handler runs at the next durable call (a timer, an activity or a
+//! signal read) after it registers. Put such a call between the registration
+//! and a read of its state. A run parked on `ctx.await_condition` emits no
+//! command. So a drive before the signal arrives returns
+//! [`SqliteError::Stuck`]. `poll_once` and `run_until_idle` report it as a
+//! per-execution error and still drive the other runs. The run stays
+//! `RUNNING`, and the next drive after `send_signal` resumes it.
+//!
+//! A signal-or-deadline wait races the signal against a durable deadline
+//! timer. The signal wins if it arrives first. Otherwise the timer fires and
+//! the wait resolves to `None`. **Arrival time** decides the winner, at
+//! millisecond precision (issue #1069 P2), not consumption order:
+//! - The ingest reads staged signals in arrival order (`received_at`), not
+//!   insertion order (`signal_seq`). An on-time signal staged after a late one
+//!   still wins.
+//! - Before each staged signal, the ingest compares its `received_at` with
+//!   the `fire_at` of each race deadline of that name. It uses the tie rule of
+//!   the Postgres `merge_wake_events`: a tie goes to the timer. Each deadline
+//!   fires at most once.
+//! - A deadline at or before the signal arrival records its `TimerFired` first.
+//!   The timeout wins, and the late signal stays in history for a later wait.
+//! - An on-time signal wins, also when the drive comes after the deadline.
+//! - **Only the race deadline timer** (the core `__signal_timeout:{seq}:{name}`
+//!   row) can go ahead of a signal (issue #1069 P2). An unrelated durable
+//!   timer never does.
+//!
+//! When the **signal** wins, the core emits a `CancelRaceLosers` bookkeeping
+//! command to delete the losing deadline timer. This backend deletes the
+//! `harvest_timers` row in the same cycle transaction, for a suspending batch
+//! and for the terminal drain. So the run completes cleanly and leaves no
+//! orphaned timer.
 //!
 //! **Known limitation — a plain `wait_for_signal(name)` composed with a
 //! `wait_for_signal_timeout(name, ...)` on the SAME signal name concurrently** (e.g.
@@ -458,20 +488,12 @@
 //! the late-signal-vs-deadline tests) — do not also add a plain `wait_for_signal`
 //! on the same name in the same race.
 //!
-//! Signal ingress is validated at the boundary:
-//! [`SqliteRuntime::send_signal`](crate::SqliteRuntime::send_signal) rejects a signal
-//! aimed at an unknown execution ([`SqliteError::ExecutionNotFound`]) or a terminal
-//! one ([`SqliteError::WorkflowNotRunning`]) instead of staging a row no live pull
-//! primitive could ever consume — mirroring the Postgres engine's rejection of a
-//! signal to an unknown/terminal target. A `RUNNING` execution stages (and later
-//! consumes) the signal exactly as before.
-//!
-//! The push-handler and non-blocking drain APIs — `register_signal_handler`
-//! (#546), `drain_signals` / `try_receive_signal` (#775) — depend on the Postgres
-//! task-preparation ingest that promotes *all* pending signals into history up
-//! front, which this single-writer backend does not implement; a workflow that
-//! relies on them will not see its signals here. Restrict to the pull primitives
-//! on this backend; push-based signal *handlers* remain a follow-up.
+//! [`SqliteRuntime::send_signal`](crate::SqliteRuntime::send_signal) validates
+//! the target at the boundary. An unknown execution is
+//! [`SqliteError::ExecutionNotFound`]. A terminal one is
+//! [`SqliteError::WorkflowNotRunning`]. No drive could consume a row staged for
+//! either, so the call rejects it, as the Postgres engine does. A `RUNNING`
+//! execution stages the signal, and the next drive consumes it.
 //!
 //! There is deliberately **no import/seed-a-foreign-history API**. The
 //! cross-backend guarantee (a history written here replays on the core engine) is
@@ -479,6 +501,27 @@
 //! in-flight history would have to rebuild the derived task/timer rows from any
 //! open scheduled work (or reject such histories) so a run isn't wedged — that is
 //! a follow-up.
+//!
+//! # Updates (issue #2025)
+//!
+//! [`SqliteRuntime::update`](crate::SqliteRuntime::update) runs an update and
+//! returns its result. The workflow body registers the handler, or
+//! [`SqliteRuntime::register_update`](crate::SqliteRuntime::register_update)
+//! adds a declarative `#[update]`.
+//!
+//! The runtime replays the run to rebuild the handlers. The arg schema and the
+//! validator run before any write, so a rejection writes no event. The handler
+//! then runs. One transaction appends `UpdateAdmitted` and then
+//! `UpdateCompleted` or `UpdateFailed`.
+//!
+//! The handler runs on that separate replay. State that the handler writes does
+//! not reach the workflow body. Use an update to compute a result from the
+//! workflow state, not to change that state. A `RecordUpdateResult` command from the workflow body records
+//! the same events in the decision cycle, as on Postgres.
+//!
+//! The handler can await any future, within a 5 second limit. It cannot await
+//! a durable command, such as an activity or a timer. Such a handler returns
+//! [`SqliteError::UpdateTimedOut`] and writes no event.
 //!
 //! # Robustness — healthy-run-killer containment (Codex #1069 / round 8)
 //!
@@ -557,6 +600,7 @@ mod queue;
 mod runtime;
 mod schema;
 mod store;
+mod update;
 mod worker;
 
 pub use autumn_harvest::{ExecutionId, WorkflowEvent};

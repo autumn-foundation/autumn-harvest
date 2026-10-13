@@ -1487,6 +1487,34 @@ impl<'de> serde::Deserialize<'de> for Priority {
     }
 }
 
+/// Kani proofs of the shard bytes in an execution id.
+///
+/// The `kani` CI job runs them. See `docs/testing/formal-methods.md`.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// An id built for an encodable shard decodes to that shard, for every
+    /// UUID. The other 14 bytes of the UUID are kept.
+    ///
+    /// A shard that is not encodable keeps only its low 16 bits. The
+    /// decoded value is still in `0..=0xFFFF`, so a decode cannot panic.
+    #[kani::proof]
+    fn execution_id_round_trips_every_encodable_shard() {
+        let bytes: [u8; 16] = kani::any();
+        let shard = ShardId::new(kani::any());
+        let id = ExecutionId::new_with_shard_bytes(Uuid::from_bytes(bytes), shard);
+        let decoded = id.shard().as_i32();
+        assert!((0..=0xFFFF).contains(&decoded));
+        assert_eq!(id.as_uuid().as_bytes()[2..], bytes[2..]);
+        if crate::shard::is_encodable_shard(shard) {
+            assert_eq!(id.shard(), shard);
+            assert!(!id.shard().is_unencoded());
+        }
+        kani::cover!(shard.as_i32() > 0xFFFF && decoded < 0xFFFF);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

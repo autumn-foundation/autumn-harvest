@@ -7,7 +7,7 @@
 //! * both gates are deliberately non-strict, so deleting either leaves a green
 //!   build that verifies nothing;
 //! * the clippy step for this crate is the only place `--all-targets` lint
-//!   coverage exists for it — the workspace `lint` job does not use
+//!   coverage exists for it — the workspace clippy jobs do not use
 //!   `--workspace`.
 //!
 //! So the steps are asserted here, the way `determinism_static_analysis_docs`
@@ -148,9 +148,9 @@ fn the_corpus_suite_runs_in_ci() {
 #[test]
 fn this_crate_is_linted_in_ci() {
     assert_wired(
-        "lint",
+        "clippy-crates",
         &["cargo clippy -p autumn-harvest-verify --all-targets -- -D warnings"],
-        "The workspace `lint` job does not use `--workspace`, so this is the \
+        "The workspace clippy jobs do not use `--workspace`, so this is the \
          only clippy coverage this crate has, and the only step that compiles \
          its test targets outside the `harvest-verify` job.",
     );

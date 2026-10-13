@@ -542,6 +542,7 @@ pub const COPIED_RELATIONS: &[&str] = &[
     "harvest_signals",
     "harvest_payload_refs",
     "harvest_workflow_logs",
+    "harvest_llm_ledger",
     "harvest_stream_chunks",
 ];
 
@@ -562,6 +563,7 @@ pub const SCHEMA_PARITY_RELATIONS: &[&str] = &[
     "harvest_signals",
     "harvest_payload_refs",
     "harvest_workflow_logs",
+    "harvest_llm_ledger",
     "harvest_stream_chunks",
     "harvest_task_queue",
 ];
@@ -1511,6 +1513,15 @@ mod db {
         )
         .await?;
 
+        // Issue #1996: the agent cost ledger moves with the run. The usage
+        // report skips the sealed source, so a row left there drops out.
+        let llm_ledger = read_json(
+            source,
+            "SELECT COALESCE(jsonb_agg(to_jsonb(l)), '[]'::jsonb) AS payload \
+             FROM harvest_llm_ledger l WHERE l.workflow_exec_id = $1",
+            exec_id,
+        )
+        .await?;
         // Durable stream chunks (issue #1974). Copied for the same reason as
         // the logs: they are author output, and erasure must reach them on
         // the execution's own shard.
@@ -1686,6 +1697,7 @@ mod db {
                 ("harvest_timers", &timers),
                 ("harvest_signals", &signals),
                 ("harvest_payload_refs", &payload_refs),
+                ("harvest_llm_ledger", &llm_ledger),
             ] {
                 diesel::sql_query(format!(
                     "INSERT INTO {table} SELECT * FROM \
@@ -1861,6 +1873,7 @@ mod db {
         "DELETE FROM harvest_signals WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_payload_refs WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_workflow_logs WHERE workflow_exec_id = $1",
+        "DELETE FROM harvest_llm_ledger WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_stream_chunks WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_task_queue WHERE workflow_exec_id = $1",
     ];

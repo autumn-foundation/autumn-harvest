@@ -952,6 +952,14 @@ pub fn outstanding_signal(
             "session {exec_id} {reason}, so it cannot be driven again"
         ));
     }
+    // Each drive reads EVERY staged row of the session (issue #2020), of any
+    // name. One row it cannot read fails every drive.
+    if let Some(name) = unreadable_staged_signal(conn, exec_id)? {
+        return Err(format!(
+            "session {exec_id} holds a staged signal for {name} that the engine \
+             cannot read, so every drive fails and a decision can never be taken up"
+        ));
+    }
     // `fired = 0` is the backend's own proof of a wait that is still armed.
     // An approval that timed out leaves its timer behind with `fired = 1`,
     // and a timed-out wait has no answer either. Reading every timer would
@@ -990,6 +998,41 @@ pub fn outstanding_signal(
     Ok(None)
 }
 
+/// The name of the first staged row that the backend cannot read, if any.
+///
+/// The backend reads `received_at` as an `i64`, and `payload_json` as a
+/// `String` that it parses as JSON, for every undelivered row of the run.
+/// `SQLite` typing is dynamic, so a column can hold another class. Any such
+/// row fails that read.
+fn unreadable_staged_signal(conn: &Connection, exec_id: &str) -> Result<Option<String>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT name, payload_json, received_at FROM harvest_signals \
+             WHERE exec_id = ?1 AND delivered = 0 \
+             ORDER BY received_at, signal_seq",
+        )
+        .map_err(|e| format!("cannot prepare the staged signal query: {e}"))?;
+    let mut rows = statement
+        .query([exec_id])
+        .map_err(|e| format!("cannot read the staged signals: {e}"))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("cannot read a staged signal: {e}"))?
+    {
+        let name: String = row
+            .get(0)
+            .map_err(|e| format!("cannot read a staged signal name: {e}"))?;
+        let readable = row.get::<_, i64>(2).is_ok()
+            && row
+                .get::<_, String>(1)
+                .is_ok_and(|payload| serde_json::from_str::<serde_json::Value>(&payload).is_ok());
+        if !readable {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
 /// The signal a deadline timer belongs to, if it is one.
 fn signal_of(timer_id: &str) -> Option<String> {
     timer_id
@@ -1002,7 +1045,7 @@ fn signal_of(timer_id: &str) -> Option<String> {
 ///
 /// TWO tables answer that, and one of them alone is not enough. A decision is
 /// STAGED in `harvest_signals` when it is sent, and the event is appended
-/// later, when the workflow takes it up. A daemon that stopped between the
+/// later, on the next drive. A daemon that stopped between the
 /// two holds a decision that will win on the next drive.
 ///
 /// Reading the event alone would restore the wait over such a decision, and a
@@ -1079,7 +1122,7 @@ fn delivered_decision(conn: &Connection, exec_id: &str, signal: &str) -> Result<
 /// take up. `Some(false)` is a row that suppresses the wait and that no drive
 /// can consume.
 ///
-/// The row is read the way `peek_pending_signal` reads it, and then
+/// The row is read as a `String`, as the backend reads it, and then
 /// deserialised into the type the workflow asks for. Nothing here restates
 /// what that type accepts, so nothing here can drift from it.
 ///
@@ -1098,9 +1141,9 @@ fn delivered_decision(conn: &Connection, exec_id: &str, signal: &str) -> Result<
 /// An UNKNOWN key is accepted, because the type accepts it. Measured:
 /// `{"approved":true,"extra":1}` deserialises.
 ///
-/// The row is chosen with the backend's OWN order. `peek_pending_signal`
-/// takes the earliest-arrived undelivered row, so a bare `LIMIT 1` could
-/// report on a row the engine never reads.
+/// The row is chosen with the backend's OWN order. The wait takes the
+/// earliest-arrived row of its name, so a bare `LIMIT 1` could report on a
+/// later row.
 fn staged_decision(conn: &Connection, exec_id: &str, signal: &str) -> Result<Option<bool>, String> {
     let mut statement = conn
         .prepare(

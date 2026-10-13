@@ -56,9 +56,9 @@ Its withheld-permit accounting is built on `tokio::sync::Semaphore` and
 `OwnedSemaphorePermit`. `heartbeat.rs` drains a `tokio::sync::mpsc` channel.
 Both are async-runtime properties.
 
-**Status: shipped.** Three models in `tests/shuttle_models.rs` cover
-`slot_tuner.rs` and `heartbeat.rs`, each under the random and the PCT
-scheduler. They drive the real code through the `src/shuttle_sync.rs` shim.
+**Status: shipped.** Four models in `tests/shuttle_models.rs` cover
+`slot_tuner.rs`, `heartbeat.rs` and `adaptive_limit.rs`, each under the
+random and the PCT scheduler. They drive the real code through the `src/shuttle_sync.rs` shim.
 They found two `resize_toward` defects, both fixed. The `shuttle` job in
 `.github/workflows/ci.yml` runs them on every PR. See
 [`shuttle.md`](shuttle.md#defects-found).

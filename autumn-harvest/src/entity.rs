@@ -498,6 +498,29 @@ const fn over_byte_budget(loaded: u64, op_bytes: u64, cap: u64) -> bool {
     loaded.saturating_add(op_bytes) > cap / 2
 }
 
+/// Kani proofs of the entity byte budget (issue #1975).
+///
+/// The `kani` CI job runs them. See `docs/testing/formal-methods.md`.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// A counter grows by 0 or 1 bytes, and by 1 only when `n + 1` gains a
+    /// digit. The subtraction never underflows.
+    #[kani::proof]
+    fn counter_growth_is_one_byte_at_a_power_of_ten() {
+        let n: u64 = kani::any();
+        let growth = counter_growth(n);
+        assert!(growth <= 1);
+        if n < u64::MAX {
+            // A table, not `ilog10`, so the harness adds no symbolic divide.
+            let powers: [u64; 19] = core::array::from_fn(|i| 10_u64.pow(i as u32 + 1));
+            assert_eq!(growth == 1, powers.contains(&(n + 1)));
+        }
+        kani::cover!(growth == 1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::Future;
