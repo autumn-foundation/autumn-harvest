@@ -144,6 +144,15 @@ pub async fn probe_version(
             firecracker_bin.display()
         ))
     })?;
+    // A wrapper can print a version and still fail. Such a binary fails
+    // each launch too, so it is no valid version.
+    if !output.status.success() {
+        return Err(SandboxError::Config(format!(
+            "{} --version did not exit cleanly: {}",
+            firecracker_bin.display(),
+            output.status
+        )));
+    }
     let text = String::from_utf8_lossy(&output.stdout);
     let version = parse_version(&text, binary).ok_or_else(|| {
         SandboxError::Config(format!(
@@ -342,6 +351,13 @@ mod tests {
         assert_eq!(probe_version(&good, fc).await.unwrap(), (1, 17, 0));
         assert!(probe_version(&old, fc).await.is_err());
         assert!(probe_version(&dir.join("missing"), fc).await.is_err());
+        // A probe that prints a version but fails is not a version.
+        let failing = dir.join("fc-failing");
+        write_executable(&failing, "#!/bin/sh\necho 'Firecracker v1.17.0'\nexit 1\n");
+        assert!(matches!(
+            probe_version(&failing, fc).await,
+            Err(SandboxError::Config(ref m)) if m.contains("exit")
+        ));
         // A Firecracker binary given as the jailer is a config error.
         assert!(matches!(
             probe_version(&good, VmmBinary::Jailer).await,

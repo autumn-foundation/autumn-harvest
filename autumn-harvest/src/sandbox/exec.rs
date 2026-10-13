@@ -648,38 +648,48 @@ fn spawn_capture<R: AsyncRead + Unpin + Send + 'static>(
 
 /// A private work directory, removed when the run ends.
 struct WorkDir {
+    /// The parent of `path`. Only the executor can write it, so code of
+    /// another uid cannot move the work directory out of the cleanup.
+    parent: PathBuf,
     path: PathBuf,
-    /// The directory, opened before the code runs. The code owns the
-    /// directory, so it can move it and leave a link at `path`. So the
-    /// outputs are read through this handle, never through `path`.
+    /// The directory, opened before the code runs. A non-root executor
+    /// shares its uid with the code, so the code can still move the
+    /// directory. So the outputs are read through this handle, never
+    /// through `path`.
     handle: std::fs::File,
     removed: bool,
 }
 
 impl WorkDir {
-    /// Create a new directory with mode `0700` that the executor owns.
+    /// Create a new directory with mode `0700` that the executor owns, in a
+    /// new parent with mode `0711`.
     fn create(root: &Path) -> Result<Self, SandboxError> {
-        let path = root.join(format!("harvest-sbx-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .map_err(|e| {
-                SandboxError::Unavailable(format!(
-                    "could not create the work directory {}: {e}",
-                    path.display()
-                ))
-            })?;
+        let parent = root.join(format!("harvest-sbx-{}", uuid::Uuid::new_v4().simple()));
+        let path = parent.join("work");
+        let created = std::fs::DirBuilder::new()
+            .mode(0o711)
+            .create(&parent)
+            .and_then(|()| std::fs::DirBuilder::new().mode(0o700).create(&path));
+        if let Err(e) = created {
+            let _ = remove_work_dir(&parent);
+            return Err(SandboxError::Unavailable(format!(
+                "could not create the work directory {}: {e}",
+                path.display()
+            )));
+        }
         let handle = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&path)
             .map_err(|e| {
+                let _ = remove_work_dir(&parent);
                 SandboxError::Unavailable(format!(
                     "could not open the work directory {}: {e}",
                     path.display()
                 ))
             })?;
         Ok(Self {
+            parent,
             path,
             handle,
             removed: false,
@@ -702,11 +712,11 @@ impl WorkDir {
 
     async fn remove(mut self) {
         self.removed = true;
-        let path = self.path.clone();
-        let removed = tokio::task::spawn_blocking(move || remove_work_dir(&path)).await;
+        let parent = self.parent.clone();
+        let removed = tokio::task::spawn_blocking(move || remove_work_dir(&parent)).await;
         if !matches!(removed, Ok(Ok(()))) {
             tracing::warn!(
-                path = %self.path.display(),
+                path = %self.parent.display(),
                 "could not remove a sandbox work directory"
             );
         }
@@ -716,7 +726,7 @@ impl WorkDir {
 impl Drop for WorkDir {
     fn drop(&mut self) {
         if !self.removed {
-            let _ = remove_work_dir(&self.path);
+            let _ = remove_work_dir(&self.parent);
         }
     }
 }
@@ -1193,6 +1203,42 @@ mod tests {
         let dir = PathBuf::from(lines.next().unwrap());
         assert_eq!(lines.next(), Some("700"));
         assert!(!dir.exists(), "{} must be removed", dir.display());
+    }
+
+    #[tokio::test]
+    async fn the_work_directory_and_its_parent_are_removed() {
+        let out = run(sh("pwd")).await;
+        let dir = PathBuf::from(out.stdout.trim());
+        let parent = dir.parent().unwrap().to_path_buf();
+        assert!(
+            parent
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("harvest-sbx-")),
+            "the work directory needs its own parent: {}",
+            dir.display()
+        );
+        assert!(!parent.exists(), "{} must be removed", parent.display());
+    }
+
+    #[tokio::test]
+    #[ignore = "needs root; the Sandbox (KVM) workflow runs it with sudo"]
+    async fn root_the_code_cannot_move_its_work_directory() {
+        // SAFETY: geteuid has no preconditions.
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
+        let out = run(sh(
+            "d=$(pwd); if mv \"$d\" \"$d.moved\" 2>/dev/null; then echo moved; else echo kept; fi; echo \"$d\"",
+        ))
+        .await;
+        let mut lines = out.stdout.lines();
+        let verdict = lines.next();
+        if let Some(dir) = lines.next() {
+            let _ = std::fs::remove_dir_all(format!("{dir}.moved"));
+        }
+        assert_eq!(
+            verdict,
+            Some("kept"),
+            "a moved directory escapes the cleanup"
+        );
     }
 
     #[tokio::test]
