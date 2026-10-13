@@ -38,6 +38,11 @@ pub const KILL_WAIT: Duration = Duration::from_secs(5);
 /// The time that teardown waits for a killed cgroup to empty.
 pub const CGROUP_EMPTY_WAIT: Duration = Duration::from_secs(2);
 
+/// The time that a launch can take to lay out its VM directory and start
+/// the VMM. A copy of an image across file systems can take longer, so keep
+/// the images on the file system of the jail.
+pub const LAUNCH_SETUP_ALLOWANCE: Duration = Duration::from_secs(10);
+
 /// The bytes of VMM stderr that a launcher keeps for error reports.
 pub const STDERR_TAIL_BYTES: usize = 2048;
 
@@ -71,6 +76,12 @@ pub trait VmLauncher: Send + Sync + 'static {
     /// backend then uses it in place of its own setting.
     fn guest_port(&self) -> Option<u32> {
         None
+    }
+
+    /// The longest time that [`Self::launch`] can take. The backend adds it
+    /// to its overhead. Zero by default.
+    fn launch_budget(&self) -> Duration {
+        Duration::ZERO
     }
 }
 
@@ -122,7 +133,8 @@ pub struct LauncherConfig {
     /// The vsock port of the guest agent. It must not be `u32::MAX`, the
     /// wildcard port.
     pub guest_port: u32,
-    /// The time limit of the API socket and of each API call.
+    /// The time limit of the whole API boot: the wait for the socket and
+    /// each call.
     pub api_timeout: Duration,
 }
 
@@ -529,6 +541,10 @@ impl FirecrackerLauncher {
     /// can read them. They hold the guest memory, so the golden microVM must
     /// hold no secret.
     ///
+    /// Both files replace an old pair only after both copies are complete.
+    /// A launch that starts between the two renames can see a mixed pair.
+    /// So create a snapshot before the launchers that use it start.
+    ///
     /// # Errors
     ///
     /// Returns [`SandboxError::Config`] without the jailer, and
@@ -599,10 +615,7 @@ impl FirecrackerLauncher {
         let out = out_dir.to_path_buf();
         tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&out)?;
-            for (from, to) in &copies {
-                copy_out(from, to, gid)?;
-            }
-            Ok::<(), std::io::Error>(())
+            publish_snapshot(&copies, gid)
         })
         .await
         .map_err(|e| SandboxError::Unavailable(format!("the snapshot copy failed: {e}")))?
@@ -780,8 +793,29 @@ impl FirecrackerLauncher {
         })
     }
 
-    /// Configure and start, or restore, a VM through its API socket.
+    /// Configure and start, or restore, a VM through its API socket, within
+    /// the API timeout in total.
     async fn boot_through_api(
+        &self,
+        vm: &mut RunningVm,
+        socket: &Path,
+        boot: &BootMethod,
+    ) -> Result<(), SandboxError> {
+        tokio::time::timeout(
+            self.config.api_timeout,
+            self.api_boot_steps(vm, socket, boot),
+        )
+        .await
+        .map_err(|_| {
+            SandboxError::Unavailable(format!(
+                "the API boot did not finish within {:?}",
+                self.config.api_timeout
+            ))
+        })?
+    }
+
+    /// The steps of [`Self::boot_through_api`].
+    async fn api_boot_steps(
         &self,
         vm: &mut RunningVm,
         socket: &Path,
@@ -856,6 +890,19 @@ impl VmLauncher for FirecrackerLauncher {
     fn guest_port(&self) -> Option<u32> {
         Some(self.config.guest_port)
     }
+
+    /// The two version probes of the first launch, the API boot, and
+    /// [`LAUNCH_SETUP_ALLOWANCE`].
+    fn launch_budget(&self) -> Duration {
+        let api = match self.config.boot {
+            BootMethod::ConfigFile => Duration::ZERO,
+            BootMethod::Api | BootMethod::Snapshot(_) => self.config.api_timeout,
+        };
+        super::posture::VERSION_PROBE_TIMEOUT
+            .saturating_mul(2)
+            .saturating_add(api)
+            .saturating_add(LAUNCH_SETUP_ALLOWANCE)
+    }
 }
 
 /// The API socket of an unjailed VM, in its directory.
@@ -876,6 +923,38 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
 ///
 /// The VMM can write its jail, so the source must be a regular file and not
 /// a symbolic link.
+/// Copy each snapshot file to its target, and replace the old files only
+/// when every copy is complete.
+///
+/// Each copy goes to a temporary name next to its target and is synced.
+/// So a failed copy, such as on a full disk, keeps the old pair.
+fn publish_snapshot(copies: &[(PathBuf, PathBuf)], gid: u32) -> std::io::Result<()> {
+    let mut staged = Vec::new();
+    let mut publish = || {
+        for (from, to) in copies {
+            let name = to.file_name().unwrap_or_default().to_string_lossy();
+            let temp = to.with_file_name(format!(".{name}.{}", uuid::Uuid::new_v4().simple()));
+            staged.push(temp.clone());
+            copy_out(from, &temp, gid)?;
+        }
+        for (temp, (_, to)) in staged.iter().zip(copies) {
+            std::fs::rename(temp, to)?;
+        }
+        // Sync the directory, so the new names survive a crash.
+        if let Some(dir) = copies.first().and_then(|(_, to)| to.parent()) {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(())
+    };
+    let result = publish();
+    if result.is_err() {
+        for temp in &staged {
+            let _ = std::fs::remove_file(temp);
+        }
+    }
+    result
+}
+
 fn copy_out(from: &Path, to: &Path, gid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let mut source = std::fs::OpenOptions::new()
@@ -890,8 +969,7 @@ fn copy_out(from: &Path, to: &Path, gid: u32) -> std::io::Result<()> {
     }
     let mut target = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o640)
         .custom_flags(libc::O_NOFOLLOW)
         .open(to)?;
@@ -1500,6 +1578,88 @@ mod tests {
             ]
         );
         vm.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_api_boot_is_bounded_as_a_whole() {
+        let dir = temp_dir();
+        let server = dir.join("slow_api.py");
+        let slow = FAKE_API_PY.replace(
+            "    conn, _ = srv.accept()\n",
+            "    conn, _ = srv.accept()\n    __import__('time').sleep(0.15)\n",
+        );
+        assert_ne!(slow, FAKE_API_PY);
+        std::fs::write(&server, slow).unwrap();
+        let fc = script(
+            &dir,
+            "firecracker",
+            &format!("exec python3 {} \"$@\"", server.display()),
+        );
+        let mut config = unjailed(&dir, fc, BootMethod::Api);
+        // Each call takes 150 ms, under the timeout. Six calls take more.
+        config.api_timeout = Duration::from_millis(500);
+        let launcher = new_launcher(config).unwrap();
+        let err = launcher.launch().await.err().expect("a slow API boot");
+        assert!(
+            matches!(err, SandboxError::Unavailable(ref m) if m.contains("API")),
+            "{err:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_launch_budget_covers_the_version_probes_and_the_api_boot() {
+        let dir = temp_dir();
+        let fc = script(&dir, "firecracker", "exit 0");
+        let mut config = unjailed(&dir, fc, BootMethod::Api);
+        config.api_timeout = Duration::from_secs(7);
+        let launcher = new_launcher(config).unwrap();
+        let need = super::super::posture::VERSION_PROBE_TIMEOUT * 2 + Duration::from_secs(7);
+        assert!(
+            launcher.launch_budget() > need,
+            "{:?}",
+            launcher.launch_budget()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_snapshot_copy_keeps_the_old_pair() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = temp_dir();
+        let out = dir.join("golden");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("state"), b"old state").unwrap();
+        std::fs::write(out.join("memory"), b"old memory").unwrap();
+        std::fs::write(dir.join("new-state"), b"new state").unwrap();
+        // SAFETY: getegid has no preconditions.
+        let gid = unsafe { libc::getegid() };
+        let copies = [
+            (dir.join("new-state"), out.join("state")),
+            (dir.join("missing-memory"), out.join("memory")),
+        ];
+        publish_snapshot(&copies, gid).expect_err("a missing memory file");
+        assert_eq!(std::fs::read(out.join("state")).unwrap(), b"old state");
+        assert_eq!(std::fs::read(out.join("memory")).unwrap(), b"old memory");
+        assert_eq!(
+            std::fs::read_dir(&out).unwrap().count(),
+            2,
+            "a temporary file is left"
+        );
+        std::fs::write(dir.join("new-memory"), b"new memory").unwrap();
+        let copies = [
+            (dir.join("new-state"), out.join("state")),
+            (dir.join("new-memory"), out.join("memory")),
+        ];
+        publish_snapshot(&copies, gid).unwrap();
+        assert_eq!(std::fs::read(out.join("state")).unwrap(), b"new state");
+        assert_eq!(std::fs::read(out.join("memory")).unwrap(), b"new memory");
+        let mode = std::fs::metadata(out.join("memory"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o640);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -169,6 +169,9 @@ runtime refuses a policy that allows the network on a backend without one.
   for the jailer.
 - Absolute paths in `LauncherConfig`. Firecracker runs in the VM directory,
   so the launcher refuses a relative path.
+- Images on the file system of the jail, so each launch links them. The
+  backend overhead allows 10 seconds to lay out a jail, not a copy of a large
+  image.
 - `JailerConfig::cgroup_root` set to the cgroup v2 mount of the jailer: the
   first `cgroup2` line in `/proc/mounts`. The default is `/sys/fs/cgroup`.
   The launcher refuses another path, because teardown kills the cgroups
@@ -302,7 +305,10 @@ subtree, because cgroup v2 keeps processes only in leaves.
 jailer, so each restore sees the same paths.
 `FirecrackerLauncher::create_golden_snapshot` boots a golden microVM, waits
 for its agent, pauses it and saves the files. No code runs in it. The files
-hold the guest memory, so the golden microVM must hold no secret.
+hold the guest memory, so the golden microVM must hold no secret. The new
+pair replaces an old pair only after both copies are complete. Create it
+before the launchers that use it start, because a launch between the two
+renames can see a mixed pair.
 
 Clones of one snapshot share their user-space random state. Each run
 therefore carries fresh host entropy, and VMGenID reseeds the kernel on Linux

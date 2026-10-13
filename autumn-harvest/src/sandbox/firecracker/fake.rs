@@ -68,6 +68,8 @@ pub struct FakeLauncher {
     pub port: Option<u32>,
     /// The number of `guest_port` calls.
     pub port_queries: AtomicUsize,
+    /// The answer of `launch_budget`.
+    pub launch_budget: std::time::Duration,
 }
 
 impl FakeLauncher {
@@ -87,6 +89,7 @@ impl FakeLauncher {
             crashed: Arc::default(),
             port: None,
             port_queries: AtomicUsize::new(0),
+            launch_budget: std::time::Duration::ZERO,
         }
     }
 
@@ -139,6 +142,10 @@ impl VmLauncher for FakeLauncher {
     fn guest_port(&self) -> Option<u32> {
         self.port_queries.fetch_add(1, Ordering::SeqCst);
         self.port
+    }
+
+    fn launch_budget(&self) -> std::time::Duration {
+        self.launch_budget
     }
 }
 
