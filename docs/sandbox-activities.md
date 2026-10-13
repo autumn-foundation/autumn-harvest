@@ -132,6 +132,10 @@ The process executor gives each run:
   reserves about 600 MiB of address space at start;
 - an empty network namespace when the policy denies the network. When the
   host cannot create one, the run fails closed with `SandboxUnavailable`;
+- a process limit. A root worker runs the code as a dedicated uid. A
+  non-root worker runs each run in a new user namespace, which counts the
+  processes of that run alone. That needs Linux 5.14 or later and user
+  namespaces. Without them, the run fails closed;
 - uid and gid `65534` when the worker runs as root. The executor refuses
   uid 0 and gid 0 for the code.
 

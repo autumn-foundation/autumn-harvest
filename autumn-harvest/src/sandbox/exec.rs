@@ -13,10 +13,12 @@
 //! - every inherited descriptor above 2 marked close-on-exec;
 //! - an empty signal mask;
 //! - `PR_SET_NO_NEW_PRIVS`;
-//! - rlimits for CPU, data memory, file size, open files and core dumps. The
-//!   data rlimit adds [`DATA_HEADROOM_BYTES`] for JIT reservations;
+//! - rlimits for CPU, data memory, file size, open files, processes and core
+//!   dumps. The data rlimit adds [`DATA_HEADROOM_BYTES`] for JIT
+//!   reservations;
 //! - an empty network namespace when the plan denies the network;
-//! - a dedicated uid and gid when the executor runs as root.
+//! - a dedicated uid and gid when the executor runs as root, or else a new
+//!   user namespace, so the process limit counts only this run.
 //!
 //! A process that calls `setsid` leaves the group, and the host executor
 //! cannot kill it. On a root host, concurrent runs share the uid `nobody`
@@ -55,6 +57,10 @@ pub const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// network namespace. No other setup step returns it, so the parent can name
 /// the cause.
 const NETNS_FAILED: i32 = libc::ENETDOWN;
+
+/// The errno that the child setup reports when it cannot create a user
+/// namespace for a non-root run. No other setup step returns it.
+const USERNS_FAILED: i32 = libc::EUSERS;
 
 /// The data rlimit on top of the memory limit.
 ///
@@ -248,7 +254,8 @@ enum End {
 ///
 /// # Errors
 ///
-/// Returns [`SandboxError::Config`] for uid 0 or gid 0.
+/// Returns [`SandboxError::Config`] for uid 0 or gid 0, and for a non-root
+/// executor on Linux before 5.14, which cannot bound the processes.
 fn effective_run_as(options: &ExecOptions) -> Result<Option<(u32, u32)>, SandboxError> {
     // SAFETY: geteuid has no preconditions.
     let root = unsafe { libc::geteuid() } == 0;
@@ -258,7 +265,41 @@ fn effective_run_as(options: &ExecOptions) -> Result<Option<(u32, u32)>, Sandbox
             "the code must not run as uid 0 or gid 0".into(),
         ));
     }
+    if !root && !release_at_least(&kernel_release(), (5, 14)) {
+        return Err(SandboxError::Config(
+            "a non-root executor needs Linux 5.14 or later to bound the processes of a run".into(),
+        ));
+    }
     Ok(run_as)
+}
+
+/// The release of the running kernel, or an empty string.
+fn kernel_release() -> String {
+    // SAFETY: a zeroed utsname is valid, and uname only fills it.
+    let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+    // SAFETY: `name` is a valid utsname to write.
+    if unsafe { libc::uname(&raw mut name) } != 0 {
+        return String::new();
+    }
+    // SAFETY: uname writes a NUL-terminated release string.
+    unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Whether a kernel `release` such as `6.1.155-x` is at least
+/// `major.minor`. A release that does not parse is not.
+fn release_at_least(release: &str, (major, minor): (u32, u32)) -> bool {
+    let mut parts = release
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .map(str::parse::<u32>);
+    match (parts.next(), parts.next()) {
+        (Some(Ok(found_major)), Some(Ok(found_minor))) => {
+            (found_major, found_minor) >= (major, minor)
+        }
+        _ => false,
+    }
 }
 
 /// Kills a process group when the run future is dropped. The run takes the
@@ -280,6 +321,11 @@ fn spawn_error(command: &str, err: &io::Error) -> SandboxError {
         Some(NETNS_FAILED) => SandboxError::Unavailable(
             "the policy denies the network, and this host does not allow an empty network \
              namespace; the run fails closed"
+                .into(),
+        ),
+        Some(USERNS_FAILED) => SandboxError::Unavailable(
+            "a non-root executor needs a user namespace to bound the processes, and this host \
+             does not allow one; the run fails closed"
                 .into(),
         ),
         Some(libc::ENOENT | libc::EACCES | libc::ENOEXEC) => SandboxError::Denied(format!(
@@ -345,17 +391,27 @@ impl ChildSetup {
             {
                 return Err(io::Error::last_os_error());
             }
-            if self.deny_network {
-                // Root can create a network namespace directly. Another user
-                // needs a user namespace to hold the capability.
-                let flags = if self.root {
-                    libc::CLONE_NEWNET
+            // Root can create a network namespace directly. Another user
+            // always enters a new user namespace. It holds the capability for
+            // the network namespace, and it counts the processes of the run
+            // apart from those of the worker.
+            let net = if self.deny_network {
+                libc::CLONE_NEWNET
+            } else {
+                0
+            };
+            let flags = if self.root {
+                net
+            } else {
+                libc::CLONE_NEWUSER | net
+            };
+            if flags != 0 && libc::unshare(flags) != 0 {
+                let failed = if self.deny_network {
+                    NETNS_FAILED
                 } else {
-                    libc::CLONE_NEWUSER | libc::CLONE_NEWNET
+                    USERNS_FAILED
                 };
-                if libc::unshare(flags) != 0 {
-                    return Err(io::Error::from_raw_os_error(NETNS_FAILED));
-                }
+                return Err(io::Error::from_raw_os_error(failed));
             }
             mark_descriptors_cloexec();
             set_limit(libc::RLIMIT_CORE, 0, 0)?;
@@ -367,16 +423,16 @@ impl ChildSetup {
             set_limit(libc::RLIMIT_DATA, self.data_bytes, self.data_bytes)?;
             set_limit(libc::RLIMIT_FSIZE, self.file_bytes, self.file_bytes)?;
             set_limit(libc::RLIMIT_NOFILE, self.open_files, self.open_files)?;
-            if let Some((uid, gid)) = self.run_as {
-                // A process count limit is a per-uid limit, so it is exact
-                // only for a dedicated uid.
-                set_limit(libc::RLIMIT_NPROC, self.processes, self.processes)?;
-                if libc::setgroups(0, std::ptr::null()) != 0
+            // Linux counts processes per uid in each user namespace, from
+            // 5.14 on. So the limit is exact for a dedicated uid, and for a
+            // non-root run in its own user namespace.
+            set_limit(libc::RLIMIT_NPROC, self.processes, self.processes)?;
+            if let Some((uid, gid)) = self.run_as
+                && (libc::setgroups(0, std::ptr::null()) != 0
                     || libc::setgid(gid) != 0
-                    || libc::setuid(uid) != 0
-                {
-                    return Err(io::Error::last_os_error());
-                }
+                    || libc::setuid(uid) != 0)
+            {
+                return Err(io::Error::last_os_error());
             }
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                 return Err(io::Error::last_os_error());
@@ -843,6 +899,45 @@ mod tests {
 
     fn options() -> ExecOptions {
         ExecOptions::default()
+    }
+
+    #[tokio::test]
+    async fn the_process_limit_holds_without_root() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            // Root runs the code as a dedicated uid. A root_ test covers it.
+            return;
+        }
+        let mut policy = SandboxPolicy::for_development().with_network(NetworkPolicy::Allow);
+        policy.default_limits.max_processes = 8;
+        // Each fork that works prints one line.
+        let plan = policy
+            .plan(&sh("i=0; while [ $i -lt 20 ]; do \
+                 ( echo started; exec sleep 5 >/dev/null 2>&1 ) & i=$((i+1)); done; wait"))
+            .unwrap();
+        match execute_plan(&plan, &options(), &CancellationToken::new()).await {
+            Ok(out) => {
+                let started = out.stdout.lines().filter(|l| *l == "started").count();
+                // The limit counts the processes of this run, not those of
+                // the worker, so some forks work and some fail.
+                assert!(
+                    (1..20).contains(&started),
+                    "{started} forks worked: {}",
+                    out.stderr
+                );
+            }
+            Err(SandboxError::Unavailable(m)) if m.contains("user namespace") => {}
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn the_kernel_release_sets_the_process_count() {
+        assert!(release_at_least("6.18.44-fc-v114", (5, 14)));
+        assert!(release_at_least("5.14.0-362.el9.x86_64", (5, 14)));
+        assert!(!release_at_least("5.4.0-150-generic", (5, 14)));
+        assert!(!release_at_least("4.18.0", (5, 14)));
+        assert!(!release_at_least("garbage", (5, 14)));
     }
 
     #[test]

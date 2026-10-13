@@ -15,6 +15,25 @@ use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 
 use super::launcher::{LaunchedVm, VmLauncher};
+
+/// Write an executable file for a test, with mode `0755`.
+///
+/// A test that writes a file and then runs it can fail with ETXTBSY. Another
+/// test thread can fork while the write descriptor is open, and the child
+/// keeps the descriptor until its own exec. So `install` writes the file in
+/// its own process, and no thread of the test binary holds a descriptor.
+pub fn write_executable(path: &Path, contents: &str) {
+    let source = path.with_extension("src");
+    std::fs::write(&source, contents).expect("write the source");
+    let status = std::process::Command::new("install")
+        .args(["-m", "0755"])
+        .arg(&source)
+        .arg(path)
+        .status()
+        .expect("run install");
+    assert!(status.success(), "install failed for {}", path.display());
+    std::fs::remove_file(&source).expect("remove the source");
+}
 use crate::sandbox::error::SandboxError;
 use crate::sandbox::guest::{PlanExecutor, Served, UnmanagedKernel, serve_connection};
 use crate::sandbox::protocol::{HostMessage, MAX_FRAME_BYTES, read_message};

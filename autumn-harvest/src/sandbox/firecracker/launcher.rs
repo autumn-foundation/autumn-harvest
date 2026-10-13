@@ -553,11 +553,10 @@ impl FirecrackerLauncher {
             .mode(0o700)
             .create(&root)
             .map_err(|e| prepare_error(id, "the jail", &e))?;
-        // A failed step removes the jail, so a failed launch leaves nothing.
-        let fail = |what: &str, e: &std::io::Error| {
-            let _ = crate::sandbox::exec::remove_work_dir(&jail);
-            prepare_error(id, what, e)
-        };
+        // A failed step or a dropped launch removes the jail, so it leaves
+        // nothing.
+        let guard = JailGuard::new(jail.clone());
+        let fail = |what: &str, e: &std::io::Error| prepare_error(id, what, e);
         let mut links = vec![
             (
                 config.image.kernel.clone(),
@@ -583,12 +582,18 @@ impl FirecrackerLauncher {
             ));
         }
         // A copy across file systems can take seconds, so it runs off the
-        // async workers.
+        // async workers. A dropped launch does not stop this task. So the
+        // task removes the jail again when the guard is gone.
+        let abandoned = guard.abandoned();
+        let task_jail = jail.clone();
         let linked = tokio::task::spawn_blocking(move || {
-            for (from, to, what) in links {
-                link_or_copy(&from, &to).map_err(|e| (what, e))?;
+            let linked = links
+                .into_iter()
+                .try_for_each(|(from, to, what)| link_or_copy(&from, &to).map_err(|e| (what, e)));
+            if abandoned.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = crate::sandbox::exec::remove_work_dir(&task_jail);
             }
-            Ok(())
+            linked
         })
         .await;
         match linked {
@@ -628,6 +633,7 @@ impl FirecrackerLauncher {
                 &firecracker_args,
             ))
             .current_dir(&jail);
+        guard.disarm();
         Ok(Prepared {
             vm_dir: jail,
             vsock: root.join(VSOCK_SOCKET),
@@ -962,6 +968,45 @@ fn write_config(path: &Path, document: &super::config::VmConfigFile) -> std::io:
     std::fs::write(path, json)
 }
 
+/// Removes a jail when a launch stops before the VMM owns it.
+///
+/// A dropped launch future drops the guard, and the guard removes the jail.
+/// The guard also marks the jail as abandoned, so a task that still writes
+/// into it removes it again when it ends.
+struct JailGuard {
+    jail: Option<PathBuf>,
+    abandoned: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl JailGuard {
+    fn new(jail: PathBuf) -> Self {
+        Self {
+            jail: Some(jail),
+            abandoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// The flag that the guard sets when it removes the jail.
+    fn abandoned(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.abandoned)
+    }
+
+    /// Keep the jail. The caller now owns its removal.
+    fn disarm(mut self) {
+        self.jail = None;
+    }
+}
+
+impl Drop for JailGuard {
+    fn drop(&mut self) {
+        if let Some(jail) = self.jail.take() {
+            self.abandoned
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = crate::sandbox::exec::remove_work_dir(&jail);
+        }
+    }
+}
+
 /// The parts of a launch before the process starts.
 struct Prepared {
     vm_dir: PathBuf,
@@ -1193,8 +1238,10 @@ mod tests {
         } else {
             format!("if [ \"$1\" = --version ]; then echo '{version}'; exit 0; fi\n")
         };
-        std::fs::write(&path, format!("#!/bin/sh\n{answer}{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::sandbox::firecracker::fake::write_executable(
+            &path,
+            &format!("#!/bin/sh\n{answer}{body}\n"),
+        );
         path
     }
 
@@ -1733,6 +1780,43 @@ while True:
                 "{name}: {err:?}"
             );
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_launch_dropped_while_it_links_the_image_leaves_no_jail() {
+        let dir = temp_dir();
+        let launcher = FirecrackerLauncher::new(jailed(&dir)).unwrap();
+        let vm_root = dir.join("jail/firecracker");
+        let jails = || -> Vec<PathBuf> {
+            std::fs::read_dir(&vm_root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect()
+        };
+        let mut launch = launcher.launch();
+        // Poll once at a time. The link step is the first wait after the
+        // jail exists, so the launch stops there.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while jails().is_empty() {
+            assert!(Instant::now() < deadline, "the launch never made a jail");
+            let polled = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(launch.as_mut().poll(cx).is_pending())
+            })
+            .await;
+            assert!(polled, "the launch ended before it made a jail");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        drop(launch);
+        // The link task can still run after the drop.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !jails().is_empty() {
+            assert!(Instant::now() < deadline, "the jail stayed: {:?}", jails());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(launcher);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

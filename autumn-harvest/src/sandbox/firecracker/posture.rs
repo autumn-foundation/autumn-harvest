@@ -253,6 +253,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::sandbox::firecracker::fake::write_executable;
 
     #[test]
     fn versions_are_parsed() {
@@ -285,13 +286,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("harvest-posture-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let good = dir.join("fc-good");
-        std::fs::write(&good, "#!/bin/sh\necho 'Firecracker v1.17.0'\n").unwrap();
+        write_executable(&good, "#!/bin/sh\necho 'Firecracker v1.17.0'\n");
         let old = dir.join("fc-old");
-        std::fs::write(&old, "#!/bin/sh\necho 'Firecracker v1.14.0'\n").unwrap();
-        for path in [&good, &old] {
-            std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-                .unwrap();
-        }
+        write_executable(&old, "#!/bin/sh\necho 'Firecracker v1.14.0'\n");
         assert_eq!(probe_version(&good).await.unwrap(), (1, 17, 0));
         assert!(probe_version(&old).await.is_err());
         assert!(probe_version(&dir.join("missing")).await.is_err());
