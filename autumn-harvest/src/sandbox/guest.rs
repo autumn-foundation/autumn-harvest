@@ -568,6 +568,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_malformed_outcome_frame_gives_a_bounded_error() {
+        let kind = format!("bad\0{}", "x".repeat(1 << 20));
+        let reply = serde_json::json!({"version": 1, "message": {"type": kind}});
+        let err = fake_guest_reply(reply).await.unwrap_err();
+        assert!(matches!(err, SandboxError::Protocol(_)), "{err:?}");
+        let err = err.to_string();
+        assert!(
+            err.len() <= MAX_GUEST_ERROR_BYTES + 64,
+            "{} bytes",
+            err.len()
+        );
+        assert!(!err.contains('\0'));
+    }
+
+    #[tokio::test]
     async fn an_unreadable_request_gets_an_error_frame() {
         let (mut host, mut guest) = tokio::io::duplex(4096);
         let executor = Recorder {

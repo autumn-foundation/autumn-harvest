@@ -651,11 +651,14 @@ struct WorkDir {
     /// The parent of `path`. Only the executor can write it, so code of
     /// another uid cannot move the work directory out of the cleanup.
     parent: PathBuf,
+    /// The parent, opened before the code runs.
+    parent_handle: std::fs::File,
     path: PathBuf,
     /// The directory, opened before the code runs. A non-root executor
     /// shares its uid with the code, so the code can still move the
     /// directory. So the outputs are read through this handle, never
-    /// through `path`.
+    /// through `path`. The cleanup finds both directories through their
+    /// handles.
     handle: std::fs::File,
     removed: bool,
 }
@@ -666,30 +669,24 @@ impl WorkDir {
     fn create(root: &Path) -> Result<Self, SandboxError> {
         let parent = root.join(format!("harvest-sbx-{}", uuid::Uuid::new_v4().simple()));
         let path = parent.join("work");
-        let created = std::fs::DirBuilder::new()
+        let opened = std::fs::DirBuilder::new()
             .mode(0o711)
             .create(&parent)
-            .and_then(|()| std::fs::DirBuilder::new().mode(0o700).create(&path));
-        if let Err(e) = created {
+            .and_then(|()| open_directory(&parent))
+            .and_then(|parent_handle| {
+                std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+                Ok((parent_handle, open_directory(&path)?))
+            });
+        let (parent_handle, handle) = opened.map_err(|e| {
             let _ = remove_work_dir(&parent);
-            return Err(SandboxError::Unavailable(format!(
+            SandboxError::Unavailable(format!(
                 "could not create the work directory {}: {e}",
                 path.display()
-            )));
-        }
-        let handle = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)
-            .map_err(|e| {
-                let _ = remove_work_dir(&parent);
-                SandboxError::Unavailable(format!(
-                    "could not open the work directory {}: {e}",
-                    path.display()
-                ))
-            })?;
+            ))
+        })?;
         Ok(Self {
             parent,
+            parent_handle,
             path,
             handle,
             removed: false,
@@ -712,23 +709,66 @@ impl WorkDir {
 
     async fn remove(mut self) {
         self.removed = true;
-        let parent = self.parent.clone();
-        let removed = tokio::task::spawn_blocking(move || remove_work_dir(&parent)).await;
+        let path = self.parent.clone();
+        let removed = tokio::task::spawn_blocking(move || self.remove_now()).await;
         if !matches!(removed, Ok(Ok(()))) {
             tracing::warn!(
-                path = %self.parent.display(),
+                path = %path.display(),
                 "could not remove a sandbox work directory"
             );
         }
+    }
+
+    /// Remove the parent, then the work directory if the code moved it out.
+    fn remove_now(&self) -> io::Result<()> {
+        let mut result = Ok(());
+        for (dir, path) in [
+            (&self.parent_handle, &self.parent),
+            (&self.handle, &self.path),
+        ] {
+            if let Some(path) = current_path(dir, path)
+                && let Err(e) = remove_work_dir(&path)
+            {
+                result = Err(e);
+            }
+        }
+        result
     }
 }
 
 impl Drop for WorkDir {
     fn drop(&mut self) {
         if !self.removed {
-            let _ = remove_work_dir(&self.parent);
+            let _ = self.remove_now();
         }
     }
+}
+
+/// Open the directory `path` without following a symbolic link.
+fn open_directory(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+/// The path of the open directory `dir` now, or `None` when it is gone.
+///
+/// The code can move a directory of its own uid. Then `/proc/self/fd` gives
+/// the new path. A path counts only when it names the same directory.
+fn current_path(dir: &std::fs::File, expected: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = dir.metadata().ok()?;
+    let same = |path: &Path| {
+        std::fs::symlink_metadata(path).is_ok_and(|found| {
+            found.is_dir() && found.dev() == meta.dev() && found.ino() == meta.ino()
+        })
+    };
+    if same(expected) {
+        return Some(expected.to_path_buf());
+    }
+    let path = std::fs::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd())).ok()?;
+    same(&path).then_some(path)
 }
 
 /// Write the plan files into `dir`. The directory is new, and only the
@@ -1218,6 +1258,36 @@ mod tests {
             dir.display()
         );
         assert!(!parent.exists(), "{} must be removed", parent.display());
+    }
+
+    #[tokio::test]
+    async fn the_cleanup_finds_a_work_directory_that_the_code_moved() {
+        // A sticky directory that all can write, as /tmp is.
+        let scratch = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            scratch.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o1777),
+        )
+        .unwrap();
+        let options = ExecOptions {
+            scratch_root: scratch.path().to_path_buf(),
+            ..ExecOptions::default()
+        };
+        // A non-root executor shares its uid with the code, so the code can
+        // move both directories. A root executor keeps them in place.
+        let code = "echo data > kept; p=$(dirname \"$PWD\"); r=$(dirname \"$p\"); \
+                    mv \"$p\" \"$r/moved\" 2>/dev/null; \
+                    mv \"$r/moved/work\" \"$r/work-moved\" 2>/dev/null; \
+                    mkdir \"$r/moved/extra\" 2>/dev/null; true";
+        let out = execute_plan(&plan(&sh(code)), &options, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(out.success(), "{}", out.stderr);
+        let left: Vec<_> = std::fs::read_dir(scratch.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "the cleanup left {left:?}");
     }
 
     #[tokio::test]

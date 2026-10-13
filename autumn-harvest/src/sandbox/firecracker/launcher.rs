@@ -275,6 +275,7 @@ impl FirecrackerLauncher {
                         .into(),
                 ));
             }
+            super::jailer::check_extra_cgroups(jailer)?;
             // The jailer makes the chroot and the cgroup, then drops to the
             // jail uid. Each step needs root, so another uid fails each launch.
             if euid != 0 {
@@ -2013,6 +2014,21 @@ while True:
         // A config-file boot never calls the API.
         config.boot = BootMethod::ConfigFile;
         new_launcher(config).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_extra_cgroup_that_replaces_a_launcher_limit_is_a_config_error() {
+        let dir = temp_dir();
+        let mut config = jailed(&dir);
+        if let Confinement::Jailer(jailer) = &mut config.confinement {
+            jailer.extra_cgroups.push(("pids.max".into(), "max".into()));
+        }
+        let err = new_launcher(config).expect_err("a replaced limit");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("pids.max")),
+            "{err:?}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

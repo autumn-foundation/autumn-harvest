@@ -309,8 +309,36 @@ where
             ),
         )));
     }
-    serde_json::from_slice(&body).map_err(|e| FrameError::Malformed(e.to_string()))
+    serde_json::from_slice(&body).map_err(|e| FrameError::Malformed(peer_reason(&e)))
 }
+
+/// The text of `error`, cut to [`MAX_FRAME_ERROR_BYTES`], with each NUL as
+/// U+FFFD.
+///
+/// A serde error can quote a field of the peer, such as an unknown `type`.
+/// The formatter stops at the cap, so no second copy of a large quote is made.
+fn peer_reason(error: &dyn std::fmt::Display) -> String {
+    struct Capped(String);
+    impl std::fmt::Write for Capped {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            for c in text.chars() {
+                let c = if c == '\0' { '\u{fffd}' } else { c };
+                if self.0.len() + c.len_utf8() > MAX_FRAME_ERROR_BYTES {
+                    return Err(std::fmt::Error);
+                }
+                self.0.push(c);
+            }
+            Ok(())
+        }
+    }
+    let mut reason = Capped(String::new());
+    let _ = std::fmt::Write::write_fmt(&mut reason, format_args!("{error}"));
+    reason.0
+}
+
+/// The longest reason that [`FrameError::Malformed`] keeps from a peer, in
+/// bytes.
+pub const MAX_FRAME_ERROR_BYTES: usize = 1024;
 
 /// Wrap `message` in an envelope of this protocol version.
 #[must_use]
@@ -516,6 +544,29 @@ mod tests {
             .await
             .expect_err("unknown type");
         assert!(matches!(err, FrameError::Malformed(_)));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_reason_is_bounded_and_has_no_nul() {
+        let mut buf = Vec::new();
+        let kind = format!("bad\0{}", "x".repeat(1 << 20));
+        let raw = serde_json::json!({"version": 1, "message": {"type": kind}});
+        write_frame(&mut buf, &raw, 2 << 20).await.unwrap();
+        let err = read_message::<_, GuestMessage>(&mut buf.as_slice(), 2 << 20)
+            .await
+            .expect_err("unknown type");
+        let FrameError::Malformed(reason) = err else {
+            panic!("{err:?}");
+        };
+        assert!(
+            reason.len() <= MAX_FRAME_ERROR_BYTES,
+            "{} bytes",
+            reason.len()
+        );
+        assert!(
+            reason.starts_with("unknown variant `bad\u{fffd}x"),
+            "{reason}"
+        );
     }
 
     fn outcome_json() -> serde_json::Value {

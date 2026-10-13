@@ -40,7 +40,9 @@ pub struct JailerConfig {
     pub cgroup_parent: String,
     /// The cgroup v2 mount point, for teardown.
     pub cgroup_root: PathBuf,
-    /// More cgroup values, on top of the CPU, memory and pid limits.
+    /// More cgroup values, on top of the CPU, memory and pid limits. Each
+    /// key must be a plain controller file, such as `cpuset.cpus`. The
+    /// launcher refuses a key that it sets itself, and a `cgroup.` core file.
     pub extra_cgroups: Vec<(String, String)>,
     /// A network namespace to join. `None` keeps the namespace of the jailer,
     /// and `verify_host` reports that as critical. The microVM has no network
@@ -120,20 +122,60 @@ pub fn cgroup_dir(config: &JailerConfig, vm_id: &str) -> PathBuf {
 ///
 /// `cpu.max` grants one CPU per vCPU. `memory.max` is the guest memory plus
 /// [`VMM_MEMORY_OVERHEAD_MIB`]. `pids.max` is [`VMM_MAX_PIDS`]. The extra
-/// values follow.
+/// values come first. The jailer writes the values in order, so a launcher
+/// limit always wins.
 #[must_use]
 pub fn cgroup_values(config: &JailerConfig, machine: MachineSpec) -> Vec<(String, String)> {
+    let mut values = config.extra_cgroups.clone();
+    values.extend(launcher_cgroup_values(machine));
+    values
+}
+
+/// The CPU, memory, swap and pid limits that the launcher sets.
+fn launcher_cgroup_values(machine: MachineSpec) -> [(String, String); 4] {
     let cpu_quota = u64::from(machine.vcpu_count) * 100_000;
     let memory = (u64::from(machine.mem_size_mib) + VMM_MEMORY_OVERHEAD_MIB) * 1024 * 1024;
-    let mut values = vec![
+    [
         ("cpu.max".to_owned(), format!("{cpu_quota} 100000")),
         ("memory.max".to_owned(), memory.to_string()),
         ("pids.max".to_owned(), VMM_MAX_PIDS.to_string()),
         // Guest memory must not reach the swap device.
         ("memory.swap.max".to_owned(), "0".to_owned()),
-    ];
-    values.extend(config.extra_cgroups.iter().cloned());
-    values
+    ]
+}
+
+/// Check that each extra cgroup value names a plain controller file and
+/// leaves the launcher limits in place.
+///
+/// # Errors
+///
+/// [`SandboxError::Config`] for a key that is not a plain file name, a
+/// `cgroup.` core file, or a key that [`cgroup_values`] sets.
+pub fn check_extra_cgroups(config: &JailerConfig) -> Result<(), SandboxError> {
+    let limits = launcher_cgroup_values(MachineSpec::default());
+    for (key, value) in &config.extra_cgroups {
+        // A slash, a space or `=` could reach another file or another value.
+        let plain = key.contains('.')
+            && !key.starts_with('.')
+            && key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        let problem = if !plain {
+            "is not a plain controller file name"
+        } else if key.starts_with("cgroup.") {
+            "is a cgroup core file, not a limit"
+        } else if limits.iter().any(|(limit, _)| limit == key) {
+            "would replace a launcher limit"
+        } else if value.chars().any(char::is_control) {
+            "has a control character in its value"
+        } else {
+            continue;
+        };
+        return Err(SandboxError::Config(format!(
+            "the extra cgroup value {key:?} {problem}"
+        )));
+    }
+    Ok(())
 }
 
 /// The jailer arguments that run `firecracker_bin` as `vm_id`.
@@ -237,12 +279,59 @@ mod tests {
         assert_eq!(
             values,
             [
+                ("cpuset.cpus".to_owned(), "2-3".to_owned()),
                 ("cpu.max".to_owned(), "200000 100000".to_owned()),
                 ("memory.max".to_owned(), (320u64 * 1024 * 1024).to_string()),
                 ("pids.max".to_owned(), "64".to_owned()),
                 ("memory.swap.max".to_owned(), "0".to_owned()),
-                ("cpuset.cpus".to_owned(), "2-3".to_owned()),
             ]
+        );
+    }
+
+    #[test]
+    fn an_extra_cgroup_cannot_replace_a_launcher_limit() {
+        for (key, value) in [
+            ("memory.max", "max"),
+            ("memory.swap.max", "max"),
+            ("pids.max", "max"),
+            ("cpu.max", "max 100000"),
+            ("../memory.max", "1"),
+            ("memory.max=max x", "1"),
+            ("memory .max", "1"),
+            ("cgroup.procs", "1"),
+            ("", "1"),
+            ("cpuset.cpus", "2-3\n"),
+        ] {
+            let mut config = config();
+            config.extra_cgroups.push((key.into(), value.into()));
+            let err = check_extra_cgroups(&config).expect_err(key);
+            assert!(matches!(err, SandboxError::Config(_)), "{err:?}");
+        }
+        let mut config = config();
+        config.extra_cgroups = vec![
+            ("cpuset.cpus".into(), "2-3".into()),
+            ("memory.high".into(), "200M".into()),
+            ("hugetlb.2MB.max".into(), "0".into()),
+            ("cpu.weight".into(), "50".into()),
+        ];
+        check_extra_cgroups(&config).unwrap();
+    }
+
+    #[test]
+    fn the_launcher_limits_are_written_last() {
+        let mut config = config();
+        config
+            .extra_cgroups
+            .push(("memory.max".into(), "max".into()));
+        let values = cgroup_values(&config, MachineSpec::default());
+        let last = values.iter().rposition(|(key, _)| key == "memory.max");
+        assert_eq!(
+            last.map(|i| values[i].1.as_str()),
+            Some(
+                ((u64::from(MachineSpec::default().mem_size_mib) + VMM_MEMORY_OVERHEAD_MIB) << 20)
+                    .to_string()
+                    .as_str()
+            )
         );
     }
 

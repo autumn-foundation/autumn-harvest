@@ -147,6 +147,8 @@ matters, because the microVM ends after one run.
 - It has no seccomp filter, no mount namespace and no cgroup.
 - A process that calls `setsid` leaves the group, and the executor cannot
   kill it.
+- The code can write wherever its uid can write, such as `/tmp`. The
+  executor removes only the work directory, also when the code moves it.
 - On a root host, concurrent runs share the uid `nobody`, unless `run_as`
   names another uid. A non-root worker refuses `run_as`.
 
@@ -182,6 +184,10 @@ runtime refuses a policy that allows the network on a backend without one.
 - One launcher per tenant, each with its own jail uid and gid. The microVMs
   of one launcher share their uid, so an escaped VMM can signal its
   siblings.
+- Extra cgroup values in `JailerConfig::extra_cgroups` that name plain
+  controller files. The launcher refuses `cpu.max`, `memory.max`,
+  `memory.swap.max`, `pids.max` and the `cgroup.` core files, because it sets
+  the limits itself.
 
 Call `verify_host` before the first run. It checks the versions and the host.
 Under `PosturePolicy::Enforce`, the default, it refuses a critical finding.
