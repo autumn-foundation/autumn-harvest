@@ -47,8 +47,10 @@ let task = AgentTask::new("Plan a trip to Lisbon.")
 
 The planner sees one more tool, `delegate`. Its input is `agent`, one of the
 peer names, and `task`, the text for the peer. The tool description lists
-each peer with its description. A run with peers reserves the name
-`delegate`, so an app tool with that name is hidden.
+each peer with its description. A run with a mandate reserves the name
+`delegate`, so an app tool with that name is hidden. The name stays reserved
+when the lookup finds no peer. The model then sees no `delegate` tool, and a
+call to it gets a refusal.
 
 The result of a delegation is JSON:
 

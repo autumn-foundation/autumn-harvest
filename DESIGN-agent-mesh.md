@@ -141,7 +141,7 @@ its default, so a run with no mandate records the same bytes as before.
 | AC | Criterion |
 |----|-----------|
 | AC1 | A harness holds a peer roster. A run with a mandate reads only the peers that its mandate names, through one recorded activity per agent run. A restart reads the record and does not look up again. |
-| AC2 | The `delegate` tool appears only for a run with a mandate and at least one known peer. A run with no mandate records the same request bytes as before. |
+| AC2 | The `delegate` tool appears only for a run with a mandate and at least one known peer. A run with a mandate reserves the name, even with no known peer. A run with no mandate records the same request bytes as before. |
 | AC3 | A `delegate` call runs the peer inline with its own prompt, a fresh transcript and its own step bound. Only its final answer returns to the parent. |
 | AC4 | A crash inside a child resumes without a second call for any finished child model turn. |
 | AC5 | A child mandate is the meet of the parent mandate and the peer role. Property tests prove that each bound only narrows. |

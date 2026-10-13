@@ -730,10 +730,9 @@ async fn run_tool(
             Err(reason) => ToolOutcome::error(&reason),
         });
     }
-    if let Some(agent) = run
-        .agent
-        .filter(|agent| call.name == DELEGATE_TOOL && !agent.peers.is_empty())
-    {
+    // Under a mandate, the workflow owns the name `delegate`, even with no
+    // peer to ask. Such a call gets a named refusal.
+    if let Some(agent) = run.agent.filter(|_| call.name == DELEGATE_TOOL) {
         return delegate(ctx, run, agent, progress, tree, &call).await;
     }
     ctx.execute_activity(

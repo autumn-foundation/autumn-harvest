@@ -14,7 +14,8 @@ and `DESIGN-agent-mesh.md` the plan.
   record, so a roster change cannot change a recorded run.
 - **Delegation.** The workflow tool `delegate` runs a peer inline. The child
   gets its own prompt, a fresh transcript and the run id
-  `{root run id}:d{n}`. Only its final answer returns.
+  `{root run id}:d{n}`. Only its final answer returns. A run with a mandate
+  reserves the name `delegate`, even when the lookup finds no peer.
 - **Mandate.** `AgentTask::mandate` bounds the tree: depth, delegations,
   peers, tools and read-only. A child mandate is the meet of the parent
   mandate and the peer role. Property tests prove that authority only

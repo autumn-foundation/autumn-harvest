@@ -212,6 +212,64 @@ async fn a_mandate_with_no_known_peer_offers_no_delegate_tool() {
     assert!(!offered(&model.requests()[0]).contains(DELEGATE_TOOL));
 }
 
+// AC2
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mandate_reserves_the_delegate_name_with_no_known_peer() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        delegate("d1", "ghost", "haunt", 1),
+        answer("alone", 1),
+    ]);
+    let harness = AgentHarness::new(model.clone()).tool(recorded_tool(
+        DELEGATE_TOOL,
+        ToolEffect::ReadOnly,
+        &recorder,
+    ));
+    let mut rt = runtime(&db, harness);
+
+    let exec = sqlite::start(&mut rt, &planner(&["ghost"])).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.stop, AgentStop::Completed);
+    assert!(
+        !offered(&model.requests()[0]).contains(DELEGATE_TOOL),
+        "the app tool of that name stays hidden"
+    );
+    assert_eq!(
+        recorder.runs(),
+        Vec::<Value>::new(),
+        "the app tool never runs"
+    );
+    assert_eq!(report.delegations.len(), 1);
+    assert_eq!(report.delegations[0].refusal, Some(Refusal::UnknownPeer));
+}
+
+// AC2
+#[tokio::test(flavor = "multi_thread")]
+async fn with_no_mandate_an_app_tool_named_delegate_runs() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        calls(&[("c1", DELEGATE_TOOL, json!({"to": "bob"}))], 1),
+        answer("handed over", 1),
+    ]);
+    let harness = AgentHarness::new(model.clone()).tool(recorded_tool(
+        DELEGATE_TOOL,
+        ToolEffect::ReadOnly,
+        &recorder,
+    ));
+    let mut rt = runtime(&db, harness);
+
+    let exec = sqlite::start(&mut rt, &AgentTask::new("hand it over")).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.stop, AgentStop::Completed);
+    assert!(offered(&model.requests()[0]).contains(DELEGATE_TOOL));
+    assert_eq!(recorder.runs(), vec![json!({"to": "bob"})]);
+    assert_eq!(report.delegations.len(), 0, "no delegation runs");
+}
+
 /// Run `task` with `replies` and the default roster. Returns the verdict
 /// code that the first delegate result names.
 async fn refused(task: AgentTask, harness_peers: Vec<Peer>, replies: Vec<Reply>) -> Value {

@@ -16,7 +16,7 @@ use crate::error::AgentError;
 use crate::flow::{FlowRules, call_labels};
 use crate::heartbeat::{HeartbeatTask, Precheck};
 use crate::memory::{MEMORY_TOOL, MemoryScope, MemoryStore, MemoryTool, render_snapshot};
-use crate::mesh::{Peer, valid_name};
+use crate::mesh::{DELEGATE_TOOL, Peer, valid_name};
 use crate::message::{ContentPart, RunId, TokenUsage, ToolDefinition};
 use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse, UNKNOWN_MODEL_ID};
 use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
@@ -382,8 +382,10 @@ impl AgentHarness {
             request.extra_tools.iter().cloned(),
         );
         let allowed = request.allowed_tools.as_ref();
+        // Only a run with a mandate names its acting agent.
+        let mandate = request.agent.is_some();
         let tools: Vec<_> = self
-            .permitted(&builtins, allowed)
+            .permitted(&builtins, allowed, mandate)
             .map(Tool::definition)
             .collect();
         let chat = ChatRequest {
@@ -443,6 +445,7 @@ impl AgentHarness {
                     read_only: request.read_only,
                     builtins: &builtins,
                     allowed,
+                    mandate,
                     exercised: &request.flow_labels,
                 },
                 &mut policy_budget,
@@ -533,6 +536,7 @@ impl AgentHarness {
             read_only,
             builtins,
             allowed,
+            mandate,
             exercised,
         } = scope;
         let started = tokio::time::Instant::now();
@@ -563,7 +567,9 @@ impl AgentHarness {
                 }
                 continue;
             }
-            let tool = self.visible(builtins).find(|tool| tool.name() == call.name);
+            let tool = self
+                .visible(builtins, mandate)
+                .find(|tool| tool.name() == call.name);
             if tool.is_none() && !self.flow.is_empty() {
                 // This worker cannot label the call. Another worker with
                 // another tool list could run it with no labels.
@@ -689,8 +695,10 @@ impl AgentHarness {
                 call.name
             )));
         }
+        // The workflow runs each `delegate` call under a mandate itself, so a
+        // call here holds no mandate.
         let Some(tool) = self
-            .visible(&builtins)
+            .visible(&builtins, false)
             .find(|tool| tool.name() == call.name)
         else {
             return Ok(self.error_outcome(&format!("unknown tool {:?}", call.name)));
@@ -831,22 +839,32 @@ impl AgentHarness {
         &'a self,
         builtins: &'a [Arc<dyn Tool>],
         allowed: Option<&'a BTreeSet<String>>,
+        mandate: bool,
     ) -> impl Iterator<Item = &'a dyn Tool> {
-        self.visible(builtins)
+        self.visible(builtins, mandate)
             .filter(move |tool| permits(builtins, allowed, tool.name()))
     }
 
     /// The built-in tools, then each app tool whose name no built-in takes.
     ///
     /// A built-in wins a name clash. Two tools with one name would make many
-    /// providers refuse the request.
-    fn visible<'a>(&'a self, builtins: &'a [Arc<dyn Tool>]) -> impl Iterator<Item = &'a dyn Tool> {
+    /// providers refuse the request. `mandate` tells whether the run holds a
+    /// mandate.
+    fn visible<'a>(
+        &'a self,
+        builtins: &'a [Arc<dyn Tool>],
+        mandate: bool,
+    ) -> impl Iterator<Item = &'a dyn Tool> {
         // With a store installed, `memory` stays reserved even when this run
         // gets no memory tool. An app tool of that name could otherwise slip
         // past the memory-write opt-in.
         let reserved = self.memory.is_some();
+        // Under a mandate, `delegate` stays reserved even with no peer to
+        // ask. An app tool of that name could otherwise pass for a delegation.
         let taken = move |name: &str| {
-            (reserved && name == MEMORY_TOOL) || builtins.iter().any(|tool| tool.name() == name)
+            (reserved && name == MEMORY_TOOL)
+                || (mandate && name == DELEGATE_TOOL)
+                || builtins.iter().any(|tool| tool.name() == name)
         };
         builtins.iter().map(AsRef::as_ref).chain(
             self.tools
@@ -865,6 +883,8 @@ struct Scope<'a> {
     builtins: &'a [Arc<dyn Tool>],
     /// The harness tools that the mandate permits. `None` means every tool.
     allowed: Option<&'a BTreeSet<String>>,
+    /// The run holds a mandate, so the name `delegate` is reserved.
+    mandate: bool,
     /// The flow labels that the run tree exercised before the turn.
     exercised: &'a BTreeSet<String>,
 }

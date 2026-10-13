@@ -155,7 +155,8 @@ A worker with a payload cap other than the default must say so. Set
 The names `memory` and `schedule_followup` belong to the built-in tools.
 When a built-in is active, it hides an app tool with the same name. With a
 memory store installed, `memory` is always reserved, even in a run that gets
-no memory tool.
+no memory tool. In a run with a mandate, `delegate` is reserved too. See
+[agent mesh](agent-mesh.md).
 
 A tool error is cut to fit the result cap too, so a huge error message
 cannot fail the run.
