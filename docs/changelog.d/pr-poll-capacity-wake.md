@@ -6,17 +6,23 @@ worker read that condition after the claim. A permit could free during the
 claim. The pools then looked free, so the wait did not listen for the
 release. The backlog of the refused kind waited one full poll interval.
 
-Now the gate records each refusal in a flag, as `limit_refused` does for an
-adaptive limit (issue #1836). The next idle wait reads and clears the flag,
-and it wakes on `capacity_freed`. `Notify` keeps the release that came
-before the wait, so the wait ends at once. This covers the single-shard
-loop, the multi-shard loop and the listener wait, because each one reads
-`capacity_bound`.
+Now the gate records each refusal in a flag. While the flag is set, an
+idle wait also wakes on `capacity_freed`. `Notify` keeps the release that
+came before the wait, so the wait ends at once. This covers the
+single-shard loop, the multi-shard loop and the listener wait, because each
+one reads `capacity_bound`.
+
+A read does not clear the flag. Several claim loops share it, so a read
+that cleared it could drop a refusal that a follower recorded during the
+read. A poll does not clear it either, because a poll of another shard
+cannot claim the refused backlog. Only a wake on `capacity_freed` clears
+it. The next poll then sees the gate again and sets the flag if it still
+refuses. A stale flag costs at most one extra poll.
 
 In a multi-shard round, the 10 ms closing wait of a shard's Postgres drain
-no longer reads the flag. It used to clear the flag and take the stored
-wake of an earlier gated shard. The round's own idle wait then slept a full
-poll interval.
+no longer listens for a freed permit. It could take the stored wake of an
+earlier gated shard. The round's own idle wait then slept a full poll
+interval.
 
 **Known limit.** Two release paths still do not notify `capacity_freed`: a
 poll permit that goes back after a claim error, and a slot-tuner shrink
@@ -33,6 +39,7 @@ Each failure showed a gap of one poll interval, about 3 s, between two
 **Tests.** `a_permit_freed_during_a_gated_poll_still_wakes_the_idle_wait`
 frees the activity permit between the gated poll and the idle wait.
 `a_multi_shard_drain_leaves_the_capacity_wake_to_the_round` drains a second
-shard after a gated poll and checks that the round still wakes. Both failed
-before the fix. The integration test above passed in every local
+shard after a gated poll and checks that the round still wakes.
+`a_refusal_stays_armed_until_a_wait_wakes_on_it` records a follower refusal
+between two reads of the leader. Each failed before its fix. The integration test above passed in every local
 Postgres run after the fix.
