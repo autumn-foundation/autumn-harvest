@@ -2,7 +2,8 @@
 //!
 //! A run with a [`Mandate`] can delegate a task to a [`Peer`]. The peer runs
 //! as a sub-agent inside the parent workflow. Each child model call and tool
-//! call is an activity of the parent history, so a crash repays nothing.
+//! call is an activity of the parent history. After a crash, replay reads
+//! each finished call and does not send it again.
 //!
 //! A mandate bounds the delegation tree. A child mandate is the meet of the
 //! parent mandate and the peer role, so authority only narrows down the tree.
@@ -32,6 +33,33 @@ pub const DEFAULT_MAX_DELEGATIONS: u32 = 16;
 
 /// The most characters in an agent name.
 pub const MAX_NAME_LEN: usize = 64;
+
+/// The most bytes in a tool name or a flow label of a mandate.
+pub const MAX_ITEM_LEN: usize = 128;
+
+/// The most entries in one set or chain of a mandate.
+pub const MAX_SET_LEN: usize = 256;
+
+/// The name that a record shows for a peer name that is not valid.
+pub const INVALID_NAME: &str = "_invalid";
+
+/// The keys of a mandate on the wire. [`Mandate::from_meta`] refuses any
+/// other key, because a newer sender can add a field that narrows the run.
+const WIRE_KEYS: [&str; 7] = [
+    "chain",
+    "max_depth",
+    "peers",
+    "tools",
+    "max_delegations",
+    "read_only",
+    "flow_labels",
+];
+
+/// Whether `item` is a valid tool name or flow label: 1 to
+/// [`MAX_ITEM_LEN`] bytes with no control character.
+fn valid_item(item: &str) -> bool {
+    !item.is_empty() && item.len() <= MAX_ITEM_LEN && !item.chars().any(char::is_control)
+}
 
 /// Whether `name` is a valid agent name.
 ///
@@ -187,6 +215,11 @@ pub struct Mandate {
     /// Refuse every tool call that writes or acts outside.
     #[serde(default, skip_serializing_if = "is_false")]
     pub read_only: bool,
+    /// The flow labels that the caller tree exercised. A receiver adds them
+    /// to its own run tree. Labels only grow, so a caller can only narrow a
+    /// run with them.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
 }
 
 impl Mandate {
@@ -201,6 +234,7 @@ impl Mandate {
             tools: None,
             max_delegations: DEFAULT_MAX_DELEGATIONS,
             read_only: false,
+            flow_labels: BTreeSet::new(),
         }
     }
 
@@ -274,13 +308,42 @@ impl Mandate {
         if self.chain.is_empty() {
             return Err("the mandate chain is empty".to_owned());
         }
+        let tools = self.tools.as_ref().map_or(0, BTreeSet::len);
+        if [
+            self.chain.len(),
+            self.peers.len(),
+            tools,
+            self.flow_labels.len(),
+        ]
+        .into_iter()
+        .any(|len| len > MAX_SET_LEN)
+        {
+            return Err(format!(
+                "a mandate set holds more than {MAX_SET_LEN} entries"
+            ));
+        }
+        if let Some(bad) = self
+            .tools
+            .iter()
+            .flatten()
+            .chain(&self.flow_labels)
+            .find(|item| !valid_item(item))
+        {
+            return Err(format!(
+                "{:?} is not a valid tool name or label",
+                crate::harness::truncate(bad, MAX_NAME_LEN)
+            ));
+        }
         if let Some(bad) = self
             .chain
             .iter()
             .chain(&self.peers)
             .find(|name| !valid_name(name))
         {
-            return Err(format!("{bad:?} is not a valid agent name"));
+            return Err(format!(
+                "{:?} is not a valid agent name",
+                crate::harness::truncate(bad, MAX_NAME_LEN)
+            ));
         }
         let distinct: BTreeSet<&String> = self.chain.iter().collect();
         if distinct.len() != self.chain.len() {
@@ -325,17 +388,47 @@ impl Mandate {
             tools: meet_tools(self.tools.as_ref(), peer.tools.as_ref()),
             max_delegations: self.max_delegations,
             read_only: self.read_only || peer.read_only,
+            flow_labels: self.flow_labels.clone(),
         })
+    }
+
+    /// The mandate to send with a call to `peer` in another process.
+    ///
+    /// It is [`Mandate::delegate`] with two changes for the wire. The
+    /// receiver starts its own delegation count at zero, so `max_delegations`
+    /// becomes the remainder of this tree. `flow_labels` holds the labels
+    /// that this tree exercised, so the receiver keeps them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Refusal`] when the holder may not delegate to `peer`.
+    pub fn outbound(
+        &self,
+        peer: &Peer,
+        used: u32,
+        flow_labels: &BTreeSet<String>,
+    ) -> Result<Self, Refusal> {
+        let mut child = self.delegate(peer, used)?;
+        child.max_delegations = self.max_delegations.saturating_sub(used.saturating_add(1));
+        child.flow_labels.extend(flow_labels.iter().cloned());
+        Ok(child)
     }
 
     /// Narrow this local mandate by a mandate that a caller in another
     /// process sent.
     ///
+    /// This mandate must be a root mandate, such as [`Mandate::new`] gives.
+    /// The result is the meet of both mandates. Its flow labels are the union,
+    /// because more labels only narrow a run.
+    ///
     /// # Errors
     ///
-    /// Returns the [`Refusal`] when the inbound mandate is malformed, or when
-    /// its chain makes a cycle or passes a depth bound.
+    /// Returns the [`Refusal`] when either mandate is malformed, or when the
+    /// inbound chain makes a cycle or passes a depth bound.
     pub fn accept(&self, inbound: &Self) -> Result<Self, Refusal> {
+        if self.depth() != 0 {
+            return Err(Refusal::InvalidMandate);
+        }
         inbound.validate().map_err(|_| Refusal::InvalidMandate)?;
         let holder = self.holder();
         let mut chain = inbound.chain.clone();
@@ -354,10 +447,16 @@ impl Mandate {
             tools: meet_tools(self.tools.as_ref(), inbound.tools.as_ref()),
             max_delegations: self.max_delegations.min(inbound.max_delegations),
             read_only: self.read_only || inbound.read_only,
+            flow_labels: self
+                .flow_labels
+                .union(&inbound.flow_labels)
+                .cloned()
+                .collect(),
         };
         if merged.depth() > merged.max_depth {
             return Err(Refusal::DepthExceeded);
         }
+        merged.validate().map_err(|_| Refusal::InvalidMandate)?;
         Ok(merged)
     }
 
@@ -372,6 +471,9 @@ impl Mandate {
 
     /// Read a mandate from `meta`. Returns `None` when `meta` has none.
     ///
+    /// The read is strict. An unknown key fails it, so a field that a newer
+    /// sender adds to narrow the run is never dropped without a sign.
+    ///
     /// # Errors
     ///
     /// Returns why the value under [`MANDATE_META_KEY`] is not a valid
@@ -380,6 +482,15 @@ impl Mandate {
         let Some(value) = meta.get(MANDATE_META_KEY) else {
             return Ok(None);
         };
+        let Some(fields) = value.as_object() else {
+            return Err("the mandate is not a JSON object".to_owned());
+        };
+        if let Some(unknown) = fields.keys().find(|key| !WIRE_KEYS.contains(&key.as_str())) {
+            return Err(format!(
+                "the mandate has the unknown key {:?}",
+                crate::harness::truncate(unknown, MAX_NAME_LEN)
+            ));
+        }
         let mandate: Self = serde_json::from_value(value.clone())
             .map_err(|err| format!("the mandate does not decode: {err}"))?;
         mandate.validate()?;
@@ -388,14 +499,21 @@ impl Mandate {
 }
 
 /// Why a delegation did not run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// A delegation runs the checks in the order of the variants, from
+/// `InvalidArguments` to `BudgetExhausted`. Only [`Mandate::accept`] returns
+/// `InvalidMandate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(rename_all = "snake_case")]
+#[error("the delegation is refused: {}", self.code())]
 #[non_exhaustive]
 pub enum Refusal {
-    /// The roster has no valid peer of that name.
-    UnknownPeer,
+    /// The arguments of the `delegate` call do not decode.
+    InvalidArguments,
     /// The mandate does not name the peer.
     NotPermitted,
+    /// The roster has no valid peer of that name.
+    UnknownPeer,
     /// The peer is already in the chain.
     Cycle,
     /// The delegation passes the depth bound.
@@ -413,8 +531,9 @@ impl Refusal {
     #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
-            Self::UnknownPeer => "unknown_peer",
+            Self::InvalidArguments => "invalid_arguments",
             Self::NotPermitted => "not_permitted",
+            Self::UnknownPeer => "unknown_peer",
             Self::Cycle => "cycle",
             Self::DepthExceeded => "depth_exceeded",
             Self::FanOutExhausted => "fan_out_exhausted",
@@ -423,12 +542,17 @@ impl Refusal {
         }
     }
 
-    /// The text that the delegating model reads.
+    /// The text that the delegating model reads. The peer name is cut to
+    /// [`MAX_NAME_LEN`] characters.
     #[must_use]
     pub fn message(self, peer: &str) -> String {
+        let peer = crate::harness::truncate(peer, MAX_NAME_LEN);
         match self {
-            Self::UnknownPeer => format!("no agent named {peer:?} is known"),
+            Self::InvalidArguments => {
+                "the delegate call needs exactly the arguments agent and task".to_owned()
+            }
             Self::NotPermitted => format!("this agent may not delegate to {peer:?}"),
+            Self::UnknownPeer => format!("no agent named {peer:?} is known"),
             Self::Cycle => format!("{peer:?} is already in the delegation chain"),
             Self::DepthExceeded => format!("a delegation to {peer:?} passes the depth bound"),
             Self::FanOutExhausted => {
@@ -488,8 +612,10 @@ pub(crate) fn delegate_definition(peers: &[Peer]) -> ToolDefinition {
 
 /// One delegation of a run tree, as the report lists it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DelegationRecord {
-    /// The agents from the root to the delegate. The delegate is last.
+    /// The agents from the root to the delegate. The delegate is last. A
+    /// peer name that is not valid shows as [`INVALID_NAME`].
     pub chain: Vec<String>,
     /// The run id of the child. `None` when the delegation did not run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -629,8 +755,9 @@ mod tests {
     #[test]
     fn verdict_codes_are_stable_and_distinct() {
         let all = [
-            Refusal::UnknownPeer,
+            Refusal::InvalidArguments,
             Refusal::NotPermitted,
+            Refusal::UnknownPeer,
             Refusal::Cycle,
             Refusal::DepthExceeded,
             Refusal::FanOutExhausted,
@@ -641,9 +768,92 @@ mod tests {
         assert_eq!(codes.len(), all.len());
         for refusal in all {
             assert_eq!(json!(refusal), json!(refusal.code()));
-            assert!(refusal.message("researcher").contains("researcher"));
+            assert!(refusal.to_string().contains(refusal.code()));
+            if refusal != Refusal::InvalidArguments {
+                assert!(refusal.message("researcher").contains("researcher"));
+            }
         }
         assert_eq!(Refusal::FanOutExhausted.code(), "fan_out_exhausted");
+        assert_eq!(MANDATE_META_KEY, "io.autumn-harvest/mandate");
+    }
+
+    #[test]
+    fn a_long_peer_name_is_cut_in_the_message() {
+        let message = Refusal::UnknownPeer.message(&"x".repeat(10_000));
+        assert!(message.len() < 200, "{}", message.len());
+    }
+
+    #[test]
+    fn outbound_sends_the_remainder_and_the_labels() {
+        let parent = Mandate::new("planner")
+            .peers(["researcher"])
+            .max_delegations(10);
+        let labels = set(&["untrusted_input"]);
+        let child = parent
+            .outbound(&Peer::new("researcher", "R."), 3, &labels)
+            .unwrap();
+        assert_eq!(child.max_delegations, 6, "10 less the 3 used and this one");
+        assert_eq!(child.flow_labels, labels);
+        assert_eq!(child.chain, vec!["planner", "researcher"]);
+        assert_eq!(
+            parent.outbound(&Peer::new("researcher", "R."), 10, &labels),
+            Err(Refusal::FanOutExhausted)
+        );
+    }
+
+    #[test]
+    fn accept_unions_the_labels_and_needs_a_root() {
+        let local = Mandate {
+            flow_labels: set(&["private_data"]),
+            ..Mandate::new("researcher")
+        };
+        let inbound = Mandate {
+            flow_labels: set(&["untrusted_input"]),
+            ..Mandate::new("planner")
+        };
+        let merged = local.accept(&inbound).unwrap();
+        assert_eq!(
+            merged.flow_labels,
+            set(&["private_data", "untrusted_input"])
+        );
+        let not_root = Mandate::new("a")
+            .peers(["researcher"])
+            .delegate(&Peer::new("researcher", "R."), 0)
+            .unwrap();
+        assert_eq!(not_root.accept(&inbound), Err(Refusal::InvalidMandate));
+    }
+
+    #[test]
+    fn validate_bounds_tools_labels_and_sizes() {
+        assert!(Mandate::new("a").tools(["read"]).validate().is_ok());
+        assert!(Mandate::new("a").tools([""]).validate().is_err());
+        assert!(Mandate::new("a").tools(["a\nb"]).validate().is_err());
+        assert!(
+            Mandate::new("a")
+                .tools(["x".repeat(MAX_ITEM_LEN + 1)])
+                .validate()
+                .is_err()
+        );
+        let many = (0..=MAX_SET_LEN).map(|n| format!("t{n}"));
+        assert!(Mandate::new("a").tools(many).validate().is_err());
+        let labels = Mandate {
+            flow_labels: set(&["ok", ""]),
+            ..Mandate::new("a")
+        };
+        assert!(labels.validate().is_err());
+    }
+
+    #[test]
+    fn from_meta_refuses_an_unknown_key() {
+        let mut meta = Map::new();
+        meta.insert(
+            MANDATE_META_KEY.into(),
+            json!({"chain": ["a"], "max_depth": 1, "max_delegations": 1, "tool": ["x"]}),
+        );
+        let err = Mandate::from_meta(&meta).unwrap_err();
+        assert!(err.contains("tool"), "{err}");
+        meta.insert(MANDATE_META_KEY.into(), json!(["not", "an", "object"]));
+        assert!(Mandate::from_meta(&meta).is_err());
     }
 
     #[test]
@@ -712,6 +922,7 @@ mod tests {
             tools: Some(set(&["read", "write"])),
             max_delegations: 3,
             read_only: true,
+            flow_labels: BTreeSet::new(),
         };
         let merged = local.accept(&inbound).unwrap();
         assert_eq!(merged.chain, vec!["planner", "researcher"]);
@@ -784,15 +995,19 @@ mod tests {
             tools(),
             0_u32..5,
             any::<bool>(),
+            names(),
         )
             .prop_map(
-                |(chain, max_depth, peers, tools, max_delegations, read_only)| Mandate {
-                    chain: chain.into_iter().collect(),
-                    max_depth,
-                    peers,
-                    tools,
-                    max_delegations,
-                    read_only,
+                |(chain, max_depth, peers, tools, max_delegations, read_only, flow_labels)| {
+                    Mandate {
+                        chain: chain.into_iter().collect(),
+                        max_depth,
+                        peers,
+                        tools,
+                        max_delegations,
+                        read_only,
+                        flow_labels,
+                    }
                 },
             )
     }
@@ -851,6 +1066,25 @@ mod tests {
                 prop_assert_eq!(merged.holder(), local.holder());
                 prop_assert!(merged.depth() <= merged.max_depth);
                 prop_assert!(merged.validate().is_ok());
+                prop_assert!(merged.flow_labels.is_superset(&local.flow_labels));
+                prop_assert!(merged.flow_labels.is_superset(&inbound.flow_labels));
+            }
+        }
+
+        #[test]
+        fn a_delegation_that_meets_every_bound_is_admitted(parent in mandate(), role in peer(), used in 0_u32..5) {
+            let admissible = parent.peers.contains(&role.name)
+                && !parent.chain.contains(&role.name)
+                && parent.depth() < parent.max_depth
+                && used < parent.max_delegations;
+            prop_assert_eq!(parent.delegate(&role, used).is_ok(), admissible);
+        }
+
+        #[test]
+        fn outbound_never_widens_the_delegation(parent in mandate(), role in peer(), used in 0_u32..5) {
+            if let Ok(child) = parent.outbound(&role, used, &BTreeSet::new()) {
+                prop_assert!(narrower(&child, &parent));
+                prop_assert!(child.max_delegations < parent.max_delegations);
             }
         }
 

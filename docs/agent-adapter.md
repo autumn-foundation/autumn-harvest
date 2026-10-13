@@ -100,13 +100,16 @@ let built = HarvestBuilder::new()
 
 `workflows()` returns `agent_loop` and `agent_heartbeat`. `activities()`
 returns `agent_model_turn`, `agent_tool_call`, `agent_memory_snapshot`,
-`agent_deliver` and `agent_precheck`. The test
+`agent_deliver`, `agent_precheck` and `agent_discover_peers`. The test
 `the_engine_registration_builds` builds this exact registration.
 
 Start a run under the name `agent_loop` with an `AgentTask` as input. To
-decide on a gated call, send a signal to the run. Build the name with
-`approval::approval_signal(step, position, call_id)` from the recorded
-`ModelTurn`, and send a serialised `Approval` as the payload. A worker with
+decide on a gated call, send a signal to the run, with a serialised
+`Approval` as the payload. Read the signal name from the wait: the
+deadline timer of the wait is `__signal_timeout:<seq>:<signal name>`. On
+SQLite, `RunState::WaitingSignal` holds the name. For a run with no
+delegation, `approval::approval_signal(step, position, call_id)` also builds
+it from the recorded `ModelTurn`. A worker with
 no harness fails the call as `AgentHarnessMissing`, which is not retryable.
 
 A worker with a payload cap other than the default must say so. Set
@@ -190,7 +193,9 @@ the model as the prompt.
 ## 5. Approvals
 
 A call that the policy answers with `RequireApproval` waits on one signal.
-The name is `tool_approval:<step>:<position>:<call_id>`.
+The name is `tool_approval:<round>:<position>:<call_id>`. `round` counts the
+tool rounds of the whole run tree. With no delegation, it is the step of the
+run.
 `approval::approval_call_id` reads the call id back from a name.
 
 | Decision | Effect |
@@ -288,8 +293,8 @@ strict replay compares each recorded input as it was written.
 - **A follow-up chain shares one workflow history.** Each segment adds to
   it. Keep `max_chain` low, or start a new run from the report.
 - **The session entity is separate.** It is a sibling issue.
-- **One agent per harness model.** A delegated peer uses the same model. See
-  [the agent mesh guide](agent-mesh.md).
+- **All agents share the harness model.** A peer cannot choose its own
+  model. See [the agent mesh guide](agent-mesh.md).
 - **The cost ledger needs Postgres.** The SQLite path calls the model
   directly, with no activity context, so it writes no ledger rows.
 
@@ -593,6 +598,7 @@ change.
 | `agent_tool_call` | The recorded outcome of the same call, or an error stub. No tool runs. |
 | `agent_memory_snapshot` | The recorded snapshot, or an empty one. |
 | `agent_deliver` | A stub. No report leaves the harness. |
+| `agent_discover_peers` | The recorded peers for the same names, or none. The candidate needs no roster. |
 | Any other activity, such as `agent_precheck` | No mock. The candidate run fails. |
 
 A tool or snapshot activity that failed the source fails the candidate at the

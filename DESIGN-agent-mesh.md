@@ -6,10 +6,10 @@ no delegation, no hop or cycle control, no budget split, and no rule over a
 sequence of tool calls. This change adds those primitives to
 `autumn-harvest-agent`.
 
-**No migration. No new `WorkflowEvent` variant. No core engine change.** The
-change adds one activity, `agent_discover_peers`, and new optional fields on
-recorded payloads. Each new field is left out at its default, so a run with
-no mandate records the same bytes as before.
+**No migration. No new `WorkflowEvent` variant. No core engine change except
+the AC16 compile fix.** The change adds one activity, `agent_discover_peers`,
+and new optional fields on recorded payloads. Each new field is left out at
+its default, so a run with no mandate records the same bytes as before.
 
 ---
 
@@ -44,7 +44,7 @@ no mandate records the same bytes as before.
 |---|------|---------|
 | B1 | A sub-agent as a child workflow per delegation. | Rejected for now. SQLite has no children. A child needs its own budget hand-off and result path. |
 | B2 | A sub-agent as an inline loop in the parent workflow, behind a workflow-handled `delegate` tool. | **Adopted.** It runs on both backends. Each child step is an activity of the parent history. |
-| B3 | A sub-agent as a tool inside `agent_tool_call`. | Rejected. The activity has one attempt and 10 minutes. A crash repays the whole child. |
+| B3 | A sub-agent as a tool inside `agent_tool_call`. | Rejected. The activity has one attempt and 10 minutes. After a crash, the whole child runs again. |
 | B4 | Put the peer roster in `AgentTask`. | Rejected. Each run would copy every prompt into its input. The roster is operator state. |
 | B5 | Keep the roster on the harness. Read it through one recorded activity per agent run. | **Adopted.** Replay reads the record, so a roster change cannot change a recorded run. |
 | B6 | A `Mandate` that a child gets as the meet of its parent mandate and its peer role. | **Adopted.** It follows the IETF delegation-chain drafts and Bounded Agents. |
@@ -155,7 +155,10 @@ no mandate records the same bytes as before.
 | AC13 | Old histories decode. All existing tests pass. `eval` re-drives a delegation run. |
 | AC14 | Each model turn records the acting agent name. The model-turn span carries `gen_ai.agent.name`. |
 | AC15 | The user guide, the research note, this plan and a changelog fragment exist. Comments and docs use ASD-STE100 style. The comment-hygiene audit passes. |
-| AC16 | The workspace compiles: the duplicate `ActivityInfo` fields in `remote_task.rs` are removed. |
+| AC16 | The workspace compiles. This PR removes the duplicate `ActivityInfo` fields in `remote_task.rs`. |
+| AC17 | Flow labels carry across runs. `AgentReport::flow_labels` returns them, and `AgentTask::flow_labels`, `HeartbeatTask::flow_labels` and the wire mandate seed them. |
+| AC18 | A call after a delegation in the same turn never runs on a decision that predates the child labels. |
+| AC19 | The wire form is strict and bounded. `from_meta` refuses an unknown key. `validate` bounds names and set sizes. `accept` needs a root. `outbound` sends the remainder of the fan-out. |
 
 ## 2. Tests (red first)
 
@@ -167,3 +170,22 @@ no mandate records the same bytes as before.
 | `tests/mesh.rs` on SQLite: discovery, delegation, isolation, refusals, budget, report, allowlist, flow rules, child approval, crash resume | 1–4, 6–10, 12, 14 | SQLite file |
 | `tests/eval.rs`: a delegation run evaluates | 13 | In-memory engine |
 | `engine_activities`: the registration includes the new activity | 1 | No DB |
+
+## 3. Review findings and fixes
+
+Four review agents read the change: correctness and replay, security,
+API and docs, and test quality. Each row names a finding and its fix.
+
+| # | Finding | Fix | AC |
+|---|---------|-----|----|
+| F1 | Labels reset on each run. A later run that continues the transcript can send what an earlier run read. | `AgentTask`, `AgentReport`, `HeartbeatTask` and `Mandate` carry `flow_labels`. | AC17 |
+| F2 | A turn decides a call after `delegate` before the child adds its labels. | `run_round` does not run a later call when the delegation added labels. The model reads "call it again". | AC18 |
+| F3 | An unknown tool gets no labels, so a worker with another tool list can run it unlabelled. | With flow rules, the decision denies an unknown tool. | AC10 |
+| F4 | A wire mandate keeps the full fan-out and drops labels. | `Mandate::outbound` sends the remainder and the labels. `accept` unions the labels. | AC19 |
+| F5 | Inbound tool names and sets are unbounded. An unknown key is dropped. | `validate` bounds them. `from_meta` refuses an unknown key. | AC19 |
+| F6 | A tool allowlist cannot remove the `memory` tool. | An allowlist must name `memory`. | AC6 |
+| F7 | A malformed `delegate` call leaves no record. A refused record keeps the raw model text. | `invalid_arguments` verdict. A name that is not valid shows as `_invalid`. | AC7 |
+| F8 | A peer cap of zero still allows one model call. | `budget_exhausted`. | AC8 |
+| F9 | `accept` drops the chain prefix of a local mandate that is not a root. | `accept` needs a root. | AC19 |
+| F10 | A child of a workflow-id run uses the response cache. | `shares_run_id` covers `{root}:d{n}`. | AC13 |
+| F11 | Docs: a non-compiling example, stale adapter docs, loose claims, long sentences. | Corrected. `Refusal` implements `Error`. | AC15 |

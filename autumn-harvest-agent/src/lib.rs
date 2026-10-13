@@ -98,7 +98,7 @@ pub use heartbeat::{
 };
 pub use loop_guard::LoopGuard;
 pub use memory::{EditKey, InMemoryMemoryStore, MemoryBlock, MemoryScope, MemoryStore};
-pub use mesh::{DELEGATE_TOOL, DelegationRecord, MANDATE_META_KEY, Mandate, Peer, Refusal};
+pub use mesh::{DelegationRecord, MANDATE_META_KEY, Mandate, Peer, Refusal};
 pub use message::{
     ChatMessage, ChatRole, ContentPart, RunId, SessionId, StopReason, TokenUsage, ToolCall,
     ToolDefinition,

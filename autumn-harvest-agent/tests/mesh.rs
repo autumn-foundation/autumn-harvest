@@ -10,9 +10,10 @@ use std::sync::Arc;
 
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest_agent::flow::labels;
+use autumn_harvest_agent::mesh::DELEGATE_TOOL;
 use autumn_harvest_agent::{
-    AgentHarness, AgentStop, AgentTask, Approval, ChatRole, ContentPart, DELEGATE_TOOL, FlowRules,
-    FnTool, Mandate, ModelTurn, ModelTurnRequest, Peer, Refusal, Rule, TokenUsage, ToolCall,
+    AgentHarness, AgentStop, AgentTask, Approval, ChatRole, ContentPart, FlowRules, FnTool,
+    Mandate, ModelTurn, ModelTurnRequest, Peer, Refusal, Rule, TokenUsage, ToolCall,
     ToolCallRequest, ToolDecision, ToolEffect, ToolRules, sqlite,
 };
 use autumn_harvest_sqlite::RunState;
@@ -192,7 +193,7 @@ async fn a_run_with_no_mandate_records_no_mesh_fields() {
         Vec::<Value>::new()
     );
     let turn = &scheduled(&history, "agent_model_turn")[0];
-    for key in ["agent", "allowed_tools", "exercised"] {
+    for key in ["agent", "allowed_tools", "flow_labels"] {
         assert!(turn.get(key).is_none(), "{key}");
     }
 }
@@ -303,6 +304,7 @@ async fn each_refusal_names_a_distinct_verdict() {
     .await;
     assert_eq!(fan_out, "fan_out_exhausted");
 
+    // The parent spends exactly its cap, so no tokens are left for a child.
     let capped = planner(&["researcher"]).max_total_tokens(10);
     let budget = refused(
         capped,
@@ -511,7 +513,17 @@ async fn a_nested_delegation_keeps_the_chain_and_rolls_usage_up() {
         report.delegations[1].usage.input_tokens, 14,
         "a record counts its whole subtree"
     );
-    assert_ne!(report.delegations[0].run_id, report.delegations[1].run_id);
+    let history_ids = rt.load_history(exec).unwrap();
+    let root = scheduled(&history_ids, "agent_model_turn")[0]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(report.delegations[1].run_id, Some(format!("{root}:d1")));
+    assert_eq!(
+        report.delegations[0].run_id,
+        Some(format!("{root}:d2")),
+        "the grandchild takes the next ordinal of the tree"
+    );
     let history = rt.load_history(exec).unwrap();
     assert_eq!(
         scheduled(&history, "agent_discover_peers"),
@@ -714,22 +726,22 @@ async fn a_turn_records_labels_only_with_flow_rules() {
         tenant: None,
         agent: None,
         allowed_tools: None,
-        exercised: BTreeSet::new(),
+        flow_labels: BTreeSet::new(),
     };
     let plain = AgentHarness::new(model.clone()).tool(inbox());
     let turn = plain.model_turn(request.clone()).await.unwrap();
-    assert_eq!(turn.labels, Vec::<Vec<String>>::new());
+    assert_eq!(turn.labels, Vec::<BTreeSet<String>>::new());
     let ruled = AgentHarness::new(model)
         .tool(inbox())
         .flow_rules(FlowRules::rule_of_two());
     let turn = ruled.model_turn(request).await.unwrap();
     assert_eq!(
         turn.labels,
-        vec![vec![
+        vec![BTreeSet::from([
             "effect:read_only".to_owned(),
             "private_data".to_owned(),
             "untrusted_input".to_owned(),
-        ]]
+        ])]
     );
 }
 
@@ -796,7 +808,7 @@ async fn a_gated_call_in_a_child_waits_on_a_tree_unique_name() {
 
 // AC1, AC4
 #[tokio::test(flavor = "multi_thread")]
-async fn a_restart_inside_a_child_repays_nothing_and_looks_up_nothing() {
+async fn a_restart_inside_a_child_resends_nothing_and_looks_up_nothing() {
     let (_dir, db) = fresh_db();
     let recorder = Arc::new(Recorder::default());
     let before = ScriptedModel::new(vec![
@@ -858,6 +870,11 @@ async fn a_child_inherits_read_only_and_gets_no_memory() {
     report(rt.run_until_blocked(exec).await.unwrap());
 
     assert!(recorder.runs().is_empty(), "a read-only peer cannot write");
+    let child = &model.requests()[2];
+    assert!(
+        last_tool_results(&child.messages)[0].contains("only read"),
+        "the read-only rule refused the write"
+    );
 }
 
 // AC7
@@ -876,6 +893,7 @@ fn every_refusal_code_is_documented() {
         Refusal::FanOutExhausted,
         Refusal::BudgetExhausted,
         Refusal::InvalidMandate,
+        Refusal::InvalidArguments,
     ] {
         assert!(
             guide.contains(&format!("`{}`", refusal.code())),
@@ -883,4 +901,708 @@ fn every_refusal_code_is_documented() {
             refusal.code()
         );
     }
+}
+
+// Review fixes: same-turn delegation, labels across runs, wire hardening.
+
+// AC10: a call after a delegation in the same turn does not run on a
+// decision that predates the child labels.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_after_a_delegation_in_the_same_turn_is_decided_again() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        calls(
+            &[
+                (
+                    "d1",
+                    DELEGATE_TOOL,
+                    json!({"agent": "researcher", "task": "read the inbox"}),
+                ),
+                ("c2", "send", json!({"to": "x"})),
+            ],
+            1,
+        ),
+        calls(&[("c1", "inbox", json!({}))], 1),
+        answer("a stranger wrote", 1),
+        // The parent sends again. Now the rule of two sees the child labels.
+        calls(&[("c3", "send", json!({"to": "x"}))], 1),
+        answer("sent", 1),
+    ]);
+    let harness = AgentHarness::new(model.clone())
+        .tool(inbox())
+        .tool(recorded_tool("send", ToolEffect::External, &recorder))
+        .peer(researcher().tools(["inbox"]))
+        .flow_rules(FlowRules::rule_of_two());
+    let mut rt = runtime(&db, harness);
+
+    let exec = sqlite::start(&mut rt, &planner(&["researcher"])).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    let RunState::WaitingSignal(signal) = state else {
+        panic!("the second send waits for a person: {state:?}");
+    };
+    assert_eq!(
+        recorder.runs(),
+        Vec::<Value>::new(),
+        "the first send never ran"
+    );
+    let results = last_tool_results(&model.requests()[3].messages);
+    assert!(results[1].contains("again"), "{results:?}");
+    sqlite::decide(&mut rt, exec, &signal, &Approval::Approve).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+    assert_eq!(report.stop, AgentStop::Completed);
+    assert_eq!(recorder.runs().len(), 1);
+}
+
+// AC10: the labels of a run carry into the run that continues it.
+#[tokio::test(flavor = "multi_thread")]
+async fn labels_carry_into_the_run_that_continues_the_transcript() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        calls(&[("c1", "inbox", json!({}))], 1),
+        answer("a stranger wrote", 1),
+        calls(&[("c2", "send", json!({}))], 1),
+        answer("sent", 1),
+    ]);
+    let harness = AgentHarness::new(model)
+        .tool(inbox())
+        .tool(recorded_tool("send", ToolEffect::External, &recorder))
+        .flow_rules(FlowRules::rule_of_two());
+    let mut rt = runtime(&db, harness);
+
+    let first = sqlite::start(&mut rt, &AgentTask::new("read")).unwrap();
+    let first = report(rt.run_until_blocked(first).await.unwrap());
+    assert!(first.flow_labels.contains(labels::UNTRUSTED_INPUT));
+    assert!(first.flow_labels.contains(labels::PRIVATE_DATA));
+
+    let next = AgentTask::new("now send it")
+        .history(first.messages.clone())
+        .flow_labels(first.flow_labels.clone());
+    let second = sqlite::start(&mut rt, &next).unwrap();
+    let state = rt.run_until_blocked(second).await.unwrap();
+    assert!(
+        matches!(state, RunState::WaitingSignal(_)),
+        "the send in the next run waits for a person: {state:?}"
+    );
+    assert_eq!(recorder.runs(), Vec::<Value>::new());
+}
+
+// AC10: with flow rules, a call to an unknown tool is denied. A worker with
+// another tool list cannot run it with no labels.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_tool_is_denied_under_flow_rules() {
+    let model = ScriptedModel::new(vec![calls(&[("c1", "ghost", json!({}))], 1)]);
+    let harness = AgentHarness::new(model).flow_rules(FlowRules::rule_of_two());
+    let turn = harness.model_turn(turn_request()).await.unwrap();
+    assert!(
+        matches!(&turn.decisions[0], ToolDecision::Deny { reason } if reason.contains("unknown")),
+        "{:?}",
+        turn.decisions
+    );
+}
+
+/// A bare model-turn request.
+fn turn_request() -> ModelTurnRequest {
+    ModelTurnRequest {
+        run_id: "r".into(),
+        session_id: None,
+        steps_used: 0,
+        max_steps: 8,
+        usage: TokenUsage::default(),
+        messages: vec![autumn_harvest_agent::ChatMessage::text(
+            ChatRole::User,
+            "go",
+        )],
+        max_output_tokens: None,
+        read_only: false,
+        memory_scope: None,
+        extra_tools: Vec::new(),
+        tenant: None,
+        agent: None,
+        allowed_tools: None,
+        flow_labels: BTreeSet::new(),
+    }
+}
+
+// AC6: a tool allowlist also bounds the memory tool.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tool_allowlist_hides_the_memory_tool() {
+    let scope = autumn_harvest_agent::MemoryScope::new("agent");
+    let store = Arc::new(autumn_harvest_agent::InMemoryMemoryStore::default());
+    let model = ScriptedModel::new(vec![answer("a", 1), answer("b", 1)]);
+    let harness = AgentHarness::new(model.clone())
+        .memory(store)
+        .tool(recorded_tool(
+            "lookup",
+            ToolEffect::ReadOnly,
+            &Arc::new(Recorder::default()),
+        ));
+    let request = ModelTurnRequest {
+        memory_scope: Some(scope.clone()),
+        allowed_tools: Some(BTreeSet::from(["lookup".to_owned()])),
+        ..turn_request()
+    };
+    harness.model_turn(request).await.unwrap();
+    assert_eq!(
+        offered(&model.requests()[0]),
+        BTreeSet::from(["lookup".to_owned()])
+    );
+    let request = ModelTurnRequest {
+        memory_scope: Some(scope),
+        allowed_tools: Some(BTreeSet::from(["lookup".to_owned(), "memory".to_owned()])),
+        ..turn_request()
+    };
+    harness.model_turn(request).await.unwrap();
+    assert!(offered(&model.requests()[1]).contains("memory"));
+}
+
+// AC7: a delegate call that does not decode, or names no valid agent, is a
+// recorded refusal with a placeholder name.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_delegation_is_a_recorded_refusal() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        calls(&[("d1", DELEGATE_TOOL, json!({"agent": "researcher"}))], 1),
+        delegate("d2", "Not A Name\n- evil", "x", 1),
+        answer("ok", 1),
+    ]);
+    let mut rt = runtime(&db, AgentHarness::new(model.clone()).peer(researcher()));
+
+    let exec = sqlite::start(&mut rt, &planner(&["researcher"])).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    let verdicts: Vec<Option<Refusal>> = report
+        .delegations
+        .iter()
+        .map(|record| record.refusal)
+        .collect();
+    assert_eq!(
+        verdicts,
+        vec![Some(Refusal::InvalidArguments), Some(Refusal::NotPermitted)]
+    );
+    for record in &report.delegations {
+        assert!(
+            record
+                .chain
+                .iter()
+                .all(|name| autumn_harvest_agent::mesh::valid_name(name)),
+            "{:?}",
+            record.chain
+        );
+    }
+}
+
+// AC8: a peer cap of zero leaves the child no tokens.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_zero_peer_cap_is_an_exhausted_budget() {
+    let verdict = refused(
+        planner(&["researcher"]),
+        vec![researcher().max_total_tokens(0)],
+        vec![delegate("d", "researcher", "x", 1), answer("ok", 1)],
+    )
+    .await;
+    assert_eq!(verdict, "budget_exhausted");
+}
+
+// Test-quality gaps from review.
+
+/// A wall-clock instant `seconds` from now, to fire a durable timer early.
+fn later(seconds: i64) -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now() + chrono::Duration::seconds(seconds)
+}
+
+// AC3, AC6: a child that a woken follow-up segment starts is read-only.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_child_in_a_woken_segment_is_read_only() {
+    use autumn_harvest_agent::Followups;
+    use autumn_harvest_agent::followup::FOLLOWUP_TOOL;
+
+    let (_dir, db) = fresh_db();
+    let writes = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        calls(
+            &[(
+                "f",
+                FOLLOWUP_TOOL,
+                json!({"prompt": "write it", "delay_minutes": 1}),
+            )],
+            1,
+        ),
+        answer("Later.", 1),
+        delegate("d1", "researcher", "write the note", 1),
+        calls(&[("w", "write", json!({}))], 1),
+        answer("could not write", 1),
+        answer("Done.", 1),
+    ]);
+    let harness = AgentHarness::new(model.clone())
+        .tool(recorded_tool("write", ToolEffect::Write, &writes))
+        .peer(researcher());
+    let mut rt = runtime(&db, harness);
+
+    let task =
+        planner(&["researcher"]).followups(Followups::new(std::time::Duration::from_secs(600)));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let _ = rt.run_until_blocked(exec).await.unwrap();
+    let run = report(rt.run_until_blocked_as_of(exec, later(120)).await.unwrap());
+
+    assert_eq!(run.text, "Done.");
+    assert_eq!(writes.runs(), Vec::<Value>::new());
+    let child = &model.requests()[4];
+    assert!(
+        last_tool_results(&child.messages)[0].contains("only read"),
+        "{:?}",
+        last_tool_results(&child.messages)
+    );
+}
+
+/// A harness with `inbox`, a counted `send`, a gate on `inbox`, and a rule
+/// that denies a send after untrusted input.
+fn gated_inbox(model: Arc<ScriptedModel>, sends: &Arc<Recorder>) -> AgentHarness {
+    AgentHarness::new(model)
+        .tool(inbox())
+        .tool(recorded_tool("send", ToolEffect::External, sends))
+        .policy(Arc::new(ToolRules::new().tool("inbox", Rule::Ask)))
+        .flow_rules(FlowRules::new().forbid(
+            [labels::UNTRUSTED_INPUT, "effect:external"],
+            Rule::Deny("no send after untrusted input".into()),
+        ))
+}
+
+// AC10: an approved or an edited call adds its labels.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approved_or_edited_call_adds_its_labels() {
+    for approval in [
+        Approval::Approve,
+        Approval::Edit {
+            arguments: json!({"folder": "spam"}),
+        },
+    ] {
+        let (_dir, db) = fresh_db();
+        let sends = Arc::new(Recorder::default());
+        let model = ScriptedModel::new(vec![
+            calls(&[("c1", "inbox", json!({}))], 1),
+            calls(&[("c2", "send", json!({}))], 1),
+            answer("done", 1),
+        ]);
+        let mut rt = runtime(&db, gated_inbox(model, &sends));
+        let exec = sqlite::start(&mut rt, &AgentTask::new("triage")).unwrap();
+        let RunState::WaitingSignal(signal) = rt.run_until_blocked(exec).await.unwrap() else {
+            panic!("the inbox read waits for a person");
+        };
+        sqlite::decide(&mut rt, exec, &signal, &approval).unwrap();
+        let report = report(rt.run_until_blocked(exec).await.unwrap());
+        assert_eq!(report.stop, AgentStop::Completed);
+        assert_eq!(sends.runs(), Vec::<Value>::new(), "{approval:?}");
+        assert!(report.flow_labels.contains(labels::UNTRUSTED_INPUT));
+    }
+}
+
+// AC10: in one turn, the labels of an earlier call count for a later call.
+#[tokio::test(flavor = "multi_thread")]
+async fn labels_count_within_one_turn() {
+    let (_dir, db) = fresh_db();
+    let sends = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        calls(&[("c1", "inbox", json!({})), ("c2", "send", json!({}))], 1),
+        answer("sent", 1),
+    ]);
+    let harness = AgentHarness::new(model)
+        .tool(inbox())
+        .tool(recorded_tool("send", ToolEffect::External, &sends))
+        .flow_rules(FlowRules::rule_of_two());
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::start(&mut rt, &AgentTask::new("triage")).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(&state, RunState::WaitingSignal(name) if name.ends_with(":1:c2")),
+        "{state:?}"
+    );
+}
+
+// AC6, AC10: a mandate deny keeps the labels aligned, and a flow deny beats
+// a policy ask.
+#[tokio::test(flavor = "multi_thread")]
+async fn labels_stay_aligned_and_a_flow_deny_beats_an_ask() {
+    let sends = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![calls(
+        &[
+            ("c1", "wipe", json!({})),
+            ("c2", "inbox", json!({})),
+            ("c3", "send", json!({})),
+        ],
+        1,
+    )]);
+    let harness = AgentHarness::new(model)
+        .tool(recorded_tool("wipe", ToolEffect::Write, &sends))
+        .tool(inbox())
+        .tool(recorded_tool("send", ToolEffect::External, &sends))
+        .policy(Arc::new(ToolRules::new().tool("send", Rule::Ask)))
+        .flow_rules(FlowRules::new().forbid(
+            [labels::UNTRUSTED_INPUT, "effect:external"],
+            Rule::Deny("no send after untrusted input".into()),
+        ));
+    let request = ModelTurnRequest {
+        allowed_tools: Some(BTreeSet::from(["inbox".to_owned(), "send".to_owned()])),
+        ..turn_request()
+    };
+    let turn = harness.model_turn(request).await.unwrap();
+    assert_eq!(turn.labels.len(), 3);
+    assert_eq!(
+        turn.labels[0],
+        BTreeSet::new(),
+        "the mandate deny has no labels"
+    );
+    assert!(turn.labels[1].contains(labels::UNTRUSTED_INPUT));
+    assert!(matches!(turn.decisions[0], ToolDecision::Deny { .. }));
+    assert_eq!(turn.decisions[1], ToolDecision::Allow);
+    assert!(
+        matches!(&turn.decisions[2], ToolDecision::Deny { reason } if reason.contains("untrusted")),
+        "{:?}",
+        turn.decisions[2]
+    );
+}
+
+// AC8: the peer cap binds a child when the parent has no cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_peer_cap_binds_when_the_parent_has_none() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        delegate("d1", "researcher", "dig", 1),
+        calls(&[("c1", "lookup", json!({}))], 25),
+        answer("parent goes on", 1),
+    ]);
+    let harness = AgentHarness::new(model)
+        .tool(recorded_tool("lookup", ToolEffect::ReadOnly, &recorder))
+        .peer(researcher().max_total_tokens(20));
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::start(&mut rt, &planner(&["researcher"])).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+    assert_eq!(report.stop, AgentStop::Completed);
+    assert_eq!(report.delegations[0].stop, Some(AgentStop::TokensExhausted));
+    assert_eq!(recorder.runs(), Vec::<Value>::new());
+}
+
+// AC8: the parent remainder binds a peer with no cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_parent_remainder_binds_an_uncapped_peer() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        delegate("d1", "researcher", "dig", 30),
+        calls(&[("c1", "lookup", json!({}))], 80),
+        answer("unreachable", 1),
+    ]);
+    let harness = AgentHarness::new(model.clone())
+        .tool(recorded_tool(
+            "lookup",
+            ToolEffect::ReadOnly,
+            &Arc::new(Recorder::default()),
+        ))
+        .peer(researcher());
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::start(&mut rt, &planner(&["researcher"]).max_total_tokens(100)).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+    assert_eq!(report.stop, AgentStop::TokensExhausted);
+    assert_eq!(model.calls(), 2);
+    assert_eq!(report.delegations[0].stop, Some(AgentStop::TokensExhausted));
+}
+
+// AC6: a tool allowlist keeps the delegate tool, and the workflow passes the
+// allowlist to the tool-call activity.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_allowlist_keeps_delegate_and_reaches_the_tool_call() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        delegate("d1", "researcher", "look", 1),
+        calls(&[("c1", "lookup", json!({"q": 1}))], 1),
+        answer("found", 1),
+        answer("done", 1),
+    ]);
+    let harness = AgentHarness::new(model.clone())
+        .tool(recorded_tool("lookup", ToolEffect::ReadOnly, &recorder))
+        .tool(recorded_tool("wipe", ToolEffect::Write, &recorder))
+        .peer(researcher());
+    let mut rt = runtime(&db, harness);
+    let task = AgentTask::new("go").mandate(
+        Mandate::new("planner")
+            .peers(["researcher"])
+            .tools(["lookup"]),
+    );
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.stop, AgentStop::Completed);
+    assert_eq!(
+        offered(&model.requests()[0]),
+        BTreeSet::from([DELEGATE_TOOL.to_owned(), "lookup".to_owned()])
+    );
+    assert_eq!(recorder.runs(), vec![json!({"q": 1})]);
+    let history = rt.load_history(exec).unwrap();
+    assert_eq!(
+        scheduled(&history, "agent_tool_call")[0]["allowed_tools"],
+        json!(["lookup"]),
+        "the child inherits the root allowlist"
+    );
+}
+
+// AC3, AC9: a child stops at its own step bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_child_stops_at_its_own_step_bound() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        delegate("d1", "researcher", "dig", 1),
+        calls(&[("c1", "lookup", json!({"n": 1}))], 1),
+        calls(&[("c2", "lookup", json!({"n": 2}))], 1),
+        answer("parent", 1),
+    ]);
+    let harness = AgentHarness::new(model)
+        .tool(recorded_tool(
+            "lookup",
+            ToolEffect::ReadOnly,
+            &Arc::new(Recorder::default()),
+        ))
+        .peer(researcher().max_steps(1));
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::start(&mut rt, &planner(&["researcher"])).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+    let record = &report.delegations[0];
+    assert_eq!(record.stop, Some(AgentStop::StepsExhausted));
+    assert_eq!(record.steps_used, 1);
+    assert_eq!(record.tool_calls, 1);
+}
+
+// AC3: a child gets no memory and no follow-ups, even when the parent has
+// both.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_child_gets_no_memory_and_no_followups() {
+    use autumn_harvest_agent::{Followups, InMemoryMemoryStore, MemoryScope};
+
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        delegate("d1", "researcher", "dig", 1),
+        answer("dug", 1),
+        answer("done", 1),
+    ]);
+    let harness = AgentHarness::new(model.clone())
+        .memory(Arc::new(InMemoryMemoryStore::default()))
+        .peer(researcher());
+    let mut rt = runtime(&db, harness);
+    let task = planner(&["researcher"])
+        .memory(MemoryScope::new("agent"))
+        .followups(Followups::new(std::time::Duration::from_secs(600)));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    report(rt.run_until_blocked(exec).await.unwrap());
+
+    let requests = model.requests();
+    assert!(offered(&requests[0]).contains("memory"));
+    let child = offered(&requests[1]);
+    assert!(!child.contains("memory"), "{child:?}");
+    assert!(!child.contains("schedule_followup"), "{child:?}");
+    let history = rt.load_history(exec).unwrap();
+    assert_eq!(scheduled(&history, "agent_memory_snapshot").len(), 1);
+}
+
+// AC9: child run ids extend the root run id with the tree ordinal.
+#[tokio::test(flavor = "multi_thread")]
+async fn child_run_ids_extend_the_root_run_id() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        delegate("d1", "researcher", "one", 1),
+        answer("first", 1),
+        delegate("d2", "researcher", "two", 1),
+        answer("second", 1),
+        answer("done", 1),
+    ]);
+    let mut rt = runtime(&db, AgentHarness::new(model).peer(researcher()));
+    let exec = sqlite::start(&mut rt, &planner(&["researcher"])).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+    let history = rt.load_history(exec).unwrap();
+    let root = scheduled(&history, "agent_model_turn")[0]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let ids: Vec<Option<String>> = report
+        .delegations
+        .iter()
+        .map(|record| record.run_id.clone())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![Some(format!("{root}:d1")), Some(format!("{root}:d2"))]
+    );
+}
+
+// AC12: a parent round after a child round takes the next tree round.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parent_round_after_a_child_takes_the_next_round() {
+    let (_dir, db) = fresh_db();
+    let writes = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        delegate("d1", "researcher", "write", 1),
+        calls(&[("c1", "write", json!({"who": "child"}))], 1),
+        answer("child wrote", 1),
+        calls(&[("c1", "write", json!({"who": "parent"}))], 1),
+        answer("done", 1),
+    ]);
+    let harness = AgentHarness::new(model)
+        .tool(recorded_tool("write", ToolEffect::Write, &writes))
+        .policy(Arc::new(ToolRules::ask_before_acting()))
+        .peer(researcher());
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::start(&mut rt, &planner(&["researcher"])).unwrap();
+    let mut names = Vec::new();
+    loop {
+        match rt.run_until_blocked(exec).await.unwrap() {
+            RunState::WaitingSignal(name) => {
+                sqlite::decide(&mut rt, exec, &name, &Approval::Approve).unwrap();
+                names.push(name);
+            }
+            RunState::Completed(_) => break,
+            other => panic!("unexpected state {other:?}"),
+        }
+    }
+    assert_eq!(names, vec!["tool_approval:1:0:c1", "tool_approval:2:0:c1"]);
+    assert_eq!(writes.runs().len(), 2);
+}
+
+// AC5: an invalid task mandate fails the run before any model call.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalid_task_mandate_fails_before_any_model_call() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![answer("never", 1)]);
+    let mut rt = runtime(&db, AgentHarness::new(model.clone()));
+    let task = AgentTask::new("go").mandate(Mandate::new("Bad Name"));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(&state, RunState::Failed(err) if err.contains("mandate")),
+        "{state:?}"
+    );
+    assert_eq!(model.calls(), 0);
+}
+
+// AC1: discovery filters, deduplicates and sorts the roster.
+#[test]
+fn discovery_filters_and_orders_the_roster() {
+    let harness = AgentHarness::new(ScriptedModel::new(Vec::new()))
+        .peer(Peer::new("writer", "W."))
+        .peer(Peer::new("Bad Name", "B."))
+        .peer(Peer::new("researcher", "old"))
+        .peer(Peer::new("researcher", "new"));
+    let found = harness.discover_peers(&[
+        "researcher".to_owned(),
+        "writer".to_owned(),
+        "Bad Name".to_owned(),
+        "ghost".to_owned(),
+    ]);
+    let names: Vec<(&str, &str)> = found
+        .iter()
+        .map(|peer| (peer.name.as_str(), peer.description.as_str()))
+        .collect();
+    assert_eq!(names, vec![("researcher", "new"), ("writer", "W.")]);
+}
+
+// AC3: the child answer is cut to the tool output limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_child_answer_is_cut() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        delegate("d1", "researcher", "dig", 1),
+        answer(&"x".repeat(9_000), 1),
+        answer("done", 1),
+    ]);
+    let mut rt = runtime(&db, AgentHarness::new(model.clone()).peer(researcher()));
+    let exec = sqlite::start(&mut rt, &planner(&["researcher"])).unwrap();
+    report(rt.run_until_blocked(exec).await.unwrap());
+    let result: Value =
+        serde_json::from_str(&last_tool_results(&model.requests()[2].messages)[0]).unwrap();
+    let answer = result["answer"].as_str().unwrap();
+    assert!(
+        answer.ends_with("[truncated]"),
+        "{}",
+        &answer[answer.len() - 20..]
+    );
+    assert!(answer.chars().count() < 8_100);
+}
+
+/// A tracing subscriber that keeps the name and the fields of each span.
+#[derive(Clone, Default)]
+struct Spans(Arc<std::sync::Mutex<Vec<(String, String, String)>>>);
+
+struct Fields<'a>(&'a mut Vec<(String, String)>);
+
+impl tracing::field::Visit for Fields<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push((field.name().to_owned(), format!("{value:?}")));
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.push((field.name().to_owned(), value.to_owned()));
+    }
+}
+
+impl Spans {
+    fn keep(&self, span: &str, record: &dyn Fn(&mut Fields<'_>)) {
+        let mut fields = Vec::new();
+        record(&mut Fields(&mut fields));
+        let mut kept = self.0.lock().unwrap();
+        for (name, value) in fields {
+            kept.push((span.to_owned(), name, value));
+        }
+    }
+}
+
+impl tracing::Subscriber for Spans {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::always()
+    }
+
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        let name = span.metadata().name();
+        self.keep(name, &|fields| span.record(fields));
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+        self.keep("agent_model_turn", &|fields| values.record(fields));
+    }
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+// AC14: the model-turn span names the acting agent.
+#[tokio::test]
+async fn the_model_turn_span_names_the_agent() {
+    let spans = Spans::default();
+    let _guard = tracing::subscriber::set_default(spans.clone());
+    let harness = AgentHarness::new(ScriptedModel::new(vec![answer("hi", 1)]));
+    let request = ModelTurnRequest {
+        agent: Some("researcher".into()),
+        ..turn_request()
+    };
+    harness.model_turn(request).await.unwrap();
+    let kept = spans.0.lock().unwrap().clone();
+    assert!(
+        kept.contains(&(
+            "agent_model_turn".to_owned(),
+            "gen_ai.agent.name".to_owned(),
+            "researcher".to_owned()
+        )),
+        "{kept:?}"
+    );
 }

@@ -108,6 +108,11 @@ pub struct AgentTask {
     /// [`mesh`](crate::mesh).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mandate: Option<Mandate>,
+    /// The flow labels that earlier runs of this conversation exercised.
+    /// Pass [`AgentReport::flow_labels`] here when you pass the transcript as
+    /// the history. See [`flow`](crate::flow).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
 }
 
 /// Where the run id of a task comes from.
@@ -146,7 +151,20 @@ impl AgentTask {
             run_id_source: RunIdSource::ExecutionId,
             tenant: None,
             mandate: None,
+            flow_labels: BTreeSet::new(),
         }
+    }
+
+    /// Start with the flow labels that earlier runs exercised. See
+    /// [`flow_labels`](Self::flow_labels).
+    #[must_use]
+    pub fn flow_labels<I, S>(mut self, labels: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.flow_labels = labels.into_iter().map(Into::into).collect();
+        self
     }
 
     /// Set the mandate of the root agent. See [`mandate`](Self::mandate).
@@ -336,7 +354,7 @@ pub struct ModelTurnRequest {
     pub allowed_tools: Option<BTreeSet<String>>,
     /// The flow labels that the run tree has exercised before this turn.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub exercised: BTreeSet<String>,
+    pub flow_labels: BTreeSet<String>,
 }
 
 /// The recorded result of one model-turn activity.
@@ -361,7 +379,7 @@ pub struct ModelTurn {
     /// The flow labels of each tool call, in order. Empty when the harness
     /// has no flow rules.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub labels: Vec<Vec<String>>,
+    pub labels: Vec<BTreeSet<String>>,
 }
 
 impl ModelTurn {
@@ -501,9 +519,14 @@ pub struct AgentReport {
     /// than `completed`, so the follow-up did not run.
     #[serde(default)]
     pub followup_dropped: bool,
-    /// Each delegation of the run tree, in order, refused ones too.
+    /// Each delegation of the run tree, refused ones too, in the order each
+    /// ended.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub delegations: Vec<DelegationRecord>,
+    /// The flow labels that the run tree exercised, with the labels of the
+    /// task. Pass them to the next run of this conversation.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
 }
 
 /// The transcript without system messages.
@@ -625,7 +648,7 @@ mod tests {
             "tenant",
             "agent",
             "allowed_tools",
-            "exercised",
+            "flow_labels",
         ] {
             assert!(!fields.contains_key(key), "{key}");
         }
@@ -643,15 +666,13 @@ mod tests {
     #[test]
     fn a_task_and_a_report_with_no_mesh_keep_the_recorded_shape() {
         let task = AgentTask::new("go");
-        assert!(
-            serde_json::to_value(&task)
-                .unwrap()
-                .get("mandate")
-                .is_none()
-        );
+        let encoded = serde_json::to_value(&task).unwrap();
+        assert!(encoded.get("mandate").is_none());
+        assert!(encoded.get("flow_labels").is_none());
         let old = json!({"input": "go", "max_steps": 8, "approval_timeout_secs": 60});
         let decoded: AgentTask = serde_json::from_value(old).unwrap();
         assert_eq!(decoded.mandate, None);
+        assert_eq!(decoded.flow_labels, BTreeSet::new());
         let with = AgentTask::new("go").mandate(Mandate::new("planner"));
         let back: AgentTask = serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
         assert_eq!(back.mandate, Some(Mandate::new("planner")));
@@ -663,12 +684,10 @@ mod tests {
         });
         let decoded: AgentReport = serde_json::from_value(report).unwrap();
         assert_eq!(decoded.delegations, Vec::new());
-        assert!(
-            serde_json::to_value(&decoded)
-                .unwrap()
-                .get("delegations")
-                .is_none()
-        );
+        assert_eq!(decoded.flow_labels, BTreeSet::new());
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        assert!(encoded.get("delegations").is_none());
+        assert!(encoded.get("flow_labels").is_none());
 
         let turn = json!({
             "content": [], "stop": "end_turn",
@@ -676,7 +695,7 @@ mod tests {
             "decisions": [],
         });
         let decoded: ModelTurn = serde_json::from_value(turn).unwrap();
-        assert_eq!(decoded.labels, Vec::<Vec<String>>::new());
+        assert_eq!(decoded.labels, Vec::<BTreeSet<String>>::new());
         assert!(
             serde_json::to_value(&decoded)
                 .unwrap()

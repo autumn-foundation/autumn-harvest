@@ -1186,7 +1186,8 @@ async fn each_segment_sees_its_recorded_memory_snapshot() {
 /// peer lookup answers it (agent mesh, AC13).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delegation_run_evaluates_without_divergence() {
-    use autumn_harvest_agent::{DELEGATE_TOOL, Mandate, Peer};
+    use autumn_harvest_agent::mesh::DELEGATE_TOOL;
+    use autumn_harvest_agent::{Mandate, Peer};
 
     let (_dir, db) = fresh_db();
     let script = || {
@@ -1230,7 +1231,8 @@ async fn a_delegation_run_evaluates_without_divergence() {
 /// the same agent (agent mesh, AC13).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_child_call_takes_the_outcome_of_the_same_agent() {
-    use autumn_harvest_agent::{DELEGATE_TOOL, Mandate, Peer, ToolContext};
+    use autumn_harvest_agent::mesh::DELEGATE_TOOL;
+    use autumn_harvest_agent::{Mandate, Peer, ToolContext};
 
     let whoami = || {
         FnTool::with_context(
@@ -1294,4 +1296,80 @@ async fn a_child_call_takes_the_outcome_of_the_same_agent() {
         result.contains(":d1"),
         "the child gets its own outcome: {result}"
     );
+}
+
+/// A nested and a refused delegation evaluate with no roster on the
+/// candidate (agent mesh, AC13).
+#[tokio::test(flavor = "multi_thread")]
+async fn nested_and_refused_delegations_evaluate_without_divergence() {
+    use autumn_harvest_agent::mesh::DELEGATE_TOOL;
+    use autumn_harvest_agent::{Mandate, Peer};
+
+    let delegate = |id: &str, agent: &str| {
+        calls(
+            &[(id, DELEGATE_TOOL, json!({"agent": agent, "task": "go"}))],
+            1,
+        )
+    };
+    let script = || {
+        vec![
+            delegate("d1", "researcher"),
+            delegate("d2", "critic"),
+            answer("checked", 1),
+            answer("dug", 1),
+            delegate("d3", "ghost"),
+            answer("planned", 1),
+        ]
+    };
+    let (_dir, db) = fresh_db();
+    let harness = AgentHarness::new(ScriptedModel::new(script()))
+        .peer(Peer::new("researcher", "R.").peers(["critic"]))
+        .peer(Peer::new("critic", "C."));
+    let mut rt = runtime(&db, harness);
+    let task = AgentTask::new("go").mandate(
+        Mandate::new("planner")
+            .peers(["researcher", "critic", "ghost"])
+            .max_depth(2),
+    );
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    let source = rt.load_history(exec).unwrap();
+
+    let model = ScriptedModel::new(script());
+    let evaluation = evaluate(&source, &Candidate::new(AgentHarness::new(model.clone())))
+        .await
+        .unwrap();
+
+    assert!(!evaluation.diverged(), "{evaluation:#?}");
+    assert_eq!(model.calls(), 6);
+    let RunEnd::Completed(report) = &evaluation.candidate else {
+        panic!("the candidate completes: {:?}", evaluation.candidate);
+    };
+    let RunEnd::Completed(recorded) = &evaluation.recorded else {
+        panic!("the source completes");
+    };
+    // The candidate engine has its own execution id, so compare each record
+    // with the lane of its run id only.
+    let shape = |report: &autumn_harvest_agent::AgentReport| {
+        report
+            .delegations
+            .iter()
+            .map(|record| {
+                (
+                    record.chain.clone(),
+                    record.stop,
+                    record.refusal,
+                    record.usage,
+                    record
+                        .run_id
+                        .as_deref()
+                        .and_then(|id| id.rsplit_once(':'))
+                        .map(|(_, lane)| lane.to_owned()),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(shape(report), shape(recorded));
+    assert_eq!(report.delegations.len(), 3);
 }

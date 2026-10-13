@@ -93,7 +93,7 @@ fn agent_loop_history(filler: Filler) -> Vec<WorkflowEvent> {
             tenant: None,
             agent: None,
             allowed_tools: None,
-            exercised: std::collections::BTreeSet::new(),
+            flow_labels: std::collections::BTreeSet::new(),
         };
         let call = ToolCall {
             id: format!("call-{turn}"),

@@ -11,10 +11,10 @@ picks the primitives that Harvest adopts now. The plan for that work is in
 Which agent mesh primitives can Harvest adopt? Which of them does a durable
 workflow engine make stronger than a gateway or a framework does?
 
-**Short answer.** Six primitives fit the engine well: a peer roster, a
-delegation mandate, budget roll-up, cycle and depth guards, flow rules on
-infrastructure-held state, and mandate propagation between processes. The
-engine holds the delegation tree in one history. Replay never pays for a
+**Short answer.** Section 5 lists eight primitives to adopt now. The core
+ones are a peer roster, a delegation mandate, and budget roll-up. Cycle and
+depth guards, flow rules and mandate propagation complete them. The engine
+holds the delegation tree in one history. Replay never pays for a
 finished step twice. The tree runs one step at a time, so siblings cannot
 race on a shared budget.
 
@@ -149,7 +149,7 @@ Sources: `autumn-harvest-agent/src/`, `autumn-harvest/src/remote_task.rs`,
 | Primitive | Verdict | Why |
 |-----------|---------|-----|
 | Peer roster with a durable lookup | **Adopt now** | The roster lives on the worker. The run records what it saw, so replay is stable. |
-| Delegation as a workflow tool | **Adopt now** | Each child model call and tool call is an activity. A crash repays nothing. |
+| Delegation as a workflow tool | **Adopt now** | Each child model call and tool call is an activity. After a crash, no finished call runs again. |
 | Mandate with monotone narrowing | **Adopt now** | A pure function. Property tests can prove it. |
 | Budget roll-up and split | **Adopt now** | The tree runs one step at a time, so the fan-out race cannot happen. |
 | Cycle, depth and fan-out guards with distinct verdicts | **Adopt now** | Small, pure and directly testable. |
@@ -168,8 +168,9 @@ Sources: `autumn-harvest-agent/src/`, `autumn-harvest/src/remote_task.rs`,
 
 1. **One history holds the tree.** Every child turn, tool call and refusal is
    an event in the parent run. An auditor reads one history.
-2. **Replay never repays.** A crash in a child resumes at the child step that
-   was in flight. Earlier model calls come back from history.
+2. **Replay sends no finished call again.** A crash in a child resumes at
+   the child step that was in flight. Earlier model calls come back from
+   history.
 3. **No fan-out race.** The tree runs one step at a time inside one workflow.
    A child budget is a slice of the parent remainder. Two children cannot
    read the same remainder.

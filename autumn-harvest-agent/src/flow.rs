@@ -3,12 +3,18 @@
 //!
 //! Each tool carries labels, such as [`labels::UNTRUSTED_INPUT`]. Each call
 //! also carries the label of its [`ToolEffect`]. A run tree records the labels
-//! of every call that ran. A [`FlowRule`] names a label set that one run tree
-//! must not complete without a person.
+//! of every call that the decision lets run. A [`FlowRule`] names a label set
+//! and what happens to the call that completes it: a person decides, or the
+//! call is refused.
 //!
 //! The workflow holds the exercised labels, and the model-turn activity
 //! records each decision. Model output cannot remove a label. Replay reads the
 //! recorded decision and does not check the rules again.
+//!
+//! A run that continues another run must also continue its labels. Pass
+//! [`AgentReport::flow_labels`](crate::AgentReport::flow_labels) to
+//! [`AgentTask::flow_labels`](crate::AgentTask::flow_labels), as you pass the
+//! transcript to the history.
 
 use std::collections::BTreeSet;
 
@@ -38,7 +44,7 @@ pub const fn effect_label(effect: ToolEffect) -> &'static str {
 /// The labels of one call: the tool labels and the effect label. A call to
 /// an unknown tool has no labels.
 #[must_use]
-pub fn call_labels(tool: Option<&dyn Tool>) -> BTreeSet<String> {
+pub(crate) fn call_labels(tool: Option<&dyn Tool>) -> BTreeSet<String> {
     tool.map(|tool| {
         tool.labels()
             .iter()
@@ -49,7 +55,8 @@ pub fn call_labels(tool: Option<&dyn Tool>) -> BTreeSet<String> {
     .unwrap_or_default()
 }
 
-/// One label set that a run tree must not complete without a person.
+/// One label set, and what happens to the call that completes it in one run
+/// tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowRule {
     labels: BTreeSet<String>,
@@ -100,9 +107,9 @@ impl FlowRules {
         Self { rules }
     }
 
-    /// The Agents Rule of Two: a run tree holds at most two of untrusted
-    /// input, private data, and a write or external effect. A call that
-    /// completes all three waits for a person.
+    /// The Agents Rule of Two. A run tree needs a person before it holds all
+    /// three of untrusted input, private data, and a write or external
+    /// effect. The call that completes the three waits for a person.
     #[must_use]
     pub fn rule_of_two() -> Self {
         let read = [labels::UNTRUSTED_INPUT, labels::PRIVATE_DATA];

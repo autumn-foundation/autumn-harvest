@@ -62,7 +62,7 @@ fn turn_request() -> ModelTurnRequest {
         tenant: None,
         agent: None,
         allowed_tools: None,
-        exercised: std::collections::BTreeSet::new(),
+        flow_labels: std::collections::BTreeSet::new(),
     }
 }
 

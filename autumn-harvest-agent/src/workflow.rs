@@ -32,7 +32,8 @@ use crate::heartbeat::{HeartbeatTask, agent_heartbeat_info};
 use crate::loop_guard::{LoopTracker, LoopVerdict, warning_note};
 use crate::memory::MemoryScope;
 use crate::mesh::{
-    DELEGATE_TOOL, DelegateArgs, DelegationRecord, Mandate, Peer, Refusal, delegate_definition,
+    DELEGATE_TOOL, DelegateArgs, DelegationRecord, INVALID_NAME, Mandate, Peer, Refusal,
+    delegate_definition, valid_name,
 };
 use crate::message::{ChatMessage, ChatRole, ContentPart, RunId, StopReason, TokenUsage, ToolCall};
 use crate::policy::ToolDecision;
@@ -111,6 +112,7 @@ impl Progress {
             followups: self.chain,
             followup_dropped: false,
             delegations: tree.records.clone(),
+            flow_labels: tree.exercised.clone(),
         }
     }
 }
@@ -129,7 +131,8 @@ struct Tree {
     rounds: u32,
     /// Delegations that started in the tree.
     delegations: u32,
-    /// The flow labels of every call that ran in the tree.
+    /// The flow labels of the task, and of every call in the tree that the
+    /// decision let run.
     exercised: BTreeSet<String>,
     /// Each delegation, in the order it ended.
     records: Vec<DelegationRecord>,
@@ -215,7 +218,12 @@ pub(crate) async fn drive(
         root: progress.run_id.clone(),
         rounds: 0,
         delegations: 0,
-        exercised: BTreeSet::new(),
+        exercised: task
+            .flow_labels
+            .iter()
+            .chain(task.mandate.iter().flat_map(|mandate| &mandate.flow_labels))
+            .cloned()
+            .collect(),
         records: Vec::new(),
     };
     let agent = match &task.mandate {
@@ -391,7 +399,7 @@ async fn run_segment(
             tenant: task.tenant.clone(),
             agent: run.agent.map(|agent| agent.mandate.holder().to_owned()),
             allowed_tools: run.allowed_tools(),
-            exercised: tree.exercised.clone(),
+            flow_labels: tree.exercised.clone(),
         };
         // A request the engine would refuse is not sent. The refusal is not
         // retryable, so it would fail the run after earlier work was paid for.
@@ -513,6 +521,8 @@ async fn run_round(
     let mut spent = 0_u64;
     let mut full = false;
     let mut looped = false;
+    let mut stale = false;
+    let no_labels = BTreeSet::new();
     for (position, call) in calls.into_iter().enumerate() {
         progress.tool_calls = progress.tool_calls.saturating_add(1);
         let call_id = call.id.clone();
@@ -520,6 +530,8 @@ async fn run_round(
             ToolOutcome::error(NOT_RUN_FULL).content
         } else if looped {
             ToolOutcome::error(NOT_RUN_LOOP).content
+        } else if stale {
+            ToolOutcome::error(NOT_RUN_STALE).content
         } else {
             // A recorded turn always holds one decision per call. A missing
             // one denies the call rather than guess.
@@ -530,13 +542,19 @@ async fn run_round(
                     .unwrap_or_else(|| ToolDecision::Deny {
                         reason: "no recorded decision".to_owned(),
                     });
-            let labels = turn.labels.get(position).map_or(&[][..], Vec::as_slice);
+            let labels = turn.labels.get(position).unwrap_or(&no_labels);
+            // With flow rules, the turn decided each call against the labels
+            // before the round. A delegation can add the labels of its child.
+            // The calls after it then hold a stale decision, so they do not run.
+            let expected: Option<BTreeSet<String>> =
+                (!turn.labels.is_empty()).then(|| tree.exercised.union(labels).cloned().collect());
             let name = call.name.clone();
             let arguments = call.arguments.clone();
             let at = Slot { position, ..slot };
             let mut content = decide(ctx, run, progress, tree, at, call, (decision, labels))
                 .await?
                 .content;
+            stale = expected.is_some_and(|expected| !tree.exercised.is_subset(&expected));
             match progress
                 .tracker
                 .record(&task.loop_guard, &name, &arguments, &content)
@@ -583,6 +601,11 @@ const NOT_RUN_FULL: &str = "the call did not run: the results passed the request
 /// run.
 const NOT_RUN_LOOP: &str = "the call did not run: the loop guard stopped the run";
 
+/// The answer to a call that did not run because a delegation earlier in the
+/// round added flow labels after the decision.
+const NOT_RUN_STALE: &str = "the call did not run: a delegation earlier in this turn \
+     changed the flow labels, so its decision is stale; call it again to get a new decision";
+
 /// Act on one recorded policy decision.
 ///
 /// `labels` are the recorded flow labels of the call. They join the tree
@@ -594,7 +617,7 @@ async fn decide(
     tree: &mut Tree,
     slot: Slot,
     call: ToolCall,
-    (decision, labels): (ToolDecision, &[String]),
+    (decision, labels): (ToolDecision, &BTreeSet<String>),
 ) -> Result<ToolOutcome, String> {
     match decision {
         ToolDecision::Allow => {
@@ -623,7 +646,7 @@ async fn gated_call(
     tree: &mut Tree,
     slot: Slot,
     mut call: ToolCall,
-    labels: &[String],
+    labels: &BTreeSet<String>,
 ) -> Result<ToolOutcome, String> {
     let task = run.task;
     let decision = await_decision::<Approval>(
@@ -717,8 +740,8 @@ async fn run_tool(
 ///
 /// The child gets the peer prompt, a fresh transcript and the task text. It
 /// sees nothing else of the parent. Its model calls and tool calls are
-/// activities of this workflow, so replay repays none of them. Only its final
-/// answer returns, as the tool result.
+/// activities of this workflow, so replay sends none of them again. Only
+/// its final answer returns, as the tool result.
 async fn delegate(
     ctx: &WorkflowContext,
     run: Run<'_>,
@@ -727,20 +750,26 @@ async fn delegate(
     tree: &mut Tree,
     call: &ToolCall,
 ) -> Result<ToolOutcome, String> {
-    let args: DelegateArgs = match serde_json::from_value(call.arguments.clone()) {
-        Ok(args) => args,
-        Err(err) => {
-            return Ok(ToolOutcome::error(&format!(
-                "the delegate arguments do not decode: {err}"
-            )));
-        }
-    };
     let task = run.task;
-    let child = match admit(agent, task, progress, tree, &args.agent) {
-        Ok(child) => child,
-        Err(refusal) => {
+    let admitted = serde_json::from_value::<DelegateArgs>(call.arguments.clone())
+        .map_err(|_| (Refusal::InvalidArguments, String::new()))
+        .and_then(|args| {
+            admit(agent, task, progress, tree, &args.agent)
+                .map(|child| (child, args.task))
+                .map_err(|refusal| (refusal, args.agent))
+        });
+    let (child, child_input) = match admitted {
+        Ok(admitted) => admitted,
+        Err((refusal, name)) => {
+            // The model wrote the name, so a record keeps it only when it is
+            // a valid agent name.
+            let shown = if valid_name(&name) {
+                name.clone()
+            } else {
+                INVALID_NAME.to_owned()
+            };
             let mut chain = agent.mandate.chain.clone();
-            chain.push(args.agent.clone());
+            chain.push(shown);
             tree.records.push(DelegationRecord {
                 chain,
                 run_id: None,
@@ -750,7 +779,7 @@ async fn delegate(
                 steps_used: 0,
                 tool_calls: 0,
             });
-            return Ok(refused(refusal, &args.agent));
+            return Ok(refused(refusal, &name));
         }
     };
     let Admitted {
@@ -763,7 +792,7 @@ async fn delegate(
     let read_only = task.read_only || mandate.read_only;
     let child_agent = discover(ctx, &mandate).await?;
     let child_task = AgentTask {
-        input: args.task,
+        input: child_input,
         system: peer.system.clone(),
         history: Vec::new(),
         session_id: task.session_id.clone(),
@@ -782,6 +811,8 @@ async fn delegate(
         run_id_source: task.run_id_source,
         tenant: task.tenant.clone(),
         mandate: Some(mandate),
+        // The tree holds the labels, so the child task carries none.
+        flow_labels: BTreeSet::new(),
     };
     let mut child = Progress::new(run_id.clone(), Vec::new());
     let child_run = Run {
@@ -849,13 +880,14 @@ fn admit<'a>(
     let remainder = task
         .max_total_tokens
         .map(|max| max.saturating_sub(progress.usage.total()));
-    if remainder == Some(0) {
-        return Err(Refusal::BudgetExhausted);
-    }
     let max_total_tokens = match (remainder, peer.max_total_tokens) {
         (Some(left), Some(own)) => Some(left.min(own)),
         (left, own) => left.or(own),
     };
+    // A cap of zero would still let the child make one model call.
+    if max_total_tokens == Some(0) {
+        return Err(Refusal::BudgetExhausted);
+    }
     Ok(Admitted {
         mandate,
         peer,

@@ -1354,6 +1354,7 @@ mod tests {
                 followups: 0,
                 followup_dropped: false,
                 delegations: Vec::new(),
+                flow_labels: std::collections::BTreeSet::new(),
             })
         };
         let done = report(crate::AgentStop::Completed);

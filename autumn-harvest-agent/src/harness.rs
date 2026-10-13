@@ -235,8 +235,8 @@ impl AgentHarness {
     }
 
     /// Add one peer to the roster. A run whose mandate names the peer can
-    /// delegate to it. A later peer with the same name replaces an earlier
-    /// one.
+    /// delegate to it. When two peers share a name, the later one wins at
+    /// lookup.
     #[must_use]
     pub fn peer(mut self, peer: Peer) -> Self {
         self.roster.push(peer);
@@ -253,7 +253,7 @@ impl AgentHarness {
 
     /// The peers of the roster that `names` lists, in name order.
     ///
-    /// A name with no peer, or a peer with an invalid name, is left out.
+    /// The result skips a name with no peer and a peer with an invalid name.
     #[must_use]
     pub fn discover_peers(&self, names: &[String]) -> Vec<Peer> {
         let wanted: BTreeSet<&String> = names.iter().collect();
@@ -443,7 +443,7 @@ impl AgentHarness {
                     read_only: request.read_only,
                     builtins: &builtins,
                     allowed,
-                    exercised: &request.exercised,
+                    exercised: &request.flow_labels,
                 },
                 &mut policy_budget,
             )
@@ -549,8 +549,9 @@ impl AgentHarness {
         } else {
             self.policy.as_ref()
         };
-        // Each call that is not denied may run, so its labels count for the
-        // calls after it in this turn. That fails closed.
+        // Each call that is not denied may run. Its labels count for the
+        // calls after it in this turn before it runs, so the check fails
+        // closed.
         let mut seen = exercised.clone();
         for call in turn.calls() {
             if !permits(builtins, allowed, &call.name) {
@@ -558,11 +559,20 @@ impl AgentHarness {
                     reason: format!("the tool {:?} is not in this agent's mandate", call.name),
                 });
                 if !self.flow.is_empty() {
-                    turn.labels.push(Vec::new());
+                    turn.labels.push(BTreeSet::new());
                 }
                 continue;
             }
             let tool = self.visible(builtins).find(|tool| tool.name() == call.name);
+            if tool.is_none() && !self.flow.is_empty() {
+                // This worker cannot label the call. Another worker with
+                // another tool list could run it with no labels.
+                turn.decisions.push(ToolDecision::Deny {
+                    reason: format!("unknown tool {:?}: flow rules need its labels", call.name),
+                });
+                turn.labels.push(BTreeSet::new());
+                continue;
+            }
             let decide = policy.decide(&call, tool, info);
             let mut decision = tokio::time::timeout_at(deadline, decide)
                 .await
@@ -575,7 +585,7 @@ impl AgentHarness {
                 if !matches!(decision, ToolDecision::Deny { .. }) {
                     seen.extend(labels.iter().cloned());
                 }
-                turn.labels.push(labels.into_iter().collect());
+                turn.labels.push(labels);
             }
             turn.decisions.push(decision);
         }
@@ -808,8 +818,7 @@ impl AgentHarness {
             .collect()
     }
 
-    /// The visible tools that `allowed` permits. A built-in is always
-    /// permitted.
+    /// The visible tools that `allowed` permits.
     fn permitted<'a>(
         &'a self,
         builtins: &'a [Arc<dyn Tool>],
@@ -852,11 +861,14 @@ struct Scope<'a> {
     exercised: &'a BTreeSet<String>,
 }
 
-/// Whether the mandate permits the tool `name`. A built-in is always
-/// permitted. Its own switch, such as the memory scope, governs it.
+/// Whether the mandate permits the tool `name`.
+///
+/// The mandate never bounds a workflow tool, such as `delegate`. Its own
+/// switch governs it. The `memory` tool writes state that later runs read,
+/// so an allowlist must name it.
 fn permits(builtins: &[Arc<dyn Tool>], allowed: Option<&BTreeSet<String>>, name: &str) -> bool {
     allowed.is_none_or(|allowed| allowed.contains(name))
-        || builtins.iter().any(|tool| tool.name() == name)
+        || (name != MEMORY_TOOL && builtins.iter().any(|tool| tool.name() == name))
 }
 
 /// The stricter of two decisions: a deny, then an approval, then an allow.

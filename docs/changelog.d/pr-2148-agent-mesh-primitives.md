@@ -1,4 +1,4 @@
-## Feature — Agent mesh primitives: delegation, mandates, budgets and flow rules
+## Feature — Agent mesh primitives: delegation, mandates, budgets and flow rules (PR #2148)
 
 **What shipped.** `autumn-harvest-agent` gains agent mesh primitives. A run
 can delegate a task to a peer agent. The peer runs as a sub-agent inside the
@@ -19,37 +19,50 @@ and `DESIGN-agent-mesh.md` the plan.
   peers, tools and read-only. A child mandate is the meet of the parent
   mandate and the peer role. Property tests prove that authority only
   narrows. A tool outside the mandate is hidden, denied and refused again at
-  call time.
-- **Refusals.** A refused delegation names its verdict: `not_permitted`,
-  `unknown_peer`, `cycle`, `depth_exceeded`, `fan_out_exhausted` or
-  `budget_exhausted`.
+  call time. An allowlist must name `memory` to keep the memory tool.
+- **Refusals.** A refused delegation names its verdict: `invalid_arguments`,
+  `not_permitted`, `unknown_peer`, `cycle`, `depth_exceeded`,
+  `fan_out_exhausted` or `budget_exhausted`. `Mandate::accept` can also
+  return `invalid_mandate`. `Refusal` implements `std::error::Error`.
 - **Budgets.** A child cap is the smaller of the peer cap and the parent
-  remainder. The parent adds the child usage, and stops before another model
-  call when the tree passes its cap. `AgentReport::delegations` lists each
-  delegation with its subtree usage.
+  remainder. A cap of zero is refused. The parent adds the child usage, and
+  stops before another model call when the tree passes its cap.
+  `AgentReport::delegations` lists each delegation with its subtree usage.
 - **Flow rules.** `Tool::labels` and `FlowRules` gate the call that completes
   a forbidden label set in one run tree. `FlowRules::rule_of_two()` follows
   Meta's Agents Rule of Two. The workflow holds the exercised labels, so model
-  output cannot remove one.
-- **Wire form.** `MANDATE_META_KEY` and `Mandate::accept` carry a mandate to
-  another process. The receiver can only narrow it.
+  output cannot remove one. A call after a delegation in the same turn does
+  not run on a stale decision. With flow rules, an unknown tool is denied.
+- **Label carry.** `AgentReport::flow_labels` returns the labels of a run.
+  `AgentTask::flow_labels` and `HeartbeatTask::flow_labels` seed the next
+  run of the same conversation.
+- **Wire form.** `MANDATE_META_KEY`, `Mandate::outbound` and
+  `Mandate::accept` carry a mandate to another process. The receiver can only
+  narrow it. `Mandate::from_meta` refuses an unknown key.
 - **Approval names.** One tool-round counter spans the tree, so a parent and
   a child never share a signal name. A run with no delegation keeps its old
   names.
 - **Evaluation.** `eval::evaluate` mocks the peer lookup with the recorded
   answer. A recorded tool outcome answers only an equal call of the same
   agent.
+- **Response cache.** A child of a run whose run id is the workflow id skips
+  the cache, as its parent does.
 - **Fix.** `remote_task::activities` set `input_schema` and `output_schema`
-  twice, so the workspace did not compile. The duplicate pair is removed.
+  twice, so the workspace did not compile. This PR removes the duplicate
+  pair.
 
 **Invariants.** No new `WorkflowEvent` variant. No migration. No route. Each
 new field of a recorded payload is left out at its default, so a run with no
-mandate records the same bytes as before. `ModelTurnRequest`, `ModelTurn`,
-`ToolCallRequest` and `AgentReport` gain fields, so a struct literal of one of
-them needs the new fields.
+mandate records the same bytes as before. `AgentTask`, `ModelTurnRequest`,
+`ModelTurn`, `ToolCallRequest`, `AgentReport` and `HeartbeatTask` gain
+fields. A struct literal of one of them needs the new fields.
+`DelegationRecord` is `#[non_exhaustive]`.
 
-**Tests.** `mesh` and `flow` unit and property tests.
+**Tests.** `mesh` and `flow` unit and property tests cover the mandate
+rules, the wire form and the flow check.
 `autumn-harvest-agent/tests/mesh.rs` runs each acceptance criterion on
-SQLite: isolation, refusals, budgets, the tool allowlist, flow rules in both
-directions, tree-unique approval names and a restart inside a child. Two
-`eval` tests cover a delegation run and per-agent outcome matching.
+SQLite. It covers isolation, refusals, budgets, the tool allowlist, flow
+rules in both directions and across runs, and the same-turn delegation case.
+It also covers tree-unique approval names, a restart inside a child and the
+model-turn span. Three `eval` tests cover delegation runs and per-agent
+outcome matching.
