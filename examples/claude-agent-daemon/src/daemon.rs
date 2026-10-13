@@ -1811,6 +1811,11 @@ async fn drive_one(
             // of it, which is text this daemon did not write.
             tracing::error!(%exec, error = %crate::one_line(&error), "session failed");
         }
+        // Issue #2021: a cancelled or terminated run cannot be driven again.
+        Ok(RunState::Cancelled(reason) | RunState::Terminated(reason)) => {
+            retire(blocked, live, exec);
+            tracing::info!(%exec, reason = %crate::one_line(&reason), "session stopped");
+        }
         Ok(RunState::InProgress) => {
             blocked.remove(&exec);
         }

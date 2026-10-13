@@ -307,8 +307,6 @@ pub fn activities() -> Vec<ActivityInfo> {
         input_schema: None,
         output_schema: None,
         handler: start_handler,
-        input_schema: None,
-        output_schema: None,
     }]
 }
 
