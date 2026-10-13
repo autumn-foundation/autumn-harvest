@@ -27,6 +27,9 @@ pub const DEFAULT_BACKEND_OVERHEAD: Duration = Duration::from_secs(30);
 /// The time that a backend gets to tear down after the runtime cancels it.
 pub const CLEANUP_GRACE: Duration = Duration::from_secs(10);
 
+/// The longest image name, in bytes. The outcome bound has room for it.
+pub const MAX_IMAGE_NAME_BYTES: usize = 256;
+
 /// The default time that a run waits for a free slot.
 pub const DEFAULT_QUEUE_WAIT: Duration = Duration::from_secs(30);
 
@@ -117,6 +120,14 @@ impl SandboxRuntime {
             return Err(SandboxError::Config(format!(
                 "the backend isolation {isolation} is weaker than the policy minimum {}",
                 policy.min_isolation
+            )));
+        }
+        if let Some(image) = backend.image()
+            && (image.len() > MAX_IMAGE_NAME_BYTES || image.chars().any(char::is_control))
+        {
+            return Err(SandboxError::Config(format!(
+                "the image name must be at most {MAX_IMAGE_NAME_BYTES} bytes, with no control \
+                 character"
             )));
         }
         if policy.network == NetworkPolicy::Allow && !backend.supports_network() {
@@ -268,6 +279,7 @@ impl SandboxRuntime {
             plan: plan.clone(),
         };
         let backend_cancel = cancel.child_token();
+        let started = tokio::time::Instant::now();
         let execute = self.backend.execute(job, backend_cancel.clone());
         tokio::pin!(execute);
         let result = tokio::select! {
@@ -286,6 +298,10 @@ impl SandboxRuntime {
         };
         let mut outcome = result?;
         outcome.check_bounds(&plan)?;
+        // The host sets these fields. A guest duration is at most the time
+        // that the host measured.
+        let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        outcome.duration_ms = outcome.duration_ms.min(elapsed);
         outcome.isolation = self.backend.isolation();
         outcome.image = self.backend.image();
         Ok(outcome)
@@ -490,6 +506,54 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(out.isolation, IsolationLevel::Process);
         assert_eq!(out.image.as_deref(), Some("fake:1"));
+    }
+
+    #[tokio::test]
+    async fn the_duration_is_never_longer_than_the_host_measured() {
+        let mut backend = FakeBackend::new(IsolationLevel::Process);
+        let mut lying = outcome(RunStatus::Exited { code: 0 });
+        lying.duration_ms = u64::MAX;
+        backend.answer = Mutex::new(Some(Ok(lying)));
+        let (_, runtime) = runtime(backend);
+        let out = runtime
+            .run(
+                &SandboxRequest::new("sh", "true"),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.duration_ms < 60_000, "{}", out.duration_ms);
+    }
+
+    /// A backend with an image name that history cannot hold.
+    struct BadImageBackend(String);
+
+    impl SandboxBackend for BadImageBackend {
+        fn isolation(&self) -> IsolationLevel {
+            IsolationLevel::Process
+        }
+
+        fn image(&self) -> Option<String> {
+            Some(self.0.clone())
+        }
+
+        fn execute(
+            &self,
+            _job: SandboxJob,
+            _cancel: CancellationToken,
+        ) -> BoxFuture<'_, Result<SandboxOutcome, SandboxError>> {
+            Box::pin(async { Err(SandboxError::Cancelled) })
+        }
+    }
+
+    #[test]
+    fn a_long_or_nul_image_name_is_a_config_error() {
+        for name in ["x".repeat(MAX_IMAGE_NAME_BYTES + 1), "a\0b".to_owned()] {
+            let backend = Arc::new(BadImageBackend(name));
+            let err = SandboxRuntime::new(backend, SandboxPolicy::for_development())
+                .expect_err("bad image name");
+            assert!(matches!(err, SandboxError::Config(_)), "{err:?}");
+        }
     }
 
     #[tokio::test]

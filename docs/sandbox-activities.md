@@ -81,7 +81,9 @@ The outcome is JSON too:
   `skipped_outputs` names each output that the run does not return, with the
   reason. A file can be missing, too large, a symbolic link, a hard link, or
   not a regular file.
-- The host sets `isolation` and `image`. The guest cannot change them.
+- The host sets `isolation` and `image`. The guest cannot change them. The
+  image name has at most 256 bytes and no control character. The host also
+  caps `duration_ms` at the time that it measured.
 - A reader of the outcome skips an unknown field. So a later release can add
   a field, and an older worker still reads the result.
 
