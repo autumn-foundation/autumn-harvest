@@ -79,7 +79,7 @@ and `harvest_signals.idempotency_key`. An old file gains them on open.
   external events first. Each event is the same, and replay accepts both
   orders.
 
-**Tests.** `autumn-harvest-sqlite/tests/integration/composition.rs` has 55
+**Tests.** `autumn-harvest-sqlite/tests/integration/composition.rs` has 56
 tests. Each test replays every history it asserts on the core
 `WorkflowReplayer`, with the run's ids. They cover:
 
@@ -98,7 +98,8 @@ tests. Each test replays every history it asserts on the core
 - `join!` of an await and a child in both orders;
 - an operator cancel and a terminate of a child, a terminated await target, a
   child that continues as new, and an await across a continue-as-new;
-- the terminal and cancel cap checks with and without cascade events, and an update and
+- the terminal, cancel and fallback cancel cap checks with and without
+  cascade events, and an update and
   a query on a child that read its parent.
 
 Unit tests cover the schema step, a race loser with no row, and the panic

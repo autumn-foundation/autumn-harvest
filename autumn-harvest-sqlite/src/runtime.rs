@@ -1191,7 +1191,8 @@ impl SqliteRuntime {
         };
         let tx = self.conn.transaction()?;
         fail_dropped_tasks(&tx, exec, &self.activities)?;
-        if caps.reached(&tx, exec)?.is_some() {
+        let cascade = composition::cascade_event_count(&tx, exec)?;
+        if caps.reached_with(&tx, exec, cascade)?.is_some() {
             drop(tx);
             let tx = self.conn.transaction()?;
             seal_with_cancel_event(&tx, exec, CANCELLED_STATE, reason, now)?;

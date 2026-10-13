@@ -588,6 +588,21 @@ async fn spawns_then_cleans_up(ctx: &WorkflowContext, _n: i64) -> Result<Value, 
     ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
 }
 
+/// Spawns a detached child under `request_cancel`, then waits on an activity
+/// that no one registers.
+#[workflow]
+async fn spawns_then_waits_on_missing(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    ctx.spawn_child_workflow_detached_raw(
+        "waits_for_go",
+        json!(0),
+        ParentClosePolicy::RequestCancel,
+    )
+    .map_err(|e| e.to_string())?;
+    ctx.execute_activity_raw("missing", json!(0), "default")
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn runtime() -> SqliteRuntime {
@@ -656,6 +671,7 @@ fn fixtures() -> Vec<WorkflowInfo> {
         busy_panic_info(),
         parent_child_timeout_panic_info(),
         spawns_then_cleans_up_info(),
+        spawns_then_waits_on_missing_info(),
     ]
 }
 
@@ -2223,6 +2239,41 @@ async fn the_cancel_cap_check_counts_cascade_events() {
             .iter()
             .any(|e| matches!(e, WorkflowEvent::SideEffectRecorded { .. })),
         "the cleanup batch rolls back: {history:#?}"
+    );
+    let cascades = history
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ChildWorkflowCascadeApplied { .. }))
+        .count();
+    assert_eq!(cascades, 1, "{history:#?}");
+}
+
+/// The fallback cancel seal counts the cascade events too. Task failures that
+/// would reach the cap with them roll back.
+#[tokio::test]
+async fn the_fallback_cancel_cap_check_counts_cascade_events() {
+    let mut rt = runtime();
+    // `WorkflowStarted`, `ChildWorkflowSpawnedDetached` and `ActivityScheduled`
+    // come first. The task failure and the cascade event then reach the cap.
+    rt.set_history_event_hard_cap(Some(5));
+    let parent = rt
+        .start_workflow("spawns_then_waits_on_missing", json!(0))
+        .unwrap();
+    let err = rt.run_until_blocked(parent).await.unwrap_err();
+    assert!(
+        matches!(err, SqliteError::UnregisteredActivity(_)),
+        "{err:?}"
+    );
+
+    rt.cancel(parent, "ops").unwrap();
+    let state = rt.run_until_blocked(parent).await;
+
+    assert!(matches!(state, Ok(RunState::Cancelled(_))), "{state:?}");
+    let history = rt.load_history(parent).unwrap();
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityFailed { .. })),
+        "the task failure rolls back: {history:#?}"
     );
     let cascades = history
         .iter()
