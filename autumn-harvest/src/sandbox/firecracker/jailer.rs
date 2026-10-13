@@ -180,6 +180,32 @@ pub fn check_extra_cgroups(config: &JailerConfig) -> Result<(), SandboxError> {
     Ok(())
 }
 
+/// Check that `cgroup_parent` names a cgroup below `cgroup_root`.
+///
+/// The jailer takes it as a path relative to the hierarchy, and teardown
+/// joins it to `cgroup_root`. An absolute path or `..` would leave the
+/// hierarchy, so the parent must be plain path components.
+///
+/// # Errors
+///
+/// [`SandboxError::Config`] for a parent that can leave the hierarchy.
+pub fn check_cgroup_parent(config: &JailerConfig) -> Result<(), SandboxError> {
+    let parent = &config.cgroup_parent;
+    let plain = !parent.is_empty()
+        && !parent.chars().any(char::is_control)
+        && Path::new(parent)
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)));
+    if plain {
+        Ok(())
+    } else {
+        Err(SandboxError::Config(format!(
+            "the cgroup parent {parent:?} must be a relative path of plain names below the \
+             cgroup root"
+        )))
+    }
+}
+
 /// Check that `cgroup_root` is the cgroup v2 mount of the jailer.
 ///
 /// # Errors
@@ -285,6 +311,27 @@ pub fn jailer_args(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cgroup_parent_stays_below_the_cgroup_root() {
+        for parent in ["", "/etc", "../escape", "a/../../b", "./a", "a\nb"] {
+            let config = JailerConfig {
+                cgroup_parent: parent.to_owned(),
+                ..config()
+            };
+            assert!(
+                matches!(check_cgroup_parent(&config), Err(SandboxError::Config(ref m)) if m.contains("cgroup parent")),
+                "{parent:?}"
+            );
+        }
+        for parent in ["harvest-sandbox", "workers/harvest-sandbox"] {
+            let config = JailerConfig {
+                cgroup_parent: parent.to_owned(),
+                ..config()
+            };
+            check_cgroup_parent(&config).unwrap();
+        }
+    }
 
     fn config() -> JailerConfig {
         JailerConfig::new("/usr/bin/jailer", 10_000, 10_000)

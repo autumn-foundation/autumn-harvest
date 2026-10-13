@@ -273,6 +273,7 @@ impl FirecrackerLauncher {
                         .into(),
                 ));
             }
+            super::jailer::check_cgroup_parent(jailer)?;
             super::jailer::check_extra_cgroups(jailer)?;
             super::jailer::check_cgroup_root(jailer, mounts)?;
             // The jailer makes the chroot and the cgroup, then drops to the
