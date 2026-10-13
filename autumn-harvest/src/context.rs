@@ -2349,13 +2349,15 @@ impl WorkflowLogger<'_> {
         // `max_lines` would make the store's `admit == lines.len()` and the
         // truncation marker would never fire, turning AC4's visible overflow
         // into silent loss.
-        let queued = self
-            .ctx
-            .log_commands_queued
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if queued > u64::from(policy.max_lines()) {
+        //
+        // A call over the bound queues nothing, so it does not count. The
+        // counter then equals the queued `RecordLog` commands, and a scope
+        // cancel that withdraws them gives back the whole budget (#1984).
+        let queued = &self.ctx.log_commands_queued;
+        if queued.load(std::sync::atomic::Ordering::Relaxed) > u64::from(policy.max_lines()) {
             return;
         }
+        queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let capped = truncate_on_char_boundary(message, policy.max_message_bytes);
         // `seq` IS the call ordinal: a deterministic identity for this logical
@@ -7578,14 +7580,27 @@ impl WorkflowContext {
                     None => states.remove(&entry.timer_id),
                 };
             }
-            let mut epochs = self
-                .timer_arm_epochs
-                .lock()
-                .expect("timer_arm_epochs lock poisoned");
-            match entry.epoch {
-                Some(epoch) => epochs.insert(entry.timer_id, epoch),
-                None => epochs.remove(&entry.timer_id),
+            let undone = {
+                let mut epochs = self
+                    .timer_arm_epochs
+                    .lock()
+                    .expect("timer_arm_epochs lock poisoned");
+                let undone = epochs.get(&entry.timer_id).copied();
+                match entry.epoch {
+                    Some(epoch) => epochs.insert(entry.timer_id.clone(), epoch),
+                    None => epochs.remove(&entry.timer_id),
+                };
+                undone
             };
+            if let Some(undone) = undone.filter(|epoch| Some(*epoch) != entry.epoch) {
+                crate::cancellation_scope::rewind_armed_timer(
+                    &self.live_scopes.lock().expect("live scopes lock poisoned"),
+                    seq,
+                    &entry.timer_id,
+                    undone,
+                    entry.epoch,
+                );
+            }
         }
     }
 
@@ -15122,8 +15137,11 @@ impl WorkflowContext {
     }
 
     /// Whether an unconsumed marker with this name is in history.
+    ///
+    /// The read does not pump signal handlers, as a scope or shield marker
+    /// lookup does not (issue #1984).
     pub(crate) fn has_unconsumed_marker(&self, name: &str) -> bool {
-        self.match_history(|m| m.has_unconsumed_marker(name))
+        self.match_history_unpumped(|m| m.has_unconsumed_marker(name))
     }
 
     /// Consume the marker `name`, tolerating interleaved sibling events.
@@ -15175,7 +15193,9 @@ impl WorkflowContext {
         &self,
         members: &crate::cancellation_scope::ScopeMembers,
     ) {
-        self.match_history(|m| {
+        // Unpumped, as the replay path is: a live cancel runs no signal
+        // handler that its replay would run only after the scope.
+        self.match_history_unpumped(|m| {
             m.consume_race_loser_frontier(&members.activities, &members.children);
         });
     }

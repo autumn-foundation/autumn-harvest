@@ -27595,6 +27595,18 @@ async fn process_workflow_task(
 
                 let mut pending_cancel_metrics = Vec::new();
                 if let Some(reason) = &deferred_cancel_ends_run {
+                    // An admitted update that finished this cycle keeps its
+                    // terminal event. The cancel then reads the next event id.
+                    let mut update_event_id =
+                        store::next_event_id_for(conn, prepared.exec_id).await?;
+                    persist_update_result_commands(
+                        conn,
+                        prepared.exec_id,
+                        &pending_cmds,
+                        &mut update_event_id,
+                        registry.payload_codecs(),
+                    )
+                    .await?;
                     let (_, starts, checks, terminal_metric) =
                         crate::execution::cancel_workflow_execution_collect_now(
                             conn,

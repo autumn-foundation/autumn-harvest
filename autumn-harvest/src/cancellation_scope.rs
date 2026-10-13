@@ -273,6 +273,41 @@ impl ScopeShared {
 /// A resident future keeps its scopes across cycles. A resolved member must
 /// leave the set. Otherwise a later operation that reuses its timer id would
 /// look like a member, and a cancel would tear it down.
+/// Give the other live scopes back the arm that an undone mutation replaced.
+///
+/// A nested scope that arms or resets a timer records the new epoch in each
+/// enclosing scope. Its cancel restores the timer's prior epoch. An enclosing
+/// scope that tracks the undone epoch must track the prior arm again, or a
+/// later cancel of that scope would miss the arm. The cancelled scope keeps
+/// its own entry, so its cancel does not claim the prior arm.
+pub(crate) fn rewind_armed_timer(
+    live: &[std::sync::Weak<ScopeShared>],
+    undone_scope: u32,
+    timer_id: &str,
+    undone: u64,
+    prior: Option<u64>,
+) {
+    for shared in live.iter().filter_map(std::sync::Weak::upgrade) {
+        if shared.seq == undone_scope {
+            continue;
+        }
+        let mut inner = shared.lock();
+        let Some(at) = inner
+            .armed_timers
+            .iter()
+            .position(|(id, epoch)| id.as_str() == timer_id && *epoch == undone)
+        else {
+            continue;
+        };
+        match prior {
+            Some(epoch) => inner.armed_timers[at].1 = epoch,
+            None => {
+                inner.armed_timers.remove(at);
+            }
+        }
+    }
+}
+
 /// Whether a scope that replays a cancel holds a command that parks.
 ///
 /// The worker never gets a held command, so it is invisible to the park
@@ -2216,8 +2251,116 @@ mod tests {
         let nd = ctx.take_nd_details();
         assert!(nd.is_none(), "{nd:?}");
         // The next history read delivers the signal.
-        let _ = ctx.has_unconsumed_marker("none");
+        let _ = ctx.history_event_count();
         assert!(poked.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A withdrawn scope gives back the whole log budget, also for log calls
+    /// over the line cap that queued nothing.
+    #[tokio::test]
+    async fn a_withdrawn_scope_gives_back_its_log_budget() {
+        let ctx = WorkflowContext::new_test().with_log_policy(Some(
+            crate::context::WorkflowLogPolicy::new().with_max_lines(1),
+        ));
+        let result = bounded(run_then_cancel(&ctx, async {
+            for _ in 0..4 {
+                ctx.log_info("in scope");
+            }
+            std::future::pending::<()>().await;
+        }))
+        .await;
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+
+        ctx.log_info("after");
+
+        let commands = ctx.drain_commands();
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::RecordLog { message, .. } if message == "after"
+            )),
+            "the log after the scope is kept: {commands:?}"
+        );
+    }
+
+    /// A live scope cancel does not run the handler of a signal at the cursor.
+    /// The replay of that cancel runs it only after the scope returns.
+    #[tokio::test]
+    async fn a_live_scope_cancel_does_not_run_a_signal_handler() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started(),
+                WorkflowEvent::SignalReceived {
+                    signal_name: "poke".into(),
+                    payload: json!(1),
+                },
+            ],
+        );
+        let poked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&poked);
+        ctx.register_signal_handler_raw("poke", move |_| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let result = bounded(run_then_cancel(&ctx, std::future::pending::<()>())).await;
+
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+        assert!(
+            !poked.load(std::sync::atomic::Ordering::SeqCst),
+            "the handler must not run inside the scope cancel"
+        );
+    }
+
+    /// An outer scope tracks a persisted arm. A nested scope resets the same
+    /// timer and is cancelled. A later cancel of the outer scope still
+    /// cancels the original arm, so a re-arm is not a no-op.
+    #[tokio::test]
+    async fn an_outer_cancel_still_cancels_an_arm_after_a_nested_reset_is_undone() {
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), armed_deadline_history());
+        let outer = ctx.cancellation_scope();
+        let inner = ctx.cancellation_scope();
+        let body = async {
+            let _arm = ctx.start_timer("deadline", 60);
+            let nested = inner
+                .run(async {
+                    ctx.reset_timer("deadline", 30).expect("reset_timer");
+                    inner.cancel();
+                    std::future::pending::<()>().await;
+                })
+                .await;
+            assert!(
+                matches!(nested, Err(HarvestError::Cancelled(_))),
+                "{nested:?}"
+            );
+            std::future::pending::<()>().await;
+        };
+        let sibling = async {
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            outer.cancel();
+        };
+
+        let (result, ()) = bounded(async { tokio::join!(outer.run(body), sibling) }).await;
+
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+        let _ = ctx.drain_commands();
+        let _again = ctx.start_timer("deadline", 60);
+        let commands = ctx.drain_commands();
+        assert_eq!(
+            arms(&commands),
+            1,
+            "the outer cancel cancelled the original arm: {commands:?}"
+        );
     }
 
     /// A captured side-effect value replays as recorded. A cap lowered after
