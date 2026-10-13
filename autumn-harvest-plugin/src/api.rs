@@ -25644,7 +25644,7 @@ async fn fork_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
-    Json(request): Json<WorkflowForkRequest>,
+    request: Result<Json<WorkflowForkRequest>, JsonRejection>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
@@ -25662,6 +25662,16 @@ async fn fork_workflow(
         }
     };
     let exec_id_str = exec_id.to_string();
+    // The handler unwraps the body itself, so a rejected body is audited too.
+    // The response keeps the status of the extractor.
+    let request = match request {
+        Ok(Json(request)) => request,
+        Err(rejection) => {
+            let failure = format!("invalid request body: {}", rejection.body_text());
+            let _ = audit_fork_on_default(&api_state, &context, &exec_id_str, Some(&failure)).await;
+            return rejection.into_response();
+        }
+    };
     // Fail closed in the boot window. With no runtime there are no payload
     // codecs, so an override would land in plaintext.
     let runtime = match api_state.runtime() {

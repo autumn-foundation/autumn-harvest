@@ -187,6 +187,7 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | A reset of a fork skips the lineage check. | The reset walks the fork lineage under its lock. An erased ancestor is `ErasedSource`; a gap, a seal or a deep lineage is `ForkLineage` (`409`). |
 | The `LiveFork` lineage walk scans every execution for each rebalance candidate. | A partial index on `start_source_ref WHERE start_source = 'fork'` serves the seed, and the step joins on the primary key. |
 | A fork of an old run is pinned to a retired source build. | A fork at point 0 resolves its build like a fresh start. A carried prefix keeps the source build; the runbook gives the compatibility remedy. |
+| The JSON extractor rejects a bad body before the handler runs, so the attempt writes no audit row. | The handler unwraps the body itself and writes a failed `workflow.fork` row. The status stays `400`, `415` or `422`. |
 
 ## 2. Tests
 

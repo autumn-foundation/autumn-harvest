@@ -335,6 +335,36 @@ async fn fork_route_maps_refusals() {
     );
 }
 
+/// A body that the JSON extractor rejects still writes one failed audit row.
+/// The status stays the status of the extractor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rejected_fork_body_is_audited() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, true);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+    let source = seed_completed(&mut conn).await.to_string();
+
+    for body in [json!({ "effects": "LIVE" }), json!({ "effect": "live" })] {
+        let (status, _) = post_fork(&app, &source, body, true).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    assert_eq!(
+        fork_audit_rows(&url, &source).await,
+        2,
+        "one row per refusal"
+    );
+    let failed: i64 = autumn_harvest::schema::harvest_audit_log::table
+        .filter(autumn_harvest::schema::harvest_audit_log::operation.eq("workflow.fork"))
+        .filter(autumn_harvest::schema::harvest_audit_log::target_id.eq(&source))
+        .filter(autumn_harvest::schema::harvest_audit_log::status.eq("failed"))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count failed rows");
+    assert_eq!(failed, 2, "each refusal is a failed row");
+}
+
 /// A live fork sends the completion callbacks of its source, so it checks
 /// them against the current SSRF policy, as a rerun does. A target that the
 /// policy no longer admits refuses the fork with `422`. A recorded fork sends
