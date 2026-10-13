@@ -7,9 +7,9 @@
 //! is a result, not a tool error, so the model can read stderr and fix its
 //! code.
 //!
-//! The harness cuts a long tool result. The view therefore keeps a head and
-//! a tail of each stream and a short part of each output file, so the status
-//! and stderr stay in the part that the model reads.
+//! The harness cuts a long tool result. So the view keeps a head and a tail
+//! of each stream, and a short part of each output file. The status and
+//! stderr then stay in the part that the model reads.
 //!
 //! The tool runs inside the tool-call activity of the agent loop. History
 //! records the outcome, so replay never runs the code again.

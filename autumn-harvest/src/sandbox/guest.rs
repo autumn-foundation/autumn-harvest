@@ -102,7 +102,7 @@ const FRAME_OVERHEAD_BYTES: usize = 64 * 1024;
 /// Serve one connection: answer a ping, or run one plan.
 ///
 /// A request that the guest cannot read gets an error frame with an empty
-/// run id, so the host sees a protocol mismatch, not a lost connection. A
+/// run id. So the host sees a protocol mismatch, not a lost connection. A
 /// run counts as served even when its reply fails, so a single-use guest
 /// never runs a second plan.
 ///

@@ -102,9 +102,11 @@ impl SandboxRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`SandboxError::Config`] when the policy is not valid, when
-    /// the backend isolation is weaker than `policy.min_isolation`, or when
-    /// the policy allows the network on a backend without one.
+    /// Returns [`SandboxError::Config`] in these cases:
+    ///
+    /// - the policy is not valid;
+    /// - the backend isolation is weaker than `policy.min_isolation`;
+    /// - the policy allows the network on a backend without one.
     pub fn new(
         backend: Arc<dyn SandboxBackend>,
         policy: SandboxPolicy,
