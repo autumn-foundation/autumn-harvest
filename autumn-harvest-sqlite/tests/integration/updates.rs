@@ -1187,6 +1187,39 @@ async fn an_update_sees_a_pending_cancel() {
     );
 }
 
+/// Updates after a cancel meet the cleanup budget, as the body's own
+/// events do (issue #2021).
+#[tokio::test]
+async fn updates_after_a_cancel_meet_the_cleanup_budget() {
+    let (mut rt, exec) = blocked_limit_run().await;
+    let from = rt.load_history(exec).unwrap().len();
+    rt.cancel(exec, "stop").unwrap();
+
+    let mut accepted = 0;
+    let err = loop {
+        match rt.update(exec, "set_limit", json!(5)).await {
+            Ok(_) => accepted += 1,
+            Err(err) => break err,
+        }
+        assert!(accepted <= 500, "the budget must stop the updates");
+    };
+
+    assert!(
+        matches!(err, SqliteError::UpdateHistoryCapReached { .. }),
+        "{err:?}"
+    );
+    let history = rt.load_history(exec).unwrap();
+    assert!(
+        history.len() - from <= 1_000,
+        "{} events",
+        history.len() - from
+    );
+    assert!(matches!(
+        history.last(),
+        Some(WorkflowEvent::WorkflowCancelled { reason }) if reason == "stop"
+    ));
+}
+
 /// An update below the caps is unchanged.
 #[tokio::test]
 async fn update_below_the_caps_succeeds() {

@@ -1138,7 +1138,8 @@ impl SqliteRuntime {
     ///   time, for example because it awaits a durable command.
     /// - [`SqliteError::UpdateHistoryCapReached`] if the two update events
     ///   would reach a history cap. The run then fails at the cap, as a drive
-    ///   fails it. Under a pending cancel the run ends `CANCELLED` instead.
+    ///   fails it. Under a pending cancel the cleanup budget is one more cap,
+    ///   and the run ends `CANCELLED` instead.
     /// - [`SqliteError::UpdateFailed`] if the handler returns an error or
     ///   panics. History records `WorkflowEvent::UpdateFailed`.
     /// - A persistence error if the history cannot be read or written.
@@ -1224,8 +1225,12 @@ impl SqliteRuntime {
             .iter()
             .map(|e| serde_json::to_string(e).map(|json| json.len() as u64))
             .sum::<Result<u64, _>>()?;
+        // Issue #2021: under a pending cancel the cleanup budget is one more
+        // event cap, as on the drive.
+        let budget_end = store::cancel_request(&self.conn, exec)?
+            .map(|(_, from)| from.saturating_add(CANCEL_CLEANUP_EVENT_BUDGET));
         let caps = CapCheck {
-            policy: self.history_policy,
+            policy: self.cancel_policy(budget_end),
             start_bytes: history_bytes.saturating_add(added),
             workflow_type: &workflow_name,
         };
