@@ -209,6 +209,7 @@ impl FirecrackerLauncher {
     /// Returns [`SandboxError::Config`] in these cases:
     ///
     /// - the machine has no memory, or a vCPU count outside 1 to 32;
+    /// - an API or snapshot boot has an API timeout of zero;
     /// - a path is missing;
     /// - a snapshot boot has no jailer;
     /// - the jail uid or gid is 0, or this process is not root with a jail;
@@ -230,6 +231,13 @@ impl FirecrackerLauncher {
                 "a microVM needs 1 to {MAX_VCPUS} vCPUs and some memory, not {} vCPUs and {} MiB",
                 machine.vcpu_count, machine.mem_size_mib
             )));
+        }
+        if matches!(config.boot, BootMethod::Api | BootMethod::Snapshot(_))
+            && config.api_timeout.is_zero()
+        {
+            return Err(SandboxError::Config(
+                "an API or snapshot boot needs an API timeout above zero".into(),
+            ));
         }
         let mut required = vec![
             ("the Firecracker binary", &config.firecracker_bin),
@@ -1986,6 +1994,23 @@ while True:
             "a copy must give the jail the access that a hard link gives"
         );
         assert_eq!(std::fs::read(&to).unwrap(), b"memory");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_zero_api_timeout_is_a_config_error() {
+        let dir = temp_dir();
+        let fc = script(&dir, "firecracker", "exit 0");
+        let mut config = unjailed(&dir, fc, BootMethod::Api);
+        config.api_timeout = Duration::ZERO;
+        let err = new_launcher(config.clone()).expect_err("zero API timeout");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("API timeout")),
+            "{err:?}"
+        );
+        // A config-file boot never calls the API.
+        config.boot = BootMethod::ConfigFile;
+        new_launcher(config).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 

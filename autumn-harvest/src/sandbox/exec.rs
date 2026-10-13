@@ -216,9 +216,11 @@ pub async fn execute_plan(
     };
 
     let (outputs, skipped_outputs) = {
-        let dir = work.path().to_path_buf();
+        let root = work.handle.try_clone().map_err(|e| {
+            SandboxError::Unavailable(format!("could not reopen the work directory: {e}"))
+        })?;
         let plan = plan.clone();
-        tokio::task::spawn_blocking(move || collect_outputs(&dir, &plan))
+        tokio::task::spawn_blocking(move || collect_outputs(&root, &plan))
             .await
             .map_err(|e| SandboxError::Unavailable(format!("output collection failed: {e}")))?
     };
@@ -628,6 +630,10 @@ fn spawn_capture<R: AsyncRead + Unpin + Send + 'static>(
 /// A private work directory, removed when the run ends.
 struct WorkDir {
     path: PathBuf,
+    /// The directory, opened before the code runs. The code owns the
+    /// directory, so it can move it and leave a link at `path`. So the
+    /// outputs are read through this handle, never through `path`.
+    handle: std::fs::File,
     removed: bool,
 }
 
@@ -644,8 +650,19 @@ impl WorkDir {
                     path.display()
                 ))
             })?;
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .map_err(|e| {
+                SandboxError::Unavailable(format!(
+                    "could not open the work directory {}: {e}",
+                    path.display()
+                ))
+            })?;
         Ok(Self {
             path,
+            handle,
             removed: false,
         })
     }
@@ -731,9 +748,9 @@ fn write_files(
     Ok(())
 }
 
-/// Read the requested outputs from `dir`, within the per-file and the total
-/// budgets.
-fn collect_outputs(dir: &Path, plan: &ExecPlan) -> (Vec<OutputFile>, Vec<SkippedOutput>) {
+/// Read the requested outputs beneath `root`, the work directory handle,
+/// within the per-file and the total budgets.
+fn collect_outputs(root: &std::fs::File, plan: &ExecPlan) -> (Vec<OutputFile>, Vec<SkippedOutput>) {
     let mut outputs = Vec::new();
     let mut skipped = Vec::new();
     let mut budget = plan.max_output_files_total_bytes;
@@ -744,21 +761,8 @@ fn collect_outputs(dir: &Path, plan: &ExecPlan) -> (Vec<OutputFile>, Vec<Skipped
             reason,
         });
     };
-    let root = match std::fs::File::open(dir) {
-        Ok(root) => root,
-        Err(e) => {
-            for path in &plan.outputs {
-                skip(
-                    &mut skipped,
-                    path,
-                    format!("the work directory is gone: {e}"),
-                );
-            }
-            return (outputs, skipped);
-        }
-    };
     for path in &plan.outputs {
-        match read_output(&root, path, plan.max_output_file_bytes) {
+        match read_output(root, path, plan.max_output_file_bytes) {
             Ok(content) => {
                 let size = u64::try_from(content.len()).unwrap_or(u64::MAX);
                 if size > budget {
@@ -1481,6 +1485,33 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.stderr.is_empty(), "the shell must report failed forks");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs root; the Sandbox (KVM) workflow runs it with sudo"]
+    async fn root_outputs_come_from_the_work_directory_even_after_a_swap() {
+        // SAFETY: geteuid has no preconditions.
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
+        // The code owns its work directory. It moves it away and leaves a
+        // link to /etc at the old path.
+        let plan = SandboxPolicy::for_development()
+            .with_network(NetworkPolicy::Allow)
+            .plan(
+                &sh("echo mine > passwd; d=$(pwd); mv \"$d\" \"$d.moved\"; ln -s /etc \"$d\"; echo \"$d\"")
+                    .with_output("passwd"),
+            )
+            .unwrap();
+        let out = execute_plan(&plan, &options(), &CancellationToken::new())
+            .await
+            .unwrap();
+        let moved = format!("{}.moved", out.stdout.trim());
+        let _ = std::fs::remove_dir_all(&moved);
+        let passwd = out.outputs.iter().find(|o| o.path == "passwd");
+        assert_eq!(
+            passwd.map(|o| o.content.as_slice()),
+            Some(&b"mine\n"[..]),
+            "the output must come from the work directory: {out:?}"
+        );
     }
 
     #[test]
