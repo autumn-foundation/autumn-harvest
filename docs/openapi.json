@@ -3354,7 +3354,7 @@
                     "type": "integer"
                   },
                   "overlap_policy": {
-                    "description": "One of: skip, buffer_one, buffer_all, cancel_other, terminate_other. Defaults to skip.",
+                    "description": "One of: skip, buffer_one, buffer_all, cancel_other, terminate_other, allow_all. Defaults to skip.",
                     "type": "string"
                   },
                   "paused": {
@@ -3480,7 +3480,7 @@
                     "type": "integer"
                   },
                   "overlap_policy": {
-                    "description": "What to do when a fire lands while the previous run is still going: skip, buffer_one, buffer_all, or allow_all.",
+                    "description": "What to do when a fire lands while the previous run is still going: skip, buffer_one, buffer_all, cancel_other, terminate_other or allow_all.",
                     "type": "string"
                   },
                   "paused": {
@@ -3736,7 +3736,7 @@
                     "description": "New total run budget (issue #478). Tri-state: omit = unchanged, explicit null (or 0) = remove the budget."
                   },
                   "overlap_policy": {
-                    "description": "New overlap policy: skip, buffer_one, buffer_all, cancel_other, terminate_other (issue #241)."
+                    "description": "New overlap policy: skip, buffer_one, buffer_all, cancel_other, terminate_other or allow_all (issues #241, #1985)."
                   },
                   "queue_name": {
                     "description": "New task queue name for scheduled runs."

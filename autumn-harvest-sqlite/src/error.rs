@@ -236,6 +236,12 @@ pub enum SqliteError {
         existing_state: String,
     },
 
+    /// A signal broke a rule of its name. A `harvest.promise:` signal must
+    /// carry a [`PromiseSettlement`](autumn_harvest::durable_promise::PromiseSettlement)
+    /// (issue #1985).
+    #[error("invalid signal: {0}")]
+    InvalidSignal(String),
+
     /// A value stored in `SQLite` could not be parsed back into its Rust type.
     #[error("corrupt stored value: {0}")]
     Corrupt(String),
