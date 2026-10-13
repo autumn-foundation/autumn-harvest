@@ -47,6 +47,11 @@ No migration, no new `WorkflowEvent` variant, and no worker change other than
 the adaptive-limit list. History records the request and the outcome, and
 replay never runs the code again.
 
+**Also in this PR (issue #2008).** A re-driven workflow task can find no new
+result. A resident workflow now waits again for its parked activities, as a
+cold replay does, and keeps its state. Before, it declined and replayed cold.
+That made the agent-loop hit-rate test flaky.
+
 Evidence: the sandbox unit tests run on every OS in `test-nodb`, with a fake
 VMM, fake `firecracker` and `jailer` scripts and a fake API server. The new
 `Sandbox (KVM)` workflow boots real microVMs, and it runs the `root_` tests
