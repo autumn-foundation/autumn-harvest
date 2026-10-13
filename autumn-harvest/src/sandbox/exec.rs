@@ -208,7 +208,10 @@ pub async fn execute_plan(
         exit = main_exit(&mut child, group, exit_fd.as_ref()) => End::Exited(exit),
         () = tokio::time::sleep(plan.limits.wall_clock()) => End::TimedOut,
         () = cancel.cancelled() => End::Cancelled,
-        () = cpu_spent(cgroup.as_ref(), cpu_budget) => End::CpuSpent,
+        spent = cpu_spent(cgroup.as_ref(), cpu_budget) => match spent {
+            Ok(()) => End::CpuSpent,
+            Err(reason) => End::CpuUnknown(reason),
+        },
     };
     // Kill the group in every case: background processes must not outlive
     // the run, hold the pipes, or keep using the CPU. The cgroup also holds
@@ -270,6 +273,8 @@ enum End {
     TimedOut,
     Cancelled,
     CpuSpent,
+    /// The run cgroup could not report its CPU time.
+    CpuUnknown(String),
 }
 
 /// A pidfd of `pid`. It becomes readable when the process exits, and it
@@ -373,6 +378,12 @@ fn run_status(end: End) -> Result<RunStatus, SandboxError> {
         End::CpuSpent => RunStatus::Signaled {
             signal: libc::SIGXCPU,
         },
+        // Without the CPU time the budget cannot hold, so the run fails.
+        End::CpuUnknown(reason) => {
+            return Err(SandboxError::Unavailable(format!(
+                "the run cgroup lost its CPU time: {reason}"
+            )));
+        }
         End::Exited(None) => {
             return Err(SandboxError::Unavailable(
                 "the executor did not reap the child".into(),
@@ -402,7 +413,12 @@ fn next_cpu_poll(left_usec: u64, cpus: u64) -> Duration {
 
 /// Wait until the processes in `cgroup` have used `budget` of CPU time. Without
 /// a cgroup, wait forever.
-async fn cpu_spent(cgroup: Option<&RunCgroup>, budget: Duration) {
+///
+/// # Errors
+///
+/// Returns the reason when the CPU time cannot be read. Then the run has no
+/// CPU limit, so the executor ends it.
+async fn cpu_spent(cgroup: Option<&RunCgroup>, budget: Duration) -> Result<(), String> {
     let Some(cgroup) = cgroup else {
         return std::future::pending().await;
     };
@@ -410,9 +426,9 @@ async fn cpu_spent(cgroup: Option<&RunCgroup>, budget: Duration) {
     let cpus = std::thread::available_parallelism()
         .map_or(1, |n| u64::try_from(n.get()).unwrap_or(u64::MAX));
     loop {
-        let used = cgroup.cpu_usec().unwrap_or(0);
+        let used = cgroup.cpu_usec()?;
         if used >= budget {
-            return;
+            return Ok(());
         }
         tokio::time::sleep(next_cpu_poll(budget - used, cpus)).await;
     }
@@ -468,18 +484,20 @@ impl RunCgroup {
             )));
         }
         // A budget that the executor cannot read is no budget.
-        if cgroup.cpu_usec().is_none() {
+        if let Err(reason) = cgroup.cpu_usec() {
             return Err(SandboxError::Unavailable(format!(
-                "the run cgroup {} reports no CPU time; the run fails closed",
-                cgroup.dir.display()
+                "the run cgroup reports no CPU time ({reason}); the run fails closed"
             )));
         }
         Ok(cgroup)
     }
 
     /// The CPU time of each process that ran in the cgroup, in microseconds.
-    fn cpu_usec(&self) -> Option<u64> {
-        usage_usec(&std::fs::read_to_string(self.dir.join("cpu.stat")).ok()?)
+    fn cpu_usec(&self) -> Result<u64, String> {
+        let path = self.dir.join("cpu.stat");
+        let stat = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        usage_usec(&stat).ok_or_else(|| format!("{} has no usage_usec", path.display()))
     }
 
     /// Kill each process in the cgroup, without waiting.
@@ -1973,6 +1991,35 @@ mod tests {
         assert_eq!(next_cpu_poll(10_000_000, 1), CPU_POLL);
         assert_eq!(next_cpu_poll(0, 4), MIN_CPU_POLL);
         assert_eq!(next_cpu_poll(500, 0), MIN_CPU_POLL);
+    }
+
+    #[tokio::test]
+    async fn the_cpu_watch_fails_closed_when_cpu_stat_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let stat = dir.path().join("cpu.stat");
+        std::fs::write(&stat, "usage_usec 10\n").unwrap();
+        let cgroup = RunCgroup {
+            dir: dir.path().to_path_buf(),
+            procs: std::fs::File::open(&stat).unwrap(),
+            removed: true,
+        };
+        std::fs::write(&stat, "no usage here\n").unwrap();
+        let watch = tokio::time::timeout(
+            Duration::from_secs(2),
+            cpu_spent(Some(&cgroup), Duration::from_secs(60)),
+        )
+        .await
+        .expect("the watch must end when it cannot read the CPU time");
+        assert!(watch.is_err(), "{watch:?}");
+    }
+
+    #[test]
+    fn a_lost_cpu_time_is_a_retryable_failure() {
+        let err = run_status(End::CpuUnknown("cpu.stat is gone".into())).expect_err("no status");
+        assert!(
+            matches!(err, SandboxError::Unavailable(ref m) if m.contains("cpu.stat")),
+            "{err:?}"
+        );
     }
 
     #[test]

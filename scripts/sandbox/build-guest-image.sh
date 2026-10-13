@@ -57,12 +57,15 @@ fi
 mkdir -p "${out}"
 out="$(cd "${out}" && pwd)"
 work="$(mktemp -d)"
+# The new files wait in a stage directory in OUT_DIR, on the same file
+# system. A failed step keeps the old image, and the end renames each file.
+stage="$(mktemp -d "${out}/.stage.XXXXXX")"
 container=""
 cleanup() {
   if [ -n "${container}" ]; then
     docker rm -f "${container}" >/dev/null 2>&1 || true
   fi
-  rm -rf "${work}"
+  rm -rf "${work}" "${stage}"
 }
 trap cleanup EXIT
 
@@ -81,9 +84,8 @@ fi
 
 # 2. The kernel, checked against its digest.
 echo "kernel: ${kernel_url}"
-curl -fsSL --retry 3 -o "${out}/vmlinux" "${kernel_url}"
-if ! echo "${kernel_sha256}  ${out}/vmlinux" | sha256sum -c - >/dev/null; then
-  rm -f "${out}/vmlinux"
+curl -fsSL --retry 3 -o "${stage}/vmlinux" "${kernel_url}"
+if ! echo "${kernel_sha256}  ${stage}/vmlinux" | sha256sum -c - >/dev/null; then
   echo "build-guest-image: the kernel digest is not ${kernel_sha256}" >&2
   exit 1
 fi
@@ -96,7 +98,6 @@ else
 fi
 docker start -a "${container}" >/dev/null
 mkdir -p "${work}/rootfs"
-rm -f "${out}/rootfs.ext4"
 # The image files must keep their owners, mostly root. Without root, tar
 # makes the caller the owner of each file, and the caller can have the uid
 # of the code. So a non-root build runs the extraction and mkfs under
@@ -117,10 +118,15 @@ docker export "${container}" | "${as_root[@]}" sh -euc '
   mkdir -p "${rootfs}/work" "${rootfs}/proc" "${rootfs}/sys" "${rootfs}/dev" "${rootfs}/tmp"
   size_mib=$(( $(du -sm "${rootfs}" | cut -f1) + 64 ))
   mkfs.ext4 -q -F -L harvest-rootfs -d "${rootfs}" "${image}" "${size_mib}M"
-' build-rootfs "${work}/rootfs" "${agent}" "${out}/rootfs.ext4"
+' build-rootfs "${work}/rootfs" "${agent}" "${stage}/rootfs.ext4"
 
-# 4. The digests.
-(cd "${out}" && sha256sum vmlinux rootfs.ext4 > image.sha256)
+# 4. The digests, then the new image replaces the old one. Each rename is
+# atomic. A crash between them can mix the files, and image.sha256 then
+# shows it.
+(cd "${stage}" && sha256sum vmlinux rootfs.ext4 > image.sha256)
+for file in rootfs.ext4 vmlinux image.sha256; do
+  mv -f "${stage}/${file}" "${out}/${file}"
+done
 cat "${out}/image.sha256"
 
 if [ "$(id -u)" -ne 0 ]; then

@@ -229,6 +229,63 @@ fn the_image_script_refuses_a_kernel_url_without_a_digest() {
     assert!(stderr.contains("KERNEL_SHA256"), "{stderr}");
 }
 
+#[cfg(unix)]
+#[test]
+fn a_failed_image_build_keeps_the_old_image() {
+    use sha2::Digest as _;
+    let scratch = std::env::temp_dir().join(format!("hsbx-rebuild-{}", std::process::id()));
+    let out = scratch.join("image");
+    std::fs::create_dir_all(&out).expect("out dir");
+    std::fs::write(out.join("vmlinux"), b"old kernel").expect("old kernel");
+    std::fs::write(out.join("rootfs.ext4"), b"old rootfs").expect("old rootfs");
+    let kernel = scratch.join("new-kernel");
+    std::fs::write(&kernel, b"new kernel").expect("new kernel");
+    let digest = sha2::Sha256::digest(b"new kernel")
+        .iter()
+        .fold(String::new(), |mut hex, b| {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{b:02x}");
+            hex
+        });
+    let mut cases = vec![(
+        "a kernel digest mismatch",
+        "0".repeat(64),
+        "python:3.12-alpine".to_owned(),
+    )];
+    // The kernel is good, and the root file system step fails.
+    cases.push((
+        "a failed root file system",
+        digest,
+        "harvest.invalid/!!".to_owned(),
+    ));
+    for (case, sha, base) in cases {
+        let result = std::process::Command::new("bash")
+            .arg(repo_root().join(IMAGE_SCRIPT))
+            .arg(&out)
+            .env("KERNEL_URL", format!("file://{}", kernel.display()))
+            .env("KERNEL_SHA256", sha)
+            .env("BASE_IMAGE", base)
+            .env("AGENT_BIN", "/nonexistent/harvest-guest-agent")
+            .output()
+            .expect("bash runs");
+        assert!(!result.status.success(), "{case}: the build must fail");
+        let kept = |name: &str| std::fs::read(out.join(name)).unwrap_or_default();
+        assert_eq!(kept("vmlinux"), b"old kernel", "{case}");
+        assert_eq!(kept("rootfs.ext4"), b"old rootfs", "{case}");
+        let mut left: Vec<_> = std::fs::read_dir(&out)
+            .expect("out dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["rootfs.ext4", "vmlinux"],
+            "{case}: a staged file is left"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 #[test]
 fn the_guide_names_the_kernel_arguments_that_the_config_sets() {
     let guide = read(GUIDE);
