@@ -1285,6 +1285,7 @@ mod tests {
             decisions: Vec::new(),
             cache_hit: false,
             labels: Vec::new(),
+            releases: Vec::new(),
         }
     }
 

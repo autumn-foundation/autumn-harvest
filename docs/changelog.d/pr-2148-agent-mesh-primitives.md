@@ -31,8 +31,11 @@ and `DESIGN-agent-mesh.md` the plan.
   `AgentReport::delegations` lists each delegation with its subtree usage,
   rounds and calls. The report counters cover the whole tree.
 - **Flow rules.** `Tool::labels` and `FlowRules` gate the call that completes
-  a forbidden label set in one run tree. Each later call that touches the set
-  needs its own approval. `FlowRules::rule_of_two()` follows Meta's Agents
+  a forbidden label set in one run tree. By default, each later call that
+  touches the set needs its own approval. `Recheck::UntilApproved` asks until
+  a person approves one call, and that approval releases the rule for the run
+  tree. Only a recorded approval releases a rule, so carried labels, a
+  rejection or a waiting call in the same turn release nothing. `FlowRules::rule_of_two()` follows Meta's Agents
   Rule of Two. The workflow holds the exercised labels, so model
   output cannot remove one. A call after a delegation in the same turn does
   not run on a stale decision. With flow rules, an unknown tool is denied.

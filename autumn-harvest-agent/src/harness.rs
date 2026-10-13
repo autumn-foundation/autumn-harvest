@@ -13,7 +13,7 @@ use tracing::Instrument;
 
 use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::error::AgentError;
-use crate::flow::{FlowRules, call_labels};
+use crate::flow::{FlowRules, Released, call_labels};
 use crate::heartbeat::{HeartbeatTask, Precheck};
 use crate::memory::{MEMORY_TOOL, MemoryScope, MemoryStore, MemoryTool, render_snapshot};
 use crate::mesh::{DELEGATE_TOOL, Peer, delegate_definition, valid_name};
@@ -438,6 +438,7 @@ impl AgentHarness {
                 decisions: Vec::new(),
                 cache_hit,
                 labels: Vec::new(),
+                releases: Vec::new(),
             };
             let info = RunInfo {
                 run_id: RunId::new(request.run_id.clone()),
@@ -454,6 +455,7 @@ impl AgentHarness {
                     builtins: &builtins,
                     allowed,
                     exercised: &request.flow_labels,
+                    released: &request.flow_released,
                 },
                 &mut policy_budget,
             )
@@ -544,6 +546,7 @@ impl AgentHarness {
             builtins,
             allowed,
             exercised,
+            released,
         } = scope;
         let started = tokio::time::Instant::now();
         let deadline = started + *budget;
@@ -561,9 +564,14 @@ impl AgentHarness {
         };
         // Each call that is not denied may run. Its labels count for the
         // calls after it in this turn before it runs, so the check fails
-        // closed.
+        // closed. A release counts only after the approval, so a call that
+        // waits releases nothing for the calls after it.
         let mut seen = exercised.clone();
+        let can_release = self.flow.can_release();
         for call in turn.calls() {
+            if can_release {
+                turn.releases.push(Released::new());
+            }
             if !permits(builtins, allowed, &call.name) {
                 turn.decisions.push(ToolDecision::Deny {
                     reason: format!("the tool {:?} is not in this agent's mandate", call.name),
@@ -591,9 +599,13 @@ impl AgentHarness {
                 });
             if !self.flow.is_empty() {
                 let labels = call_labels(tool);
-                decision = strictest(decision, self.flow.check(&seen, &labels));
+                let (flow, freed) = self.flow.decide(&seen, released, &labels);
+                decision = strictest(decision, flow);
                 if !matches!(decision, ToolDecision::Deny { .. }) {
                     seen.extend(labels.iter().cloned());
+                    if let Some(slot) = turn.releases.last_mut() {
+                        *slot = freed;
+                    }
                 }
                 turn.labels.push(labels);
             }
@@ -878,6 +890,8 @@ struct Scope<'a> {
     allowed: Option<&'a BTreeSet<String>>,
     /// The flow labels that the run tree exercised before the turn.
     exercised: &'a BTreeSet<String>,
+    /// The flow rules that a person released before the turn.
+    released: &'a Released,
 }
 
 /// Whether the mandate permits the tool `name`.

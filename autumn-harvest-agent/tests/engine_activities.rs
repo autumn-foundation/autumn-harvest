@@ -63,6 +63,7 @@ fn turn_request() -> ModelTurnRequest {
         agent: None,
         allowed_tools: None,
         flow_labels: std::collections::BTreeSet::new(),
+        flow_released: autumn_harvest_agent::Released::new(),
     }
 }
 

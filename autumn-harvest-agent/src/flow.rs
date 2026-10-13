@@ -6,11 +6,14 @@
 //! of every call that the decision lets run. A [`FlowRule`] names a label set
 //! and what happens to the call that completes it: a person decides, or the
 //! call is refused. After that, each call with a label of the set trips the
-//! rule again. One approval releases one call.
+//! rule again. Under [`Recheck::EachCall`], the default, one approval releases
+//! one call. Under [`Recheck::UntilApproved`], one approval releases the rule
+//! for the rest of the run tree.
 //!
-//! The workflow holds the exercised labels, and the model-turn activity
-//! records each decision. Model output cannot remove a label. Replay reads the
-//! recorded decision and does not check the rules again.
+//! The workflow holds the exercised labels and the released rules. The
+//! model-turn activity records each decision. Model output cannot remove a
+//! label or release a rule. Replay reads the recorded decision and does not
+//! check the rules again.
 //!
 //! A run that continues another run must also continue its labels. Pass
 //! [`AgentReport::flow_labels`](crate::AgentReport::flow_labels) to
@@ -20,6 +23,9 @@
 use std::collections::BTreeSet;
 
 use crate::policy::{Rule, ToolDecision};
+
+/// The rules that an approval releases, each named by its label set.
+pub type Released = BTreeSet<BTreeSet<String>>;
 use crate::tool::{Tool, ToolEffect};
 
 /// Well-known tool labels.
@@ -56,12 +62,31 @@ pub(crate) fn call_labels(tool: Option<&dyn Tool>) -> BTreeSet<String> {
     .unwrap_or_default()
 }
 
+/// Which calls a rule gates after its label set is complete in a run tree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Recheck {
+    /// Each later call with a label of the set trips the rule again. One
+    /// approval releases one call. This is the default.
+    #[default]
+    EachCall,
+    /// The rule trips as under [`Recheck::EachCall`] until a person approves
+    /// a call that trips it. The approval releases the rule for the rest of
+    /// the run tree. A later send can then carry data from a later prompt
+    /// injection.
+    ///
+    /// Only an approval releases the rule. A rejection, a timeout, a call
+    /// that waits in the same turn, or labels from another run release
+    /// nothing. A [`Rule::Deny`] rule never asks, so it is never released.
+    UntilApproved,
+}
+
 /// One label set, and what happens to the call that completes it in one run
 /// tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowRule {
     labels: BTreeSet<String>,
     rule: Rule,
+    recheck: Recheck,
 }
 
 impl FlowRule {
@@ -75,6 +100,12 @@ impl FlowRule {
     #[must_use]
     pub const fn rule(&self) -> &Rule {
         &self.rule
+    }
+
+    /// Which calls the rule gates after its set is complete.
+    #[must_use]
+    pub const fn recheck(&self) -> Recheck {
+        self.recheck
     }
 }
 
@@ -91,11 +122,24 @@ impl FlowRules {
         Self::default()
     }
 
-    /// Add a rule. A call that completes `labels` in one run tree gets
-    /// `rule`. Each later call with one of `labels` gets `rule` too.
-    /// [`Rule::Allow`] and an empty set add nothing.
+    /// Add a rule with [`Recheck::EachCall`]. A call that completes `labels`
+    /// in one run tree gets `rule`. Each later call with one of `labels` gets
+    /// `rule` too. [`Rule::Allow`] and an empty set add nothing.
     #[must_use]
     pub fn forbid<I, S>(self, labels: I, rule: Rule) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.forbid_with(labels, rule, Recheck::EachCall)
+    }
+
+    /// Add a rule with the given `recheck`. [`Rule::Allow`] and an empty set
+    /// add nothing.
+    ///
+    /// Two rules with the same label set share one release.
+    #[must_use]
+    pub fn forbid_with<I, S>(self, labels: I, rule: Rule, recheck: Recheck) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -105,7 +149,22 @@ impl FlowRules {
             return self;
         }
         let mut rules = self.rules;
-        rules.push(FlowRule { labels, rule });
+        rules.push(FlowRule {
+            labels,
+            rule,
+            recheck,
+        });
+        Self { rules }
+    }
+
+    /// Set `recheck` on every rule that the harness has now.
+    #[must_use]
+    pub fn with_recheck(self, recheck: Recheck) -> Self {
+        let rules = self
+            .rules
+            .into_iter()
+            .map(|rule| FlowRule { recheck, ..rule })
+            .collect();
         Self { rules }
     }
 
@@ -113,7 +172,8 @@ impl FlowRules {
     /// three of untrusted input, private data, and a write or external
     /// effect. The call that completes the three waits for a person. Each
     /// later call with one of the labels waits too, so each send needs its own
-    /// approval.
+    /// approval. [`FlowRules::with_recheck`] with [`Recheck::UntilApproved`]
+    /// asks once per run tree instead.
     #[must_use]
     pub fn rule_of_two() -> Self {
         let read = [labels::UNTRUSTED_INPUT, labels::PRIVATE_DATA];
@@ -140,19 +200,48 @@ impl FlowRules {
         &self.rules
     }
 
+    /// Whether an approval can release a rule of the harness.
+    #[must_use]
+    pub fn can_release(&self) -> bool {
+        self.rules
+            .iter()
+            .any(|rule| rule.recheck == Recheck::UntilApproved && rule.rule == Rule::Ask)
+    }
+
     /// The decision for a call with `call` labels, after the run tree has
-    /// exercised `exercised`.
+    /// exercised `exercised` and a person has released `released`.
     ///
     /// A rule trips when its set is inside `exercised` plus `call`, and the
     /// call carries at least one label of the set. The label can already be
     /// in `exercised`. A complete set thus gates each later call that touches
-    /// it, and one approval never releases the next call. The strictest
-    /// tripped rule wins. With no tripped rule, the answer is
+    /// it. A [`Recheck::UntilApproved`] rule in `released` does not trip. The
+    /// strictest tripped rule wins. With no tripped rule, the answer is
     /// [`ToolDecision::Allow`].
     #[must_use]
-    pub fn check(&self, exercised: &BTreeSet<String>, call: &BTreeSet<String>) -> ToolDecision {
+    pub fn check(
+        &self,
+        exercised: &BTreeSet<String>,
+        released: &Released,
+        call: &BTreeSet<String>,
+    ) -> ToolDecision {
+        self.decide(exercised, released, call).0
+    }
+
+    /// [`check`](Self::check), and the rules that an approval of the call
+    /// releases. The set is empty unless the decision asks a person.
+    pub(crate) fn decide(
+        &self,
+        exercised: &BTreeSet<String>,
+        released: &Released,
+        call: &BTreeSet<String>,
+    ) -> (ToolDecision, Released) {
         let mut verdict = ToolDecision::Allow;
+        let mut freed = Released::new();
         for rule in &self.rules {
+            let until_approved = rule.recheck == Recheck::UntilApproved;
+            if until_approved && released.contains(&rule.labels) {
+                continue;
+            }
             let adds = rule.labels.iter().any(|label| call.contains(label));
             let completes = rule
                 .labels
@@ -163,9 +252,12 @@ impl FlowRules {
             }
             let tripped = match &rule.rule {
                 Rule::Deny(reason) => {
-                    return ToolDecision::Deny {
-                        reason: reason.clone(),
-                    };
+                    return (
+                        ToolDecision::Deny {
+                            reason: reason.clone(),
+                        },
+                        Released::new(),
+                    );
                 }
                 Rule::Ask => ToolDecision::RequireApproval {
                     reason: format!(
@@ -175,11 +267,14 @@ impl FlowRules {
                 },
                 Rule::Allow => continue,
             };
+            if until_approved {
+                freed.insert(rule.labels.clone());
+            }
             if verdict == ToolDecision::Allow {
                 verdict = tripped;
             }
         }
-        verdict
+        (verdict, freed)
     }
 }
 
@@ -191,6 +286,10 @@ mod tests {
 
     fn set(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    fn none() -> Released {
+        Released::new()
     }
 
     #[test]
@@ -225,15 +324,18 @@ mod tests {
     #[test]
     fn a_rule_trips_on_the_call_that_completes_it() {
         let rules = FlowRules::new().forbid(["a", "b"], Rule::Deny("no a and b".into()));
-        assert_eq!(rules.check(&set(&[]), &set(&["a"])), ToolDecision::Allow);
         assert_eq!(
-            rules.check(&set(&["a"]), &set(&["b"])),
+            rules.check(&set(&[]), &none(), &set(&["a"])),
+            ToolDecision::Allow
+        );
+        assert_eq!(
+            rules.check(&set(&["a"]), &none(), &set(&["b"])),
             ToolDecision::Deny {
                 reason: "no a and b".into()
             }
         );
         assert_eq!(
-            rules.check(&set(&[]), &set(&["a", "b"])),
+            rules.check(&set(&[]), &none(), &set(&["a", "b"])),
             ToolDecision::Deny {
                 reason: "no a and b".into()
             }
@@ -241,7 +343,7 @@ mod tests {
         // A call that adds no label of the set passes, even after the set is
         // complete.
         assert_eq!(
-            rules.check(&set(&["a", "b"]), &set(&["c"])),
+            rules.check(&set(&["a", "b"]), &none(), &set(&["c"])),
             ToolDecision::Allow
         );
     }
@@ -254,12 +356,92 @@ mod tests {
         };
         // One approval releases one call. A later call with a label of the
         // set asks again, even when the tree already holds that label.
-        assert_eq!(rules.check(&set(&["a", "b"]), &set(&["a"])), ask);
-        assert_eq!(rules.check(&set(&["a", "b"]), &set(&["b", "c"])), ask);
+        assert_eq!(rules.check(&set(&["a", "b"]), &none(), &set(&["a"])), ask);
         assert_eq!(
-            rules.check(&set(&["a", "b"]), &set(&["c"])),
+            rules.check(&set(&["a", "b"]), &none(), &set(&["b", "c"])),
+            ask
+        );
+        assert_eq!(
+            rules.check(&set(&["a", "b"]), &none(), &set(&["c"])),
             ToolDecision::Allow
         );
+    }
+
+    #[test]
+    fn until_approved_gates_each_call_until_a_release() {
+        let rules = FlowRules::new().forbid_with(["a", "b"], Rule::Ask, Recheck::UntilApproved);
+        let ask = ToolDecision::RequireApproval {
+            reason: "this call completes the flow labels a, b".into(),
+        };
+        assert_eq!(
+            rules.check(&set(&[]), &none(), &set(&["a"])),
+            ToolDecision::Allow
+        );
+        // With no release, a complete set gates each call that touches it.
+        assert_eq!(rules.check(&set(&["a"]), &none(), &set(&["b"])), ask);
+        assert_eq!(rules.check(&set(&["a", "b"]), &none(), &set(&["a"])), ask);
+        // An approval of a tripped call releases the rule.
+        let (decision, releases) = rules.decide(&set(&["a"]), &none(), &set(&["b"]));
+        assert_eq!(decision, ask);
+        assert_eq!(releases, Released::from([set(&["a", "b"])]));
+        assert_eq!(
+            rules.check(&set(&["a", "b"]), &releases, &set(&["a"])),
+            ToolDecision::Allow
+        );
+        assert_eq!(
+            rules.check(&set(&["a", "b"]), &releases, &set(&["b", "c"])),
+            ToolDecision::Allow
+        );
+    }
+
+    #[test]
+    fn only_an_until_approved_ask_rule_can_be_released() {
+        let each = FlowRules::new().forbid(["a", "b"], Rule::Ask);
+        let (decision, releases) = each.decide(&set(&["a"]), &none(), &set(&["b"]));
+        assert!(matches!(decision, ToolDecision::RequireApproval { .. }));
+        assert_eq!(releases, none());
+        assert!(!each.can_release());
+        // An each-call rule ignores a release of the same set.
+        let prior = Released::from([set(&["a", "b"])]);
+        assert!(matches!(
+            each.check(&set(&["a", "b"]), &prior, &set(&["a"])),
+            ToolDecision::RequireApproval { .. }
+        ));
+        let deny = FlowRules::new().forbid_with(
+            ["a", "b"],
+            Rule::Deny("never".into()),
+            Recheck::UntilApproved,
+        );
+        assert!(!deny.can_release());
+        assert_eq!(
+            deny.decide(&set(&["a"]), &none(), &set(&["b"])),
+            (
+                ToolDecision::Deny {
+                    reason: "never".into()
+                },
+                none()
+            )
+        );
+    }
+
+    #[test]
+    fn each_call_is_the_default_and_with_recheck_sets_every_rule() {
+        let default = FlowRules::rule_of_two();
+        assert!(
+            default
+                .rules()
+                .iter()
+                .all(|rule| rule.recheck() == Recheck::EachCall)
+        );
+        let relaxed = FlowRules::rule_of_two().with_recheck(Recheck::UntilApproved);
+        assert_eq!(relaxed.rules().len(), default.rules().len());
+        assert!(
+            relaxed
+                .rules()
+                .iter()
+                .all(|rule| rule.recheck() == Recheck::UntilApproved)
+        );
+        assert!(relaxed.can_release());
     }
 
     #[test]
@@ -268,11 +450,11 @@ mod tests {
             .forbid(["a", "b"], Rule::Ask)
             .forbid(["b", "c"], Rule::Deny("never".into()));
         assert!(matches!(
-            rules.check(&set(&["a"]), &set(&["b"])),
+            rules.check(&set(&["a"]), &none(), &set(&["b"])),
             ToolDecision::RequireApproval { .. }
         ));
         assert!(matches!(
-            rules.check(&set(&["a", "c"]), &set(&["b"])),
+            rules.check(&set(&["a", "c"]), &none(), &set(&["b"])),
             ToolDecision::Deny { .. }
         ));
     }
@@ -291,20 +473,24 @@ mod tests {
         assert_eq!(rules.rules().len(), 2);
         let read = set(&[labels::UNTRUSTED_INPUT, labels::PRIVATE_DATA]);
         assert!(matches!(
-            rules.check(&read, &set(&["effect:external"])),
+            rules.check(&read, &none(), &set(&["effect:external"])),
             ToolDecision::RequireApproval { .. }
         ));
         assert!(matches!(
-            rules.check(&read, &set(&["effect:write"])),
+            rules.check(&read, &none(), &set(&["effect:write"])),
             ToolDecision::RequireApproval { .. }
         ));
         // Two of the three pass.
         assert_eq!(
-            rules.check(&set(&[labels::PRIVATE_DATA]), &set(&["effect:external"])),
+            rules.check(
+                &set(&[labels::PRIVATE_DATA]),
+                &none(),
+                &set(&["effect:external"])
+            ),
             ToolDecision::Allow
         );
         assert_eq!(
-            rules.check(&read, &set(&["effect:read_only"])),
+            rules.check(&read, &none(), &set(&["effect:read_only"])),
             ToolDecision::Allow
         );
     }

@@ -151,7 +151,7 @@ mandate records the same bytes as before.
 | AC7 | A refused delegation returns a distinct verdict: `unknown_peer`, `not_permitted`, `cycle`, `depth_exceeded`, `fan_out_exhausted` or `budget_exhausted`. |
 | AC8 | The child token cap is the smaller of the peer cap and the parent remainder. The parent adds the child usage and stops before another model call when the tree passes its cap. |
 | AC9 | `AgentReport::delegations` lists each delegation with its chain, run id, stop or verdict, and subtree usage, rounds and calls. The report counters cover the whole tree. |
-| AC10 | With `FlowRules::rule_of_two()`, a call that completes the forbidden label set needs approval. Each later call that touches the set needs its own approval. Labels that a child exercises count for its parent, and the reverse. |
+| AC10 | With `FlowRules::rule_of_two()`, a call that completes the forbidden label set needs approval. Each later call that touches the set needs its own approval. With `Recheck::UntilApproved`, one approval releases the rule for the run tree, and only a recorded approval releases it. Labels that a child exercises count for its parent, and the reverse. |
 | AC11 | A mandate encodes under `io.autumn-harvest/mandate`. `Mandate::accept` narrows a local mandate by an inbound one. It refuses a cycle and a depth overflow. |
 | AC12 | A gated call inside a child waits on a signal name that is unique in the run tree. A run with no delegation keeps its old names. |
 | AC13 | Old histories decode. All existing tests pass. `eval` re-drives a delegation run. |
@@ -193,3 +193,4 @@ API and docs, and test quality. Each row names a finding and its fix.
 | F11 | Docs: a non-compiling example, stale adapter docs, loose claims, long sentences. | Corrected. `Refusal` implements `Error`. | AC15 |
 | F12 | Codex: the tool-call worker does not check the labels that the decision saw. A deploy can change a tool between the two. | `ToolCallRequest::labels` carries the recorded labels. The activity refuses a tool whose labels grew. | AC10 |
 | F13 | CI: the `verus` job fails on `trunk-dev` too. The pinned rolling Verus release has no assets now. | Pin the weekly release `0.2026.10.04.426d8b0`. All 33 proofs verify with it. `trunk-dev` made the same pin in #2138, and the merge keeps its version. | AC16 |
+| F14 | Review: a first `OnComplete` design read a complete label set as an approval. A waiting call in the same turn, a rejection, or carried labels then released the rule. | `Recheck::UntilApproved` releases a rule only on a recorded approval. The workflow holds the released rules. | AC10 |

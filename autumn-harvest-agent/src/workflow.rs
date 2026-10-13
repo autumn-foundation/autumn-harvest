@@ -26,6 +26,7 @@ use autumn_harvest::prelude::*;
 use crate::approval::{Approval, Decision, approval_signal, await_decision};
 use crate::bounds::{exceeds_bytes, json_len};
 use crate::delivery::{Report, ReportSource, report_text};
+use crate::flow::Released;
 use crate::followup::{self, FOLLOWUP_TOOL, Planned};
 use crate::harness::{AgentHarness, CacheTenant, DEFAULT_TOOL_OUTPUT_LIMIT, truncate};
 use crate::heartbeat::{HeartbeatTask, agent_heartbeat_info};
@@ -144,6 +145,10 @@ struct Tree {
     /// The flow labels of the task, and of every call in the tree that the
     /// decision let run.
     exercised: BTreeSet<String>,
+    /// The flow rules that a person released by an approval in this tree.
+    /// Another run or a remote peer never adds one, so a carried label can
+    /// never stand in for an approval.
+    released: Released,
     /// Each delegation, in the order it ended.
     records: Vec<DelegationRecord>,
 }
@@ -234,6 +239,7 @@ pub(crate) async fn drive(
             .chain(task.mandate.iter().flat_map(|mandate| &mandate.flow_labels))
             .cloned()
             .collect(),
+        released: Released::new(),
         records: Vec::new(),
     };
     let agent = match &task.mandate {
@@ -410,6 +416,7 @@ async fn run_segment(
             agent: run.agent.map(|agent| agent.mandate.holder().to_owned()),
             allowed_tools: run.allowed_tools(),
             flow_labels: tree.exercised.clone(),
+            flow_released: tree.released.clone(),
         };
         // A request the engine would refuse is not sent. The refusal is not
         // retryable, so it would fail the run after earlier work was paid for.
@@ -458,6 +465,7 @@ async fn run_segment(
             round: tree.rounds,
             position: 0,
             labels: None,
+            releases: None,
         };
         progress.steps = progress.steps.saturating_add(1);
         tree.rounds = tree.rounds.saturating_add(1);
@@ -513,6 +521,9 @@ struct Slot<'a> {
     /// The flow labels that the decision recorded for the call. `None` when
     /// the turn recorded no labels, because its worker had no flow rules.
     labels: Option<&'a BTreeSet<String>>,
+    /// The flow rules that an approval of the call releases. `None` when no
+    /// rule of the deciding worker can be released.
+    releases: Option<&'a Released>,
 }
 
 impl Slot<'_> {
@@ -521,6 +532,14 @@ impl Slot<'_> {
     fn exercise(self, tree: &mut Tree) {
         if let Some(labels) = self.labels {
             tree.exercised.extend(labels.iter().cloned());
+        }
+    }
+
+    /// Release the rules that the call tripped. Only a person's approval
+    /// calls this.
+    fn release(self, tree: &mut Tree) {
+        if let Some(releases) = self.releases {
+            tree.released.extend(releases.iter().cloned());
         }
     }
 }
@@ -577,6 +596,7 @@ async fn run_round(
             let at = Slot {
                 position,
                 labels,
+                releases: turn.releases.get(position),
                 ..slot
             };
             let mut content = decide(ctx, run, progress, tree, at, call, decision)
@@ -685,11 +705,13 @@ async fn gated_call(
     match decision {
         Decision::Decided(Approval::Approve) => {
             slot.exercise(tree);
+            slot.release(tree);
             run_tool(ctx, run, progress, tree, slot, call).await
         }
         Decision::Decided(Approval::Edit { arguments }) => {
             call.arguments = arguments;
             slot.exercise(tree);
+            slot.release(tree);
             run_tool(ctx, run, progress, tree, slot, call).await
         }
         Decision::Decided(Approval::Reject { reason }) => Ok(ToolOutcome::error(&format!(

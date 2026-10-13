@@ -13,7 +13,7 @@ use autumn_harvest_agent::flow::labels;
 use autumn_harvest_agent::mesh::DELEGATE_TOOL;
 use autumn_harvest_agent::{
     AgentHarness, AgentStop, AgentTask, Approval, ChatRole, ContentPart, FlowRules, FnTool,
-    Mandate, ModelTurn, ModelTurnRequest, Peer, Refusal, Rule, TokenUsage, ToolCall,
+    Mandate, ModelTurn, ModelTurnRequest, Peer, Recheck, Refusal, Rule, TokenUsage, ToolCall,
     ToolCallRequest, ToolDecision, ToolEffect, ToolRules, sqlite,
 };
 use autumn_harvest_sqlite::RunState;
@@ -771,6 +771,111 @@ async fn one_approval_releases_one_send() {
 
 // AC10
 #[tokio::test(flavor = "multi_thread")]
+async fn until_approved_one_approval_releases_the_later_sends() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        calls(&[("c1", "inbox", json!({}))], 1),
+        calls(&[("c2", "send", json!({"to": "x"}))], 1),
+        calls(&[("c3", "send", json!({"to": "y"}))], 1),
+        answer("sent twice", 1),
+    ]);
+    let harness = AgentHarness::new(model)
+        .tool(inbox())
+        .tool(recorded_tool("send", ToolEffect::External, &recorder))
+        .flow_rules(FlowRules::rule_of_two().with_recheck(Recheck::UntilApproved));
+    let mut rt = runtime(&db, harness);
+
+    let exec = sqlite::start(&mut rt, &AgentTask::new("triage")).unwrap();
+    let RunState::WaitingSignal(first) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("the send that completes the set waits for a person");
+    };
+    sqlite::decide(&mut rt, exec, &first, &Approval::Approve).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+    assert_eq!(
+        report.stop,
+        AgentStop::Completed,
+        "the second send needs no approval"
+    );
+    assert_eq!(
+        recorder.runs(),
+        vec![json!({"to": "x"}), json!({"to": "y"})]
+    );
+}
+
+// AC10: a send in the same turn as a rejected send still waits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_send_releases_no_send_of_its_turn() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        calls(&[("c1", "inbox", json!({}))], 1),
+        calls(
+            &[
+                ("c2", "send", json!({"to": "x"})),
+                ("c3", "send", json!({"to": "y"})),
+            ],
+            1,
+        ),
+        answer("done", 1),
+    ]);
+    let harness = AgentHarness::new(model)
+        .tool(inbox())
+        .tool(recorded_tool("send", ToolEffect::External, &recorder))
+        .flow_rules(FlowRules::rule_of_two().with_recheck(Recheck::UntilApproved));
+    let mut rt = runtime(&db, harness);
+
+    let exec = sqlite::start(&mut rt, &AgentTask::new("triage")).unwrap();
+    let RunState::WaitingSignal(first) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("the first send waits for a person");
+    };
+    sqlite::decide(
+        &mut rt,
+        exec,
+        &first,
+        &Approval::Reject {
+            reason: "no".into(),
+        },
+    )
+    .unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::WaitingSignal(_)),
+        "the second send of the turn waits too: {state:?}"
+    );
+    assert_eq!(recorder.runs(), Vec::<serde_json::Value>::new());
+}
+
+// AC10: labels carried in from another run release nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn carried_labels_release_no_send() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        calls(&[("c1", "send", json!({"to": "x"}))], 1),
+        answer("done", 1),
+    ]);
+    let harness = AgentHarness::new(model)
+        .tool(recorded_tool("send", ToolEffect::External, &recorder))
+        .flow_rules(FlowRules::rule_of_two().with_recheck(Recheck::UntilApproved));
+    let mut rt = runtime(&db, harness);
+
+    let task = AgentTask::new("triage").flow_labels([
+        labels::UNTRUSTED_INPUT,
+        labels::PRIVATE_DATA,
+        "effect:external",
+    ]);
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::WaitingSignal(_)),
+        "no person approved a send in this tree: {state:?}"
+    );
+    assert_eq!(recorder.runs(), Vec::<serde_json::Value>::new());
+}
+
+// AC10
+#[tokio::test(flavor = "multi_thread")]
 async fn with_no_untrusted_read_the_send_runs_at_once() {
     let (_dir, db) = fresh_db();
     let recorder = Arc::new(Recorder::default());
@@ -860,6 +965,39 @@ async fn labels_a_parent_exercises_count_for_its_child() {
     );
 }
 
+// AC10: a release spans the run tree.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approval_in_a_child_releases_the_rule_for_its_parent() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        calls(&[("c1", "inbox", json!({}))], 1),
+        delegate("d1", "courier", "send a reply", 1),
+        calls(&[("c2", "send", json!({"to": "x"}))], 1),
+        answer("sent", 1),
+        calls(&[("c3", "send", json!({"to": "y"}))], 1),
+        answer("done", 1),
+    ]);
+    let harness = AgentHarness::new(model)
+        .tool(inbox())
+        .tool(recorded_tool("send", ToolEffect::External, &recorder))
+        .peer(Peer::new("courier", "Sends mail.").tools(["send"]))
+        .flow_rules(FlowRules::rule_of_two().with_recheck(Recheck::UntilApproved));
+    let mut rt = runtime(&db, harness);
+
+    let exec = sqlite::start(&mut rt, &planner(&["courier"])).unwrap();
+    let RunState::WaitingSignal(child) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("the child send waits for a person");
+    };
+    sqlite::decide(&mut rt, exec, &child, &Approval::Approve).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+    assert_eq!(report.stop, AgentStop::Completed, "the parent send runs");
+    assert_eq!(
+        recorder.runs(),
+        vec![json!({"to": "x"}), json!({"to": "y"})]
+    );
+}
+
 // AC10
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rejected_call_adds_no_labels() {
@@ -922,6 +1060,7 @@ async fn a_turn_records_labels_only_with_flow_rules() {
         agent: None,
         allowed_tools: None,
         flow_labels: BTreeSet::new(),
+        flow_released: autumn_harvest_agent::Released::new(),
     };
     let plain = AgentHarness::new(model.clone()).tool(inbox());
     let turn = plain.model_turn(request.clone()).await.unwrap();
@@ -1217,6 +1356,7 @@ fn turn_request() -> ModelTurnRequest {
         agent: None,
         allowed_tools: None,
         flow_labels: BTreeSet::new(),
+        flow_released: autumn_harvest_agent::Released::new(),
     }
 }
 

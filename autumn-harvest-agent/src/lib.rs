@@ -89,7 +89,7 @@ pub mod workflow;
 pub use approval::Approval;
 pub use delivery::{Delivery, LogDelivery, Report, ReportSource};
 pub use error::{AgentError, ErrorKind};
-pub use flow::{FlowRule, FlowRules};
+pub use flow::{FlowRule, FlowRules, Recheck, Released};
 pub use followup::Followups;
 pub use harness::AgentHarness;
 pub use heartbeat::{

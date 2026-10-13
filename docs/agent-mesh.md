@@ -20,7 +20,7 @@ The plan is in [`DESIGN-agent-mesh.md`](../DESIGN-agent-mesh.md).
 | Mandate | `Mandate` | Bounds depth, delegations, peers and tools. A child gets the meet. |
 | Refusal | `Refusal` | Names why a delegation did not run. |
 | Budget roll-up | `AgentReport::delegations` | Cuts the child cap from the parent remainder. Adds the child usage to the parent. |
-| Flow rules | `FlowRules`, `Tool::labels` | Gate the call that completes a forbidden label set in the tree, and each later call that touches the set. |
+| Flow rules | `FlowRules`, `Tool::labels`, `Recheck` | Gate the call that completes a forbidden label set in the tree. By default, also gate each later call that touches the set. |
 | Label carry | `AgentReport::flow_labels`, `AgentTask::flow_labels` | Keeps the labels of a conversation from one run to the next. |
 | Wire form | `MANDATE_META_KEY`, `Mandate::outbound`, `Mandate::accept` | Carries a mandate to another process. The receiver can only narrow it. |
 
@@ -217,12 +217,48 @@ Write your own rule with `FlowRules::new().forbid(labels, rule)`.
 `Rule::Ask` waits for a person. `Rule::Deny(reason)` refuses the call.
 `Rule::Allow` and an empty set add nothing.
 
+`Recheck` sets what one approval releases:
+
+| `Recheck` | After the set is complete |
+| --- | --- |
+| `EachCall` (default) | Each call with a label of the set trips the rule again. One approval releases one call. |
+| `UntilApproved` | Each call with a label of the set trips the rule until a person approves one of them. That approval releases the rule for the rest of the run tree. |
+
+Set it on one rule with `forbid_with(labels, rule, recheck)`, or on every rule
+with `with_recheck(recheck)`:
+
+```rust
+let rules = FlowRules::rule_of_two().with_recheck(Recheck::UntilApproved);
+```
+
+Use `UntilApproved` when a person approves a flow, not each send. With
+`EachCall`, each later read of untrusted input waits for a person too, because
+the read carries a label of the set.
+
+`UntilApproved` is weaker. After the approval, each send runs with no
+person, and a send can carry data from a later prompt injection. Keep
+`EachCall` when a send can leak data.
+
+Only a person's approval, or an edit, releases a rule. Each of these releases
+nothing, so the rule still gates:
+
+- A rejection or a timeout.
+- A call that waits in the same turn. A second send in the turn of the first
+  send waits for its own decision.
+- Labels from another run: `AgentTask::flow_labels`, or an inbound mandate.
+  A release lasts for one run tree, so a continued run or a remote peer asks
+  again.
+- A `Rule::Deny` rule. It never asks, so nothing releases it.
+
+The workflow holds the released rules, by label set. Two rules with the same
+label set share one release.
+
 How the check works:
 
 - A rule trips when the call carries a label of the set, and the set is
   complete with the call. The label can already be in the tree. So after the
-  set is complete, each call that touches it trips the rule again. A call
-  with no label of the set passes.
+  set is complete, each call that touches it trips the rule again. A released
+  `UntilApproved` rule does not trip. A call with no label of the set passes.
 - The strictest tripped rule wins, and the policy answer still counts.
 - A label counts once the decision lets its call run: an allow, or an
   approval. It counts even when the tool then fails. A denied, rejected or
@@ -241,10 +277,11 @@ How the check works:
 - One label set spans the tree. A child answer enters the parent context, and
   a parent task text enters the child. So labels flow both ways.
 
-The workflow holds the label set. The model-turn activity records each
-decision and the labels of each call. Model output cannot remove a label, and
-replay does not check the rules again. A turn records labels only when the
-harness has flow rules. Install the same flow rules on every worker.
+The workflow holds the label set and the released rules. The model-turn
+activity records each decision, the labels of each call, and the rules that an
+approval of each call releases. Model output cannot remove a label or release
+a rule, and replay does not check the rules again. A turn records labels only
+when the harness has flow rules. Install the same flow rules on every worker.
 
 ### Carry the labels to the next run
 
@@ -256,7 +293,8 @@ let next = AgentTask::new("Now reply to the sender.")
     .flow_labels(report.flow_labels.clone());
 ```
 
-`HeartbeatTask::flow_labels` does the same for a heartbeat tick.
+`HeartbeatTask::flow_labels` does the same for a heartbeat tick. The next run
+gets no release. An `UntilApproved` rule asks again there.
 
 ## 8. Approvals in a child
 

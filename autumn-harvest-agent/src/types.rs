@@ -9,6 +9,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use crate::flow::Released;
 use crate::followup::Followups;
 use crate::loop_guard::LoopGuard;
 use crate::memory::MemoryScope;
@@ -355,6 +356,10 @@ pub struct ModelTurnRequest {
     /// The flow labels that the run tree has exercised before this turn.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub flow_labels: BTreeSet<String>,
+    /// The flow rules that a person released in the run tree before this
+    /// turn. See [`Recheck::UntilApproved`](crate::Recheck::UntilApproved).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_released: Released,
 }
 
 /// The recorded result of one model-turn activity.
@@ -380,6 +385,10 @@ pub struct ModelTurn {
     /// has no flow rules.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<BTreeSet<String>>,
+    /// The flow rules that an approval of each tool call releases, in order.
+    /// Empty when no rule of the harness can be released.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub releases: Vec<Released>,
 }
 
 impl ModelTurn {
@@ -628,6 +637,7 @@ mod tests {
             decisions: vec![ToolDecision::Allow],
             cache_hit: false,
             labels: Vec::new(),
+            releases: Vec::new(),
         };
         assert_eq!(turn.text(), "ab");
         let calls = turn.calls();
@@ -656,6 +666,7 @@ mod tests {
             "agent",
             "allowed_tools",
             "flow_labels",
+            "flow_released",
         ] {
             assert!(!fields.contains_key(key), "{key}");
         }
@@ -704,6 +715,13 @@ mod tests {
         });
         let decoded: ModelTurn = serde_json::from_value(turn).unwrap();
         assert_eq!(decoded.labels, Vec::<BTreeSet<String>>::new());
+        assert_eq!(decoded.releases, Vec::<Released>::new());
+        assert!(
+            serde_json::to_value(&decoded)
+                .unwrap()
+                .get("releases")
+                .is_none()
+        );
         assert!(
             serde_json::to_value(&decoded)
                 .unwrap()
