@@ -212,7 +212,8 @@ impl FirecrackerLauncher {
     /// - a path is missing;
     /// - a snapshot boot has no jailer;
     /// - the jail uid or gid is 0;
-    /// - another user can change a binary or an image of a jailed launch;
+    /// - another user can change a binary, an image, the jail root or the
+    ///   network namespace of a jailed launch;
     /// - the lease cannot be taken.
     pub fn new(config: LauncherConfig) -> Result<Self, SandboxError> {
         // Firecracker refuses these at each launch. Refuse them once, here.
@@ -250,14 +251,13 @@ impl FirecrackerLauncher {
                 )));
             }
         }
-        if let Confinement::Jailer(jailer) = &config.confinement {
-            if jailer.uid == 0 || jailer.gid == 0 {
-                return Err(SandboxError::Config(
-                    "the jailer must drop to a non-root uid and gid, or an escaped VMM keeps root"
-                        .into(),
-                ));
-            }
-            check_trusted_files(&config, jailer)?;
+        if let Confinement::Jailer(jailer) = &config.confinement
+            && (jailer.uid == 0 || jailer.gid == 0)
+        {
+            return Err(SandboxError::Config(
+                "the jailer must drop to a non-root uid and gid, or an escaped VMM keeps root"
+                    .into(),
+            ));
         }
         let exec_name = super::jailer::exec_name(&config.firecracker_bin)?;
         let owner = uuid::Uuid::new_v4().simple().to_string()[..OWNER_TAG_HEX].to_owned();
@@ -266,6 +266,9 @@ impl FirecrackerLauncher {
         std::fs::create_dir_all(&vm_root).map_err(|e| {
             SandboxError::Config(format!("cannot create {}: {e}", vm_root.display()))
         })?;
+        if let Confinement::Jailer(jailer) = &config.confinement {
+            check_trusted_files(&config, jailer, &vm_root)?;
+        }
         let lease = InstanceLease::acquire(&vm_root, &owner)?;
         Ok(Self {
             config,
@@ -819,15 +822,23 @@ fn copy_out(from: &Path, to: &Path, gid: u32) -> std::io::Result<()> {
     target.sync_all()
 }
 
-/// Check that no other user can change a file that a jailed launch trusts.
+/// Check that no other user can change a path that a jailed launch trusts.
 ///
 /// The launcher runs the Firecracker and jailer binaries as root, before the
 /// jailer drops to the jail uid. A user who can change one runs code as root.
 ///
+/// The root jailer builds each jail under `vm_root`, and it joins the network
+/// namespace. A user who can move either path can move a jail, or give an
+/// escaped VMM a network.
+///
 /// The jail holds hard links to the kernel, the root file system and the
 /// snapshot files. A file that the jail uid owns, or that its group or
 /// others can write, lets one escaped VMM change the next microVM.
-fn check_trusted_files(config: &LauncherConfig, jailer: &JailerConfig) -> Result<(), SandboxError> {
+fn check_trusted_files(
+    config: &LauncherConfig,
+    jailer: &JailerConfig,
+    vm_root: &Path,
+) -> Result<(), SandboxError> {
     use std::os::unix::fs::MetadataExt as _;
     // SAFETY: geteuid has no preconditions.
     let euid = unsafe { libc::geteuid() };
@@ -835,8 +846,14 @@ fn check_trusted_files(config: &LauncherConfig, jailer: &JailerConfig) -> Result
         std::fs::symlink_metadata(what)
             .map_err(|e| SandboxError::Config(format!("cannot inspect {}: {e}", what.display())))
     };
-    for binary in [&config.firecracker_bin, &jailer.jailer_bin] {
-        check_trusted_ancestors(binary, euid, inspect)?;
+    let mut trusted = vec![
+        config.firecracker_bin.as_path(),
+        jailer.jailer_bin.as_path(),
+        vm_root,
+    ];
+    trusted.extend(jailer.netns.as_deref());
+    for path in trusted {
+        check_trusted_ancestors(path, euid, inspect)?;
     }
     let jail_uid = jailer.uid;
     let mut shared = vec![&config.image.kernel, &config.image.rootfs];
@@ -1716,6 +1733,48 @@ while True:
                 "{name}: {err:?}"
             );
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_jail_path_that_others_can_change_is_a_config_error() {
+        let dir = temp_dir();
+        let open = dir.join("open");
+        std::fs::create_dir_all(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let with = |change: &dyn Fn(&mut JailerConfig)| {
+            let mut config = jailed(&dir);
+            if let Confinement::Jailer(jail) = &mut config.confinement {
+                change(jail);
+            }
+            FirecrackerLauncher::new(config)
+        };
+        let refused = |result: Result<FirecrackerLauncher, SandboxError>, what: &str| {
+            let err = result.expect_err(what);
+            assert!(
+                matches!(err, SandboxError::Config(ref m) if m.contains(what)),
+                "{what}: {err:?}"
+            );
+        };
+        // The root jailer builds each jail under the chroot base.
+        refused(with(&|jail| jail.chroot_base = open.join("jail")), "open");
+        // An escaped VMM must stay in the empty network namespace.
+        let netns = open.join("vm1");
+        std::fs::write(&netns, b"").unwrap();
+        std::fs::set_permissions(&netns, std::fs::Permissions::from_mode(0o444)).unwrap();
+        refused(with(&|jail| jail.netns = Some(netns.clone())), "open");
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        with(&|jail| jail.netns = Some(netns.clone())).unwrap();
+        let link = dir.join("netns-link");
+        std::os::unix::fs::symlink(&netns, &link).unwrap();
+        refused(
+            with(&|jail| jail.netns = Some(link.clone())),
+            "symbolic link",
+        );
+        refused(
+            with(&|jail| jail.netns = Some(dir.join("missing"))),
+            "missing",
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

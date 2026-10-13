@@ -93,7 +93,7 @@ A failure means that the code does not reach an outcome.
 
 | Error type | Retry | Cause |
 |------------|-------|-------|
-| `SandboxDenied` | No | The request breaks the policy, the runtime command does not exist, or the worker configuration is not valid. |
+| `SandboxDenied` | No | The request breaks the policy or the exec limits, the runtime command does not exist, or the worker configuration is not valid. |
 | `SandboxUnavailable` | Yes | The backend cannot boot, connect or finish in time. No slot is free, or the attempt has too little time left. |
 | `SandboxProtocolViolation` | No | The guest sends a malformed, oversized or wrong answer, or speaks another protocol version. |
 | `SandboxCancelled` | Yes | The caller cancels the activity. The backend kills the run. |
@@ -158,14 +158,15 @@ runtime refuses a policy that allows the network on a backend without one.
   versions: CVE-2026-5747 and CVE-2026-1386.
 - KSM off, nested KVM off, and no CPU vulnerability that reports
   `Vulnerable`.
-- A jail base directory that belongs to root, and that only root can write.
-- Firecracker and jailer binaries, a kernel, a root file system and a
-  snapshot that belong to root, with no symbolic link in their paths. Only
-  root may write each directory above them, except a sticky directory such
-  as /tmp. The launcher refuses other files, and it refuses a jail uid or
-  gid of 0.
+- Root owns each trusted path: the jail base, network namespace, Firecracker
+  and jailer binaries, kernel, root file system and snapshot. No such path
+  holds a symbolic link. Only root may write each directory above them,
+  except a sticky directory such as /tmp. The launcher refuses other paths,
+  and it refuses a jail uid or gid of 0.
 - SMT off on a host that serves more than one tenant. Swap off.
 - An empty network namespace for the jailer, through `JailerConfig::netns`.
+  Give its path under `/run/netns`, because `/var/run` is a symbolic link on
+  most hosts.
   The microVM has no network device. The namespace also cuts the network of
   an escaped VMM.
 - One launcher per tenant, each with its own jail uid and gid. The microVMs

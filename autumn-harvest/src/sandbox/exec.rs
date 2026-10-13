@@ -285,6 +285,10 @@ fn spawn_error(command: &str, err: &io::Error) -> SandboxError {
         Some(libc::ENOENT | libc::EACCES | libc::ENOEXEC) => SandboxError::Denied(format!(
             "the runtime command {command:?} could not start: {err}"
         )),
+        // The same arguments and variables fail the same way on a retry.
+        Some(libc::E2BIG) => SandboxError::Denied(format!(
+            "the arguments and variables of {command:?} are too large for exec: {err}"
+        )),
         _ => SandboxError::Unavailable(format!("could not start {command:?}: {err}")),
     }
 }
@@ -839,6 +843,13 @@ mod tests {
 
     fn options() -> ExecOptions {
         ExecOptions::default()
+    }
+
+    #[test]
+    fn a_command_line_too_large_for_exec_is_a_denial() {
+        // The same request fails the same way on each retry.
+        let err = spawn_error("sh", &io::Error::from_raw_os_error(libc::E2BIG));
+        assert!(matches!(err, SandboxError::Denied(_)), "{err:?}");
     }
 
     fn plan(request: &SandboxRequest) -> ExecPlan {

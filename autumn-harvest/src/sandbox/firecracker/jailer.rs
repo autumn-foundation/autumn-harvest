@@ -33,8 +33,8 @@ pub struct JailerConfig {
     pub uid: u32,
     /// The gid of the VMM process.
     pub gid: u32,
-    /// The chroot base directory. It must be root-owned and not writable by
-    /// other users.
+    /// The chroot base directory. It and each directory above it must belong
+    /// to root, and only root may write them. The launcher checks this.
     pub chroot_base: PathBuf,
     /// The parent cgroup, relative to `cgroup_root`.
     pub cgroup_parent: String,
@@ -45,7 +45,8 @@ pub struct JailerConfig {
     /// A network namespace to join. `None` keeps the namespace of the jailer.
     /// The microVM has no network device either way. An empty namespace,
     /// such as one from `ip netns add`, also cuts the network of an escaped
-    /// VMM.
+    /// VMM. Give the path under `/run/netns`. The launcher refuses a symbolic
+    /// link in the path, and `/var/run` is one on most hosts.
     pub netns: Option<PathBuf>,
     /// The `fsize` rlimit of the VMM, in bytes. It must hold a snapshot of
     /// the guest memory. The default is [`DEFAULT_FSIZE_LIMIT`].

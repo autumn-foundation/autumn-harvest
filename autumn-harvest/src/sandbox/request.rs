@@ -19,6 +19,10 @@ pub const MAX_PATH_BYTES: usize = 512;
 /// The longest component of a path, in bytes: the Linux `NAME_MAX`.
 pub const MAX_NAME_BYTES: usize = 255;
 
+/// The longest argument or `NAME=value` string that Linux `execve` takes, in
+/// bytes. `MAX_ARG_STRLEN` is 32 pages of 4 KiB, and it counts the NUL.
+pub const MAX_EXEC_STRING_BYTES: usize = 32 * 4096 - 1;
+
 /// The most components in one path.
 pub const MAX_PATH_DEPTH: usize = 16;
 
@@ -489,6 +493,21 @@ impl SandboxPolicy {
         let arg_bytes: usize = request.args.iter().map(String::len).sum();
         if arg_bytes > sizes.max_arg_bytes {
             return over("argument bytes", arg_bytes, sizes.max_arg_bytes);
+        }
+        // Linux refuses a longer string with E2BIG. A variable reaches exec
+        // as `NAME=value`.
+        let longest = request
+            .args
+            .iter()
+            .map(String::len)
+            .chain(request.env.iter().map(|(k, v)| k.len() + 1 + v.len()))
+            .max()
+            .unwrap_or(0);
+        if longest > MAX_EXEC_STRING_BYTES {
+            return Err(SandboxError::Denied(format!(
+                "an argument or variable takes {longest} bytes, over the exec limit of \
+                 {MAX_EXEC_STRING_BYTES}"
+            )));
         }
         if request.env.len() > sizes.max_env {
             return over("environment variables", request.env.len(), sizes.max_env);

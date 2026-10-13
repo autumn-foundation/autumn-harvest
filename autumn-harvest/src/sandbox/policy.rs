@@ -11,6 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::error::SandboxError;
+use super::request::MAX_EXEC_STRING_BYTES;
 
 /// How strongly a backend isolates code from the host.
 ///
@@ -281,6 +282,12 @@ impl SandboxPolicy {
             super::request::validate_relative_path(&spec.file_name).map_err(|e| {
                 SandboxError::Config(format!("runtime {name:?} has a bad file name: {e}"))
             })?;
+            if spec.argv.iter().any(|a| a.len() > MAX_EXEC_STRING_BYTES) {
+                return Err(SandboxError::Config(format!(
+                    "runtime {name:?} has an argument over the exec limit of \
+                     {MAX_EXEC_STRING_BYTES} bytes"
+                )));
+            }
         }
         for (field, default, max) in limit_pairs(&self.default_limits, &self.max_limits) {
             if default == 0 || max == 0 {
@@ -296,6 +303,11 @@ impl SandboxPolicy {
         }
         if self.path_env.contains('\0') {
             return Err(SandboxError::Config("the PATH value holds NUL".into()));
+        }
+        if "PATH=".len() + self.path_env.len() > MAX_EXEC_STRING_BYTES {
+            return Err(SandboxError::Config(format!(
+                "the PATH value is over the exec limit of {MAX_EXEC_STRING_BYTES} bytes"
+            )));
         }
         // Each request and each outcome must fit one guest frame. Otherwise
         // an accepted request fails late, as a retryable fault.
@@ -551,10 +563,13 @@ mod tests {
 
     #[test]
     fn a_runtime_too_large_for_a_frame_is_a_config_error() {
+        // Each argument fits exec, but all of them together do not fit a frame.
+        let mut argv = vec!["sh".to_owned()];
+        argv.extend(std::iter::repeat_n("x".repeat(100 * 1024), 120));
         let policy = SandboxPolicy::default().with_runtime(
             "big",
             RuntimeSpec {
-                argv: vec!["sh".into(), "x".repeat(12 * 1024 * 1024)],
+                argv,
                 file_name: "main.sh".into(),
             },
         );
@@ -563,6 +578,67 @@ mod tests {
             "{:?}",
             policy.validate()
         );
+    }
+
+    #[test]
+    fn a_runtime_string_over_the_exec_limit_is_a_config_error() {
+        use crate::sandbox::request::MAX_EXEC_STRING_BYTES;
+        let with_arg = |arg: String| {
+            SandboxPolicy::default().with_runtime(
+                "big",
+                RuntimeSpec {
+                    argv: vec!["sh".into(), arg],
+                    file_name: "main.sh".into(),
+                },
+            )
+        };
+        with_arg("x".repeat(MAX_EXEC_STRING_BYTES))
+            .validate()
+            .unwrap();
+        let over = with_arg("x".repeat(MAX_EXEC_STRING_BYTES + 1)).validate();
+        assert!(
+            matches!(over, Err(SandboxError::Config(ref m)) if m.contains("exec")),
+            "{over:?}"
+        );
+        // The process gets `PATH=` and the value as one string.
+        let policy = SandboxPolicy {
+            path_env: "x".repeat(MAX_EXEC_STRING_BYTES - "PATH=".len() + 1),
+            ..SandboxPolicy::default()
+        };
+        let over = policy.validate();
+        assert!(
+            matches!(over, Err(SandboxError::Config(ref m)) if m.contains("exec")),
+            "{over:?}"
+        );
+    }
+
+    #[test]
+    fn an_argument_or_variable_over_the_exec_limit_is_denied() {
+        use crate::sandbox::request::{MAX_EXEC_STRING_BYTES, SandboxRequest};
+        let mut sizes = DEFAULT_SIZE_BOUNDS;
+        sizes.max_arg_bytes = 1 << 20;
+        sizes.max_env_bytes = 1 << 20;
+        let policy = SandboxPolicy::default().with_sizes(sizes);
+        let request = SandboxRequest::new("sh", "");
+        let fits = request.clone().with_arg("x".repeat(MAX_EXEC_STRING_BYTES));
+        policy.plan(&fits).unwrap();
+        let fits = request
+            .clone()
+            .with_env("A", "x".repeat(MAX_EXEC_STRING_BYTES - 2));
+        policy.plan(&fits).unwrap();
+        // A variable reaches exec as `NAME=value`.
+        for over in [
+            request
+                .clone()
+                .with_arg("x".repeat(MAX_EXEC_STRING_BYTES + 1)),
+            request.with_env("A", "x".repeat(MAX_EXEC_STRING_BYTES - 1)),
+        ] {
+            let result = policy.plan(&over);
+            assert!(
+                matches!(result, Err(SandboxError::Denied(ref m)) if m.contains("exec")),
+                "{result:?}"
+            );
+        }
     }
 
     #[test]
