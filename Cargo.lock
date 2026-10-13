@@ -387,6 +387,7 @@ dependencies = [
  "futures",
  "ghash",
  "hmac 0.13.0",
+ "libc",
  "loom",
  "lru",
  "metrics",
@@ -441,6 +442,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -546,6 +548,16 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "autumn-harvest-sandbox-guest"
+version = "0.7.0"
+dependencies = [
+ "autumn-harvest",
+ "libc",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

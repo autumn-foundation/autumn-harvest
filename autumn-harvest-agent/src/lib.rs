@@ -74,6 +74,8 @@ pub mod message;
 pub mod model;
 pub mod policy;
 pub mod response_cache;
+#[cfg(feature = "sandbox")]
+pub mod sandbox;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod tool;

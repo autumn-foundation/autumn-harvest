@@ -18,6 +18,8 @@ sqlite = ["dep:autumn-harvest-sqlite"]
 # Replay-as-evaluation (issue #2001). Drives a recorded run in the in-memory
 # test engine, so it needs the engine's `testing` surface.
 eval = ["autumn-harvest/testing"]
+# A tool that runs agent code in a sandbox. See `docs/sandbox-activities.md`.
+sandbox = ["autumn-harvest/sandbox-activities"]
 
 [dependencies]
 # The backend-neutral core only: no Diesel, no Postgres, no autumn-web.
@@ -38,6 +40,9 @@ autumn-harvest-sqlite = { version = "0.7.0", path = "../autumn-harvest-sqlite" }
 futures = { workspace = true }
 proptest = { workspace = true }
 tempfile = "3"
+# The sandbox tool tests pass a cancellation token. The core crate already
+# depends on this version.
+tokio-util = "0.7"
 # Measures gzip against delta encoding (issue #2009). Already in the lockfile.
 flate2 = "1"
 tokio = { workspace = true }

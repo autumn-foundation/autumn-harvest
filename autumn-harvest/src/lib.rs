@@ -585,6 +585,8 @@ pub mod store;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod timeout;
+#[cfg(feature = "sandbox-activities")]
+pub mod sandbox;
 #[cfg(feature = "wasm-activities")]
 pub mod wasm_activities;
 /// Journaled, capability-gated host calls for WASM activities (issue #2014).
