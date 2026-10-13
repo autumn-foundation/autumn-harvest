@@ -165,6 +165,10 @@ runtime refuses a policy that allows the network on a backend without one.
 
 - Linux with `/dev/kvm`, cgroup v2 with `cgroup.kill` (Linux 5.14), and root
   for the jailer.
+- `JailerConfig::cgroup_root` set to the cgroup v2 mount of the jailer: the
+  first `cgroup2` line in `/proc/mounts`. The default is `/sys/fs/cgroup`.
+  The launcher refuses another path, because teardown kills the cgroups
+  under it.
 - Firecracker 1.14.4 or later on 1.14, or 1.15.1 or later. The first launch
   checks the versions of `firecracker` and `jailer`. It refuses older
   versions: CVE-2026-5747 and CVE-2026-1386.

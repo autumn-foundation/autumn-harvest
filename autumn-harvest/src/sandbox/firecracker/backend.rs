@@ -21,19 +21,22 @@ pub const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The default time that the guest gets on top of the wall-clock limit to
 /// send its outcome.
 ///
-/// The guest waits up to two seconds for the pipes of the code to close, and
-/// then removes the work directory. The grace covers both.
+/// The guest waits up to two seconds for the pipes of the code to close.
+/// Then it waits up to two seconds for the run cgroup to empty, and removes
+/// the work directory. The grace covers each step.
 pub const DEFAULT_RESPONSE_GRACE: Duration = Duration::from_secs(10);
 
-/// The shortest response grace: the guest pipe wait, and one second to send
-/// the outcome.
-pub const MIN_RESPONSE_GRACE: Duration =
-    crate::sandbox::exec::PIPE_DRAIN_GRACE.saturating_add(Duration::from_secs(1));
+/// The shortest response grace. It holds the guest pipe wait and the run
+/// cgroup wait. It adds one second to read the outputs, remove the work
+/// directory and send the outcome.
+pub const MIN_RESPONSE_GRACE: Duration = crate::sandbox::exec::PIPE_DRAIN_GRACE
+    .saturating_add(crate::sandbox::exec::CGROUP_WAIT)
+    .saturating_add(Duration::from_secs(1));
 
 /// The timing of the backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackendSettings {
-    /// The vsock port of the guest agent.
+    /// The vsock port of the guest agent, when the launcher sets none.
     pub guest_port: u32,
     /// The time from launch until the guest agent accepts.
     pub boot_timeout: Duration,
@@ -56,6 +59,8 @@ pub struct FirecrackerBackend {
     launcher: Arc<dyn VmLauncher>,
     pool: Option<WarmPool>,
     settings: BackendSettings,
+    /// The vsock port of the guest agent, fixed at construction.
+    port: u32,
 }
 
 impl std::fmt::Debug for FirecrackerBackend {
@@ -74,13 +79,14 @@ impl FirecrackerBackend {
     ///
     /// Returns [`SandboxError::Config`] for a boot timeout of zero, a
     /// response grace under [`MIN_RESPONSE_GRACE`], or the wildcard guest
-    /// port.
+    /// port. The port is the port of the launcher, or else of the settings.
     pub fn new(
         launcher: Arc<dyn VmLauncher>,
         settings: BackendSettings,
     ) -> Result<Self, SandboxError> {
-        // A launcher without a port of its own uses this one.
-        if settings.guest_port == super::vsock::VMADDR_PORT_ANY {
+        // Ask the launcher once, so the pool and each run use one port.
+        let port = launcher.guest_port().unwrap_or(settings.guest_port);
+        if port == super::vsock::VMADDR_PORT_ANY {
             return Err(SandboxError::Config(
                 "the guest port u32::MAX is VMADDR_PORT_ANY, which no host can connect to".into(),
             ));
@@ -103,6 +109,7 @@ impl FirecrackerBackend {
             launcher,
             pool: None,
             settings,
+            port,
         })
     }
 
@@ -141,10 +148,8 @@ impl FirecrackerBackend {
 
     /// The vsock port of the guest agent: the port of the launcher, or the
     /// port of the settings.
-    fn guest_port(&self) -> u32 {
-        self.launcher
-            .guest_port()
-            .unwrap_or(self.settings.guest_port)
+    const fn guest_port(&self) -> u32 {
+        self.port
     }
 
     /// Run `job` on `vm`: connect over vsock, send the plan, read the
@@ -254,6 +259,7 @@ impl Drop for VmGuard {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::sync::atomic::Ordering;
     use std::time::Instant;
 
     use super::*;
@@ -309,6 +315,43 @@ mod tests {
             ..fast()
         };
         FirecrackerBackend::new(launcher(GuestMode::Serve), settings).unwrap();
+    }
+
+    #[test]
+    fn the_minimum_grace_covers_the_guest_cleanup() {
+        let cleanup = crate::sandbox::exec::PIPE_DRAIN_GRACE
+            + crate::sandbox::exec::CGROUP_WAIT
+            + Duration::from_secs(1);
+        assert!(MIN_RESPONSE_GRACE >= cleanup, "{MIN_RESPONSE_GRACE:?}");
+    }
+
+    #[test]
+    fn a_launcher_with_the_wildcard_port_is_a_config_error() {
+        let mut fake = FakeLauncher::new(
+            GuestMode::Serve,
+            Arc::new(HostNetworkExecutor(ProcessExecutor::new(
+                ExecOptions::default(),
+            ))),
+        );
+        fake.port = Some(u32::MAX);
+        let err = FirecrackerBackend::new(Arc::new(fake), fast()).expect_err("VMADDR_PORT_ANY");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("port")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_backend_asks_the_launcher_for_its_port_once() {
+        let fake = launcher(GuestMode::Serve);
+        let backend = FirecrackerBackend::new(fake.clone(), fast()).unwrap();
+        for _ in 0..2 {
+            backend
+                .execute(job("true", 5_000), CancellationToken::new())
+                .await
+                .unwrap();
+        }
+        assert_eq!(fake.port_queries.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -432,7 +475,8 @@ mod tests {
             .await
             .expect_err("hang");
         assert!(matches!(err, SandboxError::Unavailable(_)), "{err:?}");
-        assert!(started.elapsed() < Duration::from_secs(5));
+        // The run gets its wall clock and then the grace, no more.
+        assert!(started.elapsed() < MIN_RESPONSE_GRACE + Duration::from_secs(2));
         assert_eq!(fake.live(), 0);
     }
 

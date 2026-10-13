@@ -38,7 +38,9 @@ pub struct JailerConfig {
     pub chroot_base: PathBuf,
     /// The parent cgroup, relative to `cgroup_root`.
     pub cgroup_parent: String,
-    /// The cgroup v2 mount point, for teardown.
+    /// The cgroup v2 mount point, for teardown. It must be the first cgroup
+    /// v2 mount in `/proc/mounts`, which the jailer uses. The launcher
+    /// checks this.
     pub cgroup_root: PathBuf,
     /// More cgroup values, on top of the CPU, memory and pid limits. Each
     /// key must be a plain controller file, such as `cpuset.cpus`. The
@@ -178,6 +180,57 @@ pub fn check_extra_cgroups(config: &JailerConfig) -> Result<(), SandboxError> {
     Ok(())
 }
 
+/// Check that `cgroup_root` is the cgroup v2 mount of the jailer.
+///
+/// # Errors
+///
+/// [`SandboxError::Config`] when it is not.
+pub fn check_cgroup_root(config: &JailerConfig, mounts: &str) -> Result<(), SandboxError> {
+    // The jailer creates each cgroup under the first cgroup v2 mount in
+    // /proc/mounts. Teardown must kill that cgroup, not another path.
+    let mount = mounts.lines().find_map(|line| {
+        let mut fields = line.split(' ');
+        let (_, dir, kind) = (fields.next()?, fields.next()?, fields.next()?);
+        (kind == "cgroup2").then(|| unescape_mount_path(dir))
+    });
+    match mount {
+        Some(mount) if mount == config.cgroup_root => Ok(()),
+        Some(mount) => Err(SandboxError::Config(format!(
+            "the jailer uses the cgroup v2 mount {}, so JailerConfig::cgroup_root must be it, \
+             not {}",
+            mount.display(),
+            config.cgroup_root.display()
+        ))),
+        None => Err(SandboxError::Config(
+            "the jailer needs cgroup v2, and the mount table has no cgroup2 mount".into(),
+        )),
+    }
+}
+
+/// A path from the mount table. The table writes some bytes, such as a
+/// space, as a backslash and three octal digits.
+fn unescape_mount_path(field: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt as _;
+    let bytes = field.as_bytes();
+    let mut path = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while let Some(&byte) = bytes.get(i) {
+        let escaped = bytes
+            .get(i + 1..i + 4)
+            .filter(|digits| byte == b'\\' && digits.iter().all(|d| (b'0'..=b'7').contains(d)))
+            .and_then(|digits| std::str::from_utf8(digits).ok())
+            .and_then(|digits| u8::from_str_radix(digits, 8).ok());
+        if let Some(value) = escaped {
+            path.push(value);
+            i += 4;
+        } else {
+            path.push(byte);
+            i += 1;
+        }
+    }
+    PathBuf::from(std::ffi::OsString::from_vec(path))
+}
+
 /// The jailer arguments that run `firecracker_bin` as `vm_id`.
 ///
 /// The arguments after `--` go to Firecracker. The jailer always runs with
@@ -315,6 +368,32 @@ mod tests {
             ("cpu.weight".into(), "50".into()),
         ];
         check_extra_cgroups(&config).unwrap();
+    }
+
+    #[test]
+    fn the_cgroup_root_must_be_the_jailer_cgroup_mount() {
+        let mounts = "proc /proc proc rw 0 0\n\
+                      cgroup2 /sys/fs/cgroup/unified cgroup2 rw 0 0\n\
+                      cgroup2 /mnt/other cgroup2 rw 0 0\n";
+        let mut config = config();
+        // The default path is not the mount that the jailer uses here.
+        let err = check_cgroup_root(&config, mounts).expect_err("a hybrid host");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("/sys/fs/cgroup/unified")),
+            "{err:?}"
+        );
+        config.cgroup_root = PathBuf::from("/sys/fs/cgroup/unified/");
+        check_cgroup_root(&config, mounts).unwrap();
+        // The jailer takes the first cgroup v2 mount.
+        config.cgroup_root = PathBuf::from("/mnt/other");
+        assert!(check_cgroup_root(&config, mounts).is_err());
+        // The mount table writes a space as \040.
+        config.cgroup_root = PathBuf::from("/mnt/a b");
+        check_cgroup_root(&config, "cgroup2 /mnt/a\\040b cgroup2 rw 0 0\n").unwrap();
+        assert!(matches!(
+            check_cgroup_root(&config, "proc /proc proc rw 0 0\n"),
+            Err(SandboxError::Config(_))
+        ));
     }
 
     #[test]

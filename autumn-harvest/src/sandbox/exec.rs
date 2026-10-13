@@ -75,7 +75,7 @@ const CGROUP_FAILED: i32 = libc::EBADSLT;
 const CPU_POLL: Duration = Duration::from_millis(50);
 
 /// The time that the cleanup waits for a killed run cgroup to empty.
-const CGROUP_WAIT: Duration = Duration::from_secs(2);
+pub const CGROUP_WAIT: Duration = Duration::from_secs(2);
 
 /// The time that a dropped run waits for its killed cgroup to empty.
 const CGROUP_DROP_WAIT: Duration = Duration::from_millis(200);

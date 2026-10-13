@@ -64,6 +64,10 @@ pub struct FakeLauncher {
     pub failures_left: AtomicUsize,
     /// The ids of the VMs whose VMM has exited.
     pub crashed: Arc<std::sync::Mutex<Vec<String>>>,
+    /// The answer of `guest_port`.
+    pub port: Option<u32>,
+    /// The number of `guest_port` calls.
+    pub port_queries: AtomicUsize,
 }
 
 impl FakeLauncher {
@@ -81,6 +85,8 @@ impl FakeLauncher {
             launched: Arc::new(AtomicUsize::new(0)),
             failures_left: AtomicUsize::new(0),
             crashed: Arc::default(),
+            port: None,
+            port_queries: AtomicUsize::new(0),
         }
     }
 
@@ -128,6 +134,11 @@ impl VmLauncher for FakeLauncher {
 
     fn image_name(&self) -> Option<String> {
         Some("fake-image".into())
+    }
+
+    fn guest_port(&self) -> Option<u32> {
+        self.port_queries.fetch_add(1, Ordering::SeqCst);
+        self.port
     }
 }
 

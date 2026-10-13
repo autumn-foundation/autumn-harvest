@@ -217,16 +217,20 @@ impl FirecrackerLauncher {
     /// - a snapshot boot has no jailer;
     /// - the jail uid or gid is 0, or this process is not root with a jail;
     /// - the jail cannot read an image;
+    /// - `JailerConfig::cgroup_root` is not the cgroup v2 mount of the jailer;
     /// - another user can change a binary, an image, the jail root or the
     ///   network namespace of a jailed launch;
     /// - the lease cannot be taken.
     pub fn new(config: LauncherConfig) -> Result<Self, SandboxError> {
         // SAFETY: geteuid has no preconditions.
-        Self::new_with_euid(config, unsafe { libc::geteuid() })
+        let euid = unsafe { libc::geteuid() };
+        let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
+        Self::new_on_host(config, euid, &mounts)
     }
 
-    /// [`Self::new`] for a process with the effective uid `euid`.
-    fn new_with_euid(config: LauncherConfig, euid: u32) -> Result<Self, SandboxError> {
+    /// [`Self::new`] for a process with the uid `euid` and the mount table
+    /// `mounts`.
+    fn new_on_host(config: LauncherConfig, euid: u32, mounts: &str) -> Result<Self, SandboxError> {
         // Firecracker refuses these at each launch. Refuse them once, here.
         let machine = config.machine;
         if !(1..=MAX_VCPUS).contains(&machine.vcpu_count) || machine.mem_size_mib == 0 {
@@ -284,6 +288,7 @@ impl FirecrackerLauncher {
                 ));
             }
             super::jailer::check_extra_cgroups(jailer)?;
+            super::jailer::check_cgroup_root(jailer, mounts)?;
             // The jailer makes the chroot and the cgroup, then drops to the
             // jail uid. Each step needs root, so another uid fails each launch.
             if euid != 0 {
@@ -1775,7 +1780,14 @@ while True:
     /// A launcher for `config`, built as if this process were root. A
     /// jailed launcher needs root, and most tests run without it.
     fn new_launcher(config: LauncherConfig) -> Result<FirecrackerLauncher, SandboxError> {
-        FirecrackerLauncher::new_with_euid(config, 0)
+        // The jailer of a test uses the cgroup root of its config.
+        let mounts = match &config.confinement {
+            Confinement::Jailer(jail) => {
+                format!("cgroup2 {} cgroup2 rw 0 0\n", jail.cgroup_root.display())
+            }
+            Confinement::Unjailed { .. } => String::new(),
+        };
+        FirecrackerLauncher::new_on_host(config, 0, &mounts)
     }
 
     fn jailed(dir: &Path) -> LauncherConfig {
@@ -2057,9 +2069,32 @@ while True:
     }
 
     #[test]
+    fn a_cgroup_root_that_the_jailer_does_not_use_is_a_config_error() {
+        let dir = temp_dir();
+        let err = FirecrackerLauncher::new_on_host(
+            jailed(&dir),
+            0,
+            "cgroup2 /sys/fs/cgroup cgroup2 rw 0 0\n",
+        )
+        .expect_err("another cgroup root");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("cgroup")),
+            "{err:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_jailed_launcher_needs_root() {
         let dir = temp_dir();
-        let err = FirecrackerLauncher::new_with_euid(jailed(&dir), 1000)
+        let config = jailed(&dir);
+        let mounts = match &config.confinement {
+            Confinement::Jailer(jail) => {
+                format!("cgroup2 {} cgroup2 rw 0 0\n", jail.cgroup_root.display())
+            }
+            Confinement::Unjailed { .. } => unreachable!(),
+        };
+        let err = FirecrackerLauncher::new_on_host(config, 1000, &mounts)
             .expect_err("the jailer needs root");
         assert!(
             matches!(err, SandboxError::Config(ref m) if m.contains("root")),
