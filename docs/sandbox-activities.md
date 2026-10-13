@@ -165,6 +165,8 @@ runtime refuses a policy that allows the network on a backend without one.
 
 - Linux with `/dev/kvm`, cgroup v2 with `cgroup.kill` (Linux 5.14), and root
   for the jailer.
+- Absolute paths in `LauncherConfig`. Firecracker runs in the VM directory,
+  so the launcher refuses a relative path.
 - `JailerConfig::cgroup_root` set to the cgroup v2 mount of the jailer: the
   first `cgroup2` line in `/proc/mounts`. The default is `/sys/fs/cgroup`.
   The launcher refuses another path, because teardown kills the cgroups
@@ -197,8 +199,9 @@ runtime refuses a policy that allows the network on a backend without one.
   `memory.swap.max`, `pids.max` and the `cgroup.` core files, because it sets
   the limits itself.
 
-Call `verify_host` before the first run. It checks the versions and the host.
-Under `PosturePolicy::Enforce`, the default, it refuses a critical finding.
+Call `verify_host` before the first run. It checks the versions and the host,
+including cgroup v2 at `JailerConfig::cgroup_root`. Under
+`PosturePolicy::Enforce`, the default, it refuses a critical finding.
 An unjailed launcher is a critical finding too, and so is a jailer with no
 network namespace. SMT and swap give warnings.
 
@@ -332,7 +335,8 @@ not fit is only counted.
 
 - The registration sets `start_to_close` to `max_attempt_time`. That is the
   queue wait, the wall-clock ceiling, the backend overhead and the cleanup
-  grace together.
+  grace together. The backend overhead is at least what the backend needs:
+  for Firecracker, the boot timeout, the response grace and the teardown.
 - The handler gives the runtime the time left in the attempt. The runtime
   keeps the cleanup grace for teardown. It does not start code that cannot
   finish in the rest. So a retry does not overlap a live run.

@@ -165,12 +165,13 @@ pub async fn probe_version(
     Ok(version)
 }
 
-/// Inspect the host under `root`, normally `/`.
+/// Inspect the host under `root`, normally `/`. `cgroup_mount` is the cgroup
+/// v2 mount of the jailer.
 ///
 /// Critical: no `/dev/kvm`, KSM on, nested KVM on, a CPU vulnerability that
 /// reports `Vulnerable`, or no cgroup v2. Warning: SMT on, or swap on.
 #[must_use]
-pub fn inspect_host(root: &Path) -> Vec<PostureFinding> {
+pub fn inspect_host(root: &Path, cgroup_mount: &Path) -> Vec<PostureFinding> {
     let read = |rel: &str| std::fs::read_to_string(root.join(rel)).map(|s| s.trim().to_owned());
     let mut findings = Vec::new();
     let mut find = |check: &str, detail: String, severity: Severity| {
@@ -216,10 +217,11 @@ pub fn inspect_host(root: &Path) -> Vec<PostureFinding> {
             }
         }
     }
-    if !root.join("sys/fs/cgroup/cgroup.controllers").exists() {
+    let cgroup = cgroup_mount.strip_prefix("/").unwrap_or(cgroup_mount);
+    if !root.join(cgroup).join("cgroup.controllers").exists() {
         find(
             "cgroup_v2",
-            "cgroup v2 is not mounted at /sys/fs/cgroup".into(),
+            format!("cgroup v2 is not mounted at {}", cgroup_mount.display()),
             Severity::Critical,
         );
     }
@@ -390,10 +392,35 @@ mod tests {
     }
 
     #[test]
+    fn the_cgroup_check_reads_the_configured_mount() {
+        let root = fake_sys();
+        std::fs::remove_file(root.join("sys/fs/cgroup/cgroup.controllers")).unwrap();
+        std::fs::create_dir_all(root.join("sys/fs/cgroup/unified")).unwrap();
+        std::fs::write(
+            root.join("sys/fs/cgroup/unified/cgroup.controllers"),
+            "cpu\n",
+        )
+        .unwrap();
+        assert_eq!(inspect_host(&root, Path::new("/sys/fs/cgroup/unified")), []);
+        let findings = inspect_host(&root, Path::new("/sys/fs/cgroup"));
+        assert!(
+            findings.iter().any(|f| f.check == "cgroup_v2"),
+            "{findings:?}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_hardened_host_has_no_findings() {
         let root = fake_sys();
-        assert_eq!(inspect_host(&root), []);
-        assert!(enforce(&inspect_host(&root), PosturePolicy::Enforce).is_ok());
+        assert_eq!(inspect_host(&root, Path::new("/sys/fs/cgroup")), []);
+        assert!(
+            enforce(
+                &inspect_host(&root, Path::new("/sys/fs/cgroup")),
+                PosturePolicy::Enforce
+            )
+            .is_ok()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -435,7 +462,7 @@ mod tests {
             "Filename Type Size Used Priority\n/swapfile file 1024 0 -2\n",
         )
         .unwrap();
-        let findings = inspect_host(&root);
+        let findings = inspect_host(&root, Path::new("/sys/fs/cgroup"));
         let checks: Vec<(&str, Severity)> = findings
             .iter()
             .map(|f| (f.check.as_str(), f.severity))
@@ -464,7 +491,7 @@ mod tests {
     fn a_warning_alone_does_not_stop_the_backend() {
         let root = fake_sys();
         std::fs::write(root.join("sys/devices/system/cpu/smt/active"), "1\n").unwrap();
-        let findings = inspect_host(&root);
+        let findings = inspect_host(&root, Path::new("/sys/fs/cgroup"));
         assert_eq!(findings.len(), 1);
         assert!(enforce(&findings, PosturePolicy::Enforce).is_ok());
         std::fs::remove_dir_all(root).unwrap();

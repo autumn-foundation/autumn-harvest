@@ -192,6 +192,16 @@ impl SandboxBackend for FirecrackerBackend {
         IsolationLevel::MicroVm
     }
 
+    /// A boot, the response grace, and the teardown of the VMM and its
+    /// cgroup.
+    fn overhead(&self) -> Duration {
+        self.settings
+            .boot_timeout
+            .saturating_add(self.settings.response_grace)
+            .saturating_add(super::launcher::KILL_WAIT)
+            .saturating_add(super::launcher::CGROUP_EMPTY_WAIT)
+    }
+
     fn image(&self) -> Option<String> {
         self.launcher.image_name()
     }
@@ -315,6 +325,20 @@ mod tests {
             ..fast()
         };
         FirecrackerBackend::new(launcher(GuestMode::Serve), settings).unwrap();
+    }
+
+    #[test]
+    fn the_overhead_covers_the_boot_the_grace_and_the_teardown() {
+        let settings = BackendSettings {
+            boot_timeout: Duration::from_secs(60),
+            ..fast()
+        };
+        let backend = FirecrackerBackend::new(launcher(GuestMode::Serve), settings).unwrap();
+        let need = Duration::from_secs(60)
+            + settings.response_grace
+            + super::super::launcher::KILL_WAIT
+            + super::super::launcher::CGROUP_EMPTY_WAIT;
+        assert!(SandboxBackend::overhead(&backend) >= need);
     }
 
     #[test]

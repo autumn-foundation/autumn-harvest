@@ -272,6 +272,25 @@ impl FirecrackerLauncher {
         if let Confinement::Jailer(jailer) = &config.confinement {
             required.push(("the jailer binary", &jailer.jailer_bin));
         }
+        let mut paths = required.clone();
+        match &config.confinement {
+            Confinement::Unjailed { work_root } => paths.push(("the work root", work_root)),
+            Confinement::Jailer(jailer) => {
+                paths.push(("the jail base", &jailer.chroot_base));
+                paths.push(("the cgroup root", &jailer.cgroup_root));
+                if let Some(netns) = &jailer.netns {
+                    paths.push(("the network namespace", netns));
+                }
+            }
+        }
+        // Firecracker runs in the VM directory, so a relative path would
+        // name another file there.
+        if let Some((what, path)) = paths.iter().find(|(_, path)| !path.is_absolute()) {
+            return Err(SandboxError::Config(format!(
+                "{what} {} must be an absolute path",
+                path.display()
+            )));
+        }
         for (what, path) in &required {
             if !path.is_file() {
                 return Err(SandboxError::Config(format!(
@@ -366,7 +385,11 @@ impl FirecrackerLauncher {
         policy: PosturePolicy,
     ) -> Result<Vec<PostureFinding>, SandboxError> {
         self.check_versions().await?;
-        let mut findings = super::posture::inspect_host(root);
+        let cgroup_mount = match &self.config.confinement {
+            Confinement::Jailer(jailer) => jailer.cgroup_root.clone(),
+            Confinement::Unjailed { .. } => PathBuf::from(super::jailer::DEFAULT_CGROUP_ROOT),
+        };
+        let mut findings = super::posture::inspect_host(root, &cgroup_mount);
         match &self.config.confinement {
             Confinement::Jailer(jailer) => {
                 findings.extend(super::posture::inspect_jail_base(&jailer.chroot_base));
@@ -2019,6 +2042,35 @@ while True:
             "a copy must give the jail the access that a hard link gives"
         );
         assert_eq!(std::fs::read(&to).unwrap(), b"memory");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_relative_launcher_path_is_a_config_error() {
+        let dir = temp_dir();
+        let fc = script(&dir, "firecracker", "exit 0");
+        // A relative path under the git-ignored target directory.
+        let relative = PathBuf::from(format!("target/hl-rel-{}", uuid::Uuid::new_v4().simple()));
+        let mut config = unjailed(&dir, fc.clone(), BootMethod::ConfigFile);
+        config.confinement = Confinement::Unjailed {
+            work_root: relative.clone(),
+        };
+        let result = new_launcher(config).map(|_| ());
+        let _ = std::fs::remove_dir_all(&relative);
+        let err = result.expect_err("a relative work root");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("absolute")),
+            "{err:?}"
+        );
+        let mut config = unjailed(&dir, fc, BootMethod::ConfigFile);
+        config.image.kernel = PathBuf::from("vmlinux");
+        let err = new_launcher(config)
+            .map(|_| ())
+            .expect_err("a relative kernel");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("absolute")),
+            "{err:?}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

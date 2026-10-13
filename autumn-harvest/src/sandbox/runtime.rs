@@ -71,6 +71,13 @@ pub trait SandboxBackend: Send + Sync + 'static {
         false
     }
 
+    /// The longest time that the backend can need on top of the wall-clock
+    /// limit, such as a boot, a response grace and a teardown. The runtime
+    /// never gives a run less. Zero by default.
+    fn overhead(&self) -> Duration {
+        Duration::ZERO
+    }
+
     /// Run `job`. Stop and clean up when `cancel` fires.
     fn execute(
         &self,
@@ -139,12 +146,13 @@ impl SandboxRuntime {
                 "the policy allows the network, but the backend gives code no network".into(),
             ));
         }
+        let overhead = DEFAULT_BACKEND_OVERHEAD.max(backend.overhead());
         Ok(Self {
             backend,
             policy: Arc::new(policy),
             permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT)),
             max_concurrent: DEFAULT_MAX_CONCURRENT,
-            overhead: DEFAULT_BACKEND_OVERHEAD,
+            overhead,
             queue_wait: DEFAULT_QUEUE_WAIT,
             image,
         })
@@ -160,9 +168,10 @@ impl SandboxRuntime {
     }
 
     /// Set the time that the backend gets on top of the wall-clock limit.
+    /// It is never less than [`SandboxBackend::overhead`].
     #[must_use]
-    pub const fn with_backend_overhead(mut self, overhead: Duration) -> Self {
-        self.overhead = overhead;
+    pub fn with_backend_overhead(mut self, overhead: Duration) -> Self {
+        self.overhead = overhead.max(self.backend.overhead());
         self
     }
 
@@ -565,6 +574,43 @@ pub(crate) mod tests {
         ) -> BoxFuture<'_, Result<SandboxOutcome, SandboxError>> {
             Box::pin(async { Err(SandboxError::Cancelled) })
         }
+    }
+
+    /// A backend that needs a long time on top of the wall clock.
+    struct SlowBackend(Duration);
+
+    impl SandboxBackend for SlowBackend {
+        fn isolation(&self) -> IsolationLevel {
+            IsolationLevel::Process
+        }
+
+        fn overhead(&self) -> Duration {
+            self.0
+        }
+
+        fn execute(
+            &self,
+            _job: SandboxJob,
+            _cancel: CancellationToken,
+        ) -> BoxFuture<'_, Result<SandboxOutcome, SandboxError>> {
+            Box::pin(async { Err(SandboxError::Cancelled) })
+        }
+    }
+
+    #[test]
+    fn the_runtime_gives_a_run_the_overhead_of_its_backend() {
+        let need = DEFAULT_BACKEND_OVERHEAD + Duration::from_secs(30);
+        let runtime = SandboxRuntime::new(
+            Arc::new(SlowBackend(need)),
+            SandboxPolicy::for_development(),
+        )
+        .unwrap();
+        assert_eq!(runtime.backend_overhead(), need);
+        // A smaller explicit overhead cannot cut the time that the backend needs.
+        let runtime = runtime.with_backend_overhead(Duration::from_secs(1));
+        assert_eq!(runtime.backend_overhead(), need);
+        let runtime = runtime.with_backend_overhead(need * 2);
+        assert_eq!(runtime.backend_overhead(), need * 2);
     }
 
     #[test]
