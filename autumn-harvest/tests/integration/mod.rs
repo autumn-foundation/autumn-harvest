@@ -189,6 +189,7 @@ mod legal_hold_tests;
 #[cfg(feature = "db")]
 mod lifecycle_model_props;
 mod lineage_store_tests;
+mod llm_budget_tests;
 #[cfg(all(feature = "db", feature = "testing"))]
 mod llm_ledger_tests;
 mod lock_order_docs;

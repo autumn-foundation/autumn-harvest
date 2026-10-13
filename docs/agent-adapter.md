@@ -130,8 +130,8 @@ A worker with a payload cap other than the default must say so. Set
 - `max_result_bytes(bytes)` — the activity-result cap of the workers. A
   larger tool result is cut to fit it. The default is the engine default.
 - `model_timeout(d)` — the time budget of one model call. The default is
-  13 minutes. With the policy budget, it stays below the 15-minute
-  `start_to_close`. A call over it is a
+  13 minutes. With the policy, cache and ledger budgets, it stays below the
+  15-minute `start_to_close`. A call over it is a
   retryable failure.
 - `tool_timeout(d)` — the time budget of one tool call. The default is
   9 minutes, below the 10-minute `start_to_close`. A call over it is an
@@ -143,6 +143,9 @@ A worker with a payload cap other than the default must say so. Set
   precheck. The default is 30 seconds.
 - `cache_timeout(d)` — the time budget of one response-cache call. The
   default is 5 seconds.
+- `budget_timeout(d)` — the time budget of the LLM budget check of one
+  turn (issue #1997). The default is 10 seconds. A check over it is a
+  retryable failure, before the model call.
 - `memory(store)` — the `MemoryStore` for runs with a memory scope.
 - `delivery(delivery)` — where reports go. The default is `LogDelivery`.
 - `precheck(precheck)` — the cheap check that can skip a heartbeat tick.
@@ -245,6 +248,7 @@ A bound is a normal end, not an error. `AgentReport.stop` names it:
 | `steps_exhausted` | The model asked for tools after `max_steps` rounds. |
 | `tokens_exhausted` | The run spent more than `max_total_tokens`, follow-ups included. |
 | `transcript_full` | The next request, or the results of one round, could not fit the request cap. The request was not sent. |
+| `budget_exceeded` | A run or tenant LLM budget refused the next model call. The call was not sent. See [LLM budgets](#llm-budgets-issue-1997). |
 | `loop_detected` | The loop guard saw the same call, with the same result, too many times. |
 
 A turn that ends the run before its tool calls run is left out of
@@ -264,6 +268,69 @@ reads.
 
 The run fails when a model call fails for good: a non-retryable kind, for
 example a rejected API key, or four failed attempts.
+
+### LLM budgets (issue #1997)
+
+`max_total_tokens` bounds one run inside the workflow. A budget on the
+Postgres engine also bounds a tenant across runs, and it can bound cost.
+
+Each model turn checks the budget before the call. The budget sums the
+[cost ledger](#the-cost-ledger) rows of the run and of its tenant. The cost
+caps are in millionths of a US dollar, as `cost_usd_micros` is. An unpriced
+call adds no cost, so only the token caps apply to it. Price the cache
+counts in `cost_usd_micros` if your provider bills them at another rate.
+
+The ledger writes the calls of a completed attempt only. A call in an
+attempt that fails or times out is not counted, even when the provider
+charges for it.
+
+The budget counts `input_tokens` plus `output_tokens`. `input_tokens` must
+count the whole prompt, cached tokens included. Some providers report the
+cached tokens apart, so add them to `input_tokens` in your `AgentModel`.
+
+A response cache hit calls no model. It spends no tokens and records no
+row. The budget check still runs before the cache lookup, so a spent cap
+refuses a turn that the cache could answer.
+
+A failed spend read retries the turn, and uses one of its four attempts.
+The turn calls no model before the check passes, so the retry pays nothing.
+
+Declare the caps on `agent_loop`, and set the tenant on each task:
+
+```rust
+use autumn_harvest::builder::HarvestBuilder;
+use autumn_harvest::quota::QuotaPolicy;
+use autumn_harvest_agent::AgentTask;
+use autumn_harvest_agent::workflow::{activities, agent_loop_info};
+
+let budget = QuotaPolicy::new("tenant")
+    .with_max_run_llm_tokens(200_000)
+    .with_max_tenant_llm_cost_usd_micros(50_000_000) // 50 US dollars a day
+    .with_tenant_llm_window_secs(86_400);
+let built = HarvestBuilder::new()
+    .workflows(vec![agent_loop_info().with_quota(budget)])
+    .activities(activities())
+    .state(harness)
+    .build();
+
+let task = AgentTask::new("Summarise the ticket.").tenant("acme");
+```
+
+Register `agent_loop` with its policy on every worker that runs
+`agent_model_turn`. The check reads the policy in its own process. A worker
+without it does not enforce the budget, and logs one warning.
+
+A spent cap refuses the next model turn. The adapter does not send the call,
+and the run ends under `budget_exceeded`. Three limits apply:
+
+- The cap is soft. The last turn that passes the check can pass the cap by
+  its whole usage. Runs of one tenant at the same time can pass it
+  together.
+- A task with no `tenant` has no tenant budget. Its run caps still apply.
+- The budget reads `AgentTask::tenant` as the task gives it. It does not
+  read the verified tenant (#1977), as the response cache does.
+- The SQLite backend rejects a workflow that declares `quota`. A budgeted
+  `agent_loop` therefore does not build there.
 
 ## 8. History types
 

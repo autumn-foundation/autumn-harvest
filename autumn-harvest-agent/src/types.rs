@@ -99,6 +99,9 @@ pub struct AgentTask {
     ///
     /// On Postgres, the verified tenant of the run wins over this field. Set
     /// it on SQLite, or for a run that has no verified tenant.
+    ///
+    /// A `QuotaPolicy` on `agent_loop` with the key `"tenant"` reads it for
+    /// the tenant LLM budgets (issue #1997).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
 }
@@ -428,6 +431,8 @@ impl ToolOutcome {
 }
 
 /// Why a run ended.
+///
+/// Later releases can add a reason, so a `match` needs a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -442,6 +447,9 @@ pub enum AgentStop {
     TokensExhausted,
     /// The next request was too large to record. It was not sent.
     TranscriptFull,
+    /// A run or tenant LLM budget refuses the next model call (issue
+    /// #1997). The adapter does not send the call.
+    BudgetExceeded,
     /// The model repeated the same tool call with the same result too often.
     LoopDetected,
 }
@@ -537,6 +545,22 @@ mod tests {
     #[test]
     fn stop_names_are_stable_in_history() {
         assert_eq!(json!(AgentStop::TranscriptFull), json!("transcript_full"));
+        assert_eq!(json!(AgentStop::BudgetExceeded), json!("budget_exceeded"));
+    }
+
+    #[test]
+    fn the_tenant_is_in_the_input_only_when_set() {
+        let plain = serde_json::to_value(AgentTask::new("go")).unwrap();
+        assert!(plain.get("tenant").is_none());
+        let task = AgentTask::new("go").tenant("acme");
+        let value = serde_json::to_value(&task).unwrap();
+        assert_eq!(value["tenant"], "acme");
+        assert_eq!(
+            autumn_harvest::quota::resolve_quota_key("tenant", &value).as_deref(),
+            Some("acme")
+        );
+        let back: AgentTask = serde_json::from_value(value).unwrap();
+        assert_eq!(back.tenant.as_deref(), Some("acme"));
     }
 
     #[test]

@@ -381,6 +381,8 @@ pub mod info;
 pub mod interceptor;
 /// Every persisted workflow execution state and every sanctioned transition.
 pub mod lifecycle;
+/// LLM token and cost budgets per run and per tenant (issue #1997).
+pub mod llm_budget;
 /// Agent cost ledger: model, tokens, cost and latency per LLM step (issue
 /// #1996).
 pub mod llm_ledger;
