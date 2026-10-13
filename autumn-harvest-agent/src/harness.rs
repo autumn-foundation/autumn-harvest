@@ -27,8 +27,8 @@ pub const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 8_000;
 
 /// The default time budget of one model call: 13 minutes.
 ///
-/// With [`DEFAULT_POLICY_TIMEOUT`] and three [`DEFAULT_CACHE_TIMEOUT`]
-/// budgets, it stays below the 15-minute `start_to_close` of
+/// With [`DEFAULT_POLICY_TIMEOUT`], three [`DEFAULT_CACHE_TIMEOUT`] budgets
+/// and one [`DEFAULT_BUDGET_TIMEOUT`], it stays below the 15-minute `start_to_close` of
 /// `agent_model_turn`. A slow call therefore ends as a
 /// retryable failure that the harness reports. It does not end as an engine
 /// timeout, which SQLite reports only after the body returns.
@@ -60,6 +60,14 @@ pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 /// the store. Each call has this budget. A cache call over it is a miss.
 pub const DEFAULT_CACHE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The default time budget of the LLM budget check of one turn: 10 seconds
+/// (issue #1997).
+///
+/// The check reads the spend of the run and of its tenant before the model
+/// call. Without a budget, a slow pool or a slow read could use up the
+/// `start_to_close` of the turn.
+pub const DEFAULT_BUDGET_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The bytes that the `ToolOutcome` JSON adds around its content.
 const OUTCOME_ENVELOPE_BYTES: u64 = 64;
 
@@ -83,6 +91,7 @@ pub struct AgentHarness {
     policy_timeout: Duration,
     hook_timeout: Duration,
     cache_timeout: Duration,
+    budget_timeout: Duration,
     memory: Option<Arc<dyn MemoryStore>>,
     delivery: Arc<dyn Delivery>,
     precheck: Option<Arc<dyn Precheck>>,
@@ -105,6 +114,7 @@ impl AgentHarness {
             policy_timeout: DEFAULT_POLICY_TIMEOUT,
             hook_timeout: DEFAULT_HOOK_TIMEOUT,
             cache_timeout: DEFAULT_CACHE_TIMEOUT,
+            budget_timeout: DEFAULT_BUDGET_TIMEOUT,
             memory: None,
             delivery: Arc::new(LogDelivery),
             precheck: None,
@@ -226,12 +236,38 @@ impl AgentHarness {
     }
 
     /// Set the time budget of one response-cache call. One turn makes at
-    /// most three. Keep the sum of the model, policy and cache budgets below
-    /// the 15-minute `start_to_close` of `agent_model_turn`.
+    /// most three. Keep the sum of the model, policy, cache and budget-check
+    /// budgets below the 15-minute `start_to_close` of `agent_model_turn`.
     #[must_use]
     pub const fn cache_timeout(mut self, timeout: Duration) -> Self {
         self.cache_timeout = timeout;
         self
+    }
+
+    /// Set the time budget of the LLM budget check of one turn (issue
+    /// #1997). Keep the sum of the model, policy, cache and budget-check
+    /// budgets below the 15-minute `start_to_close` of `agent_model_turn`.
+    #[must_use]
+    pub const fn budget_timeout(mut self, timeout: Duration) -> Self {
+        self.budget_timeout = timeout;
+        self
+    }
+
+    /// Run the LLM budget check of one turn (issue #1997).
+    ///
+    /// A refusal returns the refusal. A check over the budget time fails as
+    /// a retryable `LlmBudgetCheckFailed`. Either way, the turn calls no
+    /// model, so a retry pays nothing.
+    pub(crate) async fn check_budget<F>(&self, check: impl FnOnce() -> F) -> Result<(), String>
+    where
+        F: std::future::Future<Output = Result<(), String>>,
+    {
+        let budget = self.budget_timeout;
+        let Ok(checked) = tokio::time::timeout(budget, check()).await else {
+            let reason = format!("the read took longer than {budget:?}");
+            return Err(autumn_harvest::llm_budget::check_failed(&reason).into_error_payload());
+        };
+        checked
     }
 
     /// Whether a turn can use the response cache: the harness has a cache,
@@ -873,8 +909,49 @@ mod tests {
 
     #[test]
     fn the_default_budgets_fit_the_model_turn_start_to_close() {
-        let turn = DEFAULT_MODEL_TIMEOUT + DEFAULT_POLICY_TIMEOUT + 3 * DEFAULT_CACHE_TIMEOUT;
+        let turn = DEFAULT_MODEL_TIMEOUT
+            + DEFAULT_POLICY_TIMEOUT
+            + 3 * DEFAULT_CACHE_TIMEOUT
+            + DEFAULT_BUDGET_TIMEOUT;
         assert!(turn < Duration::from_secs(15 * 60), "{turn:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_budget_check_fails_retryable() {
+        let harness =
+            AgentHarness::new(Arc::new(NoModel)).budget_timeout(Duration::from_millis(20));
+        let outcome = harness
+            .check_budget(std::future::pending::<Result<(), String>>)
+            .await;
+        let failure = autumn_harvest::failure::parse_typed_payload(&outcome.unwrap_err()).unwrap();
+        assert_eq!(
+            failure.error_type,
+            autumn_harvest::llm_budget::ERROR_TYPE_LLM_BUDGET_CHECK_FAILED
+        );
+        assert!(!failure.non_retryable);
+    }
+
+    #[tokio::test]
+    async fn a_budget_refusal_passes_through() {
+        let harness = AgentHarness::new(Arc::new(NoModel));
+        let outcome = harness
+            .check_budget(|| async { Err("refused".to_owned()) })
+            .await;
+        assert_eq!(outcome, Err("refused".to_owned()));
+        assert_eq!(harness.check_budget(|| async { Ok(()) }).await, Ok(()));
+    }
+
+    /// A model that the budget tests never call.
+    #[derive(Debug)]
+    struct NoModel;
+
+    impl AgentModel for NoModel {
+        fn chat<'a>(
+            &'a self,
+            _request: &'a ChatRequest,
+        ) -> crate::model::BoxFuture<'a, Result<crate::model::ChatResponse, AgentError>> {
+            Box::pin(async { Err(AgentError::new(ErrorKind::Provider, "unused")) })
+        }
     }
 
     #[test]

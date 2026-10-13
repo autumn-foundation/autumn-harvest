@@ -6,8 +6,10 @@
 # mirrored function matches the engine source.
 #
 # VERUS names a local verus binary. Without it, the script downloads the
-# pinned release and checks its SHA-256. The release names the Rust
-# toolchain that it links against, and rustup installs that toolchain.
+# pinned release and checks its SHA-256. Pin a weekly release. Verus keeps
+# only the newest rolling release, so a rolling pin returns 404 when the
+# next one ships. The release names the Rust toolchain that it links
+# against, and rustup installs that toolchain.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

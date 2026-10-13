@@ -44,6 +44,10 @@ pub struct ChatResponse {
 /// Return an [`AgentError`] whose kind says whether a retry can succeed.
 /// `RateLimited`, `Transport` and `Unavailable` retry with backoff. Every
 /// other kind fails the call at once.
+///
+/// The LLM budgets (issue #1997) count `input_tokens` plus `output_tokens` of
+/// [`ChatResponse::usage`]. Count the whole prompt in `input_tokens`, cached
+/// tokens included, even when the provider reports them apart.
 pub trait AgentModel: Send + Sync + std::fmt::Debug {
     /// Send one request and decode the answer.
     fn chat<'a>(
@@ -71,7 +75,8 @@ pub trait AgentModel: Send + Sync + std::fmt::Debug {
     /// The cost of one call, in millionths of a US dollar (issue #1996).
     ///
     /// Return `None` when the price is not known. The ledger then counts the
-    /// call as unpriced.
+    /// call as unpriced. The cost budgets (issue #1997) sum this value, so an
+    /// unpriced call adds no cost.
     fn cost_usd_micros(&self, usage: &TokenUsage) -> Option<u64> {
         let _ = usage;
         None

@@ -2926,6 +2926,10 @@ pub struct WorkflowContext {
     commands: Mutex<Vec<BufferedCommand>>,
     /// Harvest futures parked with no result channel (issue #1797).
     parks: ParkCounter,
+    /// Keys of the promises this run has made, named or generated (issue
+    /// #1985). A key settles once, so a second handle for it would wait
+    /// forever.
+    promise_keys: Mutex<std::collections::HashSet<String>>,
     /// Deterministic "now" -- the timestamp from the `WorkflowStarted` event.
     start_time: DateTime<Utc>,
     /// History-size thresholds visible to author code.
@@ -3530,8 +3534,22 @@ impl WorkflowContext {
     /// The frontier question that actually holds for a signal wait is whether
     /// any matching signal remains available at all. Mirrors the #779 fix, which
     /// exempted the child-timeout race's `InProgress` arm for the same reason.
-    fn check_strict_replay_signal_no_match(&self, signal_name: &str) -> HarvestResult<()> {
-        if self.canary_mode && !self.match_history(|m| m.has_unconsumed_signal(signal_name)) {
+    ///
+    /// For a payload-matching wait (issue #1985), only a signal whose event
+    /// index is in `accepted` counts as available.
+    fn check_strict_replay_signal_no_match(
+        &self,
+        signal_name: &str,
+        accepted: Option<&std::collections::HashSet<usize>>,
+    ) -> HarvestResult<()> {
+        if self.canary_mode
+            && !self.match_history(|m| {
+                accepted.map_or_else(
+                    || m.has_unconsumed_signal(signal_name),
+                    |set| m.has_unconsumed_signal_accepting(signal_name, set),
+                )
+            })
+        {
             return Ok(());
         }
         self.check_strict_replay_no_match(&format!("WaitForSignal({signal_name})"))
@@ -3752,6 +3770,7 @@ impl WorkflowContext {
             matcher: Mutex::new(matcher),
             commands: Mutex::new(Vec::new()),
             parks: ParkCounter::default(),
+            promise_keys: Mutex::default(),
             start_time,
             history_policy,
             execution_timeout: None,
@@ -3888,7 +3907,15 @@ impl WorkflowContext {
     /// The read locks the matcher directly, so it runs no signal-handler
     /// pump. A pump here could dispatch a signal handler after the cycle
     /// ends. The read does not move the cursor.
-    pub(crate) fn first_unconsumed_command_event(&self) -> Option<(usize, String)> {
+    ///
+    /// The `SQLite` query replay uses it to refuse a drifted running run
+    /// (issue #2022), as the drive does.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher mutex is poisoned.
+    #[must_use]
+    pub fn first_unconsumed_command_event(&self) -> Option<(usize, String)> {
         self.matcher
             .lock()
             .expect("matcher lock poisoned")
@@ -3938,6 +3965,7 @@ impl WorkflowContext {
             matcher: Mutex::new(crate::replay::HistoryMatcher::new(vec![])),
             commands: Mutex::new(Vec::new()),
             parks: ParkCounter::default(),
+            promise_keys: Mutex::default(),
             start_time,
             history_policy: WorkflowHistoryPolicy::default(),
             execution_timeout: None,
@@ -4022,6 +4050,7 @@ impl WorkflowContext {
             matcher: Mutex::new(HistoryMatcher::new(vec![])),
             commands: Mutex::new(Vec::new()),
             parks: ParkCounter::default(),
+            promise_keys: Mutex::default(),
             start_time,
             history_policy: WorkflowHistoryPolicy::default(),
             execution_timeout: None,
@@ -9764,10 +9793,141 @@ impl WorkflowContext {
     ///
     /// Panics if the internal replay matcher mutex is poisoned.
     pub async fn wait_for_signal(&self, signal_name: &str) -> HarvestResult<Value> {
-        let history_match = self.match_history(|m| m.match_signal(signal_name));
+        match self.begin_signal_wait(signal_name, None)? {
+            Ok(payload) => Ok(payload),
+            Err(rx) => Self::finish_signal_wait(signal_name, rx).await,
+        }
+    }
+
+    /// Wait for the first `signal_name` signal whose payload satisfies
+    /// `predicate` (issue #1985).
+    ///
+    /// This is the payload-matching event wait, like Cloudflare
+    /// `step.waitForEvent`. A same-name signal that fails the predicate is
+    /// not consumed. It stays buffered, and a later wait for that name can
+    /// take it. Signals keep their recorded order.
+    /// The buffer belongs to the current run. Continue-as-new does not move
+    /// a rejected signal to the next run.
+    ///
+    /// # Determinism contract
+    ///
+    /// `predicate` must be a pure function of the payload. Replay runs it
+    /// again over the recorded `SignalReceived` events. A changed predicate
+    /// can take a different event, and replay then reports drift.
+    ///
+    /// Do not register a push signal handler for the same name. The handler
+    /// claims every buffered signal of that name.
+    ///
+    /// ```rust,no_run
+    /// # async fn example(ctx: &autumn_harvest::WorkflowContext) -> autumn_harvest::HarvestResult<()> {
+    /// let order = ctx
+    ///     .wait_for_signal_matching("order", |p| p["id"] == 42)
+    ///     .await?;
+    /// # let _ = order;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Same as [`wait_for_signal`](Self::wait_for_signal).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn wait_for_signal_matching<F>(
+        &self,
+        signal_name: &str,
+        predicate: F,
+    ) -> HarvestResult<Value>
+    where
+        F: Fn(&Value) -> bool + Send,
+    {
+        match self.begin_signal_wait(signal_name, Some(&predicate))? {
+            Ok(payload) => Ok(payload),
+            Err(rx) => Self::finish_signal_wait(signal_name, rx).await,
+        }
+    }
+
+    /// Typed form of [`wait_for_signal_matching`](Self::wait_for_signal_matching)
+    /// (issue #1985).
+    ///
+    /// A payload that does not decode into `O` is a non-match. It stays
+    /// buffered, as a payload that fails `predicate` does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if the matched payload cannot
+    /// be decoded. Propagates all errors from
+    /// [`wait_for_signal`](Self::wait_for_signal).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn receive_signal_matching<O, F>(
+        &self,
+        signal_name: &str,
+        predicate: F,
+    ) -> HarvestResult<O>
+    where
+        O: serde::de::DeserializeOwned,
+        F: Fn(&O) -> bool + Send,
+    {
+        let raw = self
+            .wait_for_signal_matching(signal_name, move |payload| {
+                serde_json::from_value::<O>(payload.clone()).is_ok_and(|typed| predicate(&typed))
+            })
+            .await?;
+        Ok(serde_json::from_value(raw)?)
+    }
+
+    /// Matches a signal wait against history (issue #1985).
+    ///
+    /// Returns `Ok(Ok(payload))` for a recorded match. Returns `Ok(Err(rx))`
+    /// after it pushes `WaitForSignal`. The caller then awaits `rx`. The
+    /// predicate is not held across the await, so it needs no `Sync` bound.
+    ///
+    /// The predicate runs with no matcher lock held. It may call back into
+    /// the context, and a panic in it does not poison the matcher lock.
+    #[allow(clippy::type_complexity)]
+    fn begin_signal_wait(
+        &self,
+        signal_name: &str,
+        predicate: Option<&dyn Fn(&Value) -> bool>,
+    ) -> HarvestResult<Result<Value, oneshot::Receiver<Value>>> {
+        // Candidates are in match order. The predicate stops at the first
+        // accepted payload, so it never sees a later signal. Each candidate is
+        // cloned under the lock and tested after the lock is released. The
+        // cursor resumes each lookup, so the scan stays linear.
+        let accepted: Option<std::collections::HashSet<usize>> = predicate.map(|accepts| {
+            let mut cursor = crate::replay::SignalCandidateCursor::default();
+            std::iter::from_fn(|| {
+                let (next, index, payload) = self
+                    .matcher
+                    .lock()
+                    .expect("matcher lock poisoned")
+                    .next_signal_candidate(signal_name, cursor)?;
+                cursor = next;
+                Some((index, payload))
+            })
+            .find(|(_, payload)| accepts(payload))
+            .map(|(index, _)| index)
+            .into_iter()
+            .collect()
+        });
+        let history_match = self.match_history(|m| match &accepted {
+            Some(set) => {
+                let found = m.match_signal_accepting(signal_name, set);
+                if matches!(found, HistoryMatch::NoMatch) {
+                    m.note_predicate_signal_wait(signal_name);
+                }
+                found
+            }
+            None => m.match_signal(signal_name),
+        });
 
         match history_match {
-            HistoryMatch::Matched { output } => Ok(output),
+            HistoryMatch::Matched { output } => Ok(Ok(output)),
             HistoryMatch::Diverged {
                 expected,
                 actual,
@@ -9800,20 +9960,181 @@ impl WorkflowContext {
                 ))
             }
             HistoryMatch::NoMatch => {
-                self.check_strict_replay_signal_no_match(signal_name)?;
+                self.check_strict_replay_signal_no_match(signal_name, accepted.as_ref())?;
 
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::WaitForSignal {
                     signal_name: signal_name.to_string(),
                     result_tx: tx,
                 });
-                rx.await.map_err(|_| {
-                    HarvestError::Cancelled(format!(
-                        "signal '{signal_name}' cancelled: result channel dropped"
-                    ))
-                })
+                Ok(Err(rx))
             }
         }
+    }
+
+    /// Awaits the result channel of a parked signal wait.
+    async fn finish_signal_wait(
+        signal_name: &str,
+        rx: oneshot::Receiver<Value>,
+    ) -> HarvestResult<Value> {
+        rx.await.map_err(|_| {
+            HarvestError::Cancelled(format!(
+                "signal '{signal_name}' cancelled: result channel dropped"
+            ))
+        })
+    }
+
+    // ── Durable promises (issue #1985) ─────────────────────────────────────
+
+    /// A durable promise with the key `key` in this run.
+    ///
+    /// The key is part of the token, so a caller that knows the run can build
+    /// the token. Use [`new_promise`](Self::new_promise) for a key that
+    /// nobody can guess. A key settles once per run. See
+    /// [`crate::durable_promise`].
+    ///
+    /// Each call records the token in one `SideEffectRecorded` event. Replay
+    /// reads the token from history, so it does not depend on the execution
+    /// id of the replaying run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Config`] if `key` is empty, longer than
+    /// [`crate::durable_promise::MAX_PROMISE_KEY_LEN`] bytes, or holds a
+    /// character outside `[A-Za-z0-9._:-]`. Also returns it if this run
+    /// already has a handle for `key`. A key settles once, so a second
+    /// handle would wait forever. Keep the first handle and wait on it again.
+    /// Returns the errors of [`side_effect`](Self::side_effect).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub fn promise(
+        &self,
+        key: impl Into<String>,
+    ) -> HarvestResult<crate::durable_promise::DurablePromise<'_>> {
+        let fresh = crate::durable_promise::PromiseId::new(self.execution_id(), key)
+            .map_err(|e| HarvestError::Config(e.to_string()))?;
+        // Refuse before the token is recorded, so the refusal leaves no event.
+        let first_handle = self
+            .promise_keys
+            .lock()
+            .expect("promise key set poisoned")
+            .insert(fresh.key().to_owned());
+        if !first_handle {
+            return Err(HarvestError::Config(format!(
+                "promise key '{}' already has a handle in this run; wait on that handle",
+                fresh.key()
+            )));
+        }
+        let promise = self.record_promise(|| fresh)?;
+        // A reset fork replays the source run's token. Its key can differ from
+        // `key` when the key names the run. Register the recorded key too, so
+        // a second handle for it is refused in the fork as in the source run.
+        self.promise_keys
+            .lock()
+            .expect("promise key set poisoned")
+            .insert(promise.id().key().to_owned());
+        Ok(promise)
+    }
+
+    /// A durable promise with a new `UUIDv7` key.
+    ///
+    /// This is the Restate awakeable shape. Send `promise.id().to_string()`
+    /// to the caller that settles it. The token is recorded as for
+    /// [`promise`](Self::promise).
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`side_effect`](Self::side_effect).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub fn new_promise(&self) -> HarvestResult<crate::durable_promise::DurablePromise<'_>> {
+        let execution_id = self.execution_id();
+        let promise = self.record_promise(|| {
+            crate::durable_promise::PromiseId::from_uuid(execution_id, uuid::Uuid::now_v7())
+        })?;
+        // Register the recorded key, so `promise` refuses a second handle for
+        // it. Replay records the same key, so the set is the same.
+        self.promise_keys
+            .lock()
+            .expect("promise key set poisoned")
+            .insert(promise.id().key().to_owned());
+        Ok(promise)
+    }
+
+    /// Records a promise token once and returns the recorded token on replay.
+    ///
+    /// A reset fork replays the carried history under a new execution id.
+    /// The recorded token keeps its activity inputs byte-identical.
+    fn record_promise<F>(
+        &self,
+        mint: F,
+    ) -> HarvestResult<crate::durable_promise::DurablePromise<'_>>
+    where
+        F: FnOnce() -> crate::durable_promise::PromiseId,
+    {
+        let id = self.side_effect(crate::durable_promise::PROMISE_SIDE_EFFECT_NAME, mint)?;
+        Ok(crate::durable_promise::DurablePromise::new(self, id))
+    }
+
+    /// Resolves a durable promise that another run created.
+    ///
+    /// The settlement is a signal to that run with the promise idempotency
+    /// key, so only the first settlement wins. See
+    /// [`signal_external_workflow_with_idempotency`](Self::signal_external_workflow_with_idempotency).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if `value` cannot be
+    /// serialized. Same as
+    /// [`signal_external_workflow`](Self::signal_external_workflow) otherwise.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn resolve_promise<P: serde::Serialize>(
+        &self,
+        id: &crate::durable_promise::PromiseId,
+        value: P,
+    ) -> HarvestResult<()> {
+        let settlement =
+            crate::durable_promise::PromiseSettlement::resolved(serde_json::to_value(value)?);
+        self.settle_promise(id, &settlement).await
+    }
+
+    /// Rejects a durable promise that another run created.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`resolve_promise`](Self::resolve_promise).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn reject_promise(
+        &self,
+        id: &crate::durable_promise::PromiseId,
+        error: impl Into<String>,
+    ) -> HarvestResult<()> {
+        let settlement = crate::durable_promise::PromiseSettlement::rejected(error);
+        self.settle_promise(id, &settlement).await
+    }
+
+    async fn settle_promise(
+        &self,
+        id: &crate::durable_promise::PromiseId,
+        settlement: &crate::durable_promise::PromiseSettlement,
+    ) -> HarvestResult<()> {
+        self.signal_external_workflow_with_idempotency(
+            id.execution_id(),
+            &id.signal_name(),
+            settlement.to_value(),
+            id.idempotency_key(),
+        )
+        .await
     }
 
     /// Wait for a named signal, but give up after `timeout` and return `None`.
@@ -10357,6 +10678,15 @@ impl WorkflowContext {
                     "ExternalSignalRequested(target={target}, signal={signal_name})"
                 ))?;
                 let payload_json = serde_json::to_value(&payload)?;
+                // Issue #1985: a broken promise signal is the sender's bug.
+                // Refuse it here, before a request is recorded. The outbox
+                // would otherwise report it as a target state, such as
+                // `not_running`.
+                crate::durable_promise::settlement_idempotency_key(
+                    signal_name,
+                    &payload_json,
+                    idempotency_key.as_deref(),
+                )?;
                 let observed = serde_json::to_string(&payload_json).map_or(0, |s| s.len() as u64);
                 if self.payload_max_signal > 0 && observed > self.payload_max_signal {
                     return Err(HarvestError::PayloadTooLarge {
@@ -16144,6 +16474,46 @@ impl ActivityContext {
         }
     }
 
+    /// Build a context for an embedded backend, such as `autumn-harvest-sqlite`
+    /// (issue #2024).
+    ///
+    /// The backend drains `heartbeat_tx` and persists each payload.
+    /// `heartbeat_details` is the checkpoint of the previous attempt. The
+    /// idempotency key derives from `identity.activity_id`, as in the
+    /// Postgres worker. The cancellation token never fires.
+    ///
+    /// Not for activity authors. A test builds a context with
+    /// [`new_test`](Self::new_test) instead.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new_embedded(
+        state: SharedState,
+        identity: ActivityIdentity,
+        heartbeat_tx: tokio::sync::mpsc::Sender<serde_json::Value>,
+        heartbeat_details: Option<serde_json::Value>,
+    ) -> Self {
+        let key = IdempotencyKey::from_activity_exec_id(identity.activity_id);
+        Self::new(
+            state,
+            Some(heartbeat_tx.into()),
+            tokio_util::sync::CancellationToken::new(),
+            identity,
+        )
+        .seed_heartbeat_details(heartbeat_details)
+        .with_idempotency_key(key)
+    }
+
+    /// Seed the checkpoint of the previous attempt and the auto-heartbeat
+    /// re-send cell (issues #151, #682).
+    fn seed_heartbeat_details(mut self, details: Option<serde_json::Value>) -> Self {
+        self.heartbeat_details.clone_from(&details);
+        *self
+            .last_heartbeat_payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = details;
+        self
+    }
+
     /// Attach a trace context carrier captured from the task payload so the
     /// activity handler can stitch downstream calls into the same trace.
     #[must_use]
@@ -16682,6 +17052,63 @@ impl ActivityContext {
     #[must_use]
     pub const fn activity_id(&self) -> ActivityExecId {
         self.identity.activity_id
+    }
+
+    /// Refuse this LLM step when its run or its tenant has spent a budget
+    /// (issue #1997).
+    ///
+    /// Call it before the model call, and record the call with
+    /// [`Self::record_llm_call`] after it. The caps come from the
+    /// [`QuotaPolicy`](crate::quota::QuotaPolicy) of the workflow type. With
+    /// no LLM cap, it returns at once and reads no row. A spent cap gives a
+    /// non-retryable failure payload of type
+    /// [`ERROR_TYPE_LLM_BUDGET_EXCEEDED`](crate::llm_budget::ERROR_TYPE_LLM_BUDGET_EXCEEDED).
+    /// A failed read gives a retryable payload of type
+    /// [`ERROR_TYPE_LLM_BUDGET_CHECK_FAILED`](crate::llm_budget::ERROR_TYPE_LLM_BUDGET_CHECK_FAILED).
+    ///
+    /// A context with no database, such as a test context or a local
+    /// activity, always passes. The check reads the policy in this process.
+    /// A worker that does not register the workflow type passes, and logs one
+    /// warning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an activity error payload, for use with `?` in the body.
+    // Without `db`, the body has no await: it always passes.
+    #[cfg_attr(
+        not(feature = "db"),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
+    pub async fn check_llm_budget(&self) -> Result<(), String> {
+        #[cfg(feature = "db")]
+        if let Some(state) = self.transactional_state.as_ref()
+            && let Some(policy) = crate::llm_budget::policy_for(self.workflow_type())
+        {
+            use crate::failure::IntoActivityErrorString as _;
+
+            let spend = async {
+                let mut conn = crate::pool::acquire_within_pool_bound(&state.pool).await?;
+                crate::llm_budget::load_llm_spend(
+                    &mut conn,
+                    state.exec_id,
+                    policy.tenant_llm_window_secs,
+                    policy.has_tenant_llm_cap(),
+                )
+                .await
+            }
+            .await
+            .map_err(|error| crate::llm_budget::check_failed(&error).into_error_payload())?;
+            if let Some(violation) = crate::llm_budget::check_llm_budget(&spend, &policy) {
+                self.metrics
+                    .record_quota_rejected(self.workflow_type(), violation.resource.as_str());
+                return Err(
+                    crate::llm_budget::LlmBudgetExceeded::from_violation(violation)
+                        .into_failure()
+                        .into_error_payload(),
+                );
+            }
+        }
+        Ok(())
     }
 
     /// `true` when this activity is running inline as a local activity.
@@ -17759,13 +18186,8 @@ impl ActivityContext {
     /// including [`heartbeat_details`](Self::heartbeat_details).
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
-    pub fn with_heartbeat_details(mut self, details: Option<serde_json::Value>) -> Self {
-        self.heartbeat_details.clone_from(&details);
-        *self
-            .last_heartbeat_payload
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = details;
-        self
+    pub fn with_heartbeat_details(self, details: Option<serde_json::Value>) -> Self {
+        self.seed_heartbeat_details(details)
     }
 
     /// Like [`new_test`](Self::new_test) but with a caller-supplied identity, so
@@ -17836,6 +18258,52 @@ mod tests {
     use crate::types::{ActivityExecId, ShardId};
     use chrono::Utc;
     use std::time::Duration;
+
+    // ── Embedded-backend context (issue #2024) ──────────────────────────────
+
+    #[tokio::test]
+    async fn an_embedded_context_heartbeats_and_resumes() {
+        let identity = ActivityIdentity::for_test();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let ctx = ActivityContext::new_embedded(
+            empty_shared_state(),
+            identity.clone(),
+            tx,
+            Some(serde_json::json!({"done": 2})),
+        );
+
+        let resumed: Option<Value> = ctx.heartbeat_details().unwrap();
+        assert_eq!(resumed, Some(serde_json::json!({"done": 2})));
+        ctx.heartbeat(serde_json::json!({"done": 3})).await.unwrap();
+        assert_eq!(rx.recv().await, Some(serde_json::json!({"done": 3})));
+        assert_eq!(
+            ctx.idempotency_key().unwrap(),
+            &IdempotencyKey::from_activity_exec_id(identity.activity_id)
+        );
+        assert_eq!(ctx.identity(), identity);
+        assert!(!ctx.is_local());
+        assert!(!ctx.is_cancelled());
+        ctx.check_cancellation().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_embedded_context_reports_a_closed_sink_as_cancelled() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let ctx = ActivityContext::new_embedded(
+            empty_shared_state(),
+            ActivityIdentity::for_test(),
+            tx,
+            None,
+        );
+
+        let resumed: Option<Value> = ctx.heartbeat_details().unwrap();
+        assert_eq!(resumed, None);
+        assert!(matches!(
+            ctx.heartbeat(1).await,
+            Err(HarvestError::ActivityCancelled(_))
+        ));
+    }
 
     // ── Signal handlers (issue #546) ────────────────────────────────────────
 
@@ -24140,6 +24608,128 @@ mod tests {
             .await
             .expect("signal should replay");
         assert_eq!(payload, serde_json::json!({"ok": true}));
+    }
+
+    // ── wait_for_signal_matching / receive_signal_matching (issue #1985) ──
+
+    fn order_signal(payload: Value) -> WorkflowEvent {
+        WorkflowEvent::SignalReceived {
+            signal_name: "order".to_string(),
+            payload,
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_matching_returns_the_first_matching_payload() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started_event(),
+                order_signal(serde_json::json!({"id": 41})),
+                order_signal(serde_json::json!({"id": 42})),
+            ],
+        );
+        let payload = ctx
+            .wait_for_signal_matching("order", |p| p["id"] == 42)
+            .await
+            .expect("the matching signal replays");
+        assert_eq!(payload, serde_json::json!({"id": 42}));
+        let skipped = ctx.wait_for_signal("order").await.expect("still buffered");
+        assert_eq!(skipped, serde_json::json!({"id": 41}));
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_matching_parks_without_a_match() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![started_event(), order_signal(serde_json::json!({"id": 41}))],
+        );
+        let parked = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            ctx.wait_for_signal_matching("order", |p| p["id"] == 42),
+        )
+        .await;
+        assert!(parked.is_err(), "the wait must park: {parked:?}");
+        let commands = ctx.drain_commands();
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::WaitForSignal { signal_name, .. } if signal_name == "order"
+            )),
+            "the park reuses WaitForSignal: {commands:?}"
+        );
+        assert!(
+            ctx.signal_probed_at_frontier("order"),
+            "a predicate wait must stop a warm resume"
+        );
+        assert!(
+            !ctx.history_has_unconsumed_events(),
+            "the rejected signal is not drift"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_matching_predicate_may_call_the_context() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started_event(),
+                order_signal(serde_json::json!({"id": 41})),
+                order_signal(serde_json::json!({"id": 42})),
+            ],
+        );
+        let matched = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.wait_for_signal_matching("order", |p| !ctx.is_replaying() || p["id"] == 42),
+        )
+        .await
+        .expect("a predicate that reads the context must not deadlock")
+        .expect("the matching signal replays");
+        assert_eq!(matched, serde_json::json!({"id": 42}));
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_matching_stops_at_the_first_match() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started_event(),
+                order_signal(serde_json::json!({"id": 42})),
+                order_signal(serde_json::json!("not an order")),
+            ],
+        );
+        let matched = ctx
+            .wait_for_signal_matching("order", |p| {
+                p["id"]
+                    .as_u64()
+                    .expect("the predicate never sees a later payload")
+                    == 42
+            })
+            .await
+            .expect("the first signal matches");
+        assert_eq!(matched, serde_json::json!({"id": 42}));
+    }
+
+    #[derive(Debug, serde::Deserialize, PartialEq)]
+    struct Order {
+        id: u64,
+    }
+
+    #[tokio::test]
+    async fn receive_signal_matching_skips_a_payload_that_does_not_decode() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started_event(),
+                order_signal(serde_json::json!("not an order")),
+                order_signal(serde_json::json!({"id": 42})),
+            ],
+        );
+        let order: Order = ctx
+            .receive_signal_matching("order", |o: &Order| o.id == 42)
+            .await
+            .expect("the decodable match replays");
+        assert_eq!(order, Order { id: 42 });
     }
 
     // ── wait_for_signal_timeout / receive_signal_timeout (issue #476) ──────
