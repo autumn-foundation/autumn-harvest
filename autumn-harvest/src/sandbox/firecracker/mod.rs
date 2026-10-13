@@ -19,6 +19,8 @@ pub mod config;
 #[cfg(test)]
 pub(crate) mod fake;
 pub mod jailer;
+#[cfg(test)]
+mod kvm_tests;
 pub mod launcher;
 pub mod pool;
 pub mod posture;

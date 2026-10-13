@@ -1,0 +1,101 @@
+# Sandboxed code activities on real Firecracker microVMs.
+#
+# The `test-nodb` job of ci.yml runs the sandbox tests without KVM. This
+# workflow boots real microVMs on a GitHub runner with /dev/kvm. It builds the
+# guest image with scripts/sandbox/build-guest-image.sh and runs the ignored
+# `sandbox::firecracker::kvm_tests`. See docs/sandbox-activities.md.
+#
+# The jailer test needs root, so a second step runs the test binary with sudo.
+# Each download has a pinned digest.
+name: Sandbox (KVM)
+
+on:
+  pull_request:
+    paths:
+      - "autumn-harvest/src/sandbox/**"
+      - "autumn-harvest-sandbox-guest/**"
+      - "scripts/sandbox/**"
+      - ".github/workflows/sandbox-kvm.yml"
+  push:
+    branches: [trunk-dev]
+    paths:
+      - "autumn-harvest/src/sandbox/**"
+      - "autumn-harvest-sandbox-guest/**"
+      - "scripts/sandbox/**"
+      - ".github/workflows/sandbox-kvm.yml"
+  workflow_dispatch:
+  schedule:
+    # Weekly on Monday at 04:17 UTC, so a new runner image cannot break KVM
+    # unseen.
+    - cron: "17 4 * * 1"
+
+concurrency:
+  group: sandbox-kvm-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  FIRECRACKER_VERSION: v1.17.0
+  FIRECRACKER_SHA256: 06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558
+  KERNEL_URL: https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.155
+  KERNEL_SHA256: e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2
+
+jobs:
+  kvm:
+    name: Sandbox (KVM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Give the runner user /dev/kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - name: Install Firecracker and the jailer
+        run: |
+          dir="${RUNNER_TEMP}/fc"
+          mkdir -p "${dir}"
+          url="https://github.com/firecracker-microvm/firecracker/releases/download"
+          curl -fsSL --retry 3 -o "${dir}/fc.tgz" \
+            "${url}/${FIRECRACKER_VERSION}/firecracker-${FIRECRACKER_VERSION}-x86_64.tgz"
+          echo "${FIRECRACKER_SHA256}  ${dir}/fc.tgz" | sha256sum -c -
+          tar -xzf "${dir}/fc.tgz" -C "${dir}"
+          release="${dir}/release-${FIRECRACKER_VERSION}-x86_64"
+          # Short names keep the jailed socket paths below the AF_UNIX limit.
+          install -m 0755 "${release}/firecracker-${FIRECRACKER_VERSION}-x86_64" "${dir}/firecracker"
+          install -m 0755 "${release}/jailer-${FIRECRACKER_VERSION}-x86_64" "${dir}/jailer"
+          "${dir}/firecracker" --version
+          echo "HARVEST_FIRECRACKER_BIN=${dir}/firecracker" >> "${GITHUB_ENV}"
+          echo "HARVEST_JAILER_BIN=${dir}/jailer" >> "${GITHUB_ENV}"
+      - name: Build the guest image
+        run: |
+          scripts/sandbox/build-guest-image.sh "${RUNNER_TEMP}/image"
+          echo "HARVEST_GUEST_KERNEL=${RUNNER_TEMP}/image/vmlinux" >> "${GITHUB_ENV}"
+          echo "HARVEST_GUEST_ROOTFS=${RUNNER_TEMP}/image/rootfs.ext4" >> "${GITHUB_ENV}"
+      - name: Run the KVM tests
+        run: >-
+          cargo test -p autumn-harvest --no-default-features --features sandbox-activities --lib
+          sandbox::firecracker::kvm_tests -- --ignored --test-threads=1
+      - name: Run the jailer test as root
+        run: |
+          bin="$(cargo test -p autumn-harvest --no-default-features --features sandbox-activities \
+            --lib --no-run --message-format=json \
+            | jq -r 'select(.profile.test == true and .target.kind == ["lib"]) | .executable')"
+          sudo env \
+            "HARVEST_FIRECRACKER_BIN=${HARVEST_FIRECRACKER_BIN}" \
+            "HARVEST_JAILER_BIN=${HARVEST_JAILER_BIN}" \
+            "HARVEST_GUEST_KERNEL=${HARVEST_GUEST_KERNEL}" \
+            "HARVEST_GUEST_ROOTFS=${HARVEST_GUEST_ROOTFS}" \
+            "${bin}" sandbox::firecracker::kvm_tests::the_jailer --ignored --test-threads=1

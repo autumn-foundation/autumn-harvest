@@ -7,7 +7,8 @@ from the research and the plan.
 
 **No migration. No new `WorkflowEvent` variant. No worker change.** A sandbox
 run is an ordinary activity. The feature is `sandbox-activities`, off by
-default. It needs no database, and it adds no new crate.
+default. It needs no database, and a default build gains no dependency. The
+guest agent is a separate binary crate that only the guest image uses.
 
 ---
 
@@ -149,14 +150,14 @@ The evidence column is filled in when the work is done. See §3.
 
 | AC | Statement |
 |----|-----------|
-| AC1 | The feature is off by default, adds no crate, and builds on Linux, macOS and Windows. |
+| AC1 | The feature is off by default, adds no dependency to a default build, and builds on Linux, macOS and Windows. |
 | AC2 | An agent submits code, a runtime, files, stdin, arguments, environment and output paths as JSON. Unknown fields are an error. |
 | AC3 | The policy checks each request. A violation is a non-retryable denial that names the rule and the limit. |
 | AC4 | The default policy denies the network and refuses a backend weaker than a microVM. |
 | AC5 | A non-zero exit, a signal and a timeout are outcomes. Stdout and stderr keep a bounded head and tail, with byte counts and truncation flags. NUL never reaches history. |
 | AC6 | Requested output files return, bounded. A symlink, a FIFO or a path outside the work directory never returns. |
 | AC7 | Infrastructure faults are retryable. Denials and protocol violations are not. A cancel stops the run. |
-| AC8 | The process executor clears the environment, runs in a private directory, applies rlimits, makes the child a session leader, closes inherited descriptors, resets the signal mask, sets no-new-privileges and kills the whole group. |
+| AC8 | The process executor clears the environment, runs in a private directory and applies rlimits. It makes the child a session leader and closes inherited descriptors. It resets the signal mask, sets no-new-privileges and kills the whole group. |
 | AC9 | The process executor denies the network with an empty namespace, and it fails closed when it cannot create one. |
 | AC10 | The wire protocol uses versioned, length-prefixed frames. It checks the cap before it reads a body, and it checks the run id. |
 | AC11 | The guest agent answers a ping, runs one plan, reseeds its random pool from host entropy, and checks the plan again. |
@@ -171,7 +172,7 @@ The evidence column is filled in when the work is done. See §3.
 | AC20 | `HarvestBuilder::sandbox_activity` registers a normal activity. Its handler honors cancellation, injects the idempotency key, and sets timeouts and the result cap from the policy. |
 | AC21 | The agent crate offers a `Tool` that runs code through the runtime. Its effect follows the network policy. |
 | AC22 | A guide, this design record and the changelog fragment exist in ASD-STE100 style, and the comment hygiene gate passes. |
-| AC23 | CI runs the new tests on every OS where they apply. The KVM test is opt-in and documented. |
+| AC23 | CI runs the new tests on every OS where they apply. A dedicated workflow runs the KVM tests on real microVMs, and the guide documents them. |
 
 ---
 
@@ -196,6 +197,7 @@ green.
 | Activity | `sandbox::activity::tests` | AC20, R25, R26 |
 | Agent tool | `autumn-harvest-agent` `sandbox` tests | AC21 |
 | Docs | `sandbox_activities_docs` guard suite | AC22 |
+| Real microVMs | `sandbox::firecracker::kvm_tests`, ignored without KVM | AC12, AC15, AC16, AC23 |
 
 ---
 
