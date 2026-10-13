@@ -27,13 +27,17 @@
 //!
 //! # When a warm decision resumes
 //!
-//! The delta must start with the events of the last suspension, in order.
-//! Then it must hold at least one event that resolves a parked await. Each
-//! parked await resolves at most once. A resolving event must be an
-//! activity success, a timer fire or a signal. The start and heartbeat
-//! events of a parked activity may come before its result, because replay
-//! skips those too. The live channels carry these payloads exactly, as a
-//! replay reads them. Any other delta declines.
+//! The delta must start with all the events of the last suspension, in
+//! order. Then it holds the events that resolve parked awaits. Each parked
+//! await resolves at most once. A resolving event must be an activity
+//! success, a timer fire or a signal. The start and heartbeat events of a
+//! parked activity may come before its result, because replay skips those
+//! too. The live channels carry these payloads exactly, as a replay reads
+//! them. Any other delta declines.
+//!
+//! A delta with no resolving event is a redundant wake. Each parked
+//! activity then waits again, as in a partial join. A lone timer or signal
+//! cannot wait again, so its redundant wake declines.
 //!
 //! # Partial joins
 //!
@@ -97,7 +101,9 @@ pub enum ResumeDeclined {
     KeyChanged,
     /// The delta does not start with the events of the last suspension.
     OwnEventsMismatch,
-    /// The delta resolves no parked await.
+    /// The delta resolves no parked await, and the resume cannot wait
+    /// again. The delta is shorter than the events of the last suspension,
+    /// or the lone parked await is a timer or a signal.
     NoResolution,
     /// The delta holds an event after every parked await resolved, or a
     /// second result for one await.
@@ -606,16 +612,21 @@ impl ResidentWorkflow {
     /// that the live channel can carry each payload exactly.
     ///
     /// Decision boundaries (issue #1833) are skipped. Replay never reads them.
+    ///
+    /// A delta that holds all the own events and no result resolves no
+    /// await. That is a redundant wake, so every await stays parked.
     fn resolutions(&self, delta: &[WorkflowEvent]) -> Result<Vec<Option<usize>>, ResumeDeclined> {
         let mut events = delta
             .iter()
             .enumerate()
             .filter(|(_, event)| !event.is_decision_boundary());
         // A delta shorter than the own events is checked as far as it goes.
+        let mut own_seen = 0;
         let own_match = self.own_events.iter().all(|expected| {
-            events
-                .next()
-                .is_none_or(|(_, event)| expected.matches(event))
+            events.next().is_none_or(|(_, event)| {
+                own_seen += 1;
+                expected.matches(event)
+            })
         });
         if !own_match {
             return Err(ResumeDeclined::OwnEventsMismatch);
@@ -647,7 +658,9 @@ impl ResidentWorkflow {
             }
             resolved[index] = Some(at);
         }
-        if resolved.iter().all(Option::is_none) {
+        // A short delta can still lack an event that the last decision
+        // wrote, so only a complete one is a redundant wake.
+        if resolved.iter().all(Option::is_none) && own_seen < self.own_events.len() {
             return Err(ResumeDeclined::NoResolution);
         }
         Ok(resolved)
@@ -671,6 +684,11 @@ impl ResidentWorkflow {
             return Err(ResumeDeclined::KeyChanged);
         }
         let mut ends: Vec<usize> = self.resolutions(delta)?.into_iter().flatten().collect();
+        // A redundant wake runs one step that only waits again. A lone timer
+        // or signal cannot wait again, so the step declines it.
+        if ends.is_empty() {
+            return self.step(delta, span_meta).await;
+        }
         ends.sort_unstable();
         // The last step also takes the progress events after the last result.
         if let Some(last) = ends.last_mut() {
@@ -717,8 +735,8 @@ impl ResidentWorkflow {
                 parked.deliver(&delta[at])?;
                 continue;
             }
-            // Only an activity can wait again. Capture parks a timer or a
-            // signal only alone, and a delta always resolves a lone await.
+            // Only an activity can wait again. A lone timer or signal that
+            // a redundant wake does not resolve declines here.
             let wait = parked.into_wait().ok_or(ResumeDeclined::NoResolution)?;
             if let WorkflowCommand::WaitForActivity { activity_id, .. } = &wait {
                 reparked.push(*activity_id);
@@ -1483,11 +1501,6 @@ mod tests {
                 Box::new(|_own, id| vec![completed(id)]),
             ),
             (
-                "own events only",
-                ResumeDeclined::NoResolution,
-                Box::new(|own, _id| own.to_vec()),
-            ),
-            (
                 "wrong activity id",
                 ResumeDeclined::UnexpectedEvent("ActivityCompleted"),
                 Box::new(move |own, _id| [own.to_vec(), vec![completed(other)]].concat()),
@@ -1707,6 +1720,52 @@ mod tests {
             declined.err(),
             Some(ResumeDeclined::KeyChanged),
             "a new shard or name must decline"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wake_with_nothing_new_waits_again() {
+        // A second wake for results that the last decision already read
+        // brings only the own events of the suspension.
+        let (resident, own, id) = suspended_activity().await;
+        let (outcome, next) = resident
+            .resume(&own)
+            .await
+            .expect("a wake with nothing new must not decline");
+        assert!(
+            matches!(&outcome, WorkflowOutcome::Suspended { commands }
+                if matches!(commands.as_slice(), [WorkflowCommand::WaitForActivity { activity_id, .. }] if *activity_id == id)),
+            "the cycle must only wait again: {outcome:?}"
+        );
+        let next = next.expect("the workflow stays resident");
+        let (outcome, _) = next
+            .resume(&[decision_boundary(), completed(id)])
+            .await
+            .expect("the result resolves");
+        assert!(
+            matches!(&outcome, WorkflowOutcome::Completed { output, .. } if *output == json!(1)),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wake_with_nothing_new_declines_for_a_lone_timer() {
+        let (outcome, resident) = start(
+            ExecutionId::new(),
+            vec![started(Value::Null)],
+            timer_loop_workflow,
+            Value::Null,
+        )
+        .await;
+        let WorkflowOutcome::Suspended { commands } = outcome else {
+            panic!("the first decision must suspend");
+        };
+        let own = own_events(&commands);
+        let resident = resident.expect("a timer suspension is resident");
+        assert_eq!(
+            resident.resume(&own).await.err(),
+            Some(ResumeDeclined::NoResolution),
+            "only an activity can wait again"
         );
     }
 
