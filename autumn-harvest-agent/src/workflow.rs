@@ -762,6 +762,18 @@ async fn run_tool(
     .map_err(|e| e.to_string())
 }
 
+/// The arguments of a `delegate` call, or `None` when they are not exactly
+/// `agent` and `task`.
+///
+/// serde also decodes a struct from a JSON array, so the arguments must be
+/// an object to have the named fields.
+fn delegate_args(arguments: &serde_json::Value) -> Option<DelegateArgs> {
+    arguments
+        .is_object()
+        .then(|| serde_json::from_value(arguments.clone()).ok())
+        .flatten()
+}
+
 /// Run one `delegate` call: refuse it with a named verdict, or run the peer
 /// inline as a sub-agent.
 ///
@@ -778,11 +790,7 @@ async fn delegate(
     call: &ToolCall,
 ) -> Result<ToolOutcome, String> {
     let task = run.task;
-    // serde also decodes a struct from a JSON array, so the arguments must
-    // be an object to have the named fields `agent` and `task`.
-    let admitted = Some(&call.arguments)
-        .filter(|arguments| arguments.is_object())
-        .and_then(|arguments| serde_json::from_value::<DelegateArgs>(arguments.clone()).ok())
+    let admitted = delegate_args(&call.arguments)
         .ok_or((Refusal::InvalidArguments, String::new()))
         .and_then(|args| {
             admit(agent, task, progress, tree, &args.agent)
