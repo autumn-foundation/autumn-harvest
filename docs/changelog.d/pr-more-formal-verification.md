@@ -1,7 +1,7 @@
 ## More formal verification: Verus proofs, more Kani proofs, a fourth Shuttle model
 
 **Verus.** A new `verus` CI job runs `scripts/check-verus-proofs.sh`. The
-script pins the Verus release `0.2026.10.12.4bfc2b4` by SHA-256 and checks
+script pins the weekly Verus release `0.2026.10.04.426d8b0` by SHA-256 and checks
 `formal/verus/src/lib.rs`. The proofs take about 2 seconds.
 
 - `mixers.rs`: `policy::mix64`, `dlq::mix64` and `chaos::splitmix64` are
