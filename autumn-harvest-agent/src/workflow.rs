@@ -955,8 +955,19 @@ async fn cache_tenant(
 /// id, the step and the call id as an idempotency key. With a shared run
 /// id, a hit could give a tool a key that an earlier run used, so the turn
 /// skips the cache.
+///
+/// A delegated child has the run id `{root}:d{n}`. A later run of the same
+/// workflow id gives its child the same id, so the rule covers the root part.
 fn shares_run_id(run_id: &str, workflow_id: &str, execution_id: &str) -> bool {
-    run_id == workflow_id && run_id != execution_id
+    let root = child_root(run_id).unwrap_or(run_id);
+    (run_id == workflow_id || root == workflow_id) && run_id != execution_id && root != execution_id
+}
+
+/// The root run id of a delegated child run id `{root}:d{n}`, or `None` for
+/// any other run id.
+fn child_root(run_id: &str) -> Option<&str> {
+    let (root, ordinal) = run_id.rsplit_once(":d")?;
+    (!ordinal.is_empty() && ordinal.bytes().all(|byte| byte.is_ascii_digit())).then_some(root)
 }
 
 /// Pick the cache tenant from the verified read and the task field.
@@ -1109,6 +1120,16 @@ mod tests {
         assert!(!shares_run_id("0e3c", "daily", "0e3c"));
         // A test context has neither id.
         assert!(!shares_run_id("run-1", "", "00000000"));
+    }
+
+    #[test]
+    fn a_child_of_a_workflow_id_run_skips_the_cache() {
+        assert!(shares_run_id("daily:d1", "daily", "0e3c"));
+        assert!(shares_run_id("daily:d12", "daily", "0e3c"));
+        assert!(!shares_run_id("0e3c:d1", "daily", "0e3c"));
+        // A workflow id that only looks like a child id keeps the old rule.
+        assert!(shares_run_id("agent:daily", "agent:daily", "0e3c"));
+        assert!(!shares_run_id("agent:daily", "agent", "0e3c"));
     }
 
     #[test]
