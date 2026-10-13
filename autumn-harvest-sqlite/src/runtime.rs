@@ -1041,7 +1041,14 @@ impl SqliteRuntime {
     /// `batch` holds the events of the cycle that ends the run. They persist
     /// before the terminal `WorkflowCancelled` event, as on the completed and
     /// failed paths (issue #2020). A batch that reaches a history cap or the
-    /// cleanup budget is discarded, so the seal adds only `WorkflowCancelled`.
+    /// cleanup budget is discarded.
+    ///
+    /// The seal drops each pending task. The body can await such a task, and
+    /// replay then parks before `WorkflowCancelled`. So each dropped task first
+    /// gets a non-retryable `ActivityFailed`. The failures must fit the history
+    /// caps. They do not count toward the cleanup budget, because each one
+    /// resolves a task that the budget already admitted. Failures that reach a
+    /// cap roll back, and the seal then adds only `WorkflowCancelled`.
     fn seal_cancelled(
         &mut self,
         exec: ExecutionId,
@@ -1049,16 +1056,39 @@ impl SqliteRuntime {
         batch: Option<CancelBatch<'_>>,
     ) -> SqliteResult<RunState> {
         if let Some(batch) = batch {
+            let caps = CapCheck {
+                policy: self.history_policy,
+                start_bytes: batch.caps.start_bytes,
+                workflow_type: batch.caps.workflow_type,
+            };
             let tx = self.conn.transaction()?;
             batch.ingest.apply(&tx, exec)?;
             persist_terminal_pending_commands(&tx, exec, batch.pending)?;
             if batch.caps.reached(&tx, exec)?.is_none() {
-                seal_with_cancel_event(&tx, exec, CANCELLED_STATE, reason)?;
-                tx.commit()?;
-                return Ok(RunState::Cancelled(reason.to_string()));
+                fail_dropped_tasks(&tx, exec, &self.activities)?;
+                if caps.reached(&tx, exec)?.is_none() {
+                    seal_with_cancel_event(&tx, exec, CANCELLED_STATE, reason)?;
+                    tx.commit()?;
+                    return Ok(RunState::Cancelled(reason.to_string()));
+                }
             }
         }
+        let (_, history_bytes) = store::load_history_sized(&self.conn, exec)?;
+        let workflow_name = store::workflow_name_of(&self.conn, exec)?;
+        let caps = CapCheck {
+            policy: self.history_policy,
+            start_bytes: history_bytes,
+            workflow_type: &workflow_name,
+        };
         let tx = self.conn.transaction()?;
+        fail_dropped_tasks(&tx, exec, &self.activities)?;
+        if caps.reached(&tx, exec)?.is_some() {
+            drop(tx);
+            let tx = self.conn.transaction()?;
+            seal_with_cancel_event(&tx, exec, CANCELLED_STATE, reason)?;
+            tx.commit()?;
+            return Ok(RunState::Cancelled(reason.to_string()));
+        }
         seal_with_cancel_event(&tx, exec, CANCELLED_STATE, reason)?;
         tx.commit()?;
         Ok(RunState::Cancelled(reason.to_string()))
@@ -1635,75 +1665,12 @@ impl SqliteRuntime {
             | SqliteError::UnknownWorkflow(_)
             | SqliteError::Stuck(_)),
         ) = &result
-            && let Some((reason, from)) = store::cancel_request(&self.conn, exec)?
+            && let Some((reason, _)) = store::cancel_request(&self.conn, exec)?
         {
             tracing::warn!(%exec, ?error, "a pending cancel ends a run the drive cannot advance");
-            if matches!(error, SqliteError::UnregisteredActivity(_)) {
-                return self.seal_cancelled_failing_unregistered(exec, &reason, from);
-            }
             return self.seal_cancelled(exec, &reason, None);
         }
         result
-    }
-
-    /// End `exec` `CANCELLED` after an unregistered activity, and first fail
-    /// each pending task that the seal drops (issue #2021).
-    ///
-    /// The body awaits those activities. Without a result, replay parks before
-    /// `WorkflowCancelled` and diverges. A non-retryable `ActivityFailed` lets
-    /// replay resolve each await and reach the terminal event.
-    ///
-    /// The failures are one more batch, so the history caps and the cleanup
-    /// budget apply. A batch that reaches them rolls back, and the seal adds
-    /// only `WorkflowCancelled`.
-    fn seal_cancelled_failing_unregistered(
-        &mut self,
-        exec: ExecutionId,
-        reason: &str,
-        cancel_from: usize,
-    ) -> SqliteResult<RunState> {
-        let (_, history_bytes) = store::load_history_sized(&self.conn, exec)?;
-        let workflow_name = store::workflow_name_of(&self.conn, exec)?;
-        let caps = CapCheck {
-            policy: self.cancel_policy(Some(
-                cancel_from.saturating_add(CANCEL_CLEANUP_EVENT_BUDGET),
-            )),
-            start_bytes: history_bytes,
-            workflow_type: &workflow_name,
-        };
-        let tx = self.conn.transaction()?;
-        for (activity_id, name, attempt) in queue::pending_tasks(&tx, exec)? {
-            let (error, error_type) = if self.activities.contains_key(&name) {
-                (
-                    format!("the cancel seal dropped pending activity: {name}"),
-                    CANCEL_SEALED_ERROR_TYPE,
-                )
-            } else {
-                (
-                    SqliteError::unregistered(&name).to_string(),
-                    UNREGISTERED_ACTIVITY_ERROR_TYPE,
-                )
-            };
-            store::append_event(
-                &tx,
-                exec,
-                &WorkflowEvent::ActivityFailed {
-                    activity_id,
-                    error,
-                    attempt: attempt.saturating_add(1),
-                    error_type: error_type.to_string(),
-                    non_retryable: true,
-                    details: None,
-                },
-            )?;
-        }
-        if caps.reached(&tx, exec)?.is_some() {
-            drop(tx);
-            return self.seal_cancelled(exec, reason, None);
-        }
-        seal_with_cancel_event(&tx, exec, CANCELLED_STATE, reason)?;
-        tx.commit()?;
-        Ok(RunState::Cancelled(reason.to_string()))
     }
 
     /// The history policy of a cycle (issue #2021). Under a pending cancel,
@@ -2840,6 +2807,43 @@ const DEFAULT_TERMINATE_REASON: &str = "workflow termination requested";
 fn reason_or(reason: &str, default: &str) -> String {
     let reason = reason.trim();
     if reason.is_empty() { default } else { reason }.to_string()
+}
+
+/// Append a non-retryable `ActivityFailed` for each pending task of `exec`,
+/// inside the caller's seal transaction (issue #2021). The error type is
+/// `UnregisteredActivity` for an unregistered activity, and `CancelSealed`
+/// otherwise.
+fn fail_dropped_tasks(
+    conn: &Connection,
+    exec: ExecutionId,
+    activities: &HashMap<String, ActivitySpec>,
+) -> SqliteResult<()> {
+    for (activity_id, name, attempt) in queue::pending_tasks(conn, exec)? {
+        let (error, error_type) = if activities.contains_key(&name) {
+            (
+                format!("the cancel seal dropped pending activity: {name}"),
+                CANCEL_SEALED_ERROR_TYPE,
+            )
+        } else {
+            (
+                SqliteError::unregistered(&name).to_string(),
+                UNREGISTERED_ACTIVITY_ERROR_TYPE,
+            )
+        };
+        store::append_event(
+            conn,
+            exec,
+            &WorkflowEvent::ActivityFailed {
+                activity_id,
+                error,
+                attempt: attempt.saturating_add(1),
+                error_type: error_type.to_string(),
+                non_retryable: true,
+                details: None,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 /// Append `WorkflowCancelled { reason }` and seal `exec` in `state` with

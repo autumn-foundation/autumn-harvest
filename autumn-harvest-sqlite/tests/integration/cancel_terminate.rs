@@ -1315,6 +1315,44 @@ async fn failures_past_the_history_cap_leave_a_cancel_only_seal() {
 }
 
 #[tokio::test]
+async fn a_cancel_seal_resolves_a_retry_in_backoff() {
+    let (_dir, path) = temp_db();
+    let t0 = fixed_now();
+    let (exec, calls) = {
+        let (mut rt, calls) = runtime(&path);
+        let exec = rt.start_workflow("retries", json!(5)).unwrap();
+        assert!(matches!(
+            rt.run_until_blocked_as_of(exec, t0).await.unwrap(),
+            RunState::WaitingTimer
+        ));
+        (exec, calls)
+    };
+    // A reopen that registers no workflow cannot replay the body. The seal
+    // runs at once, while the retry still waits in backoff.
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.cancel(exec, "enough").unwrap();
+
+    let state = rt.run_until_blocked_as_of(exec, t0).await.unwrap();
+    assert!(matches!(&state, RunState::Cancelled(reason) if reason == "enough"));
+    assert_eq!(
+        calls.flaky.load(Ordering::SeqCst),
+        1,
+        "the retry did not run"
+    );
+    assert_eq!(leftover_rows(&path, exec), (0, 0, 0));
+
+    let history = rt.load_history(exec).unwrap();
+    let events = history.len();
+    let report = replay(history, "retries", retries_info().handler).await;
+    // The seal fails the dropped retry, so replay resolves the await.
+    assert!(
+        matches!(&report.status, ReplayStatus::WorkflowFailed { .. }),
+        "the dropped retry must resolve on replay:\n{report}"
+    );
+    assert_eq!(report.events_replayed, events);
+}
+
+#[tokio::test]
 async fn a_terminated_history_replays_on_the_core_replayer() {
     let (_dir, path) = temp_db();
     let (mut rt, _calls) = runtime(&path);

@@ -27,6 +27,10 @@ the agent daemon, could not stop a stuck run.
 - Both paths append the core `WorkflowCancelled { reason }` event as the last
   event, as Postgres does. They delete pending tasks, unfired timers and
   staged signals.
+- A cancel seal first records a non-retryable `ActivityFailed` for each
+  pending task that it drops, within the history caps. A body that awaits
+  the task then replays. The error type is `UnregisteredActivity` or
+  `CancelSealed`. `terminate` adds no failures, as on Postgres.
 - An unknown id returns `ExecutionNotFound`. A terminal run returns
   `WorkflowNotRunning`. Postgres treats a repeat call on a terminal run as a
   no-op. A blank reason gets the Postgres default text.
@@ -71,8 +75,9 @@ covers:
 - a deadlock and a panic under a pending request;
 - a busy body that ignores the request and keeps running activities;
 - an unregistered cleanup activity, alone or beside a registered one, and
-  an unregistered workflow. Each pending task gets a non-retryable
-  `ActivityFailed` within the caps, so the history replays;
+  an unregistered workflow;
+- a seal that drops a pending task. The task gets a non-retryable
+  `ActivityFailed` within the history caps, so the history replays;
 - a cleanup that reaches the history cap, and a final or suspending batch
   past the cap or the budget;
 - a side effect of the returning cycle, and a second drive of a cancelled run;

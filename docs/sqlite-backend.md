@@ -344,15 +344,18 @@ The run ends `CANCELLED` when one of these occurs:
   run. A parked await cannot see the request.
 - The cycle diverges or deadlocks. The driver discards that cycle.
 - The drive meets an error that repeats on every drive: an unregistered
-  activity or workflow, or a stuck cycle. After an unregistered activity,
-  each pending task first gets a non-retryable `ActivityFailed`, so the
-  history still replays. The error type is `UnregisteredActivity`, or
-  `CancelSealed` for a registered task. A batch of failures that reaches a
-  cap or the budget rolls back, and the seal adds only `WorkflowCancelled`.
+  activity or workflow, or a stuck cycle.
 - The run has added 1,000 events since the request. A body that ignores the
   request and keeps working cannot run forever. The budget leaves room for
   about 500 cleanup activities. The budget acts as one more event cap: a
   cycle whose events reach it, or reach a history cap, is discarded.
+
+The seal drops each pending task. Each one first gets a non-retryable
+`ActivityFailed`, so a body that awaits it still replays. The error type
+is `UnregisteredActivity` for an unregistered activity, and `CancelSealed`
+otherwise. These failures must fit the history caps, but not the cleanup
+budget. Failures that reach a cap roll back, and the seal then adds only
+`WorkflowCancelled`. `terminate` adds no failures, as on Postgres.
 
 So every cancel ends the run. Cleanup can run activities, but it must not
 wait on a timer or a signal: that wait ends the run. A pending activity task,
