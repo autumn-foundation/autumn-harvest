@@ -34,13 +34,17 @@ use crate::tool::{Tool, ToolContext, ToolEffect};
 pub const DEFAULT_TOOL_NAME: &str = "run_code";
 
 /// The characters of each stream in the view of the model.
-pub const VIEW_STREAM_CHARS: usize = 2400;
+pub const VIEW_STREAM_CHARS: usize = 2000;
 
-/// The characters of all output files together in the view of the model.
-pub const VIEW_FILE_CHARS: usize = 1200;
+/// The characters of all output entries together in the view of the model:
+/// paths, skip reasons and file text.
+pub const VIEW_OUTPUTS_CHARS: usize = 1500;
 
-/// The characters of each skip reason in the view of the model.
-const VIEW_REASON_CHARS: usize = 80;
+/// The characters of each path and each skip reason in the view.
+const VIEW_LABEL_CHARS: usize = 80;
+
+/// Room for the JSON structure of one output entry, in characters.
+const VIEW_ENTRY_CHARS: usize = 48;
 
 /// A tool that runs code on a [`SandboxRuntime`].
 #[derive(Debug, Clone)]
@@ -210,41 +214,59 @@ impl Tool for SandboxTool {
 
 /// The bounded view of `outcome` that the model reads.
 ///
-/// Each stream keeps a head and a tail of [`VIEW_STREAM_CHARS`]. The UTF-8
-/// output files share [`VIEW_FILE_CHARS`] as `text`. Another file shows only
-/// its size. The byte counts stay exact.
+/// The harness sorts the keys and cuts the end, and `outputs` sorts before
+/// `status`. So the output entries share [`VIEW_OUTPUTS_CHARS`]: each path
+/// and skip reason is cut, and UTF-8 file text shares the rest. An entry that
+/// does not fit is only counted, in `outputs_more` or `skipped_more`. Each
+/// stream keeps a head and a tail of [`VIEW_STREAM_CHARS`]. The byte counts
+/// stay exact.
 #[must_use]
 pub fn model_view(outcome: &SandboxOutcome) -> serde_json::Value {
-    let mut file_budget = VIEW_FILE_CHARS;
-    let outputs: Vec<serde_json::Value> = outcome
-        .outputs
-        .iter()
-        .map(|file| {
-            let Ok(text) = std::str::from_utf8(&file.content) else {
-                return serde_json::json!({
-                    "path": file.path,
+    let mut budget = VIEW_OUTPUTS_CHARS;
+    let mut outputs = Vec::new();
+    let mut outputs_more = 0usize;
+    let entries = outcome.outputs.len() + outcome.skipped_outputs.len();
+    for (index, file) in outcome.outputs.iter().enumerate() {
+        let path = cut(&file.path, VIEW_LABEL_CHARS);
+        let cost = path.chars().count() + VIEW_ENTRY_CHARS;
+        if cost > budget {
+            outputs_more += 1;
+            continue;
+        }
+        budget -= cost;
+        let entry = std::str::from_utf8(&file.content).map_or_else(
+            |_| serde_json::json!({"path": path, "bytes": file.content.len(), "binary": true}),
+            |text| {
+                // Share the rest evenly, so one large file leaves room for
+                // the entries after it.
+                let shown = cut(text, budget / (entries - index));
+                budget -= shown.chars().count();
+                serde_json::json!({
+                    "path": path,
                     "bytes": file.content.len(),
-                    "binary": true,
-                });
-            };
-            let shown = cut(text, file_budget);
-            file_budget = file_budget.saturating_sub(shown.chars().count());
-            serde_json::json!({
-                "path": file.path,
-                "bytes": file.content.len(),
-                "text": shown,
-                "truncated": shown != text,
-            })
-        })
-        .collect();
-    let skipped: Vec<serde_json::Value> = outcome
-        .skipped_outputs
-        .iter()
-        .map(|skip| serde_json::json!({"path": skip.path, "reason": cut(&skip.reason, VIEW_REASON_CHARS)}))
-        .collect();
+                    "text": shown,
+                    "truncated": shown != text,
+                })
+            },
+        );
+        outputs.push(entry);
+    }
+    let mut skipped = Vec::new();
+    let mut skipped_more = 0usize;
+    for skip in &outcome.skipped_outputs {
+        let path = cut(&skip.path, VIEW_LABEL_CHARS);
+        let reason = cut(&skip.reason, VIEW_LABEL_CHARS);
+        let cost = path.chars().count() + reason.chars().count() + VIEW_ENTRY_CHARS;
+        if cost > budget {
+            skipped_more += 1;
+            continue;
+        }
+        budget -= cost;
+        skipped.push(serde_json::json!({"path": path, "reason": reason}));
+    }
     let stdout = cut(&outcome.stdout, VIEW_STREAM_CHARS);
     let stderr = cut(&outcome.stderr, VIEW_STREAM_CHARS);
-    serde_json::json!({
+    let mut view = serde_json::json!({
         "status": outcome.status,
         "stdout_truncated": outcome.stdout_truncated || stdout != outcome.stdout,
         "stderr_truncated": outcome.stderr_truncated || stderr != outcome.stderr,
@@ -255,7 +277,16 @@ pub fn model_view(outcome: &SandboxOutcome) -> serde_json::Value {
         "outputs": outputs,
         "skipped_outputs": skipped,
         "duration_ms": outcome.duration_ms,
-    })
+    });
+    for (key, more) in [
+        ("outputs_more", outputs_more),
+        ("skipped_more", skipped_more),
+    ] {
+        if more > 0 {
+            view[key] = serde_json::json!(more);
+        }
+    }
+    view
 }
 
 /// `text` with at most `max` characters: the head and the tail around a
@@ -279,7 +310,7 @@ mod tests {
 
     use autumn_harvest::sandbox::runtime::BoxFuture as SandboxFuture;
     use autumn_harvest::sandbox::{
-        OutputFile, RunStatus, SandboxBackend, SandboxJob, SandboxPolicy,
+        OutputFile, RunStatus, SandboxBackend, SandboxJob, SandboxPolicy, SkippedOutput,
     };
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
@@ -424,6 +455,43 @@ mod tests {
             ToolEffect::Write,
             "a host process can change host files"
         );
+    }
+
+    #[test]
+    fn many_long_output_paths_do_not_push_the_status_out_of_the_cut() {
+        let mut outcome = SandboxOutcome {
+            status: RunStatus::Exited { code: 1 },
+            stdout: "o".repeat(50_000),
+            stderr: "Traceback: boom".into(),
+            stdout_bytes: 50_000,
+            stderr_bytes: 15,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            outputs: Vec::new(),
+            skipped_outputs: Vec::new(),
+            duration_ms: 5,
+            isolation: IsolationLevel::MicroVm,
+            image: None,
+        };
+        for i in 0..16 {
+            outcome.outputs.push(OutputFile {
+                path: format!("{i:02}/{}", "p".repeat(500)),
+                content: vec![b'x'; 300],
+            });
+            outcome.skipped_outputs.push(SkippedOutput {
+                path: format!("{i:02}/{}", "q".repeat(500)),
+                reason: "r".repeat(256),
+            });
+        }
+        let text = model_view(&outcome).to_string();
+        assert!(text.len() < 8000, "{} bytes", text.len());
+        let status = text.find("\"status\"").unwrap();
+        let stderr = text.find("Traceback: boom").unwrap();
+        assert!(
+            status < 3000 && stderr < 3500,
+            "status at {status}, stderr at {stderr}"
+        );
+        assert!(text.contains("\"outputs_more\""), "{text}");
     }
 
     #[test]

@@ -107,9 +107,13 @@ jobs:
           bin="$(cargo test -p autumn-harvest --no-default-features --features sandbox-activities \
             --lib --no-run --message-format=json \
             | jq -r 'select(.profile.test == true and .target.kind == ["lib"]) | .executable')"
+          # A jailed launcher refuses an image that a non-root user could
+          # replace, so the root tests use a copy that root owns.
+          sudo install -d -m 0755 /srv/harvest-image
+          sudo install -m 0644 "${HARVEST_GUEST_KERNEL}" "${HARVEST_GUEST_ROOTFS}" /srv/harvest-image/
           sudo env \
             "HARVEST_FIRECRACKER_BIN=${HARVEST_FIRECRACKER_BIN}" \
             "HARVEST_JAILER_BIN=${HARVEST_JAILER_BIN}" \
-            "HARVEST_GUEST_KERNEL=${HARVEST_GUEST_KERNEL}" \
-            "HARVEST_GUEST_ROOTFS=${HARVEST_GUEST_ROOTFS}" \
+            "HARVEST_GUEST_KERNEL=/srv/harvest-image/vmlinux" \
+            "HARVEST_GUEST_ROOTFS=/srv/harvest-image/rootfs.ext4" \
             "${bin}" root_ --ignored --test-threads=1

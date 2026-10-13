@@ -249,6 +249,12 @@ impl FirecrackerLauncher {
             }
         }
         if let Confinement::Jailer(jailer) = &config.confinement {
+            if jailer.uid == 0 || jailer.gid == 0 {
+                return Err(SandboxError::Config(
+                    "the jailer must drop to a non-root uid and gid, or an escaped VMM keeps root"
+                        .into(),
+                ));
+            }
             check_shared_files(&config, jailer.uid)?;
         }
         let exec_name = super::jailer::exec_name(&config.firecracker_bin)?;
@@ -823,13 +829,56 @@ fn check_shared_files(config: &LauncherConfig, jail_uid: u32) -> Result<(), Sand
         shared.push(&files.state);
         shared.push(&files.memory);
     }
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
     for path in shared {
-        let meta = std::fs::metadata(path)
-            .map_err(|e| SandboxError::Config(format!("cannot inspect {}: {e}", path.display())))?;
+        let inspect = |what: &Path| {
+            std::fs::symlink_metadata(what).map_err(|e| {
+                SandboxError::Config(format!("cannot inspect {}: {e}", what.display()))
+            })
+        };
+        check_trusted_ancestors(path, euid, inspect)?;
+        let meta = inspect(path)?;
         if meta.uid() == jail_uid || meta.mode() & 0o022 != 0 {
             return Err(SandboxError::Config(format!(
                 "{} must not belong to the jail uid {jail_uid}, and only its owner may write it",
                 path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Check the path of a shared file and each of its parent directories.
+///
+/// A user who can write a parent can replace the file between the check and
+/// the link. So the path must hold no symbolic link, and each part must
+/// belong to root or to this process. A directory that others can write
+/// must be sticky, such as /tmp, so each entry stays with its owner.
+fn check_trusted_ancestors(
+    path: &Path,
+    euid: u32,
+    inspect: impl Fn(&Path) -> Result<std::fs::Metadata, SandboxError>,
+) -> Result<(), SandboxError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let absolute = std::path::absolute(path)
+        .map_err(|e| SandboxError::Config(format!("bad path {}: {e}", path.display())))?;
+    let canonical = std::fs::canonicalize(&absolute)
+        .map_err(|e| SandboxError::Config(format!("cannot resolve {}: {e}", path.display())))?;
+    if canonical != absolute {
+        return Err(SandboxError::Config(format!(
+            "{} must not pass through a symbolic link",
+            path.display()
+        )));
+    }
+    for part in canonical.ancestors() {
+        let meta = inspect(part)?;
+        let others_write = meta.mode() & 0o022 != 0;
+        let sticky_dir = meta.is_dir() && meta.mode() & 0o1000 != 0;
+        if (meta.uid() != 0 && meta.uid() != euid) || (others_write && !sticky_dir) {
+            return Err(SandboxError::Config(format!(
+                "{} must belong to root or to this process, and others must not write it",
+                part.display()
             )));
         }
     }
@@ -1571,6 +1620,57 @@ while True:
             let err = FirecrackerLauncher::new(config).expect_err("bad machine");
             assert!(matches!(err, SandboxError::Config(_)), "{err:?}");
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_root_jail_identity_is_a_config_error() {
+        for (uid, gid) in [(0, 12_345), (12_345, 0)] {
+            let dir = temp_dir();
+            let mut config = jailed(&dir);
+            if let Confinement::Jailer(jail) = &mut config.confinement {
+                jail.uid = uid;
+                jail.gid = gid;
+            }
+            let err = FirecrackerLauncher::new(config).expect_err("root jail identity");
+            assert!(
+                matches!(err, SandboxError::Config(ref m) if m.contains("root")),
+                "{err:?}"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_shared_image_in_a_directory_that_others_can_write_is_a_config_error() {
+        let dir = temp_dir();
+        let config = jailed(&dir);
+        let parent = config.image.rootfs.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = FirecrackerLauncher::new(config.clone()).expect_err("writable parent");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("write")),
+            "{err:?}"
+        );
+        // A sticky directory, such as /tmp, keeps each entry to its owner.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        FirecrackerLauncher::new(config).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_shared_image_behind_a_symbolic_link_is_a_config_error() {
+        let dir = temp_dir();
+        let mut config = jailed(&dir);
+        let link = dir.join("rootfs-link.ext4");
+        std::os::unix::fs::symlink(&config.image.rootfs, &link).unwrap();
+        config.image.rootfs = link;
+        let err = FirecrackerLauncher::new(config).expect_err("symlink");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("symbolic link")),
+            "{err:?}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

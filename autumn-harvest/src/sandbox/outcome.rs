@@ -11,6 +11,9 @@ use super::error::SandboxError;
 use super::policy::IsolationLevel;
 use super::request::ExecPlan;
 
+/// The highest Linux signal number, `SIGRTMAX`.
+pub const MAX_SIGNAL: i32 = 64;
+
 /// The longest reason of a skipped output, in bytes.
 pub const MAX_SKIP_REASON_BYTES: usize = 256;
 
@@ -183,6 +186,22 @@ impl SandboxOutcome {
         matches!(self.status, RunStatus::Exited { code: 0 })
     }
 
+    /// Check that Linux can report the status.
+    ///
+    /// Linux exit codes are 0 to 255, and signals are 1 to 64. The executor
+    /// reports signal 0 when the status names neither.
+    fn check_status(&self) -> Result<(), SandboxError> {
+        match self.status {
+            RunStatus::Exited { code } if !(0..=255).contains(&code) => Err(
+                SandboxError::Protocol(format!("exit code {code} is not 0 to 255")),
+            ),
+            RunStatus::Signaled { signal } if !(0..=MAX_SIGNAL).contains(&signal) => Err(
+                SandboxError::Protocol(format!("signal {signal} is not 0 to {MAX_SIGNAL}")),
+            ),
+            _ => Ok(()),
+        }
+    }
+
     /// Check that an outcome from a guest respects the bounds of `plan`.
     ///
     /// The guest runs untrusted code, so the host checks each bound again
@@ -193,6 +212,7 @@ impl SandboxOutcome {
     /// Returns [`SandboxError::Protocol`] for the first broken bound.
     pub fn check_bounds(&self, plan: &ExecPlan) -> Result<(), SandboxError> {
         let violation = |what: String| Err(SandboxError::Protocol(what));
+        self.check_status()?;
         // Lossy decoding turns one invalid byte into three bytes of U+FFFD,
         // and the capture adds one truncation marker.
         let kept = usize::try_from(plan.limits.max_output_bytes).unwrap_or(usize::MAX);
@@ -429,6 +449,35 @@ pub(crate) mod tests {
             out.check_bounds(&plan),
             Err(SandboxError::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn impossible_exit_codes_and_signals_break_the_bounds() {
+        let plan = SandboxPolicy::default()
+            .plan(&SandboxRequest::new("sh", "true"))
+            .unwrap();
+        for status in [
+            RunStatus::Exited { code: -1 },
+            RunStatus::Exited { code: 256 },
+            RunStatus::Signaled { signal: -9 },
+            RunStatus::Signaled { signal: 65 },
+        ] {
+            assert!(
+                matches!(
+                    outcome(status).check_bounds(&plan),
+                    Err(SandboxError::Protocol(_))
+                ),
+                "{status:?}"
+            );
+        }
+        for status in [
+            RunStatus::Exited { code: 255 },
+            RunStatus::Signaled { signal: 0 },
+            RunStatus::Signaled { signal: 64 },
+            RunStatus::TimedOut,
+        ] {
+            assert!(outcome(status).check_bounds(&plan).is_ok(), "{status:?}");
+        }
     }
 
     #[test]
