@@ -200,8 +200,9 @@ pub async fn execute_plan(
     let stderr = spawn_capture(child.stderr.take(), cap);
 
     let cpu_budget = Duration::from_secs(plan.limits.cpu_seconds);
+    let exit_fd = group.and_then(open_pidfd);
     let end = tokio::select! {
-        status = child.wait() => End::Exited(status),
+        exit = main_exit(&mut child, exit_fd.as_ref()) => End::Exited(exit),
         () = tokio::time::sleep(plan.limits.wall_clock()) => End::TimedOut,
         () = cancel.cancelled() => End::Cancelled,
         () = cpu_spent(cgroup.as_ref(), cpu_budget) => End::CpuSpent,
@@ -215,9 +216,15 @@ pub async fn execute_plan(
     if let Some(cgroup) = &cgroup {
         cgroup.kill();
     }
-    if !matches!(end, End::Exited(_)) {
-        let _ = child.wait().await;
-    }
+    // Reap the main process only now, after the kill of its group.
+    let end = match end {
+        End::Exited(None) => End::Exited(Some(child.wait().await)),
+        End::Exited(exit) => End::Exited(exit),
+        other => {
+            let _ = child.wait().await;
+            other
+        }
+    };
     let duration = started.elapsed();
     let (stdout, stderr) = tokio::join!(stdout.finish(), stderr.finish());
     if let Some(cgroup) = cgroup.take() {
@@ -255,10 +262,41 @@ pub async fn execute_plan(
 
 /// How the main process ended.
 enum End {
-    Exited(io::Result<std::process::ExitStatus>),
+    /// The main process exited. `None` until the executor reaps it.
+    Exited(Option<io::Result<std::process::ExitStatus>>),
     TimedOut,
     Cancelled,
     CpuSpent,
+}
+
+/// A pidfd of `pid`. It becomes readable when the process exits, and it
+/// does not reap the process. `None` before Linux 5.3.
+fn open_pidfd(pid: i32) -> Option<tokio::io::unix::AsyncFd<OwnedFd>> {
+    // SAFETY: pidfd_open takes a pid and flags. It returns a new descriptor
+    // with close-on-exec, or -1.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    let fd = i32::try_from(fd).ok().filter(|fd| *fd >= 0)?;
+    // SAFETY: the descriptor is new, and nothing else owns it.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE).ok()
+}
+
+/// Wait until the main process exits.
+///
+/// With a pidfd, the process stays a zombie, so its pid and process group
+/// stay taken until the executor kills the group and reaps it. Without one,
+/// this reaps the process and returns its status.
+async fn main_exit(
+    child: &mut tokio::process::Child,
+    pidfd: Option<&tokio::io::unix::AsyncFd<OwnedFd>>,
+) -> Option<io::Result<std::process::ExitStatus>> {
+    match pidfd {
+        Some(pidfd) => {
+            let _ = pidfd.readable().await;
+            None
+        }
+        None => Some(child.wait().await),
+    }
 }
 
 /// The command that runs `plan` in `work` with `setup`.
@@ -297,12 +335,17 @@ fn run_status(end: End) -> Result<RunStatus, SandboxError> {
         End::CpuSpent => RunStatus::Signaled {
             signal: libc::SIGXCPU,
         },
-        End::Exited(Err(e)) => {
+        End::Exited(None) => {
+            return Err(SandboxError::Unavailable(
+                "the executor did not reap the child".into(),
+            ));
+        }
+        End::Exited(Some(Err(e))) => {
             return Err(SandboxError::Unavailable(format!(
                 "could not wait for the child: {e}"
             )));
         }
-        End::Exited(Ok(status)) => match (status.code(), status.signal()) {
+        End::Exited(Some(Ok(status))) => match (status.code(), status.signal()) {
             (Some(code), _) => RunStatus::Exited { code },
             (None, Some(signal)) => RunStatus::Signaled { signal },
             (None, None) => RunStatus::Signaled { signal: 0 },
@@ -1774,6 +1817,23 @@ mod tests {
         assert!(total <= 512 * 1024, "{total}");
         assert_eq!(out.outputs.len() + out.skipped_outputs.len(), 3);
         assert_ne!(out.skipped_outputs, []);
+    }
+
+    #[tokio::test]
+    async fn the_main_process_stays_unreaped_until_the_group_is_killed() {
+        let mut child = tokio::process::Command::new("true").spawn().unwrap();
+        let pid = i32::try_from(child.id().unwrap()).unwrap();
+        let pidfd = open_pidfd(pid);
+        assert!(pidfd.is_some(), "this kernel has pidfd_open");
+        let exit = main_exit(&mut child, pidfd.as_ref()).await;
+        assert!(exit.is_none(), "the exit must not reap the process");
+        // The zombie still holds its pid, so its process group stays taken.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let state = stat
+            .rsplit_once(") ")
+            .and_then(|(_, rest)| rest.chars().next());
+        assert_eq!(state, Some('Z'));
+        assert!(child.wait().await.unwrap().success());
     }
 
     #[test]
