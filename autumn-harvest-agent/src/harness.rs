@@ -13,7 +13,7 @@ use crate::error::AgentError;
 use crate::heartbeat::{HeartbeatTask, Precheck};
 use crate::memory::{MEMORY_TOOL, MemoryScope, MemoryStore, MemoryTool, render_snapshot};
 use crate::message::{ContentPart, RunId, TokenUsage, ToolDefinition};
-use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse};
+use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse, UNKNOWN_MODEL_ID};
 use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
 use crate::response_cache::{CacheKey, KeyTenant, ResponseCache};
 use crate::tool::{Tool, ToolContext, ToolEffect};
@@ -292,8 +292,25 @@ impl AgentHarness {
         &self,
         request: ModelTurnRequest,
         tenant: CacheTenant,
-        mut prepare: impl FnMut(&mut Vec<ContentPart>),
+        prepare: impl FnMut(&mut Vec<ContentPart>),
     ) -> Result<ModelTurn, String> {
+        self.model_turn_timed_in(request, tenant, prepare)
+            .await
+            .map(|(turn, _latency)| turn)
+    }
+
+    /// [`model_turn_in`](Self::model_turn_in), with the latency of the model
+    /// call (issue #1996).
+    ///
+    /// The latency covers the model call only, not the cache or the policy.
+    /// It is `None` when a cache hit answers the turn, because no model call
+    /// ran.
+    pub(crate) async fn model_turn_timed_in(
+        &self,
+        request: ModelTurnRequest,
+        tenant: CacheTenant,
+        mut prepare: impl FnMut(&mut Vec<ContentPart>),
+    ) -> Result<(ModelTurn, Option<Duration>), String> {
         let builtins = self.builtins(
             request.memory_scope.as_ref(),
             request.extra_tools.iter().cloned(),
@@ -314,6 +331,7 @@ impl AgentHarness {
         // miss, so the second pass asks the model. Both passes share one
         // policy budget, so the turn stays inside `start_to_close`.
         let mut policy_budget = self.policy_timeout;
+        let mut latency = None;
         loop {
             let cache_hit = cached.is_some();
             // A fresh answer waits for its decisions before it reaches the cache.
@@ -325,7 +343,9 @@ impl AgentHarness {
                     ..response
                 }
             } else {
+                let started = std::time::Instant::now();
                 let response = self.call_model(&chat).await?;
+                latency = Some(started.elapsed());
                 fresh = key.as_ref().map(|key| (key, response.clone()));
                 response
             };
@@ -364,7 +384,59 @@ impl AgentHarness {
             {
                 self.cache_store(key, &response).await;
             }
-            return Ok(turn);
+            return Ok((turn, latency));
+        }
+    }
+
+    /// Record one model call in the agent cost ledger (issue #1996).
+    ///
+    /// A ledger refusal does not fail the turn, because the reply is already
+    /// paid for. The turn records its tokens even when the model metadata is
+    /// bad:
+    /// - no model id, or one that the ledger refuses, becomes
+    ///   [`UNKNOWN_MODEL_ID`];
+    /// - a cost that the ledger refuses is dropped, so the call is unpriced.
+    ///
+    /// Each refusal logs a warning.
+    pub(crate) fn record_turn(
+        &self,
+        ctx: &autumn_harvest::context::ActivityContext,
+        usage: &TokenUsage,
+        latency: Duration,
+    ) {
+        use autumn_harvest::llm_ledger::LlmCall;
+
+        let mut model = self.client.model_id().unwrap_or(UNKNOWN_MODEL_ID);
+        if let Err(err) = LlmCall::new(model, 0, 0).validate() {
+            tracing::warn!(
+                error = %err,
+                "the agent cost ledger refused the model id; recording the turn as {UNKNOWN_MODEL_ID:?}"
+            );
+            model = UNKNOWN_MODEL_ID;
+        }
+        let cost = self.client.cost_usd_micros(usage).filter(|&cost| {
+            let check = LlmCall::new(UNKNOWN_MODEL_ID, 0, 0)
+                .with_cost_usd_micros(cost)
+                .validate();
+            if let Err(err) = &check {
+                tracing::warn!(
+                    error = %err,
+                    "the agent cost ledger refused the cost; recording the turn as unpriced"
+                );
+            }
+            check.is_ok()
+        });
+        let mut call = LlmCall::new(
+            model,
+            u64::from(usage.input_tokens),
+            u64::from(usage.output_tokens),
+        )
+        .with_latency(latency);
+        if let Some(cost) = cost {
+            call = call.with_cost_usd_micros(cost);
+        }
+        if let Err(err) = ctx.record_llm_call(call) {
+            tracing::warn!(error = %err, "the agent cost ledger refused a model turn");
         }
     }
 

@@ -1211,6 +1211,28 @@ diesel::table! {
 diesel::table! {
     use diesel::sql_types::*;
 
+    /// Agent cost ledger (issue #1996): one row per LLM call that an
+    /// activity records.
+    ///
+    /// The completion transaction writes it. `event_id` names the completion
+    /// event. The table is outside `harvest_events` and in clear.
+    harvest_llm_ledger (workflow_exec_id, event_id, call_index) {
+        workflow_exec_id -> Uuid,
+        event_id         -> Int4,
+        call_index       -> Int4,
+        activity_name    -> Text,
+        model            -> Text,
+        input_tokens     -> Int8,
+        output_tokens    -> Int8,
+        cost_usd_micros  -> Nullable<Int8>,
+        latency_ms       -> Int8,
+        recorded_at      -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
     /// Durable workflow output-stream chunks (issue #1974).
     ///
     /// Written in the worker persist transaction by
@@ -1316,6 +1338,7 @@ diesel::table! {
 
 diesel::joinable!(harvest_stream_chunks -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_workflow_logs -> harvest_workflow_executions (workflow_exec_id));
+diesel::joinable!(harvest_llm_ledger -> harvest_workflow_executions (workflow_exec_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     harvest_workflow_executions,
@@ -1357,6 +1380,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_mutex_waiters,
     harvest_stream_chunks,
     harvest_workflow_logs,
+    harvest_llm_ledger,
     harvest_codec_rotation_cursor,
     harvest_codec_key_state,
 );

@@ -24,7 +24,7 @@ R&D decision record [`docs/rnd/sqlite-feasibility.md`](rnd/sqlite-feasibility.md
 5. [Registering workflows and activities](#5-registering-workflows-and-activities)
 6. [Starting a workflow](#6-starting-a-workflow)
 7. [The drive model](#7-the-drive-model)
-8. [Signals (pull-only)](#8-signals-pull-only)
+8. [Signals](#8-signals), and [updates](#updates-issue-2025)
 9. [Durability and crash recovery](#9-durability-and-crash-recovery)
 10. [The single-writer / single-server contract](#10-the-single-writer--single-server-contract)
 11. [v0.1 non-goals and follow-ups](#11-v01-non-goals-and-follow-ups)
@@ -306,8 +306,10 @@ an agent session or a poller, must therefore bound its history. Call
 - It appends `WorkflowContinuedAsNew` and seals the run `CONTINUED_AS_NEW`.
 - It starts a successor with the same `workflow_name` and `workflow_id`. The
   successor's `WorkflowStarted` carries `input`.
-- It moves every undelivered signal to the successor. A consumed signal
-  stays with the old run.
+- It appends the staged signals that the hand-off decision replayed to the
+  old run (issue #2020). Such a signal stays with the old run, read or not,
+  as on Postgres. A backlog past the room the history caps leave was not
+  replayed. It moves to the successor, so each signal arrives exactly once.
 - It deletes the old run's pending tasks and unfired timers.
 
 `run_until_blocked` returns `RunState::ContinuedAsNew(successor)`. A later
@@ -346,10 +348,10 @@ event JSON length when the decision starts. Postgres measures
 
 ---
 
-## 8. Signals (pull-only)
+## 8. Signals
 
-Deliver a signal from outside with `send_signal`; consume it inside the workflow
-with a **pull** primitive.
+Deliver a signal from outside with `send_signal`. Read it inside the workflow
+with any signal API.
 
 ```rust
 // Inside the workflow — block until the signal arrives:
@@ -361,22 +363,84 @@ rt.send_signal(exec, "approve", serde_json::json!(true))?;
 rt.run_until_blocked(exec).await?;
 ```
 
-A staged signal is appended to history (as `SignalReceived`) **only when a
-workflow reaches a pull primitive that consumes it** — this backend is
-pull-only. The supported pull surface is the plain waits
-(`wait_for_signal` / `receive_signal`) and the signal-or-deadline waits
-(`wait_for_signal_timeout` / `receive_signal_timeout`, which race the signal
-against a durable deadline timer).
+Each drive appends every staged signal to history (as `SignalReceived`)
+before the workflow runs, in arrival order. Postgres does the same at task
+preparation. So every signal API works here:
+
+- the blocking waits `wait_for_signal` / `receive_signal`;
+- the non-blocking reads `drain_signals` / `try_receive_signal`;
+- push handlers (`register_signal_handler`), also with `await_condition`;
+- the signal-or-deadline waits `wait_for_signal_timeout` /
+  `receive_signal_timeout`. They race the signal against a durable deadline
+  timer, and arrival time decides the winner.
+
+A push handler runs at the next durable call (a timer, an activity or a signal
+read) after it registers. Put such a call between the registration and a read
+of its state. A run parked on `await_condition` emits no command, so a drive
+before the signal returns `SqliteError::Stuck`. `poll_once` and
+`run_until_idle` report it as a per-execution error and still drive the other
+runs. The run stays `RUNNING`. Drive it again after `send_signal`.
+
+The history caps bound this ingest. A drive reads staged signals only up to
+the room the caps leave. A signal flood thus fails the run at the cap, as on
+Postgres, and never loads past it into memory.
+
+A signal that the workflow never reads also reaches history. The strict core
+`WorkflowReplayer` then reports `NonDeterminismDetected(EarlyCompletion)`, as
+for a Postgres history. A signal that lost a deadline race is exempt. A file
+from an earlier release can hold signals staged for a name that the run never
+awaited. The first drive after the upgrade appends them to history.
 
 `send_signal` validates the target at the boundary: an unknown execution is
 `SqliteError::ExecutionNotFound` and a terminal one is
-`SqliteError::WorkflowNotRunning`, so a wakeup no live wait could ever consume is
+`SqliteError::WorkflowNotRunning`, so a wakeup no drive could ever consume is
 rejected rather than silently lost.
 
-> Push-based signal *handlers* (`register_signal_handler`) and the non-blocking
-> drain APIs (`drain_signals` / `try_receive_signal`) depend on the Postgres
-> task-preparation ingest and are **not** available here — restrict to the pull
-> primitives.
+### Updates (issue #2025)
+
+An update is a request with a result. Register the handler in the workflow
+body, or register a declarative `#[update]` with `register_update`.
+
+```rust
+// Inside the workflow — register the handler before the first wait:
+ctx.register_update_handler(
+    "quote",
+    |input| if input.as_i64() > Some(0) { Ok(()) } else { Err("must be positive".into()) },
+    |input| async move { Ok(serde_json::json!({ "price": input })) },
+);
+
+// Or register a declarative `#[update(workflow = "...")]` handler:
+// rt.register_update(&quote_info());
+
+// From outside — run the update and get its result:
+let result = rt.update(exec, "quote", serde_json::json!(5)).await?;
+```
+
+`update` replays the run to rebuild its handlers. The arg schema runs first. A
+violation is `SqliteError::UpdateInputInvalid`. The validator runs next. A
+rejection is `SqliteError::UpdateRejected`. Neither writes an event.
+
+The handler then runs. One transaction appends `UpdateAdmitted` and then
+`UpdateCompleted`. If the handler returns an error or panics, the transaction
+appends `UpdateFailed` instead, and the call returns
+`SqliteError::UpdateFailed`. These are the core update events, so the history
+replays on the core `WorkflowReplayer`.
+
+The update does not drive the run. Call `run_until_blocked` after it, as after
+`send_signal`.
+
+The history caps count the two update events. An update that would reach a
+cap writes no update event. The run then fails at the cap, as a drive fails
+it, and the call returns `SqliteError::UpdateHistoryCapReached`.
+
+The handler runs once, on a separate replay of the run. **State that the
+handler writes does not reach the workflow body.** Use an update to compute a
+result from the workflow state, not to change that state. Replay returns the
+recorded result and does not run the handler again.
+
+The handler can await any future, within a 5 second limit. It cannot await a
+durable command, such as an activity or a timer. Such a handler returns
+`SqliteError::UpdateTimedOut` and writes no event.
 
 ---
 
@@ -473,9 +537,9 @@ specific command/feature. The run then ends `FAILED` (see below):
   `request_cancel_external_workflow`).
 - **Local activities** (`execute_local_activity`) and **external / task-token
   activities**.
-- **Updates**, **search attributes** (`upsert_search_attributes`), and a
-  **continue-as-new to a different type** (`continue_as_new_as_type`). The
-  token is `ContinueAsNew.new_workflow_type`. A same-type `continue_as_new` is
+- **Search attributes** (`upsert_search_attributes`) and a **continue-as-new
+  to a different type** (`continue_as_new_as_type`). The token is
+  `ContinueAsNew.new_workflow_type`. A same-type `continue_as_new` is
   supported (see [§7](#7-the-drive-model)).
 - **Worker sessions** (`create_session`) and **cancellable durable timers**
   (`start_timer` / `TimerHandle::…` — use the fire-once `ctx.timer(...)`).
@@ -546,8 +610,8 @@ gate no control flow): `ctx.set_current_details(...)` and a re-park
 - **[`examples/claude-agent-daemon/`](../examples/claude-agent-daemon/)** — a
   whole application on this backend: a local daemon that runs Claude agent
   sessions as durable workflows. It shows the drive loop
-  ([§7](#7-the-drive-model)), pull signals with a deadline
-  ([§8](#8-signals-pull-only)), and crash recovery
+  ([§7](#7-the-drive-model)), signals with a deadline
+  ([§8](#8-signals)), and crash recovery
   ([§9](#9-durability-and-crash-recovery)) in one place, and it runs with no API
   key against a scripted offline model.
 
