@@ -778,8 +778,12 @@ async fn delegate(
     call: &ToolCall,
 ) -> Result<ToolOutcome, String> {
     let task = run.task;
-    let admitted = serde_json::from_value::<DelegateArgs>(call.arguments.clone())
-        .map_err(|_| (Refusal::InvalidArguments, String::new()))
+    // serde also decodes a struct from a JSON array, so the arguments must
+    // be an object to have the named fields `agent` and `task`.
+    let admitted = Some(&call.arguments)
+        .filter(|arguments| arguments.is_object())
+        .and_then(|arguments| serde_json::from_value::<DelegateArgs>(arguments.clone()).ok())
+        .ok_or((Refusal::InvalidArguments, String::new()))
         .and_then(|args| {
             admit(agent, task, progress, tree, &args.agent)
                 .map(|child| (child, args.task))

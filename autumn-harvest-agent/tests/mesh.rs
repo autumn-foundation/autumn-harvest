@@ -1231,6 +1231,24 @@ async fn a_malformed_delegation_is_a_recorded_refusal() {
     }
 }
 
+// AC7: the arguments must be the named fields, not a positional array.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_positional_delegate_call_is_refused_as_invalid_arguments() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        calls(&[("d1", DELEGATE_TOOL, json!(["researcher", "dig"]))], 1),
+        answer("ok", 1),
+    ]);
+    let mut rt = runtime(&db, AgentHarness::new(model.clone()).peer(researcher()));
+
+    let exec = sqlite::start(&mut rt, &planner(&["researcher"])).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.delegations.len(), 1);
+    assert_eq!(report.delegations[0].refusal, Some(Refusal::InvalidArguments));
+    assert_eq!(model.calls(), 2, "no child model call runs");
+}
+
 // AC8: a peer cap of zero leaves the child no tokens.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_zero_peer_cap_is_an_exhausted_budget() {
