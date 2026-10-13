@@ -1036,22 +1036,28 @@ impl SqliteRuntime {
 
     /// End a cancel-requested `exec` `CANCELLED` (issue #2021).
     ///
-    /// `ingest` is the cycle's signal plan, and `pending` holds the bookkeeping
-    /// commands of a cycle that returned. Both persist before the terminal
-    /// `WorkflowCancelled` event, as on the completed and failed paths (issue
-    /// #2020). The seal ends the run, so it skips the history caps.
+    /// `batch` holds the events of the cycle that ends the run. They persist
+    /// before the terminal `WorkflowCancelled` event, as on the completed and
+    /// failed paths (issue #2020). A batch that reaches a history cap or the
+    /// cleanup budget is discarded, so the seal adds only `WorkflowCancelled`.
     fn seal_cancelled(
         &mut self,
         exec: ExecutionId,
         reason: &str,
-        ingest: Option<&worker::SignalIngest>,
-        pending: &[WorkflowCommand],
+        batch: Option<CancelBatch<'_>>,
     ) -> SqliteResult<RunState> {
-        let tx = self.conn.transaction()?;
-        if let Some(ingest) = ingest {
-            ingest.apply(&tx, exec)?;
+        if let Some(batch) = batch {
+            let tx = self.conn.transaction()?;
+            batch.ingest.apply(&tx, exec)?;
+            persist_terminal_pending_commands(&tx, exec, batch.pending)?;
+            let count = usize::try_from(store::next_seq(&tx, exec)?).unwrap_or(usize::MAX);
+            if count < batch.budget_end && batch.caps.reached(&tx, exec)?.is_none() {
+                seal_with_cancel_event(&tx, exec, CANCELLED_STATE, reason)?;
+                tx.commit()?;
+                return Ok(RunState::Cancelled(reason.to_string()));
+            }
         }
-        persist_terminal_pending_commands(&tx, exec, pending)?;
+        let tx = self.conn.transaction()?;
         seal_with_cancel_event(&tx, exec, CANCELLED_STATE, reason)?;
         tx.commit()?;
         Ok(RunState::Cancelled(reason.to_string()))
@@ -1836,9 +1842,14 @@ impl SqliteRuntime {
         if let Some((reason, from)) = &cancel
             && history.len().saturating_sub(*from) >= CANCEL_CLEANUP_EVENT_BUDGET
         {
-            return self.seal_cancelled(exec, reason, None, &[]);
+            return self.seal_cancelled(exec, reason, None);
         }
-        let cancel_reason = cancel.map(|(reason, _)| reason);
+        let (cancel_reason, budget_end) = cancel.map_or((None, 0), |(reason, from)| {
+            (
+                Some(reason),
+                from.saturating_add(CANCEL_CLEANUP_EVENT_BUDGET),
+            )
+        });
         let ingest = self.plan_ingest(exec, now, history.len(), history_bytes)?;
         history.extend(ingest.events().cloned());
         let input = store::execution_input(&self.conn, exec)?;
@@ -1951,16 +1962,23 @@ impl SqliteRuntime {
         //   cancel always ends the run.
         // - A body that continues as new has returned too. The cancel wins,
         //   so the run ends without a successor.
+        // - The final batch must fit the history caps and the cleanup budget.
         if let Some(reason) = &cancel_reason {
+            let batch = |pending| CancelBatch {
+                ingest: &ingest,
+                pending,
+                caps: &caps,
+                budget_end,
+            };
             match &outcome {
                 WorkflowOutcome::Completed { .. }
                 | WorkflowOutcome::ContinuedAsNew { .. }
                 | WorkflowOutcome::Failed {
                     non_deterministic_details: None,
                     ..
-                } => return self.seal_cancelled(exec, reason, Some(&ingest), &pending),
+                } => return self.seal_cancelled(exec, reason, Some(batch(&pending))),
                 WorkflowOutcome::Failed { .. } | WorkflowOutcome::TaskFailed { .. } => {
-                    return self.seal_cancelled(exec, reason, Some(&ingest), &[]);
+                    return self.seal_cancelled(exec, reason, Some(batch(&[])));
                 }
                 WorkflowOutcome::Suspended { .. } => {}
             }
@@ -2110,7 +2128,7 @@ impl SqliteRuntime {
                 // Issue #2021: a pending cancel wins over a cap that its
                 // cleanup reaches. The seal adds only `WorkflowCancelled`.
                 if let Some(cancel) = cancel_reason {
-                    return self.seal_cancelled(exec, cancel, None, &[]);
+                    return self.seal_cancelled(exec, cancel, None);
                 }
                 return self.fail_for_history_cap(exec, &reason, now);
             }
@@ -2130,7 +2148,7 @@ impl SqliteRuntime {
         if let Some(reason) = cancel_reason
             && !queue::has_pending_activity(&self.conn, exec)?
         {
-            return self.seal_cancelled(exec, reason, None, &[]);
+            return self.seal_cancelled(exec, reason, None);
         }
         self.classify_block(exec, commands)
     }
@@ -2683,6 +2701,19 @@ fn cancel_and_seal_prior(
     queue::delete_undelivered_signals_for_execution(conn, prior_exec)?;
     store::seal_execution(conn, prior_exec, SEALED_STATE)?;
     Ok(())
+}
+
+/// The events of the cycle that ends a cancelled run, and the limits they
+/// must fit (issue #2021).
+struct CancelBatch<'a> {
+    /// The cycle's signal plan.
+    ingest: &'a worker::SignalIngest,
+    /// The bookkeeping commands of a cycle that returned.
+    pending: &'a [WorkflowCommand],
+    /// The history caps.
+    caps: &'a CapCheck<'a>,
+    /// The history length the cleanup budget allows.
+    budget_end: usize,
 }
 
 /// The most events that a cleanup can add after a cancel request (issue

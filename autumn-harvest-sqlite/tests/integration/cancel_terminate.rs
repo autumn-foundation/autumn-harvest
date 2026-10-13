@@ -217,6 +217,21 @@ async fn spins(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
     }
 }
 
+/// When cancelled, mints 1,100 UUIDs in one cycle, then returns.
+#[workflow]
+async fn floods_on_cancel(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
+    ctx.execute_activity_raw("step", json!(n), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    if ctx.is_cancelled() {
+        for _ in 0..1_100 {
+            let _ = ctx.new_uuid();
+        }
+        return Ok(json!("flooded"));
+    }
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
 /// Counts the calls of each activity and records the cleanup input.
 #[derive(Default)]
 struct Calls {
@@ -252,6 +267,7 @@ fn register(rt: &mut SqliteRuntime, calls: &Arc<Calls>) {
     rt.register_workflow(&panics_on_cancel_info());
     rt.register_workflow(&continues_info());
     rt.register_workflow(&spins_info());
+    rt.register_workflow(&floods_on_cancel_info());
     let c = Arc::clone(calls);
     rt.register_activity_raw(
         "step",
@@ -781,6 +797,48 @@ async fn a_cleanup_that_reaches_the_history_cap_still_ends_cancelled() {
         "a pending cancel wins over a cap that its cleanup reaches, got {state:?}"
     );
     assert_sealed_without_cleanup(&rt, &calls, exec, &prefix, "stop");
+}
+
+#[tokio::test]
+async fn a_final_batch_past_the_cleanup_budget_is_discarded() {
+    let (_dir, path) = temp_db();
+    let (mut rt, calls) = runtime(&path);
+    let exec = start_parked(&mut rt, "floods_on_cancel").await;
+    let prefix = rt.load_history(exec).unwrap();
+
+    rt.cancel(exec, "stop").unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+
+    assert!(matches!(&state, RunState::Cancelled(reason) if reason == "stop"));
+    assert_sealed_without_cleanup(&rt, &calls, exec, &prefix, "stop");
+}
+
+#[tokio::test]
+async fn a_final_batch_past_the_history_cap_is_discarded() {
+    let (_dir, path) = temp_db();
+    let (mut rt, calls) = runtime(&path);
+    let exec = start_parked(&mut rt, "mints_on_cancel").await;
+    let prefix = rt.load_history(exec).unwrap();
+    // The cleanup activity fits. Its UUID side effect reaches the cap.
+    rt.set_history_event_hard_cap(Some(u64::try_from(prefix.len() + 3).unwrap()));
+
+    rt.cancel(exec, "stop").unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+
+    assert!(matches!(&state, RunState::Cancelled(reason) if reason == "stop"));
+    let history = rt.load_history(exec).unwrap();
+    assert!(
+        history.len() <= prefix.len() + 3,
+        "the seal must not grow history past the cap: {} events",
+        history.len()
+    );
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::SideEffectRecorded { .. })),
+        "the batch that reached the cap is discarded"
+    );
+    assert_eq!(calls.cleanup.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
