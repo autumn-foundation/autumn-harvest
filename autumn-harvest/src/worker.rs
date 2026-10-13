@@ -31420,9 +31420,12 @@ pub struct Worker {
     /// wait (issue #1836). The next idle wait then also wakes on
     /// `capacity_freed`, even when the slot freed before the wait began.
     limit_refused: AtomicBool,
-    /// The poll gate refused a kind since the last idle wait (issue #1787).
-    /// The next idle wait then also wakes on `capacity_freed`, even when the
-    /// permit freed during the claim.
+    /// The poll gate refused a kind, and no idle wait has woken on
+    /// `capacity_freed` since (issue #1787). An idle wait then also wakes on
+    /// `capacity_freed`, even when the permit freed during the claim. A read
+    /// does not clear the flag, so a refusal of another claim loop stays
+    /// armed. Only the wake clears it, because the next poll then sees the
+    /// gate again.
     pool_refused: AtomicBool,
     /// Set the first time `spawn_monitoring_tasks` runs to completion (issue
     /// #548 review). Guards against a hypothetical second invocation (e.g. a
@@ -34294,7 +34297,7 @@ impl Worker {
             if shard_listeners.iter().all(Option::is_none) {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
-                    () = self.capacity_freed.notified(), if capacity_bound => {}
+                    () = self.capacity_freed.notified(), if capacity_bound => self.capacity_woke(),
                     () = self.deferral_due.notified() => {}
                     () = tokio::time::sleep(poll_interval) => {}
                 }
@@ -34328,6 +34331,7 @@ impl Worker {
             if capacity_bound
                 && futures::FutureExt::now_or_never(self.capacity_freed.notified()).is_some()
             {
+                self.capacity_woke();
                 break 'notify_wait;
             }
             if futures::FutureExt::now_or_never(self.deferral_due.notified()).is_some() {
@@ -36038,7 +36042,7 @@ impl Worker {
             let capacity_bound = shard_count == 1 && self.capacity_bound();
             tokio::select! {
                 () = self.shutdown.cancelled() => {}
-                () = self.capacity_freed.notified(), if capacity_bound => {}
+                () = self.capacity_freed.notified(), if capacity_bound => self.capacity_woke(),
                 () = self.deferral_due.notified() => {}
                 () = tokio::time::sleep(wait) => {}
             }
@@ -36538,7 +36542,7 @@ impl Worker {
             // A full pool also wakes on a released permit (issue #1787).
             let capacity_bound = self.capacity_bound();
             tokio::select! {
-                () = self.capacity_freed.notified(), if capacity_bound => {}
+                () = self.capacity_freed.notified(), if capacity_bound => self.capacity_woke(),
                 () = self.deferral_due.notified() => {}
                 () = idle_wait => {}
             }
@@ -37168,17 +37172,26 @@ impl Worker {
     /// frees its limit slot before its dispatch permit, so the wake finds
     /// the slot free.
     ///
-    /// Also true when the gate refused a kind since the last wait. A permit
-    /// can free while the gated poll claims. The pools then look free here,
-    /// but the backlog of the refused kind still waits. `Notify` stores the
-    /// release, so the wait finds it.
+    /// Also true when the gate refused a kind and no wait has woken on
+    /// `capacity_freed` since. A permit can free while the gated poll
+    /// claims. The pools then look free here, but the backlog of the refused
+    /// kind still waits. `Notify` stores the release, so the wait finds it.
+    /// The flag is read after the pools, so a refusal between the two reads
+    /// still counts.
     fn capacity_bound(&self) -> bool {
         let limit_refused = self.limit_refused.swap(false, Ordering::Relaxed);
-        let pool_refused = self.pool_refused.swap(false, Ordering::Relaxed);
-        self.poll_admission_now() != PollAdmission::Any
+        let pools_full = self.poll_admission_now() != PollAdmission::Any;
+        pools_full
             || limit_refused
-            || pool_refused
+            || AtomicBool::load(&self.pool_refused, Ordering::Relaxed)
             || self.registry.adaptive_limits.any_saturated()
+    }
+
+    /// An idle wait woke on `capacity_freed` (issue #1787). The next poll
+    /// sees the gate again, so the refusal flag has done its work. A poll of
+    /// another shard cannot claim the refused backlog, so no poll clears it.
+    fn capacity_woke(&self) {
+        self.pool_refused.store(false, Ordering::Relaxed);
     }
 
     /// Mark each kind the gate refuses (issue #1787). See `gate_refused`.
@@ -53471,8 +53484,31 @@ mod tests {
             worker.capacity_bound(),
             "the idle wait after a gated poll must wake on a freed permit"
         );
-        // The flag lasts for one idle wait.
+        // A read does not clear the flag, and neither does a poll that may
+        // claim any kind. The wake on the freed permit does.
+        assert!(worker.capacity_bound());
+        worker.record_gate_refusal(PollAdmission::Any);
+        assert!(worker.capacity_bound());
+        worker.capacity_woke();
         assert!(!worker.capacity_bound());
+    }
+
+    /// A refusal that another claim loop records while the leader decides
+    /// its wait stays armed for the next decision (issue #1787).
+    #[test]
+    fn a_refusal_stays_armed_until_a_wait_wakes_on_it() {
+        use crate::queue::TaskType;
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        assert!(!worker.capacity_bound());
+        // A follower's poll is refused between two reads of the leader.
+        worker.record_gate_refusal(PollAdmission::Only(TaskType::Workflow));
+        assert!(worker.capacity_bound());
+        assert!(
+            worker.capacity_bound(),
+            "a read of the leader must not clear a refusal of another loop"
+        );
     }
 
     /// The short closing wait of a multi-shard turn leaves the capacity
