@@ -26,6 +26,7 @@ use serde_json::Value;
 use crate::error::{SqliteError, SqliteResult};
 use crate::history_cap::{CapCheck, HistoryCapReason};
 use crate::lock::WriterLock;
+use crate::query::{DEFAULT_QUERY_TIMEOUT, QueryReplay};
 use crate::{composition, lock, queue, schema, store, update, worker};
 
 /// A synchronous activity body, keyed by name.
@@ -265,6 +266,8 @@ pub struct SqliteRuntime {
     /// (issue #2026). The call clears it at its start and end. Any progress
     /// also clears it, because progress can unblock a run.
     drive_blocked: HashSet<ExecutionId>,
+    /// The time limit of one query replay (issue #2022).
+    query_timeout: std::time::Duration,
 }
 
 impl Drop for SqliteRuntime {
@@ -373,6 +376,7 @@ impl SqliteRuntime {
             writer_lock,
             history_policy: WorkflowHistoryPolicy::default(),
             drive_blocked: HashSet::new(),
+            query_timeout: DEFAULT_QUERY_TIMEOUT,
         })
     }
 
@@ -996,6 +1000,21 @@ impl SqliteRuntime {
         // The single-writer runtime holds `SQLite`'s only write handle, so the
         // state read and the stage cannot race a concurrent transition: no other
         // writer exists to seal the execution between the check and the insert.
+
+        // Issue #1985: a promise signal must carry a settlement, and a promise
+        // settles once. The Postgres path drops a second settlement through its
+        // idempotency key. This backend has no key, so it skips the stage. The
+        // check runs before the terminal check, so a retry after the run ends
+        // is a no-op here too, as on Postgres.
+        if name.starts_with(autumn_harvest::durable_promise::PROMISE_SIGNAL_PREFIX) {
+            // A missing run reports `NotFound` before the payload check.
+            store::execution_state(&self.conn, exec)?;
+            autumn_harvest::durable_promise::settlement_idempotency_key(name, &payload, None)
+                .map_err(|e| SqliteError::InvalidSignal(e.to_string()))?;
+            if store::has_signal(&self.conn, exec, name)? {
+                return Ok(());
+            }
+        }
         self.refuse_unless_running(exec)?;
         // Enforce the signal-payload cap at INGRESS (issue #252, Codex #1069
         // `runtime.rs:346`), before the `harvest_signals` row is staged.
@@ -1500,6 +1519,73 @@ impl SqliteRuntime {
             }
             _ => Ok(ExecutionOutcome::Running),
         }
+    }
+
+    /// Run the query `name` on `exec` with `args`, and return its answer
+    /// (issue #2022).
+    ///
+    /// The query replays the stored history to the run's frontier, then calls
+    /// the handler that `ctx.register_query` registered. It writes nothing:
+    /// no event, no row, no staged-signal delivery, no activity body.
+    ///
+    /// - A running run answers with the state at its frontier: the first
+    ///   command that the history does not record.
+    /// - A terminal run answers with the state at its recorded end.
+    ///
+    /// The replay runs workflow code up to the frontier, as a drive does.
+    /// Code past the last recorded event runs again in each query. That
+    /// includes a `ctx.side_effect` closure the history does not record yet.
+    ///
+    /// The call reads the rows immediately. The returned future then replays
+    /// them, so it borrows nothing from the runtime. The answer is a
+    /// point-in-time read as of the call.
+    ///
+    /// ```no_run
+    /// # async fn example(
+    /// #     rt: &autumn_harvest_sqlite::SqliteRuntime,
+    /// #     exec: autumn_harvest_sqlite::ExecutionId,
+    /// # ) -> autumn_harvest_sqlite::SqliteResult<()> {
+    /// let stage = rt.query(exec, "stage", serde_json::Value::Null).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// The future resolves to an error in these cases:
+    ///
+    /// - [`SqliteError::ExecutionNotFound`]: the id is unknown.
+    /// - [`SqliteError::UnknownWorkflow`]: the workflow is not registered.
+    /// - [`SqliteError::QueryNotFound`]: the replay registers no handler
+    ///   named `name`.
+    /// - [`SqliteError::QueryFailed`]: the handler returns `Err`.
+    /// - [`SqliteError::QueryPanicked`]: the handler panics, or the workflow
+    ///   panics during the replay of a running run.
+    /// - [`SqliteError::QueryTimedOut`]: the replay passes the query timeout.
+    /// - [`SqliteError::QueryUnavailable`]: a terminal run cannot give a
+    ///   stable answer.
+    /// - [`SqliteError::NonDeterministic`]: the workflow code changed, so the
+    ///   replay of a running run diverges. A drive returns the same error.
+    /// - A persistence error: a row cannot be read.
+    pub fn query(
+        &self,
+        exec: ExecutionId,
+        name: &str,
+        args: Value,
+    ) -> impl std::future::Future<Output = SqliteResult<Value>> + Send + 'static {
+        let loaded = QueryReplay::load(&self.conn, &self.workflows, self.history_policy, exec);
+        let name = name.to_string();
+        let timeout = self.query_timeout;
+        async move { loaded?.run(name, args, timeout).await }
+    }
+
+    /// Set the time limit of a query replay. The default is
+    /// [`DEFAULT_QUERY_TIMEOUT`](crate::DEFAULT_QUERY_TIMEOUT), 5 s.
+    ///
+    /// A future that [`query`](Self::query) already returned keeps the old
+    /// limit. A limit too large to add to the current time means no limit.
+    pub const fn set_query_timeout(&mut self, timeout: std::time::Duration) {
+        self.query_timeout = timeout;
     }
 
     // ── Drivers ──────────────────────────────────────────────────────────────
@@ -4509,5 +4595,103 @@ mod feature_gate_tests {
             .query_row("SELECT COUNT(*) FROM harvest_signals", [], |r| r.get(0))
             .unwrap();
         assert_eq!(signals, 0, "no signal row staged");
+    }
+
+    /// Counts the staged rows of signal `name`.
+    fn staged(rt: &super::SqliteRuntime, name: &str) -> i64 {
+        rt.conn
+            .query_row(
+                "SELECT COUNT(*) FROM harvest_signals WHERE name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    // Issue #1985: a promise signal must carry a settlement, as on Postgres.
+    #[test]
+    fn a_promise_signal_without_a_settlement_stages_no_row() {
+        let mut rt = super::SqliteRuntime::open_in_memory().unwrap();
+        rt.register_workflow(&base_wf_info());
+        let exec = rt.start_workflow("base_wf", serde_json::json!(0)).unwrap();
+
+        let name = "harvest.promise:approval";
+        let err = rt
+            .send_signal(exec, name, serde_json::json!("not a settlement"))
+            .unwrap_err();
+        assert!(
+            matches!(err, super::SqliteError::InvalidSignal(_)),
+            "got {err:?}"
+        );
+        assert_eq!(staged(&rt, name), 0, "no signal row staged");
+    }
+
+    // Issue #1985: a promise settles once. A second settlement stages no row,
+    // as the Postgres idempotency key drops it. Other signals still stage
+    // every send.
+    #[test]
+    fn a_second_promise_settlement_stages_no_row() {
+        let mut rt = super::SqliteRuntime::open_in_memory().unwrap();
+        rt.register_workflow(&base_wf_info());
+        let exec = rt.start_workflow("base_wf", serde_json::json!(0)).unwrap();
+
+        let name = "harvest.promise:approval";
+        let first =
+            autumn_harvest::durable_promise::PromiseSettlement::resolved(serde_json::json!(1))
+                .to_value();
+        let second =
+            autumn_harvest::durable_promise::PromiseSettlement::rejected("late").to_value();
+        rt.send_signal(exec, name, first).unwrap();
+        rt.send_signal(exec, name, second).unwrap();
+        assert_eq!(staged(&rt, name), 1, "only the first settlement stages");
+
+        rt.send_signal(exec, "go", serde_json::json!(1)).unwrap();
+        rt.send_signal(exec, "go", serde_json::json!(2)).unwrap();
+        assert_eq!(staged(&rt, "go"), 2, "other signals stage every send");
+    }
+
+    // Issue #1985: a retried settlement after the run ends is a no-op, as on
+    // Postgres. A settlement the run never had still fails on a terminal run.
+    #[test]
+    fn a_retried_settlement_after_the_run_ends_is_a_no_op() {
+        let mut rt = super::SqliteRuntime::open_in_memory().unwrap();
+        rt.register_workflow(&base_wf_info());
+        let exec = rt.start_workflow("base_wf", serde_json::json!(0)).unwrap();
+
+        let name = "harvest.promise:approval";
+        let settlement =
+            autumn_harvest::durable_promise::PromiseSettlement::resolved(serde_json::json!(1))
+                .to_value();
+        rt.send_signal(exec, name, settlement.clone()).unwrap();
+        rt.conn
+            .execute(
+                "UPDATE harvest_signals SET delivered = 1 WHERE name = ?1",
+                [name],
+            )
+            .unwrap();
+        rt.conn
+            .execute(
+                "UPDATE harvest_executions SET state = 'COMPLETED' WHERE exec_id = ?1",
+                [exec.to_string()],
+            )
+            .unwrap();
+
+        rt.send_signal(exec, name, settlement.clone()).unwrap();
+        assert_eq!(staged(&rt, name), 1, "the retry stages no row");
+
+        let err = rt
+            .send_signal(exec, "harvest.promise:other", settlement)
+            .unwrap_err();
+        assert!(
+            matches!(err, super::SqliteError::WorkflowNotRunning { .. }),
+            "got {err:?}"
+        );
+        let err = rt
+            .send_signal(exec, "go", serde_json::json!(1))
+            .unwrap_err();
+        assert!(
+            matches!(err, super::SqliteError::WorkflowNotRunning { .. }),
+            "got {err:?}"
+        );
     }
 }

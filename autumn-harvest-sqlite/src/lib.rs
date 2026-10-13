@@ -642,6 +642,14 @@
 //!   shared with the Postgres engine. Put the activity branch first in a mixed
 //!   `join!`.
 //!
+//! # Queries (issue #2022)
+//!
+//! [`SqliteRuntime::query`] calls a handler that `ctx.register_query`
+//! registered. It loads the history, replays the run to its frontier, then
+//! calls the handler. It writes nothing. A running run answers with the state
+//! at its frontier. A terminal run answers with the state at its recorded
+//! end. One process holds the run, so a query needs no routing to a worker.
+//!
 //! # Deterministic side effects
 //!
 //! `ctx.system_now()`, `ctx.new_uuid()`, `ctx.random_*()`, and `ctx.side_effect()`
@@ -661,6 +669,7 @@ mod composition;
 mod error;
 mod history_cap;
 mod lock;
+mod query;
 mod queue;
 mod runtime;
 mod schema;
@@ -672,6 +681,7 @@ pub use autumn_harvest::{ExecutionId, WorkflowEvent};
 
 pub use crate::error::{SqliteError, SqliteResult};
 pub use crate::history_cap::HistoryCapReason;
+pub use crate::query::DEFAULT_QUERY_TIMEOUT;
 pub use crate::runtime::{
     ActivityBody, ActivitySpec, ExecutionOutcome, RunState, SqliteRuntime, StartOutcome,
     UNSUPPORTED_FEATURE_ERROR_TYPE,

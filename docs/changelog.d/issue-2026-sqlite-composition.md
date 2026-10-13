@@ -11,7 +11,7 @@ backend.
   the child in the parent's decision transaction. The child is a full run with
   a parent link. Its `workflow_id` is its execution id. Both
   `ctx.info().parent_execution_id` and the new `SqliteRuntime::parent_execution`
-  name the parent. An update replay sees the same parent link.
+  name the parent. An update replay and a query replay see the same parent link.
 - **Results.** An awaited child's terminal writes `ChildWorkflowCompleted` or
   `ChildWorkflowFailed` to its `RUNNING` parent in the same transaction. A
   typed failure keeps `error_type`, `details` and `non_retryable`. A cancelled
@@ -77,7 +77,7 @@ and `harvest_signals.idempotency_key`. An old file gains them on open.
   external events first. Each event is the same, and replay accepts both
   orders.
 
-**Tests.** `autumn-harvest-sqlite/tests/integration/composition.rs` has 49
+**Tests.** `autumn-harvest-sqlite/tests/integration/composition.rs` has 50
 tests. Each test replays every history it asserts on the core
 `WorkflowReplayer`, with the run's ids. They cover:
 
@@ -94,8 +94,8 @@ tests. Each test replays every history it asserts on the core
 - `join!` of an await and a child in both orders;
 - an operator cancel and a terminate of a child, a terminated await target, a
   child that continues as new, and an await across a continue-as-new;
-- the terminal cap check with and without cascade events, and an update on
-  a child that reads its parent.
+- the terminal cap check with and without cascade events, and an update and
+  a query on a child that read its parent.
 
 Unit tests cover the schema step and a race loser with no row. The core test
 `match_external_await_resolves_past_a_sibling_child` pins the replay fix. The

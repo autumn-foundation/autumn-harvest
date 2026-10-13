@@ -24,7 +24,7 @@ R&D decision record [`docs/rnd/sqlite-feasibility.md`](rnd/sqlite-feasibility.md
 5. [Registering workflows and activities](#5-registering-workflows-and-activities)
 6. [Starting a workflow](#6-starting-a-workflow)
 7. [The drive model](#7-the-drive-model)
-8. [Signals](#8-signals), and [updates](#updates-issue-2025)
+8. [Signals, queries and updates](#8-signals-queries-and-updates)
 9. [Child workflows and commands between runs](#9-child-workflows-and-commands-between-runs)
 10. [Durability and crash recovery](#10-durability-and-crash-recovery)
 11. [The single-writer / single-server contract](#11-the-single-writer--single-server-contract)
@@ -469,7 +469,7 @@ event JSON length when the decision starts. Postgres measures
 
 ---
 
-## 8. Signals
+## 8. Signals, queries and updates
 
 Deliver a signal from outside with `send_signal`. Read it inside the workflow
 with any signal API.
@@ -516,6 +516,53 @@ awaited. The first drive after the upgrade appends them to history.
 `SqliteError::ExecutionNotFound` and a terminal one is
 `SqliteError::WorkflowNotRunning`, so a wakeup no drive could ever consume is
 rejected rather than silently lost.
+
+### Queries (issue #2022)
+
+Read a run's state with `query`. It calls a handler that
+`ctx.register_query` registered, and it writes nothing.
+
+```rust
+// Inside the workflow — expose state:
+let stage = Arc::new(Mutex::new("started"));
+let read = Arc::clone(&stage);
+ctx.register_query("stage", move || serde_json::json!(*read.lock().unwrap()));
+
+// From outside — read it:
+let stage = rt.query(exec, "stage", serde_json::Value::Null).await?;
+```
+
+`query` loads the history and replays the run to its frontier. It then calls
+the handler. It appends no event, changes no row, delivers no staged signal,
+fires no timer and runs no activity body.
+
+- A running run answers with the state at its frontier: the first command
+  that the history does not record. The replay does not know a query that
+  the workflow registers past that point.
+- A running run with a pending `cancel` replays with that reason, so
+  `ctx.cancellation_reason()` reads as it does on the next drive.
+- A terminal run answers with the state at its recorded end.
+- The call reads the rows immediately. The returned future borrows nothing,
+  so it can go to `tokio::spawn`. A later `set_query_timeout` does not change
+  it.
+
+> The replay runs workflow code, as a drive does. Code past the last recorded
+> event runs again in each query, a `ctx.side_effect` closure included. Keep
+> that code free of external effects. Put an external effect in an activity.
+
+The future resolves to one of these errors:
+
+| Error | Cause |
+|---|---|
+| `ExecutionNotFound` | The execution id is unknown. |
+| `UnknownWorkflow` | The run's workflow is not registered in this runtime. |
+| `QueryNotFound` | The replay registered no handler with this name. |
+| `QueryFailed` | The handler returned `Err`. |
+| `QueryPanicked` | The handler panicked, or the workflow panicked during the replay of a running run. |
+| `QueryTimedOut` | The replay passed the query timeout. The default is 5 s. Set it with `set_query_timeout`. The timeout holds only while the replay yields. |
+| `NonDeterministic` | The workflow code changed, so the replay of a running run diverges. A drive returns the same error. |
+| `QueryUnavailable` | A terminal run cannot give a stable answer. The workflow code changed, the replay panicked, or a seal for an unsupported feature or a history cap left side effects unrecorded. |
+| Other variants | A row cannot be read. |
 
 ### Updates (issue #2025)
 
@@ -834,7 +881,7 @@ gate no control flow): `ctx.set_current_details(...)` and a re-park
   whole application on this backend: a local daemon that runs Claude agent
   sessions as durable workflows. It shows the drive loop
   ([§7](#7-the-drive-model)), signals with a deadline
-  ([§8](#8-signals)), and crash recovery
+  ([§8](#8-signals-queries-and-updates)), and crash recovery
   ([§10](#10-durability-and-crash-recovery)) in one place, and it runs with no API
   key against a scripted offline model.
 

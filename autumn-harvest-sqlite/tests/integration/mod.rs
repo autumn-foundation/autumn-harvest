@@ -40,3 +40,4 @@ mod unknown_execution_id;
 mod unsupported_terminal;
 mod updates;
 mod workflow_info_features;
+mod workflow_queries;

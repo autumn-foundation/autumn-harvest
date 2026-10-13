@@ -117,6 +117,7 @@ Policies that **never** produce advisory warnings:
 | `cancel_other` | always `false` |
 | `terminate_other` | always `false` |
 | `buffer_all` | always `false` |
+| `allow_all` | always `false` |
 
 Policies that **always** produce advisory warnings when `effective_at` is non-null:
 

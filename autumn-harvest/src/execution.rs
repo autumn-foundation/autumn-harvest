@@ -7413,9 +7413,23 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
             // deadlock. One lock order, taken first everywhere, closes it.
             lock_execution_admission(conn, request.workflow_name, request.workflow_id).await?;
 
+            // Issue #1985: a durable promise settles once on this path too.
+            // The settlement rules can force or refuse the signal key.
+            let signal_key = crate::durable_promise::settlement_idempotency_key(
+                request.signal_name,
+                &request.signal_payload,
+                request.idempotency_key.as_deref(),
+            )?
+            .map(str::to_owned);
+
             // Cross-execution dedupe: scope by (workflow_name, workflow_id, key)
             // so escalation/reset paths on a new exec_id don't re-queue the signal.
-            if let Some(key) = request.idempotency_key.as_deref()
+            // A promise belongs to one run, so its key dedupes per execution
+            // only, at the insert below (issue #1985).
+            let promise_signal = request
+                .signal_name
+                .starts_with(crate::durable_promise::PROMISE_SIGNAL_PREFIX);
+            if let Some(key) = signal_key.as_deref().filter(|_| !promise_signal)
                 && let Some(prior) = lookup_idempotent_signal_dedupe(
                     conn,
                     request.workflow_name,
@@ -7506,6 +7520,27 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
             )
             .await?;
 
+            // Issue #1985: a promise skips the cross-run dedupe above. A retry
+            // against the same run must still dedupe before the payload cap,
+            // so a tightened cap cannot turn a settled retry into an error.
+            if promise_signal
+                && !started.created
+                && let Some(key) = signal_key.as_deref()
+                && crate::signal::signal_idempotency_key_exists(conn, started.exec_id, key).await?
+            {
+                return Ok((
+                    SignalWithStartOutcome {
+                        exec_id: started.exec_id,
+                        workflow_name: started.workflow_name,
+                        workflow_id: started.workflow_id,
+                        state: started.state,
+                        started_fresh: false,
+                        signal_delivered: false,
+                    },
+                    effects,
+                ));
+            }
+
             // Check signal payload cap here — after start/attach/AlreadyExists
             // resolution — so RejectDuplicate conflicts surface as 409 AlreadyExists
             // rather than 413 PayloadTooLarge when the payload happens to be oversized.
@@ -7525,7 +7560,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
                     started.exec_id,
                     request.signal_name,
                     request.signal_payload,
-                    request.idempotency_key.as_deref(),
+                    signal_key.as_deref(),
                     codecs,
                 )
                 .await?

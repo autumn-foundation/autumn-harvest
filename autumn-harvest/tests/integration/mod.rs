@@ -337,6 +337,10 @@ mod signal_with_start_tests;
 mod sla_breach_tests;
 mod slo_pack_docs;
 mod slot_tuner_tests;
+#[cfg(all(feature = "db", feature = "testing"))]
+mod small_primitives_db_tests;
+#[cfg(feature = "testing")]
+mod small_primitives_tests;
 mod speculative_execution_docs;
 mod sqlite_feasibility_docs;
 mod sqlite_portable_activity_tests;

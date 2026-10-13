@@ -455,11 +455,13 @@ async fn continues_once(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
     Ok(n)
 }
 
-/// Registers `parent`, which returns the parent id that the body saw, then
-/// waits for `go`.
+/// Registers a `parent` update and a `parent` query. Each returns the parent
+/// id that the body saw. The body then waits for `go`.
 #[workflow]
 async fn reports_parent_on_update(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
     let parent = ctx.info().parent_execution_id.map(|p| p.to_string());
+    let seen = parent.clone();
+    ctx.register_query_handler("parent", move |_: &Value| Ok::<Value, String>(json!(seen)));
     ctx.register_update_handler_no_validator("parent", move |_input: Value| {
         let parent = parent.clone();
         async move { Ok(json!(parent)) }
@@ -1946,6 +1948,21 @@ async fn an_update_on_a_child_sees_its_parent() {
     let child = children_of(&rt, parent)[0];
 
     let out = rt.update(child, "parent", json!(null)).await.unwrap();
+
+    assert_eq!(out, json!(parent.to_string()));
+}
+
+/// A query replays a child with its parent link, as a drive does.
+#[tokio::test]
+async fn a_query_on_a_child_sees_its_parent() {
+    let mut rt = runtime();
+    let parent = rt
+        .start_workflow("parent_of_update_target", json!(0))
+        .unwrap();
+    rt.run_until_blocked(parent).await.unwrap();
+    let child = children_of(&rt, parent)[0];
+
+    let out = rt.query(child, "parent", json!(null)).await.unwrap();
 
     assert_eq!(out, json!(parent.to_string()));
 }
