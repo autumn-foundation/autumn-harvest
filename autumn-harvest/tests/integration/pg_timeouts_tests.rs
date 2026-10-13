@@ -3145,6 +3145,9 @@ async fn a_recently_used_connection_is_handed_out_without_a_ping() {
     .expect("engine pool builds");
     // Connect first, so that only pool work lies between the two checkouts.
     let mut admin = connect(&url).await;
+    // Warm the pool. The timed checkout then reuses the connection and does
+    // not wait for a new one.
+    drop(pool.get().await.expect("warm the pool"));
     let checked_out = Instant::now();
     let old_pid = {
         let mut conn = pool.get().await.expect("first connection");
