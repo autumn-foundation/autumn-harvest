@@ -973,6 +973,8 @@ impl SqliteRuntime {
     ///   run. A parked await cannot see the request.
     /// - The cycle diverges or deadlocks. The body sees the request from the
     ///   start of its replay, so a check before recorded commands diverges.
+    /// - The run has added [`CANCEL_CLEANUP_EVENT_BUDGET`] events since the
+    ///   request, so a body that ignores the request cannot run forever.
     ///
     /// The run then gets `WorkflowCancelled` as its last event, and its pending
     /// tasks, unfired timers and staged signals are deleted. The drive that ends
@@ -1826,6 +1828,17 @@ impl SqliteRuntime {
         // applies the plan first, so a discarded cycle consumes no signal.
         // The plan stops at the room the history caps leave.
         let (mut history, history_bytes) = store::load_history_sized(&self.conn, exec)?;
+        // Issue #2021: a stored cancel request reaches the body through the
+        // span meta. The history gets `WorkflowCancelled` only at the seal.
+        // A body that ignores the request and keeps working could run forever,
+        // so the cleanup may add only a bounded number of events.
+        let cancel = store::cancel_request(&self.conn, exec)?;
+        if let Some((reason, from)) = &cancel
+            && history.len().saturating_sub(*from) >= CANCEL_CLEANUP_EVENT_BUDGET
+        {
+            return self.seal_cancelled(exec, reason, None, &[]);
+        }
+        let cancel_reason = cancel.map(|(reason, _)| reason);
         let ingest = self.plan_ingest(exec, now, history.len(), history_bytes)?;
         history.extend(ingest.events().cloned());
         let input = store::execution_input(&self.conn, exec)?;
@@ -1834,9 +1847,6 @@ impl SqliteRuntime {
         // Codex #1069 P2 runtime.rs:780) so `ctx.info().workflow_id` is STABLE across
         // replays — it is threaded into the context below, never regenerated.
         let workflow_id = store::workflow_id_of(&self.conn, exec)?;
-        // Issue #2021: a stored cancel request reaches the body through the
-        // span meta. The history gets `WorkflowCancelled` only at the seal.
-        let cancel_reason = store::cancel_reason(&self.conn, exec)?;
         let handler = *self
             .workflows
             .get(&workflow_name)
@@ -2667,6 +2677,11 @@ fn cancel_and_seal_prior(
     store::seal_execution(conn, prior_exec, SEALED_STATE)?;
     Ok(())
 }
+
+/// The most events that a cleanup can add after a cancel request (issue
+/// #2021). A drive that finds more ends the run `CANCELLED` before replay.
+/// One activity adds two events, so the cleanup has room for about 500.
+const CANCEL_CLEANUP_EVENT_BUDGET: usize = 1_000;
 
 /// The state a cooperative cancel seals (issue #2021).
 const CANCELLED_STATE: &str = "CANCELLED";

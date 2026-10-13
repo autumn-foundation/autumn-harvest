@@ -268,24 +268,34 @@ pub fn seal_execution(
 
 /// Store a cooperative cancel request on a `RUNNING` row (issue #2021).
 ///
-/// The first request wins. A repeat call changes nothing.
+/// The first request wins. A repeat call changes nothing. The row also keeps
+/// the history length at the request, which bounds the cleanup.
 pub fn request_cancel(conn: &Connection, exec_id: ExecutionId, reason: &str) -> SqliteResult<()> {
     conn.execute(
-        "UPDATE harvest_executions SET cancel_reason = ?2 \
+        "UPDATE harvest_executions SET cancel_reason = ?2, cancel_from_seq = \
+           (SELECT COALESCE(MAX(seq) + 1, 0) FROM harvest_events WHERE exec_id = ?1) \
          WHERE exec_id = ?1 AND state = 'RUNNING' AND cancel_reason IS NULL",
         params![exec_id.to_string(), reason],
     )?;
     Ok(())
 }
 
-/// The stored cooperative cancel request of `exec_id`, if any (issue #2021).
-/// It is pending only while the row is `RUNNING`.
-pub fn cancel_reason(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Option<String>> {
-    Ok(conn.query_row(
-        "SELECT cancel_reason FROM harvest_executions WHERE exec_id = ?1",
+/// The stored cooperative cancel request of `exec_id`, if any (issue #2021):
+/// the reason and the history length at the request. It is pending only while
+/// the row is `RUNNING`.
+pub fn cancel_request(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> SqliteResult<Option<(String, usize)>> {
+    let (reason, from): (Option<String>, Option<i64>) = conn.query_row(
+        "SELECT cancel_reason, cancel_from_seq FROM harvest_executions WHERE exec_id = ?1",
         params![exec_id.to_string()],
-        |row| row.get(0),
-    )?)
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(reason.map(|reason| {
+        let from = from.and_then(|seq| usize::try_from(seq).ok()).unwrap_or(0);
+        (reason, from)
+    }))
 }
 
 /// Put `exec_id` in a terminal `state` with `reason` as its error (issue

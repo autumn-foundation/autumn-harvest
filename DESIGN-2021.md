@@ -4,8 +4,8 @@
 Cancel is cooperative. Terminate seals the run at once.
 
 **No new `WorkflowEvent` variant.** Both paths record the core
-`WorkflowCancelled` event, as Postgres does. The SQLite schema gets one
-nullable column, `harvest_executions.cancel_reason`. The core gets one new
+`WorkflowCancelled` event, as Postgres does. The SQLite schema gets two
+nullable columns, `harvest_executions.cancel_reason` and `cancel_from_seq`. The core gets one new
 seam, `WorkflowExecuteSpanMeta::cancellation_reason`.
 
 ---
@@ -56,6 +56,7 @@ seam, `WorkflowExecuteSpanMeta::cancellation_reason`.
 | E2 | When the body blocks on a signal or a timer and no activity is left to run. | **Adopted.** A parked await cannot observe the cancel (0.1). Without this rule a stuck run never ends. |
 | E3 | Wait while an activity task is still pending, for example a retry in backoff. | **Adopted.** That work can still resolve the await. The body then sees the cancel at its next check. |
 | E4 | Fire pending timers early to wake the body. | Rejected. A false `TimerFired` makes the history lie. |
+| E6 | When the run has added 1,000 events since the request. | **Adopted after the Codex review.** A body that ignores the request and keeps running activities makes progress on every cycle, so E2 never applies. The bound is durable: `cancel_from_seq` stores the history length at the request. |
 | E5 | When the cycle diverges or deadlocks. | **Adopted after review.** The body sees the request from the start of its replay. A check before recorded commands therefore diverges on every drive. The driver discards that cycle and ends the run. |
 
 ### 0.4 Reverse brainstorm — how can this change do harm?

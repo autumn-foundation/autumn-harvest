@@ -343,6 +343,9 @@ The run ends `CANCELLED` when one of these occurs:
 - The body blocks on a signal or a timer, and no activity task is left to
   run. A parked await cannot see the request.
 - The cycle diverges or deadlocks. The driver discards that cycle.
+- The run has added 1,000 events since the request. A body that ignores the
+  request and keeps working cannot run forever. The budget leaves room for
+  about 500 cleanup activities.
 
 So every cancel ends the run. Cleanup can run activities, but it must not
 wait on a timer or a signal: that wait ends the run. A pending activity task,

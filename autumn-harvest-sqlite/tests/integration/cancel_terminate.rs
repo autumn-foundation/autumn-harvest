@@ -202,6 +202,21 @@ async fn continues(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
     Ok(json!("unreachable"))
 }
 
+/// Runs `step` forever and never checks for a cancel.
+#[workflow]
+async fn spins(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let mut i = 0_i64;
+    loop {
+        ctx.execute_activity_raw("step", json!(i), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        i += 1;
+        if i == 2 && !ctx.is_cancelled() {
+            ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+        }
+    }
+}
+
 /// Counts the calls of each activity and records the cleanup input.
 #[derive(Default)]
 struct Calls {
@@ -236,6 +251,7 @@ fn register(rt: &mut SqliteRuntime, calls: &Arc<Calls>) {
     rt.register_workflow(&hangs_on_cancel_info());
     rt.register_workflow(&panics_on_cancel_info());
     rt.register_workflow(&continues_info());
+    rt.register_workflow(&spins_info());
     let c = Arc::clone(calls);
     rt.register_activity_raw(
         "step",
@@ -724,6 +740,28 @@ async fn a_cancel_wins_over_continue_as_new() {
     assert!(
         matches!(rt.outcome(exec).unwrap(), ExecutionOutcome::Terminated(s) if s == "CANCELLED")
     );
+}
+
+#[tokio::test]
+async fn a_body_that_ignores_the_cancel_and_keeps_working_still_ends() {
+    let (_dir, path) = temp_db();
+    let (mut rt, calls) = runtime(&path);
+    let exec = start_parked(&mut rt, "spins").await;
+    let before = rt.load_history(exec).unwrap().len();
+
+    rt.cancel(exec, "stop").unwrap();
+    let state = rt.run_until_blocked(exec).await;
+
+    assert!(
+        matches!(&state, Ok(RunState::Cancelled(reason)) if reason == "stop"),
+        "a busy body must not outrun the cancel, got {state:?}"
+    );
+    let added = rt.load_history(exec).unwrap().len() - before;
+    assert!(
+        added <= 1_002,
+        "the cleanup budget bounds the events after the request, got {added}"
+    );
+    assert!(calls.step.load(Ordering::SeqCst) < 600);
 }
 
 #[tokio::test]

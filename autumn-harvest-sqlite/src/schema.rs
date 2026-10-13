@@ -63,10 +63,13 @@ CREATE TABLE IF NOT EXISTS harvest_executions (
                                            -- TERMINATED | CONTINUED_AS_NEW
     output_json   TEXT,
     error         TEXT,
-    cancel_reason TEXT                     -- a cooperative cancel request (issue #2021).
+    cancel_reason TEXT,                    -- a cooperative cancel request (issue #2021).
                                            -- NULL until `cancel` stores a request. The
                                            -- drive reads it only while the run is
                                            -- RUNNING. A terminal run keeps the value.
+    cancel_from_seq INTEGER                -- the history length when `cancel` stored
+                                           -- the request (issue #2021). It bounds the
+                                           -- events that a cleanup can add.
 );
 
 -- Non-unique lookup index for the (workflow_name, workflow_id) reuse-policy probe
@@ -248,7 +251,8 @@ use crate::error::SqliteResult;
 ///   valid unchanged and is treated as "defaults not yet frozen" (its next claim
 ///   resolves and freezes them).
 /// - **issue #2021** — `harvest_executions.cancel_reason`, the stored cooperative
-///   cancel request. It is nullable, so an old row has no pending cancel.
+///   cancel request, and `cancel_from_seq`, the history length at the request.
+///   Both are nullable, so an old row has no pending cancel.
 ///
 /// # Errors
 ///
@@ -274,6 +278,12 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
         "harvest_executions",
         "cancel_reason",
         "ALTER TABLE harvest_executions ADD COLUMN cancel_reason TEXT",
+    )?;
+    add_column_if_absent(
+        conn,
+        "harvest_executions",
+        "cancel_from_seq",
+        "ALTER TABLE harvest_executions ADD COLUMN cancel_from_seq INTEGER",
     )?;
     Ok(())
 }
@@ -347,6 +357,7 @@ mod tests {
         assert!(column_exists(&conn, "harvest_tasks", "schedule_to_close_at").unwrap());
         assert!(column_exists(&conn, "harvest_tasks", "defaults_frozen").unwrap());
         assert!(column_exists(&conn, "harvest_executions", "cancel_reason").unwrap());
+        assert!(column_exists(&conn, "harvest_executions", "cancel_from_seq").unwrap());
     }
 
     // Issue #2021: an old `harvest_executions` gets `cancel_reason`. The old row
@@ -366,15 +377,17 @@ mod tests {
 
         migrate(&conn).unwrap();
 
-        let (state, reason): (String, Option<String>) = conn
+        let (state, reason, from): (String, Option<String>, Option<i64>) = conn
             .query_row(
-                "SELECT state, cancel_reason FROM harvest_executions WHERE exec_id = 'e1'",
+                "SELECT state, cancel_reason, cancel_from_seq FROM harvest_executions \
+                 WHERE exec_id = 'e1'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
         assert_eq!(state, "RUNNING");
         assert_eq!(reason, None);
+        assert_eq!(from, None);
     }
 
     // An old-schema `harvest_tasks` (missing the freeze columns) is brought up to

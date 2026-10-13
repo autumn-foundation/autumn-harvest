@@ -14,7 +14,10 @@ the agent daemon, could not stop a stuck run.
   returns `Ok` or `Err`, or continues as new. No successor starts. It also ends when the body blocks on a signal or a
   timer with no activity task left, because a parked await cannot see the
   request. It also ends when the cycle diverges or deadlocks: the driver
-  discards that cycle.
+  discards that cycle. It also ends once the run adds 1,000 events after the
+  request, so a body that ignores the request and keeps working cannot run
+  forever. `harvest_executions.cancel_from_seq` stores the history length at
+  the request.
 - A pending activity task, such as a retry in backoff, still runs. A repeat
   cancel keeps the first reason. The request survives a reopen.
 - `SqliteRuntime::terminate(exec, reason)` ends the run `TERMINATED` in one
@@ -43,7 +46,7 @@ pending. A recorded `WorkflowCancelled` wins. Every other caller passes
 The `WorkflowNotRunning` message now ends "cannot accept the request".
 
 **Invariants.** No new `WorkflowEvent` variant. No Postgres migration. The
-SQLite schema adds one nullable column through the additive `migrate` step.
+SQLite schema adds two nullable columns through the additive `migrate` step.
 `harvest_events` stays append-only.
 
 **Known limits.**
@@ -64,6 +67,7 @@ covers:
 - a body parked on a signal, on a timer, and behind a pending retry;
 - a check before recorded steps and before a recorded timer;
 - a deadlock and a panic under a pending request;
+- a busy body that ignores the request and keeps running activities;
 - a side effect of the returning cycle, and a second drive of a cancelled run;
 - a signal consumed after a request, and a cancel that wins over
   `continue_as_new`;
