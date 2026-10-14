@@ -2205,8 +2205,12 @@ impl SqliteRuntime {
         if let Some(deadline) = config.deadline_at.filter(|at| now >= *at) {
             return self.seal_timed_out(exec, deadline, now);
         }
-        // A local activity waits for its retry backoff here.
-        if config.local_retry_at.is_some_and(|at| now < at) {
+        // A local activity waits for its retry backoff here. A pending cancel
+        // skips the wait: the next attempt runs now, so the activity resolves
+        // and the body sees the cancel.
+        if config.local_retry_at.is_some_and(|at| now < at)
+            && store::cancel_request(&self.conn, exec)?.is_none()
+        {
             return Ok(RunState::WaitingTimer);
         }
 

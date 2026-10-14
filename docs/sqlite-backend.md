@@ -504,7 +504,8 @@ attempt. Some limits apply:
   it returns.
 - A backoff and a timeout round up to whole milliseconds.
 - A retry backoff ends the cycle. A drive before its end returns
-  `RunState::WaitingTimer`. Postgres sleeps inline instead. So a signal can
+  `RunState::WaitingTimer`. Postgres sleeps inline instead. A pending cancel
+  skips the wait, so the next attempt runs at once. So a signal can
   reach the run between two attempts. A signal handler that then issues a
   durable command shares a batch with the local activity, and the run ends
   `FAILED`.

@@ -523,3 +523,29 @@ async fn a_hung_local_activity_times_out_at_its_budget() {
     );
     assert_replays(info.name, info.handler, rt.load_history(exec).unwrap()).await;
 }
+
+// A cancel does not wait out a local retry backoff. The next attempt runs at
+// once, so the activity resolves, and the run then ends `CANCELLED`.
+#[tokio::test]
+async fn a_cancel_skips_a_local_retry_backoff() {
+    let info = calls_slow_retry_info();
+    let mut rt = runtime(&info);
+    let _clock = install_clock(&mut rt);
+    let calls = fail_once(&mut rt, &slow_retry_info(), "not yet".to_string());
+    let exec = rt.start_workflow(info.name, json!(4)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::WaitingTimer), "got {state:?}");
+
+    rt.cancel(exec, "stop").unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::Cancelled(ref r) if r == "stop"),
+        "got {state:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the next attempt ran at once"
+    );
+    assert_replays(info.name, info.handler, rt.load_history(exec).unwrap()).await;
+}
