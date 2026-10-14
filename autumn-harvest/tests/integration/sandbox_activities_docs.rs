@@ -412,6 +412,40 @@ fn image_links_cannot_take_a_build_write_out_of_the_image() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn a_publish_makes_each_image_file_readable_by_the_jail() {
+    use std::os::unix::fs::PermissionsExt as _;
+    const FILES: [&str; 3] = ["rootfs.ext4", "vmlinux", "image.sha256"];
+    let scratch = std::env::temp_dir().join(format!("hsbx-publish-mode-{}", std::process::id()));
+    let (stage, out) = (scratch.join("stage"), scratch.join("out"));
+    std::fs::create_dir_all(&stage).expect("stage dir");
+    std::fs::create_dir_all(&out).expect("out dir");
+    for file in FILES {
+        let path = stage.join(file);
+        std::fs::write(&path, file).expect("stage file");
+        // A build under umask 077 makes files that only the owner can read.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("stage mode");
+    }
+    let status = std::process::Command::new("bash")
+        .arg(repo_root().join(PUBLISH_SCRIPT))
+        .arg(&stage)
+        .arg(&out)
+        .status()
+        .expect("run publish-image.sh");
+    assert!(status.success(), "{status}");
+    // The jailed VMM reads each file as the jail uid.
+    for file in FILES {
+        let mode = std::fs::metadata(out.join(file))
+            .expect("published file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o644, "{file}: {mode:o}");
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn a_publish_waits_for_a_launcher_that_pins() {
     use std::io::BufRead as _;
     const FILES: [&str; 3] = ["rootfs.ext4", "vmlinux", "image.sha256"];

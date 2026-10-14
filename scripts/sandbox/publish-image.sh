@@ -17,6 +17,13 @@ stage="${1:?usage: publish-image.sh STAGE_DIR OUT_DIR}"
 out="${2:?usage: publish-image.sh STAGE_DIR OUT_DIR}"
 files=(rootfs.ext4 vmlinux image.sha256)
 
+# The jailed VMM reads each file as the jail uid. A build under a strict
+# umask, such as 077, makes files that only the owner can read. So each
+# file gets mode 0644 before it moves.
+for file in "${files[@]}"; do
+  chmod 0644 "${stage}/${file}"
+done
+
 exec 9<"${out}"
 if ! flock -w 60 -x 9; then
   echo "publish-image: ${out} stayed locked; nothing is published" >&2

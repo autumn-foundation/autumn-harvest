@@ -2115,9 +2115,21 @@ fn vm_root_of(confinement: &Confinement, exec_name: &str) -> PathBuf {
 }
 
 /// Write a VM document as JSON.
+///
+/// A jailed Firecracker reads the file as the jail uid. The umask can narrow
+/// the mode of the open, so the file gets mode 0644 again after the write.
 fn write_config(path: &Path, document: &super::config::VmConfigFile) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let json = serde_json::to_vec_pretty(document).map_err(std::io::Error::other)?;
-    std::fs::write(path, json)
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(path)?;
+    file.write_all(&json)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o644))
 }
 
 /// Removes a jail when a launch stops before the VMM owns it.
@@ -3860,6 +3872,27 @@ while True:
         // The jail uid runs the jailer's copy, which keeps this mode.
         let mode = std::fs::metadata(&copies[0]).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o555, "{mode:o}");
+    }
+
+    #[test]
+    fn the_vm_config_is_readable_under_a_strict_umask() {
+        let Some(dir) = in_child_with_umask(
+            "077",
+            "sandbox::firecracker::launcher::tests::the_vm_config_is_readable_under_a_strict_umask",
+        ) else {
+            return;
+        };
+        let document = vm_config(
+            &image(&dir),
+            MachineSpec::default(),
+            &VmPaths::jailed(),
+            GUEST_AGENT_PORT,
+        );
+        let path = dir.join(CONFIG_FILE);
+        write_config(&path, &document).unwrap();
+        // The jailed Firecracker reads the file as the jail uid.
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644, "{mode:o}");
     }
 
     #[test]
