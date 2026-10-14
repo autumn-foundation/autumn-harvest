@@ -150,8 +150,8 @@ impl PlanExecutor for ProcessExecutor {
 ///
 /// - [`SandboxError::Denied`]: the plan fails its check, or the command
 ///   cannot start.
-/// - [`SandboxError::Unavailable`]: the executor cannot isolate the network
-///   or set up the work directory.
+/// - [`SandboxError::Unavailable`]: the executor cannot isolate the network,
+///   set up the work directory, or remove the run cgroup.
 /// - [`SandboxError::Cancelled`]: `cancel` fires.
 ///
 /// The executor kills the process group and removes the work directory in
@@ -233,8 +233,13 @@ pub async fn execute_plan(
     };
     let duration = started.elapsed();
     let (stdout, stderr) = tokio::join!(stdout.finish(), stderr.finish());
-    if let Some(cgroup) = cgroup.take() {
-        cgroup.remove().await;
+    let cleaned = match cgroup.as_mut() {
+        Some(cgroup) => cgroup.remove().await,
+        None => Ok(()),
+    };
+    if let Err(e) = cleaned {
+        work.remove().await;
+        return Err(e);
     }
 
     let status = run_status(end)?;
@@ -506,17 +511,28 @@ impl RunCgroup {
     }
 
     /// Kill each process in the cgroup, wait for it to empty, and remove it.
-    async fn remove(mut self) {
-        self.removed = true;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::Unavailable`] when the cgroup is still there.
+    /// A process of the run can still be alive, so the run fails closed. The
+    /// drop then tries again.
+    async fn remove(&mut self) -> Result<(), SandboxError> {
         let dir = self.dir.clone();
         let removed = tokio::task::spawn_blocking(move || {
             crate::sandbox::cgroup::kill_and_remove(&dir, CGROUP_WAIT);
             !dir.exists()
         })
         .await;
-        if !matches!(removed, Ok(true)) {
-            tracing::warn!(path = %self.dir.display(), "could not remove a sandbox run cgroup");
+        if matches!(removed, Ok(true)) {
+            self.removed = true;
+            return Ok(());
         }
+        Err(SandboxError::Unavailable(format!(
+            "the run cgroup {} is still there after the cleanup, so a process of the run can \
+             still be alive; the run fails closed",
+            self.dir.display()
+        )))
     }
 }
 
@@ -2011,6 +2027,29 @@ mod tests {
         .await
         .expect("the watch must end when it cannot read the CPU time");
         assert!(watch.is_err(), "{watch:?}");
+    }
+
+    #[tokio::test]
+    async fn a_run_cgroup_that_keeps_a_process_fails_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("cgroup.events");
+        std::fs::write(&events, "populated 1\n").unwrap();
+        let mut cgroup = RunCgroup {
+            dir: dir.path().to_path_buf(),
+            procs: std::fs::File::open(&events).unwrap(),
+            removed: false,
+        };
+        let err = cgroup.remove().await.expect_err("a process is left");
+        assert!(
+            matches!(err, SandboxError::Unavailable(ref m) if m.contains("still")),
+            "{err:?}"
+        );
+        // The drop tries again, so it writes `cgroup.kill` once more.
+        assert!(!cgroup.removed, "the cleanup must stay armed");
+        let kill = dir.path().join("cgroup.kill");
+        std::fs::remove_file(&kill).unwrap();
+        drop(cgroup);
+        assert!(kill.exists(), "the drop did not try again");
     }
 
     #[test]
