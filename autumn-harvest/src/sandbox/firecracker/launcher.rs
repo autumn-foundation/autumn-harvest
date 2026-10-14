@@ -98,12 +98,72 @@ pub trait VmLauncher: Send + Sync + 'static {
 }
 
 /// The two snapshot files of a golden microVM.
+///
+/// A manifest next to the state file holds the boot arguments and the
+/// machine of the snapshot. Its name is the state file name and `.json`. A
+/// launcher with other values refuses the snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotFiles {
     /// The VM state file.
     pub state: PathBuf,
     /// The guest memory file.
     pub memory: PathBuf,
+}
+
+/// What a golden snapshot keeps of its launcher. A restore cannot change
+/// it: the guest agent keeps the port of its boot arguments.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SnapshotMeta {
+    boot_args: String,
+    vcpu_count: u8,
+    mem_size_mib: u32,
+}
+
+impl SnapshotMeta {
+    /// The values of `config`.
+    fn of(config: &LauncherConfig) -> Self {
+        Self {
+            boot_args: super::config::boot_args(&config.image, config.guest_port),
+            vcpu_count: config.machine.vcpu_count,
+            mem_size_mib: config.machine.mem_size_mib,
+        }
+    }
+
+    /// The manifest file next to the snapshot state file `state`.
+    fn path(state: &Path) -> PathBuf {
+        let mut name = state.file_name().unwrap_or_default().to_os_string();
+        name.push(".json");
+        state.with_file_name(name)
+    }
+
+    /// Check that the snapshot of `files` keeps the values of `config`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::Config`] when the manifest is missing, is not
+    /// valid, or holds other values. Each run would otherwise time out.
+    fn check(config: &LauncherConfig, files: &SnapshotFiles) -> Result<(), SandboxError> {
+        let path = Self::path(&files.state);
+        let found: Self = std::fs::read(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
+            .map_err(|e| {
+                SandboxError::Config(format!(
+                    "cannot read the snapshot manifest {}: {e}; create the snapshot with \
+                     create_golden_snapshot",
+                    path.display()
+                ))
+            })?;
+        let want = Self::of(config);
+        if found != want {
+            return Err(SandboxError::Config(format!(
+                "the snapshot keeps {found:?}, but this launcher has {want:?}; a restored \
+                 guest keeps the boot arguments, such as harvest.port, and the machine of \
+                 its snapshot"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// How a launcher boots each microVM.
@@ -224,6 +284,10 @@ impl PinnedImage {
                 "cannot lock the image directories for the pin: {e}; a publish can hold them"
             ))
         })?;
+        // The manifest lands with the pair, so the lock covers it too.
+        if let BootMethod::Snapshot(snapshot) = &config.boot {
+            SnapshotMeta::check(config, snapshot)?;
+        }
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&dir)
@@ -885,14 +949,24 @@ impl FirecrackerLauncher {
             state: out_dir.join(SNAPSHOT_STATE_FILE),
             memory: out_dir.join(SNAPSHOT_MEMORY_FILE),
         };
-        let copies = [
+        let mut copies = vec![
             (root.join(SNAPSHOT_STATE_FILE), files.state.clone()),
             (root.join(SNAPSHOT_MEMORY_FILE), files.memory.clone()),
         ];
+        let meta = serde_json::to_vec(&SnapshotMeta::of(&self.config)).map_err(|e| {
+            SandboxError::Unavailable(format!("cannot encode the snapshot manifest: {e}"))
+        })?;
+        let meta_path = SnapshotMeta::path(&files.state);
         let out = out_dir.to_path_buf();
         tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&out)?;
-            publish_snapshot(&copies, gid)
+            // The manifest replaces the old one with the pair, as one set.
+            let staged = staging_name(&meta_path);
+            std::fs::write(&staged, &meta)?;
+            copies.push((staged.clone(), meta_path));
+            let published = publish_snapshot(&copies, gid);
+            let _ = std::fs::remove_file(&staged);
+            published
         })
         .await
         .map_err(|e| SandboxError::Unavailable(format!("the snapshot copy failed: {e}")))?
@@ -3378,6 +3452,45 @@ while True:
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Write the snapshot manifest of `config` for `files`.
+    fn write_snapshot_meta(config: &LauncherConfig, files: &SnapshotFiles) {
+        let meta = serde_json::to_vec(&SnapshotMeta::of(config)).unwrap();
+        std::fs::write(SnapshotMeta::path(&files.state), meta).unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_must_keep_the_boot_args_and_machine_of_the_launcher() {
+        let dir = temp_dir();
+        let files = SnapshotFiles {
+            state: dir.join("snap.state"),
+            memory: dir.join("snap.mem"),
+        };
+        std::fs::write(&files.state, b"state").unwrap();
+        std::fs::write(&files.memory, b"memory").unwrap();
+        let mut config = jailed(&dir);
+        config.boot = BootMethod::Snapshot(files.clone());
+        let refused = |what: &str| {
+            let err = new_launcher(config.clone()).expect_err(what);
+            assert!(
+                matches!(err, SandboxError::Config(ref m) if m.contains("snapshot")),
+                "{what}: {err:?}"
+            );
+        };
+        refused("a snapshot without a manifest");
+        // The guest agent of the snapshot listens on its own port.
+        let mut other = config.clone();
+        other.guest_port = GUEST_AGENT_PORT + 1;
+        write_snapshot_meta(&other, &files);
+        refused("a snapshot with another guest port");
+        let mut other = config.clone();
+        other.machine.mem_size_mib = 1024;
+        write_snapshot_meta(&other, &files);
+        refused("a snapshot with another machine");
+        write_snapshot_meta(&config, &files);
+        drop(new_launcher(config).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn a_snapshot_launch_keeps_the_pair_of_the_launcher_start() {
         let dir = temp_dir();
@@ -3389,6 +3502,7 @@ while True:
         std::fs::write(&files.memory, b"old memory").unwrap();
         let mut config = jailed(&dir);
         config.boot = BootMethod::Snapshot(files.clone());
+        write_snapshot_meta(&config, &files);
         let launcher = new_launcher(config).unwrap();
         // Only the memory file of a new pair has landed.
         let old_memory = publish_over(&files.memory, b"new memory");
@@ -3510,7 +3624,7 @@ while True:
             guest_port: GUEST_AGENT_PORT,
             api_timeout: Duration::from_secs(5),
         };
-        let launcher = new_launcher(config).unwrap();
+        let launcher = new_launcher(config.clone()).unwrap();
         let out = dir.join("golden");
         let files = launcher
             .create_golden_snapshot(&out, Duration::from_secs(10))
@@ -3520,7 +3634,11 @@ while True:
         assert_eq!(files.memory, out.join("snapshot.mem"));
         assert_eq!(std::fs::read(&files.state).unwrap(), b"state");
         assert_eq!(std::fs::read(&files.memory).unwrap(), b"memory");
-        for file in [&files.state, &files.memory] {
+        // The manifest lands with the pair, and a restore with this config
+        // passes its check.
+        SnapshotMeta::check(&config, &files).unwrap();
+        let manifest = SnapshotMeta::path(&files.state);
+        for file in [&files.state, &files.memory, &manifest] {
             let meta = std::fs::metadata(file).unwrap();
             assert_eq!(meta.mode() & 0o777, 0o640, "{}", file.display());
             assert_eq!(meta.gid(), 23_456, "the jailed VMM reads it by group");

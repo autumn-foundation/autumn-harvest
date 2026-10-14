@@ -376,9 +376,15 @@ for its agent, pauses it and saves the files. No code runs in it. The files
 hold the guest memory, so the golden microVM must hold no secret. The new
 pair replaces an old pair only after both copies are complete, and a failed
 rename puts the old file back. When that fails too, the old file stays under a
-hidden backup name, and the error names it. The renames hold the directory lock, so a
-launcher that starts meanwhile waits. A host crash between the two renames
-can leave a mixed pair, so create the snapshot again after such a crash.
+hidden backup name, and the error names it. The renames hold the directory
+lock, so a launcher that starts meanwhile waits. A host crash between the two
+renames can leave a mixed pair, so create the snapshot again after such a
+crash.
+
+A restored guest keeps the boot arguments and the machine of its snapshot,
+such as the `harvest.port` of its agent. So the snapshot gets a manifest next
+to its state file, `snapshot.state.json`, with these values. A launcher with
+other values, or a snapshot without a manifest, is a config error.
 
 Clones of one snapshot share their user-space random state. Each run
 therefore carries fresh host entropy, and VMGenID reseeds the kernel on Linux
