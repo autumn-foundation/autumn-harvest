@@ -65,7 +65,8 @@ const STATUS_PREFIX: &str = "**Submission status:**";
 const REPLAY_RULES: &[&[&str]] = &[
     &["MUST set `workflow.replay`"],
     &[
-        "MUST NOT emit a span for an operation that history already records",
+        "MUST NOT emit a span for an operation that a replay cycle reads from history",
+        "The first live application of an operation still gets its span",
         "`execute_activity`",
         "`schedule_activity`",
         "`start_child_workflow`",

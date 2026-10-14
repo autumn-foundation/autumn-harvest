@@ -129,11 +129,11 @@ The key words MUST, MUST NOT, SHOULD and SHOULD NOT are as in RFC 2119.
 1. An `execute_workflow` span MUST set `workflow.replay`. The value is
    `true` for a cycle that rebuilds state from history. It is `false` for
    a first cycle and for a resume from state in memory.
-2. Instrumentation MUST NOT emit a span for an operation that history
-   already records. This covers `execute_activity` for a recorded result.
-   It also covers `schedule_activity` and `start_child_workflow` for a
-   recorded command. A replay reads the record. It does not run the
-   operation again.
+2. Instrumentation MUST NOT emit a span for an operation that a replay
+   cycle reads from history. This covers `execute_activity` for a recorded
+   result. It also covers `schedule_activity` and `start_child_workflow`
+   for a recorded command. The first live application of an operation
+   still gets its span, even when the engine writes the event first.
 3. A replay cycle SHOULD start a new root span. It SHOULD NOT use the
    original trace context as its parent, because the original trace can
    be closed or dropped before the replay.
@@ -244,7 +244,7 @@ A new `workflow` area at `development` stability:
   `send_signal`, `deliver_signal`, `fire_timer`.
 - A replay rule. A replay cycle sets `workflow.replay`. It starts a new
   root span with a link to the original trace. It emits no span for an
-  operation that history already records.
+  operation that a replay cycle reads from history.
 
 A draft Weaver model (`model/workflow/registry.yaml` and
 `model/workflow/spans.yaml`) is at

@@ -119,6 +119,9 @@ code, guard quality, and style. The fixes:
 - Codex found that `fire_timer` could start before its parent cycle
   existed. The `fire_timer` and `deliver_signal` spans now start inside
   the `execute_workflow` cycle. A guard checks each child span.
+- Codex found that rule 2 also forbade the first live `deliver_signal` or
+  `fire_timer` span, when an engine writes the event first. Rule 2 now
+  covers only what a replay cycle reads from history.
 
 ### 0.6 Decisions
 
