@@ -282,8 +282,8 @@ pub fn running(reader: &Reader, workflow_name: &str) -> Result<Vec<RunningSessio
     // it.
     //
     // The backend matches the name and the state by their BYTES. A column of
-    // TEXT affinity still keeps a stored BLOB as a BLOB, so a damaged row can
-    // hold the right bytes in the wrong class. The engine reads these columns
+    // TEXT affinity still keeps a stored BLOB as a BLOB. A damaged row can
+    // therefore hold the right bytes in the wrong class. The engine reads these columns
     // into a `String`, and refuses a BLOB there. Such a row is matched, and
     // its field reads as `Unreadable`. The row is then named damaged.
     //
@@ -1403,8 +1403,8 @@ pub fn executions(
     before: Option<i64>,
 ) -> Result<Vec<SessionSummary>, String> {
     // The backend walks the rowid backwards, which is the order the listing
-    // wants, so it stops at the cap. It matches the name by its BYTES: a
-    // session recorded as a `BLOB` was once missing from the listing, while
+    // wants, so it stops at the cap. It matches the name by its BYTES. A
+    // session recorded as a `BLOB` was once missing from the listing. Then
     // `status` and `history` reported that it does not exist.
     //
     // Each row arrives with its payloads, one row at a time. It is cut to a

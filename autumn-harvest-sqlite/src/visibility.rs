@@ -417,8 +417,8 @@ impl ToSql for Param {
 /// [`OPTIONAL_COLUMNS`] and fixed SQL reach the text.
 ///
 /// The name, the state and the workflow id are compared as bytes. A `BLOB`
-/// that holds the same letters as a `TEXT` value never compares equal to it,
-/// and a damaged row would then drop out of the listing. The cast keeps the
+/// with the same letters as a `TEXT` value never compares equal to it. A
+/// damaged row would then drop out of the listing. The cast keeps the
 /// name out of the index choice, so the query walks the `rowid` backwards.
 /// That is the order of the listing, so the walk stops at the page size. A
 /// filter that matches few rows walks further.
