@@ -396,7 +396,9 @@ Clones of one snapshot share their user-space random state. Each run
 therefore carries fresh host entropy, and VMGenID reseeds the kernel on Linux
 5.18 and later. A restored microVM also starts with the clock of the
 snapshot, and each run sets the clock again. Rebuild the snapshot on each
-change of Firecracker, the host kernel or the CPU model.
+change of Firecracker, the host kernel or the CPU model. The manifest holds
+all three. A launcher refuses a snapshot of another host kernel or CPU model
+at its start, and of another Firecracker at its first version check.
 
 ## The agent tool
 

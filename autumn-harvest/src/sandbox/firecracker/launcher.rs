@@ -121,6 +121,11 @@ struct SnapshotMeta {
     /// booted kernel, and the guest reads the root file system.
     kernel_sha256: String,
     rootfs_sha256: String,
+    /// The Firecracker version, the host kernel and the CPU model. A
+    /// snapshot does not load on another one of them.
+    firecracker: String,
+    host_kernel: String,
+    cpu: String,
 }
 
 impl SnapshotMeta {
@@ -129,13 +134,21 @@ impl SnapshotMeta {
     /// # Errors
     ///
     /// Returns the error of a file that cannot be read.
-    fn of(config: &LauncherConfig, kernel: &Path, rootfs: &Path) -> std::io::Result<Self> {
+    fn of(
+        config: &LauncherConfig,
+        (kernel, rootfs): (&Path, &Path),
+        firecracker: super::posture::Version,
+    ) -> std::io::Result<Self> {
+        let (major, minor, patch) = firecracker;
         Ok(Self {
             boot_args: super::config::boot_args(&config.image, config.guest_port),
             vcpu_count: config.machine.vcpu_count,
             mem_size_mib: config.machine.mem_size_mib,
             kernel_sha256: file_sha256(kernel)?,
             rootfs_sha256: file_sha256(rootfs)?,
+            firecracker: format!("{major}.{minor}.{patch}"),
+            host_kernel: host_kernel()?,
+            cpu: cpu_model()?,
         })
     }
 
@@ -146,13 +159,15 @@ impl SnapshotMeta {
         state.with_file_name(name)
     }
 
-    /// Check that the snapshot of `files` keeps the values of `config`.
+    /// Check that the snapshot of `files` keeps the values of `config` and
+    /// this host, and return its manifest. The Firecracker version is
+    /// checked apart, at the first version probe.
     ///
     /// # Errors
     ///
     /// Returns [`SandboxError::Config`] when the manifest is missing, is not
-    /// valid, or holds other values. Each run would otherwise time out.
-    fn check(config: &LauncherConfig, files: &SnapshotFiles) -> Result<(), SandboxError> {
+    /// valid, or holds other values. Each run would otherwise fail.
+    fn check(config: &LauncherConfig, files: &SnapshotFiles) -> Result<Self, SandboxError> {
         let path = Self::path(&files.state);
         let found: Self = std::fs::read(&path)
             .map_err(|e| e.to_string())
@@ -164,17 +179,42 @@ impl SnapshotMeta {
                     path.display()
                 ))
             })?;
-        let want = Self::of(config, &config.image.kernel, &config.image.rootfs).map_err(|e| {
+        let mut want = Self::of(
+            config,
+            (&config.image.kernel, &config.image.rootfs),
+            (0, 0, 0),
+        )
+        .map_err(|e| {
             SandboxError::Config(format!("cannot read the guest image for its digest: {e}"))
         })?;
+        want.firecracker.clone_from(&found.firecracker);
         if found != want {
             return Err(SandboxError::Config(format!(
                 "the snapshot keeps {found:?}, but this launcher has {want:?}; a restored \
-                 guest keeps the boot arguments, such as harvest.port, and the machine of \
-                 its snapshot"
+                 guest keeps the boot arguments, such as harvest.port, the machine and the \
+                 image of its snapshot, and loads only on its host kernel and CPU model"
             )));
         }
-        Ok(())
+        Ok(found)
+    }
+
+    /// Check that the snapshot was made with the Firecracker `version`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::Config`] for another version. Each load would
+    /// fail, and a retry cannot help.
+    fn check_firecracker(&self, version: super::posture::Version) -> Result<(), SandboxError> {
+        let (major, minor, patch) = version;
+        let running = format!("{major}.{minor}.{patch}");
+        if self.firecracker == running {
+            return Ok(());
+        }
+        Err(SandboxError::Config(format!(
+            "the snapshot was made with Firecracker {}, but this host runs Firecracker \
+             {running}; create the snapshot again",
+            self.firecracker
+        )))
     }
 }
 
@@ -229,7 +269,8 @@ pub struct FirecrackerLauncher {
     exec_name: String,
     owner: String,
     /// Set after the first version check that passes.
-    versions_checked: tokio::sync::OnceCell<()>,
+    /// The Firecracker version, once the first check passed.
+    versions_checked: tokio::sync::OnceCell<super::posture::Version>,
     /// The lease and the leftover cgroups, shared with each microVM.
     tenancy: Arc<Tenancy>,
 }
@@ -265,6 +306,8 @@ struct PinnedImage {
     kernel: PathBuf,
     rootfs: PathBuf,
     snapshot: Option<SnapshotFiles>,
+    /// The manifest of the snapshot, checked at the pin.
+    meta: Option<SnapshotMeta>,
 }
 
 impl PinnedImage {
@@ -297,9 +340,10 @@ impl PinnedImage {
             ))
         })?;
         // The manifest lands with the pair, so the lock covers it too.
-        if let BootMethod::Snapshot(snapshot) = &config.boot {
-            SnapshotMeta::check(config, snapshot)?;
-        }
+        let meta = match &config.boot {
+            BootMethod::Snapshot(snapshot) => Some(SnapshotMeta::check(config, snapshot)?),
+            BootMethod::ConfigFile | BootMethod::Api => None,
+        };
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&dir)
@@ -322,6 +366,7 @@ impl PinnedImage {
                 kernel: link(&config.image.kernel, KERNEL_FILE)?,
                 rootfs: link(&config.image.rootfs, ROOTFS_FILE)?,
                 snapshot,
+                meta,
             })
         })();
         if pinned.is_err() {
@@ -830,18 +875,24 @@ impl FirecrackerLauncher {
 
     /// Check the Firecracker and jailer versions once. A failed check runs
     /// again on the next call.
-    async fn check_versions(&self) -> Result<(), SandboxError> {
-        self.versions_checked
+    async fn check_versions(&self) -> Result<super::posture::Version, SandboxError> {
+        let version = self
+            .versions_checked
             .get_or_try_init(|| async {
                 use super::posture::{VmmBinary, probe_version};
-                probe_version(&self.config.firecracker_bin, VmmBinary::Firecracker).await?;
+                let version =
+                    probe_version(&self.config.firecracker_bin, VmmBinary::Firecracker).await?;
                 if let Confinement::Jailer(jailer) = &self.config.confinement {
                     probe_version(&jailer.jailer_bin, VmmBinary::Jailer).await?;
                 }
-                Ok::<(), SandboxError>(())
+                let meta = self.tenancy.pinned.as_ref().and_then(|p| p.meta.as_ref());
+                if let Some(meta) = meta {
+                    meta.check_firecracker(version)?;
+                }
+                Ok::<_, SandboxError>(version)
             })
             .await?;
-        Ok(())
+        Ok(*version)
     }
 
     /// Create the VM directory and the command for `id`.
@@ -914,13 +965,13 @@ impl FirecrackerLauncher {
                 self.config.machine.mem_size_mib
             )));
         }
-        self.check_versions().await?;
+        let firecracker = self.check_versions().await?;
         let id = new_vm_id(&self.owner);
         validate_vm_id(&id)?;
         let prepared = self.prepare_jailed(jailer, &id, &BootMethod::Api).await?;
         let mut vm = RunningVm::spawn(id, prepared, Arc::clone(&self.tenancy))?;
         let result = self
-            .snapshot_vm(&mut vm, out_dir, boot_timeout, jailer.gid)
+            .snapshot_vm(&mut vm, out_dir, (boot_timeout, jailer.gid), firecracker)
             .await;
         vm.teardown().await;
         result
@@ -932,8 +983,8 @@ impl FirecrackerLauncher {
         &self,
         vm: &mut RunningVm,
         out_dir: &Path,
-        boot_timeout: Duration,
-        gid: u32,
+        (boot_timeout, gid): (Duration, u32),
+        firecracker: super::posture::Version,
     ) -> Result<SnapshotFiles, SandboxError> {
         let socket = vm.api_socket.clone().ok_or_else(|| {
             SandboxError::Unavailable("the golden microVM has no API socket".into())
@@ -981,7 +1032,7 @@ impl FirecrackerLauncher {
         let meta_path = SnapshotMeta::path(&files.state);
         let out = out_dir.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let meta = SnapshotMeta::of(&config, &kernel, &rootfs)?;
+            let meta = SnapshotMeta::of(&config, (&kernel, &rootfs), firecracker)?;
             let meta = serde_json::to_vec(&meta).map_err(std::io::Error::other)?;
             std::fs::create_dir_all(&out)?;
             // The manifest replaces the old one with the pair, as one set.
@@ -1302,6 +1353,38 @@ const SNAPSHOT_MEMORY_FILE: &str = "snapshot.mem";
 /// The time limit of the pause and snapshot calls. A full snapshot writes
 /// the whole guest memory.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The release of the host kernel, which restores a snapshot.
+fn host_kernel() -> std::io::Result<String> {
+    Ok(std::fs::read_to_string("/proc/sys/kernel/osrelease")?
+        .trim()
+        .to_owned())
+}
+
+/// The CPU model of this host: the model lines of its first CPU in
+/// `/proc/cpuinfo`. A snapshot holds CPU state.
+fn cpu_model() -> std::io::Result<String> {
+    const KEYS: [&str; 9] = [
+        "vendor_id",
+        "cpu family",
+        "model",
+        "model name",
+        "stepping",
+        "CPU implementer",
+        "CPU variant",
+        "CPU part",
+        "CPU revision",
+    ];
+    let info = std::fs::read_to_string("/proc/cpuinfo")?;
+    let first = info.split("\n\n").next().unwrap_or_default();
+    Ok(first
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(key, _)| KEYS.contains(&key.trim()))
+        .map(|(key, value)| format!("{}={}", key.trim(), value.trim()))
+        .collect::<Vec<_>>()
+        .join("; "))
+}
 
 /// The SHA-256 digest of the file at `path`, in hex.
 fn file_sha256(path: &Path) -> std::io::Result<String> {
@@ -2403,6 +2486,40 @@ mod tests {
             .map(|path| std::fs::read(path).unwrap())
             .collect();
         assert_eq!(kept, [b"old state".to_vec()]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_of_another_firecracker_is_a_config_error() {
+        let dir = temp_dir();
+        let files = SnapshotFiles {
+            state: dir.join("snap.state"),
+            memory: dir.join("snap.mem"),
+        };
+        std::fs::write(&files.state, b"state").unwrap();
+        std::fs::write(&files.memory, b"memory").unwrap();
+        let mut config = jailed(&dir);
+        config.boot = BootMethod::Snapshot(files.clone());
+        // The fake Firecracker reports 1.17.0.
+        let image = (config.image.kernel.as_path(), config.image.rootfs.as_path());
+        write_meta(
+            &files,
+            &SnapshotMeta::of(&config, image, (1, 16, 0)).unwrap(),
+        );
+        let launcher = new_launcher(config.clone()).unwrap();
+        let err = launcher
+            .check_versions()
+            .await
+            .expect_err("another Firecracker");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("Firecracker")),
+            "{err:?}"
+        );
+        drop(launcher);
+        write_snapshot_meta(&config, &files);
+        let launcher = new_launcher(config).unwrap();
+        launcher.check_versions().await.unwrap();
+        drop(launcher);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3634,8 +3751,13 @@ while True:
 
     /// Write the snapshot manifest of `config` for `files`.
     fn write_snapshot_meta(config: &LauncherConfig, files: &SnapshotFiles) {
-        let meta = SnapshotMeta::of(config, &config.image.kernel, &config.image.rootfs).unwrap();
-        let meta = serde_json::to_vec(&meta).unwrap();
+        let image = (config.image.kernel.as_path(), config.image.rootfs.as_path());
+        write_meta(files, &SnapshotMeta::of(config, image, (1, 17, 0)).unwrap());
+    }
+
+    /// Write `meta` as the snapshot manifest of `files`.
+    fn write_meta(files: &SnapshotFiles, meta: &SnapshotMeta) {
+        let meta = serde_json::to_vec(meta).unwrap();
         std::fs::write(SnapshotMeta::path(&files.state), meta).unwrap();
     }
 
@@ -3678,6 +3800,25 @@ while True:
         std::fs::write(&other.image.rootfs, b"another rootfs").unwrap();
         write_snapshot_meta(&other, &files);
         refused("a snapshot of another root file system");
+        // A snapshot holds CPU state, and the host kernel restores it.
+        let image = (config.image.kernel.as_path(), config.image.rootfs.as_path());
+        let meta = SnapshotMeta::of(&config, image, (1, 17, 0)).unwrap();
+        write_meta(
+            &files,
+            &SnapshotMeta {
+                cpu: "another CPU".into(),
+                ..meta.clone()
+            },
+        );
+        refused("a snapshot of another CPU model");
+        write_meta(
+            &files,
+            &SnapshotMeta {
+                host_kernel: "another kernel".into(),
+                ..meta
+            },
+        );
+        refused("a snapshot of another host kernel");
         write_snapshot_meta(&config, &files);
         drop(new_launcher(config).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
@@ -3828,7 +3969,8 @@ while True:
         assert_eq!(std::fs::read(&files.memory).unwrap(), b"memory");
         // The manifest lands with the pair, and a restore with this config
         // passes its check.
-        SnapshotMeta::check(&config, &files).unwrap();
+        let meta = SnapshotMeta::check(&config, &files).unwrap();
+        meta.check_firecracker((1, 17, 0)).unwrap();
         let manifest = SnapshotMeta::path(&files.state);
         for file in [&files.state, &files.memory, &manifest] {
             let meta = std::fs::metadata(file).unwrap();
