@@ -217,8 +217,9 @@ fn launcher_boot_args(image: &GuestImage, port: u32) -> Vec<String> {
     ]
 }
 
-/// Check that the init path is one kernel word, and that no extra boot
-/// argument replaces an argument of the launcher.
+/// Check that the init path is one kernel word. Check also that no extra
+/// boot argument replaces an argument of the launcher or reaches the guest
+/// agent as an option.
 ///
 /// # Errors
 ///
@@ -258,6 +259,14 @@ pub fn check_boot_args(image: &GuestImage) -> Result<(), SandboxError> {
         .iter()
         .flat_map(|arg| arg.split_whitespace())
     {
+        // The kernel gives `--`, each word after it and each unknown word
+        // to init. No kernel parameter starts with `-`, so such a word is
+        // an option of the guest agent, which could change its mode.
+        if arg.starts_with('-') {
+            return Err(SandboxError::Config(format!(
+                "the extra boot argument {arg:?} would reach the guest agent as an option"
+            )));
+        }
         let name = key(arg);
         if reserved.contains(&name) {
             return Err(SandboxError::Config(format!(
@@ -432,6 +441,30 @@ mod tests {
         }
         let mut image = image();
         image.extra_boot_args.push("harvest.debug=1".into());
+        check_boot_args(&image).unwrap();
+    }
+
+    #[test]
+    fn an_extra_boot_arg_cannot_reach_the_guest_agent() {
+        for to_init in [
+            "--",
+            "-- --listen-unix /tmp/agent.sock",
+            "--listen-unix /tmp/agent.sock",
+            "nosmt -s",
+        ] {
+            let mut image = image();
+            image.extra_boot_args.push(to_init.into());
+            assert!(
+                matches!(check_boot_args(&image), Err(SandboxError::Config(_))),
+                "{to_init}"
+            );
+        }
+        let mut image = image();
+        image.extra_boot_args.extend([
+            "nosmt".into(),
+            "mitigations=auto".into(),
+            "random.trust_cpu=on".into(),
+        ]);
         check_boot_args(&image).unwrap();
     }
 

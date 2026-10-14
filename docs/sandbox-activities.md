@@ -297,6 +297,11 @@ What each microVM gets:
 - the kernel arguments `reboot=k panic=1 8250.nr_uarts=0`;
 - an 8 GiB `fsize` limit on the VMM, by default.
 
+`GuestImage::extra_boot_args` adds kernel arguments. The launcher refuses an
+extra argument that replaces one of its own, and a word that starts with `-`.
+The kernel gives `--` and the words after it to init, so such a word could
+change the mode of the guest agent.
+
 Teardown kills the process, then the cgroup through `cgroup.kill`, then
 removes the jail. It runs after success, error, timeout and cancel. It also
 runs when the caller drops the run future. The host never reads a pid from
