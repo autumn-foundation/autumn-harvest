@@ -159,7 +159,8 @@ and the `harvest_mutex_seq` counter.
 3. Each attempt appends `LocalActivityCompleted`, or `LocalActivityFailed`.
    A terminal failure also appends `LocalActivityExhausted`.
 4. The per-attempt budget is `start_to_close`, capped at 60 seconds, as on
-   Postgres. It is checked after the body returns.
+   Postgres. Under Tokio, an `#[activity]` body past it is dropped. A
+   closure body is checked after it returns.
 
 A batch with a durable awaitable ends the run `FAILED` with
 `UnsupportedFeature`, as Postgres rejects it (issue #950). This backend also

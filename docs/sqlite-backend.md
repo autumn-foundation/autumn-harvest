@@ -498,8 +498,11 @@ the body inline, after the decision commits. Each failed attempt appends
 failure also appends `LocalActivityExhausted`. A crash resumes at the next
 attempt. Some limits apply:
 
-- The per-attempt budget is `start_to_close`, capped at 60 seconds. It is
-  checked after the body returns, as for a regular activity here.
+- The per-attempt budget is `start_to_close`, capped at 60 seconds. Under a
+  Tokio runtime, an `#[activity]` body that runs past it is dropped, as on
+  Postgres. A closure body cannot be stopped, so its budget is checked after
+  it returns.
+- A backoff and a timeout round up to whole milliseconds.
 - A retry backoff ends the cycle. A drive before its end returns
   `RunState::WaitingTimer`. Postgres sleeps inline instead. So a signal can
   reach the run between two attempts. A signal handler that then issues a

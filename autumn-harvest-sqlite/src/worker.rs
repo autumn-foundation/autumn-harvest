@@ -1277,8 +1277,9 @@ impl LocalRun {
 ///
 /// A closure body gets no context. An `#[activity]` body gets the local
 /// context that the Postgres worker builds. A panic becomes the retryable
-/// `HandlerPanic` failure. The budget is checked after the body returns, as
-/// for a regular activity on this backend. As on Postgres, the result has no
+/// `HandlerPanic` failure. An `#[activity]` body that runs past its budget is
+/// dropped under a Tokio runtime. A closure body cannot be stopped, so its
+/// budget is checked after it returns. As on Postgres, the result has no
 /// size cap here. The history byte cap still bounds it.
 pub async fn run_local_attempt(
     exec_id: ExecutionId,
@@ -1315,16 +1316,49 @@ pub async fn run_local_attempt(
                 .with_max_attempts(run.max_attempts())
                 .with_deadline(deadline)
                 .with_previous_failure(previous_failure);
-            run_local_handler(*handler, &ctx, run.input.clone()).await
+            let body = run_local_handler(*handler, &ctx, run.input.clone());
+            match within_budget(body, budget).await {
+                Some(result) => result,
+                None => return Err(local_timeout_error(run, budget)),
+            }
         }
     };
     if started.elapsed() > budget {
-        return Err(format!(
-            "local activity '{}' timed out after {budget:?}",
-            run.name
-        ));
+        return Err(local_timeout_error(run, budget));
     }
     result
+}
+
+/// The Postgres error text of a local attempt that ran past `budget`.
+fn local_timeout_error(run: &LocalRun, budget: std::time::Duration) -> String {
+    format!("local activity '{}' timed out after {budget:?}", run.name)
+}
+
+/// Await `body` for at most `budget`. Returns `None` at the budget, and the
+/// body is dropped, as on Postgres (issue #2029).
+///
+/// The timer is Tokio's. The drive may run on another runtime, or on a Tokio
+/// runtime with no timer. The body then runs to its end, and the caller
+/// checks the budget after it returns.
+async fn within_budget<F>(body: F, budget: std::time::Duration) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    let sleep = tokio::runtime::Handle::try_current()
+        .ok()
+        .and_then(|_| std::panic::catch_unwind(|| tokio::time::sleep(budget)).ok());
+    let Some(sleep) = sleep else {
+        return Some(body.await);
+    };
+    let mut body = std::pin::pin!(body);
+    let mut sleep = std::pin::pin!(sleep);
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(output) = body.as_mut().poll(cx) {
+            return Poll::Ready(Some(output));
+        }
+        sleep.as_mut().poll(cx).map(|()| None)
+    })
+    .await
 }
 
 /// Await one local `#[activity]` handler, and contain a panic in the call

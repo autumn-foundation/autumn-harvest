@@ -969,7 +969,7 @@ impl SqliteRuntime {
         // Round up, so a sub-millisecond timeout never fires at once.
         let timeout_ms = policy
             .and_then(|p| p.execution_timeout)
-            .map(|d| i64::try_from(d.as_nanos().div_ceil(1_000_000)).unwrap_or(i64::MAX));
+            .map(duration_to_millis_ceil);
         let retry_policy_json = policy
             .and_then(|p| p.retry_policy.as_ref())
             .map(serde_json::to_string)
@@ -2832,7 +2832,7 @@ impl SqliteRuntime {
             // sleep, so it never blocks the caller's async runtime.
             let retry_at = backoff
                 .filter(|delay| !delay.is_zero())
-                .map(|delay| failure_now().saturating_add(duration_to_millis_saturating(delay)));
+                .map(|delay| failure_now().saturating_add(duration_to_millis_ceil(delay)));
             let tx = self.conn.transaction()?;
             for event in &events {
                 store::append_event(&tx, exec, event)?;
@@ -3459,7 +3459,7 @@ fn retry_plan(
         autumn_harvest::policy::compute_retry_delay_with_seed(&policy, config.attempt, seed);
     Ok(Some(RetryPlan {
         attempt: config.attempt.saturating_add(1),
-        start_at: now.saturating_add(duration_to_millis_saturating(delay)),
+        start_at: now.saturating_add(duration_to_millis_ceil(delay)),
     }))
 }
 
@@ -4041,6 +4041,14 @@ pub fn duration_to_millis_saturating(d: std::time::Duration) -> i64 {
     i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
 }
 
+/// Convert a positive `d` to whole milliseconds, rounded up (issue #2029).
+///
+/// A timeout or a backoff then never ends before its declared duration. A
+/// pathologically large value saturates to [`i64::MAX`].
+fn duration_to_millis_ceil(d: std::time::Duration) -> i64 {
+    i64::try_from(d.as_nanos().div_ceil(1_000_000)).unwrap_or(i64::MAX)
+}
+
 /// Human name for a command (for error messages). EVERY current
 /// [`WorkflowCommand`] variant is named explicitly, so an unsupported command is
 /// always rejected BY NAME rather than as an opaque `"Unknown"` (issue #1069 P2,
@@ -4538,6 +4546,19 @@ mod tests {
                 Some("max_result_bytes"),
             );
         }
+    }
+
+    // Issue #2029: a positive delay or timeout never rounds down to zero.
+    #[test]
+    fn duration_to_millis_ceil_rounds_a_fraction_up() {
+        use std::time::Duration;
+
+        use super::duration_to_millis_ceil;
+        assert_eq!(duration_to_millis_ceil(Duration::ZERO), 0);
+        assert_eq!(duration_to_millis_ceil(Duration::from_micros(1)), 1);
+        assert_eq!(duration_to_millis_ceil(Duration::from_micros(1_500)), 2);
+        assert_eq!(duration_to_millis_ceil(Duration::from_millis(7)), 7);
+        assert_eq!(duration_to_millis_ceil(Duration::MAX), i64::MAX);
     }
 
     // `command_name` is EXHAUSTIVE (no `_ => "Unknown"` arm). A future core

@@ -62,6 +62,12 @@ async fn hinted(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
     Ok(n)
 }
 
+#[activity(local = true)]
+async fn hangs(_ctx: &ActivityContext, _n: i64) -> Result<i64, String> {
+    std::future::pending::<()>().await;
+    Ok(0)
+}
+
 #[activity]
 async fn remote(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
     Ok(n)
@@ -93,6 +99,19 @@ async fn calls_hinted(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
     ctx.execute_local_activity(&hinted_info(), n)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Calls a local activity that never returns, with a 50 ms budget.
+#[workflow]
+async fn calls_hangs(ctx: &WorkflowContext, n: i64) -> Result<String, String> {
+    let budget = Some(Duration::from_millis(50));
+    match ctx
+        .execute_local_activity_with_opts::<_, i64>(&hangs_info(), n, None, budget)
+        .await
+    {
+        Ok(_) => Ok("unexpected success".to_string()),
+        Err(e) => Ok(format!("caught: {e}")),
+    }
 }
 
 #[workflow]
@@ -484,4 +503,23 @@ async fn a_history_cap_during_a_local_attempt_keeps_its_result() {
             "WorkflowFailed"
         ]
     );
+}
+
+// A local handler that never returns fails at its budget, as on Postgres.
+// It must not hang the drive.
+#[tokio::test]
+async fn a_hung_local_activity_times_out_at_its_budget() {
+    let info = calls_hangs_info();
+    let mut rt = runtime(&info);
+    rt.register_activity(&hangs_info());
+    let exec = rt.start_workflow(info.name, json!(1)).unwrap();
+    let state = tokio::time::timeout(Duration::from_secs(5), rt.run_until_blocked(exec))
+        .await
+        .expect("the drive must not hang")
+        .unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v.as_str().is_some_and(|s| s.contains("timed out after"))),
+        "got {state:?}"
+    );
+    assert_replays(info.name, info.handler, rt.load_history(exec).unwrap()).await;
 }
