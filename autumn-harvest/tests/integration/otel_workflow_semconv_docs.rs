@@ -504,6 +504,13 @@ fn check_span_contract(id: &str, group: &Value, refs: &BTreeMap<String, Value>) 
         run_id_ok,
         "`{id}` must require `workflow.run.id`, or require it: {RUN_ID_CONDITION}"
     );
+    if id.contains("_signal.") {
+        assert_eq!(
+            refs.get("workflow.signal.name").and_then(Value::as_str),
+            Some("required"),
+            "`{id}` must require `workflow.signal.name`: its span name omits the signal"
+        );
+    }
     let error = refs
         .get("error.type")
         .and_then(|level| level.get("conditionally_required").and_then(Value::as_str));

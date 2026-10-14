@@ -201,7 +201,8 @@ groups:
       - ref: workflow.name
         requirement_level: recommended
       - ref: workflow.signal.name
-        requirement_level: recommended
+        requirement_level: required
+        sampling_relevant: true
       - ref: workflow.signal.id
         requirement_level: opt_in
       - ref: error.type
@@ -238,7 +239,8 @@ groups:
       - ref: workflow.run.id
         requirement_level: required
       - ref: workflow.signal.name
-        requirement_level: recommended
+        requirement_level: required
+        sampling_relevant: true
       - ref: workflow.signal.id
         requirement_level: opt_in
       - ref: error.type

@@ -110,6 +110,9 @@ code, guard quality, and style. The fixes:
   and that `send_signal` used a narrower run id condition. Each end
   boundary now covers a failure, and every optional run id uses one
   condition. A guard checks both.
+- Codex then found that the signal spans did not require the signal name.
+  Their span names carry the workflow name only. Both now require
+  `workflow.signal.name`, and a guard checks it.
 
 ### 0.6 Decisions
 

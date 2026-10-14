@@ -98,8 +98,8 @@ attribute.
 | `span.workflow.start_child_workflow.producer` | `PRODUCER` | `start_child_workflow {workflow.name}` | system, operation, child name |
 | `span.workflow.schedule_activity.producer` | `PRODUCER` | `schedule_activity {workflow.activity.name}` | system, operation, activity name, run id |
 | `span.workflow.execute_activity.consumer` | `CONSUMER` | `execute_activity {workflow.activity.name}` | system, operation, activity name, run id, attempt |
-| `span.workflow.send_signal.producer` | `PRODUCER` | `send_signal {workflow.name}` | system, operation |
-| `span.workflow.deliver_signal.consumer` | `CONSUMER` | `deliver_signal {workflow.name}` | system, operation, name, run id |
+| `span.workflow.send_signal.producer` | `PRODUCER` | `send_signal {workflow.name}` | system, operation, signal name |
+| `span.workflow.deliver_signal.consumer` | `CONSUMER` | `deliver_signal {workflow.name}` | system, operation, name, run id, signal name |
 | `span.workflow.fire_timer.internal` | `INTERNAL` | `fire_timer` | system, operation, run id |
 
 Each span note in the model gives the start and end of its operation. If
