@@ -33,6 +33,21 @@ pub const CONFIG_FILE: &str = "vm-config.json";
 /// The guest agent path in the root file system. The kernel runs it as init.
 pub const GUEST_INIT: &str = "/sbin/harvest-guest-agent";
 
+/// The size of the Firecracker kernel command line, with its NUL. It is
+/// `arch::CMDLINE_MAX_SIZE`, which is 2048 bytes on `x86_64` and on `aarch64`.
+pub const FIRECRACKER_CMDLINE_SIZE: usize = 2048;
+
+/// The bytes that the launcher keeps for the arguments that Firecracker adds.
+///
+/// Firecracker 1.17 adds `pci=off` and `root=/dev/vda ro`. On `x86_64` it also
+/// adds one `virtio_mmio.device=` entry for each device. For the drive, the
+/// vsock and the entropy device of a microVM, that is 130 bytes. The reserve
+/// leaves room for a later version.
+pub const FIRECRACKER_CMDLINE_RESERVE: usize = 256;
+
+/// The longest boot argument line that the launcher gives to Firecracker.
+pub const MAX_BOOT_ARGS_BYTES: usize = FIRECRACKER_CMDLINE_SIZE - 1 - FIRECRACKER_CMDLINE_RESERVE;
+
 /// The prefix of each VM id that this crate creates.
 pub const VM_ID_PREFIX: &str = "hsbx-";
 
@@ -92,7 +107,7 @@ pub struct GuestImage {
     pub init: String,
     /// More kernel arguments. An argument may not use a key that the
     /// launcher sets, such as `init` or `harvest.port`, and it may not hold
-    /// a double quote.
+    /// a double quote. The whole line stays within [`MAX_BOOT_ARGS_BYTES`].
     pub extra_boot_args: Vec<String>,
     /// A name for the image, such as a digest. Outcomes report it.
     pub name: Option<String>,
@@ -243,7 +258,7 @@ fn launcher_boot_args(image: &GuestImage, port: u32) -> Vec<String> {
 
 /// Check that the init path is one kernel word. Check also that no extra
 /// boot argument replaces an argument of the launcher or reaches the guest
-/// agent as an option.
+/// agent as an option. The whole line must fit Firecracker.
 ///
 /// # Errors
 ///
@@ -297,6 +312,16 @@ pub fn check_boot_args(image: &GuestImage) -> Result<(), SandboxError> {
                 "the extra boot argument {arg:?} would replace the launcher argument {name:?}"
             )));
         }
+    }
+    // Firecracker refuses a longer line at each boot, so a retry cannot help.
+    // `u32::MAX` has as many digits as the longest port.
+    let line = boot_args(image, u32::MAX).len();
+    if line > MAX_BOOT_ARGS_BYTES {
+        return Err(SandboxError::Config(format!(
+            "the boot arguments take {line} bytes, but Firecracker takes at most \
+             {MAX_BOOT_ARGS_BYTES}: its line holds {FIRECRACKER_CMDLINE_SIZE} bytes with the NUL \
+             and the arguments that it adds"
+        )));
     }
     Ok(())
 }
@@ -531,6 +556,43 @@ mod tests {
             matches!(check_boot_args(&with_nul), Err(SandboxError::Config(_))),
             "an extra argument with a NUL"
         );
+    }
+
+    #[test]
+    fn a_boot_line_over_the_firecracker_limit_is_a_config_error() {
+        // Firecracker refuses this line at every boot, so a retry cannot help.
+        let mut image = image();
+        image
+            .extra_boot_args
+            .push(format!("harvest.pad={}", "a".repeat(3 * 1024)));
+        let err = check_boot_args(&image).expect_err("a 3 KiB boot argument");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("Firecracker")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn the_longest_boot_line_fits_firecracker_with_its_own_arguments() {
+        // An extra argument adds a space and its own bytes to the line.
+        let pad = |len: usize| format!("harvest.pad={}", "a".repeat(len - "harvest.pad=".len()));
+        let mut image = image();
+        let room = MAX_BOOT_ARGS_BYTES - boot_args(&image, u32::MAX).len() - 1;
+        image.extra_boot_args.push(pad(room));
+        check_boot_args(&image).unwrap();
+        assert_eq!(boot_args(&image, u32::MAX).len(), MAX_BOOT_ARGS_BYTES);
+        // Firecracker 1.17 on x86_64 adds these for the three devices.
+        let line = format!(
+            "{} pci=off root=/dev/vda ro virtio_mmio.device=4K@0xc0001000:5 \
+             virtio_mmio.device=4K@0xc0002000:6 virtio_mmio.device=4K@0xc0003000:7",
+            boot_args(&image, u32::MAX)
+        );
+        assert!(line.len() < FIRECRACKER_CMDLINE_SIZE, "{}", line.len());
+        image.extra_boot_args[0].push('a');
+        assert!(matches!(
+            check_boot_args(&image),
+            Err(SandboxError::Config(_))
+        ));
     }
 
     #[test]

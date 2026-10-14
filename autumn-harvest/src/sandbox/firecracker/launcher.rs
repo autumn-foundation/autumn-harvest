@@ -3183,6 +3183,23 @@ while True:
     }
 
     #[test]
+    fn a_boot_line_too_long_for_firecracker_is_a_config_error() {
+        let dir = temp_dir();
+        let fc = script(&dir, "firecracker", "exit 0");
+        let mut config = unjailed(&dir, fc, BootMethod::ConfigFile);
+        config
+            .image
+            .extra_boot_args
+            .push(format!("harvest.pad={}", "a".repeat(3 * 1024)));
+        let err = new_launcher(config).expect_err("too long");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("Firecracker")),
+            "{err:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_base_dir_too_long_for_a_socket_path_is_a_config_error() {
         let dir = temp_dir();
         let fc = script(&dir, "firecracker", "exit 0");

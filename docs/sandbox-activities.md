@@ -348,6 +348,9 @@ What each microVM gets:
 extra argument that replaces one of its own, and a word that starts with `-`.
 The kernel gives `--` and the words after it to init, so such a word could
 change the mode of the guest agent.
+The whole line may hold at most 1791 bytes (`MAX_BOOT_ARGS_BYTES`).
+Firecracker adds its own arguments and refuses a line over 2047 bytes at
+each boot. So the launcher refuses a longer line as a config error.
 
 Teardown kills the process group of the VMM, then the cgroup through
 `cgroup.kill`, then removes the jail. The VMM is not reaped before the group
