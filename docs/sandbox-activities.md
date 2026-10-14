@@ -131,7 +131,8 @@ let harvest = HarvestBuilder::new()
 
 The process executor gives each run:
 
-- a new private work directory, removed after the run;
+- a new private work directory, removed after the run. A removal that fails
+  ends the run as `SandboxUnavailable`, and the drop tries again;
 - no host environment;
 - a new session, and a kill of the whole process group at exit, timeout,
   cancel and drop;

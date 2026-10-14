@@ -151,7 +151,8 @@ impl PlanExecutor for ProcessExecutor {
 /// - [`SandboxError::Denied`]: the plan fails its check, or the command
 ///   cannot start.
 /// - [`SandboxError::Unavailable`]: the executor cannot isolate the network,
-///   set up the work directory, or remove the run cgroup.
+///   set up the work directory, or remove the run cgroup or the work
+///   directory.
 /// - [`SandboxError::Cancelled`]: `cancel` fires.
 ///
 /// The executor kills the process group and removes the work directory in
@@ -238,7 +239,7 @@ pub async fn execute_plan(
         None => Ok(()),
     };
     if let Err(e) = cleaned {
-        work.remove().await;
+        let _ = work.remove().await;
         return Err(e);
     }
 
@@ -253,7 +254,7 @@ pub async fn execute_plan(
             .await
             .map_err(|e| SandboxError::Unavailable(format!("output collection failed: {e}")))?
     };
-    work.remove().await;
+    work.remove().await?;
 
     Ok(SandboxOutcome {
         status,
@@ -1115,16 +1116,47 @@ impl WorkDir {
         &self.path
     }
 
-    async fn remove(mut self) {
-        self.removed = true;
+    /// Remove the directory and its parent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::Unavailable`] when the removal fails. The
+    /// files of the run then still use the disk, so the run fails closed. The
+    /// drop tries the removal again.
+    async fn remove(self) -> Result<(), SandboxError> {
+        self.remove_with(Self::remove_now).await
+    }
+
+    /// [`Self::remove`] with `remove` as the removal, so a test can fail it.
+    async fn remove_with(
+        mut self,
+        remove: fn(&Self) -> io::Result<()>,
+    ) -> Result<(), SandboxError> {
         let path = self.parent.clone();
-        let removed = tokio::task::spawn_blocking(move || self.remove_now()).await;
-        if !matches!(removed, Ok(Ok(()))) {
-            tracing::warn!(
-                path = %path.display(),
-                "could not remove a sandbox work directory"
-            );
+        let removed = tokio::task::spawn_blocking(move || {
+            let result = remove(&self);
+            // A failed removal keeps the drop armed.
+            if result.is_ok() {
+                self.disarm();
+            }
+            result
+        })
+        .await;
+        match removed {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(SandboxError::Unavailable(format!(
+                "could not remove the work directory {}: {e}; the run fails closed",
+                path.display()
+            ))),
+            Err(e) => Err(SandboxError::Unavailable(format!(
+                "the work directory cleanup failed: {e}"
+            ))),
         }
+    }
+
+    /// Mark the directory removed, so the drop does nothing.
+    const fn disarm(&mut self) {
+        self.removed = true;
     }
 
     /// Remove the work directory, then the parent, wherever the code moved
@@ -2110,6 +2142,23 @@ mod tests {
         .await
         .expect("the watch must end when it cannot read the CPU time");
         assert!(watch.is_err(), "{watch:?}");
+    }
+
+    #[tokio::test]
+    async fn a_work_dir_that_cannot_be_removed_fails_the_run() {
+        let scratch = tempfile::tempdir().unwrap();
+        let work = WorkDir::create(scratch.path()).unwrap();
+        let parent = work.parent.clone();
+        let err = work
+            .remove_with(|_| Err(io::Error::other("an injected failure")))
+            .await
+            .expect_err("the removal fails");
+        assert!(
+            matches!(err, SandboxError::Unavailable(ref m) if m.contains("work directory")),
+            "{err:?}"
+        );
+        // The cleanup stayed armed, so the drop tried the real removal.
+        assert!(!parent.exists(), "the drop did not try again");
     }
 
     #[tokio::test]

@@ -410,6 +410,7 @@ impl SandboxPolicy {
             .saturating_add(engine)
             .saturating_add(string("PATH=".len() + self.path_env.len()))
             .saturating_add(count(EXECUTOR_ENV_BYTES))
+            .saturating_add(count(EXEC_FILENAME_BYTES))
     }
 
     /// The most bytes that the JSON of one request can have.
@@ -464,6 +465,10 @@ impl SandboxPolicy {
 /// Linux allows a quarter of the stack limit. That is 2 MiB for the default
 /// stack limit of 8 MiB.
 pub const MAX_EXEC_TOTAL_BYTES: usize = 2 * 1024 * 1024;
+
+/// The executable path that exec also copies: `PATH_MAX` bytes and a NUL.
+/// A longer path fails with `ENAMETOOLONG`.
+const EXEC_FILENAME_BYTES: usize = 4096 + 1;
 
 /// The bytes that exec adds to each string: a NUL and a pointer.
 const EXEC_STRING_OVERHEAD: usize = 1 + 8;
@@ -728,6 +733,30 @@ mod tests {
                 "{result:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_exec_bound_counts_the_executable_path() {
+        let mut policy = SandboxPolicy::default();
+        policy.runtimes.clear();
+        let mut sizes = DEFAULT_SIZE_BOUNDS;
+        sizes.max_args = 0;
+        sizes.max_arg_bytes = 0;
+        sizes.max_env = 0;
+        sizes.max_env_bytes = 0;
+        let policy = policy
+            .with_runtime("sh", RuntimeSpec::new(&["sh"], "main.sh"))
+            .with_sizes(sizes);
+        // `sh` and `main.sh` each add a NUL and a pointer.
+        let argv = (2 + 9) + (7 + 9);
+        let path = "PATH=".len() + policy.path_env.len() + 9;
+        let engine = MAX_ENGINE_ENV_BYTES + MAX_ENGINE_ENV_VARS * 10;
+        // Exec also copies the executable path: `PATH_MAX` and a NUL.
+        let filename = 4096 + 1;
+        assert_eq!(
+            policy.max_exec_total_bytes(),
+            count(argv + path + engine + EXECUTOR_ENV_BYTES + filename)
+        );
     }
 
     #[test]
