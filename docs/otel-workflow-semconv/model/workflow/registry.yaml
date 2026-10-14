@@ -6,6 +6,15 @@ groups:
       Attributes that describe durable workflow runs and the steps that they
       schedule.
     attributes:
+      - id: workflow.system.name
+        type: string
+        stability: development
+        brief: >
+          The name of the durable workflow engine.
+        note: >
+          Each engine documents its own lower-case value. A later revision
+          can list well-known values.
+        examples: ["temporal", "dapr"]
       - id: workflow.name
         type: string
         stability: development
@@ -86,10 +95,12 @@ groups:
         type: boolean
         stability: development
         brief: >
-          Whether the workflow code runs as a replay of recorded history.
+          Whether the cycle rebuilds workflow state from recorded history.
         note: >
-          A replay rebuilds state from history. It does not repeat the side
-          effects of the original run.
+          The value is true for each cycle that re-runs workflow code over
+          recorded history, a routine resume included. It is false for a
+          first cycle and for a resume from state in memory. A replay does
+          not repeat the side effects of the original run.
       - id: workflow.signal.name
         type: string
         stability: development

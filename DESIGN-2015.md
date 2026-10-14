@@ -3,8 +3,8 @@
 Issue #2015 asks for a standards play. OpenTelemetry has no workflow
 semantic conventions. ADR 0001 already defines eight span kinds, the
 `harvest.*` attributes and a replay rule. The deliverable is a draft
-proposal in `docs/`, generalized away from Harvest names. It is then
-submitted upstream, or a decision not to submit is recorded.
+proposal in `docs/`, generalized away from Harvest names. A maintainer
+then submits it upstream or records a decision not to submit.
 
 **No migration. No new `WorkflowEvent` variant. No engine change.** The
 change adds a proposal page, a Weaver model, a guard suite and one CI step.
@@ -17,18 +17,18 @@ change adds a proposal page, a Weaver model, a guard suite and one CI step.
 
 - ADR 0001 §2 lists eight spans. Each has a kind: `INTERNAL`, `PRODUCER`
   or `CONSUMER`.
-- `telemetry.rs` defines ten `ATTR_*` constants. ADR 0001 §1 lists seven.
-  The three signal attributes came later.
+- `telemetry.rs` defines more `ATTR_*` constants than the seven in ADR 0001
+  §1. The signal attributes came later, and no span emits them yet.
 - The code also emits `harvest.timer.start`. ADR 0001 does not list it.
 - ADR 0001 §4 is the replay rule. A replayed run gets a new root span with a
-  link to the original. Activity spans are not emitted during replay.
+  link to the original. A replay emits no activity spans.
 - The OTel attribute registry has no `workflow` namespace. The nearest
   prior art is `cicd.pipeline.*`, which models CI/CD pipeline runs.
 - Upstream conventions are Weaver YAML under `model/<area>/`, with Markdown
   under `docs/<area>/`. A new area needs a group of committed owners.
 - Dapr began to codify its workflow telemetry with Weaver in 2026
-  (dapr/dapr#9213). Its post proposes `PRODUCER` spans to schedule and
-  `CONSUMER` spans to execute.
+  (dapr/dapr#9213). The OTel blog post on that work proposes `PRODUCER`
+  spans to schedule and `CONSUMER` spans to execute.
 - Issue #1838 maps two Harvest metrics onto messaging conventions. This
   change covers spans only.
 
@@ -45,7 +45,8 @@ change adds a proposal page, a Weaver model, a guard suite and one CI step.
 | B7 | Propose `harvest.shard.id` as `workflow.shard.id`. | Rejected. Sharding is an engine detail. |
 | B8 | Map the ADR 0001 names to the generic names in a table. | **Adopted.** Harvest users can read the proposal against their spans. |
 | B9 | Open the upstream issue from this change. | Rejected. Submission is a maintainer action. The page records its status and holds the issue text. |
-| B10 | Keep the ADR kind for each span, even where Dapr differs. | **Adopted.** The draft describes shipped practice. The kind question is open upstream. |
+| B10 | Keep the ADR kind for each span, even where Dapr differs. | Adopted, then reversed in review. The trace API defines `CONSUMER` for work that a producer starts. The execute spans are `CONSUMER`, and the mapping notes the Harvest kind. |
+| B11 | Add a `workflow.system.name` attribute. | **Adopted in review.** Upstream naming asks for a system attribute in an area with several systems. |
 
 ### 0.3 Reverse brainstorm — how can this change do harm?
 
@@ -60,9 +61,11 @@ change adds a proposal page, a Weaver model, a guard suite and one CI step.
 | R7 | The page tables drift from the YAML. | A guard compares the page tables with the model ids. |
 | R8 | The replay rule is lost in the generalization. | A guard needs `workflow.replay` on the execute span and a normative replay section. |
 | R9 | The page claims a submission that did not happen. | The status line must be `pending`, `submitted` with an upstream link, or `declined` with a reason. |
-| R10 | Long sentences make the page hard to read. | A guard caps prose sentences and YAML briefs at 25 words. |
+| R10 | Long sentences make the page hard to read. | A guard caps prose sentences, the issue text and every YAML text at 25 words. |
 | R11 | A docs-only change skips the `test` matrix. | The `lint` job runs the guard suite. A guard checks the step. |
-| R12 | Nobody finds the page. | ADR 0001 and `docs/telemetry.md` link it. A guard checks the ADR link. |
+| R12 | Nobody finds the page. | ADR 0001 and `docs/telemetry.md` link it. A guard checks both links. |
+| R13 | The page claims that Harvest conforms where it does not. | Section 7 lists each known gap: span links, parents, attributes. |
+| R14 | A hand copy in the issue text drifts from the model. | A guard needs each attribute and operation in the issue text. The prose states no counts. |
 
 ### 0.4 Six thinking hats
 
@@ -75,13 +78,31 @@ change adds a proposal page, a Weaver model, a guard suite and one CI step.
 | Green | Invite Dapr as co-proposer through dapr/dapr#9213. Offer the replay rule as the distinct contribution. |
 | Blue | Ship the draft, the model and the guards. Record the submission as `pending` until a maintainer files it. |
 
-### 0.5 Decisions
+### 0.5 Review record
+
+Four review agents read the change: upstream format, fidelity to the
+code, guard quality, and style. The fixes:
+
+- The execute spans are `CONSUMER` (B10). `workflow.system.name` is new
+  (B11). Each span carries `sampling_relevant` marks.
+- A run id is conditionally required where an engine can lack it.
+- `send_signal` has a span-name fallback.
+- `workflow.replay` now states its meaning for a routine resume. That
+  meaning matches Harvest.
+- Section 7 lists where Harvest does not conform (R13). ADR 0001 §2.6 and
+  §2.7 describe parents that the code does not set. That ADR error is out
+  of scope here.
+- The guards read numbered replay rules, wrapped constants, the type and
+  kind columns, duplicate ids and the issue text. Five mutations confirm
+  that each new check fails on a bad edit.
+
+### 0.6 Decisions
 
 - Page: `docs/otel-workflow-semconv/README.md`. Model:
   `docs/otel-workflow-semconv/model/workflow/`.
 - Namespace: `workflow.*`. Stability: `development` for every group.
 - Span id: `span.workflow.<operation>.<kind>`. Span name:
-  `{workflow.operation.name} {target}`.
+  `{workflow.operation.name} {target}`. The execute spans are `CONSUMER`.
 - Replay: the execute span carries `workflow.replay`. A replayed operation
   emits no second span.
 - Submission: a GitHub issue in `open-telemetry/semantic-conventions`,
@@ -94,18 +115,18 @@ change adds a proposal page, a Weaver model, a guard suite and one CI step.
 | Phase | Test | Proves |
 |-------|------|--------|
 | Red → green | `proposal_cites_the_issue_and_its_sources` | The page cites #2015, #1838 and ADR 0001. |
-| Red → green | `every_adr_span_maps_to_a_proposed_span_of_the_same_kind` | R1, R2. |
+| Red → green | `every_adr_span_maps_to_its_own_proposed_span` | R1, R2. A changed kind needs a note. |
 | Red → green | `every_attr_constant_is_mapped_or_excluded_with_a_reason` | R3. |
 | Red → green | `the_model_is_generalized_and_well_named` | R4. |
 | Red → green | `the_model_has_the_weaver_shape` | R5, R6. |
-| Red → green | `the_page_tables_match_the_model` | R7. |
+| Red → green | `the_page_tables_match_the_model` | R7, R14. |
 | Red → green | `the_operation_enum_names_one_span_each` | B5. |
 | Red → green | `the_replay_rule_is_normative` | R8. |
 | Red → green | `the_submission_status_is_recorded` | R9. |
-| Red → green | `prose_sentences_and_briefs_stay_short` | R10. |
+| Red → green | `prose_sentences_and_yaml_texts_stay_short` | R10. |
 | Red → green | `guards_run_on_docs_only_changes` | R11. |
 | Red → green | `the_adr_and_the_telemetry_page_link_the_proposal` | R12. |
-| Refactor | `helpers_parse_their_inputs` | The table and heading parsers. |
+| Refactor | `helpers_parse_their_inputs` | The table, heading, list, paragraph and fence parsers. |
 
 ## 2. Acceptance criteria
 

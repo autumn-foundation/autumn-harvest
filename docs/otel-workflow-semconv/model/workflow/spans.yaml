@@ -11,18 +11,27 @@ groups:
       scheduled work. The worker then uses it as the parent of the
       `execute_workflow` span.
     attributes:
+      - ref: workflow.system.name
+        requirement_level: required
+        sampling_relevant: true
       - ref: workflow.operation.name
         requirement_level: required
+        sampling_relevant: true
       - ref: workflow.name
         requirement_level: required
+        sampling_relevant: true
       - ref: workflow.run.id
-        requirement_level: required
+        requirement_level:
+          conditionally_required: If the engine knows the run id when the span starts.
       - ref: workflow.queue.name
         requirement_level: recommended
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If the engine refuses to schedule the run.
 
-  - id: span.workflow.execute_workflow.internal
+  - id: span.workflow.execute_workflow.consumer
     type: span
-    span_kind: internal
+    span_kind: consumer
     stability: development
     brief: This span describes one decision cycle of a workflow run.
     note: |
@@ -31,14 +40,20 @@ groups:
       A live cycle uses the stored context of the scheduling span as its
       parent. A replay cycle follows the replay rule of this proposal.
     attributes:
+      - ref: workflow.system.name
+        requirement_level: required
+        sampling_relevant: true
       - ref: workflow.operation.name
         requirement_level: required
+        sampling_relevant: true
       - ref: workflow.name
         requirement_level: required
+        sampling_relevant: true
       - ref: workflow.run.id
         requirement_level: required
       - ref: workflow.replay
         requirement_level: required
+        sampling_relevant: true
       - ref: workflow.queue.name
         requirement_level: recommended
       - ref: error.type
@@ -56,12 +71,18 @@ groups:
       The `workflow.name` and `workflow.run.id` attributes describe the
       child run.
     attributes:
+      - ref: workflow.system.name
+        requirement_level: required
+        sampling_relevant: true
       - ref: workflow.operation.name
         requirement_level: required
+        sampling_relevant: true
       - ref: workflow.name
         requirement_level: required
+        sampling_relevant: true
       - ref: workflow.run.id
-        requirement_level: required
+        requirement_level:
+          conditionally_required: If the engine knows the child run id when the span starts.
 
   - id: span.workflow.schedule_activity.producer
     type: span
@@ -71,18 +92,23 @@ groups:
     note: |
       The span name SHOULD be `schedule_activity {workflow.activity.name}`.
     attributes:
+      - ref: workflow.system.name
+        requirement_level: required
+        sampling_relevant: true
       - ref: workflow.operation.name
         requirement_level: required
+        sampling_relevant: true
       - ref: workflow.activity.name
         requirement_level: required
+        sampling_relevant: true
       - ref: workflow.run.id
         requirement_level: required
       - ref: workflow.queue.name
         requirement_level: recommended
 
-  - id: span.workflow.execute_activity.internal
+  - id: span.workflow.execute_activity.consumer
     type: span
-    span_kind: internal
+    span_kind: consumer
     stability: development
     brief: This span describes one attempt of an activity.
     note: |
@@ -91,10 +117,15 @@ groups:
       Each attempt gets its own span. A retry is a new span with a higher
       `workflow.activity.attempt`.
     attributes:
+      - ref: workflow.system.name
+        requirement_level: required
+        sampling_relevant: true
       - ref: workflow.operation.name
         requirement_level: required
+        sampling_relevant: true
       - ref: workflow.activity.name
         requirement_level: required
+        sampling_relevant: true
       - ref: workflow.run.id
         requirement_level: required
       - ref: workflow.activity.attempt
@@ -111,21 +142,31 @@ groups:
     stability: development
     brief: This span describes a caller that sends a signal to a workflow run.
     note: |
-      The span name SHOULD be `send_signal {workflow.name}`.
+      The span name SHOULD be `send_signal {workflow.name}`. If the name of
+      the target workflow is not available, the span name SHOULD be
+      `send_signal`.
 
       The `workflow.name` and `workflow.run.id` attributes describe the
       target run.
     attributes:
+      - ref: workflow.system.name
+        requirement_level: required
+        sampling_relevant: true
       - ref: workflow.operation.name
         requirement_level: required
+        sampling_relevant: true
       - ref: workflow.run.id
-        requirement_level: required
+        requirement_level:
+          conditionally_required: If the caller addresses one run.
       - ref: workflow.name
         requirement_level: recommended
       - ref: workflow.signal.name
         requirement_level: recommended
       - ref: workflow.signal.id
         requirement_level: opt_in
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If the engine refuses the signal.
 
   - id: span.workflow.deliver_signal.consumer
     type: span
@@ -134,11 +175,20 @@ groups:
     brief: This span describes a workflow run that receives a signal.
     note: |
       The span name SHOULD be `deliver_signal {workflow.name}`.
+
+      The span SHOULD be a child of the `execute_workflow` span that
+      observes the signal. It SHOULD link to the `send_signal` span when
+      the engine stores that context.
     attributes:
+      - ref: workflow.system.name
+        requirement_level: required
+        sampling_relevant: true
       - ref: workflow.operation.name
         requirement_level: required
+        sampling_relevant: true
       - ref: workflow.name
         requirement_level: required
+        sampling_relevant: true
       - ref: workflow.run.id
         requirement_level: required
       - ref: workflow.signal.name
@@ -154,10 +204,14 @@ groups:
     note: |
       The span name SHOULD be `fire_timer`.
 
-      The span is a child of the `execute_workflow` span that observes the
-      timer.
+      The span SHOULD be a child of the `execute_workflow` span that
+      observes the timer.
     attributes:
+      - ref: workflow.system.name
+        requirement_level: required
+        sampling_relevant: true
       - ref: workflow.operation.name
         requirement_level: required
+        sampling_relevant: true
       - ref: workflow.run.id
         requirement_level: required
