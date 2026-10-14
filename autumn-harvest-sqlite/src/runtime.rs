@@ -15,9 +15,9 @@ use autumn_harvest::executor::{
     run_workflow_with_state_history_policy_and_caps,
 };
 use autumn_harvest::{
-    ActivityExecId, ActivityInfo, ExecutionId, NoOpMetrics, TimerId, UpdateHandlerInfo, UpdateId,
-    WorkflowCommand, WorkflowEvent, WorkflowHandlerFn, WorkflowHistoryPolicy,
-    WorkflowIdReusePolicy, WorkflowInfo, WorkflowOutcome,
+    ActivityExecId, ActivityHandlerFn, ActivityInfo, ExecutionId, NoOpMetrics, TimerId,
+    UpdateHandlerInfo, UpdateId, WorkflowCommand, WorkflowEvent, WorkflowHandlerFn,
+    WorkflowHistoryPolicy, WorkflowIdReusePolicy, WorkflowInfo, WorkflowOutcome,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
@@ -26,14 +26,27 @@ use serde_json::Value;
 use crate::error::{SqliteError, SqliteResult};
 use crate::history_cap::{CapCheck, HistoryCapReason};
 use crate::lock::WriterLock;
+use crate::query::{DEFAULT_QUERY_TIMEOUT, QueryReplay};
 use crate::{lock, queue, schema, store, update, worker};
 
-/// The activity body a workflow's `execute_activity_raw(name, ...)` resolves to.
+/// A synchronous activity body, keyed by name.
 ///
-/// Synchronous and keyed by name. The valuable, reused part of the engine is the
-/// workflow orchestration + deterministic replay; activity execution is a simple
-/// registered closure (no `ActivityContext`, no I/O framework).
+/// [`ActivitySpec::new`] and
+/// [`register_activity_with_body`](SqliteRuntime::register_activity_with_body)
+/// take one. It gets no `ActivityContext`. The default
+/// [`register_activity`](SqliteRuntime::register_activity) runs the
+/// `#[activity]` body instead (issue #2024).
 pub type ActivityBody = Box<dyn Fn(Value) -> Result<Value, String> + Send + Sync>;
+
+/// What runs for one registered activity (issue #2024).
+// Crate-internal like the `ActivitySpec` fields that hold it.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) enum ActivityRunner {
+    /// A synchronous closure. It runs inline and gets no `ActivityContext`.
+    Closure(ActivityBody),
+    /// The `#[activity]` handler. The drain awaits it with an `ActivityContext`.
+    Handler(ActivityHandlerFn),
+}
 
 /// A registered activity: its body plus the declared-default metadata this
 /// backend honors at dispatch/finalize.
@@ -42,7 +55,7 @@ pub struct ActivitySpec {
     // (read by the worker). `pub` would leak them onto the public type, so
     // `pub(crate)` is deliberate and NOT redundant despite the private module.
     #[allow(clippy::redundant_pub_crate)]
-    pub(crate) body: ActivityBody,
+    pub(crate) body: ActivityRunner,
     #[allow(clippy::redundant_pub_crate)]
     pub(crate) max_attempts: u32,
     /// The activity's declared total (cross-retry) deadline
@@ -106,7 +119,7 @@ impl ActivitySpec {
         body: impl Fn(Value) -> Result<Value, String> + Send + Sync + 'static,
     ) -> Self {
         Self {
-            body: Box::new(body),
+            body: ActivityRunner::Closure(Box::new(body)),
             max_attempts: max_attempts.max(1),
             schedule_to_close: None,
             default_retry_policy: None,
@@ -239,6 +252,8 @@ pub struct SqliteRuntime {
     /// The history caps and the soft continue-as-new threshold (issue #2023).
     /// The defaults match the Postgres worker.
     history_policy: WorkflowHistoryPolicy,
+    /// The time limit of one query replay (issue #2022).
+    query_timeout: std::time::Duration,
 }
 
 impl Drop for SqliteRuntime {
@@ -346,6 +361,7 @@ impl SqliteRuntime {
             now_fn: std::sync::Arc::new(Utc::now),
             writer_lock,
             history_policy: WorkflowHistoryPolicy::default(),
+            query_timeout: DEFAULT_QUERY_TIMEOUT,
         })
     }
 
@@ -454,8 +470,37 @@ impl SqliteRuntime {
         self.workflows.insert(info.name.to_string(), info.handler);
     }
 
-    /// Register an activity from its macro-generated [`ActivityInfo`] plus its
-    /// (synchronous) body.
+    /// Register an activity from its macro-generated [`ActivityInfo`]. The
+    /// `#[activity]` body itself runs (issue #2024).
+    ///
+    /// The drain awaits `info.handler` on the caller's async runtime, with a real
+    /// [`ActivityContext`](autumn_harvest::ActivityContext). So one `#[activity]`
+    /// fn runs unchanged on this backend and on Postgres:
+    ///
+    /// - `info()` reports the same dispatch values as the Postgres worker. They
+    ///   are the run, the activity, the 1-based attempt, the frozen attempt cap,
+    ///   the task queue and the task row id.
+    /// - `deadline()` is the earlier of claim time plus `start_to_close` and the
+    ///   `schedule_to_close` deadline.
+    /// - `heartbeat(..)` persists the latest payload on the task row. The next
+    ///   attempt, also after a crash and reopen, reads it with
+    ///   `heartbeat_details()`.
+    /// - `previous_failure()` is the previous attempt's error message.
+    /// - The cancellation token never fires on this backend.
+    ///
+    /// A panic in the body becomes a retryable `HandlerPanic` failure, as on
+    /// Postgres. A body that never returns blocks the drive. If the caller drops
+    /// the drive future, for example with a timeout, the next drive of that run
+    /// re-runs the body, as after a crash.
+    ///
+    /// Some values differ from Postgres by design:
+    ///
+    /// - With no declared `retry`, this backend runs one attempt, so
+    ///   `max_attempts()` is `1`. Postgres applies its engine default.
+    /// - A re-run after a crash or a dropped drive keeps its `attempt` number.
+    ///   Postgres counts the lost attempt.
+    /// - `state()` is always `None`, `headers()` is empty, and `metrics()`
+    ///   records nothing.
     ///
     /// This is the **audited, `ActivityInfo`-driven** registration path — the
     /// analog of [`register_workflow`](Self::register_workflow) — and the one that
@@ -488,10 +533,7 @@ impl SqliteRuntime {
     ///   `max_concurrent`, `requires`, `is_local`, and a raised
     ///   `max_input_bytes` / `max_result_bytes`.
     /// - **ACCEPTED, inert**: `name` (registration key), `module` (diagnostics),
-    ///   and a lone `concurrency_key` (groups a cap that is not set). The core
-    ///   async `ActivityInfo::handler` is intentionally NOT used — this backend
-    ///   runs a caller-supplied SYNCHRONOUS body (no `ActivityContext`, no I/O
-    ///   framework), matching the crate's activity model.
+    ///   and a lone `concurrency_key` (groups a cap that is not set).
     ///
     /// # Panics
     ///
@@ -501,11 +543,33 @@ impl SqliteRuntime {
     /// and diverge from the declared `#[activity(...)]` contract. Use
     /// [`register_activity_raw`](Self::register_activity_raw) for a hand-made body
     /// that carries no declared defaults.
-    pub fn register_activity(
+    pub fn register_activity(&mut self, info: &ActivityInfo) {
+        self.register_audited_activity(info, ActivityRunner::Handler(info.handler));
+    }
+
+    /// Register an activity from its [`ActivityInfo`], but run a synchronous
+    /// `body` in place of the `#[activity]` body.
+    ///
+    /// The audit and the declared defaults are the same as for
+    /// [`register_activity`](Self::register_activity). The closure gets no
+    /// `ActivityContext`. Use it to stub an activity in a test. Before issue
+    /// #2024 this was the only form, under the name `register_activity`.
+    ///
+    /// # Panics
+    ///
+    /// Panics on the same unsupported features as
+    /// [`register_activity`](Self::register_activity).
+    pub fn register_activity_with_body(
         &mut self,
         info: &ActivityInfo,
         body: impl Fn(Value) -> Result<Value, String> + Send + Sync + 'static,
     ) {
+        self.register_audited_activity(info, ActivityRunner::Closure(Box::new(body)));
+    }
+
+    /// Audit `info` and register `body` under its name with its declared
+    /// defaults.
+    fn register_audited_activity(&mut self, info: &ActivityInfo, body: ActivityRunner) {
         if let Some((feature, hint)) = unsupported_activity_feature(info) {
             panic!(
                 "autumn-harvest-sqlite (v0.1): activity `{}` declares the unsupported \
@@ -531,7 +595,7 @@ impl SqliteRuntime {
         self.activities.insert(
             info.name.to_string(),
             ActivitySpec {
-                body: Box::new(body),
+                body,
                 max_attempts,
                 schedule_to_close: info.default_schedule_to_close,
                 // Store the WHOLE policy (backoff + `non_retryable_errors`), not just
@@ -921,6 +985,21 @@ impl SqliteRuntime {
         // The single-writer runtime holds `SQLite`'s only write handle, so the
         // state read and the stage cannot race a concurrent transition: no other
         // writer exists to seal the execution between the check and the insert.
+
+        // Issue #1985: a promise signal must carry a settlement, and a promise
+        // settles once. The Postgres path drops a second settlement through its
+        // idempotency key. This backend has no key, so it skips the stage. The
+        // check runs before the terminal check, so a retry after the run ends
+        // is a no-op here too, as on Postgres.
+        if name.starts_with(autumn_harvest::durable_promise::PROMISE_SIGNAL_PREFIX) {
+            // A missing run reports `NotFound` before the payload check.
+            store::execution_state(&self.conn, exec)?;
+            autumn_harvest::durable_promise::settlement_idempotency_key(name, &payload, None)
+                .map_err(|e| SqliteError::InvalidSignal(e.to_string()))?;
+            if store::has_signal(&self.conn, exec, name)? {
+                return Ok(());
+            }
+        }
         self.refuse_unless_running(exec)?;
         // Enforce the signal-payload cap at INGRESS (issue #252, Codex #1069
         // `runtime.rs:346`), before the `harvest_signals` row is staged.
@@ -1399,6 +1478,73 @@ impl SqliteRuntime {
             }
             _ => Ok(ExecutionOutcome::Running),
         }
+    }
+
+    /// Run the query `name` on `exec` with `args`, and return its answer
+    /// (issue #2022).
+    ///
+    /// The query replays the stored history to the run's frontier, then calls
+    /// the handler that `ctx.register_query` registered. It writes nothing:
+    /// no event, no row, no staged-signal delivery, no activity body.
+    ///
+    /// - A running run answers with the state at its frontier: the first
+    ///   command that the history does not record.
+    /// - A terminal run answers with the state at its recorded end.
+    ///
+    /// The replay runs workflow code up to the frontier, as a drive does.
+    /// Code past the last recorded event runs again in each query. That
+    /// includes a `ctx.side_effect` closure the history does not record yet.
+    ///
+    /// The call reads the rows immediately. The returned future then replays
+    /// them, so it borrows nothing from the runtime. The answer is a
+    /// point-in-time read as of the call.
+    ///
+    /// ```no_run
+    /// # async fn example(
+    /// #     rt: &autumn_harvest_sqlite::SqliteRuntime,
+    /// #     exec: autumn_harvest_sqlite::ExecutionId,
+    /// # ) -> autumn_harvest_sqlite::SqliteResult<()> {
+    /// let stage = rt.query(exec, "stage", serde_json::Value::Null).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// The future resolves to an error in these cases:
+    ///
+    /// - [`SqliteError::ExecutionNotFound`]: the id is unknown.
+    /// - [`SqliteError::UnknownWorkflow`]: the workflow is not registered.
+    /// - [`SqliteError::QueryNotFound`]: the replay registers no handler
+    ///   named `name`.
+    /// - [`SqliteError::QueryFailed`]: the handler returns `Err`.
+    /// - [`SqliteError::QueryPanicked`]: the handler panics, or the workflow
+    ///   panics during the replay of a running run.
+    /// - [`SqliteError::QueryTimedOut`]: the replay passes the query timeout.
+    /// - [`SqliteError::QueryUnavailable`]: a terminal run cannot give a
+    ///   stable answer.
+    /// - [`SqliteError::NonDeterministic`]: the workflow code changed, so the
+    ///   replay of a running run diverges. A drive returns the same error.
+    /// - A persistence error: a row cannot be read.
+    pub fn query(
+        &self,
+        exec: ExecutionId,
+        name: &str,
+        args: Value,
+    ) -> impl std::future::Future<Output = SqliteResult<Value>> + Send + 'static {
+        let loaded = QueryReplay::load(&self.conn, &self.workflows, self.history_policy, exec);
+        let name = name.to_string();
+        let timeout = self.query_timeout;
+        async move { loaded?.run(name, args, timeout).await }
+    }
+
+    /// Set the time limit of a query replay. The default is
+    /// [`DEFAULT_QUERY_TIMEOUT`](crate::DEFAULT_QUERY_TIMEOUT), 5 s.
+    ///
+    /// A future that [`query`](Self::query) already returned keeps the old
+    /// limit. A limit too large to add to the current time means no limit.
+    pub const fn set_query_timeout(&mut self, timeout: std::time::Duration) {
+        self.query_timeout = timeout;
     }
 
     // ── Drivers ──────────────────────────────────────────────────────────────
@@ -1901,6 +2047,9 @@ impl SqliteRuntime {
             };
         }
 
+        // A drive dropped mid-body leaves its task `RUNNING` (issue #2024).
+        // Nothing else owns it now, so hand it back to the claim.
+        queue::reclaim_running_for_execution(&self.conn, exec)?;
         // Plan every staged signal before replay (issue #2020). Replay reads
         // the planned events in memory. Each persisting transaction below
         // applies the plan first, so a discarded cycle consumes no signal.
@@ -2156,16 +2305,24 @@ impl SqliteRuntime {
                 execution_id: exec,
                 details: error,
             }),
-            WorkflowOutcome::Suspended { commands } => self.drive_suspension(
-                exec,
-                &ingest,
-                &history,
-                &commands,
-                &caps,
-                now,
-                failure_now,
-                cancel_reason.as_deref(),
-            ),
+            WorkflowOutcome::Suspended { commands } => {
+                let owner = worker::RunOwner {
+                    workflow_id: &workflow_id,
+                    workflow_type: &workflow_name,
+                };
+                self.drive_suspension(
+                    exec,
+                    &owner,
+                    &ingest,
+                    &history,
+                    &commands,
+                    &caps,
+                    now,
+                    failure_now,
+                    cancel_reason.as_deref(),
+                )
+                .await
+            }
         }
     }
 
@@ -2184,9 +2341,10 @@ impl SqliteRuntime {
     /// the await, so the run waits for it.
     // The inputs of one decision cycle. A struct would only rename them.
     #[allow(clippy::too_many_arguments)]
-    fn drive_suspension(
+    async fn drive_suspension(
         &mut self,
         exec: ExecutionId,
+        owner: &worker::RunOwner<'_>,
         ingest: &worker::SignalIngest,
         history: &[WorkflowEvent],
         commands: &[WorkflowCommand],
@@ -2210,11 +2368,13 @@ impl SqliteRuntime {
         let drained = worker::drain_ready(
             &mut self.conn,
             exec,
+            owner,
             now,
             failure_now,
             &self.activities,
             settle_after_first_terminal,
-        )?;
+        )
+        .await?;
         if applied || drained {
             return Ok(RunState::InProgress);
         }
@@ -3447,15 +3607,17 @@ const fn unsupported_workflow_feature(info: &WorkflowInfo) -> Option<(&'static s
 ///   and a claim-time registry fallback on the RAW path, `runtime.rs:331`),
 ///   `default_start_to_close` (via the command on the TYPED path and the same
 ///   claim-time fallback on the RAW path), `default_queue` (recorded).
-/// - **REJECTED** (reported here) — a dispatch-admission / cross-worker semantic
-///   this single-writer backend has no analog for, or a cap raiser that would
-///   otherwise silently apply the STRICTER global cap:
-///   `default_heartbeat_timeout` (no heartbeating in the inline drain),
-///   `default_schedule_to_start` (no queue-wait scanner), `circuit_breaker`
-///   (#369), `rate_limit_*` (#332), `max_concurrent` (#247), `requires`
-///   (capability routing), `is_local` (local-activity `RunLocalActivity` dispatch
-///   is a command-layer non-goal), and a raised `max_input_bytes` /
-///   `max_result_bytes` (#252).
+/// - **REJECTED** (reported here): each is a dispatch-admission or cross-worker
+///   semantic with no single-writer analog, or a cap raiser. A cap raiser would
+///   otherwise silently apply the STRICTER global cap.
+///   - `default_heartbeat_timeout`: heartbeats are stored, but no scanner times
+///     out a silent attempt.
+///   - `default_schedule_to_start`: no queue-wait scanner.
+///   - `circuit_breaker` (#369), `rate_limit_*` (#332), `max_concurrent` (#247).
+///   - `requires`: capability routing.
+///   - `is_local`: local-activity `RunLocalActivity` dispatch is a command-layer
+///     non-goal.
+///   - A raised `max_input_bytes` / `max_result_bytes` (#252).
 /// - **ACCEPTED, inert**: `name`, `module`, and a lone `concurrency_key` (groups a
 ///   cap that is not set). Also `input_schema` and `output_schema`: only the
 ///   schema contract reads them (issue #1994).
@@ -3482,8 +3644,8 @@ const fn unsupported_activity_feature(info: &ActivityInfo) -> Option<(&'static s
     if info.default_heartbeat_timeout.is_some() {
         return Some((
             "heartbeat_timeout",
-            "Activity bodies run synchronously inline (no ActivityContext, no \
-             heartbeating), so a heartbeat-timeout could never be observed. Use \
+            "ctx.heartbeat(..) stores a checkpoint, but no scanner here times out \
+             a silent attempt, so a heartbeat-timeout could never be observed. Use \
              start_to_close (honored) for a per-attempt bound, or schedule_to_close \
              (honored) for a total cross-retry deadline.",
         ));
@@ -4108,5 +4270,103 @@ mod feature_gate_tests {
             .query_row("SELECT COUNT(*) FROM harvest_signals", [], |r| r.get(0))
             .unwrap();
         assert_eq!(signals, 0, "no signal row staged");
+    }
+
+    /// Counts the staged rows of signal `name`.
+    fn staged(rt: &super::SqliteRuntime, name: &str) -> i64 {
+        rt.conn
+            .query_row(
+                "SELECT COUNT(*) FROM harvest_signals WHERE name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    // Issue #1985: a promise signal must carry a settlement, as on Postgres.
+    #[test]
+    fn a_promise_signal_without_a_settlement_stages_no_row() {
+        let mut rt = super::SqliteRuntime::open_in_memory().unwrap();
+        rt.register_workflow(&base_wf_info());
+        let exec = rt.start_workflow("base_wf", serde_json::json!(0)).unwrap();
+
+        let name = "harvest.promise:approval";
+        let err = rt
+            .send_signal(exec, name, serde_json::json!("not a settlement"))
+            .unwrap_err();
+        assert!(
+            matches!(err, super::SqliteError::InvalidSignal(_)),
+            "got {err:?}"
+        );
+        assert_eq!(staged(&rt, name), 0, "no signal row staged");
+    }
+
+    // Issue #1985: a promise settles once. A second settlement stages no row,
+    // as the Postgres idempotency key drops it. Other signals still stage
+    // every send.
+    #[test]
+    fn a_second_promise_settlement_stages_no_row() {
+        let mut rt = super::SqliteRuntime::open_in_memory().unwrap();
+        rt.register_workflow(&base_wf_info());
+        let exec = rt.start_workflow("base_wf", serde_json::json!(0)).unwrap();
+
+        let name = "harvest.promise:approval";
+        let first =
+            autumn_harvest::durable_promise::PromiseSettlement::resolved(serde_json::json!(1))
+                .to_value();
+        let second =
+            autumn_harvest::durable_promise::PromiseSettlement::rejected("late").to_value();
+        rt.send_signal(exec, name, first).unwrap();
+        rt.send_signal(exec, name, second).unwrap();
+        assert_eq!(staged(&rt, name), 1, "only the first settlement stages");
+
+        rt.send_signal(exec, "go", serde_json::json!(1)).unwrap();
+        rt.send_signal(exec, "go", serde_json::json!(2)).unwrap();
+        assert_eq!(staged(&rt, "go"), 2, "other signals stage every send");
+    }
+
+    // Issue #1985: a retried settlement after the run ends is a no-op, as on
+    // Postgres. A settlement the run never had still fails on a terminal run.
+    #[test]
+    fn a_retried_settlement_after_the_run_ends_is_a_no_op() {
+        let mut rt = super::SqliteRuntime::open_in_memory().unwrap();
+        rt.register_workflow(&base_wf_info());
+        let exec = rt.start_workflow("base_wf", serde_json::json!(0)).unwrap();
+
+        let name = "harvest.promise:approval";
+        let settlement =
+            autumn_harvest::durable_promise::PromiseSettlement::resolved(serde_json::json!(1))
+                .to_value();
+        rt.send_signal(exec, name, settlement.clone()).unwrap();
+        rt.conn
+            .execute(
+                "UPDATE harvest_signals SET delivered = 1 WHERE name = ?1",
+                [name],
+            )
+            .unwrap();
+        rt.conn
+            .execute(
+                "UPDATE harvest_executions SET state = 'COMPLETED' WHERE exec_id = ?1",
+                [exec.to_string()],
+            )
+            .unwrap();
+
+        rt.send_signal(exec, name, settlement.clone()).unwrap();
+        assert_eq!(staged(&rt, name), 1, "the retry stages no row");
+
+        let err = rt
+            .send_signal(exec, "harvest.promise:other", settlement)
+            .unwrap_err();
+        assert!(
+            matches!(err, super::SqliteError::WorkflowNotRunning { .. }),
+            "got {err:?}"
+        );
+        let err = rt
+            .send_signal(exec, "go", serde_json::json!(1))
+            .unwrap_err();
+        assert!(
+            matches!(err, super::SqliteError::WorkflowNotRunning { .. }),
+            "got {err:?}"
+        );
     }
 }

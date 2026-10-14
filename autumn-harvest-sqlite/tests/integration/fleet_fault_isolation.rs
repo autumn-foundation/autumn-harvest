@@ -135,19 +135,39 @@ fn start_after(
     panic!("did not land an execution after the target one in 20,000 tries");
 }
 
+/// Opens a runtime with `setup` until the execution that `setup` starts
+/// leaves room above it in the id order.
+///
+/// `start_after` needs a fresh id that sorts after the first one. A first id
+/// near the top of the id space leaves almost no such ids, so even 20,000
+/// tries can fail. A first id whose byte after the fixed shard prefix is
+/// below `0x80` leaves at least half the space above it. `start_after` then
+/// succeeds in one or two tries. A fresh runtime per try leaves no stray run
+/// behind.
+fn runtime_with_headroom(
+    setup: impl Fn(&mut SqliteRuntime) -> ExecutionId,
+) -> (SqliteRuntime, ExecutionId) {
+    loop {
+        let mut rt = SqliteRuntime::open_in_memory().unwrap();
+        let first = setup(&mut rt);
+        if first.to_string().as_bytes()[4] < b'8' {
+            return (rt, first);
+        }
+    }
+}
+
 fn start_healthy_after(rt: &mut SqliteRuntime, broken: ExecutionId) -> ExecutionId {
     start_after(rt, "healthy_wf", &json!(0), broken)
 }
 
 #[tokio::test]
 async fn poll_once_drives_the_rest_of_the_fleet_past_an_unsupported_command() {
-    let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&broken_wf_info());
-    rt.register_workflow(&healthy_wf_info());
-
-    let broken = rt
-        .start_workflow("broken_wf", json!(ExecutionId::new()))
-        .unwrap();
+    let (mut rt, broken) = runtime_with_headroom(|rt| {
+        rt.register_workflow(&broken_wf_info());
+        rt.register_workflow(&healthy_wf_info());
+        rt.start_workflow("broken_wf", json!(ExecutionId::new()))
+            .unwrap()
+    });
     let healthy_after = start_healthy_after(&mut rt, broken);
 
     let err = rt
@@ -178,13 +198,12 @@ async fn poll_once_drives_the_rest_of_the_fleet_past_an_unsupported_command() {
 
 #[tokio::test]
 async fn run_until_idle_does_not_permanently_stall_executions_after_a_broken_one() {
-    let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&broken_wf_info());
-    rt.register_workflow(&healthy_wf_info());
-
-    let broken = rt
-        .start_workflow("broken_wf", json!(ExecutionId::new()))
-        .unwrap();
+    let (mut rt, broken) = runtime_with_headroom(|rt| {
+        rt.register_workflow(&broken_wf_info());
+        rt.register_workflow(&healthy_wf_info());
+        rt.start_workflow("broken_wf", json!(ExecutionId::new()))
+            .unwrap()
+    });
     let healthy_after = start_healthy_after(&mut rt, broken);
 
     // Mirrors the issue's repro: an application driving the fleet in a loop,
@@ -207,13 +226,12 @@ async fn run_until_idle_does_not_permanently_stall_executions_after_a_broken_one
 // coverage of the same fix.
 #[tokio::test]
 async fn poll_once_as_of_drives_the_rest_of_the_fleet_past_an_unsupported_command() {
-    let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&broken_wf_info());
-    rt.register_workflow(&healthy_wf_info());
-
-    let broken = rt
-        .start_workflow("broken_wf", json!(ExecutionId::new()))
-        .unwrap();
+    let (mut rt, broken) = runtime_with_headroom(|rt| {
+        rt.register_workflow(&broken_wf_info());
+        rt.register_workflow(&healthy_wf_info());
+        rt.start_workflow("broken_wf", json!(ExecutionId::new()))
+            .unwrap()
+    });
     let healthy_after = start_healthy_after(&mut rt, broken);
 
     let err = rt
@@ -239,13 +257,13 @@ async fn poll_once_as_of_drives_the_rest_of_the_fleet_past_an_unsupported_comman
 /// though its own error never surfaces.
 #[tokio::test]
 async fn poll_once_still_attempts_every_broken_execution_in_one_pass() {
-    let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&counting_broken_wf_info());
+    let (mut rt, first) = runtime_with_headroom(|rt| {
+        rt.register_workflow(&counting_broken_wf_info());
+        rt.start_workflow("counting_broken_wf", json!(ExecutionId::new()))
+            .unwrap()
+    });
+    // A start does not run the workflow, so the counter is still unchanged.
     let attempts_before = COUNTING_BROKEN_ATTEMPTS.load(Ordering::SeqCst);
-
-    let first = rt
-        .start_workflow("counting_broken_wf", json!(ExecutionId::new()))
-        .unwrap();
     let second = start_after(
         &mut rt,
         "counting_broken_wf",
@@ -282,14 +300,13 @@ async fn poll_once_still_attempts_every_broken_execution_in_one_pass() {
 /// completion. It must still report the broken execution's error.
 #[tokio::test]
 async fn run_until_idle_converges_a_multi_cycle_execution_in_one_call_past_a_broken_one() {
-    let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&broken_wf_info());
-    rt.register_workflow(&two_step_wf_info());
-    rt.register_activity_raw("increment", increment_activity());
-
-    let broken = rt
-        .start_workflow("broken_wf", json!(ExecutionId::new()))
-        .unwrap();
+    let (mut rt, broken) = runtime_with_headroom(|rt| {
+        rt.register_workflow(&broken_wf_info());
+        rt.register_workflow(&two_step_wf_info());
+        rt.register_activity_raw("increment", increment_activity());
+        rt.start_workflow("broken_wf", json!(ExecutionId::new()))
+            .unwrap()
+    });
     let healthy_after = start_after(&mut rt, "two_step_wf", &json!(10), broken);
 
     let err = rt
@@ -438,14 +455,13 @@ async fn unregistered_activity_wf(ctx: &WorkflowContext, n: i64) -> Result<i64, 
 /// the coverage of a run that fails on EVERY pass and stays `RUNNING`.
 #[tokio::test]
 async fn run_until_idle_converges_past_a_persistently_broken_running_execution() {
-    let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&unregistered_activity_wf_info());
-    rt.register_workflow(&two_step_wf_info());
-    rt.register_activity_raw("increment", increment_activity());
-
-    let broken = rt
-        .start_workflow("unregistered_activity_wf", json!(1))
-        .unwrap();
+    let (mut rt, broken) = runtime_with_headroom(|rt| {
+        rt.register_workflow(&unregistered_activity_wf_info());
+        rt.register_workflow(&two_step_wf_info());
+        rt.register_activity_raw("increment", increment_activity());
+        rt.start_workflow("unregistered_activity_wf", json!(1))
+            .unwrap()
+    });
     let healthy_after = start_after(&mut rt, "two_step_wf", &json!(10), broken);
 
     for _ in 1..=2 {

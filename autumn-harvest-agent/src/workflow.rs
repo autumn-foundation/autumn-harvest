@@ -19,6 +19,7 @@
 
 use std::time::Duration;
 
+use autumn_harvest::llm_budget::LlmBudgetExceeded;
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
 
@@ -277,10 +278,17 @@ async fn run_segment(
         if exceeds_bytes(&request, task.request_cap()) {
             return Ok(AgentStop::TranscriptFull);
         }
-        let turn: ModelTurn = ctx
+        let turn: ModelTurn = match ctx
             .execute_activity(&agent_model_turn_info(), request)
             .await
-            .map_err(|e| e.to_string())?;
+        {
+            Ok(turn) => turn,
+            // A spent LLM budget is a bound, so the run ends normally.
+            Err(error) if LlmBudgetExceeded::is_refusal(&error) => {
+                return Ok(AgentStop::BudgetExceeded);
+            }
+            Err(error) => return Err(error.to_string()),
+        };
 
         progress.usage = progress.usage.saturating_add(turn.usage);
         let over_budget = task
@@ -567,6 +575,10 @@ fn harness(ctx: &ActivityContext) -> Result<&AgentHarness, String> {
 /// A rate limit, a transport fault, an outage or a timeout retries with
 /// backoff. Any other failure fails the call at once.
 ///
+/// The turn first runs the LLM budget check of its workflow type (issue
+/// #1997). A spent budget refuses the turn before the model call, and the
+/// loop ends under `budget_exceeded`.
+///
 /// A turn that calls the model records one call in the agent cost ledger
 /// (issue #1996). `AgentModel::model_id` names the model, and
 /// `AgentModel::cost_usd_micros` prices the call. A response cache hit calls
@@ -584,6 +596,7 @@ pub async fn agent_model_turn(
     request: ModelTurnRequest,
 ) -> Result<ModelTurn, String> {
     let harness = harness(ctx)?;
+    harness.check_budget(|| ctx.check_llm_budget()).await?;
     let tenant = cache_tenant(ctx, harness, &request).await;
     let (turn, latency) = harness
         .model_turn_timed_in(request, tenant, |_content| {})

@@ -27,16 +27,17 @@
 //!
 //! # When a warm decision resumes
 //!
-//! The delta must start with the events of the last suspension, in order.
-//! Then it must hold at least one event that resolves a parked await, or
-//! nothing more. A re-driven task can find no new result. A cold replay of
-//! that history waits for the same activities, so the cycle waits for each
-//! one again. A parked timer or signal cannot wait again, so it declines. Each
-//! parked await resolves at most once. A resolving event must be an
-//! activity success, a timer fire or a signal. The start and heartbeat
-//! events of a parked activity may come before its result, because replay
-//! skips those too. The live channels carry these payloads exactly, as a
-//! replay reads them. Any other delta declines.
+//! The delta must start with all the events of the last suspension, in
+//! order. Then it holds the events that resolve parked awaits. Each parked
+//! await resolves at most once. A resolving event must be an activity
+//! success, a timer fire or a signal. The start and heartbeat events of a
+//! parked activity may come before its result, because replay skips those
+//! too. The live channels carry these payloads exactly, as a replay reads
+//! them. Any other delta declines.
+//!
+//! A delta with no resolving event is a redundant wake. Each parked
+//! activity then waits again, as in a partial join. A lone timer or signal
+//! cannot wait again, so its redundant wake declines.
 //!
 //! # Partial joins
 //!
@@ -100,7 +101,9 @@ pub enum ResumeDeclined {
     KeyChanged,
     /// The delta does not start with the events of the last suspension.
     OwnEventsMismatch,
-    /// The delta resolves no parked await.
+    /// The delta resolves no parked await, and the resume cannot wait
+    /// again. The delta is shorter than the events of the last suspension,
+    /// or the lone parked await is a timer or a signal.
     NoResolution,
     /// The delta holds an event after every parked await resolved, or a
     /// second result for one await.
@@ -609,6 +612,9 @@ impl ResidentWorkflow {
     /// that the live channel can carry each payload exactly.
     ///
     /// Decision boundaries (issue #1833) are skipped. Replay never reads them.
+    ///
+    /// A delta that holds all the own events and no result resolves no
+    /// await. That is a redundant wake, so every await stays parked.
     fn resolutions(&self, delta: &[WorkflowEvent]) -> Result<Vec<Option<usize>>, ResumeDeclined> {
         let mut events = delta
             .iter()
@@ -652,8 +658,8 @@ impl ResidentWorkflow {
             }
             resolved[index] = Some(at);
         }
-        // A complete delta that resolves nothing is a wake with no new
-        // result. Its cycle only waits again.
+        // A short delta can still lack an event that the last decision
+        // wrote, so only a complete one is a redundant wake.
         if resolved.iter().all(Option::is_none) && own_seen < self.own_events.len() {
             return Err(ResumeDeclined::NoResolution);
         }
@@ -678,9 +684,9 @@ impl ResidentWorkflow {
             return Err(ResumeDeclined::KeyChanged);
         }
         let mut ends: Vec<usize> = self.resolutions(delta)?.into_iter().flatten().collect();
+        // A redundant wake runs one step that only waits again. A lone timer
+        // or signal cannot wait again, so the step declines it.
         if ends.is_empty() {
-            // A wake with no new result (issue #2008). A cold replay waits
-            // for the same activities, so this cycle waits for each one.
             return self.step(delta, span_meta).await;
         }
         ends.sort_unstable();
@@ -729,9 +735,8 @@ impl ResidentWorkflow {
                 parked.deliver(&delta[at])?;
                 continue;
             }
-            // Only an activity can wait again. Capture parks a timer or a
-            // signal only alone, so a delta that does not resolve it
-            // declines.
+            // Only an activity can wait again. A lone timer or signal that
+            // a redundant wake does not resolve declines here.
             let wait = parked.into_wait().ok_or(ResumeDeclined::NoResolution)?;
             if let WorkflowCommand::WaitForActivity { activity_id, .. } = &wait {
                 reparked.push(*activity_id);
@@ -1326,6 +1331,18 @@ mod tests {
         })
     }
 
+    /// Parks on a payload-matching signal wait (issue #1985).
+    ///
+    /// A warm resume sends any same-name payload to the parked future. It
+    /// does not run the predicate.
+    fn predicate_wait_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            ctx.wait_for_signal_matching("order", |p| p["id"] == 42)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
     /// Acquires a durable mutex, then awaits an activity.
     fn mutex_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
         Box::pin(async move {
@@ -1348,7 +1365,7 @@ mod tests {
     #[tokio::test]
     async fn capture_names_why_a_suspension_is_not_resident() {
         // Issue #2007: each miss reason is the `outcome` label of a decision.
-        let cases: [(&str, WorkflowHandlerFn, ResidentOutcome); 6] = [
+        let cases: [(&str, WorkflowHandlerFn, ResidentOutcome); 7] = [
             (
                 "mixed join",
                 mixed_join_workflow,
@@ -1362,6 +1379,11 @@ mod tests {
                 "child workflow",
                 child_workflow,
                 ResidentOutcome::Unsupported,
+            ),
+            (
+                "signal predicate",
+                predicate_wait_workflow,
+                ResidentOutcome::Blocked,
             ),
         ];
         for (name, handler, expected) in cases {
@@ -1698,6 +1720,52 @@ mod tests {
             declined.err(),
             Some(ResumeDeclined::KeyChanged),
             "a new shard or name must decline"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wake_with_nothing_new_waits_again() {
+        // A second wake for results that the last decision already read
+        // brings only the own events of the suspension.
+        let (resident, own, id) = suspended_activity().await;
+        let (outcome, next) = resident
+            .resume(&own)
+            .await
+            .expect("a wake with nothing new must not decline");
+        assert!(
+            matches!(&outcome, WorkflowOutcome::Suspended { commands }
+                if matches!(commands.as_slice(), [WorkflowCommand::WaitForActivity { activity_id, .. }] if *activity_id == id)),
+            "the cycle must only wait again: {outcome:?}"
+        );
+        let next = next.expect("the workflow stays resident");
+        let (outcome, _) = next
+            .resume(&[decision_boundary(), completed(id)])
+            .await
+            .expect("the result resolves");
+        assert!(
+            matches!(&outcome, WorkflowOutcome::Completed { output, .. } if *output == json!(1)),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wake_with_nothing_new_declines_for_a_lone_timer() {
+        let (outcome, resident) = start(
+            ExecutionId::new(),
+            vec![started(Value::Null)],
+            timer_loop_workflow,
+            Value::Null,
+        )
+        .await;
+        let WorkflowOutcome::Suspended { commands } = outcome else {
+            panic!("the first decision must suspend");
+        };
+        let own = own_events(&commands);
+        let resident = resident.expect("a timer suspension is resident");
+        assert_eq!(
+            resident.resume(&own).await.err(),
+            Some(ResumeDeclined::NoResolution),
+            "only an activity can wait again"
         );
     }
 
@@ -2386,55 +2454,6 @@ mod tests {
         };
         let own = own_events(&commands);
         (resident.expect("a join stays resident"), own, a, b)
-    }
-
-    /// A re-driven task can find no new event (issue #2008). A cold replay
-    /// of that history waits for the same activity, so the future waits on.
-    #[tokio::test]
-    async fn a_wake_with_only_the_own_events_keeps_an_activity_waiting() {
-        let (resident, own, id) = suspended_activity().await;
-        let wake = [own, vec![decision_boundary()]].concat();
-        let (outcome, next) = resident
-            .resume(&wake)
-            .await
-            .expect("a wake with no new event keeps waiting");
-        assert!(
-            matches!(&outcome, WorkflowOutcome::Suspended { commands }
-                if matches!(commands.as_slice(), [WorkflowCommand::WaitForActivity { activity_id, .. }] if *activity_id == id)),
-            "the cycle must only wait: {outcome:?}"
-        );
-        let next = next.expect("the activity stays resident");
-        let (outcome, _) = next
-            .resume(&[decision_boundary(), completed(id)])
-            .await
-            .expect("the result resolves");
-        assert!(
-            matches!(&outcome, WorkflowOutcome::Completed { output, .. } if *output == json!(1)),
-            "{outcome:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_wake_with_only_the_own_events_keeps_a_join_waiting() {
-        let (resident, own, a, b) = suspended_pair().await;
-        let (outcome, next) = resident
-            .resume(&own)
-            .await
-            .expect("a wake with no new event keeps waiting");
-        assert!(
-            matches!(&outcome, WorkflowOutcome::Suspended { commands } if commands.len() == 2),
-            "the cycle must wait for both: {outcome:?}"
-        );
-        let next = next.expect("the join stays resident");
-        let (outcome, _) = next
-            .resume(&[completed(a), completed(b)])
-            .await
-            .expect("both results resolve");
-        assert!(
-            matches!(&outcome, WorkflowOutcome::Suspended { commands }
-                if matches!(commands.as_slice(), [WorkflowCommand::ScheduleActivity { name, .. }] if name == "c")),
-            "the join completes and schedules `c`: {outcome:?}"
-        );
     }
 
     #[tokio::test]

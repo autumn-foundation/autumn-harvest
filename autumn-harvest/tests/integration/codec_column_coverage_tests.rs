@@ -447,6 +447,44 @@ async fn columns_stay_in_clear_while_column_encoding_is_off() {
     );
 }
 
+/// A durable promise settlement is a signal row, so it holds ciphertext too.
+/// The dedupe key stays in clear, so a second settlement is still refused.
+#[tokio::test]
+async fn a_promise_settlement_with_codecs_is_ciphertext() {
+    use autumn_harvest::durable_promise::{self, PromiseId};
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = format!("cc-{}", Uuid::new_v4().simple());
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, &codecs, "cc_signal_echo", &queue, None).await;
+    let approve = PromiseId::new(exec_id, "approve").expect("promise id");
+    let deny = PromiseId::new(exec_id, "deny").expect("promise id");
+
+    let value = json!({"pin": SIGNAL_SECRET});
+    assert!(
+        durable_promise::resolve_with_codecs(&mut conn, &approve, value.clone(), &codecs)
+            .await
+            .expect("resolve")
+    );
+    assert!(
+        durable_promise::reject_with_codecs(&mut conn, &deny, SIGNAL_SECRET, &codecs)
+            .await
+            .expect("reject")
+    );
+    assert!(
+        !durable_promise::resolve_with_codecs(&mut conn, &approve, value, &codecs)
+            .await
+            .expect("second resolve"),
+        "the first settlement wins"
+    );
+
+    let payloads = signal_payloads(&mut conn, exec_id.as_uuid()).await;
+    assert_eq!(payloads.len(), 2, "one row per promise");
+    for payload in &payloads {
+        assert_ciphertext(payload, SIGNAL_SECRET, "promise settlement");
+    }
+}
+
 #[tokio::test]
 async fn a_dead_letter_input_is_ciphertext_and_replay_requeues_plaintext() {
     let (url, _c) = setup_test_database_url_or_env().await;
