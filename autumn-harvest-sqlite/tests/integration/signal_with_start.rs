@@ -117,10 +117,10 @@ fn completed(state: &RunState) -> Value {
     }
 }
 
-async fn assert_replays(rt: &SqliteRuntime, exec: ExecutionId) {
+async fn assert_replays(history: Vec<WorkflowEvent>) {
     let report = WorkflowReplayer::new()
         .register_fn("inbox", inbox_info().handler)
-        .replay_from_events(rt.load_history(exec).unwrap())
+        .replay_from_events(history)
         .await;
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),
@@ -174,7 +174,7 @@ async fn a_duplicate_keyed_signal_is_staged_once() {
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert_eq!(completed(&state), json!("a"), "the first payload wins");
     assert_eq!(signal_events(&rt, exec), 1, "the run sees the signal once");
-    assert_replays(&rt, exec).await;
+    assert_replays(rt.load_history(exec).unwrap()).await;
 }
 
 #[tokio::test]
@@ -342,7 +342,7 @@ async fn signal_with_start_starts_a_run_and_the_run_receives_the_signal() {
 
     let state = rt.run_until_blocked(out.exec_id).await.unwrap();
     assert_eq!(completed(&state), json!("hello"));
-    assert_replays(&rt, out.exec_id).await;
+    assert_replays(rt.load_history(out.exec_id).unwrap()).await;
 }
 
 #[tokio::test]

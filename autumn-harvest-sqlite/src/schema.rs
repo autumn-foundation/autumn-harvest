@@ -207,7 +207,10 @@ CREATE TABLE IF NOT EXISTS harvest_signals (
     name         TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     delivered    INTEGER NOT NULL DEFAULT 0,
-    received_at  INTEGER NOT NULL DEFAULT 0   -- absolute epoch-millisecond the signal arrived
+    received_at  INTEGER NOT NULL DEFAULT 0,  -- absolute epoch-millisecond the signal arrived
+    idempotency_key TEXT                      -- the caller's dedupe key (issue #2028).
+                                              -- NULL = no key. `migrate` builds the
+                                              -- unique index on (exec_id, key).
 );
 
 -- Without this, every exec_id/delivered-scoped query here (the signal read,
@@ -261,6 +264,11 @@ use crate::error::SqliteResult;
 /// - **issue #2021** — `harvest_executions.cancel_reason`, the stored cooperative
 ///   cancel request, and `cancel_from_seq`, the history length at the request.
 ///   Both are nullable, so an old row has no pending cancel.
+/// - **issue #2028** — `harvest_signals.idempotency_key` and its partial unique
+///   index on `(exec_id, idempotency_key)`. The index is built here, because the
+///   base [`SCHEMA`] runs before an old table has the column. When the column is
+///   new, each promise settlement takes its name as its key (see
+///   [`back_fill_promise_keys`]).
 ///
 /// # Errors
 ///
@@ -306,10 +314,49 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
         "cancel_from_seq",
         "ALTER TABLE harvest_executions ADD COLUMN cancel_from_seq INTEGER",
     )?;
+    // issue #2028: the signal idempotency key.
+    let key_added = add_column_if_absent(
+        conn,
+        "harvest_signals",
+        "idempotency_key",
+        "ALTER TABLE harvest_signals ADD COLUMN idempotency_key TEXT",
+    )?;
+    conn.execute_batch(SIGNAL_KEY_INDEX)?;
+    if key_added {
+        back_fill_promise_keys(conn)?;
+    }
+    Ok(())
+}
+
+/// The partial unique index that enforces a signal idempotency key (issue
+/// #2028). A NULL key is outside the index, so an unkeyed signal always
+/// stages. It matches the Postgres `uq_harvest_signals_idem`.
+const SIGNAL_KEY_INDEX: &str = "\
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_harvest_signals_idem \
+        ON harvest_signals (exec_id, idempotency_key) \
+        WHERE idempotency_key IS NOT NULL;";
+
+/// Give each stored promise settlement its name as its key (issue #2028).
+///
+/// Before issue #2028, this backend deduped a settlement by its name. Now the
+/// key does it, so an old settlement needs the key too. Only the first row of
+/// each `(exec_id, name)` takes the key. A later duplicate keeps NULL, so the
+/// unique index stays valid.
+fn back_fill_promise_keys(conn: &Connection) -> SqliteResult<()> {
+    conn.execute(
+        "UPDATE harvest_signals SET idempotency_key = name \
+         WHERE idempotency_key IS NULL \
+           AND substr(name, 1, length(?1)) = ?1 \
+           AND signal_seq = (SELECT MIN(first.signal_seq) FROM harvest_signals AS first \
+                             WHERE first.exec_id = harvest_signals.exec_id \
+                               AND first.name = harvest_signals.name)",
+        [autumn_harvest::durable_promise::PROMISE_SIGNAL_PREFIX],
+    )?;
     Ok(())
 }
 
 /// Run `add_column_sql` iff `table` does not already have a column named `column`.
+/// Returns `true` when it added the column.
 ///
 /// `table`/`column` are backend-internal string LITERALS (never caller input), so
 /// interpolating them into the `PRAGMA table_info(...)` probe is safe — a `PRAGMA`
@@ -319,11 +366,12 @@ fn add_column_if_absent(
     table: &str,
     column: &str,
     add_column_sql: &str,
-) -> SqliteResult<()> {
-    if !column_exists(conn, table, column)? {
-        conn.execute_batch(add_column_sql)?;
+) -> SqliteResult<bool> {
+    if column_exists(conn, table, column)? {
+        return Ok(false);
     }
-    Ok(())
+    conn.execute_batch(add_column_sql)?;
+    Ok(true)
 }
 
 /// True iff `table` has a column named `column`, read from `PRAGMA table_info`
@@ -467,9 +515,7 @@ mod tests {
     // keeps its data and has no pending cancel.
     #[test]
     fn migrate_adds_cancel_reason_to_an_old_executions_table() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(OLD_HARVEST_EXECUTIONS_DDL).unwrap();
-        conn.execute_batch(OLD_HARVEST_TASKS_DDL).unwrap();
+        let conn = old_database();
         conn.execute(
             "INSERT INTO harvest_executions (exec_id, workflow_name, input_json, state) \
              VALUES ('e1', 'wf', '{}', 'RUNNING')",
@@ -497,9 +543,7 @@ mod tests {
     // date additively — the two columns are added, existing data is preserved.
     #[test]
     fn migrate_adds_freeze_columns_to_an_old_schema_table() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(OLD_HARVEST_EXECUTIONS_DDL).unwrap();
-        conn.execute_batch(OLD_HARVEST_TASKS_DDL).unwrap();
+        let conn = old_database();
         // Seed a pre-existing row to prove data survives the ALTER.
         conn.execute(
             "INSERT INTO harvest_tasks \
@@ -538,9 +582,7 @@ mod tests {
     // read NULL on an existing row.
     #[test]
     fn migrate_adds_the_heartbeat_and_error_columns() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(OLD_HARVEST_EXECUTIONS_DDL).unwrap();
-        conn.execute_batch(OLD_HARVEST_TASKS_DDL).unwrap();
+        let conn = old_database();
         conn.execute(
             "INSERT INTO harvest_tasks \
              (task_id, exec_id, activity_id, name, input_json, queue, state, attempt, \

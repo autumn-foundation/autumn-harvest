@@ -862,6 +862,23 @@ impl SqliteRuntime {
         input: Value,
         policy: WorkflowIdReusePolicy,
     ) -> SqliteResult<StartOutcome> {
+        self.check_start(workflow_name, &input)?;
+        let tx = self.conn.transaction()?;
+        let outcome = start_in_tx(
+            &tx,
+            workflow_name,
+            workflow_id,
+            input,
+            policy,
+            StartMatrix::Plain,
+        )?;
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    /// The checks of every start, before any write: a registered workflow and
+    /// the input cap.
+    fn check_start(&self, workflow_name: &str, input: &Value) -> SqliteResult<()> {
         if !self.workflows.contains_key(workflow_name) {
             return Err(SqliteError::UnknownWorkflow(workflow_name.to_string()));
         }
@@ -873,7 +890,7 @@ impl SqliteRuntime {
         // the core does. A zero cap means uncapped (the core convention); the default
         // `DEFAULT_MAX_WORKFLOW_INPUT_BYTES` (2 MiB) is > 0, so the check is active.
         if DEFAULT_MAX_WORKFLOW_INPUT_BYTES > 0 {
-            let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
+            let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
             if observed > DEFAULT_MAX_WORKFLOW_INPUT_BYTES {
                 return Err(SqliteError::PayloadTooLarge {
                     kind: "workflow_input",
@@ -882,90 +899,13 @@ impl SqliteRuntime {
                 });
             }
         }
-
-        // A non-blank caller-supplied id is the reuse key; a blank/None id has no
-        // reuse key (it defaults to the fresh exec-id string form, unique per run),
-        // so it always creates a distinct execution regardless of `policy`.
-        let business_id = workflow_id.filter(|id| !id.trim().is_empty());
-
-        let tx = self.conn.transaction()?;
-        let outcome = match business_id {
-            // No reuse key → always fresh; `workflow_id` defaults to the exec-id
-            // string form so `ctx.info().workflow_id` is never empty and is
-            // distinct per run (issue #698).
-            None => insert_fresh_execution(&tx, workflow_name, None, input)?,
-            Some(id) => {
-                let prior = store::find_active_execution_by_key(&tx, workflow_name, id)?;
-                match (policy, prior) {
-                    // No active prior → create fresh under every policy.
-                    (_, None) => insert_fresh_execution(&tx, workflow_name, Some(id), input)?,
-
-                    // Return the existing execution unchanged.
-                    (WorkflowIdReusePolicy::AllowDuplicate, Some((prior_exec, _))) => {
-                        StartOutcome {
-                            exec_id: prior_exec,
-                            created: false,
-                        }
-                    }
-
-                    // Refuse the duplicate — drop the (uncommitted) transaction so no
-                    // fresh row is written, and surface the collision.
-                    (
-                        WorkflowIdReusePolicy::RejectDuplicate,
-                        Some((existing_exec_id, existing_state)),
-                    ) => {
-                        return Err(SqliteError::AlreadyExists {
-                            existing_exec_id,
-                            existing_state,
-                        });
-                    }
-
-                    // Replace a FAILED or CANCELLED prior, as on Postgres.
-                    // Otherwise return the existing run.
-                    (
-                        WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
-                        Some((prior_exec, prior_state)),
-                    ) => {
-                        if prior_state == "FAILED" || prior_state == CANCELLED_STATE {
-                            cancel_and_seal_prior(&tx, prior_exec, &prior_state)?;
-                            insert_fresh_execution(&tx, workflow_name, Some(id), input)?
-                        } else {
-                            StartOutcome {
-                                exec_id: prior_exec,
-                                created: false,
-                            }
-                        }
-                    }
-
-                    // Cancel + seal EVERY active prior for the key, then start fresh.
-                    // A pre-#1068 database may already hold MULTIPLE RUNNING rows for
-                    // one key (the old always-fresh behavior), so sealing only the
-                    // newest (`Some(_)` here) would leave older RUNNING duplicates
-                    // active and still driven by `run_until_idle` — defeating the
-                    // terminate-and-restart guarantee (Codex #1080 P2). Re-query the
-                    // FULL active set and reconcile every row: a still-RUNNING prior
-                    // records a `WorkflowCancelled` event and has its PENDING tasks /
-                    // unfired timers cleaned up; an already-terminal prior is sealed
-                    // without a cancellation event. All happen in this one start
-                    // transaction, so the result is exactly one active row (the fresh
-                    // run) with no orphaned RUNNING prior. (When there is no active
-                    // prior at all the `(_, None)` arm above already handles it.)
-                    (WorkflowIdReusePolicy::TerminateIfRunning, Some(_)) => {
-                        for (prior_exec, prior_state) in
-                            store::find_active_executions_by_key(&tx, workflow_name, id)?
-                        {
-                            cancel_and_seal_prior(&tx, prior_exec, &prior_state)?;
-                        }
-                        insert_fresh_execution(&tx, workflow_name, Some(id), input)?
-                    }
-                }
-            }
-        };
-        tx.commit()?;
-        Ok(outcome)
+        Ok(())
     }
 
     /// Deliver an inbound signal. The next drive appends it to history.
+    ///
+    /// It is [`send_signal_idempotent`](Self::send_signal_idempotent) with no
+    /// key, so every call stages a row.
     ///
     /// # Errors
     ///
@@ -1015,115 +955,189 @@ impl SqliteRuntime {
         payload: Value,
         received_at: DateTime<Utc>,
     ) -> SqliteResult<()> {
-        // Validate the target BEFORE staging (Codex #1069 P2). `harvest_signals`
-        // has no FK or state check. An unconditional stage returns `Ok(())` for
-        // a typoed id or a sealed run. No drive will ever consume that row, so
-        // the wakeup is silently lost. Mirror the Postgres `send_signal`
-        // rejections. `store::execution_state` returns `ExecutionNotFound` for an
-        // unknown id. A terminal execution is `WorkflowNotRunning`. A RUNNING
-        // (non-terminal) execution stages as before.
-        //
-        // The single-writer runtime holds `SQLite`'s only write handle, so the
-        // state read and the stage cannot race a concurrent transition: no other
-        // writer exists to seal the execution between the check and the insert.
-
-        // Issue #1985: a promise signal must carry a settlement, and a promise
-        // settles once. The Postgres path drops a second settlement through its
-        // idempotency key. This backend has no key, so it skips the stage. The
-        // check runs before the terminal check, so a retry after the run ends
-        // is a no-op here too, as on Postgres.
-        if name.starts_with(autumn_harvest::durable_promise::PROMISE_SIGNAL_PREFIX) {
-            // A missing run reports `NotFound` before the payload check.
-            store::execution_state(&self.conn, exec)?;
-            autumn_harvest::durable_promise::settlement_idempotency_key(name, &payload, None)
-                .map_err(|e| SqliteError::InvalidSignal(e.to_string()))?;
-            if store::has_signal(&self.conn, exec, name)? {
-                return Ok(());
-            }
-        }
-        self.refuse_unless_running(exec)?;
-        // Enforce the signal-payload cap at INGRESS (issue #252, Codex #1069
-        // `runtime.rs:346`), before the `harvest_signals` row is staged.
-        // Otherwise the next drive records an oversized `SignalReceived` event.
-        // That bloats history and accepts a payload that Postgres rejects at its
-        // boundary. Checked AFTER the not-found / terminal rejections above: the
-        // target's existence/state is a precondition for accepting ANY signal, so a
-        // typoed or sealed target reports that (the more actionable error) rather
-        // than a size complaint — the prompt's chosen order. (The Postgres HTTP
-        // boundary happens to check the cap *before* `send_signal`'s state check;
-        // both reject and neither stages the row, so the only observable difference
-        // is the error KIND for the pathological "oversized payload to an
-        // unknown/terminal target" case — a caller bug either way.) Measured as the
-        // serialized-JSON byte length, matching the core (`serde_json::to_string`).
-        if DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES > 0 {
-            let observed = serde_json::to_string(&payload).map_or(0, |s| s.len() as u64);
-            if observed > DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES {
-                return Err(SqliteError::PayloadTooLarge {
-                    kind: "signal_payload",
-                    observed_bytes: observed,
-                    cap_bytes: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
-                });
-            }
-        }
-        // Millisecond precision (issue #1069 P2): `received_at` is compared against
-        // a deadline timer's `fire_at` (both epoch-MILLISECOND) by the wake-event
-        // ingest, so a whole-second floor could flip an on-time signal past its
-        // deadline near a second boundary.
-        store::stage_signal(
-            &self.conn,
-            exec,
-            name,
-            &payload,
-            received_at.timestamp_millis(),
-        )
+        self.signal_execution(exec, name, &payload, None, received_at)
+            .map(|_staged| ())
     }
 
-    /// Stub for the red phase (issue #2028).
+    /// Deliver a signal at most once per idempotency key (issue #2028).
+    ///
+    /// Returns `Ok(true)` when the call stages the signal. Returns `Ok(false)`
+    /// when `exec` already holds a signal with this key. The probe runs before
+    /// the state check, so a retry after the run ends is also `Ok(false)`, as on
+    /// Postgres. A partial unique index on `(exec_id, idempotency_key)`
+    /// enforces the key.
+    ///
+    /// An empty key is no key, so the call always stages. A key is scoped to
+    /// `exec`. For a key scoped to the whole `(workflow_name, workflow_id)`
+    /// chain, use [`send_signal_by_workflow_id`](Self::send_signal_by_workflow_id).
+    ///
+    /// A `harvest.promise:` signal always uses its name as its key, so a
+    /// promise settles once (issue #1985).
     ///
     /// # Errors
     ///
-    /// Always [`SqliteError::Unsupported`].
+    /// As [`send_signal`](Self::send_signal). Also
+    /// [`SqliteError::InvalidSignal`] when a normal signal uses a
+    /// `harvest.promise:` key, or a promise signal has a bad payload or a
+    /// different key.
     #[allow(clippy::needless_pass_by_value)]
     pub fn send_signal_idempotent(
         &mut self,
-        _exec: ExecutionId,
-        _name: &str,
-        _payload: Value,
-        _idempotency_key: Option<&str>,
+        exec: ExecutionId,
+        name: &str,
+        payload: Value,
+        idempotency_key: Option<&str>,
     ) -> SqliteResult<bool> {
-        Err(SqliteError::Unsupported("send_signal_idempotent".into()))
+        self.signal_execution(exec, name, &payload, idempotency_key, Utc::now())
     }
 
-    /// Stub for the red phase (issue #2028).
+    /// Signal the run that a `(workflow_name, workflow_id)` key names (issue
+    /// #2028).
+    ///
+    /// The call resolves the `RUNNING` run of the key. A continue-as-new
+    /// successor keeps the key, so the call reaches it. With no running run,
+    /// the newest run of the key is terminal, and the call refuses it.
+    ///
+    /// A key that a run of the chain already holds returns
+    /// [`SignalDelivery`] with `delivered: false` for that run, in any state.
+    /// So a retry after a continue-as-new or after the run ends stages
+    /// nothing. A promise key is scoped to its run only, as on Postgres. Each
+    /// call is one transaction.
     ///
     /// # Errors
     ///
-    /// Always [`SqliteError::Unsupported`].
+    /// Returns [`SqliteError::BlankWorkflowId`] for a blank id,
+    /// [`SqliteError::WorkflowIdNotFound`] when the key has no run, and
+    /// [`SqliteError::WorkflowNotRunning`] when its newest run is terminal.
+    /// Otherwise as [`send_signal_idempotent`](Self::send_signal_idempotent).
     #[allow(clippy::needless_pass_by_value)]
     pub fn send_signal_by_workflow_id(
         &mut self,
-        _workflow_name: &str,
-        _workflow_id: &str,
-        _name: &str,
-        _payload: Value,
-        _idempotency_key: Option<&str>,
+        workflow_name: &str,
+        workflow_id: &str,
+        name: &str,
+        payload: Value,
+        idempotency_key: Option<&str>,
     ) -> SqliteResult<SignalDelivery> {
-        Err(SqliteError::Unsupported(
-            "send_signal_by_workflow_id".into(),
-        ))
+        if workflow_id.trim().is_empty() {
+            return Err(SqliteError::BlankWorkflowId);
+        }
+        let key = signal_key(name, &payload, idempotency_key)?;
+        let tx = self.conn.transaction()?;
+        if let Some(holder) = key_in_chain(&tx, workflow_name, workflow_id, name, key)? {
+            return Ok(SignalDelivery {
+                exec_id: holder,
+                delivered: false,
+            });
+        }
+        let (exec, _state) = store::resolve_run_by_key(&tx, workflow_name, workflow_id)?
+            .ok_or_else(|| SqliteError::WorkflowIdNotFound {
+                workflow_name: workflow_name.to_string(),
+                workflow_id: workflow_id.to_string(),
+            })?;
+        let delivered = stage_keyed(&tx, exec, name, &payload, key, Utc::now())?;
+        tx.commit()?;
+        Ok(SignalDelivery {
+            exec_id: exec,
+            delivered,
+        })
     }
 
-    /// Stub for the red phase (issue #2028).
+    /// Start a run of the key and signal it, or signal the run that exists
+    /// (issue #2028).
+    ///
+    /// One transaction holds the key probe, the start decision, any start or
+    /// replace, and the signal stage. An error rolls back all of them. The next
+    /// drive appends the signal before the body runs (issue #2020).
+    ///
+    /// | Prior state | `AllowDuplicate` | `RejectDuplicate` | `AllowDuplicateFailedOnly` | `TerminateIfRunning` |
+    /// |---|---|---|---|---|
+    /// | none | start + signal | start + signal | start + signal | start + signal |
+    /// | `RUNNING` | signal | `AlreadyExists` | signal | cancel + start + signal |
+    /// | `COMPLETED` / `FAILED` / `CANCELLED` | start + signal | `AlreadyExists` | start + signal | start + signal |
+    /// | `TERMINATED` / `CONTINUED_AS_NEW` | start + signal | start + signal | start + signal | start + signal |
+    ///
+    /// A terminal prior is the difference from
+    /// [`start_workflow_with_reuse_policy`](Self::start_workflow_with_reuse_policy).
+    /// A signal to a terminal run cannot land, so this call starts a fresh run,
+    /// as on Postgres. A start over a prior seals the prior `CONTINUED_AS_NEW`,
+    /// as the plain-start replace does.
+    ///
+    /// A key that a run of the chain already holds returns `started_fresh:
+    /// false` and `signal_delivered: false` for that run, before the matrix
+    /// runs. So a retry after the first run ends starts nothing.
     ///
     /// # Errors
     ///
-    /// Always [`SqliteError::Unsupported`].
-    #[allow(clippy::needless_pass_by_value)]
+    /// - [`SqliteError::BlankWorkflowId`] for a blank id.
+    /// - [`SqliteError::UnknownWorkflow`] for an unregistered workflow.
+    /// - [`SqliteError::AlreadyExists`] for a `RejectDuplicate` collision.
+    /// - [`SqliteError::PayloadTooLarge`] for an oversized input or payload.
+    /// - [`SqliteError::InvalidSignal`] for a broken key rule.
+    /// - A persistence error.
     pub fn signal_with_start(
         &mut self,
-        _request: SignalWithStart<'_>,
+        request: SignalWithStart<'_>,
     ) -> SqliteResult<SignalWithStartOutcome> {
-        Err(SqliteError::Unsupported("signal_with_start".into()))
+        let SignalWithStart {
+            workflow_name,
+            workflow_id,
+            input,
+            reuse_policy,
+            signal_name,
+            signal_payload,
+            idempotency_key,
+        } = request;
+        if workflow_id.trim().is_empty() {
+            return Err(SqliteError::BlankWorkflowId);
+        }
+        self.check_start(workflow_name, &input)?;
+        let key = signal_key(signal_name, &signal_payload, idempotency_key)?;
+        let tx = self.conn.transaction()?;
+        if let Some(holder) = key_in_chain(&tx, workflow_name, workflow_id, signal_name, key)? {
+            return Ok(SignalWithStartOutcome {
+                exec_id: holder,
+                started_fresh: false,
+                signal_delivered: false,
+            });
+        }
+        let started = start_in_tx(
+            &tx,
+            workflow_name,
+            Some(workflow_id),
+            input,
+            reuse_policy,
+            StartMatrix::SignalWithStart,
+        )?;
+        let signal_delivered = stage_keyed(
+            &tx,
+            started.exec_id,
+            signal_name,
+            &signal_payload,
+            key,
+            Utc::now(),
+        )?;
+        tx.commit()?;
+        Ok(SignalWithStartOutcome {
+            exec_id: started.exec_id,
+            started_fresh: started.created,
+            signal_delivered,
+        })
+    }
+
+    /// Stage a signal on `exec`. Returns `true` when it staged a row.
+    fn signal_execution(
+        &self,
+        exec: ExecutionId,
+        name: &str,
+        payload: &Value,
+        idempotency_key: Option<&str>,
+        received_at: DateTime<Utc>,
+    ) -> SqliteResult<bool> {
+        // A missing run reports `NotFound` before the key rules.
+        store::execution_state(&self.conn, exec)?;
+        let key = signal_key(name, payload, idempotency_key)?;
+        stage_keyed(&self.conn, exec, name, payload, key, received_at)
     }
 
     /// Request a cooperative cancel of `exec` (issue #2021).
@@ -1194,14 +1208,7 @@ impl SqliteRuntime {
     /// The single writer holds the only write handle, so no transition can
     /// happen between this check and the caller's write.
     fn refuse_unless_running(&self, exec: ExecutionId) -> SqliteResult<()> {
-        let state = store::execution_state(&self.conn, exec)?;
-        if autumn_harvest::erase::is_terminal_state(&state) {
-            return Err(SqliteError::WorkflowNotRunning {
-                execution_id: exec,
-                state,
-            });
-        }
-        Ok(())
+        refuse_unless_running(&self.conn, exec)
     }
 
     /// End a cancel-requested `exec` `CANCELLED` (issue #2021).
@@ -3023,6 +3030,192 @@ fn cancel_and_seal_prior(
     queue::delete_undelivered_signals_for_execution(conn, prior_exec)?;
     store::seal_execution(conn, prior_exec, SEALED_STATE)?;
     Ok(())
+}
+
+/// Which start matrix applies (issue #2028).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartMatrix {
+    /// A plain start returns a terminal prior under `AllowDuplicate` and
+    /// `AllowDuplicateFailedOnly`.
+    Plain,
+    /// Signal-with-start replaces a terminal prior instead, so the signal can
+    /// land.
+    SignalWithStart,
+}
+
+/// Apply the `(workflow_name, workflow_id)` reuse matrix inside the caller's
+/// transaction (issues #1068 and #2028). The callers document the two
+/// matrices.
+fn start_in_tx(
+    conn: &Connection,
+    workflow_name: &str,
+    workflow_id: Option<&str>,
+    input: Value,
+    policy: WorkflowIdReusePolicy,
+    matrix: StartMatrix,
+) -> SqliteResult<StartOutcome> {
+    // A non-blank caller-supplied id is the reuse key; a blank/None id has no
+    // reuse key (it defaults to the fresh exec-id string form, unique per run),
+    // so it always creates a distinct execution regardless of `policy`.
+    let Some(id) = workflow_id.filter(|id| !id.trim().is_empty()) else {
+        // No reuse key → always fresh; `workflow_id` defaults to the exec-id
+        // string form so `ctx.info().workflow_id` is never empty and is
+        // distinct per run (issue #698).
+        return insert_fresh_execution(conn, workflow_name, None, input);
+    };
+    let Some((prior_exec, prior_state)) =
+        store::find_active_execution_by_key(conn, workflow_name, id)?
+    else {
+        // No active prior → create fresh under every policy.
+        return insert_fresh_execution(conn, workflow_name, Some(id), input);
+    };
+    let existing = StartOutcome {
+        exec_id: prior_exec,
+        created: false,
+    };
+    // Signal-with-start cannot signal a terminal prior, so it replaces it.
+    let replace_terminal = matrix == StartMatrix::SignalWithStart
+        && autumn_harvest::erase::is_terminal_state(&prior_state);
+    match policy {
+        WorkflowIdReusePolicy::AllowDuplicate if !replace_terminal => Ok(existing),
+        // Refuse the duplicate — drop the (uncommitted) transaction so no
+        // fresh row is written, and surface the collision.
+        WorkflowIdReusePolicy::RejectDuplicate => Err(SqliteError::AlreadyExists {
+            existing_exec_id: prior_exec,
+            existing_state: prior_state,
+        }),
+        // Replace a FAILED or CANCELLED prior, as on Postgres. Otherwise return
+        // the existing run.
+        WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+            if !replace_terminal && prior_state != "FAILED" && prior_state != CANCELLED_STATE =>
+        {
+            Ok(existing)
+        }
+        WorkflowIdReusePolicy::AllowDuplicate | WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
+            cancel_and_seal_prior(conn, prior_exec, &prior_state)?;
+            insert_fresh_execution(conn, workflow_name, Some(id), input)
+        }
+        // Cancel and seal EVERY active prior for the key, then start fresh.
+        // A pre-#1068 database can hold MULTIPLE RUNNING rows for one key,
+        // from the old always-fresh start. A seal of only the newest row
+        // leaves the older rows active. `run_until_idle` then still drives
+        // them, which breaks the terminate-and-restart guarantee (Codex #1080
+        // P2). So read the FULL active set and reconcile every row. A RUNNING
+        // prior records `WorkflowCancelled` and loses its PENDING tasks and
+        // unfired timers. A terminal prior is sealed with no cancel event.
+        // One start transaction does all of it. The result is exactly one
+        // active row, the fresh run.
+        WorkflowIdReusePolicy::TerminateIfRunning => {
+            for (prior_exec, prior_state) in
+                store::find_active_executions_by_key(conn, workflow_name, id)?
+            {
+                cancel_and_seal_prior(conn, prior_exec, &prior_state)?;
+            }
+            insert_fresh_execution(conn, workflow_name, Some(id), input)
+        }
+    }
+}
+
+/// Returns `Ok` only when `exec` is a stored, non-terminal execution.
+fn refuse_unless_running(conn: &Connection, exec: ExecutionId) -> SqliteResult<()> {
+    let state = store::execution_state(conn, exec)?;
+    if autumn_harvest::erase::is_terminal_state(&state) {
+        return Err(SqliteError::WorkflowNotRunning {
+            execution_id: exec,
+            state,
+        });
+    }
+    Ok(())
+}
+
+/// Apply the key rules to a signal (issues #1985 and #2028).
+///
+/// An empty key is no key. A promise signal uses its name as its key. A
+/// normal signal cannot use a promise key. Returns the key to store.
+fn signal_key<'a>(
+    name: &'a str,
+    payload: &Value,
+    idempotency_key: Option<&'a str>,
+) -> SqliteResult<Option<&'a str>> {
+    let key = idempotency_key.filter(|key| !key.is_empty());
+    autumn_harvest::durable_promise::settlement_idempotency_key(name, payload, key)
+        .map_err(|e| SqliteError::InvalidSignal(e.to_string()))
+}
+
+/// The run of the `(workflow_name, workflow_id)` chain that already holds
+/// `key`, if any (issue #2028). A promise key is scoped to its run, so it
+/// skips this probe, as on Postgres.
+fn key_in_chain(
+    conn: &Connection,
+    workflow_name: &str,
+    workflow_id: &str,
+    name: &str,
+    key: Option<&str>,
+) -> SqliteResult<Option<ExecutionId>> {
+    match key {
+        Some(key) if !name.starts_with(autumn_harvest::durable_promise::PROMISE_SIGNAL_PREFIX) => {
+            store::find_signal_key_in_chain(conn, workflow_name, workflow_id, key)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Stage one signal on `exec` inside the caller's transaction (issue #2028).
+///
+/// Returns `Ok(false)` when `exec` already holds `key`. The probe runs before
+/// the state check, so a keyed retry after the run ends is a no-op, as on
+/// Postgres. Returns `Ok(true)` when it stages the row.
+fn stage_keyed(
+    conn: &Connection,
+    exec: ExecutionId,
+    name: &str,
+    payload: &Value,
+    key: Option<&str>,
+    received_at: DateTime<Utc>,
+) -> SqliteResult<bool> {
+    if let Some(key) = key
+        && store::has_signal_key(conn, exec, key)?
+    {
+        return Ok(false);
+    }
+    // Validate the target BEFORE staging (Codex #1069 P2). `harvest_signals`
+    // has no FK or state check. No drive consumes a row staged for a sealed
+    // run, so the wakeup would be lost silently. A terminal execution is
+    // `WorkflowNotRunning`, as on Postgres. The single writer holds the only
+    // write handle, so no transition can happen between this check and the
+    // insert.
+    refuse_unless_running(conn, exec)?;
+    // Enforce the signal-payload cap at INGRESS (issue #252, Codex #1069
+    // `runtime.rs:346`), before the `harvest_signals` row is staged.
+    // Otherwise the next drive records an oversized `SignalReceived` event.
+    // That bloats history and accepts a payload that Postgres rejects at its
+    // boundary. The check runs AFTER the not-found and terminal checks. A
+    // valid, running target is a precondition for ANY signal. So a typoed or
+    // sealed target reports that, the more actionable error, and not the
+    // size. The size is the serialized-JSON byte length, as in the core.
+    if DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES > 0 {
+        let observed = serde_json::to_string(payload).map_or(0, |s| s.len() as u64);
+        if observed > DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES {
+            return Err(SqliteError::PayloadTooLarge {
+                kind: "signal_payload",
+                observed_bytes: observed,
+                cap_bytes: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+            });
+        }
+    }
+    // Millisecond precision (issue #1069 P2): `received_at` is compared against
+    // a deadline timer's `fire_at` (both epoch-MILLISECOND) by the wake-event
+    // ingest, so a whole-second floor could flip an on-time signal past its
+    // deadline near a second boundary.
+    store::stage_signal(
+        conn,
+        exec,
+        name,
+        payload,
+        received_at.timestamp_millis(),
+        key,
+    )?;
+    Ok(true)
 }
 
 /// The events of the cycle that ends a cancelled run, and the limits they

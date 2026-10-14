@@ -741,15 +741,19 @@ pub fn delete_unfired_timers_for_execution(
 /// never be delivered, because the prior is never driven again. This backend has
 /// no retention/GC pass to reclaim it otherwise. Returns the number of rows deleted.
 /// Delivered rows are left untouched (inert audit history).
+///
+/// A row with an idempotency key also stays (issue #2028). It is the record
+/// that dedupes a retry of its key after the seal.
 pub fn delete_undelivered_signals_for_execution(
     conn: &Connection,
     exec_id: ExecutionId,
 ) -> SqliteResult<usize> {
-    Ok(conn.execute(
-        "DELETE FROM harvest_signals WHERE exec_id = ?1 AND delivered = 0",
-        params![exec_id.to_string()],
-    )?)
+    Ok(conn.execute(DELETE_UNDELIVERED_SIGNALS_SQL, params![exec_id.to_string()])?)
 }
+
+/// The statement of [`delete_undelivered_signals_for_execution`].
+const DELETE_UNDELIVERED_SIGNALS_SQL: &str = "DELETE FROM harvest_signals \
+     WHERE exec_id = ?1 AND delivered = 0 AND idempotency_key IS NULL";
 
 /// Move every undelivered signal of `from` to `to` (issue #2023).
 ///
@@ -774,8 +778,8 @@ mod tests {
     use autumn_harvest::ExecutionId;
 
     use super::{
-        delete_undelivered_signals_for_execution, due_timers, due_timers_with_deadlines,
-        enqueue_timer,
+        DELETE_UNDELIVERED_SIGNALS_SQL, delete_undelivered_signals_for_execution, due_timers,
+        due_timers_with_deadlines, enqueue_timer,
     };
     use crate::schema;
 
@@ -789,7 +793,7 @@ mod tests {
 
         let plan: String = conn
             .query_row(
-                "EXPLAIN QUERY PLAN DELETE FROM harvest_signals WHERE exec_id = ?1 AND delivered = 0",
+                &format!("EXPLAIN QUERY PLAN {DELETE_UNDELIVERED_SIGNALS_SQL}"),
                 params![exec.to_string()],
                 |row| row.get::<_, String>(3),
             )
