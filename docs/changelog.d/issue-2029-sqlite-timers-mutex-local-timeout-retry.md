@@ -20,7 +20,9 @@ its history replays on the core `WorkflowReplayer`.
   `lock_seq` fences `ReleaseMutex`. Every terminal state setter releases
   the run's locks and queue places. A release that frees a lock is progress,
   so `run_until_idle` drives the waiter. An acquire must be the only
-  awaitable in its batch, as on Postgres.
+  awaitable in its batch, as on Postgres. This backend also rejects a timer
+  await beside an acquire, because a timer that fires first breaks the replay
+  of the grant. A run that stops waiting gives up its queue place.
 - **Local activities.** `register_activity` accepts `local = true`. A local
   activity that declares `schedule_to_close` panics at registration, as
   Postgres rejects it. The cycle appends `LocalActivityScheduled`. The body
@@ -36,14 +38,18 @@ its history replays on the core `WorkflowReplayer`.
   `deadline_at`. Each cycle checks the deadline first. A late run gets
   `WorkflowExecutionTimedOut`, ends `TIMED_OUT` with the Postgres error text,
   and loses its open rows and locks. The drive returns the new
-  `RunState::TimedOut(error)`. `ctx.deadline()` reports the deadline.
+  `RunState::TimedOut(error)`. `ctx.deadline()` reports the same deadline,
+  because `WorkflowStarted` carries the run's start instant. A signal, an
+  update, a cancel or a terminate after the deadline seals the run first and
+  gets `WorkflowNotRunning`.
 - **Workflow retry (#523).** A start freezes the policy and
   `workflow_attempt = 1`. An author failure that the policy allows starts a
   retry in the failure transaction. The retry gets the same input, the next
   attempt, its own exec id as its `workflow_id`, and every signal of the
   failed run, undelivered. The failed run gets `WorkflowRetryScheduled`. The
-  retry waits for its backoff in `start_at`. `SqliteRuntime::successor` now
-  returns a retry too.
+  retry waits for its backoff in `start_at`, and a cancel ends it at once.
+  `SqliteRuntime::successor` now returns a retry too. The jitter seeds are the
+  Postgres ones.
 - **Schema.** `harvest_executions` gains `execution_timeout_ms`,
   `deadline_at`, `start_at`, `workflow_attempt`, `retry_policy_json`,
   `retry_of_exec_id` and `local_retry_at`. `schema::migrate` adds them to an old file.

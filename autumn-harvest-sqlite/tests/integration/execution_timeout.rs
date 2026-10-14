@@ -12,6 +12,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::{WorkflowHandlerFn, WorkflowInfo};
@@ -40,6 +41,25 @@ async fn waits_forever(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
 #[workflow(execution_timeout = "30s")]
 async fn sleeps_past_deadline(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
     ctx.timer("long", 120).await.map_err(|e| e.to_string())?;
+    Ok(0)
+}
+
+/// Returns its deadline in epoch milliseconds.
+#[workflow(execution_timeout = "30s")]
+async fn reports_deadline(ctx: &WorkflowContext, _n: i64) -> Result<Option<i64>, String> {
+    Ok(ctx.deadline().map(|d| d.timestamp_millis()))
+}
+
+/// Waits forever, with a retry policy that must not apply to a timeout.
+#[workflow(
+    execution_timeout = "30s",
+    retry = RetryPolicy::fixed(3, std::time::Duration::from_secs(1))
+)]
+async fn times_out_with_retry(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    let _: serde_json::Value = ctx
+        .wait_for_signal("never")
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(0)
 }
 
@@ -162,4 +182,66 @@ async fn a_sub_millisecond_timeout_does_not_fire_at_once() {
     let exec = rt.start_workflow(info.name, json!(1)).unwrap();
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(matches!(state, RunState::Completed(_)), "got {state:?}");
+}
+
+// `ctx.deadline()` reports the deadline that the drive enforces.
+#[tokio::test]
+async fn ctx_deadline_is_the_enforced_deadline() {
+    let info = reports_deadline_info();
+    let (mut rt, _clock) = runtime(&info);
+    let exec = rt.start_workflow(info.name, json!(1)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == 1_000_030_000_i64),
+        "got {state:?}"
+    );
+}
+
+// A timeout never retries, as on Postgres. A late signal is refused.
+#[tokio::test]
+async fn a_timeout_never_retries_and_refuses_late_input() {
+    let info = times_out_with_retry_info();
+    let (mut rt, clock) = runtime(&info);
+    let exec = rt.start_workflow(info.name, json!(1)).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+
+    clock.set(31);
+    // The signal call finds the deadline passed and seals the run first.
+    assert!(matches!(
+        rt.send_signal(exec, "never", json!(1)),
+        Err(SqliteError::WorkflowNotRunning { ref state, .. }) if state == "TIMED_OUT"
+    ));
+    assert_eq!(rt.successor(exec).unwrap(), None);
+    assert_replays(info.name, info.handler, rt.load_history(exec).unwrap()).await;
+}
+
+// H8: the seal deletes the unfired timer row.
+#[tokio::test]
+async fn the_timeout_seal_deletes_the_timer_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("timeout.db");
+    let info = sleeps_past_deadline_info();
+    let exec = {
+        let mut rt = SqliteRuntime::open(&path).unwrap();
+        rt.register_workflow(&info);
+        let clock = Clock(Arc::new(AtomicI64::new(0)));
+        clock.set(0);
+        let read = clock.clone();
+        rt.set_clock(move || Utc.timestamp_opt(read.0.load(Ordering::SeqCst), 0).unwrap());
+        let exec = rt.start_workflow(info.name, json!(1)).unwrap();
+        rt.run_until_blocked(exec).await.unwrap();
+        clock.set(31);
+        let state = rt.run_until_blocked(exec).await.unwrap();
+        assert!(matches!(state, RunState::TimedOut(_)), "got {state:?}");
+        exec
+    };
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    let timers: i64 = raw
+        .query_row(
+            "SELECT COUNT(*) FROM harvest_timers WHERE exec_id = ?1 AND fired = 0",
+            [exec.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(timers, 0);
 }

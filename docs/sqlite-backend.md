@@ -486,7 +486,10 @@ ends, for any reason, releases every lock and queue place that it holds.
 No step wakes a waiter. `run_until_idle` and `poll_once` drive it again, and
 a release counts as progress, so `run_until_idle` makes one more pass. A held
 lock survives a reopen. An acquire must be the only awaitable in its batch,
-as on Postgres. Another awaitable beside it ends the run `FAILED`.
+as on Postgres. Another awaitable beside it ends the run `FAILED`. This
+backend also rejects a cancellable timer await beside an acquire, which
+Postgres accepts. A timer that fires first would break the replay of the
+grant.
 
 **Local activities.** Register a `#[activity(local = true)]` fn as usual.
 `ctx.execute_local_activity` then appends `LocalActivityScheduled` and runs
@@ -498,7 +501,10 @@ attempt. Some limits apply:
 - The per-attempt budget is `start_to_close`, capped at 60 seconds. It is
   checked after the body returns, as for a regular activity here.
 - A retry backoff ends the cycle. A drive before its end returns
-  `RunState::WaitingTimer`. Postgres sleeps inline instead.
+  `RunState::WaitingTimer`. Postgres sleeps inline instead. So a signal can
+  reach the run between two attempts. A signal handler that then issues a
+  durable command shares a batch with the local activity, and the run ends
+  `FAILED`.
 - A local activity cannot share a batch with a durable awaitable, as on
   Postgres (issue #950). This backend also rejects a second local activity
   in one batch. Such a batch ends the run `FAILED`.
@@ -509,7 +515,13 @@ past it gets `WorkflowExecutionTimedOut`, ends `TIMED_OUT` with the error
 `timeout: WorkflowExecution for <name>`, and loses its open rows and locks.
 The drive returns `RunState::TimedOut(error)`. `ctx.deadline()` reports the
 deadline. A continue-as-new successor and a retry count a new deadline from
-their own start. A run that nothing drives times out at its next drive.
+their own start. A run that nothing drives times out at its next drive. A
+signal or an update after the deadline gets `WorkflowNotRunning`.
+
+A drive after the deadline seals the run before it reads new input. A timer
+or a signal that came due before the deadline is then lost, if no drive ran
+in between. Drive a run more often than its timeout to avoid this. Postgres
+has the same race when its worker lags behind the timeout sweeper.
 
 **Workflow retry.** `#[workflow(retry = ..)]` freezes the policy at start.
 A run that returns a retryable error ends `FAILED`. The same transaction then

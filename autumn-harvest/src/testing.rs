@@ -2345,7 +2345,8 @@ fn history_ends_in_terminal_failure(events: &[WorkflowEvent]) -> bool {
 ///
 /// Only trailing decision boundaries and cascade records may follow the
 /// seal. A seal at index 0 is a truncated export, not a timed-out run, so it
-/// keeps strict treatment.
+/// keeps strict treatment. The canary path has no advancing timer clock, so
+/// this replay ignores `with_advancing_timer_clock`.
 fn timed_out_seal_start(events: &[WorkflowEvent]) -> Option<usize> {
     let seal = events.iter().rposition(|event| {
         !event.is_decision_boundary()

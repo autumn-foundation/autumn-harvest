@@ -81,6 +81,24 @@ Each primitive records the same core events as Postgres. No new
 | H10 | A retry runs before its backoff. | The successor row holds `start_at`. The drive returns `WaitingTimer` until then. |
 | H11 | An old database file lacks the new columns. | `schema::migrate` adds each column, `local_retry_at` included. Each one is nullable or has a default. |
 
+### 0.3a Review record
+
+Four review agents and Codex read the first push. These changes followed:
+
+- A local retry backoff no longer sleeps. It parks the run in
+  `local_retry_at`. A typed `retry_after` hint wins over the policy.
+- `pending_timer_arms` walks history in order. A cancel after a fire ends
+  no arm, so a classic timer on the same id arms once.
+- `WorkflowStarted` carries the run's start instant. `ctx.deadline()` then
+  matches the stored deadline, also on an update, a query and a retry.
+- A cancel ends a retry during its backoff. Late input after the deadline
+  seals the run first. A seal also clears a `RUNNING` task row.
+- The local result has no size cap, and a cap reached by an attempt keeps
+  its first event, as on Postgres. The jitter seeds are the Postgres ones.
+- A timer await beside an acquire stays rejected. A test showed that a timer
+  fire before the grant breaks replay. Postgres accepts this shape.
+- Known limit: a drive after the deadline seals before it reads late input.
+
 ### 0.4 Six thinking hats
 
 - **White (facts).** Section 0.1. Three acceptance criteria: a test per

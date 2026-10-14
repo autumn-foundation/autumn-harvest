@@ -358,14 +358,13 @@
 //! retains the workflow's `name`, `handler`, `execution_timeout` and
 //! workflow-level `retry_policy` (issue #2029). Every OTHER `WorkflowInfo` field
 //! (populated by `#[workflow(...)]` attributes or the fluent builder) would
-//! otherwise be **silently dropped**. To close that class the SAME way the command
-//! layer already closes its own (above), `register_workflow` audits the incoming
-//! [`WorkflowInfo`](autumn_harvest::WorkflowInfo) and **PANICS at registration**
-//! (setup-time — mirroring the Postgres `HarvestPlugin::build()` panic on
-//! registration misconfiguration) if it declares an execution- or
-//! admission-affecting feature this v0.1 backend cannot honor, naming the specific
-//! feature and pointing at the supported alternative (Codex #1069 P2). The
-//! partition:
+//! otherwise be **silently dropped**. `register_workflow` closes that class as
+//! the command layer closes its own (above). It audits the incoming
+//! [`WorkflowInfo`](autumn_harvest::WorkflowInfo). It **PANICS at registration**
+//! if the info declares an execution- or admission-affecting feature that this
+//! v0.1 backend cannot honor. The Postgres `HarvestPlugin::build()` panics on a
+//! misconfiguration in the same way. The panic names the feature and points at
+//! the supported alternative (Codex #1069 P2). The partition:
 //!
 //! - **REJECTED (would change lifecycle or admission semantics if ignored):**
 //!   - `concurrency` (#247), `debounce` (#499), `batch` (#518), `throttle` (#607) —

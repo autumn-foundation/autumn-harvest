@@ -122,6 +122,17 @@ async fn mixes_local_and_remote(ctx: &WorkflowContext, n: i64) -> Result<i64, St
         .map_err(|e| e.to_string())
 }
 
+/// Joins two local activities, which this backend rejects.
+#[workflow]
+async fn joins_two_locals(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    let info = double_info();
+    let (a, b) = tokio::join!(
+        ctx.execute_local_activity::<_, i64>(&info, n),
+        ctx.execute_local_activity::<_, i64>(&info, n),
+    );
+    Ok(a.map_err(|e| e.to_string())? + b.map_err(|e| e.to_string())?)
+}
+
 /// Joins a local activity with a timer, which issue #950 forbids.
 #[workflow]
 async fn joins_local_with_timer(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
@@ -327,13 +338,20 @@ async fn a_local_retry_backoff_parks_the_run_without_sleeping() {
     let started = Instant::now();
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(matches!(state, RunState::WaitingTimer), "got {state:?}");
-    assert!(started.elapsed() < Duration::from_secs(5), "the drive slept");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the drive slept"
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
     clock.store(1_000_009, Ordering::SeqCst);
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(matches!(state, RunState::WaitingTimer), "got {state:?}");
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "no attempt before the backoff");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "no attempt before the backoff"
+    );
 
     clock.store(1_000_010, Ordering::SeqCst);
     let state = rt.run_until_blocked(exec).await.unwrap();
@@ -375,4 +393,95 @@ async fn a_retry_after_hint_sets_the_backoff() {
         e,
         WorkflowEvent::LocalActivityFailed { error, .. } if error == "busy"
     )));
+}
+
+// This backend runs one local activity per batch. It rejects a second one,
+// and the run ends `FAILED` with no local activity recorded.
+#[tokio::test]
+async fn two_local_activities_in_one_batch_end_failed() {
+    let info = joins_two_locals_info();
+    let mut rt = runtime(&info);
+    let exec = rt.start_workflow(info.name, json!(1)).unwrap();
+    let err = rt.run_until_blocked(exec).await.unwrap_err();
+    assert!(
+        matches!(err, SqliteError::Unsupported(ref m) if m.starts_with("RunLocalActivity")),
+        "got {err:?}"
+    );
+    let history = rt.load_history(exec).unwrap();
+    assert!(!kinds(&history).contains(&"LocalActivityScheduled"));
+    assert!(matches!(
+        history.last(),
+        Some(WorkflowEvent::WorkflowFailed { error_type: Some(t), .. })
+            if t == autumn_harvest_sqlite::UNSUPPORTED_FEATURE_ERROR_TYPE
+    ));
+}
+
+// H6: a reopen during a local retry backoff resumes at the next attempt. It
+// does not record a second `LocalActivityScheduled`.
+#[tokio::test]
+async fn a_local_retry_resumes_after_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("local.db");
+    let info = calls_slow_retry_info();
+    let open = |path: &std::path::Path| {
+        let mut rt = SqliteRuntime::open(path).unwrap();
+        rt.register_workflow(&info);
+        let clock = install_clock(&mut rt);
+        (rt, clock)
+    };
+    let exec = {
+        let (mut rt, _clock) = open(&path);
+        let calls = fail_once(&mut rt, &slow_retry_info(), "not yet".to_string());
+        let exec = rt.start_workflow(info.name, json!(8)).unwrap();
+        let state = rt.run_until_blocked(exec).await.unwrap();
+        assert!(matches!(state, RunState::WaitingTimer), "got {state:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        exec
+    };
+    let (mut rt, clock) = open(&path);
+    let calls = Arc::new(AtomicU32::new(0));
+    let seen = calls.clone();
+    rt.register_activity_with_body(&slow_retry_info(), move |input| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        Ok(input)
+    });
+    clock.store(1_000_010, Ordering::SeqCst);
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == 8),
+        "got {state:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "only attempt 2 ran again");
+    let history = rt.load_history(exec).unwrap();
+    let scheduled = kinds(&history)
+        .iter()
+        .filter(|k| **k == "LocalActivityScheduled")
+        .count();
+    assert_eq!(scheduled, 1);
+    assert_replays(info.name, info.handler, history).await;
+}
+
+// At a history cap the attempt's result stays, as on Postgres. The run then
+// fails at the cap, and the cap never retries.
+#[tokio::test]
+async fn a_history_cap_during_a_local_attempt_keeps_its_result() {
+    let info = calls_broken_info();
+    let mut rt = runtime(&info);
+    rt.set_history_event_hard_cap(Some(3));
+    let exec = rt.start_workflow(info.name, json!(1)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::Failed(ref e) if e.contains("HistoryCapExceeded")),
+        "got {state:?}"
+    );
+    let history = rt.load_history(exec).unwrap();
+    assert_eq!(
+        kinds(&history),
+        [
+            "WorkflowStarted",
+            "LocalActivityScheduled",
+            "LocalActivityFailed",
+            "WorkflowFailed"
+        ]
+    );
 }

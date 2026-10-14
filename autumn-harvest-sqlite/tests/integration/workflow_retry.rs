@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::time::Duration;
 
+use autumn_harvest::WorkflowIdReusePolicy;
 use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
@@ -98,6 +99,25 @@ async fn waits_then_fails(ctx: &WorkflowContext, _n: i64) -> Result<i64, String>
         return Err("first attempt failed".to_string());
     }
     Ok(go)
+}
+
+/// Fails on attempt 1, then waits for a signal that never comes.
+#[workflow(execution_timeout = "30s", retry = no_jitter(2, 10))]
+async fn fails_then_waits(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    let attempt = ctx
+        .execute_activity_raw("attempt", json!(null), "default")
+        .await
+        .map_err(|e| e.to_string())?
+        .as_i64()
+        .unwrap_or_default();
+    if attempt < 2 {
+        return Err("first attempt failed".to_string());
+    }
+    let _: serde_json::Value = ctx
+        .wait_for_signal("never")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(attempt)
 }
 
 fn runtime(info: &WorkflowInfo) -> SqliteRuntime {
@@ -229,4 +249,101 @@ async fn the_retry_receives_the_signals_again() {
         "got {state:?}"
     );
     assert_replays(info.name, info.handler, rt.load_history(second).unwrap()).await;
+}
+
+/// Installs a settable clock in epoch seconds on `rt`.
+fn install_clock(rt: &mut SqliteRuntime) -> Arc<AtomicI64> {
+    let clock = Arc::new(AtomicI64::new(1_000_000));
+    let read = clock.clone();
+    rt.set_clock(move || Utc.timestamp_opt(read.load(Ordering::SeqCst), 0).unwrap());
+    clock
+}
+
+// A cancel ends a retry that still waits for its backoff, at once.
+#[tokio::test]
+async fn a_cancel_ends_a_retry_during_its_backoff() {
+    let info = slow_retry_info();
+    let mut rt = runtime(&info);
+    let clock = install_clock(&mut rt);
+    let first = rt.start_workflow(info.name, json!(0)).unwrap();
+    rt.run_until_blocked(first).await.unwrap();
+    let second = rt.successor(first).unwrap().expect("a retry");
+
+    clock.store(1_000_001, Ordering::SeqCst);
+    rt.cancel(second, "stop").unwrap();
+    let state = rt.run_until_blocked(second).await.unwrap();
+    assert!(
+        matches!(state, RunState::Cancelled(ref r) if r == "stop"),
+        "got {state:?}"
+    );
+}
+
+// The retry keeps the timeout, and its deadline counts from its own start.
+#[tokio::test]
+async fn the_retry_counts_its_deadline_from_its_start() {
+    let info = fails_then_waits_info();
+    let mut rt = runtime(&info);
+    let clock = install_clock(&mut rt);
+    let first = rt.start_workflow(info.name, json!(0)).unwrap();
+    rt.run_until_blocked(first).await.unwrap();
+    let second = rt.successor(first).unwrap().expect("a retry");
+
+    // The retry starts at 10 s, so its deadline is 40 s.
+    clock.store(1_000_039, Ordering::SeqCst);
+    let state = rt.run_until_blocked(second).await.unwrap();
+    assert!(matches!(state, RunState::WaitingSignal(_)), "got {state:?}");
+    clock.store(1_000_040, Ordering::SeqCst);
+    let state = rt.run_until_blocked(second).await.unwrap();
+    assert!(matches!(state, RunState::TimedOut(_)), "got {state:?}");
+    assert_eq!(
+        rt.successor(second).unwrap(),
+        None,
+        "a timeout never retries"
+    );
+}
+
+// A reuse-policy seal of a failed run is not a continue-as-new, even when
+// the failed run started a retry.
+#[tokio::test]
+async fn a_reuse_seal_of_a_retried_run_reports_no_successor() {
+    let info = always_fails_info();
+    let mut rt = runtime(&info);
+    let first = rt
+        .start_workflow_with_id(info.name, "key", json!(0))
+        .unwrap();
+    rt.run_until_blocked(first).await.unwrap();
+    assert!(rt.successor(first).unwrap().is_some());
+
+    rt.start_workflow_with_reuse_policy(
+        info.name,
+        "key",
+        json!(0),
+        WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
+    )
+    .unwrap();
+    assert_eq!(rt.successor(first).unwrap(), None);
+    let state = rt.run_until_blocked(first).await.unwrap();
+    assert!(
+        !matches!(state, RunState::ContinuedAsNew(_)),
+        "got {state:?}"
+    );
+}
+
+// `ctx.deadline()` of a retry counts from its start, as `WorkflowStarted`
+// carries the start instant.
+#[tokio::test]
+async fn the_retry_starts_at_its_backoff() {
+    let info = slow_retry_info();
+    let mut rt = runtime(&info);
+    let _clock = install_clock(&mut rt);
+    let first = rt.start_workflow(info.name, json!(0)).unwrap();
+    rt.run_until_blocked(first).await.unwrap();
+    let second = rt.successor(first).unwrap().expect("a retry");
+    let started = rt.load_history(second).unwrap();
+    assert!(
+        matches!(&started[0], WorkflowEvent::WorkflowStarted { timestamp, .. }
+            if timestamp.timestamp() == 1_000_010),
+        "got {:?}",
+        started[0]
+    );
 }

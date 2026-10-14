@@ -1278,8 +1278,8 @@ impl LocalRun {
 /// A closure body gets no context. An `#[activity]` body gets the local
 /// context that the Postgres worker builds. A panic becomes the retryable
 /// `HandlerPanic` failure. The budget is checked after the body returns, as
-/// for a regular activity on this backend. An oversized result becomes the
-/// non-retryable `PayloadTooLarge` failure.
+/// for a regular activity on this backend. As on Postgres, the result has no
+/// size cap here. The history byte cap still bounds it.
 pub async fn run_local_attempt(
     exec_id: ExecutionId,
     owner: &RunOwner<'_>,
@@ -1324,21 +1324,7 @@ pub async fn run_local_attempt(
             run.name
         ));
     }
-    match result {
-        Ok(output) if DEFAULT_MAX_ACTIVITY_RESULT_BYTES > 0 => {
-            let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
-            if observed > DEFAULT_MAX_ACTIVITY_RESULT_BYTES {
-                Err(payload_too_large_activity_envelope(
-                    &run.name,
-                    observed,
-                    DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
-                ))
-            } else {
-                Ok(output)
-            }
-        }
-        other => other,
-    }
+    result
 }
 
 /// Await one local `#[activity]` handler, and contain a panic in the call
@@ -1427,9 +1413,20 @@ pub fn local_attempt_events(
 }
 
 /// The jitter seed of a local retry. It differs per activity of one run.
+///
+/// It is the FNV-1a mix of the Postgres worker, so both backends pick the
+/// same backoff.
 fn local_retry_seed(exec_id: ExecutionId, activity_id: ActivityExecId) -> u64 {
-    let low = |id: u128| u64::from_le_bytes(id.to_le_bytes()[..8].try_into().unwrap_or([0; 8]));
-    low(exec_id.as_uuid().as_u128()) ^ low(activity_id.as_uuid().as_u128())
+    const PRIME: u64 = 0x1000_0000_01b3;
+    let mut seed = 0xcbf2_9ce4_8422_2325_u64;
+    for id in [exec_id.as_uuid().as_u128(), activity_id.as_uuid().as_u128()] {
+        let raw = id.to_le_bytes();
+        for half in [&raw[..8], &raw[8..]] {
+            seed ^= u64::from_le_bytes(half.try_into().unwrap_or([0; 8]));
+            seed = seed.wrapping_mul(PRIME);
+        }
+    }
+    seed
 }
 
 /// Fire one due timer atomically: append `TimerFired` and mark the timer row

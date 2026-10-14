@@ -100,6 +100,25 @@ pub fn insert_execution_with_config(
     Ok(())
 }
 
+impl RunConfig {
+    /// The timeout and the deadline that a workflow context gets, so
+    /// `ctx.deadline()` reads the same values on a drive, an update and a
+    /// query.
+    pub fn context_deadline(
+        &self,
+    ) -> (
+        Option<chrono::Duration>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        (
+            self.execution_timeout_ms
+                .and_then(chrono::Duration::try_milliseconds),
+            self.deadline_at
+                .and_then(chrono::DateTime::from_timestamp_millis),
+        )
+    }
+}
+
 /// The stored [`RunConfig`] of `exec_id` (issue #2029).
 pub fn run_config(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<RunConfig> {
     let row = conn
@@ -489,9 +508,25 @@ pub fn load_history_sized(
 /// The successor that `exec_id` continued as, if any (issue #2023).
 ///
 /// Only a run that ends with `WorkflowContinuedAsNew` has one. A reuse-policy
-/// seal shares the `CONTINUED_AS_NEW` state but writes no such event. A failed
-/// run that ends with `WorkflowRetryScheduled` names its retry (issue #2029).
+/// seal shares the `CONTINUED_AS_NEW` state but writes no such event.
 pub fn successor_of(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Option<ExecutionId>> {
+    Ok(match last_event(conn, exec_id)? {
+        Some(WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. }) => Some(new_exec_id),
+        _ => None,
+    })
+}
+
+/// The retry that the failed `exec_id` started, if any (issue #2029). Only a
+/// run that ends with `WorkflowRetryScheduled` has one.
+pub fn retry_of(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Option<ExecutionId>> {
+    Ok(match last_event(conn, exec_id)? {
+        Some(WorkflowEvent::WorkflowRetryScheduled { retry_exec_id, .. }) => Some(retry_exec_id),
+        _ => None,
+    })
+}
+
+/// The last event of `exec_id`, if any.
+fn last_event(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Option<WorkflowEvent>> {
     let last: Option<String> = conn
         .query_row(
             "SELECT event_json FROM harvest_events WHERE exec_id = ?1 ORDER BY seq DESC LIMIT 1",
@@ -499,16 +534,7 @@ pub fn successor_of(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Opt
             |row| row.get(0),
         )
         .optional()?;
-    match last.map(|json| serde_json::from_str(&json)).transpose()? {
-        Some(
-            WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. }
-            | WorkflowEvent::WorkflowRetryScheduled {
-                retry_exec_id: new_exec_id,
-                ..
-            },
-        ) => Ok(Some(new_exec_id)),
-        _ => Ok(None),
-    }
+    Ok(last.map(|json| serde_json::from_str(&json)).transpose()?)
 }
 
 /// True if history already holds an `ActivityScheduled` for `activity_id` (keeps
@@ -531,36 +557,30 @@ pub fn history_has_activity_scheduled(events: &[WorkflowEvent], activity_id: &st
 /// OCCURRENCE, not the bare id: a plain "history already has a `TimerStarted`
 /// for this id?" guard would wrongly match a PRIOR *fired* arm and skip a genuine
 /// re-arm, wedging the run. `> 0` means an arm is already recorded and unfired
-/// (a replay-cycle re-emit — skip it); `<= 0` means every prior arm has ended, so
+/// (a replay-cycle re-emit — skip it); `== 0` means every prior arm has fired, so
 /// a `StartTimer` for this id is a genuinely new arm that must be persisted.
 ///
 /// A `TimerCancelled` ends an arm too (issue #2029). A cancellable timer can
-/// then release its id to `ctx.timer`. A cancel with no live arm, such as a
-/// second cancel, still counts, so the value can go below zero.
+/// then release its id to `ctx.timer`. The walk follows history order, and an
+/// end with no live arm, such as a cancel after a fire, ends nothing. So the
+/// value is never below zero.
 pub fn pending_timer_arms(events: &[WorkflowEvent], timer_id: &str) -> i64 {
-    let started = events
-        .iter()
-        .filter(|e| {
-            matches!(e, WorkflowEvent::TimerStarted { timer_id: id, .. }
-                if id.to_string() == timer_id)
-        })
-        .count();
-    let fired = events
-        .iter()
-        .filter(|e| {
-            matches!(e, WorkflowEvent::TimerFired { timer_id: id }
-                if id.to_string() == timer_id)
-        })
-        .count();
-    let cancelled = events
-        .iter()
-        .filter(|e| {
-            matches!(e, WorkflowEvent::TimerCancelled { timer_id: id }
-                if id.to_string() == timer_id)
-        })
-        .count();
-    let count = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
-    count(started) - count(fired) - count(cancelled)
+    let mut pending: i64 = 0;
+    for event in events {
+        match event {
+            WorkflowEvent::TimerStarted { timer_id: id, .. } if id.as_str() == timer_id => {
+                pending = pending.saturating_add(1);
+            }
+            WorkflowEvent::TimerFired { timer_id: id }
+            | WorkflowEvent::TimerCancelled { timer_id: id }
+                if id.as_str() == timer_id =>
+            {
+                pending = (pending - 1).max(0);
+            }
+            _ => {}
+        }
+    }
+    pending
 }
 
 // ── Activity attempt audit log ───────────────────────────────────────────────
@@ -733,4 +753,48 @@ pub fn mark_signal_delivered(conn: &Connection, seq: i64) -> SqliteResult<()> {
         params![seq],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use autumn_harvest::{TimerId, WorkflowEvent};
+
+    use super::pending_timer_arms;
+
+    fn started() -> WorkflowEvent {
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("x".to_string()),
+            duration_secs: 5,
+        }
+    }
+
+    fn fired() -> WorkflowEvent {
+        WorkflowEvent::TimerFired {
+            timer_id: TimerId::new("x".to_string()),
+        }
+    }
+
+    fn cancelled() -> WorkflowEvent {
+        WorkflowEvent::TimerCancelled {
+            timer_id: TimerId::new("x".to_string()),
+        }
+    }
+
+    // Issue #2029: a cancel after a fire ends no arm, so a later arm stays
+    // pending and a replay does not arm it again.
+    #[test]
+    fn a_cancel_after_a_fire_ends_no_arm() {
+        let history = [started(), fired(), cancelled(), started()];
+        assert_eq!(pending_timer_arms(&history, "x"), 1);
+    }
+
+    #[test]
+    fn a_cancel_ends_a_live_arm_and_never_goes_below_zero() {
+        assert_eq!(pending_timer_arms(&[started(), cancelled()], "x"), 0);
+        assert_eq!(pending_timer_arms(&[cancelled(), cancelled()], "x"), 0);
+        assert_eq!(
+            pending_timer_arms(&[started(), cancelled(), started()], "x"),
+            1
+        );
+    }
 }

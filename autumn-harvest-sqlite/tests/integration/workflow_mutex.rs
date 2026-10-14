@@ -48,6 +48,29 @@ async fn acquires_beside_a_signal(ctx: &WorkflowContext, _n: i64) -> Result<i64,
     Ok(0)
 }
 
+/// Takes the lock, releases it, then waits for a signal that never comes.
+#[workflow]
+async fn locks_then_waits(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    let guard = ctx.mutex("k").acquire().await.map_err(|e| e.to_string())?;
+    guard.release();
+    let _: serde_json::Value = ctx
+        .wait_for_signal("never")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(0)
+}
+
+/// Waits for the lock and a cancellable timer in one batch.
+#[workflow]
+async fn locks_beside_a_timer(ctx: &WorkflowContext, _n: i64) -> Result<String, String> {
+    let timer = ctx.start_timer("pace", 5);
+    let (guard, fired) = tokio::join!(ctx.mutex("k").acquire(), timer.await_fire());
+    let guard = guard.map_err(|e| e.to_string())?;
+    let fired = fired.map_err(|e| e.to_string())?;
+    guard.release();
+    Ok(format!("{fired:?}"))
+}
+
 fn runtime(infos: &[&WorkflowInfo]) -> SqliteRuntime {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     for info in infos {
@@ -200,4 +223,59 @@ async fn an_acquire_beside_another_awaitable_ends_failed() {
         WorkflowEvent::WorkflowFailed { error_type: Some(t), .. }
             if t == UNSUPPORTED_FEATURE_ERROR_TYPE
     )));
+}
+
+// A waiter that is cancelled leaves the queue, so the next waiter gets the
+// lock.
+#[tokio::test]
+async fn a_cancelled_waiter_leaves_the_queue() {
+    let holder = holds_until_signal_info();
+    let waiter = locks_once_info();
+    let mut rt = runtime(&[&holder, &waiter]);
+    let h = rt.start_workflow(holder.name, json!(0)).unwrap();
+    rt.run_until_blocked(h).await.unwrap();
+    let first = rt.start_workflow(waiter.name, json!(1)).unwrap();
+    let second = rt.start_workflow(waiter.name, json!(2)).unwrap();
+    rt.run_until_blocked(first).await.unwrap();
+    rt.run_until_blocked(second).await.unwrap();
+
+    rt.cancel(first, "stop").unwrap();
+    let state = rt.run_until_blocked(first).await.unwrap();
+    assert!(matches!(state, RunState::Cancelled(_)), "got {state:?}");
+    rt.send_signal(h, "release", json!(null)).unwrap();
+    rt.run_until_idle().await.unwrap();
+    assert!(matches!(
+        rt.outcome(second).unwrap(),
+        ExecutionOutcome::Completed(_)
+    ));
+}
+
+// H5: a release counts as progress, also when the holder then blocks. The
+// fleet poll then makes one more pass, so a waiter can run.
+#[tokio::test]
+async fn a_release_is_progress_when_the_holder_then_blocks() {
+    let info = locks_then_waits_info();
+    let mut rt = runtime(&[&info]);
+    rt.start_workflow(info.name, json!(0)).unwrap();
+    let passes = [
+        rt.poll_once().await.unwrap(),
+        rt.poll_once().await.unwrap(),
+        rt.poll_once().await.unwrap(),
+    ];
+    assert_eq!(passes, [true, true, false], "grant, release, then blocked");
+}
+
+// Postgres accepts a timer await beside an acquire, but the shape does not
+// replay. A timer that fires first puts `TimerFired` where the positional
+// grant matcher expects `MutexGranted`. This backend rejects it.
+#[tokio::test]
+async fn an_acquire_beside_a_timer_await_ends_failed() {
+    let info = locks_beside_a_timer_info();
+    let mut rt = runtime(&[&info]);
+    let exec = rt.start_workflow(info.name, json!(0)).unwrap();
+    let err = rt.run_until_blocked(exec).await.unwrap_err();
+    assert!(
+        matches!(err, SqliteError::Unsupported(ref m) if m.starts_with("AcquireMutex") && m.contains("ArmTimer")),
+        "got {err:?}"
+    );
 }

@@ -86,6 +86,27 @@ pub fn release(
     Ok(n > 0)
 }
 
+/// Remove `exec` from the queue of every key except `keep` (issue #2029).
+///
+/// A body that waits on a key re-emits its acquire on each replay. A batch
+/// without that acquire means the body no longer waits, for example after
+/// a timer won a select against the acquire. Its stale queue place would
+/// otherwise block the key once it reaches the head.
+pub fn drop_stale_waits(conn: &Connection, exec: ExecutionId, keep: &[&str]) -> SqliteResult<()> {
+    let mut stmt = conn
+        .prepare_cached("SELECT lock_key FROM harvest_mutex_waiters WHERE waiter_exec_id = ?1")?;
+    let queued = stmt
+        .query_map(params![exec.to_string()], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for key in queued.iter().filter(|key| !keep.contains(&key.as_str())) {
+        conn.execute(
+            "DELETE FROM harvest_mutex_waiters WHERE lock_key = ?1 AND waiter_exec_id = ?2",
+            params![key, exec.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
 /// Release every lock that `exec` holds, and remove it from every queue.
 ///
 /// Each terminal state setter in [`store`](crate::store) calls it in the
@@ -108,7 +129,7 @@ mod tests {
     use autumn_harvest::ExecutionId;
     use rusqlite::Connection;
 
-    use super::{acquire, release, release_all};
+    use super::{acquire, drop_stale_waits, release, release_all};
     use crate::schema;
 
     fn open() -> Connection {
@@ -150,6 +171,24 @@ mod tests {
         let new = acquire(&conn, a, "k").unwrap().unwrap();
         assert!(!release(&conn, a, "k", old).unwrap());
         assert!(release(&conn, a, "k", new).unwrap());
+    }
+
+    // A run that stops waiting gives up its queue place.
+    #[test]
+    fn a_stale_queue_place_is_dropped() {
+        let conn = open();
+        let (h, a, b) = (ExecutionId::new(), ExecutionId::new(), ExecutionId::new());
+        let seq = acquire(&conn, h, "k").unwrap().unwrap();
+        assert_eq!(acquire(&conn, a, "k").unwrap(), None);
+        assert_eq!(acquire(&conn, b, "k").unwrap(), None);
+        drop_stale_waits(&conn, a, &[]).unwrap();
+        release(&conn, h, "k", seq).unwrap();
+        assert!(
+            acquire(&conn, b, "k").unwrap().is_some(),
+            "a left the queue"
+        );
+        // A key in `keep` keeps its place.
+        drop_stale_waits(&conn, b, &["k"]).unwrap();
     }
 
     // H4: a run that ends frees its locks and leaves every queue.

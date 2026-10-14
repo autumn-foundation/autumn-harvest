@@ -50,6 +50,24 @@ async fn cancels_after_signal(ctx: &WorkflowContext, _n: i64) -> Result<String, 
     Ok(format!("{outcome:?}"))
 }
 
+/// Fires a cancellable timer, cancels it, then reuses its id for `ctx.timer`.
+#[workflow]
+async fn fires_cancels_then_reuses(ctx: &WorkflowContext, _n: i64) -> Result<String, String> {
+    let handle = ctx.start_timer("x", 5);
+    handle.await_fire().await.map_err(|e| e.to_string())?;
+    handle.cancel().map_err(|e| e.to_string())?;
+    ctx.timer("x", 5).await.map_err(|e| e.to_string())?;
+    Ok("done".to_string())
+}
+
+/// Arms a timer but never awaits it, then waits for a signal.
+#[workflow]
+async fn arms_without_await(ctx: &WorkflowContext, _n: i64) -> Result<String, String> {
+    let _handle = ctx.start_timer("unawaited", 5);
+    let _: serde_json::Value = ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+    Ok("signalled".to_string())
+}
+
 /// Cancels a cancellable timer, then reuses its id for `ctx.timer`.
 #[workflow]
 async fn reuses_cancelled_id(ctx: &WorkflowContext, _n: i64) -> Result<String, String> {
@@ -212,4 +230,46 @@ async fn an_armed_timer_survives_a_reopen() {
         .await
         .unwrap();
     assert!(matches!(state, RunState::Completed(_)), "got {state:?}");
+}
+
+// A cancel after a fire ends no arm. The classic timer on the same id then
+// arms once, and does not arm again on each replay.
+#[tokio::test]
+async fn a_fired_then_cancelled_id_arms_one_classic_timer() {
+    let info = fires_cancels_then_reuses_info();
+    let mut rt = runtime(&info);
+    let exec = rt.start_workflow(info.name, json!(0)).unwrap();
+
+    for secs in [0, 5] {
+        let state = rt.run_until_blocked_as_of(exec, t(secs)).await.unwrap();
+        assert!(
+            matches!(state, RunState::WaitingTimer),
+            "at {secs}s: {state:?}"
+        );
+    }
+    let state = rt.run_until_blocked_as_of(exec, t(10)).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "got {state:?}");
+    let history = rt.load_history(exec).unwrap();
+    assert_eq!(count(&history, "TimerStarted"), 2);
+    assert_eq!(count(&history, "TimerFired"), 2);
+    assert_replays(info.name, info.handler, history).await;
+}
+
+// T2: an armed timer that the body never awaits has no row, so it never
+// fires while the body waits on something else.
+#[tokio::test]
+async fn an_unawaited_timer_never_fires() {
+    let info = arms_without_await_info();
+    let mut rt = runtime(&info);
+    let exec = rt.start_workflow(info.name, json!(0)).unwrap();
+
+    rt.run_until_blocked_as_of(exec, t(0)).await.unwrap();
+    let state = rt.run_until_blocked_as_of(exec, t(60)).await.unwrap();
+    assert!(matches!(state, RunState::WaitingSignal(_)), "got {state:?}");
+    rt.send_signal_as_of(exec, "go", json!(1), t(61)).unwrap();
+    let state = rt.run_until_blocked_as_of(exec, t(62)).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "got {state:?}");
+    let history = rt.load_history(exec).unwrap();
+    assert_eq!(count(&history, "TimerFired"), 0);
+    assert_replays(info.name, info.handler, history).await;
 }
