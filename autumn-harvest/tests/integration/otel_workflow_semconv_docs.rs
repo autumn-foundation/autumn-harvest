@@ -46,12 +46,18 @@ const REPLAY_SECTION: &str = "## 6. Replay";
 const ISSUE_TEXT_SECTION: &str = "## 9. Upstream issue text";
 const STATUS_PREFIX: &str = "**Submission status:**";
 
-/// The replay rules that section 6 must state, with spaces normalized.
-const REPLAY_RULES: &[&str] = &[
-    "MUST set `workflow.replay`",
-    "MUST NOT emit an `execute_activity` span for an activity result that history already records",
-    "SHOULD start a new root span",
-    "SHOULD add a span link",
+/// The replay rules that section 6 must state. Each rule is a set of
+/// phrases that one numbered item must hold.
+const REPLAY_RULES: &[&[&str]] = &[
+    &["MUST set `workflow.replay`"],
+    &[
+        "MUST NOT emit a span for an operation that history already records",
+        "`execute_activity`",
+        "`schedule_activity`",
+        "`start_child_workflow`",
+    ],
+    &["SHOULD start a new root span"],
+    &["SHOULD add a span link"],
 ];
 
 fn repo_root() -> PathBuf {
@@ -623,8 +629,10 @@ fn the_replay_rule_is_normative() {
     let rules = numbered_items(page_section(&page, REPLAY_SECTION));
     for rule in REPLAY_RULES {
         assert!(
-            rules.iter().any(|item| item.contains(rule)),
-            "{PAGE} section 6 must have a numbered rule that says: {rule}"
+            rules
+                .iter()
+                .any(|item| rule.iter().all(|phrase| item.contains(phrase))),
+            "{PAGE} section 6 must have one numbered rule that holds: {rule:?}"
         );
     }
 }

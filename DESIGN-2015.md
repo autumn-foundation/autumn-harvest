@@ -95,6 +95,9 @@ code, guard quality, and style. The fixes:
 - The guards read numbered replay rules, wrapped constants, the type and
   kind columns, duplicate ids and the issue text. Five mutations confirm
   that each new check fails on a bad edit.
+- The Codex review on the PR found that rule 2 let a replay emit the
+  schedule spans again. Rule 2 now covers each operation that history
+  records. The replay guard needs the schedule spans in that rule.
 
 ### 0.6 Decisions
 
