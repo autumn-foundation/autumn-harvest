@@ -240,11 +240,48 @@ fn switch_finding(
 /// Inspect the host under `root`, normally `/`. `cgroup_mount` is the cgroup
 /// v2 mount of the jailer.
 ///
-/// Critical: no `/dev/kvm`, KSM on or unknown, nested KVM on or unknown, a
-/// CPU vulnerability that reports `Vulnerable`, or no cgroup v2. Warning: SMT
-/// on, or swap on.
+/// Critical: no usable `/dev/kvm`, KSM on or unknown, nested KVM on or
+/// unknown, a CPU vulnerability that reports `Vulnerable`, or no cgroup v2.
+/// Warning: SMT on, or swap on.
 #[must_use]
 pub fn inspect_host(root: &Path, cgroup_mount: &Path) -> Vec<PostureFinding> {
+    inspect_host_with(root, cgroup_mount, kvm_problem)
+}
+
+/// Why `path` is not a usable KVM device, or `None`.
+///
+/// A masked device, such as a plain file or `/dev/null`, fails each launch.
+/// So the check wants the KVM character device 10:232, open for read and
+/// write by the worker. An unjailed VMM opens it as the worker. The jailer
+/// makes its own node for a jailed VMM.
+fn kvm_problem(path: &Path) -> Option<String> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) => return Some(format!("{} cannot be read: {e}", path.display())),
+    };
+    let rdev = meta.rdev();
+    if !meta.file_type().is_char_device() || libc::major(rdev) != 10 || libc::minor(rdev) != 232 {
+        return Some(format!(
+            "{} is not the KVM device, character device 10:232",
+            path.display()
+        ));
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .err()
+        .map(|e| format!("{} cannot be opened to read and write: {e}", path.display()))
+}
+
+/// [`inspect_host`] with `kvm` as the KVM device check, so a test can
+/// replace it.
+fn inspect_host_with(
+    root: &Path,
+    cgroup_mount: &Path,
+    kvm: fn(&Path) -> Option<String>,
+) -> Vec<PostureFinding> {
     let read = |rel: &str| std::fs::read_to_string(root.join(rel)).map(|s| s.trim().to_owned());
     let mut findings = Vec::new();
     let mut find = |check: &str, detail: String, severity: Severity| {
@@ -254,8 +291,8 @@ pub fn inspect_host(root: &Path, cgroup_mount: &Path) -> Vec<PostureFinding> {
             severity,
         });
     };
-    if !root.join("dev/kvm").exists() {
-        find("kvm", "/dev/kvm is missing".into(), Severity::Critical);
+    if let Some(detail) = kvm(&root.join("dev/kvm")) {
+        find("kvm", detail, Severity::Critical);
     }
     if let Some(detail) = switch_finding(
         root,
@@ -453,6 +490,35 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The host checks of `root`, with the fake `/dev/kvm` of
+    /// [`fake_sys`]: a plain file that only has to exist.
+    fn inspect(root: &Path, cgroup_mount: &Path) -> Vec<PostureFinding> {
+        inspect_host_with(root, cgroup_mount, |path| {
+            (!path.exists()).then(|| "missing".to_owned())
+        })
+    }
+
+    #[test]
+    fn only_a_usable_kvm_device_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        // A masked device: a plain file, another character device, or none.
+        let file = dir.path().join("kvm");
+        std::fs::write(&file, b"").unwrap();
+        assert!(kvm_problem(&file).is_some(), "a plain file");
+        assert!(kvm_problem(Path::new("/dev/null")).is_some(), "/dev/null");
+        assert!(kvm_problem(&dir.path().join("none")).is_some(), "no file");
+        // A real device passes when this host lets the worker open it.
+        let real = Path::new("/dev/kvm");
+        if std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(real)
+            .is_ok()
+        {
+            assert_eq!(kvm_problem(real), None);
+        }
+    }
+
     fn fake_sys() -> PathBuf {
         let root = std::env::temp_dir().join(format!("harvest-sys-{}", uuid::Uuid::new_v4()));
         let write = |rel: &str, body: &str| {
@@ -486,8 +552,8 @@ mod tests {
             "cpu\n",
         )
         .unwrap();
-        assert_eq!(inspect_host(&root, Path::new("/sys/fs/cgroup/unified")), []);
-        let findings = inspect_host(&root, Path::new("/sys/fs/cgroup"));
+        assert_eq!(inspect(&root, Path::new("/sys/fs/cgroup/unified")), []);
+        let findings = inspect(&root, Path::new("/sys/fs/cgroup"));
         assert!(
             findings.iter().any(|f| f.check == "cgroup_v2"),
             "{findings:?}"
@@ -498,7 +564,7 @@ mod tests {
     #[test]
     fn an_unreadable_ksm_state_is_critical() {
         let ksm = |root: &Path| {
-            inspect_host(root, Path::new("/sys/fs/cgroup"))
+            inspect(root, Path::new("/sys/fs/cgroup"))
                 .into_iter()
                 .filter(|f| f.check == "ksm" && f.severity == Severity::Critical)
                 .count()
@@ -520,7 +586,7 @@ mod tests {
     #[test]
     fn an_unknown_nested_kvm_state_is_critical() {
         let nested = |root: &Path| {
-            inspect_host(root, Path::new("/sys/fs/cgroup"))
+            inspect(root, Path::new("/sys/fs/cgroup"))
                 .into_iter()
                 .filter(|f| f.check == "nested_kvm" && f.severity == Severity::Critical)
                 .count()
@@ -552,7 +618,7 @@ mod tests {
     #[test]
     fn an_unknown_cpu_vulnerability_status_is_critical() {
         let cpu = |root: &Path| {
-            inspect_host(root, Path::new("/sys/fs/cgroup"))
+            inspect(root, Path::new("/sys/fs/cgroup"))
                 .into_iter()
                 .filter(|f| f.check == "cpu_vulnerability" && f.severity == Severity::Critical)
                 .count()
@@ -600,7 +666,7 @@ mod tests {
     fn an_unreadable_cpu_vulnerability_state_is_critical() {
         let root = fake_sys();
         std::fs::remove_dir_all(root.join("sys/devices/system/cpu/vulnerabilities")).unwrap();
-        let findings = inspect_host(&root, Path::new("/sys/fs/cgroup"));
+        let findings = inspect(&root, Path::new("/sys/fs/cgroup"));
         assert!(
             findings
                 .iter()
@@ -613,10 +679,10 @@ mod tests {
     #[test]
     fn a_hardened_host_has_no_findings() {
         let root = fake_sys();
-        assert_eq!(inspect_host(&root, Path::new("/sys/fs/cgroup")), []);
+        assert_eq!(inspect(&root, Path::new("/sys/fs/cgroup")), []);
         assert!(
             enforce(
-                &inspect_host(&root, Path::new("/sys/fs/cgroup")),
+                &inspect(&root, Path::new("/sys/fs/cgroup")),
                 PosturePolicy::Enforce
             )
             .is_ok()
@@ -662,7 +728,7 @@ mod tests {
             "Filename Type Size Used Priority\n/swapfile file 1024 0 -2\n",
         )
         .unwrap();
-        let findings = inspect_host(&root, Path::new("/sys/fs/cgroup"));
+        let findings = inspect(&root, Path::new("/sys/fs/cgroup"));
         let checks: Vec<(&str, Severity)> = findings
             .iter()
             .map(|f| (f.check.as_str(), f.severity))
@@ -691,7 +757,7 @@ mod tests {
     fn a_warning_alone_does_not_stop_the_backend() {
         let root = fake_sys();
         std::fs::write(root.join("sys/devices/system/cpu/smt/active"), "1\n").unwrap();
-        let findings = inspect_host(&root, Path::new("/sys/fs/cgroup"));
+        let findings = inspect(&root, Path::new("/sys/fs/cgroup"));
         assert_eq!(findings.len(), 1);
         assert!(enforce(&findings, PosturePolicy::Enforce).is_ok());
         std::fs::remove_dir_all(root).unwrap();

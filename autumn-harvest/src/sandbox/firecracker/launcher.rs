@@ -99,8 +99,8 @@ pub trait VmLauncher: Send + Sync + 'static {
 
 /// The two snapshot files of a golden microVM.
 ///
-/// A manifest next to the state file holds the boot arguments and the
-/// machine of the snapshot. Its name is the state file name and `.json`. A
+/// A manifest next to the state file holds the boot arguments, the machine
+/// and the image digests of the snapshot. Its name is the state file name and `.json`. A
 /// launcher with other values refuses the snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotFiles {
@@ -117,16 +117,26 @@ struct SnapshotMeta {
     boot_args: String,
     vcpu_count: u8,
     mem_size_mib: u32,
+    /// The SHA-256 digests of the image. The snapshot memory holds the
+    /// booted kernel, and the guest reads the root file system.
+    kernel_sha256: String,
+    rootfs_sha256: String,
 }
 
 impl SnapshotMeta {
-    /// The values of `config`.
-    fn of(config: &LauncherConfig) -> Self {
-        Self {
+    /// The values of `config`, with the image files `kernel` and `rootfs`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of a file that cannot be read.
+    fn of(config: &LauncherConfig, kernel: &Path, rootfs: &Path) -> std::io::Result<Self> {
+        Ok(Self {
             boot_args: super::config::boot_args(&config.image, config.guest_port),
             vcpu_count: config.machine.vcpu_count,
             mem_size_mib: config.machine.mem_size_mib,
-        }
+            kernel_sha256: file_sha256(kernel)?,
+            rootfs_sha256: file_sha256(rootfs)?,
+        })
     }
 
     /// The manifest file next to the snapshot state file `state`.
@@ -154,7 +164,9 @@ impl SnapshotMeta {
                     path.display()
                 ))
             })?;
-        let want = Self::of(config);
+        let want = Self::of(config, &config.image.kernel, &config.image.rootfs).map_err(|e| {
+            SandboxError::Config(format!("cannot read the guest image for its digest: {e}"))
+        })?;
         if found != want {
             return Err(SandboxError::Config(format!(
                 "the snapshot keeps {found:?}, but this launcher has {want:?}; a restored \
@@ -953,12 +965,23 @@ impl FirecrackerLauncher {
             (root.join(SNAPSHOT_STATE_FILE), files.state.clone()),
             (root.join(SNAPSHOT_MEMORY_FILE), files.memory.clone()),
         ];
-        let meta = serde_json::to_vec(&SnapshotMeta::of(&self.config)).map_err(|e| {
-            SandboxError::Unavailable(format!("cannot encode the snapshot manifest: {e}"))
-        })?;
+        // The golden microVM booted the pinned image, so the digests come
+        // from it.
+        let (kernel, rootfs) = self.tenancy.pinned.as_ref().map_or_else(
+            || {
+                (
+                    self.config.image.kernel.clone(),
+                    self.config.image.rootfs.clone(),
+                )
+            },
+            |pinned| (pinned.kernel.clone(), pinned.rootfs.clone()),
+        );
+        let config = self.config.clone();
         let meta_path = SnapshotMeta::path(&files.state);
         let out = out_dir.to_path_buf();
         tokio::task::spawn_blocking(move || {
+            let meta = SnapshotMeta::of(&config, &kernel, &rootfs)?;
+            let meta = serde_json::to_vec(&meta).map_err(std::io::Error::other)?;
             std::fs::create_dir_all(&out)?;
             // The manifest replaces the old one with the pair, as one set.
             let staged = staging_name(&meta_path);
@@ -1278,6 +1301,28 @@ const SNAPSHOT_MEMORY_FILE: &str = "snapshot.mem";
 /// The time limit of the pause and snapshot calls. A full snapshot writes
 /// the whole guest memory.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The SHA-256 digest of the file at `path`, in hex.
+fn file_sha256(path: &Path) -> std::io::Result<String> {
+    use sha2::Digest as _;
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&chunk[..n]);
+    }
+    let mut hex = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok(hex)
+}
 
 /// The longest time that a pin or a snapshot publish waits for the lock of
 /// an image directory.
@@ -3564,7 +3609,8 @@ while True:
 
     /// Write the snapshot manifest of `config` for `files`.
     fn write_snapshot_meta(config: &LauncherConfig, files: &SnapshotFiles) {
-        let meta = serde_json::to_vec(&SnapshotMeta::of(config)).unwrap();
+        let meta = SnapshotMeta::of(config, &config.image.kernel, &config.image.rootfs).unwrap();
+        let meta = serde_json::to_vec(&meta).unwrap();
         std::fs::write(SnapshotMeta::path(&files.state), meta).unwrap();
     }
 
@@ -3596,6 +3642,17 @@ while True:
         other.machine.mem_size_mib = 1024;
         write_snapshot_meta(&other, &files);
         refused("a snapshot with another machine");
+        // The memory of the snapshot holds the kernel that booted it.
+        let mut other = config.clone();
+        other.image.kernel = dir.join("other-vmlinux");
+        std::fs::write(&other.image.kernel, b"another kernel").unwrap();
+        write_snapshot_meta(&other, &files);
+        refused("a snapshot of another kernel");
+        let mut other = config.clone();
+        other.image.rootfs = dir.join("other-rootfs.ext4");
+        std::fs::write(&other.image.rootfs, b"another rootfs").unwrap();
+        write_snapshot_meta(&other, &files);
+        refused("a snapshot of another root file system");
         write_snapshot_meta(&config, &files);
         drop(new_launcher(config).unwrap());
         std::fs::remove_dir_all(dir).unwrap();

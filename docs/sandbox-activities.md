@@ -177,7 +177,8 @@ runtime refuses a policy that allows the network on a backend without one.
 ### Host requirements
 
 - Linux with `/dev/kvm`, cgroup v2 with `cgroup.kill` (Linux 5.14), and root
-  for the jailer.
+  for the jailer. `verify_host` wants the KVM character device 10:232, open
+  to read and write. A masked device, such as a plain file, is critical.
 - Absolute paths in `LauncherConfig`. Firecracker runs in the VM directory,
   so the launcher refuses a relative path.
 - Images and snapshot files on the file system of the jail root, so each
@@ -385,8 +386,9 @@ crash.
 
 A restored guest keeps the boot arguments and the machine of its snapshot,
 such as the `harvest.port` of its agent. So the snapshot gets a manifest next
-to its state file, `snapshot.state.json`, with these values. A launcher with
-other values, or a snapshot without a manifest, is a config error.
+to its state file, `snapshot.state.json`, with these values. It also holds the
+SHA-256 digests of the kernel and the root file system. A launcher with other
+values, or a snapshot without a manifest, is a config error.
 
 Clones of one snapshot share their user-space random state. Each run
 therefore carries fresh host entropy, and VMGenID reseeds the kernel on Linux
