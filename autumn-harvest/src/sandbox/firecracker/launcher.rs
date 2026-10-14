@@ -19,7 +19,8 @@
 //! the root file system and the snapshot pair into a directory of its own,
 //! and each launch links from there. So a new image that lands one file at
 //! a time never gives a launch a mixed pair. It takes effect at the next
-//! launcher start.
+//! launcher start. The pin holds a shared lock on each image directory, and
+//! a publish holds an exclusive one. So a pin never sees half a publish.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -209,6 +210,17 @@ impl PinnedImage {
                 dir.display()
             ))
         };
+        // A publish renames files under an exclusive lock of their directory.
+        // The shared locks keep all links of the pin inside one publish.
+        let mut files = vec![config.image.kernel.as_path(), config.image.rootfs.as_path()];
+        if let BootMethod::Snapshot(snapshot) = &config.boot {
+            files.extend([snapshot.state.as_path(), snapshot.memory.as_path()]);
+        }
+        let _locks = lock_dirs(&files, libc::LOCK_SH, IMAGE_LOCK_WAIT).map_err(|e| {
+            SandboxError::Unavailable(format!(
+                "cannot lock the image directories for the pin: {e}; a publish can hold them"
+            ))
+        })?;
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&dir)
@@ -251,7 +263,7 @@ impl Tenancy {
 
     /// Keep `cgroup` when it is still there.
     fn keep_if_left(&self, cgroup: &Path) {
-        if !cgroup.exists() {
+        if crate::sandbox::cgroup::is_gone(cgroup) {
             return;
         }
         tracing::warn!(
@@ -272,7 +284,7 @@ impl Tenancy {
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|cgroup| {
                 crate::sandbox::cgroup::kill_and_remove(cgroup, Duration::ZERO);
-                cgroup.exists()
+                !crate::sandbox::cgroup::is_gone(cgroup)
             });
     }
 
@@ -635,7 +647,7 @@ impl FirecrackerLauncher {
             if let Confinement::Jailer(jailer) = &self.config.confinement {
                 let cgroup = super::jailer::cgroup_dir(jailer, &vm_id);
                 kill_cgroup_now(&cgroup);
-                if cgroup.exists() {
+                if !crate::sandbox::cgroup::is_gone(&cgroup) {
                     left.insert(owner.clone());
                 }
             }
@@ -677,7 +689,7 @@ impl FirecrackerLauncher {
             };
             if dead.contains(owner) {
                 kill_cgroup_now(&entry.path());
-                if entry.path().exists() {
+                if !crate::sandbox::cgroup::is_gone(&entry.path()) {
                     left.insert(owner.to_owned());
                 }
             }
@@ -722,11 +734,10 @@ impl FirecrackerLauncher {
     ///
     /// Both files replace an old pair only after both copies are complete.
     /// A failed rename puts the old file back. A running launcher pinned its
-    /// pair at its start, so the renames do not reach its launches. A
-    /// launcher that starts between the two renames can pin a mixed pair.
-    /// So create a snapshot before the launchers that use it start. A host
-    /// crash between the two renames can also leave a mixed pair, so create
-    /// the snapshot again after it.
+    /// pair at its start, so the renames do not reach its launches. The
+    /// renames hold an exclusive lock on `out_dir`, so a launcher that starts
+    /// meanwhile waits for them. A host crash between the two renames can
+    /// leave a mixed pair, so create the snapshot again after it.
     ///
     /// # Errors
     ///
@@ -1126,6 +1137,55 @@ const SNAPSHOT_MEMORY_FILE: &str = "snapshot.mem";
 /// the whole guest memory.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The longest time that a pin or a snapshot publish waits for the lock of
+/// an image directory.
+const IMAGE_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// The time between two tries of a held lock.
+const IMAGE_LOCK_POLL: Duration = Duration::from_millis(10);
+
+/// Lock the directory of each file in `files` with `op`, a `flock`
+/// operation. The locks go when the returned files close.
+///
+/// A pin takes shared locks. A publish takes an exclusive lock while it
+/// renames files, as `publish-image.sh` does. So a pin never links the
+/// files of a publish in progress.
+///
+/// # Errors
+///
+/// Returns `WouldBlock` when a lock stays held for `wait`, or the error of
+/// an open.
+fn lock_dirs(
+    files: &[&Path],
+    op: libc::c_int,
+    wait: Duration,
+) -> std::io::Result<Vec<std::fs::File>> {
+    use std::os::fd::AsRawFd as _;
+    let dirs: std::collections::BTreeSet<&Path> = files.iter().filter_map(|f| f.parent()).collect();
+    let deadline = std::time::Instant::now() + wait;
+    let mut locks = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        let file = std::fs::File::open(dir)?;
+        loop {
+            // SAFETY: flock reads no memory, and the descriptor is open.
+            if unsafe { libc::flock(file.as_raw_fd(), op | libc::LOCK_NB) } == 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            let busy = matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            );
+            if !busy || std::time::Instant::now() >= deadline {
+                return Err(err);
+            }
+            std::thread::sleep(IMAGE_LOCK_POLL);
+        }
+        locks.push(file);
+    }
+    Ok(locks)
+}
+
 /// Copy each snapshot file to its target, and replace the old files only
 /// when every copy is complete.
 ///
@@ -1146,6 +1206,10 @@ fn publish_snapshot(copies: &[(PathBuf, PathBuf)], gid: u32) -> std::io::Result<
             .cloned()
             .zip(copies.iter().map(|(_, to)| to.clone()))
             .collect();
+        // A pin links under a shared lock of the directory. So it cannot link
+        // one old file and one new file.
+        let targets: Vec<&Path> = copies.iter().map(|(_, to)| to.as_path()).collect();
+        let _lock = lock_dirs(&targets, libc::LOCK_EX, IMAGE_LOCK_WAIT)?;
         replace_all(&moves)?;
         // Sync the directory, so the new names survive a crash.
         if let Some(dir) = copies.first().and_then(|(_, to)| to.parent()) {
@@ -2919,6 +2983,24 @@ while True:
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn a_cgroup_that_cannot_be_checked_is_kept() {
+        let dir = temp_dir();
+        let launcher = new_launcher(jailed(&dir)).unwrap();
+        // A path below a file cannot be checked, so it may still be there.
+        let file = dir.join("file");
+        std::fs::write(&file, b"").unwrap();
+        let unknown = file.join("cgroup");
+        launcher.tenancy.keep_if_left(&unknown);
+        assert!(!launcher.tenancy.is_empty(), "the cgroup was not kept");
+        launcher.tenancy.retry();
+        assert!(!launcher.tenancy.is_empty(), "the retry dropped the cgroup");
+        let lease = launcher.lease_path().to_path_buf();
+        drop(launcher);
+        assert!(lease.exists(), "the lease went before the cgroup");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn a_vm_that_outlives_its_launcher_keeps_the_lease() {
         let dir = temp_dir();
@@ -3026,6 +3108,78 @@ while True:
         assert!(pinned.is_dir(), "{}", pinned.display());
         drop(launcher);
         assert!(!pinned.exists(), "the launcher left its pinned image");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Lock `dir` with `op`, as a publish or a pin does.
+    fn hold_lock(dir: &Path, op: libc::c_int) -> std::fs::File {
+        use std::os::fd::AsRawFd as _;
+        let file = std::fs::File::open(dir).unwrap();
+        // SAFETY: flock reads no memory, and the descriptor is open.
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), op) }, 0);
+        file
+    }
+
+    #[test]
+    fn a_launcher_does_not_pin_half_a_publish() {
+        let dir = temp_dir();
+        let config = jailed(&dir);
+        let (kernel, rootfs) = (config.image.kernel.clone(), config.image.rootfs.clone());
+        // A publish holds the image directory and has moved one file.
+        let publish = hold_lock(&dir, libc::LOCK_EX);
+        publish_over(&kernel, b"new kernel");
+        let start = std::thread::spawn(move || new_launcher(config).unwrap());
+        std::thread::sleep(Duration::from_millis(200));
+        publish_over(&rootfs, b"new rootfs");
+        drop(publish);
+        let launcher = start.join().unwrap();
+        let pinned = launcher.tenancy.pinned.as_ref().unwrap();
+        assert_eq!(std::fs::read(&pinned.kernel).unwrap(), b"new kernel");
+        assert_eq!(std::fs::read(&pinned.rootfs).unwrap(), b"new rootfs");
+        drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_lock_that_stays_held_ends_the_wait() {
+        let dir = temp_dir();
+        let file = dir.join("vmlinux");
+        std::fs::write(&file, b"kernel").unwrap();
+        let publish = hold_lock(&dir, libc::LOCK_EX);
+        let started = Instant::now();
+        let err = lock_dirs(&[&file], libc::LOCK_SH, Duration::from_millis(100))
+            .expect_err("the directory stays locked");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock, "{err}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(publish);
+        drop(lock_dirs(&[&file], libc::LOCK_SH, Duration::from_millis(100)).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_publish_waits_for_a_pin() {
+        let dir = temp_dir();
+        let out = dir.join("golden");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("state"), b"old state").unwrap();
+        std::fs::write(out.join("memory"), b"old memory").unwrap();
+        std::fs::write(dir.join("new-state"), b"new state").unwrap();
+        std::fs::write(dir.join("new-memory"), b"new memory").unwrap();
+        // SAFETY: getegid has no preconditions.
+        let gid = unsafe { libc::getegid() };
+        let copies = [
+            (dir.join("new-state"), out.join("state")),
+            (dir.join("new-memory"), out.join("memory")),
+        ];
+        let pin = hold_lock(&out, libc::LOCK_SH);
+        let publish = std::thread::spawn(move || publish_snapshot(&copies, gid));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(std::fs::read(out.join("state")).unwrap(), b"old state");
+        assert_eq!(std::fs::read(out.join("memory")).unwrap(), b"old memory");
+        drop(pin);
+        publish.join().unwrap().unwrap();
+        assert_eq!(std::fs::read(out.join("state")).unwrap(), b"new state");
+        assert_eq!(std::fs::read(out.join("memory")).unwrap(), b"new memory");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

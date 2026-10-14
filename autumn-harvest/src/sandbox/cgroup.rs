@@ -63,6 +63,13 @@ pub fn is_empty(dir: &Path) -> bool {
     })
 }
 
+/// Whether the cgroup at `dir` is gone. A check that fails, such as with
+/// `EACCES`, does not prove it. A process can still be alive there.
+#[must_use]
+pub fn is_gone(dir: &Path) -> bool {
+    matches!(dir.try_exists(), Ok(false))
+}
+
 /// Kill every process in the cgroup at `dir`, wait up to `wait` for it to
 /// empty, and remove it. The removal fails while a process is left.
 pub fn kill_and_remove(dir: &Path, wait: Duration) {
@@ -92,6 +99,18 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn a_cgroup_that_cannot_be_checked_is_not_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(is_gone(&dir.path().join("gone")));
+        assert!(!is_gone(dir.path()));
+        // A path below a file gives `ENOTDIR`, as `EACCES` does for a lost
+        // delegation. Neither proves that the cgroup is gone.
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(!is_gone(&file.join("cgroup")));
     }
 
     #[test]

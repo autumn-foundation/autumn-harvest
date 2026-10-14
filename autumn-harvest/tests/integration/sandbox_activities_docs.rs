@@ -358,6 +358,58 @@ fn a_failed_publish_puts_back_the_old_image() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn a_publish_waits_for_a_launcher_that_pins() {
+    use std::io::BufRead as _;
+    const FILES: [&str; 3] = ["rootfs.ext4", "vmlinux", "image.sha256"];
+    let scratch = std::env::temp_dir().join(format!("hsbx-publish-lock-{}", std::process::id()));
+    let (stage, out) = (scratch.join("stage"), scratch.join("out"));
+    std::fs::create_dir_all(&stage).expect("stage dir");
+    std::fs::create_dir_all(&out).expect("out dir");
+    for file in FILES {
+        std::fs::write(out.join(file), format!("old {file}")).expect("old file");
+        std::fs::write(stage.join(file), format!("new {file}")).expect("new file");
+    }
+    // A launcher pins under a shared lock of the image directory.
+    let mut pin = std::process::Command::new("flock")
+        .arg("--shared")
+        .arg(&out)
+        .args(["sh", "-c", "echo held; read _"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("flock runs");
+    let mut held = String::new();
+    std::io::BufReader::new(pin.stdout.take().expect("stdout"))
+        .read_line(&mut held)
+        .expect("the pin reports its lock");
+    assert_eq!(held.trim(), "held");
+    let mut publish = std::process::Command::new("bash")
+        .arg(repo_root().join(PUBLISH_SCRIPT))
+        .arg(&stage)
+        .arg(&out)
+        .spawn()
+        .expect("bash runs");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        publish.try_wait().expect("publish state").is_none(),
+        "the publish did not wait for the pin"
+    );
+    for file in FILES {
+        let kept = std::fs::read_to_string(out.join(file)).unwrap_or_default();
+        assert_eq!(kept, format!("old {file}"), "{file} moved during a pin");
+    }
+    drop(pin.stdin.take());
+    pin.wait().expect("the pin ends");
+    assert!(publish.wait().expect("the publish ends").success());
+    for file in FILES {
+        let new = std::fs::read_to_string(out.join(file)).unwrap_or_default();
+        assert_eq!(new, format!("new {file}"));
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 #[test]
 fn the_guide_names_the_kernel_arguments_that_the_config_sets() {
     let guide = read(GUIDE);

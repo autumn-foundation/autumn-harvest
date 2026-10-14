@@ -251,6 +251,12 @@ root, and each launch links from there. So an image that lands one file at a
 time never gives a launch a mixed pair. A new image takes effect at the next
 worker start. An unjailed launcher reads the configured paths at each launch.
 
+The pin holds a shared `flock` on each image directory while it links. The
+script holds an exclusive `flock` on the output directory while it renames,
+and so does a snapshot publish. So a launcher never pins half a publish. A
+tool that publishes in another way must take the same lock. The script needs
+`flock` from util-linux.
+
 The guest agent is process 1. It mounts `/proc`, `/sys`, the cgroup v2 file
 system, `/dev`, `/tmp` and a `/work` tmpfs. It listens on vsock port 52. Each
 run mixes 32 bytes of host entropy into the kernel pool and forces a reseed.
@@ -356,10 +362,9 @@ jailer, so each restore sees the same paths.
 for its agent, pauses it and saves the files. No code runs in it. The files
 hold the guest memory, so the golden microVM must hold no secret. The new
 pair replaces an old pair only after both copies are complete, and a failed
-rename puts the old file back. Create it before the launchers that use it
-start, because a launch between the two renames can see a mixed pair. A host
-crash between the two renames can also leave a mixed pair, so create the
-snapshot again after such a crash.
+rename puts the old file back. The renames hold the directory lock, so a
+launcher that starts meanwhile waits. A host crash between the two renames
+can leave a mixed pair, so create the snapshot again after such a crash.
 
 Clones of one snapshot share their user-space random state. Each run
 therefore carries fresh host entropy, and VMGenID reseeds the kernel on Linux

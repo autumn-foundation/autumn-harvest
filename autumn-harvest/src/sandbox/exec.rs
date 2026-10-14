@@ -521,7 +521,7 @@ impl RunCgroup {
         let dir = self.dir.clone();
         let removed = tokio::task::spawn_blocking(move || {
             crate::sandbox::cgroup::kill_and_remove(&dir, CGROUP_WAIT);
-            !dir.exists()
+            crate::sandbox::cgroup::is_gone(&dir)
         })
         .await;
         if matches!(removed, Ok(true)) {
@@ -2050,6 +2050,27 @@ mod tests {
         std::fs::remove_file(&kill).unwrap();
         drop(cgroup);
         assert!(kill.exists(), "the drop did not try again");
+    }
+
+    #[tokio::test]
+    async fn a_run_cgroup_that_cannot_be_checked_fails_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        let mut cgroup = RunCgroup {
+            dir: file.join("cgroup"),
+            procs: std::fs::File::open(&file).unwrap(),
+            removed: false,
+        };
+        let err = cgroup
+            .remove()
+            .await
+            .expect_err("the cgroup is not proven gone");
+        assert!(
+            matches!(err, SandboxError::Unavailable(ref m) if m.contains("still")),
+            "{err:?}"
+        );
+        assert!(!cgroup.removed, "the cleanup must stay armed");
     }
 
     #[test]
