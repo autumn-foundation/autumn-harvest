@@ -170,6 +170,9 @@ pub struct WorkerRuntimeConfig {
     pub queues: Vec<String>,
     /// Optional per-queue dispatch weights (issue #515). Empty = default unchanged behaviour.
     pub queue_weights: std::collections::HashMap<String, u32>,
+    /// Rotate claims across fairness keys (issue #1976). `false` = the
+    /// unchanged claim statement.
+    pub fairness_keys: bool,
     /// Optional Postgres URL for LISTEN/NOTIFY wakeups.
     pub notification_database_url: Option<String>,
     /// Optional per-shard LISTEN/NOTIFY database URLs for multi-shard workers
@@ -339,7 +342,8 @@ impl WorkerRuntimeConfig {
     ///
     /// Returns [`HarvestError::Config`] if `queues` is empty, if
     /// `max_concurrent_claims` is 0, or if `cancellation_grace_period`
-    /// exceeds [`MAX_CANCELLATION_GRACE_PERIOD`].
+    /// exceeds [`MAX_CANCELLATION_GRACE_PERIOD`]. With `fairness_keys` on, it
+    /// also rejects a queue name that the weight API does not accept.
     pub fn validate(&self) -> HarvestResult<()> {
         if self.queues.is_empty() {
             return Err(HarvestError::Config(
@@ -371,6 +375,34 @@ impl WorkerRuntimeConfig {
                         queue = %name,
                         "queue_weights entry has no matching bound queue and will be ignored"
                     );
+                }
+            }
+        }
+        // Priority ageing sorts before the fairness lag (issue #1976). An old
+        // flood's rows then carry the largest ageing boost, so they can
+        // outrank a newer key until its rows age too. Warn, as the two do not
+        // combine well in a shared queue.
+        if self.fairness_keys && self.priority_aging_secs.is_some_and(|k| k > 0) {
+            tracing::warn!(
+                "fairness_keys and priority_aging_secs are both on: ageing sorts \
+                 before the fairness lag, so an old flood can outrank a newer key; \
+                 see docs/fairness-keys.md"
+            );
+        }
+        // A fair worker's queues must be names that the weight API accepts
+        // (issue #1976). Otherwise no operator could set a weight for their
+        // keys. The weight routes put the queue in a URL path segment. URL
+        // parsing removes `.` and `..` there, so those names are refused too.
+        if self.fairness_keys {
+            for queue in &self.queues {
+                crate::queue_pause::validate_queue_name(queue).map_err(|e| {
+                    HarvestError::Config(format!("fairness_keys: queue {queue:?}: {e}"))
+                })?;
+                if queue == "." || queue == ".." {
+                    return Err(HarvestError::Config(format!(
+                        "fairness_keys: queue {queue:?} is a URL dot segment, \
+                         which the weight API cannot address"
+                    )));
                 }
             }
         }
@@ -456,6 +488,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             worker_id: uuid::Uuid::new_v4().to_string(),
             queues: cfg.queues,
             queue_weights: cfg.queue_weights,
+            fairness_keys: cfg.fairness_keys,
             notification_database_url: cfg.notification_database_url,
             shard_notification_database_urls: cfg.shard_notification_database_urls,
             max_concurrent_workflows: cfg.max_concurrent_workflows,
@@ -2160,6 +2193,8 @@ struct DetachedSpawnPersistence<'a> {
     registry: &'a HandlerRegistry,
     parent_execution: &'a WorkflowExecution,
     execute_span: &'a tracing::Span,
+    // The parent task's fairness key (issue #1976).
+    parent_fairness_key: Option<&'a str>,
     // The EXPLICIT context-local router this placement was resolved against,
     // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
     resolved_router: Option<&'a crate::shard::ShardRouter>,
@@ -2177,6 +2212,7 @@ impl DetachedSpawnPersistence<'_> {
             self.parent_execution,
             commands,
             self.execute_span,
+            self.parent_fairness_key,
             self.resolved_router,
         )
         .await
@@ -9566,6 +9602,9 @@ pub async fn persist_workflow_failure(
     // Priority from the current task so the retry inherits the same queue priority
     // and is not silently demoted behind normal work (issue #523 P2).
     priority: crate::types::Priority,
+    // The current task's fairness key, so the retry stays with its tenant
+    // (issue #1976). `None` takes the retry's quota key.
+    fairness_key: Option<String>,
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
@@ -9774,6 +9813,7 @@ pub async fn persist_workflow_failure(
                     ),
                     start_source_ref: exec_ref.start_source_ref.as_deref(),
                     started_by: exec_ref.started_by.as_deref(),
+                    fairness_key: fairness_key.clone(),
                     // A retry belongs to the tenant of the run it retries
                     // (issue #1977).
                     tenant: exec_ref.tenant.as_deref(),
@@ -11248,6 +11288,7 @@ fn build_activity_enqueue_plan(
     execute_span: &tracing::Span,
     assigned_build_id: Option<&str>,
     parent_priority: i32,
+    parent_fairness_key: Option<&str>,
     context_headers: Option<&serde_json::Value>,
     workflow_input: &serde_json::Value,
 ) -> HarvestResult<ActivityEnqueuePlan> {
@@ -11297,6 +11338,8 @@ fn build_activity_enqueue_plan(
         // workflows' activities are also claimed ahead of lower-priority work
         // on the same queue (issue #249).
         params.priority = parent_priority;
+        // The activity shares its workflow's tenant (issue #1976).
+        params.fairness_key = parent_fairness_key.map(str::to_owned);
 
         if let Some(requires) = activity.requires {
             let reqs = crate::eligibility::parse_requirements(requires).map_err(|err| {
@@ -11562,6 +11605,7 @@ async fn persist_scheduled_activities(
     execute_span: &tracing::Span,
     assigned_build_id: Option<&str>,
     parent_priority: i32,
+    parent_fairness_key: Option<&str>,
     context_headers: Option<&serde_json::Value>,
     workflow_input: &serde_json::Value,
 ) -> HarvestResult<()> {
@@ -11576,6 +11620,7 @@ async fn persist_scheduled_activities(
         execute_span,
         assigned_build_id,
         parent_priority,
+        parent_fairness_key,
         context_headers,
         workflow_input,
     )?;
@@ -11970,6 +12015,8 @@ async fn persist_all_started_child_workflows(
     children: &[StartedChildWorkflowCommand],
     sticky: Option<queue::StickyHint<'_>>,
     execute_span: &tracing::Span,
+    // The parent's fairness key. A child inherits it (issue #1976).
+    parent_fairness_key: Option<&str>,
     // The EXPLICIT context-local router this placement was resolved against,
     // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
     resolved_router: Option<&crate::shard::ShardRouter>,
@@ -12253,6 +12300,7 @@ async fn persist_all_started_child_workflows(
             parent_execution,
             commands,
             &execute_span,
+            parent_fairness_key,
             resolved_router,
         )
         .await?;
@@ -12290,6 +12338,7 @@ async fn persist_all_started_child_workflows(
                     .get(&child.child_id.as_uuid())
                     .cloned()
                     .flatten(),
+                parent_fairness_key,
             )?;
             crate::cross_shard_child::record_cross_shard_child(
                 conn,
@@ -12408,6 +12457,10 @@ async fn persist_all_started_child_workflows(
             params.required_build_id = parent_execution.assigned_build_id.clone();
             (params.concurrency_key, params.max_concurrent) =
                 resolve_workflow_concurrency(registry, &child.workflow_name, &child.input);
+            params.fairness_key = crate::queue_fairness::fairness_key_for(
+                parent_fairness_key,
+                plan.child_quota_key.as_deref(),
+            );
             params.trace_context = child_trace_ctxs
                 .get(&child.child_id.as_uuid())
                 .cloned()
@@ -12548,6 +12601,10 @@ async fn persist_all_started_child_workflows(
                         .clone_from(&parent_execution.assigned_build_id);
                     (params.concurrency_key, params.max_concurrent) =
                         resolve_workflow_concurrency(registry, &child.workflow_name, &child.input);
+                    params.fairness_key = crate::queue_fairness::fairness_key_for(
+                        parent_fairness_key,
+                        plan.child_quota_key.as_deref(),
+                    );
                     params.trace_context = child_trace_ctxs
                         .get(&child.child_id.as_uuid())
                         .cloned()
@@ -12989,6 +13046,8 @@ fn cross_shard_child_spec(
     // placement changes WHERE a child runs, never what it is.
     parent_close_policy: Option<crate::types::ParentClosePolicy>,
     trace_context: Option<TraceContextCarrier>,
+    // The parent's fairness key. The child inherits it (issue #1976).
+    parent_fairness_key: Option<&str>,
 ) -> HarvestResult<crate::cross_shard_child::CrossShardChildSpec> {
     let detached = parent_close_policy.is_some();
     let defaults = resolve_child_workflow_defaults(registry, workflow_name);
@@ -13050,6 +13109,10 @@ fn cross_shard_child_spec(
             defaults.retry_policy.as_deref().cloned()
         },
         trace_context,
+        fairness_key: crate::queue_fairness::fairness_key_for(
+            parent_fairness_key,
+            quota_key.as_deref(),
+        ),
         quota_key,
         quota: defaults
             .quota
@@ -13166,7 +13229,7 @@ fn resolve_child_workflow_defaults(
 // Long by construction (and longer since #956 added the cross-shard early
 // return): the body is dominated by a wide, fully-explicit `NewWorkflowExecution`
 // literal, matching its `persist_all_started_child_workflows` twin.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn insert_awaited_child_execution(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -13174,6 +13237,8 @@ async fn insert_awaited_child_execution(
     parent_exec_id: ExecutionId,
     child: &StartedChildWorkflowCommand,
     trace_context: Option<TraceContextCarrier>,
+    // The parent's fairness key. A child inherits it (issue #1976).
+    parent_fairness_key: Option<&str>,
     // The EXPLICIT context-local router this placement was resolved against,
     // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
     resolved_router: Option<&crate::shard::ShardRouter>,
@@ -13201,6 +13266,7 @@ async fn insert_awaited_child_execution(
             &child.input,
             None, // awaited child
             trace_context,
+            parent_fairness_key,
         )?;
         return crate::cross_shard_child::record_cross_shard_child(
             conn,
@@ -13298,6 +13364,8 @@ async fn insert_awaited_child_execution(
     params.required_build_id = parent_execution.assigned_build_id.clone();
     (params.concurrency_key, params.max_concurrent) =
         resolve_workflow_concurrency(registry, &child.workflow_name, &child.input);
+    params.fairness_key =
+        crate::queue_fairness::fairness_key_for(parent_fairness_key, child_quota_key.as_deref());
     params.trace_context = trace_context;
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -13368,6 +13436,8 @@ async fn persist_child_timeout_race(
     timer: &StartedTimerCommand,
     sticky: Option<queue::StickyHint<'_>>,
     execute_span: &tracing::Span,
+    // The parent's fairness key. A child inherits it (issue #1976).
+    parent_fairness_key: Option<&str>,
     // The EXPLICIT context-local router this placement was resolved against,
     // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
     resolved_router: Option<&crate::shard::ShardRouter>,
@@ -13530,6 +13600,7 @@ async fn persist_child_timeout_race(
                     parent_exec_id,
                     child,
                     child_trace_ctx,
+                    parent_fairness_key,
                     resolved_router,
                 )
                 .await?;
@@ -13719,6 +13790,7 @@ async fn persist_mixed_suspension_batch(
     sticky: Option<queue::StickyHint<'_>>,
     execute_span: &tracing::Span,
     parent_priority: i32,
+    parent_fairness_key: Option<&str>,
     // The EXPLICIT context-local router this placement was resolved against,
     // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
     resolved_router: Option<&crate::shard::ShardRouter>,
@@ -13777,6 +13849,7 @@ async fn persist_mixed_suspension_batch(
         execute_span,
         parent_execution.assigned_build_id.as_deref(),
         parent_priority,
+        parent_fairness_key,
         parent_execution.context_headers.as_ref(),
         &parent_execution.input,
     )?;
@@ -14048,6 +14121,7 @@ async fn persist_mixed_suspension_batch(
                 exec_id,
                 child,
                 trace_ctx,
+                parent_fairness_key,
                 resolved_router,
             )
             .await?;
@@ -14694,6 +14768,7 @@ pub async fn fail_task_and_execution_with_history(
             None,
             None,
             crate::types::Priority::default(),
+            None,
             codecs,
             // `metrics: None` above -- nothing can ever be collected here.
             &mut Vec::new(),
@@ -15554,6 +15629,8 @@ async fn create_detached_child_executions(
     parent_execution: &WorkflowExecution,
     commands: &[WorkflowCommand],
     execute_span: &tracing::Span,
+    // The parent's fairness key. A child inherits it (issue #1976).
+    parent_fairness_key: Option<&str>,
     // The EXPLICIT context-local router this placement was resolved against,
     // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
     resolved_router: Option<&crate::shard::ShardRouter>,
@@ -15643,6 +15720,7 @@ async fn create_detached_child_executions(
                     { ATTR_SHARD_ID } = child_id.shard().as_i32(),
                 )
                 .in_scope(|| registry.telemetry().capture_trace_context()),
+                parent_fairness_key,
             )?;
             crate::cross_shard_child::record_cross_shard_child(
                 conn,
@@ -15826,6 +15904,10 @@ async fn create_detached_child_executions(
         params.required_build_id = parent_execution.assigned_build_id.clone();
         (params.concurrency_key, params.max_concurrent) =
             resolve_workflow_concurrency(registry, workflow_name, input);
+        params.fairness_key = crate::queue_fairness::fairness_key_for(
+            parent_fairness_key,
+            child_quota_key.as_deref(),
+        );
         params.trace_context = tracing::info_span!(
             parent: execute_span,
             "harvest.child_workflow.start",
@@ -21234,6 +21316,7 @@ async fn handle_suspended_workflow(
         registry,
         parent_execution: context.execution,
         execute_span: context.execute_span,
+        parent_fairness_key: context.persistence.task.fairness_key.as_deref(),
         resolved_router,
     };
 
@@ -21275,6 +21358,7 @@ async fn handle_suspended_workflow(
             context.execute_span,
             context.execution.assigned_build_id.as_deref(),
             context.persistence.task.priority,
+            context.persistence.task.fairness_key.as_deref(),
             context.execution.context_headers.as_ref(),
             &context.execution.input,
         )
@@ -21306,6 +21390,7 @@ async fn handle_suspended_workflow(
             &timer,
             sticky,
             context.execute_span,
+            context.persistence.task.fairness_key.as_deref(),
             resolved_router,
         )
         .await;
@@ -21351,6 +21436,7 @@ async fn handle_suspended_workflow(
             &children,
             sticky,
             context.execute_span,
+            context.persistence.task.fairness_key.as_deref(),
             resolved_router,
         )
         .await
@@ -21401,6 +21487,7 @@ async fn handle_suspended_workflow(
             sticky,
             context.execute_span,
             context.persistence.task.priority,
+            context.persistence.task.fairness_key.as_deref(),
             resolved_router,
         )
         .await
@@ -22164,6 +22251,7 @@ async fn reject_child_continue_as_new(
             None,
             None,
             crate::types::Priority::default(),
+            None,
             codecs,
             // `metrics: None` above -- nothing can ever be collected here.
             &mut Vec::new(),
@@ -23231,6 +23319,7 @@ async fn persist_workflow_continue_as_new_with_verdict(
                 None,
                 None,
                 crate::types::Priority::default(),
+                None,
                 registry.payload_codecs(),
                 &mut Vec::new(),
             )
@@ -23446,6 +23535,12 @@ async fn persist_workflow_continue_as_new_with_verdict(
     enqueue.concurrency_key = successor_concurrency_key;
     enqueue.max_concurrent = successor_concurrency_cap;
     enqueue.rate_limit_key = persistence.task.rate_limit_key.clone();
+    // The successor stays with its tenant, for a cross-type target too
+    // (issue #1976). With no key it takes its own quota key.
+    enqueue.fairness_key = crate::queue_fairness::fairness_key_for(
+        persistence.task.fairness_key.as_deref(),
+        successor_quota_key.as_deref(),
+    );
 
     Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
         // Issue #1184: this transaction seals the predecessor
@@ -23783,6 +23878,7 @@ async fn persist_workflow_outcome(
                     .concurrency_cap
                     .and_then(|c| u32::try_from(c).ok()),
                 crate::types::Priority::from_i32(persistence.task.priority).unwrap_or_default(),
+                persistence.task.fairness_key.clone(),
                 registry.payload_codecs(),
                 pending_cancel_metrics,
             )
@@ -24328,6 +24424,7 @@ async fn persist_terminal_outcome_commands(
         execution,
         pending_cmds,
         execute_span,
+        persistence.task.fairness_key.as_deref(),
         resolved_router,
     )
     .await?;
@@ -26063,6 +26160,7 @@ async fn process_workflow_task(
                     registry,
                     parent_execution: &prepared.execution,
                     execute_span: &detached_execute_span,
+                    parent_fairness_key: task.fairness_key.as_deref(),
                     resolved_router: resolved_router.as_ref(),
                 };
                 let local_batch = extract_run_local_activity(commands);
@@ -35617,6 +35715,7 @@ impl Worker {
                     ),
                     session_slots: self.config.max_concurrent_sessions,
                     priority_aging_secs: self.config.priority_aging_secs,
+                    fairness_keys: self.config.fairness_keys,
                     ineligible_activities: &self.ineligible_activities,
                     shard_assignments: &self.config.shard_assignments,
                     registered_workflows: &registered_workflows,
@@ -36141,7 +36240,7 @@ impl Worker {
         let claim_started = std::time::Instant::now();
         let claimed = self
             .claim_with_conflict_retry(&mut conn, async |conn| {
-                queue::claim_task_by_id_on_shard(
+                queue::claim_task_by_id_with_fairness(
                     conn,
                     lease.task_id,
                     &self.config.queues,
@@ -36151,6 +36250,7 @@ impl Worker {
                     circuit_breakers.tracked_activity_names(),
                     &exclusions,
                     shard,
+                    self.claim_fairness(),
                 )
                 .await
             })
@@ -37309,6 +37409,16 @@ impl Worker {
         .await
     }
 
+    /// The claim's fairness mode, from [`WorkerRuntimeConfig::fairness_keys`]
+    /// (issue #1976).
+    const fn claim_fairness(&self) -> queue::ClaimFairness {
+        if self.config.fairness_keys {
+            queue::ClaimFairness::Keys
+        } else {
+            queue::ClaimFairness::Off
+        }
+    }
+
     /// The activity names that a claim must skip: the names with unmet
     /// requirements, plus the types at their adaptive limit (issue #1836).
     fn claim_exclusions(&self) -> std::borrow::Cow<'_, [String]> {
@@ -37576,7 +37686,7 @@ impl Worker {
                 let claim_started = std::time::Instant::now();
                 let claimed = self
                     .claim_with_conflict_retry(&mut conn, async |conn| {
-                        queue::claim_task_of_kind_on_shard(
+                        queue::claim_task_with_fairness(
                             conn,
                             &single_queue,
                             &self.config.worker_id,
@@ -37586,6 +37696,7 @@ impl Worker {
                             &exclusions,
                             shard,
                             kind,
+                            self.claim_fairness(),
                         )
                         .await
                     })
@@ -37628,7 +37739,7 @@ impl Worker {
         let claim_started = std::time::Instant::now();
         let claimed = self
             .claim_with_conflict_retry(&mut conn, async |conn| {
-                queue::claim_task_of_kind_on_shard(
+                queue::claim_task_with_fairness(
                     conn,
                     &self.config.queues,
                     &self.config.worker_id,
@@ -37638,6 +37749,7 @@ impl Worker {
                     &exclusions,
                     shard,
                     kind,
+                    self.claim_fairness(),
                 )
                 .await
             })
@@ -41429,6 +41541,7 @@ mod tests {
             max_concurrent_sessions: 0,
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
             scanner: crate::scanner_lease::ScannerConfig::default(),
+            fairness_keys: false,
         }
     }
 
@@ -41502,6 +41615,26 @@ mod tests {
             err.to_string().contains("cancellation_grace_period"),
             "{err}"
         );
+    }
+
+    /// A fair worker only polls queues whose keys the weight API can address
+    /// (issue #1976).
+    #[test]
+    fn runtime_config_validate_checks_queue_names_with_fairness_keys() {
+        let mut cfg = default_runtime_config();
+        cfg.queues = vec![" padded ".to_owned()];
+        assert!(cfg.validate().is_ok(), "fairness off accepts any name");
+        cfg.fairness_keys = true;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("fairness_keys"), "{err}");
+        // A URL drops a dot segment, so the weight routes cannot name it.
+        for dots in [".", ".."] {
+            cfg.queues = vec![dots.to_owned()];
+            let err = cfg.validate().unwrap_err();
+            assert!(err.to_string().contains("dot segment"), "{err}");
+        }
+        cfg.queues = vec!["shared".to_owned()];
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -42322,6 +42455,7 @@ mod tests {
             adaptive_limit: crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
             #[cfg(feature = "db")]
             sharded_pool: None,
+            fairness_keys: false,
         };
 
         let runtime_cfg: WorkerRuntimeConfig = builder_cfg.into();
@@ -50725,6 +50859,7 @@ mod tests {
             timed_out_claims: None,
             handler_started_at: None,
             new_start: false,
+            fairness_key: None,
         }
     }
 

@@ -324,6 +324,7 @@ mod db_tests {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         };
         start_or_load_workflow_execution(&mut conn, first_params, None)
@@ -405,6 +406,7 @@ mod db_tests {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         };
         start_or_load_workflow_execution(&mut conn, start_params, None)
