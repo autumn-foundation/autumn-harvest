@@ -168,8 +168,9 @@ pub async fn probe_version(
 /// Inspect the host under `root`, normally `/`. `cgroup_mount` is the cgroup
 /// v2 mount of the jailer.
 ///
-/// Critical: no `/dev/kvm`, KSM on, nested KVM on, a CPU vulnerability that
-/// reports `Vulnerable`, or no cgroup v2. Warning: SMT on, or swap on.
+/// Critical: no `/dev/kvm`, KSM on or unreadable, nested KVM on, a CPU
+/// vulnerability that reports `Vulnerable`, or no cgroup v2. Warning: SMT on,
+/// or swap on.
 #[must_use]
 pub fn inspect_host(root: &Path, cgroup_mount: &Path) -> Vec<PostureFinding> {
     let read = |rel: &str| std::fs::read_to_string(root.join(rel)).map(|s| s.trim().to_owned());
@@ -184,12 +185,29 @@ pub fn inspect_host(root: &Path, cgroup_mount: &Path) -> Vec<PostureFinding> {
     if !root.join("dev/kvm").exists() {
         find("kvm", "/dev/kvm is missing".into(), Severity::Critical);
     }
-    if read("sys/kernel/mm/ksm/run").is_ok_and(|v| v == "1") {
-        find(
+    // A KSM state that cannot be read is not a safe state. A kernel without
+    // KSM has no `ksm` directory, so its absence is safe.
+    match read("sys/kernel/mm/ksm/run") {
+        Ok(state) if state == "0" || state == "2" => {}
+        Ok(state) if state == "1" => find(
             "ksm",
             "KSM merges pages across tenants; disable it".into(),
             Severity::Critical,
-        );
+        ),
+        Ok(state) => find(
+            "ksm",
+            format!("KSM reports the unknown state {state:?}"),
+            Severity::Critical,
+        ),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && !root.join("sys/kernel/mm/ksm").exists()
+                && root.join("sys/kernel/mm").is_dir() => {}
+        Err(e) => find(
+            "ksm",
+            format!("the KSM state cannot be read: {e}"),
+            Severity::Critical,
+        ),
     }
     for module in ["kvm_intel", "kvm_amd"] {
         if read(&format!("sys/module/{module}/parameters/nested"))
@@ -424,6 +442,28 @@ mod tests {
             findings.iter().any(|f| f.check == "cgroup_v2"),
             "{findings:?}"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_ksm_state_is_critical() {
+        let ksm = |root: &Path| {
+            inspect_host(root, Path::new("/sys/fs/cgroup"))
+                .into_iter()
+                .filter(|f| f.check == "ksm" && f.severity == Severity::Critical)
+                .count()
+        };
+        let root = fake_sys();
+        let run = root.join("sys/kernel/mm/ksm/run");
+        // A masked file reads empty, and a directory cannot be read.
+        std::fs::write(&run, "").unwrap();
+        assert_eq!(ksm(&root), 1, "an empty state");
+        std::fs::remove_file(&run).unwrap();
+        std::fs::create_dir(&run).unwrap();
+        assert_eq!(ksm(&root), 1, "an unreadable state");
+        // A kernel without KSM has no ksm directory.
+        std::fs::remove_dir_all(root.join("sys/kernel/mm/ksm")).unwrap();
+        assert_eq!(ksm(&root), 0, "no KSM in the kernel");
         std::fs::remove_dir_all(root).unwrap();
     }
 

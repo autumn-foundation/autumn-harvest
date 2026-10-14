@@ -49,7 +49,8 @@ An agent sends a request as JSON. Unknown fields are an error.
 | `limits` | `timeout_ms`, `cpu_seconds`, `memory_mib` and `max_output_bytes`. Each must be at most the policy ceiling. |
 
 The policy bounds the size of each request and each outcome. Both bounds must
-fit the 64 MiB guest frame, or the policy is not valid.
+fit the 64 MiB guest frame, or the policy is not valid. Each runtime with the
+largest request must also fit the 2 MiB total exec limit of Linux.
 
 The outcome is JSON too:
 
@@ -186,8 +187,8 @@ runtime refuses a policy that allows the network on a backend without one.
   checks the versions of `firecracker` and `jailer`. It refuses older
   versions: CVE-2026-5747 and CVE-2026-1386.
 - KSM off, nested KVM off, and no CPU vulnerability that reports
-  `Vulnerable`. A CPU vulnerability state that cannot be read is also
-  critical.
+  `Vulnerable`. A KSM or CPU vulnerability state that cannot be read is also
+  critical. A kernel without KSM is safe.
 - Root owns each trusted path: the jail base, network namespace, Firecracker
   and jailer binaries, kernel, root file system and snapshot. No such path
   holds a symbolic link. Only root may write each directory above them,

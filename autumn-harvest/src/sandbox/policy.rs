@@ -266,7 +266,8 @@ impl SandboxPolicy {
     ///
     /// - a default limit is over its ceiling, or a limit is zero;
     /// - no runtime exists;
-    /// - a runtime name or spec is not valid.
+    /// - a runtime name or spec is not valid;
+    /// - a runtime with the largest request is over the total exec limit.
     pub fn validate(&self) -> Result<(), SandboxError> {
         if self.runtimes.is_empty() {
             return Err(SandboxError::Config("the policy names no runtime".into()));
@@ -311,6 +312,17 @@ impl SandboxPolicy {
             return Err(SandboxError::Config(format!(
                 "the PATH value is over the exec limit of {MAX_EXEC_STRING_BYTES} bytes"
             )));
+        }
+        // Linux also limits all exec strings together. Each runtime must
+        // take the largest request without `E2BIG`.
+        for (name, spec) in &self.runtimes {
+            let total = self.max_exec_bytes(spec);
+            if total > count(MAX_EXEC_TOTAL_BYTES) {
+                return Err(SandboxError::Config(format!(
+                    "runtime {name:?} with the largest request passes {total} bytes to exec, \
+                     over the total exec limit of {MAX_EXEC_TOTAL_BYTES}"
+                )));
+            }
         }
         // The outcome decoder stops at this cap, so a request may not ask for
         // more outputs.
@@ -367,6 +379,29 @@ impl SandboxPolicy {
             .saturating_add(OUTCOME_ENVELOPE_BYTES)
     }
 
+    /// The most bytes that one run of `spec` passes to exec. Each string
+    /// adds a NUL and a pointer, and each variable adds `=`.
+    fn max_exec_bytes(&self, spec: &RuntimeSpec) -> u64 {
+        let string = |len: usize| count(len).saturating_add(count(EXEC_STRING_OVERHEAD));
+        let strings = |n: usize, extra: usize| {
+            count(n).saturating_mul(count(EXEC_STRING_OVERHEAD.saturating_add(extra)))
+        };
+        let fixed = spec
+            .argv
+            .iter()
+            .map(|arg| string(arg.len()))
+            .fold(string(spec.file_name.len()), u64::saturating_add);
+        let args = count(self.sizes.max_arg_bytes).saturating_add(strings(self.sizes.max_args, 0));
+        let env = count(self.sizes.max_env_bytes).saturating_add(strings(self.sizes.max_env, 1));
+        let engine = count(MAX_ENGINE_ENV_BYTES).saturating_add(strings(MAX_ENGINE_ENV_VARS, 1));
+        fixed
+            .saturating_add(args)
+            .saturating_add(env)
+            .saturating_add(engine)
+            .saturating_add(string("PATH=".len() + self.path_env.len()))
+            .saturating_add(count(EXECUTOR_ENV_BYTES))
+    }
+
     /// The most bytes that the JSON of one request can have.
     #[must_use]
     pub fn max_request_json_bytes(&self) -> u64 {
@@ -414,6 +449,18 @@ impl SandboxPolicy {
             .saturating_add(OUTCOME_ENVELOPE_BYTES)
     }
 }
+
+/// The most bytes that exec takes for all arguments and variables together.
+/// Linux allows a quarter of the stack limit. That is 2 MiB for the default
+/// stack limit of 8 MiB.
+pub const MAX_EXEC_TOTAL_BYTES: usize = 2 * 1024 * 1024;
+
+/// The bytes that exec adds to each string: a NUL and a pointer.
+const EXEC_STRING_OVERHEAD: usize = 1 + 8;
+
+/// The bytes of the variables that the executor sets, other than `PATH`.
+/// Three of them hold the work path, which is shorter than `PATH_MAX`.
+const EXECUTOR_ENV_BYTES: usize = 4 * (4096 + 16);
 
 /// The most engine variables, such as `HARVEST_ATTEMPT`, that one run gets.
 pub const MAX_ENGINE_ENV_VARS: usize = 8;
@@ -587,10 +634,17 @@ mod tests {
 
     #[test]
     fn a_runtime_too_large_for_a_frame_is_a_config_error() {
-        // Each argument fits exec, but all of them together do not fit a frame.
+        // The runtime fits exec, but it takes the largest request over a frame.
+        let frame = u64::try_from(crate::sandbox::protocol::MAX_FRAME_BYTES).unwrap();
+        let mut sizes = DEFAULT_SIZE_BOUNDS;
+        let rest = SandboxPolicy::default().max_request_json_bytes() - sizes.max_input_bytes * 6;
+        // Leave 1 MiB of the frame free. The runtime takes about 9 MiB of it.
+        sizes.max_input_bytes = (frame - rest - (1 << 20)) / 6;
+        let fits = SandboxPolicy::default().with_sizes(sizes);
+        fits.validate().unwrap();
         let mut argv = vec!["sh".to_owned()];
-        argv.extend(std::iter::repeat_n("x".repeat(100 * 1024), 120));
-        let policy = SandboxPolicy::default().with_runtime(
+        argv.extend(std::iter::repeat_n("x".repeat(100 * 1024), 15));
+        let policy = fits.with_runtime(
             "big",
             RuntimeSpec {
                 argv,
@@ -640,9 +694,10 @@ mod tests {
     fn an_argument_or_variable_over_the_exec_limit_is_denied() {
         use crate::sandbox::request::{MAX_EXEC_STRING_BYTES, SandboxRequest};
         let mut sizes = DEFAULT_SIZE_BOUNDS;
-        sizes.max_arg_bytes = 1 << 20;
-        sizes.max_env_bytes = 1 << 20;
+        sizes.max_arg_bytes = 512 * 1024;
+        sizes.max_env_bytes = 512 * 1024;
         let policy = SandboxPolicy::default().with_sizes(sizes);
+        policy.validate().unwrap();
         let request = SandboxRequest::new("sh", "");
         let fits = request.clone().with_arg("x".repeat(MAX_EXEC_STRING_BYTES));
         policy.plan(&fits).unwrap();
@@ -663,6 +718,30 @@ mod tests {
                 "{result:?}"
             );
         }
+    }
+
+    #[test]
+    fn exec_strings_past_the_total_limit_are_a_config_error() {
+        // Each argument fits the string limit, but all of them do not fit
+        // the total limit of execve.
+        let arg = "a".repeat(100 * 1024);
+        let argv: Vec<&str> = std::iter::repeat_n(arg.as_str(), 70).collect();
+        let policy = SandboxPolicy::default().with_runtime("big", RuntimeSpec::new(&argv, "x"));
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("exec")),
+            "{:?}",
+            policy.validate()
+        );
+        // The request bounds count too.
+        let mut sizes = DEFAULT_SIZE_BOUNDS;
+        sizes.max_arg_bytes = 3 * 1024 * 1024;
+        let policy = SandboxPolicy::default().with_sizes(sizes);
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("exec")),
+            "{:?}",
+            policy.validate()
+        );
+        SandboxPolicy::default().validate().unwrap();
     }
 
     #[test]
