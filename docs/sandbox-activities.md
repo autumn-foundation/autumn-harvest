@@ -81,6 +81,9 @@ The outcome is JSON too:
   `skipped_outputs` names each output that the run does not return, with the
   reason. A file can be missing, too large, a symbolic link, a hard link, or
   not a regular file.
+- Each output list holds at most `MAX_OUTPUT_ENTRIES` (4096) entries. The
+  host decoder stops there, so a guest cannot fill host memory with tiny
+  entries. A policy may not allow more outputs.
 - The host sets `isolation` and `image`. The guest cannot change them. The
   image name has at most 256 bytes and no control character. The host also
   caps `duration_ms` at the time that it measured.
@@ -183,7 +186,8 @@ runtime refuses a policy that allows the network on a backend without one.
   checks the versions of `firecracker` and `jailer`. It refuses older
   versions: CVE-2026-5747 and CVE-2026-1386.
 - KSM off, nested KVM off, and no CPU vulnerability that reports
-  `Vulnerable`.
+  `Vulnerable`. A CPU vulnerability state that cannot be read is also
+  critical.
 - Root owns each trusted path: the jail base, network namespace, Firecracker
   and jailer binaries, kernel, root file system and snapshot. No such path
   holds a symbolic link. Only root may write each directory above them,

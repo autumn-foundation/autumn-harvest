@@ -17,6 +17,10 @@ pub const MAX_SIGNAL: i32 = 64;
 /// The longest reason of a skipped output, in bytes.
 pub const MAX_SKIP_REASON_BYTES: usize = 256;
 
+/// The most entries in each output list of an outcome, and the most outputs
+/// that a policy can allow.
+pub const MAX_OUTPUT_ENTRIES: usize = 4096;
+
 /// How the code ended.
 ///
 /// The decoder reads the fields in any order, because Postgres `jsonb`
@@ -174,8 +178,10 @@ pub struct SandboxOutcome {
     /// middle.
     pub stderr_truncated: bool,
     /// The output files that the run returns.
+    #[serde(deserialize_with = "bounded_list")]
     pub outputs: Vec<OutputFile>,
     /// The output files that the run does not return.
+    #[serde(deserialize_with = "bounded_list")]
     pub skipped_outputs: Vec<SkippedOutput>,
     /// The wall-clock time of the run, in milliseconds.
     pub duration_ms: u64,
@@ -184,6 +190,45 @@ pub struct SandboxOutcome {
     /// The guest image that ran the code, when the operator names it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+}
+
+/// Read a list of at most [`MAX_OUTPUT_ENTRIES`] items.
+///
+/// The guest writes the list. Each tiny entry costs the host far more memory
+/// than its bytes in the frame. So the decoder stops at the cap, before it
+/// builds a longer list.
+fn bounded_list<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    /// Reads the items, up to the cap.
+    struct Bounded<T>(std::marker::PhantomData<T>);
+
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for Bounded<T> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "a list of at most {MAX_OUTPUT_ENTRIES} items")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<T>, A::Error> {
+            use serde::de::Error as _;
+            let hint = seq.size_hint().unwrap_or(0).min(MAX_OUTPUT_ENTRIES);
+            let mut items = Vec::with_capacity(hint);
+            while let Some(item) = seq.next_element()? {
+                if items.len() == MAX_OUTPUT_ENTRIES {
+                    return Err(A::Error::custom(format!(
+                        "an output list holds at most {MAX_OUTPUT_ENTRIES} items"
+                    )));
+                }
+                items.push(item);
+            }
+            Ok(items)
+        }
+    }
+
+    deserializer.deserialize_seq(Bounded(std::marker::PhantomData))
 }
 
 impl SandboxOutcome {
@@ -325,6 +370,20 @@ pub(crate) mod tests {
     use super::*;
     use crate::sandbox::policy::SandboxPolicy;
     use crate::sandbox::request::SandboxRequest;
+
+    #[test]
+    fn the_decoder_stops_at_the_output_entry_cap() {
+        let mut json = serde_json::to_value(outcome(RunStatus::Exited { code: 0 })).unwrap();
+        let entry = serde_json::json!({"path": "a", "reason": ""});
+        json["skipped_outputs"] = serde_json::Value::Array(vec![entry; MAX_OUTPUT_ENTRIES + 1]);
+        let err = serde_json::from_value::<SandboxOutcome>(json.clone()).expect_err("too many");
+        assert!(err.to_string().contains("at most"), "{err}");
+        json["skipped_outputs"]
+            .as_array_mut()
+            .unwrap()
+            .truncate(MAX_OUTPUT_ENTRIES);
+        serde_json::from_value::<SandboxOutcome>(json).unwrap();
+    }
 
     pub fn outcome(status: RunStatus) -> SandboxOutcome {
         SandboxOutcome {

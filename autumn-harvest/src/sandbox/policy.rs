@@ -312,6 +312,15 @@ impl SandboxPolicy {
                 "the PATH value is over the exec limit of {MAX_EXEC_STRING_BYTES} bytes"
             )));
         }
+        // The outcome decoder stops at this cap, so a request may not ask for
+        // more outputs.
+        let cap = super::outcome::MAX_OUTPUT_ENTRIES;
+        if self.sizes.max_outputs > cap {
+            return Err(SandboxError::Config(format!(
+                "the policy allows {} outputs, over the {cap} that an outcome holds",
+                self.sizes.max_outputs
+            )));
+        }
         // Each request and each outcome must fit one guest frame. Otherwise
         // an accepted request fails late, as a retryable fault.
         let frame = u64::try_from(super::protocol::MAX_FRAME_BYTES).unwrap_or(u64::MAX);
@@ -657,6 +666,20 @@ mod tests {
     }
 
     #[test]
+    fn a_policy_cannot_allow_more_outputs_than_an_outcome_holds() {
+        let mut sizes = DEFAULT_SIZE_BOUNDS;
+        sizes.max_outputs = crate::sandbox::outcome::MAX_OUTPUT_ENTRIES + 1;
+        sizes.max_output_file_bytes = 1;
+        sizes.max_output_files_total_bytes = 1;
+        let policy = SandboxPolicy::default().with_sizes(sizes);
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("outputs")),
+            "{:?}",
+            policy.validate()
+        );
+    }
+
+    #[test]
     fn the_bounds_count_each_path_and_each_item() {
         let base = SandboxPolicy::default();
         let mut sizes = DEFAULT_SIZE_BOUNDS;
@@ -665,17 +688,6 @@ mod tests {
         let path = u64::try_from(crate::sandbox::request::MAX_PATH_BYTES).unwrap();
         assert!(more.max_request_json_bytes() >= base.max_request_json_bytes() + 6 * path);
         assert!(more.max_outcome_json_bytes() >= base.max_outcome_json_bytes() + 6 * path);
-        // Many outputs with tiny byte budgets still cannot fit a frame.
-        let mut sizes = DEFAULT_SIZE_BOUNDS;
-        sizes.max_outputs = 200_000;
-        sizes.max_output_file_bytes = 1;
-        sizes.max_output_files_total_bytes = 1;
-        let policy = SandboxPolicy::default().with_sizes(sizes);
-        assert!(
-            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("frame")),
-            "{:?}",
-            policy.validate()
-        );
     }
 
     #[test]

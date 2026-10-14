@@ -202,20 +202,37 @@ pub fn inspect_host(root: &Path, cgroup_mount: &Path) -> Vec<PostureFinding> {
             );
         }
     }
+    // A state that cannot be read is not a safe state, so it is critical too.
     let vulnerabilities = root.join("sys/devices/system/cpu/vulnerabilities");
-    if let Ok(entries) = std::fs::read_dir(&vulnerabilities) {
-        let mut names: Vec<_> = entries.filter_map(Result::ok).collect();
-        names.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in names {
-            let state = std::fs::read_to_string(entry.path()).unwrap_or_default();
-            if state.trim_start().starts_with("Vulnerable") {
-                find(
-                    "cpu_vulnerability",
-                    format!("{}: {}", entry.file_name().to_string_lossy(), state.trim()),
-                    Severity::Critical,
-                );
+    match std::fs::read_dir(&vulnerabilities) {
+        Ok(entries) => {
+            let mut names: Vec<_> = entries.filter_map(Result::ok).collect();
+            names.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in names {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                match std::fs::read_to_string(entry.path()) {
+                    Ok(state) if state.trim_start().starts_with("Vulnerable") => find(
+                        "cpu_vulnerability",
+                        format!("{name}: {}", state.trim()),
+                        Severity::Critical,
+                    ),
+                    Ok(_) => {}
+                    Err(e) => find(
+                        "cpu_vulnerability",
+                        format!("{name}: the state cannot be read: {e}"),
+                        Severity::Critical,
+                    ),
+                }
             }
         }
+        Err(e) => find(
+            "cpu_vulnerability",
+            format!(
+                "{} cannot be read, so the CPU vulnerability state is unknown: {e}",
+                vulnerabilities.display()
+            ),
+            Severity::Critical,
+        ),
     }
     let cgroup = cgroup_mount.strip_prefix("/").unwrap_or(cgroup_mount);
     if !root.join(cgroup).join("cgroup.controllers").exists() {
@@ -405,6 +422,20 @@ mod tests {
         let findings = inspect_host(&root, Path::new("/sys/fs/cgroup"));
         assert!(
             findings.iter().any(|f| f.check == "cgroup_v2"),
+            "{findings:?}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_cpu_vulnerability_state_is_critical() {
+        let root = fake_sys();
+        std::fs::remove_dir_all(root.join("sys/devices/system/cpu/vulnerabilities")).unwrap();
+        let findings = inspect_host(&root, Path::new("/sys/fs/cgroup"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.check == "cpu_vulnerability" && f.severity == Severity::Critical),
             "{findings:?}"
         );
         std::fs::remove_dir_all(root).unwrap();
