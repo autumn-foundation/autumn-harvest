@@ -423,7 +423,7 @@ fn model_mismatch(exec_id: &str, recorded: &str, served: &str) -> String {
 /// The activity-level checks stay as a backstop, but they can only fail a run.
 /// This is the check that protects the work.
 fn check_resumable(
-    reader: &Connection,
+    reader: &inspect::Reader,
     workspace: &str,
     model: &str,
 ) -> Result<Vec<ExecutionId>, String> {
@@ -750,7 +750,7 @@ async fn answer(write_half: &mut tokio::net::unix::OwnedWriteHalf, response: &Re
 /// Apply one control command.
 fn handle(
     runtime: &mut SqliteRuntime,
-    reader: &Connection,
+    reader: &inspect::Reader,
     blocked: &mut Parked,
     live: &mut Live,
     workspace: &str,
@@ -1070,7 +1070,7 @@ fn expired(reader: &Connection, execution_id: &str, signal: &str) -> Result<Opti
 /// The session must exist. An event read of an unknown id returns no rows, so
 /// without this check a mistyped audit target prints an empty history and
 /// exits clean. That reads as a session that did nothing.
-fn history(reader: &Connection, execution_id: &str, before: Option<i64>) -> Response {
+fn history(reader: &inspect::Reader, execution_id: &str, before: Option<i64>) -> Response {
     // Parsed for the message it gives, and not for a value. A mistyped id is
     // told apart from a real one this database does not hold.
     if let Err(e) = execution_id.parse::<ExecutionId>() {
@@ -1148,7 +1148,7 @@ fn describe(line: &inspect::EventLine) -> String {
 
 /// Project every execution row into an operator view.
 pub fn sessions(
-    reader: &Connection,
+    reader: &inspect::Reader,
     blocked: &Parked,
     full: bool,
     before: Option<i64>,

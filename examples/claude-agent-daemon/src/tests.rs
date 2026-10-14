@@ -3032,7 +3032,7 @@ fn a_goal_opening_with_a_nul_is_measured_whole() {
         .expect("the blank session is recorded");
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let running = inspect::running(&reader, WORKFLOW_NAME).expect("the query runs");
     let goal_of = |exec: &str| {
         running
@@ -3140,7 +3140,7 @@ fn a_recorded_task_rust_cannot_read_is_never_enlisted() {
     );
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let running = inspect::running(&reader, WORKFLOW_NAME).expect("the query still answers");
     assert!(enlisted(&running, "good"), "a readable task is enlisted");
     for row in ["bad-goal", "bad-workspace", "bad-spare", "raw-bytes"] {
@@ -3202,7 +3202,7 @@ fn a_task_document_in_the_wrong_storage_class_is_never_enlisted() {
     );
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let running = inspect::running(&reader, WORKFLOW_NAME).expect("the query still answers");
     assert!(enlisted(&running, "good"), "a readable task is enlisted");
     assert!(
@@ -3299,7 +3299,7 @@ fn a_goal_of_unicode_space_is_refused_as_submit_refuses_it() {
         .expect("the session is recorded");
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let running = inspect::running(&reader, WORKFLOW_NAME).expect("the query runs");
     let unicode_goal = |exec: &str| {
         running
@@ -3454,9 +3454,8 @@ fn a_directory_entry_holding_a_line_break_is_counted_and_not_named() {
 ///
 /// An index on the workflow name cannot answer `ORDER BY rowid`. A lookup
 /// through it therefore sorts every matching session in a temporary B-tree
-/// before the LIMIT applies. Matching the name by its bytes takes it out of
-/// the planner's index choice, which leaves the rowid walk the listing
-/// already wants.
+/// before the LIMIT applies. The session listing now runs in the backend,
+/// and `autumn-harvest-sqlite` carries its plan test (issue #2027).
 ///
 /// The test reads the PRODUCTION query strings and asks the database how it
 /// would run them. The fixture carries the schema shapes and the index the
@@ -3466,11 +3465,7 @@ fn a_directory_entry_holding_a_line_break_is_counted_and_not_named() {
 fn every_paged_query_is_planned_as_a_seek() {
     let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
     conn.execute_batch(
-        "CREATE TABLE harvest_executions (exec_id TEXT, workflow_name TEXT, \
-         workflow_id TEXT, state TEXT, input_json TEXT, output_json TEXT, error TEXT);
-         CREATE INDEX idx_harvest_executions_key \
-             ON harvest_executions (workflow_name, workflow_id);
-         CREATE TABLE harvest_events (exec_id TEXT NOT NULL, seq INTEGER NOT NULL, \
+        "CREATE TABLE harvest_events (exec_id TEXT NOT NULL, seq INTEGER NOT NULL, \
          event_json TEXT NOT NULL, PRIMARY KEY (exec_id, seq));",
     )
     .expect("the fixture schema is created");
@@ -3488,7 +3483,6 @@ fn every_paged_query_is_planned_as_a_seek() {
     };
 
     let top = crate::inspect::no_cursor(None);
-    let turn_ceiling = i64::from(u32::MAX);
     let cases = [
         (
             "events",
@@ -3516,20 +3510,6 @@ fn every_paged_query_is_planned_as_a_seek() {
             crate::inspect::UNCLASSIFIED_AFTER_QUERY,
             vec![&"exec-1" as &dyn rusqlite::ToSql, &7_i64],
             "seq>?",
-        ),
-        (
-            "sessions",
-            crate::inspect::SESSIONS_QUERY,
-            vec![
-                &"agent_session" as &dyn rusqlite::ToSql,
-                &201_i64,
-                &2000_i64,
-                &top,
-                &crate::inspect::COUNTER_CEILING,
-                &turn_ceiling,
-                &crate::inspect::TIMEOUT_CEILING,
-            ],
-            "rowid<?",
         ),
     ];
     for (name, sql, params, bound) in cases {
@@ -3893,7 +3873,7 @@ fn a_damaged_row_does_not_hide_the_listing() {
         .expect("the damaged report is recorded");
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
     assert_eq!(listed.len(), 3, "every row is still named");
     let row = |exec: &str| listed_row(&listed, exec);
@@ -3971,7 +3951,7 @@ fn a_row_that_cannot_be_read_is_read_as_nothing() {
         .expect("the surrogate row is recorded");
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
     assert_eq!(listed.len(), 3, "every row is still named");
     let row = |exec: &str| listed_row(&listed, exec);
@@ -4068,7 +4048,7 @@ fn a_listed_document_in_the_wrong_storage_class_reads_as_nothing() {
     );
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
     assert_eq!(listed.len(), 3, "every row is still named");
     let row = |exec: &str| listed_row(&listed, exec);
@@ -4157,7 +4137,7 @@ fn a_listed_counter_outside_the_rust_range_is_no_report() {
     }
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
     let row = |exec: &str| listed_row(&listed, exec);
     assert_eq!(
@@ -4262,7 +4242,7 @@ fn a_listed_field_of_malformed_bytes_is_not_shown_as_its_prefix() {
     );
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
     let row = listed_row(&listed, "bad-suffix");
     assert!(
@@ -5335,7 +5315,7 @@ fn a_listing_shows_a_goal_that_holds_a_nul() {
         .expect("the session is recorded");
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
     let row = listed.first().expect("the session is listed");
     assert_eq!(
@@ -6156,7 +6136,7 @@ fn a_listing_walks_back_through_its_cursor() {
     }
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let all = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing reads");
     assert_eq!(all.len(), 5, "the fixture holds five sessions");
     assert_eq!(
@@ -6228,7 +6208,7 @@ fn a_full_page_carries_its_cursor() {
     }
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let parked = daemon::Parked::new();
     let (shown, more, older) =
         daemon::sessions(&reader, &parked, false, None).expect("the listing reads");
@@ -12743,8 +12723,14 @@ fn a_refusal_the_api_sends_is_accepted() {
 ///
 /// The listing showed a plausible prefix for bytes nobody wrote, and called
 /// the row sound, while the status refused the same field.
+///
+/// Since issue #2027 the listing decodes each field whole, so no byte budget
+/// exists. The two fixtures keep the old budget as their size, because that
+/// is the edge the fault lived at.
 #[test]
 fn a_cut_is_proven_by_the_length_and_not_by_the_size() {
+    // The byte budget the listing once asked the database for.
+    const OLD_LISTED_BYTES: usize = (inspect::MAX_LISTED_CHARS as usize + 1) * 4;
     let dir = tempfile::tempdir().expect("a temporary directory");
     let db = dir.path().join("cuts.db");
     let writer = rusqlite::Connection::open(&db).expect("the database opens");
@@ -12752,13 +12738,11 @@ fn a_cut_is_proven_by_the_length_and_not_by_the_size() {
 
     // EXACTLY the budget, ending inside a character. Nothing follows it, so
     // no cut happened and the broken tail is damage.
-    let mut exact = "x"
-        .repeat(inspect::MAX_LISTED_BYTES as usize - 1)
-        .into_bytes();
+    let mut exact = "x".repeat(OLD_LISTED_BYTES - 1).into_bytes();
     exact.push(0xE2);
     // LONGER than the budget, and every character whole. The database cuts
     // it, and the cut lands inside the last character it returns.
-    let long = "é".repeat(inspect::MAX_LISTED_BYTES as usize).into_bytes();
+    let long = "é".repeat(OLD_LISTED_BYTES).into_bytes();
     for (exec, bytes) in [("exact", &exact), ("long", &long)] {
         writer
             .execute(
