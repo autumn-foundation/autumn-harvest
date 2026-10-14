@@ -8,6 +8,10 @@
 //! Each JSON body is an [`Envelope`] with a protocol version. The host sends
 //! [`HostMessage`] values, and the guest answers with [`GuestMessage`]
 //! values. One connection carries one exchange.
+//!
+//! A run takes four frames. The host sends `run`. The guest answers `ready`
+//! when it has decoded and checked the plan. The host then sends `start`
+//! with its clock, and the guest answers with the outcome.
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -43,6 +47,8 @@ pub enum HostMessage {
     Ping,
     /// Run a plan. Boxed, because a plan is large and a ping is empty.
     Run(Box<RunMessage>),
+    /// Start the run, after the guest answers [`GuestMessage::Ready`].
+    Start(StartMessage),
 }
 
 /// The body of [`HostMessage::Run`].
@@ -55,12 +61,19 @@ pub struct RunMessage {
     /// its kernel random pool before the code runs, so two microVMs restored
     /// from one snapshot do not share random state.
     pub entropy: String,
-    /// The host wall clock, in milliseconds since the Unix epoch. The guest
-    /// sets its clock from it, because a microVM restored from a snapshot
-    /// starts with the clock of the snapshot.
-    pub unix_time_ms: u64,
     /// The plan to run.
     pub plan: ExecPlan,
+}
+
+/// The body of [`HostMessage::Start`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartMessage {
+    /// The host wall clock, in milliseconds since the Unix epoch. The guest
+    /// sets its clock from it, because a microVM restored from a snapshot
+    /// starts with the clock of the snapshot. The host takes it after the
+    /// guest decoded the request, so a slow transfer does not delay it.
+    pub unix_time_ms: u64,
 }
 
 /// A message from the guest to the host.
@@ -74,6 +87,8 @@ pub struct RunMessage {
 pub enum GuestMessage {
     /// The guest agent is ready.
     Pong,
+    /// The guest decoded and checked the run, and waits for the start.
+    Ready(ReadyMessage),
     /// The outcome of a run.
     Outcome(OutcomeMessage),
     /// The guest could not run the plan.
@@ -143,6 +158,9 @@ impl<'de> serde::de::Visitor<'de> for GuestMessageVisitor {
         } = fields;
         match (kind.as_deref(), run_id, outcome, error_kind, message) {
             (Some("pong"), None, None, None, None) => Ok(GuestMessage::Pong),
+            (Some("ready"), Some(run_id), None, None, None) => {
+                Ok(GuestMessage::Ready(ReadyMessage { run_id }))
+            }
             (Some("outcome"), Some(run_id), Some(outcome), None, None) => {
                 Ok(GuestMessage::Outcome(OutcomeMessage { run_id, outcome }))
             }
@@ -154,12 +172,12 @@ impl<'de> serde::de::Visitor<'de> for GuestMessageVisitor {
                 }))
             }
             (None, ..) => Err(A::Error::missing_field("type")),
-            (Some(kind @ ("pong" | "outcome" | "error")), ..) => Err(A::Error::custom(format!(
-                "a guest {kind} message has the wrong fields"
-            ))),
+            (Some(kind @ ("pong" | "ready" | "outcome" | "error")), ..) => Err(A::Error::custom(
+                format!("a guest {kind} message has the wrong fields"),
+            )),
             (Some(other), ..) => Err(A::Error::unknown_variant(
                 other,
-                &["pong", "outcome", "error"],
+                &["pong", "ready", "outcome", "error"],
             )),
         }
     }
@@ -176,6 +194,14 @@ pub(crate) fn put<T, E: serde::de::Error>(
     }
     *slot = Some(value);
     Ok(())
+}
+
+/// The body of [`GuestMessage::Ready`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadyMessage {
+    /// The id from the run message.
+    pub run_id: String,
 }
 
 /// The body of [`GuestMessage::Outcome`].
@@ -421,10 +447,17 @@ mod tests {
         let run = HostMessage::Run(Box::new(RunMessage {
             run_id: "r1".into(),
             entropy: "00".repeat(32),
-            unix_time_ms: 1_700_000_000_000,
             plan,
         }));
         assert_eq!(round_trip(&envelope(run.clone())).await.message, run);
+        let start = HostMessage::Start(StartMessage {
+            unix_time_ms: 1_700_000_000_000,
+        });
+        assert_eq!(round_trip(&envelope(start.clone())).await.message, start);
+        let ready = GuestMessage::Ready(ReadyMessage {
+            run_id: "r1".into(),
+        });
+        assert_eq!(round_trip(&ready).await, ready);
         let ping = envelope(HostMessage::Ping);
         assert_eq!(
             serde_json::to_value(&ping).unwrap(),
@@ -599,6 +632,8 @@ mod tests {
     fn a_guest_message_with_the_wrong_fields_is_refused() {
         for text in [
             r#"{"type":"pong","run_id":"r1"}"#.to_owned(),
+            r#"{"type":"ready"}"#.to_owned(),
+            r#"{"type":"ready","run_id":"r1","kind":"internal"}"#.to_owned(),
             r#"{"type":"outcome","run_id":"r1"}"#.to_owned(),
             r#"{"type":"error","run_id":"r1","kind":"internal"}"#.to_owned(),
             r#"{"type":"shell"}"#.to_owned(),

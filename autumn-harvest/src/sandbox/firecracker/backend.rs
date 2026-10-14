@@ -21,8 +21,8 @@ pub const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The default time that the guest gets on top of the wall-clock limit to
 /// send its outcome.
 ///
-/// The guest decodes the request and writes the input files. After the run,
-/// it waits up to two seconds for the pipes of the code to close. Then it
+/// The guest writes the input files. After the run, it waits up to two
+/// seconds for the pipes of the code to close. Then it
 /// waits up to two seconds for the run cgroup to empty, reads the outputs,
 /// removes the work tree and sends the outcome. The grace covers each step.
 pub const DEFAULT_RESPONSE_GRACE: Duration = Duration::from_secs(15);
@@ -42,8 +42,8 @@ pub const WORK_REMOVE_ALLOWANCE: Duration = Duration::from_secs(2);
 /// The shortest response grace.
 ///
 /// It holds the guest pipe wait, the run cgroup wait and the removal of the
-/// work tree. It adds one frame allowance to decode the request and write
-/// the input files, and one to read the outputs and send the outcome.
+/// work tree. It adds one frame allowance to write the input files, and one
+/// to read the outputs and send the outcome.
 pub const MIN_RESPONSE_GRACE: Duration = crate::sandbox::exec::PIPE_DRAIN_GRACE
     .saturating_add(crate::sandbox::exec::CGROUP_WAIT)
     .saturating_add(WORK_REMOVE_ALLOWANCE)
@@ -196,10 +196,10 @@ impl FirecrackerBackend {
 
 /// Send `job` on `stream` and wait for its outcome.
 ///
-/// The request write has its own limit, `send_limit`. The outcome `budget`
-/// starts when the write ends, so a large request takes no time from the
-/// code. A write ends only when the guest has read all but the socket
-/// buffer.
+/// The request has its own limit, `send_limit`. It covers the write, the
+/// guest decode, the ready answer and the start message. The outcome
+/// `budget` starts after the start, so a large request takes no time from
+/// the code.
 async fn exchange<S>(
     stream: &mut S,
     job: &SandboxJob,
@@ -409,8 +409,8 @@ mod tests {
 
     #[test]
     fn the_minimum_grace_covers_the_guest_setup_and_cleanup() {
-        // One frame for the request decode and the input files, one for the
-        // outputs and the outcome frame.
+        // One frame for the input files, one for the outputs and the
+        // outcome frame.
         let need = crate::sandbox::exec::PIPE_DRAIN_GRACE
             + crate::sandbox::exec::CGROUP_WAIT
             + WORK_REMOVE_ALLOWANCE
@@ -716,14 +716,15 @@ mod tests {
     }
 
     /// A guest on `stream` that waits `before_read`, reads the request,
-    /// waits `before_reply`, and sends an outcome.
+    /// takes the start, waits `before_reply`, and sends an outcome.
     fn slow_guest(
         mut stream: tokio::io::DuplexStream,
         before_read: Duration,
         before_reply: Duration,
     ) -> tokio::task::JoinHandle<()> {
         use crate::sandbox::protocol::{
-            GuestMessage, HostMessage, MAX_FRAME_BYTES, OutcomeMessage, read_message, write_message,
+            GuestMessage, HostMessage, MAX_CONTROL_FRAME_BYTES, MAX_FRAME_BYTES, OutcomeMessage,
+            ReadyMessage, read_message, write_message,
         };
         tokio::spawn(async move {
             tokio::time::sleep(before_read).await;
@@ -731,6 +732,16 @@ mod tests {
             let HostMessage::Run(run) = message else {
                 panic!("not a run");
             };
+            let ready = GuestMessage::Ready(ReadyMessage {
+                run_id: run.run_id.clone(),
+            });
+            write_message(&mut stream, ready, MAX_FRAME_BYTES)
+                .await
+                .unwrap();
+            let start: HostMessage = read_message(&mut stream, MAX_CONTROL_FRAME_BYTES)
+                .await
+                .unwrap();
+            assert!(matches!(start, HostMessage::Start(_)), "{start:?}");
             tokio::time::sleep(before_reply).await;
             let outcome = SandboxOutcome {
                 status: RunStatus::Exited { code: 0 },

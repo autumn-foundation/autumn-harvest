@@ -13,8 +13,8 @@ use super::error::SandboxError;
 use super::outcome::{MAX_SKIP_REASON_BYTES, SandboxOutcome, shown};
 use super::protocol::{
     FrameError, GuestErrorKind, GuestErrorMessage, GuestMessage, HostMessage,
-    MAX_CONTROL_FRAME_BYTES, MAX_FRAME_BYTES, OutcomeMessage, PROTOCOL_VERSION, RunMessage,
-    read_message, write_message,
+    MAX_CONTROL_FRAME_BYTES, MAX_FRAME_BYTES, OutcomeMessage, PROTOCOL_VERSION, ReadyMessage,
+    RunMessage, StartMessage, read_message, write_message,
 };
 use super::request::ExecPlan;
 use super::runtime::{BoxFuture, SandboxJob};
@@ -170,8 +170,18 @@ where
             return Ok(Served::Ping);
         }
         HostMessage::Run(run) => run,
+        HostMessage::Start(_) => {
+            let reason = "a start message came before a run".to_owned();
+            let reply = GuestMessage::Error(GuestErrorMessage {
+                run_id: String::new(),
+                kind: GuestErrorKind::InvalidPlan,
+                message: reason.clone(),
+            });
+            let _ = write_message(stream, reply, MAX_CONTROL_FRAME_BYTES).await;
+            return Err(FrameError::Malformed(reason));
+        }
     };
-    let reply = match run_plan(&run, executor, kernel).await {
+    let reply = match run_plan(&run, stream, executor, kernel).await {
         Ok(outcome) => GuestMessage::Outcome(OutcomeMessage {
             run_id: run.run_id,
             outcome,
@@ -188,12 +198,17 @@ where
     Ok(Served::Run)
 }
 
-/// Check the run, reseed the random pool, set the clock, then run the plan.
-async fn run_plan(
+/// Check the run and reseed the random pool. Then wait for the start, set
+/// the clock, and run the plan.
+async fn run_plan<S>(
     run: &RunMessage,
+    stream: &mut S,
     executor: &dyn PlanExecutor,
     kernel: &dyn GuestKernel,
-) -> Result<SandboxOutcome, (GuestErrorKind, String)> {
+) -> Result<SandboxOutcome, (GuestErrorKind, String)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let entropy = parse_entropy(&run.entropy).map_err(|e| (GuestErrorKind::InvalidPlan, e))?;
     run.plan
         .validate()
@@ -206,7 +221,13 @@ async fn run_plan(
             format!("could not reseed the random pool: {e}"),
         )
     })?;
-    kernel.set_clock(run.unix_time_ms).map_err(|e| {
+    let start = await_start(stream, &run.run_id).await.map_err(|e| {
+        (
+            GuestErrorKind::Internal,
+            format!("the host did not start the run: {e}"),
+        )
+    })?;
+    kernel.set_clock(start.unix_time_ms).map_err(|e| {
         (
             GuestErrorKind::Internal,
             format!("could not set the clock: {e}"),
@@ -220,6 +241,29 @@ async fn run_plan(
             SandboxError::Denied(message) => (GuestErrorKind::SpawnFailed, message),
             other => (GuestErrorKind::Internal, other.to_string()),
         })
+}
+
+/// Tell the host that the run is ready, and read its start message.
+///
+/// # Errors
+///
+/// Returns a message when the stream fails or the host sends another
+/// message.
+async fn await_start<S>(stream: &mut S, run_id: &str) -> Result<StartMessage, String>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let ready = GuestMessage::Ready(ReadyMessage {
+        run_id: run_id.to_owned(),
+    });
+    write_message(stream, ready, MAX_FRAME_BYTES)
+        .await
+        .map_err(|e| e.to_string())?;
+    match read_message(stream, MAX_CONTROL_FRAME_BYTES).await {
+        Ok(HostMessage::Start(start)) => Ok(start),
+        Ok(_) => Err("the host sent another message in place of the start".into()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Parse 64 lowercase hex characters into 32 bytes.
@@ -302,25 +346,41 @@ where
     read_outcome(stream, job).await
 }
 
-/// Send the run request of `job` to the guest.
+/// Send the run request of `job` to the guest, and start the run.
+///
+/// The host takes its clock for the start message only after the guest
+/// answers that it decoded the request. So neither the transfer nor the
+/// decode puts the guest clock behind.
 ///
 /// # Errors
 ///
-/// Returns [`SandboxError::Unavailable`] when the stream fails, and
-/// [`SandboxError::Denied`] when the request is too large.
+/// - [`SandboxError::Unavailable`] when the stream fails, or when the guest
+///   reports an internal error.
+/// - [`SandboxError::Denied`] when the request is too large.
+/// - [`SandboxError::Protocol`] for a malformed or wrong answer, or a
+///   refused plan.
 pub async fn send_run<S>(stream: &mut S, job: &SandboxJob) -> Result<(), SandboxError>
 where
-    S: AsyncWrite + Unpin + Send,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let run = HostMessage::Run(Box::new(RunMessage {
         run_id: job.run_id.clone(),
         entropy: format_entropy(&job.entropy),
-        unix_time_ms: unix_time_ms(),
         plan: job.plan.clone(),
     }));
     write_message(stream, run, MAX_FRAME_BYTES)
         .await
-        .map_err(|e| run_write_error(&e))
+        .map_err(|e| run_write_error(&e))?;
+    match read_reply(stream, job).await? {
+        GuestMessage::Ready(ready) if ready.run_id == job.run_id => {}
+        other => return Err(wrong_reply(other, job)),
+    }
+    let start = HostMessage::Start(StartMessage {
+        unix_time_ms: unix_time_ms(),
+    });
+    write_message(stream, start, MAX_CONTROL_FRAME_BYTES)
+        .await
+        .map_err(|e| SandboxError::Unavailable(format!("could not start the run: {e}")))
 }
 
 /// Read the outcome of `job` from the guest.
@@ -335,34 +395,60 @@ pub async fn read_outcome<S>(
 where
     S: AsyncRead + Unpin + Send,
 {
-    let reply: GuestMessage = read_message(stream, max_outcome_frame_bytes(&job.plan))
+    match read_reply(stream, job).await? {
+        GuestMessage::Outcome(message) if message.run_id == job.run_id => Ok(message.outcome),
+        other => Err(wrong_reply(other, job)),
+    }
+}
+
+/// Read one answer of the guest to `job`.
+async fn read_reply<S>(stream: &mut S, job: &SandboxJob) -> Result<GuestMessage, SandboxError>
+where
+    S: AsyncRead + Unpin + Send,
+{
+    read_message(stream, max_outcome_frame_bytes(&job.plan))
         .await
         .map_err(|e| match e {
             FrameError::Closed | FrameError::Io(_) => SandboxError::Unavailable(format!(
-                "the guest closed the connection without an outcome: {e}"
+                "the guest closed the connection without an answer: {e}"
             )),
             FrameError::TooLarge { .. } | FrameError::Malformed(_) => {
-                SandboxError::Protocol(format!("bad outcome frame: {e}"))
+                SandboxError::Protocol(format!("bad guest frame: {e}"))
             }
-        })?;
+        })
+}
+
+/// The error for a guest answer that is not the one the host waits for.
+fn wrong_reply(reply: GuestMessage, job: &SandboxJob) -> SandboxError {
     match reply {
-        GuestMessage::Outcome(message) if message.run_id == job.run_id => Ok(message.outcome),
-        GuestMessage::Outcome(message) => Err(SandboxError::Protocol(format!(
-            "the outcome has run id {}, not {:?}",
-            shown(&message.run_id),
-            job.run_id
-        ))),
-        GuestMessage::Error(error) if error.run_id.is_empty() => Err(SandboxError::Protocol(
-            format!("the guest refused the request: {}", clean(&error.message)),
+        GuestMessage::Ready(ReadyMessage { run_id })
+        | GuestMessage::Outcome(OutcomeMessage { run_id, .. })
+            if run_id != job.run_id =>
+        {
+            SandboxError::Protocol(format!(
+                "the answer has run id {}, not {:?}",
+                shown(&run_id),
+                job.run_id
+            ))
+        }
+        GuestMessage::Ready(_) => {
+            SandboxError::Protocol("the guest sent a second ready message".into())
+        }
+        GuestMessage::Outcome(_) => {
+            SandboxError::Protocol("the guest sent an outcome before the start".into())
+        }
+        GuestMessage::Error(error) if error.run_id.is_empty() => SandboxError::Protocol(format!(
+            "the guest refused the request: {}",
+            clean(&error.message)
         )),
         GuestMessage::Error(error) if error.run_id != job.run_id => {
-            Err(SandboxError::Protocol(format!(
+            SandboxError::Protocol(format!(
                 "the error has run id {}, not {:?}",
                 shown(&error.run_id),
                 job.run_id
-            )))
+            ))
         }
-        GuestMessage::Error(error) => Err(match error.kind {
+        GuestMessage::Error(error) => match error.kind {
             GuestErrorKind::InvalidPlan => SandboxError::Protocol(format!(
                 "the guest refused the plan: {}",
                 clean(&error.message)
@@ -371,10 +457,8 @@ where
             GuestErrorKind::Internal => {
                 SandboxError::Unavailable(format!("the guest failed: {}", clean(&error.message)))
             }
-        }),
-        GuestMessage::Pong => Err(SandboxError::Protocol(
-            "the guest answered a run with a pong".into(),
-        )),
+        },
+        GuestMessage::Pong => SandboxError::Protocol("the guest answered a run with a pong".into()),
     }
 }
 
@@ -530,6 +614,46 @@ mod tests {
         assert_eq!(log, ["reseed 7", "clock near=true", "execute sh main.sh"]);
     }
 
+    /// A guest kernel that keeps the clock that it gets.
+    #[derive(Default)]
+    struct ClockKernel(Mutex<Option<u64>>);
+
+    impl GuestKernel for ClockKernel {
+        fn reseed(&self, _entropy: &[u8; 32]) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn set_clock(&self, unix_time_ms: u64) -> std::io::Result<()> {
+            *self.0.lock().unwrap() = Some(unix_time_ms);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_clock_is_taken_after_the_request_transfer() {
+        // A small pipe makes the request write wait until the guest reads.
+        let (mut host, mut guest) = tokio::io::duplex(64);
+        let kernel = Arc::new(ClockKernel::default());
+        let guest_kernel = Arc::clone(&kernel);
+        let sent = unix_time_ms();
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let executor = Recorder {
+                events: Arc::default(),
+                answer: Ok(outcome(RunStatus::Exited { code: 0 })),
+            };
+            serve_connection(&mut guest, &executor, guest_kernel.as_ref()).await
+        });
+        request_run(&mut host, &job()).await.unwrap();
+        assert_eq!(server.await.unwrap().unwrap(), Served::Run);
+        let clock = kernel.0.lock().unwrap().expect("the guest set its clock");
+        assert!(
+            clock >= sent + 500,
+            "the guest clock is {} ms behind the host",
+            (sent + 500).saturating_sub(clock)
+        );
+    }
+
     #[tokio::test]
     async fn a_failed_reseed_stops_the_run() {
         let (result, log) =
@@ -567,13 +691,24 @@ mod tests {
         assert!(matches!(result, Err(SandboxError::Unavailable(_))));
     }
 
-    /// A fake guest that reads the request and answers with `reply`.
+    /// A fake guest that takes the request, waits for the start, and
+    /// answers with `reply`.
     async fn fake_guest_reply<T: serde::Serialize + Send + Sync + 'static>(
         reply: T,
     ) -> Result<SandboxOutcome, SandboxError> {
         let (mut host, mut guest) = tokio::io::duplex(1 << 20);
         let server = tokio::spawn(async move {
             let _: HostMessage = read_message(&mut guest, MAX_FRAME_BYTES).await.unwrap();
+            let ready = GuestMessage::Ready(ReadyMessage {
+                run_id: "run-1".into(),
+            });
+            write_message(&mut guest, ready, MAX_FRAME_BYTES)
+                .await
+                .unwrap();
+            let start: HostMessage = read_message(&mut guest, MAX_CONTROL_FRAME_BYTES)
+                .await
+                .unwrap();
+            assert!(matches!(start, HostMessage::Start(_)), "{start:?}");
             write_frame(&mut guest, &reply, MAX_FRAME_BYTES)
                 .await
                 .unwrap();
@@ -581,6 +716,52 @@ mod tests {
         let result = request_run(&mut host, &job()).await;
         server.await.unwrap();
         result
+    }
+
+    #[tokio::test]
+    async fn an_outcome_before_the_start_is_a_protocol_violation() {
+        let (mut host, mut guest) = tokio::io::duplex(1 << 20);
+        let server = tokio::spawn(async move {
+            let _: HostMessage = read_message(&mut guest, MAX_FRAME_BYTES).await.unwrap();
+            let early = GuestMessage::Outcome(OutcomeMessage {
+                run_id: "run-1".into(),
+                outcome: outcome(RunStatus::Exited { code: 0 }),
+            });
+            write_message(&mut guest, early, MAX_FRAME_BYTES)
+                .await
+                .unwrap();
+        });
+        let result = request_run(&mut host, &job()).await;
+        server.await.unwrap();
+        assert!(
+            matches!(result, Err(SandboxError::Protocol(ref m)) if m.contains("before the start")),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_start_without_a_run_is_refused() {
+        let (mut host, mut guest) = tokio::io::duplex(4096);
+        let executor = Recorder {
+            events: Arc::default(),
+            answer: Ok(outcome(RunStatus::Exited { code: 0 })),
+        };
+        let server =
+            tokio::spawn(
+                async move { serve_connection(&mut guest, &executor, &UnmanagedKernel).await },
+            );
+        let start = HostMessage::Start(StartMessage { unix_time_ms: 0 });
+        write_message(&mut host, start, MAX_CONTROL_FRAME_BYTES)
+            .await
+            .unwrap();
+        let reply: GuestMessage = read_message(&mut host, MAX_CONTROL_FRAME_BYTES)
+            .await
+            .unwrap();
+        assert!(
+            matches!(reply, GuestMessage::Error(ref e) if e.run_id.is_empty()),
+            "{reply:?}"
+        );
+        assert!(server.await.unwrap().is_err());
     }
 
     #[tokio::test]
@@ -647,7 +828,6 @@ mod tests {
         let run = HostMessage::Run(Box::new(RunMessage {
             run_id: "run-1".into(),
             entropy: "00".repeat(32),
-            unix_time_ms: 0,
             plan: job().plan,
         }));
         write_message(&mut host, run, MAX_FRAME_BYTES)
@@ -737,7 +917,6 @@ mod tests {
         let run = HostMessage::Run(Box::new(RunMessage {
             run_id: job.run_id,
             entropy: "not-hex".into(),
-            unix_time_ms: 0,
             plan: job.plan,
         }));
         write_message(&mut host, run, MAX_FRAME_BYTES)

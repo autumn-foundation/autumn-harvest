@@ -240,8 +240,10 @@ sudo install -o root -g root -m 0644 image/vmlinux image/rootfs.ext4 /srv/harves
 The guest agent is process 1. It mounts `/proc`, `/sys`, the cgroup v2 file
 system, `/dev`, `/tmp` and a `/work` tmpfs. It listens on vsock port 52. Each
 run mixes 32 bytes of host entropy into the kernel pool and forces a reseed.
-Each run also sets the guest clock from the host clock. Then the agent runs
-the code as uid 1000 and reboots, and Firecracker exits.
+Each run also sets the guest clock from the host clock. The host reads its
+clock only after the guest has decoded the request, so a slow transfer does
+not put the guest clock behind. Then the agent runs the code as uid 1000 and
+reboots, and Firecracker exits.
 
 Each run gets its own cgroup in the guest. So `cpu_seconds` bounds the CPU
 time of all processes of the run together. When the run passes it, the agent

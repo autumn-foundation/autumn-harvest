@@ -36,7 +36,10 @@ pub fn write_executable(path: &Path, contents: &str) {
 }
 use crate::sandbox::error::SandboxError;
 use crate::sandbox::guest::{PlanExecutor, Served, UnmanagedKernel, serve_connection};
-use crate::sandbox::protocol::{HostMessage, MAX_FRAME_BYTES, read_message};
+use crate::sandbox::protocol::{
+    GuestMessage, HostMessage, MAX_CONTROL_FRAME_BYTES, MAX_FRAME_BYTES, ReadyMessage,
+    read_message, write_message,
+};
 use crate::sandbox::runtime::BoxFuture;
 
 /// How a fake guest behaves.
@@ -48,7 +51,8 @@ pub enum GuestMode {
     NeverListen,
     /// Accept, then send a frame that is not JSON.
     Garbage,
-    /// Accept, read the request, and never answer.
+    /// Accept and read the request. Take a run, then never send its
+    /// outcome. Never answer a ping.
     Hang,
     /// The VMM process has exited.
     Exited,
@@ -211,6 +215,14 @@ fn spawn_muxer(path: &Path, mode: GuestMode, executor: Arc<dyn PlanExecutor>) ->
                 }
                 GuestMode::Hang => {
                     let _ = stream.write_all(b"OK 1073741824\n").await;
+                    if let Ok(HostMessage::Run(run)) =
+                        read_message(&mut stream, MAX_FRAME_BYTES).await
+                    {
+                        let ready = GuestMessage::Ready(ReadyMessage { run_id: run.run_id });
+                        let _ = write_message(&mut stream, ready, MAX_FRAME_BYTES).await;
+                        let _: Result<HostMessage, _> =
+                            read_message(&mut stream, MAX_CONTROL_FRAME_BYTES).await;
+                    }
                     let mut sink = Vec::new();
                     let _ = stream.read_to_end(&mut sink).await;
                 }
