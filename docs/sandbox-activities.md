@@ -299,7 +299,9 @@ removes the jail. It runs after success, error, timeout and cancel. It also
 runs when the caller drops the run future. The host never reads a pid from
 the jail. A cgroup that is still there after the teardown stays with the
 launcher. The launcher kills and removes it again before each launch and in
-each `sweep_stale`.
+each `sweep_stale`. Each microVM holds the launcher lease until its teardown
+ends, so a teardown that outlives the launcher keeps its owner live. The lease
+file stays while a cgroup is left, so a later sweep removes the cgroup.
 
 Each launcher holds a lease file next to its VM directories. `sweep_stale`
 removes the microVMs and the cgroups of each owner whose lease is not locked.
