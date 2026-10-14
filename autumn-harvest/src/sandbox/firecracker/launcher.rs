@@ -595,17 +595,27 @@ impl FirecrackerLauncher {
         };
         let mut vm_dirs = Vec::new();
         let mut leases = Vec::new();
-        for entry in entries.filter_map(Result::ok) {
+        // A scan that fails can miss a VM directory, so each dead lease stays.
+        let mut complete = true;
+        for entry in entries {
+            let Ok(entry) = entry else {
+                complete = false;
+                continue;
+            };
             let name = entry.file_name().to_string_lossy().into_owned();
             let Some(rest) = name.strip_prefix(VM_ID_PREFIX) else {
                 continue;
             };
             if let Some(owner) = rest.strip_suffix(LEASE_SUFFIX) {
                 leases.push((owner.to_owned(), entry.path()));
-            } else if let Some((owner, _)) = rest.split_once('-')
-                && entry.file_type().is_ok_and(|t| t.is_dir())
-            {
-                vm_dirs.push((owner.to_owned(), name.clone(), entry.path()));
+            } else if let Some((owner, _)) = rest.split_once('-') {
+                match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => {
+                        vm_dirs.push((owner.to_owned(), name.clone(), entry.path()));
+                    }
+                    Ok(_) => {}
+                    Err(_) => complete = false,
+                }
             }
         }
         // An owner is live when another process holds its lease lock. An
@@ -639,6 +649,9 @@ impl FirecrackerLauncher {
             .collect();
         // The owners that still have a VM directory or a cgroup.
         let mut left = std::collections::BTreeSet::new();
+        if !complete {
+            left.extend(dead.iter().cloned());
+        }
         let mut removed = 0;
         for (owner, vm_id, path) in vm_dirs {
             if live.contains(&owner) {
@@ -670,6 +683,10 @@ impl FirecrackerLauncher {
     /// Kill and remove each cgroup of a `dead` owner. A dropped microVM can
     /// leave its cgroup after its jail is gone. Add each owner with a cgroup
     /// that is still there to `left`.
+    ///
+    /// A scan that fails can miss a cgroup. Then each dead owner goes to
+    /// `left`, so its lease stays for a later sweep. A parent that is surely
+    /// absent holds no cgroup.
     fn sweep_cgroups(
         &self,
         dead: &std::collections::BTreeSet<String>,
@@ -679,7 +696,19 @@ impl FirecrackerLauncher {
             return;
         };
         let parent = jailer.cgroup_root.join(&jailer.cgroup_parent);
-        for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+        let entries = match std::fs::read_dir(&parent) {
+            Ok(entries) => entries,
+            Err(_) if crate::sandbox::cgroup::is_gone(&parent) => return,
+            Err(_) => {
+                left.extend(dead.iter().cloned());
+                return;
+            }
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                left.extend(dead.iter().cloned());
+                continue;
+            };
             let name = entry.file_name().to_string_lossy().into_owned();
             let Some((owner, _)) = name
                 .strip_prefix(VM_ID_PREFIX)
@@ -2941,6 +2970,28 @@ while True:
             b"",
             "the sweep killed a cgroup of another VM root"
         );
+        drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_cgroup_scan_that_fails_keeps_the_dead_leases() {
+        let dir = temp_dir();
+        let config = jailed(&dir);
+        let parent = cgroup_parent(&config);
+        let launcher = new_launcher(config).unwrap();
+        let lease = launcher.vm_root().join("hsbx-deadbeef.lease");
+        std::fs::write(&lease, b"").unwrap();
+        // A file in place of the cgroup parent makes the scan fail.
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir_all(parent.parent().unwrap()).unwrap();
+        std::fs::write(&parent, b"").unwrap();
+        launcher.sweep_stale();
+        assert!(lease.exists(), "a failed scan dropped a dead lease");
+        // A cgroup parent that is absent holds no cgroup.
+        std::fs::remove_file(&parent).unwrap();
+        launcher.sweep_stale();
+        assert!(!lease.exists(), "the sweep kept the lease of a dead owner");
         drop(launcher);
         std::fs::remove_dir_all(dir).unwrap();
     }
