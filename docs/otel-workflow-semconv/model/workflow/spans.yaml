@@ -22,7 +22,7 @@ groups:
         sampling_relevant: true
       - ref: workflow.run.id
         requirement_level:
-          conditionally_required: If the engine knows the run id when the span starts.
+          conditionally_required: If the run id is available before the span ends.
       - ref: workflow.queue.name
         requirement_level: recommended
       - ref: error.type
@@ -82,7 +82,7 @@ groups:
         sampling_relevant: true
       - ref: workflow.run.id
         requirement_level:
-          conditionally_required: If the engine knows the child run id when the span starts.
+          conditionally_required: If the child run id is available before the span ends.
 
   - id: span.workflow.schedule_activity.producer
     type: span

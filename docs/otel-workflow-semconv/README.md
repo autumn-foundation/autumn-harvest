@@ -101,9 +101,10 @@ attribute.
 | `span.workflow.deliver_signal.consumer` | `CONSUMER` | `deliver_signal {workflow.name}` | system, operation, name, run id |
 | `span.workflow.fire_timer.internal` | `INTERNAL` | `fire_timer` | system, operation, run id |
 
-A run id is conditionally required where an engine can lack it when the
-span starts. Examples are a start that the server refuses, and a signal to
-a workflow id with no run id.
+A run id is conditionally required where an engine can lack it. The span
+MUST carry the run id when the id is available before the span ends. A
+start that the server refuses has no run id. A signal to a workflow id can
+have no run id.
 
 The parent rules follow the kinds:
 
