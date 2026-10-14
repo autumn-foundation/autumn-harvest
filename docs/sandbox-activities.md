@@ -227,7 +227,8 @@ runtime refuses a policy that allows the network on a backend without one.
 - Extra cgroup values in `JailerConfig::extra_cgroups` that name plain
   controller files. The launcher refuses `cpu.max`, `memory.max`,
   `memory.swap.max`, `pids.max` and the `cgroup.` core files, because it sets
-  the limits itself.
+  the limits itself. The jailer gets each value as an argument. So the
+  launcher also refuses values that do not fit the exec limits.
 
 Call `verify_host` before the first run. It checks the versions and the host,
 including cgroup v2 at `JailerConfig::cgroup_root`. Under
@@ -376,7 +377,9 @@ is outside the cgroup of a systemd service by default. So a stop of the
 service does not kill the microVMs, but the next `sweep_stale` does. To tie
 them to the service, set `Delegate=yes`. Then set `cgroup_parent` to a cgroup
 inside the service subtree. The worker process must then run in a leaf of that
-subtree, because cgroup v2 keeps processes only in leaves.
+subtree, because cgroup v2 keeps processes only in leaves. Each component of
+`cgroup_parent` must fit a file name (255 bytes), and each VM cgroup file must
+fit a path (4095 bytes).
 
 ### Speed
 

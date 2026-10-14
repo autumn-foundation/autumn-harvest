@@ -6,8 +6,27 @@
 
 use std::path::{Path, PathBuf};
 
-use super::config::MachineSpec;
+use super::config::{MachineSpec, OWNER_TAG_HEX, VM_ID_PREFIX, VM_ID_RANDOM_HEX};
 use crate::sandbox::error::SandboxError;
+use crate::sandbox::request::{MAX_EXEC_STRING_BYTES, MAX_NAME_BYTES};
+
+/// The Linux `PATH_MAX`: the longest path, with its NUL.
+const PATH_MAX: usize = 4096;
+
+/// The bytes that exec adds to each string: a NUL and a pointer.
+const EXEC_STRING_OVERHEAD: usize = 1 + 8;
+
+/// The longest name of a cgroup core file that the jailer writes.
+const LONGEST_CORE_FILE: &str = "cgroup.subtree_control";
+
+/// A VM id as long as each id that [`super::config::new_vm_id`] makes.
+fn longest_vm_id() -> String {
+    format!(
+        "{VM_ID_PREFIX}{}-{}",
+        "0".repeat(OWNER_TAG_HEX),
+        "0".repeat(VM_ID_RANDOM_HEX)
+    )
+}
 
 /// The default chroot base of the jailer.
 pub const DEFAULT_CHROOT_BASE: &str = "/srv/jailer";
@@ -202,15 +221,19 @@ pub fn check_limits(config: &JailerConfig) -> Result<(), SandboxError> {
     }
 }
 
-/// Check that `cgroup_parent` names a cgroup below `cgroup_root`.
+/// Check that `cgroup_parent` names a cgroup below `cgroup_root` that the
+/// jailer can make.
 ///
 /// The jailer takes it as a path relative to the hierarchy, and teardown
 /// joins it to `cgroup_root`. An absolute path or `..` would leave the
-/// hierarchy, so the parent must be plain path components.
+/// hierarchy, so the parent must be plain path components. The jailer makes
+/// each component with `mkdir` and writes each VM cgroup file by path. So
+/// `NAME_MAX` bounds each component, and `PATH_MAX` bounds each file path.
 ///
 /// # Errors
 ///
-/// [`SandboxError::Config`] for a parent that can leave the hierarchy.
+/// [`SandboxError::Config`] for a parent that can leave the hierarchy, or
+/// that is too long for the file system.
 pub fn check_cgroup_parent(config: &JailerConfig) -> Result<(), SandboxError> {
     let parent = &config.cgroup_parent;
     let plain = !parent.is_empty()
@@ -218,14 +241,88 @@ pub fn check_cgroup_parent(config: &JailerConfig) -> Result<(), SandboxError> {
         && Path::new(parent)
             .components()
             .all(|part| matches!(part, std::path::Component::Normal(_)));
-    if plain {
-        Ok(())
-    } else {
-        Err(SandboxError::Config(format!(
+    if !plain {
+        return Err(SandboxError::Config(format!(
             "the cgroup parent {parent:?} must be a relative path of plain names below the \
              cgroup root"
-        )))
+        )));
     }
+    if parent.split('/').any(|part| part.len() > MAX_NAME_BYTES) {
+        return Err(SandboxError::Config(format!(
+            "the cgroup parent has a component longer than the {MAX_NAME_BYTES} bytes of a file \
+             name"
+        )));
+    }
+    let longest_file = config
+        .extra_cgroups
+        .iter()
+        .map(|(key, _)| key.len())
+        .chain(
+            launcher_cgroup_values(MachineSpec::default())
+                .iter()
+                .map(|(key, _)| key.len()),
+        )
+        .chain([LONGEST_CORE_FILE.len()])
+        .max()
+        .unwrap_or(0);
+    let dir = cgroup_dir(config, &longest_vm_id());
+    let longest = dir.as_os_str().len() + 1 + longest_file;
+    if longest > PATH_MAX - 1 {
+        return Err(SandboxError::Config(format!(
+            "the cgroup files of a VM below this cgroup parent have paths of up to {longest} \
+             bytes, over the {} bytes of a path",
+            PATH_MAX - 1
+        )));
+    }
+    Ok(())
+}
+
+/// Check that the jailer command of each launch fits the exec limits.
+///
+/// The check builds the longest command: the longest VM id, a Firecracker
+/// path of `PATH_MAX`, and `firecracker_args`. Exec takes each string up to
+/// `MAX_ARG_STRLEN`, and all strings together up to `allowance`. The spawn
+/// clears the environment, so no variables count. A launch over a limit
+/// fails with `E2BIG` each time, and a retry cannot help.
+///
+/// # Errors
+///
+/// [`SandboxError::Config`] for one string or a whole command over its limit.
+pub fn check_jailer_exec(
+    config: &JailerConfig,
+    machine: MachineSpec,
+    firecracker_args: &[String],
+    allowance: u64,
+) -> Result<(), SandboxError> {
+    let exec_file = "x".repeat(PATH_MAX - 1);
+    let args = jailer_args(
+        config,
+        Path::new(&exec_file),
+        &longest_vm_id(),
+        machine,
+        firecracker_args,
+    );
+    if let Some(arg) = args.iter().find(|arg| arg.len() > MAX_EXEC_STRING_BYTES) {
+        let start: String = arg.chars().take(32).collect();
+        return Err(SandboxError::Config(format!(
+            "the jailer argument {start:?}... is longer than the {MAX_EXEC_STRING_BYTES} bytes \
+             that exec takes for one string"
+        )));
+    }
+    // The jailer path is argv[0], and exec also copies it as the file name.
+    let total = args
+        .iter()
+        .map(String::len)
+        .chain([PATH_MAX - 1, PATH_MAX - 1])
+        .map(|len| u64::try_from(len + EXEC_STRING_OVERHEAD).unwrap_or(u64::MAX))
+        .fold(0, u64::saturating_add);
+    if total > allowance {
+        return Err(SandboxError::Config(format!(
+            "the jailer command takes up to {total} bytes of arguments, over the exec \
+             allowance of {allowance} bytes; shorten the extra cgroup values"
+        )));
+    }
+    Ok(())
 }
 
 /// Check that `cgroup_root` is the cgroup v2 mount of the jailer.
@@ -357,6 +454,71 @@ mod tests {
 
     fn config() -> JailerConfig {
         JailerConfig::new("/usr/bin/jailer", 10_000, 10_000)
+    }
+
+    #[test]
+    fn a_cgroup_parent_must_fit_the_file_system_limits() {
+        let with = |parent: String| JailerConfig {
+            cgroup_parent: parent,
+            ..config()
+        };
+        // The jailer creates each component with mkdir.
+        let err = check_cgroup_parent(&with("a".repeat(256))).expect_err("over NAME_MAX");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("255")),
+            "{err:?}"
+        );
+        check_cgroup_parent(&with("a".repeat(255))).unwrap();
+        // It also writes the files of each VM cgroup by path.
+        let deep = |n: usize| vec!["a".repeat(255); n].join("/");
+        let err = check_cgroup_parent(&with(deep(16))).expect_err("over PATH_MAX");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("4095")),
+            "{err:?}"
+        );
+        check_cgroup_parent(&with(deep(15))).unwrap();
+    }
+
+    /// The Firecracker arguments of a boot from a config file, the longest.
+    fn config_file_args() -> Vec<String> {
+        ["--config-file", "vm-config.json", "--no-api"]
+            .map(str::to_owned)
+            .to_vec()
+    }
+
+    #[test]
+    fn the_jailer_command_must_fit_the_exec_allowance() {
+        let machine = MachineSpec::default();
+        let args = config_file_args();
+        // The default command fits the smallest allowance that Linux gives.
+        let smallest = 128 * 1024;
+        check_jailer_exec(&config(), machine, &args, smallest).unwrap();
+        let mut big = config();
+        for i in 0..4 {
+            big.extra_cgroups
+                .push((format!("io.x{i}"), "1".repeat(40_000)));
+        }
+        let err = check_jailer_exec(&big, machine, &args, smallest).expect_err("160 KB");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("exec allowance")),
+            "{err:?}"
+        );
+        check_jailer_exec(&big, machine, &args, 2 * 1024 * 1024).unwrap();
+    }
+
+    #[test]
+    fn a_jailer_argument_over_max_arg_strlen_is_a_config_error() {
+        let mut config = config();
+        config.extra_cgroups.push((
+            "io.max".into(),
+            "1".repeat(crate::sandbox::request::MAX_EXEC_STRING_BYTES),
+        ));
+        let err = check_jailer_exec(&config, MachineSpec::default(), &[], 6 << 20)
+            .expect_err("one argument too long");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("io.max")),
+            "{err:?}"
+        );
     }
 
     #[test]

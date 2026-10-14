@@ -819,14 +819,19 @@ const fn exec_capacity_for(stack: libc::rlim_t) -> u64 {
     }
 }
 
-/// The hard stack limit of this process, or `None` when it cannot be read.
-fn stack_hard_limit() -> Option<libc::rlim_t> {
+/// The stack limits of this process, or `None` when they cannot be read.
+fn stack_limit() -> Option<libc::rlimit> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
     // SAFETY: getrlimit writes a valid stack value.
-    (unsafe { libc::getrlimit(libc::RLIMIT_STACK, &raw mut limit) } == 0).then_some(limit.rlim_max)
+    (unsafe { libc::getrlimit(libc::RLIMIT_STACK, &raw mut limit) } == 0).then_some(limit)
+}
+
+/// The hard stack limit of this process, or `None` when it cannot be read.
+fn stack_hard_limit() -> Option<libc::rlim_t> {
+    stack_limit().map(|limit| limit.rlim_max)
 }
 
 /// The most bytes that one exec of this executor takes for all arguments
@@ -838,6 +843,15 @@ fn stack_hard_limit() -> Option<libc::rlim_t> {
 #[must_use]
 pub fn exec_capacity() -> u64 {
     exec_capacity_for(stack_hard_limit().map_or(0, child_stack_limit))
+}
+
+/// The exec allowance of one spawn of this process, such as the jailer.
+///
+/// A spawn keeps the soft stack limit of this process. An unreadable limit
+/// gives the smallest allowance.
+#[must_use]
+pub fn spawn_exec_capacity() -> u64 {
+    exec_capacity_for(stack_limit().map_or(0, |limit| limit.rlim_cur))
 }
 
 /// The rlimit resource type: glibc and musl declare it apart.

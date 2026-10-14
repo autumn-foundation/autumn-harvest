@@ -610,6 +610,14 @@ impl FirecrackerLauncher {
             super::jailer::check_limits(jailer)?;
             super::jailer::check_extra_cgroups(jailer)?;
             super::jailer::check_cgroup_root(jailer, mounts)?;
+            // `RunningVm::spawn` clears the environment, so only the
+            // arguments of the jailer count.
+            super::jailer::check_jailer_exec(
+                jailer,
+                machine,
+                &config_file_args(),
+                crate::sandbox::exec::spawn_exec_capacity(),
+            )?;
             if let Some(netns) = &jailer.netns {
                 netns_check(netns)?;
             }
@@ -1187,11 +1195,7 @@ impl FirecrackerLauncher {
                 );
                 write_config(&root.join(CONFIG_FILE), &document)
                     .map_err(|e| fail("the config", &e))?;
-                vec![
-                    "--config-file".into(),
-                    CONFIG_FILE.into(),
-                    "--no-api".into(),
-                ]
+                config_file_args()
             }
             BootMethod::Api | BootMethod::Snapshot(_) => {
                 api_socket = Some(root.join(super::api::JAILED_API_SOCKET));
@@ -1528,6 +1532,16 @@ fn copy_binaries(
         copies.push(to);
     }
     Ok(copies)
+}
+
+/// The Firecracker arguments of a boot from [`CONFIG_FILE`]. No other boot
+/// has longer ones.
+fn config_file_args() -> Vec<String> {
+    vec![
+        "--config-file".into(),
+        CONFIG_FILE.into(),
+        "--no-api".into(),
+    ]
 }
 
 /// The request type of `ioctl`: glibc and musl declare it apart.
@@ -2894,6 +2908,26 @@ mod tests {
             .filter(|name| name.to_string_lossy().ends_with(VMM_COPIES_SUFFIX))
             .collect();
         assert!(left.is_empty(), "{left:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_jailer_command_over_the_exec_allowance_is_a_config_error() {
+        let dir = temp_dir();
+        let mut config = jailed(&dir);
+        let Confinement::Jailer(jail) = &mut config.confinement else {
+            unreachable!()
+        };
+        // About 7 MB of arguments, over the 6 MiB that any stack limit gives.
+        for i in 0..64 {
+            jail.extra_cgroups
+                .push((format!("io.x{i}"), "1".repeat(110_000)));
+        }
+        let err = new_launcher(config).expect_err("a jailer command over the allowance");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("exec allowance")),
+            "{err:?}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
