@@ -31537,10 +31537,10 @@ pub struct Worker {
     /// armed. Only the wake clears it, because the next poll then sees the
     /// gate again.
     pool_refused: AtomicBool,
-    /// Ends an idle wait that took its snapshot before a refusal (issue
+    /// Arms an unbound idle wait when a refusal follows its snapshot (issue
     /// #1787). `record_gate_refusal` and `claim_exclusions` fire it when
     /// their flag turns on. `notify_waiters` stores no wake, so a refusal
-    /// never ends a later wait that already counts it.
+    /// never arms a wait that starts after it.
     refusal_recorded: tokio::sync::Notify,
     /// Set the first time `spawn_monitoring_tasks` runs to completion (issue
     /// #548 review). Guards against a hypothetical second invocation (e.g. a
@@ -33209,11 +33209,11 @@ impl Drop for CapacityPermit {
 
 /// The capacity part of one idle wait of a poll loop (issue #1787).
 ///
-/// [`Worker::capacity_wait`] takes it just before the wait. With `bound`, a
-/// released permit ends the wait and clears the refusal flag. Without it, a
-/// refusal recorded after the snapshot ends the wait. Another claim loop
-/// records it when the gate or an adaptive limit holds a kind back. The
-/// next poll then sees the refusal, so the wait after it is bound.
+/// [`Worker::capacity_wait`] takes it just before the wait. A released
+/// permit ends a `bound` wait and clears the refusal flag. An unbound wait
+/// first waits for a refusal after its snapshot. Another claim loop records
+/// one when the gate holds a kind back, or when an adaptive limit holds a
+/// type back. The wait is then bound, so a released permit ends it.
 struct CapacityWait<'a> {
     worker: &'a Worker,
     bound: bool,
@@ -33222,15 +33222,17 @@ struct CapacityWait<'a> {
 }
 
 impl CapacityWait<'_> {
-    /// Resolve when the capacity of the worker can unblock a claim. The
-    /// loop then polls again.
+    /// Resolve on a released permit. An unbound wait first waits for a
+    /// refusal after its snapshot. The loop then polls again.
+    ///
+    /// A refusal alone does not end the wait. A poll right after it would
+    /// meet the same full pool or limit, so it could claim nothing.
     async fn woken(self) {
-        if self.bound {
-            self.worker.capacity_freed.notified().await;
-            self.worker.capacity_woke();
-        } else {
+        if !self.bound {
             self.refused.await;
         }
+        self.worker.capacity_freed.notified().await;
+        self.worker.capacity_woke();
     }
 }
 
@@ -36878,12 +36880,7 @@ impl Worker {
                         .wait_for_notification(self.config.poll_interval)
                         .await
                     {
-                        Ok(Some(_)) => {
-                            // Host clocks can run ahead of the database NOW(). A
-                            // jittered delay lets a new task become claimable,
-                            // and spreads the claims of many workers (issue #1796).
-                            tokio::time::sleep(crate::notify::settle_delay()).await;
-                        }
+                        Ok(Some(_)) => return true,
                         Ok(None) => {}
                         Err(error) => {
                             tracing::warn!(
@@ -36897,13 +36894,22 @@ impl Worker {
                 } else {
                     tokio::time::sleep(self.config.poll_interval).await;
                 }
+                false
             };
             // A full pool also wakes on a released permit (issue #1787).
             let capacity = self.capacity_wait();
-            tokio::select! {
-                () = capacity.woken() => {}
-                () = self.deferral_due.notified() => {}
-                () = idle_wait => {}
+            let notified = tokio::select! {
+                () = capacity.woken() => false,
+                () = self.deferral_due.notified() => false,
+                notified = idle_wait => notified,
+            };
+            if notified {
+                // Host clocks can run ahead of the database NOW(). A jittered
+                // delay lets a new task become claimable, and spreads the
+                // claims of many workers (issue #1796). It runs after the
+                // select, so no other wake cuts it short. An earlier wake
+                // leaves the NOTIFY queued for the next wait.
+                tokio::time::sleep(crate::notify::settle_delay()).await;
             }
         }
     }
@@ -37553,12 +37559,20 @@ impl Worker {
     /// The wait registers for a refusal before it reads `capacity_bound`.
     /// Another claim loop can record a refusal just after that read. A
     /// `Notified` future receives each `notify_waiters` call made after its
-    /// creation, so that refusal still ends the wait.
+    /// creation, so that refusal still arms the wait.
     fn capacity_wait(&self) -> CapacityWait<'_> {
+        self.capacity_wait_after(|| {})
+    }
+
+    /// [`Self::capacity_wait`], with a hook that runs right after the read.
+    /// A test records a refusal there, to pin the order of the two steps.
+    fn capacity_wait_after(&self, after_read: impl FnOnce()) -> CapacityWait<'_> {
         let refused = self.refusal_recorded.notified();
+        let bound = self.capacity_bound();
+        after_read();
         CapacityWait {
             worker: self,
-            bound: self.capacity_bound(),
+            bound,
             refused,
         }
     }
@@ -53937,10 +53951,10 @@ mod tests {
     }
 
     /// A refusal that a follower records after the leader takes its snapshot
-    /// still ends the leader's idle wait (issue #1787). Without that wake,
-    /// the refused backlog waits one poll interval after its permit frees.
+    /// arms the leader's idle wait on a released permit (issue #1787).
+    /// Without it, the refused backlog waits up to one poll interval.
     #[test]
-    fn a_refusal_after_the_snapshot_ends_the_idle_wait() {
+    fn a_refusal_after_the_snapshot_arms_the_wake_on_a_released_permit() {
         use crate::queue::TaskType;
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
         let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
@@ -53950,23 +53964,53 @@ mod tests {
             !wait.bound,
             "free pools and no refusal: no wake on a permit"
         );
+        let woken = wait.woken();
+        tokio::pin!(woken);
+        assert!(futures::FutureExt::now_or_never(woken.as_mut()).is_none());
         // A follower's poll is refused after the snapshot.
         worker.record_gate_refusal(PollAdmission::Only(TaskType::Workflow));
         assert!(
-            futures::FutureExt::now_or_never(wait.woken()).is_some(),
-            "a refusal after the snapshot must end the idle wait"
+            futures::FutureExt::now_or_never(woken.as_mut()).is_none(),
+            "a refusal alone does not end the wait"
+        );
+        // The running task of the refused kind ends.
+        worker.capacity_freed.notify_one();
+        assert!(
+            futures::FutureExt::now_or_never(woken.as_mut()).is_some(),
+            "a refusal after the snapshot must arm the wake on a released permit"
         );
         assert!(
-            worker.capacity_bound(),
-            "the refusal stays armed, so the next wait wakes on a permit"
+            !AtomicBool::load(&worker.pool_refused, Ordering::Relaxed),
+            "the wake on a released permit clears the refusal flag"
+        );
+    }
+
+    /// The wait registers for a refusal before it reads `capacity_bound`
+    /// (issue #1787). A refusal right after the read still arms it.
+    #[test]
+    fn a_refusal_right_after_the_read_still_arms_the_wait() {
+        use crate::queue::TaskType;
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        let wait = worker.capacity_wait_after(|| {
+            worker.record_gate_refusal(PollAdmission::Only(TaskType::Workflow));
+        });
+        assert!(!wait.bound, "the read came before the refusal");
+        let woken = wait.woken();
+        tokio::pin!(woken);
+        worker.capacity_freed.notify_one();
+        assert!(
+            futures::FutureExt::now_or_never(woken.as_mut()).is_some(),
+            "a refusal between the read and the wait must arm the wait"
         );
     }
 
     /// A claim that skips a type at its adaptive limit after the snapshot
-    /// also ends the idle wait (issue #1836). The type can reach its limit
-    /// through a claim of another loop.
+    /// also arms the idle wait (issue #1836). The freed limit slot then
+    /// ends it.
     #[test]
-    fn a_limit_refusal_after_the_snapshot_ends_the_idle_wait() {
+    fn a_limit_refusal_after_the_snapshot_arms_the_wake_on_a_freed_slot() {
         use crate::adaptive_limit::{Acquire, AdaptiveLimitConfig};
         use crate::policy::AdaptiveLimitPolicy;
         let registry = Arc::new(
@@ -53979,7 +54023,9 @@ mod tests {
 
         let wait = worker.capacity_wait();
         assert!(!wait.bound, "no type at its limit: no wake on a permit");
-        let Acquire::Acquired(_slot) = worker.registry.adaptive_limits.try_acquire("capped") else {
+        let woken = wait.woken();
+        tokio::pin!(woken);
+        let Acquire::Acquired(slot) = worker.registry.adaptive_limits.try_acquire("capped") else {
             panic!("the first attempt takes the one slot");
         };
         // A follower's claim skips the type at its limit.
@@ -53987,16 +54033,18 @@ mod tests {
             worker.claim_exclusions(),
             std::borrow::Cow::Owned(_)
         ));
+        assert!(futures::FutureExt::now_or_never(woken.as_mut()).is_none());
+        drop(slot);
         assert!(
-            futures::FutureExt::now_or_never(wait.woken()).is_some(),
-            "a limit refusal after the snapshot must end the idle wait"
+            futures::FutureExt::now_or_never(woken.as_mut()).is_some(),
+            "a limit refusal after the snapshot must arm the wake on a freed slot"
         );
     }
 
-    /// A refusal that a wait already counts does not end a later wait. Only
-    /// a refusal after the snapshot of that wait does (issue #1787).
+    /// A refusal before the snapshot does not arm a later unbound wait. Only
+    /// a refusal after that snapshot does (issue #1787).
     #[test]
-    fn an_earlier_refusal_does_not_end_a_later_wait() {
+    fn an_earlier_refusal_does_not_arm_a_later_wait() {
         use crate::queue::TaskType;
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
         let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
@@ -54005,31 +54053,42 @@ mod tests {
         worker.capacity_woke();
         let wait = worker.capacity_wait();
         assert!(!wait.bound);
+        let woken = wait.woken();
+        tokio::pin!(woken);
+        worker.capacity_freed.notify_one();
         assert!(
-            futures::FutureExt::now_or_never(wait.woken()).is_none(),
-            "an earlier refusal must not end a later wait"
+            futures::FutureExt::now_or_never(woken.as_mut()).is_none(),
+            "an earlier refusal must not arm a later wait"
         );
     }
 
-    /// A wait that already wakes on a released permit ignores a later
-    /// refusal. The released permit ends it and clears the flag (issue
-    /// #1787).
+    /// A refusal does not end a bound wait. A released permit ends it and
+    /// clears the flag (issue #1787).
     #[test]
     fn a_bound_wait_ends_on_a_released_permit_only() {
         use crate::queue::TaskType;
+        let mut cfg = default_runtime_config();
+        cfg.max_concurrent_activities = 1;
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
-        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+        let worker = Worker::new(cfg, registry).expect("valid config");
 
-        worker.record_gate_refusal(PollAdmission::Only(TaskType::Workflow));
+        let running = Arc::clone(&worker.activity_semaphore)
+            .try_acquire_owned()
+            .expect("one activity permit");
         let wait = worker.capacity_wait();
-        assert!(wait.bound);
+        assert!(wait.bound, "a full pool binds the wait");
+        assert!(!AtomicBool::load(&worker.pool_refused, Ordering::Relaxed));
         let woken = wait.woken();
         tokio::pin!(woken);
-        worker.record_gate_refusal(PollAdmission::Only(TaskType::Activity));
+        assert!(futures::FutureExt::now_or_never(woken.as_mut()).is_none());
+        // This refusal turns the flag on, so it fires the refusal wake.
+        worker.record_gate_refusal(PollAdmission::Only(TaskType::Workflow));
+        assert!(AtomicBool::load(&worker.pool_refused, Ordering::Relaxed));
         assert!(
             futures::FutureExt::now_or_never(woken.as_mut()).is_none(),
-            "a refusal must not end a wait that wakes on a released permit"
+            "a refusal must not end a bound wait"
         );
+        drop(running);
         worker.capacity_freed.notify_one();
         assert!(futures::FutureExt::now_or_never(woken.as_mut()).is_some());
         assert!(
