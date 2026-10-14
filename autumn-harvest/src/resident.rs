@@ -1331,6 +1331,18 @@ mod tests {
         })
     }
 
+    /// Parks on a payload-matching signal wait (issue #1985).
+    ///
+    /// A warm resume sends any same-name payload to the parked future. It
+    /// does not run the predicate.
+    fn predicate_wait_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            ctx.wait_for_signal_matching("order", |p| p["id"] == 42)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
     /// Acquires a durable mutex, then awaits an activity.
     fn mutex_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
         Box::pin(async move {
@@ -1353,7 +1365,7 @@ mod tests {
     #[tokio::test]
     async fn capture_names_why_a_suspension_is_not_resident() {
         // Issue #2007: each miss reason is the `outcome` label of a decision.
-        let cases: [(&str, WorkflowHandlerFn, ResidentOutcome); 6] = [
+        let cases: [(&str, WorkflowHandlerFn, ResidentOutcome); 7] = [
             (
                 "mixed join",
                 mixed_join_workflow,
@@ -1367,6 +1379,11 @@ mod tests {
                 "child workflow",
                 child_workflow,
                 ResidentOutcome::Unsupported,
+            ),
+            (
+                "signal predicate",
+                predicate_wait_workflow,
+                ResidentOutcome::Blocked,
             ),
         ];
         for (name, handler, expected) in cases {

@@ -25,8 +25,8 @@
 // The `#[workflow]`/`#[activity]` macros reference their input params, so a
 // deliberately-unused param reads as a "used underscore binding" through expansion.
 #![allow(clippy::used_underscore_binding)]
-// The `#[activity]` fixture bodies are trivial and await-free — the crate runs a
-// registered `ActivitySpec`, not the macro body.
+// The `#[activity]` fixture bodies are trivial and await-free. These tests
+// register closures in their place.
 #![allow(clippy::unused_async)]
 
 use std::sync::Arc;
@@ -137,7 +137,7 @@ async fn frozen_retry_policy_survives_re_registration() {
     let calls = Arc::new(AtomicUsize::new(0));
     // Spec A: the info-registered activity carries `retry = fixed(3, 60s)`, so the
     // frozen policy has max_attempts = 3 and a 60s backoff.
-    rt.register_activity(&flaky_info(), failing_body(&calls));
+    rt.register_activity_with_body(&flaky_info(), failing_body(&calls));
 
     let t0 = fixed_now();
     let exec = rt.start_workflow("flaky_wf", json!(21)).unwrap();
@@ -237,7 +237,7 @@ async fn frozen_schedule_to_close_deadline_survives_re_registration() {
     let calls = Arc::new(AtomicUsize::new(0));
     // Spec A: total deadline 5m (300s), retry fixed(10, 4m). Frozen at schedule as
     // an absolute deadline of scheduled_at + 300s.
-    rt.register_activity(
+    rt.register_activity_with_body(
         &stc_info_with_deadline(Duration::from_secs(300)),
         failing_body(&calls),
     );
@@ -255,7 +255,7 @@ async fn frozen_schedule_to_close_deadline_survives_re_registration() {
 
     // Re-register under a MUCH LONGER deadline (1h). Pre-fix this would let the run
     // keep retrying past the original 5m deadline.
-    rt.register_activity(
+    rt.register_activity_with_body(
         &stc_info_with_deadline(Duration::from_secs(3600)),
         failing_body(&calls),
     );
@@ -340,7 +340,7 @@ async fn frozen_start_to_close_survives_re_registration() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     // Spec A: a tight 1ms per-attempt budget, frozen onto the task row at schedule.
-    rt.register_activity(&stc2_info(Duration::from_millis(1)), stc2_body(&calls));
+    rt.register_activity_with_body(&stc2_info(Duration::from_millis(1)), stc2_body(&calls));
 
     let t0 = fixed_now();
     let exec = rt.start_workflow("stc2_wf", json!(7)).unwrap();
@@ -356,7 +356,7 @@ async fn frozen_start_to_close_survives_re_registration() {
 
     // Re-register with a GENEROUS 1h budget. Pre-fix this would let the slow attempt
     // 2 complete instead of timing out at the original 1ms budget.
-    rt.register_activity(&stc2_info(Duration::from_secs(3600)), stc2_body(&calls));
+    rt.register_activity_with_body(&stc2_info(Duration::from_secs(3600)), stc2_body(&calls));
 
     // Drive past the backoff: attempt 2 sleeps 40ms — over the FROZEN 1ms budget →
     // ActivityTimedOut { StartToClose }. Under the bug (1h budget) it completes.
@@ -467,7 +467,7 @@ async fn old_schema_db_reopens_and_migrates() {
 
     // A fresh schedule + drive works end-to-end on the migrated database.
     rt.register_workflow(&plain_wf_info());
-    rt.register_activity(&plain_act_info(), |input: serde_json::Value| Ok(input));
+    rt.register_activity_with_body(&plain_act_info(), |input: serde_json::Value| Ok(input));
     let exec = rt.start_workflow("plain_wf", json!(41)).unwrap();
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(
@@ -518,7 +518,7 @@ async fn stable_registration_unchanged() {
     // policy without any re-registration.
     let mut info = stable_act_info();
     info.default_schedule_to_close = Some(Duration::from_secs(600)); // 10m total cap
-    rt.register_activity(&info, move |input: serde_json::Value| {
+    rt.register_activity_with_body(&info, move |input: serde_json::Value| {
         if body_calls.fetch_add(1, Ordering::SeqCst) == 0 {
             Err("transient".to_string())
         } else {
@@ -627,7 +627,7 @@ async fn frozen_cap_survives_re_registration_via_claim_time_freeze() {
     );
 
     // (c) Register `late_act` under spec A: max_attempts = 3, fixed 60s backoff.
-    rt.register_activity(&late_act_info(), failing_body(&calls));
+    rt.register_activity_with_body(&late_act_info(), failing_body(&calls));
 
     // (d) Drive → the FIRST claim FREEZES spec A (max_attempts = 3, fixed(3, 60s))
     // onto the row; attempt 1 fails retryably and backs off 60s.

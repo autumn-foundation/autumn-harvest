@@ -113,6 +113,15 @@ pub struct ClaimedTask {
     /// to `true`. The activity BODY is always resolved from the registry regardless —
     /// only the policy/deadline scalars are frozen.
     pub defaults_frozen: bool,
+    /// The task's queue (issue #2024). `ActivityContext::info().queue_name`
+    /// reports it.
+    pub queue: String,
+    /// The latest persisted heartbeat payload (issue #2024). It is the
+    /// checkpoint that `ActivityContext::heartbeat_details` returns.
+    pub heartbeat_details: Option<Value>,
+    /// The previous attempt's error message (issue #2024). `None` on the
+    /// first attempt.
+    pub last_error: Option<String>,
 }
 
 fn next_task_seq(conn: &Connection) -> SqliteResult<i64> {
@@ -135,6 +144,26 @@ fn next_timer_arm_seq(conn: &Connection) -> SqliteResult<i64> {
             row.get(0)
         })?;
     Ok(max.map_or(0, |m| m + 1))
+}
+
+/// Reclaim the tasks of `exec_id` that a dropped drive left `RUNNING` (issue
+/// #2024).
+///
+/// The drain awaits an `#[activity]` body after its claim commits. A caller can
+/// drop the drive future during that await, for example with a timeout. The row
+/// then stays `RUNNING`, and no later drive in this process claims it. Drives
+/// are serialised by `&mut SqliteRuntime`, so a `RUNNING` row at the start of a
+/// drive has no live owner. The body re-runs, as after a crash. Returns the
+/// number of rows reclaimed.
+pub fn reclaim_running_for_execution(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> SqliteResult<usize> {
+    let n = conn.execute(
+        "UPDATE harvest_tasks SET state = 'PENDING' WHERE state = 'RUNNING' AND exec_id = ?1",
+        params![exec_id.to_string()],
+    )?;
+    Ok(n)
 }
 
 /// Reclaim tasks stranded `RUNNING` by a crash, flipping them back to `PENDING`.
@@ -289,7 +318,7 @@ pub fn claim_next_ready_task_tx(
         .query_row(
             "SELECT task_id, activity_id, name, input_json, attempt, max_attempts, \
              retry_policy_json, start_to_close_ms, scheduled_at, schedule_to_close_at, \
-             defaults_frozen \
+             defaults_frozen, queue, heartbeat_details, last_error \
              FROM harvest_tasks WHERE state = 'PENDING' AND exec_id = ?1 AND run_at <= ?2 \
              ORDER BY seq LIMIT 1",
             params![exec_id.to_string(), now],
@@ -306,6 +335,11 @@ pub fn claim_next_ready_task_tx(
                     row.get::<_, i64>(8)?,
                     row.get::<_, Option<i64>>(9)?,
                     row.get::<_, i64>(10)?,
+                    (
+                        row.get::<_, String>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
+                    ),
                 ))
             },
         )
@@ -323,6 +357,7 @@ pub fn claim_next_ready_task_tx(
         scheduled_at,
         schedule_to_close_at,
         defaults_frozen,
+        (queue, heartbeat_json, last_error),
     )) = row
     else {
         // No ready task — commit the empty read tx to release the lock cleanly.
@@ -341,6 +376,10 @@ pub fn claim_next_ready_task_tx(
     let retry_policy = retry_policy_json
         .as_deref()
         .map(serde_json::from_str::<RetryPolicy>)
+        .transpose()?;
+    let heartbeat_details = heartbeat_json
+        .as_deref()
+        .map(serde_json::from_str::<Value>)
         .transpose()?;
 
     // Flip to RUNNING but do NOT commit — the caller freezes the resolved defaults
@@ -366,6 +405,9 @@ pub fn claim_next_ready_task_tx(
         // registered spec, anchored to `scheduled_at`).
         schedule_to_close_at,
         defaults_frozen: defaults_frozen != 0,
+        queue,
+        heartbeat_details,
+        last_error,
     };
     Ok(Some((tx, task)))
 }
@@ -448,15 +490,20 @@ pub fn pending_tasks(
 /// window this pass), so keeping its low `seq` is correct and leaves existing
 /// ordering undisturbed. For an IMMEDIATE (zero-delay) retry, use
 /// [`requeue_task_to_back`] instead.
+///
+/// `last_error` is the failed attempt's message. The next attempt reads it as
+/// `ActivityContext::previous_failure` (issue #2024).
 pub fn requeue_task(
     conn: &Connection,
     task_id: &str,
     attempt: u32,
     run_at: i64,
+    last_error: &str,
 ) -> SqliteResult<()> {
     conn.execute(
-        "UPDATE harvest_tasks SET state = 'PENDING', attempt = ?2, run_at = ?3 WHERE task_id = ?1",
-        params![task_id, i64::from(attempt), run_at],
+        "UPDATE harvest_tasks SET state = 'PENDING', attempt = ?2, run_at = ?3, last_error = ?4 \
+         WHERE task_id = ?1",
+        params![task_id, i64::from(attempt), run_at, last_error],
     )?;
     Ok(())
 }
@@ -478,17 +525,32 @@ pub fn requeue_task(
 /// ready sibling before returning to it — round-robin fairness. Outside a race a
 /// zero-delay-retrying activity has no siblings, so the bump is harmless: it is
 /// simply re-claimed immediately anyway.
+///
+/// `last_error` has the same role as in [`requeue_task`].
 pub fn requeue_task_to_back(
     conn: &Connection,
     task_id: &str,
     attempt: u32,
     run_at: i64,
+    last_error: &str,
 ) -> SqliteResult<()> {
     let seq = next_task_seq(conn)?;
     conn.execute(
-        "UPDATE harvest_tasks SET state = 'PENDING', attempt = ?2, run_at = ?3, seq = ?4 \
-         WHERE task_id = ?1",
-        params![task_id, i64::from(attempt), run_at, seq],
+        "UPDATE harvest_tasks SET state = 'PENDING', attempt = ?2, run_at = ?3, seq = ?4, \
+         last_error = ?5 WHERE task_id = ?1",
+        params![task_id, i64::from(attempt), run_at, seq, last_error],
+    )?;
+    Ok(())
+}
+
+/// Persist `details` as the task's latest heartbeat checkpoint (issue #2024).
+///
+/// Last write wins. The write is one autocommit `UPDATE`, because the body
+/// runs outside any transaction.
+pub fn record_heartbeat(conn: &Connection, task_id: &str, details: &Value) -> SqliteResult<()> {
+    conn.execute(
+        "UPDATE harvest_tasks SET heartbeat_details = ?2 WHERE task_id = ?1",
+        params![task_id, serde_json::to_string(details)?],
     )?;
     Ok(())
 }

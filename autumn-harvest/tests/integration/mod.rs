@@ -189,6 +189,7 @@ mod legal_hold_tests;
 #[cfg(feature = "db")]
 mod lifecycle_model_props;
 mod lineage_store_tests;
+mod llm_budget_tests;
 #[cfg(all(feature = "db", feature = "testing"))]
 mod llm_ledger_tests;
 mod lock_order_docs;
@@ -336,8 +337,13 @@ mod signal_with_start_tests;
 mod sla_breach_tests;
 mod slo_pack_docs;
 mod slot_tuner_tests;
+#[cfg(all(feature = "db", feature = "testing"))]
+mod small_primitives_db_tests;
+#[cfg(feature = "testing")]
+mod small_primitives_tests;
 mod speculative_execution_docs;
 mod sqlite_feasibility_docs;
+mod sqlite_portable_activity_tests;
 mod standalone_activity_docs;
 #[cfg(feature = "db")]
 mod standalone_activity_overhead_perf;

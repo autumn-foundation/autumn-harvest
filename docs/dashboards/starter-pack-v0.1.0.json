@@ -1725,7 +1725,7 @@
               }
             }
           ],
-          "description": "Fresh workflow starts rejected because a resolved per-tenant quota key was at or over its declared active-executions, history-bytes, or dead-letters cap (issue #946). Per-key usage-vs-limit is visible at GET /api/harvest/admin/quotas."
+          "description": "Fresh workflow starts rejected because a resolved per-tenant quota key was at or over its declared active-executions, history-bytes, or dead-letters cap (issue #946). It also counts LLM steps that an LLM budget refused, under the run_llm_* and tenant_llm_* resources (issue #1997). Per-key usage-vs-limit is visible at GET /api/harvest/admin/quotas."
         },
         {
           "id": 933,
