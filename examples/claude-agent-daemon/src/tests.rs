@@ -12894,3 +12894,35 @@ fn a_pending_task_the_backend_cannot_claim_refuses_the_restart() {
         "a row the backend no longer claims is not this check's business"
     );
 }
+
+/// Issue #2027: the daemon reads executions through the backend only.
+///
+/// The test reads every production source file. A line of code that names
+/// `harvest_executions` is a direct read of the engine table. A comment may
+/// still name it.
+#[test]
+fn the_daemon_source_does_not_read_the_executions_table() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    for entry in std::fs::read_dir(&src).expect("the source directory reads") {
+        let path = entry.expect("the entry reads").path();
+        if path.file_name().is_some_and(|name| name == "tests.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("the source file reads");
+        for (n, line) in text.lines().enumerate() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            if code.contains("harvest_executions") {
+                offenders.push(format!("{}:{}: {code}", path.display(), n + 1));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "the daemon reads harvest_executions directly:\n{}",
+        offenders.join("\n")
+    );
+}

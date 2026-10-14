@@ -623,6 +623,7 @@ mod runtime;
 mod schema;
 mod store;
 mod update;
+mod visibility;
 mod worker;
 
 pub use autumn_harvest::{ExecutionId, WorkflowEvent};
@@ -631,7 +632,11 @@ pub use crate::error::{SqliteError, SqliteResult};
 pub use crate::history_cap::HistoryCapReason;
 pub use crate::query::DEFAULT_QUERY_TIMEOUT;
 pub use crate::runtime::{
-    ActivityBody, ActivitySpec, ExecutionOutcome, RunState, SqliteRuntime, StartOutcome,
-    UNSUPPORTED_FEATURE_ERROR_TYPE,
+    ActivityBody, ActivitySpec, ExecutionOutcome, RunState, SqliteRuntime, StartOptions,
+    StartOutcome, UNSUPPORTED_FEATURE_ERROR_TYPE,
 };
 pub use crate::store::ActivityAttempt;
+pub use crate::visibility::{
+    DEFAULT_LIST_LIMIT, ExecutionDescription, ExecutionFilter, ExecutionPage, ExecutionSummary,
+    ListCursor, MAX_LIST_LIMIT, SqliteReader, Stored,
+};

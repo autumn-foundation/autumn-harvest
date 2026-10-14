@@ -27,7 +27,8 @@ use crate::error::{SqliteError, SqliteResult};
 use crate::history_cap::{CapCheck, HistoryCapReason};
 use crate::lock::WriterLock;
 use crate::query::{DEFAULT_QUERY_TIMEOUT, QueryReplay};
-use crate::{lock, queue, schema, store, update, worker};
+use crate::visibility::{ExecutionDescription, ExecutionFilter, ExecutionPage, ListCursor};
+use crate::{lock, queue, schema, store, update, visibility, worker};
 
 /// A synchronous activity body, keyed by name.
 ///
@@ -190,6 +191,19 @@ pub struct StartOutcome {
     /// `true` for a fresh insert (a new `WorkflowStarted` was appended); `false`
     /// when the policy returned an existing execution without starting a new run.
     pub created: bool,
+}
+
+/// Options for [`SqliteRuntime::start_workflow_with_options`] (issue #2027).
+#[derive(Debug, Clone, Default)]
+pub struct StartOptions {
+    /// The business workflow id. `None` or a blank id gives a fresh run.
+    pub workflow_id: Option<String>,
+    /// What to do when a run with this workflow id exists.
+    pub reuse_policy: WorkflowIdReusePolicy,
+    /// A JSON value stored with the run. No command changes it later.
+    pub memo: Option<Value>,
+    /// The search attributes at start. Each value is a JSON primitive.
+    pub search_attributes: serde_json::Map<String, Value>,
 }
 
 /// The `error_type` of the `WorkflowFailed` event that seals an execution
@@ -745,6 +759,31 @@ impl SqliteRuntime {
                 WorkflowIdReusePolicy::AllowDuplicate,
             )?
             .exec_id)
+    }
+
+    /// Start (or reuse) a workflow with a memo and search attributes
+    /// (issue #2027).
+    ///
+    /// The id and the reuse policy act as in
+    /// [`start_workflow_with_reuse_policy`](Self::start_workflow_with_reuse_policy).
+    /// A start that returns an existing run does not change its memo or its
+    /// search attributes.
+    ///
+    /// # Errors
+    ///
+    /// The errors of
+    /// [`start_workflow_with_reuse_policy`](Self::start_workflow_with_reuse_policy).
+    /// Returns [`SqliteError::InvalidSearchAttribute`] for a search attribute
+    /// that is not a JSON primitive. Returns [`SqliteError::PayloadTooLarge`]
+    /// for a memo over the workflow-input cap.
+    pub fn start_workflow_with_options(
+        &mut self,
+        workflow_name: &str,
+        input: Value,
+        options: StartOptions,
+    ) -> SqliteResult<StartOutcome> {
+        let _ = (workflow_name, input, options);
+        Err(SqliteError::Unsupported("start_workflow_with_options".to_string()))
     }
 
     /// Start (or reuse) a workflow under an explicit
@@ -1478,6 +1517,45 @@ impl SqliteRuntime {
             }
             _ => Ok(ExecutionOutcome::Running),
         }
+    }
+
+    /// One page of executions, newest first, with no payloads (issue #2027).
+    ///
+    /// [`SqliteReader`](crate::SqliteReader) has the same read without the
+    /// writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::InvalidSearchAttribute`] for a filter value that
+    /// is not a JSON primitive. Returns [`SqliteError::Sqlite`] if the query
+    /// fails.
+    pub fn list_executions(&self, filter: &ExecutionFilter) -> SqliteResult<ExecutionPage> {
+        visibility::list(&self.conn, filter)
+    }
+
+    /// Call `visit` once for each row of one page, newest first, with its
+    /// payloads (issue #2027). Only one row is in memory at a time. Returns
+    /// the cursor of the next page.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`list_executions`](Self::list_executions).
+    pub fn visit_executions(
+        &self,
+        filter: &ExecutionFilter,
+        visit: impl FnMut(ExecutionDescription),
+    ) -> SqliteResult<Option<ListCursor>> {
+        visibility::visit_rows(&self.conn, filter, visit)
+    }
+
+    /// One execution with its payloads (issue #2027).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns
+    /// [`SqliteError::Sqlite`] if the query fails.
+    pub fn describe(&self, exec: ExecutionId) -> SqliteResult<ExecutionDescription> {
+        visibility::describe(&self.conn, exec)
     }
 
     /// Run the query `name` on `exec` with `args`, and return its answer

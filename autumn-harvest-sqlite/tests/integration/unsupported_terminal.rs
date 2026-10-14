@@ -14,7 +14,7 @@
 
 // The `#[workflow]` macro references its input param through expansion.
 #![allow(clippy::used_underscore_binding)]
-// `upserts_then_completes` and `healthy` hold no `.await`; each ends in one cycle.
+// `spawns_detached_then_completes` and `healthy` hold no `.await`; each ends in one cycle.
 #![allow(clippy::unused_async)]
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -66,11 +66,12 @@ async fn uses_a_session(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
     Ok(())
 }
 
-/// Completes, but its last cycle also emits a search-attribute upsert. The
-/// terminal drain rejects that command.
+/// Completes, but its last cycle also spawns a detached child. The terminal
+/// drain rejects that command. A search-attribute upsert was the example
+/// until issue #2027 made it supported.
 #[workflow]
-async fn upserts_then_completes(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
-    ctx.upsert_search_attrs([("stage".to_string(), Some(json!("done")))])
+async fn spawns_detached_then_completes(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    ctx.spawn_child_workflow_detached_raw("child", json!({}), autumn_harvest::ParentClosePolicy::Abandon)
         .map_err(|e| e.to_string())?;
     Ok(n)
 }
@@ -187,14 +188,14 @@ async fn a_worker_session_ends_failed_with_a_typed_reason() {
 #[tokio::test]
 async fn an_unsupported_command_in_the_terminal_cycle_ends_failed() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&upserts_then_completes_info());
+    rt.register_workflow(&spawns_detached_then_completes_info());
     let exec = rt
-        .start_workflow("upserts_then_completes", json!(7))
+        .start_workflow("spawns_detached_then_completes", json!(7))
         .unwrap();
 
     let err = rt.run_until_blocked(exec).await.unwrap_err();
     assert!(matches!(err, SqliteError::Unsupported(_)), "{err}");
-    assert_sealed_unsupported(&rt, exec, "UpsertSearchAttributes");
+    assert_sealed_unsupported(&rt, exec, "SpawnDetachedChildWorkflow");
     assert!(
         !rt.load_history(exec)
             .unwrap()
