@@ -266,6 +266,20 @@ async fn a_forking_run_cannot_pass_its_cpu_budget() {
 
 #[tokio::test]
 #[ignore = "needs /dev/kvm, Firecracker and a guest image"]
+async fn a_background_process_left_in_the_guest_does_not_fail_the_run() {
+    // The guest agent is process 1. It adopts the orphan and does not reap it.
+    // A zombie does not keep a cgroup v2 group populated, so the run cgroup goes.
+    let harness = Harness::new(unjailed(BootMethod::ConfigFile), 0).await;
+    let outcome = harness
+        .run(&SandboxRequest::new("sh", "sleep 300 & echo started"))
+        .await;
+    exited(&outcome);
+    assert_eq!(outcome.stdout, "started\n");
+    harness.assert_clean().await;
+}
+
+#[tokio::test]
+#[ignore = "needs /dev/kvm, Firecracker and a guest image"]
 async fn a_run_cannot_pass_its_memory_limit() {
     let harness = Harness::new(unjailed(BootMethod::ConfigFile), 0).await;
     // The data rlimit has 1 GiB of headroom, so only the run cgroup stops this.

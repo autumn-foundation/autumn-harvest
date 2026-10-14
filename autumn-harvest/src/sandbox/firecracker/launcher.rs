@@ -235,6 +235,10 @@ pub enum Confinement {
     /// Behind the jailer. Needs root. Use it in production.
     Jailer(JailerConfig),
     /// As a plain child process in `work_root`. For development only.
+    ///
+    /// Teardown kills the process group of the VMM. A helper that leaves the
+    /// group, for example with `setsid`, outlives it. Only the jailer cgroup
+    /// holds every process.
     Unjailed {
         /// The directory that holds one directory per VM.
         work_root: PathBuf,

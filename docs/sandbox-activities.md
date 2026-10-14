@@ -357,7 +357,10 @@ each boot. So the launcher refuses a longer line as a config error.
 Teardown kills the process group of the VMM, then the cgroup through
 `cgroup.kill`, then removes the jail. The VMM is not reaped before the group
 kill, so its pid still names its group. So an unjailed wrapper leaves no
-helper behind either. It runs after success, error, timeout and cancel. It also
+helper in that group behind either. An unjailed helper that leaves the group,
+for example with `setsid`, outlives the teardown. Only the cgroup of the
+jailer holds every process. Teardown runs after success, error, timeout and
+cancel. It also
 runs when the caller drops the run future. The host never reads a pid from
 the jail. Without `cgroup.kill`, teardown freezes the cgroup and waits until
 it reports `frozen 1`. Only then does it send `SIGKILL` to each pid in it, so
