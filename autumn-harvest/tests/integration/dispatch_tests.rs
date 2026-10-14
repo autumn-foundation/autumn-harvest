@@ -1673,6 +1673,73 @@ async fn a_workflow_reference_waits_for_a_workflow_permit() {
     .await;
 }
 
+/// A reference for a full pool waits for a permit. The reader does not spin
+/// on it (issue #1429).
+///
+/// A worker gives such a reference straight back, so a peer with a permit can
+/// read it. While the other pool has a free permit, the read size is not
+/// zero. So the reader read the same reference again at once, and gave it
+/// back again. That loop made thousands of channel calls per second. With
+/// an in-memory channel it never yielded, so it starved the task that held
+/// the permit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reference_for_a_full_pool_does_not_spin_the_reader() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = unique_queue("f7_spin");
+    let _cleanup = SeededQueueGuard {
+        url: url.clone(),
+        queue: queue.clone(),
+    };
+
+    let mut conn = connect(&url).await;
+    let first = start_on(&mut conn, "dispatch_slow", &queue).await;
+    let second = start_on(&mut conn, "dispatch_slow", &queue).await;
+
+    let channel = Arc::new(MemoryDispatch::new());
+    let _guard = install(&channel);
+
+    let config = WorkerRuntimeConfig {
+        max_concurrent_workflows: 1,
+        max_concurrent_activities: 8,
+        ..worker_config(&queue, vec![ShardId::new(0)])
+    };
+    let worker = Arc::new(make_worker_with(
+        config,
+        vec![wf_info("dispatch_slow", slow_workflow)],
+        vec![ActivityInfo {
+            is_local: true,
+            default_queue: None,
+            ..act_info("slow_local", slow_local_activity, None)
+        }],
+        empty_shared_state(),
+    ));
+
+    let pool = build_pool(&url);
+    let mut check = connect(&url).await;
+    with_worker(worker, pool, async {
+        for exec in [first, second] {
+            wait_for_state(&mut check, exec, &["COMPLETED"], Duration::from_secs(30)).await;
+        }
+    })
+    .await;
+
+    // Each run holds the one workflow permit for at least 800 ms. A reader
+    // that waits up to 10 ms per read releases a reference about 80 times in
+    // that hold. A spinning reader released it about 65,000 times.
+    let released = channel.released_ids();
+    for exec in [first, second] {
+        for task in tasks_for(&mut check, exec).await {
+            let count = released.iter().filter(|id| **id == task.id).count();
+            assert!(
+                count <= 1_000,
+                "the reader released the reference of task {} {count} times",
+                task.id
+            );
+        }
+    }
+}
+
 /// A stale reference must not spend a claimable sibling's share of the same
 /// batch (Codex review, issue #1429).
 ///

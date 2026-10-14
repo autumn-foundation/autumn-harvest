@@ -33256,6 +33256,38 @@ enum ReferenceDisposition {
     Handled,
 }
 
+/// The pools that refused a reference of one dispatch batch (issue #1429).
+///
+/// A pool refuses a reference when it has no free permit, or when the
+/// shard's share of it is spent. See [`Worker::wait_for_refused_permit`].
+#[derive(Debug, Clone, Copy, Default)]
+struct RefusedPools {
+    workflow: bool,
+    activity: bool,
+}
+
+impl RefusedPools {
+    /// Note a reference that went back with no claim attempt.
+    const fn note(&mut self, kind: Option<crate::dispatch::DispatchKind>) {
+        match kind {
+            Some(crate::dispatch::DispatchKind::Workflow) => self.workflow = true,
+            Some(crate::dispatch::DispatchKind::Activity) => self.activity = true,
+            None => {}
+        }
+    }
+}
+
+/// The longest wait of a single-shard reader after a batch that gave every
+/// reference back (issue #1429).
+///
+/// A free permit of the refused pool ends the wait at once. The cap bounds
+/// two costs of the wait. A reference of the other kind that arrives during
+/// the wait waits up to this long. A backlog of refused references ahead of
+/// a claimable one costs one wait per read. The cap is fixed, because
+/// `poll_interval` can be seconds. It keeps the reader under 100 reads per
+/// second while a pool is full.
+const DISPATCH_REFUSED_WAIT: Duration = Duration::from_millis(10);
+
 /// A task that a dispatch reference claimed, before the task starts.
 #[derive(Debug)]
 struct ClaimedReference {
@@ -35974,6 +36006,7 @@ impl Worker {
                 .div_ceil(divisor);
         let mut claimed_workflow = 0usize;
         let mut claimed_activity = 0usize;
+        let mut refused = RefusedPools::default();
         let mut leases = leases.into_iter();
         while let Some(lease) = leases.next() {
             if self.shutdown.is_cancelled() {
@@ -35997,6 +36030,7 @@ impl Worker {
                 // No permit for this pool, or this shard's own share of it is
                 // already spent this batch. Give the reference straight
                 // back, so a peer with capacity reads it on its next poll.
+                refused.note(lease.kind);
                 to_release.push((lease, Duration::ZERO));
                 continue;
             }
@@ -36048,7 +36082,45 @@ impl Worker {
         }
         self.settle_leases(state, installed, &to_ack, &to_release, &acked_tx)
             .await;
+        // A multi-shard turn that dispatched nothing returns to its round,
+        // and the round waits when every shard is idle. A wait here would
+        // delay the turn of a busy shard.
+        if dispatched == 0 && shard_count == 1 {
+            let wait = installed.settings.poll_interval.min(DISPATCH_REFUSED_WAIT);
+            self.wait_for_refused_permit(refused, wait).await;
+        }
         dispatched
+    }
+
+    /// Wait until a pool that refused a reference of one batch frees a
+    /// permit (issue #1429). `wait` caps the wait.
+    ///
+    /// The batch gives such a reference straight back, so a peer with a
+    /// permit can read it. The other pool can still have free permits, so
+    /// the next read still runs. Without this wait, the reader read the same
+    /// reference again at once and gave it back again. That loop made
+    /// thousands of channel calls per second. A channel call that completes
+    /// without a yield then starved the tasks of this worker.
+    async fn wait_for_refused_permit(&self, refused: RefusedPools, wait: Duration) {
+        if !refused.workflow && !refused.activity {
+            return;
+        }
+        // A refused pool can still show a free permit. A claimed task holds
+        // it as a reservation until its first poll, or the permit freed
+        // after the check. The reader yields, so that task can run, and the
+        // next read sees the pool again.
+        let shows_permit = (refused.workflow && self.workflow_semaphore.available_permits() > 0)
+            || (refused.activity && self.activity_semaphore.available_permits() > 0);
+        if shows_permit {
+            tokio::task::yield_now().await;
+            return;
+        }
+        tokio::select! {
+            () = self.shutdown.cancelled() => {}
+            () = tokio::time::sleep(wait) => {}
+            Ok(permit) = self.workflow_semaphore.acquire(), if refused.workflow => drop(permit),
+            Ok(permit) = self.activity_semaphore.acquire(), if refused.activity => drop(permit),
+        }
     }
 
     /// Settle one batch of [`Self::dispatch_leases`] in one `ack_many` and one
