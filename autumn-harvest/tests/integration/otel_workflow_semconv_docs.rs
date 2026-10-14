@@ -154,7 +154,9 @@ fn mapping(page: &str) -> BTreeMap<String, (String, String)> {
         .filter_map(|row| {
             let name = code(row.first()?)?.strip_prefix("harvest.")?;
             let target = (*row.get(1)?).to_owned();
-            let note = row.get(2).map_or_else(String::new, |note| (*note).to_owned());
+            let note = row
+                .get(2)
+                .map_or_else(String::new, |note| (*note).to_owned());
             Some((format!("harvest.{name}"), (target, note)))
         })
         .collect()
@@ -242,7 +244,10 @@ fn every_adr_span_maps_to_a_proposed_span_of_the_same_kind() {
 #[test]
 fn every_attr_constant_is_mapped_or_excluded_with_a_reason() {
     let constants = attr_constants(&read(TELEMETRY_RS));
-    assert!(constants.len() >= 10, "ATTR_* extraction rotted: {constants:?}");
+    assert!(
+        constants.len() >= 10,
+        "ATTR_* extraction rotted: {constants:?}"
+    );
     let mapping = mapping(&read(PAGE));
     let registry = registry_attributes();
     for constant in &constants {
@@ -273,12 +278,24 @@ fn the_model_is_generalized_and_well_named() {
         );
     }
     for id in registry_attributes().keys() {
-        assert!(id.starts_with("workflow."), "`{id}` must be in `workflow.*`");
-        assert!(is_well_named(id), "`{id}` must be lower-case dot-separated snake case");
+        assert!(
+            id.starts_with("workflow."),
+            "`{id}` must be in `workflow.*`"
+        );
+        assert!(
+            is_well_named(id),
+            "`{id}` must be lower-case dot-separated snake case"
+        );
     }
     for id in span_groups().keys() {
-        assert!(id.starts_with("span.workflow."), "`{id}` must start `span.workflow.`");
-        assert!(is_well_named(id), "`{id}` must be lower-case dot-separated snake case");
+        assert!(
+            id.starts_with("span.workflow."),
+            "`{id}` must start `span.workflow.`"
+        );
+        assert!(
+            is_well_named(id),
+            "`{id}` must be lower-case dot-separated snake case"
+        );
     }
 }
 
@@ -287,7 +304,10 @@ fn the_model_has_the_weaver_shape() {
     for group in groups(&yaml(REGISTRY), REGISTRY) {
         assert_eq!(str_field(&group, "type"), Some("attribute_group"));
         let id = str_field(&group, "id").unwrap_or_default();
-        assert!(id.starts_with("registry.workflow"), "bad registry group `{id}`");
+        assert!(
+            id.starts_with("registry.workflow"),
+            "bad registry group `{id}`"
+        );
         assert!(str_field(&group, "brief").is_some(), "`{id}` needs a brief");
     }
     for (id, attribute) in registry_attributes() {
@@ -296,8 +316,13 @@ fn the_model_has_the_weaver_shape() {
             Some("development"),
             "`{id}` must be `development`"
         );
-        assert!(str_field(&attribute, "brief").is_some(), "`{id}` needs a brief");
-        let kind = attribute.get("type").unwrap_or_else(|| panic!("`{id}` needs a type"));
+        assert!(
+            str_field(&attribute, "brief").is_some(),
+            "`{id}` needs a brief"
+        );
+        let kind = attribute
+            .get("type")
+            .unwrap_or_else(|| panic!("`{id}` needs a type"));
         match kind.as_str() {
             Some("boolean") => {}
             Some("string" | "int") => assert!(
@@ -314,7 +339,11 @@ fn the_model_has_the_weaver_shape() {
 
     let registry = registry_attributes();
     for (id, group) in span_groups() {
-        assert_eq!(str_field(&group, "type"), Some("span"), "`{id}` must be a span");
+        assert_eq!(
+            str_field(&group, "type"),
+            Some("span"),
+            "`{id}` must be a span"
+        );
         assert_eq!(
             str_field(&group, "stability"),
             Some("development"),
@@ -322,18 +351,28 @@ fn the_model_has_the_weaver_shape() {
         );
         assert!(str_field(&group, "brief").is_some(), "`{id}` needs a brief");
         let kind = str_field(&group, "span_kind").unwrap_or_default();
-        assert!(SPAN_KINDS.contains(&kind), "`{id}` has a bad span_kind `{kind}`");
-        assert!(id.ends_with(&format!(".{kind}")), "`{id}` must end with `.{kind}`");
+        assert!(
+            SPAN_KINDS.contains(&kind),
+            "`{id}` has a bad span_kind `{kind}`"
+        );
+        assert!(
+            id.ends_with(&format!(".{kind}")),
+            "`{id}` must end with `.{kind}`"
+        );
         let refs = span_refs(&group);
         assert!(!refs.is_empty(), "`{id}` must reference attributes");
         for (attribute, level) in refs {
             assert!(
-                registry.contains_key(&attribute) || GENERAL_ATTRIBUTES.contains(&attribute.as_str()),
+                registry.contains_key(&attribute)
+                    || GENERAL_ATTRIBUTES.contains(&attribute.as_str()),
                 "`{id}` refers to `{attribute}`, which no registry defines"
             );
             let valid = match level.as_str() {
                 Some(level) => matches!(level, "required" | "recommended" | "opt_in"),
-                None => level.get("conditionally_required").is_some() || level.get("recommended").is_some(),
+                None => {
+                    level.get("conditionally_required").is_some()
+                        || level.get("recommended").is_some()
+                }
             };
             assert!(valid, "`{id}` gives `{attribute}` a bad requirement_level");
         }
@@ -345,7 +384,10 @@ fn the_page_tables_match_the_model() {
     let page = read(PAGE);
     let attributes = first_cells(page_section(&page, ATTRIBUTES_SECTION), "workflow.");
     let registry: BTreeSet<String> = registry_attributes().into_keys().collect();
-    assert_eq!(attributes, registry, "{PAGE} section 4 must list each registry attribute");
+    assert_eq!(
+        attributes, registry,
+        "{PAGE} section 4 must list each registry attribute"
+    );
     let spans = first_cells(page_section(&page, SPANS_SECTION), "span.workflow.");
     let model: BTreeSet<String> = span_groups().into_keys().collect();
     assert_eq!(spans, model, "{PAGE} section 5 must list each span group");
@@ -373,13 +415,21 @@ fn the_operation_enum_names_one_span_each() {
             .unwrap_or_default()
             .to_owned();
         assert_eq!(
-            span_refs(&group).get("workflow.operation.name").and_then(Value::as_str),
+            span_refs(&group)
+                .get("workflow.operation.name")
+                .and_then(Value::as_str),
             Some("required"),
             "`{id}` must require `workflow.operation.name`"
         );
-        assert!(operations.insert(operation), "two span groups share an operation: `{id}`");
+        assert!(
+            operations.insert(operation),
+            "two span groups share an operation: `{id}`"
+        );
     }
-    assert_eq!(members, operations, "each enum member must name exactly one span");
+    assert_eq!(
+        members, operations,
+        "each enum member must name exactly one span"
+    );
 }
 
 #[test]
@@ -394,14 +444,19 @@ fn the_replay_rule_is_normative() {
         .get("span.workflow.execute_workflow.internal")
         .expect("the model must define the execute_workflow span");
     assert_eq!(
-        span_refs(execute).get("workflow.replay").and_then(Value::as_str),
+        span_refs(execute)
+            .get("workflow.replay")
+            .and_then(Value::as_str),
         Some("required"),
         "the execute_workflow span must require `workflow.replay`"
     );
     let page = read(PAGE);
     let rule = page_section(&page, REPLAY_SECTION);
     for word in ["MUST NOT", "MUST", "link"] {
-        assert!(rule.contains(word), "{PAGE} section 6 must contain `{word}`");
+        assert!(
+            rule.contains(word),
+            "{PAGE} section 6 must contain `{word}`"
+        );
     }
 }
 
@@ -441,11 +496,19 @@ fn the_submission_status_is_recorded() {
 fn prose_sentences_and_briefs_stay_short() {
     let mut texts = vec![(PAGE.to_owned(), read(PAGE))];
     for (id, attribute) in registry_attributes() {
-        texts.push((id, str_field(&attribute, "brief").unwrap_or_default().to_owned()));
+        texts.push((
+            id,
+            str_field(&attribute, "brief")
+                .unwrap_or_default()
+                .to_owned(),
+        ));
     }
     for (id, group) in span_groups() {
         for key in ["brief", "note"] {
-            texts.push((id.clone(), str_field(&group, key).unwrap_or_default().to_owned()));
+            texts.push((
+                id.clone(),
+                str_field(&group, key).unwrap_or_default().to_owned(),
+            ));
         }
     }
     let long: Vec<String> = texts
@@ -526,7 +589,10 @@ fn helpers_parse_their_inputs() {
 
     let source = "pub const ATTR_A: &str = \"harvest.a\";\nconst ATTR_B: &str = \"b\";\n\
                   pub const METRIC_C: &str = \"harvest.c\";\n";
-    assert_eq!(attr_constants(source), BTreeSet::from(["harvest.a".to_owned()]));
+    assert_eq!(
+        attr_constants(source),
+        BTreeSet::from(["harvest.a".to_owned()])
+    );
 
     assert!(is_well_named("workflow.run.id"));
     assert!(is_well_named("span.workflow.execute_workflow.internal"));

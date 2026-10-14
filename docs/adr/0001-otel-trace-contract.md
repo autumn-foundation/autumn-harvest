@@ -47,7 +47,12 @@ source of truth — the strings below repeat them for documentation clarity.
 
 **OTel semantic convention alignment**: Harvest does not yet have upstream OTel
 semconv entries. Until registered, the `harvest.*` namespace is used to avoid
-conflicts with `workflow.*` (reserved by OTel SIG-Workflow) and `db.*`.
+conflicts with a future `workflow.*` area and with `db.*`.
+
+**Upstream proposal (issue #2015).** OTel has no `workflow` namespace and no
+workflow SIG. The [workflow conventions draft](../otel-workflow-semconv/README.md)
+generalizes §1, §2 and §4 for OpenTelemetry. It maps each `harvest.*` name to
+a `workflow.*` name.
 
 ---
 

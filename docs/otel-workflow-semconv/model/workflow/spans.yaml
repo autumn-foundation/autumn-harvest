@@ -1,0 +1,163 @@
+groups:
+  - id: span.workflow.schedule_workflow.producer
+    type: span
+    span_kind: producer
+    stability: development
+    brief: This span describes a caller that schedules a workflow run.
+    note: |
+      The span name SHOULD be `schedule_workflow {workflow.name}`.
+
+      The engine SHOULD store the trace context of this span with the
+      scheduled work. The worker then uses it as the parent of the
+      `execute_workflow` span.
+    attributes:
+      - ref: workflow.operation.name
+        requirement_level: required
+      - ref: workflow.name
+        requirement_level: required
+      - ref: workflow.run.id
+        requirement_level: required
+      - ref: workflow.queue.name
+        requirement_level: recommended
+
+  - id: span.workflow.execute_workflow.internal
+    type: span
+    span_kind: internal
+    stability: development
+    brief: This span describes one decision cycle of a workflow run.
+    note: |
+      The span name SHOULD be `execute_workflow {workflow.name}`.
+
+      A live cycle uses the stored context of the scheduling span as its
+      parent. A replay cycle follows the replay rule of this proposal.
+    attributes:
+      - ref: workflow.operation.name
+        requirement_level: required
+      - ref: workflow.name
+        requirement_level: required
+      - ref: workflow.run.id
+        requirement_level: required
+      - ref: workflow.replay
+        requirement_level: required
+      - ref: workflow.queue.name
+        requirement_level: recommended
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If the cycle fails the workflow run.
+
+  - id: span.workflow.start_child_workflow.producer
+    type: span
+    span_kind: producer
+    stability: development
+    brief: This span describes a workflow run that schedules a child run.
+    note: |
+      The span name SHOULD be `start_child_workflow {workflow.name}`.
+
+      The `workflow.name` and `workflow.run.id` attributes describe the
+      child run.
+    attributes:
+      - ref: workflow.operation.name
+        requirement_level: required
+      - ref: workflow.name
+        requirement_level: required
+      - ref: workflow.run.id
+        requirement_level: required
+
+  - id: span.workflow.schedule_activity.producer
+    type: span
+    span_kind: producer
+    stability: development
+    brief: This span describes a workflow run that schedules an activity.
+    note: |
+      The span name SHOULD be `schedule_activity {workflow.activity.name}`.
+    attributes:
+      - ref: workflow.operation.name
+        requirement_level: required
+      - ref: workflow.activity.name
+        requirement_level: required
+      - ref: workflow.run.id
+        requirement_level: required
+      - ref: workflow.queue.name
+        requirement_level: recommended
+
+  - id: span.workflow.execute_activity.internal
+    type: span
+    span_kind: internal
+    stability: development
+    brief: This span describes one attempt of an activity.
+    note: |
+      The span name SHOULD be `execute_activity {workflow.activity.name}`.
+
+      Each attempt gets its own span. A retry is a new span with a higher
+      `workflow.activity.attempt`.
+    attributes:
+      - ref: workflow.operation.name
+        requirement_level: required
+      - ref: workflow.activity.name
+        requirement_level: required
+      - ref: workflow.run.id
+        requirement_level: required
+      - ref: workflow.activity.attempt
+        requirement_level: required
+      - ref: workflow.queue.name
+        requirement_level: recommended
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If the attempt fails.
+
+  - id: span.workflow.send_signal.producer
+    type: span
+    span_kind: producer
+    stability: development
+    brief: This span describes a caller that sends a signal to a workflow run.
+    note: |
+      The span name SHOULD be `send_signal {workflow.name}`.
+
+      The `workflow.name` and `workflow.run.id` attributes describe the
+      target run.
+    attributes:
+      - ref: workflow.operation.name
+        requirement_level: required
+      - ref: workflow.run.id
+        requirement_level: required
+      - ref: workflow.name
+        requirement_level: recommended
+      - ref: workflow.signal.name
+        requirement_level: recommended
+      - ref: workflow.signal.id
+        requirement_level: opt_in
+
+  - id: span.workflow.deliver_signal.consumer
+    type: span
+    span_kind: consumer
+    stability: development
+    brief: This span describes a workflow run that receives a signal.
+    note: |
+      The span name SHOULD be `deliver_signal {workflow.name}`.
+    attributes:
+      - ref: workflow.operation.name
+        requirement_level: required
+      - ref: workflow.name
+        requirement_level: required
+      - ref: workflow.run.id
+        requirement_level: required
+      - ref: workflow.signal.name
+        requirement_level: recommended
+      - ref: workflow.signal.id
+        requirement_level: opt_in
+
+  - id: span.workflow.fire_timer.internal
+    type: span
+    span_kind: internal
+    stability: development
+    brief: This span describes a durable timer that fires.
+    note: |
+      The span name SHOULD be `fire_timer`.
+
+      The span is a child of the `execute_workflow` span that observes the
+      timer.
+    attributes:
+      - ref: workflow.operation.name
+        requirement_level: required
+      - ref: workflow.run.id
+        requirement_level: required

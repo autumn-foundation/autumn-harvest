@@ -203,6 +203,10 @@ use the [Collector recipe](operations/otel-collector.md) (issue #1838). It also
 copies the metrics that match an OTel messaging semantic convention under the
 semconv name.
 
+For spans, OTel has no workflow conventions yet. The
+[workflow conventions draft](otel-workflow-semconv/README.md) proposes them
+upstream (issue #2015).
+
 ## Custom recorder
 
 If you already have a metrics backend that does not use the `metrics` crate
