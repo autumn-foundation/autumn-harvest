@@ -189,7 +189,6 @@ impl Leftovers {
     }
 
     /// Whether no cgroup is kept.
-    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.0
             .lock()
@@ -198,11 +197,24 @@ impl Leftovers {
     }
 }
 
+impl Drop for FirecrackerLauncher {
+    fn drop(&mut self) {
+        // A sweep kills a cgroup only for an owner with a lease under its VM
+        // root. So the lease stays while a cgroup of this launcher is left.
+        self.leftovers.retry();
+        if !self.leftovers.is_empty() {
+            self.lease.keep_file();
+        }
+    }
+}
+
 /// A locked file that marks a live owner of VM directories.
 #[derive(Debug)]
 pub struct InstanceLease {
     path: PathBuf,
     file: std::fs::File,
+    /// Leave the file after the drop.
+    keep_file: bool,
 }
 
 impl InstanceLease {
@@ -232,7 +244,11 @@ impl InstanceLease {
                 path.display()
             )));
         }
-        Ok(Self { path, file })
+        Ok(Self {
+            path,
+            file,
+            keep_file: false,
+        })
     }
 
     /// The lease file.
@@ -240,13 +256,21 @@ impl InstanceLease {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Leave the file after the drop. A later sweep then sees a dead owner
+    /// and removes what the owner left.
+    const fn keep_file(&mut self) {
+        self.keep_file = true;
+    }
 }
 
 impl Drop for InstanceLease {
     fn drop(&mut self) {
         // Remove the file while the lock is held. Closing the file then
         // releases the lock.
-        let _ = std::fs::remove_file(&self.path);
+        if !self.keep_file {
+            let _ = std::fs::remove_file(&self.path);
+        }
         let _ = &self.file;
     }
 }
@@ -444,6 +468,11 @@ impl FirecrackerLauncher {
     /// Remove the VMs of each owner whose lease is not locked. Returns the
     /// number of VM directories removed.
     ///
+    /// Launchers with other VM roots can share the cgroup parent. So the
+    /// sweep kills a cgroup only for a dead owner that this VM root shows: a
+    /// dead lease or a VM directory here. A dead lease stays until the VMs
+    /// and the cgroups of its owner are gone.
+    ///
     /// The sweep also tries again each cgroup that outlived a teardown of
     /// this launcher.
     pub fn sweep_stale(&self) -> usize {
@@ -478,7 +507,7 @@ impl FirecrackerLauncher {
                 continue;
             }
             match std::fs::OpenOptions::new().read(true).open(&path) {
-                Ok(file) if try_lock(&file) => dead_leases.push((path, file)),
+                Ok(file) if try_lock(&file) => dead_leases.push((owner, path, file)),
                 Ok(_) => {
                     live.insert(owner);
                 }
@@ -492,36 +521,67 @@ impl FirecrackerLauncher {
                 }
             }
         }
+        let mut dead: std::collections::BTreeSet<String> = dead_leases
+            .iter()
+            .map(|(owner, ..)| owner.clone())
+            .collect();
+        // The owners that still have a VM directory or a cgroup.
+        let mut left = std::collections::BTreeSet::new();
         let mut removed = 0;
         for (owner, vm_id, path) in vm_dirs {
             if live.contains(&owner) {
                 continue;
             }
             if let Confinement::Jailer(jailer) = &self.config.confinement {
-                kill_cgroup_now(&super::jailer::cgroup_dir(jailer, &vm_id));
+                let cgroup = super::jailer::cgroup_dir(jailer, &vm_id);
+                kill_cgroup_now(&cgroup);
+                if cgroup.exists() {
+                    left.insert(owner.clone());
+                }
             }
             if crate::sandbox::exec::remove_work_dir(&path).is_ok() {
                 removed += 1;
+            } else {
+                left.insert(owner.clone());
+            }
+            dead.insert(owner);
+        }
+        self.sweep_cgroups(&dead, &mut left);
+        for (owner, path, _locked) in dead_leases {
+            if !left.contains(&owner) {
+                let _ = std::fs::remove_file(path);
             }
         }
-        // A dropped microVM can leave its cgroup after its jail is gone.
-        if let Confinement::Jailer(jailer) = &self.config.confinement {
-            let parent = jailer.cgroup_root.join(&jailer.cgroup_parent);
-            for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let owner = name
-                    .strip_prefix(VM_ID_PREFIX)
-                    .and_then(|rest| rest.split_once('-'))
-                    .map(|(owner, _)| owner);
-                if owner.is_some_and(|owner| !live.contains(owner)) {
-                    kill_cgroup_now(&entry.path());
+        removed
+    }
+
+    /// Kill and remove each cgroup of a `dead` owner. A dropped microVM can
+    /// leave its cgroup after its jail is gone. Add each owner with a cgroup
+    /// that is still there to `left`.
+    fn sweep_cgroups(
+        &self,
+        dead: &std::collections::BTreeSet<String>,
+        left: &mut std::collections::BTreeSet<String>,
+    ) {
+        let Confinement::Jailer(jailer) = &self.config.confinement else {
+            return;
+        };
+        let parent = jailer.cgroup_root.join(&jailer.cgroup_parent);
+        for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some((owner, _)) = name
+                .strip_prefix(VM_ID_PREFIX)
+                .and_then(|rest| rest.split_once('-'))
+            else {
+                continue;
+            };
+            if dead.contains(owner) {
+                kill_cgroup_now(&entry.path());
+                if entry.path().exists() {
+                    left.insert(owner.to_owned());
                 }
             }
         }
-        for (path, _locked) in dead_leases {
-            let _ = std::fs::remove_file(path);
-        }
-        removed
     }
 
     /// Check the Firecracker and jailer versions once. A failed check runs
@@ -2633,6 +2693,8 @@ while True:
         std::fs::write(dead.join("cgroup.kill"), b"").unwrap();
         std::fs::write(dead.join("cgroup.events"), b"populated 0\n").unwrap();
         let launcher = new_launcher(config).unwrap();
+        // The dead owner left its lease under this VM root.
+        std::fs::write(launcher.vm_root().join("hsbx-deadbeef.lease"), b"").unwrap();
         let mine = parent.join(format!("hsbx-{}-{}", launcher.owner(), "e".repeat(16)));
         std::fs::create_dir_all(&mine).unwrap();
         std::fs::write(mine.join("cgroup.kill"), b"").unwrap();
@@ -2644,6 +2706,79 @@ while True:
             "a live owner keeps its cgroups"
         );
         drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The cgroup parent of the jailed test config in `dir`.
+    fn cgroup_parent(config: &LauncherConfig) -> PathBuf {
+        let Confinement::Jailer(jail) = &config.confinement else {
+            unreachable!("a jailed config");
+        };
+        jail.cgroup_root.join(&jail.cgroup_parent)
+    }
+
+    /// A fake cgroup of `owner` in `parent`, with an empty kill file.
+    fn fake_cgroup(parent: &Path, owner: &str, tag: char) -> PathBuf {
+        let cgroup = parent.join(format!("hsbx-{owner}-{}", tag.to_string().repeat(16)));
+        std::fs::create_dir_all(&cgroup).unwrap();
+        std::fs::write(cgroup.join("cgroup.kill"), b"").unwrap();
+        std::fs::write(cgroup.join("cgroup.events"), b"populated 0\n").unwrap();
+        cgroup
+    }
+
+    #[test]
+    fn the_sweep_leaves_the_cgroups_of_a_launcher_with_another_vm_root() {
+        let dir = temp_dir();
+        let config = jailed(&dir);
+        // Another launcher shares the cgroup parent, but its lease is under
+        // another VM root.
+        let other = fake_cgroup(&cgroup_parent(&config), "0badf00d", 'a');
+        let launcher = new_launcher(config).unwrap();
+        launcher.sweep_stale();
+        assert_eq!(
+            std::fs::read(other.join("cgroup.kill")).unwrap(),
+            b"",
+            "the sweep killed a cgroup of another VM root"
+        );
+        drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_dead_lease_stays_until_its_cgroups_are_gone() {
+        let dir = temp_dir();
+        let config = jailed(&dir);
+        let dead = fake_cgroup(&cgroup_parent(&config), "deadbeef", 'b');
+        let launcher = new_launcher(config).unwrap();
+        let lease = launcher.vm_root().join("hsbx-deadbeef.lease");
+        std::fs::write(&lease, b"").unwrap();
+        launcher.sweep_stale();
+        assert_eq!(std::fs::read(dead.join("cgroup.kill")).unwrap(), b"1");
+        assert!(lease.exists(), "the lease went before its cgroup");
+        std::fs::remove_dir_all(&dead).unwrap();
+        launcher.sweep_stale();
+        assert!(!lease.exists(), "the sweep kept the lease of a dead owner");
+        drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_launcher_dropped_with_leftover_cgroups_keeps_its_lease() {
+        let dir = temp_dir();
+        let config = jailed(&dir);
+        let parent = cgroup_parent(&config);
+        let launcher = new_launcher(config).unwrap();
+        let left = fake_cgroup(&parent, launcher.owner(), 'c');
+        launcher.leftovers.keep_if_left(&left);
+        let lease = launcher.lease_path().to_path_buf();
+        drop(launcher);
+        assert!(lease.exists(), "the lease went before a leftover cgroup");
+        // The next launcher sees a dead owner and kills its cgroup.
+        std::fs::write(left.join("cgroup.kill"), b"").unwrap();
+        let sweeper = new_launcher(jailed(&dir)).unwrap();
+        sweeper.sweep_stale();
+        assert_eq!(std::fs::read(left.join("cgroup.kill")).unwrap(), b"1");
+        drop(sweeper);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

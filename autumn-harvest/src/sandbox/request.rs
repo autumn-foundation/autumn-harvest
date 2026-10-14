@@ -233,8 +233,16 @@ impl ExecPlan {
             }
         }
         check_no_nested_files(&paths)?;
+        // The outcome holds each output once, so a duplicate would fail
+        // only after the code ran.
+        let mut outputs = BTreeSet::new();
         for output in &self.outputs {
             validate_relative_path(output)?;
+            if !outputs.insert(output.as_str()) {
+                return Err(SandboxError::Denied(format!(
+                    "output {output:?} appears twice"
+                )));
+            }
         }
         for (name, value) in &self.env {
             // The engine adds `HARVEST_*` variables after the request check,
@@ -875,6 +883,19 @@ mod tests {
         let mut bad = plan;
         bad.limits.wall_clock_ms = 0;
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn a_plan_that_names_an_output_twice_is_denied() {
+        let mut plan = SandboxPolicy::default()
+            .plan(&SandboxRequest::new("sh", "true").with_output("out.txt"))
+            .unwrap();
+        plan.outputs.push("out.txt".into());
+        let err = plan.validate().expect_err("a duplicate output");
+        assert!(
+            matches!(err, SandboxError::Denied(ref m) if m.contains("twice")),
+            "{err:?}"
+        );
     }
 
     #[test]

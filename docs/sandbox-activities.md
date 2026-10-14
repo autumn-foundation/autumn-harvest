@@ -303,7 +303,10 @@ each `sweep_stale`.
 
 Each launcher holds a lease file next to its VM directories. `sweep_stale`
 removes the microVMs and the cgroups of each owner whose lease is not locked.
-So a crashed worker leaves nothing behind after the next start.
+So a crashed worker leaves nothing behind after the next start. A sweep kills
+only the cgroups of owners with a lease or a VM directory under its own VM
+root. So launchers with other VM roots can share one cgroup parent. A dead
+lease stays until the microVMs and the cgroups of its owner are gone.
 
 The jailer puts each microVM cgroup under `JailerConfig::cgroup_parent`. That
 is outside the cgroup of a systemd service by default. So a stop of the
