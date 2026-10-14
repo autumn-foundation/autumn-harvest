@@ -61,8 +61,12 @@ async fn staged(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
 async fn upserts_then_spawns(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
     ctx.upsert_search_attrs([("stage".to_string(), Some(json!("lost")))])
         .map_err(|e| e.to_string())?;
-    ctx.spawn_child_workflow_detached_raw("child", json!({}), autumn_harvest::ParentClosePolicy::Abandon)
-        .map_err(|e| e.to_string())?;
+    ctx.spawn_child_workflow_detached_raw(
+        "child",
+        json!({}),
+        autumn_harvest::ParentClosePolicy::Abandon,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(0)
 }
 
@@ -109,6 +113,9 @@ fn attrs(pairs: &[(&str, Value)]) -> Map<String, Value> {
         .map(|(k, v)| ((*k).to_string(), v.clone()))
         .collect()
 }
+
+/// The empty id list, for `assert_eq!`.
+const NONE: Vec<ExecutionId> = Vec::new();
 
 fn ids(rt: &SqliteRuntime, filter: &ExecutionFilter) -> Vec<ExecutionId> {
     rt.list_executions(filter)
@@ -182,7 +189,10 @@ async fn the_start_time_is_the_started_event_time() {
     };
     let row = rt.describe(exec).unwrap();
     assert_eq!(
-        row.summary.started_at.value().map(chrono::DateTime::timestamp_millis),
+        row.summary
+            .started_at
+            .value()
+            .map(chrono::DateTime::timestamp_millis),
         Some(timestamp.timestamp_millis())
     );
     assert_eq!(row.summary.closed_at, Stored::Null, "a running run is open");
@@ -290,7 +300,11 @@ fn a_cursor_round_trips_through_its_raw_value() {
         .unwrap();
     let raw = first.next.unwrap().raw();
     let second = rt
-        .list_executions(&ExecutionFilter::new().limit(1).before(ListCursor::from_raw(raw)))
+        .list_executions(
+            &ExecutionFilter::new()
+                .limit(1)
+                .before(ListCursor::from_raw(raw)),
+        )
         .unwrap();
     assert_ne!(first.executions, second.executions);
     assert_eq!(second.executions.len(), 1);
@@ -326,7 +340,10 @@ async fn list_filters_by_state_name_and_id_prefix() {
         vec![other, open]
     );
     assert_eq!(
-        ids(&rt, &ExecutionFilter::new().state("COMPLETED").state("RUNNING")),
+        ids(
+            &rt,
+            &ExecutionFilter::new().state("COMPLETED").state("RUNNING")
+        ),
         vec![other, open, done]
     );
     assert_eq!(
@@ -350,7 +367,10 @@ async fn list_filters_by_state_name_and_id_prefix() {
         ids(&rt, &ExecutionFilter::new().exec_id(done.to_string())),
         vec![done]
     );
-    assert!(ids(&rt, &ExecutionFilter::new().workflow_name("nope")).is_empty());
+    assert_eq!(
+        ids(&rt, &ExecutionFilter::new().workflow_name("nope")),
+        NONE
+    );
 }
 
 /// A prefix holds no pattern. `%` and `_` match only themselves.
@@ -363,7 +383,10 @@ fn a_workflow_id_prefix_is_not_a_pattern() {
         ids(&rt, &ExecutionFilter::new().workflow_id_prefix("a%")),
         vec![literal]
     );
-    assert!(ids(&rt, &ExecutionFilter::new().workflow_id_prefix("a_")).is_empty());
+    assert_eq!(
+        ids(&rt, &ExecutionFilter::new().workflow_id_prefix("a_")),
+        NONE
+    );
 }
 
 #[test]
@@ -383,20 +406,35 @@ fn list_filters_by_start_time() {
         ids(&rt, &ExecutionFilter::new().started_before(middle)),
         vec![early]
     );
-    let late_at = *rt.describe(late).unwrap().summary.started_at.value().unwrap();
+    let late_at = *rt
+        .describe(late)
+        .unwrap()
+        .summary
+        .started_at
+        .value()
+        .unwrap();
     assert_eq!(
         ids(&rt, &ExecutionFilter::new().started_after(late_at)),
         vec![late],
         "the lower bound is inclusive"
     );
-    assert!(
-        ids(&rt, &ExecutionFilter::new().started_before(early_at(&rt, early))).is_empty(),
+    assert_eq!(
+        ids(
+            &rt,
+            &ExecutionFilter::new().started_before(early_at(&rt, early))
+        ),
+        NONE,
         "the upper bound is exclusive"
     );
 }
 
 fn early_at(rt: &SqliteRuntime, exec: ExecutionId) -> chrono::DateTime<Utc> {
-    *rt.describe(exec).unwrap().summary.started_at.value().unwrap()
+    *rt.describe(exec)
+        .unwrap()
+        .summary
+        .started_at
+        .value()
+        .unwrap()
 }
 
 /// `visit_executions` passes each row with its payloads, newest first.
@@ -439,7 +477,10 @@ async fn upserted_search_attributes_filter_the_list() {
     // An upsert is not progress. The drive parks on the signal and does not
     // spin.
     let state = rt.run_until_blocked(exec).await.unwrap();
-    assert!(matches!(state, RunState::WaitingSignal(ref s) if s == "go"), "{state:?}");
+    assert!(
+        matches!(state, RunState::WaitingSignal(ref s) if s == "go"),
+        "{state:?}"
+    );
     rt.run_until_blocked(quiet).await.unwrap();
 
     assert_eq!(
@@ -454,12 +495,20 @@ async fn upserted_search_attributes_filter_the_list() {
     let by = |key: &str, value: Value| ExecutionFilter::new().search_attribute(key, value);
     assert_eq!(ids(&rt, &by("stage", json!("waiting"))), vec![exec]);
     assert_eq!(ids(&rt, &by("count", json!(3))), vec![exec]);
-    assert_eq!(ids(&rt, &by("count", json!(3.0))), vec![exec], "1 matches 1.0");
+    assert_eq!(
+        ids(&rt, &by("count", json!(3.0))),
+        vec![exec],
+        "1 matches 1.0"
+    );
     assert_eq!(ids(&rt, &by("urgent", json!(true))), vec![exec]);
-    assert!(ids(&rt, &by("urgent", json!(false))).is_empty());
-    assert!(ids(&rt, &by("count", json!("3"))).is_empty(), "a type must match");
-    assert!(ids(&rt, &by("stage", json!("done"))).is_empty());
-    assert!(ids(&rt, &by("missing", json!(null))).is_empty());
+    assert_eq!(ids(&rt, &by("urgent", json!(false))), NONE);
+    assert_eq!(
+        ids(&rt, &by("count", json!("3"))),
+        NONE,
+        "a type must match"
+    );
+    assert_eq!(ids(&rt, &by("stage", json!("done"))), NONE);
+    assert_eq!(ids(&rt, &by("missing", json!(null))), NONE);
     assert_eq!(
         ids(
             &rt,
@@ -467,12 +516,12 @@ async fn upserted_search_attributes_filter_the_list() {
         ),
         vec![exec]
     );
-    assert!(
+    assert_eq!(
         ids(
             &rt,
             &by("stage", json!("waiting")).search_attribute("count", json!(4))
-        )
-        .is_empty()
+        ),
+        NONE
     );
 
     // The terminal cycle upserts again and removes a key.
@@ -488,8 +537,8 @@ async fn upserted_search_attributes_filter_the_list() {
         ]))
     );
     assert_eq!(ids(&rt, &by("stage", json!("done"))), vec![exec]);
-    assert!(ids(&rt, &by("stage", json!("waiting"))).is_empty());
-    assert!(ids(&rt, &by("scratch", json!("x"))).is_empty());
+    assert_eq!(ids(&rt, &by("stage", json!("waiting"))), NONE);
+    assert_eq!(ids(&rt, &by("scratch", json!("x"))), NONE);
 }
 
 /// A cycle that rolls back keeps no upsert.
@@ -521,7 +570,10 @@ async fn a_null_filter_matches_a_stored_null() {
         .exec_id;
     rt.start_workflow("echo", json!(2)).unwrap();
     assert_eq!(
-        ids(&rt, &ExecutionFilter::new().search_attribute("note", json!(null))),
+        ids(
+            &rt,
+            &ExecutionFilter::new().search_attribute("note", json!(null))
+        ),
         vec![exec]
     );
 }
@@ -539,13 +591,19 @@ fn a_search_attribute_that_is_not_a_primitive_is_refused() {
             },
         )
         .unwrap_err();
-    assert!(matches!(err, SqliteError::InvalidSearchAttribute(_)), "{err}");
-    assert!(rt.list_executions(&ExecutionFilter::new()).unwrap().executions.is_empty());
+    assert!(
+        matches!(err, SqliteError::InvalidSearchAttribute(_)),
+        "{err}"
+    );
+    assert_eq!(ids(&rt, &ExecutionFilter::new()), NONE, "no row is written");
 
     let err = rt
         .list_executions(&ExecutionFilter::new().search_attribute("k", json!([1])))
         .unwrap_err();
-    assert!(matches!(err, SqliteError::InvalidSearchAttribute(_)), "{err}");
+    assert!(
+        matches!(err, SqliteError::InvalidSearchAttribute(_)),
+        "{err}"
+    );
 }
 
 /// A key with quotes or dots is a plain key, not a JSON path.
@@ -564,14 +622,23 @@ fn a_search_attribute_key_is_not_a_path() {
         .unwrap()
         .exec_id;
     assert_eq!(
-        ids(&rt, &ExecutionFilter::new().search_attribute("a.b", json!(1))),
+        ids(
+            &rt,
+            &ExecutionFilter::new().search_attribute("a.b", json!(1))
+        ),
         vec![exec]
     );
     assert_eq!(
-        ids(&rt, &ExecutionFilter::new().search_attribute("q\"k", json!(2))),
+        ids(
+            &rt,
+            &ExecutionFilter::new().search_attribute("q\"k", json!(2))
+        ),
         vec![exec]
     );
-    assert!(ids(&rt, &ExecutionFilter::new().search_attribute("a", json!(1))).is_empty());
+    assert_eq!(
+        ids(&rt, &ExecutionFilter::new().search_attribute("a", json!(1))),
+        NONE
+    );
 }
 
 // ── Memo and continue-as-new ─────────────────────────────────────────────────
@@ -683,7 +750,10 @@ async fn a_reader_lists_beside_a_live_runtime() {
         page.executions[0].state,
         Stored::Value("COMPLETED".to_string())
     );
-    assert!(matches!(rt.outcome(exec).unwrap(), ExecutionOutcome::Completed(_)));
+    assert!(matches!(
+        rt.outcome(exec).unwrap(),
+        ExecutionOutcome::Completed(_)
+    ));
 
     // The reader cannot write.
     drop(rt);
@@ -716,7 +786,7 @@ fn a_damaged_row_does_not_fail_the_list() {
         "INSERT INTO harvest_executions \
          (exec_id, workflow_name, workflow_id, input_json, state, error, started_at, \
           search_attrs, memo) \
-         VALUES (CAST('blob-id' AS BLOB), 'echo', '', CAST(x'FF' AS TEXT), 7, x'00', \
+         VALUES (CAST('blob-id' AS BLOB), 'echo', '', CAST(x'FF' AS TEXT), x'FF', x'00', \
                  'soon', 'not json', '{')",
         [],
     )
@@ -755,7 +825,11 @@ fn a_damaged_row_does_not_fail_the_list() {
     let running = reader
         .list_executions(&ExecutionFilter::new().state("RUNNING"))
         .unwrap();
-    let matched: Vec<_> = running.executions.iter().map(|r| r.exec_id.clone()).collect();
+    let matched: Vec<_> = running
+        .executions
+        .iter()
+        .map(|r| r.exec_id.clone())
+        .collect();
     assert_eq!(
         matched,
         vec![
@@ -795,13 +869,10 @@ fn a_reader_reads_a_file_without_the_new_columns() {
     assert_eq!(row.summary.search_attributes, Stored::Null);
     assert_eq!(row.output_json, Stored::Value("2".to_string()));
     // A filter on a missing column matches nothing, and does not fail.
-    assert!(
-        reader
-            .list_executions(&ExecutionFilter::new().started_after(Utc::now()))
-            .unwrap()
-            .executions
-            .is_empty()
-    );
+    let page = reader
+        .list_executions(&ExecutionFilter::new().started_after(Utc::now()))
+        .unwrap();
+    assert_eq!(page.executions, Vec::new());
 }
 
 /// The runtime migrates an old file, and an old row keeps its data.

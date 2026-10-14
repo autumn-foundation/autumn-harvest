@@ -7,7 +7,8 @@ use std::path::Path;
 
 use autumn_harvest::ExecutionId;
 use chrono::{DateTime, Utc};
-use rusqlite::Connection;
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, OpenFlags, Row, ToSql};
 use serde_json::{Map, Value};
 
 use crate::error::{SqliteError, SqliteResult};
@@ -17,6 +18,24 @@ pub const DEFAULT_LIST_LIMIT: u32 = 100;
 
 /// The largest page. A larger [`ExecutionFilter::limit`] is cut to this.
 pub const MAX_LIST_LIMIT: u32 = 1000;
+
+/// How long a reader waits for the writer's transaction to commit.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The columns a file can lack. An older file reads each one as NULL.
+///
+/// `exec_id`, `workflow_name` and `state` are not here. Every file has them,
+/// so a query fails on a table without them.
+const OPTIONAL_COLUMNS: [&str; 8] = [
+    "workflow_id",
+    "started_at",
+    "closed_at",
+    "search_attrs",
+    "memo",
+    "input_json",
+    "output_json",
+    "error",
+];
 
 /// One stored field, read without failing its row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,11 +84,13 @@ pub struct ListCursor(i64);
 
 impl ListCursor {
     /// A cursor from its raw value, as [`ListCursor::raw`] gave it.
+    #[must_use]
     pub const fn from_raw(raw: i64) -> Self {
         Self(raw)
     }
 
     /// The raw value, to carry the cursor outside this process.
+    #[must_use]
     pub const fn raw(self) -> i64 {
         self.0
     }
@@ -176,7 +197,7 @@ impl ExecutionFilter {
 }
 
 /// One execution as a listing shows it. It carries no payload.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionSummary {
     /// The position of this row. Pass it to [`ExecutionFilter::before`].
     pub cursor: ListCursor,
@@ -200,13 +221,14 @@ pub struct ExecutionSummary {
 
 impl ExecutionSummary {
     /// The execution id, when it is readable and parses.
+    #[must_use]
     pub fn execution_id(&self) -> Option<ExecutionId> {
         self.exec_id.value().and_then(|id| id.parse().ok())
     }
 }
 
 /// One execution with its payloads.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionDescription {
     /// The fields a listing shows.
     pub summary: ExecutionSummary,
@@ -220,7 +242,7 @@ pub struct ExecutionDescription {
 }
 
 /// One page of a listing, newest first.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionPage {
     /// The rows of this page.
     pub executions: Vec<ExecutionSummary>,
@@ -244,8 +266,11 @@ impl SqliteReader {
     ///
     /// Returns [`SqliteError::Sqlite`] if the file cannot be opened.
     pub fn open(path: impl AsRef<Path>) -> SqliteResult<Self> {
-        let _ = path;
-        Err(SqliteError::Unsupported("SqliteReader::open".to_string()))
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        // A read waits this long for the writer to commit, as the runtime's
+        // own connection does.
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        Ok(Self { conn })
     }
 
     /// One page of executions, newest first, with no payloads.
@@ -288,22 +313,342 @@ impl SqliteReader {
 
 /// See [`SqliteReader::list_executions`].
 pub fn list(conn: &Connection, filter: &ExecutionFilter) -> SqliteResult<ExecutionPage> {
-    let _ = (conn, filter);
-    Err(SqliteError::Unsupported("list_executions".to_string()))
+    let mut executions = Vec::new();
+    let next = query(conn, filter, false, |row| {
+        executions.push(summary(row)?);
+        Ok(())
+    })?;
+    Ok(ExecutionPage { executions, next })
 }
 
 /// See [`SqliteReader::visit_executions`].
 pub fn visit_rows(
     conn: &Connection,
     filter: &ExecutionFilter,
-    visit: impl FnMut(ExecutionDescription),
+    mut visit: impl FnMut(ExecutionDescription),
 ) -> SqliteResult<Option<ListCursor>> {
-    let _ = (conn, filter, visit);
-    Err(SqliteError::Unsupported("visit_executions".to_string()))
+    query(conn, filter, true, |row| {
+        visit(description(row)?);
+        Ok(())
+    })
 }
 
 /// See [`SqliteReader::describe`].
 pub fn describe(conn: &Connection, exec: ExecutionId) -> SqliteResult<ExecutionDescription> {
-    let _ = (conn, exec);
-    Err(SqliteError::Unsupported("describe".to_string()))
+    let filter = ExecutionFilter::new().exec_id(exec.to_string()).limit(1);
+    let mut found = None;
+    visit_rows(conn, &filter, |row| found = Some(row))?;
+    found.ok_or(SqliteError::ExecutionNotFound(exec))
+}
+
+/// The page size `filter` asks for, cut to the range 1 to [`MAX_LIST_LIMIT`].
+fn page_size(filter: &ExecutionFilter) -> u32 {
+    filter
+        .limit
+        .unwrap_or(DEFAULT_LIST_LIMIT)
+        .clamp(1, MAX_LIST_LIMIT)
+}
+
+/// Run one page of the listing query, and call `each` for each row.
+///
+/// The query reads one row past the page. That row is never passed on. It
+/// only says that a next page exists. The payload columns are selected only
+/// when `payloads` is set.
+fn query(
+    conn: &Connection,
+    filter: &ExecutionFilter,
+    payloads: bool,
+    mut each: impl FnMut(&Row<'_>) -> SqliteResult<()>,
+) -> SqliteResult<Option<ListCursor>> {
+    let (sql, params) = build_query(&present_columns(conn)?, filter, payloads)?;
+    let mut statement = conn.prepare(&sql)?;
+    let bound: Vec<&dyn ToSql> = params.iter().map(|p| p as &dyn ToSql).collect();
+    let mut rows = statement.query(bound.as_slice())?;
+    let size = page_size(filter);
+    let mut passed = 0_u32;
+    let mut last = None;
+    while let Some(row) = rows.next()? {
+        if passed == size {
+            return Ok(last);
+        }
+        last = Some(ListCursor(row.get(0)?));
+        each(row)?;
+        passed += 1;
+    }
+    Ok(None)
+}
+
+/// The optional columns that the file has.
+///
+/// A reader cannot migrate a file. It therefore asks the file which columns
+/// exist, and selects NULL for the rest. The question is asked on each call,
+/// because a runtime can migrate the file while a reader is open.
+fn present_columns(conn: &Connection) -> SqliteResult<Vec<&'static str>> {
+    let mut statement = conn.prepare("SELECT name FROM pragma_table_info('harvest_executions')")?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(OPTIONAL_COLUMNS
+        .into_iter()
+        .filter(|column| names.iter().any(|name| name == column))
+        .collect())
+}
+
+/// One bound parameter of the listing query.
+enum Param {
+    Int(i64),
+    Real(f64),
+    Text(String),
+}
+
+impl ToSql for Param {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        match self {
+            Self::Int(v) => v.to_sql(),
+            Self::Real(v) => v.to_sql(),
+            Self::Text(v) => v.to_sql(),
+        }
+    }
+}
+
+/// The SQL and the parameters of one page.
+///
+/// Every value is a bound parameter. Only column names from
+/// [`OPTIONAL_COLUMNS`] and fixed SQL reach the text.
+///
+/// The name, the state and the workflow id are compared as bytes. A `BLOB`
+/// that holds the same letters as a `TEXT` value never compares equal to it,
+/// and a damaged row would then drop out of the listing. The cast keeps the
+/// name out of the index choice, so the query walks the `rowid` backwards.
+/// That is the order of the listing, so the walk stops at the page size. A
+/// filter that matches few rows walks further.
+fn build_query(
+    present: &[&str],
+    filter: &ExecutionFilter,
+    payloads: bool,
+) -> SqliteResult<(String, Vec<Param>)> {
+    let column = |name: &str| {
+        if present.contains(&name) {
+            name.to_string()
+        } else {
+            "NULL".to_string()
+        }
+    };
+    let mut select = vec![
+        "rowid".to_string(),
+        "exec_id".to_string(),
+        "workflow_name".to_string(),
+        column("workflow_id"),
+        "state".to_string(),
+        column("started_at"),
+        column("closed_at"),
+        column("search_attrs"),
+        column("memo"),
+    ];
+    if payloads {
+        select.extend(["input_json", "output_json", "error"].map(column));
+    }
+
+    let mut params = vec![Param::Int(filter.before.map_or(i64::MAX, ListCursor::raw))];
+    // The cursor is a bound, and not `(? IS NULL OR rowid < ?)`. The planner
+    // cannot seek on an `OR`. The largest `rowid` stands in for no cursor,
+    // and no insert counter reaches it.
+    let mut terms = vec!["rowid < ?1".to_string()];
+    if let Some(name) = &filter.workflow_name {
+        let p = bind(&mut params, Param::Text(name.clone()));
+        terms.push(format!("cast(workflow_name as blob) = cast({p} as blob)"));
+    }
+    if let Some(exec_id) = &filter.exec_id {
+        // A plain compare, so the primary key answers it.
+        let p = bind(&mut params, Param::Text(exec_id.clone()));
+        terms.push(format!("exec_id = {p}"));
+    }
+    if let Some(prefix) = &filter.workflow_id_prefix {
+        let len = i64::try_from(prefix.len()).unwrap_or(i64::MAX);
+        let n = bind(&mut params, Param::Int(len));
+        let p = bind(&mut params, Param::Text(prefix.clone()));
+        terms.push(format!(
+            "substr(cast({} as blob), 1, {n}) = cast({p} as blob)",
+            column("workflow_id")
+        ));
+    }
+    if !filter.states.is_empty() {
+        let any: Vec<String> = filter
+            .states
+            .iter()
+            .map(|state| {
+                let p = bind(&mut params, Param::Text(state.clone()));
+                format!("cast({p} as blob)")
+            })
+            .collect();
+        terms.push(format!("cast(state as blob) IN ({})", any.join(", ")));
+    }
+    let started = column("started_at");
+    if let Some(at) = filter.started_after {
+        let p = bind(&mut params, Param::Int(at.timestamp_millis()));
+        terms.push(format!(
+            "typeof({started}) = 'integer' AND {started} >= {p}"
+        ));
+    }
+    if let Some(at) = filter.started_before {
+        let p = bind(&mut params, Param::Int(at.timestamp_millis()));
+        terms.push(format!("typeof({started}) = 'integer' AND {started} < {p}"));
+    }
+    let attrs = column("search_attrs");
+    for (key, value) in &filter.search_attributes {
+        terms.push(search_attr_term(&mut params, &attrs, key, value)?);
+    }
+    let limit = bind(&mut params, Param::Int(i64::from(page_size(filter)) + 1));
+    let sql = format!(
+        "SELECT {} FROM harvest_executions WHERE {} ORDER BY rowid DESC LIMIT {limit}",
+        select.join(", "),
+        terms.join(" AND ")
+    );
+    Ok((sql, params))
+}
+
+/// The term that matches rows whose search attribute `key` equals `value`.
+///
+/// `json_each` raises on text that is not JSON, and that would fail the whole
+/// page. The guard gives such a row no attributes.
+fn search_attr_term(
+    params: &mut Vec<Param>,
+    attrs: &str,
+    key: &str,
+    value: &Value,
+) -> SqliteResult<String> {
+    let k = bind(params, Param::Text(key.to_string()));
+    let test = match value {
+        Value::Null => "type = 'null'".to_string(),
+        Value::Bool(true) => "type = 'true'".to_string(),
+        Value::Bool(false) => "type = 'false'".to_string(),
+        Value::Number(number) => {
+            let v = number.as_i64().map_or_else(
+                || Param::Real(number.as_f64().unwrap_or(f64::NAN)),
+                Param::Int,
+            );
+            let p = bind(params, v);
+            format!("type IN ('integer', 'real') AND atom = {p}")
+        }
+        Value::String(text) => {
+            let p = bind(params, Param::Text(text.clone()));
+            format!("type = 'text' AND atom = {p}")
+        }
+        Value::Array(_) | Value::Object(_) => {
+            return Err(SqliteError::InvalidSearchAttribute(format!(
+                "the filter on `{key}` must be a JSON string, number, boolean or null"
+            )));
+        }
+    };
+    Ok(format!(
+        "EXISTS (SELECT 1 FROM json_each(CASE WHEN typeof({attrs}) = 'text' \
+         AND json_valid({attrs}) AND json_type({attrs}) = 'object' \
+         THEN {attrs} END) WHERE key = {k} AND {test})"
+    ))
+}
+
+/// Push `value` and return its placeholder.
+fn bind(params: &mut Vec<Param>, value: Param) -> String {
+    params.push(value);
+    format!("?{}", params.len())
+}
+
+/// Read one listed row. The column order is the one [`build_query`] selects.
+fn summary(row: &Row<'_>) -> SqliteResult<ExecutionSummary> {
+    Ok(ExecutionSummary {
+        cursor: ListCursor(row.get(0)?),
+        exec_id: text(row.get_ref(1)?),
+        workflow_name: text(row.get_ref(2)?),
+        workflow_id: text(row.get_ref(3)?),
+        state: text(row.get_ref(4)?),
+        started_at: time(row.get_ref(5)?),
+        closed_at: time(row.get_ref(6)?),
+        search_attributes: match json(row.get_ref(7)?) {
+            Stored::Value(Value::Object(map)) => Stored::Value(map),
+            Stored::Value(_) | Stored::Unreadable => Stored::Unreadable,
+            Stored::Null => Stored::Null,
+        },
+        memo: json(row.get_ref(8)?),
+    })
+}
+
+/// Read one visited row, with its payloads.
+fn description(row: &Row<'_>) -> SqliteResult<ExecutionDescription> {
+    Ok(ExecutionDescription {
+        summary: summary(row)?,
+        input_json: text(row.get_ref(9)?),
+        output_json: text(row.get_ref(10)?),
+        error: text(row.get_ref(11)?),
+    })
+}
+
+/// A text field. A value of another class, or bytes that are not UTF-8, is
+/// unreadable. The engine reads these columns as `String`, so it would refuse
+/// the same value.
+fn text(value: ValueRef<'_>) -> Stored<String> {
+    match value {
+        ValueRef::Null => Stored::Null,
+        ValueRef::Text(bytes) => std::str::from_utf8(bytes)
+            .map_or(Stored::Unreadable, |text| Stored::Value(text.to_string())),
+        ValueRef::Integer(_) | ValueRef::Real(_) | ValueRef::Blob(_) => Stored::Unreadable,
+    }
+}
+
+/// An epoch-millisecond field.
+fn time(value: ValueRef<'_>) -> Stored<DateTime<Utc>> {
+    match value {
+        ValueRef::Null => Stored::Null,
+        ValueRef::Integer(ms) => {
+            DateTime::from_timestamp_millis(ms).map_or(Stored::Unreadable, Stored::Value)
+        }
+        ValueRef::Real(_) | ValueRef::Text(_) | ValueRef::Blob(_) => Stored::Unreadable,
+    }
+}
+
+/// A JSON text field.
+fn json(value: ValueRef<'_>) -> Stored<Value> {
+    match value {
+        ValueRef::Null => Stored::Null,
+        ValueRef::Text(bytes) => {
+            serde_json::from_slice(bytes).map_or(Stored::Unreadable, Stored::Value)
+        }
+        ValueRef::Integer(_) | ValueRef::Real(_) | ValueRef::Blob(_) => Stored::Unreadable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+
+    use super::{ExecutionFilter, build_query, present_columns};
+    use crate::schema::SCHEMA;
+
+    /// The page query seeks on the cursor and never sorts in a temporary
+    /// B-tree. A sort would read every matching row before the limit.
+    #[test]
+    fn the_page_query_walks_the_rowid_without_a_sort() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let filter = ExecutionFilter::new()
+            .workflow_name("wf")
+            .state("RUNNING")
+            .workflow_id_prefix("order-")
+            .started_after(chrono::Utc::now())
+            .search_attribute("stage", serde_json::json!("done"));
+        for payloads in [false, true] {
+            let (sql, params) =
+                build_query(&present_columns(&conn).unwrap(), &filter, payloads).unwrap();
+            let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let bound: Vec<&dyn rusqlite::ToSql> =
+                params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+            let plan: Vec<String> = statement
+                .query_map(bound.as_slice(), |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let plan = plan.join("\n");
+            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+            assert!(plan.contains("rowid<?"), "{plan}");
+        }
+    }
 }

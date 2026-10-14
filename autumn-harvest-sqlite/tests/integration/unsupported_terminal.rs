@@ -71,8 +71,12 @@ async fn uses_a_session(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
 /// until issue #2027 made it supported.
 #[workflow]
 async fn spawns_detached_then_completes(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
-    ctx.spawn_child_workflow_detached_raw("child", json!({}), autumn_harvest::ParentClosePolicy::Abandon)
-        .map_err(|e| e.to_string())?;
+    ctx.spawn_child_workflow_detached_raw(
+        "child",
+        json!({}),
+        autumn_harvest::ParentClosePolicy::Abandon,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(n)
 }
 

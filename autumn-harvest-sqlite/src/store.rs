@@ -260,8 +260,8 @@ pub fn seal_execution(
     sealed_state: &str,
 ) -> SqliteResult<()> {
     conn.execute(
-        "UPDATE harvest_executions SET state = ?2 WHERE exec_id = ?1",
-        params![exec_id.to_string(), sealed_state],
+        "UPDATE harvest_executions SET state = ?2, closed_at = ?3 WHERE exec_id = ?1",
+        params![exec_id.to_string(), sealed_state, now_millis()],
     )?;
     Ok(())
 }
@@ -307,24 +307,120 @@ pub fn set_terminal_with_reason(
     reason: &str,
 ) -> SqliteResult<()> {
     conn.execute(
-        "UPDATE harvest_executions SET state = ?2, error = ?3 WHERE exec_id = ?1",
-        params![exec_id.to_string(), state, reason],
+        "UPDATE harvest_executions SET state = ?2, error = ?3, closed_at = ?4 \
+         WHERE exec_id = ?1",
+        params![exec_id.to_string(), state, reason, now_millis()],
     )?;
     Ok(())
 }
 
 pub fn set_completed(conn: &Connection, exec_id: ExecutionId, output: &Value) -> SqliteResult<()> {
     conn.execute(
-        "UPDATE harvest_executions SET state = 'COMPLETED', output_json = ?2 WHERE exec_id = ?1",
-        params![exec_id.to_string(), serde_json::to_string(output)?],
+        "UPDATE harvest_executions SET state = 'COMPLETED', output_json = ?2, closed_at = ?3 \
+         WHERE exec_id = ?1",
+        params![
+            exec_id.to_string(),
+            serde_json::to_string(output)?,
+            now_millis()
+        ],
     )?;
     Ok(())
 }
 
 pub fn set_failed(conn: &Connection, exec_id: ExecutionId, error: &str) -> SqliteResult<()> {
     conn.execute(
-        "UPDATE harvest_executions SET state = 'FAILED', error = ?2 WHERE exec_id = ?1",
-        params![exec_id.to_string(), error],
+        "UPDATE harvest_executions SET state = 'FAILED', error = ?2, closed_at = ?3 \
+         WHERE exec_id = ?1",
+        params![exec_id.to_string(), error, now_millis()],
+    )?;
+    Ok(())
+}
+
+/// The wall clock in epoch milliseconds. A terminal write stores it as
+/// `closed_at` (issue #2027).
+fn now_millis() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// Store the start time, the memo and the search attributes of a new run
+/// (issue #2027).
+pub fn set_start_fields(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    started_at: i64,
+    memo: Option<&Value>,
+    search_attrs: Option<&serde_json::Map<String, Value>>,
+) -> SqliteResult<()> {
+    conn.execute(
+        "UPDATE harvest_executions SET started_at = ?2, memo = ?3, search_attrs = ?4 \
+         WHERE exec_id = ?1",
+        params![
+            exec_id.to_string(),
+            started_at,
+            memo.map(serde_json::to_string).transpose()?,
+            search_attrs.map(serde_json::to_string).transpose()?
+        ],
+    )?;
+    Ok(())
+}
+
+/// Copy the memo and the search attributes of `from` to `to`. A
+/// continue-as-new successor keeps both, as on Postgres (issue #2027).
+pub fn copy_memo_and_search_attrs(
+    conn: &Connection,
+    from: ExecutionId,
+    to: ExecutionId,
+) -> SqliteResult<()> {
+    conn.execute(
+        "UPDATE harvest_executions SET \
+           memo = (SELECT memo FROM harvest_executions WHERE exec_id = ?1), \
+           search_attrs = (SELECT search_attrs FROM harvest_executions WHERE exec_id = ?1) \
+         WHERE exec_id = ?2",
+        params![from.to_string(), to.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Merge one `UpsertSearchAttributes` patch into the stored object (issue
+/// #2027). `Some` sets a key and `None` removes it, as on Postgres.
+///
+/// A stored value that is not a readable JSON object is replaced, as the
+/// Postgres merge replaces a base that is not an object. The result is always
+/// an object, never NULL.
+pub fn upsert_search_attrs(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    patch: &std::collections::HashMap<String, Option<Value>>,
+) -> SqliteResult<()> {
+    let stored: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT CASE WHEN typeof(search_attrs) = 'text' \
+                    THEN cast(search_attrs as blob) END \
+             FROM harvest_executions WHERE exec_id = ?1",
+            params![exec_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(SqliteError::ExecutionNotFound(exec_id))?;
+    let mut merged = match stored.and_then(|bytes| serde_json::from_slice(&bytes).ok()) {
+        Some(Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    // The patch is a map, so its order is arbitrary. Each key appears once,
+    // so the order does not change the result.
+    for (key, value) in patch {
+        match value {
+            Some(value) => {
+                merged.insert(key.clone(), value.clone());
+            }
+            None => {
+                merged.remove(key);
+            }
+        }
+    }
+    conn.execute(
+        "UPDATE harvest_executions SET search_attrs = ?2 WHERE exec_id = ?1",
+        params![exec_id.to_string(), serde_json::to_string(&merged)?],
     )?;
     Ok(())
 }

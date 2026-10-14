@@ -67,9 +67,20 @@ CREATE TABLE IF NOT EXISTS harvest_executions (
                                            -- NULL until `cancel` stores a request. The
                                            -- drive reads it only while the run is
                                            -- RUNNING. A terminal run keeps the value.
-    cancel_from_seq INTEGER                -- the history length when `cancel` stored
+    cancel_from_seq INTEGER,               -- the history length when `cancel` stored
                                            -- the request (issue #2021). It bounds the
                                            -- events that a cleanup can add.
+    started_at    INTEGER,                 -- the `WorkflowStarted` time in epoch
+                                           -- milliseconds (issue #2027). NULL on a row
+                                           -- written before that issue.
+    closed_at     INTEGER,                 -- the time of the terminal write in epoch
+                                           -- milliseconds (issue #2027). NULL while the
+                                           -- run is open.
+    search_attrs  TEXT,                    -- the search attributes as a JSON object
+                                           -- (issue #2027). NULL until a start or an
+                                           -- upsert sets one.
+    memo          TEXT                     -- the start memo as JSON (issue #2027). No
+                                           -- command changes it after the start.
 );
 
 -- Non-unique lookup index for the (workflow_name, workflow_id) reuse-policy probe
@@ -261,6 +272,9 @@ use crate::error::SqliteResult;
 /// - **issue #2021** — `harvest_executions.cancel_reason`, the stored cooperative
 ///   cancel request, and `cancel_from_seq`, the history length at the request.
 ///   Both are nullable, so an old row has no pending cancel.
+/// - **issue #2027** — `harvest_executions.started_at`, `closed_at`,
+///   `search_attrs` and `memo`. All four are nullable. An old row has no start
+///   time, no close time, no search attributes and no memo.
 ///
 /// # Errors
 ///
@@ -306,6 +320,27 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
         "cancel_from_seq",
         "ALTER TABLE harvest_executions ADD COLUMN cancel_from_seq INTEGER",
     )?;
+    // issue #2027: the columns that list and describe read.
+    for (column, sql) in [
+        (
+            "started_at",
+            "ALTER TABLE harvest_executions ADD COLUMN started_at INTEGER",
+        ),
+        (
+            "closed_at",
+            "ALTER TABLE harvest_executions ADD COLUMN closed_at INTEGER",
+        ),
+        (
+            "search_attrs",
+            "ALTER TABLE harvest_executions ADD COLUMN search_attrs TEXT",
+        ),
+        (
+            "memo",
+            "ALTER TABLE harvest_executions ADD COLUMN memo TEXT",
+        ),
+    ] {
+        add_column_if_absent(conn, "harvest_executions", column, sql)?;
+    }
     Ok(())
 }
 
@@ -409,6 +444,45 @@ mod tests {
         assert_eq!(state, "RUNNING");
         assert_eq!(reason, None);
         assert_eq!(from, None);
+    }
+
+    // Issue #2027: an old `harvest_executions` gains the four visibility
+    // columns. The old row keeps its data, and each new column reads NULL.
+    #[test]
+    fn migrate_adds_the_visibility_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(OLD_HARVEST_EXECUTIONS_DDL).unwrap();
+        conn.execute_batch(OLD_HARVEST_TASKS_DDL).unwrap();
+        conn.execute(
+            "INSERT INTO harvest_executions (exec_id, workflow_name, input_json, state) \
+             VALUES ('e1', 'wf', '{}', 'RUNNING')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        let row: (
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT state, started_at, closed_at, search_attrs, memo \
+                 FROM harvest_executions WHERE exec_id = 'e1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("RUNNING".to_string(), None, None, None, None));
+        let fresh = Connection::open_in_memory().unwrap();
+        fresh.execute_batch(SCHEMA).unwrap();
+        for column in ["started_at", "closed_at", "search_attrs", "memo"] {
+            assert!(column_exists(&fresh, "harvest_executions", column).unwrap());
+        }
     }
 
     // An old-schema `harvest_tasks` (missing the freeze columns) is brought up to
