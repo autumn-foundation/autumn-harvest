@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::task::Poll;
 
-use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
+use autumn_harvest::builder::{DEFAULT_MAX_ACTIVITY_RESULT_BYTES, DEFAULT_RETRY_AFTER_CEILING};
 use autumn_harvest::context::{ActivityIdentity, empty_shared_state};
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::{
@@ -1395,6 +1395,12 @@ pub fn local_attempt_events(
         || run.retry_policy.as_ref().is_some_and(|p| {
             p.is_non_retryable(typed.as_ref().map(|f| f.error_type.as_str()), &error)
         });
+    // A positive `retry_after` hint wins over the policy, within the Postgres
+    // ceiling.
+    let hint = autumn_harvest::policy::resolve_retry_after_hint(
+        typed.as_ref().and_then(|f| f.retry_after),
+        DEFAULT_RETRY_AFTER_CEILING,
+    );
     let message = typed.map_or(error, |f| f.message);
     let failed = WorkflowEvent::LocalActivityFailed {
         activity_id,
@@ -1410,10 +1416,12 @@ pub fn local_attempt_events(
         return (vec![failed, exhausted], None);
     }
     let seed = local_retry_seed(exec_id, activity_id);
-    let delay = run
-        .retry_policy
-        .as_ref()
-        .and_then(|p| p.next_delay_with_seed(attempt, seed))
+    let delay = hint
+        .or_else(|| {
+            run.retry_policy
+                .as_ref()
+                .and_then(|p| p.next_delay_with_seed(attempt, seed))
+        })
         .unwrap_or_default();
     (vec![failed], Some(delay))
 }
@@ -1422,16 +1430,6 @@ pub fn local_attempt_events(
 fn local_retry_seed(exec_id: ExecutionId, activity_id: ActivityExecId) -> u64 {
     let low = |id: u128| u64::from_le_bytes(id.to_le_bytes()[..8].try_into().unwrap_or([0; 8]));
     low(exec_id.as_uuid().as_u128()) ^ low(activity_id.as_uuid().as_u128())
-}
-
-/// Wait `delay` before the next local attempt (issue #2029).
-///
-/// Postgres sleeps inline too. The wait blocks the thread, because the drive
-/// may run on any async runtime, and it holds no transaction.
-pub fn local_backoff(delay: std::time::Duration) {
-    if !delay.is_zero() {
-        std::thread::sleep(delay);
-    }
 }
 
 /// Fire one due timer atomically: append `TimerFired` and mark the timer row

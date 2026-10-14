@@ -44,8 +44,9 @@ Each primitive records the same core events as Postgres. No new
   `WorkflowRetryScheduled { retry_exec_id, attempt, fire_at }`. The
   successor's `workflow_id` is its own exec id. Non-determinism, a handler
   panic, an engine error, a timeout and a cancel never retry.
-- **SQLite today.** `apply_commands` and the terminal drain reject all four
-  commands. `register_workflow` panics on `execution_timeout` and
+- **SQLite today.** `apply_commands` and the terminal drain reject
+  `ArmTimer`, `CancelTimer`, `AcquireMutex`, `ReleaseMutex` and
+  `RunLocalActivity`. `register_workflow` panics on `execution_timeout` and
   `retry_policy`. `register_activity` panics on `local = true`.
 
 ### 0.2 Brainstorm — how can each primitive work on one writer?
@@ -55,7 +56,7 @@ Each primitive records the same core events as Postgres. No new
 | T1 | Apply `ArmTimer` and `CancelTimer` in the cycle transaction, in command order. A fresh arm appends `TimerStarted`. An await arm inserts a row only when no unfired row exists. | **Adopted.** It matches the Postgres event order and keeps the first deadline. |
 | T2 | Insert the row at the fresh arm. | Rejected. An unawaited timer could then fire while the body waits on something else. |
 | M1 | Two tables: a lock row per key and a FIFO waiter queue. A grant appends `MutexGranted` in the cycle transaction. | **Adopted.** One writer makes the check and the grant atomic. |
-| M2 | Leases and a reclaim scanner, as on Postgres. | Rejected. A holder that crashes resumes on reopen with its lock. The terminal sweep frees every other lock. |
+| M2 | Leases and a reclaim scanner, as on Postgres. | Rejected. A holder that crashes resumes on reopen with its lock. Each terminal state setter frees the locks of its run. |
 | M3 | Wake a waiter with an event on its history. | Rejected. Postgres appends no wake event. The fleet poll drives every run, so a waiter re-drives on the next pass. |
 | L1 | Append `LocalActivityScheduled` in the cycle transaction. Run the body after the commit. Append each attempt result in its own transaction. | **Adopted.** It is the Postgres order, and a crash resumes from the recorded attempts. |
 | L2 | Run a local activity as a regular task. | Rejected. The history would then hold `ActivityScheduled`, which does not replay on Postgres. |
@@ -74,11 +75,11 @@ Each primitive records the same core events as Postgres. No new
 | H4 | A holder ends without a release, so its waiters wait forever. | Every terminal state setter releases the run's locks and waiter rows in the same transaction. |
 | H5 | A release does not count as progress, so `run_until_idle` stops before the waiter runs. | A release that deletes a row reports progress. |
 | H6 | A crash after `LocalActivityScheduled` runs the body twice. | At-least-once, as on Postgres. The context passes the recorded failures, so the loop resumes at the next attempt. |
-| H7 | A failing local activity sleeps on a runtime without a timer. | The backoff sleep uses Tokio when a Tokio runtime is present. Otherwise it blocks the thread. |
+| H7 | A failing local activity sleeps and blocks the caller's async runtime. | A backoff stores `local_retry_at` and ends the cycle. The drive returns `WaitingTimer` until then. |
 | H8 | A timed-out run keeps a timer, a task or a lock. | The timeout seal deletes the open rows and releases the locks. |
 | H9 | A retry loops forever. | `workflow_attempt` is frozen on the row and grows by one per retry. The successor stops at `max_attempts`. |
 | H10 | A retry runs before its backoff. | The successor row holds `start_at`. The drive returns `WaitingTimer` until then. |
-| H11 | An old database file lacks the new columns. | `schema::migrate` adds each column. Each one is nullable or has a default. |
+| H11 | An old database file lacks the new columns. | `schema::migrate` adds each column, `local_retry_at` included. Each one is nullable or has a default. |
 
 ### 0.4 Six thinking hats
 
@@ -86,7 +87,8 @@ Each primitive records the same core events as Postgres. No new
   primitive that completes, a replay of each history on the core
   `WorkflowReplayer`, and `docs/sqlite-backend.md` §11 without the shipped
   items.
-- **Red (feel).** The mutex and the retry change who drives what. They must
+- **Red (feel).** The mutex and the retry let one run's state decide when
+  another run continues. They must
   stay simple to reason about on one writer.
 - **Black (risks).** Section 0.3. Five features in one change make a large
   diff. Each feature is a separate section of code and a separate test file.
@@ -117,11 +119,12 @@ Three tables hold the state: `harvest_mutex_locks`, `harvest_mutex_waiters`
 and the `harvest_mutex_seq` counter.
 
 - `AcquireMutex` enqueues the run. When the key is free and the run is first
-  in the queue, it mints a `lock_seq`, inserts the lock row, removes the
-  waiter row and appends `MutexGranted`. Otherwise the run waits, and the
-  drive returns `RunState::WaitingMutex(key)`.
+  in the queue, the acquire mints a `lock_seq`. It inserts the lock row,
+  removes the waiter row and appends `MutexGranted`. Otherwise the run
+  waits, and the drive returns `RunState::WaitingMutex(key)`.
 - The acquire must be the only suspending command in its batch, as on
-  Postgres. Another awaitable in the batch seals the run `Unsupported`.
+  Postgres. Another awaitable in the batch ends the run `FAILED` with
+  `UnsupportedFeature`.
 - `ReleaseMutex` deletes the lock row that matches the run and `lock_seq`.
 - Each terminal state setter releases the run's locks and deletes its waiter
   rows.
@@ -140,8 +143,13 @@ and the `harvest_mutex_seq` counter.
 4. The per-attempt budget is `start_to_close`, capped at 60 seconds, as on
    Postgres. It is checked after the body returns.
 
-A batch with more than one local activity, or with a durable awaitable,
-seals the run `Unsupported` (issue #950).
+A batch with a durable awaitable ends the run `FAILED` with
+`UnsupportedFeature`, as Postgres rejects it (issue #950). This backend also
+rejects a second local activity in one batch.
+
+A retry with a backoff stores `local_retry_at` and ends the cycle. A drive
+before that time returns `RunState::WaitingTimer`. Postgres sleeps inline
+instead, which would block the caller's async runtime here.
 
 ## 4. Execution timeout
 

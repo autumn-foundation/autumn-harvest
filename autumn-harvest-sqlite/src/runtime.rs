@@ -474,14 +474,13 @@ impl SqliteRuntime {
     /// `debounce`, `batch`, `throttle`, `quota`, or a raised `max_input_bytes`. The
     /// panic message names the specific feature and points at the supported
     /// alternative. Running the workflow with the feature silently missing would
-    /// diverge from the declared `#[workflow(...)]` contract (Codex #1069 P2,
-    /// `runtime.rs:602`/`:686`).
+    /// diverge from the declared `#[workflow(...)]` contract (Codex #1069 P2).
     pub fn register_workflow(&mut self, info: &WorkflowInfo) {
         if let Some((feature, hint)) = unsupported_workflow_feature(info) {
             panic!(
                 "autumn-harvest-sqlite (v0.1): workflow `{}` declares the unsupported \
-                 `{feature}` feature. This embedded single-writer backend retains only \
-                 the handler at registration, so honoring it is a v0.1 non-goal (issue \
+                 `{feature}` feature. This embedded single-writer backend does not \
+                 implement it, so honoring it is a v0.1 non-goal (issue \
                  #1068 follow-ups) — registering it anyway would silently drop the \
                  setting and diverge from the #[workflow(...)] contract. {hint}",
                 info.name,
@@ -960,9 +959,10 @@ impl SqliteRuntime {
     fn start_config(&self, workflow_name: &str) -> SqliteResult<store::RunConfig> {
         let now = (self.now_fn)().timestamp_millis();
         let policy = self.workflow_policies.get(workflow_name);
+        // Round up, so a sub-millisecond timeout never fires at once.
         let timeout_ms = policy
             .and_then(|p| p.execution_timeout)
-            .map(duration_to_millis_saturating);
+            .map(|d| i64::try_from(d.as_nanos().div_ceil(1_000_000)).unwrap_or(i64::MAX));
         let retry_policy_json = policy
             .and_then(|p| p.retry_policy.as_ref())
             .map(serde_json::to_string)
@@ -974,6 +974,7 @@ impl SqliteRuntime {
             attempt: 1,
             retry_policy_json,
             retry_of: None,
+            local_retry_at: None,
         })
     }
 
@@ -2160,6 +2161,10 @@ impl SqliteRuntime {
         if let Some(deadline) = config.deadline_at.filter(|at| now >= *at) {
             return self.seal_timed_out(exec, deadline, now);
         }
+        // A local activity waits for its retry backoff here.
+        if config.local_retry_at.is_some_and(|at| now < at) {
+            return Ok(RunState::WaitingTimer);
+        }
 
         // A drive dropped mid-body leaves its task `RUNNING` (issue #2024).
         // Nothing else owns it now, so hand it back to the claim.
@@ -2491,7 +2496,7 @@ impl SqliteRuntime {
                 local: Some(run), ..
             } => {
                 let terminal = self
-                    .run_local_activity(exec, owner, run, caps, now, cancel_reason)
+                    .run_local_activity(exec, owner, run, caps, now, failure_now, cancel_reason)
                     .await?;
                 return Ok(terminal.unwrap_or(RunState::InProgress));
             }
@@ -2724,8 +2729,8 @@ impl SqliteRuntime {
                 }
                 // Reject every OTHER unsupported command BY NAME via
                 // `command_name`. Examples are child workflows, external
-                // activities, signals and cancels, local activities, search
-                // attributes and detached children. No current variant is an
+                // activities, external signals and cancels, search attributes
+                // and detached children. No current variant is an
                 // opaque `"Unknown"` (Codex #1069 P2, `runtime.rs:840`). Dropping
                 // the uncommitted `tx` rolls back the whole batch. So an
                 // unsupported command after a supported one persists NEITHER the
@@ -2747,6 +2752,11 @@ impl SqliteRuntime {
     /// crash resumes at the next attempt. Each result commits in its own
     /// transaction, within the history caps. The context sees the result on
     /// the next replay, as on Postgres.
+    ///
+    /// A retry with a backoff stores `local_retry_at` and ends the cycle. The
+    /// drive then returns `WaitingTimer` until that time. Postgres sleeps
+    /// inline instead.
+    #[allow(clippy::too_many_arguments)]
     async fn run_local_activity(
         &mut self,
         exec: ExecutionId,
@@ -2754,6 +2764,7 @@ impl SqliteRuntime {
         run: worker::LocalRun,
         caps: &CapCheck<'_>,
         now: i64,
+        failure_now: &(dyn Fn() -> i64 + Send + Sync),
         cancel_reason: Option<&str>,
     ) -> SqliteResult<Option<RunState>> {
         let mut previous_failure = run.last_error.clone();
@@ -2766,9 +2777,17 @@ impl SqliteRuntime {
                 worker::run_local_attempt(exec, owner, spec, &run, attempt, previous_failure).await;
             previous_failure = result.as_ref().err().cloned();
             let (events, backoff) = worker::local_attempt_events(exec, &run, attempt, result);
+            // A backoff parks the run until `retry_at`. The drive does not
+            // sleep, so it never blocks the caller's async runtime.
+            let retry_at = backoff
+                .filter(|delay| !delay.is_zero())
+                .map(|delay| failure_now().saturating_add(duration_to_millis_saturating(delay)));
             let tx = self.conn.transaction()?;
             for event in &events {
                 store::append_event(&tx, exec, event)?;
+            }
+            if let Some(at) = retry_at {
+                store::set_local_retry_at(&tx, exec, at)?;
             }
             if let Some(reason) = caps.reached(&tx, exec)? {
                 drop(tx);
@@ -2779,9 +2798,8 @@ impl SqliteRuntime {
                 };
             }
             tx.commit()?;
-            match backoff {
-                Some(delay) => worker::local_backoff(delay),
-                None => break,
+            if backoff.is_none() || retry_at.is_some() {
+                break;
             }
         }
         Ok(None)
@@ -3318,6 +3336,7 @@ fn successor_config(
         attempt,
         retry_policy_json: config.retry_policy_json,
         retry_of,
+        local_retry_at: None,
     }
 }
 

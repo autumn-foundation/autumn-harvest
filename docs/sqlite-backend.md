@@ -178,11 +178,10 @@ rt.register_activity(&reserve_inventory_info());
 
 - **`register_workflow(&WorkflowInfo)`** retains the workflow's `name`,
   `handler`, `execution_timeout` and workflow-level `retry_policy` (issue
-  #2029). If the `#[workflow(...)]` attributes declare an
-  execution/admission-affecting feature this v0.1 backend cannot honor
-  (`concurrency`, `debounce`, `batch`, `throttle`, `quota`, a raised
-  `max_input_bytes`), registration
-  **panics at setup time** naming the feature — never a silently-dropped setting.
+  #2029). If `#[workflow(...)]` declares a feature this v0.1 backend cannot
+  honor, registration **panics at setup time** and names it. These features
+  are `concurrency`, `debounce`, `batch`, `throttle`, `quota` and a raised
+  `max_input_bytes`. A setting is never dropped silently.
 - **`register_activity(&ActivityInfo)`** is the default. It runs the
   `#[activity]` body with an `ActivityContext`. It honors the
   declared `#[activity(...)]` defaults it can (`schedule_to_close`, the full
@@ -498,10 +497,11 @@ attempt. Some limits apply:
 
 - The per-attempt budget is `start_to_close`, capped at 60 seconds. It is
   checked after the body returns, as for a regular activity here.
-- A retry backoff sleeps in the drive, on the real clock, as Postgres sleeps
-  inline.
-- A local activity cannot share a batch with a durable awaitable or a second
-  local activity (issue #950). Such a batch ends the run `FAILED`.
+- A retry backoff ends the cycle. A drive before its end returns
+  `RunState::WaitingTimer`. Postgres sleeps inline instead.
+- A local activity cannot share a batch with a durable awaitable, as on
+  Postgres (issue #950). This backend also rejects a second local activity
+  in one batch. Such a batch ends the run `FAILED`.
 
 **Execution timeout.** `#[workflow(execution_timeout = "30s")]` stores a
 deadline at start, from the runtime clock. Each cycle checks it first. A run
@@ -786,7 +786,8 @@ That drive still returns `SqliteError::Unsupported`, so the caller sees the
 reason. A later drive returns `RunState::Failed` and does not run the handler
 again. `outcome()` returns `ExecutionOutcome::Failed`.
 
-Only an unsupported feature or a history cap seals a run. Other errors leave
+Only an unsupported feature or a history cap seals a run `FAILED`. An
+execution timeout ends a run `TIMED_OUT`. Other errors leave
 the run `RUNNING`:
 an unregistered workflow or activity, a replay divergence, a contained panic
 under its budget, or a failed task. A fix in the same runtime can then resume

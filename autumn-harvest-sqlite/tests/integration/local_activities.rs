@@ -11,15 +11,28 @@
 #![allow(clippy::unused_async)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
-use autumn_harvest::policy::RetryPolicy;
+use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::{WorkflowHandlerFn, WorkflowInfo};
 use autumn_harvest_sqlite::{RunState, SqliteError, SqliteRuntime};
+use chrono::{TimeZone, Utc};
 use serde_json::json;
+
+/// A policy with a fixed backoff and no jitter.
+const fn paced(max_attempts: u32, secs: u64) -> RetryPolicy {
+    RetryPolicy {
+        max_attempts,
+        initial_interval: Duration::from_secs(secs),
+        backoff_coefficient: 1.0,
+        max_interval: Duration::from_secs(secs),
+        non_retryable_errors: Vec::new(),
+        jitter: JitterPolicy::None,
+    }
+}
 
 #[activity(local = true)]
 async fn double(ctx: &ActivityContext, n: i64) -> Result<i64, String> {
@@ -39,6 +52,16 @@ async fn broken(_ctx: &ActivityContext, _n: i64) -> Result<i64, String> {
     Err("always broken".to_string())
 }
 
+#[activity(local = true, retry = paced(2, 10))]
+async fn slow_retry(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
+    Ok(n)
+}
+
+#[activity(local = true, retry = paced(2, 0))]
+async fn hinted(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
+    Ok(n)
+}
+
 #[activity]
 async fn remote(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
     Ok(n)
@@ -54,6 +77,20 @@ async fn calls_double(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
 #[workflow]
 async fn calls_flaky(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
     ctx.execute_local_activity(&flaky_info(), n)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[workflow]
+async fn calls_slow_retry(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    ctx.execute_local_activity(&slow_retry_info(), n)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[workflow]
+async fn calls_hinted(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    ctx.execute_local_activity(&hinted_info(), n)
         .await
         .map_err(|e| e.to_string())
 }
@@ -248,4 +285,94 @@ fn a_local_activity_with_schedule_to_close_panics_at_registration() {
     info.default_schedule_to_close = Some(Duration::from_secs(10));
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_activity(&info);
+}
+
+/// A settable clock in epoch seconds, installed on `rt`.
+fn install_clock(rt: &mut SqliteRuntime) -> Arc<AtomicI64> {
+    let clock = Arc::new(AtomicI64::new(1_000_000));
+    let read = clock.clone();
+    rt.set_clock(move || Utc.timestamp_opt(read.load(Ordering::SeqCst), 0).unwrap());
+    clock
+}
+
+/// Registers `info` with a body that fails once with `error`, then returns
+/// its input. Returns the call counter.
+fn fail_once(
+    rt: &mut SqliteRuntime,
+    info: &autumn_harvest::ActivityInfo,
+    error: String,
+) -> Arc<AtomicU32> {
+    let calls = Arc::new(AtomicU32::new(0));
+    let seen = calls.clone();
+    rt.register_activity_with_body(info, move |input| {
+        if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(error.clone())
+        } else {
+            Ok(input)
+        }
+    });
+    calls
+}
+
+// A retry backoff must not block the drive. The run waits until the
+// backoff ends, and only then runs the next attempt.
+#[tokio::test]
+async fn a_local_retry_backoff_parks_the_run_without_sleeping() {
+    let info = calls_slow_retry_info();
+    let mut rt = runtime(&info);
+    let clock = install_clock(&mut rt);
+    let calls = fail_once(&mut rt, &slow_retry_info(), "not yet".to_string());
+    let exec = rt.start_workflow(info.name, json!(4)).unwrap();
+
+    let started = Instant::now();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::WaitingTimer), "got {state:?}");
+    assert!(started.elapsed() < Duration::from_secs(5), "the drive slept");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    clock.store(1_000_009, Ordering::SeqCst);
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::WaitingTimer), "got {state:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no attempt before the backoff");
+
+    clock.store(1_000_010, Ordering::SeqCst);
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == 4),
+        "got {state:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_replays(info.name, info.handler, rt.load_history(exec).unwrap()).await;
+}
+
+// A typed `retry_after` hint wins over a zero policy backoff, as on Postgres.
+#[tokio::test]
+async fn a_retry_after_hint_sets_the_backoff() {
+    let info = calls_hinted_info();
+    let mut rt = runtime(&info);
+    let clock = install_clock(&mut rt);
+    let error = ActivityFailure::retryable("Http429", "busy")
+        .with_retry_after(Duration::from_secs(30))
+        .into_error_payload();
+    let calls = fail_once(&mut rt, &hinted_info(), error);
+    let exec = rt.start_workflow(info.name, json!(6)).unwrap();
+
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::WaitingTimer), "got {state:?}");
+    clock.store(1_000_029, Ordering::SeqCst);
+    rt.run_until_blocked(exec).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the hint holds the retry");
+
+    clock.store(1_000_030, Ordering::SeqCst);
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == 6),
+        "got {state:?}"
+    );
+    // The stored error is the typed message, as on Postgres.
+    let history = rt.load_history(exec).unwrap();
+    assert!(history.iter().any(|e| matches!(
+        e,
+        WorkflowEvent::LocalActivityFailed { error, .. } if error == "busy"
+    )));
 }

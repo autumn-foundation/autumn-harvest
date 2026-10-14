@@ -51,6 +51,9 @@ pub struct RunConfig {
     pub retry_policy_json: Option<String>,
     /// The failed run that this run retries.
     pub retry_of: Option<ExecutionId>,
+    /// The epoch-millisecond end of a local-activity retry backoff. A drive
+    /// before it waits. A new run has none.
+    pub local_retry_at: Option<i64>,
 }
 
 /// Insert a `RUNNING` row with no timeout and no retry. The unit tests use it.
@@ -102,7 +105,8 @@ pub fn run_config(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<RunCo
     let row = conn
         .query_row(
             "SELECT execution_timeout_ms, deadline_at, start_at, workflow_attempt, \
-             retry_policy_json, retry_of_exec_id FROM harvest_executions WHERE exec_id = ?1",
+             retry_policy_json, retry_of_exec_id, local_retry_at \
+             FROM harvest_executions WHERE exec_id = ?1",
             params![exec_id.to_string()],
             |r| {
                 Ok((
@@ -112,12 +116,21 @@ pub fn run_config(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<RunCo
                     r.get::<_, i64>(3)?,
                     r.get::<_, Option<String>>(4)?,
                     r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
                 ))
             },
         )
         .optional()?
         .ok_or(SqliteError::ExecutionNotFound(exec_id))?;
-    let (execution_timeout_ms, deadline_at, start_at, attempt, retry_policy_json, retry_of) = row;
+    let (
+        execution_timeout_ms,
+        deadline_at,
+        start_at,
+        attempt,
+        retry_policy_json,
+        retry_of,
+        local_retry_at,
+    ) = row;
     let retry_of = retry_of
         .map(|id| {
             id.parse()
@@ -131,7 +144,18 @@ pub fn run_config(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<RunCo
         attempt: u32::try_from(attempt).unwrap_or(1).max(1),
         retry_policy_json,
         retry_of,
+        local_retry_at,
     })
+}
+
+/// Park `exec_id` until the local-activity backoff ends at `at` (issue
+/// #2029).
+pub fn set_local_retry_at(conn: &Connection, exec_id: ExecutionId, at: i64) -> SqliteResult<()> {
+    conn.execute(
+        "UPDATE harvest_executions SET local_retry_at = ?2 WHERE exec_id = ?1",
+        params![exec_id.to_string(), at],
+    )?;
+    Ok(())
 }
 
 pub fn execution_exists(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<bool> {
@@ -498,7 +522,8 @@ pub fn history_has_activity_scheduled(events: &[WorkflowEvent], activity_id: &st
 }
 
 /// The number of currently-*pending* arms of `timer_id` — recorded
-/// `TimerStarted(timer_id)` events not yet matched by a `TimerFired(timer_id)`.
+/// `TimerStarted(timer_id)` events not yet ended by a `TimerFired` or a
+/// `TimerCancelled`.
 ///
 /// A timer id may be RE-ARMED under the same name (the poll-loop idiom
 /// `loop { ctx.timer("tick", 1).await?; … }`), which the core supports via
@@ -506,12 +531,12 @@ pub fn history_has_activity_scheduled(events: &[WorkflowEvent], activity_id: &st
 /// OCCURRENCE, not the bare id: a plain "history already has a `TimerStarted`
 /// for this id?" guard would wrongly match a PRIOR *fired* arm and skip a genuine
 /// re-arm, wedging the run. `> 0` means an arm is already recorded and unfired
-/// (a replay-cycle re-emit — skip it); `== 0` means every prior arm has fired, so
+/// (a replay-cycle re-emit — skip it); `<= 0` means every prior arm has ended, so
 /// a `StartTimer` for this id is a genuinely new arm that must be persisted.
 ///
 /// A `TimerCancelled` ends an arm too (issue #2029). A cancellable timer can
-/// release its id to `ctx.timer`, and a reset cancels twice, so the count can
-/// go below zero. A caller treats any value up to zero as "no pending arm".
+/// then release its id to `ctx.timer`. A cancel with no live arm, such as a
+/// second cancel, still counts, so the value can go below zero.
 pub fn pending_timer_arms(events: &[WorkflowEvent], timer_id: &str) -> i64 {
     let started = events
         .iter()

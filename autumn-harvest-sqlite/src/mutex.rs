@@ -11,8 +11,8 @@
 //! releases every lock it holds, through [`release_all`].
 //!
 //! No step wakes a waiter. The fleet poll drives every run, so a waiter
-//! tries again on the next pass. This matches Postgres, which appends no
-//! event to the waiter either.
+//! tries again on the next pass. Postgres wakes the next waiter on a release.
+//! It appends no event either, so the two histories match.
 
 use autumn_harvest::ExecutionId;
 use rusqlite::{Connection, OptionalExtension, params};

@@ -17,7 +17,7 @@ its history replays on the core `WorkflowReplayer`.
   `harvest_mutex_waiters` and `harvest_mutex_seq`. A grant goes to the first
   run in the FIFO queue of a free key. It mints a new `lock_seq` and appends
   `MutexGranted`. A waiting run returns the new `RunState::WaitingMutex(key)`.
-  `ReleaseMutex` is fenced by `lock_seq`. Every terminal state setter releases
+  `lock_seq` fences `ReleaseMutex`. Every terminal state setter releases
   the run's locks and queue places. A release that frees a lock is progress,
   so `run_until_idle` drives the waiter. An acquire must be the only
   awaitable in its batch, as on Postgres.
@@ -28,8 +28,10 @@ its history replays on the core `WorkflowReplayer`.
   appends `LocalActivityFailed` or `LocalActivityCompleted`. A terminal
   failure adds `LocalActivityExhausted`. The per-attempt budget is
   `start_to_close`, capped at 60 seconds and checked after the body returns.
-  A retry backoff sleeps in the drive. A batch with a durable awaitable or a
-  second local activity ends the run `FAILED` (issue #950).
+  A retry backoff parks the run in `local_retry_at`, and the drive does not
+  sleep. A batch with a durable awaitable ends the run `FAILED`, as on
+  Postgres (issue #950). This backend also rejects a second local activity
+  in one batch. A typed `retry_after` hint wins over the policy backoff.
 - **Execution timeout (#243).** A start stores `execution_timeout_ms` and
   `deadline_at`. Each cycle checks the deadline first. A late run gets
   `WorkflowExecutionTimedOut`, ends `TIMED_OUT` with the Postgres error text,
@@ -43,12 +45,13 @@ its history replays on the core `WorkflowReplayer`.
   retry waits for its backoff in `start_at`. `SqliteRuntime::successor` now
   returns a retry too.
 - **Schema.** `harvest_executions` gains `execution_timeout_ms`,
-  `deadline_at`, `start_at`, `workflow_attempt`, `retry_policy_json` and
-  `retry_of_exec_id`. `schema::migrate` adds them to an old file.
+  `deadline_at`, `start_at`, `workflow_attempt`, `retry_policy_json`,
+  `retry_of_exec_id` and `local_retry_at`. `schema::migrate` adds them to an old file.
 
 **Core.** `ActivityContext::new_embedded_local` is a new hidden constructor
 for an embedded local-activity context. `WorkflowReplayer::replay_from_events`
-now replays a history that ends in `WorkflowExecutionTimedOut` as an
+and `replay_from_snapshot` now replay a history that ends in
+`WorkflowExecutionTimedOut` as an
 in-flight run up to the seal. The engine seals such a run while the body is
 parked, so no command follows the last recorded event. A divergence before
 the seal still reports.

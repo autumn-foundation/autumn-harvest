@@ -152,3 +152,14 @@ async fn the_fleet_poll_times_out_a_sleeping_run_and_drops_its_timer() {
     );
     assert_replays(info.name, info.handler, history).await;
 }
+
+// A sub-millisecond timeout rounds up. It must not fire at the start.
+#[tokio::test]
+async fn a_sub_millisecond_timeout_does_not_fire_at_once() {
+    let mut info = quick_info();
+    info.execution_timeout = Some(std::time::Duration::from_micros(500));
+    let (mut rt, _clock) = runtime(&info);
+    let exec = rt.start_workflow(info.name, json!(1)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "got {state:?}");
+}

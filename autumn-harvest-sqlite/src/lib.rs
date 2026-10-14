@@ -287,8 +287,9 @@
 //!   fields this single-writer backend cannot honor).
 //! - **A batch that breaks a solo rule.** A mutex acquire must be the only
 //!   awaitable in its batch (`AcquireMutex`). A local activity cannot share a
-//!   batch with a durable awaitable or a second local activity
-//!   (`RunLocalActivity`, issue #950). Postgres rejects both shapes too.
+//!   batch with a durable awaitable (`RunLocalActivity`, issue #950). Postgres
+//!   rejects both shapes too. This backend also rejects a second local
+//!   activity in one batch.
 //!
 //! The command-name table (`runtime.rs`) is EXHAUSTIVE — a future core
 //! `WorkflowCommand` variant is a compile error in this backend, forcing an
@@ -335,13 +336,15 @@
 //!   `TimerCancelled`.
 //! - **Workflow mutex.** `ctx.mutex(key).acquire()` grants a free key to the
 //!   first run in its FIFO queue and appends `MutexGranted`. A run that waits
-//!   returns [`RunState::WaitingMutex`]. A release is fenced by `lock_seq`. A run
+//!   returns [`RunState::WaitingMutex`]. `lock_seq` fences each release. A run
 //!   that ends releases every lock and queue place it holds. No step wakes a
 //!   waiter: the fleet poll drives it again.
-//! - **Local activities.** `#[activity(local = true)]` registers. The cycle
-//!   appends `LocalActivityScheduled`, then runs the body inline. Each attempt
-//!   appends `LocalActivityFailed` or `LocalActivityCompleted`, and a terminal
-//!   failure adds `LocalActivityExhausted`. A retry backoff blocks the drive.
+//! - **Local activities.** `register_activity` accepts `#[activity(local =
+//!   true)]`. The cycle appends `LocalActivityScheduled`. The body runs inline
+//!   after the commit. Each attempt appends `LocalActivityFailed` or
+//!   `LocalActivityCompleted`, and a terminal failure adds
+//!   `LocalActivityExhausted`. A retry backoff ends the cycle. A drive before
+//!   its end returns [`RunState::WaitingTimer`].
 //! - **Execution timeout.** A start stores the deadline. Each cycle checks it
 //!   first. A run past it gets `WorkflowExecutionTimedOut`, ends `TIMED_OUT`,
 //!   and returns [`RunState::TimedOut`].
@@ -361,8 +364,8 @@
 //! (setup-time — mirroring the Postgres `HarvestPlugin::build()` panic on
 //! registration misconfiguration) if it declares an execution- or
 //! admission-affecting feature this v0.1 backend cannot honor, naming the specific
-//! feature and pointing at the supported alternative (Codex #1069 P2,
-//! `runtime.rs:602` `execution_timeout`, `:686` `retry_policy`). The partition:
+//! feature and pointing at the supported alternative (Codex #1069 P2). The
+//! partition:
 //!
 //! - **REJECTED (would change lifecycle or admission semantics if ignored):**
 //!   - `concurrency` (#247), `debounce` (#499), `batch` (#518), `throttle` (#607) —

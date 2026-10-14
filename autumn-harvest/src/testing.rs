@@ -1166,6 +1166,21 @@ impl WorkflowReplayer {
                 reproduced_failure: None,
             };
         };
+        // Issue #2029: a run sealed TIMED_OUT replays up to its seal.
+        if let Some(seal) = timed_out_seal_start(&snapshot.events) {
+            let mut prefix = snapshot;
+            prefix.events.truncate(seal);
+            return self
+                .replay_canary_snapshot_effective(
+                    prefix,
+                    execution_timeout,
+                    deadline_at,
+                    parent_execution_id,
+                    workflow_id,
+                    queue_name,
+                )
+                .await;
+        }
 
         // Issue #798 (Codex round 21): borrow the candidate's declarative
         // handlers for the duration of the executor call.
@@ -7868,6 +7883,31 @@ mod tests {
         timed_out(&mut events);
         let replayer = WorkflowReplayer::new().register_fn("activity", activity_workflow);
         let report = replayer.replay_from_events(events).await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
+
+    // Issue #2029: the snapshot and JSON paths apply the same rule.
+    #[tokio::test]
+    async fn a_timed_out_snapshot_replays() {
+        let (exec_id, mut events) = activity_events();
+        events.pop();
+        timed_out(&mut events);
+        let snapshot = HistorySnapshot {
+            workflow_name: "activity".into(),
+            execution_id: exec_id,
+            events,
+            context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
+            queue_name: None,
+        };
+        let replayer = WorkflowReplayer::new().register_fn("activity", activity_workflow);
+        let report = replayer.replay_from_snapshot(snapshot).await;
         assert!(
             matches!(report.status, ReplayStatus::ReplaySucceeded),
             "{report}"

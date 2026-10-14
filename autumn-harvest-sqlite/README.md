@@ -129,7 +129,7 @@ A complete, runnable version is in
   `ctx.start_timer` and `TimerHandle` arm, cancel and reset durable timers.
   `ctx.mutex(key).acquire()` grants a key in FIFO order, and a waiting run
   returns `RunState::WaitingMutex(key)`. `#[activity(local = true)]` runs
-  inline in the decision cycle. `#[workflow(execution_timeout = ..)]` ends a
+  inline after its decision commits. `#[workflow(execution_timeout = ..)]` ends a
   late run `TIMED_OUT`. `#[workflow(retry = ..)]` starts a retry run, which
   `successor(exec)` returns. Each records the Postgres events.
 

@@ -586,7 +586,7 @@ pub fn enqueue_timer(
     // `INSERT OR REPLACE` (not `OR IGNORE`) so a timer id can be RE-ARMED under the
     // same name after a prior fire (the poll-loop idiom). The caller
     // (`apply_commands`) only reaches this for a genuinely-new arm — occurrence
-    // idempotency (`store::pending_timer_arms == 0`) guarantees no *pending* arm of
+    // idempotency (`store::pending_timer_arms <= 0`) guarantees no *pending* arm of
     // this id exists — so any conflicting `(exec_id, timer_id)` row is a spent
     // (`fired = 1`) row from a previous arm that is safe to supersede with the
     // fresh unfired arm. `OR IGNORE` would instead silently keep the spent row and

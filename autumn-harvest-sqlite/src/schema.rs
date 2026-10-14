@@ -85,8 +85,11 @@ CREATE TABLE IF NOT EXISTS harvest_executions (
                                            -- (issue #2029).
     retry_policy_json TEXT,                -- the frozen workflow-level RetryPolicy
                                            -- (issue #2029). NULL = no retry.
-    retry_of_exec_id TEXT                  -- the failed run that this retry replaces
+    retry_of_exec_id TEXT,                 -- the failed run that this retry replaces
                                            -- (issue #2029).
+    local_retry_at INTEGER                 -- the epoch-millisecond end of a local
+                                           -- activity's retry backoff (issue #2029).
+                                           -- A drive before it waits.
 );
 
 -- Non-unique lookup index for the (workflow_name, workflow_id) reuse-policy probe
@@ -238,8 +241,8 @@ CREATE INDEX IF NOT EXISTS idx_harvest_signals_exec_arrival
     ON harvest_signals (exec_id, delivered, received_at, signal_seq);
 DROP INDEX IF EXISTS idx_harvest_signals_exec_delivered;
 
--- The workflow mutex (issue #2029). A lock row means the key is held. The
--- grant and the release run in the drive transaction of the single writer.
+-- The workflow mutex (issue #2029). A lock row means the key is held. Each
+-- grant and each release runs in one write transaction of the single writer.
 CREATE TABLE IF NOT EXISTS harvest_mutex_locks (
     lock_key       TEXT PRIMARY KEY,
     holder_exec_id TEXT NOT NULL,
@@ -306,7 +309,8 @@ use crate::error::SqliteResult;
 ///   cancel request, and `cancel_from_seq`, the history length at the request.
 ///   Both are nullable, so an old row has no pending cancel.
 /// - **issue #2029** — `harvest_executions.execution_timeout_ms`, `deadline_at`,
-///   `start_at`, `workflow_attempt`, `retry_policy_json` and `retry_of_exec_id`.
+///   `start_at`, `workflow_attempt`, `retry_policy_json`, `retry_of_exec_id` and
+///   `local_retry_at`.
 ///   Each is nullable or has a default, so an old row has no timeout and no
 ///   retry. The mutex tables are new, so `CREATE TABLE IF NOT EXISTS` adds them.
 ///
@@ -362,6 +366,7 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
         ("workflow_attempt", "INTEGER NOT NULL DEFAULT 1"),
         ("retry_policy_json", "TEXT"),
         ("retry_of_exec_id", "TEXT"),
+        ("local_retry_at", "INTEGER"),
     ] {
         add_column_if_absent(
             conn,
