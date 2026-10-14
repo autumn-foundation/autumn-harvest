@@ -245,3 +245,64 @@ async fn the_timeout_seal_deletes_the_timer_row() {
         .unwrap();
     assert_eq!(timers, 0);
 }
+
+/// Signals that the body started, then hangs.
+static HANG_STARTED: std::sync::OnceLock<Arc<tokio::sync::Notify>> = std::sync::OnceLock::new();
+
+fn hang_started() -> Arc<tokio::sync::Notify> {
+    Arc::clone(HANG_STARTED.get_or_init(Default::default))
+}
+
+#[activity]
+async fn hangs(_ctx: &ActivityContext, _n: i64) -> Result<i64, String> {
+    hang_started().notify_one();
+    std::future::pending::<()>().await;
+    unreachable!("a pending future never resolves")
+}
+
+/// Awaits an activity that never returns.
+#[workflow(execution_timeout = "30s")]
+async fn awaits_a_hung_activity(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    ctx.execute_activity(&hangs_info(), n)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// A drive dropped mid-body leaves the task `RUNNING`. A late signal seals the
+// run without a drive, so the seal must remove that row too.
+#[tokio::test]
+async fn a_late_input_seal_deletes_a_running_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("running.db");
+    let info = awaits_a_hung_activity_info();
+    let exec = {
+        let mut rt = SqliteRuntime::open(&path).unwrap();
+        rt.register_workflow(&info);
+        rt.register_activity(&hangs_info());
+        let clock = Clock(Arc::new(AtomicI64::new(0)));
+        clock.set(0);
+        let read = clock.clone();
+        rt.set_clock(move || Utc.timestamp_opt(read.0.load(Ordering::SeqCst), 0).unwrap());
+        let exec = rt.start_workflow(info.name, json!(1)).unwrap();
+        let started = hang_started();
+        tokio::select! {
+            state = rt.run_until_blocked(exec) => panic!("the hung body must block: {state:?}"),
+            () = started.notified() => {}
+        }
+        clock.set(31);
+        assert!(matches!(
+            rt.send_signal(exec, "late", json!(1)),
+            Err(SqliteError::WorkflowNotRunning { ref state, .. }) if state == "TIMED_OUT"
+        ));
+        exec
+    };
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    let open: i64 = raw
+        .query_row(
+            "SELECT COUNT(*) FROM harvest_tasks WHERE exec_id = ?1 AND state IN ('PENDING', 'RUNNING')",
+            [exec.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(open, 0, "the seal must not strand a RUNNING task");
+}

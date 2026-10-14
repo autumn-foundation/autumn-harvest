@@ -1958,7 +1958,8 @@ impl SqliteRuntime {
     /// End `exec` `TIMED_OUT` at its `deadline` (issue #2029).
     ///
     /// One transaction appends `WorkflowExecutionTimedOut`, sets the state and
-    /// the Postgres error text, and deletes the open rows. The terminal setter
+    /// the Postgres error text, and deletes the open rows. A `RUNNING` task
+    /// is one of them. The terminal setter
     /// also releases the run's mutex locks. The event is the Postgres one, so
     /// the history replays on any backend.
     fn seal_timed_out(
@@ -1984,6 +1985,9 @@ impl SqliteRuntime {
             },
         )?;
         store::set_terminal_with_reason(&tx, exec, TIMED_OUT_STATE, &error)?;
+        // A late signal or update seals without a drive, so no reclaim ran.
+        // A drive dropped mid-body can leave a `RUNNING` row with no owner.
+        queue::reclaim_running_for_execution(&tx, exec)?;
         delete_open_rows(&tx, exec)?;
         tx.commit()?;
         self.workflow_panic_strikes.remove(&exec);
