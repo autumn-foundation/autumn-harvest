@@ -291,8 +291,9 @@ pub struct FirecrackerLauncher {
 struct Tenancy {
     lease: InstanceLease,
     leftovers: Mutex<Vec<PathBuf>>,
-    /// The VM directories that a teardown could not remove. The sweep skips
-    /// the VMs of a live owner, so only the launcher tries them again.
+    /// The VM, jail and copy directories that a removal could not remove.
+    /// The sweep skips the directories of a live owner, so only the launcher
+    /// tries them again.
     dirs: Mutex<Vec<PathBuf>>,
     /// The image that a jailed launcher pinned at its start.
     pinned: Option<PinnedImage>,
@@ -401,14 +402,14 @@ impl Tenancy {
             .push(cgroup.to_path_buf());
     }
 
-    /// Keep the VM directory `dir` when it is still there.
+    /// Keep the directory `dir` of this launcher when it is still there.
     fn keep_dir_if_left(&self, dir: &Path) {
         if matches!(dir.try_exists(), Ok(false)) {
             return;
         }
         tracing::warn!(
             dir = %dir.display(),
-            "could not remove a sandbox VM directory; the launcher tries it again"
+            "could not remove a sandbox directory; the launcher tries it again"
         );
         self.dirs
             .lock()
@@ -923,14 +924,16 @@ impl FirecrackerLauncher {
             .join(format!("{}{VMM_COPIES_SUFFIX}", new_vm_id(&self.owner)));
         // A dropped check removes the copies. A copy task that still runs
         // then removes them again when it ends.
-        let guard = JailGuard::new(dir.clone());
+        let guard = JailGuard::new(dir.clone(), Arc::clone(&self.tenancy));
         let abandoned = guard.abandoned();
         let task_dir = dir.clone();
         let task_ids = ids.clone();
+        let task_tenancy = Arc::clone(&self.tenancy);
         let copies = tokio::task::spawn_blocking(move || {
             let copies = copy_binaries(&task_dir, &sources, &task_ids);
             if abandoned.load(std::sync::atomic::Ordering::SeqCst) {
                 let _ = crate::sandbox::exec::remove_work_dir(&task_dir);
+                task_tenancy.keep_dir_if_left(&task_dir);
             }
             copies
         })
@@ -945,6 +948,7 @@ impl FirecrackerLauncher {
             jailer: copies.next(),
             version: (0, 0, 0),
             sources: ids,
+            tenancy: Arc::clone(&self.tenancy),
         };
         vmm.version = probe_version(&vmm.firecracker, VmmBinary::Firecracker).await?;
         if let Some(jailer) = &vmm.jailer {
@@ -1141,7 +1145,7 @@ impl FirecrackerLauncher {
             .map_err(|e| prepare_error(id, "the jail", &e))?;
         // A failed step or a dropped launch removes the jail, so it leaves
         // nothing.
-        let guard = JailGuard::new(jail.clone());
+        let guard = JailGuard::new(jail.clone(), Arc::clone(&self.tenancy));
         let fail = |what: &str, e: &std::io::Error| prepare_error(id, what, e);
         // The image that this launcher pinned at its start.
         let pinned = self.tenancy.pinned.as_ref();
@@ -1176,12 +1180,14 @@ impl FirecrackerLauncher {
         // the task removes the jail again when the guard is gone.
         let abandoned = guard.abandoned();
         let task_jail = jail.clone();
+        let task_tenancy = Arc::clone(&self.tenancy);
         let linked = tokio::task::spawn_blocking(move || {
             let linked = links.into_iter().try_for_each(|(from, to, what)| {
                 std::fs::hard_link(&from, &to).map_err(|e| (what, e))
             });
             if abandoned.load(std::sync::atomic::Ordering::SeqCst) {
                 let _ = crate::sandbox::exec::remove_work_dir(&task_jail);
+                task_tenancy.keep_dir_if_left(&task_jail);
             }
             linked
         })
@@ -1438,6 +1444,8 @@ struct CheckedVmm {
     version: super::posture::Version,
     /// The identity of each configured binary at its copy.
     sources: Vec<FileId>,
+    /// The tenancy that tries the directory again when its removal fails.
+    tenancy: Arc<Tenancy>,
 }
 
 impl CheckedVmm {
@@ -1469,6 +1477,7 @@ impl CheckedVmm {
 impl Drop for CheckedVmm {
     fn drop(&mut self) {
         let _ = crate::sandbox::exec::remove_work_dir(&self.dir);
+        self.tenancy.keep_dir_if_left(&self.dir);
     }
 }
 
@@ -2119,13 +2128,16 @@ fn write_config(path: &Path, document: &super::config::VmConfigFile) -> std::io:
 struct JailGuard {
     jail: Option<PathBuf>,
     abandoned: Arc<std::sync::atomic::AtomicBool>,
+    /// The tenancy that tries the jail again when its removal fails.
+    tenancy: Arc<Tenancy>,
 }
 
 impl JailGuard {
-    fn new(jail: PathBuf) -> Self {
+    fn new(jail: PathBuf, tenancy: Arc<Tenancy>) -> Self {
         Self {
             jail: Some(jail),
             abandoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tenancy,
         }
     }
 
@@ -2146,6 +2158,7 @@ impl Drop for JailGuard {
             self.abandoned
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = crate::sandbox::exec::remove_work_dir(&jail);
+            self.tenancy.keep_dir_if_left(&jail);
         }
     }
 }
@@ -4078,6 +4091,58 @@ while True:
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Make the removal of `dir` fail, then let a sweep try it again.
+    /// Return whether the sweep removed it.
+    fn swept_again(launcher: &FirecrackerLauncher, dir: &Path, drop_owner: impl FnOnce()) -> bool {
+        // A file in place of the directory makes the removal fail.
+        std::fs::write(dir, b"").unwrap();
+        drop_owner();
+        std::fs::remove_file(dir).unwrap();
+        std::fs::create_dir(dir).unwrap();
+        std::fs::write(dir.join("file"), b"left").unwrap();
+        launcher.sweep_stale();
+        !dir.exists()
+    }
+
+    #[test]
+    fn vmm_copies_that_cannot_be_removed_are_tried_again() {
+        let dir = temp_dir();
+        let launcher = new_launcher(jailed(&dir)).unwrap();
+        let copies = launcher.vm_root().join(format!(
+            "{}{VMM_COPIES_SUFFIX}",
+            new_vm_id(launcher.owner())
+        ));
+        let vmm = CheckedVmm {
+            dir: copies.clone(),
+            firecracker: PathBuf::new(),
+            jailer: None,
+            version: (1, 15, 0),
+            sources: Vec::new(),
+            tenancy: Arc::clone(&launcher.tenancy),
+        };
+        // The sweep skips the directories of a live owner.
+        assert!(
+            swept_again(&launcher, &copies, || drop(vmm)),
+            "the launcher did not try the copies again"
+        );
+        drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_abandoned_jail_that_cannot_be_removed_is_tried_again() {
+        let dir = temp_dir();
+        let launcher = new_launcher(jailed(&dir)).unwrap();
+        let jail = launcher.vm_root().join(new_vm_id(launcher.owner()));
+        let guard = JailGuard::new(jail.clone(), Arc::clone(&launcher.tenancy));
+        assert!(
+            swept_again(&launcher, &jail, || drop(guard)),
+            "the launcher did not try the jail again"
+        );
+        drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Whether the process `pid` runs. A zombie is dead.
     fn is_alive(pid: i32) -> bool {
         std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
@@ -4338,11 +4403,12 @@ while True:
         assert_eq!(std::fs::read(root.join(KERNEL_FILE)).unwrap(), old_kernel);
         assert_eq!(std::fs::read(root.join(ROOTFS_FILE)).unwrap(), old_rootfs);
         drop(prepared);
-        // The pinned image goes with the launcher.
+        // The pinned image goes with the launcher and the last of its copies.
         let pinned = launcher
             .vm_root()
             .join(format!("hsbx-{}-image", launcher.owner()));
         assert!(pinned.is_dir(), "{}", pinned.display());
+        drop(vmm);
         drop(launcher);
         assert!(!pinned.exists(), "the launcher left its pinned image");
         std::fs::remove_dir_all(dir).unwrap();
