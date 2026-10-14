@@ -240,6 +240,12 @@ as root:
 sudo install -o root -g root -m 0644 image/vmlinux image/rootfs.ext4 /srv/harvest-image/
 ```
 
+A jailed launcher pins its image at its start. It hard-links the kernel, the
+root file system and the snapshot pair into `hsbx-<owner>-image` under its VM
+root, and each launch links from there. So an image that lands one file at a
+time never gives a launch a mixed pair. A new image takes effect at the next
+worker start. An unjailed launcher reads the configured paths at each launch.
+
 The guest agent is process 1. It mounts `/proc`, `/sys`, the cgroup v2 file
 system, `/dev`, `/tmp` and a `/work` tmpfs. It listens on vsock port 52. Each
 run mixes 32 bytes of host entropy into the kernel pool and forces a reseed.
@@ -272,7 +278,7 @@ let launcher = FirecrackerLauncher::new(LauncherConfig {
     firecracker_bin: "/usr/local/bin/firecracker".into(),
     image: GuestImage::new("/var/lib/harvest/image/vmlinux", "/var/lib/harvest/image/rootfs.ext4")
         .with_name("rootfs-sha256:..."),
-    machine: MachineSpec { vcpu_count: 1, mem_size_mib: 512 },
+    machine: MachineSpec::default(),
     boot: BootMethod::ConfigFile,
     confinement: Confinement::Jailer(jail),
     guest_port: 52,
@@ -289,9 +295,12 @@ The backend takes the guest port from the launcher.
 
 What each microVM gets:
 
-- one vCPU and 512 MiB by default, with `cpu.max`, `memory.max`,
-  `memory.swap.max` and `pids.max` on its cgroup. The microVM size bounds
-  the memory that the code uses;
+- one vCPU and 2176 MiB by default, with `cpu.max`, `memory.max`,
+  `memory.swap.max` and `pids.max` on its cgroup. That is the 2 GiB memory
+  ceiling of the default policy plus a 128 MiB guest reserve
+  (`GUEST_MEMORY_RESERVE_MIB`). Firecracker maps guest memory on first use,
+  so the unused part costs no host memory. The runtime refuses a policy
+  whose memory ceiling is above the microVM size less the reserve;
 - a read-only root drive, a vsock device and a virtio-rng device;
 - no network device, no metadata service and no serial console;
 - the kernel arguments `reboot=k panic=1 8250.nr_uarts=0`;

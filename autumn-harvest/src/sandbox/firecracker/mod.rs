@@ -27,7 +27,7 @@ pub mod posture;
 pub mod vsock;
 
 pub use backend::{BackendSettings, FirecrackerBackend};
-pub use config::{GuestImage, MachineSpec};
+pub use config::{GUEST_MEMORY_RESERVE_MIB, GuestImage, MachineSpec};
 pub use jailer::JailerConfig;
 pub use launcher::{BootMethod, Confinement, FirecrackerLauncher, LauncherConfig, SnapshotFiles};
 pub use posture::PosturePolicy;

@@ -14,6 +14,12 @@
 //! directories. [`FirecrackerLauncher::sweep_stale`] removes the VMs of each
 //! owner whose lease is not locked, so a crashed worker leaves no VM behind
 //! after the next start.
+//!
+//! A jailed launcher pins its image at its start. It hard-links the kernel,
+//! the root file system and the snapshot pair into a directory of its own,
+//! and each launch links from there. So a new image that lands one file at
+//! a time never gives a launch a mixed pair. It takes effect at the next
+//! launcher start.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -23,9 +29,9 @@ use std::time::Duration;
 
 use super::api::ApiClient;
 use super::config::{
-    CONFIG_FILE, GuestImage, KERNEL_FILE, MAX_SOCKET_PATH_BYTES, MachineSpec, OWNER_TAG_HEX,
-    ROOTFS_FILE, VM_ID_PREFIX, VM_ID_RANDOM_HEX, VSOCK_SOCKET, VmPaths, new_vm_id, validate_vm_id,
-    vm_config,
+    CONFIG_FILE, GUEST_MEMORY_RESERVE_MIB, GuestImage, KERNEL_FILE, MAX_SOCKET_PATH_BYTES,
+    MachineSpec, OWNER_TAG_HEX, ROOTFS_FILE, VM_ID_PREFIX, VM_ID_RANDOM_HEX, VSOCK_SOCKET, VmPaths,
+    new_vm_id, validate_vm_id, vm_config,
 };
 use super::jailer::JailerConfig;
 use super::posture::{PostureFinding, PosturePolicy};
@@ -82,6 +88,11 @@ pub trait VmLauncher: Send + Sync + 'static {
     /// to its overhead. Zero by default.
     fn launch_budget(&self) -> Duration {
         Duration::ZERO
+    }
+
+    /// The most memory that one run can use, in bytes. `None` by default.
+    fn memory_capacity(&self) -> Option<u64> {
+        None
     }
 }
 
@@ -166,13 +177,75 @@ pub struct FirecrackerLauncher {
 struct Tenancy {
     lease: InstanceLease,
     leftovers: Mutex<Vec<PathBuf>>,
+    /// The image that a jailed launcher pinned at its start.
+    pinned: Option<PinnedImage>,
+}
+
+/// The image files of a launcher, hard-linked at its start into a directory
+/// of its own.
+#[derive(Debug)]
+struct PinnedImage {
+    dir: PathBuf,
+    kernel: PathBuf,
+    rootfs: PathBuf,
+    snapshot: Option<SnapshotFiles>,
+}
+
+impl PinnedImage {
+    /// Hard-link the image files of `config` into the directory of `owner`
+    /// under `vm_root`. The construction checked that they are on the file
+    /// system of the jail, so nothing is copied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::Config`] when a link fails. Nothing is left.
+    fn pin(config: &LauncherConfig, vm_root: &Path, owner: &str) -> Result<Self, SandboxError> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let dir = vm_root.join(format!("{VM_ID_PREFIX}{owner}-image"));
+        let fail = |what: &Path, e: &std::io::Error| {
+            SandboxError::Config(format!(
+                "cannot pin {} in {}: {e}",
+                what.display(),
+                dir.display()
+            ))
+        };
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|e| fail(vm_root, &e))?;
+        let link = |from: &Path, name: &str| {
+            let to = dir.join(name);
+            std::fs::hard_link(from, &to).map_err(|e| fail(from, &e))?;
+            Ok::<_, SandboxError>(to)
+        };
+        let pinned = (|| {
+            let snapshot = match &config.boot {
+                BootMethod::Snapshot(files) => Some(SnapshotFiles {
+                    state: link(&files.state, SNAPSHOT_STATE_FILE)?,
+                    memory: link(&files.memory, SNAPSHOT_MEMORY_FILE)?,
+                }),
+                BootMethod::ConfigFile | BootMethod::Api => None,
+            };
+            Ok(Self {
+                dir: dir.clone(),
+                kernel: link(&config.image.kernel, KERNEL_FILE)?,
+                rootfs: link(&config.image.rootfs, ROOTFS_FILE)?,
+                snapshot,
+            })
+        })();
+        if pinned.is_err() {
+            let _ = crate::sandbox::exec::remove_work_dir(&dir);
+        }
+        pinned
+    }
 }
 
 impl Tenancy {
-    const fn new(lease: InstanceLease) -> Self {
+    const fn new(lease: InstanceLease, pinned: Option<PinnedImage>) -> Self {
         Self {
             lease,
             leftovers: Mutex::new(Vec::new()),
+            pinned,
         }
     }
 
@@ -219,6 +292,10 @@ impl Drop for Tenancy {
         self.retry();
         if !self.is_empty() {
             self.lease.keep_file();
+        }
+        // No launch can start now, and each microVM has its own links.
+        if let Some(pinned) = &self.pinned {
+            let _ = crate::sandbox::exec::remove_work_dir(&pinned.dir);
         }
     }
 }
@@ -333,9 +410,13 @@ impl FirecrackerLauncher {
     fn new_on_host(config: LauncherConfig, euid: u32, mounts: &str) -> Result<Self, SandboxError> {
         // Firecracker refuses these at each launch. Refuse them once, here.
         let machine = config.machine;
-        if !(1..=MAX_VCPUS).contains(&machine.vcpu_count) || machine.mem_size_mib == 0 {
+        // The guest kernel and agent keep some memory, so a run needs more.
+        if !(1..=MAX_VCPUS).contains(&machine.vcpu_count)
+            || machine.mem_size_mib <= GUEST_MEMORY_RESERVE_MIB
+        {
             return Err(SandboxError::Config(format!(
-                "a microVM needs 1 to {MAX_VCPUS} vCPUs and some memory, not {} vCPUs and {} MiB",
+                "a microVM needs 1 to {MAX_VCPUS} vCPUs and more than \
+                 {GUEST_MEMORY_RESERVE_MIB} MiB, not {} vCPUs and {} MiB",
                 machine.vcpu_count, machine.mem_size_mib
             )));
         }
@@ -384,12 +465,17 @@ impl FirecrackerLauncher {
             check_trusted_files(&config, jailer, &vm_root)?;
         }
         let lease = InstanceLease::acquire(&vm_root, &owner)?;
+        // The lease comes first, so a sweep sees a live owner of the pin.
+        let pinned = match &config.confinement {
+            Confinement::Jailer(_) => Some(PinnedImage::pin(&config, &vm_root, &owner)?),
+            Confinement::Unjailed { .. } => None,
+        };
         Ok(Self {
             config,
             exec_name,
             owner,
             versions_checked: tokio::sync::OnceCell::new(),
-            tenancy: Arc::new(Tenancy::new(lease)),
+            tenancy: Arc::new(Tenancy::new(lease, pinned)),
         })
     }
 
@@ -635,10 +721,12 @@ impl FirecrackerLauncher {
     /// hold no secret.
     ///
     /// Both files replace an old pair only after both copies are complete.
-    /// A failed rename puts the old file back. A launch that starts between
-    /// the two renames can see a mixed pair. So create a snapshot before the
-    /// launchers that use it start. A host crash between the two renames can
-    /// also leave a mixed pair, so create the snapshot again after it.
+    /// A failed rename puts the old file back. A running launcher pinned its
+    /// pair at its start, so the renames do not reach its launches. A
+    /// launcher that starts between the two renames can pin a mixed pair.
+    /// So create a snapshot before the launchers that use it start. A host
+    /// crash between the two renames can also leave a mixed pair, so create
+    /// the snapshot again after it.
     ///
     /// # Errors
     ///
@@ -753,19 +841,22 @@ impl FirecrackerLauncher {
         // nothing.
         let guard = JailGuard::new(jail.clone());
         let fail = |what: &str, e: &std::io::Error| prepare_error(id, what, e);
+        // The image that this launcher pinned at its start.
+        let pinned = self.tenancy.pinned.as_ref();
+        let kernel = pinned.map_or(&config.image.kernel, |pinned| &pinned.kernel);
+        let rootfs = pinned.map_or(&config.image.rootfs, |pinned| &pinned.rootfs);
         let mut links = vec![
+            (kernel.clone(), root.join(KERNEL_FILE), "the kernel"),
             (
-                config.image.kernel.clone(),
-                root.join(KERNEL_FILE),
-                "the kernel",
-            ),
-            (
-                config.image.rootfs.clone(),
+                rootfs.clone(),
                 root.join(ROOTFS_FILE),
                 "the root file system",
             ),
         ];
         if let BootMethod::Snapshot(files) = boot {
+            let files = pinned
+                .and_then(|pinned| pinned.snapshot.as_ref())
+                .unwrap_or(files);
             links.push((
                 files.state.clone(),
                 root.join(SNAPSHOT_STATE_FILE),
@@ -1014,6 +1105,11 @@ impl VmLauncher for FirecrackerLauncher {
             .saturating_mul(2)
             .saturating_add(api)
             .saturating_add(LAUNCH_SETUP_ALLOWANCE)
+    }
+
+    /// The guest memory less the guest reserve.
+    fn memory_capacity(&self) -> Option<u64> {
+        Some(self.config.machine.run_memory_bytes())
     }
 }
 
@@ -2313,6 +2409,21 @@ while True:
     }
 
     #[test]
+    fn the_launcher_reports_the_memory_a_run_can_use() {
+        let dir = temp_dir();
+        let fc = script(&dir, "firecracker", "exit 0");
+        let mut config = unjailed(&dir, fc, BootMethod::ConfigFile);
+        config.machine = MachineSpec {
+            vcpu_count: 1,
+            mem_size_mib: 512,
+        };
+        let launcher = new_launcher(config).unwrap();
+        assert_eq!(launcher.memory_capacity(), Some(384 << 20));
+        drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_machine_outside_the_firecracker_range_is_a_config_error() {
         let dir = temp_dir();
         for machine in [
@@ -2327,6 +2438,11 @@ while True:
             MachineSpec {
                 vcpu_count: 1,
                 mem_size_mib: 0,
+            },
+            // The guest kernel and agent keep this much, so a run gets none.
+            MachineSpec {
+                vcpu_count: 1,
+                mem_size_mib: super::super::config::GUEST_MEMORY_RESERVE_MIB,
             },
         ] {
             let fc = script(&dir, "firecracker", "exit 0");
@@ -2431,12 +2547,14 @@ while True:
         let dir = temp_dir();
         let launcher = new_launcher(jailed(&dir)).unwrap();
         let vm_root = dir.join("jail/firecracker");
+        // The pinned image is not a jail.
+        let pinned = vm_root.join(format!("hsbx-{}-image", launcher.owner()));
         let jails = || -> Vec<PathBuf> {
             std::fs::read_dir(&vm_root)
                 .unwrap()
                 .filter_map(Result::ok)
                 .map(|entry| entry.path())
-                .filter(|path| path.is_dir())
+                .filter(|path| path.is_dir() && *path != pinned)
                 .collect()
         };
         let mut launch = launcher.launch();
@@ -2873,6 +2991,74 @@ while True:
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Replace `path` by a rename, as `publish-image.sh` does, and return
+    /// the old bytes.
+    fn publish_over(path: &Path, bytes: &[u8]) -> Vec<u8> {
+        let old = std::fs::read(path).unwrap();
+        let next = path.with_extension("next");
+        std::fs::write(&next, bytes).unwrap();
+        std::fs::rename(&next, path).unwrap();
+        old
+    }
+
+    #[tokio::test]
+    async fn a_launch_keeps_the_image_of_the_launcher_start() {
+        let dir = temp_dir();
+        let config = jailed(&dir);
+        let (kernel, rootfs) = (config.image.kernel.clone(), config.image.rootfs.clone());
+        let launcher = new_launcher(config).unwrap();
+        // A new image lands one file at a time while the launcher runs.
+        let old_kernel = publish_over(&kernel, b"new kernel");
+        let old_rootfs = publish_over(&rootfs, b"new rootfs");
+        let id = new_vm_id(launcher.owner());
+        let prepared = launcher
+            .prepare(&id, &BootMethod::ConfigFile)
+            .await
+            .unwrap();
+        let root = prepared.vm_dir.join("root");
+        assert_eq!(std::fs::read(root.join(KERNEL_FILE)).unwrap(), old_kernel);
+        assert_eq!(std::fs::read(root.join(ROOTFS_FILE)).unwrap(), old_rootfs);
+        drop(prepared);
+        // The pinned image goes with the launcher.
+        let pinned = launcher
+            .vm_root()
+            .join(format!("hsbx-{}-image", launcher.owner()));
+        assert!(pinned.is_dir(), "{}", pinned.display());
+        drop(launcher);
+        assert!(!pinned.exists(), "the launcher left its pinned image");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_launch_keeps_the_pair_of_the_launcher_start() {
+        let dir = temp_dir();
+        let files = SnapshotFiles {
+            state: dir.join("snap.state"),
+            memory: dir.join("snap.mem"),
+        };
+        std::fs::write(&files.state, b"old state").unwrap();
+        std::fs::write(&files.memory, b"old memory").unwrap();
+        let mut config = jailed(&dir);
+        config.boot = BootMethod::Snapshot(files.clone());
+        let launcher = new_launcher(config).unwrap();
+        // Only the memory file of a new pair has landed.
+        let old_memory = publish_over(&files.memory, b"new memory");
+        let id = new_vm_id(launcher.owner());
+        let boot = launcher.config().boot.clone();
+        let prepared = launcher.prepare(&id, &boot).await.unwrap();
+        let root = prepared.vm_dir.join("root");
+        assert_eq!(
+            std::fs::read(root.join(SNAPSHOT_MEMORY_FILE)).unwrap(),
+            old_memory
+        );
+        assert_eq!(
+            std::fs::read(root.join(SNAPSHOT_STATE_FILE)).unwrap(),
+            b"old state"
+        );
+        drop((prepared, launcher));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn a_golden_snapshot_needs_an_api_timeout() {
         // A config-file launcher may have no API timeout, but a golden
@@ -2969,10 +3155,12 @@ while True:
             assert_eq!(meta.mode() & 0o777, 0o640, "{}", file.display());
             assert_eq!(meta.gid(), 23_456, "the jailed VMM reads it by group");
         }
+        // The pinned image is not a jail.
+        let pinned = format!("hsbx-{}-image", launcher.owner());
         let jails = std::fs::read_dir(launcher.vm_root())
             .unwrap()
             .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()) && e.file_name() != *pinned)
             .count();
         assert_eq!(jails, 0, "the golden VM is torn down");
         drop(launcher);

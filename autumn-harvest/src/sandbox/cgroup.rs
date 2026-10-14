@@ -17,12 +17,17 @@ const POLL: Duration = Duration::from_millis(10);
 /// `wait` until `cgroup.events` reports `frozen 1`. A frozen process cannot
 /// exit or fork. Then each pid in `cgroup.procs` names a process of the
 /// cgroup, and one pass of `SIGKILL` reaches each one. A cgroup that is not
-/// frozen in time gets no signal, and a later call kills it.
+/// frozen in time gets no signal, and a later call kills it. A cgroup that
+/// cannot freeze gets no signal at all.
 pub fn kill(dir: &Path, wait: Duration) {
     if std::fs::write(dir.join("cgroup.kill"), b"1").is_ok() {
         return;
     }
-    let _ = std::fs::write(dir.join("cgroup.freeze"), b"1");
+    // A cgroup that cannot freeze is gone or has no freezer. Its pids are
+    // not safe to signal.
+    if std::fs::write(dir.join("cgroup.freeze"), b"1").is_err() {
+        return;
+    }
     let deadline = Instant::now() + wait;
     while !is_frozen(dir) {
         if Instant::now() >= deadline {
@@ -75,6 +80,19 @@ mod tests {
     use std::os::unix::process::ExitStatusExt as _;
 
     use super::*;
+
+    #[test]
+    fn a_missing_cgroup_ends_the_kill_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        let started = std::time::Instant::now();
+        kill(&gone, Duration::from_secs(2));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+    }
 
     #[test]
     fn the_fallback_signals_no_pid_before_the_freeze_holds() {

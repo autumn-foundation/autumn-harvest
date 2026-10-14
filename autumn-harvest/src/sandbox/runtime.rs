@@ -81,6 +81,12 @@ pub trait SandboxBackend: Send + Sync + 'static {
         Duration::ZERO
     }
 
+    /// The most memory that one run can use, in bytes, or `None` with no
+    /// bound. A runtime refuses a policy whose memory ceiling is above it.
+    fn memory_capacity(&self) -> Option<u64> {
+        None
+    }
+
     /// Run `job`. Stop and clean up when `cancel` fires.
     fn execute(
         &self,
@@ -122,7 +128,9 @@ impl SandboxRuntime {
     ///
     /// - the policy is not valid;
     /// - the backend isolation is weaker than `policy.min_isolation`;
-    /// - the policy allows the network on a backend without one.
+    /// - the policy allows the network on a backend without one;
+    /// - the memory ceiling of the policy is above what one run of the
+    ///   backend can use.
     pub fn new(
         backend: Arc<dyn SandboxBackend>,
         policy: SandboxPolicy,
@@ -148,6 +156,19 @@ impl SandboxRuntime {
             return Err(SandboxError::Config(
                 "the policy allows the network, but the backend gives code no network".into(),
             ));
+        }
+        // A run past the memory of the backend would fail as a whole, far
+        // below the limit that the policy gives it.
+        let ceiling = policy.max_limits.memory_bytes;
+        if let Some(capacity) = backend.memory_capacity()
+            && ceiling > capacity
+        {
+            return Err(SandboxError::Config(format!(
+                "the policy memory ceiling of {} MiB is above the {} MiB that one run of the \
+                 backend can use",
+                ceiling >> 20,
+                capacity >> 20
+            )));
         }
         let overhead = DEFAULT_BACKEND_OVERHEAD.max(backend.overhead());
         Ok(Self {
@@ -468,6 +489,43 @@ pub(crate) mod tests {
             "{err:?}"
         );
         SandboxRuntime::new(Arc::new(NoNetworkBackend), SandboxPolicy::default()).unwrap();
+    }
+
+    /// A microVM backend whose runs get at most 384 MiB.
+    struct SmallBackend;
+
+    impl SandboxBackend for SmallBackend {
+        fn isolation(&self) -> IsolationLevel {
+            IsolationLevel::MicroVm
+        }
+
+        fn memory_capacity(&self) -> Option<u64> {
+            Some(384 << 20)
+        }
+
+        fn execute(
+            &self,
+            _job: SandboxJob,
+            _cancel: CancellationToken,
+        ) -> BoxFuture<'_, Result<SandboxOutcome, SandboxError>> {
+            Box::pin(async { Err(SandboxError::Cancelled) })
+        }
+    }
+
+    #[test]
+    fn a_memory_ceiling_above_the_backend_is_a_config_error() {
+        let err = SandboxRuntime::new(Arc::new(SmallBackend), SandboxPolicy::default())
+            .expect_err("2 GiB does not fit 384 MiB");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("memory")),
+            "{err:?}"
+        );
+        let mut max = crate::sandbox::policy::MAX_LIMITS;
+        max.memory_bytes = 384 << 20;
+        let mut default = crate::sandbox::policy::DEFAULT_LIMITS;
+        default.memory_bytes = 256 << 20;
+        let fits = SandboxPolicy::default().with_limits(default, max);
+        SandboxRuntime::new(Arc::new(SmallBackend), fits).unwrap();
     }
 
     #[test]

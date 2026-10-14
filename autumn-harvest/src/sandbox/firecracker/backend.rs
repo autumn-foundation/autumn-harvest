@@ -255,6 +255,10 @@ impl SandboxBackend for FirecrackerBackend {
         self.launcher.image_name()
     }
 
+    fn memory_capacity(&self) -> Option<u64> {
+        self.launcher.memory_capacity()
+    }
+
     fn execute(
         &self,
         job: SandboxJob,

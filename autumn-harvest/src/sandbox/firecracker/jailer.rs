@@ -470,7 +470,10 @@ mod tests {
             &config,
             Path::new("/opt/fc/firecracker"),
             "hsbx-a-1",
-            MachineSpec::default(),
+            MachineSpec {
+                vcpu_count: 1,
+                mem_size_mib: 512,
+            },
             &[
                 "--config-file".into(),
                 "vm-config.json".into(),

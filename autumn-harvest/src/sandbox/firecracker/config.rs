@@ -39,6 +39,10 @@ pub const VM_ID_PREFIX: &str = "hsbx-";
 /// The root drive id. Firecracker resource ids reject `-`.
 pub const ROOT_DRIVE_ID: &str = "rootfs";
 
+/// The guest memory that the guest kernel and the guest agent keep. A run
+/// gets the rest of the microVM.
+pub const GUEST_MEMORY_RESERVE_MIB: u32 = 128;
+
 /// The size of one microVM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MachineSpec {
@@ -49,11 +53,23 @@ pub struct MachineSpec {
 }
 
 impl Default for MachineSpec {
+    /// One vCPU, and the 2 GiB memory ceiling of the default policy plus
+    /// [`GUEST_MEMORY_RESERVE_MIB`]. Firecracker maps guest memory on first
+    /// use, so the unused part costs no host memory.
     fn default() -> Self {
         Self {
             vcpu_count: 1,
-            mem_size_mib: 512,
+            mem_size_mib: 2048 + GUEST_MEMORY_RESERVE_MIB,
         }
+    }
+}
+
+impl MachineSpec {
+    /// The memory that one run can use: the guest memory less
+    /// [`GUEST_MEMORY_RESERVE_MIB`].
+    #[must_use]
+    pub const fn run_memory_bytes(&self) -> u64 {
+        (self.mem_size_mib.saturating_sub(GUEST_MEMORY_RESERVE_MIB) as u64) << 20
     }
 }
 
@@ -356,7 +372,15 @@ mod tests {
 
     #[test]
     fn the_config_file_has_the_documented_shape() {
-        let config = vm_config(&image(), MachineSpec::default(), &VmPaths::jailed(), 52);
+        let config = vm_config(
+            &image(),
+            MachineSpec {
+                vcpu_count: 1,
+                mem_size_mib: 512,
+            },
+            &VmPaths::jailed(),
+            52,
+        );
         let json = serde_json::to_value(&config).unwrap();
         let args = boot_args(&image(), 52);
         assert_eq!(
@@ -498,6 +522,15 @@ mod tests {
         assert!(
             matches!(check_boot_args(&with_nul), Err(SandboxError::Config(_))),
             "an extra argument with a NUL"
+        );
+    }
+
+    #[test]
+    fn the_default_machine_fits_the_default_policy() {
+        let machine = MachineSpec::default();
+        assert!(
+            machine.run_memory_bytes() >= crate::sandbox::policy::MAX_LIMITS.memory_bytes,
+            "{machine:?}"
         );
     }
 
