@@ -656,5 +656,5 @@ pub use crate::runtime::{
 pub use crate::store::ActivityAttempt;
 pub use crate::visibility::{
     DEFAULT_LIST_LIMIT, ExecutionDescription, ExecutionFilter, ExecutionPage, ExecutionSummary,
-    ListCursor, MAX_LIST_LIMIT, SqliteReader, Stored,
+    ListCursor, MAX_FILTER_TERMS, MAX_LIST_LIMIT, SqliteReader, Stored,
 };

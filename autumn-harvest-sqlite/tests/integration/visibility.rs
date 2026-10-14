@@ -8,10 +8,11 @@
 use std::path::Path;
 use std::time::Duration;
 
+use autumn_harvest::WorkflowIdReusePolicy;
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{
-    ExecutionFilter, ExecutionOutcome, ListCursor, MAX_LIST_LIMIT, RunState, SqliteError,
-    SqliteReader, SqliteRuntime, StartOptions, Stored,
+    ExecutionFilter, ExecutionOutcome, ListCursor, MAX_FILTER_TERMS, MAX_LIST_LIMIT, RunState,
+    SqliteError, SqliteReader, SqliteRuntime, StartOptions, Stored,
 };
 use chrono::Utc;
 use rusqlite::Connection;
@@ -167,7 +168,7 @@ async fn describe_returns_every_field_the_daemon_reads() {
     let started_at = *summary.started_at.value().expect("a start time");
     let closed_at = *summary.closed_at.value().expect("a close time");
     assert!(started_at >= before - chrono::TimeDelta::milliseconds(1));
-    assert!(closed_at >= started_at);
+    assert!(closed_at >= started_at, "{closed_at} < {started_at}");
     assert!(closed_at <= Utc::now());
 
     // The listed row is the same row, without the payloads.
@@ -898,4 +899,143 @@ fn an_old_file_gains_the_new_columns_on_open() {
     assert_eq!(page.executions.len(), 1);
     assert_eq!(page.executions[0].exec_id, Stored::Value("old".to_string()));
     assert_eq!(page.executions[0].started_at, Stored::Null);
+}
+
+// ── Review fixes ─────────────────────────────────────────────────────────────
+
+/// A reuse-policy seal of a closed prior keeps the prior's close time.
+#[tokio::test]
+async fn a_second_seal_keeps_the_first_close_time() {
+    let mut rt = runtime();
+    let prior = rt.start_workflow_with_id("echo", "same", json!(1)).unwrap();
+    rt.run_until_blocked(prior).await.unwrap();
+    let closed = rt.describe(prior).unwrap().summary.closed_at;
+    std::thread::sleep(Duration::from_millis(5));
+    let fresh = rt
+        .start_workflow_with_options(
+            "echo",
+            json!(2),
+            StartOptions::new()
+                .workflow_id("same")
+                .reuse_policy(WorkflowIdReusePolicy::TerminateIfRunning),
+        )
+        .unwrap();
+    assert!(fresh.created);
+    let after = rt.describe(prior).unwrap().summary;
+    assert_eq!(after.state, Stored::Value("CONTINUED_AS_NEW".to_string()));
+    assert_eq!(after.closed_at, closed, "the first close time stands");
+}
+
+/// The start time is the exact `WorkflowStarted` time, so a filter bound
+/// one microsecond away still separates the run.
+#[test]
+fn the_start_time_filter_is_exact_to_the_microsecond() {
+    let mut rt = runtime();
+    let exec = rt.start_workflow("echo", json!(1)).unwrap();
+    let Some(WorkflowEvent::WorkflowStarted { timestamp, .. }) =
+        rt.load_history(exec).unwrap().first().cloned()
+    else {
+        panic!("the history starts with WorkflowStarted");
+    };
+    let row = rt.describe(exec).unwrap();
+    assert_eq!(row.summary.started_at, Stored::Value(timestamp));
+    let tick = chrono::TimeDelta::microseconds(1);
+    assert_eq!(
+        ids(
+            &rt,
+            &ExecutionFilter::new().started_before(timestamp + tick)
+        ),
+        vec![exec]
+    );
+    assert_eq!(
+        ids(&rt, &ExecutionFilter::new().started_after(timestamp + tick)),
+        NONE
+    );
+    assert_eq!(
+        ids(&rt, &ExecutionFilter::new().started_after(timestamp)),
+        vec![exec]
+    );
+    assert_eq!(
+        ids(&rt, &ExecutionFilter::new().started_before(timestamp)),
+        NONE
+    );
+}
+
+/// An integer above `i64::MAX` cannot compare exactly in JSON1, so a filter
+/// on one is refused.
+#[test]
+fn a_filter_integer_above_the_i64_range_is_refused() {
+    let rt = runtime();
+    let err = rt
+        .list_executions(
+            &ExecutionFilter::new().search_attribute("n", json!(9_223_372_036_854_775_809_u64)),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, SqliteError::InvalidSearchAttribute(_)),
+        "{err}"
+    );
+    // The top of the range still compares exactly.
+    rt.list_executions(&ExecutionFilter::new().search_attribute("n", json!(i64::MAX)))
+        .unwrap();
+}
+
+/// A filter with too many terms is refused before the query is built.
+#[test]
+fn a_filter_with_too_many_terms_is_refused() {
+    let rt = runtime();
+    let mut states = ExecutionFilter::new();
+    let mut attrs = ExecutionFilter::new();
+    for n in 0..=MAX_FILTER_TERMS {
+        states = states.state(format!("S{n}"));
+        attrs = attrs.search_attribute(format!("k{n}"), json!(n));
+    }
+    for filter in [states, attrs] {
+        let err = rt.list_executions(&filter).unwrap_err();
+        assert!(matches!(err, SqliteError::InvalidFilter(_)), "{err}");
+    }
+}
+
+/// An exact workflow id matches that id and not a longer one.
+#[test]
+fn an_exact_workflow_id_matches_only_itself() {
+    let mut rt = runtime();
+    let seven = rt
+        .start_workflow_with_id("echo", "order-7", json!(1))
+        .unwrap();
+    rt.start_workflow_with_id("echo", "order-70", json!(1))
+        .unwrap();
+    assert_eq!(
+        ids(&rt, &ExecutionFilter::new().workflow_id("order-7")),
+        vec![seven]
+    );
+}
+
+/// An unknown workflow is reported before the options are checked, as on
+/// every other start path.
+#[test]
+fn an_unknown_workflow_is_reported_first() {
+    let mut rt = runtime();
+    let err = rt
+        .start_workflow_with_options(
+            "nope",
+            json!(1),
+            StartOptions::new().search_attribute("bad", json!([1])),
+        )
+        .unwrap_err();
+    assert!(matches!(err, SqliteError::UnknownWorkflow(_)), "{err}");
+}
+
+/// The builders set the same fields as a struct literal.
+#[test]
+fn the_start_option_builders_set_each_field() {
+    let options = StartOptions::new()
+        .workflow_id("w")
+        .reuse_policy(WorkflowIdReusePolicy::RejectDuplicate)
+        .memo(json!("m"))
+        .search_attribute("k", json!(1));
+    assert_eq!(options.workflow_id.as_deref(), Some("w"));
+    assert_eq!(options.reuse_policy, WorkflowIdReusePolicy::RejectDuplicate);
+    assert_eq!(options.memo, Some(json!("m")));
+    assert_eq!(options.search_attributes, attrs(&[("k", json!(1))]));
 }

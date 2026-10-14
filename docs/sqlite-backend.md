@@ -651,22 +651,34 @@ loop {
 let run = rt.describe(started.exec_id)?;
 ```
 
-- **Filters.** `workflow_name`, `exec_id`, `workflow_id_prefix`, `state`
-  (repeat it for several states), `started_after` (inclusive),
-  `started_before` (exclusive) and `search_attribute`. Set filters combine
-  with AND.
+- **Filters.** `workflow_name`, `exec_id`, `workflow_id` (exact),
+  `workflow_id_prefix`, `state` (repeat it for several states),
+  `started_after` (inclusive), `started_before` (exclusive) and
+  `search_attribute`. Set filters combine with AND. A filter holds at most
+  64 states and 64 search attributes. A larger one is
+  `SqliteError::InvalidFilter`.
+- **Times.** `started_at` is the `WorkflowStarted` time, to the microsecond.
+  `closed_at` is the time of the first terminal write. A later reuse-policy
+  seal does not move it.
 - **Search attributes.** A filter tests equality. Numbers compare as numbers,
   so `1` matches `1.0`. A filter value must be a JSON string, number, boolean
-  or `null`. Another value is `SqliteError::InvalidSearchAttribute`.
-- **Pages.** A page holds at most `limit` rows: 100 by default and 1000 at
-  most. `next` is the cursor of the next page, or `None` at the end.
-- **No payloads in a list.** `list_executions` reads no input, output or
+  or `null`. Another value is `SqliteError::InvalidSearchAttribute`. So is an
+  integer above `i64::MAX`: JSON1 reads it as a float, which cannot tell
+  neighbouring values apart.
+- **Pages.** A page holds `limit` rows: 100 by default, cut to the range 1 to
+  1000. `next` is the cursor of the next page, or `None` at the end. The
+  cursor is the table `rowid`. A `VACUUM` can renumber it, so do not keep a
+  cursor across one.
+- **No payloads in a list.** `list_executions` returns no input, output or
   error. `visit_executions(&filter, |run| ...)` passes the same rows with
-  their payloads, one row at a time.
+  their payloads, one row at a time. The visit holds one read snapshot until
+  it returns, so keep the closure short. A long one stops the WAL file from
+  shrinking.
 - **Damaged rows.** Each field is a `Stored` value: `Value`, `Null` or
-  `Unreadable`. A value in the wrong storage class, text that is not UTF-8,
-  or JSON that does not parse is `Unreadable`. One bad row does not fail
-  the page.
+  `Unreadable`. A value in the wrong storage class or text that is not
+  UTF-8 is `Unreadable`. So is a memo or search-attribute value that does
+  not parse, and search attributes that are not an object. One bad row does
+  not fail the page.
 - **A reader beside the writer.** `SqliteReader::open(path)` opens the file
   `READ_ONLY` and takes no writer lock. It has the same three reads. It
   reads a file that an older version wrote. A column that the file does not
@@ -675,7 +687,8 @@ let run = rt.describe(started.exec_id)?;
   transaction, on the suspend path and on the terminal path, as on
   Postgres. `None` removes a key. A cycle that rolls back keeps no patch.
 - **Memo.** The start sets it. No command changes it later. A start that
-  returns an existing run leaves that run's memo as it is.
+  returns an existing run leaves its memo and its search attributes as they
+  are.
 - **Continue-as-new.** The successor keeps the memo and the search
   attributes.
 
@@ -685,8 +698,14 @@ Limits:
   not match it.
 - Search-attribute filters test equality only. There is no comparison,
   `IN` or `EXISTS` predicate.
-- The name and state filters compare bytes, so they use no index. A filter
-  that matches few rows in a large file walks the table to fill a page.
+- One state filter seeks on an index. Every other filter walks the table
+  from the newest row. A filter that matches few rows in a large file walks
+  far to fill a page. A run's later columns sit after its input, so the walk
+  also reads past each large input.
+- A start does not check search-attribute keys against the
+  `upsert_search_attrs` rules, as on Postgres. Search attributes have no
+  size cap of their own.
+- The memo is stored as plain JSON. This backend has no payload codec.
 
 ---
 
@@ -786,11 +805,13 @@ specific command/feature. The run then ends `FAILED` (see below):
 - **Local activities** (`execute_local_activity`) and **external / task-token
   activities**.
 - A **continue-as-new to a different type** (`continue_as_new_as_type`).
-  Search attributes are supported since issue #2027. The token is
-  `ContinueAsNew.new_workflow_type`. A same-type `continue_as_new` is
-  supported (see [§7](#7-the-drive-model)).
+  The token is `ContinueAsNew.new_workflow_type`. A same-type
+  `continue_as_new` is supported (see [§7](#7-the-drive-model)).
 - **Worker sessions** (`create_session`) and **cancellable durable timers**
   (`start_timer` / `TimerHandle::…` — use the fire-once `ctx.timer(...)`).
+
+Search attributes are supported since issue #2027. See
+[§8](#list-describe-and-search-attributes-issue-2027).
 
 A rejected execution ends `FAILED` (issue #1834). The drive that meets the
 feature rolls back the whole cycle. It then seals the run in a new

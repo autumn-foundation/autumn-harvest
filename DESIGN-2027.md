@@ -68,7 +68,7 @@ memo. The daemon then reads executions through the backend.
 | R7 | The reader writes to the file, or takes the writer lock. | It opens the file `READ_ONLY`. A test opens a reader beside a live runtime. |
 | R8 | A filter value with SQL in it changes the query. | Every value is a bound parameter. |
 | R9 | A search attribute that is an object breaks the filter. | Start rejects a value that is not a primitive. The core rejects it in a patch. A filter value that is not a primitive is an error. |
-| R10 | A list walks the whole table. | The cursor is a `rowid` bound and the limit is capped. A plan test asserts no temporary B-tree. A filter that matches few rows still walks the table. Section 2 records it. |
+| R10 | A list walks the whole table. | The cursor is a `rowid` bound and the limit is capped. A plan test asserts no temporary B-tree. One state seeks on an index on `cast(state as blob)`. Other filters that match few rows still walk the table. Section 2 records it. |
 | R11 | The migration fails on an old file. | It only adds nullable columns, and only when a column is absent. |
 | R12 | The daemon reads `harvest_executions` again later. | A test reads the daemon source and refuses the table name. |
 | R13 | The daemon shows a row that `status` refuses. | Both decode the whole document with the same function. |
@@ -99,8 +99,8 @@ memo. The daemon then reads executions through the backend.
 
 | Column | Type | Meaning |
 |---|---|---|
-| `started_at` | INTEGER | The `WorkflowStarted` time, in epoch milliseconds. |
-| `closed_at` | INTEGER | The time of the terminal write, in epoch milliseconds. |
+| `started_at` | INTEGER | The `WorkflowStarted` time, in epoch microseconds. |
+| `closed_at` | INTEGER | The time of the first terminal write, in epoch microseconds. |
 | `search_attrs` | TEXT | A JSON object, or NULL. |
 | `memo` | TEXT | Any JSON value, or NULL. |
 
@@ -114,9 +114,11 @@ memo. The daemon then reads executions through the backend.
   calls `f` once for each row and holds one row at a time.
 - `describe(exec) -> ExecutionDescription`. One row with its payloads.
 
-`ExecutionFilter` filters by workflow name, exact execution id, workflow id
-prefix, states, a start-time range and search-attribute equality. All
-filters combine with AND. `before` and `limit` page the result.
+`ExecutionFilter` filters by workflow name, exact execution id, exact
+workflow id, workflow id prefix, states, a start-time range and
+search-attribute equality. All filters combine with AND. `before` and
+`limit` page the result. A filter holds at most 64 states and 64 search
+attributes.
 
 Each stored field is a `Stored<T>`: `Value`, `Null` or `Unreadable`.
 
@@ -124,10 +126,13 @@ Each stored field is a `Stored<T>`: `Value`, `Null` or `Unreadable`.
 
 - `UpsertSearchAttributes` merges its patch into `search_attrs` in the cycle
   transaction. It is not progress. It no longer seals the run.
+- An index on `cast(state as blob)` serves a single-state filter. The daemon
+  startup read then does not walk the finished sessions.
 - `start_workflow_with_options` takes a workflow id, a reuse policy, a memo
   and search attributes.
 - A continue-as-new copies the memo and the search attributes.
-- Every terminal write sets `closed_at`.
+- The first terminal write sets `closed_at`. A later reuse-policy seal keeps
+  it.
 
 ### 1.4 The daemon
 
@@ -142,16 +147,42 @@ issue.
 - A row written before this change has no `started_at`. A time filter does
   not match it.
 - Search-attribute filters test equality only. Numbers compare as numbers,
-  so `1` matches `1.0`.
-- A filter that matches few rows walks the table to fill a page. The name
-  and state filters compare bytes, so they cannot use an index.
+  so `1` matches `1.0`. A filter integer above `i64::MAX` is refused, because
+  JSON1 reads it as a float.
+- One state filter seeks on an index. Any other filter that matches few rows
+  walks the table to fill a page, and reads past each large input.
+- Search attributes have no size cap of their own, as on Postgres.
 - Start-time search-attribute keys are not checked against the core key
   rules. Postgres does not check them either. A value must be a primitive.
 - The memo is stored as plain JSON. This backend has no payload codec.
 
 ---
 
-## 3. Tests and acceptance criteria
+## 3. Review record
+
+Four review agents read the change from four angles: backend correctness,
+daemon parity, SQL security and performance, and API and documentation. A
+Codex review ran on the pull request. The fixes:
+
+- A reuse-policy seal moved the close time of a run that had already ended.
+  The seal now keeps the first close time.
+- A millisecond start time broke a start-time filter below one millisecond.
+  Both times are now microseconds, and the event time is cut to match.
+- A filter integer above `i64::MAX` matched its float neighbours. It is now
+  refused.
+- A state filter read past every large input in the file. One state now
+  seeks on an index. Several states walk the `rowid`, so no page sorts.
+- An unbounded filter list could reach the `SQLite` variable and depth
+  limits. A filter now holds at most 64 states and 64 search attributes.
+- An exact workflow id filter, as on Postgres, and builders on `StartOptions`.
+- The daemon source guard now reads every directory and joins split
+  strings. A `concat!` or a line continuation no longer escapes it.
+- Documentation gaps and the load-bearing rationale that the daemon move
+  had cut.
+
+---
+
+## 4. Tests and acceptance criteria
 
 | AC | Test |
 |----|------|

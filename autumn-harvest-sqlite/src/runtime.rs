@@ -206,6 +206,43 @@ pub struct StartOptions {
     pub search_attributes: serde_json::Map<String, Value>,
 }
 
+impl StartOptions {
+    /// Options with no workflow id, the default reuse policy, no memo and no
+    /// search attributes.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the business workflow id.
+    #[must_use]
+    pub fn workflow_id(mut self, id: impl Into<String>) -> Self {
+        self.workflow_id = Some(id.into());
+        self
+    }
+
+    /// Set the reuse policy.
+    #[must_use]
+    pub const fn reuse_policy(mut self, policy: WorkflowIdReusePolicy) -> Self {
+        self.reuse_policy = policy;
+        self
+    }
+
+    /// Set the memo.
+    #[must_use]
+    pub fn memo(mut self, memo: Value) -> Self {
+        self.memo = Some(memo);
+        self
+    }
+
+    /// Set the search attribute `key` to `value`.
+    #[must_use]
+    pub fn search_attribute(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.search_attributes.insert(key.into(), value);
+        self
+    }
+}
+
 /// The `error_type` of the `WorkflowFailed` event that seals an execution
 /// which reached an unsupported feature (issue #1834).
 pub const UNSUPPORTED_FEATURE_ERROR_TYPE: &str = "UnsupportedFeature";
@@ -769,7 +806,8 @@ impl SqliteRuntime {
     /// The id and the reuse policy act as in
     /// [`start_workflow_with_reuse_policy`](Self::start_workflow_with_reuse_policy).
     /// A start that returns an existing run does not change its memo or its
-    /// search attributes.
+    /// search attributes. The keys are not checked against the
+    /// `upsert_search_attrs` rules, as on Postgres.
     ///
     /// # Errors
     ///
@@ -784,6 +822,10 @@ impl SqliteRuntime {
         input: Value,
         options: StartOptions,
     ) -> SqliteResult<StartOutcome> {
+        // An unknown workflow is the first error, as on every other start path.
+        if !self.workflows.contains_key(workflow_name) {
+            return Err(SqliteError::UnknownWorkflow(workflow_name.to_string()));
+        }
         let StartOptions {
             workflow_id,
             reuse_policy,
@@ -3231,12 +3273,14 @@ fn insert_run(
     input: Value,
     fields: RunFields<'_>,
 ) -> SqliteResult<()> {
-    let started = Utc::now();
+    // Microseconds, so the column holds the event time exactly. Postgres
+    // keeps a `timestamptz` to the microsecond too.
+    let started = chrono::SubsecRound::trunc_subsecs(Utc::now(), 6);
     store::insert_execution(conn, exec, workflow_name, workflow_id, &input)?;
     store::set_start_fields(
         conn,
         exec,
-        started.timestamp_millis(),
+        started.timestamp_micros(),
         fields.memo,
         fields.search_attrs,
     )?;

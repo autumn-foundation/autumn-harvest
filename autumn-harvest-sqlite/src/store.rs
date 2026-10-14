@@ -260,8 +260,11 @@ pub fn seal_execution(
     sealed_state: &str,
 ) -> SqliteResult<()> {
     conn.execute(
-        "UPDATE harvest_executions SET state = ?2, closed_at = ?3 WHERE exec_id = ?1",
-        params![exec_id.to_string(), sealed_state, now_millis()],
+        // A reuse-policy seal can close a run that already ended. The first
+        // close time stands (issue #2027).
+        "UPDATE harvest_executions SET state = ?2, closed_at = coalesce(closed_at, ?3) \
+         WHERE exec_id = ?1",
+        params![exec_id.to_string(), sealed_state, now_micros()],
     )?;
     Ok(())
 }
@@ -309,7 +312,7 @@ pub fn set_terminal_with_reason(
     conn.execute(
         "UPDATE harvest_executions SET state = ?2, error = ?3, closed_at = ?4 \
          WHERE exec_id = ?1",
-        params![exec_id.to_string(), state, reason, now_millis()],
+        params![exec_id.to_string(), state, reason, now_micros()],
     )?;
     Ok(())
 }
@@ -321,7 +324,7 @@ pub fn set_completed(conn: &Connection, exec_id: ExecutionId, output: &Value) ->
         params![
             exec_id.to_string(),
             serde_json::to_string(output)?,
-            now_millis()
+            now_micros()
         ],
     )?;
     Ok(())
@@ -331,15 +334,15 @@ pub fn set_failed(conn: &Connection, exec_id: ExecutionId, error: &str) -> Sqlit
     conn.execute(
         "UPDATE harvest_executions SET state = 'FAILED', error = ?2, closed_at = ?3 \
          WHERE exec_id = ?1",
-        params![exec_id.to_string(), error, now_millis()],
+        params![exec_id.to_string(), error, now_micros()],
     )?;
     Ok(())
 }
 
-/// The wall clock in epoch milliseconds. A terminal write stores it as
+/// The wall clock in epoch microseconds. A terminal write stores it as
 /// `closed_at` (issue #2027).
-fn now_millis() -> i64 {
-    chrono::Utc::now().timestamp_millis()
+fn now_micros() -> i64 {
+    chrono::Utc::now().timestamp_micros()
 }
 
 /// Store the start time, the memo and the search attributes of a new run

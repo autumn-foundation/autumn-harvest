@@ -12881,32 +12881,47 @@ fn a_pending_task_the_backend_cannot_claim_refuses_the_restart() {
 
 /// Issue #2027: the daemon reads executions through the backend only.
 ///
-/// The test reads every production source file. A line of code that names
-/// `harvest_executions` is a direct read of the engine table. A comment may
-/// still name it.
+/// The test reads every production source file, in every directory under
+/// `src`. It drops each comment, then every quote, backslash, comma and
+/// space. A table name split across a line continuation or a `concat!` still
+/// reads as one word then. A comment may still name the table.
 #[test]
 fn the_daemon_source_does_not_read_the_executions_table() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut offenders = Vec::new();
-    for entry in std::fs::read_dir(&src).expect("the source directory reads") {
-        let path = entry.expect("the entry reads").path();
-        if path.file_name().is_some_and(|name| name == "tests.rs") {
-            continue;
+    fn sources(dir: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("the source directory reads") {
+            let path = entry.expect("the entry reads").path();
+            if path.is_dir() {
+                sources(&path, found);
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && path.file_name().is_some_and(|name| name != "tests.rs")
+            {
+                found.push(path);
+            }
         }
+    }
+    let mut files = Vec::new();
+    sources(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+    assert!(!files.is_empty(), "the guard must read some source");
+    let mut offenders = Vec::new();
+    for path in files {
         let text = std::fs::read_to_string(&path).expect("the source file reads");
-        for (n, line) in text.lines().enumerate() {
-            let code = line.trim_start();
-            if code.starts_with("//") {
-                continue;
-            }
-            if code.contains("harvest_executions") {
-                offenders.push(format!("{}:{}: {code}", path.display(), n + 1));
-            }
+        let code: String = text
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .concat()
+            .chars()
+            .filter(|c| !matches!(c, '"' | '\\' | ',' | '+') && !c.is_whitespace())
+            .collect();
+        if code.contains("harvest_executions") {
+            offenders.push(path.display().to_string());
         }
     }
     assert!(
         offenders.is_empty(),
-        "the daemon reads harvest_executions directly:\n{}",
-        offenders.join("\n")
+        "the daemon reads harvest_executions directly: {offenders:?}"
     );
 }

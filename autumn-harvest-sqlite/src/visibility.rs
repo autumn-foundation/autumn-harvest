@@ -19,6 +19,10 @@ pub const DEFAULT_LIST_LIMIT: u32 = 100;
 /// The largest page. A larger [`ExecutionFilter::limit`] is cut to this.
 pub const MAX_LIST_LIMIT: u32 = 1000;
 
+/// The most states, and separately the most search attributes, one filter
+/// can hold. A larger list is [`SqliteError::InvalidFilter`].
+pub const MAX_FILTER_TERMS: usize = 64;
+
 /// How long a reader waits for the writer's transaction to commit.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -106,6 +110,8 @@ pub struct ExecutionFilter {
     pub workflow_name: Option<String>,
     /// Only the run with this execution id.
     pub exec_id: Option<String>,
+    /// Only runs with exactly this business workflow id.
+    pub workflow_id: Option<String>,
     /// Only runs whose business workflow id starts with these bytes.
     pub workflow_id_prefix: Option<String>,
     /// Only runs in one of these states. An empty list matches every state.
@@ -143,6 +149,13 @@ impl ExecutionFilter {
     #[must_use]
     pub fn exec_id(mut self, exec_id: impl Into<String>) -> Self {
         self.exec_id = Some(exec_id.into());
+        self
+    }
+
+    /// Only runs with exactly the business workflow id `id`.
+    #[must_use]
+    pub fn workflow_id(mut self, id: impl Into<String>) -> Self {
+        self.workflow_id = Some(id.into());
         self
     }
 
@@ -188,7 +201,8 @@ impl ExecutionFilter {
         self
     }
 
-    /// At most `limit` rows. The limit is cut to [`MAX_LIST_LIMIT`].
+    /// At most `limit` rows. The limit is cut to the range 1 to
+    /// [`MAX_LIST_LIMIT`].
     #[must_use]
     pub const fn limit(mut self, limit: u32) -> Self {
         self.limit = Some(limit);
@@ -287,7 +301,8 @@ impl SqliteReader {
     /// Call `visit` once for each row of one page, newest first.
     ///
     /// Each row carries its payloads. Only one row is in memory at a time.
-    /// Returns the cursor of the next page.
+    /// Returns the cursor of the next page. The read holds one snapshot until
+    /// it returns, so a slow `visit` stops the WAL file from shrinking.
     ///
     /// # Errors
     ///
@@ -403,16 +418,35 @@ type Param = rusqlite::types::Value;
 /// [`OPTIONAL_COLUMNS`] and fixed SQL reach the text.
 ///
 /// The name, the state and the workflow id are compared as bytes. A `BLOB`
-/// with the same letters as a `TEXT` value never compares equal to it. A
-/// damaged row would then drop out of the listing. The cast keeps the
-/// name out of the index choice, so the query walks the `rowid` backwards.
-/// That is the order of the listing, so the walk stops at the page size. A
-/// filter that matches few rows walks further.
+/// with the same letters as a `TEXT` value never compares equal to it.
+/// Without the cast, a damaged row drops out of the listing.
+///
+/// The cast keeps the name out of the index choice, so the query walks the
+/// `rowid` backwards. That is the order of the listing, so the walk stops at
+/// the page size. An index on the name cannot answer `ORDER BY rowid`. A
+/// lookup through it sorts every matching row in a temporary B-tree before
+/// the limit applies. Measured on 20000 runs, the first page took 11.7 ms
+/// through the index and 0.1 ms by the walk.
+///
+/// The trade goes the other way for a rare name. A name with 50 runs in 20000
+/// took 2.9 ms by the walk, against 0.09 ms through the index. The walk wins
+/// for a file that holds mostly one workflow, which is the embedded case.
+///
+/// A single state uses `idx_harvest_executions_state`. It indexes the same
+/// cast, so it returns rows in `rowid` order and needs no sort either. The
+/// index also spares a state filter from reading past a large `input_json` on
+/// every row of the file.
 fn build_query(
     present: &[&str],
     filter: &ExecutionFilter,
     payloads: bool,
 ) -> SqliteResult<(String, Vec<Param>)> {
+    if filter.states.len() > MAX_FILTER_TERMS || filter.search_attributes.len() > MAX_FILTER_TERMS {
+        return Err(SqliteError::InvalidFilter(format!(
+            "a filter holds at most {MAX_FILTER_TERMS} states and \
+             {MAX_FILTER_TERMS} search attributes"
+        )));
+    }
     let column = |name: &str| {
         if present.contains(&name) {
             name.to_string()
@@ -451,6 +485,13 @@ fn build_query(
         let p = bind(&mut params, Param::Text(exec_id.clone()));
         terms.push(format!("exec_id = {p}"));
     }
+    if let Some(id) = &filter.workflow_id {
+        let p = bind(&mut params, Param::Text(id.clone()));
+        terms.push(format!(
+            "cast({} as blob) = cast({p} as blob)",
+            column("workflow_id")
+        ));
+    }
     if let Some(prefix) = &filter.workflow_id_prefix {
         let len = i64::try_from(prefix.len()).unwrap_or(i64::MAX);
         let n = bind(&mut params, Param::Integer(len));
@@ -469,17 +510,22 @@ fn build_query(
                 format!("cast({p} as blob)")
             })
             .collect();
-        terms.push(format!("cast(state as blob) IN ({})", any.join(", ")));
+        // One state seeks on `idx_harvest_executions_state`. Several states
+        // through that index come back out of `rowid` order, and the page
+        // then sorts every match. The `+` keeps several states off the index,
+        // so they walk the `rowid` and stop at the page size.
+        let state = if any.len() == 1 { "state" } else { "+state" };
+        terms.push(format!("cast({state} as blob) IN ({})", any.join(", ")));
     }
     let started = column("started_at");
     if let Some(at) = filter.started_after {
-        let p = bind(&mut params, Param::Integer(at.timestamp_millis()));
+        let p = bind(&mut params, Param::Integer(at.timestamp_micros()));
         terms.push(format!(
             "typeof({started}) = 'integer' AND {started} >= {p}"
         ));
     }
     if let Some(at) = filter.started_before {
-        let p = bind(&mut params, Param::Integer(at.timestamp_millis()));
+        let p = bind(&mut params, Param::Integer(at.timestamp_micros()));
         terms.push(format!("typeof({started}) = 'integer' AND {started} < {p}"));
     }
     let attrs = column("search_attrs");
@@ -514,10 +560,18 @@ fn search_attr_term(
         Value::Bool(true) => "type = 'true'".to_string(),
         Value::Bool(false) => "type = 'false'".to_string(),
         Value::Number(number) => {
-            let v = number.as_i64().map_or_else(
-                || Param::Real(number.as_f64().unwrap_or(f64::NAN)),
-                Param::Integer,
-            );
+            // JSON1 reads an integer above `i64::MAX` as a float, which
+            // cannot tell neighbouring values apart. A filter on one would
+            // match the wrong runs, so it is refused.
+            let v = match (number.as_i64(), number.is_u64()) {
+                (Some(int), _) => Param::Integer(int),
+                (None, true) => {
+                    return Err(SqliteError::InvalidSearchAttribute(format!(
+                        "the filter on `{key}` is an integer above the 64-bit signed range"
+                    )));
+                }
+                (None, false) => Param::Real(number.as_f64().unwrap_or(f64::NAN)),
+            };
             let p = bind(params, v);
             format!("type IN ('integer', 'real') AND atom = {p}")
         }
@@ -585,12 +639,12 @@ fn text(value: ValueRef<'_>) -> Stored<String> {
     }
 }
 
-/// An epoch-millisecond field.
+/// An epoch-microsecond field.
 fn time(value: ValueRef<'_>) -> Stored<DateTime<Utc>> {
     match value {
         ValueRef::Null => Stored::Null,
-        ValueRef::Integer(ms) => {
-            DateTime::from_timestamp_millis(ms).map_or(Stored::Unreadable, Stored::Value)
+        ValueRef::Integer(us) => {
+            DateTime::from_timestamp_micros(us).map_or(Stored::Unreadable, Stored::Value)
         }
         ValueRef::Real(_) | ValueRef::Text(_) | ValueRef::Blob(_) => Stored::Unreadable,
     }
@@ -640,6 +694,39 @@ mod tests {
             let plan = plan.join("\n");
             assert!(!plan.contains("TEMP B-TREE"), "{plan}");
             assert!(plan.contains("rowid<?"), "{plan}");
+        }
+    }
+
+    /// One state seeks on `idx_harvest_executions_state`, so a startup read
+    /// of the RUNNING rows does not read every row of the file. Several
+    /// states walk the `rowid`. No plan sorts.
+    #[test]
+    fn a_state_filter_seeks_on_the_state_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        for filter in [
+            ExecutionFilter::new().state("RUNNING"),
+            ExecutionFilter::new().workflow_name("wf").state("RUNNING"),
+            ExecutionFilter::new().state("RUNNING").state("FAILED"),
+        ] {
+            let (sql, params) =
+                build_query(&present_columns(&conn).unwrap(), &filter, true).unwrap();
+            let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let bound: Vec<&dyn rusqlite::ToSql> =
+                params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+            let plan: Vec<String> = statement
+                .query_map(bound.as_slice(), |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let plan = plan.join("\n");
+            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+            let indexed = filter.states.len() == 1;
+            assert_eq!(
+                plan.contains("idx_harvest_executions_state"),
+                indexed,
+                "{plan}"
+            );
         }
     }
 }

@@ -71,10 +71,10 @@ CREATE TABLE IF NOT EXISTS harvest_executions (
                                            -- the request (issue #2021). It bounds the
                                            -- events that a cleanup can add.
     started_at    INTEGER,                 -- the `WorkflowStarted` time in epoch
-                                           -- milliseconds (issue #2027). NULL on a row
+                                           -- microseconds (issue #2027). NULL on a row
                                            -- written before that issue.
-    closed_at     INTEGER,                 -- the time of the terminal write in epoch
-                                           -- milliseconds (issue #2027). NULL while the
+    closed_at     INTEGER,                 -- the time of the first terminal write in
+                                           -- epoch microseconds (issue #2027). NULL while the
                                            -- run is open.
     search_attrs  TEXT,                    -- the search attributes as a JSON object
                                            -- (issue #2027). NULL until a start or an
@@ -94,6 +94,15 @@ CREATE TABLE IF NOT EXISTS harvest_executions (
 -- needing no separate additive migration.
 CREATE INDEX IF NOT EXISTS idx_harvest_executions_key
     ON harvest_executions (workflow_name, workflow_id);
+
+-- The state filter of a listing (issue #2027). It indexes the same expression
+-- the filter tests, so the planner can use it. The filter compares bytes, so a
+-- value in the wrong storage class still matches. Without the index, a filter
+-- on `state` reads past `input_json` on every row, which is slow when the
+-- inputs are large. The index is non-unique and idempotent, so it builds on
+-- every open of an older file.
+CREATE INDEX IF NOT EXISTS idx_harvest_executions_state
+    ON harvest_executions (cast(state as blob));
 
 CREATE TABLE IF NOT EXISTS harvest_events (
     exec_id    TEXT NOT NULL,
