@@ -36911,7 +36911,7 @@ impl Worker {
     /// NOTIFY. A released permit or a due deferral also ends the wait.
     ///
     /// After a NOTIFY, the leader sleeps the settle delay. Host clocks can
-    /// run ahead of the database NOW(). The jittered delay lets a new task
+    /// run ahead of the database `NOW()`. The jittered delay lets a new task
     /// become claimable, and spreads the claims of many workers. It runs
     /// after the select, so no other wake cuts it short. An earlier wake
     /// leaves the NOTIFY queued for the next wait.
