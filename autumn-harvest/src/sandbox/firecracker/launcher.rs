@@ -30,8 +30,8 @@ use std::time::Duration;
 use super::api::ApiClient;
 use super::config::{
     CONFIG_FILE, GUEST_MEMORY_RESERVE_MIB, GuestImage, KERNEL_FILE, MAX_SOCKET_PATH_BYTES,
-    MachineSpec, OWNER_TAG_HEX, ROOTFS_FILE, VM_ID_PREFIX, VM_ID_RANDOM_HEX, VSOCK_SOCKET, VmPaths,
-    new_vm_id, validate_vm_id, vm_config,
+    MachineSpec, OWNER_TAG_HEX, PINNED_IMAGE_SUFFIX, ROOTFS_FILE, VM_ID_PREFIX, VM_ID_RANDOM_HEX,
+    VSOCK_SOCKET, VmPaths, new_vm_id, validate_vm_id, vm_config,
 };
 use super::jailer::JailerConfig;
 use super::posture::{PostureFinding, PosturePolicy};
@@ -201,7 +201,7 @@ impl PinnedImage {
     /// Returns [`SandboxError::Config`] when a link fails. Nothing is left.
     fn pin(config: &LauncherConfig, vm_root: &Path, owner: &str) -> Result<Self, SandboxError> {
         use std::os::unix::fs::DirBuilderExt as _;
-        let dir = vm_root.join(format!("{VM_ID_PREFIX}{owner}-image"));
+        let dir = vm_root.join(format!("{VM_ID_PREFIX}{owner}{PINNED_IMAGE_SUFFIX}"));
         let fail = |what: &Path, e: &std::io::Error| {
             SandboxError::Config(format!(
                 "cannot pin {} in {}: {e}",

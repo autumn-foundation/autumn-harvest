@@ -36,6 +36,10 @@ pub const GUEST_INIT: &str = "/sbin/harvest-guest-agent";
 /// The prefix of each VM id that this crate creates.
 pub const VM_ID_PREFIX: &str = "hsbx-";
 
+/// The suffix of the directory where a launcher pins its image, after
+/// `hsbx-<owner>`.
+pub const PINNED_IMAGE_SUFFIX: &str = "-image";
+
 /// The root drive id. Firecracker resource ids reject `-`.
 pub const ROOT_DRIVE_ID: &str = "rootfs";
 
