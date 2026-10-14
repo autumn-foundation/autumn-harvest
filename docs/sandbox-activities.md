@@ -187,8 +187,9 @@ runtime refuses a policy that allows the network on a backend without one.
   checks the versions of `firecracker` and `jailer`. It refuses older
   versions: CVE-2026-5747 and CVE-2026-1386.
 - KSM off, nested KVM off, and no CPU vulnerability that reports
-  `Vulnerable`. A KSM or CPU vulnerability state that cannot be read is also
-  critical. A kernel without KSM is safe.
+  `Vulnerable`. A KSM, nested KVM or CPU vulnerability state that cannot be
+  read, or that is unknown, is also critical. A kernel without KSM, or
+  without a loaded KVM vendor module, is safe for that check.
 - Root owns each trusted path: the jail base, network namespace, Firecracker
   and jailer binaries, kernel, root file system and snapshot. No such path
   holds a symbolic link. Only root may write each directory above them,

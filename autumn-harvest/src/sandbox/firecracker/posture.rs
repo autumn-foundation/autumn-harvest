@@ -165,12 +165,48 @@ pub async fn probe_version(
     Ok(version)
 }
 
+/// Whether `path` is surely absent. A check that fails proves nothing.
+fn is_absent(path: &Path) -> bool {
+    matches!(path.try_exists(), Ok(false))
+}
+
+/// The detail of a critical finding for a kernel switch, or `None`.
+///
+/// `owner` is the directory of the feature under `root`, and `file` is the
+/// switch in it. A feature that the kernel lacks has no directory, so it is
+/// safe. A switch that is on, unknown or unreadable is not safe.
+fn switch_finding(
+    root: &Path,
+    owner: &str,
+    file: &str,
+    (off, on): (&[&str], &[&str]),
+    on_detail: &str,
+) -> Option<String> {
+    let path = root.join(owner).join(file);
+    match std::fs::read_to_string(&path).map(|s| s.trim().to_owned()) {
+        Ok(state) if off.contains(&state.as_str()) => None,
+        Ok(state) if on.contains(&state.as_str()) => Some(on_detail.to_owned()),
+        Ok(state) => Some(format!(
+            "{} reports the unknown state {state:?}",
+            path.display()
+        )),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && is_absent(&root.join(owner))
+                && root.join(owner).parent().is_some_and(Path::is_dir) =>
+        {
+            None
+        }
+        Err(e) => Some(format!("{} cannot be read: {e}", path.display())),
+    }
+}
+
 /// Inspect the host under `root`, normally `/`. `cgroup_mount` is the cgroup
 /// v2 mount of the jailer.
 ///
-/// Critical: no `/dev/kvm`, KSM on or unreadable, nested KVM on, a CPU
-/// vulnerability that reports `Vulnerable`, or no cgroup v2. Warning: SMT on,
-/// or swap on.
+/// Critical: no `/dev/kvm`, KSM on or unknown, nested KVM on or unknown, a
+/// CPU vulnerability that reports `Vulnerable`, or no cgroup v2. Warning: SMT
+/// on, or swap on.
 #[must_use]
 pub fn inspect_host(root: &Path, cgroup_mount: &Path) -> Vec<PostureFinding> {
     let read = |rel: &str| std::fs::read_to_string(root.join(rel)).map(|s| s.trim().to_owned());
@@ -185,39 +221,24 @@ pub fn inspect_host(root: &Path, cgroup_mount: &Path) -> Vec<PostureFinding> {
     if !root.join("dev/kvm").exists() {
         find("kvm", "/dev/kvm is missing".into(), Severity::Critical);
     }
-    // A KSM state that cannot be read is not a safe state. A kernel without
-    // KSM has no `ksm` directory, so its absence is safe.
-    match read("sys/kernel/mm/ksm/run") {
-        Ok(state) if state == "0" || state == "2" => {}
-        Ok(state) if state == "1" => find(
-            "ksm",
-            "KSM merges pages across tenants; disable it".into(),
-            Severity::Critical,
-        ),
-        Ok(state) => find(
-            "ksm",
-            format!("KSM reports the unknown state {state:?}"),
-            Severity::Critical,
-        ),
-        Err(e)
-            if e.kind() == std::io::ErrorKind::NotFound
-                && !root.join("sys/kernel/mm/ksm").exists()
-                && root.join("sys/kernel/mm").is_dir() => {}
-        Err(e) => find(
-            "ksm",
-            format!("the KSM state cannot be read: {e}"),
-            Severity::Critical,
-        ),
+    if let Some(detail) = switch_finding(
+        root,
+        "sys/kernel/mm/ksm",
+        "run",
+        (&["0", "2"], &["1"]),
+        "KSM merges pages across tenants; disable it",
+    ) {
+        find("ksm", detail, Severity::Critical);
     }
     for module in ["kvm_intel", "kvm_amd"] {
-        if read(&format!("sys/module/{module}/parameters/nested"))
-            .is_ok_and(|v| v == "Y" || v == "1")
-        {
-            find(
-                "nested_kvm",
-                format!("{module}.nested is on; nested KVM had escape bugs"),
-                Severity::Critical,
-            );
+        if let Some(detail) = switch_finding(
+            root,
+            &format!("sys/module/{module}"),
+            "parameters/nested",
+            (&["N", "0"], &["Y", "1"]),
+            &format!("{module}.nested is on; nested KVM had escape bugs"),
+        ) {
+            find("nested_kvm", detail, Severity::Critical);
         }
     }
     // A state that cannot be read is not a safe state, so it is critical too.
@@ -464,6 +485,38 @@ mod tests {
         // A kernel without KSM has no ksm directory.
         std::fs::remove_dir_all(root.join("sys/kernel/mm/ksm")).unwrap();
         assert_eq!(ksm(&root), 0, "no KSM in the kernel");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_unknown_nested_kvm_state_is_critical() {
+        let nested = |root: &Path| {
+            inspect_host(root, Path::new("/sys/fs/cgroup"))
+                .into_iter()
+                .filter(|f| f.check == "nested_kvm" && f.severity == Severity::Critical)
+                .count()
+        };
+        let root = fake_sys();
+        let param = root.join("sys/module/kvm_intel/parameters/nested");
+        for (state, want) in [
+            ("N\n", 0),
+            ("0\n", 0),
+            ("Y\n", 1),
+            ("1\n", 1),
+            ("", 1),
+            ("?\n", 1),
+        ] {
+            std::fs::write(&param, state).unwrap();
+            assert_eq!(nested(&root), want, "the state {state:?}");
+        }
+        // A loaded module with a masked or unreadable parameter is unknown.
+        std::fs::remove_file(&param).unwrap();
+        assert_eq!(nested(&root), 1, "a module without the parameter");
+        std::fs::create_dir(&param).unwrap();
+        assert_eq!(nested(&root), 1, "an unreadable parameter");
+        // A module that is not loaded has no directory.
+        std::fs::remove_dir_all(root.join("sys/module/kvm_intel")).unwrap();
+        assert_eq!(nested(&root), 0, "no KVM module");
         std::fs::remove_dir_all(root).unwrap();
     }
 
