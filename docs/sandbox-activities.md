@@ -322,7 +322,9 @@ What each microVM gets:
 - a read-only root drive, a vsock device and a virtio-rng device;
 - no network device, no metadata service and no serial console;
 - the kernel arguments `reboot=k panic=1 8250.nr_uarts=0`;
-- an 8 GiB `fsize` limit on the VMM, by default.
+- an 8 GiB `fsize` limit on the VMM, by default. A golden snapshot writes
+  the whole guest memory to one file, so `create_golden_snapshot` refuses a
+  limit below the guest memory.
 
 `GuestImage::extra_boot_args` adds kernel arguments. The launcher refuses an
 extra argument that replaces one of its own, and a word that starts with `-`.

@@ -796,8 +796,9 @@ impl FirecrackerLauncher {
     ///
     /// # Errors
     ///
-    /// Returns [`SandboxError::Config`] without the jailer, or with an API
-    /// timeout or a boot timeout of zero. Returns
+    /// Returns [`SandboxError::Config`] without the jailer, with an API
+    /// timeout or a boot timeout of zero, or with a jailer `fsize` limit
+    /// below the guest memory. Returns
     /// [`SandboxError::Unavailable`] when a step fails. The golden microVM is
     /// torn down on each path.
     pub async fn create_golden_snapshot(
@@ -823,6 +824,18 @@ impl FirecrackerLauncher {
             return Err(SandboxError::Config(
                 "a golden snapshot needs a boot timeout above zero".into(),
             ));
+        }
+        // The memory file holds the whole guest memory, and the `fsize`
+        // rlimit of the VMM bounds it. A retry cannot fix a small limit.
+        let memory = u64::from(self.config.machine.mem_size_mib) << 20;
+        if let Some(limit) = jailer.fsize_limit
+            && limit < memory
+        {
+            return Err(SandboxError::Config(format!(
+                "a golden snapshot writes {} MiB of guest memory, above the jailer fsize limit \
+                 of {limit} bytes",
+                self.config.machine.mem_size_mib
+            )));
         }
         self.check_versions().await?;
         let id = new_vm_id(&self.owner);
@@ -3409,6 +3422,27 @@ while True:
             .await;
         assert!(
             matches!(result, Err(SandboxError::Config(ref m)) if m.contains("API timeout")),
+            "{result:?}"
+        );
+        drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_golden_snapshot_needs_room_for_the_guest_memory() {
+        let dir = temp_dir();
+        let mut config = jailed(&dir);
+        let Confinement::Jailer(jail) = &mut config.confinement else {
+            unreachable!("a jailed config");
+        };
+        // The memory file of a 2176 MiB guest does not fit 1 GiB.
+        jail.fsize_limit = Some(1 << 30);
+        let launcher = new_launcher(config).unwrap();
+        let result = launcher
+            .create_golden_snapshot(&dir.join("golden"), Duration::from_secs(5))
+            .await;
+        assert!(
+            matches!(result, Err(SandboxError::Config(ref m)) if m.contains("fsize")),
             "{result:?}"
         );
         drop(launcher);
