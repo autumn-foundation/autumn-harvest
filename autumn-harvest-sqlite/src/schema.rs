@@ -249,11 +249,11 @@ use crate::error::SqliteResult;
 /// already exists is left with its *original* column set — a database created
 /// before a column was added would otherwise be missing it, and a fresh `INSERT`
 /// (which lists the new column) would fail with "no such column". This step is the
-/// backend's minimal, forward-only migration: it is **strictly additive** (only
-/// `ALTER TABLE … ADD COLUMN`, never `DROP`/`RENAME`), **idempotent** (each column
-/// is added only when absent, so it is safe to run on every open — including a
-/// fresh database that already has the column), and preserves every existing row's
-/// data.
+/// backend's minimal, forward-only migration. It is **additive**: it adds columns
+/// and indexes, and never drops or renames. It is **idempotent**: each column is
+/// added only when absent, so it is safe to run on every open, a fresh database
+/// included. It keeps every existing row. The one row update is the issue #2028
+/// back-fill, which only sets a NULL key.
 ///
 /// Current migrations:
 /// - **issue #2024** — `harvest_tasks.heartbeat_details` and
@@ -270,12 +270,13 @@ use crate::error::SqliteResult;
 ///   index on `(exec_id, idempotency_key)`. The index is built here, because the
 ///   base [`SCHEMA`] runs before an old table has the column. When the column is
 ///   new, each promise settlement takes its name as its key (see
-///   [`back_fill_promise_keys`]).
+///   [`back_fill_promise_keys`]). One transaction holds the column, the index and
+///   the back-fill, so a crash cannot leave the column without the back-fill.
 ///
 /// # Errors
 ///
-/// Returns [`SqliteError::Sqlite`](crate::SqliteError::Sqlite) if a column probe or
-/// `ALTER TABLE` fails.
+/// Returns [`SqliteError::Sqlite`](crate::SqliteError::Sqlite) if a column probe,
+/// an `ALTER TABLE`, the index build or the back-fill fails.
 pub fn migrate(conn: &Connection) -> SqliteResult<()> {
     // issue #1068: freeze resolved activity defaults onto the task row.
     add_column_if_absent(
@@ -316,17 +317,21 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
         "cancel_from_seq",
         "ALTER TABLE harvest_executions ADD COLUMN cancel_from_seq INTEGER",
     )?;
-    // issue #2028: the signal idempotency key.
+    // issue #2028: the signal idempotency key. The back-fill runs only when the
+    // column is new. So the column, the index and the back-fill share one
+    // transaction: a crash after the column must not skip the back-fill.
+    let tx = conn.unchecked_transaction()?;
     let key_added = add_column_if_absent(
-        conn,
+        &tx,
         "harvest_signals",
         "idempotency_key",
         "ALTER TABLE harvest_signals ADD COLUMN idempotency_key TEXT",
     )?;
-    conn.execute_batch(SIGNAL_KEY_INDEX)?;
+    tx.execute_batch(SIGNAL_KEY_INDEX)?;
     if key_added {
-        back_fill_promise_keys(conn)?;
+        back_fill_promise_keys(&tx)?;
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -343,7 +348,8 @@ const SIGNAL_KEY_INDEX: &str = "\
 /// Before issue #2028, this backend deduped a settlement by its name. Now the
 /// key does it, so an old settlement needs the key too. Only the first row of
 /// each `(exec_id, name)` takes the key. A later duplicate keeps NULL, so the
-/// unique index stays valid.
+/// unique index stays valid. A row whose run already holds the key also keeps
+/// NULL, so a second run of the back-fill cannot break the index.
 fn back_fill_promise_keys(conn: &Connection) -> SqliteResult<()> {
     conn.execute(
         "UPDATE harvest_signals SET idempotency_key = name \
@@ -351,7 +357,10 @@ fn back_fill_promise_keys(conn: &Connection) -> SqliteResult<()> {
            AND substr(name, 1, length(?1)) = ?1 \
            AND signal_seq = (SELECT MIN(first.signal_seq) FROM harvest_signals AS first \
                              WHERE first.exec_id = harvest_signals.exec_id \
-                               AND first.name = harvest_signals.name)",
+                               AND first.name = harvest_signals.name) \
+           AND NOT EXISTS (SELECT 1 FROM harvest_signals AS held \
+                           WHERE held.exec_id = harvest_signals.exec_id \
+                             AND held.idempotency_key = harvest_signals.name)",
         [autumn_harvest::durable_promise::PROMISE_SIGNAL_PREFIX],
     )?;
     Ok(())

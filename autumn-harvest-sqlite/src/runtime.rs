@@ -876,30 +876,19 @@ impl SqliteRuntime {
         Ok(outcome)
     }
 
-    /// The checks of every start, before any write: a registered workflow and
-    /// the input cap.
+    /// The checks of a plain start, before any write: a registered workflow
+    /// and the input cap.
     fn check_start(&self, workflow_name: &str, input: &Value) -> SqliteResult<()> {
-        if !self.workflows.contains_key(workflow_name) {
-            return Err(SqliteError::UnknownWorkflow(workflow_name.to_string()));
+        self.check_registered(workflow_name)?;
+        check_input_cap(input)
+    }
+
+    /// Returns `Ok` only when `workflow_name` has a registered handler.
+    fn check_registered(&self, workflow_name: &str) -> SqliteResult<()> {
+        if self.workflows.contains_key(workflow_name) {
+            return Ok(());
         }
-        // Enforce the workflow-input cap BEFORE any write (issue #252, Codex #1069
-        // `runtime.rs:264`). The Postgres start path rejects an oversized input with
-        // `PayloadTooLarge` before persisting anything; without this the SQLite
-        // backend would store/replay an unbounded input and accept a start other
-        // backends reject. Measured as the serialized-JSON byte length, exactly as
-        // the core does. A zero cap means uncapped (the core convention); the default
-        // `DEFAULT_MAX_WORKFLOW_INPUT_BYTES` (2 MiB) is > 0, so the check is active.
-        if DEFAULT_MAX_WORKFLOW_INPUT_BYTES > 0 {
-            let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
-            if observed > DEFAULT_MAX_WORKFLOW_INPUT_BYTES {
-                return Err(SqliteError::PayloadTooLarge {
-                    kind: "workflow_input",
-                    observed_bytes: observed,
-                    cap_bytes: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
-                });
-            }
-        }
-        Ok(())
+        Err(SqliteError::UnknownWorkflow(workflow_name.to_string()))
     }
 
     /// Deliver an inbound signal. The next drive appends it to history.
@@ -968,8 +957,10 @@ impl SqliteRuntime {
     /// enforces the key.
     ///
     /// An empty key is no key, so the call always stages. A key is scoped to
-    /// `exec`. For a key scoped to the whole `(workflow_name, workflow_id)`
-    /// chain, use [`send_signal_by_workflow_id`](Self::send_signal_by_workflow_id).
+    /// the run that holds the row. A continue-as-new moves an undelivered row
+    /// to the successor, so a retry to the old `exec` is `WorkflowNotRunning`.
+    /// For a key scoped to the whole `(workflow_name, workflow_id)` chain, use
+    /// [`send_signal_by_workflow_id`](Self::send_signal_by_workflow_id).
     ///
     /// A `harvest.promise:` signal always uses its name as its key, so a
     /// promise settles once (issue #1985).
@@ -1067,6 +1058,12 @@ impl SqliteRuntime {
     /// false` and `signal_delivered: false` for that run, before the matrix
     /// runs. So a retry after the first run ends starts nothing.
     ///
+    /// A `RUNNING` prior with a pending cooperative cancel counts as
+    /// `CANCELLED`, because the next drive ends it. A replace seals every
+    /// active run of the key. The input cap applies only when the call starts
+    /// a run, because an attach ignores the input. A cancelled `RUNNING` prior gets the Postgres
+    /// reason `"terminated by signal-with-start"`.
+    ///
     /// # Errors
     ///
     /// - [`SqliteError::BlankWorkflowId`] for a blank id.
@@ -1091,7 +1088,9 @@ impl SqliteRuntime {
         if workflow_id.trim().is_empty() {
             return Err(SqliteError::BlankWorkflowId);
         }
-        self.check_start(workflow_name, &input)?;
+        // The input cap applies only when the call creates a run. An attach
+        // ignores the input, as on Postgres (issue #918).
+        self.check_registered(workflow_name)?;
         let key = signal_key(signal_name, &signal_payload, idempotency_key)?;
         let tx = self.conn.transaction()?;
         if let Some(holder) = key_in_chain(&tx, workflow_name, workflow_id, signal_name, key)? {
@@ -1182,8 +1181,8 @@ impl SqliteRuntime {
     /// Terminate `exec` at once (issue #2021).
     ///
     /// One transaction appends `WorkflowCancelled { reason }`, ends the run
-    /// `TERMINATED`, and deletes its pending tasks, unfired timers and staged
-    /// signals. The body does not run again, and `terminate` drops a pending
+    /// `TERMINATED`, and deletes its pending tasks, unfired timers and unkeyed
+    /// staged signals. The body does not run again, and `terminate` drops a pending
     /// cancel request. A later drive returns [`RunState::Terminated`]. A blank
     /// `reason` becomes `"workflow termination requested"`, as on Postgres.
     ///
@@ -1930,7 +1929,7 @@ impl SqliteRuntime {
     }
 
     /// Seal `exec` `FAILED` with the typed unsupported-feature reason, and
-    /// remove its pending tasks, unfired timers and staged signals.
+    /// remove its pending tasks, unfired timers and unkeyed staged signals.
     ///
     /// The `WorkflowFailed` event carries [`UNSUPPORTED_FEATURE_ERROR_TYPE`]
     /// and `non_retryable = true`. A retry would meet the same feature again.
@@ -1990,7 +1989,7 @@ impl SqliteRuntime {
     }
 
     /// Append `event`, set `exec` `FAILED` with `error`, and remove its pending
-    /// tasks, unfired timers and staged signals, in one transaction.
+    /// tasks, unfired timers and unkeyed staged signals, in one transaction.
     fn seal_failed(
         &mut self,
         exec: ExecutionId,
@@ -2990,8 +2989,8 @@ const SEALED_STATE: &str = "CONTINUED_AS_NEW";
 /// no orphan can be claimed / fire against a run that is never driven again). An
 /// already-terminal prior (`COMPLETED`, `FAILED` or `CANCELLED`) is sealed WITHOUT a cancellation
 /// event and has no PENDING tasks or unfired timers left to clean up. Every prior
-/// being sealed — RUNNING or already-terminal — also has its undelivered staged
-/// signals deleted. A signal can be staged while the prior is RUNNING. It can then
+/// being sealed — RUNNING or already-terminal — also has its unkeyed undelivered
+/// staged signals deleted. A keyed row stays (issue #2028). A signal can be staged while the prior is RUNNING. It can then
 /// outlive the prior even if the prior reaches COMPLETED/FAILED on its own (the
 /// workflow never awaited that signal name). The row is then just as unreachable,
 /// regardless of which state sealed it. This backend has no retention/GC pass, so
@@ -3005,13 +3004,14 @@ fn cancel_and_seal_prior(
     conn: &Connection,
     prior_exec: ExecutionId,
     prior_state: &str,
+    reason: &str,
 ) -> SqliteResult<()> {
     if prior_state == "RUNNING" {
         store::append_event(
             conn,
             prior_exec,
             &WorkflowEvent::WorkflowCancelled {
-                reason: "superseded by a TerminateIfRunning start (#1068)".to_string(),
+                reason: reason.to_string(),
             },
         )?;
         queue::delete_pending_tasks_for_execution(conn, prior_exec)?;
@@ -3035,6 +3035,33 @@ enum StartMatrix {
     SignalWithStart,
 }
 
+impl StartMatrix {
+    /// The `WorkflowCancelled` reason of a `RUNNING` prior that a replace
+    /// cancels. Signal-with-start uses the Postgres text.
+    const fn cancel_reason(self) -> &'static str {
+        match self {
+            Self::Plain => "superseded by a TerminateIfRunning start (#1068)",
+            Self::SignalWithStart => "terminated by signal-with-start",
+        }
+    }
+
+    /// Insert a fresh run of the key. Signal-with-start checks the input cap
+    /// here, because an attach ignores the input. A plain start checks it
+    /// before its transaction.
+    fn insert_fresh(
+        self,
+        conn: &Connection,
+        workflow_name: &str,
+        workflow_id: Option<&str>,
+        input: Value,
+    ) -> SqliteResult<StartOutcome> {
+        if self == Self::SignalWithStart {
+            check_input_cap(&input)?;
+        }
+        insert_fresh_execution(conn, workflow_name, workflow_id, input)
+    }
+}
+
 /// Apply the `(workflow_name, workflow_id)` reuse matrix inside the caller's
 /// transaction (issues #1068 and #2028). The callers document the two
 /// matrices.
@@ -3046,28 +3073,31 @@ fn start_in_tx(
     policy: WorkflowIdReusePolicy,
     matrix: StartMatrix,
 ) -> SqliteResult<StartOutcome> {
-    // A non-blank caller-supplied id is the reuse key; a blank/None id has no
-    // reuse key (it defaults to the fresh exec-id string form, unique per run),
-    // so it always creates a distinct execution regardless of `policy`.
+    // A non-blank id is the reuse key. A blank or `None` id has no reuse key.
+    // It defaults to the fresh exec-id string, so each call creates a new run.
     let Some(id) = workflow_id.filter(|id| !id.trim().is_empty()) else {
-        // No reuse key → always fresh; `workflow_id` defaults to the exec-id
-        // string form so `ctx.info().workflow_id` is never empty and is
-        // distinct per run (issue #698).
-        return insert_fresh_execution(conn, workflow_name, None, input);
+        // `ctx.info().workflow_id` is then never empty and is distinct per run
+        // (issue #698).
+        return matrix.insert_fresh(conn, workflow_name, None, input);
     };
     let Some((prior_exec, prior_state)) =
         store::find_active_execution_by_key(conn, workflow_name, id)?
     else {
         // No active prior → create fresh under every policy.
-        return insert_fresh_execution(conn, workflow_name, Some(id), input);
+        return matrix.insert_fresh(conn, workflow_name, Some(id), input);
     };
     let existing = StartOutcome {
         exec_id: prior_exec,
         created: false,
     };
-    // Signal-with-start cannot signal a terminal prior, so it replaces it.
+    // Signal-with-start cannot usefully signal a terminal prior, so it
+    // replaces it. A RUNNING prior with a pending cooperative cancel counts as
+    // terminal too (issue #2021). The next drive ends it CANCELLED, so the
+    // signal would never act. Postgres sets CANCELLED at once, so its matrix
+    // replaces such a run.
     let replace_terminal = matrix == StartMatrix::SignalWithStart
-        && autumn_harvest::erase::is_terminal_state(&prior_state);
+        && (autumn_harvest::erase::is_terminal_state(&prior_state)
+            || store::cancel_request(conn, prior_exec)?.is_some());
     match policy {
         WorkflowIdReusePolicy::AllowDuplicate if !replace_terminal => Ok(existing),
         // Refuse the duplicate — drop the (uncommitted) transaction so no
@@ -3083,29 +3113,59 @@ fn start_in_tx(
         {
             Ok(existing)
         }
-        WorkflowIdReusePolicy::AllowDuplicate | WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
-            cancel_and_seal_prior(conn, prior_exec, &prior_state)?;
-            insert_fresh_execution(conn, workflow_name, Some(id), input)
+        // A plain start replaces only the newest prior. It never cancels an
+        // older RUNNING duplicate that a FAILED-only replace leaves alone.
+        WorkflowIdReusePolicy::AllowDuplicate | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+            if !replace_terminal =>
+        {
+            cancel_and_seal_prior(conn, prior_exec, &prior_state, matrix.cancel_reason())?;
+            matrix.insert_fresh(conn, workflow_name, Some(id), input)
         }
         // Cancel and seal EVERY active prior for the key, then start fresh.
         // A pre-#1068 database can hold MULTIPLE RUNNING rows for one key,
         // from the old always-fresh start. A seal of only the newest row
         // leaves the older rows active. `run_until_idle` then still drives
-        // them, which breaks the terminate-and-restart guarantee (Codex #1080
-        // P2). So read the FULL active set and reconcile every row. A RUNNING
-        // prior records `WorkflowCancelled` and loses its PENDING tasks and
-        // unfired timers. A terminal prior is sealed with no cancel event.
-        // One start transaction does all of it. The result is exactly one
-        // active row, the fresh run.
-        WorkflowIdReusePolicy::TerminateIfRunning => {
+        // them, which breaks the terminate-and-restart guarantee (issue
+        // #1080). So read the FULL active set and reconcile every row. A
+        // RUNNING prior records `WorkflowCancelled` and loses its PENDING tasks
+        // and unfired timers. The call seals a terminal prior with no cancel
+        // event. One start transaction does all of it. The result is exactly
+        // one active row, the fresh run.
+        //
+        // A signal-with-start replace does the same, as Postgres upgrades it
+        // to `TerminateIfRunning`.
+        WorkflowIdReusePolicy::AllowDuplicate
+        | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+        | WorkflowIdReusePolicy::TerminateIfRunning => {
             for (prior_exec, prior_state) in
                 store::find_active_executions_by_key(conn, workflow_name, id)?
             {
-                cancel_and_seal_prior(conn, prior_exec, &prior_state)?;
+                cancel_and_seal_prior(conn, prior_exec, &prior_state, matrix.cancel_reason())?;
             }
-            insert_fresh_execution(conn, workflow_name, Some(id), input)
+            matrix.insert_fresh(conn, workflow_name, Some(id), input)
         }
     }
+}
+
+/// Returns `Ok` only when `input` fits the workflow-input cap.
+fn check_input_cap(input: &Value) -> SqliteResult<()> {
+    // Enforce the workflow-input cap BEFORE any write (issue #252). The Postgres
+    // start path rejects an oversized input with `PayloadTooLarge` before it
+    // persists anything. Without this check, this backend stores and replays an
+    // unbounded input that other backends reject. The size is the serialized-JSON
+    // byte length, as in the core. A zero cap means no cap. The default (2 MiB)
+    // is above zero, so the check is active.
+    if DEFAULT_MAX_WORKFLOW_INPUT_BYTES > 0 {
+        let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
+        if observed > DEFAULT_MAX_WORKFLOW_INPUT_BYTES {
+            return Err(SqliteError::PayloadTooLarge {
+                kind: "workflow_input",
+                observed_bytes: observed,
+                cap_bytes: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Returns `Ok` only when `exec` is a stored, non-terminal execution.
@@ -3173,21 +3233,24 @@ fn stage_keyed(
     {
         return Ok(false);
     }
-    // Validate the target BEFORE staging (Codex #1069 P2). `harvest_signals`
+    // Validate the target BEFORE staging (issue #1069). `harvest_signals`
     // has no FK or state check. No drive consumes a row staged for a sealed
     // run, so the wakeup would be lost silently. A terminal execution is
     // `WorkflowNotRunning`, as on Postgres. The single writer holds the only
     // write handle, so no transition can happen between this check and the
     // insert.
     refuse_unless_running(conn, exec)?;
-    // Enforce the signal-payload cap at INGRESS (issue #252, Codex #1069
-    // `runtime.rs:346`), before the `harvest_signals` row is staged.
+    // Enforce the signal-payload cap at INGRESS (issues #252 and #1069),
+    // before the `harvest_signals` row is staged.
     // Otherwise the next drive records an oversized `SignalReceived` event.
     // That bloats history and accepts a payload that Postgres rejects at its
     // boundary. The check runs AFTER the not-found and terminal checks. A
     // valid, running target is a precondition for ANY signal. So a typoed or
     // sealed target reports that, the more actionable error, and not the
-    // size. The size is the serialized-JSON byte length, as in the core.
+    // size. The Postgres HTTP boundary checks the cap before the state. So
+    // an oversized signal to a terminal run differs only in its error kind.
+    // Both backends refuse it and stage no row. The size is the
+    // serialized-JSON byte length, as in the core.
     if DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES > 0 {
         let observed = serde_json::to_string(payload).map_or(0, |s| s.len() as u64);
         if observed > DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES {
@@ -3198,10 +3261,10 @@ fn stage_keyed(
             });
         }
     }
-    // Millisecond precision (issue #1069 P2): `received_at` is compared against
-    // a deadline timer's `fire_at` (both epoch-MILLISECOND) by the wake-event
-    // ingest, so a whole-second floor could flip an on-time signal past its
-    // deadline near a second boundary.
+    // Millisecond precision (issue #1069). The wake-event ingest compares
+    // `received_at` with a deadline timer's `fire_at`. Both are epoch
+    // milliseconds. A whole-second floor can move an on-time signal past its
+    // deadline.
     store::stage_signal(
         conn,
         exec,

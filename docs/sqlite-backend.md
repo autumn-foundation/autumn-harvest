@@ -457,7 +457,7 @@ fails, and the drive returns `RunState::Failed` with the reason JSON. The
 `WorkflowFailed` event holds the same JSON in `error`. The event is
 byte-identical to the one the Postgres worker writes. Parse the JSON as
 `HistoryCapReason`. The seal removes the run's pending tasks, unfired timers
-and staged signals.
+and unkeyed staged signals.
 
 A continuing run is exempt, because its successor starts a new history. The
 event count includes the decision's own appends. The byte count is the stored
@@ -530,8 +530,12 @@ let staged = rt.send_signal_idempotent(exec, "approve", json!(true), Some("hook-
   returns `Ok(false)`, not an error, as on Postgres.
 - A seal (cancel, terminate, failure, replace) keeps a keyed row, so its key
   still dedupes. Unkeyed rows are deleted, as before.
-- An empty key is no key. A normal signal cannot use a `harvest.promise:`
-  key. That is `SqliteError::InvalidSignal`.
+- The key is scoped to the run that holds the row. A continue-as-new moves an
+  undelivered row to the successor. A retry to the old `exec` then returns
+  `SqliteError::WorkflowNotRunning`. Use `send_signal_by_workflow_id` for a
+  key that spans the chain.
+- An empty key is no key, on every path. A normal signal cannot use a
+  `harvest.promise:` key. That is `SqliteError::InvalidSignal`.
 
 Signal a run by its business id:
 
@@ -546,6 +550,12 @@ let delivery = rt.send_signal_by_workflow_id("order", "order-7", "approve", json
   `SqliteError::WorkflowNotRunning`. With no run at all, it returns
   `SqliteError::WorkflowIdNotFound`. A blank id is
   `SqliteError::BlankWorkflowId`.
+- The checks run in this order: the blank id, the key rules, the chain key
+  probe, the run lookup, then the run state and the payload cap. Postgres
+  reports these outcomes as `ByIdSignalOutcome` values. This backend returns
+  errors.
+- A key that the chain already holds returns `delivered: false`, with the
+  `exec_id` of the run that holds it.
 
 Start a run and signal it, or signal the run that exists:
 
@@ -577,6 +587,21 @@ A terminal prior is the difference from the plain start matrix in
 [§6](#6-starting-a-workflow). A signal cannot land on a terminal run, so
 the call starts a fresh run, as on Postgres. The fresh run seals the prior
 `CONTINUED_AS_NEW`.
+
+- A `RUNNING` run with a pending cooperative cancel counts as `CANCELLED`.
+  The next drive ends it, so a signal cannot act there. Postgres sets
+  `CANCELLED` at once, so its matrix gives the same result.
+- A replace seals every active run of the key, as `TerminateIfRunning` does.
+- The input cap applies only when the call starts a run. An attach ignores
+  the input, as on Postgres.
+- The new calls stamp the arrival time from the wall clock, as `send_signal`
+  does.
+- A cancelled `RUNNING` prior gets `WorkflowCancelled` with the reason
+  `"terminated by signal-with-start"`, the Postgres text.
+- After a replace, `outcome(prior)` returns
+  `ExecutionOutcome::Terminated("CONTINUED_AS_NEW")`, as for a plain-start
+  replace. Postgres still reports the prior's own outcome. Read the result of
+  a replaced `COMPLETED` prior from the last event of `load_history(prior)`.
 
 Both `send_signal_by_workflow_id` and `signal_with_start` dedupe a key
 across every run of the key, in any state. A retry after a continue-as-new,
@@ -791,8 +816,9 @@ transaction, with a typed `WorkflowFailed` event:
 | `non_retryable` | `true` |
 | `error` | The `SqliteError::Unsupported` message |
 
-The seal also removes the run's pending tasks, unfired timers and staged
-signals. The cycle's own cleanup rolled back, and nothing can use them now.
+The seal also removes the run's pending tasks, unfired timers and unkeyed
+staged signals. The cycle's own cleanup rolled back, and nothing can use them
+now. A keyed signal stays, so its key still dedupes (issue #2028).
 
 That drive still returns `SqliteError::Unsupported`, so the caller sees the
 reason. A later drive returns `RunState::Failed` and does not run the handler

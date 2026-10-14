@@ -61,10 +61,10 @@ pub enum SqliteError {
     /// `CONTINUED_AS_NEW`).
     ///
     /// [`send_signal`](crate::SqliteRuntime::send_signal) mirrors the Postgres
-    /// rejection of a signal to a terminal target.
+    /// rejection of a signal to a terminal target. No drive consumes a row
+    /// staged for a sealed run, so the wakeup would be lost silently.
     /// [`send_signal_by_workflow_id`](crate::SqliteRuntime::send_signal_by_workflow_id)
-    /// returns it when the newest run of the key is terminal (issue #2028). No drive consumes a row
-    /// staged for a sealed run, so the wakeup would be lost silently. `update`
+    /// returns it when the newest run of the key is terminal (issue #2028). `update`
     /// also returns it (issue #2025), and so do
     /// [`cancel`](crate::SqliteRuntime::cancel) and
     /// [`terminate`](crate::SqliteRuntime::terminate) (issue #2021). An unknown
@@ -249,8 +249,8 @@ pub enum SqliteError {
         workflow_id: String,
     },
 
-    /// A call that addresses a run by its business id got a blank id (issue
-    /// #2028). A blank id has no reuse key, so it can match no run.
+    /// A call that addresses a run by its business id has a blank id (issue
+    /// #2028). A blank id has no reuse key, so it matches no run.
     #[error("the workflow_id must not be blank")]
     BlankWorkflowId,
 

@@ -196,6 +196,15 @@ async fn a_keyed_retry_after_delivery_stages_nothing() {
         .unwrap();
     assert!(!again, "a delivered key still dedupes");
     assert_eq!(staged(&path, exec, "first"), 1);
+    let delivered: i64 = raw(&path)
+        .query_row(
+            "SELECT delivered FROM harvest_signals WHERE idempotency_key = 'k'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(delivered, 1, "the drive delivered the keyed row");
+    assert_eq!(signal_events(&rt, exec), 1);
 }
 
 #[tokio::test]
@@ -424,13 +433,15 @@ async fn a_failed_stage_rolls_back_the_prior_cancel() {
         )
         .unwrap();
 
-    rt.signal_with_start(sws(
-        "cart-4",
-        WorkflowIdReusePolicy::TerminateIfRunning,
-        json!(1),
-        None,
-    ))
-    .unwrap_err();
+    let err = rt
+        .signal_with_start(sws(
+            "cart-4",
+            WorkflowIdReusePolicy::TerminateIfRunning,
+            json!(1),
+            None,
+        ))
+        .unwrap_err();
+    assert!(matches!(err, SqliteError::Sqlite(_)), "{err:?}");
     assert!(matches!(
         rt.outcome(prior).unwrap(),
         ExecutionOutcome::Running
@@ -760,9 +771,369 @@ async fn signal_by_workflow_id_prefers_the_live_run() {
     // A terminated run leaves the key free, so this is a new run.
     let live = parked_inbox(&mut rt, "acct-7").await;
     assert_ne!(old, live);
+    // A newer terminal row of the key. Only the active-first order picks the
+    // older live run over it.
+    raw(&path)
+        .execute(
+            "INSERT INTO harvest_executions (exec_id, workflow_name, workflow_id, input_json, state) \
+             VALUES (?1, 'inbox', 'acct-7', '0', 'COMPLETED')",
+            [ExecutionId::new().to_string()],
+        )
+        .unwrap();
 
     let delivery = rt
         .send_signal_by_workflow_id("inbox", "acct-7", "go", json!(1), None)
         .unwrap();
     assert_eq!(delivery.exec_id, live);
+}
+
+// ── Review follow-ups ────────────────────────────────────────────────────────
+
+/// Park `inbox` under `id`, then end it in `state`.
+async fn prior_in(rt: &mut SqliteRuntime, id: &str, state: &str) -> ExecutionId {
+    let exec = parked_inbox(rt, id).await;
+    match state {
+        "COMPLETED" => {
+            rt.send_signal(exec, "go", json!(0)).unwrap();
+            completed(&rt.run_until_blocked(exec).await.unwrap());
+        }
+        "CANCELLED" => {
+            rt.cancel(exec, "stop").unwrap();
+            let state = rt.run_until_blocked(exec).await.unwrap();
+            assert!(matches!(state, RunState::Cancelled(_)), "{state:?}");
+        }
+        "TERMINATED" => rt.terminate(exec, "stop").unwrap(),
+        other => panic!("no prior state {other}"),
+    }
+    exec
+}
+
+#[tokio::test]
+async fn the_matrix_over_terminal_priors() {
+    use WorkflowIdReusePolicy::{
+        AllowDuplicate, AllowDuplicateFailedOnly, RejectDuplicate, TerminateIfRunning,
+    };
+    for prior_state in ["COMPLETED", "CANCELLED", "TERMINATED"] {
+        for policy in [
+            AllowDuplicate,
+            RejectDuplicate,
+            AllowDuplicateFailedOnly,
+            TerminateIfRunning,
+        ] {
+            let (_dir, path) = temp_db();
+            let mut rt = runtime(&path);
+            let prior = prior_in(&mut rt, "m-1", prior_state).await;
+            let signals_before = all_signals(&path);
+            let result = rt.signal_with_start(sws("m-1", policy, json!(1), None));
+            let case = format!("{prior_state} under {policy:?}");
+            // A TERMINATED prior frees the key under every policy.
+            if policy == RejectDuplicate && prior_state != "TERMINATED" {
+                let err = result.unwrap_err();
+                assert!(
+                    matches!(err, SqliteError::AlreadyExists { existing_exec_id, .. } if existing_exec_id == prior),
+                    "{case}: {err:?}"
+                );
+                assert_eq!(all_signals(&path), signals_before, "{case}");
+                continue;
+            }
+            let out = result.unwrap();
+            assert!(out.started_fresh && out.signal_delivered, "{case}");
+            assert_ne!(out.exec_id, prior, "{case}");
+            assert_eq!(
+                completed(&rt.run_until_blocked(out.exec_id).await.unwrap()),
+                json!(1),
+                "{case}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_failed_stage_leaves_a_replaced_prior_unchanged() {
+    let (_dir, path) = temp_db();
+    let mut rt = runtime(&path);
+    let prior = prior_in(&mut rt, "cart-12", "COMPLETED").await;
+    raw(&path)
+        .execute_batch(
+            "CREATE TRIGGER fail_stage BEFORE INSERT ON harvest_signals \
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .unwrap();
+
+    let err = rt
+        .signal_with_start(sws(
+            "cart-12",
+            WorkflowIdReusePolicy::AllowDuplicate,
+            json!(1),
+            None,
+        ))
+        .unwrap_err();
+    assert!(matches!(err, SqliteError::Sqlite(_)), "{err:?}");
+    assert!(
+        matches!(rt.outcome(prior).unwrap(), ExecutionOutcome::Completed(ref v) if *v == json!(0)),
+        "the prior keeps its state and output"
+    );
+    assert_eq!(runs_for_key(&path, "inbox", "cart-12"), 1, "no fresh run");
+}
+
+#[tokio::test]
+async fn a_keyed_reject_duplicate_retry_dedupes() {
+    let (_dir, path) = temp_db();
+    let mut rt = runtime(&path);
+    let policy = WorkflowIdReusePolicy::RejectDuplicate;
+    let first = rt
+        .signal_with_start(sws("cart-13", policy, json!(1), Some("k")))
+        .unwrap();
+    let retry = rt
+        .signal_with_start(sws("cart-13", policy, json!(1), Some("k")))
+        .unwrap();
+    assert!(first.started_fresh && first.signal_delivered);
+    assert_eq!(
+        retry,
+        SignalWithStartOutcome {
+            exec_id: first.exec_id,
+            started_fresh: false,
+            signal_delivered: false,
+        },
+        "the key probe runs before the reuse policy"
+    );
+    assert_eq!(all_signals(&path), 1);
+}
+
+#[tokio::test]
+async fn a_key_survives_a_reopen() {
+    let (_dir, path) = temp_db();
+    let policy = WorkflowIdReusePolicy::AllowDuplicate;
+    let exec = {
+        let mut rt = runtime(&path);
+        rt.signal_with_start(sws("cart-14", policy, json!(1), Some("k")))
+            .unwrap()
+            .exec_id
+    };
+
+    let mut rt = runtime(&path);
+    let retry = rt
+        .signal_with_start(sws("cart-14", policy, json!(1), Some("k")))
+        .unwrap();
+    assert!(!retry.started_fresh && !retry.signal_delivered);
+    assert!(
+        !rt.send_signal_idempotent(exec, "go", json!(1), Some("k"))
+            .unwrap()
+    );
+    assert_eq!(all_signals(&path), 1);
+}
+
+#[tokio::test]
+async fn opening_an_old_file_adds_the_key_and_back_fills_promises() {
+    let (_dir, path) = temp_db();
+    let exec = ExecutionId::new();
+    raw(&path)
+        .execute_batch(&format!(
+            "CREATE TABLE harvest_signals (\
+                 signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, exec_id TEXT NOT NULL, \
+                 name TEXT NOT NULL, payload_json TEXT NOT NULL, \
+                 delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0); \
+             INSERT INTO harvest_signals (exec_id, name, payload_json) VALUES \
+                 ('{exec}', 'harvest.promise:p', '{{}}'), ('{exec}', 'go', '1');"
+        ))
+        .unwrap();
+
+    drop(runtime(&path));
+    drop(runtime(&path));
+
+    let mut stmt = raw(&path);
+    let keys: Vec<(String, Option<String>)> = stmt
+        .prepare("SELECT name, idempotency_key FROM harvest_signals ORDER BY signal_seq")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            (
+                "harvest.promise:p".to_string(),
+                Some("harvest.promise:p".to_string())
+            ),
+            ("go".to_string(), None),
+        ]
+    );
+    stmt = raw(&path);
+    let dup = stmt.execute(
+        "INSERT INTO harvest_signals (exec_id, name, payload_json, idempotency_key) \
+         VALUES (?1, 'x', '1', 'harvest.promise:p')",
+        [exec.to_string()],
+    );
+    assert!(dup.is_err(), "the reopened file enforces the key");
+}
+
+#[tokio::test]
+async fn a_replace_seal_keeps_the_keyed_row() {
+    let (_dir, path) = temp_db();
+    let mut rt = runtime(&path);
+    let prior = parked_inbox(&mut rt, "cart-15").await;
+    rt.send_signal_idempotent(prior, "go", json!(1), Some("k"))
+        .unwrap();
+    rt.send_signal(prior, "go", json!(2)).unwrap();
+
+    rt.start_workflow_with_reuse_policy(
+        "inbox",
+        "cart-15",
+        json!(0),
+        WorkflowIdReusePolicy::TerminateIfRunning,
+    )
+    .unwrap();
+    assert_eq!(staged(&path, prior, "go"), 1, "only the keyed row stays");
+    assert!(
+        !rt.send_signal_idempotent(prior, "go", json!(1), Some("k"))
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn the_input_cap_applies_only_to_a_start() {
+    let (_dir, path) = temp_db();
+    let mut rt = runtime(&path);
+    let policy = WorkflowIdReusePolicy::AllowDuplicate;
+    let big = json!("x".repeat(3 * 1024 * 1024));
+    let mut request = sws("cart-16", policy, json!(1), None);
+    request.input = big.clone();
+
+    let err = rt.signal_with_start(request.clone()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SqliteError::PayloadTooLarge {
+                kind: "workflow_input",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(runs_for_key(&path, "inbox", "cart-16"), 0);
+
+    let exec = parked_inbox(&mut rt, "cart-16").await;
+    let out = rt.signal_with_start(request).unwrap();
+    assert_eq!(out.exec_id, exec);
+    assert!(out.signal_delivered, "an attach ignores the input");
+
+    let mut oversized = sws("cart-16", policy, json!("x".repeat(300 * 1024)), None);
+    oversized.input = big;
+    let err = rt.signal_with_start(oversized).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SqliteError::PayloadTooLarge {
+                kind: "signal_payload",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(staged(&path, exec, "go"), 1);
+}
+
+#[tokio::test]
+async fn an_empty_key_on_signal_with_start_is_no_key() {
+    let (_dir, path) = temp_db();
+    let mut rt = runtime(&path);
+    let policy = WorkflowIdReusePolicy::AllowDuplicate;
+    let first = rt
+        .signal_with_start(sws("cart-17", policy, json!(1), Some("")))
+        .unwrap();
+    let second = rt
+        .signal_with_start(sws("cart-17", policy, json!(2), Some("")))
+        .unwrap();
+    assert!(first.signal_delivered && second.signal_delivered);
+    assert_eq!(staged(&path, first.exec_id, "go"), 2);
+}
+
+#[tokio::test]
+async fn a_cancelled_prior_gets_the_postgres_reason() {
+    let (_dir, path) = temp_db();
+    let mut rt = runtime(&path);
+    let prior = parked_inbox(&mut rt, "cart-18").await;
+    rt.signal_with_start(sws(
+        "cart-18",
+        WorkflowIdReusePolicy::TerminateIfRunning,
+        json!(1),
+        None,
+    ))
+    .unwrap();
+    assert!(matches!(
+        rt.load_history(prior).unwrap().last(),
+        Some(WorkflowEvent::WorkflowCancelled { reason }) if reason == "terminated by signal-with-start"
+    ));
+}
+
+#[tokio::test]
+async fn a_pending_cancel_counts_as_terminal() {
+    let (_dir, path) = temp_db();
+    let mut rt = runtime(&path);
+    let prior = parked_inbox(&mut rt, "cart-19").await;
+    rt.cancel(prior, "stop").unwrap();
+
+    let err = rt
+        .signal_with_start(sws(
+            "cart-19",
+            WorkflowIdReusePolicy::RejectDuplicate,
+            json!(1),
+            None,
+        ))
+        .unwrap_err();
+    assert!(matches!(err, SqliteError::AlreadyExists { .. }), "{err:?}");
+
+    let out = rt
+        .signal_with_start(sws(
+            "cart-19",
+            WorkflowIdReusePolicy::AllowDuplicate,
+            json!(1),
+            Some("k"),
+        ))
+        .unwrap();
+    assert!(out.started_fresh && out.signal_delivered);
+    assert_ne!(out.exec_id, prior, "the signal goes to a run that can act");
+    assert_eq!(
+        completed(&rt.run_until_blocked(out.exec_id).await.unwrap()),
+        json!(1)
+    );
+}
+
+#[tokio::test]
+async fn a_replace_seals_every_legacy_active_row() {
+    let (_dir, path) = temp_db();
+    let mut rt = runtime(&path);
+    let older = parked_inbox(&mut rt, "cart-20").await;
+    // A pre-#1068 file can hold a newer active row of the same key.
+    raw(&path)
+        .execute(
+            "INSERT INTO harvest_executions (exec_id, workflow_name, workflow_id, input_json, state) \
+             VALUES (?1, 'inbox', 'cart-20', '0', 'COMPLETED')",
+            [ExecutionId::new().to_string()],
+        )
+        .unwrap();
+
+    let out = rt
+        .signal_with_start(sws(
+            "cart-20",
+            WorkflowIdReusePolicy::AllowDuplicate,
+            json!(1),
+            None,
+        ))
+        .unwrap();
+    assert!(out.started_fresh);
+    assert!(matches!(
+        rt.outcome(older).unwrap(),
+        ExecutionOutcome::Terminated(_)
+    ));
+    let running: i64 = raw(&path)
+        .query_row(
+            "SELECT COUNT(*) FROM harvest_executions \
+             WHERE workflow_id = 'cart-20' AND state = 'RUNNING'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(running, 1, "only the fresh run is active");
 }

@@ -518,8 +518,9 @@
 //! signals the running run of a `(workflow_name, workflow_id)` key, and refuses
 //! a terminal one.
 //! [`signal_with_start`](crate::SqliteRuntime::signal_with_start) starts a run
-//! and signals it, or signals the run that exists, in one transaction. Both
-//! calls dedupe a key across the whole chain of runs of the key.
+//! and signals it, or signals the run that exists, in one transaction.
+//! `send_signal_by_workflow_id` and `signal_with_start` dedupe a key across
+//! the whole chain of runs of the key.
 //!
 //! There is deliberately **no import/seed-a-foreign-history API**. The
 //! cross-backend guarantee (a history written here replays on the core engine) is

@@ -71,7 +71,11 @@ unique index. No new `WorkflowEvent` variant.**
 | R7 | A failure between the start and the stage leaves a run with no signal. | One transaction. An error drops it uncommitted. |
 | R8 | An empty key collides across unrelated signals. | An empty key is no key, as on Postgres. |
 | R9 | A normal signal takes a `harvest.promise:` key and blocks the real settlement. | `settlement_idempotency_key` rejects it as `InvalidSignal`. |
-| R10 | An old file has duplicate promise rows. The unique index build fails on open. | The back-fill uses `UPDATE OR IGNORE`. The index is built first. |
+| R10 | An old file has duplicate promise rows. The unique index build fails on open. | The index is built while every key is NULL. The back-fill keys only the first row of each `(exec_id, name)`. |
+| R13 | A crash after the column add skips the back-fill forever. | One transaction holds the column, the index and the back-fill. |
+| R14 | An oversized input fails an attach that ignores the input. | Signal-with-start checks the input cap only when it starts a run. |
+| R15 | Signal-with-start attaches to a run with a pending cancel. The next drive ends it, and the signal never acts. | Such a run counts as `CANCELLED` in the matrix. |
+| R16 | A replace over a legacy file seals only the newest of several active rows. | A signal-with-start replace seals every active row, as `TerminateIfRunning` does. |
 | R11 | A blank `workflow_id` never matches its chain, so keyed retries start new runs. | Signal-with-start and by-id reject a blank id as `BlankWorkflowId`. |
 | R12 | By-id signals a terminal run while a live run exists for the key. | Resolution is active-first. |
 
@@ -86,7 +90,9 @@ unique index. No new `WorkflowEvent` variant.**
   bounded by the caller's keys. The migration adds an index on open. Two
   new error variants grow the enum. A `COMPLETED` prior that
   signal-with-start replaces seals `CONTINUED_AS_NEW`, as the plain-start
-  replace does, so `outcome()` no longer returns its output.
+  replace does, so `outcome()` no longer returns its output. Postgres
+  reports the prior's own outcome. That gap predates this change and needs
+  its own issue. The guide points to `load_history` meanwhile.
 - **Yellow (benefits).** Parity with Postgres for webhook ingress. The
   database, not the caller, enforces the key. The promise path loses its
   special case.
@@ -131,14 +137,13 @@ calls it with no key.
 
 ### 1.4 `signal_with_start`
 
-One transaction:
+Checks before the transaction: a non-blank id, a registered workflow and
+the key rules. Then one transaction:
 
-1. Checks before the transaction: a registered workflow, a non-blank id,
-   the input cap and the key rules.
-2. The chain probe, as in 1.3 step 2. A hit returns
+1. The chain probe, as in 1.3 step 2. A hit returns
    `started_fresh: false, signal_delivered: false`.
-3. The start matrix below.
-4. The keyed stage on the run that step 3 gives.
+2. The start matrix below. The input cap applies only when it starts a run.
+3. The keyed stage on the run that step 2 gives.
 
 | Prior state | `AllowDuplicate` | `RejectDuplicate` | `AllowDuplicateFailedOnly` | `TerminateIfRunning` |
 |---|---|---|---|---|
@@ -171,7 +176,12 @@ keyed rows). Integration tests:
 | Signal-with-start signals a live run and starts nothing. | AC2 |
 | An injected stage failure rolls back the start and the prior's cancel. | AC2, R7 |
 | A keyed signal-with-start retry stages once, also after completion. | AC1, AC2, R5 |
-| The matrix: terminal prior, `RejectDuplicate`, `TerminateIfRunning`, `AllowDuplicateFailedOnly`. | AC2 |
+| The matrix: each policy over no prior, a `RUNNING`, a `COMPLETED`, a `CANCELLED` and a `TERMINATED` prior. | AC2 |
+| A failed stage leaves a replaced `COMPLETED` prior unchanged. | AC2, R7 |
+| A keyed retry survives a reopen of the file. An old file migrates on open. | AC1, R10, R13 |
+| An oversized input fails a start and passes an attach. | R14 |
+| A pending cancel counts as terminal. | R15 |
+| A replace seals every legacy active row. | R16 |
 | A blank id, an unknown workflow, and an oversized payload start nothing. | AC2, R11 |
 | A repeated promise settlement through signal-with-start stages once. | R9 |
 | By-id reaches the live run. | AC3 |

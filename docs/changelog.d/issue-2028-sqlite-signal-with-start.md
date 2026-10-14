@@ -1,7 +1,8 @@
 ## Phase — SQLite: keyed signals, signal by workflow id, signal-with-start (issue #2028)
 
-On SQLite, `send_signal` took only an `ExecutionId`. A retried delivery
-staged the signal twice. No call could start a run or signal it in one step.
+Before this change, `send_signal` on SQLite takes only an `ExecutionId`. A
+retried delivery stages the signal twice. No call starts a run or signals it
+in one step.
 
 **What shipped**
 
@@ -15,16 +16,21 @@ staged the signal twice. No call could start a run or signal it in one step.
   call reaches it.
 - `signal_with_start(SignalWithStart { .. })` starts a run and signals it, or
   signals the run that exists, in one transaction. It follows the Postgres
-  matrix: a terminal prior gets a fresh run.
+  matrix. Under every policy but `RejectDuplicate`, a terminal prior gets a
+  fresh run. The input cap applies only when the call starts a run.
 - The by-id and signal-with-start calls dedupe a key across every run of the
   `(workflow_name, workflow_id)` chain. A promise key dedupes per run only.
 - New errors: `WorkflowIdNotFound` and `BlankWorkflowId`. New types:
   `SignalDelivery`, `SignalWithStart` and `SignalWithStartOutcome`.
 
-**Migration.** Additive and run on open. `harvest_signals` gains
-`idempotency_key` and the partial unique index `uq_harvest_signals_idem` on
-`(exec_id, idempotency_key)`. Each old promise settlement takes its name as
-its key.
+**Migration.** Additive and run on open, in one transaction.
+`harvest_signals` gains `idempotency_key` and the partial unique index
+`uq_harvest_signals_idem` on `(exec_id, idempotency_key)`. Each old promise
+settlement takes its name as its key.
+
+**Limits.** An `exec`-targeted key is scoped to the run that holds the row. A
+continue-as-new moves an undelivered row to the successor. A replaced prior
+reports `Terminated("CONTINUED_AS_NEW")`, as for a plain-start replace.
 
 **Behavior change.** A seal (cancel, terminate, failure, replace) now keeps
 an undelivered signal that has a key, so its key still dedupes. Unkeyed rows

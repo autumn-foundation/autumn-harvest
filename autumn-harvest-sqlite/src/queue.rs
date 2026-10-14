@@ -735,7 +735,7 @@ pub fn delete_unfired_timers_for_execution(
     )?)
 }
 
-/// Delete every undelivered staged signal row for an execution — companion to
+/// Delete every unkeyed, undelivered staged signal row for an execution — companion to
 /// [`delete_pending_tasks_for_execution`] / [`delete_unfired_timers_for_execution`]
 /// for the `TerminateIfRunning` seal. A signal staged against a sealed prior can
 /// never be delivered, because the prior is never driven again. This backend has
