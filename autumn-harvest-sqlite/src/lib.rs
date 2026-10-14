@@ -260,8 +260,8 @@
 //! ## Unsupported workflow primitives — rejected LOUDLY, by name
 //!
 //! Every out-of-subset primitive a workflow can reach surfaces as
-//! [`SqliteError::Unsupported`] whose message NAMES the specific
-//! `WorkflowCommand` (never an opaque `"Unknown"`, Codex #1069 P2) — a workflow
+//! [`SqliteError::Unsupported`]. Its message NAMES the specific
+//! `WorkflowCommand`, never an opaque `"Unknown"` (Codex #1069 P2). A workflow
 //! author gets an actionable failure, not a silent gap.
 //!
 //! The run then ends `FAILED` (issue #1834). The drive rolls back the cycle and
@@ -285,10 +285,10 @@
 //! - **Worker sessions** — `ctx.create_session(...)` (issue #606; a session dispatch
 //!   carries the `session_id` / `schedule_to_start_override` `ScheduleActivity`
 //!   fields this single-writer backend cannot honor).
-//! - **A batch that breaks a solo rule** — a mutex acquire beside another
-//!   awaitable (`AcquireMutex`), or a local activity beside a durable
-//!   awaitable or a second local activity (`RunLocalActivity`, issue #950).
-//!   Postgres rejects both shapes too.
+//! - **A batch that breaks a solo rule.** A mutex acquire must be the only
+//!   awaitable in its batch (`AcquireMutex`). A local activity cannot share a
+//!   batch with a durable awaitable or a second local activity
+//!   (`RunLocalActivity`, issue #950). Postgres rejects both shapes too.
 //!
 //! The command-name table (`runtime.rs`) is EXHAUSTIVE — a future core
 //! `WorkflowCommand` variant is a compile error in this backend, forcing an
