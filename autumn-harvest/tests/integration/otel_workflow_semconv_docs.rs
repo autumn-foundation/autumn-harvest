@@ -504,6 +504,17 @@ fn check_span_contract(id: &str, group: &Value, refs: &BTreeMap<String, Value>) 
         run_id_ok,
         "`{id}` must require `workflow.run.id`, or require it: {RUN_ID_CONDITION}"
     );
+    if note.contains("SHOULD be a child of the `execute_workflow` span") {
+        let start = note
+            .split("The span starts when")
+            .nth(1)
+            .and_then(|rest| rest.split('.').next())
+            .unwrap_or_default();
+        assert!(
+            start.contains("`execute_workflow` cycle"),
+            "`{id}` is a child of `execute_workflow`, so it must start inside that cycle"
+        );
+    }
     if id.contains("_signal.") {
         assert_eq!(
             refs.get("workflow.signal.name").and_then(Value::as_str),

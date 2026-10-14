@@ -116,6 +116,9 @@ code, guard quality, and style. The fixes:
 - Codex found that the issue text linked the moving `trunk-dev` branch.
   The link now holds a `<commit>` placeholder, and the steps say to fill
   it. A guard rejects a branch link.
+- Codex found that `fire_timer` could start before its parent cycle
+  existed. The `fire_timer` and `deliver_signal` spans now start inside
+  the `execute_workflow` cycle. A guard checks each child span.
 
 ### 0.6 Decisions
 

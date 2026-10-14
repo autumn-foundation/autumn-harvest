@@ -221,9 +221,9 @@ groups:
       observes the signal. It SHOULD link to the `send_signal` span when
       the engine stores that context.
 
-      The span starts when the engine hands the signal to the run. It
-      ends when the workflow code has received the signal, or the
-      delivery fails.
+      The span starts when the `execute_workflow` cycle takes the signal
+      from the engine. It ends when the workflow code has received the
+      signal, or the delivery fails.
       If the operation ends in an error, the span status SHOULD be `Error`.
     attributes:
       - ref: workflow.system.name
@@ -258,8 +258,10 @@ groups:
       The span SHOULD be a child of the `execute_workflow` span that
       observes the timer.
 
-      The span starts when the engine finds the due timer. It ends when
-      the run has received the timer result, or the delivery fails.
+      The span starts when the `execute_workflow` cycle applies the
+      fired timer. It ends when the workflow code has received the timer
+      result, or the delivery fails. A scheduler that finds a due timer
+      earlier emits no span for that step.
       If the operation ends in an error, the span status SHOULD be `Error`.
     attributes:
       - ref: workflow.system.name
