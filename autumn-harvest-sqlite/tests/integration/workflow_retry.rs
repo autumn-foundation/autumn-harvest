@@ -6,6 +6,8 @@
 
 // The `#[workflow]` macro references its input param through expansion.
 #![allow(clippy::used_underscore_binding)]
+// Fixture bodies return at once, with no `.await`.
+#![allow(clippy::unused_async)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
@@ -174,7 +176,10 @@ async fn the_retry_waits_for_its_backoff() {
     clock.store(1_000_009, Ordering::SeqCst);
     let state = rt.run_until_blocked(second).await.unwrap();
     assert!(matches!(state, RunState::WaitingTimer), "got {state:?}");
-    assert!(rt.load_history(second).unwrap().len() == 1, "nothing ran yet");
+    assert!(
+        rt.load_history(second).unwrap().len() == 1,
+        "nothing ran yet"
+    );
 
     clock.store(1_000_010, Ordering::SeqCst);
     let state = rt.run_until_blocked(second).await.unwrap();

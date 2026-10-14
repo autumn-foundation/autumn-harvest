@@ -43,10 +43,7 @@ async fn holds_until_signal(ctx: &WorkflowContext, _n: i64) -> Result<i64, Strin
 /// Waits for the lock and a signal in one batch.
 #[workflow]
 async fn acquires_beside_a_signal(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
-    let (guard, _signal) = tokio::join!(
-        ctx.mutex("k").acquire(),
-        ctx.wait_for_signal("go"),
-    );
+    let (guard, _signal) = tokio::join!(ctx.mutex("k").acquire(), ctx.wait_for_signal("go"),);
     drop(guard);
     Ok(0)
 }
@@ -56,7 +53,7 @@ fn runtime(infos: &[&WorkflowInfo]) -> SqliteRuntime {
     for info in infos {
         rt.register_workflow(info);
     }
-    rt.register_activity_raw("work", ActivitySpec::new(1, |input| Ok(input)));
+    rt.register_activity_raw("work", ActivitySpec::new(1, Ok));
     rt
 }
 
@@ -174,7 +171,7 @@ async fn a_held_lock_survives_a_reopen() {
     let mut rt = SqliteRuntime::open(&path).unwrap();
     rt.register_workflow(&holder);
     rt.register_workflow(&waiter);
-    rt.register_activity_raw("work", ActivitySpec::new(1, |input| Ok(input)));
+    rt.register_activity_raw("work", ActivitySpec::new(1, Ok));
     let state = rt.run_until_blocked(w).await.unwrap();
     assert!(matches!(state, RunState::WaitingMutex(_)), "got {state:?}");
     rt.send_signal(h, "release", json!(null)).unwrap();

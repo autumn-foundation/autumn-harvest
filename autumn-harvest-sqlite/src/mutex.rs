@@ -29,14 +29,14 @@ pub fn acquire(conn: &Connection, exec: ExecutionId, key: &str) -> SqliteResult<
         "INSERT OR IGNORE INTO harvest_mutex_waiters (lock_key, waiter_exec_id) VALUES (?1, ?2)",
         params![key, exec],
     )?;
-    let held: Option<i64> = conn
+    let taken: Option<i64> = conn
         .query_row(
             "SELECT 1 FROM harvest_mutex_locks WHERE lock_key = ?1",
             params![key],
             |row| row.get(0),
         )
         .optional()?;
-    if held.is_some() {
+    if taken.is_some() {
         return Ok(None);
     }
     let head: Option<String> = conn
@@ -72,7 +72,12 @@ pub fn acquire(conn: &Connection, exec: ExecutionId, key: &str) -> SqliteResult<
 ///
 /// The guard of a released grant pushes its release again on each replay.
 /// The fence makes that repeat a no-op, also after a later grant of the key.
-pub fn release(conn: &Connection, exec: ExecutionId, key: &str, lock_seq: i64) -> SqliteResult<bool> {
+pub fn release(
+    conn: &Connection,
+    exec: ExecutionId,
+    key: &str,
+    lock_seq: i64,
+) -> SqliteResult<bool> {
     let n = conn.execute(
         "DELETE FROM harvest_mutex_locks \
          WHERE lock_key = ?1 AND holder_exec_id = ?2 AND lock_seq = ?3",

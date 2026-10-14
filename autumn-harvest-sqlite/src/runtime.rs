@@ -1761,9 +1761,7 @@ impl SqliteRuntime {
             let now = (self.now_fn)().timestamp_millis();
             match self.drive_one_cycle(exec, now, &failure_now).await {
                 Ok(
-                    RunState::WaitingSignal(_)
-                    | RunState::WaitingTimer
-                    | RunState::WaitingMutex(_),
+                    RunState::WaitingSignal(_) | RunState::WaitingTimer | RunState::WaitingMutex(_),
                 ) => {}
                 Ok(_) => progress = true,
                 Err(err) => {
@@ -1795,9 +1793,7 @@ impl SqliteRuntime {
         for exec in store::running_executions(&self.conn)? {
             match self.drive_one_cycle(exec, now, &failure_now).await {
                 Ok(
-                    RunState::WaitingSignal(_)
-                    | RunState::WaitingTimer
-                    | RunState::WaitingMutex(_),
+                    RunState::WaitingSignal(_) | RunState::WaitingTimer | RunState::WaitingMutex(_),
                 ) => {}
                 Ok(_) => progress = true,
                 Err(err) => record_fleet_error(exec, err, &mut first_error),
@@ -1938,7 +1934,12 @@ impl SqliteRuntime {
     /// the Postgres error text, and deletes the open rows. The terminal setter
     /// also releases the run's mutex locks. The event is the Postgres one, so
     /// the history replays on any backend.
-    fn seal_timed_out(&mut self, exec: ExecutionId, deadline: i64, now: i64) -> SqliteResult<RunState> {
+    fn seal_timed_out(
+        &mut self,
+        exec: ExecutionId,
+        deadline: i64,
+        now: i64,
+    ) -> SqliteResult<RunState> {
         let workflow_name = store::workflow_name_of(&self.conn, exec)?;
         let error = autumn_harvest::HarvestError::Timeout {
             timeout_type: autumn_harvest::TimeoutType::WorkflowExecution,
@@ -2487,8 +2488,7 @@ impl SqliteRuntime {
         let applied = match self.apply_commands(exec, ingest, history, commands, caps, now)? {
             // Issue #2029: run the local activity now, then replay again.
             Applied::Committed {
-                local: Some(run),
-                ..
+                local: Some(run), ..
             } => {
                 let terminal = self
                     .run_local_activity(exec, owner, run, caps, now, cancel_reason)
@@ -2710,73 +2710,17 @@ impl SqliteRuntime {
                         produced = true;
                     }
                 }
-                // The workflow mutex (issue #2029, #691). A grant appends
-                // `MutexGranted`, and the next replay resumes the body. A
-                // queued acquire writes no event, so it is not progress.
-                WorkflowCommand::AcquireMutex { key, .. } => {
-                    if let Some(lock_seq) = mutex::acquire(&tx, exec, key)? {
-                        let acquired_at = DateTime::from_timestamp_millis(now).unwrap_or_default();
-                        store::append_event(
-                            &tx,
-                            exec,
-                            &WorkflowEvent::MutexGranted {
-                                key: key.clone(),
-                                lock_seq,
-                                acquired_at,
-                            },
-                        )?;
+                // The workflow mutex (issue #2029, #691).
+                cmd @ (WorkflowCommand::AcquireMutex { .. }
+                | WorkflowCommand::ReleaseMutex { .. }) => {
+                    if apply_mutex_command(&tx, exec, cmd, now)? {
                         produced = true;
                     }
                 }
-                // A release that frees a lock is progress. The fleet poll then
-                // makes one more pass, and a waiter gets the lock. A replayed
-                // release of an old grant frees nothing.
-                WorkflowCommand::ReleaseMutex { key, lock_seq } => {
-                    if mutex::release(&tx, exec, key, *lock_seq)? {
-                        produced = true;
-                    }
-                }
-                // A local activity (issue #2029). Its scheduled event takes the
-                // command's place in history. The body runs after the commit.
-                WorkflowCommand::RunLocalActivity {
-                    activity_id,
-                    name,
-                    input,
-                    start_to_close,
-                    retry_policy,
-                    already_scheduled,
-                    failed_attempts,
-                    last_error,
-                    ..
-                } => {
-                    if !self.activities.contains_key(name) {
-                        return Err(SqliteError::unregistered(name));
-                    }
-                    if !*already_scheduled {
-                        store::append_event(
-                            &tx,
-                            exec,
-                            &WorkflowEvent::LocalActivityScheduled {
-                                activity_id: *activity_id,
-                                name: name.clone(),
-                                input: input.clone(),
-                                resolved: true,
-                                retry_policy: retry_policy.clone(),
-                                start_to_close_nanos: start_to_close
-                                    .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)),
-                            },
-                        )?;
-                    }
+                // A local activity (issue #2029). Its body runs after the commit.
+                cmd @ WorkflowCommand::RunLocalActivity { .. } => {
+                    local = schedule_local_activity(&tx, &self.activities, exec, cmd)?;
                     produced = true;
-                    local = Some(worker::LocalRun {
-                        activity_id: *activity_id,
-                        name: name.clone(),
-                        input: input.clone(),
-                        start_to_close: *start_to_close,
-                        retry_policy: retry_policy.clone(),
-                        failed_attempts: *failed_attempts,
-                        last_error: last_error.clone(),
-                    });
                 }
                 // Reject every OTHER unsupported command BY NAME via
                 // `command_name`. Examples are child workflows, external
@@ -2819,8 +2763,7 @@ impl SqliteRuntime {
                 .get(&run.name)
                 .ok_or_else(|| SqliteError::unregistered(&run.name))?;
             let result =
-                worker::run_local_attempt(exec, owner, spec, &run, attempt, previous_failure)
-                    .await;
+                worker::run_local_attempt(exec, owner, spec, &run, attempt, previous_failure).await;
             previous_failure = result.as_ref().err().cloned();
             let (events, backoff) = worker::local_attempt_events(exec, &run, attempt, result);
             let tx = self.conn.transaction()?;
@@ -3344,7 +3287,7 @@ fn insert_run(
     input: Value,
     config: &store::RunConfig,
 ) -> SqliteResult<()> {
-    store::insert_execution(conn, exec, workflow_name, workflow_id, &input, config)?;
+    store::insert_execution_with_config(conn, exec, workflow_name, workflow_id, &input, config)?;
     store::append_event(
         conn,
         exec,
@@ -3411,10 +3354,10 @@ fn retry_plan(
     {
         return Ok(None);
     }
-    let non_retryable = match error_type {
-        Some(kind) => policy.is_non_retryable(Some(kind), ""),
-        None => policy.is_non_retryable(None, &failure.message),
-    };
+    let non_retryable = error_type.map_or_else(
+        || policy.is_non_retryable(None, &failure.message),
+        |kind| policy.is_non_retryable(Some(kind), ""),
+    );
     if non_retryable {
         return Ok(None);
     }
@@ -3604,6 +3547,99 @@ fn apply_timer_command(
         }
         _ => Ok(false),
     }
+}
+
+/// Apply one mutex command inside the caller's transaction (issue #2029,
+/// #691). Returns `true` if it changed a durable row.
+///
+/// - A grant appends `MutexGranted`, and the next replay resumes the body. A
+///   queued acquire writes no event, so it is not progress.
+/// - A release that frees a lock is progress. The fleet poll then makes one
+///   more pass, and a waiter gets the lock. A replayed release of an old
+///   grant frees nothing.
+fn apply_mutex_command(
+    conn: &Connection,
+    exec: ExecutionId,
+    cmd: &WorkflowCommand,
+    now: i64,
+) -> SqliteResult<bool> {
+    match cmd {
+        WorkflowCommand::AcquireMutex { key, .. } => {
+            let Some(lock_seq) = mutex::acquire(conn, exec, key)? else {
+                return Ok(false);
+            };
+            let acquired_at = DateTime::from_timestamp_millis(now).unwrap_or_default();
+            store::append_event(
+                conn,
+                exec,
+                &WorkflowEvent::MutexGranted {
+                    key: key.clone(),
+                    lock_seq,
+                    acquired_at,
+                },
+            )?;
+            Ok(true)
+        }
+        WorkflowCommand::ReleaseMutex { key, lock_seq } => {
+            mutex::release(conn, exec, key, *lock_seq)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Record one `RunLocalActivity` inside the caller's transaction, and return
+/// the run that the drive starts after the commit (issue #2029).
+///
+/// The `LocalActivityScheduled` event takes the command's place in history,
+/// unless the context reports it as already recorded. An unregistered
+/// activity rolls the cycle back, as for a regular activity.
+fn schedule_local_activity(
+    conn: &Connection,
+    activities: &HashMap<String, ActivitySpec>,
+    exec: ExecutionId,
+    cmd: &WorkflowCommand,
+) -> SqliteResult<Option<worker::LocalRun>> {
+    let WorkflowCommand::RunLocalActivity {
+        activity_id,
+        name,
+        input,
+        start_to_close,
+        retry_policy,
+        already_scheduled,
+        failed_attempts,
+        last_error,
+        ..
+    } = cmd
+    else {
+        return Ok(None);
+    };
+    if !activities.contains_key(name) {
+        return Err(SqliteError::unregistered(name));
+    }
+    if !*already_scheduled {
+        store::append_event(
+            conn,
+            exec,
+            &WorkflowEvent::LocalActivityScheduled {
+                activity_id: *activity_id,
+                name: name.clone(),
+                input: input.clone(),
+                resolved: true,
+                retry_policy: retry_policy.clone(),
+                start_to_close_nanos: start_to_close
+                    .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)),
+            },
+        )?;
+    }
+    Ok(Some(worker::LocalRun {
+        activity_id: *activity_id,
+        name: name.clone(),
+        input: input.clone(),
+        start_to_close: *start_to_close,
+        retry_policy: retry_policy.clone(),
+        failed_attempts: *failed_attempts,
+        last_error: last_error.clone(),
+    }))
 }
 
 /// Reject a batch that mixes a solo awaitable with others (issue #2029).
@@ -3808,20 +3844,20 @@ fn persist_terminal_pending_commands<'c>(
             | WorkflowCommand::PublishDurableProgress { .. }
             // Durable workflow logs (issue #790) — Postgres-only sink; a benign
             // NO-OP here for the same reason as `PublishProgress`.
-            | WorkflowCommand::RecordLog { .. } => {}
+            | WorkflowCommand::RecordLog { .. }
+            // Issue #2029: the terminal state setter releases every lock and
+            // queue place of the run, which covers each release. An acquire
+            // that the body did not await granted nothing. A local activity
+            // that the body did not await records nothing, as on Postgres.
+            | WorkflowCommand::ReleaseMutex { .. }
+            | WorkflowCommand::AcquireMutex { .. }
+            | WorkflowCommand::RunLocalActivity { .. } => {}
             // Issue #2029: a fresh arm records `TimerStarted`, and a cancel
             // records `TimerCancelled`. An await arm needs no row, because the
             // run ends. This is the Postgres terminal policy.
             cmd @ (WorkflowCommand::ArmTimer { .. } | WorkflowCommand::CancelTimer { .. }) => {
                 apply_timer_command(conn, exec, cmd, None)?;
             }
-            // Issue #2029: the terminal state setter releases every lock and
-            // queue place of the run, which covers each release. An acquire
-            // that the body did not await granted nothing. A local activity
-            // that the body did not await records nothing, as on Postgres.
-            WorkflowCommand::ReleaseMutex { .. }
-            | WorkflowCommand::AcquireMutex { .. }
-            | WorkflowCommand::RunLocalActivity { .. } => {}
             // Any OTHER out-of-subset command in a terminal drain is rejected BY
             // NAME via `command_name` — no opaque `"Unknown"` for any current
             // variant (Codex #1069 P2, `runtime.rs:840`).
@@ -4210,10 +4246,9 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        command_name, persist_scheduled_activity,
-        persist_started_timer, unsupported_activity_feature,
+        command_name, persist_scheduled_activity, persist_started_timer,
+        unsupported_activity_feature,
     };
-    use crate::error::SqliteError;
     use crate::{queue, schema, store};
 
     fn open() -> Connection {

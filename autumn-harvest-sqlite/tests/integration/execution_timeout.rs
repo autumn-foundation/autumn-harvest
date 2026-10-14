@@ -6,6 +6,8 @@
 
 // The `#[workflow]` macro references its input param through expansion.
 #![allow(clippy::used_underscore_binding)]
+// Fixture bodies return at once, with no `.await`.
+#![allow(clippy::unused_async)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};

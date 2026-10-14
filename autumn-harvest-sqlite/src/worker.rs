@@ -1258,7 +1258,9 @@ pub struct LocalRun {
 impl LocalRun {
     /// The attempt cap: the policy's `max_attempts`, or 1.
     pub fn max_attempts(&self) -> u32 {
-        self.retry_policy.as_ref().map_or(1, |p| p.max_attempts.max(1))
+        self.retry_policy
+            .as_ref()
+            .map_or(1, |p| p.max_attempts.max(1))
     }
 
     /// The per-attempt budget: the declared one, capped at

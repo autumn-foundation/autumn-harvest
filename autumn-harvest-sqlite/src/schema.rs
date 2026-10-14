@@ -475,6 +475,16 @@ mod tests {
         assert_eq!(from, None);
     }
 
+    /// The six timeout and retry columns of one row (issue #2029).
+    type TimeoutRetryRow = (
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        i64,
+        Option<String>,
+        Option<String>,
+    );
+
     // Issue #2029: an old row gains the timeout and retry columns. It has no
     // deadline, no start delay and no policy, and it is attempt 1.
     #[test]
@@ -492,12 +502,21 @@ mod tests {
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
 
-        let row: (Option<i64>, Option<i64>, Option<i64>, i64, Option<String>, Option<String>) =
-            conn.query_row(
+        let row: TimeoutRetryRow = conn
+            .query_row(
                 "SELECT execution_timeout_ms, deadline_at, start_at, workflow_attempt, \
                  retry_policy_json, retry_of_exec_id FROM harvest_executions",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(row, (None, None, None, 1, None, None));

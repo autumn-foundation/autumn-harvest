@@ -53,7 +53,22 @@ pub struct RunConfig {
     pub retry_of: Option<ExecutionId>,
 }
 
+/// Insert a `RUNNING` row with no timeout and no retry. The unit tests use it.
+#[cfg(test)]
 pub fn insert_execution(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    workflow_name: &str,
+    workflow_id: &str,
+    input: &Value,
+) -> SqliteResult<()> {
+    let config = RunConfig::default();
+    insert_execution_with_config(conn, exec_id, workflow_name, workflow_id, input, &config)
+}
+
+/// Insert a `RUNNING` row with the timeout and retry settings of `config`
+/// (issue #2029).
+pub fn insert_execution_with_config(
     conn: &Connection,
     exec_id: ExecutionId,
     workflow_name: &str,
@@ -104,7 +119,10 @@ pub fn run_config(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<RunCo
         .ok_or(SqliteError::ExecutionNotFound(exec_id))?;
     let (execution_timeout_ms, deadline_at, start_at, attempt, retry_policy_json, retry_of) = row;
     let retry_of = retry_of
-        .map(|id| id.parse().map_err(|_| SqliteError::corrupt("retry_of_exec_id")))
+        .map(|id| {
+            id.parse()
+                .map_err(|_| SqliteError::corrupt("retry_of_exec_id"))
+        })
         .transpose()?;
     Ok(RunConfig {
         execution_timeout_ms,

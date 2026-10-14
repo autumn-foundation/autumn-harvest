@@ -44,10 +44,7 @@ async fn resets_timer(ctx: &WorkflowContext, _n: i64) -> Result<String, String> 
 #[workflow]
 async fn cancels_after_signal(ctx: &WorkflowContext, _n: i64) -> Result<String, String> {
     let handle = ctx.start_timer("deadline", 60);
-    let _: serde_json::Value = ctx
-        .wait_for_signal("go")
-        .await
-        .map_err(|e| e.to_string())?;
+    let _: serde_json::Value = ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
     handle.cancel().map_err(|e| e.to_string())?;
     let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
     Ok(format!("{outcome:?}"))
@@ -116,7 +113,10 @@ async fn a_repeated_await_keeps_the_first_deadline() {
 
     for secs in [0, 4, 9] {
         let state = rt.run_until_blocked_as_of(exec, t(secs)).await.unwrap();
-        assert!(matches!(state, RunState::WaitingTimer), "at {secs}s: {state:?}");
+        assert!(
+            matches!(state, RunState::WaitingTimer),
+            "at {secs}s: {state:?}"
+        );
     }
     let state = rt.run_until_blocked_as_of(exec, t(10)).await.unwrap();
     assert!(matches!(state, RunState::Completed(_)), "got {state:?}");
@@ -162,7 +162,10 @@ async fn a_timer_cancelled_after_a_signal_completes_the_run() {
     let exec = rt.start_workflow(info.name, json!(0)).unwrap();
 
     let state = rt.run_until_blocked_as_of(exec, t(0)).await.unwrap();
-    assert!(matches!(state, RunState::WaitingSignal(ref s) if s == "go"), "got {state:?}");
+    assert!(
+        matches!(state, RunState::WaitingSignal(ref s) if s == "go"),
+        "got {state:?}"
+    );
     rt.send_signal_as_of(exec, "go", json!(1), t(1)).unwrap();
     let state = rt.run_until_blocked_as_of(exec, t(2)).await.unwrap();
     assert!(

@@ -1801,7 +1801,12 @@ async fn drive_one(
         }
         // Issue #2029: another run holds the mutex. A later tick retries.
         Ok(RunState::WaitingMutex(key)) => {
-            note(blocked, exec, format!("waiting for the `{key}` mutex"), None);
+            note(
+                blocked,
+                exec,
+                format!("waiting for the `{key}` mutex"),
+                None,
+            );
         }
         Ok(RunState::Completed(output)) => {
             retire(blocked, live, exec);
@@ -1818,9 +1823,7 @@ async fn drive_one(
         // Issue #2021: a cancelled or terminated run cannot be driven again.
         // Issue #2029: a timed-out run cannot be driven again either.
         Ok(
-            RunState::Cancelled(reason)
-            | RunState::Terminated(reason)
-            | RunState::TimedOut(reason),
+            RunState::Cancelled(reason) | RunState::Terminated(reason) | RunState::TimedOut(reason),
         ) => {
             retire(blocked, live, exec);
             tracing::info!(%exec, reason = %crate::one_line(&reason), "session stopped");

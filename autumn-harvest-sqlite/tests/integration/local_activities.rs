@@ -7,6 +7,8 @@
 
 // The `#[workflow]` macro references its input param through expansion.
 #![allow(clippy::used_underscore_binding)]
+// Fixture bodies return at once, with no `.await`.
+#![allow(clippy::unused_async)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -58,7 +60,10 @@ async fn calls_flaky(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
 
 #[workflow]
 async fn calls_broken(ctx: &WorkflowContext, n: i64) -> Result<String, String> {
-    match ctx.execute_local_activity::<_, i64>(&broken_info(), n).await {
+    match ctx
+        .execute_local_activity::<_, i64>(&broken_info(), n)
+        .await
+    {
         Ok(_) => Ok("unexpected success".to_string()),
         Err(e) => Ok(format!("caught: {e}")),
     }
