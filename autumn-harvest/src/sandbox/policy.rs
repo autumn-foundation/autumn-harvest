@@ -265,6 +265,7 @@ impl SandboxPolicy {
     /// Returns [`SandboxError::Config`] for one of these defects:
     ///
     /// - a default limit is over its ceiling, or a limit is zero;
+    /// - the size bounds allow no file, so no code file;
     /// - no runtime exists;
     /// - a runtime name or spec is not valid;
     /// - a runtime with the largest request is over the total exec limit.
@@ -334,6 +335,13 @@ impl SandboxPolicy {
                      over the total exec limit of {MAX_EXEC_TOTAL_BYTES}"
                 )));
             }
+        }
+        // The code file counts as one file. Without it, each request is a
+        // denial.
+        if self.sizes.max_files == 0 {
+            return Err(SandboxError::Config(
+                "the policy allows no file, and the code file counts as one".into(),
+            ));
         }
         // The outcome decoder stops at this cap, so a request may not ask for
         // more outputs.
@@ -835,6 +843,23 @@ mod tests {
             "{:?}",
             policy.validate()
         );
+    }
+
+    #[test]
+    fn a_policy_must_allow_the_code_file() {
+        let mut sizes = DEFAULT_SIZE_BOUNDS;
+        sizes.max_files = 0;
+        let policy = SandboxPolicy::default().with_sizes(sizes);
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("code file")),
+            "{:?}",
+            policy.validate()
+        );
+        sizes.max_files = 1;
+        SandboxPolicy::default()
+            .with_sizes(sizes)
+            .validate()
+            .unwrap();
     }
 
     #[test]

@@ -17,7 +17,9 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use super::backend::{BackendSettings, FirecrackerBackend};
-use super::config::{GUEST_AGENT_PORT, GuestImage, MachineSpec, PINNED_IMAGE_SUFFIX, VM_ID_PREFIX};
+use super::config::{
+    GUEST_AGENT_PORT, GuestImage, MachineSpec, PINNED_IMAGE_SUFFIX, VM_ID_PREFIX, VMM_COPIES_SUFFIX,
+};
 use super::jailer::JailerConfig;
 use super::launcher::{BootMethod, Confinement, FirecrackerLauncher, LauncherConfig};
 use super::posture::PosturePolicy;
@@ -137,9 +139,12 @@ fn vm_dirs(root: &Path) -> Vec<String> {
                 .filter_map(Result::ok)
                 .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
                 .map(|e| e.file_name().to_string_lossy().into_owned())
-                // The live launcher keeps its pinned image.
+                // The live launcher keeps its pinned image and its checked
+                // binaries.
                 .filter(|name| {
-                    name.starts_with(VM_ID_PREFIX) && !name.ends_with(PINNED_IMAGE_SUFFIX)
+                    name.starts_with(VM_ID_PREFIX)
+                        && !name.ends_with(PINNED_IMAGE_SUFFIX)
+                        && !name.ends_with(VMM_COPIES_SUFFIX)
                 })
                 .collect()
         })

@@ -40,6 +40,10 @@ pub const VM_ID_PREFIX: &str = "hsbx-";
 /// `hsbx-<owner>`.
 pub const PINNED_IMAGE_SUFFIX: &str = "-image";
 
+/// The suffix of a directory where a launcher keeps the VMM binaries that a
+/// version check passed, after a VM id of its owner.
+pub const VMM_COPIES_SUFFIX: &str = "-vmm";
+
 /// The root drive id. Firecracker resource ids reject `-`.
 pub const ROOT_DRIVE_ID: &str = "rootfs";
 

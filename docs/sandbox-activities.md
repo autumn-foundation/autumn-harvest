@@ -85,6 +85,9 @@ The outcome is JSON too:
   `skipped_outputs` names each output that the run does not return, with the
   reason. A file can be missing, too large, a symbolic link, a hard link, or
   not a regular file.
+- A read of an output stops at `max_output_file_bytes` or at the bytes left
+  of `max_output_files_total_bytes`, whichever is less. A file that does not
+  fit is skipped unread.
 - Each output list holds at most `MAX_OUTPUT_ENTRIES` (4096) entries. The
   host decoder stops there, so a guest cannot fill host memory with tiny
   entries. A policy may not allow more outputs.
@@ -190,8 +193,13 @@ runtime refuses a policy that allows the network on a backend without one.
   under it.
 - Firecracker 1.14.4 or later on 1.14, or 1.15.1 or later. The first launch
   checks the versions of `firecracker` and `jailer`. It refuses older
-  versions: CVE-2026-5747 and CVE-2026-1386. A launch checks them again
-  when a deploy replaced or changed either binary since the last check.
+  versions: CVE-2026-5747 and CVE-2026-1386. The launcher copies each
+  binary that passes into a directory of its own, and each launch runs the
+  copies. So a deploy cannot swap a binary between the check and the launch.
+  A deploy that replaced or changed either binary gives a new check and new
+  copies.
+- A jail base, or an unjailed `work_root`, that lets the worker run programs.
+  The copies run from there, so a `noexec` mount fails each check.
 - KSM off, nested KVM off, and each CPU vulnerability `Not affected` or
   mitigated. Any other CPU status, such as `Vulnerable` or `Unknown`, is
   critical. A KSM, nested KVM or CPU vulnerability state that cannot be read,

@@ -117,6 +117,9 @@ pub fn check_version(version: Version) -> Result<(), SandboxError> {
     }
 }
 
+/// The wait before a version probe tries a busy binary again.
+const BUSY_RETRY: Duration = Duration::from_millis(10);
+
 /// Run `<binary> --version` with no environment and check the result.
 ///
 /// # Errors
@@ -127,15 +130,26 @@ pub async fn probe_version(
     firecracker_bin: &Path,
     binary: VmmBinary,
 ) -> Result<Version, SandboxError> {
-    let output = tokio::time::timeout(
-        VERSION_PROBE_TIMEOUT,
-        tokio::process::Command::new(firecracker_bin)
-            .arg("--version")
-            .env_clear()
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
+    // The launcher probes a copy that it just wrote. Another thread can fork
+    // while the copy is open for writing, and the child holds it until its
+    // exec. So a busy copy is tried again, within the time limit.
+    let output = tokio::time::timeout(VERSION_PROBE_TIMEOUT, async {
+        loop {
+            let output = tokio::process::Command::new(firecracker_bin)
+                .arg("--version")
+                .env_clear()
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output()
+                .await;
+            match output {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    tokio::time::sleep(BUSY_RETRY).await;
+                }
+                output => return output,
+            }
+        }
+    })
     .await
     .map_err(|_| SandboxError::Config("`firecracker --version` did not finish".into()))?
     .map_err(|e| {

@@ -1310,6 +1310,16 @@ fn write_files(
 /// Read the requested outputs beneath `root`, the work directory handle,
 /// within the per-file and the total budgets.
 fn collect_outputs(root: &std::fs::File, plan: &ExecPlan) -> (Vec<OutputFile>, Vec<SkippedOutput>) {
+    collect_outputs_with(root, plan, read_output)
+}
+
+/// [`collect_outputs`] with `read` for each file, so a test can see each
+/// cap. `read` takes the root, the path, the cap and the name of the cap.
+fn collect_outputs_with(
+    root: &std::fs::File,
+    plan: &ExecPlan,
+    mut read: impl FnMut(&std::fs::File, &str, u64, &str) -> Result<Vec<u8>, String>,
+) -> (Vec<OutputFile>, Vec<SkippedOutput>) {
     let mut outputs = Vec::new();
     let mut skipped = Vec::new();
     let mut budget = plan.max_output_files_total_bytes;
@@ -1321,7 +1331,14 @@ fn collect_outputs(root: &std::fs::File, plan: &ExecPlan) -> (Vec<OutputFile>, V
         });
     };
     for path in &plan.outputs {
-        match read_output(root, path, plan.max_output_file_bytes) {
+        // The read stops at the budget left too. So a file that cannot fit
+        // is skipped by its size, unread, and many large files cost no time.
+        let (max, cap) = if budget < plan.max_output_file_bytes {
+            (budget, "the bytes left of the output budget")
+        } else {
+            (plan.max_output_file_bytes, "the limit")
+        };
+        match read(root, path, max, cap) {
             Ok(content) => {
                 let size = u64::try_from(content.len()).unwrap_or(u64::MAX);
                 if size > budget {
@@ -1348,7 +1365,7 @@ fn collect_outputs(root: &std::fs::File, plan: &ExecPlan) -> (Vec<OutputFile>, V
 
 /// Read one output file, beneath `root`, with no symbolic link anywhere on
 /// the path.
-fn read_output(root: &std::fs::File, path: &str, max: u64) -> Result<Vec<u8>, String> {
+fn read_output(root: &std::fs::File, path: &str, max: u64, cap: &str) -> Result<Vec<u8>, String> {
     let file = open_beneath(root, path).map_err(|e| match e.raw_os_error() {
         Some(libc::ENOENT) => "the file does not exist".to_owned(),
         Some(libc::ELOOP | libc::EXDEV) => {
@@ -1370,7 +1387,7 @@ fn read_output(root: &std::fs::File, path: &str, max: u64) -> Result<Vec<u8>, St
     }
     if meta.len() > max {
         return Err(format!(
-            "the file holds {} bytes, over the limit of {max} bytes",
+            "the file holds {} bytes, over {cap} of {max} bytes",
             meta.len()
         ));
     }
@@ -1379,7 +1396,7 @@ fn read_output(root: &std::fs::File, path: &str, max: u64) -> Result<Vec<u8>, St
         .read_to_end(&mut content)
         .map_err(|e| format!("the file cannot be read: {e}"))?;
     if u64::try_from(content.len()).unwrap_or(u64::MAX) > max {
-        return Err(format!("the file grew over the limit of {max} bytes"));
+        return Err(format!("the file grew over {cap} of {max} bytes"));
     }
     Ok(content)
 }
@@ -2081,6 +2098,40 @@ mod tests {
         let out = run(request).await;
         assert_eq!(out.outputs, []);
         assert!(out.skipped_outputs[0].reason.contains("bytes"));
+    }
+
+    #[test]
+    fn each_output_read_stops_at_the_budget_left() {
+        let mut plan = plan(
+            &sh("true")
+                .with_output("a")
+                .with_output("b")
+                .with_output("c"),
+        );
+        plan.max_output_file_bytes = 100;
+        plan.max_output_files_total_bytes = 150;
+        let root = std::fs::File::open(std::env::temp_dir()).unwrap();
+        let mut caps = Vec::new();
+        // Each file holds 100 bytes. A smaller cap skips it unread.
+        let (outputs, skipped) = collect_outputs_with(&root, &plan, |_, _, max, cap| {
+            caps.push((max, cap.to_owned()));
+            if max < 100 {
+                Err(format!("over {cap} of {max} bytes"))
+            } else {
+                Ok(vec![0; 100])
+            }
+        });
+        let budget = "the bytes left of the output budget".to_owned();
+        assert_eq!(
+            caps,
+            [
+                (100, "the limit".to_owned()),
+                (50, budget.clone()),
+                (50, budget)
+            ]
+        );
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(skipped.len(), 2);
     }
 
     #[tokio::test]

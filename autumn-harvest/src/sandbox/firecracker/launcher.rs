@@ -32,7 +32,7 @@ use super::api::ApiClient;
 use super::config::{
     CONFIG_FILE, GUEST_MEMORY_RESERVE_MIB, GuestImage, KERNEL_FILE, MAX_SOCKET_PATH_BYTES,
     MachineSpec, OWNER_TAG_HEX, PINNED_IMAGE_SUFFIX, ROOTFS_FILE, VM_ID_PREFIX, VM_ID_RANDOM_HEX,
-    VSOCK_SOCKET, VmPaths, new_vm_id, validate_vm_id, vm_config,
+    VMM_COPIES_SUFFIX, VSOCK_SOCKET, VmPaths, new_vm_id, validate_vm_id, vm_config,
 };
 use super::jailer::JailerConfig;
 use super::posture::{PostureFinding, PosturePolicy};
@@ -268,10 +268,9 @@ pub struct FirecrackerLauncher {
     config: LauncherConfig,
     exec_name: String,
     owner: String,
-    /// Set after the first version check that passes.
-    /// The VMM binaries and the Firecracker version of the last check that
-    /// passed. A binary replaced since then is checked again.
-    versions_checked: tokio::sync::Mutex<Option<(Vec<FileId>, super::posture::Version)>>,
+    /// The copies of the VMM binaries that the last version check passed.
+    /// A binary replaced since then is checked again.
+    versions_checked: tokio::sync::Mutex<Option<Arc<CheckedVmm>>>,
     /// The lease and the leftover cgroups, shared with each microVM.
     tenancy: Arc<Tenancy>,
 }
@@ -874,44 +873,81 @@ impl FirecrackerLauncher {
         }
     }
 
-    /// Check the Firecracker and jailer versions once. A failed check runs
-    /// again on the next call.
-    async fn check_versions(&self) -> Result<super::posture::Version, SandboxError> {
+    /// Check the Firecracker and jailer versions, and copy the binaries that
+    /// pass. A failed check runs again on the next call.
+    ///
+    /// A deploy can replace a binary while the worker runs. So a launch runs
+    /// the copies, not the configured paths, and a check holds only for the
+    /// files that it copied.
+    async fn check_versions(&self) -> Result<Arc<CheckedVmm>, SandboxError> {
         use super::posture::{VmmBinary, probe_version};
-        let mut binaries = vec![self.config.firecracker_bin.as_path()];
+        let mut sources = vec![("firecracker", self.config.firecracker_bin.clone())];
         if let Confinement::Jailer(jailer) = &self.config.confinement {
-            binaries.push(&jailer.jailer_bin);
+            sources.push(("jailer", jailer.jailer_bin.clone()));
         }
-        // Each launch runs the binaries by path. A deploy can replace one
-        // while the worker runs, so a passed check holds only for its files.
-        let ids = binaries
+        let ids = sources
             .iter()
-            .map(|path| file_id(path))
+            .map(|(_, path)| file_id(path))
             .collect::<Result<Vec<_>, _>>()?;
         let mut checked = self.versions_checked.lock().await;
-        if let Some((seen, version)) = checked.as_ref()
-            && *seen == ids
+        if let Some(vmm) = checked.as_ref()
+            && vmm.sources == ids
         {
-            return Ok(*version);
+            return Ok(Arc::clone(vmm));
         }
-        let version = probe_version(&self.config.firecracker_bin, VmmBinary::Firecracker).await?;
-        if let Confinement::Jailer(jailer) = &self.config.confinement {
-            probe_version(&jailer.jailer_bin, VmmBinary::Jailer).await?;
+        let dir = self
+            .vm_root()
+            .join(format!("{}{VMM_COPIES_SUFFIX}", new_vm_id(&self.owner)));
+        // A dropped check removes the copies. A copy task that still runs
+        // then removes them again when it ends.
+        let guard = JailGuard::new(dir.clone());
+        let abandoned = guard.abandoned();
+        let task_dir = dir.clone();
+        let task_ids = ids.clone();
+        let copies = tokio::task::spawn_blocking(move || {
+            let copies = copy_binaries(&task_dir, &sources, &task_ids);
+            if abandoned.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = crate::sandbox::exec::remove_work_dir(&task_dir);
+            }
+            copies
+        })
+        .await
+        .map_err(|e| SandboxError::Unavailable(format!("the binary copy failed: {e}")))??;
+        guard.disarm();
+        // The copies go with this value, so a failed check leaves nothing.
+        let mut copies = copies.into_iter();
+        let mut vmm = CheckedVmm {
+            dir,
+            firecracker: copies.next().unwrap_or_default(),
+            jailer: copies.next(),
+            version: (0, 0, 0),
+            sources: ids,
+        };
+        vmm.version = probe_version(&vmm.firecracker, VmmBinary::Firecracker).await?;
+        if let Some(jailer) = &vmm.jailer {
+            probe_version(jailer, VmmBinary::Jailer).await?;
         }
         let meta = self.tenancy.pinned.as_ref().and_then(|p| p.meta.as_ref());
         if let Some(meta) = meta {
-            meta.check_firecracker(version)?;
+            meta.check_firecracker(vmm.version)?;
         }
-        *checked = Some((ids, version));
+        let vmm = Arc::new(vmm);
+        *checked = Some(Arc::clone(&vmm));
         drop(checked);
-        Ok(version)
+        Ok(vmm)
     }
 
-    /// Create the VM directory and the command for `id`.
-    async fn prepare(&self, id: &str, boot: &BootMethod) -> Result<Prepared, SandboxError> {
+    /// Create the VM directory and the command for `id`. The command runs
+    /// the binaries of `vmm`.
+    async fn prepare(
+        &self,
+        id: &str,
+        boot: &BootMethod,
+        vmm: &Arc<CheckedVmm>,
+    ) -> Result<Prepared, SandboxError> {
         match &self.config.confinement {
-            Confinement::Jailer(jailer) => self.prepare_jailed(jailer, id, boot).await,
-            Confinement::Unjailed { work_root } => self.prepare_unjailed(work_root, id, boot),
+            Confinement::Jailer(jailer) => self.prepare_jailed(jailer, id, boot, vmm).await,
+            Confinement::Unjailed { work_root } => self.prepare_unjailed(work_root, id, boot, vmm),
         }
     }
 
@@ -977,13 +1013,15 @@ impl FirecrackerLauncher {
                 self.config.machine.mem_size_mib
             )));
         }
-        let firecracker = self.check_versions().await?;
+        let vmm = self.check_versions().await?;
         let id = new_vm_id(&self.owner);
         validate_vm_id(&id)?;
-        let prepared = self.prepare_jailed(jailer, &id, &BootMethod::Api).await?;
+        let prepared = self
+            .prepare_jailed(jailer, &id, &BootMethod::Api, &vmm)
+            .await?;
         let mut vm = RunningVm::spawn(id, prepared, Arc::clone(&self.tenancy))?;
         let result = self
-            .snapshot_vm(&mut vm, out_dir, (boot_timeout, jailer.gid), firecracker)
+            .snapshot_vm(&mut vm, out_dir, (boot_timeout, jailer.gid), vmm.version)
             .await;
         vm.teardown().await;
         result
@@ -1067,6 +1105,7 @@ impl FirecrackerLauncher {
         jailer: &JailerConfig,
         id: &str,
         boot: &BootMethod,
+        vmm: &Arc<CheckedVmm>,
     ) -> Result<Prepared, SandboxError> {
         use std::os::unix::fs::DirBuilderExt as _;
         let config = &self.config;
@@ -1151,16 +1190,8 @@ impl FirecrackerLauncher {
                 Vec::new()
             }
         };
-        let mut command = tokio::process::Command::new(&jailer.jailer_bin);
-        command
-            .args(super::jailer::jailer_args(
-                jailer,
-                &config.firecracker_bin,
-                id,
-                config.machine,
-                &firecracker_args,
-            ))
-            .current_dir(&jail);
+        let mut command = vmm.jailer_command(jailer, id, config.machine, &firecracker_args)?;
+        command.current_dir(&jail);
         guard.disarm();
         Ok(Prepared {
             vm_dir: jail,
@@ -1168,6 +1199,7 @@ impl FirecrackerLauncher {
             api_socket,
             cgroup: Some(super::jailer::cgroup_dir(jailer, id)),
             command,
+            vmm: Some(Arc::clone(vmm)),
         })
     }
 
@@ -1177,6 +1209,7 @@ impl FirecrackerLauncher {
         work_root: &Path,
         id: &str,
         boot: &BootMethod,
+        vmm: &Arc<CheckedVmm>,
     ) -> Result<Prepared, SandboxError> {
         use std::os::unix::fs::DirBuilderExt as _;
         let config = &self.config;
@@ -1211,7 +1244,7 @@ impl FirecrackerLauncher {
                 api_socket = Some(socket);
             }
         }
-        let mut command = tokio::process::Command::new(&config.firecracker_bin);
+        let mut command = tokio::process::Command::new(&vmm.firecracker);
         command.args(args).current_dir(&dir);
         Ok(Prepared {
             vm_dir: dir.clone(),
@@ -1219,6 +1252,7 @@ impl FirecrackerLauncher {
             api_socket,
             cgroup: None,
             command,
+            vmm: Some(Arc::clone(vmm)),
         })
     }
 
@@ -1309,10 +1343,10 @@ impl VmLauncher for FirecrackerLauncher {
     fn launch(&self) -> BoxFuture<'_, Result<Box<dyn LaunchedVm>, SandboxError>> {
         Box::pin(async move {
             self.tenancy.retry();
-            self.check_versions().await?;
+            let vmm = self.check_versions().await?;
             let id = new_vm_id(&self.owner);
             validate_vm_id(&id)?;
-            let prepared = self.prepare(&id, &self.config.boot).await?;
+            let prepared = self.prepare(&id, &self.config.boot, &vmm).await?;
             let mut vm = RunningVm::spawn(id, prepared, Arc::clone(&self.tenancy))?;
             if let Some(socket) = vm.api_socket.clone()
                 && let Err(e) = self
@@ -1366,6 +1400,125 @@ const SNAPSHOT_MEMORY_FILE: &str = "snapshot.mem";
 /// the whole guest memory.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Copies of the VMM binaries that a version check passed.
+///
+/// Each launch runs these copies. A deploy can replace a configured binary
+/// at any time, but it cannot change a copy. So a launch runs the bytes that
+/// the check ran. The directory goes with the last user of the copies.
+#[derive(Debug)]
+struct CheckedVmm {
+    /// The directory of the copies: `hsbx-<owner>-<random>-vmm` in the VM
+    /// root. A sweep removes it as a VM directory of a dead owner.
+    dir: PathBuf,
+    /// The Firecracker copy. It keeps the file name, because the jailer
+    /// names the chroot after it.
+    firecracker: PathBuf,
+    /// The jailer copy of a jailed launcher.
+    jailer: Option<PathBuf>,
+    /// The Firecracker version.
+    version: super::posture::Version,
+    /// The identity of each configured binary at its copy.
+    sources: Vec<FileId>,
+}
+
+impl CheckedVmm {
+    /// The command that starts the jailer copy for `id`, with the Firecracker
+    /// copy as its exec file.
+    fn jailer_command(
+        &self,
+        jailer: &JailerConfig,
+        id: &str,
+        machine: MachineSpec,
+        firecracker_args: &[String],
+    ) -> Result<tokio::process::Command, SandboxError> {
+        let bin = self
+            .jailer
+            .as_ref()
+            .ok_or_else(|| SandboxError::Config("the version check copied no jailer".into()))?;
+        let mut command = tokio::process::Command::new(bin);
+        command.args(super::jailer::jailer_args(
+            jailer,
+            &self.firecracker,
+            id,
+            machine,
+            firecracker_args,
+        ));
+        Ok(command)
+    }
+}
+
+impl Drop for CheckedVmm {
+    fn drop(&mut self) {
+        let _ = crate::sandbox::exec::remove_work_dir(&self.dir);
+    }
+}
+
+/// Copy each `(name, path)` of `sources` to `<dir>/<name>/<file name>`, with
+/// mode `0555`. Each source must still be its entry of `ids`, before and
+/// after its copy. Otherwise a deploy changed it during the check.
+///
+/// The jailer copies the Firecracker binary into the chroot with its mode,
+/// and runs it as the jail uid. So each user may run a copy. The directory
+/// has mode `0700`, so only the worker reaches the copies.
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Unavailable`] when a copy fails or a source
+/// changes. The next check tries again.
+fn copy_binaries(
+    dir: &Path,
+    sources: &[(&str, PathBuf)],
+    ids: &[FileId],
+) -> Result<Vec<PathBuf>, SandboxError> {
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    let fail = |what: &Path, e: &dyn std::fmt::Display| {
+        SandboxError::Unavailable(format!("cannot copy {}: {e}", what.display()))
+    };
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| fail(dir, &e))?;
+    let mut copies = Vec::with_capacity(sources.len());
+    for ((name, from), id) in sources.iter().zip(ids) {
+        let file_name = from
+            .file_name()
+            .ok_or_else(|| fail(from, &"the path has no file name"))?;
+        let to = dir.join(name).join(file_name);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(dir.join(name))
+            .map_err(|e| fail(from, &e))?;
+        // A plain open of a FIFO waits for a writer. So the open does not
+        // block, and a file that is not regular is refused.
+        let mut source = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(from)
+            .map_err(|e| fail(from, &e))?;
+        if !source.metadata().is_ok_and(|meta| meta.is_file()) {
+            return Err(fail(from, &"the path is not a regular file"));
+        }
+        let changed =
+            |source: &std::fs::File| !source.metadata().is_ok_and(|meta| FileId::of(&meta) == *id);
+        if changed(&source) {
+            return Err(fail(from, &"a deploy changed the file during the check"));
+        }
+        let mut copy = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o555)
+            .open(&to)
+            .map_err(|e| fail(from, &e))?;
+        std::io::copy(&mut source, &mut copy).map_err(|e| fail(from, &e))?;
+        drop(copy);
+        if changed(&source) {
+            return Err(fail(from, &"a deploy changed the file during the check"));
+        }
+        copies.push(to);
+    }
+    Ok(copies)
+}
+
 /// What identifies the file at a path. A replaced or rewritten file has
 /// another inode, size or change time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1377,18 +1530,25 @@ struct FileId {
     ctime: (i64, i64),
 }
 
+impl FileId {
+    /// The identity in `meta`.
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+}
+
 /// The identity of the file at `path`.
 fn file_id(path: &Path) -> Result<FileId, SandboxError> {
-    use std::os::unix::fs::MetadataExt as _;
     let meta = std::fs::metadata(path)
         .map_err(|e| SandboxError::Config(format!("cannot inspect {}: {e}", path.display())))?;
-    Ok(FileId {
-        dev: meta.dev(),
-        ino: meta.ino(),
-        size: meta.size(),
-        mtime: (meta.mtime(), meta.mtime_nsec()),
-        ctime: (meta.ctime(), meta.ctime_nsec()),
-    })
+    Ok(FileId::of(&meta))
 }
 
 /// The most bytes of a snapshot manifest.
@@ -1916,6 +2076,8 @@ struct Prepared {
     api_socket: Option<PathBuf>,
     cgroup: Option<PathBuf>,
     command: tokio::process::Command,
+    /// The checked binaries that `command` runs.
+    vmm: Option<Arc<CheckedVmm>>,
 }
 
 /// A running Firecracker process and what it owns on the host.
@@ -1934,6 +2096,9 @@ struct RunningVm {
     tenancy: Arc<Tenancy>,
     /// The process group of the VMM: its pid, as it leads a new group.
     group: Option<i32>,
+    /// The checked binaries. The jailer copies Firecracker after its start,
+    /// so they stay until the teardown.
+    _vmm: Option<Arc<CheckedVmm>>,
 }
 
 impl RunningVm {
@@ -1990,6 +2155,7 @@ impl RunningVm {
             down: false,
             tenancy,
             group,
+            _vmm: prepared.vmm,
         })
     }
 
@@ -2331,10 +2497,12 @@ mod tests {
         let launcher = new_launcher(config).unwrap();
         let err = launcher.launch().await.err().expect("no api socket");
         assert!(matches!(err, SandboxError::Unavailable(_)));
+        // The checked binaries belong to the launcher, not to the launch.
         let left: Vec<_> = std::fs::read_dir(launcher.vm_root())
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| e.path().is_dir())
+            .filter(|e| !e.file_name().to_string_lossy().ends_with(VMM_COPIES_SUFFIX))
             .collect();
         assert!(left.is_empty(), "a failed launch must leave nothing");
         std::fs::remove_dir_all(dir).unwrap();
@@ -2624,7 +2792,7 @@ mod tests {
     async fn a_replaced_vmm_binary_is_checked_again() {
         let dir = temp_dir();
         let launcher = new_launcher(jailed(&dir)).unwrap();
-        assert_eq!(launcher.check_versions().await.unwrap(), (1, 17, 0));
+        assert_eq!(launcher.check_versions().await.unwrap().version, (1, 17, 0));
         // A deploy replaces Firecracker with a version that has a known escape.
         let next = dir.join("firecracker.next");
         crate::sandbox::firecracker::fake::write_executable(
@@ -2637,6 +2805,113 @@ mod tests {
             .await
             .expect_err("the old check must not cover the new binary");
         assert!(matches!(err, SandboxError::Config(_)), "{err:?}");
+        drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Replace the file at `path` with a script of `body`, as a deploy does.
+    fn swap(path: &Path, body: &str) {
+        let next = path.with_extension("next");
+        crate::sandbox::firecracker::fake::write_executable(&next, body);
+        std::fs::rename(&next, path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_launch_runs_the_firecracker_that_the_check_passed() {
+        let dir = temp_dir();
+        let fc = script(&dir, "firecracker", "echo checked > ran");
+        let launcher = new_launcher(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
+        let vmm = launcher.check_versions().await.unwrap();
+        // A deploy swaps the binary after the check and before the spawn.
+        swap(
+            &launcher.config().firecracker_bin,
+            "#!/bin/sh\necho swapped > ran\n",
+        );
+        let id = new_vm_id(launcher.owner());
+        let mut prepared = launcher
+            .prepare(&id, &BootMethod::ConfigFile, &vmm)
+            .await
+            .unwrap();
+        assert!(prepared.command.status().await.unwrap().success());
+        let ran = std::fs::read_to_string(prepared.vm_dir.join("ran")).unwrap();
+        assert_eq!(ran.trim(), "checked");
+        let root = launcher.vm_root();
+        drop((prepared, vmm, launcher));
+        // The copies go with their last user.
+        let left: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name.to_string_lossy().ends_with(VMM_COPIES_SUFFIX))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_vmm_binary_that_is_not_a_file_fails_the_check_at_once() {
+        let dir = temp_dir();
+        let fc = script(&dir, "firecracker", "exit 0");
+        let launcher = new_launcher(unjailed(&dir, fc.clone(), BootMethod::ConfigFile)).unwrap();
+        // The start refuses a FIFO, so a deploy swaps one in later.
+        let fifo = dir.join("fifo");
+        let path =
+            std::ffi::CString::new(fifo.clone().into_os_string().into_encoded_bytes()).unwrap();
+        // SAFETY: mkfifo reads a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o755) }, 0);
+        std::fs::rename(&fifo, &fc).unwrap();
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(launcher.check_versions()).map(drop);
+            drop(launcher);
+            done.send(result)
+        });
+        let result = result
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the check must not wait for a writer");
+        assert!(
+            matches!(result, Err(SandboxError::Unavailable(ref m)) if m.contains("regular file")),
+            "{result:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_jailed_launch_runs_the_binaries_that_the_check_passed() {
+        let dir = temp_dir();
+        let config = jailed(&dir);
+        let Confinement::Jailer(jail) = &config.confinement else {
+            unreachable!()
+        };
+        let checked = (
+            std::fs::read(&config.firecracker_bin).unwrap(),
+            std::fs::read(&jail.jailer_bin).unwrap(),
+        );
+        let launcher = new_launcher(config.clone()).unwrap();
+        let vmm = launcher.check_versions().await.unwrap();
+        swap(&config.firecracker_bin, "#!/bin/sh\nexit 0\n");
+        swap(&jail.jailer_bin, "#!/bin/sh\nexit 0\n");
+        let id = new_vm_id(launcher.owner());
+        let prepared = launcher
+            .prepare(&id, &BootMethod::ConfigFile, &vmm)
+            .await
+            .unwrap();
+        let command = prepared.command.as_std();
+        assert_eq!(std::fs::read(command.get_program()).unwrap(), checked.1);
+        let args: Vec<_> = command.get_args().collect();
+        let at = args.iter().position(|a| *a == "--exec-file").unwrap();
+        let exec_file = Path::new(args[at + 1]);
+        assert_eq!(std::fs::read(exec_file).unwrap(), checked.0);
+        // The jailer names the chroot after the file name.
+        assert_eq!(exec_file.file_name(), config.firecracker_bin.file_name());
+        // The jailer keeps the mode in the chroot, and the jail uid runs it.
+        let mode = std::fs::metadata(exec_file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o555, "{mode:o}");
+        drop(prepared);
         drop(launcher);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2908,6 +3183,7 @@ while True:
             api_socket: None,
             cgroup: Some(cgroup.clone()),
             command,
+            vmm: None,
         };
         let mut vm =
             RunningVm::spawn("hsbx-test".into(), prepared, Arc::clone(&launcher.tenancy)).unwrap();
@@ -3195,7 +3471,7 @@ while True:
         let dir = temp_dir();
         let launcher = new_launcher(jailed(&dir)).unwrap();
         let vm_root = dir.join("jail/firecracker");
-        // The pinned image is not a jail.
+        // The pinned image and the checked binaries are not jails.
         let pinned = vm_root.join(format!("hsbx-{}-image", launcher.owner()));
         let jails = || -> Vec<PathBuf> {
             std::fs::read_dir(&vm_root)
@@ -3203,6 +3479,7 @@ while True:
                 .filter_map(Result::ok)
                 .map(|entry| entry.path())
                 .filter(|path| path.is_dir() && *path != pinned)
+                .filter(|path| !path.to_string_lossy().ends_with(VMM_COPIES_SUFFIX))
                 .collect()
         };
         let mut launch = launcher.launch();
@@ -3544,6 +3821,7 @@ while True:
             api_socket: None,
             cgroup: None,
             command,
+            vmm: None,
         };
         let mut vm =
             RunningVm::spawn("hsbx-test".into(), prepared, Arc::clone(&launcher.tenancy)).unwrap();
@@ -3590,6 +3868,7 @@ while True:
             api_socket: None,
             cgroup: None,
             command,
+            vmm: None,
         };
         let mut vm =
             RunningVm::spawn("hsbx-test".into(), prepared, Arc::clone(&launcher.tenancy)).unwrap();
@@ -3737,6 +4016,7 @@ while True:
             api_socket: None,
             cgroup: Some(left.clone()),
             command,
+            vmm: None,
         };
         let mut vm =
             RunningVm::spawn("hsbx-test".into(), prepared, Arc::clone(&launcher.tenancy)).unwrap();
@@ -3773,6 +4053,7 @@ while True:
             api_socket: None,
             cgroup: None,
             command,
+            vmm: None,
         };
         let mut vm =
             RunningVm::spawn("hsbx-test".into(), prepared, Arc::clone(&launcher.tenancy)).unwrap();
@@ -3811,8 +4092,9 @@ while True:
         let old_kernel = publish_over(&kernel, b"new kernel");
         let old_rootfs = publish_over(&rootfs, b"new rootfs");
         let id = new_vm_id(launcher.owner());
+        let vmm = launcher.check_versions().await.unwrap();
         let prepared = launcher
-            .prepare(&id, &BootMethod::ConfigFile)
+            .prepare(&id, &BootMethod::ConfigFile, &vmm)
             .await
             .unwrap();
         let root = prepared.vm_dir.join("root");
@@ -3993,7 +4275,8 @@ while True:
         let old_memory = publish_over(&files.memory, b"new memory");
         let id = new_vm_id(launcher.owner());
         let boot = launcher.config().boot.clone();
-        let prepared = launcher.prepare(&id, &boot).await.unwrap();
+        let vmm = launcher.check_versions().await.unwrap();
+        let prepared = launcher.prepare(&id, &boot, &vmm).await.unwrap();
         let root = prepared.vm_dir.join("root");
         assert_eq!(
             std::fs::read(root.join(SNAPSHOT_MEMORY_FILE)).unwrap(),
@@ -4129,12 +4412,13 @@ while True:
             assert_eq!(meta.mode() & 0o777, 0o640, "{}", file.display());
             assert_eq!(meta.gid(), 23_456, "the jailed VMM reads it by group");
         }
-        // The pinned image is not a jail.
+        // The pinned image and the checked binaries are not jails.
         let pinned = format!("hsbx-{}-image", launcher.owner());
         let jails = std::fs::read_dir(launcher.vm_root())
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()) && e.file_name() != *pinned)
+            .filter(|e| !e.file_name().to_string_lossy().ends_with(VMM_COPIES_SUFFIX))
             .count();
         assert_eq!(jails, 0, "the golden VM is torn down");
         drop(launcher);
