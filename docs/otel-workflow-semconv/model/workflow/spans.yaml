@@ -12,7 +12,8 @@ groups:
       `execute_workflow` span.
 
       The span starts when the caller sends the start request. It ends
-      when the engine durably accepts or refuses the run.
+      when the engine durably accepts or refuses the run, or the request
+      fails.
       If the operation ends in an error, the span status SHOULD be `Error`.
     attributes:
       - ref: workflow.system.name
@@ -82,7 +83,8 @@ groups:
       child run.
 
       The span starts when the parent issues the child start command. It
-      ends when the engine durably records the command.
+      ends when the engine durably records or refuses the command, or
+      the write fails.
       If the operation ends in an error, the span status SHOULD be `Error`.
     attributes:
       - ref: workflow.system.name
@@ -97,7 +99,7 @@ groups:
         sampling_relevant: true
       - ref: workflow.run.id
         requirement_level:
-          conditionally_required: If the child run id is available before the span ends.
+          conditionally_required: If the run id is available before the span ends.
       - ref: error.type
         requirement_level:
           conditionally_required: If the operation ends in an error.
@@ -111,7 +113,8 @@ groups:
       The span name SHOULD be `schedule_activity {workflow.activity.name}`.
 
       The span starts when the workflow issues the activity command. It
-      ends when the engine durably records the scheduled activity.
+      ends when the engine durably records or refuses the command, or
+      the write fails.
       If the operation ends in an error, the span status SHOULD be `Error`.
     attributes:
       - ref: workflow.system.name
@@ -144,7 +147,7 @@ groups:
       `workflow.activity.attempt`.
 
       The span starts when a worker begins the attempt. It ends when the
-      attempt returns a result or an error.
+      attempt returns a result or fails.
       If the operation ends in an error, the span status SHOULD be `Error`.
     attributes:
       - ref: workflow.system.name
@@ -181,7 +184,8 @@ groups:
       target run.
 
       The span starts when the caller sends the signal. It ends when the
-      engine durably accepts or refuses the signal.
+      engine durably accepts or refuses the signal, or the request
+      fails.
       If the operation ends in an error, the span status SHOULD be `Error`.
     attributes:
       - ref: workflow.system.name
@@ -193,7 +197,7 @@ groups:
         note: The value MUST be `send_signal`.
       - ref: workflow.run.id
         requirement_level:
-          conditionally_required: If the caller addresses one run.
+          conditionally_required: If the run id is available before the span ends.
       - ref: workflow.name
         requirement_level: recommended
       - ref: workflow.signal.name
@@ -217,7 +221,8 @@ groups:
       the engine stores that context.
 
       The span starts when the engine hands the signal to the run. It
-      ends when the workflow code has received the signal.
+      ends when the workflow code has received the signal, or the
+      delivery fails.
       If the operation ends in an error, the span status SHOULD be `Error`.
     attributes:
       - ref: workflow.system.name
@@ -252,7 +257,7 @@ groups:
       observes the timer.
 
       The span starts when the engine finds the due timer. It ends when
-      the run has received the timer result.
+      the run has received the timer result, or the delivery fails.
       If the operation ends in an error, the span status SHOULD be `Error`.
     attributes:
       - ref: workflow.system.name

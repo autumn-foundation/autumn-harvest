@@ -106,6 +106,10 @@ code, guard quality, and style. The fixes:
   status on each span. Each span note now states both, and a guard checks
   them. It also proposed an event for `fire_timer`. That changes the ADR
   span set, so it is open question 9 and goes to the maintainer.
+- The next Codex round found that the end boundaries covered success only,
+  and that `send_signal` used a narrower run id condition. Each end
+  boundary now covers a failure, and every optional run id uses one
+  condition. A guard checks both.
 
 ### 0.6 Decisions
 

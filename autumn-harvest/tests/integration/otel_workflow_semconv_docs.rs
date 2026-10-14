@@ -46,6 +46,9 @@ const NOTE_PHRASES: &[&str] = &[
     "the span status SHOULD be `Error`",
 ];
 
+/// The only condition under which a span may make the run id optional.
+const RUN_ID_CONDITION: &str = "If the run id is available before the span ends.";
+
 /// The condition under which every span must carry `error.type`.
 const ERROR_CONDITION: &str = "If the operation ends in an error.";
 
@@ -469,6 +472,48 @@ fn the_model_is_generalized_and_well_named() {
     }
 }
 
+/// Check the note boundaries, the error status, the run id condition and
+/// `error.type` of one span group.
+fn check_span_contract(id: &str, group: &Value, refs: &BTreeMap<String, Value>) {
+    let note = str_field(group, "note")
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for phrase in NOTE_PHRASES {
+        assert!(
+            note.contains(phrase),
+            "the note of `{id}` must say: {phrase}"
+        );
+    }
+    let end = note
+        .split("It ends when")
+        .nth(1)
+        .and_then(|rest| rest.split('.').next())
+        .unwrap_or_default();
+    assert!(
+        end.contains("fail"),
+        "the end boundary of `{id}` must cover a failure: It ends when{end}."
+    );
+    let run_id = refs.get("workflow.run.id");
+    let run_id_ok = run_id.is_some_and(|level| {
+        level.as_str() == Some("required")
+            || level.get("conditionally_required").and_then(Value::as_str) == Some(RUN_ID_CONDITION)
+    });
+    assert!(
+        run_id_ok,
+        "`{id}` must require `workflow.run.id`, or require it: {RUN_ID_CONDITION}"
+    );
+    let error = refs
+        .get("error.type")
+        .and_then(|level| level.get("conditionally_required").and_then(Value::as_str));
+    assert_eq!(
+        error,
+        Some(ERROR_CONDITION),
+        "`{id}` must make `error.type` conditionally required: {ERROR_CONDITION}"
+    );
+}
+
 #[test]
 fn the_model_has_the_weaver_shape() {
     for group in groups(&yaml(REGISTRY), REGISTRY) {
@@ -523,25 +568,7 @@ fn the_model_has_the_weaver_shape() {
             "`{id}` must end with `.{kind}`"
         );
         let refs = span_refs(&group);
-        let note = str_field(&group, "note")
-            .unwrap_or_default()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        for phrase in NOTE_PHRASES {
-            assert!(
-                note.contains(phrase),
-                "the note of `{id}` must say: {phrase}"
-            );
-        }
-        let error = refs
-            .get("error.type")
-            .and_then(|level| level.get("conditionally_required").and_then(Value::as_str));
-        assert_eq!(
-            error,
-            Some(ERROR_CONDITION),
-            "`{id}` must make `error.type` conditionally required: {ERROR_CONDITION}"
-        );
+        check_span_contract(&id, &group, &refs);
         for attribute in ALWAYS_REQUIRED {
             assert_eq!(
                 refs.get(*attribute).and_then(Value::as_str),
