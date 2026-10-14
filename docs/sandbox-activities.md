@@ -297,7 +297,9 @@ What each microVM gets:
 Teardown kills the process, then the cgroup through `cgroup.kill`, then
 removes the jail. It runs after success, error, timeout and cancel. It also
 runs when the caller drops the run future. The host never reads a pid from
-the jail.
+the jail. A cgroup that is still there after the teardown stays with the
+launcher. The launcher kills and removes it again before each launch and in
+each `sweep_stale`.
 
 Each launcher holds a lease file next to its VM directories. `sweep_stale`
 removes the microVMs and the cgroups of each owner whose lease is not locked.

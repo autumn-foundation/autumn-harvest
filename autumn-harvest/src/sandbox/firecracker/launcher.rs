@@ -147,6 +147,55 @@ pub struct FirecrackerLauncher {
     lease: InstanceLease,
     /// Set after the first version check that passes.
     versions_checked: tokio::sync::OnceCell<()>,
+    /// The cgroups that outlived the teardown of their microVM.
+    leftovers: Leftovers,
+}
+
+/// The cgroups of microVMs that a teardown could not remove.
+///
+/// A process of the microVM can still be alive in such a cgroup.
+/// [`FirecrackerLauncher::sweep_stale`] skips the cgroups of a live owner.
+/// So the launcher keeps them, and kills and removes them again before each
+/// launch and in each sweep.
+#[derive(Debug, Clone, Default)]
+struct Leftovers(Arc<Mutex<Vec<PathBuf>>>);
+
+impl Leftovers {
+    /// Keep `cgroup` when it is still there.
+    fn keep_if_left(&self, cgroup: &Path) {
+        if !cgroup.exists() {
+            return;
+        }
+        tracing::warn!(
+            cgroup = %cgroup.display(),
+            "a sandbox VM cgroup outlived its teardown; the launcher tries it again"
+        );
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(cgroup.to_path_buf());
+    }
+
+    /// Kill and remove each kept cgroup again. Keep each one that is still
+    /// there.
+    fn retry(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|cgroup| {
+                crate::sandbox::cgroup::kill_and_remove(cgroup, Duration::ZERO);
+                cgroup.exists()
+            });
+    }
+
+    /// Whether no cgroup is kept.
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
+    }
 }
 
 /// A locked file that marks a live owner of VM directories.
@@ -302,6 +351,7 @@ impl FirecrackerLauncher {
             owner,
             lease,
             versions_checked: tokio::sync::OnceCell::new(),
+            leftovers: Leftovers::default(),
         })
     }
 
@@ -393,7 +443,11 @@ impl FirecrackerLauncher {
 
     /// Remove the VMs of each owner whose lease is not locked. Returns the
     /// number of VM directories removed.
+    ///
+    /// The sweep also tries again each cgroup that outlived a teardown of
+    /// this launcher.
     pub fn sweep_stale(&self) -> usize {
+        self.leftovers.retry();
         let root = self.vm_root();
         let Ok(entries) = std::fs::read_dir(&root) else {
             return 0;
@@ -546,7 +600,7 @@ impl FirecrackerLauncher {
         let id = new_vm_id(&self.owner);
         validate_vm_id(&id)?;
         let prepared = self.prepare_jailed(jailer, &id, &BootMethod::Api).await?;
-        let mut vm = RunningVm::spawn(id, prepared)?;
+        let mut vm = RunningVm::spawn(id, prepared, self.leftovers.clone())?;
         let result = self
             .snapshot_vm(&mut vm, out_dir, boot_timeout, jailer.gid)
             .await;
@@ -849,11 +903,12 @@ impl FirecrackerLauncher {
 impl VmLauncher for FirecrackerLauncher {
     fn launch(&self) -> BoxFuture<'_, Result<Box<dyn LaunchedVm>, SandboxError>> {
         Box::pin(async move {
+            self.leftovers.retry();
             self.check_versions().await?;
             let id = new_vm_id(&self.owner);
             validate_vm_id(&id)?;
             let prepared = self.prepare(&id, &self.config.boot).await?;
-            let mut vm = RunningVm::spawn(id, prepared)?;
+            let mut vm = RunningVm::spawn(id, prepared, self.leftovers.clone())?;
             if let Some(socket) = vm.api_socket.clone()
                 && let Err(e) = self
                     .boot_through_api(&mut vm, &socket, &self.config.boot)
@@ -1276,10 +1331,15 @@ struct RunningVm {
     stderr_task: Option<tokio::task::JoinHandle<()>>,
     exited_at: Option<std::time::Instant>,
     down: bool,
+    leftovers: Leftovers,
 }
 
 impl RunningVm {
-    fn spawn(id: String, mut prepared: Prepared) -> Result<Self, SandboxError> {
+    fn spawn(
+        id: String,
+        mut prepared: Prepared,
+        leftovers: Leftovers,
+    ) -> Result<Self, SandboxError> {
         prepared
             .command
             .env_clear()
@@ -1325,6 +1385,7 @@ impl RunningVm {
             stderr_task,
             exited_at: None,
             down: false,
+            leftovers,
         })
     }
 
@@ -1341,7 +1402,8 @@ impl RunningVm {
 
     /// Kill the VMM, then its cgroup, then remove its directory. Each step
     /// is safe to repeat. `down` is set only at the end, so a drop in the
-    /// middle still runs the rest in [`Drop`].
+    /// middle still runs the rest in [`Drop`]. A cgroup that is still there
+    /// goes to the launcher, which tries it again.
     async fn teardown(&mut self) {
         if self.down {
             return;
@@ -1350,6 +1412,7 @@ impl RunningVm {
         let _ = tokio::time::timeout(KILL_WAIT, self.child.wait()).await;
         if let Some(cgroup) = &self.cgroup {
             kill_cgroup(cgroup).await;
+            self.leftovers.keep_if_left(cgroup);
         }
         if let Some(task) = self.stderr_task.take() {
             task.abort();
@@ -1408,12 +1471,13 @@ impl Drop for RunningVm {
             return;
         }
         // The async teardown did not run. Kill now, and clean up what can
-        // be cleaned without waiting. The next sweep removes the rest.
+        // be cleaned without waiting.
         let _ = self.child.start_kill();
         if let Some(cgroup) = &self.cgroup {
-            // The kill is not instant, so this removal can fail. The next
-            // `sweep_stale` then removes the cgroup.
+            // The kill is not instant, so this removal can fail. The
+            // launcher then tries the cgroup again.
             crate::sandbox::cgroup::kill_and_remove(cgroup, Duration::ZERO);
+            self.leftovers.keep_if_left(cgroup);
         }
         if let Some(task) = self.stderr_task.take() {
             task.abort();
@@ -2000,6 +2064,44 @@ while True:
         let status = waiter.join().unwrap();
         assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
         std::fs::remove_dir_all(cgroup).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cgroup_that_outlives_the_teardown_is_tried_again() {
+        let dir = temp_dir();
+        let launcher = new_launcher(jailed(&dir)).unwrap();
+        // A cgroup that still reports a process cannot be removed.
+        let name = format!("hsbx-{}-{}", launcher.owner(), "f".repeat(16));
+        let cgroup = dir.join("cgroup").join(name);
+        std::fs::create_dir_all(&cgroup).unwrap();
+        std::fs::write(cgroup.join("cgroup.events"), b"populated 1\n").unwrap();
+        let vm_dir = dir.join("vm");
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("30");
+        let prepared = Prepared {
+            vsock: vm_dir.join("v.sock"),
+            vm_dir,
+            api_socket: None,
+            cgroup: Some(cgroup.clone()),
+            command,
+        };
+        let mut vm =
+            RunningVm::spawn("hsbx-test".into(), prepared, launcher.leftovers.clone()).unwrap();
+        vm.teardown().await;
+        drop(vm);
+        // The sweep skips the cgroups of a live owner, but not this one.
+        let kill = cgroup.join("cgroup.kill");
+        std::fs::remove_file(&kill).unwrap();
+        launcher.sweep_stale();
+        assert!(kill.exists(), "the sweep did not kill the cgroup again");
+        assert!(!launcher.leftovers.is_empty());
+        // A cgroup that is gone leaves the list.
+        std::fs::remove_dir_all(&cgroup).unwrap();
+        launcher.sweep_stale();
+        assert!(launcher.leftovers.is_empty());
+        drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
