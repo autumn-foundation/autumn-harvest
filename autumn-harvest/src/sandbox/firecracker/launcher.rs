@@ -561,12 +561,17 @@ impl FirecrackerLauncher {
         // SAFETY: geteuid has no preconditions.
         let euid = unsafe { libc::geteuid() };
         let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
-        Self::new_on_host(config, euid, &mounts)
+        Self::new_on_host(config, euid, &mounts, check_netns)
     }
 
     /// [`Self::new`] for a process with the uid `euid` and the mount table
-    /// `mounts`.
-    fn new_on_host(config: LauncherConfig, euid: u32, mounts: &str) -> Result<Self, SandboxError> {
+    /// `mounts`. `netns_check` checks the network namespace of a jailer.
+    fn new_on_host(
+        config: LauncherConfig,
+        euid: u32,
+        mounts: &str,
+        netns_check: fn(&Path) -> Result<(), SandboxError>,
+    ) -> Result<Self, SandboxError> {
         // Firecracker refuses these at each launch. Refuse them once, here.
         let machine = config.machine;
         // The guest kernel and agent keep some memory, so a run needs more.
@@ -605,6 +610,9 @@ impl FirecrackerLauncher {
             super::jailer::check_limits(jailer)?;
             super::jailer::check_extra_cgroups(jailer)?;
             super::jailer::check_cgroup_root(jailer, mounts)?;
+            if let Some(netns) = &jailer.netns {
+                netns_check(netns)?;
+            }
             // The jailer makes the chroot and the cgroup, then drops to the
             // jail uid. Each step needs root, so another uid fails each launch.
             if euid != 0 {
@@ -1470,7 +1478,7 @@ fn copy_binaries(
     sources: &[(&str, PathBuf)],
     ids: &[FileId],
 ) -> Result<Vec<PathBuf>, SandboxError> {
-    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
     let fail = |what: &Path, e: &dyn std::fmt::Display| {
         SandboxError::Unavailable(format!("cannot copy {}: {e}", what.display()))
     };
@@ -1510,6 +1518,9 @@ fn copy_binaries(
             .open(&to)
             .map_err(|e| fail(from, &e))?;
         std::io::copy(&mut source, &mut copy).map_err(|e| fail(from, &e))?;
+        // The umask can narrow the mode of the open, so it is set again.
+        copy.set_permissions(std::fs::Permissions::from_mode(0o555))
+            .map_err(|e| fail(from, &e))?;
         drop(copy);
         if changed(&source) {
             return Err(fail(from, &"a deploy changed the file during the check"));
@@ -1517,6 +1528,44 @@ fn copy_binaries(
         copies.push(to);
     }
     Ok(copies)
+}
+
+/// The request type of `ioctl`: glibc and musl declare it apart.
+#[cfg(target_env = "gnu")]
+type Ioctl = libc::c_ulong;
+/// The request type of `ioctl`: glibc and musl declare it apart.
+#[cfg(not(target_env = "gnu"))]
+type Ioctl = libc::c_int;
+
+/// `NS_GET_NSTYPE`: `_IO(0xb7, 0x3)`. Only a namespace handle answers it.
+const NS_GET_NSTYPE: Ioctl = 0xb703;
+
+/// Check that `path` is a network namespace handle, such as a bind mount in
+/// `/run/netns`. The jailer joins it with `setns`, so another file fails
+/// each launch.
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Config`] when `path` cannot be opened, or holds
+/// another file or another namespace.
+fn check_netns(path: &Path) -> Result<(), SandboxError> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let refuse =
+        |why: &str| SandboxError::Config(format!("the network namespace {} {why}", path.display()));
+    // A plain open of a FIFO waits for a writer.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| refuse(&format!("cannot be opened: {e}")))?;
+    // SAFETY: NS_GET_NSTYPE takes no argument, and the descriptor is open.
+    let kind = unsafe { libc::ioctl(file.as_raw_fd(), NS_GET_NSTYPE) };
+    if kind == libc::CLONE_NEWNET {
+        Ok(())
+    } else {
+        Err(refuse("is not a network namespace handle"))
+    }
 }
 
 /// What identifies the file at a path. A replaced or rewritten file has
@@ -3314,7 +3363,8 @@ while True:
             }
             Confinement::Unjailed { .. } => String::new(),
         };
-        FirecrackerLauncher::new_on_host(config, 0, &mounts)
+        // A test cannot make a namespace handle without root.
+        FirecrackerLauncher::new_on_host(config, 0, &mounts, |_| Ok(()))
     }
 
     fn jailed(dir: &Path) -> LauncherConfig {
@@ -3651,6 +3701,7 @@ while True:
             jailed(&dir),
             0,
             "cgroup2 /sys/fs/cgroup cgroup2 rw 0 0\n",
+            |_| Ok(()),
         )
         .expect_err("another cgroup root");
         assert!(
@@ -3658,6 +3709,83 @@ while True:
             "{err:?}"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_a_network_namespace_handle_passes_the_netns_check() {
+        check_netns(Path::new("/proc/self/ns/net")).unwrap();
+        let dir = temp_dir();
+        let file = dir.join("netns-file");
+        std::fs::write(&file, b"").unwrap();
+        for path in [
+            Path::new("/proc/self/ns/mnt"),
+            file.as_path(),
+            &dir.join("missing"),
+        ] {
+            let err = check_netns(path).expect_err("not a network namespace");
+            assert!(
+                matches!(err, SandboxError::Config(ref m) if m.contains("network namespace")),
+                "{}: {err:?}",
+                path.display()
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_netns_that_is_not_a_namespace_is_a_config_error() {
+        let dir = temp_dir();
+        let mut config = jailed(&dir);
+        let file = dir.join("netns-file");
+        std::fs::write(&file, b"").unwrap();
+        let mounts = match &mut config.confinement {
+            Confinement::Jailer(jail) => {
+                jail.netns = Some(file);
+                format!("cgroup2 {} cgroup2 rw 0 0\n", jail.cgroup_root.display())
+            }
+            Confinement::Unjailed { .. } => unreachable!(),
+        };
+        // The jailer joins it with setns, so a plain file fails each launch.
+        let err = FirecrackerLauncher::new_on_host(config, 0, &mounts, check_netns)
+            .expect_err("a plain file");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("network namespace")),
+            "{err:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// When set, `copies_keep_their_mode_under_a_strict_umask` copies into
+    /// this directory. Its parent run sets the variable and umask `0077`.
+    const UMASK_CHILD: &str = "HARVEST_TEST_UMASK_CHILD";
+
+    #[test]
+    fn copies_keep_their_mode_under_a_strict_umask() {
+        let Some(dir) = std::env::var_os(UMASK_CHILD) else {
+            // The umask is per process, so a child runs this test under it.
+            let dir = temp_dir();
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("umask 077 && exec \"$0\" \"$@\"")
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sandbox::firecracker::launcher::tests::copies_keep_their_mode_under_a_strict_umask",
+                ])
+                .env(UMASK_CHILD, &dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{status}");
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let fc = script(&dir, "firecracker", "exit 0");
+        let ids = [file_id(&fc).unwrap()];
+        let copies = copy_binaries(&dir.join("copies"), &[("firecracker", fc)], &ids).unwrap();
+        // The jail uid runs the jailer's copy, which keeps this mode.
+        let mode = std::fs::metadata(&copies[0]).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o555, "{mode:o}");
     }
 
     #[test]
@@ -3670,7 +3798,7 @@ while True:
             }
             Confinement::Unjailed { .. } => unreachable!(),
         };
-        let err = FirecrackerLauncher::new_on_host(config, 1000, &mounts)
+        let err = FirecrackerLauncher::new_on_host(config, 1000, &mounts, |_| Ok(()))
             .expect_err("the jailer needs root");
         assert!(
             matches!(err, SandboxError::Config(ref m) if m.contains("root")),

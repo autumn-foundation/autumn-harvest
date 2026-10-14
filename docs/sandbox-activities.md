@@ -217,7 +217,8 @@ runtime refuses a policy that allows the network on a backend without one.
 - SMT off on a host that serves more than one tenant. Swap off.
 - An empty network namespace for the jailer, through `JailerConfig::netns`.
   Give its path under `/run/netns`, because `/var/run` is a symbolic link on
-  most hosts.
+  most hosts. The jailer joins it with `setns`, so the launcher refuses a
+  path that is not a network namespace handle.
   The microVM has no network device. The namespace also cuts the network of
   an escaped VMM.
 - One launcher per tenant, each with its own jail uid and gid. The microVMs

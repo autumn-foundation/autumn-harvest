@@ -51,7 +51,8 @@ pub struct JailerConfig {
     /// device either way. An empty namespace,
     /// such as one from `ip netns add`, also cuts the network of an escaped
     /// VMM. Give the path under `/run/netns`. The launcher refuses a symbolic
-    /// link in the path, and `/var/run` is one on most hosts.
+    /// link in the path, and `/var/run` is one on most hosts. It also refuses
+    /// a path that is not a network namespace handle.
     pub netns: Option<PathBuf>,
     /// The `fsize` rlimit of the VMM, in bytes. It must hold a snapshot of
     /// the guest memory. The default is [`DEFAULT_FSIZE_LIMIT`].
