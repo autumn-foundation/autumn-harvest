@@ -38,6 +38,14 @@ const SPAN_KINDS: &[&str] = &["internal", "producer", "consumer", "client", "ser
 /// Attributes that every span must require.
 const ALWAYS_REQUIRED: &[&str] = &["workflow.system.name", "workflow.operation.name"];
 
+/// Phrases that each span note must hold: its start and end boundaries, and
+/// its status on error.
+const NOTE_PHRASES: &[&str] = &[
+    "The span starts when",
+    "It ends when",
+    "the span status SHOULD be `Error`",
+];
+
 /// The condition under which every span must carry `error.type`.
 const ERROR_CONDITION: &str = "If the operation ends in an error.";
 
@@ -515,6 +523,17 @@ fn the_model_has_the_weaver_shape() {
             "`{id}` must end with `.{kind}`"
         );
         let refs = span_refs(&group);
+        let note = str_field(&group, "note")
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for phrase in NOTE_PHRASES {
+            assert!(
+                note.contains(phrase),
+                "the note of `{id}` must say: {phrase}"
+            );
+        }
         let error = refs
             .get("error.type")
             .and_then(|level| level.get("conditionally_required").and_then(Value::as_str));

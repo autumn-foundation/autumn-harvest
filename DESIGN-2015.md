@@ -102,6 +102,10 @@ code, guard quality, and style. The fixes:
   that `error.type` was missing on some spans, and that the run id rule was
   too weak. Each span ref now pins its operation value. Each span carries
   `error.type` when its operation ends in an error. Guards check both.
+- A later Codex round asked for start and end boundaries and an error
+  status on each span. Each span note now states both, and a guard checks
+  them. It also proposed an event for `fire_timer`. That changes the ADR
+  span set, so it is open question 9 and goes to the maintainer.
 
 ### 0.6 Decisions
 

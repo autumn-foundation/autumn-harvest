@@ -10,6 +10,10 @@ groups:
       The engine SHOULD store the trace context of this span with the
       scheduled work. The worker then uses it as the parent of the
       `execute_workflow` span.
+
+      The span starts when the caller sends the start request. It ends
+      when the engine durably accepts or refuses the run.
+      If the operation ends in an error, the span status SHOULD be `Error`.
     attributes:
       - ref: workflow.system.name
         requirement_level: required
@@ -40,6 +44,10 @@ groups:
 
       A live cycle uses the stored context of the scheduling span as its
       parent. A replay cycle follows the replay rule of this proposal.
+
+      The span starts when a worker begins a decision cycle. It ends
+      when the cycle commits its result or fails.
+      If the operation ends in an error, the span status SHOULD be `Error`.
     attributes:
       - ref: workflow.system.name
         requirement_level: required
@@ -72,6 +80,10 @@ groups:
 
       The `workflow.name` and `workflow.run.id` attributes describe the
       child run.
+
+      The span starts when the parent issues the child start command. It
+      ends when the engine durably records the command.
+      If the operation ends in an error, the span status SHOULD be `Error`.
     attributes:
       - ref: workflow.system.name
         requirement_level: required
@@ -97,6 +109,10 @@ groups:
     brief: This span describes a workflow run that schedules an activity.
     note: |
       The span name SHOULD be `schedule_activity {workflow.activity.name}`.
+
+      The span starts when the workflow issues the activity command. It
+      ends when the engine durably records the scheduled activity.
+      If the operation ends in an error, the span status SHOULD be `Error`.
     attributes:
       - ref: workflow.system.name
         requirement_level: required
@@ -126,6 +142,10 @@ groups:
 
       Each attempt gets its own span. A retry is a new span with a higher
       `workflow.activity.attempt`.
+
+      The span starts when a worker begins the attempt. It ends when the
+      attempt returns a result or an error.
+      If the operation ends in an error, the span status SHOULD be `Error`.
     attributes:
       - ref: workflow.system.name
         requirement_level: required
@@ -159,6 +179,10 @@ groups:
 
       The `workflow.name` and `workflow.run.id` attributes describe the
       target run.
+
+      The span starts when the caller sends the signal. It ends when the
+      engine durably accepts or refuses the signal.
+      If the operation ends in an error, the span status SHOULD be `Error`.
     attributes:
       - ref: workflow.system.name
         requirement_level: required
@@ -191,6 +215,10 @@ groups:
       The span SHOULD be a child of the `execute_workflow` span that
       observes the signal. It SHOULD link to the `send_signal` span when
       the engine stores that context.
+
+      The span starts when the engine hands the signal to the run. It
+      ends when the workflow code has received the signal.
+      If the operation ends in an error, the span status SHOULD be `Error`.
     attributes:
       - ref: workflow.system.name
         requirement_level: required
@@ -222,6 +250,10 @@ groups:
 
       The span SHOULD be a child of the `execute_workflow` span that
       observes the timer.
+
+      The span starts when the engine finds the due timer. It ends when
+      the run has received the timer result.
+      If the operation ends in an error, the span status SHOULD be `Error`.
     attributes:
       - ref: workflow.system.name
         requirement_level: required

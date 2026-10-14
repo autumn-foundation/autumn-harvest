@@ -102,6 +102,9 @@ attribute.
 | `span.workflow.deliver_signal.consumer` | `CONSUMER` | `deliver_signal {workflow.name}` | system, operation, name, run id |
 | `span.workflow.fire_timer.internal` | `INTERNAL` | `fire_timer` | system, operation, run id |
 
+Each span note in the model gives the start and end of its operation. If
+the operation ends in an error, the span status SHOULD be `Error`.
+
 Each span sets `workflow.operation.name` to its own operation. For example,
 a `schedule_workflow` span MUST NOT carry `execute_activity`.
 
@@ -204,6 +207,10 @@ Harvest does not yet conform to every rule of this draft:
    tools. The area can need a narrower name, such as `durable_workflow`.
 8. **System values.** `workflow.system.name` has no list of well-known
    values yet.
+9. **Timer fire.** A timer fire is close to a point in time. The OTel
+   guidance models such an occurrence as an event, not a span. This draft
+   keeps the ADR 0001 span. An event on `execute_workflow` is the
+   alternative.
 
 ## 9. Upstream issue text
 
@@ -253,6 +260,7 @@ draft lists where it does not yet conform.
 - A separate business id beside `workflow.run.id`.
 - Reuse of `messaging.destination.name` for the task queue.
 - A narrower namespace than `workflow`.
+- A span or an event for `fire_timer`.
 
 #### Group
 
